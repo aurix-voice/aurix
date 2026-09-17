@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             cascade_peers: config.media.cascade_peers.clone(),
             advertised_addr,
             downlink_bitrate: config.media.default_bitrate,
+            rx_workers: config.media.rx_workers,
         },
     );
 

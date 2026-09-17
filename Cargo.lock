@@ -414,6 +414,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurix-loadtest"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "aurix-common",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures-util",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "aurix-media"
 version = "1.0.0"
 dependencies = [

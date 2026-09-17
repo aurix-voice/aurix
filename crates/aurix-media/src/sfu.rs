@@ -31,6 +31,8 @@ pub struct SfuOptions {
     /// Address advertised to WebRTC clients (external IP + media port).
     pub advertised_addr: Option<SocketAddr>,
     pub downlink_bitrate: u32,
+    /// Number of concurrent UDP receive workers (0 = derive from available CPUs).
+    pub rx_workers: usize,
 }
 
 impl Default for SfuOptions {
@@ -45,6 +47,7 @@ impl Default for SfuOptions {
             cascade_peers: Vec::new(),
             advertised_addr: None,
             downlink_bitrate: 32_000,
+            rx_workers: 0,
         }
     }
 }
@@ -122,6 +125,16 @@ impl SfuNode {
 
     pub fn options(&self) -> &SfuOptions {
         &self.options
+    }
+
+    fn rx_worker_count(configured: usize) -> usize {
+        if configured > 0 {
+            return configured;
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(2, 8)
     }
 
     pub async fn start(&mut self, bind_addr: &str) -> Result<()> {
@@ -281,8 +294,11 @@ impl SfuNode {
             }));
         }
 
-        // Main UDP receive loop
-        {
+        // UDP receive workers. Several tasks drain the same socket so that per-packet work
+        // (HMAC verification, fan-out signing, sends) runs in parallel across the runtime
+        // instead of serialising behind a single recv loop and overflowing SO_RCVBUF.
+        let workers = Self::rx_worker_count(self.options.rx_workers);
+        for worker in 0..workers {
             let router = router.clone();
             let webrtc = webrtc_mgr.clone();
             let socket = socket.clone();
@@ -301,13 +317,14 @@ impl SfuNode {
                             }
                         }
                         Err(e) => {
-                            error!("UDP recv error: {}", e);
+                            error!("UDP recv error (worker {}): {}", worker, e);
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                     }
                 }
             });
         }
+        info!("SFU UDP receive workers: {}", workers);
 
         self.start_session_cleanup();
         self.start_speaking_timeout();

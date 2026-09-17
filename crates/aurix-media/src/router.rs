@@ -373,6 +373,18 @@ impl PacketRouter {
         }
     }
 
+    /// Fast-path UDP send: try the non-blocking syscall first and only park the task on
+    /// socket writability when the kernel send buffer is actually full.
+    async fn send_udp(&self, out: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
+        match self.socket.try_send_to(out, addr) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.socket.send_to(out, addr).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn fan_out(
         &self,
         channel: &Arc<MediaChannel>,
@@ -428,7 +440,7 @@ impl PacketRouter {
                     } else {
                         Self::sign_body(plain_body.clone(), &receiver.media_key)
                     };
-                    match self.socket.send_to(&out, addr).await {
+                    match self.send_udp(&out, addr).await {
                         Ok(n) => {
                             receiver.record_packet_sent(n as u64);
                             aurix_metrics::PACKETS_SENT.inc();

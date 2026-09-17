@@ -311,6 +311,9 @@ pub struct MediaConfig {
     /// Milliseconds without audio after which a participant stops being "speaking".
     #[serde(default = "default_speaking_timeout_ms")]
     pub speaking_timeout_ms: u64,
+    /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
+    #[serde(default)]
+    pub rx_workers: usize,
     /// Shared secret authenticating cascade (node-to-node relay) traffic.
     #[serde(default)]
     pub cascade_secret: Option<String>,
@@ -358,6 +361,7 @@ impl Default for MediaConfig {
             worker_threads: 4,
             require_packet_auth: true,
             speaking_timeout_ms: default_speaking_timeout_ms(),
+            rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),
             cascade_discovery: true,

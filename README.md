@@ -170,6 +170,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN` | allows `/admin/setup` after the first admin exists; unset after use |
 | `AURIX__MEDIA__EXTERNAL_IP` | public IP advertised to clients for UDP media |
 | `AURIX__MEDIA__REQUIRE_PACKET_AUTH` | `true` (default) — drop unauthenticated media |
+| `AURIX__MEDIA__RX_WORKERS` | concurrent UDP receive workers on the SFU socket; `0` (default) = CPU count clamped to 2–8 |
 | `AURIX__MEDIA__CASCADE_SECRET`, `AURIX__MEDIA__CASCADE_PEERS` | shared secret + allow-list for SFU↔SFU relay |
 | `AURIX__TURN__*` | `ENABLED`, `EXTERNAL_IP`, `REALM`, `AUTH_SECRET` (≥ 32 bytes), `MIN_PORT`/`MAX_PORT` relay range |
 | `AURIX__SERVER__CORS_ORIGINS` | explicit origins; `*` is rejected in production |
@@ -262,6 +263,38 @@ authenticated audio Alice→Bob, forged-packet rejection, recording of real Opus
 allocation with API-issued credentials, and clean-up on disconnect.
 
 System dependencies for building: `pkg-config`, `libssl-dev`, `cmake`, `libopus-dev` (Debian names).
+
+### Load testing
+
+`aurix-loadtest` is a reproducible load generator that behaves like real native clients: it
+creates channels and tokens through the REST API (API key required), opens one WebSocket per
+session, performs an authenticated `SessionBind` over UDP, joins channels and then streams
+HMAC-signed AURX audio from the configured speakers while every member verifies the downlink
+with its own session key (nothing bypasses production validation).
+
+```bash
+cargo build --release -p aurix-server -p aurix-loadtest
+./target/release/aurix-loadtest \
+  --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081 --metrics http://127.0.0.1:9090/metrics \
+  --api-key aurx_...            # or AURIX_LOADTEST_API_KEY
+  --sessions 1000 --channels 100 --speakers 2 --pps 50 --duration 30 [--json]
+```
+
+The report contains session setup success/latency, packets sent vs. delivered (`expected =
+speakers × (members − 1) × frames`), bad-auth count, one-way latency percentiles (a timestamp is
+embedded in every payload), control-plane message counts and a before/after diff of the server’s
+Prometheus counters (`packets_*`, CPU seconds, RSS). Kernel-side drops show up in
+`/proc/net/snmp` → `Udp: RcvbufErrors`; the loadgen host needs `ulimit -n` ≥ 2 × sessions.
+
+Reference run (release build, 8 vCPU host shared with the load generator, PostgreSQL + Redis):
+
+| scenario | in / out pps | delivered | one-way p50 / p99 | server CPU | RSS |
+|---|---|---|---|---|---|
+| 1000 sessions, 100 channels × 10, 2 speakers | 10k / 90k | 100 % | 2.5 / 4.8 ms | ~0.4 core | 48 MB |
+| 2000 sessions, 200 channels × 10, 4 speakers | 40k / 360k | 99.8 % | 2.1 / 4.8 ms | ~1.4 cores | 70 MB |
+
+The second scenario delivered only 79 % (p99 13.6 ms, 167k `RcvbufErrors`) before the SFU used
+parallel receive workers and non-blocking sends; that is what `media.rx_workers` controls.
 
 ## Limitations
 
