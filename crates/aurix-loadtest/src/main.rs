@@ -559,7 +559,7 @@ async fn main() -> Result<()> {
         "setup": {
             "channels_ms": channels_ms, "tokens_ms": tokens_ms, "sessions_ms": setup_ms,
             "sessions_ok": ok, "sessions_failed": stats.sessions_failed.load(Ordering::Relaxed),
-            "session_setup_avg_ms": if ok > 0 { stats.setup_ms_total.load(Ordering::Relaxed) / ok } else { 0 },
+            "session_setup_avg_ms": stats.setup_ms_total.load(Ordering::Relaxed).checked_div(ok).unwrap_or(0),
             "session_setup_max_ms": stats.setup_ms_max.load(Ordering::Relaxed),
         },
         "media": {
