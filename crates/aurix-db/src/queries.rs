@@ -741,6 +741,14 @@ pub async fn mark_node_unhealthy(pool: &DbPool, node_id: Uuid) -> Result<(), sql
     Ok(())
 }
 
+pub async fn delete_media_node(pool: &DbPool, node_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM media_nodes WHERE id = $1")
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ── Audit Log Queries ──
 
 pub async fn insert_audit_log(pool: &DbPool, entry: &AuditLogRow) -> Result<(), sqlx::Error> {

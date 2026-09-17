@@ -176,7 +176,10 @@ impl JwtService {
                 jsonwebtoken::errors::ErrorKind::InvalidToken => {
                     AurixError::TokenInvalid("Malformed token".into())
                 }
-                _ => AurixError::TokenInvalid(format!("Token validation failed: {e}")),
+                _ => {
+                    tracing::debug!("token rejected: {e}");
+                    AurixError::TokenInvalid("Token validation failed".into())
+                }
             }
         })?;
 

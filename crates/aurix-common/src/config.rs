@@ -27,12 +27,39 @@ impl AurixConfig {
         builder = builder.add_source(
             config::Environment::with_prefix("AURIX")
                 .separator("__")
-                .try_parsing(true),
+                .try_parsing(true)
+                .list_separator(",")
+                .with_list_parse_key("server.cors_origins")
+                .with_list_parse_key("server.trusted_proxies")
+                .with_list_parse_key("media.cascade_peers"),
         );
         let cfg = builder.build()?;
-        let config: AurixConfig = cfg.try_deserialize()?;
+        let mut config: AurixConfig = cfg.try_deserialize()?;
+        config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Trim list entries and drop empty ones so `AURIX__SERVER__TRUSTED_PROXIES=""` or
+    /// `"a, b"` from the environment behave as expected.
+    pub fn normalize(&mut self) {
+        fn clean(list: &mut Vec<String>) {
+            list.iter_mut().for_each(|s| *s = s.trim().to_string());
+            list.retain(|s| !s.is_empty());
+        }
+        clean(&mut self.server.cors_origins);
+        clean(&mut self.server.trusted_proxies);
+        clean(&mut self.media.cascade_peers);
+        for opt in [
+            &mut self.media.external_ip,
+            &mut self.turn.external_ip,
+            &mut self.auth.admin_bootstrap_token,
+            &mut self.recording.encryption_key,
+        ] {
+            if opt.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                *opt = None;
+            }
+        }
     }
 
     pub fn is_production(&self) -> bool {
@@ -91,6 +118,11 @@ impl AurixConfig {
                 if is_placeholder_secret(&self.turn.auth_secret) {
                     anyhow::bail!(
                         "turn.auth_secret is a placeholder value; set a real secret in production"
+                    );
+                }
+                if self.turn.external_ip.is_none() && self.media.external_ip.is_none() {
+                    anyhow::bail!(
+                        "turn.external_ip (or media.external_ip) must be set in production so TURN URIs are routable"
                     );
                 }
             }
@@ -479,5 +511,63 @@ impl Default for RateLimitConfig {
             channel_joins_per_minute: 30,
             messages_per_second: 10,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev_config() -> AurixConfig {
+        let mut cfg = AurixConfig::default();
+        cfg.server.environment = "development".into();
+        cfg
+    }
+
+    #[test]
+    fn production_rejects_wildcard_cors_and_placeholder_secrets() {
+        let mut cfg = dev_config();
+        assert!(cfg.validate().is_ok(), "development defaults must validate");
+
+        cfg.server.environment = "production".into();
+        cfg.turn.enabled = false;
+        cfg.media.external_ip = Some("203.0.113.10".into());
+        cfg.database.url = "postgres://prod:s3cret@db/aurix".into();
+        cfg.auth.jwt_secret = "change-me-in-production-this-is-not-secure-32bytes!".into();
+        cfg.server.cors_origins = vec!["https://game.example.com".into()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("placeholder"));
+
+        cfg.auth.jwt_secret = "a".repeat(48);
+        cfg.server.cors_origins = vec!["*".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cors_origins"), "{err}");
+
+        cfg.server.cors_origins = vec!["https://game.example.com".into()];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn env_lists_are_comma_separated() {
+        std::env::set_var(
+            "AURIX__SERVER__CORS_ORIGINS",
+            "https://a.example,https://b.example",
+        );
+        std::env::set_var(
+            "AURIX__SERVER__TRUSTED_PROXIES",
+            "10.0.0.0/8, 192.168.0.0/16",
+        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default");
+        let cfg = AurixConfig::load(Some(path)).expect("load with env overrides");
+        std::env::remove_var("AURIX__SERVER__CORS_ORIGINS");
+        std::env::remove_var("AURIX__SERVER__TRUSTED_PROXIES");
+        assert_eq!(
+            cfg.server.cors_origins,
+            vec!["https://a.example", "https://b.example"]
+        );
+        assert_eq!(cfg.server.trusted_proxies.len(), 2);
     }
 }

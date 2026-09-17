@@ -1,53 +1,120 @@
-version: "3.9"
+# Production-shaped single-node deployment.
+#
+#   cp .env.example .env   # fill in real secrets (never commit .env)
+#   docker compose up -d --build
+#
+# All secrets come from the environment / .env; nothing sensitive lives in this file.
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: aurix
-      POSTGRES_PASSWORD: aurix
-      POSTGRES_DB: aurix
-    volumes: [pgdata:/var/lib/postgresql/data]
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-aurix}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aurix"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
-      retries: 5
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { memory: 2g }
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      retries: 5
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { memory: 384m }
 
   aurix:
     build: .
+    image: aurix-server:local
+    restart: unless-stopped
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports:
-      - "8080:8080"
-      - "8081:8081"
-      - "10000:10000/udp"
-      - "3478:3478/udp"
+      - "8080:8080"          # REST API (put a TLS-terminating proxy in front or set AURIX__SERVER__TLS_*)
+      - "8081:8081"          # WebSocket signalling
+      - "10000:10000/udp"    # native AURX media
+      - "3478:3478/udp"      # TURN
+      - "3478:3478/tcp"
+      # TURN relay range: must match AURIX__TURN__MIN_PORT / MAX_PORT. Docker publishes each port
+      # individually, so keep the range small here or run with `network_mode: host` for large ranges.
+      - "49160-49200:49160-49200/udp"
+      - "127.0.0.1:4040:4040" # Prometheus metrics — never expose publicly
     environment:
-      AURIX__DATABASE__URL: postgres://aurix:aurix@db:5432/aurix
+      AURIX__SERVER__ENVIRONMENT: production
+      AURIX__SERVER__EXTERNAL_URL: ${AURIX_EXTERNAL_URL:?public https URL of the API}
+      AURIX__SERVER__CORS_ORIGINS: ${AURIX_CORS_ORIGINS:?comma-separated allowed origins}
+      AURIX__SERVER__TRUSTED_PROXIES: ${AURIX_TRUSTED_PROXIES:-}
+      AURIX__DATABASE__URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-aurix}
       AURIX__REDIS__URL: redis://redis:6379
-      AURIX__AUTH__JWT_SECRET: "production-change-this-secret-key-32b!"
-      AURIX__TURN__AUTH_SECRET: "production-change-this-turn-secret"
+      AURIX__AUTH__JWT_SECRET: ${AURIX_JWT_SECRET:?>=32 random bytes}
+      AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ${AURIX_ADMIN_BOOTSTRAP_TOKEN:-}
+      AURIX__MEDIA__EXTERNAL_IP: ${AURIX_PUBLIC_IP:?public IP clients send media to}
+      AURIX__TURN__ENABLED: ${AURIX_TURN_ENABLED:-true}
+      AURIX__TURN__EXTERNAL_IP: ${AURIX_PUBLIC_IP}
+      AURIX__TURN__REALM: ${AURIX_TURN_REALM:-aurix}
+      AURIX__TURN__AUTH_SECRET: ${AURIX_TURN_SECRET:?>=32 random bytes}
+      AURIX__TURN__MIN_PORT: ${AURIX_TURN_MIN_PORT:-49160}
+      AURIX__TURN__MAX_PORT: ${AURIX_TURN_MAX_PORT:-49200}
+      AURIX__RECORDING__ENABLED: ${AURIX_RECORDING_ENABLED:-false}
+      AURIX__RECORDING__ENCRYPTION_ENABLED: ${AURIX_RECORDING_ENCRYPTION_ENABLED:-false}
+      AURIX__RECORDING__ENCRYPTION_KEY: ${AURIX_RECORDING_ENCRYPTION_KEY:-}
+      AURIX__RATE_LIMITING__ENABLED: "true"
+      AURIX__TRACING__LOG_LEVEL: ${AURIX_LOG_LEVEL:-info}
+    volumes:
+      - recordings:/var/lib/aurix/recordings
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 4g }
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    profiles: [observability]
     volumes:
-      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    profiles: [observability]
+    depends_on: [prometheus]
     ports:
       - "127.0.0.1:3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
-      - ./deploy/grafana:/etc/grafana/provisioning/dashboards
+      - ./deploy/grafana:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
 
 volumes:
   pgdata:
+  recordings:
+  promdata:
+  grafanadata:

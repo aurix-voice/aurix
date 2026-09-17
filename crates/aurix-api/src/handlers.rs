@@ -1,13 +1,12 @@
-use crate::errors::ApiError;
+use crate::errors::{ApiError, Json, Path, Query};
 use crate::middleware::{ApiKeyContext, ClientIp};
 use crate::state::AppState;
 use aurix_auth::ValidatedToken;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, State},
     http::HeaderMap,
-    Json,
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -1473,7 +1472,15 @@ fn issue_turn_credentials(
     let host = turn
         .external_ip
         .clone()
-        .unwrap_or_else(|| turn.host.clone());
+        .or_else(|| state.control.config.media.external_ip.clone())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| {
+            if turn.host == "0.0.0.0" || turn.host == "::" {
+                "127.0.0.1".to_string()
+            } else {
+                turn.host.clone()
+            }
+        });
     let uris = vec![
         format!("turn:{}:{}?transport=udp", host, turn.udp_port),
         format!("turn:{}:{}?transport=tcp", host, turn.tcp_port),

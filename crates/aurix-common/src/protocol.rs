@@ -456,6 +456,8 @@ impl RtpHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ControlMessage {
+    /// Accepted for backwards compatibility only: the WebSocket server authenticates the
+    /// bearer token at upgrade time and assigns the session id itself (`SessionInitAck`).
     SessionInit {
         token: String,
         session_id: SessionId,

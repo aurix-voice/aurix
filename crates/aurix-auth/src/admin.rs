@@ -169,7 +169,10 @@ impl AdminAuthService {
 
         let data = decode::<AdminClaims>(token, &key, &validation).map_err(|e| match e.kind() {
             jsonwebtoken::errors::ErrorKind::ExpiredSignature => AurixError::TokenExpired,
-            _ => AurixError::TokenInvalid(format!("Admin token invalid: {e}")),
+            _ => {
+                tracing::debug!("admin token rejected: {e}");
+                AurixError::TokenInvalid("Admin token invalid".into())
+            }
         })?;
 
         let c = data.claims;

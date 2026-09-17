@@ -63,7 +63,10 @@ impl ControlPlane {
                     id: entry.id,
                     app_id: entry.app_id.map(|a| a.0),
                     actor_id: entry.actor_id.0,
-                    action: format!("{:?}", entry.action).to_lowercase(),
+                    action: serde_json::to_value(&entry.action)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| format!("{:?}", entry.action).to_lowercase()),
                     target_type: entry.target_type,
                     target_id: entry.target_id,
                     details: entry.details,

@@ -5,8 +5,9 @@ use aurix_db::DbPool;
 use chrono::Utc;
 use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
+const STALE_NODE_RETENTION_SECS: i64 = 24 * 3600;
 const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
 pub struct NodeManager {
@@ -187,24 +188,40 @@ impl NodeManager {
 
     pub async fn check_node_health(&self) {
         self.refresh_from_db().await;
-        let mut unhealthy = Vec::new();
+        let now = Utc::now();
+        let mut timed_out = Vec::new();
+        let mut dead = Vec::new();
 
         for entry in self.nodes.iter() {
             let node = entry.value();
-            let age = Utc::now()
-                .signed_duration_since(node.last_heartbeat)
-                .num_seconds();
-            if age > HEARTBEAT_TIMEOUT_SECS {
-                unhealthy.push(*entry.key());
+            let age = now.signed_duration_since(node.last_heartbeat).num_seconds();
+            if age > STALE_NODE_RETENTION_SECS {
+                dead.push(*entry.key());
+            } else if age > HEARTBEAT_TIMEOUT_SECS {
+                timed_out.push(*entry.key());
             }
         }
 
-        for node_id in unhealthy {
-            if let Some(mut node) = self.nodes.get_mut(&node_id) {
-                node.healthy = false;
+        for node_id in timed_out {
+            let newly_unhealthy = self
+                .nodes
+                .get_mut(&node_id)
+                .map(|mut node| std::mem::replace(&mut node.healthy, false))
+                .unwrap_or(false);
+            if newly_unhealthy {
                 warn!("Node {} marked unhealthy (heartbeat timeout)", node_id);
+                let _ = aurix_db::queries::mark_node_unhealthy(&self.pool, node_id.0).await;
             }
-            let _ = aurix_db::queries::mark_node_unhealthy(&self.pool, node_id.0).await;
+        }
+
+        // Nodes silent for a long time are forgotten so the registry does not grow forever.
+        for node_id in dead {
+            self.nodes.remove(&node_id);
+            if let Err(e) = aurix_db::queries::delete_media_node(&self.pool, node_id.0).await {
+                warn!("Failed to prune stale node {node_id}: {e}");
+            } else {
+                info!("Pruned stale media node {node_id}");
+            }
         }
     }
 }

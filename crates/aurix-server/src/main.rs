@@ -217,7 +217,6 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = control.nodes.heartbeat(info.id, info).await {
                     error!("Heartbeat failed: {}", e);
                 }
-                control.nodes.check_node_health().await;
             }
         });
     }
@@ -238,37 +237,59 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let api_addr = format!("{}:{}", config.server.host, config.server.api_port);
-    let api_listener = tokio::net::TcpListener::bind(&api_addr).await?;
-    info!("API server listening on {}", api_addr);
-    let ws_addr = format!("{}:{}", config.server.host, config.server.ws_port);
-    let ws_listener = tokio::net::TcpListener::bind(&ws_addr).await?;
-    info!("WebSocket server listening on {}", ws_addr);
+    let api_addr: std::net::SocketAddr =
+        format!("{}:{}", config.server.host, config.server.api_port).parse()?;
+    let ws_addr: std::net::SocketAddr =
+        format!("{}:{}", config.server.host, config.server.ws_port).parse()?;
+    let tls = match (&config.server.tls_cert_path, &config.server.tls_key_path) {
+        (Some(cert), Some(key)) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to load TLS cert/key: {e}"))?;
+            info!("TLS enabled for API and WebSocket listeners (cert {cert})");
+            Some(cfg)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("server.tls_cert_path and server.tls_key_path must be set together"),
+    };
 
-    let api_cancel = shutdown.clone();
-    tasks.spawn(async move {
-        if let Err(e) = axum::serve(
-            api_listener,
-            api_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { api_cancel.cancelled().await })
-        .await
-        {
-            error!("API server error: {}", e);
+    let api_handle = axum_server::Handle::new();
+    let ws_handle = axum_server::Handle::new();
+    spawn_http_server(
+        &mut tasks,
+        "API",
+        api_addr,
+        api_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        tls.clone(),
+        api_handle.clone(),
+    );
+    spawn_http_server(
+        &mut tasks,
+        "WebSocket",
+        ws_addr,
+        ws_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        tls,
+        ws_handle.clone(),
+    );
+    for (name, handle, addr) in [
+        ("API", &api_handle, api_addr),
+        ("WebSocket", &ws_handle, ws_addr),
+    ] {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.listening()).await {
+            Ok(Some(bound)) => info!("{name} server listening on {bound}"),
+            _ => anyhow::bail!("{name} server failed to bind {addr}"),
         }
-    });
-    let ws_cancel = shutdown.clone();
-    tasks.spawn(async move {
-        if let Err(e) = axum::serve(
-            ws_listener,
-            ws_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { ws_cancel.cancelled().await })
-        .await
-        {
-            error!("WebSocket server error: {}", e);
-        }
-    });
+    }
+    {
+        let cancel = shutdown.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            let grace = Some(std::time::Duration::from_secs(15));
+            api_handle.graceful_shutdown(grace);
+            ws_handle.graceful_shutdown(grace);
+        });
+    }
 
     shutdown_signal().await;
     info!("Shutdown signal received; draining");
@@ -291,6 +312,38 @@ async fn main() -> anyhow::Result<()> {
     pool.close().await;
     info!("Aurix server stopped");
     Ok(())
+}
+
+fn spawn_http_server(
+    tasks: &mut tokio::task::JoinSet<()>,
+    name: &'static str,
+    addr: std::net::SocketAddr,
+    make_service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<
+        axum::Router,
+        std::net::SocketAddr,
+    >,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    handle: axum_server::Handle,
+) {
+    tasks.spawn(async move {
+        let result = match tls {
+            Some(tls) => {
+                axum_server::bind_rustls(addr, tls)
+                    .handle(handle)
+                    .serve(make_service)
+                    .await
+            }
+            None => {
+                axum_server::bind(addr)
+                    .handle(handle)
+                    .serve(make_service)
+                    .await
+            }
+        };
+        if let Err(e) = result {
+            error!("{name} server error: {e}");
+        }
+    });
 }
 
 async fn shutdown_signal() {

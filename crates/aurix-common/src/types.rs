@@ -331,6 +331,7 @@ impl Default for Orientation3D {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChannelConfig {
     pub channel_type: ChannelType,
     pub max_participants: u32,
@@ -532,10 +533,18 @@ pub struct TokenClaims {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPermission {
     pub channel_id: ChannelId,
+    #[serde(default = "default_true")]
     pub join: bool,
+    #[serde(default = "default_true")]
     pub speak: bool,
+    #[serde(default = "default_true")]
     pub receive: bool,
+    #[serde(default)]
     pub moderate: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

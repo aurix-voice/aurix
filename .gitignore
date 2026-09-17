@@ -1,3 +1,6 @@
 target/
 *.ogg
 recordings/
+.env
+.env.*
+!.env.example

@@ -389,8 +389,9 @@ impl PacketRouter {
         receivers: Vec<(Arc<MediaSession>, f32)>,
         packet: &AurixPacket,
     ) {
-        // Encode the unattenuated variant once; per-receiver encodes only when volume differs.
-        let plain: Bytes = packet.encode().freeze();
+        // Header+payload is serialized once; each receiver only pays for its own HMAC tag so
+        // downlink packets are authenticated with the receiver's session key.
+        let plain_body = Self::encode_body(packet, None);
         let e2ee = packet.header.has_flag(PacketFlags::E2ee);
         for (receiver, volume) in receivers {
             if !receiver.is_active() {
@@ -422,9 +423,10 @@ impl PacketRouter {
                         continue;
                     };
                     let out = if !e2ee && (volume - 1.0).abs() > 0.01 {
-                        Self::encode_with_volume(packet, volume)
+                        let body = Self::encode_body(packet, Some(volume));
+                        Self::sign_body(body, &receiver.media_key)
                     } else {
-                        plain.clone()
+                        Self::sign_body(plain_body.clone(), &receiver.media_key)
                     };
                     match self.socket.send_to(&out, addr).await {
                         Ok(n) => {
@@ -445,21 +447,39 @@ impl PacketRouter {
         }
     }
 
-    fn encode_with_volume(packet: &AurixPacket, volume: f32) -> Bytes {
-        let vol_byte = (volume.clamp(0.0, 1.0) * 255.0) as u8;
-        let new_payload_len = 1 + packet.payload.len();
-        let mut combined = BytesMut::with_capacity(new_payload_len);
-        combined.put_u8(vol_byte);
-        combined.put_slice(&packet.payload);
+    /// Serialize header + payload with the `Authenticated` flag set (tag appended by `sign_body`).
+    /// `volume` prepends a one-byte attenuation factor and sets `VolumeAttenuated`.
+    fn encode_body(packet: &AurixPacket, volume: Option<f32>) -> BytesMut {
         let mut header = packet.header.clone();
-        header.flags |= PacketFlags::VolumeAttenuated as u16;
-        header.flags &= !(PacketFlags::Authenticated as u16);
-        header.payload_length = new_payload_len as u16;
-        header.checksum = crc32fast::hash(&combined);
-        let mut buf = BytesMut::with_capacity(HEADER_SIZE + new_payload_len);
-        header.encode(&mut buf);
-        buf.put_slice(&combined);
-        buf.freeze()
+        header.flags |= PacketFlags::Authenticated as u16;
+        let mut buf =
+            BytesMut::with_capacity(HEADER_SIZE + 1 + packet.payload.len() + AUTH_TAG_SIZE);
+        match volume {
+            Some(v) => {
+                let vol_byte = (v.clamp(0.0, 1.0) * 255.0) as u8;
+                let mut combined = BytesMut::with_capacity(1 + packet.payload.len());
+                combined.put_u8(vol_byte);
+                combined.put_slice(&packet.payload);
+                header.flags |= PacketFlags::VolumeAttenuated as u16;
+                header.payload_length = combined.len() as u16;
+                header.checksum = crc32fast::hash(&combined);
+                header.encode(&mut buf);
+                buf.put_slice(&combined);
+            }
+            None => {
+                header.payload_length = packet.payload.len() as u16;
+                header.checksum = crc32fast::hash(&packet.payload);
+                header.encode(&mut buf);
+                buf.put_slice(&packet.payload);
+            }
+        }
+        buf
+    }
+
+    fn sign_body(mut body: BytesMut, key: &[u8]) -> Bytes {
+        let tag = aurix_common::crypto::hmac_sha256(key, &[&body]);
+        body.put_slice(&tag[..AUTH_TAG_SIZE]);
+        body.freeze()
     }
 
     async fn handle_heartbeat(
