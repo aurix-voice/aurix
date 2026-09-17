@@ -1,0 +1,9 @@
+# cargo-audit configuration (used by `cargo audit` locally and in CI).
+[advisories]
+ignore = [
+    # rsa (Marvin timing attack). Present in Cargo.lock only through sqlx-mysql, which is
+    # not enabled: Aurix builds with the `postgres` feature exclusively and the crate is
+    # never compiled (`cargo tree -i rsa` is empty). No fixed version exists upstream.
+    "RUSTSEC-2023-0071",
+]
+informational_warnings = ["unmaintained"]

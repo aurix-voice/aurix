@@ -382,22 +382,22 @@ fn init_tracing(config: &AurixConfig) {
 
     if config.tracing.enabled {
         if let Some(ref endpoint) = config.tracing.otlp_endpoint {
+            use opentelemetry::trace::TracerProvider as _;
             use opentelemetry_otlp::WithExportConfig;
-            let tracer = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(
-                    opentelemetry_otlp::new_exporter()
-                        .tonic()
-                        .with_endpoint(endpoint),
-                )
-                .with_trace_config(opentelemetry_sdk::trace::config().with_resource(
-                    opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-                        "service.name",
-                        config.tracing.service_name.clone(),
-                    )]),
-                ))
-                .install_batch(opentelemetry_sdk::runtime::Tokio)
-                .expect("Failed to initialize OTLP tracer");
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .expect("Failed to build OTLP span exporter");
+            let resource = opentelemetry_sdk::Resource::builder()
+                .with_service_name(config.tracing.service_name.clone())
+                .build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            let tracer = provider.tracer("aurix-server");
+            opentelemetry::global::set_tracer_provider(provider);
 
             let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
             subscriber.with(telemetry).init();

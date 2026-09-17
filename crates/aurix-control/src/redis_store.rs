@@ -92,9 +92,8 @@ impl RedisStore {
             let mut seen: std::collections::VecDeque<uuid::Uuid> =
                 std::collections::VecDeque::with_capacity(4096);
             loop {
-                match client.get_async_connection().await {
-                    Ok(conn) => {
-                        let mut pubsub = conn.into_pubsub();
+                match client.get_async_pubsub().await {
+                    Ok(mut pubsub) => {
                         if let Err(e) = pubsub.subscribe(EVENT_CHANNEL).await {
                             tracing::error!("Redis subscribe failed: {e}");
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

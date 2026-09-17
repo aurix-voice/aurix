@@ -121,7 +121,7 @@ impl WebRtcManager {
             .clear_codecs()
             .enable_opus(true)
             .set_stats_interval(Some(Duration::from_secs(5)))
-            .build();
+            .build(Instant::now());
 
         let candidate = Candidate::host(self.advertised_addr, "udp")
             .map_err(|e| AurixError::Transport(format!("ICE candidate: {e}")))?;
@@ -454,7 +454,7 @@ async fn poll_outputs(
                             session_id: ctx.session_id,
                             user_id: ctx.user_id,
                             rtp_time: data.time.numer() as u32,
-                            payload: data.data,
+                            payload: data.data.to_vec(),
                         })
                         .await;
                 }

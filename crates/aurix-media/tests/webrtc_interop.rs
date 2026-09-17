@@ -31,10 +31,13 @@ impl BrowserClient {
     async fn new() -> Self {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = sock.local_addr().unwrap();
-        let mut rtc = Rtc::builder().clear_codecs().enable_opus(true).build();
+        let mut rtc = Rtc::builder()
+            .clear_codecs()
+            .enable_opus(true)
+            .build(Instant::now());
         rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
         let mut api = rtc.sdp_api();
-        let mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+        let mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
         let (offer, pending) = api.apply().unwrap();
         Self {
             rtc,
@@ -74,7 +77,7 @@ impl BrowserClient {
                     Output::Event(Event::Connected) => self.connected = true,
                     Output::Event(Event::MediaData(d)) => {
                         assert_eq!(d.params.spec().codec, Codec::Opus);
-                        self.received.push(d.data);
+                        self.received.push(d.data.to_vec());
                     }
                     Output::Event(_) => {}
                     Output::Timeout(t) => break t,
