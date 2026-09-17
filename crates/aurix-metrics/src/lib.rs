@@ -143,6 +143,10 @@ pub static STUN_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
 
 // ── Rate Limit Metrics ──
 
+pub static WS_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!("aurix_ws_connections", "Open player WebSocket connections on this node").unwrap()
+});
+
 pub static RATE_LIMIT_HITS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "aurix_rate_limit_hits_total",

@@ -82,13 +82,29 @@ impl<W: Write> OggOpusWriter<W> {
         Ok(())
     }
 
-    /// Write a single Opus packet as one or more Ogg pages.
+    /// Write a single Opus packet assuming the default 20 ms frame duration.
     pub fn write_packet(&mut self, opus_data: &[u8]) -> io::Result<()> {
+        self.write_packet_with_duration(opus_data, self.samples_per_frame)
+    }
+
+    /// Write a single Opus packet that covers `samples` samples at the stream's sample rate
+    /// (i.e. the granule advance). Gaps in the source stream can be preserved by passing the
+    /// RTP timestamp delta as `samples`.
+    pub fn write_packet_with_duration(&mut self, opus_data: &[u8], samples: u64) -> io::Result<()> {
         if self.finished {
             return Err(io::Error::new(io::ErrorKind::Other, "Writer already finished"));
         }
-        self.granule += self.samples_per_frame;
+        self.granule += samples.max(1);
         self.write_page(opus_data, self.granule, 0x00)
+    }
+
+    /// Total number of samples represented by the packets written so far.
+    pub fn granule(&self) -> u64 {
+        self.granule
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
@@ -145,5 +161,53 @@ impl<W: Write> OggOpusWriter<W> {
 impl<W: Write> Drop for OggOpusWriter<W> {
     fn drop(&mut self) {
         let _ = self.finish();
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse pages back out: returns (header_type, granule, payload) per page.
+    fn parse_pages(mut data: &[u8]) -> Vec<(u8, u64, Vec<u8>)> {
+        let mut pages = Vec::new();
+        while !data.is_empty() {
+            assert_eq!(&data[0..4], OGG_CAPTURE);
+            let header_type = data[5];
+            let granule = u64::from_le_bytes(data[6..14].try_into().unwrap());
+            let nseg = data[26] as usize;
+            let segs = &data[27..27 + nseg];
+            let body_len: usize = segs.iter().map(|&s| s as usize).sum();
+            let header_len = 27 + nseg;
+            let mut page = data[..header_len + body_len].to_vec();
+            let stored_crc = u32::from_le_bytes(page[22..26].try_into().unwrap());
+            page[22..26].copy_from_slice(&[0; 4]);
+            assert_eq!(ogg_crc32(&page), stored_crc, "page CRC must verify");
+            pages.push((header_type, granule, data[header_len..header_len + body_len].to_vec()));
+            data = &data[header_len + body_len..];
+        }
+        pages
+    }
+
+    #[test]
+    fn writes_valid_ogg_opus_stream_with_real_packets_and_granules() {
+        let mut buf = Vec::new();
+        {
+            let mut w = OggOpusWriter::new(&mut buf, 0xABCD, 48_000, 1).unwrap();
+            w.write_packet(&[0xFC, 1, 2, 3]).unwrap();
+            w.write_packet_with_duration(&[0xFC, 9, 9], 1920).unwrap();
+            let big = vec![0x7Fu8; 600];
+            w.write_packet(&big).unwrap();
+            w.finish().unwrap();
+        }
+        let pages = parse_pages(&buf);
+        assert_eq!(pages.len(), 6);
+        assert_eq!(pages[0].0, 0x02, "BOS");
+        assert!(pages[0].2.starts_with(b"OpusHead"));
+        assert!(pages[1].2.starts_with(b"OpusTags"));
+        assert_eq!(pages[2], (0, 960, vec![0xFC, 1, 2, 3]));
+        assert_eq!(pages[3], (0, 960 + 1920, vec![0xFC, 9, 9]));
+        assert_eq!(pages[4].1, 960 + 1920 + 960);
+        assert_eq!(pages[4].2.len(), 600, "600-byte packet spans 3 lacing segments");
+        assert_eq!(pages[5].0, 0x04, "EOS");
     }
 }

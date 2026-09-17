@@ -447,6 +447,10 @@ impl SfuNode {
     pub fn get_session_by_user(&self, user_id: &UserId) -> Option<Arc<MediaSession>> {
         self.sessions_by_user.get(user_id).map(|s| s.value().clone())
     }
+    /// Every live session of a user on this node (a user may hold a session per device).
+    pub fn sessions_for_user(&self, user_id: &UserId) -> Vec<Arc<MediaSession>> {
+        self.sessions_by_id.iter().filter(|e| e.value().user_id == *user_id).map(|e| e.value().clone()).collect()
+    }
     pub fn active_channels(&self) -> u32 {
         self.channels.len() as u32
     }
@@ -524,6 +528,17 @@ impl SfuNode {
                 }
             }
         });
+    }
+
+    /// Tears down every live session (graceful shutdown). Recording sinks get their
+    /// `on_participant_left` callbacks so open files are finalized.
+    pub fn shutdown(&self) -> usize {
+        let ids: Vec<SessionId> = self.sessions_by_id.iter().map(|e| *e.key()).collect();
+        let n = ids.len();
+        for sid in ids {
+            let _ = self.destroy_session(&sid);
+        }
+        n
     }
 
     fn start_speaking_timeout(&self) {

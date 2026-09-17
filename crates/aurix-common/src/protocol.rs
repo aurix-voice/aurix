@@ -431,6 +431,11 @@ pub enum ControlMessage {
     RecordingConsentResponse { recording_id: uuid::Uuid, consent: crate::types::RecordingConsent },
     Error { code: String, message: String },
     Kick { channel_id: ChannelId, user_id: UserId, reason: String },
+    /// Browser clients: SDP offer for this session; the server replies with `WebRtcAnswer`.
+    WebRtcOffer { sdp: String },
+    WebRtcAnswer { sdp: String },
+    Ping { nonce: u64 },
+    Pong { nonce: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -269,6 +269,18 @@ pub async fn remove_channel_member(pool: &DbPool, channel_id: Uuid, session_id: 
     Ok(())
 }
 
+/// Close every open membership of `user_id` in a channel (kick). Tenant-checked via channels.
+pub async fn remove_user_channel_memberships(pool: &DbPool, app_id: Uuid, channel_id: Uuid, user_id: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE channel_memberships m SET left_at = NOW()
+           FROM channels c
+           WHERE c.id = m.channel_id AND c.app_id = $1 AND m.channel_id = $2 AND m.user_id = $3 AND m.left_at IS NULL"#
+    )
+    .bind(app_id).bind(channel_id).bind(user_id)
+    .execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
 pub async fn close_session_memberships(pool: &DbPool, session_id: Uuid) -> Result<u64, sqlx::Error> {
     let r = sqlx::query("UPDATE channel_memberships SET left_at = NOW() WHERE session_id = $1 AND left_at IS NULL")
         .bind(session_id).execute(pool).await?;
@@ -335,6 +347,13 @@ pub async fn list_active_bans(pool: &DbPool, app_id: Uuid, limit: i64, offset: i
     .bind(app_id).bind(limit).bind(offset).fetch_all(pool).await
 }
 
+pub async fn list_bans(pool: &DbPool, app_id: Uuid, user_id: Option<Uuid>, limit: i64, offset: i64) -> Result<Vec<BanRow>, sqlx::Error> {
+    sqlx::query_as::<_, BanRow>(
+        "SELECT * FROM bans WHERE app_id = $1 AND ($2::uuid IS NULL OR user_id = $2) ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+    )
+    .bind(app_id).bind(user_id).bind(limit).bind(offset).fetch_all(pool).await
+}
+
 pub async fn revoke_ban(pool: &DbPool, app_id: Uuid, ban_id: Uuid, revoked_by: Uuid) -> Result<u64, sqlx::Error> {
     let r = sqlx::query("UPDATE bans SET revoked_at = NOW(), revoked_by = $3 WHERE app_id = $1 AND id = $2 AND revoked_at IS NULL")
         .bind(app_id).bind(ban_id).bind(revoked_by).execute(pool).await?;
@@ -368,6 +387,11 @@ pub async fn list_moderation_events(pool: &DbPool, app_id: Uuid, status: Option<
             ).bind(app_id).bind(limit).bind(offset).fetch_all(pool).await
         }
     }
+}
+
+pub async fn get_moderation_event(pool: &DbPool, app_id: Uuid, id: Uuid) -> Result<Option<ModerationEventRow>, sqlx::Error> {
+    sqlx::query_as::<_, ModerationEventRow>("SELECT * FROM moderation_events WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(id).fetch_optional(pool).await
 }
 
 pub async fn resolve_moderation_event(pool: &DbPool, app_id: Uuid, event_id: Uuid, moderator_id: Uuid, resolution: &str) -> Result<u64, sqlx::Error> {

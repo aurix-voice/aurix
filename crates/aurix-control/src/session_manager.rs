@@ -88,6 +88,12 @@ impl SessionManager {
             .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
     }
 
+    pub async fn remove_user_from_channel(&self, app_id: AppId, channel_id: ChannelId, user_id: UserId) -> Result<u64> {
+        aurix_db::queries::remove_user_channel_memberships(&self.pool, app_id.0, channel_id.0, user_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
+    }
+
     /// Mark every open membership of a session as left (disconnect cleanup).
     pub async fn close_session_memberships(&self, session_id: SessionId) -> Result<u64> {
         aurix_db::queries::close_session_memberships(&self.pool, session_id.0)

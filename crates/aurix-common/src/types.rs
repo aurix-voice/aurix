@@ -220,6 +220,10 @@ impl Position3D {
     pub fn new(x: f32, y: f32, z: f32) -> Self { Self { x, y, z } }
     pub fn zero() -> Self { Self { x: 0.0, y: 0.0, z: 0.0 } }
 
+    pub fn is_finite(&self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+
     pub fn distance_to(&self, other: &Position3D) -> f32 {
         let dx = self.x - other.x;
         let dy = self.y - other.y;
@@ -236,6 +240,12 @@ pub struct Orientation3D {
     pub up_x: f32,
     pub up_y: f32,
     pub up_z: f32,
+}
+
+impl Orientation3D {
+    pub fn is_finite(&self) -> bool {
+        [self.forward_x, self.forward_y, self.forward_z, self.up_x, self.up_y, self.up_z].iter().all(|v| v.is_finite())
+    }
 }
 
 impl Default for Orientation3D {
@@ -485,6 +495,14 @@ pub enum AuditAction {
     ApiKeyRevoked,
     RoleChanged,
     ConfigUpdated,
+    UserKicked,
+    ModerationAction,
+    RecordingAccessed,
+    RecordingDeleted,
+    AdminLogin,
+    AdminCreated,
+    AppCreated,
+    AppDeleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

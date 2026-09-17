@@ -79,6 +79,9 @@ pub enum AurixError {
 
     #[error("Timeout: {0}")]
     Timeout(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl AurixError {
@@ -131,6 +134,7 @@ impl AurixError {
             Self::Validation(_) => 400,
             Self::Conflict(_) => 409,
             Self::Timeout(_) => 504,
+            Self::NotFound(_) => 404,
             Self::NotImplemented(_) => 501,
             Self::MediaNodeUnavailable(_) => 503,
             _ => 500,
@@ -165,6 +169,7 @@ impl AurixError {
             Self::NotImplemented(_) => "NOT_IMPLEMENTED",
             Self::Conflict(_) => "CONFLICT",
             Self::Timeout(_) => "TIMEOUT",
+            Self::NotFound(_) => "NOT_FOUND",
         }
     }
 }

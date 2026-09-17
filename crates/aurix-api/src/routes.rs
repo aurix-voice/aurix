@@ -2,79 +2,103 @@ use crate::handlers;
 use crate::middleware;
 use crate::state::AppState;
 use axum::{
+    extract::DefaultBodyLimit,
+    http::{header, HeaderValue, Method},
     middleware as axum_middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use std::time::Duration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+fn cors_layer(state: &AppState) -> CorsLayer {
+    let origins = &state.control.config.server.cors_origins;
+    let allow_origin = if origins.iter().any(|o| o == "*") {
+        // Rejected by config validation in production; convenient for local development.
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::list(origins.iter().filter_map(|o| HeaderValue::from_str(o).ok()))
+    };
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static("x-api-key"), header::HeaderName::from_static("x-bootstrap-token")])
+        .max_age(Duration::from_secs(600))
+}
+
 pub fn create_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = cors_layer(&state);
+    let body_limit = DefaultBodyLimit::max(state.control.config.server.max_body_bytes);
+    let timeout = TimeoutLayer::new(Duration::from_secs(state.control.config.server.request_timeout_secs));
 
-    // ── Public (no auth) ──
-    let public_routes = Router::new()
-        .route("/health", get(handlers::health))
-        .route("/metrics", get(aurix_metrics::metrics_handler));
+    let public_routes = Router::new().route("/health", get(handlers::health)).route("/ready", get(handlers::ready));
 
-    // ── Admin login + first admin creation (no auth) ──
-    let admin_login_routes = Router::new()
-        .route("/admin/login", post(handlers::admin_login))
-        .route("/admin/setup", post(handlers::create_admin));
+    // Bootstrap is gated inside the handler (no admins yet, or X-Bootstrap-Token).
+    let admin_public = Router::new().route("/admin/login", post(handlers::admin_login)).route("/admin/setup", post(handlers::admin_setup));
 
-    // ── Admin-protected routes (admin JWT) ──
     let admin_routes = Router::new()
-        .route("/admin/create", post(handlers::create_admin))
-        .route("/v1/apps", post(handlers::create_app))
-        .route("/v1/apps", get(handlers::list_apps))
-        .route("/v1/apps/{app_id}", get(handlers::get_app))
-        .route("/v1/apps/{app_id}", delete(handlers::delete_app))
+        .route("/admin/me", get(handlers::admin_me))
+        .route("/admin/admins", post(handlers::create_admin))
+        .route("/admin/audit-log", get(handlers::admin_list_audit_logs))
+        .route("/v1/apps", post(handlers::create_app).get(handlers::list_apps))
+        .route("/v1/apps/:app_id", get(handlers::get_app).delete(handlers::delete_app))
+        .route("/v1/apps/:app_id/rotate-key", post(handlers::admin_rotate_app_key))
         .route("/v1/nodes", get(handlers::list_media_nodes))
         .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::admin_auth_middleware));
 
-    // ── Token generation (requires API key) ──
-    let auth_routes = Router::new()
+    // Server-to-server (API key). Fine-grained permissions are enforced per handler.
+    let api_routes = Router::new()
         .route("/v1/tokens", post(handlers::generate_token))
         .route("/v1/turn/credentials", post(handlers::get_turn_credentials))
-        .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::api_key_middleware));
-
-    // ── App-scoped API routes (require API key) ──
-    let api_routes = Router::new()
-        .route("/v1/channels", post(handlers::create_channel))
-        .route("/v1/channels", get(handlers::list_channels))
-        .route("/v1/channels/{channel_id}", get(handlers::get_channel))
-        .route("/v1/channels/{channel_id}", delete(handlers::delete_channel))
-        .route("/v1/channels/{channel_id}/participants", get(handlers::get_channel_participants))
+        .route("/v1/channels", post(handlers::create_channel).get(handlers::list_channels))
+        .route("/v1/channels/:channel_id", get(handlers::get_channel).delete(handlers::delete_channel))
+        .route("/v1/channels/:channel_id/config", put(handlers::update_channel))
+        .route("/v1/channels/:channel_id/participants", get(handlers::get_channel_participants))
         .route("/v1/users", get(handlers::search_users))
-        .route("/v1/users/{user_id}", get(handlers::get_user))
+        .route("/v1/users/:user_id", get(handlers::get_user))
+        .route("/v1/users/:user_id/unban", post(handlers::unban_user_all))
         .route("/v1/moderation/ban", post(handlers::ban_user))
+        .route("/v1/moderation/bans", get(handlers::list_bans))
+        .route("/v1/moderation/bans/:ban_id/revoke", post(handlers::unban))
         .route("/v1/moderation/mute", post(handlers::server_mute))
         .route("/v1/moderation/kick", post(handlers::kick_user))
         .route("/v1/moderation/report", post(handlers::report_user))
         .route("/v1/moderation/events", get(handlers::list_moderation_events))
+        .route("/v1/moderation/events/:event_id", get(handlers::get_moderation_event))
+        .route("/v1/moderation/events/:event_id/resolve", post(handlers::resolve_moderation_event))
         .route("/v1/analytics", get(handlers::get_analytics))
-        .route("/v1/api-keys", post(handlers::create_api_key))
-        .route("/v1/api-keys", get(handlers::list_api_keys))
-        .route("/v1/api-keys/{key_id}", delete(handlers::revoke_api_key))
+        .route("/v1/api-keys", post(handlers::create_api_key).get(handlers::list_api_keys))
+        .route("/v1/api-keys/:key_id", delete(handlers::revoke_api_key))
         .route("/v1/audit-log", get(handlers::list_audit_logs))
+        .route("/v1/recordings", get(handlers::list_recordings))
         .route("/v1/recordings/start", post(handlers::start_recording))
-        .route("/v1/recordings/{recording_id}", get(handlers::get_recording))
-        .route("/v1/recordings/{recording_id}/stop", post(handlers::stop_recording))
-        .route("/v1/webrtc/offer", post(handlers::webrtc_offer))
+        .route("/v1/recordings/:recording_id", get(handlers::get_recording).delete(handlers::delete_recording))
+        .route("/v1/recordings/:recording_id/download", get(handlers::download_recording))
+        .route("/v1/recordings/:recording_id/stop", post(handlers::stop_recording))
         .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::api_key_middleware));
+
+    // Player-facing (end-user JWT).
+    let user_routes = Router::new()
+        .route("/v1/me/turn-credentials", get(handlers::get_turn_credentials_self))
+        .route("/v1/me/reports", post(handlers::report_user_self))
+        .route("/v1/me/recordings/:recording_id/consent", post(handlers::recording_consent_self))
+        .route("/v1/webrtc/offer", post(handlers::webrtc_offer))
+        .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::auth_middleware));
 
     Router::new()
         .merge(public_routes)
-        .merge(admin_login_routes)
+        .merge(admin_public)
         .merge(admin_routes)
-        .merge(auth_routes)
         .merge(api_routes)
+        .merge(user_routes)
         .layer(axum_middleware::from_fn(middleware::metrics_middleware))
         .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::rate_limit_middleware))
+        .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::client_ip_middleware))
         .layer(cors)
+        .layer(timeout)
+        .layer(body_limit)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

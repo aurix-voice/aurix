@@ -115,6 +115,12 @@ impl RedisStore {
         });
     }
 
+    pub async fn ping(&self) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let _: String = Self::with_timeout(redis::cmd("PING").query_async(&mut conn), "ping").await?;
+        Ok(())
+    }
+
     /// Record which media node a session is on.
     pub async fn set_session_node(&self, session_id: SessionId, node_id: MediaNodeId) -> Result<()> {
         let mut conn = self.conn().await?;

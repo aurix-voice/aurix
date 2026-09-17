@@ -4,6 +4,7 @@ pub mod error;
 pub mod protocol;
 pub mod crypto;
 pub mod audit;
+pub mod net;
 pub mod rate_limit;
 pub mod redis_pool;
 pub mod tts_stt;

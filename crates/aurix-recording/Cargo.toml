@@ -21,3 +21,8 @@ base64 = { workspace = true }
 crc32fast = { workspace = true }
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
+opus = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }

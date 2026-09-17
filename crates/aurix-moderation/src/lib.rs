@@ -51,39 +51,60 @@ impl ModerationService {
             .map_err(|e| AurixError::Database(format!("Ban creation failed: {e}")))?;
 
         // Also update user record
-        aurix_db::queries::ban_user(&self.pool, user_id.0, reason, expires_at)
+        aurix_db::queries::ban_user(&self.pool, app_id.0, user_id.0, reason, expires_at)
             .await
             .map_err(|e| AurixError::Database(format!("User ban update failed: {e}")))?;
 
         Ok(created)
     }
 
-    pub async fn unban_user(
-        &self,
-        ban_id: Uuid,
-        user_id: UserId,
-        revoked_by: UserId,
-    ) -> Result<()> {
-        aurix_db::queries::revoke_ban(&self.pool, ban_id, revoked_by.0)
+    /// Revoke one ban. The ban must belong to `app_id`; the user's `is_banned` flag is cleared
+    /// only when no other active ban remains for them.
+    pub async fn unban_user(&self, app_id: AppId, ban_id: Uuid, revoked_by: UserId) -> Result<UserId> {
+        let ban = aurix_db::queries::get_ban(&self.pool, app_id.0, ban_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("Ban lookup failed: {e}")))?
+            .ok_or_else(|| AurixError::Moderation("Ban not found".into()))?;
+        let affected = aurix_db::queries::revoke_ban(&self.pool, app_id.0, ban_id, revoked_by.0)
             .await
             .map_err(|e| AurixError::Database(format!("Ban revoke failed: {e}")))?;
-
-        // Check if user has any remaining active bans
-        let remaining = aurix_db::queries::get_active_bans_for_user(
-            &self.pool,
-            Uuid::nil(), // We'd need app_id here
-            user_id.0,
-        )
-        .await
-        .unwrap_or_default();
-
+        if affected == 0 {
+            return Err(AurixError::Conflict("Ban already revoked".into()));
+        }
+        let Some(user_id) = ban.user_id else {
+            return Err(AurixError::Moderation("Ban has no user target".into()));
+        };
+        let remaining = aurix_db::queries::get_active_bans_for_user(&self.pool, app_id.0, user_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
         if remaining.is_empty() {
-            aurix_db::queries::unban_user(&self.pool, user_id.0)
+            aurix_db::queries::unban_user(&self.pool, app_id.0, user_id)
                 .await
                 .map_err(|e| AurixError::Database(format!("User unban failed: {e}")))?;
         }
+        Ok(UserId(user_id))
+    }
 
-        Ok(())
+    /// Revoke every active ban for a user within an app.
+    pub async fn unban_user_all(&self, app_id: AppId, user_id: UserId, revoked_by: UserId) -> Result<usize> {
+        let bans = aurix_db::queries::get_active_bans_for_user(&self.pool, app_id.0, user_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
+        for ban in &bans {
+            aurix_db::queries::revoke_ban(&self.pool, app_id.0, ban.id, revoked_by.0)
+                .await
+                .map_err(|e| AurixError::Database(format!("Ban revoke failed: {e}")))?;
+        }
+        aurix_db::queries::unban_user(&self.pool, app_id.0, user_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("User unban failed: {e}")))?;
+        Ok(bans.len())
+    }
+
+    pub async fn list_bans(&self, app_id: AppId, user_id: Option<UserId>, limit: i64, offset: i64) -> Result<Vec<BanRow>> {
+        aurix_db::queries::list_bans(&self.pool, app_id.0, user_id.map(|u| u.0), limit, offset)
+            .await
+            .map_err(|e| AurixError::Database(format!("Ban list failed: {e}")))
     }
 
     pub async fn is_banned(&self, app_id: AppId, user_id: UserId) -> Result<bool> {
@@ -162,20 +183,20 @@ impl ModerationService {
         Ok(created)
     }
 
-    pub async fn resolve_event(
-        &self,
-        event_id: Uuid,
-        moderator_id: UserId,
-        resolution: &str,
-    ) -> Result<()> {
-        aurix_db::queries::resolve_moderation_event(
-            &self.pool,
-            event_id,
-            moderator_id.0,
-            resolution,
-        )
-        .await
-        .map_err(|e| AurixError::Database(format!("Event resolution failed: {e}")))
+    pub async fn resolve_event(&self, app_id: AppId, event_id: Uuid, moderator_id: UserId, resolution: &str) -> Result<()> {
+        let affected = aurix_db::queries::resolve_moderation_event(&self.pool, app_id.0, event_id, moderator_id.0, resolution)
+            .await
+            .map_err(|e| AurixError::Database(format!("Event resolution failed: {e}")))?;
+        if affected == 0 {
+            return Err(AurixError::Moderation("Moderation event not found or already resolved".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn get_event(&self, app_id: AppId, event_id: Uuid) -> Result<Option<ModerationEventRow>> {
+        aurix_db::queries::get_moderation_event(&self.pool, app_id.0, event_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("Event lookup failed: {e}")))
     }
 
     pub async fn list_events(

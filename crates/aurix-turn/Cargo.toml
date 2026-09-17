@@ -22,3 +22,7 @@ crc32fast = { workspace = true }
 base64 = { workspace = true }
 sha1 = { workspace = true }
 md-5 = "0.10"
+[dev-dependencies]
+rand = { workspace = true }
+crc32fast = { workspace = true }
+chrono = { workspace = true }

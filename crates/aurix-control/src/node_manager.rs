@@ -174,6 +174,15 @@ impl NodeManager {
         self.nodes.get(id).map(|e| e.value().clone())
     }
 
+    /// Graceful shutdown: stop receiving new sessions immediately instead of waiting for the
+    /// heartbeat timeout.
+    pub async fn mark_offline(&self, node_id: MediaNodeId) {
+        if let Some(mut node) = self.nodes.get_mut(&node_id) {
+            node.healthy = false;
+        }
+        let _ = aurix_db::queries::mark_node_unhealthy(&self.pool, node_id.0).await;
+    }
+
     pub async fn check_node_health(&self) {
         self.refresh_from_db().await;
         let mut unhealthy = Vec::new();
