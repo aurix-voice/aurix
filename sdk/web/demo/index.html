@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Aurix Web SDK demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.4; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin-bottom: 1rem; }
+  label { display: block; margin: .4rem 0; }
+  input { width: 100%; box-sizing: border-box; padding: .35rem; font: inherit; }
+  button { padding: .45rem .9rem; margin: .2rem .2rem .2rem 0; font: inherit; }
+  #roster li { list-style: none; padding: .3rem .5rem; border-radius: 6px; margin: .2rem 0; background: #8881; }
+  #roster li.speaking { background: #2c82; }
+  #roster li.muted { opacity: .6; }
+  #log { height: 12rem; overflow: auto; font: 12px/1.35 ui-monospace, monospace; background: #0001; padding: .5rem; white-space: pre-wrap; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+  .status { font-weight: 600; }
+  details summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>Aurix Web SDK demo</h1>
+<p>Control channel over WebSocket, microphone uplink + server-mixed downlink over WebRTC.</p>
+
+<fieldset>
+  <legend>Server</legend>
+  <div class="row">
+    <label>API URL <input id="api" value="http://127.0.0.1:8080"></label>
+    <label>WebSocket URL <input id="ws" value="ws://127.0.0.1:8081/ws"></label>
+  </div>
+  <label>Player token (JWT from <code>POST /v1/tokens</code>) <input id="token" placeholder="eyJ..."></label>
+  <label>Channel ID <input id="channel" placeholder="uuid"></label>
+  <details>
+    <summary>Development helper: issue a token with an API key (never ship an API key to browsers)</summary>
+    <div class="row">
+      <label>API key <input id="apikey" placeholder="aurx_..."></label>
+      <label>Display name <input id="name" value="web-player"></label>
+    </div>
+    <button id="mkchannel">Create channel</button>
+    <button id="mktoken">Issue token for channel</button>
+  </details>
+</fieldset>
+
+<fieldset>
+  <legend>Session <span id="state" class="status">disconnected</span></legend>
+  <button id="connect">Connect</button>
+  <button id="join" disabled>Join channel</button>
+  <button id="leave" disabled>Leave</button>
+  <button id="mute" disabled>Mute</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <span id="rtt"></span>
+  <audio id="remote" autoplay></audio>
+</fieldset>
+
+<fieldset>
+  <legend>Participants</legend>
+  <ul id="roster"></ul>
+</fieldset>
+
+<fieldset>
+  <legend>Log</legend>
+  <div id="log"></div>
+</fieldset>
+
+<script type="module">
+import { AurixClient } from '../dist/index.js';
+
+const $ = (id) => document.getElementById(id);
+const log = (...a) => { $('log').textContent += a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n'; $('log').scrollTop = 1e9; };
+
+for (const id of ['api', 'ws', 'token', 'channel', 'apikey', 'name']) {
+  const saved = sessionStorage.getItem('aurix.' + id);
+  if (saved) $(id).value = saved;
+  $(id).addEventListener('change', () => sessionStorage.setItem('aurix.' + id, $(id).value));
+}
+
+let client;
+let muted = false;
+
+function renderRoster() {
+  const ul = $('roster');
+  ul.innerHTML = '';
+  if (!client) return;
+  for (const ch of client.joinedChannels()) {
+    for (const p of client.participants(ch)) {
+      const li = document.createElement('li');
+      li.className = (p.speaking ? 'speaking ' : '') + (p.muted || p.serverMuted ? 'muted' : '');
+      li.textContent = `${p.displayName} (${p.userId.slice(0, 8)}) ${p.role !== 'unknown' ? p.role : ''}` +
+        `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.speaking ? ' 🔊' : ''}`;
+      ul.appendChild(li);
+    }
+  }
+}
+
+function setButtons(connected, joined) {
+  $('connect').disabled = connected;
+  $('join').disabled = !connected || joined;
+  $('leave').disabled = !joined;
+  $('mute').disabled = !connected;
+  $('disconnect').disabled = !connected;
+}
+
+$('connect').onclick = async () => {
+  client = new AurixClient({ apiUrl: $('api').value, wsUrl: $('ws').value, token: $('token').value.trim() });
+  client.on('connectionState', (s) => { $('state').textContent = s; setButtons(s !== 'disconnected' && s !== 'failed', client.joinedChannels().length > 0); });
+  client.on('sessionReady', (i) => log('session', i));
+  client.on('remoteStream', (s) => { $('remote').srcObject = s; log('remote stream attached'); });
+  client.on('channelJoined', (ch, ps) => { log('joined', ch, `${ps.length} participants`); renderRoster(); setButtons(true, true); });
+  client.on('channelLeft', (ch) => { log('left', ch); renderRoster(); setButtons(client.connectionState !== 'disconnected', false); });
+  client.on('participantJoined', (ch, p) => { log('+', p.displayName); renderRoster(); });
+  client.on('participantLeft', (ch, u) => { log('-', u); renderRoster(); });
+  client.on('participantUpdated', renderRoster);
+  client.on('recording', (ch, id, active, by) => {
+    log(`recording ${active ? 'started' : 'stopped'} by ${by}`);
+    if (active && confirm('This channel is being recorded. Accept?')) client.respondToRecording(id, 'accepted');
+    else if (active) client.respondToRecording(id, 'declined');
+  });
+  client.on('bitrate', (kbps, why) => log('bitrate', kbps, why));
+  client.on('kicked', (ch, why) => log('kicked from', ch, why));
+  client.on('serverError', (code, msg) => log('server error', code, msg));
+  client.on('error', (e) => log('error', e.message));
+  try {
+    await client.connect();
+    setInterval(() => { if (client?.connectionState !== 'disconnected') { $('rtt').textContent = `rtt ${client.roundTripMs.toFixed(0)} ms`; client.reportQuality().catch(() => {}); } }, 5000);
+  } catch (e) { log('connect failed:', e.message); }
+};
+
+$('join').onclick = async () => {
+  try { await client.joinChannel($('channel').value.trim()); } catch (e) { log('join failed:', e.message); }
+};
+$('leave').onclick = () => client.leaveChannel($('channel').value.trim());
+$('mute').onclick = () => { muted = !muted; client.setMuted(muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
+$('disconnect').onclick = () => client.disconnect();
+
+// ── dev helpers (server-to-server calls; only for local experiments) ──
+const apiFetch = (path, body) => fetch($('api').value.replace(/\/$/, '') + path, {
+  method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + $('apikey').value.trim() }, body: JSON.stringify(body),
+}).then(async (r) => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
+
+$('mkchannel').onclick = async () => {
+  try { const ch = await apiFetch('/v1/channels', { name: 'web-demo-' + Date.now() }); $('channel').value = ch.id; log('channel', ch.id); }
+  catch (e) { log('create channel failed:', e.message); }
+};
+$('mktoken').onclick = async () => {
+  try {
+    const t = await apiFetch('/v1/tokens', {
+      external_id: 'web-' + Math.random().toString(36).slice(2, 8), display_name: $('name').value,
+      channels: [{ channel_id: $('channel').value.trim(), join: true, speak: true, receive: true }],
+    });
+    $('token').value = t.token; log('token for user', t.user_id);
+  } catch (e) { log('issue token failed:', e.message); }
+};
+</script>
+</body>
+</html>

@@ -178,7 +178,6 @@ impl SfuNode {
         let (webrtc_event_tx, mut webrtc_event_rx) = mpsc::channel::<WebRtcMediaEvent>(4096);
         let webrtc_mgr = Arc::new(WebRtcManager::new(
             socket.clone(),
-            local_addr,
             advertised,
             webrtc_event_tx,
             self.options.downlink_bitrate,

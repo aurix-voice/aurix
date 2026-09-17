@@ -65,7 +65,6 @@ pub struct WebRtcManager {
     addr_map: Arc<DashMap<SocketAddr, SessionId>>,
     ufrag_map: Arc<DashMap<String, SessionId>>,
     socket: Arc<UdpSocket>,
-    local_addr: SocketAddr,
     /// Address advertised to browsers as the ICE host candidate (external IP + media port).
     advertised_addr: SocketAddr,
     event_tx: mpsc::Sender<WebRtcMediaEvent>,
@@ -88,7 +87,6 @@ pub struct WebRtcOfferResponse {
 impl WebRtcManager {
     pub fn new(
         socket: Arc<UdpSocket>,
-        local_addr: SocketAddr,
         advertised_addr: SocketAddr,
         event_tx: mpsc::Sender<WebRtcMediaEvent>,
         downlink_bitrate: u32,
@@ -98,7 +96,6 @@ impl WebRtcManager {
             addr_map: Arc::new(DashMap::new()),
             ufrag_map: Arc::new(DashMap::new()),
             socket,
-            local_addr,
             advertised_addr,
             event_tx,
             downlink_bitrate: downlink_bitrate as i32,
@@ -180,11 +177,14 @@ impl WebRtcManager {
 
     /// Route an incoming packet to the correct WebRTC session.
     pub async fn handle_packet(&self, data: &[u8], src: SocketAddr) {
+        // str0m matches the destination against the advertised host candidate; the socket
+        // itself is usually bound to a wildcard address, so report the candidate address.
+        let dst = self.advertised_addr;
         let sid = self.addr_map.get(&src).map(|s| *s);
         if let Some(sid) = sid {
             let tx = self.sessions.get(&sid).map(|h| h.net_tx.clone());
             if let Some(tx) = tx {
-                let _ = tx.try_send((data.to_vec(), src, self.local_addr));
+                let _ = tx.try_send((data.to_vec(), src, dst));
                 return;
             }
         }
@@ -198,7 +198,7 @@ impl WebRtcManager {
                     let tx = self.sessions.get(&sid).map(|h| h.net_tx.clone());
                     if let Some(tx) = tx {
                         self.addr_map.insert(src, sid);
-                        let _ = tx.try_send((data.to_vec(), src, self.local_addr));
+                        let _ = tx.try_send((data.to_vec(), src, dst));
                     }
                     return;
                 }
