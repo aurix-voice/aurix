@@ -1,0 +1,35 @@
+[package]
+name = "aurix-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aurix-server"
+path = "src/main.rs"
+
+[dependencies]
+aurix-common = { path = "../aurix-common" }
+aurix-db = { path = "../aurix-db" }
+aurix-auth = { path = "../aurix-auth" }
+aurix-media = { path = "../aurix-media" }
+aurix-turn = { path = "../aurix-turn" }
+aurix-control = { path = "../aurix-control" }
+aurix-api = { path = "../aurix-api" }
+aurix-ws = { path = "../aurix-ws" }
+aurix-moderation = { path = "../aurix-moderation" }
+aurix-recording = { path = "../aurix-recording" }
+aurix-metrics = { path = "../aurix-metrics" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+anyhow = { workspace = true }

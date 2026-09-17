@@ -1,0 +1,85 @@
+[server]
+host = "0.0.0.0"
+api_port = 8080
+ws_port = 8081
+region = "us_east"
+external_url = "http://localhost:8080"
+cors_origins = ["*"]
+
+[database]
+url = "postgres://aurix:aurix@localhost:5432/aurix"
+max_connections = 100
+min_connections = 5
+connect_timeout_secs = 30
+idle_timeout_secs = 600
+run_migrations = true
+
+[redis]
+url = "redis://localhost:6379"
+pool_size = 20
+
+[auth]
+jwt_secret = "change-me-in-production-this-is-not-secure-32bytes!"
+jwt_algorithm = "HS256"
+token_ttl_secs = 3600
+oauth_enabled = false
+
+[media]
+host = "0.0.0.0"
+port = 10000
+max_participants_per_node = 50000
+max_channels_per_node = 10000
+default_bitrate = 48000
+max_bitrate = 510000
+default_sample_rate = 48000
+enable_dtx = true
+enable_fec = true
+srtp_enabled = true
+e2ee_enabled = false
+heartbeat_interval_ms = 5000
+session_timeout_secs = 60
+packet_buffer_size = 4096
+worker_threads = 4
+
+[turn]
+enabled = false
+host = "0.0.0.0"
+udp_port = 3478
+tcp_port = 3478
+realm = "aurix.local"
+auth_secret = "change-me-turn-secret"
+min_port = 49152
+max_port = 65535
+allocation_lifetime_secs = 600
+max_allocations = 10000
+
+[moderation]
+enabled = false
+max_reports_per_user_per_hour = 10
+auto_mute_on_report_threshold = 5
+profanity_filter_enabled = false
+
+[recording]
+enabled = false
+storage_path = "/var/lib/aurix/recordings"
+max_recording_duration_secs = 7200
+retention_days = 90
+encryption_enabled = false
+
+[metrics]
+enabled = true
+port = 4040
+path = "/metrics"
+
+[tracing]
+enabled = true
+service_name = "aurix"
+log_level = "info"
+log_format = "json"
+
+[rate_limiting]
+enabled = false
+requests_per_second = 100
+burst_size = 200
+channel_joins_per_minute = 30
+messages_per_second = 50

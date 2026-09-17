@@ -1,0 +1,53 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aurix
+      POSTGRES_PASSWORD: aurix
+      POSTGRES_DB: aurix
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aurix"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  aurix:
+    build: .
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "10000:10000/udp"
+      - "3478:3478/udp"
+    environment:
+      AURIX__DATABASE__URL: postgres://aurix:aurix@db:5432/aurix
+      AURIX__REDIS__URL: redis://redis:6379
+      AURIX__AUTH__JWT_SECRET: "production-change-this-secret-key-32b!"
+      AURIX__TURN__AUTH_SECRET: "production-change-this-turn-secret"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./deploy/grafana:/etc/grafana/provisioning/dashboards
+
+volumes:
+  pgdata:

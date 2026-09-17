@@ -1,0 +1,17 @@
+[package]
+name = "aurix-moderation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aurix-common = { path = "../aurix-common" }
+aurix-db = { path = "../aurix-db" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }

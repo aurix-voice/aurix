@@ -1,0 +1,26 @@
+[package]
+name = "aurix-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aurix-common = { path = "../aurix-common" }
+aurix-metrics = { path = "../aurix-metrics" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+flume = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+arc-swap = { workspace = true }
+prometheus = { workspace = true }
+libc = { workspace = true }
+str0m = { workspace = true }

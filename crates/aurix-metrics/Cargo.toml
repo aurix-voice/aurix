@@ -1,0 +1,13 @@
+[package]
+name = "aurix-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aurix-common = { path = "../aurix-common" }
+prometheus = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+once_cell = "1.19"

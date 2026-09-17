@@ -1,0 +1,23 @@
+[package]
+name = "aurix-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aurix-common = { path = "../aurix-common" }
+aurix-control = { path = "../aurix-control" }
+aurix-media = { path = "../aurix-media" }
+aurix-auth = { path = "../aurix-auth" }
+aurix-db = { path = "../aurix-db" }
+aurix-metrics = { path = "../aurix-metrics" }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
