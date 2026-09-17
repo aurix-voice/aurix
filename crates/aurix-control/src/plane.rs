@@ -15,6 +15,7 @@ use aurix_db::DbPool;
 use std::sync::Arc;
 
 pub struct ControlPlane {
+    pub node_id: MediaNodeId,
     pub config: Arc<AurixConfig>,
     pub pool: DbPool,
     pub jwt: Arc<JwtService>,
@@ -31,12 +32,20 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
-    pub async fn new(config: AurixConfig, pool: DbPool) -> Result<Self> {
+    pub async fn new(config: AurixConfig, pool: DbPool, node_id: MediaNodeId) -> Result<Self> {
+        config.validate().map_err(|e| AurixError::InvalidConfiguration(e.to_string()))?;
         let jwt = Arc::new(JwtService::new(&config.auth)?);
         let rbac = Arc::new(RbacService::new());
         let api_keys = Arc::new(ApiKeyService::new(pool.clone()));
-        let admin_auth = Arc::new(AdminAuthService::new(pool.clone(), config.auth.jwt_secret.clone()));
+        let admin_auth = Arc::new(
+            AdminAuthService::new(pool.clone(), config.auth.jwt_secret.clone())
+                .with_token_ttl(config.auth.admin_token_ttl_secs)
+                .with_bootstrap_token(config.auth.admin_bootstrap_token.clone()),
+        );
         let nodes = Arc::new(NodeManager::new(pool.clone()));
+        if let Err(e) = nodes.load_from_db().await {
+            tracing::warn!("Could not load media nodes from database: {e}");
+        }
         let channels = Arc::new(ChannelManager::new(pool.clone()));
         let sessions = Arc::new(SessionManager::new(pool.clone()));
         let events = Arc::new(EventBus::new(10000));
@@ -50,7 +59,7 @@ impl ControlPlane {
             while let Ok(entry) = audit_rx.recv_async().await {
                 let row = aurix_db::models::AuditLogRow {
                     id: entry.id,
-                    app_id: None,
+                    app_id: entry.app_id.map(|a| a.0),
                     actor_id: entry.actor_id.0,
                     action: format!("{:?}", entry.action).to_lowercase(),
                     target_type: entry.target_type,
@@ -75,12 +84,24 @@ impl ControlPlane {
 
         // Redis
         let redis = match aurix_common::redis_pool::create_redis_client(&config.redis).await {
-            Ok(client) => {
-                tracing::info!("Redis connected");
-                Some(Arc::new(RedisStore::new(client)))
-            }
+            Ok(client) => match RedisStore::connect(client, node_id).await {
+                Ok(store) => {
+                    tracing::info!("Redis connected");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    if config.is_production() {
+                        return Err(AurixError::Redis(format!("Redis is required in production: {e}")));
+                    }
+                    tracing::warn!("Redis not available (non-fatal in development): {e}");
+                    None
+                }
+            },
             Err(e) => {
-                tracing::warn!("Redis not available (non-fatal): {}", e);
+                if config.is_production() {
+                    return Err(AurixError::Redis(format!("Redis is required in production: {e}")));
+                }
+                tracing::warn!("Redis not available (non-fatal in development): {}", e);
                 None
             }
         };
@@ -99,25 +120,27 @@ impl ControlPlane {
         let analytics = AnalyticsCollector::new(pool.clone());
         analytics.start();
 
-        // Start Redis Pub/Sub subscriber for cross-node events ──
+        // Cross-node event replication (origin-tagged, loop-free)
         if let Some(ref redis_store) = redis {
-            redis_store.start_event_subscriber(events.clone());
+            redis_store.start_event_replication(events.clone());
         }
 
-        // Republish local events to Redis for cross-node delivery ──
-        if let Some(ref redis_store) = redis {
-            let mut local_rx = events.subscribe();
-            let redis_pub = redis_store.clone();
-            tokio::spawn(async move {
-                while let Ok(event) = local_rx.recv().await {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = redis_pub.publish_event(&json).await;
-                    }
+        // Expire time-limited user bans
+        let ban_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match aurix_db::queries::expire_user_bans(&ban_pool).await {
+                    Ok(n) if n > 0 => tracing::info!("Expired {n} user bans"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("Ban expiry sweep failed: {e}"),
                 }
-            });
-        }
+            }
+        });
 
         Ok(Self {
+            node_id,
             config: Arc::new(config),
             pool,
             jwt,
@@ -138,6 +161,13 @@ impl ControlPlane {
         self.jwt.validate_token(token)
     }
 
+    /// Validate an admin JWT and confirm the account is still active.
+    pub async fn authenticate_admin(&self, token: &str) -> Result<AdminContext> {
+        let ctx = self.admin_auth.validate_admin_token(token)?;
+        self.admin_auth.ensure_active(ctx.admin_id).await?;
+        Ok(ctx)
+    }
+
     pub async fn authenticate_session(
         &self,
         token: &str,
@@ -145,12 +175,30 @@ impl ControlPlane {
     ) -> Result<(aurix_auth::ValidatedToken, MediaNodeInfo)> {
         let validated = self.jwt.validate_token(token)?;
 
+        let key = format!("session:{}", validated.user_id);
+        if !self.rate_limiter.check(&key) {
+            return Err(AurixError::RateLimitExceeded("Too many connection attempts".into()));
+        }
+
         let bans = aurix_db::queries::get_active_bans_for_user(
             &self.pool, validated.app_id.0, validated.user_id.0,
         ).await.map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
 
         if !bans.is_empty() {
             return Err(AurixError::UserBanned("User is banned".into()));
+        }
+
+        if let Some(user) = aurix_db::queries::get_user(&self.pool, validated.app_id.0, validated.user_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
+        {
+            let ban_active = user.is_banned
+                && user.ban_expires_at.map(|t| t > chrono::Utc::now()).unwrap_or(true);
+            if ban_active {
+                return Err(AurixError::UserBanned(
+                    user.ban_reason.unwrap_or_else(|| "User is banned".into()),
+                ));
+            }
         }
 
         // Check global mute via Redis
@@ -161,12 +209,8 @@ impl ControlPlane {
             }
         }
 
-        let key = format!("session:{}", validated.user_id);
-        if !self.rate_limiter.check(&key) {
-            return Err(AurixError::RateLimitExceeded("Too many connection attempts".into()));
-        }
-
         let node = self.nodes.select_node(self.config.server.region)?;
+        let _ = ip_address;
         let _ = aurix_db::queries::update_user_last_seen(&self.pool, validated.user_id.0).await;
 
         Ok((validated, node))

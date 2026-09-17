@@ -8,6 +8,7 @@ pub mod rate_limit;
 pub mod redis_pool;
 pub mod tts_stt;
 pub mod jitter_buffer;
+pub mod sink;
 
 pub use config::AurixConfig;
 pub use error::{AurixError, Result};

@@ -1,4 +1,4 @@
-use crate::types::{AuditAction, AuditLogEntry, UserId};
+use crate::types::{AppId, AuditAction, AuditLogEntry, UserId};
 use crate::crypto::compute_audit_hash;
 use chrono::Utc;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ impl AuditLogger {
 
     pub fn log(
         &self,
+        app_id: Option<AppId>,
         actor_id: UserId,
         action: AuditAction,
         target_type: &str,
@@ -28,11 +29,15 @@ impl AuditLogger {
         ip_address: Option<String>,
     ) {
         let mut last = self.last_hash.lock();
-        let data = serde_json::to_vec(&details).unwrap_or_default();
+        let mut data = serde_json::to_vec(&details).unwrap_or_default();
+        data.extend_from_slice(actor_id.0.as_bytes());
+        data.extend_from_slice(target_type.as_bytes());
+        data.extend_from_slice(target_id.as_bytes());
         let hash = compute_audit_hash(&last, &data);
         let entry = AuditLogEntry {
             id: Uuid::now_v7(),
             timestamp: Utc::now(),
+            app_id,
             actor_id,
             action,
             target_type: target_type.to_string(),
@@ -43,7 +48,9 @@ impl AuditLogger {
             hash: hash.clone(),
         };
         *last = hash;
-        let _ = self.sender.try_send(entry);
+        if self.sender.try_send(entry).is_err() {
+            tracing::error!("audit log queue full or closed; entry dropped");
+        }
     }
 }
 

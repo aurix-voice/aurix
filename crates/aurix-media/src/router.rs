@@ -1,161 +1,331 @@
+//! AURX/UDP packet router.
+//!
+//! Security model:
+//! * A UDP source address is only associated with a session after an authenticated
+//!   `SessionBind` (HMAC with the per-session media key handed out over the WebSocket).
+//! * Every subsequent packet must come from the bound address; when
+//!   `require_packet_auth` is on it must also carry a valid HMAC tag and a fresh
+//!   sequence number (64-packet anti-replay window shared by audio and control packets).
+//! * The SSRC in the header is never used to look up a sender.
+
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::*;
+use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::MediaChannel;
-use crate::session::MediaSession;
+use crate::session::{MediaSession, Transport};
+use crate::webrtc::{ForwardMedia, WebRtcManager};
+
+/// Notifications from the media plane to the control plane (WebSocket layer).
+#[derive(Debug, Clone)]
+pub enum MediaEvent {
+    /// UDP address authenticated for the session.
+    SessionBound { session_id: SessionId, addr: SocketAddr },
+    SpeakingChanged { session_id: SessionId, user_id: UserId, channels: Vec<ChannelId>, speaking: bool },
+    MuteChanged { session_id: SessionId, user_id: UserId, channels: Vec<ChannelId>, muted: bool },
+}
+
+pub struct RouterShared {
+    pub channels: Arc<DashMap<ChannelId, Arc<MediaChannel>>>,
+    pub channels_by_hash: Arc<DashMap<u32, ChannelId>>,
+    pub sessions_by_id: Arc<DashMap<SessionId, Arc<MediaSession>>>,
+    pub sessions_by_addr: Arc<DashMap<SocketAddr, Arc<MediaSession>>>,
+}
 
 pub struct PacketRouter {
-    channels: Arc<DashMap<ChannelId, Arc<MediaChannel>>>,
-    sessions_by_ssrc: Arc<DashMap<u32, Arc<MediaSession>>>,
-    sessions_by_addr: Arc<DashMap<SocketAddr, Arc<MediaSession>>>,
+    shared: RouterShared,
     socket: Arc<UdpSocket>,
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
+    webrtc: Option<Arc<WebRtcManager>>,
+    audio_sink: Option<Arc<dyn AudioSink>>,
+    require_packet_auth: bool,
+    events: broadcast::Sender<MediaEvent>,
 }
 
 impl PacketRouter {
     pub fn new(
-        channels: Arc<DashMap<ChannelId, Arc<MediaChannel>>>,
-        sessions_by_ssrc: Arc<DashMap<u32, Arc<MediaSession>>>,
-        sessions_by_addr: Arc<DashMap<SocketAddr, Arc<MediaSession>>>,
+        shared: RouterShared,
         socket: Arc<UdpSocket>,
         cascade: Option<Arc<CascadeRelay>>,
         audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
+        webrtc: Option<Arc<WebRtcManager>>,
+        audio_sink: Option<Arc<dyn AudioSink>>,
+        require_packet_auth: bool,
+        events: broadcast::Sender<MediaEvent>,
     ) -> Self {
-        Self { channels, sessions_by_ssrc, sessions_by_addr, socket, cascade, audio_pipeline }
+        Self { shared, socket, cascade, audio_pipeline, webrtc, audio_sink, require_packet_auth, events }
     }
 
     pub async fn route_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
         let packet = AurixPacket::decode(data)?;
+        if packet.header.packet_type == PacketType::SessionBind {
+            return self.handle_session_bind(&packet, src_addr).await;
+        }
+
+        let session = self.authenticate(&packet, src_addr)?;
         match packet.header.packet_type {
-            PacketType::Audio | PacketType::AudioFec => self.route_audio_packet(&packet, src_addr).await,
-            PacketType::Heartbeat => self.handle_heartbeat(&packet, src_addr).await,
-            PacketType::QualityReport => self.handle_quality_report(&packet, src_addr).await,
-            PacketType::MuteState => self.handle_mute_state(&packet, src_addr).await,
-            PacketType::SpeakingState => self.handle_speaking_state(&packet, src_addr).await,
-            _ => { debug!("Unhandled packet type: {:?}", packet.header.packet_type); Ok(()) }
+            PacketType::Audio | PacketType::AudioFec => self.route_audio_packet(&packet, &session).await,
+            PacketType::Heartbeat => self.handle_heartbeat(&packet, &session, src_addr).await,
+            PacketType::QualityReport => Ok(self.handle_quality_report(&packet, &session)),
+            PacketType::MuteState => Ok(self.handle_mute_state(&packet, &session)),
+            PacketType::SpeakingState => Ok(()),
+            other => {
+                debug!("Unhandled packet type {:?} from {}", other, session.session_id);
+                Ok(())
+            }
         }
     }
 
-    /// Route audio from a WebRTC session (already decoded from SRTP by str0m).
-    pub async fn route_webrtc_audio(&self, packet: &AurixPacket) -> Result<()> {
-        let _sender_session = self.sessions_by_ssrc.get(&packet.header.ssrc)
+    /// Resolve the sender by *bound address*, verify the HMAC tag and anti-replay window.
+    fn authenticate(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<Arc<MediaSession>> {
+        let session = self
+            .shared
+            .sessions_by_addr
+            .get(&src_addr)
             .map(|s| s.value().clone())
-            .ok_or_else(|| AurixError::SessionNotFound("Unknown WebRTC sender SSRC".into()))?;
+            .ok_or_else(|| AurixError::AuthenticationFailed("Unbound media source".into()))?;
+        if !session.is_active() {
+            return Err(AurixError::SessionNotFound("Session inactive".into()));
+        }
+        if packet.header.ssrc != session.ssrc {
+            return Err(AurixError::AuthenticationFailed("SSRC does not match session".into()));
+        }
+        if packet.is_authenticated() {
+            if !packet.verify_auth(&session.media_key) {
+                aurix_metrics::PACKETS_DROPPED.inc();
+                return Err(AurixError::AuthenticationFailed("Invalid packet authentication tag".into()));
+            }
+            if !session.accept_sequence(packet.header.sequence) {
+                aurix_metrics::PACKETS_DROPPED.inc();
+                return Err(AurixError::AuthenticationFailed("Replayed packet".into()));
+            }
+        } else if self.require_packet_auth {
+            aurix_metrics::PACKETS_DROPPED.inc();
+            return Err(AurixError::AuthenticationFailed("Packet authentication required".into()));
+        }
+        Ok(session)
+    }
 
-        if _sender_session.is_muted.load(std::sync::atomic::Ordering::Relaxed)
-            || _sender_session.is_server_muted.load(std::sync::atomic::Ordering::Relaxed)
-        { return Ok(()); }
+    async fn handle_session_bind(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
+        let (session_id, unix_ms, _nonce) = packet.parse_session_bind()?;
+        let session = self
+            .shared
+            .sessions_by_id
+            .get(&session_id)
+            .map(|s| s.value().clone())
+            .ok_or_else(|| AurixError::SessionNotFound("Unknown session in SessionBind".into()))?;
+        if !session.is_active() {
+            return Err(AurixError::SessionNotFound("Session inactive".into()));
+        }
+        if !packet.is_authenticated() || !packet.verify_auth(&session.media_key) {
+            aurix_metrics::PACKETS_DROPPED.inc();
+            return Err(AurixError::AuthenticationFailed("SessionBind authentication failed".into()));
+        }
+        if packet.header.ssrc != session.ssrc {
+            return Err(AurixError::AuthenticationFailed("SessionBind SSRC mismatch".into()));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        if (now - unix_ms).abs() > SESSION_BIND_MAX_SKEW_MS {
+            return Err(AurixError::AuthenticationFailed("SessionBind timestamp outside allowed skew".into()));
+        }
+        // Binds must be strictly newer than the last accepted one (blocks replayed binds).
+        let prev = session.last_bind_ms.load(std::sync::atomic::Ordering::Acquire);
+        if unix_ms <= prev {
+            return Err(AurixError::AuthenticationFailed("Replayed SessionBind".into()));
+        }
+        session.last_bind_ms.store(unix_ms, std::sync::atomic::Ordering::Release);
 
-        aurix_metrics::PACKETS_RECEIVED.inc();
-        aurix_metrics::BYTES_RECEIVED.inc_by(packet.payload.len() as u64);
-
-        let sender_channels = _sender_session.get_channels();
-        for ch_id in &sender_channels {
-            self.route_to_channel_receivers(ch_id, &_sender_session, packet).await;
-            // Cascade to remote nodes
-            if let Some(ref cascade) = self.cascade {
-                cascade.forward_to_peers(ch_id, packet).await;
+        if let Some(old) = session.get_remote_addr() {
+            if old != src_addr {
+                self.shared.sessions_by_addr.remove(&old);
             }
         }
+        session.set_transport(Transport::Aurx);
+        session.set_remote_addr(src_addr);
+        session.update_heartbeat();
+        self.shared.sessions_by_addr.insert(src_addr, session.clone());
+
+        let ack = AurixPacket::session_bind_ack(session.ssrc, now).encode_authenticated(&session.media_key);
+        let _ = self.socket.send_to(&ack, src_addr).await;
+        let _ = self.events.send(MediaEvent::SessionBound { session_id, addr: src_addr });
+        debug!("Session {} bound to {}", session_id, src_addr);
         Ok(())
     }
 
-    async fn route_audio_packet(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
-        let sender_session = self.sessions_by_addr.get(&src_addr)
-            .map(|s| s.value().clone())
-            .or_else(|| self.sessions_by_ssrc.get(&packet.header.ssrc).map(|s| s.value().clone()))
-            .ok_or_else(|| AurixError::SessionNotFound("Unknown sender".into()))?;
-
-        if sender_session.get_remote_addr().is_none() {
-            sender_session.set_remote_addr(src_addr);
-            self.sessions_by_addr.insert(src_addr, sender_session.clone());
-        }
-
-        if sender_session.is_muted.load(std::sync::atomic::Ordering::Relaxed)
-            || sender_session.is_server_muted.load(std::sync::atomic::Ordering::Relaxed)
-        { return Ok(()); }
-
-        sender_session.record_packet_received(packet.payload.len() as u64);
-        sender_session.is_speaking.store(true, std::sync::atomic::Ordering::Relaxed);
+    async fn route_audio_packet(&self, packet: &AurixPacket, sender: &Arc<MediaSession>) -> Result<()> {
+        sender.record_packet_received(packet.payload.len() as u64);
+        sender.update_heartbeat();
         aurix_metrics::PACKETS_RECEIVED.inc();
         aurix_metrics::BYTES_RECEIVED.inc_by(packet.payload.len() as u64);
 
-        // Feed to audio analysis pipeline (STT, content analysis)
-        if let Some(ref pipeline) = self.audio_pipeline {
-            let ch_hash = packet.header.channel_id_hash;
-            for entry in self.channels.iter() {
-                if aurix_common::protocol::channel_id_hash(entry.key()) == ch_hash
-                    && entry.value().has_participant(&sender_session.user_id)
-                {
-                    pipeline.process_opus_packet(
-                        sender_session.user_id,
-                        *entry.key(),
-                        &packet.payload,
-                    );
-                    break;
-                }
-            }
+        if !sender.is_transmitting_allowed() {
+            return Ok(());
         }
 
-        let ch_hash = packet.header.channel_id_hash;
-        for channel_entry in self.channels.iter() {
-            let channel = channel_entry.value();
-            let this_hash = aurix_common::protocol::channel_id_hash(&channel.channel_id);
-            if this_hash != ch_hash { continue; }
-            if !channel.has_participant(&sender_session.user_id) { continue; }
-
-            self.route_to_channel_receivers(&channel.channel_id, &sender_session, packet).await;
-
-            // ── Cascade to remote nodes ──
-            if let Some(ref cascade) = self.cascade {
-                cascade.forward_to_peers(&channel.channel_id, packet).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// Common routing: forward `packet` to all eligible receivers in `channel_id`.
-    async fn route_to_channel_receivers(
-        &self,
-        channel_id: &ChannelId,
-        _sender_session: &Arc<MediaSession>,
-        packet: &AurixPacket,
-    ) {
-        let channel = match self.channels.get(channel_id) {
-            Some(ch) => ch.value().clone(),
-            None => return,
+        let channel_id = match self.shared.channels_by_hash.get(&packet.header.channel_id_hash) {
+            Some(c) => *c.value(),
+            None => return Err(AurixError::ChannelNotFound("Unknown channel hash".into())),
         };
-        let receivers = channel.get_receivers_for_audio(packet.header.ssrc);
+        let channel = match self.shared.channels.get(&channel_id) {
+            Some(c) => c.value().clone(),
+            None => return Err(AurixError::ChannelNotFound(channel_id.to_string())),
+        };
+        if channel.app_id != sender.app_id || !channel.can_transmit(&sender.user_id) {
+            return Err(AurixError::AuthorizationDenied("Sender may not transmit in this channel".into()));
+        }
 
+        if sender.mark_audio_activity() {
+            let _ = self.events.send(MediaEvent::SpeakingChanged {
+                session_id: sender.session_id,
+                user_id: sender.user_id,
+                channels: vec![channel_id],
+                speaking: true,
+            });
+        }
+
+        self.tap_audio(&channel, sender, packet);
+        self.fan_out(&channel, sender, packet).await;
+        if let Some(ref cascade) = self.cascade {
+            cascade.forward_to_peers(&channel_id, packet).await;
+        }
+        Ok(())
+    }
+
+    /// Route depayloaded Opus audio received from a WebRTC session.
+    pub async fn route_webrtc_audio(&self, sender: &Arc<MediaSession>, rtp_time: u32, payload: Vec<u8>) -> Result<()> {
+        sender.record_packet_received(payload.len() as u64);
+        sender.update_heartbeat();
+        aurix_metrics::PACKETS_RECEIVED.inc();
+        aurix_metrics::BYTES_RECEIVED.inc_by(payload.len() as u64);
+        if !sender.is_transmitting_allowed() {
+            return Ok(());
+        }
+        let channels = sender.get_channels();
+        if channels.is_empty() {
+            return Ok(());
+        }
+        if sender.mark_audio_activity() {
+            let _ = self.events.send(MediaEvent::SpeakingChanged {
+                session_id: sender.session_id,
+                user_id: sender.user_id,
+                channels: channels.clone(),
+                speaking: true,
+            });
+        }
+        let seq = sender.sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for channel_id in channels {
+            let channel = match self.shared.channels.get(&channel_id) {
+                Some(c) => c.value().clone(),
+                None => continue,
+            };
+            if !channel.can_transmit(&sender.user_id) {
+                continue;
+            }
+            let packet = AurixPacket::audio(
+                seq,
+                rtp_time,
+                sender.ssrc,
+                channel_id_hash(&channel_id),
+                Bytes::from(payload.clone()),
+            );
+            self.tap_audio(&channel, sender, &packet);
+            self.fan_out(&channel, sender, &packet).await;
+            if let Some(ref cascade) = self.cascade {
+                cascade.forward_to_peers(&channel_id, &packet).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Inject a packet relayed from another node (already authenticated by the cascade layer).
+    pub async fn route_relayed_audio(&self, packet: &AurixPacket) -> Result<()> {
+        let channel_id = match self.shared.channels_by_hash.get(&packet.header.channel_id_hash) {
+            Some(c) => *c.value(),
+            None => return Ok(()),
+        };
+        let channel = match self.shared.channels.get(&channel_id) {
+            Some(c) => c.value().clone(),
+            None => return Ok(()),
+        };
+        let receivers = channel.get_receivers_for_relayed_audio();
+        self.deliver(&channel, receivers, packet).await;
+        Ok(())
+    }
+
+    fn tap_audio(&self, channel: &Arc<MediaChannel>, sender: &Arc<MediaSession>, packet: &AurixPacket) {
+        if packet.header.has_flag(PacketFlags::E2ee) {
+            return;
+        }
+        if let Some(ref sink) = self.audio_sink {
+            if sink.wants_channel(&channel.channel_id) {
+                sink.on_audio(channel.channel_id, sender.user_id, sender.ssrc, packet.header.timestamp, &packet.payload);
+            }
+        }
+        if let Some(ref pipeline) = self.audio_pipeline {
+            if pipeline.is_enabled() {
+                pipeline.process_opus_packet(sender.user_id, channel.channel_id, &packet.payload);
+            }
+        }
+    }
+
+    async fn fan_out(&self, channel: &Arc<MediaChannel>, sender: &Arc<MediaSession>, packet: &AurixPacket) {
+        let receivers = channel.get_receivers_for_audio(sender.ssrc);
+        self.deliver(channel, receivers, packet).await;
+    }
+
+    async fn deliver(&self, channel: &Arc<MediaChannel>, receivers: Vec<(Arc<MediaSession>, f32)>, packet: &AurixPacket) {
+        // Encode the unattenuated variant once; per-receiver encodes only when volume differs.
+        let plain: Bytes = packet.encode().freeze();
+        let e2ee = packet.header.has_flag(PacketFlags::E2ee);
         for (receiver, volume) in receivers {
-            if let Some(addr) = receiver.get_remote_addr() {
-                let out_bytes = if packet.header.has_flag(PacketFlags::E2ee) {
-                    packet.encode().freeze()
-                } else if (volume - 1.0).abs() > 0.01 {
-                    Self::encode_with_volume(packet, volume)
-                } else {
-                    packet.encode().freeze()
-                };
-
-                match self.socket.send_to(&out_bytes, addr).await {
-                    Ok(n) => {
-                        receiver.record_packet_sent(n as u64);
-                        aurix_metrics::PACKETS_SENT.inc();
-                        aurix_metrics::BYTES_SENT.inc_by(n as u64);
+            if !receiver.is_active() {
+                continue;
+            }
+            match receiver.transport() {
+                Transport::WebRtc => {
+                    if e2ee {
+                        continue;
                     }
-                    Err(e) => {
-                        aurix_metrics::PACKETS_DROPPED.inc();
-                        warn!("Failed to send audio to {}: {}", receiver.user_id, e);
+                    if let Some(ref webrtc) = self.webrtc {
+                        let ok = webrtc.send_to_session(
+                            &receiver.session_id,
+                            ForwardMedia { sender_ssrc: packet.header.ssrc, volume, payload: packet.payload.to_vec() },
+                        );
+                        if ok {
+                            receiver.record_packet_sent(packet.payload.len() as u64);
+                        } else {
+                            aurix_metrics::PACKETS_DROPPED.inc();
+                        }
+                    }
+                }
+                Transport::Aurx => {
+                    let Some(addr) = receiver.get_remote_addr() else { continue };
+                    let out = if !e2ee && (volume - 1.0).abs() > 0.01 {
+                        Self::encode_with_volume(packet, volume)
+                    } else {
+                        plain.clone()
+                    };
+                    match self.socket.send_to(&out, addr).await {
+                        Ok(n) => {
+                            receiver.record_packet_sent(n as u64);
+                            aurix_metrics::PACKETS_SENT.inc();
+                            aurix_metrics::BYTES_SENT.inc_by(n as u64);
+                        }
+                        Err(e) => {
+                            aurix_metrics::PACKETS_DROPPED.inc();
+                            warn!("Failed to send audio to {} in {}: {}", receiver.user_id, channel.channel_id, e);
+                        }
                     }
                 }
             }
@@ -165,106 +335,71 @@ impl PacketRouter {
     fn encode_with_volume(packet: &AurixPacket, volume: f32) -> Bytes {
         let vol_byte = (volume.clamp(0.0, 1.0) * 255.0) as u8;
         let new_payload_len = 1 + packet.payload.len();
-        let mut buf = BytesMut::with_capacity(HEADER_SIZE + new_payload_len);
-        let mut header = packet.header.clone();
-        header.flags |= PacketFlags::VolumeAttenuated as u16;
-        header.payload_length = new_payload_len as u16;
         let mut combined = BytesMut::with_capacity(new_payload_len);
         combined.put_u8(vol_byte);
         combined.put_slice(&packet.payload);
+        let mut header = packet.header.clone();
+        header.flags |= PacketFlags::VolumeAttenuated as u16;
+        header.flags &= !(PacketFlags::Authenticated as u16);
+        header.payload_length = new_payload_len as u16;
         header.checksum = crc32fast::hash(&combined);
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + new_payload_len);
         header.encode(&mut buf);
         buf.put_slice(&combined);
         buf.freeze()
     }
 
-    /// Route a standard RTP packet from a WebRTC-compatible client
-    pub async fn route_rtp_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
-        let rtp = RtpHeader::parse(data)?;
-        let sender_session = self.sessions_by_addr.get(&src_addr)
-            .map(|s| s.value().clone())
-            .or_else(|| self.sessions_by_ssrc.get(&rtp.ssrc).map(|s| s.value().clone()))
-            .ok_or_else(|| AurixError::SessionNotFound("Unknown RTP sender".into()))?;
-
-        if sender_session.get_remote_addr().is_none() {
-            sender_session.set_remote_addr(src_addr);
-            self.sessions_by_addr.insert(src_addr, sender_session.clone());
-        }
-
-        if sender_session.is_muted.load(std::sync::atomic::Ordering::Relaxed)
-            || sender_session.is_server_muted.load(std::sync::atomic::Ordering::Relaxed)
-        { return Ok(()); }
-
-        sender_session.record_packet_received(data.len() as u64);
-        sender_session.is_speaking.store(true, std::sync::atomic::Ordering::Relaxed);
-        aurix_metrics::PACKETS_RECEIVED.inc();
-        aurix_metrics::BYTES_RECEIVED.inc_by(data.len() as u64);
-
-        let sender_channels = sender_session.get_channels();
-        for ch_id in &sender_channels {
-            if let Some(channel) = self.channels.get(ch_id) {
-                let receivers = channel.get_receivers_for_audio(rtp.ssrc);
-                for (receiver, _volume) in receivers {
-                    if let Some(addr) = receiver.get_remote_addr() {
-                        match self.socket.send_to(data, addr).await {
-                            Ok(n) => {
-                                receiver.record_packet_sent(n as u64);
-                                aurix_metrics::PACKETS_SENT.inc();
-                                aurix_metrics::BYTES_SENT.inc_by(n as u64);
-                            }
-                            Err(e) => {
-                                aurix_metrics::PACKETS_DROPPED.inc();
-                                warn!("Failed to forward RTP to {}: {}", receiver.user_id, e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    async fn handle_heartbeat(&self, packet: &AurixPacket, session: &Arc<MediaSession>, src_addr: SocketAddr) -> Result<()> {
+        session.update_heartbeat();
+        let ack = AurixPacket::new(
+            PacketHeader::new(PacketType::HeartbeatAck, 0, packet.header.timestamp, packet.header.ssrc),
+            Bytes::new(),
+        );
+        let bytes = if packet.is_authenticated() {
+            ack.encode_authenticated(&session.media_key)
+        } else {
+            ack.encode()
+        };
+        let _ = self.socket.send_to(&bytes, src_addr).await;
         Ok(())
     }
 
-    async fn handle_heartbeat(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
-        if let Some(session) = self.sessions_by_addr.get(&src_addr) {
-            session.update_heartbeat();
-            let ack = AurixPacket { header: PacketHeader::new(PacketType::HeartbeatAck, 0, packet.header.timestamp, packet.header.ssrc), payload: Bytes::new() };
-            let _ = self.socket.send_to(&ack.encode(), src_addr).await;
+    fn handle_quality_report(&self, packet: &AurixPacket, session: &Arc<MediaSession>) {
+        if packet.payload.len() < 12 {
+            return;
         }
-        Ok(())
+        let p = &packet.payload;
+        let rtt = f32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+        let jitter = f32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+        let loss = f32::from_be_bytes([p[8], p[9], p[10], p[11]]);
+        if !(rtt.is_finite() && jitter.is_finite() && loss.is_finite()) {
+            return;
+        }
+        let mut metrics = QualityMetrics {
+            rtt_ms: rtt.clamp(0.0, 10_000.0),
+            jitter_ms: jitter.clamp(0.0, 10_000.0),
+            packet_loss_percent: loss.clamp(0.0, 100.0),
+            bitrate_kbps: 0,
+            mos_score: 0.0,
+        };
+        metrics.mos_score = metrics.calculate_mos();
+        aurix_metrics::RTT_MS.observe(metrics.rtt_ms as f64);
+        aurix_metrics::JITTER_MS.observe(metrics.jitter_ms as f64);
+        aurix_metrics::PACKET_LOSS_RATE.set(metrics.packet_loss_percent as f64);
+        session.update_quality(metrics);
     }
 
-    async fn handle_quality_report(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
-        if let Some(session) = self.sessions_by_addr.get(&src_addr) {
-            if packet.payload.len() >= 12 {
-                let rtt = f32::from_be_bytes([packet.payload[0], packet.payload[1], packet.payload[2], packet.payload[3]]);
-                let jitter = f32::from_be_bytes([packet.payload[4], packet.payload[5], packet.payload[6], packet.payload[7]]);
-                let loss = f32::from_be_bytes([packet.payload[8], packet.payload[9], packet.payload[10], packet.payload[11]]);
-                let mut metrics = QualityMetrics { rtt_ms: rtt, jitter_ms: jitter, packet_loss_percent: loss, bitrate_kbps: 0, mos_score: 0.0 };
-                metrics.mos_score = metrics.calculate_mos();
-                aurix_metrics::RTT_MS.observe(rtt as f64);
-                aurix_metrics::JITTER_MS.observe(jitter as f64);
-                aurix_metrics::PACKET_LOSS_RATE.set(loss as f64);
-                session.update_quality(metrics);
-            }
+    fn handle_mute_state(&self, packet: &AurixPacket, session: &Arc<MediaSession>) {
+        let Some(&flag) = packet.payload.first() else { return };
+        let muted = flag != 0;
+        let prev = session.is_muted.swap(muted, std::sync::atomic::Ordering::Relaxed);
+        if prev != muted {
+            let _ = self.events.send(MediaEvent::MuteChanged {
+                session_id: session.session_id,
+                user_id: session.user_id,
+                channels: session.get_channels(),
+                muted,
+            });
         }
-        Ok(())
-    }
-
-    async fn handle_mute_state(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
-        if let Some(session) = self.sessions_by_addr.get(&src_addr) {
-            if !packet.payload.is_empty() {
-                session.is_muted.store(packet.payload[0] != 0, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_speaking_state(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
-        if let Some(session) = self.sessions_by_addr.get(&src_addr) {
-            if !packet.payload.is_empty() {
-                session.is_speaking.store(packet.payload[0] != 0, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        Ok(())
     }
 }

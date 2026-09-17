@@ -3,6 +3,9 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Upper bound on distinct rate-limit keys kept in memory.
+pub const MAX_BUCKETS: usize = 500_000;
+
 #[derive(Clone)]
 pub struct RateLimiter {
     buckets: Arc<DashMap<String, TokenBucket>>,
@@ -79,16 +82,54 @@ impl RateLimiter {
             });
         }
 
+        if self.buckets.len() >= MAX_BUCKETS && !self.buckets.contains_key(key) {
+            // Under a key-flood, evict stale buckets before admitting a new key; if that does
+            // not help, fail closed for the new key rather than growing without bound.
+            self.buckets.retain(|_, bucket| bucket.last_refill.elapsed() < Duration::from_secs(60));
+            if self.buckets.len() >= MAX_BUCKETS {
+                return false;
+            }
+        }
         let mut entry = self.buckets
             .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new(self.default_rate, self.default_burst));
         entry.value_mut().try_consume(cost)
     }
 
+    /// Token-bucket check with per-key limits. If a bucket already exists for `key` with
+    /// different parameters it is re-parameterised in place (tokens are clamped to the new burst).
     pub fn check_custom(&self, key: &str, rate: u32, burst: u32) -> bool {
         let mut entry = self.buckets
             .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new(rate, burst));
-        entry.value_mut().try_consume(1.0)
+        let bucket = entry.value_mut();
+        if bucket.refill_rate != rate as f64 || bucket.max_tokens != burst as f64 {
+            bucket.refill_rate = rate as f64;
+            bucket.max_tokens = burst as f64;
+            bucket.tokens = bucket.tokens.min(bucket.max_tokens);
+        }
+        bucket.try_consume(1.0)
+    }
+
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_enforces_burst_and_custom_reparam() {
+        let rl = RateLimiter::new(1, 2);
+        assert!(rl.check("k"));
+        assert!(rl.check("k"));
+        assert!(!rl.check("k"));
+        // custom limits on a different key
+        assert!(rl.check_custom("c", 10, 1));
+        assert!(!rl.check_custom("c", 10, 1));
+        // re-parameterising to a larger burst does not grant tokens retroactively
+        assert!(!rl.check_custom("c", 10, 5));
     }
 }

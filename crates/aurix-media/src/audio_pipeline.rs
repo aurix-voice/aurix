@@ -1,10 +1,13 @@
-use aurix_common::error::Result;
+use aurix_common::error::{AurixError, Result};
 use aurix_common::tts_stt::{ContentAnalyzer, ContentViolation, SttProvider, TranscriptResult};
 use aurix_common::types::{ChannelId, UserId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Largest Opus frame (120 ms @ 48 kHz mono).
+const MAX_DECODE_SAMPLES: usize = 5760;
 
 /// Per-user PCM accumulation buffer.
 struct UserAudioBuffer {
@@ -19,6 +22,7 @@ struct UserAudioBuffer {
 pub struct AudioAnalysisPipeline {
     /// Per-user PCM buffers keyed by (user_id, channel_id)
     buffers: Mutex<HashMap<(UserId, ChannelId), UserAudioBuffer>>,
+    decoders: Mutex<HashMap<(UserId, ChannelId), opus::Decoder>>,
     stt_provider: Option<Arc<dyn SttProvider>>,
     content_analyzers: Vec<Arc<dyn ContentAnalyzer>>,
     /// How many PCM samples to accumulate before dispatching (e.g. 2 seconds at 48kHz = 96000)
@@ -40,6 +44,7 @@ impl AudioAnalysisPipeline {
         let dispatch_threshold = (sample_rate as f32 * buffer_duration_secs) as usize;
         Self {
             buffers: Mutex::new(HashMap::new()),
+            decoders: Mutex::new(HashMap::new()),
             stt_provider,
             content_analyzers,
             dispatch_threshold,
@@ -63,31 +68,23 @@ impl AudioAnalysisPipeline {
         self.violation_callback = Some(Arc::new(f));
     }
 
-    /// Feed a raw Opus packet from the router. Decodes to PCM
-    /// using a simple single-frame Opus decode, accumulates,
-    /// and dispatches when the buffer is full.
-    ///
-    /// NOTE: Opus decoding requires the `audiopus` crate with `static` feature.
-    /// If audiopus is not available, this method stores raw bytes and the
-    /// STT provider must handle Opus-encoded input directly.
+    /// Feed a raw Opus packet from the router. Decodes to PCM with a stateful
+    /// per-user decoder, accumulates, and dispatches when the buffer is full.
     pub fn process_opus_packet(
         &self,
         user_id: UserId,
         channel_id: ChannelId,
         opus_data: &[u8],
     ) {
-        // Decode Opus to PCM using a stateless single-frame decode.
-        // For production, maintain per-user decoders for cross-packet state.
-        let pcm_samples = match Self::decode_opus_frame(opus_data, self.sample_rate) {
+        let key = (user_id, channel_id);
+        let pcm_samples = match self.decode_opus_frame(key, opus_data) {
             Ok(samples) => samples,
             Err(e) => {
-                // If Opus decode is unavailable, skip analysis for this packet
                 warn!("Opus decode failed (analysis skipped): {}", e);
                 return;
             }
         };
 
-        let key = (user_id, channel_id);
         let should_dispatch = {
             let mut buffers = self.buffers.lock();
             let buf = buffers.entry(key).or_insert_with(|| UserAudioBuffer {
@@ -159,50 +156,37 @@ impl AudioAnalysisPipeline {
         }
     }
 
-    /// Minimal single-frame Opus decode.
-    /// Uses Opus packet format: the first byte encodes the TOC (table of contents).
-    /// Frame duration can be derived from the TOC to calculate sample count.
-    ///
-    /// In production with the `audiopus` crate:
-    /// ```ignore
-    /// let mut decoder = audiopus::coder::Decoder::new(
-    ///     audiopus::SampleRate::Hz48000,
-    ///     audiopus::Channels::Mono,
-    /// ).unwrap();
-    /// let mut output = vec![0i16; 5760]; // max frame size
-    /// let n = decoder.decode(Some(opus_data), &mut output, false).unwrap();
-    /// output.truncate(n);
-    /// ```
-    ///
-    /// Without audiopus, we provide a fallback that estimates frame size
-    /// from the Opus TOC byte and fills silence (for builds without libopus).
-    fn decode_opus_frame(opus_data: &[u8], sample_rate: u32) -> Result<Vec<i16>> {
+    /// Decode one Opus packet with the per-(user, channel) stateful decoder.
+    fn decode_opus_frame(&self, key: (UserId, ChannelId), opus_data: &[u8]) -> Result<Vec<i16>> {
         if opus_data.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Fallback: parse Opus TOC to determine frame duration, return silence
-        let toc = opus_data[0];
-        let config = (toc >> 3) & 0x1F;
-        let frame_duration_ms: f32 = match config {
-            0..=3 => 10.0,
-            4..=7 => 20.0,
-            8..=11 => 40.0,
-            12..=13 => 60.0,
-            14..=15 => if config == 14 { 10.0 } else { 20.0 },
-            16..=19 => 2.5,
-            20..=23 => 5.0,
-            24..=27 => 10.0,
-            28..=31 => 20.0,
-            _ => 20.0,
+        let mut decoders = self.decoders.lock();
+        let decoder = match decoders.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let d = opus::Decoder::new(self.sample_rate, opus::Channels::Mono)
+                    .map_err(|e| AurixError::Codec(format!("opus decoder: {e}")))?;
+                v.insert(d)
+            }
         };
-        let sample_count = (sample_rate as f32 * frame_duration_ms / 1000.0) as usize;
-        Ok(vec![0i16; sample_count])
+        let mut out = vec![0i16; MAX_DECODE_SAMPLES];
+        let n = decoder
+            .decode(opus_data, &mut out, false)
+            .map_err(|e| AurixError::Codec(format!("opus decode: {e}")))?;
+        out.truncate(n);
+        Ok(out)
     }
 
     /// Remove all buffers for a user (on disconnect).
     pub fn remove_user(&self, user_id: UserId) {
         let mut buffers = self.buffers.lock();
         buffers.retain(|(uid, _), _| *uid != user_id);
+        drop(buffers);
+        self.decoders.lock().retain(|(uid, _), _| *uid != user_id);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.stt_provider.is_some() || !self.content_analyzers.is_empty()
     }
 }

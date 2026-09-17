@@ -19,7 +19,7 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<DbPool, sqlx::Error>
 
     if config.run_migrations {
         tracing::info!("Running database migrations...");
-        sqlx::migrate!("../../migrations")
+        migrations::MIGRATOR
             .run(&pool)
             .await?;
         tracing::info!("Database migrations complete");

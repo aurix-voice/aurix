@@ -62,13 +62,17 @@ impl ApiKeyService {
             .ok_or_else(|| AurixError::AuthenticationFailed("API key not found".into()))?;
 
         let hash = self.hash_key(raw_key);
-        if hash != key_row.key_hash {
+        if !aurix_common::crypto::constant_time_eq(hash.as_bytes(), key_row.key_hash.as_bytes()) {
             return Err(AurixError::AuthenticationFailed("API key validation failed".into()));
         }
 
+        if !key_row.active || key_row.revoked_at.is_some() {
+            return Err(AurixError::AuthenticationFailed("API key has been revoked".into()));
+        }
+
         if let Some(expires) = key_row.expires_at {
-            if expires < Utc::now() {
-                return Err(AurixError::TokenExpired);
+            if expires <= Utc::now() {
+                return Err(AurixError::AuthenticationFailed("API key has expired".into()));
             }
         }
 
@@ -76,10 +80,14 @@ impl ApiKeyService {
         Ok(key_row)
     }
 
-    pub async fn revoke_key(&self, key_id: Uuid) -> Result<()> {
-        aurix_db::queries::revoke_api_key(&self.pool, key_id)
+    /// Revoke a key owned by `app_id`. Keys of other tenants are reported as not found.
+    pub async fn revoke_key(&self, app_id: Uuid, key_id: Uuid) -> Result<()> {
+        let affected = aurix_db::queries::revoke_api_key(&self.pool, app_id, key_id)
             .await
             .map_err(|e| AurixError::Database(format!("Failed to revoke API key: {e}")))?;
+        if affected == 0 {
+            return Err(AurixError::Validation("API key not found".into()));
+        }
         Ok(())
     }
 
@@ -87,6 +95,15 @@ impl ApiKeyService {
         aurix_db::queries::list_api_keys(&self.pool, app_id)
             .await
             .map_err(|e| AurixError::Database(format!("Failed to list API keys: {e}")))
+    }
+
+    /// Whether the key grants `permission` (e.g. `"channels:write"`). Permissions are stored as a
+    /// JSON array of strings; `"*"` grants everything.
+    pub fn has_permission(key: &ApiKeyRow, permission: &str) -> bool {
+        match key.permissions.as_array() {
+            Some(arr) => arr.iter().any(|p| p.as_str() == Some("*") || p.as_str() == Some(permission)),
+            None => false,
+        }
     }
 
     fn generate_raw_key(&self) -> String {

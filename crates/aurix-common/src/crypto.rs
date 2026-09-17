@@ -103,7 +103,11 @@ pub fn compute_audit_hash(previous_hash: &str, data: &[u8]) -> String {
 
 /// Constant-time equality check for secrets, hashes and authentication tags.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
+    use subtle::ConstantTimeEq;
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
 }
 
 pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {

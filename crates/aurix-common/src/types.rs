@@ -457,6 +457,7 @@ pub struct ChannelPermission {
 pub struct AuditLogEntry {
     pub id: Uuid,
     pub timestamp: DateTime<Utc>,
+    pub app_id: Option<AppId>,
     pub actor_id: UserId,
     pub action: AuditAction,
     pub target_type: String,

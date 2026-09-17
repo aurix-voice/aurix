@@ -1,9 +1,19 @@
 use aurix_common::types::*;
+use aurix_common::protocol::ReplayWindow;
 use chrono::{DateTime, Utc};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+
+/// How a participant's media reaches the SFU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Native AURX/UDP client (authenticated with the per-session media key).
+    Aurx,
+    /// Browser/WebRTC client (media arrives via str0m, downlink is a mixed track).
+    WebRtc,
+}
 
 #[derive(Debug)]
 pub struct MediaSession {
@@ -12,6 +22,9 @@ pub struct MediaSession {
     pub app_id: AppId,
     pub display_name: String,
     pub ssrc: u32,
+    /// Per-session HMAC key handed to the client over the authenticated control channel.
+    pub media_key: [u8; 32],
+    pub transport: RwLock<Transport>,
     pub remote_addr: RwLock<Option<SocketAddr>>,
     pub channels: RwLock<Vec<ChannelId>>,
     pub is_muted: AtomicBool,
@@ -19,9 +32,16 @@ pub struct MediaSession {
     pub is_speaking: AtomicBool,
     pub sequence: AtomicU32,
     pub last_audio_timestamp: AtomicU64,
+    /// Wall-clock ms of the last audio packet, used for the speaking timeout.
+    pub last_audio_at_ms: AtomicI64,
     pub last_heartbeat: RwLock<DateTime<Utc>>,
     pub quality: RwLock<QualityMetrics>,
     pub created_at: DateTime<Utc>,
+    pub replay: Mutex<ReplayWindow>,
+    /// Highest `SessionBind` timestamp accepted so far (rejects replayed binds).
+    pub last_bind_ms: AtomicI64,
+    /// Browser RTP SSRC (WebRTC transport only), learned from the first RTP packet.
+    pub webrtc_ssrc: AtomicU32,
     active: AtomicBool,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
@@ -36,6 +56,7 @@ impl MediaSession {
         app_id: AppId,
         display_name: String,
         ssrc: u32,
+        media_key: [u8; 32],
     ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
@@ -43,6 +64,8 @@ impl MediaSession {
             app_id,
             display_name,
             ssrc,
+            media_key,
+            transport: RwLock::new(Transport::Aurx),
             remote_addr: RwLock::new(None),
             channels: RwLock::new(Vec::new()),
             is_muted: AtomicBool::new(false),
@@ -50,6 +73,7 @@ impl MediaSession {
             is_speaking: AtomicBool::new(false),
             sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
+            last_audio_at_ms: AtomicI64::new(0),
             last_heartbeat: RwLock::new(Utc::now()),
             quality: RwLock::new(QualityMetrics {
                 rtt_ms: 0.0,
@@ -59,6 +83,9 @@ impl MediaSession {
                 mos_score: 4.5,
             }),
             created_at: Utc::now(),
+            replay: Mutex::new(ReplayWindow::default()),
+            last_bind_ms: AtomicI64::new(i64::MIN),
+            webrtc_ssrc: AtomicU32::new(0),
             active: AtomicBool::new(true),
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
@@ -75,8 +102,26 @@ impl MediaSession {
         self.active.store(false, Ordering::Relaxed);
     }
 
+    pub fn transport(&self) -> Transport {
+        *self.transport.read()
+    }
+
+    pub fn set_transport(&self, t: Transport) {
+        *self.transport.write() = t;
+    }
+
+    /// True once the UDP source address has been authenticated via `SessionBind`
+    /// (or the WebRTC ICE session connected).
+    pub fn is_bound(&self) -> bool {
+        self.remote_addr.read().is_some()
+    }
+
     pub fn set_remote_addr(&self, addr: SocketAddr) {
         *self.remote_addr.write() = Some(addr);
+    }
+
+    pub fn clear_remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr.write().take()
     }
 
     pub fn get_remote_addr(&self) -> Option<SocketAddr> {
@@ -121,6 +166,36 @@ impl MediaSession {
     pub fn record_packet_received(&self, bytes: u64) {
         self.packets_received.fetch_add(1, Ordering::Relaxed);
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Anti-replay check for an authenticated packet's sequence number.
+    pub fn accept_sequence(&self, seq: u32) -> bool {
+        self.replay.lock().check_and_update(seq)
+    }
+
+    /// Mark audio activity now. Returns `true` if the speaking state flipped to true.
+    pub fn mark_audio_activity(&self) -> bool {
+        self.last_audio_at_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+        !self.is_speaking.swap(true, Ordering::Relaxed)
+    }
+
+    /// Clear speaking if no audio arrived within `timeout_ms`. Returns `true` if it flipped to false.
+    pub fn expire_speaking(&self, timeout_ms: i64) -> bool {
+        if !self.is_speaking.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last = self.last_audio_at_ms.load(Ordering::Relaxed);
+        if Utc::now().timestamp_millis() - last > timeout_ms {
+            self.is_speaking.swap(false, Ordering::Relaxed)
+        } else {
+            false
+        }
+    }
+
+    pub fn is_transmitting_allowed(&self) -> bool {
+        self.is_active()
+            && !self.is_muted.load(Ordering::Relaxed)
+            && !self.is_server_muted.load(Ordering::Relaxed)
     }
 
     pub fn update_quality(&self, metrics: QualityMetrics) {

@@ -7,6 +7,8 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::warn;
 
+const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
+
 pub struct NodeManager {
     pool: DbPool,
     nodes: Arc<DashMap<MediaNodeId, MediaNodeInfo>>,
@@ -20,10 +22,65 @@ impl NodeManager {
         }
     }
 
+    /// Seed the in-memory registry from the database (other nodes' heartbeats).
+    pub async fn load_from_db(&self) -> Result<usize> {
+        let rows = aurix_db::queries::get_all_media_nodes(&self.pool)
+            .await
+            .map_err(|e| AurixError::Database(format!("Failed to load media nodes: {e}")))?;
+        let mut loaded = 0;
+        for row in rows {
+            let info = Self::info_from_row(&row);
+            self.nodes.insert(info.id, info);
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    /// Refresh the registry from the database so nodes registered by other processes are visible.
+    pub async fn refresh_from_db(&self) {
+        if let Ok(rows) = aurix_db::queries::get_all_media_nodes(&self.pool).await {
+            let db_ids: std::collections::HashSet<MediaNodeId> =
+                rows.iter().map(|r| MediaNodeId::from_uuid(r.id)).collect();
+            for row in rows {
+                let info = Self::info_from_row(&row);
+                // Never let a stale DB row downgrade a fresher local heartbeat.
+                let keep_local = self
+                    .nodes
+                    .get(&info.id)
+                    .map(|cur| cur.last_heartbeat >= info.last_heartbeat)
+                    .unwrap_or(false);
+                if !keep_local {
+                    self.nodes.insert(info.id, info);
+                }
+            }
+            self.nodes.retain(|id, _| db_ids.contains(id));
+        }
+    }
+
+    fn info_from_row(row: &MediaNodeRow) -> MediaNodeInfo {
+        let age = Utc::now().signed_duration_since(row.last_heartbeat).num_seconds();
+        MediaNodeInfo {
+            id: MediaNodeId::from_uuid(row.id),
+            region: Region::from_str_loose(&row.region),
+            address: row.address.clone(),
+            media_port: row.media_port as u16,
+            api_port: row.api_port as u16,
+            active_channels: row.active_channels.max(0) as u32,
+            active_participants: row.active_participants.max(0) as u32,
+            cpu_usage: row.cpu_usage as f32,
+            memory_usage: row.memory_usage as f32,
+            bandwidth_in_mbps: row.bandwidth_in_mbps as f32,
+            bandwidth_out_mbps: row.bandwidth_out_mbps as f32,
+            healthy: row.healthy && age <= HEARTBEAT_TIMEOUT_SECS,
+            last_heartbeat: row.last_heartbeat,
+            capacity: row.capacity.max(0) as u32,
+        }
+    }
+
     pub async fn register_node(&self, info: MediaNodeInfo) -> Result<()> {
         let row = MediaNodeRow {
             id: info.id.0,
-            region: format!("{:?}", info.region).to_lowercase().replace(' ', "-"),
+            region: info.region.as_str().to_string(),
             address: info.address.clone(),
             media_port: info.media_port as i32,
             api_port: info.api_port as i32,
@@ -35,7 +92,7 @@ impl NodeManager {
             bandwidth_in_mbps: info.bandwidth_in_mbps as f64,
             bandwidth_out_mbps: info.bandwidth_out_mbps as f64,
             healthy: info.healthy,
-            version: "1.0.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             last_heartbeat: Utc::now(),
             registered_at: Utc::now(),
         };
@@ -53,7 +110,7 @@ impl NodeManager {
 
         let row = MediaNodeRow {
             id: info.id.0,
-            region: format!("{:?}", info.region).to_lowercase().replace(' ', "-"),
+            region: info.region.as_str().to_string(),
             address: info.address,
             media_port: info.media_port as i32,
             api_port: info.api_port as i32,
@@ -65,7 +122,7 @@ impl NodeManager {
             bandwidth_in_mbps: info.bandwidth_in_mbps as f64,
             bandwidth_out_mbps: info.bandwidth_out_mbps as f64,
             healthy: info.healthy,
-            version: "1.0.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             last_heartbeat: Utc::now(),
             registered_at: Utc::now(),
         };
@@ -118,6 +175,7 @@ impl NodeManager {
     }
 
     pub async fn check_node_health(&self) {
+        self.refresh_from_db().await;
         let mut unhealthy = Vec::new();
 
         for entry in self.nodes.iter() {
@@ -125,7 +183,7 @@ impl NodeManager {
             let age = Utc::now()
                 .signed_duration_since(node.last_heartbeat)
                 .num_seconds();
-            if age > 30 {
+            if age > HEARTBEAT_TIMEOUT_SECS {
                 unhealthy.push(*entry.key());
             }
         }

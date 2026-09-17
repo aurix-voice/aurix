@@ -33,16 +33,28 @@ impl MediaChannel {
     }
 
     pub fn add_participant(&self, session: Arc<MediaSession>, role: ChannelRole) -> Result<(), AurixError> {
-        let count = self.participant_count.load(Ordering::Relaxed);
-        if count >= self.config.max_participants {
+        if session.app_id != self.app_id {
+            return Err(AurixError::AuthorizationDenied(
+                "Session belongs to a different application".into(),
+            ));
+        }
+        if self.participants.contains_key(&session.user_id) {
+            // Re-join with the same user: refresh session/role without changing the count.
+            self.remove_participant(&session.user_id);
+        }
+        // Reserve a slot atomically so concurrent joins cannot exceed max_participants.
+        let max = self.config.max_participants;
+        let reserved = self.participant_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+            if c >= max { None } else { Some(c + 1) }
+        });
+        if reserved.is_err() {
             return Err(AurixError::ChannelFull(
-                format!("Channel {} full ({}/{})", self.channel_id, count, self.config.max_participants),
+                format!("Channel {} full ({}/{})", self.channel_id, max, max),
             ));
         }
         self.ssrc_map.insert(session.ssrc, session.user_id);
         self.participant_roles.insert(session.user_id, role);
         self.participants.insert(session.user_id, session);
-        self.participant_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -88,6 +100,25 @@ impl MediaChannel {
 
     pub fn has_participant(&self, user_id: &UserId) -> bool {
         self.participants.contains_key(user_id)
+    }
+
+    /// True if `user_id` may transmit in this channel (role/command-speaker rules).
+    pub fn can_transmit(&self, user_id: &UserId) -> bool {
+        if !self.participants.contains_key(user_id) {
+            return false;
+        }
+        match self.channel_type {
+            ChannelType::Command => {
+                self.get_role(user_id).can_speak()
+                    || self.config.command_speakers.as_ref().is_some_and(|s| s.contains(user_id))
+            }
+            _ => true,
+        }
+    }
+
+    /// Receivers for audio relayed from another node (sender is not a local participant).
+    pub fn get_receivers_for_relayed_audio(&self) -> Vec<(Arc<MediaSession>, f32)> {
+        self.participants.iter().map(|e| (e.value().clone(), 1.0f32)).collect()
     }
 
     pub fn update_position(&self, user_id: &UserId, position: Position3D) {

@@ -69,9 +69,9 @@ pub async fn upsert_user(pool: &DbPool, user: &UserRow) -> Result<UserRow, sqlx:
     .fetch_one(pool).await
 }
 
-pub async fn get_user(pool: &DbPool, id: Uuid) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
-        .bind(id).fetch_optional(pool).await
+pub async fn get_user(pool: &DbPool, app_id: Uuid, id: Uuid) -> Result<Option<UserRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(id).fetch_optional(pool).await
 }
 
 pub async fn get_user_by_external_id(pool: &DbPool, app_id: Uuid, external_id: &str) -> Result<Option<UserRow>, sqlx::Error> {
@@ -88,16 +88,29 @@ pub async fn search_users(pool: &DbPool, app_id: Uuid, query: &str, limit: i64, 
     .fetch_all(pool).await
 }
 
-pub async fn ban_user(pool: &DbPool, user_id: Uuid, reason: &str, expires_at: Option<DateTime<Utc>>) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET is_banned = true, ban_reason = $2, ban_expires_at = $3, updated_at = NOW() WHERE id = $1")
-        .bind(user_id).bind(reason).bind(expires_at)
+pub async fn ban_user(pool: &DbPool, app_id: Uuid, user_id: Uuid, reason: &str, expires_at: Option<DateTime<Utc>>) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE users SET is_banned = true, ban_reason = $3, ban_expires_at = $4, updated_at = NOW() WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(user_id).bind(reason).bind(expires_at)
         .execute(pool).await?;
-    Ok(())
+    Ok(r.rows_affected())
 }
 
-pub async fn unban_user(pool: &DbPool, user_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET is_banned = false, ban_reason = NULL, ban_expires_at = NULL, updated_at = NOW() WHERE id = $1")
-        .bind(user_id).execute(pool).await?;
+pub async fn unban_user(pool: &DbPool, app_id: Uuid, user_id: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE users SET is_banned = false, ban_reason = NULL, ban_expires_at = NULL, updated_at = NOW() WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(user_id).execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+/// Clear `is_banned` on users whose ban has expired. Returns number of rows updated.
+pub async fn expire_user_bans(pool: &DbPool) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE users SET is_banned = false, ban_reason = NULL, ban_expires_at = NULL, updated_at = NOW() WHERE is_banned = true AND ban_expires_at IS NOT NULL AND ban_expires_at <= NOW()")
+        .execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn add_user_session_minutes(pool: &DbPool, user_id: Uuid, minutes: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET total_session_minutes = total_session_minutes + $2, last_seen_at = NOW(), updated_at = NOW() WHERE id = $1")
+        .bind(user_id).bind(minutes).execute(pool).await?;
     Ok(())
 }
 
@@ -127,7 +140,14 @@ pub async fn create_channel(pool: &DbPool, ch: &ChannelRow) -> Result<ChannelRow
     .fetch_one(pool).await
 }
 
-pub async fn get_channel(pool: &DbPool, id: Uuid) -> Result<Option<ChannelRow>, sqlx::Error> {
+pub async fn get_channel(pool: &DbPool, app_id: Uuid, id: Uuid) -> Result<Option<ChannelRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChannelRow>("SELECT * FROM channels WHERE app_id = $1 AND id = $2 AND deleted_at IS NULL")
+        .bind(app_id).bind(id).fetch_optional(pool).await
+}
+
+/// Cross-tenant lookup for internal (non-API) use only, e.g. resolving a channel row from a
+/// media-plane identifier. Callers MUST compare `app_id` before acting on the result.
+pub async fn get_channel_any_app(pool: &DbPool, id: Uuid) -> Result<Option<ChannelRow>, sqlx::Error> {
     sqlx::query_as::<_, ChannelRow>("SELECT * FROM channels WHERE id = $1 AND deleted_at IS NULL")
         .bind(id).fetch_optional(pool).await
 }
@@ -155,10 +175,16 @@ pub async fn update_channel_participant_count(pool: &DbPool, channel_id: Uuid, d
     Ok(())
 }
 
-pub async fn delete_channel(pool: &DbPool, channel_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE channels SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1")
-        .bind(channel_id).execute(pool).await?;
-    Ok(())
+pub async fn delete_channel(pool: &DbPool, app_id: Uuid, channel_id: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE channels SET deleted_at = NOW(), updated_at = NOW() WHERE app_id = $1 AND id = $2 AND deleted_at IS NULL")
+        .bind(app_id).bind(channel_id).execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn update_channel_config(pool: &DbPool, app_id: Uuid, channel_id: Uuid, config: &serde_json::Value, max_participants: i32) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE channels SET config = $3, max_participants = $4, updated_at = NOW() WHERE app_id = $1 AND id = $2 AND deleted_at IS NULL")
+        .bind(app_id).bind(channel_id).bind(config).bind(max_participants).execute(pool).await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn count_channels(pool: &DbPool, app_id: Uuid) -> Result<i64, sqlx::Error> {
@@ -192,9 +218,24 @@ pub async fn close_session(pool: &DbPool, session_id: Uuid, reason: &str, qualit
     Ok(())
 }
 
-pub async fn get_session(pool: &DbPool, id: Uuid) -> Result<Option<SessionRow>, sqlx::Error> {
-    sqlx::query_as::<_, SessionRow>("SELECT * FROM sessions WHERE id = $1")
-        .bind(id).fetch_optional(pool).await
+pub async fn get_session(pool: &DbPool, app_id: Uuid, id: Uuid) -> Result<Option<SessionRow>, sqlx::Error> {
+    sqlx::query_as::<_, SessionRow>("SELECT * FROM sessions WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(id).fetch_optional(pool).await
+}
+
+/// Close every session that is still marked open for a media node (used on node startup
+/// so that a crash does not leave phantom active sessions).
+pub async fn close_stale_sessions_for_node(pool: &DbPool, media_node_id: Uuid, reason: &str) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE sessions SET disconnected_at = NOW(), disconnect_reason = $2 WHERE media_node_id = $1 AND disconnected_at IS NULL")
+        .bind(media_node_id).bind(reason).execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn close_stale_memberships_for_node(pool: &DbPool, media_node_id: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE channel_memberships SET left_at = NOW() WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1)"
+    ).bind(media_node_id).execute(pool).await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn get_active_sessions_for_user(pool: &DbPool, user_id: Uuid) -> Result<Vec<SessionRow>, sqlx::Error> {
@@ -221,25 +262,38 @@ pub async fn add_channel_member(pool: &DbPool, m: &ChannelMembershipRow) -> Resu
     .fetch_one(pool).await
 }
 
-pub async fn remove_channel_member(pool: &DbPool, channel_id: Uuid, user_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE channel_memberships SET left_at = NOW() WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL")
-        .bind(channel_id).bind(user_id)
+pub async fn remove_channel_member(pool: &DbPool, channel_id: Uuid, session_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE channel_memberships SET left_at = NOW() WHERE channel_id = $1 AND session_id = $2 AND left_at IS NULL")
+        .bind(channel_id).bind(session_id)
         .execute(pool).await?;
     Ok(())
 }
 
-pub async fn get_channel_members(pool: &DbPool, channel_id: Uuid) -> Result<Vec<ChannelMembershipRow>, sqlx::Error> {
+pub async fn close_session_memberships(pool: &DbPool, session_id: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE channel_memberships SET left_at = NOW() WHERE session_id = $1 AND left_at IS NULL")
+        .bind(session_id).execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+/// Active members of a channel, verified to belong to `app_id` via the channels table.
+pub async fn get_channel_members(pool: &DbPool, app_id: Uuid, channel_id: Uuid) -> Result<Vec<ChannelMembershipRow>, sqlx::Error> {
     sqlx::query_as::<_, ChannelMembershipRow>(
-        "SELECT * FROM channel_memberships WHERE channel_id = $1 AND left_at IS NULL"
+        r#"SELECT m.* FROM channel_memberships m
+           JOIN channels c ON c.id = m.channel_id
+           WHERE c.app_id = $1 AND m.channel_id = $2 AND m.left_at IS NULL"#
     )
-    .bind(channel_id).fetch_all(pool).await
+    .bind(app_id).bind(channel_id).fetch_all(pool).await
 }
 
-pub async fn set_server_mute(pool: &DbPool, channel_id: Uuid, user_id: Uuid, muted: bool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE channel_memberships SET is_server_muted = $3 WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL")
-        .bind(channel_id).bind(user_id).bind(muted)
-        .execute(pool).await?;
-    Ok(())
+pub async fn set_server_mute(pool: &DbPool, app_id: Uuid, channel_id: Uuid, user_id: Uuid, muted: bool) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE channel_memberships m SET is_server_muted = $4
+           FROM channels c
+           WHERE c.id = m.channel_id AND c.app_id = $1 AND m.channel_id = $2 AND m.user_id = $3 AND m.left_at IS NULL"#
+    )
+    .bind(app_id).bind(channel_id).bind(user_id).bind(muted)
+    .execute(pool).await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn get_user_channels(pool: &DbPool, user_id: Uuid) -> Result<Vec<ChannelMembershipRow>, sqlx::Error> {
@@ -269,10 +323,22 @@ pub async fn get_active_bans_for_user(pool: &DbPool, app_id: Uuid, user_id: Uuid
     .bind(app_id).bind(user_id).fetch_all(pool).await
 }
 
-pub async fn revoke_ban(pool: &DbPool, ban_id: Uuid, revoked_by: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE bans SET revoked_at = NOW(), revoked_by = $2 WHERE id = $1")
-        .bind(ban_id).bind(revoked_by).execute(pool).await?;
-    Ok(())
+pub async fn get_ban(pool: &DbPool, app_id: Uuid, ban_id: Uuid) -> Result<Option<BanRow>, sqlx::Error> {
+    sqlx::query_as::<_, BanRow>("SELECT * FROM bans WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(ban_id).fetch_optional(pool).await
+}
+
+pub async fn list_active_bans(pool: &DbPool, app_id: Uuid, limit: i64, offset: i64) -> Result<Vec<BanRow>, sqlx::Error> {
+    sqlx::query_as::<_, BanRow>(
+        "SELECT * FROM bans WHERE app_id = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+    )
+    .bind(app_id).bind(limit).bind(offset).fetch_all(pool).await
+}
+
+pub async fn revoke_ban(pool: &DbPool, app_id: Uuid, ban_id: Uuid, revoked_by: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE bans SET revoked_at = NOW(), revoked_by = $3 WHERE app_id = $1 AND id = $2 AND revoked_at IS NULL")
+        .bind(app_id).bind(ban_id).bind(revoked_by).execute(pool).await?;
+    Ok(r.rows_affected())
 }
 
 // ── Moderation Event Queries ──
@@ -304,11 +370,11 @@ pub async fn list_moderation_events(pool: &DbPool, app_id: Uuid, status: Option<
     }
 }
 
-pub async fn resolve_moderation_event(pool: &DbPool, event_id: Uuid, moderator_id: Uuid, resolution: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE moderation_events SET status = 'resolved', moderator_user_id = $2, resolution = $3, resolved_at = NOW() WHERE id = $1")
-        .bind(event_id).bind(moderator_id).bind(resolution)
+pub async fn resolve_moderation_event(pool: &DbPool, app_id: Uuid, event_id: Uuid, moderator_id: Uuid, resolution: &str) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE moderation_events SET status = 'resolved', moderator_user_id = $3, resolution = $4, resolved_at = NOW() WHERE app_id = $1 AND id = $2 AND status <> 'resolved'")
+        .bind(app_id).bind(event_id).bind(moderator_id).bind(resolution)
         .execute(pool).await?;
-    Ok(())
+    Ok(r.rows_affected())
 }
 
 // ── Recording Queries ──
@@ -326,9 +392,16 @@ pub async fn create_recording(pool: &DbPool, rec: &RecordingRow) -> Result<Recor
     .fetch_one(pool).await
 }
 
-pub async fn get_recording(pool: &DbPool, id: Uuid) -> Result<Option<RecordingRow>, sqlx::Error> {
-    sqlx::query_as::<_, RecordingRow>("SELECT * FROM recordings WHERE id = $1")
-        .bind(id).fetch_optional(pool).await
+pub async fn get_recording(pool: &DbPool, app_id: Uuid, id: Uuid) -> Result<Option<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>("SELECT * FROM recordings WHERE app_id = $1 AND id = $2")
+        .bind(app_id).bind(id).fetch_optional(pool).await
+}
+
+pub async fn list_recordings(pool: &DbPool, app_id: Uuid, channel_id: Option<Uuid>, limit: i64, offset: i64) -> Result<Vec<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>(
+        "SELECT * FROM recordings WHERE app_id = $1 AND ($2::uuid IS NULL OR channel_id = $2) ORDER BY started_at DESC LIMIT $3 OFFSET $4"
+    )
+    .bind(app_id).bind(channel_id).bind(limit).bind(offset).fetch_all(pool).await
 }
 
 pub async fn finish_recording(pool: &DbPool, id: Uuid, size: i64, duration: f64) -> Result<(), sqlx::Error> {
@@ -450,15 +523,18 @@ pub async fn create_api_key(pool: &DbPool, key: &ApiKeyRow) -> Result<ApiKeyRow,
     .fetch_one(pool).await
 }
 
+/// Fetch by prefix regardless of state; the caller decides how to treat inactive/expired keys.
 pub async fn get_api_key_by_prefix(pool: &DbPool, prefix: &str) -> Result<Option<ApiKeyRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeyRow>("SELECT * FROM api_keys WHERE key_prefix = $1 AND active = true AND (expires_at IS NULL OR expires_at > NOW())")
+    sqlx::query_as::<_, ApiKeyRow>(
+        "SELECT * FROM api_keys WHERE key_prefix = $1 ORDER BY active DESC, created_at DESC LIMIT 1"
+    )
         .bind(prefix).fetch_optional(pool).await
 }
 
-pub async fn revoke_api_key(pool: &DbPool, key_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE api_keys SET active = false, revoked_at = NOW() WHERE id = $1")
-        .bind(key_id).execute(pool).await?;
-    Ok(())
+pub async fn revoke_api_key(pool: &DbPool, app_id: Uuid, key_id: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE api_keys SET active = false, revoked_at = NOW() WHERE app_id = $1 AND id = $2 AND active = true")
+        .bind(app_id).bind(key_id).execute(pool).await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn list_api_keys(pool: &DbPool, app_id: Uuid) -> Result<Vec<ApiKeyRow>, sqlx::Error> {
@@ -505,6 +581,17 @@ pub async fn create_admin_user(pool: &DbPool, admin: &AdminUserRow) -> Result<Ad
     .bind(&admin.display_name).bind(&admin.role).bind(admin.active)
     .bind(admin.created_at).bind(admin.updated_at)
     .fetch_one(pool).await
+}
+
+pub async fn count_admin_users(pool: &DbPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_users WHERE active = true")
+        .fetch_one(pool).await?;
+    Ok(row.0)
+}
+
+pub async fn get_admin_by_id(pool: &DbPool, id: Uuid) -> Result<Option<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>("SELECT * FROM admin_users WHERE id = $1 AND active = true")
+        .bind(id).fetch_optional(pool).await
 }
 
 pub async fn get_admin_by_email(pool: &DbPool, email: &str) -> Result<Option<AdminUserRow>, sqlx::Error> {

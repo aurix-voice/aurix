@@ -217,6 +217,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audiopus_sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
+dependencies = [
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "aurix-api"
 version = "1.0.0"
 dependencies = [
@@ -297,6 +308,7 @@ dependencies = [
  "flume",
  "hmac",
  "ipnetwork",
+ "md-5",
  "parking_lot",
  "rand",
  "redis",
@@ -304,8 +316,10 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "sqlx",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "toml",
@@ -357,6 +371,7 @@ dependencies = [
  "arc-swap",
  "aurix-common",
  "aurix-metrics",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "crc32fast",
@@ -364,14 +379,17 @@ dependencies = [
  "dashmap",
  "flume",
  "libc",
+ "opus",
  "parking_lot",
  "prometheus",
+ "rand",
  "serde",
  "serde_json",
  "str0m",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -414,14 +432,19 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
+ "hex",
+ "hmac",
+ "opus",
  "parking_lot",
  "rand",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -817,6 +840,15 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "colorchoice"
@@ -2388,6 +2420,15 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "opus"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d3809943dff6fbad5f0484449ea26bdb9cb7d8efdf26ed50d3c7f227f69eb5c"
+dependencies = [
+ "audiopus_sys",
 ]
 
 [[package]]

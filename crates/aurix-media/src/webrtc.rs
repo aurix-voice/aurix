@@ -1,8 +1,10 @@
 //! WebRTC session management using the str0m sans-IO library.
 //!
-//! Each browser client gets a dedicated `WebRtcSession` running in its own
-//! tokio task. The `WebRtcManager` demuxes incoming UDP packets to the
-//! correct session based on source address or ICE ufrag.
+//! Each browser client gets a dedicated `WebRtcSession` running in its own tokio task
+//! that owns the `Rtc` state machine. Uplink audio (`Event::MediaData`) is forwarded to
+//! the SFU router; downlink audio from every other participant is mixed server-side
+//! (`OpusMixer`) into the single negotiated audio track. The `WebRtcManager` demuxes
+//! incoming UDP packets to the correct session based on source address or ICE ufrag.
 
 use aurix_common::error::{AurixError, Result};
 use aurix_common::types::*;
@@ -10,74 +12,66 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use str0m::change::SdpOffer;
+use str0m::format::Codec;
+use str0m::media::{MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
-use str0m::{Event, Input, Output, Rtc};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
-/// A handle to communicate with a running WebRTC session task.
-#[allow(dead_code)]
+use crate::mixer::{OpusMixer, FRAME_SAMPLES};
+
+/// Handle to communicate with a running WebRTC session task.
 struct SessionHandle {
-    /// Send incoming network bytes to the session
     net_tx: mpsc::Sender<(Vec<u8>, SocketAddr, SocketAddr)>,
-    /// Send media (Opus RTP payload) to be forwarded TO this client
     media_tx: mpsc::Sender<ForwardMedia>,
-    session_id: SessionId,
-    user_id: UserId,
-    app_id: AppId,
-    /// ICE ufrag for this session (used for demuxing before address is known)
     ice_ufrag: String,
 }
 
-/// Media to forward to a WebRTC client.
+/// Opus payload from another participant to be mixed into this client's downlink.
 pub struct ForwardMedia {
-    pub ssrc: u32,
-    pub sequence: u16,
-    pub timestamp: u32,
+    pub sender_ssrc: u32,
+    pub volume: f32,
     pub payload: Vec<u8>,
 }
 
 /// Event emitted from a WebRTC session to the SFU.
 #[derive(Debug)]
 pub enum WebRtcMediaEvent {
-    /// Decoded RTP audio received from the browser
+    /// Depayloaded Opus audio received from the browser.
     AudioReceived {
         session_id: SessionId,
         user_id: UserId,
-        ssrc: u32,
-        sequence: u16,
-        timestamp: u32,
+        rtp_time: u32,
         payload: Vec<u8>,
     },
-    /// ICE connection established
-    Connected { session_id: SessionId },
-    /// Session disconnected
+    /// ICE/DTLS connected; `remote` is the authenticated peer address.
+    Connected { session_id: SessionId, remote: SocketAddr },
     Disconnected { session_id: SessionId },
 }
 
 /// Manages all WebRTC sessions. Shared across the SFU.
 pub struct WebRtcManager {
     sessions: Arc<DashMap<SessionId, SessionHandle>>,
-    /// source address → session_id (learned after first STUN)
     addr_map: Arc<DashMap<SocketAddr, SessionId>>,
-    /// ICE ufrag → session_id (for initial demux before address known)
     ufrag_map: Arc<DashMap<String, SessionId>>,
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
-    /// Channel to deliver media events to the SFU router
+    /// Address advertised to browsers as the ICE host candidate (external IP + media port).
+    advertised_addr: SocketAddr,
     event_tx: mpsc::Sender<WebRtcMediaEvent>,
+    downlink_bitrate: i32,
 }
 
 #[derive(Deserialize)]
 pub struct WebRtcOfferRequest {
     pub sdp: String,
-    pub user_id: String,
-    pub app_id: String,
-    pub display_name: String,
+    /// Client JWT (same token used for the WebSocket control channel).
+    pub token: String,
 }
 
 #[derive(Serialize)]
@@ -90,7 +84,9 @@ impl WebRtcManager {
     pub fn new(
         socket: Arc<UdpSocket>,
         local_addr: SocketAddr,
+        advertised_addr: SocketAddr,
         event_tx: mpsc::Sender<WebRtcMediaEvent>,
+        downlink_bitrate: u32,
     ) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
@@ -98,283 +94,131 @@ impl WebRtcManager {
             ufrag_map: Arc::new(DashMap::new()),
             socket,
             local_addr,
+            advertised_addr,
             event_tx,
+            downlink_bitrate: downlink_bitrate as i32,
         }
     }
 
-    /// Create a new WebRTC session from a browser SDP offer.
-    /// Returns the session ID and the SDP answer to send back.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Create a new WebRTC session from a browser SDP offer. Returns the SDP answer.
     pub fn create_session(
         &self,
         offer_sdp: &str,
         session_id: SessionId,
         user_id: UserId,
-        app_id: AppId,
     ) -> Result<String> {
-        // Build the str0m Rtc instance (ICE-lite for server)
-        let mut rtc = Rtc::builder().set_ice_lite(true).build();
+        let mut rtc = Rtc::builder()
+            .set_ice_lite(true)
+            .clear_codecs()
+            .enable_opus(true)
+            .set_stats_interval(Some(Duration::from_secs(5)))
+            .build();
 
-        // Parse the browser's SDP offer
+        let candidate = Candidate::host(self.advertised_addr, "udp")
+            .map_err(|e| AurixError::Transport(format!("ICE candidate: {e}")))?;
+        rtc.add_local_candidate(candidate);
+
         let offer = SdpOffer::from_sdp_string(offer_sdp)
             .map_err(|e| AurixError::Transport(format!("SDP parse error: {e}")))?;
-
-        // Accept the offer and generate an answer
         let answer = rtc
             .sdp_api()
             .accept_offer(offer)
             .map_err(|e| AurixError::Transport(format!("SDP accept error: {e}")))?;
-
         let answer_sdp = answer.to_sdp_string();
 
-        // Extract ICE ufrag from the Rtc for demuxing
-        let local_ufrag = rtc
-            .direct_api()
-            .local_ice_credentials()
-            .ufrag
-            .clone();
-
-        // Create channels for the session task
-        let (net_tx, net_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr)>(512);
-        let (media_tx, media_rx) = mpsc::channel::<ForwardMedia>(256);
-
-        let handle = SessionHandle {
-            net_tx,
-            media_tx,
-            session_id,
-            user_id,
-            app_id,
-            ice_ufrag: local_ufrag.clone(),
-        };
-
-        self.sessions.insert(session_id, handle);
-        if !local_ufrag.is_empty() {
-            self.ufrag_map.insert(local_ufrag, session_id);
+        let local_ufrag = rtc.direct_api().local_ice_credentials().ufrag.clone();
+        if local_ufrag.is_empty() {
+            return Err(AurixError::Transport("ICE credentials unavailable".into()));
         }
 
-        // Spawn the session actor task
-        let socket = self.socket.clone();
-        let event_tx = self.event_tx.clone();
-        let addr_map = self.addr_map.clone();
-        let sessions = self.sessions.clone();
-        let ufrag_map = self.ufrag_map.clone();
+        let mixer = OpusMixer::new(self.downlink_bitrate)?;
 
-        tokio::spawn(async move {
-            Self::session_task(
-                rtc,
-                session_id,
-                user_id,
-                net_rx,
-                media_rx,
-                socket,
-                event_tx,
-                addr_map,
-                sessions,
-                ufrag_map,
-            )
-            .await;
-        });
+        let (net_tx, net_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr)>(512);
+        let (media_tx, media_rx) = mpsc::channel::<ForwardMedia>(512);
 
-        info!(
-            "WebRTC session {} created for user {}",
-            session_id, user_id
+        self.sessions.insert(
+            session_id,
+            SessionHandle { net_tx, media_tx, ice_ufrag: local_ufrag.clone() },
         );
+        self.ufrag_map.insert(local_ufrag, session_id);
+
+        let ctx = SessionTaskCtx {
+            session_id,
+            user_id,
+            socket: self.socket.clone(),
+            event_tx: self.event_tx.clone(),
+            addr_map: self.addr_map.clone(),
+            sessions: self.sessions.clone(),
+            ufrag_map: self.ufrag_map.clone(),
+        };
+        tokio::spawn(async move { session_task(rtc, ctx, net_rx, media_rx, mixer).await });
+
+        info!("WebRTC session {} created for user {}", session_id, user_id);
         Ok(answer_sdp)
     }
 
-    /// Determine if an incoming UDP packet belongs to a WebRTC session.
-    /// Uses RFC 7983 demuxing: STUN (0-3), DTLS (20-63), RTP/RTCP (128-191).
+    /// RFC 7983 demux: STUN (0-3), DTLS (20-63), RTP/RTCP (128-191).
     pub fn is_webrtc_packet(data: &[u8]) -> bool {
-        if data.is_empty() {
-            return false;
+        match data.first() {
+            None => false,
+            Some(&b) => b <= 3 || (20..=63).contains(&b) || (128..=191).contains(&b),
         }
-        let b = data[0];
-        // STUN: first byte 0..=3
-        // DTLS: first byte 20..=63
-        // RTP/RTCP: first byte 128..=191
-        b <= 3 || (20..=63).contains(&b) || (128..=191).contains(&b)
     }
 
     /// Route an incoming packet to the correct WebRTC session.
     pub async fn handle_packet(&self, data: &[u8], src: SocketAddr) {
-        // Fast path: known address
-        if let Some(sid) = self.addr_map.get(&src) {
-            if let Some(handle) = self.sessions.get(&*sid) {
-                let _ = handle
-                    .net_tx
-                    .send((data.to_vec(), src, self.local_addr))
-                    .await;
+        let sid = self.addr_map.get(&src).map(|s| *s);
+        if let Some(sid) = sid {
+            let tx = self.sessions.get(&sid).map(|h| h.net_tx.clone());
+            if let Some(tx) = tx {
+                let _ = tx.try_send((data.to_vec(), src, self.local_addr));
                 return;
             }
         }
 
-        // Slow path: parse STUN to extract ufrag for session lookup
+        // Before the address is known, only STUN binding requests carrying our ufrag are accepted.
         if data.len() >= 20 && data[0] <= 3 {
-            if let Some(ufrag) = Self::extract_stun_ufrag(data) {
-                // str0m uses "local:remote" format in STUN USERNAME
-                let local_ufrag = ufrag.split(':').next().unwrap_or("");
-                if let Some(sid) = self.ufrag_map.get(local_ufrag) {
-                    self.addr_map.insert(src, *sid);
-                    if let Some(handle) = self.sessions.get(&*sid) {
-                        let _ = handle
-                            .net_tx
-                            .send((data.to_vec(), src, self.local_addr))
-                            .await;
+            if let Some(username) = Self::extract_stun_username(data) {
+                let local_ufrag = username.split(':').next().unwrap_or("");
+                let sid = self.ufrag_map.get(local_ufrag).map(|s| *s);
+                if let Some(sid) = sid {
+                    let tx = self.sessions.get(&sid).map(|h| h.net_tx.clone());
+                    if let Some(tx) = tx {
+                        self.addr_map.insert(src, sid);
+                        let _ = tx.try_send((data.to_vec(), src, self.local_addr));
                     }
                     return;
                 }
             }
         }
-
-        // Unknown packet, drop
         debug!("WebRTC packet from unknown source {}, dropping", src);
     }
 
-    /// Send media to a specific WebRTC session (for forwarding audio to browser).
-    pub async fn send_to_session(&self, session_id: &SessionId, media: ForwardMedia) {
-        if let Some(handle) = self.sessions.get(session_id) {
-            let _ = handle.media_tx.send(media).await;
+    /// Queue Opus audio from another participant for mixing into this client's downlink.
+    pub fn send_to_session(&self, session_id: &SessionId, media: ForwardMedia) -> bool {
+        match self.sessions.get(session_id) {
+            Some(handle) => handle.media_tx.try_send(media).is_ok(),
+            None => false,
         }
+    }
+
+    pub fn has_session(&self, session_id: &SessionId) -> bool {
+        self.sessions.contains_key(session_id)
     }
 
     pub fn remove_session(&self, session_id: &SessionId) {
         if let Some((_, handle)) = self.sessions.remove(session_id) {
             self.ufrag_map.remove(&handle.ice_ufrag);
-            // addr_map entries will be cleaned up on next access
         }
         self.addr_map.retain(|_, sid| sid != session_id);
     }
 
-    /// The per-session actor loop. Owns the `Rtc` instance (which is Send but not Sync).
-    async fn session_task(
-        mut rtc: Rtc,
-        session_id: SessionId,
-        user_id: UserId,
-        mut net_rx: mpsc::Receiver<(Vec<u8>, SocketAddr, SocketAddr)>,
-        mut media_rx: mpsc::Receiver<ForwardMedia>,
-        socket: Arc<UdpSocket>,
-        event_tx: mpsc::Sender<WebRtcMediaEvent>,
-        addr_map: Arc<DashMap<SocketAddr, SessionId>>,
-        sessions: Arc<DashMap<SessionId, SessionHandle>>,
-        _ufrag_map: Arc<DashMap<String, SessionId>>,
-    ) {
-        let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(5));
-        let mut connected = false;
-
-        loop {
-            tokio::select! {
-                Some((data, src, dst)) = net_rx.recv() => {
-                    // Try to interpret the data as a DatagramRecv
-                    if let Ok(contents) = (&data[..]).try_into() {
-                        let receive = Receive {
-                            proto: Protocol::Udp,
-                            source: src,
-                            destination: dst,
-                            contents,
-                        };
-                        if let Err(e) = rtc.handle_input(Input::Receive(Instant::now(), receive)) {
-                            warn!("WebRTC input error for {}: {}", session_id, e);
-                        }
-                    }
-                    Self::poll_outputs(&mut rtc, session_id, user_id, &socket, &event_tx, &mut connected).await;
-                }
-                Some(media) = media_rx.recv() => {
-                    // Forward media to browser: write RTP via str0m's direct API
-                    // str0m handles SRTP encryption internally
-                    let ssrc_val = media.ssrc.into();
-                    if let Some(writer) = rtc.direct_api().stream_tx(&ssrc_val) {
-                        let _ = writer.write_rtp(
-                            111.into(), // Opus payload type (standard)
-                            (media.sequence as u64).into(),
-                            media.timestamp,
-                            Instant::now(),
-                            false,      // marker
-                            Default::default(), // extensions
-                            false,      // nackable
-                            media.payload.into(),
-                        );
-                    }
-                    Self::poll_outputs(&mut rtc, session_id, user_id, &socket, &event_tx, &mut connected).await;
-                }
-                _ = tick_interval.tick() => {
-                    if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
-                        debug!("WebRTC timeout error for {}: {}", session_id, e);
-                    }
-                    Self::poll_outputs(&mut rtc, session_id, user_id, &socket, &event_tx, &mut connected).await;
-
-                    // Check if session is dead
-                    if !rtc.is_alive() {
-                        info!("WebRTC session {} ended", session_id);
-                        let _ = event_tx.send(WebRtcMediaEvent::Disconnected { session_id }).await;
-                        break;
-                    }
-                }
-                else => break,
-            }
-        }
-
-        // Cleanup
-        sessions.remove(&session_id);
-        addr_map.retain(|_, sid| *sid != session_id);
-        info!("WebRTC session task {} exited", session_id);
-    }
-
-    async fn poll_outputs(
-        rtc: &mut Rtc,
-        session_id: SessionId,
-        user_id: UserId,
-        socket: &UdpSocket,
-        event_tx: &mpsc::Sender<WebRtcMediaEvent>,
-        connected: &mut bool,
-    ) {
-        loop {
-            match rtc.poll_output() {
-                Ok(output) => match output {
-                    Output::Transmit(t) => {
-                        if let Err(e) = socket.send_to(&t.contents, t.destination).await {
-                            warn!("WebRTC transmit error: {}", e);
-                        }
-                    }
-                    Output::Event(event) => {
-                        match event {
-                            Event::IceConnectionStateChange(state) => {
-                                info!("WebRTC ICE state for {}: {:?}", session_id, state);
-                                if !*connected
-                                    && matches!(
-                                        state,
-                                        str0m::IceConnectionState::Connected
-                                            | str0m::IceConnectionState::Completed
-                                    )
-                                {
-                                    *connected = true;
-                                    let _ = event_tx
-                                        .send(WebRtcMediaEvent::Connected { session_id })
-                                        .await;
-                                }
-                            }
-                            Event::RtpPacket(rtp) => {
-                                let _ = event_tx
-                                    .send(WebRtcMediaEvent::AudioReceived {
-                                        session_id,
-                                        user_id,
-                                        ssrc: *rtp.header.ssrc,
-                                        sequence: rtp.header.sequence_number,
-                                        timestamp: rtp.header.timestamp,
-                                        payload: rtp.payload.to_vec(),
-                                    })
-                                    .await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Output::Timeout(_) => break,
-                },
-                Err(_) => break,
-            }
-        }
-    }
-
-    /// Extract the USERNAME attribute from a STUN binding request.
-    fn extract_stun_ufrag(data: &[u8]) -> Option<String> {
+    /// Extract the USERNAME attribute from a STUN message.
+    fn extract_stun_username(data: &[u8]) -> Option<String> {
         if data.len() < 20 {
             return None;
         }
@@ -383,18 +227,241 @@ impl WebRtcManager {
             return None;
         }
         let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let end = (20 + msg_len).min(data.len());
         let mut offset = 20;
-        while offset + 4 <= 20 + msg_len && offset + 4 <= data.len() {
+        while offset + 4 <= end {
             let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
-            if attr_type == 0x0006 && offset + attr_len <= data.len() {
-                // USERNAME attribute
+            if offset + attr_len > end {
+                return None;
+            }
+            if attr_type == 0x0006 {
                 return String::from_utf8(data[offset..offset + attr_len].to_vec()).ok();
             }
-            offset += attr_len;
-            offset += (4 - (attr_len % 4)) % 4; // padding
+            offset += attr_len + (4 - (attr_len % 4)) % 4;
         }
         None
+    }
+}
+
+struct SessionTaskCtx {
+    session_id: SessionId,
+    user_id: UserId,
+    socket: Arc<UdpSocket>,
+    event_tx: mpsc::Sender<WebRtcMediaEvent>,
+    addr_map: Arc<DashMap<SocketAddr, SessionId>>,
+    sessions: Arc<DashMap<SessionId, SessionHandle>>,
+    ufrag_map: Arc<DashMap<String, SessionId>>,
+}
+
+struct Downlink {
+    mid: Option<Mid>,
+    pt: Option<Pt>,
+    rtp_time: u64,
+}
+
+/// ICE-lite agents report `Disconnected` transiently until the first binding request arrives,
+/// so only tear the session down after the state persists this long.
+const ICE_DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
+struct IceState {
+    disconnected_since: Option<Instant>,
+}
+
+/// Per-session actor loop. Owns the `Rtc` instance (Send but not Sync).
+async fn session_task(
+    mut rtc: Rtc,
+    ctx: SessionTaskCtx,
+    mut net_rx: mpsc::Receiver<(Vec<u8>, SocketAddr, SocketAddr)>,
+    mut media_rx: mpsc::Receiver<ForwardMedia>,
+    mut mixer: OpusMixer,
+) {
+    let mut connected = false;
+    let mut downlink = Downlink { mid: None, pt: None, rtp_time: 0 };
+    let mut ice = IceState { disconnected_since: None };
+    let mut mix_tick = tokio::time::interval(Duration::from_millis(20));
+    mix_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // str0m tells us when it next needs a timeout; start with a short one.
+    let mut next_timeout = Instant::now() + Duration::from_millis(100);
+
+    loop {
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(next_timeout));
+        tokio::select! {
+            Some((data, src, dst)) = net_rx.recv() => {
+                if let Ok(contents) = (&data[..]).try_into() {
+                    let receive = Receive { proto: Protocol::Udp, source: src, destination: dst, contents };
+                    if let Err(e) = rtc.handle_input(Input::Receive(Instant::now(), receive)) {
+                        warn!("WebRTC input error for {}: {}", ctx.session_id, e);
+                    }
+                }
+            }
+            Some(media) = media_rx.recv() => {
+                if let Err(e) = mixer.push_opus(media.sender_ssrc, media.volume, &media.payload) {
+                    debug!("mixer decode error for {}: {}", ctx.session_id, e);
+                }
+                continue;
+            }
+            _ = mix_tick.tick() => {
+                if connected {
+                    if let (Some(mid), Some(pt)) = (downlink.mid, downlink.pt) {
+                        match mixer.mix_frame() {
+                            Ok(Some(frame)) => {
+                                let data = frame.to_vec();
+                                let ts = MediaTime::new(downlink.rtp_time, str0m::media::Frequency::FORTY_EIGHT_KHZ);
+                                if let Some(writer) = rtc.writer(mid) {
+                                    if let Err(e) = writer.write(pt, Instant::now(), ts, data) {
+                                        debug!("downlink write error for {}: {}", ctx.session_id, e);
+                                    } else {
+                                        aurix_metrics::PACKETS_SENT.inc();
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => debug!("mix error for {}: {}", ctx.session_id, e),
+                        }
+                        // RTP clock advances even for silent frames so the receiver sees DTX gaps correctly.
+                        downlink.rtp_time = downlink.rtp_time.wrapping_add(FRAME_SAMPLES as u64);
+                    }
+                }
+            }
+            _ = sleep => {
+                if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                    debug!("WebRTC timeout error for {}: {}", ctx.session_id, e);
+                }
+            }
+            else => break,
+        }
+
+        if let Some(t) = poll_outputs(&mut rtc, &ctx, &mut connected, &mut downlink, &mut ice).await {
+            next_timeout = t;
+        }
+        if let Some(since) = ice.disconnected_since {
+            if since.elapsed() > ICE_DISCONNECT_GRACE {
+                info!("WebRTC session {} ICE disconnected for too long, closing", ctx.session_id);
+                rtc.disconnect();
+            }
+        }
+
+        if !rtc.is_alive() {
+            info!("WebRTC session {} ended", ctx.session_id);
+            let _ = ctx.event_tx.send(WebRtcMediaEvent::Disconnected { session_id: ctx.session_id }).await;
+            break;
+        }
+    }
+
+    if let Some((_, h)) = ctx.sessions.remove(&ctx.session_id) {
+        ctx.ufrag_map.remove(&h.ice_ufrag);
+    }
+    ctx.addr_map.retain(|_, sid| *sid != ctx.session_id);
+    info!("WebRTC session task {} exited", ctx.session_id);
+}
+
+/// Drain str0m outputs. Returns the next timeout instant if str0m reported one.
+async fn poll_outputs(
+    rtc: &mut Rtc,
+    ctx: &SessionTaskCtx,
+    connected: &mut bool,
+    downlink: &mut Downlink,
+    ice: &mut IceState,
+) -> Option<Instant> {
+    loop {
+        match rtc.poll_output() {
+            Ok(Output::Transmit(t)) => {
+                if let Err(e) = ctx.socket.send_to(&t.contents, t.destination).await {
+                    warn!("WebRTC transmit error: {}", e);
+                }
+            }
+            Ok(Output::Event(event)) => match event {
+                Event::Connected => {
+                    ice.disconnected_since = None;
+                    if !*connected {
+                        *connected = true;
+                        let remote = ctx
+                            .addr_map
+                            .iter()
+                            .find(|e| *e.value() == ctx.session_id)
+                            .map(|e| *e.key());
+                        if let Some(remote) = remote {
+                            let _ = ctx
+                                .event_tx
+                                .send(WebRtcMediaEvent::Connected { session_id: ctx.session_id, remote })
+                                .await;
+                        }
+                    }
+                }
+                Event::IceConnectionStateChange(state) => {
+                    debug!("WebRTC ICE state for {}: {:?}", ctx.session_id, state);
+                    match state {
+                        IceConnectionState::Disconnected => {
+                            if ice.disconnected_since.is_none() {
+                                ice.disconnected_since = Some(Instant::now());
+                            }
+                        }
+                        _ => ice.disconnected_since = None,
+                    }
+                }
+                Event::MediaAdded(added) => {
+                    if added.kind == MediaKind::Audio && downlink.mid.is_none() {
+                        downlink.mid = Some(added.mid);
+                        downlink.pt = rtc
+                            .writer(added.mid)
+                            .and_then(|w| w.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()));
+                        if downlink.pt.is_none() {
+                            warn!("WebRTC session {}: no Opus payload negotiated for downlink", ctx.session_id);
+                        }
+                    }
+                }
+                Event::MediaData(data) => {
+                    if data.params.spec().codec != Codec::Opus {
+                        continue;
+                    }
+                    let _ = ctx
+                        .event_tx
+                        .send(WebRtcMediaEvent::AudioReceived {
+                            session_id: ctx.session_id,
+                            user_id: ctx.user_id,
+                            rtp_time: data.time.numer() as u32,
+                            payload: data.data,
+                        })
+                        .await;
+                }
+                _ => {}
+            },
+            Ok(Output::Timeout(t)) => return Some(t),
+            Err(e) => {
+                debug!("WebRTC poll error for {}: {}", ctx.session_id, e);
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demux_classifies_first_byte() {
+        assert!(WebRtcManager::is_webrtc_packet(&[0x00, 0x01]));
+        assert!(WebRtcManager::is_webrtc_packet(&[22, 0]));
+        assert!(WebRtcManager::is_webrtc_packet(&[0x80, 0]));
+        assert!(!WebRtcManager::is_webrtc_packet(b"AURX"));
+        assert!(!WebRtcManager::is_webrtc_packet(&[]));
+    }
+
+    #[test]
+    fn stun_username_extraction_is_bounds_checked() {
+        // header: type=0x0001, len=12, magic, txid(12)
+        let mut msg = vec![0x00, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42];
+        msg.extend_from_slice(&[0u8; 12]);
+        // USERNAME attr: type 0x0006 len 7 "abc:xyz" + 1 pad
+        msg.extend_from_slice(&[0x00, 0x06, 0x00, 0x07]);
+        msg.extend_from_slice(b"abc:xyz\0");
+        assert_eq!(WebRtcManager::extract_stun_username(&msg).as_deref(), Some("abc:xyz"));
+        // Truncated attribute must not panic or return partial data
+        msg.truncate(26);
+        msg[3] = 0x0c;
+        assert!(WebRtcManager::extract_stun_username(&msg).is_none());
     }
 }
