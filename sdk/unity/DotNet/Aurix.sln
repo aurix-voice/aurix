@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Voice", "Aurix.Voice\Aurix.Voice.csproj", "{069F0C4B-0CCD-4412-B6DE-E0BA51CECC20}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Voice.Tests", "Aurix.Voice.Tests\Aurix.Voice.Tests.csproj", "{A9BD1E36-704B-4496-8D3E-03F66A1B39A7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Demo", "Aurix.Demo\Aurix.Demo.csproj", "{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{069F0C4B-0CCD-4412-B6DE-E0BA51CECC20}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{069F0C4B-0CCD-4412-B6DE-E0BA51CECC20}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{069F0C4B-0CCD-4412-B6DE-E0BA51CECC20}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{069F0C4B-0CCD-4412-B6DE-E0BA51CECC20}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A9BD1E36-704B-4496-8D3E-03F66A1B39A7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A9BD1E36-704B-4496-8D3E-03F66A1B39A7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A9BD1E36-704B-4496-8D3E-03F66A1B39A7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A9BD1E36-704B-4496-8D3E-03F66A1B39A7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Aurix.Demo</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Concentus" Version="2.2.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Aurix.Voice/Aurix.Voice.csproj" />
+    <Compile Include="../../Samples~/Concentus/ConcentusOpusCodec.cs" />
+  </ItemGroup>
+</Project>

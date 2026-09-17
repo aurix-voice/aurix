@@ -296,6 +296,15 @@ Reference run (release build, 8 vCPU host shared with the load generator, Postgr
 The second scenario delivered only 79 % (p99 13.6 ms, 167k `RcvbufErrors`) before the SFU used
 parallel receive workers and non-blocking sends; that is what `media.rx_workers` controls.
 
+## Client SDKs
+
+| SDK | Path | Media path | Verified by |
+|-----|------|-----------|-------------|
+| Web (TypeScript) | [`sdk/web`](sdk/web) | WebRTC/Opus via the SFU, WS control plane, demo page | two-browser smoke test (ICE/DTLS, RTP both ways, decoded audio) |
+| Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX over UDP (signed SessionBind, HMAC per packet, replay window), WS control plane | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
+
+Both SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
+
 ## Limitations
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
@@ -303,8 +312,8 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 * STT/content moderation is a pluggable pipeline; no provider is bundled.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
   it assumes nodes can reach each other directly on `media.port + 1`/UDP.
-* Client SDKs (Unity/Unreal/Web) are not part of this repository; the protocol is documented in
-  `crates/aurix-common/src/protocol.rs` and the E2E test is a reference client.
+* No Unreal SDK yet; the protocol is documented in `crates/aurix-common/src/protocol.rs`, and the
+  C# `MediaTransport`/`AurxPacket` sources are a compact reference implementation.
 
 ## License
 
