@@ -426,6 +426,8 @@ pub struct MediaNodeInfo {
     pub address: String,
     pub media_port: u16,
     pub api_port: u16,
+    /// UDP port of the node-to-node relay (None when cascade is disabled on that node).
+    pub cascade_port: Option<u16>,
     pub active_channels: u32,
     pub active_participants: u32,
     pub cpu_usage: f32,

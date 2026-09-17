@@ -205,8 +205,17 @@ directly. Media (UDP) is protected by AURX HMAC / DTLS-SRTP regardless of TLS.
   unhealthy, and forgotten after 24 h.
 * Channel events (join/leave/mute/ban/recording) are replicated through Redis pub/sub with an
   origin node id, so a node never re-applies its own events.
-* For a channel spanning nodes, configure `cascade_secret` + `cascade_peers` on all nodes; audio
-  relayed between SFUs is authenticated and rate-checked.
+* Channels spanning nodes are relayed SFU-to-SFU ("cascade") **automatically**: set the same
+  `media.cascade_secret` on every node and nothing else. Each node advertises its cascade UDP port
+  (`media.port + 1`) in `media_nodes`; every `media.cascade_discovery_interval_ms` (default 3 s)
+  and immediately after a remote join/leave event, a node reconciles the topology from the
+  database — accepted peers are the healthy nodes, and each channel is forwarded only to the nodes
+  that actually hold live memberships for it. Relayed packets carry the `Relay` flag, an HMAC over
+  `cascade_secret`, and pass a per-peer anti-replay window; unknown source addresses are dropped.
+  `media.cascade_peers` remains as an optional static allow-list (e.g. for nodes not in the
+  registry) and `media.cascade_discovery=false` returns to fully static full-mesh mode. Node
+  addresses must be reachable between nodes on `media.port + 1`/UDP (the `media.external_ip` you
+  register is what peers dial).
 * Put the API/WS behind a load balancer; UDP media must reach the node the session was created on
   (`media_addr` in `SessionInitAck` already points there).
 
@@ -259,8 +268,8 @@ System dependencies for building: `pkg-config`, `libssl-dev`, `cmake`, `libopus-
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
 * No SIP/PSTN gateway, no text chat, no server-side noise suppression (clients do that).
 * STT/content moderation is a pluggable pipeline; no provider is bundled.
-* A channel's participants across several nodes require the cascade to be configured manually
-  (no automatic topology yet).
+* Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
+  it assumes nodes can reach each other directly on `media.port + 1`/UDP.
 * Client SDKs (Unity/Unreal/Web) are not part of this repository; the protocol is documented in
   `crates/aurix-common/src/protocol.rs` and the E2E test is a reference client.
 

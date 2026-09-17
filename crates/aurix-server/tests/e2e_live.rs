@@ -537,3 +537,143 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         "session must be closed in the database after WS disconnect: {user}"
     );
 }
+
+/// Two Aurix nodes sharing one PostgreSQL/Redis, no `cascade_peers` configured: the second node
+/// is given by `AURIX_E2E_API2` / `AURIX_E2E_WS2`. Alice joins on node 1, Bob on node 2, and
+/// Alice's audio must reach Bob through the automatically discovered cascade.
+#[tokio::test]
+#[ignore = "requires two running Aurix nodes; see README (Scaling)"]
+async fn two_nodes_auto_cascade_relays_audio() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Ok(ws2) = std::env::var("AURIX_E2E_WS2") else {
+        eprintln!("AURIX_E2E_WS2 not set; skipping");
+        return;
+    };
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: ws2,
+        api_key: env.api_key.clone(),
+    };
+    let http = reqwest::Client::new();
+
+    let ch: serde_json::Value = http
+        .post(format!("{}/v1/channels", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"name": format!("cascade-{}", uuid::Uuid::now_v7())}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let channel_id = ChannelId::from_uuid(ch["id"].as_str().unwrap().parse().unwrap());
+
+    let (tok_a, _) = issue_token(&env, &http, "cascade:alice", "Alice", channel_id).await;
+    let (tok_b, _) = issue_token(&env2, &http, "cascade:bob", "Bob", channel_id).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env2, "bob", tok_b).await;
+    assert_ne!(
+        alice.media_addr.port(),
+        bob.media_addr.port(),
+        "players must land on different nodes"
+    );
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+
+    for p in [&mut alice, &mut bob] {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: tok,
+        })
+        .await;
+        p.expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    }
+    // Cross-node presence replicates through Redis.
+    alice
+        .expect("ParticipantJoined(Bob) from other node", |m| {
+            matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == "Bob")
+        })
+        .await;
+
+    // Topology reconciles on the join event; give both nodes a moment and then stream.
+    let hash = channel_id_hash(&channel_id);
+    let payload = Bytes::from_static(&[0xFC, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+    let mut got = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut seq = 0u32;
+    while got < 5 && tokio::time::Instant::now() < deadline {
+        for _ in 0..5 {
+            seq += 1;
+            let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
+            alice
+                .udp
+                .send_to(
+                    &pkt.encode_authenticated(&alice.media_key),
+                    alice.media_addr,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut buf = vec![0u8; 2048];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(300), bob.udp.recv_from(&mut buf)).await
+        {
+            let p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+            if p.header.packet_type == PacketType::Audio {
+                assert_eq!(p.header.ssrc, alice.ssrc);
+                assert_eq!(&p.payload[..], &payload[..]);
+                assert!(
+                    p.verify_auth(&bob.media_key),
+                    "relayed downlink must be re-signed with Bob's key"
+                );
+                got += 1;
+            }
+        }
+    }
+    assert!(
+        got >= 5,
+        "Bob (node 2) received only {got} audio packets from Alice (node 1) via cascade"
+    );
+
+    // Bob leaves: node 1 must stop relaying this channel to node 2.
+    bob.send(&ControlMessage::ChannelLeave { channel_id }).await;
+    alice
+        .expect("ParticipantLeft(Bob)", |m| {
+            matches!(m, ControlMessage::ParticipantLeft { .. })
+        })
+        .await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let mut leaked = 0;
+    for _ in 0..10 {
+        seq += 1;
+        let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
+        alice
+            .udp
+            .send_to(
+                &pkt.encode_authenticated(&alice.media_key),
+                alice.media_addr,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    while let Some(p) = bob.recv_udp().await {
+        if p.header.packet_type == PacketType::Audio {
+            leaked += 1;
+        }
+    }
+    assert_eq!(leaked, 0, "audio kept flowing to node 2 after Bob left");
+
+    let _ = alice.ws.close(None).await;
+    let _ = bob.ws.close(None).await;
+}

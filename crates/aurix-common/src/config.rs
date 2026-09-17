@@ -53,6 +53,7 @@ impl AurixConfig {
         for opt in [
             &mut self.media.external_ip,
             &mut self.turn.external_ip,
+            &mut self.media.cascade_secret,
             &mut self.auth.admin_bootstrap_token,
             &mut self.recording.encryption_key,
         ] {
@@ -313,13 +314,24 @@ pub struct MediaConfig {
     /// Shared secret authenticating cascade (node-to-node relay) traffic.
     #[serde(default)]
     pub cascade_secret: Option<String>,
-    /// Statically configured cascade peers (`host:port`).
+    /// Statically configured cascade peers (`host:port`). Optional: peers are normally
+    /// discovered from the `media_nodes` registry (see `cascade_discovery`).
     #[serde(default)]
     pub cascade_peers: Vec<String>,
+    /// Discover cascade peers automatically from healthy nodes in the `media_nodes` table and
+    /// forward each channel only to nodes hosting its participants.
+    #[serde(default = "default_true")]
+    pub cascade_discovery: bool,
+    /// How often (ms) the cascade topology is reconciled against the registry.
+    #[serde(default = "default_cascade_discovery_interval_ms")]
+    pub cascade_discovery_interval_ms: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_cascade_discovery_interval_ms() -> u64 {
+    3000
 }
 fn default_speaking_timeout_ms() -> u64 {
     400
@@ -348,6 +360,8 @@ impl Default for MediaConfig {
             speaking_timeout_ms: default_speaking_timeout_ms(),
             cascade_secret: None,
             cascade_peers: Vec::new(),
+            cascade_discovery: true,
+            cascade_discovery_interval_ms: 3000,
         }
     }
 }

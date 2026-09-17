@@ -23,3 +23,5 @@ redis = { workspace = true }
 arc-swap = { workspace = true }
 flume = { workspace = true }
 futures-util = { workspace = true }
+parking_lot = { workspace = true }
+tokio-util = { workspace = true }

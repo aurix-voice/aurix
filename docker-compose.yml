@@ -47,6 +47,7 @@ services:
       - "8080:8080"          # REST API (put a TLS-terminating proxy in front or set AURIX__SERVER__TLS_*)
       - "8081:8081"          # WebSocket signalling
       - "10000:10000/udp"    # native AURX media
+      - "10001:10001/udp"    # SFU-to-SFU cascade (only reachable from other nodes; firewall it)
       - "3478:3478/udp"      # TURN
       - "3478:3478/tcp"
       # TURN relay range: must match AURIX__TURN__MIN_PORT / MAX_PORT. Docker publishes each port
@@ -63,6 +64,7 @@ services:
       AURIX__AUTH__JWT_SECRET: ${AURIX_JWT_SECRET:?>=32 random bytes}
       AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ${AURIX_ADMIN_BOOTSTRAP_TOKEN:-}
       AURIX__MEDIA__EXTERNAL_IP: ${AURIX_PUBLIC_IP:?public IP clients send media to}
+      AURIX__MEDIA__CASCADE_SECRET: ${AURIX_CASCADE_SECRET:-}
       AURIX__TURN__ENABLED: ${AURIX_TURN_ENABLED:-true}
       AURIX__TURN__EXTERNAL_IP: ${AURIX_PUBLIC_IP}
       AURIX__TURN__REALM: ${AURIX_TURN_REALM:-aurix}

@@ -1,14 +1,19 @@
 //! Node-to-node audio relay ("cascade") for channels spanning several SFU nodes.
 //!
 //! Every relayed packet is an AURX packet with the `Relay` flag, authenticated with the
-//! cluster-wide `media.cascade_secret` (HMAC). Packets are accepted only from configured
-//! peers, only with a valid tag and only once per (peer, sequence) within the replay window.
+//! cluster-wide `media.cascade_secret` (HMAC). Packets are accepted only from allowed peers
+//! (statically configured via `media.cascade_peers` and/or discovered from the `media_nodes`
+//! registry), only with a valid tag and only once per (peer, sequence) within the replay window.
+//!
+//! Topology is per channel: a packet is forwarded only to the nodes that currently host
+//! participants of that channel (see `set_channel_peers`, driven by `CascadeTopology`).
 
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{AurixPacket, PacketFlags, ReplayWindow, HEADER_SIZE};
 use aurix_common::types::*;
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -19,7 +24,12 @@ pub struct CascadeRelay {
     channel_peers: Arc<DashMap<ChannelId, Vec<SocketAddr>>>,
     /// Peers we accept relayed traffic from, each with its own anti-replay window.
     allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>>,
+    /// Peers from static configuration; never removed by discovery.
+    static_peers: HashSet<SocketAddr>,
+    /// Peers currently known through discovery (healthy nodes from the registry).
+    dynamic_peers: Mutex<HashSet<SocketAddr>>,
     socket: Arc<UdpSocket>,
+    local_addr: SocketAddr,
     secret: Vec<u8>,
     local_node_id: MediaNodeId,
 }
@@ -39,22 +49,30 @@ impl CascadeRelay {
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| AurixError::Transport(format!("Cascade bind failed: {e}")))?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| AurixError::Transport(format!("Cascade local_addr failed: {e}")))?;
         let allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>> = Arc::new(DashMap::new());
+        let mut static_peers = HashSet::new();
         for p in peers {
             let addr: SocketAddr = p.parse().map_err(|_| {
                 AurixError::InvalidConfiguration(format!("Invalid cascade peer address: {p}"))
             })?;
             allowed_peers.insert(addr, Mutex::new(ReplayWindow::default()));
+            static_peers.insert(addr);
         }
         info!(
-            "Cascade relay listening on {} with {} peers",
-            bind_addr,
+            "Cascade relay listening on {} with {} static peers",
+            local_addr,
             allowed_peers.len()
         );
         Ok(Self {
             channel_peers: Arc::new(DashMap::new()),
             allowed_peers,
+            static_peers,
+            dynamic_peers: Mutex::new(HashSet::new()),
             socket: Arc::new(socket),
+            local_addr,
             secret: secret.as_bytes().to_vec(),
             local_node_id,
         })
@@ -64,15 +82,47 @@ impl CascadeRelay {
         self.local_node_id
     }
 
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     pub fn allowed_peers(&self) -> Vec<SocketAddr> {
         self.allowed_peers.iter().map(|e| *e.key()).collect()
+    }
+
+    pub fn static_peers(&self) -> Vec<SocketAddr> {
+        self.static_peers.iter().copied().collect()
+    }
+
+    /// Replace the set of discovered peers. Newly seen addresses become accepted sources
+    /// (fresh replay window); addresses that disappeared and are not statically configured
+    /// are dropped from the allow-list and from every channel's forwarding list.
+    pub fn set_dynamic_peers(&self, peers: HashSet<SocketAddr>) {
+        let mut current = self.dynamic_peers.lock();
+        for added in peers.difference(&current) {
+            self.allowed_peers
+                .entry(*added)
+                .or_insert_with(|| Mutex::new(ReplayWindow::default()));
+            info!("Cascade peer discovered: {}", added);
+        }
+        for removed in current.difference(&peers) {
+            if self.static_peers.contains(removed) {
+                continue;
+            }
+            self.allowed_peers.remove(removed);
+            for mut entry in self.channel_peers.iter_mut() {
+                entry.value_mut().retain(|a| a != removed);
+            }
+            info!("Cascade peer gone: {}", removed);
+        }
+        *current = peers;
     }
 
     /// Register a remote node as having participants in a given channel. Unknown peers are refused.
     pub fn add_peer(&self, channel_id: ChannelId, peer_addr: SocketAddr) -> Result<()> {
         if !self.allowed_peers.contains_key(&peer_addr) {
             return Err(AurixError::AuthorizationDenied(format!(
-                "{peer_addr} is not a configured cascade peer"
+                "{peer_addr} is not an allowed cascade peer"
             )));
         }
         let mut entry = self.channel_peers.entry(channel_id).or_default();
@@ -82,9 +132,25 @@ impl CascadeRelay {
         Ok(())
     }
 
-    /// Subscribe every configured peer to `channel_id` (static full-mesh topology).
+    /// Replace the forwarding list for a channel with exactly the allowed peers in `peers`.
+    /// Used by discovery; an empty list removes the channel from the relay entirely.
+    pub fn set_channel_peers(&self, channel_id: ChannelId, peers: &[SocketAddr]) {
+        let filtered: Vec<SocketAddr> = peers
+            .iter()
+            .copied()
+            .filter(|p| self.allowed_peers.contains_key(p))
+            .collect();
+        if filtered.is_empty() {
+            self.channel_peers.remove(&channel_id);
+        } else {
+            self.channel_peers.insert(channel_id, filtered);
+        }
+    }
+
+    /// Subscribe every statically configured peer to `channel_id` (legacy full-mesh mode,
+    /// used when no `media_nodes` registry is available).
     pub fn add_all_peers(&self, channel_id: ChannelId) {
-        for peer in self.allowed_peers() {
+        for peer in self.static_peers() {
             let _ = self.add_peer(channel_id, peer);
         }
     }
@@ -97,6 +163,13 @@ impl CascadeRelay {
 
     pub fn remove_channel(&self, channel_id: &ChannelId) {
         self.channel_peers.remove(channel_id);
+    }
+
+    pub fn channel_peers(&self, channel_id: &ChannelId) -> Vec<SocketAddr> {
+        self.channel_peers
+            .get(channel_id)
+            .map(|p| p.value().clone())
+            .unwrap_or_default()
     }
 
     /// Forward a locally originated audio packet to all peers for this channel.
@@ -215,5 +288,50 @@ mod tests {
         assert!(relay
             .add_peer(ChannelId::new(), "127.0.0.1:45002".parse().unwrap())
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn dynamic_peers_are_added_and_pruned_but_static_kept() {
+        let static_peer: SocketAddr = "127.0.0.1:45001".parse().unwrap();
+        let dyn_a: SocketAddr = "127.0.0.1:45010".parse().unwrap();
+        let dyn_b: SocketAddr = "127.0.0.1:45011".parse().unwrap();
+        let relay = CascadeRelay::new(
+            "127.0.0.1:0",
+            MediaNodeId::new(),
+            "0123456789abcdef",
+            &[static_peer.to_string()],
+        )
+        .await
+        .unwrap();
+        let ch = ChannelId::new();
+
+        relay.set_dynamic_peers([dyn_a, dyn_b].into_iter().collect());
+        assert_eq!(relay.allowed_peers().len(), 3);
+        // Unknown addresses are silently filtered out of the channel list.
+        relay.set_channel_peers(ch, &[dyn_a, dyn_b, "127.0.0.1:1".parse().unwrap()]);
+        assert_eq!(relay.channel_peers(&ch).len(), 2);
+
+        let mut pkt = AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus"));
+        pkt.header.set_flag(PacketFlags::Relay);
+        let good = pkt.encode_authenticated(b"0123456789abcdef");
+        assert!(relay.authenticate_inbound(&good, dyn_b).is_ok());
+
+        // Node B went away: its address must be refused and removed from channels.
+        relay.set_dynamic_peers([dyn_a].into_iter().collect());
+        assert_eq!(relay.channel_peers(&ch), vec![dyn_a]);
+        let pkt2 = {
+            let mut p = AurixPacket::audio(1, 0, 43, 7, Bytes::from_static(b"opus"));
+            p.header.set_flag(PacketFlags::Relay);
+            p.encode_authenticated(b"0123456789abcdef")
+        };
+        assert!(relay.authenticate_inbound(&pkt2, dyn_b).is_err());
+        assert!(relay.authenticate_inbound(&pkt2, dyn_a).is_ok());
+
+        // Static peer survives an empty discovery result.
+        relay.set_dynamic_peers(HashSet::new());
+        assert_eq!(relay.allowed_peers(), vec![static_peer]);
+        assert!(relay.channel_peers(&ch).is_empty());
+        relay.set_channel_peers(ch, &[]);
+        assert!(!relay.has_peers(&ch));
     }
 }

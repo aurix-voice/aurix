@@ -138,6 +138,7 @@ pub struct MediaNodeRow {
     pub address: String,
     pub media_port: i32,
     pub api_port: i32,
+    pub cascade_port: Option<i32>,
     pub capacity: i32,
     pub active_channels: i32,
     pub active_participants: i32,

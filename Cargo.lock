@@ -387,11 +387,13 @@ dependencies = [
  "dashmap",
  "flume",
  "futures-util",
+ "parking_lot",
  "redis",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

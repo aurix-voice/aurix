@@ -692,9 +692,11 @@ pub async fn upsert_media_node(
     node: &MediaNodeRow,
 ) -> Result<MediaNodeRow, sqlx::Error> {
     sqlx::query_as::<_, MediaNodeRow>(
-        r#"INSERT INTO media_nodes (id, region, address, media_port, api_port, capacity, active_channels, active_participants, cpu_usage, memory_usage, bandwidth_in_mbps, bandwidth_out_mbps, healthy, version, last_heartbeat, registered_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        r#"INSERT INTO media_nodes (id, region, address, media_port, api_port, capacity, active_channels, active_participants, cpu_usage, memory_usage, bandwidth_in_mbps, bandwidth_out_mbps, healthy, version, last_heartbeat, registered_at, cascade_port)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
            ON CONFLICT (id) DO UPDATE SET
+             region = EXCLUDED.region, address = EXCLUDED.address, media_port = EXCLUDED.media_port,
+             api_port = EXCLUDED.api_port, cascade_port = EXCLUDED.cascade_port, version = EXCLUDED.version,
              active_channels = EXCLUDED.active_channels, active_participants = EXCLUDED.active_participants,
              cpu_usage = EXCLUDED.cpu_usage, memory_usage = EXCLUDED.memory_usage,
              bandwidth_in_mbps = EXCLUDED.bandwidth_in_mbps, bandwidth_out_mbps = EXCLUDED.bandwidth_out_mbps,
@@ -706,7 +708,33 @@ pub async fn upsert_media_node(
     .bind(node.active_participants).bind(node.cpu_usage).bind(node.memory_usage)
     .bind(node.bandwidth_in_mbps).bind(node.bandwidth_out_mbps)
     .bind(node.healthy).bind(&node.version).bind(node.last_heartbeat).bind(node.registered_at)
+    .bind(node.cascade_port)
     .fetch_one(pool).await
+}
+
+/// `(channel_id, media_node_id)` pairs for every live membership of the given channels that
+/// is hosted on a node other than `local_node`. Drives automatic cascade topology.
+pub async fn remote_nodes_for_channels(
+    pool: &DbPool,
+    channel_ids: &[Uuid],
+    local_node: Uuid,
+) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+    if channel_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        r#"SELECT DISTINCT m.channel_id, s.media_node_id
+           FROM channel_memberships m
+           JOIN sessions s ON s.id = m.session_id
+           WHERE m.channel_id = ANY($1)
+             AND m.left_at IS NULL
+             AND s.disconnected_at IS NULL
+             AND s.media_node_id <> $2"#,
+    )
+    .bind(channel_ids)
+    .bind(local_node)
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn get_healthy_media_nodes(

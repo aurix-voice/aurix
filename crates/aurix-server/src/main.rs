@@ -237,6 +237,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Automatic cascade topology (peers + per-channel routing from the media_nodes registry).
+    let cascade_relay = sfu.read().cascade().cloned();
+    if let Some(cascade) = cascade_relay.filter(|_| config.media.cascade_discovery) {
+        let topology = Arc::new(aurix_control::cascade_topology::CascadeTopology::new(
+            pool.clone(),
+            control.nodes.clone(),
+            node_id,
+            cascade,
+            sfu.clone(),
+        ));
+        let events = control.events.clone();
+        let interval = std::time::Duration::from_millis(config.media.cascade_discovery_interval_ms);
+        let cancel = shutdown.clone();
+        tasks.spawn(topology.run(events, interval, cancel));
+        info!(
+            "Cascade auto-discovery enabled (interval {} ms)",
+            config.media.cascade_discovery_interval_ms
+        );
+    }
+
     let api_addr: std::net::SocketAddr =
         format!("{}:{}", config.server.host, config.server.api_port).parse()?;
     let ws_addr: std::net::SocketAddr =

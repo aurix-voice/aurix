@@ -568,6 +568,9 @@ impl SfuNode {
     pub fn active_channels(&self) -> u32 {
         self.channels.len() as u32
     }
+    pub fn channel_ids(&self) -> Vec<ChannelId> {
+        self.channels.iter().map(|e| *e.key()).collect()
+    }
     pub fn active_participants(&self) -> u32 {
         self.active_participant_count.load(Ordering::Relaxed)
     }
@@ -585,6 +588,7 @@ impl SfuNode {
             address: address.to_string(),
             media_port,
             api_port,
+            cascade_port: self.cascade.as_ref().map(|c| c.local_addr().port()),
             active_channels: self.active_channels(),
             active_participants: self.active_participants(),
             cpu_usage: 0.0,

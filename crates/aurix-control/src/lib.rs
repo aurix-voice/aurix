@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod cascade_topology;
 pub mod channel_manager;
 pub mod event_bus;
 pub mod node_manager;
