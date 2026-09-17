@@ -82,6 +82,38 @@ pub enum AurixError {
 }
 
 impl AurixError {
+    /// True for errors whose details describe server internals (DB, Redis, I/O…)
+    /// and must never be echoed to API clients.
+    pub fn is_internal(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(_)
+                | Self::Redis(_)
+                | Self::Transport(_)
+                | Self::Codec(_)
+                | Self::StunTurn(_)
+                | Self::Encryption(_)
+                | Self::Recording(_)
+                | Self::Moderation(_)
+                | Self::Internal(_)
+                | Self::MediaNodeUnavailable(_)
+        )
+    }
+
+    /// Message safe to return to clients.
+    pub fn public_message(&self) -> String {
+        if self.is_internal() {
+            match self {
+                Self::MediaNodeUnavailable(_) => "No media node is currently available".to_string(),
+                Self::Recording(_) => "Recording operation failed".to_string(),
+                Self::Moderation(_) => "Moderation operation failed".to_string(),
+                _ => "Internal server error".to_string(),
+            }
+        } else {
+            self.to_string()
+        }
+    }
+
     pub fn status_code(&self) -> u16 {
         match self {
             Self::AuthenticationFailed(_) => 401,
@@ -99,6 +131,8 @@ impl AurixError {
             Self::Validation(_) => 400,
             Self::Conflict(_) => 409,
             Self::Timeout(_) => 504,
+            Self::NotImplemented(_) => 501,
+            Self::MediaNodeUnavailable(_) => 503,
             _ => 500,
         }
     }
