@@ -1,0 +1,13 @@
+{
+  "name": "Aurix.Voice",
+  "rootNamespace": "Aurix",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": ["WebGL"],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "noEngineReferences": false
+}
