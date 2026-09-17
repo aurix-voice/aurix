@@ -74,7 +74,11 @@ impl QualityEstimator {
         if self.loss_window.is_empty() {
             return 0.0;
         }
-        let lost = self.loss_window.iter().filter(|(_, received)| !received).count();
+        let lost = self
+            .loss_window
+            .iter()
+            .filter(|(_, received)| !received)
+            .count();
         (lost as f32 / self.loss_window.len() as f32) * 100.0
     }
 
@@ -110,7 +114,7 @@ impl QualityEstimator {
             93.2 - ((effective_latency - 120.0) / 10.0)
         };
         let r = r - (loss * 2.5);
-        let r = r.max(0.0).min(100.0);
+        let r = r.clamp(0.0, 100.0);
         1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6
     }
 }

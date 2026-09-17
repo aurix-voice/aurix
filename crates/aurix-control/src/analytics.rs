@@ -58,7 +58,9 @@ impl AnalyticsCollector {
                 error_count: 0,
             };
 
-            if let Err(e) = aurix_db::queries::insert_analytics_snapshot(&self.pool, &snapshot).await {
+            if let Err(e) =
+                aurix_db::queries::insert_analytics_snapshot(&self.pool, &snapshot).await
+            {
                 error!("Failed to insert snapshot for app {}: {}", app_id, e);
             }
         }

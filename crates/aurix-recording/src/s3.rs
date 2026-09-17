@@ -39,7 +39,9 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b'/' if !encode_slash => out.push('/'),
             _ => out.push_str(&format!("%{:02X}", b)),
         }
@@ -50,7 +52,9 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
 impl S3Client {
     pub fn new(cfg: S3Config) -> Result<Self> {
         if cfg.access_key.is_empty() || cfg.secret_key.is_empty() {
-            return Err(AurixError::InvalidConfiguration("S3 access/secret key required".into()));
+            return Err(AurixError::InvalidConfiguration(
+                "S3 access/secret key required".into(),
+            ));
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -64,7 +68,10 @@ impl S3Client {
         let url = url::Url::parse(&self.cfg.endpoint)
             .map_err(|e| AurixError::InvalidConfiguration(format!("invalid s3 endpoint: {e}")))?;
         let scheme = url.scheme().to_string();
-        let mut host = url.host_str().ok_or_else(|| AurixError::InvalidConfiguration("s3 endpoint has no host".into()))?.to_string();
+        let mut host = url
+            .host_str()
+            .ok_or_else(|| AurixError::InvalidConfiguration("s3 endpoint has no host".into()))?
+            .to_string();
         if let Some(p) = url.port() {
             host = format!("{host}:{p}");
         }
@@ -76,14 +83,21 @@ impl S3Client {
 
     fn canonical_path(&self, key: &str) -> String {
         if self.cfg.path_style {
-            format!("/{}/{}", uri_encode(&self.cfg.bucket, true), uri_encode(key, false))
+            format!(
+                "/{}/{}",
+                uri_encode(&self.cfg.bucket, true),
+                uri_encode(key, false)
+            )
         } else {
             format!("/{}", uri_encode(key, false))
         }
     }
 
     fn signing_key(&self, date: &str) -> Vec<u8> {
-        let k_date = hmac(format!("AWS4{}", self.cfg.secret_key).as_bytes(), date.as_bytes());
+        let k_date = hmac(
+            format!("AWS4{}", self.cfg.secret_key).as_bytes(),
+            date.as_bytes(),
+        );
         let k_region = hmac(&k_date, self.cfg.region.as_bytes());
         let k_service = hmac(&k_region, b"s3");
         hmac(&k_service, b"aws4_request")
@@ -113,11 +127,20 @@ impl S3Client {
         }
         headers.sort();
         let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
-        let signed_headers = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+        let signed_headers = headers
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
 
-        let canonical_request = format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+        let canonical_request = format!(
+            "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        );
         let scope = format!("{date}/{}/s3/aws4_request", self.cfg.region);
-        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
         let signature = hex::encode(hmac(&self.signing_key(&date), string_to_sign.as_bytes()));
         let auth = format!(
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
@@ -130,7 +153,15 @@ impl S3Client {
         let (scheme, host) = self.host()?;
         let path = self.canonical_path(key);
         let payload_hash = sha256_hex(&body);
-        let (auth, amz_date) = self.sign("PUT", &path, "", &host, Utc::now(), &payload_hash, &[("content-type", content_type)]);
+        let (auth, amz_date) = self.sign(
+            "PUT",
+            &path,
+            "",
+            &host,
+            Utc::now(),
+            &payload_hash,
+            &[("content-type", content_type)],
+        );
         let url = format!("{scheme}://{host}{path}");
         let resp = self
             .http
@@ -145,7 +176,10 @@ impl S3Client {
             .await
             .map_err(|e| AurixError::Recording(format!("S3 PUT failed: {e}")))?;
         if !resp.status().is_success() {
-            return Err(AurixError::Recording(format!("S3 PUT returned {}", resp.status())));
+            return Err(AurixError::Recording(format!(
+                "S3 PUT returned {}",
+                resp.status()
+            )));
         }
         Ok(())
     }
@@ -154,7 +188,8 @@ impl S3Client {
         let (scheme, host) = self.host()?;
         let path = self.canonical_path(key);
         let payload_hash = sha256_hex(b"");
-        let (auth, amz_date) = self.sign("DELETE", &path, "", &host, Utc::now(), &payload_hash, &[]);
+        let (auth, amz_date) =
+            self.sign("DELETE", &path, "", &host, Utc::now(), &payload_hash, &[]);
         let url = format!("{scheme}://{host}{path}");
         let resp = self
             .http
@@ -167,13 +202,21 @@ impl S3Client {
             .await
             .map_err(|e| AurixError::Recording(format!("S3 DELETE failed: {e}")))?;
         if !resp.status().is_success() && resp.status().as_u16() != 404 {
-            return Err(AurixError::Recording(format!("S3 DELETE returned {}", resp.status())));
+            return Err(AurixError::Recording(format!(
+                "S3 DELETE returned {}",
+                resp.status()
+            )));
         }
         Ok(())
     }
 
     /// Build a presigned GET URL valid for `expires_secs` (max 7 days per AWS).
-    pub fn presigned_get_url(&self, key: &str, expires_secs: u64, now: DateTime<Utc>) -> Result<String> {
+    pub fn presigned_get_url(
+        &self,
+        key: &str,
+        expires_secs: u64,
+        now: DateTime<Utc>,
+    ) -> Result<String> {
         let (scheme, host) = self.host()?;
         let path = self.canonical_path(key);
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -184,10 +227,16 @@ impl S3Client {
         let query = format!(
             "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={credential}&X-Amz-Date={amz_date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host"
         );
-        let canonical_request = format!("GET\n{path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
-        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+        let canonical_request =
+            format!("GET\n{path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
         let signature = hex::encode(hmac(&self.signing_key(&date), string_to_sign.as_bytes()));
-        Ok(format!("{scheme}://{host}{path}?{query}&X-Amz-Signature={signature}"))
+        Ok(format!(
+            "{scheme}://{host}{path}?{query}&X-Amz-Signature={signature}"
+        ))
     }
 }
 
@@ -214,8 +263,12 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).unwrap();
         let url = client().presigned_get_url("test.txt", 86400, now).unwrap();
         assert!(url.starts_with("https://examplebucket.s3.amazonaws.com/test.txt?"));
-        assert!(url.contains("X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"));
-        assert!(url.ends_with("X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"));
+        assert!(url.contains(
+            "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
+        ));
+        assert!(url.ends_with(
+            "X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use dashmap::DashMap;
-use std::time::{Duration, Instant};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Upper bound on distinct rate-limit keys kept in memory.
 pub const MAX_BUCKETS: usize = 500_000;
@@ -62,9 +62,7 @@ impl RateLimiter {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                buckets.retain(|_, bucket| {
-                    bucket.last_refill.elapsed() < Duration::from_secs(300)
-                });
+                buckets.retain(|_, bucket| bucket.last_refill.elapsed() < Duration::from_secs(300));
             }
         });
     }
@@ -76,21 +74,22 @@ impl RateLimiter {
     pub fn check_with_cost(&self, key: &str, cost: f64) -> bool {
         // Inline probabilistic cleanup if start_cleanup_task was never called
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
-        if count % 10_000 == 0 {
-            self.buckets.retain(|_, bucket| {
-                bucket.last_refill.elapsed() < Duration::from_secs(300)
-            });
+        if count.is_multiple_of(10_000) {
+            self.buckets
+                .retain(|_, bucket| bucket.last_refill.elapsed() < Duration::from_secs(300));
         }
 
         if self.buckets.len() >= MAX_BUCKETS && !self.buckets.contains_key(key) {
             // Under a key-flood, evict stale buckets before admitting a new key; if that does
             // not help, fail closed for the new key rather than growing without bound.
-            self.buckets.retain(|_, bucket| bucket.last_refill.elapsed() < Duration::from_secs(60));
+            self.buckets
+                .retain(|_, bucket| bucket.last_refill.elapsed() < Duration::from_secs(60));
             if self.buckets.len() >= MAX_BUCKETS {
                 return false;
             }
         }
-        let mut entry = self.buckets
+        let mut entry = self
+            .buckets
             .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new(self.default_rate, self.default_burst));
         entry.value_mut().try_consume(cost)
@@ -99,7 +98,8 @@ impl RateLimiter {
     /// Token-bucket check with per-key limits. If a bucket already exists for `key` with
     /// different parameters it is re-parameterised in place (tokens are clamped to the new burst).
     pub fn check_custom(&self, key: &str, rate: u32, burst: u32) -> bool {
-        let mut entry = self.buckets
+        let mut entry = self
+            .buckets
             .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new(rate, burst));
         let bucket = entry.value_mut();

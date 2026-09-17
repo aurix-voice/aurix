@@ -1,10 +1,10 @@
+use crate::error::{AurixError, Result};
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use ring::rand::SecureRandom;
 use ring::{aead, rand as ring_rand};
 use sha1::Sha1;
-use sha2::{Sha256, Digest};
-use base64::Engine;
-use crate::error::{AurixError, Result};
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
@@ -15,12 +15,15 @@ pub struct CryptoProvider {
 
 impl CryptoProvider {
     pub fn new() -> Self {
-        Self { rng: ring_rand::SystemRandom::new() }
+        Self {
+            rng: ring_rand::SystemRandom::new(),
+        }
     }
 
     pub fn generate_random_bytes(&self, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        self.rng.fill(&mut buf)
+        self.rng
+            .fill(&mut buf)
             .map_err(|_| AurixError::Encryption("Failed to generate random bytes".into()))?;
         Ok(buf)
     }
@@ -41,11 +44,13 @@ impl CryptoProvider {
             .map_err(|_| AurixError::Encryption("Invalid AES key".into()))?;
         let sealing_key = aead::LessSafeKey::new(unbound_key);
         let mut nonce_bytes = [0u8; 12];
-        self.rng.fill(&mut nonce_bytes)
+        self.rng
+            .fill(&mut nonce_bytes)
             .map_err(|_| AurixError::Encryption("Failed to generate nonce".into()))?;
         let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
         let mut in_out = plaintext.to_vec();
-        sealing_key.seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut in_out)
+        sealing_key
+            .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut in_out)
             .map_err(|_| AurixError::Encryption("Encryption failed".into()))?;
         let mut result = Vec::with_capacity(12 + in_out.len());
         result.extend_from_slice(&nonce_bytes);
@@ -65,7 +70,8 @@ impl CryptoProvider {
         nonce_arr.copy_from_slice(nonce_bytes);
         let nonce = aead::Nonce::assume_unique_for_key(nonce_arr);
         let mut in_out = encrypted.to_vec();
-        let plaintext = opening_key.open_in_place(nonce, aead::Aad::from(aad), &mut in_out)
+        let plaintext = opening_key
+            .open_in_place(nonce, aead::Aad::from(aad), &mut in_out)
             .map_err(|_| AurixError::Encryption("Decryption failed".into()))?;
         Ok(plaintext.to_vec())
     }
@@ -78,7 +84,9 @@ impl CryptoProvider {
 }
 
 impl Default for CryptoProvider {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct SrtpKeyMaterial {
@@ -139,15 +147,25 @@ pub struct TurnCredentials {
     pub expires_at: i64,
 }
 
-pub fn generate_turn_credentials(secret: &str, user: &str, ttl_secs: i64, now_unix: i64) -> TurnCredentials {
+pub fn generate_turn_credentials(
+    secret: &str,
+    user: &str,
+    ttl_secs: i64,
+    now_unix: i64,
+) -> TurnCredentials {
     let expires_at = now_unix + ttl_secs;
     let username = format!("{expires_at}:{user}");
     let password = turn_password_for_username(secret, &username);
-    TurnCredentials { username, password, expires_at }
+    TurnCredentials {
+        username,
+        password,
+        expires_at,
+    }
 }
 
 pub fn turn_password_for_username(secret: &str, username: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(hmac_sha1(secret.as_bytes(), username.as_bytes()))
+    base64::engine::general_purpose::STANDARD
+        .encode(hmac_sha1(secret.as_bytes(), username.as_bytes()))
 }
 
 /// Parse a time-limited TURN username, returning `(expiry_unix, user)` if well-formed.
@@ -180,8 +198,14 @@ mod tests {
     fn turn_credentials_roundtrip() {
         let c = generate_turn_credentials("s3cret", "user-1", 600, 1_700_000_000);
         assert_eq!(c.username, "1700000600:user-1");
-        assert_eq!(turn_password_for_username("s3cret", &c.username), c.password);
-        assert_eq!(parse_turn_username(&c.username), Some((1_700_000_600, "user-1")));
+        assert_eq!(
+            turn_password_for_username("s3cret", &c.username),
+            c.password
+        );
+        assert_eq!(
+            parse_turn_username(&c.username),
+            Some((1_700_000_600, "user-1"))
+        );
         assert!(parse_turn_username("garbage").is_none());
     }
 

@@ -40,7 +40,10 @@ impl TurnServer {
                 handler.set_relay_bind_ip(ip);
             }
         }
-        Self { handler: Arc::new(handler), config: config.clone() }
+        Self {
+            handler: Arc::new(handler),
+            config: config.clone(),
+        }
     }
 
     pub fn handler(&self) -> &Arc<TurnHandler> {
@@ -57,13 +60,25 @@ impl TurnServer {
     /// Bind sockets without entering the receive loop (used by tests and by `run`).
     pub async fn bind(&self) -> Result<(Arc<UdpSocket>, SocketAddr)> {
         let udp_addr = format!("{}:{}", self.config.host, self.config.udp_port);
-        let socket = UdpSocket::bind(&udp_addr).await.map_err(|e| AurixError::StunTurn(format!("Failed to bind TURN UDP {udp_addr}: {e}")))?;
+        let socket = UdpSocket::bind(&udp_addr).await.map_err(|e| {
+            AurixError::StunTurn(format!("Failed to bind TURN UDP {udp_addr}: {e}"))
+        })?;
         let socket = Arc::new(socket);
-        info!("TURN server listening on UDP {}", socket.local_addr().map(|a| a.to_string()).unwrap_or(udp_addr));
+        info!(
+            "TURN server listening on UDP {}",
+            socket
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or(udp_addr)
+        );
 
         let tcp_addr = format!("{}:{}", self.config.host, self.config.tcp_port);
-        let listener = TcpListener::bind(&tcp_addr).await.map_err(|e| AurixError::StunTurn(format!("Failed to bind TURN TCP {tcp_addr}: {e}")))?;
-        let tcp_local = listener.local_addr().map_err(|e| AurixError::StunTurn(e.to_string()))?;
+        let listener = TcpListener::bind(&tcp_addr).await.map_err(|e| {
+            AurixError::StunTurn(format!("Failed to bind TURN TCP {tcp_addr}: {e}"))
+        })?;
+        let tcp_local = listener
+            .local_addr()
+            .map_err(|e| AurixError::StunTurn(e.to_string()))?;
         info!("TURN server listening on TCP {}", tcp_local);
         let handler_tcp = self.handler.clone();
         tokio::spawn(async move {
@@ -100,7 +115,9 @@ impl TurnServer {
                 Ok((len, src)) => {
                     let data = &buf[..len];
                     if len >= 4 && (data[0] & 0xC0) == 0x40 {
-                        self.handler.handle_channel_data(data, src, ClientProtocol::Udp).await;
+                        self.handler
+                            .handle_channel_data(data, src, ClientProtocol::Udp)
+                            .await;
                         continue;
                     }
                     if !StunMessage::is_stun(data) {
@@ -108,7 +125,11 @@ impl TurnServer {
                     }
                     match StunMessage::decode(data) {
                         Ok(msg) => {
-                            if let Err(e) = self.handler.handle_stun_message(&msg, src, &sink, data).await {
+                            if let Err(e) = self
+                                .handler
+                                .handle_stun_message(&msg, src, &sink, data)
+                                .await
+                            {
                                 warn!("STUN handler error from {}: {}", src, e);
                             }
                         }
@@ -125,7 +146,11 @@ impl TurnServer {
 
     /// TURN over TCP (RFC 8656 §3.1): STUN messages and ChannelData frames are self-delimiting;
     /// ChannelData is padded to a 4-byte boundary on stream transports.
-    async fn handle_tcp_client(stream: tokio::net::TcpStream, peer: SocketAddr, handler: Arc<TurnHandler>) {
+    async fn handle_tcp_client(
+        stream: tokio::net::TcpStream,
+        peer: SocketAddr,
+        handler: Arc<TurnHandler>,
+    ) {
         info!("TURN TCP client connected: {}", peer);
         let _ = stream.set_nodelay(true);
         let (mut rd, mut wr) = stream.into_split();
@@ -152,8 +177,7 @@ impl TurnServer {
                 warn!("TURN TCP client {} exceeded frame limit", peer);
                 break;
             }
-            loop {
-                let Some(frame_len) = Self::tcp_frame_len(&buf) else { break };
+            while let Some(frame_len) = Self::tcp_frame_len(&buf) {
                 if frame_len > TCP_MAX_FRAME {
                     buf.clear();
                     break;
@@ -163,7 +187,9 @@ impl TurnServer {
                 }
                 let frame: Vec<u8> = buf.drain(..frame_len).collect();
                 if (frame[0] & 0xC0) == 0x40 {
-                    handler.handle_channel_data(&frame, peer, ClientProtocol::Tcp).await;
+                    handler
+                        .handle_channel_data(&frame, peer, ClientProtocol::Tcp)
+                        .await;
                 } else if let Ok(msg) = StunMessage::decode(&frame) {
                     if let Err(e) = handler.handle_stun_message(&msg, peer, &sink, &frame).await {
                         warn!("TURN TCP handler error from {}: {}", peer, e);

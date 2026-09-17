@@ -50,8 +50,13 @@ pub enum WebRtcMediaEvent {
         payload: Vec<u8>,
     },
     /// ICE/DTLS connected; `remote` is the authenticated peer address.
-    Connected { session_id: SessionId, remote: SocketAddr },
-    Disconnected { session_id: SessionId },
+    Connected {
+        session_id: SessionId,
+        remote: SocketAddr,
+    },
+    Disconnected {
+        session_id: SessionId,
+    },
 }
 
 /// Manages all WebRTC sessions. Shared across the SFU.
@@ -142,7 +147,11 @@ impl WebRtcManager {
 
         self.sessions.insert(
             session_id,
-            SessionHandle { net_tx, media_tx, ice_ufrag: local_ufrag.clone() },
+            SessionHandle {
+                net_tx,
+                media_tx,
+                ice_ufrag: local_ufrag.clone(),
+            },
         );
         self.ufrag_map.insert(local_ufrag, session_id);
 
@@ -278,8 +287,14 @@ async fn session_task(
     mut mixer: OpusMixer,
 ) {
     let mut connected = false;
-    let mut downlink = Downlink { mid: None, pt: None, rtp_time: 0 };
-    let mut ice = IceState { disconnected_since: None };
+    let mut downlink = Downlink {
+        mid: None,
+        pt: None,
+        rtp_time: 0,
+    };
+    let mut ice = IceState {
+        disconnected_since: None,
+    };
     let mut mix_tick = tokio::time::interval(Duration::from_millis(20));
     mix_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // str0m tells us when it next needs a timeout; start with a short one.
@@ -333,19 +348,28 @@ async fn session_task(
             else => break,
         }
 
-        if let Some(t) = poll_outputs(&mut rtc, &ctx, &mut connected, &mut downlink, &mut ice).await {
+        if let Some(t) = poll_outputs(&mut rtc, &ctx, &mut connected, &mut downlink, &mut ice).await
+        {
             next_timeout = t;
         }
         if let Some(since) = ice.disconnected_since {
             if since.elapsed() > ICE_DISCONNECT_GRACE {
-                info!("WebRTC session {} ICE disconnected for too long, closing", ctx.session_id);
+                info!(
+                    "WebRTC session {} ICE disconnected for too long, closing",
+                    ctx.session_id
+                );
                 rtc.disconnect();
             }
         }
 
         if !rtc.is_alive() {
             info!("WebRTC session {} ended", ctx.session_id);
-            let _ = ctx.event_tx.send(WebRtcMediaEvent::Disconnected { session_id: ctx.session_id }).await;
+            let _ = ctx
+                .event_tx
+                .send(WebRtcMediaEvent::Disconnected {
+                    session_id: ctx.session_id,
+                })
+                .await;
             break;
         }
     }
@@ -385,7 +409,10 @@ async fn poll_outputs(
                         if let Some(remote) = remote {
                             let _ = ctx
                                 .event_tx
-                                .send(WebRtcMediaEvent::Connected { session_id: ctx.session_id, remote })
+                                .send(WebRtcMediaEvent::Connected {
+                                    session_id: ctx.session_id,
+                                    remote,
+                                })
                                 .await;
                         }
                     }
@@ -404,11 +431,16 @@ async fn poll_outputs(
                 Event::MediaAdded(added) => {
                     if added.kind == MediaKind::Audio && downlink.mid.is_none() {
                         downlink.mid = Some(added.mid);
-                        downlink.pt = rtc
-                            .writer(added.mid)
-                            .and_then(|w| w.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()));
+                        downlink.pt = rtc.writer(added.mid).and_then(|w| {
+                            w.payload_params()
+                                .find(|p| p.spec().codec == Codec::Opus)
+                                .map(|p| p.pt())
+                        });
                         if downlink.pt.is_none() {
-                            warn!("WebRTC session {}: no Opus payload negotiated for downlink", ctx.session_id);
+                            warn!(
+                                "WebRTC session {}: no Opus payload negotiated for downlink",
+                                ctx.session_id
+                            );
                         }
                     }
                 }
@@ -458,7 +490,10 @@ mod tests {
         // USERNAME attr: type 0x0006 len 7 "abc:xyz" + 1 pad
         msg.extend_from_slice(&[0x00, 0x06, 0x00, 0x07]);
         msg.extend_from_slice(b"abc:xyz\0");
-        assert_eq!(WebRtcManager::extract_stun_username(&msg).as_deref(), Some("abc:xyz"));
+        assert_eq!(
+            WebRtcManager::extract_stun_username(&msg).as_deref(),
+            Some("abc:xyz")
+        );
         // Truncated attribute must not panic or return partial data
         msg.truncate(26);
         msg[3] = 0x0c;

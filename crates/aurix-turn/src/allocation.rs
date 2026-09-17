@@ -46,7 +46,14 @@ pub struct Allocation {
 }
 
 impl Allocation {
-    pub fn new(client: ClientKey, relay_addr: SocketAddr, relay_socket: Arc<UdpSocket>, username: String, realm: String, lifetime_secs: i64) -> Self {
+    pub fn new(
+        client: ClientKey,
+        relay_addr: SocketAddr,
+        relay_socket: Arc<UdpSocket>,
+        username: String,
+        realm: String,
+        lifetime_secs: i64,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::now_v7(),
@@ -79,17 +86,25 @@ impl Allocation {
         if !self.permissions.contains_key(&ip) && self.permissions.len() >= MAX_PERMISSIONS {
             return false;
         }
-        self.permissions.insert(ip, Utc::now() + Duration::seconds(PERMISSION_LIFETIME_SECS));
+        self.permissions
+            .insert(ip, Utc::now() + Duration::seconds(PERMISSION_LIFETIME_SECS));
         true
     }
 
     pub fn has_permission(&self, ip: &IpAddr) -> bool {
-        self.permissions.get(ip).map(|exp| Utc::now() < *exp).unwrap_or(false)
+        self.permissions
+            .get(ip)
+            .map(|exp| Utc::now() < *exp)
+            .unwrap_or(false)
     }
 
     /// Bind `number` to `peer`. Fails if the number or peer is already bound to something else
     /// (RFC 8656 §12.2) or the table is full.
-    pub fn add_channel_binding(&mut self, number: u16, peer_addr: SocketAddr) -> std::result::Result<(), &'static str> {
+    pub fn add_channel_binding(
+        &mut self,
+        number: u16,
+        peer_addr: SocketAddr,
+    ) -> std::result::Result<(), &'static str> {
         self.prune();
         for b in &self.channel_bindings {
             if b.number == number && b.peer_addr != peer_addr {
@@ -99,25 +114,41 @@ impl Allocation {
                 return Err("peer already bound to another channel");
             }
         }
-        if let Some(existing) = self.channel_bindings.iter_mut().find(|b| b.number == number) {
+        if let Some(existing) = self
+            .channel_bindings
+            .iter_mut()
+            .find(|b| b.number == number)
+        {
             existing.expires_at = Utc::now() + Duration::seconds(CHANNEL_LIFETIME_SECS);
         } else {
             if self.channel_bindings.len() >= MAX_CHANNELS {
                 return Err("channel table full");
             }
-            self.channel_bindings.push(ChannelBinding { number, peer_addr, expires_at: Utc::now() + Duration::seconds(CHANNEL_LIFETIME_SECS) });
+            self.channel_bindings.push(ChannelBinding {
+                number,
+                peer_addr,
+                expires_at: Utc::now() + Duration::seconds(CHANNEL_LIFETIME_SECS),
+            });
         }
         // A channel binding also installs a permission for the peer.
-        self.permissions.insert(peer_addr.ip(), Utc::now() + Duration::seconds(PERMISSION_LIFETIME_SECS));
+        self.permissions.insert(
+            peer_addr.ip(),
+            Utc::now() + Duration::seconds(PERMISSION_LIFETIME_SECS),
+        );
         Ok(())
     }
 
     pub fn get_channel_binding(&self, number: u16) -> Option<&ChannelBinding> {
-        self.channel_bindings.iter().find(|b| b.number == number && !b.is_expired())
+        self.channel_bindings
+            .iter()
+            .find(|b| b.number == number && !b.is_expired())
     }
 
     pub fn get_channel_for_peer(&self, peer: &SocketAddr) -> Option<u16> {
-        self.channel_bindings.iter().find(|b| b.peer_addr == *peer && !b.is_expired()).map(|b| b.number)
+        self.channel_bindings
+            .iter()
+            .find(|b| b.peer_addr == *peer && !b.is_expired())
+            .map(|b| b.number)
     }
 
     fn prune(&mut self) {

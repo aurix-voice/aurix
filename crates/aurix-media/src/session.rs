@@ -1,10 +1,10 @@
-use aurix_common::types::*;
 use aurix_common::protocol::ReplayWindow;
+use aurix_common::types::*;
 use chrono::{DateTime, Utc};
+use parking_lot::{Mutex, RwLock};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::{Mutex, RwLock};
 
 /// How a participant's media reaches the SFU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +175,8 @@ impl MediaSession {
 
     /// Mark audio activity now. Returns `true` if the speaking state flipped to true.
     pub fn mark_audio_activity(&self) -> bool {
-        self.last_audio_at_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+        self.last_audio_at_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
         !self.is_speaking.swap(true, Ordering::Relaxed)
     }
 

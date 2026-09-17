@@ -77,14 +77,10 @@ impl RecordingJitterBuffer {
 
         // Drain contiguous run
         let mut expected = start_seq;
-        loop {
-            if let Some(data) = self.buffer.remove(&expected) {
-                result.push((expected, data));
-                self.last_written_seq = Some(expected);
-                expected = expected.wrapping_add(1);
-            } else {
-                break;
-            }
+        while let Some(data) = self.buffer.remove(&expected) {
+            result.push((expected, data));
+            self.last_written_seq = Some(expected);
+            expected = expected.wrapping_add(1);
         }
 
         // Force-flush if buffer is too large (gap that will never be filled)
@@ -99,7 +95,10 @@ impl RecordingJitterBuffer {
                 }
             }
             if result.len() > 1 {
-                warn!("Jitter buffer force-flushed {} packets (gap detected)", result.len());
+                warn!(
+                    "Jitter buffer force-flushed {} packets (gap detected)",
+                    result.len()
+                );
             }
         }
 

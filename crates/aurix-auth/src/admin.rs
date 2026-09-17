@@ -39,7 +39,12 @@ pub struct AdminAuthService {
 
 impl AdminAuthService {
     pub fn new(pool: DbPool, jwt_secret: String) -> Self {
-        Self { pool, jwt_secret, token_ttl_secs: 8 * 3600, bootstrap_token: None }
+        Self {
+            pool,
+            jwt_secret,
+            token_ttl_secs: 8 * 3600,
+            bootstrap_token: None,
+        }
     }
 
     pub fn with_token_ttl(mut self, ttl_secs: i64) -> Self {
@@ -80,11 +85,16 @@ impl AdminAuthService {
                 "Admin bootstrap is disabled: an administrator already exists".into(),
             ));
         }
-        self.create_admin(email, password, display_name, "superadmin").await
+        self.create_admin(email, password, display_name, "superadmin")
+            .await
     }
 
     pub async fn create_admin(
-        &self, email: &str, password: &str, display_name: &str, role: &str,
+        &self,
+        email: &str,
+        password: &str,
+        display_name: &str,
+        role: &str,
     ) -> Result<AdminUserRow> {
         let email = email.trim().to_ascii_lowercase();
         if email.len() < 3 || !email.contains('@') || email.len() > 254 {
@@ -96,27 +106,41 @@ impl AdminAuthService {
             )));
         }
         if !ADMIN_ROLES.contains(&role) {
-            return Err(AurixError::Validation(format!("Unknown admin role '{role}'")));
+            return Err(AurixError::Validation(format!(
+                "Unknown admin role '{role}'"
+            )));
         }
         if aurix_db::queries::get_admin_by_email(&self.pool, &email)
             .await
             .map_err(|e| AurixError::Database(format!("Admin lookup failed: {e}")))?
             .is_some()
         {
-            return Err(AurixError::Conflict("An admin with this email already exists".into()));
+            return Err(AurixError::Conflict(
+                "An admin with this email already exists".into(),
+            ));
         }
         let password_hash = self.hash_password(password)?;
         let admin = AdminUserRow {
-            id: Uuid::now_v7(), email, password_hash,
-            display_name: display_name.to_string(), role: role.to_string(),
-            active: true, last_login_at: None, created_at: Utc::now(), updated_at: Utc::now(),
+            id: Uuid::now_v7(),
+            email,
+            password_hash,
+            display_name: display_name.to_string(),
+            role: role.to_string(),
+            active: true,
+            last_login_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         aurix_db::queries::create_admin_user(&self.pool, &admin)
             .await
             .map_err(|e| AurixError::Database(format!("Failed to create admin: {e}")))
     }
 
-    pub async fn authenticate(&self, email: &str, password: &str) -> Result<(AdminUserRow, String)> {
+    pub async fn authenticate(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<(AdminUserRow, String)> {
         let email = email.trim().to_ascii_lowercase();
         let admin = aurix_db::queries::get_admin_by_email(&self.pool, &email)
             .await
@@ -125,7 +149,9 @@ impl AdminAuthService {
         // the email exists.
         let Some(admin) = admin else {
             let _ = self.verify_password(password, DUMMY_HASH);
-            return Err(AurixError::AuthenticationFailed("Invalid credentials".into()));
+            return Err(AurixError::AuthenticationFailed(
+                "Invalid credentials".into(),
+            ));
         };
         self.verify_password(password, &admin.password_hash)?;
         let _ = aurix_db::queries::update_admin_login(&self.pool, admin.id).await;
@@ -162,13 +188,20 @@ impl AdminAuthService {
     fn generate_admin_token(&self, admin: &AdminUserRow) -> Result<String> {
         let now = Utc::now().timestamp();
         let claims = AdminClaims {
-            sub: admin.id.to_string(), admin_id: admin.id.to_string(),
-            email: admin.email.clone(), role: admin.role.clone(),
+            sub: admin.id.to_string(),
+            admin_id: admin.id.to_string(),
+            email: admin.email.clone(),
+            role: admin.role.clone(),
             typ: ADMIN_TOKEN_TYPE.to_string(),
-            exp: now + self.token_ttl_secs, iat: now,
+            exp: now + self.token_ttl_secs,
+            iat: now,
         };
-        encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(self.jwt_secret.as_bytes()))
-            .map_err(|e| AurixError::Internal(format!("Admin token generation failed: {e}")))
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )
+        .map_err(|e| AurixError::Internal(format!("Admin token generation failed: {e}")))
     }
 
     /// Verify that the admin referenced by a token is still active (tokens outlive revocation).

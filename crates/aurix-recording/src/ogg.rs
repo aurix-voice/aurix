@@ -92,7 +92,7 @@ impl<W: Write> OggOpusWriter<W> {
     /// RTP timestamp delta as `samples`.
     pub fn write_packet_with_duration(&mut self, opus_data: &[u8], samples: u64) -> io::Result<()> {
         if self.finished {
-            return Err(io::Error::new(io::ErrorKind::Other, "Writer already finished"));
+            return Err(io::Error::other("Writer already finished"));
         }
         self.granule += samples.max(1);
         self.write_page(opus_data, self.granule, 0x00)
@@ -138,16 +138,16 @@ impl<W: Write> OggOpusWriter<W> {
 
         // Build header with CRC = 0 first, then compute CRC
         let mut page = Vec::with_capacity(header_size + data.len());
-        page.extend_from_slice(OGG_CAPTURE);           // 0-3
-        page.push(0);                                   // 4: version
-        page.push(header_type);                          // 5: header type
-        page.extend_from_slice(&granule.to_le_bytes());  // 6-13
+        page.extend_from_slice(OGG_CAPTURE); // 0-3
+        page.push(0); // 4: version
+        page.push(header_type); // 5: header type
+        page.extend_from_slice(&granule.to_le_bytes()); // 6-13
         page.extend_from_slice(&self.serial.to_le_bytes()); // 14-17
         page.extend_from_slice(&self.page_seq.to_le_bytes()); // 18-21
-        page.extend_from_slice(&0u32.to_le_bytes());     // 22-25: CRC placeholder
-        page.push(num_segments);                         // 26
-        page.extend_from_slice(&segments);               // segment table
-        page.extend_from_slice(data);                    // payload
+        page.extend_from_slice(&0u32.to_le_bytes()); // 22-25: CRC placeholder
+        page.push(num_segments); // 26
+        page.extend_from_slice(&segments); // segment table
+        page.extend_from_slice(data); // payload
 
         let crc = ogg_crc32(&page);
         page[22..26].copy_from_slice(&crc.to_le_bytes());
@@ -182,7 +182,11 @@ mod tests {
             let stored_crc = u32::from_le_bytes(page[22..26].try_into().unwrap());
             page[22..26].copy_from_slice(&[0; 4]);
             assert_eq!(ogg_crc32(&page), stored_crc, "page CRC must verify");
-            pages.push((header_type, granule, data[header_len..header_len + body_len].to_vec()));
+            pages.push((
+                header_type,
+                granule,
+                data[header_len..header_len + body_len].to_vec(),
+            ));
             data = &data[header_len + body_len..];
         }
         pages
@@ -207,7 +211,11 @@ mod tests {
         assert_eq!(pages[2], (0, 960, vec![0xFC, 1, 2, 3]));
         assert_eq!(pages[3], (0, 960 + 1920, vec![0xFC, 9, 9]));
         assert_eq!(pages[4].1, 960 + 1920 + 960);
-        assert_eq!(pages[4].2.len(), 600, "600-byte packet spans 3 lacing segments");
+        assert_eq!(
+            pages[4].2.len(),
+            600,
+            "600-byte packet spans 3 lacing segments"
+        );
         assert_eq!(pages[5].0, 0x04, "EOS");
     }
 }

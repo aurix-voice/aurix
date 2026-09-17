@@ -259,7 +259,12 @@ impl StunMessage {
         let port = u16::from_be_bytes([value[2], value[3]]) ^ (STUN_MAGIC_COOKIE >> 16) as u16;
         match value[1] {
             0x01 => {
-                let ip = Ipv4Addr::new(value[4] ^ cookie[0], value[5] ^ cookie[1], value[6] ^ cookie[2], value[7] ^ cookie[3]);
+                let ip = Ipv4Addr::new(
+                    value[4] ^ cookie[0],
+                    value[5] ^ cookie[1],
+                    value[6] ^ cookie[2],
+                    value[7] ^ cookie[3],
+                );
                 Some(SocketAddr::new(IpAddr::V4(ip), port))
             }
             0x02 if value.len() >= 20 => {
@@ -286,21 +291,29 @@ impl StunMessage {
     }
 
     pub fn get_xor_address(&self, attr_type: StunAttributeType) -> Option<SocketAddr> {
-        self.get_attribute(attr_type).and_then(|a| self.decode_xor_address(&a.value))
+        self.get_attribute(attr_type)
+            .and_then(|a| self.decode_xor_address(&a.value))
     }
 
     /// All values of a repeated attribute (e.g. XOR-PEER-ADDRESS in CreatePermission).
     pub fn get_all_xor_addresses(&self, attr_type: StunAttributeType) -> Vec<SocketAddr> {
         let t = attr_type.to_u16();
-        self.attributes.iter().filter(|a| a.attr_type == t).filter_map(|a| self.decode_xor_address(&a.value)).collect()
+        self.attributes
+            .iter()
+            .filter(|a| a.attr_type == t)
+            .filter_map(|a| self.decode_xor_address(&a.value))
+            .collect()
     }
 
     pub fn get_u32(&self, attr_type: StunAttributeType) -> Option<u32> {
-        self.get_attribute(attr_type).and_then(|a| a.value.get(..4)).map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+        self.get_attribute(attr_type)
+            .and_then(|a| a.value.get(..4))
+            .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
     }
 
     pub fn get_string(&self, attr_type: StunAttributeType) -> Option<String> {
-        self.get_attribute(attr_type).and_then(|a| String::from_utf8(a.value.clone()).ok())
+        self.get_attribute(attr_type)
+            .and_then(|a| String::from_utf8(a.value.clone()).ok())
     }
 
     pub fn add_error_code(&mut self, code: u16, reason: &str) {
@@ -373,7 +386,9 @@ impl StunMessage {
 
     /// Verify MESSAGE-INTEGRITY on a raw message with the given long-term key.
     pub fn verify_integrity(raw: &[u8], key: &[u8]) -> bool {
-        let Some(mi_offset) = find_attribute_offset(raw, StunAttributeType::MessageIntegrity.to_u16()) else {
+        let Some(mi_offset) =
+            find_attribute_offset(raw, StunAttributeType::MessageIntegrity.to_u16())
+        else {
             return false;
         };
         if raw.len() < mi_offset + 24 {
@@ -416,14 +431,17 @@ impl StunMessage {
             return Err(AurixError::StunTurn("Invalid STUN magic cookie".into()));
         }
 
-        let msg_type = StunMessageType::from_u16(msg_type_raw)
-            .ok_or_else(|| AurixError::StunTurn(format!("Unknown message type: {msg_type_raw:#06x}")))?;
+        let msg_type = StunMessageType::from_u16(msg_type_raw).ok_or_else(|| {
+            AurixError::StunTurn(format!("Unknown message type: {msg_type_raw:#06x}"))
+        })?;
 
         let mut transaction_id = [0u8; 12];
         transaction_id.copy_from_slice(&data[8..20]);
 
-        if msg_len % 4 != 0 {
-            return Err(AurixError::StunTurn("Message length not 4-byte aligned".into()));
+        if !msg_len.is_multiple_of(4) {
+            return Err(AurixError::StunTurn(
+                "Message length not 4-byte aligned".into(),
+            ));
         }
         if data.len() != STUN_HEADER_SIZE + msg_len {
             return Err(AurixError::StunTurn("Message length mismatch".into()));
@@ -445,7 +463,10 @@ impl StunMessage {
             // the HMAC and must be ignored (RFC 5389 §15.4).
             let ignored = seen_integrity && attr_type != StunAttributeType::Fingerprint.to_u16();
             if !ignored {
-                attributes.push(StunAttribute { attr_type, value: data[offset..offset + attr_len].to_vec() });
+                attributes.push(StunAttribute {
+                    attr_type,
+                    value: data[offset..offset + attr_len].to_vec(),
+                });
             }
             if attr_type == StunAttributeType::MessageIntegrity.to_u16() {
                 seen_integrity = true;
@@ -512,8 +533,13 @@ mod tests {
         tampered[30] ^= 0xFF;
         assert!(!StunMessage::verify_integrity(&tampered, &key));
         let decoded = StunMessage::decode(&raw).unwrap();
-        assert!(decoded.get_attribute(StunAttributeType::MessageIntegrity).is_some());
-        assert_eq!(decoded.get_string(StunAttributeType::Realm).unwrap(), "aurix");
+        assert!(decoded
+            .get_attribute(StunAttributeType::MessageIntegrity)
+            .is_some());
+        assert_eq!(
+            decoded.get_string(StunAttributeType::Realm).unwrap(),
+            "aurix"
+        );
     }
 
     #[test]

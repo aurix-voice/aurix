@@ -9,7 +9,14 @@ pub trait AudioSink: Send + Sync {
     fn wants_channel(&self, channel_id: &ChannelId) -> bool;
 
     /// `rtp_timestamp` is in 48 kHz units; `payload` is a raw Opus packet.
-    fn on_audio(&self, channel_id: ChannelId, user_id: UserId, ssrc: u32, rtp_timestamp: u32, payload: &[u8]);
+    fn on_audio(
+        &self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        ssrc: u32,
+        rtp_timestamp: u32,
+        payload: &[u8],
+    );
 
     /// Called when a participant leaves so per-user state can be released.
     fn on_participant_left(&self, channel_id: ChannelId, user_id: UserId);

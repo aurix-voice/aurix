@@ -37,8 +37,9 @@ pub struct OpusMixer {
 
 impl OpusMixer {
     pub fn new(bitrate_bps: i32) -> Result<Self> {
-        let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-            .map_err(|e| AurixError::Codec(format!("opus encoder: {e}")))?;
+        let mut encoder =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                .map_err(|e| AurixError::Codec(format!("opus encoder: {e}")))?;
         encoder
             .set_bitrate(opus::Bitrate::Bits(bitrate_bps.clamp(6_000, 128_000)))
             .map_err(|e| AurixError::Codec(format!("opus bitrate: {e}")))?;
@@ -67,7 +68,12 @@ impl OpusMixer {
                     .map_err(|e| AurixError::Codec(format!("opus decoder: {e}")))?;
                 self.senders.insert(
                     sender,
-                    SenderState { decoder, queue: VecDeque::new(), volume, last_seen: Instant::now() },
+                    SenderState {
+                        decoder,
+                        queue: VecDeque::new(),
+                        volume,
+                        last_seen: Instant::now(),
+                    },
                 );
                 self.senders.get_mut(&sender).expect("just inserted")
             }
@@ -130,7 +136,9 @@ pub fn encode_pcm_frame(pcm: &[i16]) -> Result<Vec<u8>> {
     let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
         .map_err(|e| AurixError::Codec(format!("opus encoder: {e}")))?;
     let mut out = vec![0u8; 1275];
-    let n = enc.encode(pcm, &mut out).map_err(|e| AurixError::Codec(format!("opus encode: {e}")))?;
+    let n = enc
+        .encode(pcm, &mut out)
+        .map_err(|e| AurixError::Codec(format!("opus encode: {e}")))?;
     out.truncate(n);
     Ok(out)
 }
@@ -141,14 +149,21 @@ mod tests {
 
     fn tone(freq: f32, amp: f32) -> Vec<i16> {
         (0..FRAME_SAMPLES)
-            .map(|i| ((i as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * amp * i16::MAX as f32) as i16)
+            .map(|i| {
+                ((i as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin()
+                    * amp
+                    * i16::MAX as f32) as i16
+            })
             .collect()
     }
 
     #[test]
     fn mixes_two_senders_into_one_opus_frame() {
         let mut mixer = OpusMixer::new(32_000).unwrap();
-        assert!(mixer.mix_frame().unwrap().is_none(), "silence yields no frame");
+        assert!(
+            mixer.mix_frame().unwrap().is_none(),
+            "silence yields no frame"
+        );
 
         let a = encode_pcm_frame(&tone(440.0, 0.3)).unwrap();
         let b = encode_pcm_frame(&tone(880.0, 0.3)).unwrap();

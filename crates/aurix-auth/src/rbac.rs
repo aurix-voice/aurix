@@ -17,10 +17,7 @@ impl RbacService {
             .iter()
             .find(|p| p.channel_id == *channel_id)
             .ok_or_else(|| {
-                AurixError::AuthorizationDenied(format!(
-                    "No permission for channel {}",
-                    channel_id
-                ))
+                AurixError::AuthorizationDenied(format!("No permission for channel {}", channel_id))
             })?;
 
         if !perm.join {
@@ -40,10 +37,7 @@ impl RbacService {
             .iter()
             .find(|p| p.channel_id == *channel_id)
             .ok_or_else(|| {
-                AurixError::AuthorizationDenied(format!(
-                    "No permission for channel {}",
-                    channel_id
-                ))
+                AurixError::AuthorizationDenied(format!("No permission for channel {}", channel_id))
             })?;
 
         if !perm.speak {
@@ -63,10 +57,7 @@ impl RbacService {
             .iter()
             .find(|p| p.channel_id == *channel_id)
             .ok_or_else(|| {
-                AurixError::AuthorizationDenied(format!(
-                    "No permission for channel {}",
-                    channel_id
-                ))
+                AurixError::AuthorizationDenied(format!("No permission for channel {}", channel_id))
             })?;
 
         if !perm.receive {
@@ -86,10 +77,7 @@ impl RbacService {
             .iter()
             .find(|p| p.channel_id == *channel_id)
             .ok_or_else(|| {
-                AurixError::AuthorizationDenied(format!(
-                    "No permission for channel {}",
-                    channel_id
-                ))
+                AurixError::AuthorizationDenied(format!("No permission for channel {}", channel_id))
             })?;
 
         if !perm.moderate {

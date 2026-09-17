@@ -380,10 +380,7 @@ async fn main() -> anyhow::Result<()> {
             // WebSocket connectivity
             print!("  WebSocket endpoint... ");
             match client
-                .get(format!(
-                    "{}/ws",
-                    target_url.replace("http", "ws")
-                ))
+                .get(format!("{}/ws", target_url.replace("http", "ws")))
                 .send()
                 .await
             {
@@ -393,11 +390,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Metrics endpoint
             print!("  Metrics endpoint... ");
-            match client
-                .get(format!("{}/metrics", target_url))
-                .send()
-                .await
-            {
+            match client.get(format!("{}/metrics", target_url)).send().await {
                 Ok(resp) => println!("OK ({} bytes)", resp.content_length().unwrap_or(0)),
                 Err(e) => println!("FAILED: {}", e),
             }

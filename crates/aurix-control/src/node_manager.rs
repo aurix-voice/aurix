@@ -58,7 +58,9 @@ impl NodeManager {
     }
 
     fn info_from_row(row: &MediaNodeRow) -> MediaNodeInfo {
-        let age = Utc::now().signed_duration_since(row.last_heartbeat).num_seconds();
+        let age = Utc::now()
+            .signed_duration_since(row.last_heartbeat)
+            .num_seconds();
         MediaNodeInfo {
             id: MediaNodeId::from_uuid(row.id),
             region: Region::from_str_loose(&row.region),

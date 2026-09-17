@@ -74,14 +74,9 @@ impl JwtService {
                 )
             }
             Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-                let pub_key_path = config
-                    .jwt_public_key_path
-                    .as_ref()
-                    .ok_or_else(|| {
-                        AurixError::InvalidConfiguration(
-                            "RSA requires jwt_public_key_path".into(),
-                        )
-                    })?;
+                let pub_key_path = config.jwt_public_key_path.as_ref().ok_or_else(|| {
+                    AurixError::InvalidConfiguration("RSA requires jwt_public_key_path".into())
+                })?;
                 let pub_pem = std::fs::read(pub_key_path).map_err(|e| {
                     AurixError::InvalidConfiguration(format!("Cannot read public key: {e}"))
                 })?;
@@ -95,14 +90,9 @@ impl JwtService {
                 (encoding, decoding)
             }
             Algorithm::ES256 | Algorithm::ES384 => {
-                let pub_key_path = config
-                    .jwt_public_key_path
-                    .as_ref()
-                    .ok_or_else(|| {
-                        AurixError::InvalidConfiguration(
-                            "ECDSA requires jwt_public_key_path".into(),
-                        )
-                    })?;
+                let pub_key_path = config.jwt_public_key_path.as_ref().ok_or_else(|| {
+                    AurixError::InvalidConfiguration("ECDSA requires jwt_public_key_path".into())
+                })?;
                 let pub_pem = std::fs::read(pub_key_path).map_err(|e| {
                     AurixError::InvalidConfiguration(format!("Cannot read EC public key: {e}"))
                 })?;
@@ -138,12 +128,11 @@ impl JwtService {
         channels: Vec<ChannelPermission>,
         metadata: Option<serde_json::Value>,
     ) -> Result<String> {
-        let encoding_key = self
-            .encoding_key
-            .as_ref()
-            .ok_or_else(|| {
-                AurixError::AuthenticationFailed("No encoding key configured for token generation".into())
-            })?;
+        let encoding_key = self.encoding_key.as_ref().ok_or_else(|| {
+            AurixError::AuthenticationFailed(
+                "No encoding key configured for token generation".into(),
+            )
+        })?;
 
         let now = Utc::now().timestamp();
         let claims = Claims {
@@ -178,8 +167,8 @@ impl JwtService {
         validation.validate_exp = true;
         validation.leeway = 30;
 
-        let token_data = decode::<Claims>(token, &self.decoding_key, &validation).map_err(
-            |e| match e.kind() {
+        let token_data = decode::<Claims>(token, &self.decoding_key, &validation).map_err(|e| {
+            match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AurixError::TokenExpired,
                 jsonwebtoken::errors::ErrorKind::InvalidSignature => {
                     AurixError::TokenInvalid("Invalid signature".into())
@@ -188,8 +177,8 @@ impl JwtService {
                     AurixError::TokenInvalid("Malformed token".into())
                 }
                 _ => AurixError::TokenInvalid(format!("Token validation failed: {e}")),
-            },
-        )?;
+            }
+        })?;
 
         let claims = token_data.claims;
         let user_uuid = Uuid::parse_str(&claims.user_id)
@@ -201,13 +190,15 @@ impl JwtService {
             .channels
             .iter()
             .filter_map(|c| {
-                Uuid::parse_str(&c.channel_id).ok().map(|ch_uuid| ChannelPermission {
-                    channel_id: ChannelId::from_uuid(ch_uuid),
-                    join: c.join,
-                    speak: c.speak,
-                    receive: c.receive,
-                    moderate: c.moderate,
-                })
+                Uuid::parse_str(&c.channel_id)
+                    .ok()
+                    .map(|ch_uuid| ChannelPermission {
+                        channel_id: ChannelId::from_uuid(ch_uuid),
+                        join: c.join,
+                        speak: c.speak,
+                        receive: c.receive,
+                        moderate: c.moderate,
+                    })
             })
             .collect();
 

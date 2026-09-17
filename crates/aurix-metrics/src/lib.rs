@@ -1,9 +1,8 @@
 use once_cell::sync::Lazy;
 use prometheus::{
-    register_gauge, register_histogram, register_histogram_vec,
-    register_int_counter, register_int_counter_vec, register_int_gauge,
-    Encoder, Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    TextEncoder,
+    register_gauge, register_histogram, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge, Encoder, Gauge, Histogram, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, TextEncoder,
 };
 
 // ── Connection Metrics ──
@@ -20,9 +19,8 @@ pub static ACTIVE_PARTICIPANTS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!("aurix_active_participants", "Total active participants").unwrap()
 });
 
-pub static SESSIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("aurix_sessions_total", "Total sessions created").unwrap()
-});
+pub static SESSIONS_TOTAL: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("aurix_sessions_total", "Total sessions created").unwrap());
 
 pub static SESSION_DURATION: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
@@ -39,9 +37,8 @@ pub static PACKETS_RECEIVED: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_packets_received_total", "Total packets received").unwrap()
 });
 
-pub static PACKETS_SENT: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("aurix_packets_sent_total", "Total packets sent").unwrap()
-});
+pub static PACKETS_SENT: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("aurix_packets_sent_total", "Total packets sent").unwrap());
 
 pub static PACKETS_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_packets_dropped_total", "Total packets dropped").unwrap()
@@ -51,13 +48,11 @@ pub static BYTES_RECEIVED: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_bytes_received_total", "Total bytes received").unwrap()
 });
 
-pub static BYTES_SENT: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("aurix_bytes_sent_total", "Total bytes sent").unwrap()
-});
+pub static BYTES_SENT: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("aurix_bytes_sent_total", "Total bytes sent").unwrap());
 
-pub static PACKET_LOSS_RATE: Lazy<Gauge> = Lazy::new(|| {
-    register_gauge!("aurix_packet_loss_rate", "Current packet loss rate").unwrap()
-});
+pub static PACKET_LOSS_RATE: Lazy<Gauge> =
+    Lazy::new(|| register_gauge!("aurix_packet_loss_rate", "Current packet loss rate").unwrap());
 
 pub static RTT_MS: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
@@ -100,9 +95,8 @@ pub static API_REQUEST_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
 
 // ── Node Metrics ──
 
-pub static NODE_CPU_USAGE: Lazy<Gauge> = Lazy::new(|| {
-    register_gauge!("aurix_node_cpu_usage", "Node CPU usage percentage").unwrap()
-});
+pub static NODE_CPU_USAGE: Lazy<Gauge> =
+    Lazy::new(|| register_gauge!("aurix_node_cpu_usage", "Node CPU usage percentage").unwrap());
 
 pub static NODE_MEMORY_USAGE: Lazy<Gauge> = Lazy::new(|| {
     register_gauge!("aurix_node_memory_usage", "Node memory usage percentage").unwrap()
@@ -113,7 +107,11 @@ pub static NODE_BANDWIDTH_IN: Lazy<Gauge> = Lazy::new(|| {
 });
 
 pub static NODE_BANDWIDTH_OUT: Lazy<Gauge> = Lazy::new(|| {
-    register_gauge!("aurix_node_bandwidth_out_mbps", "Outbound bandwidth in Mbps").unwrap()
+    register_gauge!(
+        "aurix_node_bandwidth_out_mbps",
+        "Outbound bandwidth in Mbps"
+    )
+    .unwrap()
 });
 
 // ── Moderation Metrics ──
@@ -127,15 +125,13 @@ pub static MODERATION_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static ACTIVE_BANS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!("aurix_active_bans", "Number of active bans").unwrap()
-});
+pub static ACTIVE_BANS: Lazy<IntGauge> =
+    Lazy::new(|| register_int_gauge!("aurix_active_bans", "Number of active bans").unwrap());
 
 // ── TURN Metrics ──
 
-pub static TURN_ALLOCATIONS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!("aurix_turn_allocations", "Active TURN allocations").unwrap()
-});
+pub static TURN_ALLOCATIONS: Lazy<IntGauge> =
+    Lazy::new(|| register_int_gauge!("aurix_turn_allocations", "Active TURN allocations").unwrap());
 
 pub static STUN_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_stun_requests_total", "Total STUN requests").unwrap()
@@ -144,15 +140,15 @@ pub static STUN_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
 // ── Rate Limit Metrics ──
 
 pub static WS_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!("aurix_ws_connections", "Open player WebSocket connections on this node").unwrap()
+    register_int_gauge!(
+        "aurix_ws_connections",
+        "Open player WebSocket connections on this node"
+    )
+    .unwrap()
 });
 
 pub static RATE_LIMIT_HITS: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!(
-        "aurix_rate_limit_hits_total",
-        "Total rate limit hits"
-    )
-    .unwrap()
+    register_int_counter!("aurix_rate_limit_hits_total", "Total rate limit hits").unwrap()
 });
 
 pub fn gather_metrics() -> String {

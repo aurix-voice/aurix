@@ -13,7 +13,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "aurix-server", version, about = "Aurix Voice Communication Server")]
+#[command(
+    name = "aurix-server",
+    version,
+    about = "Aurix Voice Communication Server"
+)]
 struct Cli {
     #[arg(short, long, default_value = "configs/default")]
     config: String,
@@ -29,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
     let config = AurixConfig::load(Some(&cli.config))?;
     init_tracing(&config);
 
-    info!("Starting Aurix server v{} ({})", env!("CARGO_PKG_VERSION"), config.server.environment);
+    info!(
+        "Starting Aurix server v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        config.server.environment
+    );
     info!("Region: {:?}", config.server.region);
 
     let pool = aurix_db::create_pool(&config.database).await?;
@@ -56,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
     info!("Control plane initialized");
 
     match control.sessions.recover_node_state(node_id).await {
-        Ok((s, m)) if s + m > 0 => info!("Recovered {} stale sessions and {} memberships from a previous run", s, m),
+        Ok((s, m)) if s + m > 0 => info!(
+            "Recovered {} stale sessions and {} memberships from a previous run",
+            s, m
+        ),
         Ok(_) => {}
         Err(e) => error!("Stale session recovery failed: {e}"),
     }
@@ -85,13 +96,22 @@ async fn main() -> anyhow::Result<()> {
 
     // STT / content analysis pipeline (only when a provider endpoint is configured).
     if let Some(endpoint) = config.moderation.content_analysis_webhook.as_ref() {
-        let stt: Arc<dyn aurix_common::tts_stt::SttProvider> = Arc::new(aurix_common::tts_stt::WhisperSttProvider::new(endpoint));
-        let pipeline = aurix_media::audio_pipeline::AudioAnalysisPipeline::new(config.media.default_sample_rate, 2.0, Some(stt), Vec::new());
+        let stt: Arc<dyn aurix_common::tts_stt::SttProvider> =
+            Arc::new(aurix_common::tts_stt::WhisperSttProvider::new(endpoint));
+        let pipeline = aurix_media::audio_pipeline::AudioAnalysisPipeline::new(
+            config.media.default_sample_rate,
+            2.0,
+            Some(stt),
+            Vec::new(),
+        );
         sfu.set_audio_pipeline(Arc::new(pipeline));
     }
 
     let recording = if config.recording.enabled {
-        let svc = Arc::new(RecordingService::new(pool.clone(), config.recording.clone())?);
+        let svc = Arc::new(RecordingService::new(
+            pool.clone(),
+            config.recording.clone(),
+        )?);
         sfu.set_audio_sink(svc.clone());
         Some(svc)
     } else {
@@ -103,22 +123,39 @@ async fn main() -> anyhow::Result<()> {
     info!("SFU node started on {}", media_bind);
     let sfu = Arc::new(RwLock::new(sfu));
 
-    let node_address = config.media.external_ip.clone().unwrap_or_else(|| config.server.host.clone());
+    let node_address = config
+        .media
+        .external_ip
+        .clone()
+        .unwrap_or_else(|| config.server.host.clone());
     {
-        let node_info = sfu.read().node_info(&node_address, config.media.port, config.server.api_port);
+        let node_info =
+            sfu.read()
+                .node_info(&node_address, config.media.port, config.server.api_port);
         control.nodes.register_node(node_info).await?;
     }
 
-    let moderation = Arc::new(ModerationService::new(pool.clone(), config.moderation.content_analysis_webhook.clone()));
+    let moderation = Arc::new(ModerationService::new(
+        pool.clone(),
+        config.moderation.content_analysis_webhook.clone(),
+    ));
 
-    let app_state = AppState::new(control.clone(), sfu.clone(), moderation.clone(), recording.clone());
+    let app_state = AppState::new(
+        control.clone(),
+        sfu.clone(),
+        moderation.clone(),
+        recording.clone(),
+    );
     let ws_state = WsState::new(control.clone(), sfu.clone(), recording.clone());
     ws_state.start_fanout();
 
     let api_router = aurix_api::routes::create_router(app_state);
     let ws_router = axum::Router::new()
         .route("/ws", axum::routing::get(aurix_ws::ws_handler))
-        .route("/events", axum::routing::get(aurix_ws::event_stream_handler))
+        .route(
+            "/events",
+            axum::routing::get(aurix_ws::event_stream_handler),
+        )
         .with_state(ws_state.clone());
 
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -133,17 +170,25 @@ async fn main() -> anyhow::Result<()> {
                 _ = cancel.cancelled() => {}
             }
         });
-        info!("TURN server started on {}:{} (udp) / {} (tcp)", config.turn.host, config.turn.udp_port, config.turn.tcp_port);
+        info!(
+            "TURN server started on {}:{} (udp) / {} (tcp)",
+            config.turn.host, config.turn.udp_port, config.turn.tcp_port
+        );
     }
 
     if config.metrics.enabled {
         let metrics_addr = format!("{}:{}", config.server.host, config.metrics.port);
-        let metrics_router = axum::Router::new().route(&config.metrics.path, axum::routing::get(aurix_metrics::metrics_handler));
+        let metrics_router = axum::Router::new().route(
+            &config.metrics.path,
+            axum::routing::get(aurix_metrics::metrics_handler),
+        );
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
         info!("Metrics server listening on {}", metrics_addr);
         let cancel = shutdown.clone();
         tasks.spawn(async move {
-            let _ = axum::serve(listener, metrics_router).with_graceful_shutdown(async move { cancel.cancelled().await }).await;
+            let _ = axum::serve(listener, metrics_router)
+                .with_graceful_shutdown(async move { cancel.cancelled().await })
+                .await;
         });
     }
 
@@ -155,7 +200,9 @@ async fn main() -> anyhow::Result<()> {
         let node_address = node_address.clone();
         let cancel = shutdown.clone();
         tasks.spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(config.media.heartbeat_interval_ms.max(1000)));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                config.media.heartbeat_interval_ms.max(1000),
+            ));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -200,18 +247,24 @@ async fn main() -> anyhow::Result<()> {
 
     let api_cancel = shutdown.clone();
     tasks.spawn(async move {
-        if let Err(e) = axum::serve(api_listener, api_router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(async move { api_cancel.cancelled().await })
-            .await
+        if let Err(e) = axum::serve(
+            api_listener,
+            api_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { api_cancel.cancelled().await })
+        .await
         {
             error!("API server error: {}", e);
         }
     });
     let ws_cancel = shutdown.clone();
     tasks.spawn(async move {
-        if let Err(e) = axum::serve(ws_listener, ws_router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(async move { ws_cancel.cancelled().await })
-            .await
+        if let Err(e) = axum::serve(
+            ws_listener,
+            ws_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { ws_cancel.cancelled().await })
+        .await
         {
             error!("WebSocket server error: {}", e);
         }
@@ -244,7 +297,8 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {}
             _ = term.recv() => {}
@@ -283,16 +337,12 @@ fn init_tracing(config: &AurixConfig) {
                         .tonic()
                         .with_endpoint(endpoint),
                 )
-                .with_trace_config(
-                    opentelemetry_sdk::trace::config().with_resource(
-                        opentelemetry_sdk::Resource::new(vec![
-                            opentelemetry::KeyValue::new(
-                                "service.name",
-                                config.tracing.service_name.clone(),
-                            ),
-                        ]),
-                    ),
-                )
+                .with_trace_config(opentelemetry_sdk::trace::config().with_resource(
+                    opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+                        "service.name",
+                        config.tracing.service_name.clone(),
+                    )]),
+                ))
                 .install_batch(opentelemetry_sdk::runtime::Tokio)
                 .expect("Failed to initialize OTLP tracer");
 

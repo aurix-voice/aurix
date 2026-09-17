@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// A word-level timestamp from STT transcription.
@@ -25,11 +25,7 @@ pub struct TranscriptResult {
 #[async_trait]
 pub trait SttProvider: Send + Sync {
     /// Transcribe raw PCM audio (mono, 16-bit, at the given sample rate).
-    async fn transcribe(
-        &self,
-        audio_pcm: &[i16],
-        sample_rate: u32,
-    ) -> Result<TranscriptResult>;
+    async fn transcribe(&self, audio_pcm: &[i16], sample_rate: u32) -> Result<TranscriptResult>;
 
     /// Returns the name of this STT provider for logging.
     fn provider_name(&self) -> &str;
@@ -40,12 +36,7 @@ pub trait SttProvider: Send + Sync {
 pub trait TtsProvider: Send + Sync {
     /// Synthesize text into Opus-encoded audio frames.
     /// Returns a Vec of Opus packets ready for injection into a channel.
-    async fn synthesize(
-        &self,
-        text: &str,
-        voice: &str,
-        sample_rate: u32,
-    ) -> Result<Vec<Vec<u8>>>;
+    async fn synthesize(&self, text: &str, voice: &str, sample_rate: u32) -> Result<Vec<Vec<u8>>>;
 
     /// List available voice names.
     fn available_voices(&self) -> Vec<String>;
@@ -73,11 +64,7 @@ impl WhisperSttProvider {
 
 #[async_trait]
 impl SttProvider for WhisperSttProvider {
-    async fn transcribe(
-        &self,
-        audio_pcm: &[i16],
-        sample_rate: u32,
-    ) -> Result<TranscriptResult> {
+    async fn transcribe(&self, audio_pcm: &[i16], sample_rate: u32) -> Result<TranscriptResult> {
         // Convert i16 PCM to WAV bytes for the Whisper API
         let wav_data = pcm_to_wav(audio_pcm, sample_rate, 1);
 
@@ -93,18 +80,20 @@ impl SttProvider for WhisperSttProvider {
 
         let response = self
             .client
-            .post(&format!("{}/v1/audio/transcriptions", self.endpoint))
+            .post(format!("{}/v1/audio/transcriptions", self.endpoint))
             .multipart(form)
             .send()
             .await
-            .map_err(|e| crate::error::AurixError::Internal(format!("Whisper request failed: {e}")))?;
+            .map_err(|e| {
+                crate::error::AurixError::Internal(format!("Whisper request failed: {e}"))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(crate::error::AurixError::Internal(
-                format!("Whisper returned {status}: {body}"),
-            ));
+            return Err(crate::error::AurixError::Internal(format!(
+                "Whisper returned {status}: {body}"
+            )));
         }
 
         let body: serde_json::Value = response

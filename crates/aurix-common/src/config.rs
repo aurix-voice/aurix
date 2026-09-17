@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Region;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AurixConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -57,13 +57,18 @@ impl AurixConfig {
             anyhow::bail!("turn.min_port must be <= turn.max_port");
         }
         for cidr in &self.server.trusted_proxies {
-            cidr.parse::<ipnetwork::IpNetwork>()
-                .map_err(|e| anyhow::anyhow!("server.trusted_proxies entry '{cidr}' is not a valid CIDR: {e}"))?;
+            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
+                anyhow::anyhow!("server.trusted_proxies entry '{cidr}' is not a valid CIDR: {e}")
+            })?;
         }
         if self.recording.encryption_enabled && self.recording.enabled {
             match &self.recording.encryption_key {
-                None => anyhow::bail!("recording.encryption_key must be set when recording encryption is enabled"),
-                Some(k) if k.len() < 32 => anyhow::bail!("recording.encryption_key must be at least 32 characters"),
+                None => anyhow::bail!(
+                    "recording.encryption_key must be set when recording encryption is enabled"
+                ),
+                Some(k) if k.len() < 32 => {
+                    anyhow::bail!("recording.encryption_key must be at least 32 characters")
+                }
                 _ => {}
             }
         }
@@ -74,7 +79,9 @@ impl AurixConfig {
                     anyhow::bail!("auth.jwt_secret must be at least 32 bytes in production");
                 }
                 if is_placeholder_secret(&self.auth.jwt_secret) {
-                    anyhow::bail!("auth.jwt_secret is a placeholder value; set a real secret in production");
+                    anyhow::bail!(
+                        "auth.jwt_secret is a placeholder value; set a real secret in production"
+                    );
                 }
             }
             if self.turn.enabled {
@@ -82,7 +89,9 @@ impl AurixConfig {
                     anyhow::bail!("turn.auth_secret must be at least 32 bytes in production");
                 }
                 if is_placeholder_secret(&self.turn.auth_secret) {
-                    anyhow::bail!("turn.auth_secret is a placeholder value; set a real secret in production");
+                    anyhow::bail!(
+                        "turn.auth_secret is a placeholder value; set a real secret in production"
+                    );
                 }
             }
             if self.server.cors_origins.iter().any(|o| o == "*") {
@@ -101,26 +110,13 @@ impl AurixConfig {
 
 pub fn is_placeholder_secret(secret: &str) -> bool {
     let s = secret.to_ascii_lowercase();
-    s.contains("change-me") || s.contains("changeme") || s.contains("not-secure") || s.contains("example")
-        || s.contains("secret-here") || s == "secret" || s == "password"
-}
-
-impl Default for AurixConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            database: DatabaseConfig::default(),
-            redis: RedisConfig::default(),
-            auth: AuthConfig::default(),
-            media: MediaConfig::default(),
-            turn: TurnConfig::default(),
-            moderation: ModerationConfig::default(),
-            recording: RecordingConfig::default(),
-            metrics: MetricsConfig::default(),
-            tracing: TracingConfig::default(),
-            rate_limiting: RateLimitConfig::default(),
-        }
-    }
+    s.contains("change-me")
+        || s.contains("changeme")
+        || s.contains("not-secure")
+        || s.contains("example")
+        || s.contains("secret-here")
+        || s == "secret"
+        || s == "password"
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -148,9 +144,15 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
 }
 
-fn default_environment() -> String { "development".into() }
-fn default_max_body_bytes() -> usize { 1024 * 1024 }
-fn default_request_timeout_secs() -> u64 { 30 }
+fn default_environment() -> String {
+    "development".into()
+}
+fn default_max_body_bytes() -> usize {
+    1024 * 1024
+}
+fn default_request_timeout_secs() -> u64 {
+    30
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -230,7 +232,9 @@ pub struct AuthConfig {
     pub oauth_issuer_url: Option<String>,
 }
 
-fn default_admin_token_ttl_secs() -> i64 { 8 * 3600 }
+fn default_admin_token_ttl_secs() -> i64 {
+    8 * 3600
+}
 
 impl Default for AuthConfig {
     fn default() -> Self {
@@ -282,8 +286,12 @@ pub struct MediaConfig {
     pub cascade_peers: Vec<String>,
 }
 
-fn default_true() -> bool { true }
-fn default_speaking_timeout_ms() -> u64 { 400 }
+fn default_true() -> bool {
+    true
+}
+fn default_speaking_timeout_ms() -> u64 {
+    400
+}
 
 impl Default for MediaConfig {
     fn default() -> Self {
@@ -332,7 +340,9 @@ pub struct TurnConfig {
     pub credential_ttl_secs: i64,
 }
 
-fn default_turn_credential_ttl_secs() -> i64 { 24 * 3600 }
+fn default_turn_credential_ttl_secs() -> i64 {
+    24 * 3600
+}
 
 impl Default for TurnConfig {
     fn default() -> Self {

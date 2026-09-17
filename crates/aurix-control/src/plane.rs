@@ -4,8 +4,8 @@ use crate::event_bus::EventBus;
 use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
 use crate::session_manager::SessionManager;
-use aurix_auth::{ApiKeyService, JwtService, RbacService};
 use aurix_auth::admin::AdminAuthService;
+use aurix_auth::{ApiKeyService, JwtService, RbacService};
 use aurix_common::audit::AuditLogger;
 use aurix_common::config::AurixConfig;
 use aurix_common::error::{AurixError, Result};
@@ -33,7 +33,9 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     pub async fn new(config: AurixConfig, pool: DbPool, node_id: MediaNodeId) -> Result<Self> {
-        config.validate().map_err(|e| AurixError::InvalidConfiguration(e.to_string()))?;
+        config
+            .validate()
+            .map_err(|e| AurixError::InvalidConfiguration(e.to_string()))?;
         let jwt = Arc::new(JwtService::new(&config.auth)?);
         let rbac = Arc::new(RbacService::new());
         let api_keys = Arc::new(ApiKeyService::new(pool.clone()));
@@ -91,7 +93,9 @@ impl ControlPlane {
                 }
                 Err(e) => {
                     if config.is_production() {
-                        return Err(AurixError::Redis(format!("Redis is required in production: {e}")));
+                        return Err(AurixError::Redis(format!(
+                            "Redis is required in production: {e}"
+                        )));
                     }
                     tracing::warn!("Redis not available (non-fatal in development): {e}");
                     None
@@ -99,7 +103,9 @@ impl ControlPlane {
             },
             Err(e) => {
                 if config.is_production() {
-                    return Err(AurixError::Redis(format!("Redis is required in production: {e}")));
+                    return Err(AurixError::Redis(format!(
+                        "Redis is required in production: {e}"
+                    )));
                 }
                 tracing::warn!("Redis not available (non-fatal in development): {}", e);
                 None
@@ -177,23 +183,33 @@ impl ControlPlane {
 
         let key = format!("session:{}", validated.user_id);
         if !self.rate_limiter.check(&key) {
-            return Err(AurixError::RateLimitExceeded("Too many connection attempts".into()));
+            return Err(AurixError::RateLimitExceeded(
+                "Too many connection attempts".into(),
+            ));
         }
 
         let bans = aurix_db::queries::get_active_bans_for_user(
-            &self.pool, validated.app_id.0, validated.user_id.0,
-        ).await.map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
+            &self.pool,
+            validated.app_id.0,
+            validated.user_id.0,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
 
         if !bans.is_empty() {
             return Err(AurixError::UserBanned("User is banned".into()));
         }
 
-        if let Some(user) = aurix_db::queries::get_user(&self.pool, validated.app_id.0, validated.user_id.0)
-            .await
-            .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
+        if let Some(user) =
+            aurix_db::queries::get_user(&self.pool, validated.app_id.0, validated.user_id.0)
+                .await
+                .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
         {
             let ban_active = user.is_banned
-                && user.ban_expires_at.map(|t| t > chrono::Utc::now()).unwrap_or(true);
+                && user
+                    .ban_expires_at
+                    .map(|t| t > chrono::Utc::now())
+                    .unwrap_or(true);
             if ban_active {
                 return Err(AurixError::UserBanned(
                     user.ban_reason.unwrap_or_else(|| "User is banned".into()),
@@ -203,7 +219,11 @@ impl ControlPlane {
 
         // Check global mute via Redis
         if let Some(ref redis) = self.redis {
-            if redis.is_globally_muted(validated.user_id).await.unwrap_or(false) {
+            if redis
+                .is_globally_muted(validated.user_id)
+                .await
+                .unwrap_or(false)
+            {
                 // User is globally muted — still allowed to connect, just flagged
                 tracing::info!("User {} is globally server-muted", validated.user_id);
             }

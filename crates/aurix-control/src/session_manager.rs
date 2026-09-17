@@ -88,10 +88,20 @@ impl SessionManager {
             .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
     }
 
-    pub async fn remove_user_from_channel(&self, app_id: AppId, channel_id: ChannelId, user_id: UserId) -> Result<u64> {
-        aurix_db::queries::remove_user_channel_memberships(&self.pool, app_id.0, channel_id.0, user_id.0)
-            .await
-            .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
+    pub async fn remove_user_from_channel(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+    ) -> Result<u64> {
+        aurix_db::queries::remove_user_channel_memberships(
+            &self.pool,
+            app_id.0,
+            channel_id.0,
+            user_id.0,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
     }
 
     /// Mark every open membership of a session as left (disconnect cleanup).
@@ -113,7 +123,11 @@ impl SessionManager {
             .map_err(|e| AurixError::Database(format!("Server mute failed: {e}")))
     }
 
-    pub async fn get_session(&self, app_id: AppId, session_id: SessionId) -> Result<Option<SessionRow>> {
+    pub async fn get_session(
+        &self,
+        app_id: AppId,
+        session_id: SessionId,
+    ) -> Result<Option<SessionRow>> {
         aurix_db::queries::get_session(&self.pool, app_id.0, session_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Session lookup failed: {e}")))
@@ -124,16 +138,17 @@ impl SessionManager {
         let m = aurix_db::queries::close_stale_memberships_for_node(&self.pool, media_node_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Stale membership cleanup failed: {e}")))?;
-        let s = aurix_db::queries::close_stale_sessions_for_node(&self.pool, media_node_id.0, "node_restart")
-            .await
-            .map_err(|e| AurixError::Database(format!("Stale session cleanup failed: {e}")))?;
+        let s = aurix_db::queries::close_stale_sessions_for_node(
+            &self.pool,
+            media_node_id.0,
+            "node_restart",
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Stale session cleanup failed: {e}")))?;
         Ok((s, m))
     }
 
-    pub async fn get_active_sessions_for_user(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<SessionRow>> {
+    pub async fn get_active_sessions_for_user(&self, user_id: UserId) -> Result<Vec<SessionRow>> {
         aurix_db::queries::get_active_sessions_for_user(&self.pool, user_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Session lookup failed: {e}")))

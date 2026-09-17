@@ -43,7 +43,11 @@ struct PacketOrderer {
 
 impl PacketOrderer {
     fn new() -> Self {
-        Self { pending: BTreeMap::new(), last_ts: None, highest_ext: None }
+        Self {
+            pending: BTreeMap::new(),
+            last_ts: None,
+            highest_ext: None,
+        }
     }
 
     fn extend(&mut self, ts: u32) -> u64 {
@@ -52,8 +56,15 @@ impl PacketOrderer {
             return ts as u64;
         };
         let cycle = highest & !0xFFFF_FFFF;
-        let candidates = [cycle.wrapping_sub(1 << 32) | ts as u64, cycle | ts as u64, (cycle + (1u64 << 32)) | ts as u64];
-        let ext = candidates.into_iter().min_by_key(|c| c.abs_diff(highest)).unwrap_or(ts as u64);
+        let candidates = [
+            cycle.wrapping_sub(1 << 32) | ts as u64,
+            cycle | ts as u64,
+            (cycle + (1u64 << 32)) | ts as u64,
+        ];
+        let ext = candidates
+            .into_iter()
+            .min_by_key(|c| c.abs_diff(highest))
+            .unwrap_or(ts as u64);
         if ext > highest {
             self.highest_ext = Some(ext);
         }
@@ -117,7 +128,8 @@ struct ActiveState {
 
 impl ActiveState {
     fn insert(&mut self, id: Uuid, rec: ActiveRecording) {
-        self.by_channel_user.insert((rec.channel_id, rec.user_id), id);
+        self.by_channel_user
+            .insert((rec.channel_id, rec.user_id), id);
         self.channels.insert(rec.channel_id);
         self.by_id.insert(id, rec);
     }
@@ -144,15 +156,20 @@ pub struct RecordingService {
 impl RecordingService {
     pub fn new(pool: DbPool, config: RecordingConfig) -> Result<Self> {
         let encryption_key = if config.encryption_enabled {
-            let key_str = config
-                .encryption_key
-                .as_ref()
-                .ok_or_else(|| AurixError::InvalidConfiguration("Recording encryption enabled but no key provided".into()))?;
+            let key_str = config.encryption_key.as_ref().ok_or_else(|| {
+                AurixError::InvalidConfiguration(
+                    "Recording encryption enabled but no key provided".into(),
+                )
+            })?;
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(key_str)
-                .map_err(|e| AurixError::InvalidConfiguration(format!("Invalid encryption key: {e}")))?;
+                .map_err(|e| {
+                    AurixError::InvalidConfiguration(format!("Invalid encryption key: {e}"))
+                })?;
             if decoded.len() != 32 {
-                return Err(AurixError::InvalidConfiguration("Encryption key must be 32 bytes (base64 of 32 random bytes)".into()));
+                return Err(AurixError::InvalidConfiguration(
+                    "Encryption key must be 32 bytes (base64 of 32 random bytes)".into(),
+                ));
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&decoded);
@@ -165,7 +182,10 @@ impl RecordingService {
 
         let s3 = match (&config.s3_bucket, &config.s3_region) {
             (Some(bucket), Some(region)) => {
-                let endpoint = config.s3_endpoint.clone().unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+                let endpoint = config
+                    .s3_endpoint
+                    .clone()
+                    .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
                 Some(S3Client::new(S3Config {
                     endpoint,
                     region: region.clone(),
@@ -176,10 +196,21 @@ impl RecordingService {
                 })?)
             }
             (None, None) => None,
-            _ => return Err(AurixError::InvalidConfiguration("recording.s3_bucket and recording.s3_region must be set together".into())),
+            _ => {
+                return Err(AurixError::InvalidConfiguration(
+                    "recording.s3_bucket and recording.s3_region must be set together".into(),
+                ))
+            }
         };
 
-        Ok(Self { pool, config, encryption_key, encryption_key_id, s3, active: Arc::new(Mutex::new(ActiveState::default())) })
+        Ok(Self {
+            pool,
+            config,
+            encryption_key,
+            encryption_key_id,
+            s3,
+            active: Arc::new(Mutex::new(ActiveState::default())),
+        })
     }
 
     pub fn require_consent(&self) -> bool {
@@ -197,12 +228,23 @@ impl RecordingService {
         sample_rate: u32,
         channels: u8,
     ) -> Result<RecordingRow> {
-        if self.active.lock().by_channel_user.contains_key(&(channel_id, user_id)) {
-            return Err(AurixError::Conflict("User is already being recorded in this channel".into()));
+        if self
+            .active
+            .lock()
+            .by_channel_user
+            .contains_key(&(channel_id, user_id))
+        {
+            return Err(AurixError::Conflict(
+                "User is already being recorded in this channel".into(),
+            ));
         }
         let recording_id = Uuid::now_v7();
-        let dir = PathBuf::from(&self.config.storage_path).join(app_id.0.to_string()).join(channel_id.0.to_string());
-        fs::create_dir_all(&dir).await.map_err(|e| AurixError::Recording(format!("Failed to create directory: {e}")))?;
+        let dir = PathBuf::from(&self.config.storage_path)
+            .join(app_id.0.to_string())
+            .join(channel_id.0.to_string());
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AurixError::Recording(format!("Failed to create directory: {e}")))?;
 
         let file_name = format!("{}_{}.ogg", recording_id, user_id.0);
         let file_path = dir.join(&file_name).to_string_lossy().to_string();
@@ -230,12 +272,17 @@ impl RecordingService {
             .await
             .map_err(|e| AurixError::Database(format!("Recording creation failed: {e}")))?;
 
-        let file = std::fs::File::create(&file_path).map_err(|e| AurixError::Recording(format!("Failed to create file: {e}")))?;
+        let file = std::fs::File::create(&file_path)
+            .map_err(|e| AurixError::Recording(format!("Failed to create file: {e}")))?;
         let serial = crc32fast::hash(recording_id.as_bytes());
         let writer = OggOpusWriter::new(BufWriter::new(file), serial, sample_rate, channels)
             .map_err(|e| AurixError::Recording(format!("Failed to init Ogg writer: {e}")))?;
 
-        let consent = if self.config.require_consent { RecordingConsent::Pending } else { RecordingConsent::Accepted };
+        let consent = if self.config.require_consent {
+            RecordingConsent::Pending
+        } else {
+            RecordingConsent::Accepted
+        };
         self.active.lock().insert(
             recording_id,
             ActiveRecording {
@@ -250,32 +297,57 @@ impl RecordingService {
                 packets_written: 0,
             },
         );
-        info!("Recording started: {} for user {} in {} (consent: {:?})", recording_id, user_id, channel_id, consent);
+        info!(
+            "Recording started: {} for user {} in {} (consent: {:?})",
+            recording_id, user_id, channel_id, consent
+        );
         Ok(created)
     }
 
     /// Active recordings for a channel, as `(recording_id, user_id)`.
     pub fn active_in_channel(&self, channel_id: &ChannelId) -> Vec<(Uuid, UserId)> {
         let st = self.active.lock();
-        st.by_id.iter().filter(|(_, r)| r.channel_id == *channel_id).map(|(id, r)| (*id, r.user_id)).collect()
+        st.by_id
+            .iter()
+            .filter(|(_, r)| r.channel_id == *channel_id)
+            .map(|(id, r)| (*id, r.user_id))
+            .collect()
     }
 
     pub fn consent_state(&self, recording_id: &Uuid) -> Option<RecordingConsent> {
-        self.active.lock().by_id.get(recording_id).map(|r| r.consent)
+        self.active
+            .lock()
+            .by_id
+            .get(recording_id)
+            .map(|r| r.consent)
     }
 
     /// Record a participant's consent decision. Declining stops their recording immediately.
-    pub async fn set_consent(&self, app_id: AppId, recording_id: Uuid, user_id: UserId, consent: RecordingConsent) -> Result<()> {
+    pub async fn set_consent(
+        &self,
+        app_id: AppId,
+        recording_id: Uuid,
+        user_id: UserId,
+        consent: RecordingConsent,
+    ) -> Result<()> {
         let stop = {
             let mut st = self.active.lock();
-            let rec = st.by_id.get_mut(&recording_id).ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
+            let rec = st
+                .by_id
+                .get_mut(&recording_id)
+                .ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
             if rec.app_id != app_id.0 || rec.user_id != user_id {
-                return Err(AurixError::AuthorizationDenied("Consent can only be given by the recorded user".into()));
+                return Err(AurixError::AuthorizationDenied(
+                    "Consent can only be given by the recorded user".into(),
+                ));
             }
             rec.consent = consent;
             consent == RecordingConsent::Declined
         };
-        info!("Recording {} consent for user {}: {:?}", recording_id, user_id, consent);
+        info!(
+            "Recording {} consent for user {}: {:?}",
+            recording_id, user_id, consent
+        );
         if stop {
             self.stop_recording(app_id, recording_id).await?;
         }
@@ -283,7 +355,13 @@ impl RecordingService {
     }
 
     /// Feed one Opus packet (48 kHz RTP clock) into the recording of `(channel, user)`.
-    pub fn write_opus_packet(&self, channel_id: ChannelId, user_id: UserId, rtp_timestamp: u32, opus_data: &[u8]) -> Result<bool> {
+    pub fn write_opus_packet(
+        &self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        rtp_timestamp: u32,
+        opus_data: &[u8],
+    ) -> Result<bool> {
         if opus_data.is_empty() {
             return Ok(false);
         }
@@ -291,7 +369,10 @@ impl RecordingService {
         let Some(id) = st.by_channel_user.get(&(channel_id, user_id)).copied() else {
             return Ok(false);
         };
-        let rec = st.by_id.get_mut(&id).ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
+        let rec = st
+            .by_id
+            .get_mut(&id)
+            .ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
         if rec.consent != RecordingConsent::Accepted {
             return Ok(false);
         }
@@ -310,45 +391,80 @@ impl RecordingService {
             let owned = st.by_id.get(&recording_id).map(|r| r.app_id == app_id.0);
             match owned {
                 None => return Err(AurixError::Recording("Recording not active".into())),
-                Some(false) => return Err(AurixError::AuthorizationDenied("Recording belongs to another application".into())),
+                Some(false) => {
+                    return Err(AurixError::AuthorizationDenied(
+                        "Recording belongs to another application".into(),
+                    ))
+                }
                 Some(true) => {}
             }
-            let mut active = st.remove(&recording_id).ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
+            let mut active = st
+                .remove(&recording_id)
+                .ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
             for (samples, pkt) in active.orderer.flush() {
                 active
                     .writer
-                    .write_packet_with_duration(&pkt, scale_samples(samples, active.writer.sample_rate()))
+                    .write_packet_with_duration(
+                        &pkt,
+                        scale_samples(samples, active.writer.sample_rate()),
+                    )
                     .map_err(|e| AurixError::Recording(format!("Write failed: {e}")))?;
                 active.packets_written += 1;
             }
-            active.writer.finish().map_err(|e| AurixError::Recording(format!("Ogg finalize failed: {e}")))?;
+            active
+                .writer
+                .finish()
+                .map_err(|e| AurixError::Recording(format!("Ogg finalize failed: {e}")))?;
             let secs = active.writer.granule() as f64 / active.writer.sample_rate().max(1) as f64;
             (active.file_path.clone(), active.packets_written, secs)
         };
 
         if let Some(ref key) = self.encryption_key {
-            let plain = tokio::fs::read(&file_path).await.map_err(|e| AurixError::Recording(format!("Read failed: {e}")))?;
+            let plain = tokio::fs::read(&file_path)
+                .await
+                .map_err(|e| AurixError::Recording(format!("Read failed: {e}")))?;
             let encrypted = encrypt_blob(key, &plain)?;
-            tokio::fs::write(&file_path, &encrypted).await.map_err(|e| AurixError::Recording(format!("Encrypted write failed: {e}")))?;
+            tokio::fs::write(&file_path, &encrypted)
+                .await
+                .map_err(|e| AurixError::Recording(format!("Encrypted write failed: {e}")))?;
         }
 
-        let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| AurixError::Recording(format!("Metadata read failed: {e}")))?;
-        aurix_db::queries::finish_recording(&self.pool, recording_id, metadata.len() as i64, audio_secs)
+        let metadata = tokio::fs::metadata(&file_path)
             .await
-            .map_err(|e| AurixError::Database(format!("Recording finish failed: {e}")))?;
+            .map_err(|e| AurixError::Recording(format!("Metadata read failed: {e}")))?;
+        aurix_db::queries::finish_recording(
+            &self.pool,
+            recording_id,
+            metadata.len() as i64,
+            audio_secs,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Recording finish failed: {e}")))?;
 
         if let Some(ref s3) = self.s3 {
             let key = object_key(app_id, recording_id);
             match tokio::fs::read(&file_path).await {
                 Ok(body) => match s3.put_object(&key, body, "audio/ogg").await {
-                    Ok(()) => info!("Recording {} uploaded to object storage as {}", recording_id, key),
-                    Err(e) => warn!("Object storage upload failed for {}: {e} (file kept locally)", recording_id),
+                    Ok(()) => info!(
+                        "Recording {} uploaded to object storage as {}",
+                        recording_id, key
+                    ),
+                    Err(e) => warn!(
+                        "Object storage upload failed for {}: {e} (file kept locally)",
+                        recording_id
+                    ),
                 },
                 Err(e) => warn!("Could not read {} for upload: {e}", file_path),
             }
         }
 
-        info!("Recording stopped: {} ({} packets, {:.1}s audio, {} bytes)", recording_id, packets, audio_secs, metadata.len());
+        info!(
+            "Recording stopped: {} ({} packets, {:.1}s audio, {} bytes)",
+            recording_id,
+            packets,
+            audio_secs,
+            metadata.len()
+        );
         aurix_db::queries::get_recording(&self.pool, app_id.0, recording_id)
             .await
             .map_err(|e| AurixError::Database(format!("Recording lookup failed: {e}")))?
@@ -357,7 +473,11 @@ impl RecordingService {
 
     /// Stop every active recording in a channel (e.g. when the channel is destroyed).
     pub async fn stop_channel(&self, app_id: AppId, channel_id: &ChannelId) -> usize {
-        let ids: Vec<Uuid> = self.active_in_channel(channel_id).into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<Uuid> = self
+            .active_in_channel(channel_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         let mut n = 0;
         for id in ids {
             if self.stop_recording(app_id, id).await.is_ok() {
@@ -371,7 +491,9 @@ impl RecordingService {
     pub async fn on_user_left(&self, channel_id: ChannelId, user_id: UserId) {
         let target = {
             let st = self.active.lock();
-            st.by_channel_user.get(&(channel_id, user_id)).and_then(|id| st.by_id.get(id).map(|r| (*id, AppId(r.app_id))))
+            st.by_channel_user
+                .get(&(channel_id, user_id))
+                .and_then(|id| st.by_id.get(id).map(|r| (*id, AppId(r.app_id))))
         };
         if let Some((id, app_id)) = target {
             if let Err(e) = self.stop_recording(app_id, id).await {
@@ -386,7 +508,11 @@ impl RecordingService {
         let now = Utc::now();
         let expired: Vec<(Uuid, AppId)> = {
             let st = self.active.lock();
-            st.by_id.iter().filter(|(_, r)| now - r.started_at > limit).map(|(id, r)| (*id, AppId(r.app_id))).collect()
+            st.by_id
+                .iter()
+                .filter(|(_, r)| now - r.started_at > limit)
+                .map(|(id, r)| (*id, AppId(r.app_id)))
+                .collect()
         };
         let mut n = 0;
         for (id, app_id) in expired {
@@ -401,42 +527,80 @@ impl RecordingService {
         n
     }
 
-    pub async fn get_recording(&self, app_id: AppId, recording_id: Uuid) -> Result<Option<RecordingRow>> {
+    pub async fn get_recording(
+        &self,
+        app_id: AppId,
+        recording_id: Uuid,
+    ) -> Result<Option<RecordingRow>> {
         aurix_db::queries::get_recording(&self.pool, app_id.0, recording_id)
             .await
             .map_err(|e| AurixError::Database(format!("Recording lookup failed: {e}")))
     }
 
-    pub async fn list_recordings(&self, app_id: AppId, channel_id: Option<ChannelId>, limit: i64, offset: i64) -> Result<Vec<RecordingRow>> {
-        aurix_db::queries::list_recordings(&self.pool, app_id.0, channel_id.map(|c| c.0), limit, offset)
-            .await
-            .map_err(|e| AurixError::Database(format!("Recording list failed: {e}")))
+    pub async fn list_recordings(
+        &self,
+        app_id: AppId,
+        channel_id: Option<ChannelId>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<RecordingRow>> {
+        aurix_db::queries::list_recordings(
+            &self.pool,
+            app_id.0,
+            channel_id.map(|c| c.0),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Recording list failed: {e}")))
     }
 
     /// Read a finished recording, decrypting it if it was encrypted at rest.
-    pub async fn read_recording(&self, app_id: AppId, recording_id: Uuid) -> Result<(RecordingRow, Vec<u8>)> {
+    pub async fn read_recording(
+        &self,
+        app_id: AppId,
+        recording_id: Uuid,
+    ) -> Result<(RecordingRow, Vec<u8>)> {
         let row = self
             .get_recording(app_id, recording_id)
             .await?
             .ok_or_else(|| AurixError::Recording("Recording not found".into()))?;
         if row.ended_at.is_none() {
-            return Err(AurixError::Conflict("Recording is still in progress".into()));
+            return Err(AurixError::Conflict(
+                "Recording is still in progress".into(),
+            ));
         }
-        let bytes = tokio::fs::read(&row.file_path).await.map_err(|e| AurixError::Recording(format!("Read failed: {e}")))?;
+        let bytes = tokio::fs::read(&row.file_path)
+            .await
+            .map_err(|e| AurixError::Recording(format!("Read failed: {e}")))?;
         if row.encrypted {
             if row.encryption_key_id != self.encryption_key_id {
-                return Err(AurixError::Encryption("Recording was encrypted with a key that is not configured".into()));
+                return Err(AurixError::Encryption(
+                    "Recording was encrypted with a key that is not configured".into(),
+                ));
             }
-            let key = self.encryption_key.as_ref().ok_or_else(|| AurixError::Encryption("No encryption key configured".into()))?;
+            let key = self
+                .encryption_key
+                .as_ref()
+                .ok_or_else(|| AurixError::Encryption("No encryption key configured".into()))?;
             return Ok((row, decrypt_blob(key, &bytes)?));
         }
         Ok((row, bytes))
     }
 
     /// Presigned download URL when object storage is configured.
-    pub fn presigned_url(&self, app_id: AppId, recording_id: Uuid, expires_secs: u64) -> Result<Option<String>> {
+    pub fn presigned_url(
+        &self,
+        app_id: AppId,
+        recording_id: Uuid,
+        expires_secs: u64,
+    ) -> Result<Option<String>> {
         match self.s3 {
-            Some(ref s3) => Ok(Some(s3.presigned_get_url(&object_key(app_id, recording_id), expires_secs, Utc::now())?)),
+            Some(ref s3) => Ok(Some(s3.presigned_get_url(
+                &object_key(app_id, recording_id),
+                expires_secs,
+                Utc::now(),
+            )?)),
             None => Ok(None),
         }
     }
@@ -447,7 +611,9 @@ impl RecordingService {
             .await?
             .ok_or_else(|| AurixError::Recording("Recording not found".into()))?;
         if self.active.lock().by_id.contains_key(&recording_id) {
-            return Err(AurixError::Conflict("Stop the recording before deleting it".into()));
+            return Err(AurixError::Conflict(
+                "Stop the recording before deleting it".into(),
+            ));
         }
         self.remove_artifacts(&row).await;
         aurix_db::queries::delete_recording(&self.pool, recording_id)
@@ -462,8 +628,14 @@ impl RecordingService {
             Err(e) => warn!("Failed to delete recording file {}: {e}", row.file_path),
         }
         if let Some(ref s3) = self.s3 {
-            if let Err(e) = s3.delete_object(&object_key(AppId(row.app_id), row.id)).await {
-                warn!("Failed to delete recording {} from object storage: {e}", row.id);
+            if let Err(e) = s3
+                .delete_object(&object_key(AppId(row.app_id), row.id))
+                .await
+            {
+                warn!(
+                    "Failed to delete recording {} from object storage: {e}",
+                    row.id
+                );
             }
         }
     }
@@ -498,14 +670,28 @@ impl AudioSink for RecordingService {
         self.active.lock().channels.contains(channel_id)
     }
 
-    fn on_audio(&self, channel_id: ChannelId, user_id: UserId, _ssrc: u32, rtp_timestamp: u32, payload: &[u8]) {
+    fn on_audio(
+        &self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        _ssrc: u32,
+        rtp_timestamp: u32,
+        payload: &[u8],
+    ) {
         if let Err(e) = self.write_opus_packet(channel_id, user_id, rtp_timestamp, payload) {
-            warn!("Recording write failed for user {} in {}: {e}", user_id, channel_id);
+            warn!(
+                "Recording write failed for user {} in {}: {e}",
+                user_id, channel_id
+            );
         }
     }
 
     fn on_participant_left(&self, channel_id: ChannelId, user_id: UserId) {
-        let has = self.active.lock().by_channel_user.contains_key(&(channel_id, user_id));
+        let has = self
+            .active
+            .lock()
+            .by_channel_user
+            .contains_key(&(channel_id, user_id));
         if !has {
             return;
         }
@@ -517,10 +703,17 @@ impl AudioSink for RecordingService {
             // block; the durable upload is retried by the periodic maintenance job if configured.
             let finished = {
                 let mut st = active.lock();
-                let Some(id) = st.by_channel_user.get(&(channel_id, user_id)).copied() else { return };
-                let Some(mut rec) = st.remove(&id) else { return };
+                let Some(id) = st.by_channel_user.get(&(channel_id, user_id)).copied() else {
+                    return;
+                };
+                let Some(mut rec) = st.remove(&id) else {
+                    return;
+                };
                 for (samples, pkt) in rec.orderer.flush() {
-                    let _ = rec.writer.write_packet_with_duration(&pkt, scale_samples(samples, rec.writer.sample_rate()));
+                    let _ = rec.writer.write_packet_with_duration(
+                        &pkt,
+                        scale_samples(samples, rec.writer.sample_rate()),
+                    );
                 }
                 let _ = rec.writer.finish();
                 let secs = rec.writer.granule() as f64 / rec.writer.sample_rate().max(1) as f64;
@@ -534,9 +727,15 @@ impl AudioSink for RecordingService {
                     }
                 }
             }
-            let size = tokio::fs::metadata(&path).await.map(|m| m.len() as i64).unwrap_or(0);
+            let size = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
             if let Err(e) = aurix_db::queries::finish_recording(&pool, id, size, secs).await {
-                warn!("Failed to finish recording {} after participant left: {e}", id);
+                warn!(
+                    "Failed to finish recording {} after participant left: {e}",
+                    id
+                );
             } else {
                 info!("Recording {} finished: participant left", id);
             }
@@ -558,12 +757,15 @@ fn scale_samples(samples_48k: u64, sample_rate: u32) -> u64 {
 }
 
 fn encrypt_blob(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| AurixError::Encryption(format!("Cipher init failed: {e}")))?;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| AurixError::Encryption(format!("Cipher init failed: {e}")))?;
     let mut nonce_bytes = [0u8; 12];
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let encrypted = cipher.encrypt(nonce, data).map_err(|e| AurixError::Encryption(format!("Encryption failed: {e}")))?;
+    let encrypted = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| AurixError::Encryption(format!("Encryption failed: {e}")))?;
     let mut result = Vec::with_capacity(12 + encrypted.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&encrypted);
@@ -572,11 +774,16 @@ fn encrypt_blob(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
 
 fn decrypt_blob(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 12 + 16 {
-        return Err(AurixError::Encryption("Encrypted recording too short".into()));
+        return Err(AurixError::Encryption(
+            "Encrypted recording too short".into(),
+        ));
     }
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| AurixError::Encryption(format!("Cipher init failed: {e}")))?;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| AurixError::Encryption(format!("Cipher init failed: {e}")))?;
     let nonce = Nonce::from_slice(&data[..12]);
-    cipher.decrypt(nonce, &data[12..]).map_err(|_| AurixError::Encryption("Decryption failed (wrong key or corrupted file)".into()))
+    cipher.decrypt(nonce, &data[12..]).map_err(|_| {
+        AurixError::Encryption("Decryption failed (wrong key or corrupted file)".into())
+    })
 }
 
 #[cfg(test)]

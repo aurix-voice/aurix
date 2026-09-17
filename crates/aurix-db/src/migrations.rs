@@ -28,8 +28,9 @@ pub async fn get_current_version(pool: &DbPool) -> Result<i64, sqlx::Error> {
     if applied_migration_count(pool).await? == 0 {
         return Ok(0);
     }
-    let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(version) FROM _sqlx_migrations WHERE success = true")
-        .fetch_one(pool)
-        .await?;
+    let row: (Option<i64>,) =
+        sqlx::query_as("SELECT MAX(version) FROM _sqlx_migrations WHERE success = true")
+            .fetch_one(pool)
+            .await?;
     Ok(row.0.unwrap_or(0))
 }

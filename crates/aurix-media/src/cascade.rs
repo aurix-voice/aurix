@@ -25,21 +25,32 @@ pub struct CascadeRelay {
 }
 
 impl CascadeRelay {
-    pub async fn new(bind_addr: &str, local_node_id: MediaNodeId, secret: &str, peers: &[String]) -> Result<Self> {
+    pub async fn new(
+        bind_addr: &str,
+        local_node_id: MediaNodeId,
+        secret: &str,
+        peers: &[String],
+    ) -> Result<Self> {
         if secret.len() < 16 {
-            return Err(AurixError::InvalidConfiguration("media.cascade_secret must be at least 16 characters".into()));
+            return Err(AurixError::InvalidConfiguration(
+                "media.cascade_secret must be at least 16 characters".into(),
+            ));
         }
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| AurixError::Transport(format!("Cascade bind failed: {e}")))?;
         let allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>> = Arc::new(DashMap::new());
         for p in peers {
-            let addr: SocketAddr = p
-                .parse()
-                .map_err(|_| AurixError::InvalidConfiguration(format!("Invalid cascade peer address: {p}")))?;
+            let addr: SocketAddr = p.parse().map_err(|_| {
+                AurixError::InvalidConfiguration(format!("Invalid cascade peer address: {p}"))
+            })?;
             allowed_peers.insert(addr, Mutex::new(ReplayWindow::default()));
         }
-        info!("Cascade relay listening on {} with {} peers", bind_addr, allowed_peers.len());
+        info!(
+            "Cascade relay listening on {} with {} peers",
+            bind_addr,
+            allowed_peers.len()
+        );
         Ok(Self {
             channel_peers: Arc::new(DashMap::new()),
             allowed_peers,
@@ -60,7 +71,9 @@ impl CascadeRelay {
     /// Register a remote node as having participants in a given channel. Unknown peers are refused.
     pub fn add_peer(&self, channel_id: ChannelId, peer_addr: SocketAddr) -> Result<()> {
         if !self.allowed_peers.contains_key(&peer_addr) {
-            return Err(AurixError::AuthorizationDenied(format!("{peer_addr} is not a configured cascade peer")));
+            return Err(AurixError::AuthorizationDenied(format!(
+                "{peer_addr} is not a configured cascade peer"
+            )));
         }
         let mut entry = self.channel_peers.entry(channel_id).or_default();
         if !entry.contains(&peer_addr) {
@@ -107,21 +120,26 @@ impl CascadeRelay {
 
     /// Validate an inbound relayed datagram: known peer, HMAC, Relay flag, replay window.
     pub fn authenticate_inbound(&self, data: &[u8], src: SocketAddr) -> Result<AurixPacket> {
-        let window = self
-            .allowed_peers
-            .get(&src)
-            .ok_or_else(|| AurixError::AuthorizationDenied(format!("Cascade packet from unknown peer {src}")))?;
+        let window = self.allowed_peers.get(&src).ok_or_else(|| {
+            AurixError::AuthorizationDenied(format!("Cascade packet from unknown peer {src}"))
+        })?;
         let packet = AurixPacket::decode(data)?;
         if !packet.header.has_flag(PacketFlags::Relay) {
-            return Err(AurixError::Transport("Cascade packet without Relay flag".into()));
+            return Err(AurixError::Transport(
+                "Cascade packet without Relay flag".into(),
+            ));
         }
         if !packet.is_authenticated() || !packet.verify_auth(&self.secret) {
-            return Err(AurixError::AuthenticationFailed("Cascade packet authentication failed".into()));
+            return Err(AurixError::AuthenticationFailed(
+                "Cascade packet authentication failed".into(),
+            ));
         }
         // Sequence space is per (peer, ssrc); fold the ssrc in so multiple remote users don't collide.
         let seq = packet.header.sequence ^ packet.header.ssrc.rotate_left(16);
         if !window.lock().check_and_update(seq) {
-            return Err(AurixError::AuthenticationFailed("Replayed cascade packet".into()));
+            return Err(AurixError::AuthenticationFailed(
+                "Replayed cascade packet".into(),
+            ));
         }
         Ok(packet)
     }
@@ -155,7 +173,9 @@ impl CascadeRelay {
     }
 
     pub fn has_peers(&self, channel_id: &ChannelId) -> bool {
-        self.channel_peers.get(channel_id).is_some_and(|p| !p.is_empty())
+        self.channel_peers
+            .get(channel_id)
+            .is_some_and(|p| !p.is_empty())
     }
 }
 
@@ -167,9 +187,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_peer_and_bad_tag() {
         let peer: SocketAddr = "127.0.0.1:45001".parse().unwrap();
-        let relay = CascadeRelay::new("127.0.0.1:0", MediaNodeId::new(), "0123456789abcdef", &[peer.to_string()])
-            .await
-            .unwrap();
+        let relay = CascadeRelay::new(
+            "127.0.0.1:0",
+            MediaNodeId::new(),
+            "0123456789abcdef",
+            &[peer.to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut pkt = AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus"));
         pkt.header.set_flag(PacketFlags::Relay);
@@ -177,11 +202,18 @@ mod tests {
         let bad = pkt.encode_authenticated(b"wrong-secret-wrong-secret");
         let unauth = pkt.encode();
 
-        assert!(relay.authenticate_inbound(&good, "127.0.0.1:45002".parse().unwrap()).is_err());
+        assert!(relay
+            .authenticate_inbound(&good, "127.0.0.1:45002".parse().unwrap())
+            .is_err());
         assert!(relay.authenticate_inbound(&bad, peer).is_err());
         assert!(relay.authenticate_inbound(&unauth, peer).is_err());
         assert!(relay.authenticate_inbound(&good, peer).is_ok());
-        assert!(relay.authenticate_inbound(&good, peer).is_err(), "replay must be rejected");
-        assert!(relay.add_peer(ChannelId::new(), "127.0.0.1:45002".parse().unwrap()).is_err());
+        assert!(
+            relay.authenticate_inbound(&good, peer).is_err(),
+            "replay must be rejected"
+        );
+        assert!(relay
+            .add_peer(ChannelId::new(), "127.0.0.1:45002".parse().unwrap())
+            .is_err());
     }
 }

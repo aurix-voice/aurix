@@ -139,12 +139,26 @@ impl SfuNode {
             let buf_size: libc::c_int = 4 * 1024 * 1024;
             // SAFETY: fd is a valid open socket; the pointer/len describe a live c_int.
             unsafe {
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &buf_size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &buf_size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
             }
         }
 
-        let local_addr = socket.local_addr().map_err(|e| AurixError::Transport(format!("local_addr: {e}")))?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| AurixError::Transport(format!("local_addr: {e}")))?;
         let socket = Arc::new(socket);
 
         let advertised = self.options.advertised_addr.unwrap_or(local_addr);
@@ -160,12 +174,25 @@ impl SfuNode {
 
         if let Some(secret) = self.options.cascade_secret.clone() {
             let cascade_addr = format!("{}:{}", local_addr.ip(), local_addr.port().wrapping_add(1));
-            match CascadeRelay::new(&cascade_addr, self.node_id, &secret, &self.options.cascade_peers).await {
+            match CascadeRelay::new(
+                &cascade_addr,
+                self.node_id,
+                &secret,
+                &self.options.cascade_peers,
+            )
+            .await
+            {
                 Ok(cascade) => self.cascade = Some(Arc::new(cascade)),
-                Err(e) => return Err(AurixError::InvalidConfiguration(format!("Cascade relay init failed: {e}"))),
+                Err(e) => {
+                    return Err(AurixError::InvalidConfiguration(format!(
+                        "Cascade relay init failed: {e}"
+                    )))
+                }
             }
         } else if !self.options.cascade_peers.is_empty() {
-            return Err(AurixError::InvalidConfiguration("media.cascade_peers set without media.cascade_secret".into()));
+            return Err(AurixError::InvalidConfiguration(
+                "media.cascade_peers set without media.cascade_secret".into(),
+            ));
         }
 
         let router = Arc::new(PacketRouter::new(
@@ -193,27 +220,44 @@ impl SfuNode {
             tokio::spawn(async move {
                 while let Some(event) = webrtc_event_rx.recv().await {
                     match event {
-                        WebRtcMediaEvent::AudioReceived { session_id, user_id, rtp_time, payload } => {
-                            let session = sessions_by_id.get(&session_id).map(|s| s.value().clone());
+                        WebRtcMediaEvent::AudioReceived {
+                            session_id,
+                            user_id,
+                            rtp_time,
+                            payload,
+                        } => {
+                            let session =
+                                sessions_by_id.get(&session_id).map(|s| s.value().clone());
                             let Some(session) = session else { continue };
-                            if session.user_id != user_id || session.transport() != Transport::WebRtc {
+                            if session.user_id != user_id
+                                || session.transport() != Transport::WebRtc
+                            {
                                 continue;
                             }
-                            if let Err(e) = router.route_webrtc_audio(&session, rtp_time, payload).await {
+                            if let Err(e) =
+                                router.route_webrtc_audio(&session, rtp_time, payload).await
+                            {
                                 warn!("WebRTC audio route error: {}", e);
                             }
                         }
                         WebRtcMediaEvent::Connected { session_id, remote } => {
-                            if let Some(session) = sessions_by_id.get(&session_id).map(|s| s.value().clone()) {
+                            if let Some(session) =
+                                sessions_by_id.get(&session_id).map(|s| s.value().clone())
+                            {
                                 session.set_remote_addr(remote);
                                 session.update_heartbeat();
                                 sessions_by_addr.insert(remote, session.clone());
-                                let _ = events.send(MediaEvent::SessionBound { session_id, addr: remote });
+                                let _ = events.send(MediaEvent::SessionBound {
+                                    session_id,
+                                    addr: remote,
+                                });
                             }
                             info!("WebRTC session {} connected from {}", session_id, remote);
                         }
                         WebRtcMediaEvent::Disconnected { session_id } => {
-                            if let Some(session) = sessions_by_id.get(&session_id).map(|s| s.value().clone()) {
+                            if let Some(session) =
+                                sessions_by_id.get(&session_id).map(|s| s.value().clone())
+                            {
                                 if let Some(addr) = session.clear_remote_addr() {
                                     sessions_by_addr.remove(&addr);
                                 }
@@ -269,13 +313,22 @@ impl SfuNode {
         self.start_speaking_timeout();
         self.local_addr = Some(local_addr);
         self.started = true;
-        info!("SFU node {} started in region {:?}, listening on {} (advertised {})", self.node_id, self.region, local_addr, advertised);
+        info!(
+            "SFU node {} started in region {:?}, listening on {} (advertised {})",
+            self.node_id, self.region, local_addr, advertised
+        );
         Ok(())
     }
 
     /// Create a session and return it. The per-session `media_key` must be delivered to the
     /// client over the authenticated control channel; it never appears on the media path.
-    pub fn create_session(&self, session_id: SessionId, user_id: UserId, app_id: AppId, display_name: String) -> Result<Arc<MediaSession>> {
+    pub fn create_session(
+        &self,
+        session_id: SessionId,
+        user_id: UserId,
+        app_id: AppId,
+        display_name: String,
+    ) -> Result<Arc<MediaSession>> {
         if let Some((_, old)) = self.sessions_by_user.remove(&user_id) {
             self.teardown_session(&old);
             info!("Replaced existing session for user {}", user_id);
@@ -283,7 +336,13 @@ impl SfuNode {
         let max = self.options.max_participants;
         if self
             .active_participant_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| if c >= max { None } else { Some(c + 1) })
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c >= max {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
             .is_err()
         {
             return Err(AurixError::MediaNodeUnavailable("Node at capacity".into()));
@@ -302,14 +361,22 @@ impl SfuNode {
         self.sessions_by_user.insert(user_id, session.clone());
         aurix_metrics::SESSIONS_TOTAL.inc();
         aurix_metrics::ACTIVE_SESSIONS.inc();
-        info!("Session created: {} for user {} (SSRC: {})", session_id, user_id, ssrc);
+        info!(
+            "Session created: {} for user {} (SSRC: {})",
+            session_id, user_id, ssrc
+        );
         Ok(session)
     }
 
     /// Accept a browser SDP offer for an existing session and switch it to the WebRTC transport.
     pub fn attach_webrtc(&self, session_id: &SessionId, offer_sdp: &str) -> Result<String> {
-        let session = self.get_session(session_id).ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
-        let manager = self.webrtc_manager.as_ref().ok_or_else(|| AurixError::Internal("WebRTC not started".into()))?;
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        let manager = self
+            .webrtc_manager
+            .as_ref()
+            .ok_or_else(|| AurixError::Internal("WebRTC not started".into()))?;
         if manager.has_session(session_id) {
             manager.remove_session(session_id);
         }
@@ -339,13 +406,17 @@ impl SfuNode {
         }
         self.active_participant_count.fetch_sub(1, Ordering::AcqRel);
         aurix_metrics::ACTIVE_SESSIONS.dec();
-        let elapsed = Utc::now().signed_duration_since(session.created_at).num_seconds();
+        let elapsed = Utc::now()
+            .signed_duration_since(session.created_at)
+            .num_seconds();
         aurix_metrics::SESSION_DURATION.observe(elapsed as f64);
     }
 
     fn remove_from_channel(&self, channel_id: &ChannelId, session: &Arc<MediaSession>) {
         session.leave_channel(channel_id);
-        let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else { return };
+        let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else {
+            return;
+        };
         channel.remove_participant(&session.user_id);
         if let Some(ref sink) = self.audio_sink {
             sink.on_participant_left(*channel_id, session.user_id);
@@ -367,21 +438,39 @@ impl SfuNode {
             .map(|s| s.value().clone())
             .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
         // Only drop the user index if it still points at this session.
-        self.sessions_by_user.remove_if(&session.user_id, |_, s| s.session_id == *session_id);
+        self.sessions_by_user
+            .remove_if(&session.user_id, |_, s| s.session_id == *session_id);
         self.teardown_session(&session);
-        info!("Session destroyed: {} for user {}", session_id, session.user_id);
+        info!(
+            "Session destroyed: {} for user {}",
+            session_id, session.user_id
+        );
         Ok(())
     }
 
-    pub fn join_channel(&self, session_id: &SessionId, channel_id: ChannelId, config: ChannelConfig, role: ChannelRole) -> Result<Vec<Arc<MediaSession>>> {
-        let session = self.get_session(session_id).ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
-        if !self.channels.contains_key(&channel_id) && self.channels.len() as u32 >= self.options.max_channels {
-            return Err(AurixError::MediaNodeUnavailable("Node channel capacity reached".into()));
+    pub fn join_channel(
+        &self,
+        session_id: &SessionId,
+        channel_id: ChannelId,
+        config: ChannelConfig,
+        role: ChannelRole,
+    ) -> Result<Vec<Arc<MediaSession>>> {
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        if !self.channels.contains_key(&channel_id)
+            && self.channels.len() as u32 >= self.options.max_channels
+        {
+            return Err(AurixError::MediaNodeUnavailable(
+                "Node channel capacity reached".into(),
+            ));
         }
         let hash = channel_id_hash(&channel_id);
         if let Some(existing) = self.channels_by_hash.get(&hash) {
             if *existing.value() != channel_id {
-                return Err(AurixError::Internal("Channel id hash collision on this node".into()));
+                return Err(AurixError::Internal(
+                    "Channel id hash collision on this node".into(),
+                ));
             }
         }
         let mut is_new = false;
@@ -395,7 +484,9 @@ impl SfuNode {
             .value()
             .clone();
         if channel.app_id != session.app_id {
-            return Err(AurixError::AuthorizationDenied("Channel belongs to a different application".into()));
+            return Err(AurixError::AuthorizationDenied(
+                "Channel belongs to a different application".into(),
+            ));
         }
         channel.add_participant(session.clone(), role)?;
         session.join_channel(channel_id);
@@ -407,7 +498,13 @@ impl SfuNode {
             aurix_metrics::ACTIVE_CHANNELS.inc();
         }
         let existing = channel.get_other_participants(&session.user_id);
-        info!("User {} joined channel {} as {:?} (now {} participants)", session.user_id, channel_id, role, channel.participant_count());
+        info!(
+            "User {} joined channel {} as {:?} (now {} participants)",
+            session.user_id,
+            channel_id,
+            role,
+            channel.participant_count()
+        );
         Ok(existing)
     }
 
@@ -418,38 +515,55 @@ impl SfuNode {
     }
 
     pub fn leave_channel(&self, session_id: &SessionId, channel_id: &ChannelId) -> Result<()> {
-        let session = self.get_session(session_id).ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
         self.remove_from_channel(channel_id, &session);
         Ok(())
     }
 
     pub fn server_mute_user(&self, user_id: &UserId, muted: bool) -> Result<()> {
-        let session = self.get_session_by_user(user_id).ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
+        let session = self
+            .get_session_by_user(user_id)
+            .ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
         session.is_server_muted.store(muted, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn kick_user_from_channel(&self, user_id: &UserId, channel_id: &ChannelId) -> Result<()> {
-        let session = self.get_session_by_user(user_id).ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
+        let session = self
+            .get_session_by_user(user_id)
+            .ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
         self.remove_from_channel(channel_id, &session);
         Ok(())
     }
 
     pub fn get_channel_participants(&self, channel_id: &ChannelId) -> Vec<Arc<MediaSession>> {
-        self.channels.get(channel_id).map(|ch| ch.get_all_participants()).unwrap_or_default()
+        self.channels
+            .get(channel_id)
+            .map(|ch| ch.get_all_participants())
+            .unwrap_or_default()
     }
     pub fn get_channel(&self, channel_id: &ChannelId) -> Option<Arc<MediaChannel>> {
         self.channels.get(channel_id).map(|c| c.value().clone())
     }
     pub fn get_session(&self, session_id: &SessionId) -> Option<Arc<MediaSession>> {
-        self.sessions_by_id.get(session_id).map(|s| s.value().clone())
+        self.sessions_by_id
+            .get(session_id)
+            .map(|s| s.value().clone())
     }
     pub fn get_session_by_user(&self, user_id: &UserId) -> Option<Arc<MediaSession>> {
-        self.sessions_by_user.get(user_id).map(|s| s.value().clone())
+        self.sessions_by_user
+            .get(user_id)
+            .map(|s| s.value().clone())
     }
     /// Every live session of a user on this node (a user may hold a session per device).
     pub fn sessions_for_user(&self, user_id: &UserId) -> Vec<Arc<MediaSession>> {
-        self.sessions_by_id.iter().filter(|e| e.value().user_id == *user_id).map(|e| e.value().clone()).collect()
+        self.sessions_by_id
+            .iter()
+            .filter(|e| e.value().user_id == *user_id)
+            .map(|e| e.value().clone())
+            .collect()
     }
     pub fn active_channels(&self) -> u32 {
         self.channels.len() as u32
@@ -458,7 +572,10 @@ impl SfuNode {
         self.active_participant_count.load(Ordering::Relaxed)
     }
     pub fn get_user_channels(&self, user_id: &UserId) -> Vec<ChannelId> {
-        self.sessions_by_user.get(user_id).map(|s| s.get_channels()).unwrap_or_default()
+        self.sessions_by_user
+            .get(user_id)
+            .map(|s| s.get_channels())
+            .unwrap_or_default()
     }
 
     pub fn node_info(&self, address: &str, media_port: u16, api_port: u16) -> MediaNodeInfo {
@@ -500,7 +617,9 @@ impl SfuNode {
                     .map(|e| *e.key())
                     .collect();
                 for sid in stale {
-                    let Some((_, session)) = sessions.remove(&sid) else { continue };
+                    let Some((_, session)) = sessions.remove(&sid) else {
+                        continue;
+                    };
                     session.deactivate();
                     sessions_by_user.remove_if(&session.user_id, |_, s| s.session_id == sid);
                     if let Some(addr) = session.clear_remote_addr() {

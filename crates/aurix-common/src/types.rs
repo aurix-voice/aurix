@@ -1,14 +1,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserId(pub Uuid);
 
 impl UserId {
-    pub fn new() -> Self { Self(Uuid::now_v7()) }
-    pub fn from_uuid(u: Uuid) -> Self { Self(u) }
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+    pub fn from_uuid(u: Uuid) -> Self {
+        Self(u)
+    }
 }
 
 impl std::fmt::Display for UserId {
@@ -18,15 +22,27 @@ impl std::fmt::Display for UserId {
 }
 
 impl Default for UserId {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub Uuid);
 
+impl Default for ChannelId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChannelId {
-    pub fn new() -> Self { Self(Uuid::now_v7()) }
-    pub fn from_uuid(u: Uuid) -> Self { Self(u) }
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+    pub fn from_uuid(u: Uuid) -> Self {
+        Self(u)
+    }
 }
 
 impl std::fmt::Display for ChannelId {
@@ -38,9 +54,19 @@ impl std::fmt::Display for ChannelId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
 
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionId {
-    pub fn new() -> Self { Self(Uuid::now_v7()) }
-    pub fn from_uuid(u: Uuid) -> Self { Self(u) }
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+    pub fn from_uuid(u: Uuid) -> Self {
+        Self(u)
+    }
 }
 
 impl std::fmt::Display for SessionId {
@@ -52,9 +78,19 @@ impl std::fmt::Display for SessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MediaNodeId(pub Uuid);
 
+impl Default for MediaNodeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MediaNodeId {
-    pub fn new() -> Self { Self(Uuid::now_v7()) }
-    pub fn from_uuid(u: Uuid) -> Self { Self(u) }
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+    pub fn from_uuid(u: Uuid) -> Self {
+        Self(u)
+    }
 }
 
 impl std::fmt::Display for MediaNodeId {
@@ -66,9 +102,19 @@ impl std::fmt::Display for MediaNodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AppId(pub Uuid);
 
+impl Default for AppId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppId {
-    pub fn new() -> Self { Self(Uuid::now_v7()) }
-    pub fn from_uuid(u: Uuid) -> Self { Self(u) }
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+    pub fn from_uuid(u: Uuid) -> Self {
+        Self(u)
+    }
 }
 
 impl std::fmt::Display for AppId {
@@ -173,9 +219,15 @@ pub enum Region {
 impl Region {
     pub fn all() -> &'static [Region] {
         &[
-            Region::UsEast, Region::UsWest, Region::EuWest, Region::EuCentral,
-            Region::AsiaPacific, Region::SouthAmerica, Region::Australia,
-            Region::MiddleEast, Region::Africa,
+            Region::UsEast,
+            Region::UsWest,
+            Region::EuWest,
+            Region::EuCentral,
+            Region::AsiaPacific,
+            Region::SouthAmerica,
+            Region::Australia,
+            Region::MiddleEast,
+            Region::Africa,
         ]
     }
 
@@ -217,8 +269,16 @@ pub struct Position3D {
 }
 
 impl Position3D {
-    pub fn new(x: f32, y: f32, z: f32) -> Self { Self { x, y, z } }
-    pub fn zero() -> Self { Self { x: 0.0, y: 0.0, z: 0.0 } }
+    pub fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+    pub fn zero() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }
+    }
 
     pub fn is_finite(&self) -> bool {
         self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
@@ -244,15 +304,28 @@ pub struct Orientation3D {
 
 impl Orientation3D {
     pub fn is_finite(&self) -> bool {
-        [self.forward_x, self.forward_y, self.forward_z, self.up_x, self.up_y, self.up_z].iter().all(|v| v.is_finite())
+        [
+            self.forward_x,
+            self.forward_y,
+            self.forward_z,
+            self.up_x,
+            self.up_y,
+            self.up_z,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
     }
 }
 
 impl Default for Orientation3D {
     fn default() -> Self {
         Self {
-            forward_x: 0.0, forward_y: 0.0, forward_z: 1.0,
-            up_x: 0.0, up_y: 1.0, up_z: 0.0,
+            forward_x: 0.0,
+            forward_y: 0.0,
+            forward_z: 1.0,
+            up_x: 0.0,
+            up_y: 1.0,
+            up_z: 0.0,
         }
     }
 }
@@ -365,7 +438,9 @@ pub struct MediaNodeInfo {
 
 impl MediaNodeInfo {
     pub fn load_factor(&self) -> f32 {
-        if self.capacity == 0 { return 1.0; }
+        if self.capacity == 0 {
+            return 1.0;
+        }
         self.active_participants as f32 / self.capacity as f32
     }
 
@@ -392,7 +467,7 @@ impl QualityMetrics {
             93.2 - ((effective_latency - 120.0) / 10.0)
         };
         let r = r - (self.packet_loss_percent * 2.5);
-        let r = r.max(0.0).min(100.0);
+        let r = r.clamp(0.0, 100.0);
         1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6
     }
 }
@@ -512,12 +587,21 @@ pub struct PaginationParams {
 }
 
 impl Default for PaginationParams {
-    fn default() -> Self { Self { page: 1, per_page: 50 } }
+    fn default() -> Self {
+        Self {
+            page: 1,
+            per_page: 50,
+        }
+    }
 }
 
 impl PaginationParams {
-    pub fn offset(&self) -> u32 { (self.page.saturating_sub(1)) * self.per_page }
-    pub fn limit(&self) -> u32 { self.per_page.min(200) }
+    pub fn offset(&self) -> u32 {
+        (self.page.saturating_sub(1)) * self.per_page
+    }
+    pub fn limit(&self) -> u32 {
+        self.per_page.min(200)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,7 +616,13 @@ pub struct PaginatedResponse<T> {
 impl<T> PaginatedResponse<T> {
     pub fn new(data: Vec<T>, page: u32, per_page: u32, total: u64) -> Self {
         let total_pages = (total as f64 / per_page as f64).ceil() as u64;
-        Self { data, page, per_page, total, total_pages }
+        Self {
+            data,
+            page,
+            per_page,
+            total,
+            total_pages,
+        }
     }
 }
 
@@ -554,7 +644,11 @@ pub struct ReverbDescriptor {
 
 impl Default for ReverbDescriptor {
     fn default() -> Self {
-        Self { room_size: 0.5, decay_time: 1.0, wet_dry_mix: 0.3 }
+        Self {
+            room_size: 0.5,
+            decay_time: 1.0,
+            wet_dry_mix: 0.3,
+        }
     }
 }
 

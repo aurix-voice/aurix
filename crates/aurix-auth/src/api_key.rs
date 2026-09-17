@@ -52,7 +52,9 @@ impl ApiKeyService {
 
     pub async fn validate_key(&self, raw_key: &str) -> Result<ApiKeyRow> {
         if raw_key.len() < 12 {
-            return Err(AurixError::AuthenticationFailed("Invalid API key format".into()));
+            return Err(AurixError::AuthenticationFailed(
+                "Invalid API key format".into(),
+            ));
         }
 
         let prefix = &raw_key[..12];
@@ -63,16 +65,22 @@ impl ApiKeyService {
 
         let hash = self.hash_key(raw_key);
         if !aurix_common::crypto::constant_time_eq(hash.as_bytes(), key_row.key_hash.as_bytes()) {
-            return Err(AurixError::AuthenticationFailed("API key validation failed".into()));
+            return Err(AurixError::AuthenticationFailed(
+                "API key validation failed".into(),
+            ));
         }
 
         if !key_row.active || key_row.revoked_at.is_some() {
-            return Err(AurixError::AuthenticationFailed("API key has been revoked".into()));
+            return Err(AurixError::AuthenticationFailed(
+                "API key has been revoked".into(),
+            ));
         }
 
         if let Some(expires) = key_row.expires_at {
             if expires <= Utc::now() {
-                return Err(AurixError::AuthenticationFailed("API key has expired".into()));
+                return Err(AurixError::AuthenticationFailed(
+                    "API key has expired".into(),
+                ));
             }
         }
 
@@ -101,7 +109,9 @@ impl ApiKeyService {
     /// JSON array of strings; `"*"` grants everything.
     pub fn has_permission(key: &ApiKeyRow, permission: &str) -> bool {
         match key.permissions.as_array() {
-            Some(arr) => arr.iter().any(|p| p.as_str() == Some("*") || p.as_str() == Some(permission)),
+            Some(arr) => arr
+                .iter()
+                .any(|p| p.as_str() == Some("*") || p.as_str() == Some(permission)),
             None => false,
         }
     }
@@ -109,7 +119,10 @@ impl ApiKeyService {
     fn generate_raw_key(&self) -> String {
         let mut rng = rand::thread_rng();
         let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-        format!("aurx_{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes))
+        format!(
+            "aurx_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+        )
     }
 
     fn hash_key(&self, key: &str) -> String {

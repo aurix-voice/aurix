@@ -23,18 +23,29 @@ impl UdpTransport {
             let fd = socket.as_raw_fd();
             let buf_size: libc::c_int = 4 * 1024 * 1024;
             unsafe {
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
                     &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
                     &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
             }
         }
 
         info!("UDP transport bound to {}", addr);
 
-        Ok(Self { socket: Arc::new(socket), router })
+        Ok(Self {
+            socket: Arc::new(socket),
+            router,
+        })
     }
 
     pub fn socket(&self) -> Arc<UdpSocket> {

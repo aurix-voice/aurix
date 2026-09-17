@@ -29,10 +29,13 @@ pub struct AudioAnalysisPipeline {
     dispatch_threshold: usize,
     sample_rate: u32,
     /// Callback for STT results
-    stt_callback: Option<Arc<dyn Fn(UserId, ChannelId, TranscriptResult) + Send + Sync>>,
+    stt_callback: Option<TranscriptCallback>,
     /// Callback for content violations
-    violation_callback: Option<Arc<dyn Fn(UserId, ChannelId, Vec<ContentViolation>) + Send + Sync>>,
+    violation_callback: Option<ViolationCallback>,
 }
+
+pub type TranscriptCallback = Arc<dyn Fn(UserId, ChannelId, TranscriptResult) + Send + Sync>;
+pub type ViolationCallback = Arc<dyn Fn(UserId, ChannelId, Vec<ContentViolation>) + Send + Sync>;
 
 impl AudioAnalysisPipeline {
     pub fn new(
@@ -70,12 +73,7 @@ impl AudioAnalysisPipeline {
 
     /// Feed a raw Opus packet from the router. Decodes to PCM with a stateful
     /// per-user decoder, accumulates, and dispatches when the buffer is full.
-    pub fn process_opus_packet(
-        &self,
-        user_id: UserId,
-        channel_id: ChannelId,
-        opus_data: &[u8],
-    ) {
+    pub fn process_opus_packet(&self, user_id: UserId, channel_id: ChannelId, opus_data: &[u8]) {
         let key = (user_id, channel_id);
         let pcm_samples = match self.decode_opus_frame(key, opus_data) {
             Ok(samples) => samples,
@@ -143,7 +141,9 @@ impl AudioAnalysisPipeline {
                     Ok(violations) if !violations.is_empty() => {
                         warn!(
                             "Content violations detected for user {} in {}: {} issues",
-                            uid_str, cid_str, violations.len()
+                            uid_str,
+                            cid_str,
+                            violations.len()
                         );
                         if let Some(ref cb) = cb {
                             cb(user_id, channel_id, violations);

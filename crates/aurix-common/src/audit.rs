@@ -1,9 +1,9 @@
-use crate::types::{AppId, AuditAction, AuditLogEntry, UserId};
 use crate::crypto::compute_audit_hash;
+use crate::types::{AppId, AuditAction, AuditLogEntry, UserId};
 use chrono::Utc;
-use uuid::Uuid;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct AuditLogger {
     last_hash: Arc<Mutex<String>>,
@@ -18,6 +18,7 @@ impl AuditLogger {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn log(
         &self,
         app_id: Option<AppId>,

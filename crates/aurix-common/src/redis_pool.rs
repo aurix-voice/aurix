@@ -6,7 +6,9 @@ pub async fn create_redis_client(config: &RedisConfig) -> Result<redis::Client> 
         .map_err(|e| AurixError::Redis(format!("Failed to create Redis client: {e}")))?;
 
     // Verify connectivity
-    let mut conn = client.get_multiplexed_async_connection().await
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
         .map_err(|e| AurixError::Redis(format!("Failed to connect to Redis: {e}")))?;
 
     let _: String = redis::cmd("PING")

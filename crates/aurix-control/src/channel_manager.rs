@@ -22,10 +22,14 @@ impl ChannelManager {
     ) -> Result<ChannelRow> {
         let name = name.trim();
         if name.is_empty() || name.len() > 128 {
-            return Err(AurixError::Validation("Channel name must be 1..=128 characters".into()));
+            return Err(AurixError::Validation(
+                "Channel name must be 1..=128 characters".into(),
+            ));
         }
         if config.max_participants == 0 {
-            return Err(AurixError::Validation("max_participants must be > 0".into()));
+            return Err(AurixError::Validation(
+                "max_participants must be > 0".into(),
+            ));
         }
         let row = ChannelRow {
             id: Uuid::now_v7(),
@@ -48,14 +52,22 @@ impl ChannelManager {
     }
 
     /// Tenant-scoped lookup: returns `None` for channels of other apps.
-    pub async fn get_channel(&self, app_id: AppId, channel_id: ChannelId) -> Result<Option<ChannelRow>> {
+    pub async fn get_channel(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+    ) -> Result<Option<ChannelRow>> {
         aurix_db::queries::get_channel(&self.pool, app_id.0, channel_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Failed to get channel: {e}")))
     }
 
     /// Like `get_channel` but converts a miss into `ChannelNotFound`.
-    pub async fn require_channel(&self, app_id: AppId, channel_id: ChannelId) -> Result<ChannelRow> {
+    pub async fn require_channel(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+    ) -> Result<ChannelRow> {
         self.get_channel(app_id, channel_id)
             .await?
             .ok_or_else(|| AurixError::ChannelNotFound(channel_id.to_string()))
@@ -63,13 +75,18 @@ impl ChannelManager {
 
     /// Persisted channel configuration (falls back to defaults for legacy rows with
     /// malformed JSON, but always applies the row's `max_participants`).
-    pub async fn load_channel_config(&self, app_id: AppId, channel_id: ChannelId) -> Result<ChannelConfig> {
+    pub async fn load_channel_config(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+    ) -> Result<ChannelConfig> {
         let row = self.require_channel(app_id, channel_id).await?;
         Ok(Self::config_from_row(&row))
     }
 
     pub fn config_from_row(row: &ChannelRow) -> ChannelConfig {
-        let mut config: ChannelConfig = serde_json::from_value(row.config.clone()).unwrap_or_default();
+        let mut config: ChannelConfig =
+            serde_json::from_value(row.config.clone()).unwrap_or_default();
         if row.max_participants > 0 {
             config.max_participants = row.max_participants as u32;
         }
@@ -85,7 +102,11 @@ impl ChannelManager {
         let json = serde_json::to_value(config)
             .map_err(|e| AurixError::Validation(format!("Invalid channel config: {e}")))?;
         let affected = aurix_db::queries::update_channel_config(
-            &self.pool, app_id.0, channel_id.0, &json, config.max_participants as i32,
+            &self.pool,
+            app_id.0,
+            channel_id.0,
+            &json,
+            config.max_participants as i32,
         )
         .await
         .map_err(|e| AurixError::Database(format!("Failed to update channel: {e}")))?;
@@ -127,11 +148,7 @@ impl ChannelManager {
         Ok(())
     }
 
-    pub async fn update_participant_count(
-        &self,
-        channel_id: ChannelId,
-        delta: i32,
-    ) -> Result<()> {
+    pub async fn update_participant_count(&self, channel_id: ChannelId, delta: i32) -> Result<()> {
         aurix_db::queries::update_channel_participant_count(&self.pool, channel_id.0, delta)
             .await
             .map_err(|e| AurixError::Database(format!("Failed to update count: {e}")))

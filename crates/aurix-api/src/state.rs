@@ -15,8 +15,21 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(control: Arc<ControlPlane>, sfu: Arc<RwLock<SfuNode>>, moderation: Arc<ModerationService>, recording: Option<Arc<RecordingService>>) -> Self {
-        let trusted_proxies = Arc::new(aurix_common::net::parse_trusted_proxies(&control.config.server.trusted_proxies));
-        Self { control, sfu, moderation, recording, trusted_proxies }
+    pub fn new(
+        control: Arc<ControlPlane>,
+        sfu: Arc<RwLock<SfuNode>>,
+        moderation: Arc<ModerationService>,
+        recording: Option<Arc<RecordingService>>,
+    ) -> Self {
+        let trusted_proxies = Arc::new(aurix_common::net::parse_trusted_proxies(
+            &control.config.server.trusted_proxies,
+        ));
+        Self {
+            control,
+            sfu,
+            moderation,
+            recording,
+            trusted_proxies,
+        }
     }
 }

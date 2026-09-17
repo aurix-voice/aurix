@@ -19,11 +19,18 @@ pub struct RedisStore {
 
 impl RedisStore {
     pub async fn connect(client: redis::Client, node_id: MediaNodeId) -> Result<Self> {
-        let manager = tokio::time::timeout(Duration::from_secs(5), redis::aio::ConnectionManager::new(client.clone()))
-            .await
-            .map_err(|_| AurixError::Redis("Connection timed out".into()))?
-            .map_err(|e| AurixError::Redis(format!("Connection failed: {e}")))?;
-        Ok(Self { client, manager, node_id })
+        let manager = tokio::time::timeout(
+            Duration::from_secs(5),
+            redis::aio::ConnectionManager::new(client.clone()),
+        )
+        .await
+        .map_err(|_| AurixError::Redis("Connection timed out".into()))?
+        .map_err(|e| AurixError::Redis(format!("Connection failed: {e}")))?;
+        Ok(Self {
+            client,
+            manager,
+            node_id,
+        })
     }
 
     pub fn node_id(&self) -> MediaNodeId {
@@ -56,7 +63,11 @@ impl RedisStore {
             loop {
                 match outbound.recv().await {
                     Ok(event) => {
-                        let env = EventEnvelope { id: uuid::Uuid::now_v7(), origin: store.node_id, event };
+                        let env = EventEnvelope {
+                            id: uuid::Uuid::now_v7(),
+                            origin: store.node_id,
+                            event,
+                        };
                         if let Ok(json) = serde_json::to_string(&env) {
                             if let Err(e) = store.publish_event(&json).await {
                                 tracing::warn!("event replication publish failed: {e}");
@@ -78,7 +89,8 @@ impl RedisStore {
         let client = self.client.clone();
         let self_id = self.node_id;
         tokio::spawn(async move {
-            let mut seen: std::collections::VecDeque<uuid::Uuid> = std::collections::VecDeque::with_capacity(4096);
+            let mut seen: std::collections::VecDeque<uuid::Uuid> =
+                std::collections::VecDeque::with_capacity(4096);
             loop {
                 match client.get_async_connection().await {
                     Ok(conn) => {
@@ -91,7 +103,9 @@ impl RedisStore {
                         tracing::info!("Redis Pub/Sub subscriber connected");
                         let mut stream = pubsub.on_message();
                         while let Some(msg) = stream.next().await {
-                            let Ok(payload) = msg.get_payload::<String>() else { continue };
+                            let Ok(payload) = msg.get_payload::<String>() else {
+                                continue;
+                            };
                             let Ok(env) = serde_json::from_str::<EventEnvelope>(&payload) else {
                                 tracing::debug!("ignoring malformed cross-node event");
                                 continue;
@@ -117,15 +131,24 @@ impl RedisStore {
 
     pub async fn ping(&self) -> Result<()> {
         let mut conn = self.conn().await?;
-        let _: String = Self::with_timeout(redis::cmd("PING").query_async(&mut conn), "ping").await?;
+        let _: String =
+            Self::with_timeout(redis::cmd("PING").query_async(&mut conn), "ping").await?;
         Ok(())
     }
 
     /// Record which media node a session is on.
-    pub async fn set_session_node(&self, session_id: SessionId, node_id: MediaNodeId) -> Result<()> {
+    pub async fn set_session_node(
+        &self,
+        session_id: SessionId,
+        node_id: MediaNodeId,
+    ) -> Result<()> {
         let mut conn = self.conn().await?;
         let key = format!("session:{}:node", session_id);
-        Self::with_timeout(conn.set_ex::<_, _, ()>(&key, node_id.0.to_string(), 120), "set_session_node").await?;
+        Self::with_timeout(
+            conn.set_ex::<_, _, ()>(&key, node_id.0.to_string(), 120),
+            "set_session_node",
+        )
+        .await?;
         Ok(())
     }
 
@@ -134,14 +157,20 @@ impl RedisStore {
         let mut conn = self.conn().await?;
         let key = format!("session:{}:node", session_id);
         let val: Option<String> = Self::with_timeout(conn.get(&key), "get_session_node").await?;
-        Ok(val.and_then(|s| uuid::Uuid::parse_str(&s).ok()).map(MediaNodeId::from_uuid))
+        Ok(val
+            .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+            .map(MediaNodeId::from_uuid))
     }
 
     /// Record which channels a user is in (for cross-node queries).
     pub async fn add_user_channel(&self, user_id: UserId, channel_id: ChannelId) -> Result<()> {
         let mut conn = self.conn().await?;
         let key = format!("user:{}:channels", user_id);
-        Self::with_timeout(conn.sadd::<_, _, ()>(&key, channel_id.0.to_string()), "add_user_channel").await?;
+        Self::with_timeout(
+            conn.sadd::<_, _, ()>(&key, channel_id.0.to_string()),
+            "add_user_channel",
+        )
+        .await?;
         Self::with_timeout(conn.expire::<_, ()>(&key, 3600), "expire").await?;
         Ok(())
     }
@@ -149,15 +178,21 @@ impl RedisStore {
     pub async fn remove_user_channel(&self, user_id: UserId, channel_id: ChannelId) -> Result<()> {
         let mut conn = self.conn().await?;
         let key = format!("user:{}:channels", user_id);
-        Self::with_timeout(conn.srem::<_, _, ()>(&key, channel_id.0.to_string()), "remove_user_channel").await?;
+        Self::with_timeout(
+            conn.srem::<_, _, ()>(&key, channel_id.0.to_string()),
+            "remove_user_channel",
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn get_user_channels(&self, user_id: UserId) -> Result<Vec<ChannelId>> {
         let mut conn = self.conn().await?;
         let key = format!("user:{}:channels", user_id);
-        let members: Vec<String> = Self::with_timeout(conn.smembers(&key), "get_user_channels").await?;
-        Ok(members.iter()
+        let members: Vec<String> =
+            Self::with_timeout(conn.smembers(&key), "get_user_channels").await?;
+        Ok(members
+            .iter()
             .filter_map(|s| uuid::Uuid::parse_str(s).ok())
             .map(ChannelId::from_uuid)
             .collect())
@@ -182,7 +217,11 @@ impl RedisStore {
     /// Publish an event to all nodes via Redis pub/sub.
     pub async fn publish_event(&self, event_json: &str) -> Result<()> {
         let mut conn = self.conn().await?;
-        Self::with_timeout(conn.publish::<_, _, ()>(EVENT_CHANNEL, event_json), "publish").await
+        Self::with_timeout(
+            conn.publish::<_, _, ()>(EVENT_CHANNEL, event_json),
+            "publish",
+        )
+        .await
     }
 
     /// Distributed rate limiting: check if a key exceeds the limit using Redis INCR + EXPIRE.
@@ -191,7 +230,11 @@ impl RedisStore {
         let redis_key = format!("ratelimit:{}", key);
         let count: i64 = Self::with_timeout(conn.incr(&redis_key, 1i64), "rate_limit incr").await?;
         if count == 1 {
-            Self::with_timeout(conn.expire::<_, ()>(&redis_key, window_secs as i64), "rate_limit expire").await?;
+            Self::with_timeout(
+                conn.expire::<_, ()>(&redis_key, window_secs as i64),
+                "rate_limit expire",
+            )
+            .await?;
         }
         Ok(count <= limit as i64)
     }
@@ -201,7 +244,8 @@ impl RedisStore {
         let mut conn = self.conn().await?;
         let key = format!("user:{}:server_muted", user_id);
         if muted {
-            Self::with_timeout(conn.set_ex::<_, _, ()>(&key, "1", 86400), "set_global_mute").await?;
+            Self::with_timeout(conn.set_ex::<_, _, ()>(&key, "1", 86400), "set_global_mute")
+                .await?;
         } else {
             Self::with_timeout(conn.del::<_, ()>(&key), "del_global_mute").await?;
         }

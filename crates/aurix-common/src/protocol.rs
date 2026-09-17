@@ -1,7 +1,9 @@
+use crate::error::{AurixError, Result};
+use crate::types::{
+    ChannelId, ChannelRole, Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use crate::types::{ChannelId, ChannelRole, Orientation3D, Position3D, SessionId, UserId, ReverbDescriptor};
-use crate::error::{AurixError, Result};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAGIC_BYTES: [u8; 4] = [0x41, 0x55, 0x52, 0x58];
@@ -118,7 +120,9 @@ impl PacketHeader {
         }
         let version = buf.get_u8();
         if version != PROTOCOL_VERSION {
-            return Err(AurixError::Transport(format!("Unsupported protocol version: {version}")));
+            return Err(AurixError::Transport(format!(
+                "Unsupported protocol version: {version}"
+            )));
         }
         let ptype_raw = buf.get_u8();
         let packet_type = PacketType::from_u8(ptype_raw)
@@ -172,7 +176,11 @@ pub struct AurixPacket {
 
 impl AurixPacket {
     pub fn new(header: PacketHeader, payload: Bytes) -> Self {
-        Self { header, payload, auth_tag: None }
+        Self {
+            header,
+            payload,
+            auth_tag: None,
+        }
     }
 
     fn finalized_header(&self) -> PacketHeader {
@@ -209,12 +217,15 @@ impl AurixPacket {
     /// Authentication tags are extracted but NOT verified here — call `verify_auth`.
     pub fn decode(data: &[u8]) -> Result<Self> {
         if data.len() > MAX_PACKET_SIZE {
-            return Err(AurixError::Transport("Packet exceeds MAX_PACKET_SIZE".into()));
+            return Err(AurixError::Transport(
+                "Packet exceeds MAX_PACKET_SIZE".into(),
+            ));
         }
         let mut bytes = Bytes::copy_from_slice(data);
         let header = PacketHeader::decode(&mut bytes)?;
         let authenticated = header.has_flag(PacketFlags::Authenticated);
-        let expected = header.payload_length as usize + if authenticated { AUTH_TAG_SIZE } else { 0 };
+        let expected =
+            header.payload_length as usize + if authenticated { AUTH_TAG_SIZE } else { 0 };
         if bytes.remaining() < expected {
             return Err(AurixError::Transport("Payload truncated".into()));
         }
@@ -233,12 +244,18 @@ impl AurixPacket {
         } else {
             None
         };
-        Ok(Self { header, payload, auth_tag })
+        Ok(Self {
+            header,
+            payload,
+            auth_tag,
+        })
     }
 
     /// Verify the authentication tag against `key`. Returns false for unauthenticated packets.
     pub fn verify_auth(&self, key: &[u8]) -> bool {
-        let Some(tag) = self.auth_tag else { return false };
+        let Some(tag) = self.auth_tag else {
+            return false;
+        };
         let mut buf = BytesMut::with_capacity(HEADER_SIZE + self.payload.len());
         self.header.encode(&mut buf);
         buf.put_slice(&self.payload);
@@ -257,12 +274,18 @@ impl AurixPacket {
     }
 
     pub fn heartbeat(ssrc: u32, ts: u32) -> Self {
-        Self::new(PacketHeader::new(PacketType::Heartbeat, 0, ts, ssrc), Bytes::new())
+        Self::new(
+            PacketHeader::new(PacketType::Heartbeat, 0, ts, ssrc),
+            Bytes::new(),
+        )
     }
 
     pub fn bitrate_command(ssrc: u32, target_bitrate: u32) -> Self {
         let payload = target_bitrate.to_be_bytes().to_vec();
-        Self::new(PacketHeader::new(PacketType::BitrateCommand, 0, 0, ssrc), Bytes::from(payload))
+        Self::new(
+            PacketHeader::new(PacketType::BitrateCommand, 0, 0, ssrc),
+            Bytes::from(payload),
+        )
     }
 
     /// Build a `SessionBind` packet. Must be sent with `encode_authenticated(media_key)`.
@@ -271,7 +294,10 @@ impl AurixPacket {
         payload.extend_from_slice(session_id.0.as_bytes());
         payload.extend_from_slice(&unix_ms.to_be_bytes());
         payload.extend_from_slice(&nonce.to_be_bytes());
-        Self::new(PacketHeader::new(PacketType::SessionBind, 0, 0, ssrc), Bytes::from(payload))
+        Self::new(
+            PacketHeader::new(PacketType::SessionBind, 0, 0, ssrc),
+            Bytes::from(payload),
+        )
     }
 
     pub fn session_bind_ack(ssrc: u32, unix_ms: i64) -> Self {
@@ -287,11 +313,15 @@ impl AurixPacket {
             return Err(AurixError::Transport("Not a SessionBind packet".into()));
         }
         if self.payload.len() != SESSION_BIND_PAYLOAD_SIZE {
-            return Err(AurixError::Transport("Invalid SessionBind payload length".into()));
+            return Err(AurixError::Transport(
+                "Invalid SessionBind payload length".into(),
+            ));
         }
         let p = &self.payload;
-        let session_id = SessionId(uuid::Uuid::from_slice(&p[0..16])
-            .map_err(|_| AurixError::Transport("Invalid session id".into()))?);
+        let session_id = SessionId(
+            uuid::Uuid::from_slice(&p[0..16])
+                .map_err(|_| AurixError::Transport("Invalid session id".into()))?,
+        );
         let unix_ms = i64::from_be_bytes(p[16..24].try_into().unwrap());
         let nonce = u64::from_be_bytes(p[24..32].try_into().unwrap());
         Ok((session_id, unix_ms, nonce))
@@ -346,13 +376,17 @@ pub fn channel_id_hash(id: &ChannelId) -> u32 {
 
 /// Detect if raw bytes are an RTP packet (version 2, first 2 bits = 10)
 pub fn is_rtp_packet(data: &[u8]) -> bool {
-    if data.len() < RTP_HEADER_MIN_SIZE { return false; }
+    if data.len() < RTP_HEADER_MIN_SIZE {
+        return false;
+    }
     (data[0] >> 6) & 0x03 == RTP_VERSION
 }
 
 /// Detect if raw bytes are our custom Aurix protocol
 pub fn is_aurix_packet(data: &[u8]) -> bool {
-    if data.len() < HEADER_SIZE { return false; }
+    if data.len() < HEADER_SIZE {
+        return false;
+    }
     data[0..4] == MAGIC_BYTES
 }
 
@@ -378,7 +412,9 @@ impl RtpHeader {
         }
         let version = (data[0] >> 6) & 0x03;
         if version != RTP_VERSION {
-            return Err(AurixError::Transport(format!("Invalid RTP version: {version}")));
+            return Err(AurixError::Transport(format!(
+                "Invalid RTP version: {version}"
+            )));
         }
         let padding = (data[0] >> 5) & 0x01 != 0;
         let extension = (data[0] >> 4) & 0x01 != 0;
@@ -390,52 +426,142 @@ impl RtpHeader {
         let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
         let mut header_size = RTP_HEADER_MIN_SIZE + (csrc_count as usize * 4);
         if extension && header_size + 4 <= data.len() {
-            let ext_len = u16::from_be_bytes([data[header_size + 2], data[header_size + 3]]) as usize;
+            let ext_len =
+                u16::from_be_bytes([data[header_size + 2], data[header_size + 3]]) as usize;
             header_size += 4 + ext_len * 4;
         }
         Ok(Self {
-            version, padding, extension, csrc_count,
-            marker, payload_type, sequence_number,
-            timestamp, ssrc, header_size,
+            version,
+            padding,
+            extension,
+            csrc_count,
+            marker,
+            payload_type,
+            sequence_number,
+            timestamp,
+            ssrc,
+            header_size,
         })
     }
 
     pub fn payload<'a>(&self, data: &'a [u8]) -> &'a [u8] {
-        if data.len() > self.header_size { &data[self.header_size..] } else { &[] }
+        if data.len() > self.header_size {
+            &data[self.header_size..]
+        } else {
+            &[]
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ControlMessage {
-    SessionInit { token: String, session_id: SessionId },
+    SessionInit {
+        token: String,
+        session_id: SessionId,
+    },
     /// `media_key` is a base64 per-session key used to authenticate AURX UDP packets
     /// (`SessionBind` first, then every audio/control packet).
-    SessionInitAck { session_id: SessionId, ssrc: u32, media_addr: String, media_key: String },
+    SessionInitAck {
+        session_id: SessionId,
+        ssrc: u32,
+        media_addr: String,
+        media_key: String,
+    },
     /// Sent by the server once the UDP source address has been authenticated via `SessionBind`.
-    MediaBound { session_id: SessionId },
-    SessionClose { session_id: SessionId, reason: String },
-    ChannelJoin { channel_id: ChannelId, token: String },
-    ChannelJoinAck { channel_id: ChannelId, participants: Vec<ParticipantBrief> },
-    ChannelLeave { channel_id: ChannelId },
-    ParticipantJoined { channel_id: ChannelId, user_id: UserId, display_name: String, ssrc: u32 },
-    ParticipantLeft { channel_id: ChannelId, user_id: UserId },
-    MuteStateChanged { channel_id: ChannelId, user_id: UserId, muted: bool, server_muted: bool },
-    SpeakingStateChanged { channel_id: ChannelId, user_id: UserId, speaking: bool },
-    PositionUpdate { channel_id: ChannelId, positions: Vec<UserPosition> },
-    OcclusionUpdate { channel_id: ChannelId, source_user_id: UserId, occlusion_factor: f32 },
-    ReverbZoneUpdate { channel_id: ChannelId, reverb: ReverbDescriptor },
-    QualityReport { rtt_ms: f32, jitter_ms: f32, packet_loss: f32 },
-    BitrateCommand { target_bitrate_kbps: u32, reason: String },
-    RecordingNotification { channel_id: ChannelId, recording_id: uuid::Uuid, active: bool, initiated_by: UserId },
-    RecordingConsentResponse { recording_id: uuid::Uuid, consent: crate::types::RecordingConsent },
-    Error { code: String, message: String },
-    Kick { channel_id: ChannelId, user_id: UserId, reason: String },
+    MediaBound {
+        session_id: SessionId,
+    },
+    SessionClose {
+        session_id: SessionId,
+        reason: String,
+    },
+    ChannelJoin {
+        channel_id: ChannelId,
+        token: String,
+    },
+    ChannelJoinAck {
+        channel_id: ChannelId,
+        participants: Vec<ParticipantBrief>,
+    },
+    ChannelLeave {
+        channel_id: ChannelId,
+    },
+    ParticipantJoined {
+        channel_id: ChannelId,
+        user_id: UserId,
+        display_name: String,
+        ssrc: u32,
+    },
+    ParticipantLeft {
+        channel_id: ChannelId,
+        user_id: UserId,
+    },
+    MuteStateChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        muted: bool,
+        server_muted: bool,
+    },
+    SpeakingStateChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        speaking: bool,
+    },
+    PositionUpdate {
+        channel_id: ChannelId,
+        positions: Vec<UserPosition>,
+    },
+    OcclusionUpdate {
+        channel_id: ChannelId,
+        source_user_id: UserId,
+        occlusion_factor: f32,
+    },
+    ReverbZoneUpdate {
+        channel_id: ChannelId,
+        reverb: ReverbDescriptor,
+    },
+    QualityReport {
+        rtt_ms: f32,
+        jitter_ms: f32,
+        packet_loss: f32,
+    },
+    BitrateCommand {
+        target_bitrate_kbps: u32,
+        reason: String,
+    },
+    RecordingNotification {
+        channel_id: ChannelId,
+        recording_id: uuid::Uuid,
+        active: bool,
+        initiated_by: UserId,
+    },
+    RecordingConsentResponse {
+        recording_id: uuid::Uuid,
+        consent: crate::types::RecordingConsent,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    Kick {
+        channel_id: ChannelId,
+        user_id: UserId,
+        reason: String,
+    },
     /// Browser clients: SDP offer for this session; the server replies with `WebRtcAnswer`.
-    WebRtcOffer { sdp: String },
-    WebRtcAnswer { sdp: String },
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    WebRtcOffer {
+        sdp: String,
+    },
+    WebRtcAnswer {
+        sdp: String,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
