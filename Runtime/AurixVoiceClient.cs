@@ -59,7 +59,7 @@ namespace Aurix
         public const string SdkVersion = "1.0.0";
 
         private readonly string _wsUrl;
-        private readonly string _token;
+        private string _token;
         private readonly Dictionary<Guid, Dictionary<Guid, Participant>> _channels = new Dictionary<Guid, Dictionary<Guid, Participant>>();
         private readonly Dictionary<uint, Participant> _bySsrc = new Dictionary<uint, Participant>();
         private readonly Queue<Action> _mainThreadQueue = new Queue<Action>();
@@ -78,6 +78,8 @@ namespace Aurix
         private bool _muted;
         private Guid? _pendingChannelJoin;
         private TaskCompletionSource<List<Participant>> _joinTcs;
+        private string _pendingModeration;
+        private TaskCompletionSource<bool> _moderationTcs;
         private byte[] _mediaKey;
         private string _resumeToken;
         private uint _lastMediaSequence;
@@ -100,6 +102,18 @@ namespace Aurix
         /// </summary>
         public bool AutoReconnect { get; set; } = true;
         public ReconnectPolicy Reconnect { get; } = new ReconnectPolicy();
+        /// <summary>
+        /// Called before every reconnect attempt to obtain a fresh credential. Required when the client
+        /// was constructed with a one-time <c>login</c> action token: it is spent by the first connection
+        /// (and expires within its short TTL), so a fresh session after the resume window needs a new one.
+        /// </summary>
+        public Func<CancellationToken, Task<string>> TokenRefresher { get; set; }
+        /// <summary>
+        /// Called by <see cref="JoinChannelAsync(Guid, CancellationToken)"/> to obtain a one-time <c>join</c>
+        /// action token for the channel. Required when the server enforces <c>auth.require_action_tokens</c>;
+        /// without it the session credential itself authorises the join.
+        /// </summary>
+        public Func<Guid, CancellationToken, Task<string>> JoinTokenProvider { get; set; }
         /// <summary>How long the server keeps a dropped session resumable (zero = resume disabled).</summary>
         public TimeSpan ResumeGrace { get; private set; }
         /// <summary>Channels currently joined (restored across reconnects).</summary>
@@ -138,7 +152,7 @@ namespace Aurix
         public event Action<ControlMessage> OnControlMessage;
 
         /// <param name="wsUrl">e.g. <c>ws://host:8081/ws</c> (or <c>wss://</c>).</param>
-        /// <param name="token">Per-user JWT issued by your backend via <c>POST /v1/tokens</c>.</param>
+        /// <param name="token">Per-user credential issued by your backend: a session JWT (<c>POST /v1/tokens</c>) or a one-time <c>login</c> action token (<c>POST /v1/tokens/action</c>).</param>
         public AurixVoiceClient(string wsUrl, string token)
         {
             _wsUrl = wsUrl ?? throw new ArgumentNullException(nameof(wsUrl));
@@ -183,6 +197,7 @@ namespace Aurix
             var control = new ControlChannel();
             control.Closed += reason => Post(() => HandleClosed(control, reason));
             control.Received += CompletePendingJoin;
+            control.Received += CompletePendingModeration;
             try
             {
                 await control.ConnectAsync(new Uri(_wsUrl), _token, ct, resume).ConfigureAwait(false);
@@ -246,15 +261,28 @@ namespace Aurix
             SetState(VoiceConnectionState.MediaBound);
         }
 
-        /// <summary>Join a channel the token grants access to. Returns the current roster.</summary>
+        /// <summary>
+        /// Join a channel. Returns the current roster. The join is authorised by <see cref="JoinTokenProvider"/>
+        /// when set, otherwise by the session credential.
+        /// </summary>
         public async Task<IReadOnlyList<Participant>> JoinChannelAsync(Guid channelId, CancellationToken ct = default)
         {
+            EnsureConnected();
+            var provider = JoinTokenProvider;
+            var token = provider != null ? await provider(channelId, ct).ConfigureAwait(false) : _token;
+            return await JoinChannelAsync(channelId, token, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Join a channel with an explicit one-time <c>join</c> action token minted for this user and channel.</summary>
+        public async Task<IReadOnlyList<Participant>> JoinChannelAsync(Guid channelId, string joinToken, CancellationToken ct = default)
+        {
+            if (joinToken == null) throw new ArgumentNullException(nameof(joinToken));
             EnsureConnected();
             if (_joinTcs != null) throw new InvalidOperationException("a join is already in progress");
             var tcs = new TaskCompletionSource<List<Participant>>(TaskCreationOptions.RunContinuationsAsynchronously);
             _joinTcs = tcs;
             _pendingChannelJoin = channelId;
-            await _control.SendAsync(ControlMessage.ChannelJoin(channelId, _token), ct).ConfigureAwait(false);
+            await _control.SendAsync(ControlMessage.ChannelJoin(channelId, joinToken), ct).ConfigureAwait(false);
             using (var timeout = new CancellationTokenSource(RequestTimeout))
             using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("ChannelJoinAck timeout"))))
             using (ct.Register(() => tcs.TrySetCanceled()))
@@ -269,6 +297,34 @@ namespace Aurix
                 finally { _joinTcs = null; _pendingChannelJoin = null; }
             }
         }
+
+        /// <summary>
+        /// Kick or server-mute/unmute <paramref name="userId"/> in <paramref name="channelId"/> with a one-time
+        /// <c>kick</c>/<c>mute</c>/<c>unmute</c> action token minted for this user (<c>POST /v1/tokens/action</c>).
+        /// A mismatch (other actor, target, channel or action) leaves the token unused and fails with <c>AUTH_DENIED</c>;
+        /// a replay fails with <c>TOKEN_REUSED</c>.
+        /// </summary>
+        public async Task ModerateAsync(Guid channelId, Guid userId, ModerationAction action, string token, string reason = null, CancellationToken ct = default)
+        {
+            if (token == null) throw new ArgumentNullException(nameof(token));
+            EnsureConnected();
+            if (_moderationTcs != null) throw new InvalidOperationException("a moderation request is already in progress");
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _moderationTcs = tcs;
+            _pendingModeration = ModerationKey(channelId, userId, action);
+            try
+            {
+                await _control.SendAsync(ControlMessage.ModerateParticipant(channelId, userId, action, token, reason), ct).ConfigureAwait(false);
+                using (var timeout = new CancellationTokenSource(RequestTimeout))
+                using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("ModerateParticipantAck timeout"))))
+                using (ct.Register(() => tcs.TrySetCanceled()))
+                    await tcs.Task.ConfigureAwait(false);
+            }
+            finally { _moderationTcs = null; _pendingModeration = null; }
+        }
+
+        private static string ModerationKey(Guid channelId, Guid userId, ModerationAction action) =>
+            $"{channelId:D}/{userId:D}/{ControlMessage.ModerationActionToWire(action)}";
 
         /// <summary>Leave a channel. The server does not acknowledge; membership is dropped locally at once.</summary>
         public async Task LeaveChannelAsync(Guid channelId, CancellationToken ct = default)
@@ -621,6 +677,13 @@ namespace Aurix
         {
             var previous = Session;
             string resume = previous != null && _resumeToken != null ? $"{previous.SessionId:D}.{_resumeToken}" : null;
+            var refresher = TokenRefresher;
+            if (refresher != null)
+            {
+                var fresh = await refresher(ct).ConfigureAwait(false);
+                if (string.IsNullOrEmpty(fresh)) throw new InvalidOperationException("TokenRefresher returned no token");
+                _token = fresh;
+            }
             var info = await OpenSessionAsync(resume, ct).ConfigureAwait(false);
             List<Guid> rejoin = null;
             if (!info.Resumed)
@@ -812,6 +875,23 @@ namespace Aurix
                 tcs.TrySetResult(roster);
             }
             else if (m.Type == "Error")
+            {
+                tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
+            }
+        }
+
+        private void CompletePendingModeration(ControlMessage m)
+        {
+            var tcs = _moderationTcs;
+            var pending = _pendingModeration;
+            if (tcs == null || pending == null) return;
+            if (m.Type == "ModerateParticipantAck")
+            {
+                var action = ControlMessage.ParseModerationAction(m.Str("action"));
+                if (action.HasValue && ModerationKey(m.Id("channel_id"), m.Id("user_id"), action.Value) == pending)
+                    tcs.TrySetResult(true);
+            }
+            else if (m.Type == "Error" && _joinTcs == null)
             {
                 tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
             }

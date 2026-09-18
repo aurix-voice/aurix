@@ -236,6 +236,28 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void ModerationMessagesMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b6d1-131f-7160-afd2-056622380dd3");
+            var bob = Guid.Parse("01a0b6d1-132a-7385-8e7a-9ac1eceaeb0c");
+            Assert.Equal(
+                "{\"type\":\"ModerateParticipant\",\"data\":{\"channel_id\":\"" + team + "\",\"user_id\":\"" + bob +
+                "\",\"action\":\"kick\",\"token\":\"t.o.k\",\"reason\":\"afk\"}}",
+                ControlMessage.ModerateParticipant(team, bob, ModerationAction.Kick, "t.o.k", "afk"));
+            Assert.Equal(
+                "{\"type\":\"ModerateParticipant\",\"data\":{\"channel_id\":\"" + team + "\",\"user_id\":\"" + bob +
+                "\",\"action\":\"unmute\",\"token\":\"t.o.k\",\"reason\":null}}",
+                ControlMessage.ModerateParticipant(team, bob, ModerationAction.Unmute, "t.o.k", null));
+
+            var ack = ControlMessage.Parse("{\"type\":\"ModerateParticipantAck\",\"data\":{\"channel_id\":\"" + team +
+                "\",\"user_id\":\"" + bob + "\",\"action\":\"mute\"}}");
+            Assert.Equal(team, ack.Id("channel_id"));
+            Assert.Equal(bob, ack.Id("user_id"));
+            Assert.Equal(ModerationAction.Mute, ControlMessage.ParseModerationAction(ack.Str("action")));
+            Assert.Null(ControlMessage.ParseModerationAction("ban"));
+        }
+
+        [Fact]
         public void JitterBufferReordersAndFlagsLoss()
         {
             var jb = new JitterBuffer(targetDepthFrames: 2);

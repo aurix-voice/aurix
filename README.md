@@ -118,6 +118,34 @@ client.OnSessionClosed   += reason => { /* kicked/banned/shutdown: no reconnect 
   `ReconnectNow()` skips the current backoff delay (e.g. when the OS reports connectivity is back).
 * `DisconnectAsync()` and a server-side `SessionClose` never trigger a reconnect.
 
+### One-time action tokens
+
+Instead of the reusable player JWT the backend can mint single-use tokens with
+`POST /v1/tokens/action` (90 s by default): one `login`, `join`, `kick`, `mute` or `unmute` each;
+a replay on any node fails with `TOKEN_REUSED`. With `auth.require_action_tokens = true` on the
+server they are the only accepted credentials for `OpenSessionAsync` and `JoinChannelAsync`.
+
+```csharp
+var client = new AurixVoiceClient(wsUrl, await Backend.ActionTokenAsync("login"))
+{
+    TokenRefresher    = ct => Backend.ActionTokenAsync("login"),               // before each reconnect
+    JoinTokenProvider = (channelId, ct) => Backend.JoinTokenAsync(channelId),  // per JoinChannelAsync
+};
+await client.OpenSessionAsync();
+await client.JoinChannelAsync(channelId);                 // uses JoinTokenProvider
+await client.JoinChannelAsync(channelId, explicitToken);  // …or pass one yourself
+
+// in-game moderation: the backend binds the token to actor + channel + target
+var kick = await Backend.ModerationTokenAsync("kick", channelId, targetUserId);
+await client.ModerateAsync(channelId, targetUserId, ModerationAction.Kick, kick, "afk");
+```
+
+A `login` token that opened a session may still be presented to *resume* that session inside the
+grace window; `TokenRefresher` supplies the credential for every reconnect attempt (a fresh one is
+required once the server hands out a new session). `ModerateAsync` completes on
+`ModerateParticipantAck` and otherwise throws `InvalidOperationException("<CODE>: <message>")`
+with the server's error code (`TOKEN_REUSED`, `ACTION_TOKEN_REQUIRED`, `AUTH_DENIED`, …).
+
 ## .NET: build, test, end-to-end demo
 
 ```bash
