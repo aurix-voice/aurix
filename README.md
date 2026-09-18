@@ -72,6 +72,32 @@ void OnAudioFilterRead(float[] data, int ch) => mixer.Mix(data, ch);
 the mixer applies), `RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's
 bitrate adaptation.
 
+### Reconnect / session resume
+
+`AutoReconnect` is on by default. When the control connection drops unexpectedly (Wi-Fi ↔ LTE
+handover, NAT rebinding, server restart) the client keeps its session and retries with exponential
+backoff (`client.Reconnect`: 500 ms → 8 s, ±30 % jitter, 10 attempts), presenting the one-time
+resume token from `SessionInitAck`:
+
+```csharp
+client.OnRecovering      += (attempt, delay, cause) => ShowBanner($"Reconnecting… ({attempt})");
+client.OnRecovered       += info => HideBanner(info.Resumed ? "resumed" : "rejoined");
+client.OnFailedToRecover += e => ShowError(e.Message);        // State is now Failed
+client.OnSessionClosed   += reason => { /* kicked/banned/shutdown: no reconnect follows */ };
+```
+
+* Within the server's grace window (`client.ResumeGrace`, default 30 s) the same session comes back
+  (`info.Resumed == true`): same SSRC, same media key, same channels — other players never see a leave.
+  The server replays one `ChannelJoinAck` per channel, so `OnChannelJoined` fires again with a fresh roster.
+* After the grace window a fresh session is issued (`info.Resumed == false`): `OnChannelLeft` fires for the
+  old channels and they are re-joined with the same token; the SSRC changes.
+* The UDP media path is re-bound from a new local port either way (`SessionBind` with the kept key), and the
+  uplink sequence continues where it left off so the server's replay window keeps accepting packets.
+* `SendOpusFrame` is a silent no-op while `State == Reconnecting`; keep the microphone running.
+* Two unanswered pings (`PingInterval`) close a half-open socket and start the reconnect.
+  `ReconnectNow()` skips the current backoff delay (e.g. when the OS reports connectivity is back).
+* `DisconnectAsync()` and a server-side `SessionClose` never trigger a reconnect.
+
 ## .NET: build, test, end-to-end demo
 
 ```bash
@@ -84,6 +110,12 @@ AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1
 The demo creates a channel, issues two tokens, connects "alice" and "bob" over real UDP, streams an Opus-encoded
 440 Hz tone for half the run and mutes for the other half, and asserts: all packets verified (0 bad auth / replays),
 decoded RMS ≈ 0.35, speaking / mute / leave events observed by the peer. It prints `RESULT: PASS` and exits 0.
+
+`--scenario reconnect` runs the reconnect check instead: alice's control connection goes through a local
+TCP proxy that is cut abruptly — once within the grace window (same session and SSRC must resume, audio
+must keep flowing, bob must not see a leave), once for longer than it (a fresh session must re-join the
+channel), and once for good (the client must give up with `OnFailedToRecover`). Run the server with
+`AURIX__SERVER__SESSION_RESUME_GRACE_SECS=4` to keep the run short.
 
 ## Notes
 

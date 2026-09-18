@@ -19,6 +19,7 @@ namespace Aurix.Transport
     {
         public const string AurixSubprotocol = "aurix";
         public const string BearerSubprotocolPrefix = "bearer.";
+        public const string ResumeSubprotocolPrefix = "resume.";
 
         private readonly ConcurrentQueue<ControlMessage> _inbox = new ConcurrentQueue<ControlMessage>();
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
@@ -33,12 +34,17 @@ namespace Aurix.Transport
 
         public bool IsOpen => _ws != null && _ws.State == WebSocketState.Open;
 
-        public async Task ConnectAsync(Uri wsUrl, string jwt, CancellationToken ct)
+        /// <param name="resume">
+        /// Optional <c>&lt;session_id&gt;.&lt;resume_token&gt;</c> from a previous <c>SessionInitAck</c>; the
+        /// server reattaches that session instead of creating a new one if it is still within its grace period.
+        /// </param>
+        public async Task ConnectAsync(Uri wsUrl, string jwt, CancellationToken ct, string resume = null)
         {
             if (_ws != null) throw new InvalidOperationException("already connected");
             var ws = new ClientWebSocket();
             ws.Options.AddSubProtocol(AurixSubprotocol);
             ws.Options.AddSubProtocol(BearerSubprotocolPrefix + jwt);
+            if (!string.IsNullOrEmpty(resume)) ws.Options.AddSubProtocol(ResumeSubprotocolPrefix + resume);
             ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
             await ws.ConnectAsync(wsUrl, ct).ConfigureAwait(false);
             _ws = ws;
