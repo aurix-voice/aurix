@@ -1,6 +1,5 @@
 using System;
 using System.Buffers.Binary;
-using System.Security.Cryptography;
 
 namespace Aurix.Protocol
 {
@@ -25,6 +24,8 @@ namespace Aurix.Protocol
         SpeakingState = 0x61,
         QualityReport = 0x70,
         BitrateCommand = 0x71,
+        /// <summary>Cascade envelope (node-to-node only; never seen by clients).</summary>
+        Relay = 0x80,
         Error = 0xFF,
     }
 
@@ -109,10 +110,14 @@ namespace Aurix.Protocol
         }
     }
 
-    /// <summary>A decoded AURX packet. Payload is a copy of the wire bytes.</summary>
+    /// <summary>
+    /// A decoded AURX packet. Payload is a copy of the wire bytes.
+    /// Protocol v2: every packet except <see cref="PacketType.SessionBind"/> is sent with
+    /// <see cref="Seal"/> (AES-256-CTR payload + truncated HMAC tag) and received with <see cref="Open"/>.
+    /// </summary>
     public sealed class AurxPacket
     {
-        public const byte ProtocolVersion = 1;
+        public const byte ProtocolVersion = 2;
         public static readonly byte[] Magic = { 0x41, 0x55, 0x52, 0x58 }; // "AURX"
         public const int MaxPacketSize = 1400;
         public const int HeaderSize = 30;
@@ -131,6 +136,7 @@ namespace Aurix.Protocol
         }
 
         public bool IsAuthenticated => AuthTag != null;
+        public bool IsEncrypted => (Header.Flags & PacketFlags.Encrypted) != 0;
 
         /// <summary>Attenuation factor (0..1) carried by server-mixed downlink packets, or 1.0.</summary>
         public float Volume => (Header.Flags & PacketFlags.VolumeAttenuated) != 0 && Payload.Length > 0
@@ -142,22 +148,44 @@ namespace Aurix.Protocol
             ? new ReadOnlySpan<byte>(Payload, 1, Payload.Length - 1)
             : Payload;
 
-        /// <summary>Encode with a trailing truncated HMAC-SHA256 tag over header + payload.</summary>
-        public byte[] EncodeAuthenticated(byte[] mediaKey)
+        /// <summary>
+        /// Encode signed but NOT encrypted: header + plaintext payload + truncated HMAC tag.
+        /// Only for <see cref="PacketType.SessionBind"/> (the server must read the session id to
+        /// find the key). Everything else must use <see cref="Seal"/>.
+        /// </summary>
+        public byte[] EncodeAuthenticated(MediaKeys keys)
         {
-            if (mediaKey == null || mediaKey.Length == 0) throw new ArgumentException("media key required", nameof(mediaKey));
+            if (keys == null) throw new ArgumentNullException(nameof(keys));
             var header = Header;
             header.Flags |= PacketFlags.Authenticated;
+            header.Flags &= ~PacketFlags.Encrypted;
             header.PayloadLength = (ushort)Payload.Length;
             header.Checksum = Crc32.Compute(Payload);
             var buf = new byte[HeaderSize + Payload.Length + AuthTagSize];
             header.Encode(buf);
             Payload.CopyTo(buf, HeaderSize);
-            using (var hmac = new HMACSHA256(mediaKey))
-            {
-                var tag = hmac.ComputeHash(buf, 0, HeaderSize + Payload.Length);
-                Buffer.BlockCopy(tag, 0, buf, HeaderSize + Payload.Length, AuthTagSize);
-            }
+            keys.ComputeTag(buf, HeaderSize + Payload.Length, buf.AsSpan(HeaderSize + Payload.Length, AuthTagSize));
+            return buf;
+        }
+
+        /// <summary>
+        /// Encrypt the payload (AES-256-CTR, IV from type/ssrc/seq/ts) and append the HMAC tag over
+        /// header + ciphertext. The header CRC covers the ciphertext. Sets Encrypted | Authenticated.
+        /// </summary>
+        public byte[] Seal(MediaKeys keys)
+        {
+            if (keys == null) throw new ArgumentNullException(nameof(keys));
+            var header = Header;
+            header.Flags |= PacketFlags.Authenticated | PacketFlags.Encrypted;
+            header.PayloadLength = (ushort)Payload.Length;
+            var buf = new byte[HeaderSize + Payload.Length + AuthTagSize];
+            Payload.CopyTo(buf, HeaderSize);
+            Span<byte> iv = stackalloc byte[MediaKeys.IvSize];
+            keys.Iv((byte)header.Type, header.Ssrc, header.Sequence, header.Timestamp, iv);
+            keys.ApplyCtr(iv, buf, HeaderSize, Payload.Length);
+            header.Checksum = Crc32.Compute(new ReadOnlySpan<byte>(buf, HeaderSize, Payload.Length));
+            header.Encode(buf);
+            keys.ComputeTag(buf, HeaderSize + Payload.Length, buf.AsSpan(HeaderSize + Payload.Length, AuthTagSize));
             return buf;
         }
 
@@ -193,18 +221,34 @@ namespace Aurix.Protocol
             return true;
         }
 
-        /// <summary>Verify the wire tag against <paramref name="mediaKey"/>. False for unauthenticated packets.</summary>
-        public bool VerifyAuth(byte[] mediaKey)
+        /// <summary>Verify the wire tag against <paramref name="keys"/>. False for unauthenticated packets. Does not decrypt.</summary>
+        public bool VerifyAuth(MediaKeys keys)
         {
-            if (AuthTag == null) return false;
+            if (AuthTag == null || keys == null) return false;
             var buf = new byte[HeaderSize + Payload.Length];
             Header.Encode(buf);
             Payload.CopyTo(buf, HeaderSize);
-            using (var hmac = new HMACSHA256(mediaKey))
+            Span<byte> expected = stackalloc byte[AuthTagSize];
+            keys.ComputeTag(buf, buf.Length, expected);
+            return ConstantTimeEquals(expected, AuthTag);
+        }
+
+        /// <summary>
+        /// Verify the tag and, when <see cref="PacketFlags.Encrypted"/> is set, decrypt the payload in
+        /// place (flag cleared, checksum recomputed over plaintext). False leaves the packet untouched.
+        /// </summary>
+        public bool Open(MediaKeys keys)
+        {
+            if (!VerifyAuth(keys)) return false;
+            if (IsEncrypted)
             {
-                var expected = hmac.ComputeHash(buf);
-                return ConstantTimeEquals(new ReadOnlySpan<byte>(expected, 0, AuthTagSize), AuthTag);
+                Span<byte> iv = stackalloc byte[MediaKeys.IvSize];
+                keys.Iv((byte)Header.Type, Header.Ssrc, Header.Sequence, Header.Timestamp, iv);
+                keys.ApplyCtr(iv, Payload, 0, Payload.Length);
+                Header.Flags &= ~PacketFlags.Encrypted;
+                Header.Checksum = Crc32.Compute(Payload);
             }
+            return true;
         }
 
         public static bool IsAurxPacket(ReadOnlySpan<byte> data) =>
@@ -232,14 +276,17 @@ namespace Aurix.Protocol
             return new AurxPacket(PacketHeader.Create(PacketType.QualityReport, seq, 0, ssrc), p);
         }
 
-        /// <summary>SessionBind payload: session_id (16, RFC 4122 byte order) | unix_ms (8) | nonce (8).</summary>
+        /// <summary>
+        /// SessionBind payload: session_id (16, RFC 4122 byte order) | unix_ms (8) | nonce (8).
+        /// Send with <see cref="EncodeAuthenticated"/> (signed, not encrypted).
+        /// </summary>
         public static AurxPacket SessionBind(Guid sessionId, uint ssrc, long unixMs, ulong nonce)
         {
             var p = new byte[SessionBindPayloadSize];
             UuidBytes.Write(sessionId, p.AsSpan(0, 16));
             BinaryPrimitives.WriteInt64BigEndian(p.AsSpan(16), unixMs);
             BinaryPrimitives.WriteUInt64BigEndian(p.AsSpan(24), nonce);
-            return new AurxPacket(PacketHeader.Create(PacketType.SessionBind, 0, 0, ssrc), p);
+            return new AurxPacket(PacketHeader.Create(PacketType.SessionBind, (uint)nonce, (uint)unixMs, ssrc), p);
         }
 
         /// <summary>Server-side channel hash: CRC32 over the UUID's 16 raw bytes.</summary>
