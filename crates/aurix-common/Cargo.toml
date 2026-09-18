@@ -23,6 +23,8 @@ sha1 = { workspace = true }
 md-5 = { workspace = true }
 subtle = { workspace = true }
 hmac = { workspace = true }
+aes = { workspace = true }
+ctr = { workspace = true }
 rand = { workspace = true }
 dashmap = { workspace = true }
 toml = { workspace = true }

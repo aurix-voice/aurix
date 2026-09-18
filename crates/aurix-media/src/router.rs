@@ -91,12 +91,12 @@ impl PacketRouter {
     }
 
     pub async fn route_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
-        let packet = AurixPacket::decode(data)?;
+        let mut packet = AurixPacket::decode(data)?;
         if packet.header.packet_type == PacketType::SessionBind {
             return self.handle_session_bind(&packet, src_addr).await;
         }
 
-        let session = self.authenticate(&packet, src_addr)?;
+        let session = self.authenticate(&mut packet, src_addr)?;
         match packet.header.packet_type {
             PacketType::Audio | PacketType::AudioFec => {
                 self.route_audio_packet(&packet, &session).await
@@ -121,10 +121,11 @@ impl PacketRouter {
         }
     }
 
-    /// Resolve the sender by *bound address*, verify the HMAC tag and anti-replay window.
+    /// Resolve the sender by *bound address*, verify the tag, decrypt the payload in place and
+    /// check the anti-replay window.
     fn authenticate(
         &self,
-        packet: &AurixPacket,
+        packet: &mut AurixPacket,
         src_addr: SocketAddr,
     ) -> Result<Arc<MediaSession>> {
         let session = self
@@ -142,7 +143,13 @@ impl PacketRouter {
             ));
         }
         if packet.is_authenticated() {
-            if !packet.verify_auth(&session.media_key) {
+            if self.require_packet_auth && !packet.header.has_flag(PacketFlags::Encrypted) {
+                aurix_metrics::PACKETS_DROPPED.inc();
+                return Err(AurixError::AuthenticationFailed(
+                    "Encrypted payload required".into(),
+                ));
+            }
+            if !packet.open(&session.keys) {
                 aurix_metrics::PACKETS_DROPPED.inc();
                 return Err(AurixError::AuthenticationFailed(
                     "Invalid packet authentication tag".into(),
@@ -152,7 +159,7 @@ impl PacketRouter {
                 aurix_metrics::PACKETS_DROPPED.inc();
                 return Err(AurixError::AuthenticationFailed("Replayed packet".into()));
             }
-        } else if self.require_packet_auth {
+        } else if self.require_packet_auth || packet.header.has_flag(PacketFlags::Encrypted) {
             aurix_metrics::PACKETS_DROPPED.inc();
             return Err(AurixError::AuthenticationFailed(
                 "Packet authentication required".into(),
@@ -162,6 +169,11 @@ impl PacketRouter {
     }
 
     async fn handle_session_bind(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
+        if packet.header.has_flag(PacketFlags::Encrypted) {
+            return Err(AurixError::AuthenticationFailed(
+                "SessionBind must be signed, not encrypted".into(),
+            ));
+        }
         let (session_id, unix_ms, _nonce) = packet.parse_session_bind()?;
         let session = self
             .shared
@@ -172,7 +184,7 @@ impl PacketRouter {
         if !session.is_active() {
             return Err(AurixError::SessionNotFound("Session inactive".into()));
         }
-        if !packet.is_authenticated() || !packet.verify_auth(&session.media_key) {
+        if !packet.is_authenticated() || !packet.verify_auth(&session.keys) {
             aurix_metrics::PACKETS_DROPPED.inc();
             return Err(AurixError::AuthenticationFailed(
                 "SessionBind authentication failed".into(),
@@ -214,8 +226,9 @@ impl PacketRouter {
             .sessions_by_addr
             .insert(src_addr, session.clone());
 
-        let ack = AurixPacket::session_bind_ack(session.ssrc, now)
-            .encode_authenticated(&session.media_key);
+        let ack =
+            AurixPacket::session_bind_ack(session.ssrc, session.next_downlink_sequence(), now)
+                .seal(&session.keys);
         let _ = self.socket.send_to(&ack, src_addr).await;
         let _ = self.events.send(MediaEvent::SessionBound {
             session_id,
@@ -401,9 +414,8 @@ impl PacketRouter {
         receivers: Vec<(Arc<MediaSession>, f32)>,
         packet: &AurixPacket,
     ) {
-        // Header+payload is serialized once; each receiver only pays for its own HMAC tag so
-        // downlink packets are authenticated with the receiver's session key.
-        let plain_body = Self::encode_body(packet, None);
+        // Downlink packets are sealed per receiver (encrypted + authenticated with the receiver's
+        // session keys); the volume-attenuated body is built once per distinct volume on demand.
         let e2ee = packet.header.has_flag(PacketFlags::E2ee);
         for (receiver, volume) in receivers {
             if !receiver.is_active() {
@@ -435,10 +447,10 @@ impl PacketRouter {
                         continue;
                     };
                     let out = if !e2ee && (volume - 1.0).abs() > 0.01 {
-                        let body = Self::encode_body(packet, Some(volume));
-                        Self::sign_body(body, &receiver.media_key)
+                        let (header, body) = Self::attenuated_body(packet, volume);
+                        AurixPacket::seal_parts(&header, &body, &receiver.keys)
                     } else {
-                        Self::sign_body(plain_body.clone(), &receiver.media_key)
+                        AurixPacket::seal_parts(&packet.header, &packet.payload, &receiver.keys)
                     };
                     match self.send_udp(&out, addr).await {
                         Ok(n) => {
@@ -459,39 +471,14 @@ impl PacketRouter {
         }
     }
 
-    /// Serialize header + payload with the `Authenticated` flag set (tag appended by `sign_body`).
-    /// `volume` prepends a one-byte attenuation factor and sets `VolumeAttenuated`.
-    fn encode_body(packet: &AurixPacket, volume: Option<f32>) -> BytesMut {
+    /// Payload with a leading one-byte attenuation factor and a header carrying `VolumeAttenuated`.
+    fn attenuated_body(packet: &AurixPacket, volume: f32) -> (PacketHeader, BytesMut) {
         let mut header = packet.header.clone();
-        header.flags |= PacketFlags::Authenticated as u16;
-        let mut buf =
-            BytesMut::with_capacity(HEADER_SIZE + 1 + packet.payload.len() + AUTH_TAG_SIZE);
-        match volume {
-            Some(v) => {
-                let vol_byte = (v.clamp(0.0, 1.0) * 255.0) as u8;
-                let mut combined = BytesMut::with_capacity(1 + packet.payload.len());
-                combined.put_u8(vol_byte);
-                combined.put_slice(&packet.payload);
-                header.flags |= PacketFlags::VolumeAttenuated as u16;
-                header.payload_length = combined.len() as u16;
-                header.checksum = crc32fast::hash(&combined);
-                header.encode(&mut buf);
-                buf.put_slice(&combined);
-            }
-            None => {
-                header.payload_length = packet.payload.len() as u16;
-                header.checksum = crc32fast::hash(&packet.payload);
-                header.encode(&mut buf);
-                buf.put_slice(&packet.payload);
-            }
-        }
-        buf
-    }
-
-    fn sign_body(mut body: BytesMut, key: &[u8]) -> Bytes {
-        let tag = aurix_common::crypto::hmac_sha256(key, &[&body]);
-        body.put_slice(&tag[..AUTH_TAG_SIZE]);
-        body.freeze()
+        header.flags |= PacketFlags::VolumeAttenuated as u16;
+        let mut body = BytesMut::with_capacity(1 + packet.payload.len());
+        body.put_u8((volume.clamp(0.0, 1.0) * 255.0) as u8);
+        body.put_slice(&packet.payload);
+        (header, body)
     }
 
     async fn handle_heartbeat(
@@ -504,14 +491,14 @@ impl PacketRouter {
         let ack = AurixPacket::new(
             PacketHeader::new(
                 PacketType::HeartbeatAck,
-                0,
+                session.next_downlink_sequence(),
                 packet.header.timestamp,
                 packet.header.ssrc,
             ),
             Bytes::new(),
         );
         let bytes = if packet.is_authenticated() {
-            ack.encode_authenticated(&session.media_key)
+            ack.seal(&session.keys)
         } else {
             ack.encode()
         };

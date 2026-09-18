@@ -1,3 +1,4 @@
+use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
     ChannelId, ChannelRole, Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
@@ -5,9 +6,14 @@ use crate::types::{
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+/// AURX wire protocol version. v2 encrypts every authenticated payload (AES-256-CTR with keys
+/// derived from the session media key, see `MediaKeys`) in addition to the HMAC tag of v1.
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const MAGIC_BYTES: [u8; 4] = [0x41, 0x55, 0x52, 0x58];
 pub const MAX_PACKET_SIZE: usize = 1400;
+/// Node-to-node relay datagrams wrap a complete client packet, so they may exceed
+/// `MAX_PACKET_SIZE` by one header and one tag.
+pub const MAX_RELAY_PACKET_SIZE: usize = MAX_PACKET_SIZE + HEADER_SIZE + AUTH_TAG_SIZE;
 pub const HEADER_SIZE: usize = 30;
 /// Length of the truncated HMAC-SHA256 authentication tag appended to authenticated packets.
 pub const AUTH_TAG_SIZE: usize = 16;
@@ -39,6 +45,8 @@ pub enum PacketType {
     SpeakingState = 0x61,
     QualityReport = 0x70,
     BitrateCommand = 0x71,
+    /// Cascade envelope: payload is a complete (plaintext) client packet.
+    Relay = 0x80,
     Error = 0xFF,
 }
 
@@ -63,6 +71,7 @@ impl PacketType {
             0x61 => Some(Self::SpeakingState),
             0x70 => Some(Self::QualityReport),
             0x71 => Some(Self::BitrateCommand),
+            0x80 => Some(Self::Relay),
             0xFF => Some(Self::Error),
             _ => None,
         }
@@ -152,6 +161,7 @@ impl PacketHeader {
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
 pub enum PacketFlags {
+    /// Payload is AES-256-CTR encrypted with the session `MediaKeys` (always set by `seal`).
     Encrypted = 0x0001,
     Compressed = 0x0002,
     Dtx = 0x0004,
@@ -200,15 +210,50 @@ impl AurixPacket {
         buf
     }
 
-    /// Encode with a trailing HMAC-SHA256 tag (truncated to `AUTH_TAG_SIZE`) computed over the
-    /// encoded header and payload using the per-session media key.
-    pub fn encode_authenticated(&self, key: &[u8]) -> BytesMut {
+    /// Append the authentication tag without encrypting the payload. Only for `SessionBind`,
+    /// whose payload the server must read to look up the session key; everything else uses `seal`.
+    pub fn encode_authenticated(&self, keys: &MediaKeys) -> BytesMut {
         let mut buf = BytesMut::with_capacity(HEADER_SIZE + self.payload.len() + AUTH_TAG_SIZE);
         let mut header = self.finalized_header();
         header.flags |= PacketFlags::Authenticated as u16;
+        header.flags &= !(PacketFlags::Encrypted as u16);
         header.encode(&mut buf);
         buf.put_slice(&self.payload);
-        let tag = crate::crypto::hmac_sha256(key, &[&buf]);
+        let tag = crate::crypto::hmac_sha256(keys.auth_key(), &[&buf]);
+        buf.put_slice(&tag[..AUTH_TAG_SIZE]);
+        buf
+    }
+
+    /// Encrypt the payload and append the authentication tag ("seal").
+    ///
+    /// Wire layout: `header(30) | AES-256-CTR(payload) | HMAC-SHA256(auth_key, header|ciphertext)[..16]`.
+    /// The header CRC covers the ciphertext so a plain `decode` still validates integrity
+    /// before any key material is touched. Sets `Encrypted | Authenticated`.
+    pub fn seal(&self, keys: &MediaKeys) -> BytesMut {
+        Self::seal_parts(&self.header, &self.payload, keys)
+    }
+
+    /// `seal` for callers that already hold the header and payload separately (hot path in
+    /// the router, which re-seals one plaintext packet for many receivers).
+    pub fn seal_parts(header: &PacketHeader, payload: &[u8], keys: &MediaKeys) -> BytesMut {
+        let mut header = header.clone();
+        header.flags |= (PacketFlags::Authenticated as u16) | (PacketFlags::Encrypted as u16);
+        header.payload_length = payload.len() as u16;
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + payload.len() + AUTH_TAG_SIZE);
+        buf.resize(HEADER_SIZE, 0);
+        buf.put_slice(payload);
+        let iv = keys.iv(
+            header.packet_type as u8,
+            header.ssrc,
+            header.sequence,
+            header.timestamp,
+        );
+        keys.apply_ctr(&iv, &mut buf[HEADER_SIZE..]);
+        header.checksum = crc32fast::hash(&buf[HEADER_SIZE..]);
+        let mut hdr = BytesMut::with_capacity(HEADER_SIZE);
+        header.encode(&mut hdr);
+        buf[..HEADER_SIZE].copy_from_slice(&hdr);
+        let tag = crate::crypto::hmac_sha256(keys.auth_key(), &[&buf]);
         buf.put_slice(&tag[..AUTH_TAG_SIZE]);
         buf
     }
@@ -216,10 +261,13 @@ impl AurixPacket {
     /// Strict decoder: exact length (no trailing bytes), bounded size, verified checksum.
     /// Authentication tags are extracted but NOT verified here — call `verify_auth`.
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() > MAX_PACKET_SIZE {
-            return Err(AurixError::Transport(
-                "Packet exceeds MAX_PACKET_SIZE".into(),
-            ));
+        Self::decode_bounded(data, MAX_PACKET_SIZE)
+    }
+
+    /// `decode` with an explicit size bound (cascade envelopes use `MAX_RELAY_PACKET_SIZE`).
+    pub fn decode_bounded(data: &[u8], max_size: usize) -> Result<Self> {
+        if data.len() > max_size {
+            return Err(AurixError::Transport("Packet exceeds maximum size".into()));
         }
         let mut bytes = Bytes::copy_from_slice(data);
         let header = PacketHeader::decode(&mut bytes)?;
@@ -251,16 +299,40 @@ impl AurixPacket {
         })
     }
 
-    /// Verify the authentication tag against `key`. Returns false for unauthenticated packets.
-    pub fn verify_auth(&self, key: &[u8]) -> bool {
+    /// Verify the authentication tag against `keys`. Returns false for unauthenticated packets.
+    /// Does not decrypt; use `open` for the full verify-then-decrypt step.
+    pub fn verify_auth(&self, keys: &MediaKeys) -> bool {
         let Some(tag) = self.auth_tag else {
             return false;
         };
         let mut buf = BytesMut::with_capacity(HEADER_SIZE + self.payload.len());
         self.header.encode(&mut buf);
         buf.put_slice(&self.payload);
-        let expected = crate::crypto::hmac_sha256(key, &[&buf]);
+        let expected = crate::crypto::hmac_sha256(keys.auth_key(), &[&buf]);
         crate::crypto::constant_time_eq(&expected[..AUTH_TAG_SIZE], &tag)
+    }
+
+    /// Verify the tag and, if `Encrypted` is set, decrypt the payload in place. On success the
+    /// packet holds the plaintext and the `Encrypted` flag is cleared. Returns false (packet
+    /// untouched) when the packet is unauthenticated or the tag does not match.
+    pub fn open(&mut self, keys: &MediaKeys) -> bool {
+        if !self.verify_auth(keys) {
+            return false;
+        }
+        if self.header.has_flag(PacketFlags::Encrypted) {
+            let iv = keys.iv(
+                self.header.packet_type as u8,
+                self.header.ssrc,
+                self.header.sequence,
+                self.header.timestamp,
+            );
+            let mut plain = self.payload.to_vec();
+            keys.apply_ctr(&iv, &mut plain);
+            self.payload = Bytes::from(plain);
+            self.header.flags &= !(PacketFlags::Encrypted as u16);
+            self.header.checksum = crc32fast::hash(&self.payload);
+        }
+        true
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -288,21 +360,23 @@ impl AurixPacket {
         )
     }
 
-    /// Build a `SessionBind` packet. Must be sent with `encode_authenticated(media_key)`.
+    /// Build a `SessionBind` packet. Must be sent with `encode_authenticated(keys)` (signed,
+    /// not encrypted: the server needs the session id to find the key). The nonce and
+    /// timestamp are mirrored into the header.
     pub fn session_bind(session_id: &SessionId, ssrc: u32, unix_ms: i64, nonce: u64) -> Self {
         let mut payload = Vec::with_capacity(SESSION_BIND_PAYLOAD_SIZE);
         payload.extend_from_slice(session_id.0.as_bytes());
         payload.extend_from_slice(&unix_ms.to_be_bytes());
         payload.extend_from_slice(&nonce.to_be_bytes());
         Self::new(
-            PacketHeader::new(PacketType::SessionBind, 0, 0, ssrc),
+            PacketHeader::new(PacketType::SessionBind, nonce as u32, unix_ms as u32, ssrc),
             Bytes::from(payload),
         )
     }
 
-    pub fn session_bind_ack(ssrc: u32, unix_ms: i64) -> Self {
+    pub fn session_bind_ack(ssrc: u32, seq: u32, unix_ms: i64) -> Self {
         Self::new(
-            PacketHeader::new(PacketType::SessionBindAck, 0, 0, ssrc),
+            PacketHeader::new(PacketType::SessionBindAck, seq, unix_ms as u32, ssrc),
             Bytes::from(unix_ms.to_be_bytes().to_vec()),
         )
     }
@@ -326,21 +400,49 @@ impl AurixPacket {
         let nonce = u64::from_be_bytes(p[24..32].try_into().unwrap());
         Ok((session_id, unix_ms, nonce))
     }
+
+    /// Wrap a plaintext client packet into a cascade `Relay` envelope. `relay_ssrc` identifies
+    /// the sending node (random per process) and `counter` is its 64-bit send counter, split
+    /// across the sequence (low) and timestamp (high) fields so envelope IVs never repeat.
+    pub fn relay_envelope(inner: &AurixPacket, relay_ssrc: u32, counter: u64) -> Self {
+        let mut hdr = PacketHeader::new(
+            PacketType::Relay,
+            counter as u32,
+            (counter >> 32) as u32,
+            relay_ssrc,
+        );
+        hdr.set_flag(PacketFlags::Relay);
+        hdr.channel_id_hash = inner.header.channel_id_hash;
+        Self::new(hdr, inner.encode().freeze())
+    }
+
+    /// Extract the client packet carried by an opened `Relay` envelope.
+    pub fn relay_inner(&self) -> Result<AurixPacket> {
+        if self.header.packet_type != PacketType::Relay {
+            return Err(AurixError::Transport("Not a Relay packet".into()));
+        }
+        AurixPacket::decode(&self.payload)
+    }
 }
 
-/// Anti-replay window for 32-bit sequence numbers (RFC 3711 §3.3.2 style, 64-packet window).
+/// Anti-replay window over a monotonic sequence (RFC 3711 §3.3.2 style, 64-packet window).
+/// Works on 32-bit client sequences and on the 64-bit cascade envelope counter.
 #[derive(Debug, Default, Clone)]
 pub struct ReplayWindow {
-    highest: u32,
+    highest: u64,
     bitmap: u64,
     initialized: bool,
 }
 
 impl ReplayWindow {
-    pub const WINDOW: u32 = 64;
+    pub const WINDOW: u64 = 64;
 
     /// Returns true and records the sequence if it is fresh; false for replays / too-old packets.
     pub fn check_and_update(&mut self, seq: u32) -> bool {
+        self.check_and_update_u64(seq as u64)
+    }
+
+    pub fn check_and_update_u64(&mut self, seq: u64) -> bool {
         if !self.initialized {
             self.initialized = true;
             self.highest = seq;
@@ -587,6 +689,28 @@ pub struct UserPosition {
 mod tests {
     use super::*;
 
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Pinned wire vectors shared with the C# SDK tests (sdk/unity/.../ProtocolTests.cs):
+    /// any change here is a protocol change and must be mirrored in every client.
+    #[test]
+    fn v2_wire_vectors_are_stable() {
+        let keys = MediaKeys::derive(&[7u8; 32]);
+        let pkt = AurixPacket::audio(10, 20, 30, 40, Bytes::from_static(b"opus-frame"));
+        assert_eq!(
+            hex(&pkt.seal(&keys)),
+            "41555258020104010000000a000000140000001e00000028000afa37ba15f071d27d551588a11d2e7f3dcaf9bf4f86642b9ed1df5aee423d"
+        );
+        let sid = SessionId(uuid::Uuid::from_bytes([0x11; 16]));
+        let bind = AurixPacket::session_bind(&sid, 30, 1_700_000_000_000, 0x0102030405060708);
+        assert_eq!(
+            hex(&bind.encode_authenticated(&keys)),
+            "415552580233040005060708cfe568000000001e0000000000200e1d7cbb111111111111111111111111111111110000018bcfe5680001020304050607086b0c72c29a059fa0e0627df1d5942167"
+        );
+    }
+
     #[test]
     fn decode_rejects_trailing_bytes_and_oversize() {
         let pkt = AurixPacket::audio(1, 2, 3, 4, Bytes::from_static(b"hello"));
@@ -607,42 +731,97 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_roundtrip_and_tamper_detection() {
-        let key = [7u8; 32];
+    fn sealed_roundtrip_and_tamper_detection() {
+        let keys = MediaKeys::derive(&[7u8; 32]);
+        let other = MediaKeys::derive(&[8u8; 32]);
         let pkt = AurixPacket::audio(10, 20, 30, 40, Bytes::from_static(b"opus-frame"));
-        let wire = pkt.encode_authenticated(&key);
+        let wire = pkt.seal(&keys);
         let plen = pkt.payload.len();
         assert_eq!(wire.len(), HEADER_SIZE + plen + AUTH_TAG_SIZE);
-        let decoded = AurixPacket::decode(&wire).unwrap();
+        let mut decoded = AurixPacket::decode(&wire).unwrap();
         assert!(decoded.is_authenticated());
-        assert!(decoded.verify_auth(&key));
-        assert!(!decoded.verify_auth(&[8u8; 32]));
+        assert!(decoded.header.has_flag(PacketFlags::Encrypted));
+        // Ciphertext on the wire differs from the plaintext.
+        assert_ne!(&decoded.payload[..], b"opus-frame");
+        assert!(decoded.verify_auth(&keys));
+        assert!(!decoded.verify_auth(&other));
+        let mut wrong = decoded.clone();
+        assert!(!wrong.open(&other));
+        assert!(decoded.open(&keys));
+        assert_eq!(&decoded.payload[..], b"opus-frame");
+        assert!(!decoded.header.has_flag(PacketFlags::Encrypted));
 
         // Flip a payload byte and fix the CRC so only the HMAC catches it.
         let mut wire2 = wire.to_vec();
         wire2[HEADER_SIZE] ^= 0x01;
         let crc = crc32fast::hash(&wire2[HEADER_SIZE..HEADER_SIZE + plen]);
         wire2[26..30].copy_from_slice(&crc.to_be_bytes());
-        let d2 = AurixPacket::decode(&wire2).unwrap();
-        assert!(!d2.verify_auth(&key));
+        let mut d2 = AurixPacket::decode(&wire2).unwrap();
+        assert!(!d2.verify_auth(&keys));
+        assert!(!d2.open(&keys));
 
         // Unauthenticated encoding of the same packet never verifies.
-        let plain = AurixPacket::decode(&pkt.encode()).unwrap();
+        let mut plain = AurixPacket::decode(&pkt.encode()).unwrap();
         assert!(!plain.is_authenticated());
-        assert!(!plain.verify_auth(&key));
+        assert!(!plain.verify_auth(&keys));
+        assert!(!plain.open(&keys));
+    }
+
+    #[test]
+    fn seal_ivs_differ_per_sequence_and_key() {
+        let keys = MediaKeys::derive(&[7u8; 32]);
+        let a = AurixPacket::audio(1, 0, 30, 40, Bytes::from_static(b"same-frame")).seal(&keys);
+        let b = AurixPacket::audio(2, 0, 30, 40, Bytes::from_static(b"same-frame")).seal(&keys);
+        assert_ne!(
+            &a[HEADER_SIZE..HEADER_SIZE + 10],
+            &b[HEADER_SIZE..HEADER_SIZE + 10]
+        );
+        let c = AurixPacket::audio(1, 0, 30, 40, Bytes::from_static(b"same-frame"))
+            .seal(&MediaKeys::derive(&[9u8; 32]));
+        assert_ne!(
+            &a[HEADER_SIZE..HEADER_SIZE + 10],
+            &c[HEADER_SIZE..HEADER_SIZE + 10]
+        );
+        // Deterministic for identical inputs (no hidden randomness in the format).
+        let a2 = AurixPacket::audio(1, 0, 30, 40, Bytes::from_static(b"same-frame")).seal(&keys);
+        assert_eq!(a, a2);
+    }
+
+    #[test]
+    fn relay_envelope_roundtrip() {
+        let keys = MediaKeys::derive(b"cluster-cascade-secret");
+        let inner = AurixPacket::audio(5, 960, 77, 88, Bytes::from_static(b"frame"));
+        let env = AurixPacket::relay_envelope(&inner, 0xDEAD_BEEF, (3u64 << 32) | 9);
+        assert_eq!(env.header.sequence, 9);
+        assert_eq!(env.header.timestamp, 3);
+        assert!(env.header.has_flag(PacketFlags::Relay));
+        let wire = env.seal(&keys);
+        let mut got = AurixPacket::decode_bounded(&wire, MAX_RELAY_PACKET_SIZE).unwrap();
+        assert!(got.open(&keys));
+        let back = got.relay_inner().unwrap();
+        assert_eq!(back.header.sequence, 5);
+        assert_eq!(back.header.ssrc, 77);
+        assert_eq!(back.header.channel_id_hash, 88);
+        assert_eq!(&back.payload[..], b"frame");
+        assert!(!back.is_authenticated());
     }
 
     #[test]
     fn session_bind_roundtrip() {
         let sid = SessionId::new();
         let pkt = AurixPacket::session_bind(&sid, 99, 1_700_000_000_000, 42);
-        let key = [1u8; 32];
-        let decoded = AurixPacket::decode(&pkt.encode_authenticated(&key)).unwrap();
-        assert!(decoded.verify_auth(&key));
+        let keys = MediaKeys::derive(&[1u8; 32]);
+        let mut decoded = AurixPacket::decode(&pkt.encode_authenticated(&keys)).unwrap();
+        assert!(!decoded.header.has_flag(PacketFlags::Encrypted));
+        // Parseable before the key is known …
+        assert_eq!(decoded.parse_session_bind().unwrap().0, sid);
+        // … and verifiable once it is.
+        assert!(decoded.open(&keys));
         let (s, ts, nonce) = decoded.parse_session_bind().unwrap();
         assert_eq!(s, sid);
         assert_eq!(ts, 1_700_000_000_000);
         assert_eq!(nonce, 42);
+        assert_eq!(decoded.header.sequence, 42);
     }
 
     #[test]

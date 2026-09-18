@@ -52,11 +52,17 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 
 ### Security model (short)
 
-* Every AURX packet is HMAC-SHA256-authenticated with a **per-session key** handed out over the
-  authenticated WebSocket. A session must complete a signed `SessionBind` (timestamp + nonce,
-  replay-protected) before the server accepts media from its address; packets from any other
-  address, with a wrong key, wrong SSRC, or outside the replay window are dropped. Downlink
-  packets are signed with the receiver's key.
+* Native media uses **AURX protocol v2**: every packet is encrypted (AES-256-CTR) and
+  HMAC-SHA256-authenticated with keys derived from a **per-session media key** handed out over the
+  authenticated WebSocket (`auth`/`enc`/`salt` sub-keys via HMAC labels; the per-packet IV is built
+  from packet type, SSRC, sequence and timestamp, so a session's monotonic sequence counter makes
+  IVs unique). The tag covers header + ciphertext, so headers cannot be altered either. A session
+  must complete a signed `SessionBind` (the only unencrypted packet — the server needs the session
+  id to pick the key; timestamp + nonce, replay-protected) before the server accepts media from
+  its address; packets from any other address, with a wrong key, wrong SSRC, unencrypted, or
+  outside the replay window are dropped. The server decrypts once per uplink packet and re-seals
+  the downlink individually for every receiver with that receiver's keys, so no participant can
+  read another participant's packets even on a shared network.
 * WebRTC uses DTLS-SRTP; the browser's SSRCs are mapped to the authenticated session.
 * Tenant identity always comes from the validated API key / JWT — never from request bodies.
 * TURN requires MESSAGE-INTEGRITY with long-term credentials derived from the API-issued
@@ -197,7 +203,7 @@ thousands of ports.
 
 Either terminate TLS at a reverse proxy (nginx / Caddy / cloud LB — set `trusted_proxies` so
 client IPs are correct), or point `tls_cert_path`/`tls_key_path` at PEM files and expose 8080/8081
-directly. Media (UDP) is protected by AURX HMAC / DTLS-SRTP regardless of TLS.
+directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regardless of TLS.
 
 ### Scaling out
 
@@ -211,8 +217,10 @@ directly. Media (UDP) is protected by AURX HMAC / DTLS-SRTP regardless of TLS.
   (`media.port + 1`) in `media_nodes`; every `media.cascade_discovery_interval_ms` (default 3 s)
   and immediately after a remote join/leave event, a node reconciles the topology from the
   database — accepted peers are the healthy nodes, and each channel is forwarded only to the nodes
-  that actually hold live memberships for it. Relayed packets carry the `Relay` flag, an HMAC over
-  `cascade_secret`, and pass a per-peer anti-replay window; unknown source addresses are dropped.
+  that actually hold live memberships for it. Relayed packets travel inside a `Relay` envelope
+  encrypted and authenticated with keys derived from `cascade_secret` (the client's plaintext is
+  never on the wire between nodes) and pass a per-peer anti-replay window; unknown source
+  addresses are dropped.
   `media.cascade_peers` remains as an optional static allow-list (e.g. for nodes not in the
   registry) and `media.cascade_discovery=false` returns to fully static full-mesh mode. Node
   addresses must be reachable between nodes on `media.port + 1`/UDP (the `media.external_ip` you
@@ -269,8 +277,8 @@ System dependencies for building: `pkg-config`, `libssl-dev`, `cmake`, `libopus-
 `aurix-loadtest` is a reproducible load generator that behaves like real native clients: it
 creates channels and tokens through the REST API (API key required), opens one WebSocket per
 session, performs an authenticated `SessionBind` over UDP, joins channels and then streams
-HMAC-signed AURX audio from the configured speakers while every member verifies the downlink
-with its own session key (nothing bypasses production validation).
+sealed (encrypted + authenticated) AURX audio from the configured speakers while every member
+opens the downlink with its own session keys (nothing bypasses production validation).
 
 ```bash
 cargo build --release -p aurix-server -p aurix-loadtest
@@ -301,7 +309,7 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 | SDK | Path | Media path | Verified by |
 |-----|------|-----------|-------------|
 | Web (TypeScript) | [`sdk/web`](sdk/web) | WebRTC/Opus via the SFU, WS control plane, demo page | two-browser smoke test (ICE/DTLS, RTP both ways, decoded audio) |
-| Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX over UDP (signed SessionBind, HMAC per packet, replay window), WS control plane | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
+| Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
 
 Both SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
 

@@ -13,6 +13,7 @@
 //! ```
 
 use anyhow::{anyhow, Context, Result};
+use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{channel_id_hash, AurixPacket, ControlMessage, PacketType};
 use aurix_common::types::{ChannelId, SessionId};
 use base64::Engine;
@@ -123,7 +124,7 @@ struct Session {
     >,
     session_id: SessionId,
     ssrc: u32,
-    media_key: Vec<u8>,
+    keys: MediaKeys,
     media_addr: SocketAddr,
     udp: Arc<UdpSocket>,
 }
@@ -184,7 +185,7 @@ async fn setup_session(args: &Args, token: String, channel_id: ChannelId) -> Res
         ws,
         session_id: SessionId::new(),
         ssrc: 0,
-        media_key: Vec::new(),
+        keys: MediaKeys::derive(&[0u8; 32]),
         media_addr: "0.0.0.0:0".parse()?,
         udp,
     };
@@ -198,7 +199,8 @@ async fn setup_session(args: &Args, token: String, channel_id: ChannelId) -> Res
             s.session_id = session_id;
             s.ssrc = ssrc;
             s.media_addr = media_addr.parse()?;
-            s.media_key = base64::engine::general_purpose::STANDARD.decode(media_key)?;
+            let key = base64::engine::general_purpose::STANDARD.decode(media_key)?;
+            s.keys = MediaKeys::derive(&key);
         }
         other => return Err(anyhow!("expected SessionInitAck, got {other:?}")),
     }
@@ -213,13 +215,13 @@ async fn setup_session(args: &Args, token: String, channel_id: ChannelId) -> Res
     let mut bound = false;
     for _ in 0..5 {
         s.udp
-            .send_to(&bind.encode_authenticated(&s.media_key), s.media_addr)
+            .send_to(&bind.encode_authenticated(&s.keys), s.media_addr)
             .await?;
         if let Ok(Ok((n, _))) =
             tokio::time::timeout(Duration::from_millis(500), s.udp.recv_from(&mut buf)).await
         {
-            let p = AurixPacket::decode(&buf[..n])?;
-            if p.header.packet_type == PacketType::SessionBindAck && p.verify_auth(&s.media_key) {
+            let mut p = AurixPacket::decode(&buf[..n])?;
+            if p.header.packet_type == PacketType::SessionBindAck && p.open(&s.keys) {
                 bound = true;
                 break;
             }
@@ -402,7 +404,7 @@ async fn main() -> Result<()> {
         let Session {
             mut ws,
             ssrc,
-            media_key,
+            keys,
             media_addr,
             udp,
             ..
@@ -417,7 +419,7 @@ async fn main() -> Result<()> {
         // Receiver: count authenticated audio packets and their latency.
         {
             let udp = udp.clone();
-            let key = media_key.clone();
+            let key = keys.clone();
             let stats = stats.clone();
             let stop = stop.clone();
             tasks.push(tokio::spawn(async move {
@@ -427,9 +429,9 @@ async fn main() -> Result<()> {
                         _ = stop.notified() => return,
                         r = udp.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { return };
-                            let Ok(p) = AurixPacket::decode(&buf[..n]) else { continue };
+                            let Ok(mut p) = AurixPacket::decode(&buf[..n]) else { continue };
                             if p.header.packet_type != PacketType::Audio { continue; }
-                            if !p.verify_auth(&key) {
+                            if !p.open(&key) {
                                 stats.packets_bad_auth.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
@@ -477,7 +479,7 @@ async fn main() -> Result<()> {
         // Speaker: pps packets/s for the whole phase.
         if is_speaker {
             let udp = udp.clone();
-            let key = media_key.clone();
+            let key = keys.clone();
             let addr = media_addr;
             let hash = channel_id_hash(&ch);
             let stats = stats.clone();
@@ -498,11 +500,7 @@ async fn main() -> Result<()> {
                         hash,
                         Bytes::copy_from_slice(&body),
                     );
-                    if udp
-                        .send_to(&pkt.encode_authenticated(&key), addr)
-                        .await
-                        .is_ok()
-                    {
+                    if udp.send_to(&pkt.seal(&key), addr).await.is_ok() {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 }

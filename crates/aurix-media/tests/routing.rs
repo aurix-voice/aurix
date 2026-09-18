@@ -1,5 +1,6 @@
 //! End-to-end AURX routing tests over real UDP sockets on loopback.
 
+use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::*;
 use aurix_common::types::*;
 use aurix_media::{MediaEvent, SfuNode, SfuOptions};
@@ -34,7 +35,7 @@ impl Client {
         let now = chrono::Utc::now().timestamp_millis();
         let pkt = AurixPacket::session_bind(&self.session.session_id, self.session.ssrc, now, 7);
         self.sock
-            .send_to(&pkt.encode_authenticated(&self.session.media_key), sfu)
+            .send_to(&pkt.encode_authenticated(&self.session.keys), sfu)
             .await
             .unwrap();
         let mut buf = [0u8; 256];
@@ -42,12 +43,14 @@ impl Client {
             .await
             .expect("bind ack")
             .unwrap();
-        let ack = AurixPacket::decode(&buf[..n]).unwrap();
+        let mut ack = AurixPacket::decode(&buf[..n]).unwrap();
         assert_eq!(ack.header.packet_type, PacketType::SessionBindAck);
         assert!(
-            ack.verify_auth(&self.session.media_key),
-            "ack must be authenticated"
+            ack.header.has_flag(PacketFlags::Encrypted),
+            "ack must be encrypted"
         );
+        assert!(ack.open(&self.session.keys), "ack must be authenticated");
+        assert_eq!(ack.payload.len(), 8);
     }
 
     async fn send_audio(&mut self, sfu: SocketAddr, channel: &ChannelId, payload: &[u8]) {
@@ -60,18 +63,30 @@ impl Client {
             Bytes::copy_from_slice(payload),
         );
         self.sock
-            .send_to(&pkt.encode_authenticated(&self.session.media_key), sfu)
+            .send_to(&pkt.seal(&self.session.keys), sfu)
             .await
             .unwrap();
     }
 
-    async fn recv(&self) -> Option<AurixPacket> {
+    /// Receive one downlink packet, asserting it is sealed for this session, and return the
+    /// opened (plaintext) packet together with the ciphertext bytes as seen on the wire.
+    async fn recv_raw(&self) -> Option<(AurixPacket, Vec<u8>)> {
         let mut buf = [0u8; 1500];
         match tokio::time::timeout(Duration::from_millis(300), self.sock.recv_from(&mut buf)).await
         {
-            Ok(Ok((n, _))) => Some(AurixPacket::decode(&buf[..n]).unwrap()),
+            Ok(Ok((n, _))) => {
+                let mut pkt = AurixPacket::decode(&buf[..n]).unwrap();
+                assert!(pkt.header.has_flag(PacketFlags::Encrypted));
+                let wire_payload = pkt.payload.to_vec();
+                assert!(pkt.open(&self.session.keys), "downlink must verify");
+                Some((pkt, wire_payload))
+            }
             _ => None,
         }
+    }
+
+    async fn recv(&self) -> Option<AurixPacket> {
+        self.recv_raw().await.map(|(p, _)| p)
     }
 }
 
@@ -133,9 +148,14 @@ async fn bound_sessions_exchange_audio_and_spoofing_is_rejected() {
     assert!(matches!(bound, MediaEvent::SessionBound { .. }));
 
     a.send_audio(addr, &channel, b"hello-opus").await;
-    let got = b.recv().await.expect("b receives a's audio");
+    let (got, wire) = b.recv_raw().await.expect("b receives a's audio");
     assert_eq!(got.header.ssrc, s_a.ssrc);
     assert_eq!(&got.payload[..], b"hello-opus");
+    assert_ne!(
+        &wire[..],
+        b"hello-opus",
+        "payload must be encrypted on the wire"
+    );
     assert!(a.recv().await.is_none(), "sender must not hear itself");
 
     // Speaking event was emitted for A.
@@ -165,7 +185,7 @@ async fn bound_sessions_exchange_audio_and_spoofing_is_rejected() {
     );
     attacker.send_to(&spoof.encode(), addr).await.unwrap();
     attacker
-        .send_to(&spoof.encode_authenticated(b"guess"), addr)
+        .send_to(&spoof.seal(&MediaKeys::derive(b"guess")), addr)
         .await
         .unwrap();
     assert!(
@@ -186,10 +206,7 @@ async fn bound_sessions_exchange_audio_and_spoofing_is_rejected() {
         channel_id_hash(&channel),
         Bytes::from_static(b"imposter"),
     );
-    b.sock
-        .send_to(&pkt.encode_authenticated(&s_b.media_key), addr)
-        .await
-        .unwrap();
+    b.sock.send_to(&pkt.seal(&s_b.keys), addr).await.unwrap();
     assert!(a.recv().await.is_none());
 
     // Unauthenticated packet from the bound address is rejected when auth is required.
@@ -204,6 +221,37 @@ async fn bound_sessions_exchange_audio_and_spoofing_is_rejected() {
     a.sock.send_to(&pkt.encode(), addr).await.unwrap();
     assert!(b.recv().await.is_none());
 
+    // Signed-but-unencrypted audio is rejected too: v2 requires sealed payloads.
+    let seq = a.next_seq();
+    let pkt = AurixPacket::audio(
+        seq,
+        0,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"signed-plain"),
+    );
+    a.sock
+        .send_to(&pkt.encode_authenticated(&s_a.keys), addr)
+        .await
+        .unwrap();
+    assert!(b.recv().await.is_none());
+
+    // Ciphertext tampering (with a fixed-up CRC) fails the tag and is dropped.
+    let seq = a.next_seq();
+    let pkt = AurixPacket::audio(
+        seq,
+        0,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"tamper-me"),
+    );
+    let mut wire = pkt.seal(&s_a.keys).to_vec();
+    wire[HEADER_SIZE] ^= 0x80;
+    let crc = crc32fast::hash(&wire[HEADER_SIZE..HEADER_SIZE + 9]);
+    wire[26..30].copy_from_slice(&crc.to_be_bytes());
+    a.sock.send_to(&wire, addr).await.unwrap();
+    assert!(b.recv().await.is_none());
+
     // Replay of an already-seen sequence is rejected.
     let replay = AurixPacket::audio(
         2,
@@ -212,10 +260,7 @@ async fn bound_sessions_exchange_audio_and_spoofing_is_rejected() {
         channel_id_hash(&channel),
         Bytes::from_static(b"replay"),
     );
-    a.sock
-        .send_to(&replay.encode_authenticated(&s_a.media_key), addr)
-        .await
-        .unwrap();
+    a.sock.send_to(&replay.seal(&s_a.keys), addr).await.unwrap();
     assert!(b.recv().await.is_none());
 
     // Muted sender is not forwarded.
@@ -253,7 +298,7 @@ async fn capacity_is_enforced_atomically_and_bind_replay_rejected() {
     let mut c = Client::new(s.clone()).await;
     let now = chrono::Utc::now().timestamp_millis();
     let bind =
-        AurixPacket::session_bind(&s.session_id, s.ssrc, now, 1).encode_authenticated(&s.media_key);
+        AurixPacket::session_bind(&s.session_id, s.ssrc, now, 1).encode_authenticated(&s.keys);
     c.sock.send_to(&bind, addr).await.unwrap();
     assert!(c.recv().await.is_some());
     let original = c.sock.local_addr().unwrap();
@@ -270,8 +315,12 @@ async fn capacity_is_enforced_atomically_and_bind_replay_rejected() {
         now - SESSION_BIND_MAX_SKEW_MS - 1000,
         2,
     )
-    .encode_authenticated(&s.media_key);
+    .encode_authenticated(&s.keys);
     attacker.send_to(&stale, addr).await.unwrap();
+
+    // An encrypted SessionBind is refused even with the right key (must be signed-only).
+    let sealed_bind = AurixPacket::session_bind(&s.session_id, s.ssrc, now + 1, 3).seal(&s.keys);
+    attacker.send_to(&sealed_bind, addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(s.get_remote_addr().unwrap(), original);
     let _ = c.next_seq();

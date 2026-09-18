@@ -20,11 +20,12 @@ namespace Aurix.Transport
     }
 
     /// <summary>
-    /// Native AURX/UDP media transport. Every uplink packet is HMAC-authenticated with the
-    /// per-session media key and carries one monotonically increasing sequence number (the server
-    /// keeps one anti-replay window per session, shared by audio, heartbeat and control packets).
-    /// Downlink packets are authenticated by the server with the same key and replay-checked
-    /// per remote SSRC before being exposed.
+    /// Native AURX/UDP media transport (protocol v2). Every uplink packet is sealed with the
+    /// per-session <see cref="MediaKeys"/> (AES-256-CTR payload + HMAC tag) and carries one
+    /// monotonically increasing sequence number (the server keeps one anti-replay window per
+    /// session, shared by audio, heartbeat and control packets). Downlink packets are sealed by
+    /// the server with the same keys, opened here and replay-checked per remote SSRC before
+    /// being exposed. Only the initial <c>SessionBind</c> is signed without encryption.
     /// </summary>
     public sealed class MediaTransport : IDisposable
     {
@@ -32,7 +33,7 @@ namespace Aurix.Transport
 
         private readonly UdpClient _udp;
         private readonly IPEndPoint _server;
-        private readonly byte[] _mediaKey;
+        private readonly MediaKeys _keys;
         private readonly uint _ssrc;
         private readonly Guid _sessionId;
         private readonly ConcurrentQueue<IncomingAudio> _audioInbox = new ConcurrentQueue<IncomingAudio>();
@@ -62,7 +63,8 @@ namespace Aurix.Transport
             _server = server ?? throw new ArgumentNullException(nameof(server));
             _sessionId = sessionId;
             _ssrc = ssrc;
-            _mediaKey = mediaKey ?? throw new ArgumentNullException(nameof(mediaKey));
+            if (mediaKey == null) throw new ArgumentNullException(nameof(mediaKey));
+            _keys = MediaKeys.Derive(mediaKey);
             _udp = new UdpClient(server.AddressFamily);
             _udp.Client.Bind(new IPEndPoint(server.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
             _udp.Client.ReceiveBufferSize = 1 << 20;
@@ -91,7 +93,7 @@ namespace Aurix.Transport
             var nonce = new byte[8];
             using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(nonce);
             var bind = AurxPacket.SessionBind(_sessionId, _ssrc, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), BitConverter.ToUInt64(nonce, 0));
-            var wire = bind.EncodeAuthenticated(_mediaKey);
+            var wire = bind.EncodeAuthenticated(_keys);
             for (int i = 0; i < attempts; i++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -101,7 +103,7 @@ namespace Aurix.Transport
                 if (done != recv) continue;
                 var res = recv.Result;
                 if (!AurxPacket.TryDecode(res.Buffer, out var pkt, out _)) continue;
-                if (pkt.Header.Type == PacketType.SessionBindAck && pkt.VerifyAuth(_mediaKey))
+                if (pkt.Header.Type == PacketType.SessionBindAck && pkt.IsEncrypted && pkt.Open(_keys))
                 {
                     Interlocked.Exchange(ref _lastAckUnixMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                     _cts = new CancellationTokenSource();
@@ -135,7 +137,7 @@ namespace Aurix.Transport
 
         private void Send(AurxPacket packet)
         {
-            var wire = packet.EncodeAuthenticated(_mediaKey);
+            var wire = packet.Seal(_keys);
             try
             {
                 _udp.Send(wire, wire.Length, _server);
@@ -174,7 +176,7 @@ namespace Aurix.Transport
 
                 if (!r.RemoteEndPoint.Equals(_server)) continue;
                 if (!AurxPacket.TryDecode(r.Buffer, out var pkt, out _)) continue;
-                if (!pkt.VerifyAuth(_mediaKey))
+                if (!pkt.IsEncrypted || !pkt.Open(_keys))
                 {
                     Interlocked.Increment(ref _packetsBadAuth);
                     continue;
@@ -224,6 +226,7 @@ namespace Aurix.Transport
             _cts?.Cancel();
             _udp.Dispose();
             _cts?.Dispose();
+            _keys.Dispose();
         }
     }
 }

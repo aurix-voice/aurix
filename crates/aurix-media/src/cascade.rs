@@ -1,20 +1,27 @@
 //! Node-to-node audio relay ("cascade") for channels spanning several SFU nodes.
 //!
-//! Every relayed packet is an AURX packet with the `Relay` flag, authenticated with the
-//! cluster-wide `media.cascade_secret` (HMAC). Packets are accepted only from allowed peers
-//! (statically configured via `media.cascade_peers` and/or discovered from the `media_nodes`
-//! registry), only with a valid tag and only once per (peer, sequence) within the replay window.
+//! Every relayed datagram is a `Relay` envelope (see `AurixPacket::relay_envelope`) carrying the
+//! original client packet, sealed (AES-256-CTR + HMAC) with keys derived from the cluster-wide
+//! `media.cascade_secret`. The envelope's SSRC is a per-process random node id and its 64-bit
+//! counter is spread over the sequence/timestamp fields, so IVs never repeat between nodes and
+//! the per-peer anti-replay window sees one monotonic sequence. Packets are accepted only from
+//! allowed peers (statically configured via `media.cascade_peers` and/or discovered from the
+//! `media_nodes` registry), only with a valid tag and only once per (peer, sequence).
 //!
 //! Topology is per channel: a packet is forwarded only to the nodes that currently host
 //! participants of that channel (see `set_channel_peers`, driven by `CascadeTopology`).
 
+use aurix_common::crypto::MediaKeys;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::protocol::{AurixPacket, PacketFlags, ReplayWindow, HEADER_SIZE};
+use aurix_common::protocol::{
+    AurixPacket, PacketFlags, PacketType, ReplayWindow, HEADER_SIZE, MAX_RELAY_PACKET_SIZE,
+};
 use aurix_common::types::*;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
@@ -30,7 +37,9 @@ pub struct CascadeRelay {
     dynamic_peers: Mutex<HashSet<SocketAddr>>,
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
-    secret: Vec<u8>,
+    keys: MediaKeys,
+    relay_ssrc: u32,
+    relay_counter: AtomicU64,
     local_node_id: MediaNodeId,
 }
 
@@ -73,7 +82,9 @@ impl CascadeRelay {
             dynamic_peers: Mutex::new(HashSet::new()),
             socket: Arc::new(socket),
             local_addr,
-            secret: secret.as_bytes().to_vec(),
+            keys: MediaKeys::derive(secret.as_bytes()),
+            relay_ssrc: rand::random(),
+            relay_counter: AtomicU64::new(0),
             local_node_id,
         })
     }
@@ -181,9 +192,10 @@ impl CascadeRelay {
             Some(p) if !p.is_empty() => p.value().clone(),
             _ => return,
         };
-        let mut relay_packet = packet.clone();
-        relay_packet.header.set_flag(PacketFlags::Relay);
-        let data = relay_packet.encode_authenticated(&self.secret).freeze();
+        let counter = self.relay_counter.fetch_add(1, Ordering::Relaxed);
+        let data = AurixPacket::relay_envelope(packet, self.relay_ssrc, counter)
+            .seal(&self.keys)
+            .freeze();
         for peer_addr in peers {
             if let Err(e) = self.socket.send_to(&data, peer_addr).await {
                 warn!("Cascade forward to {} failed: {}", peer_addr, e);
@@ -191,30 +203,40 @@ impl CascadeRelay {
         }
     }
 
-    /// Validate an inbound relayed datagram: known peer, HMAC, Relay flag, replay window.
+    /// Validate an inbound relayed datagram (known peer, tag, Relay envelope, replay window)
+    /// and return the plaintext client packet it carries.
     pub fn authenticate_inbound(&self, data: &[u8], src: SocketAddr) -> Result<AurixPacket> {
         let window = self.allowed_peers.get(&src).ok_or_else(|| {
             AurixError::AuthorizationDenied(format!("Cascade packet from unknown peer {src}"))
         })?;
-        let packet = AurixPacket::decode(data)?;
-        if !packet.header.has_flag(PacketFlags::Relay) {
+        let mut envelope = AurixPacket::decode_bounded(data, MAX_RELAY_PACKET_SIZE)?;
+        if envelope.header.packet_type != PacketType::Relay
+            || !envelope.header.has_flag(PacketFlags::Relay)
+        {
             return Err(AurixError::Transport(
-                "Cascade packet without Relay flag".into(),
+                "Cascade datagram is not a Relay envelope".into(),
             ));
         }
-        if !packet.is_authenticated() || !packet.verify_auth(&self.secret) {
+        if !envelope.open(&self.keys) {
             return Err(AurixError::AuthenticationFailed(
                 "Cascade packet authentication failed".into(),
             ));
         }
-        // Sequence space is per (peer, ssrc); fold the ssrc in so multiple remote users don't collide.
-        let seq = packet.header.sequence ^ packet.header.ssrc.rotate_left(16);
-        if !window.lock().check_and_update(seq) {
+        let counter = ((envelope.header.timestamp as u64) << 32) | envelope.header.sequence as u64;
+        if !window.lock().check_and_update_u64(counter) {
             return Err(AurixError::AuthenticationFailed(
                 "Replayed cascade packet".into(),
             ));
         }
-        Ok(packet)
+        let inner = envelope.relay_inner()?;
+        if inner.header.packet_type != PacketType::Audio
+            && inner.header.packet_type != PacketType::AudioFec
+        {
+            return Err(AurixError::Transport(
+                "Relay envelope must carry an audio packet".into(),
+            ));
+        }
+        Ok(inner)
     }
 
     /// Receive relayed packets from peers and hand authenticated ones to `on_packet`.
@@ -269,18 +291,25 @@ mod tests {
         .await
         .unwrap();
 
-        let mut pkt = AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus"));
-        pkt.header.set_flag(PacketFlags::Relay);
-        let good = pkt.encode_authenticated(b"0123456789abcdef");
-        let bad = pkt.encode_authenticated(b"wrong-secret-wrong-secret");
-        let unauth = pkt.encode();
+        let pkt = AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus"));
+        let env = AurixPacket::relay_envelope(&pkt, 0x1234, 1);
+        let good = env.seal(&MediaKeys::derive(b"0123456789abcdef"));
+        let bad = env.seal(&MediaKeys::derive(b"wrong-secret-wrong-secret"));
+        let unauth = env.encode();
+        // A bare (non-envelope) client packet sealed with the right key is refused too.
+        let mut bare = pkt.clone();
+        bare.header.set_flag(PacketFlags::Relay);
+        let bare = bare.seal(&MediaKeys::derive(b"0123456789abcdef"));
 
         assert!(relay
             .authenticate_inbound(&good, "127.0.0.1:45002".parse().unwrap())
             .is_err());
         assert!(relay.authenticate_inbound(&bad, peer).is_err());
         assert!(relay.authenticate_inbound(&unauth, peer).is_err());
-        assert!(relay.authenticate_inbound(&good, peer).is_ok());
+        assert!(relay.authenticate_inbound(&bare, peer).is_err());
+        let inner = relay.authenticate_inbound(&good, peer).unwrap();
+        assert_eq!(inner.header.ssrc, 42);
+        assert_eq!(&inner.payload[..], b"opus");
         assert!(
             relay.authenticate_inbound(&good, peer).is_err(),
             "replay must be rejected"
@@ -311,19 +340,20 @@ mod tests {
         relay.set_channel_peers(ch, &[dyn_a, dyn_b, "127.0.0.1:1".parse().unwrap()]);
         assert_eq!(relay.channel_peers(&ch).len(), 2);
 
-        let mut pkt = AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus"));
-        pkt.header.set_flag(PacketFlags::Relay);
-        let good = pkt.encode_authenticated(b"0123456789abcdef");
+        let keys = MediaKeys::derive(b"0123456789abcdef");
+        let pkt = AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus"));
+        let good = AurixPacket::relay_envelope(&pkt, 0x1234, 1).seal(&keys);
         assert!(relay.authenticate_inbound(&good, dyn_b).is_ok());
 
         // Node B went away: its address must be refused and removed from channels.
         relay.set_dynamic_peers([dyn_a].into_iter().collect());
         assert_eq!(relay.channel_peers(&ch), vec![dyn_a]);
-        let pkt2 = {
-            let mut p = AurixPacket::audio(1, 0, 43, 7, Bytes::from_static(b"opus"));
-            p.header.set_flag(PacketFlags::Relay);
-            p.encode_authenticated(b"0123456789abcdef")
-        };
+        let pkt2 = AurixPacket::relay_envelope(
+            &AurixPacket::audio(1, 0, 43, 7, Bytes::from_static(b"opus")),
+            0x1234,
+            2,
+        )
+        .seal(&keys);
         assert!(relay.authenticate_inbound(&pkt2, dyn_b).is_err());
         assert!(relay.authenticate_inbound(&pkt2, dyn_a).is_ok());
 

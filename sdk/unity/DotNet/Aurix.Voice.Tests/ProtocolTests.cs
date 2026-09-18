@@ -33,28 +33,47 @@ namespace Aurix.Voice.Tests
             var wire = pkt.Encode();
             Assert.Equal(AurxPacket.HeaderSize + 3, wire.Length);
             Assert.Equal((byte)'A', wire[0]); Assert.Equal((byte)'X', wire[3]);
-            Assert.Equal(1, wire[4]);
+            Assert.Equal(2, wire[4]); // protocol v2
             Assert.Equal(0x01, wire[5]);
             Assert.Equal(new byte[] { 0x01, 0x02, 0x03, 0x04 }, wire[8..12]);
             Assert.Equal(new byte[] { 0x0D, 0x0E, 0x0F, 0x10 }, wire[20..24]);
             Assert.Equal(new byte[] { 0x00, 0x03 }, wire[24..26]);
         }
 
-        [Fact]
-        public void AuthenticatedRoundTripAndTamperDetection()
+        private static MediaKeys Keys(byte fill)
         {
             var key = new byte[32];
-            for (int i = 0; i < key.Length; i++) key[i] = 7;
+            for (int i = 0; i < key.Length; i++) key[i] = fill;
+            return MediaKeys.Derive(key);
+        }
+
+        private static byte[] FromHex(string hex)
+        {
+            var b = new byte[hex.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return b;
+        }
+
+        [Fact]
+        public void SealedRoundTripAndTamperDetection()
+        {
+            var key = Keys(7);
             var pkt = AurxPacket.Audio(10, 20, 30, 40, Encoding.ASCII.GetBytes("opus-frame"));
-            var wire = pkt.EncodeAuthenticated(key);
+            var wire = pkt.Seal(key);
             Assert.Equal(AurxPacket.HeaderSize + 10 + AurxPacket.AuthTagSize, wire.Length);
+            // Ciphertext on the wire, never the plaintext.
+            Assert.NotEqual(Encoding.ASCII.GetBytes("opus-frame"), wire[AurxPacket.HeaderSize..(AurxPacket.HeaderSize + 10)]);
 
             Assert.True(AurxPacket.TryDecode(wire, out var decoded, out var err), err);
             Assert.True(decoded.IsAuthenticated);
-            Assert.True(decoded.VerifyAuth(key));
-            var other = new byte[32];
-            for (int i = 0; i < other.Length; i++) other[i] = 8;
-            Assert.False(decoded.VerifyAuth(other));
+            Assert.True(decoded.IsEncrypted);
+            Assert.True(decoded.Open(key));
+            Assert.False(decoded.IsEncrypted);
+            Assert.Equal("opus-frame", Encoding.ASCII.GetString(decoded.Payload));
+
+            Assert.True(AurxPacket.TryDecode(wire, out var wrongKey, out _));
+            Assert.False(wrongKey.Open(Keys(8)));
+            Assert.True(wrongKey.IsEncrypted); // untouched on failure
 
             // Flip a payload byte and fix the CRC so only the HMAC catches it.
             var tampered = (byte[])wire.Clone();
@@ -62,7 +81,51 @@ namespace Aurix.Voice.Tests
             var crc = Crc32.Compute(new ReadOnlySpan<byte>(tampered, AurxPacket.HeaderSize, 10));
             tampered[26] = (byte)(crc >> 24); tampered[27] = (byte)(crc >> 16); tampered[28] = (byte)(crc >> 8); tampered[29] = (byte)crc;
             Assert.True(AurxPacket.TryDecode(tampered, out var d2, out _));
-            Assert.False(d2.VerifyAuth(key));
+            Assert.False(d2.Open(key));
+
+            // Header tampering (sequence) is caught too: the tag covers the header.
+            var hdrTamper = (byte[])wire.Clone();
+            hdrTamper[11] ^= 0x01;
+            Assert.True(AurxPacket.TryDecode(hdrTamper, out var d3, out _));
+            Assert.False(d3.Open(key));
+        }
+
+        [Fact]
+        public void WireVectorsMatchServer()
+        {
+            // Pinned in crates/aurix-common/src/protocol.rs (v2_wire_vectors_are_stable).
+            var key = Keys(7);
+            var pkt = AurxPacket.Audio(10, 20, 30, 40, Encoding.ASCII.GetBytes("opus-frame"));
+            Assert.Equal(
+                FromHex("41555258020104010000000a000000140000001e00000028000afa37ba15f071d27d551588a11d2e7f3dcaf9bf4f86642b9ed1df5aee423d"),
+                pkt.Seal(key));
+            var sid = UuidBytes.Read(FromHex("11111111111111111111111111111111"));
+            var bind = AurxPacket.SessionBind(sid, 30, 1_700_000_000_000L, 0x0102030405060708UL);
+            Assert.Equal(
+                FromHex("415552580233040005060708cfe568000000001e0000000000200e1d7cbb111111111111111111111111111111110000018bcfe5680001020304050607086b0c72c29a059fa0e0627df1d5942167"),
+                bind.EncodeAuthenticated(key));
+        }
+
+        [Fact]
+        public void SessionBindIsSignedNotEncryptedAndDifferentPacketsGetDifferentKeystreams()
+        {
+            var key = Keys(1);
+            var bind = AurxPacket.SessionBind(Guid.NewGuid(), 5, 1_700_000_000_000L, 42).EncodeAuthenticated(key);
+            Assert.True(AurxPacket.TryDecode(bind, out var b, out _));
+            Assert.True(b.IsAuthenticated);
+            Assert.False(b.IsEncrypted);
+            Assert.True(b.VerifyAuth(key));
+            Assert.Equal(AurxPacket.SessionBindPayloadSize, b.Payload.Length);
+
+            var body = new byte[64];
+            var w1 = AurxPacket.Audio(1, 960, 9, 1, body).Seal(key);
+            var w2 = AurxPacket.Audio(2, 1920, 9, 1, body).Seal(key);
+            Assert.NotEqual(w1[AurxPacket.HeaderSize..(AurxPacket.HeaderSize + 64)], w2[AurxPacket.HeaderSize..(AurxPacket.HeaderSize + 64)]);
+            // Empty payloads (heartbeats) seal and open too.
+            var hb = AurxPacket.Heartbeat(3, 9, 0).Seal(key);
+            Assert.True(AurxPacket.TryDecode(hb, out var h, out _));
+            Assert.True(h.Open(key));
+            Assert.Empty(h.Payload);
         }
 
         [Fact]

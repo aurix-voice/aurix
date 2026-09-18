@@ -1,3 +1,4 @@
+use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::ReplayWindow;
 use aurix_common::types::*;
 use chrono::{DateTime, Utc};
@@ -22,8 +23,10 @@ pub struct MediaSession {
     pub app_id: AppId,
     pub display_name: String,
     pub ssrc: u32,
-    /// Per-session HMAC key handed to the client over the authenticated control channel.
+    /// Per-session master media key handed to the client over the authenticated control channel.
     pub media_key: [u8; 32],
+    /// Authentication/encryption keys derived from `media_key` (see `MediaKeys`).
+    pub keys: MediaKeys,
     pub transport: RwLock<Transport>,
     pub remote_addr: RwLock<Option<SocketAddr>>,
     pub channels: RwLock<Vec<ChannelId>>,
@@ -31,6 +34,9 @@ pub struct MediaSession {
     pub is_server_muted: AtomicBool,
     pub is_speaking: AtomicBool,
     pub sequence: AtomicU32,
+    /// Sequence counter for server-originated packets addressed to this session
+    /// (acks, commands); keeps their encryption IVs unique under the session key.
+    pub downlink_sequence: AtomicU32,
     pub last_audio_timestamp: AtomicU64,
     /// Wall-clock ms of the last audio packet, used for the speaking timeout.
     pub last_audio_at_ms: AtomicI64,
@@ -65,6 +71,7 @@ impl MediaSession {
             display_name,
             ssrc,
             media_key,
+            keys: MediaKeys::derive(&media_key),
             transport: RwLock::new(Transport::Aurx),
             remote_addr: RwLock::new(None),
             channels: RwLock::new(Vec::new()),
@@ -72,6 +79,7 @@ impl MediaSession {
             is_server_muted: AtomicBool::new(false),
             is_speaking: AtomicBool::new(false),
             sequence: AtomicU32::new(0),
+            downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
             last_audio_at_ms: AtomicI64::new(0),
             last_heartbeat: RwLock::new(Utc::now()),
@@ -96,6 +104,10 @@ impl MediaSession {
 
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
+    }
+
+    pub fn next_downlink_sequence(&self) -> u32 {
+        self.downlink_sequence.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn deactivate(&self) {

@@ -12,7 +12,10 @@
 //! authenticated AURX SessionBind -> audio routed Alice -> Bob over UDP ->
 //! TURN credentials from the API accepted by the TURN server -> leave/close persisted.
 
-use aurix_common::protocol::{channel_id_hash, AurixPacket, ControlMessage, PacketType};
+use aurix_common::crypto::MediaKeys;
+use aurix_common::protocol::{
+    channel_id_hash, AurixPacket, ControlMessage, PacketFlags, PacketType,
+};
 use aurix_common::types::{ChannelId, RecordingConsent, SessionId};
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use base64::Engine;
@@ -47,7 +50,7 @@ struct Player {
     >,
     session_id: SessionId,
     ssrc: u32,
-    media_key: Vec<u8>,
+    keys: MediaKeys,
     media_addr: SocketAddr,
     udp: UdpSocket,
 }
@@ -102,7 +105,20 @@ impl Player {
     async fn recv_udp(&self) -> Option<AurixPacket> {
         let mut buf = vec![0u8; 2048];
         match tokio::time::timeout(Duration::from_secs(3), self.udp.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => Some(AurixPacket::decode(&buf[..n]).expect("bad AURX packet")),
+            Ok(Ok((n, _))) => {
+                let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+                assert!(
+                    p.header.has_flag(PacketFlags::Encrypted),
+                    "{}: downlink must be encrypted",
+                    self.name
+                );
+                assert!(
+                    p.open(&self.keys),
+                    "{}: downlink must be sealed with this session's key",
+                    self.name
+                );
+                Some(p)
+            }
             _ => None,
         }
     }
@@ -174,7 +190,7 @@ async fn connect(env: &Env, name: &'static str, token: String) -> Player {
         ws,
         session_id,
         ssrc,
-        media_key,
+        keys: MediaKeys::derive(&media_key),
         media_addr: media_addr.parse().unwrap(),
         udp,
     }
@@ -187,15 +203,12 @@ fn now_ms() -> i64 {
 async fn bind_media(p: &mut Player) {
     let pkt = AurixPacket::session_bind(&p.session_id, p.ssrc, now_ms(), rand::random());
     p.udp
-        .send_to(&pkt.encode_authenticated(&p.media_key), p.media_addr)
+        .send_to(&pkt.encode_authenticated(&p.keys), p.media_addr)
         .await
         .unwrap();
     let ack = p.recv_udp().await.expect("no SessionBindAck");
     assert_eq!(ack.header.packet_type, PacketType::SessionBindAck);
-    assert!(
-        ack.verify_auth(&p.media_key),
-        "bind ack must be authenticated"
-    );
+    assert_eq!(ack.payload.len(), 8, "bind ack carries the server unix_ms");
     let m = p
         .expect("MediaBound", |m| {
             matches!(m, ControlMessage::MediaBound { .. })
@@ -296,10 +309,7 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         let pkt = AurixPacket::audio(i + 1, (i + 1) * 960, alice.ssrc, hash, payload.clone());
         alice
             .udp
-            .send_to(
-                &pkt.encode_authenticated(&alice.media_key),
-                alice.media_addr,
-            )
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -308,10 +318,6 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         if p.header.packet_type == PacketType::Audio {
             assert_eq!(p.header.ssrc, alice.ssrc, "downlink must carry sender SSRC");
             assert_eq!(&p.payload[..], &payload[..]);
-            assert!(
-                p.verify_auth(&bob.media_key),
-                "downlink must be authenticated with Bob's key"
-            );
             got += 1;
         }
         if got >= 5 {
@@ -329,7 +335,7 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         Bytes::from_static(b"forged"),
     );
     bob.udp
-        .send_to(&forged.encode_authenticated(&bob.media_key), bob.media_addr)
+        .send_to(&forged.seal(&bob.keys), bob.media_addr)
         .await
         .unwrap();
     let stray = AurixPacket::audio(
@@ -383,10 +389,7 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         let pkt = AurixPacket::audio(i + 1, (i + 1) * 960, alice.ssrc, hash, payload.clone());
         alice
             .udp
-            .send_to(
-                &pkt.encode_authenticated(&alice.media_key),
-                alice.media_addr,
-            )
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -616,10 +619,7 @@ async fn two_nodes_auto_cascade_relays_audio() {
             let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
             alice
                 .udp
-                .send_to(
-                    &pkt.encode_authenticated(&alice.media_key),
-                    alice.media_addr,
-                )
+                .send_to(&pkt.seal(&alice.keys), alice.media_addr)
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -628,14 +628,14 @@ async fn two_nodes_auto_cascade_relays_audio() {
         while let Ok(Ok((n, _))) =
             tokio::time::timeout(Duration::from_millis(300), bob.udp.recv_from(&mut buf)).await
         {
-            let p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+            let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+            assert!(
+                p.open(&bob.keys),
+                "relayed downlink must be re-sealed with Bob's key"
+            );
             if p.header.packet_type == PacketType::Audio {
                 assert_eq!(p.header.ssrc, alice.ssrc);
                 assert_eq!(&p.payload[..], &payload[..]);
-                assert!(
-                    p.verify_auth(&bob.media_key),
-                    "relayed downlink must be re-signed with Bob's key"
-                );
                 got += 1;
             }
         }
@@ -659,10 +659,7 @@ async fn two_nodes_auto_cascade_relays_audio() {
         let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
         alice
             .udp
-            .send_to(
-                &pkt.encode_authenticated(&alice.media_key),
-                alice.media_addr,
-            )
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;

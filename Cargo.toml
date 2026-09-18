@@ -45,6 +45,8 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 aes-gcm = "0.10"
+aes = "0.8"
+ctr = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.31"

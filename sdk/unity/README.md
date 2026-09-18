@@ -9,7 +9,7 @@ sdk/unity/
 ├── package.json                 UPM package (com.aurix.voice) — add via "Add package from disk…" or a git URL
 ├── Runtime/
 │   ├── AurixVoiceClient.cs      high-level client: connect → bind media → join channels → audio/events
-│   ├── Protocol/                AURX packet codec (CRC32, HMAC-SHA256, replay window), control-message JSON
+│   ├── Protocol/                AURX v2 packet codec (CRC32, AES-256-CTR + HMAC-SHA256, key derivation, replay window), control-message JSON
 │   ├── Transport/               ControlChannel (ClientWebSocket), MediaTransport (UDP, SessionBind, heartbeats)
 │   ├── Audio/                   IOpusCodec abstraction, JitterBuffer, RemoteMixer
 │   └── Unity/AurixVoiceBehaviour.cs  MonoBehaviour: microphone capture + AudioSource playback
@@ -23,11 +23,12 @@ sdk/unity/
    API keys never ship inside a build.
 2. The client opens the WebSocket with subprotocols `aurix` and `bearer.<jwt>`; the server replies `SessionInitAck`
    with `session_id`, `ssrc`, `media_addr` and a base64 **media key** unique to this session.
-3. The client sends an HMAC-SHA256-signed `SessionBind` (session id, timestamp, nonce) over UDP and waits for a signed
-   `SessionBindAck`. From then on the server only accepts media for this SSRC from that source address.
-4. Every uplink packet is signed with the media key; every downlink packet is verified before it reaches your audio
-   code (`PacketsBadAuth` / `PacketsReplayed` counters expose rejected traffic). Replays are dropped with a 64-packet
-   window per remote SSRC, identical to the server.
+3. The client derives the session `MediaKeys` (auth / encryption / IV-salt sub-keys) from the media key and sends an
+   HMAC-signed `SessionBind` (session id, timestamp, nonce; the only packet that is not encrypted) over UDP, then
+   waits for a sealed `SessionBindAck`. From then on the server only accepts media for this SSRC from that source address.
+4. Every uplink packet is sealed (AES-256-CTR payload + HMAC tag over header and ciphertext); every downlink packet is
+   opened (verified, then decrypted) before it reaches your audio code (`PacketsBadAuth` / `PacketsReplayed` counters
+   expose rejected traffic). Replays are dropped with a 64-packet window per remote SSRC, identical to the server.
 
 ## Unity quick start
 
@@ -76,7 +77,7 @@ bitrate adaptation.
 ```bash
 cd sdk/unity/DotNet
 dotnet build                     # library (netstandard2.1) + tests + demo, warnings as errors
-dotnet test                      # packet layout, CRC32/UUID vectors, HMAC tamper detection, replay window, JSON, jitter buffer
+dotnet test                      # packet layout, CRC32/UUID vectors, seal/open + tamper detection, server wire vectors, replay window, JSON, jitter buffer
 AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081/ws
 ```
 

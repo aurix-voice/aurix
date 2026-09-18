@@ -160,7 +160,7 @@ async fn browser_and_aurx_client_hear_each_other() {
         1,
     );
     native_sock
-        .send_to(&bind.encode_authenticated(&native.media_key), sfu_addr)
+        .send_to(&bind.encode_authenticated(&native.keys), sfu_addr)
         .await
         .unwrap();
     let mut buf = [0u8; 256];
@@ -214,7 +214,11 @@ async fn browser_and_aurx_client_hear_each_other() {
     while let Ok(Ok((n, _))) =
         tokio::time::timeout(Duration::from_millis(300), native_sock.recv_from(&mut nbuf)).await
     {
-        let pkt = AurixPacket::decode(&nbuf[..n]).unwrap();
+        let mut pkt = AurixPacket::decode(&nbuf[..n]).unwrap();
+        assert!(
+            pkt.open(&native.keys),
+            "downlink must be sealed for the native session"
+        );
         if pkt.header.packet_type == PacketType::Audio {
             assert_eq!(pkt.header.ssrc, browser_session.ssrc);
             assert_eq!(pkt.header.channel_id_hash, channel_id_hash(&channel));
@@ -237,7 +241,7 @@ async fn browser_and_aurx_client_hear_each_other() {
             Bytes::from(frame.clone()),
         );
         native_sock
-            .send_to(&pkt.encode_authenticated(&native.media_key), sfu_addr)
+            .send_to(&pkt.seal(&native.keys), sfu_addr)
             .await
             .unwrap();
         browser.run_for(Duration::from_millis(20)).await;

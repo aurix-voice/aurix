@@ -1,4 +1,5 @@
 use crate::error::{AurixError, Result};
+use aes::cipher::{InnerIvInit, StreamCipher, StreamCipherCoreWrapper};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use ring::rand::SecureRandom;
@@ -8,6 +9,76 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
+type Aes256CtrCore = ctr::CtrCore<aes::Aes256, ctr::flavors::Ctr128BE>;
+
+/// Per-session AURX media keys derived from the 32-byte master key handed out in
+/// `SessionInitAck` (or from the cluster cascade secret for node-to-node relay).
+///
+/// ```text
+/// auth = HMAC-SHA256(master, "AURXv2 auth")        -- packet authentication (truncated tag)
+/// enc  = HMAC-SHA256(master, "AURXv2 enc")         -- AES-256-CTR payload encryption
+/// salt = HMAC-SHA256(master, "AURXv2 salt")[0..16] -- XORed into the per-packet IV
+/// ```
+///
+/// The IV of a packet is `salt XOR (type(1) | 0(1) | ssrc(4) | seq(4) | ts(4) | 0(2))`;
+/// the trailing 16 zero bits are the CTR block counter, so a sender must never reuse
+/// `(type, ssrc, sequence, timestamp)` under one key. Clients satisfy this with a single
+/// monotonic sequence counter (which the server's anti-replay window already requires).
+#[derive(Clone)]
+pub struct MediaKeys {
+    auth: [u8; 32],
+    cipher: aes::Aes256,
+    salt: [u8; 16],
+}
+
+impl std::fmt::Debug for MediaKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediaKeys(..)")
+    }
+}
+
+impl MediaKeys {
+    pub const IV_SIZE: usize = 16;
+
+    pub fn derive(master: &[u8]) -> Self {
+        let auth = hmac_sha256(master, &[b"AURXv2 auth"]);
+        let enc = hmac_sha256(master, &[b"AURXv2 enc"]);
+        let salt_full = hmac_sha256(master, &[b"AURXv2 salt"]);
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&salt_full[..16]);
+        Self {
+            auth,
+            cipher: <aes::Aes256 as aes::cipher::KeyInit>::new((&enc).into()),
+            salt,
+        }
+    }
+
+    pub fn auth_key(&self) -> &[u8; 32] {
+        &self.auth
+    }
+
+    pub fn iv(&self, packet_type: u8, ssrc: u32, sequence: u32, timestamp: u32) -> [u8; 16] {
+        let mut iv = [0u8; 16];
+        iv[0] = packet_type;
+        iv[2..6].copy_from_slice(&ssrc.to_be_bytes());
+        iv[6..10].copy_from_slice(&sequence.to_be_bytes());
+        iv[10..14].copy_from_slice(&timestamp.to_be_bytes());
+        for (b, s) in iv.iter_mut().zip(self.salt.iter()) {
+            *b ^= s;
+        }
+        iv
+    }
+
+    /// AES-256-CTR keystream application (encryption and decryption are the same operation).
+    pub fn apply_ctr(&self, iv: &[u8; 16], data: &mut [u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let core = Aes256CtrCore::inner_iv_init(self.cipher.clone(), iv.into());
+        let mut ctr = StreamCipherCoreWrapper::from_core(core);
+        ctr.apply_keystream(data);
+    }
+}
 
 pub struct CryptoProvider {
     rng: ring_rand::SystemRandom,
