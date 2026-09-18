@@ -13,6 +13,8 @@ pub enum ServerEvent {
         user_id: UserId,
         display_name: String,
         session_id: SessionId,
+        #[serde(default)]
+        ssrc: u32,
         timestamp: DateTime<Utc>,
     },
     ParticipantLeft {
@@ -105,6 +107,15 @@ pub enum ServerEvent {
         initiated_by: UserId,
         timestamp: DateTime<Utc>,
     },
+    /// Persistent cross-mute between two players changed; every node applies it to the live
+    /// sessions of both parties.
+    UserBlockChanged {
+        app_id: AppId,
+        user_id: UserId,
+        blocked_user_id: UserId,
+        blocked: bool,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl ServerEvent {
@@ -123,7 +134,8 @@ impl ServerEvent {
             | Self::ModerationEvent { app_id, .. }
             | Self::RecordingStarted { app_id, .. }
             | Self::RecordingStopped { app_id, .. }
-            | Self::RecordingConsentRequired { app_id, .. } => Some(*app_id),
+            | Self::RecordingConsentRequired { app_id, .. }
+            | Self::UserBlockChanged { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } => None,
         }
     }

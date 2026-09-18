@@ -138,9 +138,13 @@ namespace Aurix.Protocol
         public bool IsAuthenticated => AuthTag != null;
         public bool IsEncrypted => (Header.Flags & PacketFlags.Encrypted) != 0;
 
-        /// <summary>Attenuation factor (0..1) carried by server-mixed downlink packets, or 1.0.</summary>
+        /// <summary>Fixed-point gain byte scale: 128 = unchanged (1.0), 0 = silence, 255 ≈ 2.0 (+6 dB).</summary>
+        public const float VolumeUnity = 128f;
+
+        /// <summary>Gain factor (0..~2) carried by server-mixed downlink packets (positional attenuation ×
+        /// the per-participant volume this client asked for), or 1.0.</summary>
         public float Volume => (Header.Flags & PacketFlags.VolumeAttenuated) != 0 && Payload.Length > 0
-            ? Payload[0] / 255f
+            ? Payload[0] / VolumeUnity
             : 1f;
 
         /// <summary>Audio bytes without the optional leading volume byte.</summary>

@@ -34,6 +34,25 @@ client.updatePosition(channelId, { x: 0, y: 0, z: 0 }, { forward_x: 0, forward_y
 client.disconnect();
 ```
 
+### Local mute, per-participant volume, block
+
+These are *receiver-local*: they change what you hear, are enforced on the server before the
+audio is forwarded to you, and the other player is never told.
+
+```ts
+client.setParticipantMuted(userId, true, channelId);  // silence them in one channel
+client.setParticipantMuted(userId, true);             // …or in every channel
+client.isParticipantMuted(userId, channelId);         // true if muted there or everywhere
+client.setParticipantVolume(userId, 0.5);             // 0 (silence) … 1 (unity) … 2 (~+6 dB); RangeError otherwise
+client.setUserBlocked(userId, true);                  // persistent, mutual; survives sessions and channels
+client.on('userBlockChanged', (userId, blocked) => refreshBlockList(client.getBlockedUsers()));
+client.on('receiverPreferences', (prefs) => { /* server state at session start (blocks from the DB) */ });
+```
+
+Mutes and volumes live for the session and are replayed automatically after a non-resumed
+reconnect (channel-scoped mutes once the channel is re-joined); blocks are stored per application
+in the server database and also manageable from your backend via `/v1/users/:id/blocks`.
+
 ### Reconnect / session resume
 
 Enabled by default (`autoReconnect: true`). When the control connection drops the client keeps

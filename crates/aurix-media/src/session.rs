@@ -3,9 +3,121 @@ use aurix_common::protocol::ReplayWindow;
 use aurix_common::types::*;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Upper bound for a per-participant gain (1.0 = as sent, 2.0 = +6 dB).
+pub const MAX_PARTICIPANT_GAIN: f32 = 2.0;
+
+/// What this participant wants to hear: local ("for me") mutes, per-sender gain and the
+/// persistent cross-mute list. Evaluated per packet on the receiver side of the fan-out, so a
+/// muted or blocked sender's audio never leaves the server towards this session.
+#[derive(Debug, Default)]
+pub struct ReceiverPrefs {
+    muted_everywhere: HashSet<UserId>,
+    muted_in: HashSet<(ChannelId, UserId)>,
+    gain: HashMap<UserId, f32>,
+    /// Users this participant blocked (persisted in `user_blocks`).
+    blocked: HashSet<UserId>,
+    /// Users who blocked this participant; cross-mute is mutual so they are silenced too.
+    blocked_by: HashSet<UserId>,
+}
+
+impl ReceiverPrefs {
+    /// Gain multiplier applied to audio from `sender` in `channel`, or `None` when it must be
+    /// dropped for this receiver.
+    pub fn gain_for(&self, sender: &UserId, channel: &ChannelId) -> Option<f32> {
+        if self.blocked.contains(sender)
+            || self.blocked_by.contains(sender)
+            || self.muted_everywhere.contains(sender)
+            || self.muted_in.contains(&(*channel, *sender))
+        {
+            return None;
+        }
+        Some(self.gain.get(sender).copied().unwrap_or(1.0))
+    }
+
+    pub fn set_muted(&mut self, sender: UserId, channel: Option<ChannelId>, muted: bool) {
+        match (channel, muted) {
+            (None, true) => {
+                self.muted_everywhere.insert(sender);
+            }
+            (None, false) => {
+                self.muted_everywhere.remove(&sender);
+                self.muted_in.retain(|(_, u)| *u != sender);
+            }
+            (Some(ch), true) => {
+                self.muted_in.insert((ch, sender));
+            }
+            (Some(ch), false) => {
+                self.muted_in.remove(&(ch, sender));
+            }
+        }
+    }
+
+    pub fn set_gain(&mut self, sender: UserId, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, MAX_PARTICIPANT_GAIN)
+        } else {
+            1.0
+        };
+        if (gain - 1.0).abs() < f32::EPSILON {
+            self.gain.remove(&sender);
+        } else {
+            self.gain.insert(sender, gain);
+        }
+    }
+
+    pub fn set_blocked(&mut self, user: UserId, blocked: bool) {
+        if blocked {
+            self.blocked.insert(user);
+        } else {
+            self.blocked.remove(&user);
+        }
+    }
+
+    pub fn set_blocked_by(&mut self, user: UserId, blocked: bool) {
+        if blocked {
+            self.blocked_by.insert(user);
+        } else {
+            self.blocked_by.remove(&user);
+        }
+    }
+
+    pub fn load_blocks(
+        &mut self,
+        blocked: impl IntoIterator<Item = UserId>,
+        blocked_by: impl IntoIterator<Item = UserId>,
+    ) {
+        self.blocked = blocked.into_iter().collect();
+        self.blocked_by = blocked_by.into_iter().collect();
+    }
+
+    pub fn blocked_users(&self) -> Vec<UserId> {
+        let mut v: Vec<UserId> = self.blocked.iter().copied().collect();
+        v.sort_unstable_by_key(|u| u.0);
+        v
+    }
+
+    pub fn gains(&self) -> Vec<(UserId, f32)> {
+        self.gain.iter().map(|(u, g)| (*u, *g)).collect()
+    }
+
+    pub fn is_blocked(&self, user: &UserId) -> bool {
+        self.blocked.contains(user)
+    }
+
+    /// Muted-for-me senders, `(user, channel)` with `None` meaning every channel.
+    pub fn local_mutes(&self) -> Vec<(UserId, Option<ChannelId>)> {
+        self.muted_everywhere
+            .iter()
+            .map(|u| (*u, None))
+            .chain(self.muted_in.iter().map(|(c, u)| (*u, Some(*c))))
+            .collect()
+    }
+}
 
 /// How a participant's media reaches the SFU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +145,7 @@ pub struct MediaSession {
     pub is_muted: AtomicBool,
     pub is_server_muted: AtomicBool,
     pub is_speaking: AtomicBool,
+    pub prefs: RwLock<ReceiverPrefs>,
     pub sequence: AtomicU32,
     /// Sequence counter for server-originated packets addressed to this session
     /// (acks, commands); keeps their encryption IVs unique under the session key.
@@ -78,6 +191,7 @@ impl MediaSession {
             is_muted: AtomicBool::new(false),
             is_server_muted: AtomicBool::new(false),
             is_speaking: AtomicBool::new(false),
+            prefs: RwLock::new(ReceiverPrefs::default()),
             sequence: AtomicU32::new(0),
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
@@ -211,6 +325,11 @@ impl MediaSession {
             && !self.is_server_muted.load(Ordering::Relaxed)
     }
 
+    /// Gain this session applies to audio from `sender` in `channel`, `None` if it is silenced.
+    pub fn gain_for(&self, sender: &UserId, channel: &ChannelId) -> Option<f32> {
+        self.prefs.read().gain_for(sender, channel)
+    }
+
     pub fn update_quality(&self, metrics: QualityMetrics) {
         *self.quality.write() = metrics;
     }
@@ -241,4 +360,64 @@ pub struct SessionStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub quality: QualityMetrics,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefs_scopes_and_precedence() {
+        let mut p = ReceiverPrefs::default();
+        let (alice, bob) = (UserId::new(), UserId::new());
+        let (team, party) = (ChannelId::new(), ChannelId::new());
+        assert_eq!(p.gain_for(&alice, &team), Some(1.0));
+
+        p.set_muted(alice, Some(team), true);
+        assert_eq!(p.gain_for(&alice, &team), None);
+        assert_eq!(p.gain_for(&alice, &party), Some(1.0));
+        assert_eq!(p.gain_for(&bob, &team), Some(1.0));
+
+        p.set_muted(alice, None, true);
+        assert_eq!(p.gain_for(&alice, &party), None);
+        assert_eq!(p.local_mutes().len(), 2);
+        // Unmuting everywhere also clears channel-scoped mutes.
+        p.set_muted(alice, None, false);
+        assert_eq!(p.gain_for(&alice, &team), Some(1.0));
+        assert!(p.local_mutes().is_empty());
+
+        // Channel unmute does not touch an all-channel mute.
+        p.set_muted(alice, None, true);
+        p.set_muted(alice, Some(team), false);
+        assert_eq!(p.gain_for(&alice, &team), None);
+        p.set_muted(alice, None, false);
+
+        p.set_gain(alice, 0.25);
+        assert_eq!(p.gain_for(&alice, &team), Some(0.25));
+        p.set_gain(alice, 5.0);
+        assert_eq!(p.gain_for(&alice, &team), Some(MAX_PARTICIPANT_GAIN));
+        p.set_gain(alice, -1.0);
+        assert_eq!(p.gain_for(&alice, &team), Some(0.0));
+        p.set_gain(alice, f32::NAN);
+        assert_eq!(p.gain_for(&alice, &team), Some(1.0));
+        assert!(p.gains().is_empty(), "unity gain is not stored");
+
+        // Blocks win over gain, in both directions, and survive load_blocks replacement.
+        p.set_gain(alice, 0.5);
+        p.set_blocked(alice, true);
+        assert_eq!(p.gain_for(&alice, &team), None);
+        assert!(p.is_blocked(&alice));
+        p.set_blocked(alice, false);
+        assert_eq!(p.gain_for(&alice, &team), Some(0.5));
+        p.set_blocked_by(alice, true);
+        assert_eq!(p.gain_for(&alice, &team), None);
+        assert!(
+            !p.is_blocked(&alice),
+            "being blocked is not the same as blocking"
+        );
+        p.load_blocks([bob], []);
+        assert_eq!(p.gain_for(&alice, &team), Some(0.5));
+        assert_eq!(p.gain_for(&bob, &team), None);
+        assert_eq!(p.blocked_users(), vec![bob]);
+    }
 }

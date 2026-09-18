@@ -282,7 +282,9 @@ impl PacketRouter {
         self.tap_audio(&channel, sender, packet);
         self.fan_out(&channel, sender, packet).await;
         if let Some(ref cascade) = self.cascade {
-            cascade.forward_to_peers(&channel_id, packet).await;
+            cascade
+                .forward_to_peers(&channel_id, &sender.user_id, packet)
+                .await;
         }
         Ok(())
     }
@@ -334,14 +336,17 @@ impl PacketRouter {
             self.tap_audio(&channel, sender, &packet);
             self.fan_out(&channel, sender, &packet).await;
             if let Some(ref cascade) = self.cascade {
-                cascade.forward_to_peers(&channel_id, &packet).await;
+                cascade
+                    .forward_to_peers(&channel_id, &sender.user_id, &packet)
+                    .await;
             }
         }
         Ok(())
     }
 
-    /// Inject a packet relayed from another node (already authenticated by the cascade layer).
-    pub async fn route_relayed_audio(&self, packet: &AurixPacket) -> Result<()> {
+    /// Inject a packet relayed from another node (already authenticated by the cascade layer);
+    /// `sender` is the remote participant it originates from.
+    pub async fn route_relayed_audio(&self, sender: &UserId, packet: &AurixPacket) -> Result<()> {
         let channel_id = match self
             .shared
             .channels_by_hash
@@ -354,7 +359,7 @@ impl PacketRouter {
             Some(c) => c.value().clone(),
             None => return Ok(()),
         };
-        let receivers = channel.get_receivers_for_relayed_audio();
+        let receivers = channel.get_receivers_for_relayed_audio(sender);
         self.deliver(&channel, receivers, packet).await;
         Ok(())
     }
@@ -471,12 +476,12 @@ impl PacketRouter {
         }
     }
 
-    /// Payload with a leading one-byte attenuation factor and a header carrying `VolumeAttenuated`.
+    /// Payload with a leading one-byte gain factor and a header carrying `VolumeAttenuated`.
     fn attenuated_body(packet: &AurixPacket, volume: f32) -> (PacketHeader, BytesMut) {
         let mut header = packet.header.clone();
         header.flags |= PacketFlags::VolumeAttenuated as u16;
         let mut body = BytesMut::with_capacity(1 + packet.payload.len());
-        body.put_u8((volume.clamp(0.0, 1.0) * 255.0) as u8);
+        body.put_u8(encode_volume_byte(volume));
         body.put_slice(&packet.payload);
         (header, body)
     }

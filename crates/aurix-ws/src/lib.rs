@@ -15,9 +15,10 @@
 use aurix_auth::ValidatedToken;
 use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
-use aurix_common::protocol::{ControlMessage, ParticipantBrief};
+use aurix_common::protocol::{ControlMessage, LocalMute, ParticipantBrief, ParticipantVolume};
 use aurix_common::types::*;
 use aurix_control::{ControlPlane, ServerEvent};
+use aurix_media::session::MAX_PARTICIPANT_GAIN;
 use aurix_media::{MediaEvent, SfuNode};
 use aurix_recording::RecordingService;
 use axum::extract::ws::{Message, WebSocket};
@@ -324,13 +325,14 @@ impl WsState {
                     user_id,
                     display_name,
                     session_id,
+                    ssrc,
                     ..
                 } => {
                     let ssrc = self
                         .connections
                         .get(&session_id)
                         .map(|c| c.ssrc)
-                        .unwrap_or(0);
+                        .unwrap_or(ssrc);
                     self.broadcast_channel(
                         &channel_id,
                         &ControlMessage::ParticipantJoined {
@@ -392,6 +394,15 @@ impl WsState {
                         },
                         None,
                     );
+                }
+                ServerEvent::UserBlockChanged {
+                    app_id,
+                    user_id,
+                    blocked_user_id,
+                    blocked,
+                    ..
+                } => {
+                    self.apply_block_change(app_id, user_id, blocked_user_id, blocked);
                 }
                 ServerEvent::UserKicked {
                     app_id,
@@ -491,6 +502,32 @@ impl WsState {
             if s.app_id == app_id {
                 s.is_server_muted.store(muted, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Cross-mute is mutual: the blocker stops hearing the target and the target stops hearing
+    /// the blocker, in every live session of both on this node. The blocker's sessions get a
+    /// `UserBlockChanged` (ack / cross-device sync); the target is not told.
+    fn apply_block_change(&self, app_id: AppId, user_id: UserId, target: UserId, blocked: bool) {
+        {
+            let sfu = self.sfu.read();
+            for s in sfu.sessions_for_user(&user_id) {
+                if s.app_id == app_id {
+                    s.prefs.write().set_blocked(target, blocked);
+                }
+            }
+            for s in sfu.sessions_for_user(&target) {
+                if s.app_id == app_id {
+                    s.prefs.write().set_blocked_by(user_id, blocked);
+                }
+            }
+        }
+        let ack = ControlMessage::UserBlockChanged {
+            user_id: target,
+            blocked,
+        };
+        for sid in self.sessions_of_user(app_id, user_id) {
+            self.send_to_session(&sid, &ack);
         }
     }
 
@@ -795,6 +832,18 @@ async fn open_session(
         code: e.error_code().into(),
         message: e.public_message(),
     })?;
+    match state
+        .control
+        .blocks
+        .load_for_user(token.app_id, token.user_id)
+        .await
+    {
+        Ok(blocks) => media_session
+            .prefs
+            .write()
+            .load_blocks(blocks.blocked, blocks.blocked_by),
+        Err(e) => warn!("block list load failed for {}: {e}", token.user_id),
+    }
 
     if let Err(e) = state
         .control
@@ -840,6 +889,27 @@ async fn open_session(
         ssrc: media_session.ssrc,
         media_key: media_session.media_key,
         resumed_channels: None,
+    })
+}
+
+fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<ControlMessage> {
+    let session = state.sfu.read().get_session(session_id)?;
+    let prefs = session.prefs.read();
+    Some(ControlMessage::ReceiverPreferences {
+        blocked_users: prefs.blocked_users(),
+        local_mutes: prefs
+            .local_mutes()
+            .into_iter()
+            .map(|(user_id, channel_id)| LocalMute {
+                user_id,
+                channel_id,
+            })
+            .collect(),
+        volumes: prefs
+            .gains()
+            .into_iter()
+            .map(|(user_id, volume)| ParticipantVolume { user_id, volume })
+            .collect(),
     })
 }
 
@@ -961,6 +1031,9 @@ async fn handle_ws_connection(
     {
         cleanup_connection(&state, session_id, token.user_id, "send_failed").await;
         return;
+    }
+    if let Some(prefs) = receiver_preferences(&state, &session_id) {
+        send_msg(&tx, &prefs).await;
     }
     // A resumed client reconciles its channel state from one ChannelJoinAck per channel.
     for channel_id in attached.resumed_channels.iter().flatten() {
@@ -1283,8 +1356,95 @@ async fn handle_control_message(
                     user_id: token.user_id,
                     display_name: token.display_name.clone(),
                     session_id,
+                    ssrc: state
+                        .connections
+                        .get(&session_id)
+                        .map(|c| c.ssrc)
+                        .unwrap_or(0),
                     timestamp: chrono::Utc::now(),
                 });
+        }
+
+        ControlMessage::SetParticipantMute {
+            user_id,
+            channel_id,
+            muted,
+        } => {
+            if user_id == token.user_id {
+                return send_error(
+                    tx,
+                    "VALIDATION_ERROR",
+                    "Use MuteStateChanged to mute yourself",
+                )
+                .await;
+            }
+            if let Some(ch) = channel_id {
+                let member = state
+                    .connections
+                    .get(&session_id)
+                    .map(|c| c.channels.contains(&ch))
+                    .unwrap_or(false);
+                if !member {
+                    return send_error(tx, "NOT_IN_CHANNEL", "Not a member of this channel").await;
+                }
+            }
+            let sfu = state.sfu.read();
+            if let Some(s) = sfu.get_session(&session_id) {
+                s.prefs.write().set_muted(user_id, channel_id, muted);
+            }
+        }
+
+        ControlMessage::SetParticipantVolume { user_id, volume } => {
+            if user_id == token.user_id {
+                return send_error(tx, "VALIDATION_ERROR", "Cannot set your own volume").await;
+            }
+            if !volume.is_finite() || !(0.0..=MAX_PARTICIPANT_GAIN).contains(&volume) {
+                return send_error(
+                    tx,
+                    "VALIDATION_ERROR",
+                    &format!("volume must be within 0.0..={MAX_PARTICIPANT_GAIN}"),
+                )
+                .await;
+            }
+            let sfu = state.sfu.read();
+            if let Some(s) = sfu.get_session(&session_id) {
+                s.prefs.write().set_gain(user_id, volume);
+            }
+        }
+
+        ControlMessage::SetUserBlock { user_id, blocked } => {
+            if user_id == token.user_id {
+                return send_error(tx, "VALIDATION_ERROR", "Cannot block yourself").await;
+            }
+            let key = format!("block:{}", token.user_id);
+            if state.control.config.rate_limiting.enabled
+                && !state.control.rate_limiter.check_with_cost(&key, 1.0)
+            {
+                return send_error(tx, "RATE_LIMIT_EXCEEDED", "Too many block changes").await;
+            }
+            let res = if blocked {
+                state
+                    .control
+                    .blocks
+                    .block(token.app_id, token.user_id, user_id)
+                    .await
+            } else {
+                state
+                    .control
+                    .blocks
+                    .unblock(token.app_id, token.user_id, user_id)
+                    .await
+            };
+            if let Err(e) = res {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+            state.control.events.publish(ServerEvent::UserBlockChanged {
+                app_id: token.app_id,
+                user_id: token.user_id,
+                blocked_user_id: user_id,
+                blocked,
+                timestamp: chrono::Utc::now(),
+            });
         }
 
         ControlMessage::ChannelLeave { channel_id } => {
@@ -1498,6 +1658,8 @@ async fn handle_control_message(
         | ControlMessage::ParticipantJoined { .. }
         | ControlMessage::ParticipantLeft { .. }
         | ControlMessage::SpeakingStateChanged { .. }
+        | ControlMessage::UserBlockChanged { .. }
+        | ControlMessage::ReceiverPreferences { .. }
         | ControlMessage::BitrateCommand { .. }
         | ControlMessage::RecordingNotification { .. }
         | ControlMessage::Error { .. }

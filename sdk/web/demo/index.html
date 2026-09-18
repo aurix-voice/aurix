@@ -88,7 +88,24 @@ function renderRoster() {
       const li = document.createElement('li');
       li.className = (p.speaking ? 'speaking ' : '') + (p.muted || p.serverMuted ? 'muted' : '');
       li.textContent = `${p.displayName} (${p.userId.slice(0, 8)}) ${p.role !== 'unknown' ? p.role : ''}` +
-        `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.speaking ? ' 🔊' : ''}`;
+        `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.speaking ? ' 🔊' : ''}` +
+        `${client.isUserBlocked(p.userId) ? ' [blocked]' : ''}`;
+      if (p.userId !== client.sessionInfo?.userId) {
+        const mute = document.createElement('button');
+        const locallyMuted = client.isParticipantMuted(p.userId, ch);
+        mute.textContent = locallyMuted ? 'unmute for me' : 'mute for me';
+        mute.onclick = () => { client.setParticipantMuted(p.userId, !locallyMuted, ch); renderRoster(); };
+        const vol = document.createElement('input');
+        vol.type = 'range'; vol.min = '0'; vol.max = '2'; vol.step = '0.05';
+        vol.value = String(client.getParticipantVolume(p.userId));
+        vol.title = 'volume for me (0..2)';
+        vol.oninput = () => client.setParticipantVolume(p.userId, Number(vol.value));
+        const block = document.createElement('button');
+        const blocked = client.isUserBlocked(p.userId);
+        block.textContent = blocked ? 'unblock' : 'block';
+        block.onclick = () => client.setUserBlocked(p.userId, !blocked);
+        li.append(' ', mute, ' ', vol, ' ', block);
+      }
       ul.appendChild(li);
     }
   }
@@ -112,6 +129,8 @@ $('connect').onclick = async () => {
   client.on('participantJoined', (ch, p) => { log('+', p.displayName); renderRoster(); });
   client.on('participantLeft', (ch, u) => { log('-', u); renderRoster(); });
   client.on('participantUpdated', renderRoster);
+  client.on('receiverPreferences', (prefs) => { log('receiver prefs', prefs); renderRoster(); });
+  client.on('userBlockChanged', (u, blocked) => { log(blocked ? 'blocked' : 'unblocked', u); renderRoster(); });
   client.on('recording', (ch, id, active, by) => {
     log(`recording ${active ? 'started' : 'stopped'} by ${by}`);
     if (active && confirm('This channel is being recorded. Accept?')) client.respondToRecording(id, 'accepted');

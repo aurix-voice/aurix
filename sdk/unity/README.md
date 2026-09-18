@@ -72,6 +72,26 @@ void OnAudioFilterRead(float[] data, int ch) => mixer.Mix(data, ch);
 the mixer applies), `RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's
 bitrate adaptation.
 
+### Local mute, per-participant volume, block
+
+Receiver-local controls: they change what *this* client hears, are enforced by the server before audio is
+forwarded (so muted/blocked players cost no downlink bandwidth), and the other player is never notified.
+
+```csharp
+await client.SetParticipantMutedAsync(userId, true, channelId);   // silence them in one channel
+await client.SetParticipantMutedAsync(userId, true);              // …or everywhere
+bool muted = client.IsParticipantMuted(userId, channelId);
+await client.SetParticipantVolumeAsync(userId, 0.5f);             // 0 … 1 (unity) … MaxParticipantVolume (2, ≈ +6 dB)
+await client.SetUserBlockedAsync(userId, true);                   // persistent, mutual; survives sessions and channels
+client.OnUserBlockChanged    += (uid, blocked) => RefreshBlockList(client.BlockedUsers);
+client.OnReceiverPreferences += prefs => { /* server-side state at session start (blocks from the DB) */ };
+```
+
+The volume is folded into the per-packet volume byte (`128` = unity, so `a.Volume` already includes it together with
+positional attenuation). Mutes and volumes are session state and are replayed automatically after a non-resumed
+reconnect (channel-scoped mutes when the channel is re-joined); blocks are stored per application on the server
+and can also be managed from your backend via `/v1/users/:id/blocks`.
+
 ### Reconnect / session resume
 
 `AutoReconnect` is on by default. When the control connection drops unexpectedly (Wi-Fi ↔ LTE
@@ -116,6 +136,10 @@ TCP proxy that is cut abruptly — once within the grace window (same session an
 must keep flowing, bob must not see a leave), once for longer than it (a fresh session must re-join the
 channel), and once for good (the client must give up with `OnFailedToRecover`). Run the server with
 `AURIX__SERVER__SESSION_RESUME_GRACE_SECS=4` to keep the run short.
+
+`--scenario prefs` checks receiver-local mute / volume / block end to end over real UDP: bob mutes alice in the
+channel and everywhere (0 packets), unmutes (audio resumes), sets volume 0.5 and 2.0 (volume byte decodes to
+0.5 / ≈1.99), blocks her (silence, persisted into a fresh session, alice never notified) and unblocks.
 
 ## Notes
 

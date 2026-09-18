@@ -13,6 +13,8 @@ pub struct MediaChannel {
     participants: DashMap<UserId, Arc<MediaSession>>,
     participant_roles: DashMap<UserId, ChannelRole>,
     ssrc_map: DashMap<u32, UserId>,
+    /// Participants of this channel hosted on other nodes (learned from the event bus), so
+    /// receiver preferences can be applied to relayed audio too.
     participant_count: AtomicU32,
     positions: DashMap<UserId, Position3D>,
 }
@@ -138,12 +140,18 @@ impl MediaChannel {
         }
     }
 
-    /// Receivers for audio relayed from another node (sender is not a local participant).
-    pub fn get_receivers_for_relayed_audio(&self) -> Vec<(Arc<MediaSession>, f32)> {
-        self.participants
+    /// Receivers for audio relayed from another node: every local participant, filtered by
+    /// their own preferences towards the remote `sender`.
+    pub fn get_receivers_for_relayed_audio(
+        &self,
+        sender: &UserId,
+    ) -> Vec<(Arc<MediaSession>, f32)> {
+        let all: Vec<(Arc<MediaSession>, f32)> = self
+            .participants
             .iter()
             .map(|e| (e.value().clone(), 1.0f32))
-            .collect()
+            .collect();
+        self.apply_receiver_prefs(sender, all)
     }
 
     pub fn update_position(&self, user_id: &UserId, position: Position3D) {
@@ -161,13 +169,35 @@ impl MediaChannel {
             .unwrap_or(ChannelRole::Listener)
     }
 
-    /// Returns (session, volume_multiplier) for each receiver of audio from `sender_ssrc`.
+    /// Returns (session, volume_multiplier) for each receiver of audio from `sender_ssrc`:
+    /// channel-type routing (command/whisper/positional/team) combined with every receiver's
+    /// own preferences (local mute, per-sender gain, cross-mute).
     pub fn get_receivers_for_audio(&self, sender_ssrc: u32) -> Vec<(Arc<MediaSession>, f32)> {
         let sender_uid = match self.ssrc_map.get(&sender_ssrc) {
             Some(uid) => *uid.value(),
             None => return Vec::new(),
         };
+        let base = self.routed_receivers(&sender_uid);
+        self.apply_receiver_prefs(&sender_uid, base)
+    }
 
+    fn apply_receiver_prefs(
+        &self,
+        sender_uid: &UserId,
+        receivers: Vec<(Arc<MediaSession>, f32)>,
+    ) -> Vec<(Arc<MediaSession>, f32)> {
+        receivers
+            .into_iter()
+            .filter_map(|(receiver, volume)| {
+                let gain = receiver.gain_for(sender_uid, &self.channel_id)?;
+                let v = volume * gain;
+                (v > 0.001).then_some((receiver, v))
+            })
+            .collect()
+    }
+
+    fn routed_receivers(&self, sender_uid: &UserId) -> Vec<(Arc<MediaSession>, f32)> {
+        let sender_uid = *sender_uid;
         // ── Command channel: only speakers/mods/admins may transmit ──
         if self.channel_type == ChannelType::Command {
             let sender_role = self.get_role(&sender_uid);
@@ -272,5 +302,122 @@ impl MediaChannel {
             .filter(|e| e.key() != exclude)
             .map(|e| (e.value().clone(), 1.0f32))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(app: AppId, ssrc: u32) -> Arc<MediaSession> {
+        MediaSession::new(
+            SessionId::new(),
+            UserId::new(),
+            app,
+            format!("u{ssrc}"),
+            ssrc,
+            [ssrc as u8; 32],
+        )
+    }
+
+    fn volumes(recv: &[(Arc<MediaSession>, f32)]) -> Vec<(UserId, f32)> {
+        let mut v: Vec<(UserId, f32)> = recv.iter().map(|(s, g)| (s.user_id, *g)).collect();
+        v.sort_by_key(|(u, _)| u.0);
+        v
+    }
+
+    #[test]
+    fn local_gain_multiplies_positional_attenuation() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Positional,
+                positional_config: Some(PositionalConfig {
+                    near_distance: 1.0,
+                    far_distance: 11.0,
+                    rolloff: RolloffCurve::Linear,
+                    max_radius: 100.0,
+                }),
+                ..ChannelConfig::default()
+            },
+        );
+        let a = session(app, 1);
+        let b = session(app, 2);
+        let c = session(app, 3);
+        for s in [&a, &b, &c] {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        ch.update_position(&a.user_id, Position3D::new(0.0, 0.0, 0.0));
+        ch.update_position(&b.user_id, Position3D::new(6.0, 0.0, 0.0)); // linear -> 0.5
+        ch.update_position(&c.user_id, Position3D::new(6.0, 0.0, 0.0));
+
+        b.prefs.write().set_gain(a.user_id, 0.5);
+        c.prefs.write().set_gain(a.user_id, 2.0);
+        let got = ch.get_receivers_for_audio(1);
+        let got = volumes(&got);
+        assert_eq!(got.len(), 2);
+        for (uid, vol) in got {
+            if uid == b.user_id {
+                assert!(
+                    (vol - 0.25).abs() < 1e-5,
+                    "0.5 positional x 0.5 gain = {vol}"
+                );
+            } else {
+                assert!(
+                    (vol - 1.0).abs() < 1e-5,
+                    "0.5 positional x 2.0 boost = {vol}"
+                );
+            }
+        }
+
+        // Zero gain removes the receiver entirely (no packet is sent).
+        c.prefs.write().set_gain(a.user_id, 0.0);
+        let got = ch.get_receivers_for_audio(1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.user_id, b.user_id);
+    }
+
+    #[test]
+    fn whisper_and_command_routing_still_respect_local_mute() {
+        let app = AppId::new();
+        let a = session(app, 1);
+        let b = session(app, 2);
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Whisper,
+                whisper_target: Some(b.user_id),
+                ..ChannelConfig::default()
+            },
+        );
+        ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
+        ch.add_participant(b.clone(), ChannelRole::Speaker).unwrap();
+        assert_eq!(ch.get_receivers_for_audio(1).len(), 1);
+        b.prefs.write().set_muted(a.user_id, None, true);
+        assert!(ch.get_receivers_for_audio(1).is_empty());
+    }
+
+    #[test]
+    fn relayed_audio_applies_receiver_prefs_towards_remote_sender() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(ChannelId::new(), app, ChannelConfig::default());
+        let (a, b) = (session(app, 10), session(app, 11));
+        ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
+        ch.add_participant(b.clone(), ChannelRole::Speaker).unwrap();
+        let remote = UserId::new();
+        assert_eq!(ch.get_receivers_for_relayed_audio(&remote).len(), 2);
+
+        a.prefs.write().set_blocked(remote, true);
+        b.prefs.write().set_gain(remote, 0.5);
+        let got = ch.get_receivers_for_relayed_audio(&remote);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.ssrc, 11);
+        assert_eq!(got[0].1, 0.5);
+
+        b.prefs.write().set_blocked_by(remote, true);
+        assert!(ch.get_receivers_for_relayed_audio(&remote).is_empty());
     }
 }

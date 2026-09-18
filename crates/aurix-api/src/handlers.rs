@@ -427,6 +427,87 @@ pub async fn get_user(
     ))
 }
 
+// ── Cross-mute (block list) ──
+
+pub async fn list_user_blocks(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("users:read")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let blocked = state.control.blocks.list(ctx.app_id, user_id).await?;
+    Ok(Json(
+        serde_json::json!({ "user_id": user_id, "blocked_users": blocked }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct BlockRequest {
+    pub blocked_user_id: String,
+}
+
+pub async fn add_user_block(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<BlockRequest>,
+) -> JsonResult {
+    ctx.require("users:write")?;
+    let user_id = UserId::from_uuid(user_id);
+    let target = UserId::from_uuid(parse_uuid(&req.blocked_user_id, "blocked_user_id")?);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let created = state
+        .control
+        .blocks
+        .block(ctx.app_id, user_id, target)
+        .await?;
+    publish_block_change(&state, ctx.app_id, user_id, target, true);
+    Ok(Json(serde_json::json!({
+        "user_id": user_id, "blocked_user_id": target, "blocked": true, "created": created
+    })))
+}
+
+pub async fn remove_user_block(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path((user_id, blocked_user_id)): Path<(Uuid, Uuid)>,
+) -> JsonResult {
+    ctx.require("users:write")?;
+    let user_id = UserId::from_uuid(user_id);
+    let target = UserId::from_uuid(blocked_user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let removed = state
+        .control
+        .blocks
+        .unblock(ctx.app_id, user_id, target)
+        .await?;
+    publish_block_change(&state, ctx.app_id, user_id, target, false);
+    Ok(Json(serde_json::json!({
+        "user_id": user_id, "blocked_user_id": target, "blocked": false, "removed": removed
+    })))
+}
+
+fn publish_block_change(
+    state: &AppState,
+    app_id: AppId,
+    user_id: UserId,
+    blocked_user_id: UserId,
+    blocked: bool,
+) {
+    state
+        .control
+        .events
+        .publish(aurix_control::ServerEvent::UserBlockChanged {
+            app_id,
+            user_id,
+            blocked_user_id,
+            blocked,
+            timestamp: Utc::now(),
+        });
+}
+
 // ── Moderation ──
 
 #[derive(Deserialize)]
@@ -998,6 +1079,7 @@ const KNOWN_PERMISSIONS: &[&str] = &[
     "channels:read",
     "channels:write",
     "users:read",
+    "users:write",
     "moderation:read",
     "moderation:write",
     "recordings:read",

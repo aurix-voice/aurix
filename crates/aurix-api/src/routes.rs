@@ -100,6 +100,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/users", get(handlers::search_users))
         .route("/v1/users/:user_id", get(handlers::get_user))
         .route("/v1/users/:user_id/unban", post(handlers::unban_user_all))
+        .route(
+            "/v1/users/:user_id/blocks",
+            get(handlers::list_user_blocks).post(handlers::add_user_block),
+        )
+        .route(
+            "/v1/users/:user_id/blocks/:blocked_user_id",
+            delete(handlers::remove_user_block),
+        )
         .route("/v1/moderation/ban", post(handlers::ban_user))
         .route("/v1/moderation/bans", get(handlers::list_bans))
         .route("/v1/moderation/bans/:ban_id/revoke", post(handlers::unban))

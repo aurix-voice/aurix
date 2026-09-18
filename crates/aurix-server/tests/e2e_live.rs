@@ -14,9 +14,9 @@
 
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{
-    channel_id_hash, AurixPacket, ControlMessage, PacketFlags, PacketType,
+    channel_id_hash, encode_volume_byte, AurixPacket, ControlMessage, PacketFlags, PacketType,
 };
-use aurix_common::types::{ChannelId, RecordingConsent, SessionId};
+use aurix_common::types::{ChannelId, RecordingConsent, SessionId, UserId};
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use base64::Engine;
 use bytes::Bytes;
@@ -27,6 +27,7 @@ use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
+#[derive(Clone)]
 struct Env {
     api: String,
     ws: String,
@@ -867,8 +868,9 @@ async fn two_nodes_auto_cascade_relays_audio() {
         .unwrap();
     let channel_id = ChannelId::from_uuid(ch["id"].as_str().unwrap().parse().unwrap());
 
-    let (tok_a, _) = issue_token(&env, &http, "cascade:alice", "Alice", channel_id).await;
+    let (tok_a, alice_uid) = issue_token(&env, &http, "cascade:alice", "Alice", channel_id).await;
     let (tok_b, _) = issue_token(&env2, &http, "cascade:bob", "Bob", channel_id).await;
+    let alice_uid = UserId::from_uuid(alice_uid.parse().unwrap());
     let mut alice = connect(&env, "alice", tok_a).await;
     let mut bob = connect(&env2, "bob", tok_b).await;
     assert_ne!(
@@ -936,6 +938,86 @@ async fn two_nodes_auto_cascade_relays_audio() {
         "Bob (node 2) received only {got} audio packets from Alice (node 1) via cascade"
     );
 
+    // Receiver-local preferences must hold across the cascade: Bob's node knows Alice only as
+    // a relayed SSRC, and Alice's node learns about Bob's block through the event bus.
+    let bob_payload = Bytes::from_static(&[0xFC, 1, 1, 2, 3, 5, 8, 13]);
+    let mut bob_seq = 1000u32;
+    while bob.recv_udp().await.is_some() {}
+    while alice.recv_udp().await.is_some() {}
+    send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
+    bob_seq += 10;
+    let (_, n) = audio_from(&alice, bob.ssrc, &bob_payload).await;
+    assert!(n >= 8, "baseline: Alice got {n} relayed packets from Bob");
+
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: alice_uid,
+        channel_id: None,
+        muted: true,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&alice, channel_id, seq + 1, &payload).await;
+    seq += 10;
+    let (_, n) = audio_from(&bob, alice.ssrc, &payload).await;
+    assert_eq!(n, 0, "local mute must drop relayed audio from Alice");
+
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: alice_uid,
+        channel_id: None,
+        muted: false,
+    })
+    .await;
+    bob.send(&ControlMessage::SetParticipantVolume {
+        user_id: alice_uid,
+        volume: 0.5,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&alice, channel_id, seq + 1, &payload).await;
+    seq += 10;
+    let (gain, n) = audio_from(&bob, alice.ssrc, &payload).await;
+    assert!(n >= 8, "unmuted relayed audio came back ({n} packets)");
+    assert_eq!(
+        gain,
+        Some(encode_volume_byte(0.5)),
+        "relayed audio carries Bob's local gain"
+    );
+
+    bob.send(&ControlMessage::SetUserBlock {
+        user_id: alice_uid,
+        blocked: true,
+    })
+    .await;
+    bob.expect("UserBlockChanged", |m| {
+        matches!(m, ControlMessage::UserBlockChanged { user_id, blocked: true } if *user_id == alice_uid)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    send_audio(&alice, channel_id, seq + 1, &payload).await;
+    seq += 10;
+    send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
+    bob_seq += 10;
+    let (_, to_bob) = audio_from(&bob, alice.ssrc, &payload).await;
+    let (_, to_alice) = audio_from(&alice, bob.ssrc, &bob_payload).await;
+    assert_eq!(to_bob, 0, "blocked Alice must not reach Bob across nodes");
+    assert_eq!(
+        to_alice, 0,
+        "cross-mute is mutual: Bob must not reach Alice on the other node"
+    );
+    bob.send(&ControlMessage::SetUserBlock {
+        user_id: alice_uid,
+        blocked: false,
+    })
+    .await;
+    bob.expect("UserBlockChanged(unblocked)", |m| {
+        matches!(m, ControlMessage::UserBlockChanged { user_id, blocked: false } if *user_id == alice_uid)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
+    let (_, n) = audio_from(&alice, bob.ssrc, &bob_payload).await;
+    assert!(n >= 8, "unblock restores relayed audio ({n} packets)");
+
     // Bob leaves: node 1 must stop relaying this channel to node 2.
     bob.send(&ControlMessage::ChannelLeave { channel_id }).await;
     alice
@@ -964,4 +1046,319 @@ async fn two_nodes_auto_cascade_relays_audio() {
 
     let _ = alice.ws.close(None).await;
     let _ = bob.ws.close(None).await;
+}
+
+/// Drains every audio packet from `ssrc` arriving at `to` until the link is quiet for 400 ms,
+/// returning the gain byte of the first one (`None` when not attenuated) and the packet count.
+async fn audio_from(to: &Player, ssrc: u32, payload: &Bytes) -> (Option<u8>, usize) {
+    let mut got = 0;
+    let mut gain = None;
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
+        if p.header.packet_type != PacketType::Audio || p.header.ssrc != ssrc {
+            continue;
+        }
+        if p.header.has_flag(PacketFlags::VolumeAttenuated) {
+            gain.get_or_insert(p.payload[0]);
+            assert_eq!(&p.payload[1..], &payload[..]);
+        } else {
+            assert_eq!(&p.payload[..], &payload[..]);
+        }
+        got += 1;
+    }
+    (gain, got)
+}
+
+/// Receiver-side controls over the control plane and REST: a local mute and a per-participant
+/// volume shape only the caller's downlink; a cross-mute is mutual, persists in the database,
+/// is applied to a brand-new session at login and shows up in `ReceiverPreferences`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn local_mute_volume_and_persistent_cross_mute() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "e2e:mute-alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e:mute-bob", "Bob", channel_id).await;
+    let (tok_c, _) = issue_token(&env, &http, "e2e:mute-carol", "Carol", channel_id).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env, "bob", tok_b.clone()).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        let prefs = p
+            .expect("ReceiverPreferences", |m| {
+                matches!(m, ControlMessage::ReceiverPreferences { .. })
+            })
+            .await;
+        if let ControlMessage::ReceiverPreferences {
+            blocked_users,
+            local_mutes,
+            volumes,
+        } = prefs
+        {
+            assert!(blocked_users.is_empty() && local_mutes.is_empty() && volumes.is_empty());
+        }
+        bind_media(p).await;
+        join(p, channel_id).await;
+    }
+    let hello = Bytes::from_static(b"hello");
+
+    // Baseline.
+    send_audio(&alice, channel_id, 1, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await, (None, 10));
+    assert_eq!(audio_from(&carol, alice.ssrc, &hello).await, (None, 10));
+
+    // Bob mutes Alice for himself only: no MuteStateChanged is broadcast, Carol still hears her.
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: uid_a,
+        channel_id: Some(channel_id),
+        muted: true,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&alice, channel_id, 100, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+    assert_eq!(audio_from(&carol, alice.ssrc, &hello).await.1, 10);
+    while let Some(m) = alice.try_recv(Duration::from_millis(300)).await {
+        assert!(
+            !matches!(
+                m,
+                ControlMessage::MuteStateChanged { .. } | ControlMessage::UserBlockChanged { .. }
+            ),
+            "the sender must not learn about a local mute: {m:?}"
+        );
+    }
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: uid_a,
+        channel_id: None,
+        muted: false,
+    })
+    .await;
+
+    // Muting a channel one is not a member of is rejected.
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: uid_a,
+        channel_id: Some(ChannelId::new()),
+        muted: true,
+    })
+    .await;
+    bob.expect(
+        "NOT_IN_CHANNEL",
+        |m| matches!(m, ControlMessage::Error { code, .. } if code == "NOT_IN_CHANNEL"),
+    )
+    .await;
+
+    // Per-participant volume: Bob hears Alice at 0.5, Carol at full.
+    bob.send(&ControlMessage::SetParticipantVolume {
+        user_id: uid_a,
+        volume: 0.5,
+    })
+    .await;
+    bob.send(&ControlMessage::SetParticipantVolume {
+        user_id: uid_a,
+        volume: 3.0,
+    })
+    .await;
+    bob.expect(
+        "VALIDATION_ERROR",
+        |m| matches!(m, ControlMessage::Error { code, .. } if code == "VALIDATION_ERROR"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&alice, channel_id, 200, &hello).await;
+    assert_eq!(
+        audio_from(&bob, alice.ssrc, &hello).await,
+        (Some(encode_volume_byte(0.5)), 10)
+    );
+    assert_eq!(audio_from(&carol, alice.ssrc, &hello).await, (None, 10));
+    bob.send(&ControlMessage::SetParticipantVolume {
+        user_id: uid_a,
+        volume: 1.0,
+    })
+    .await;
+
+    // Cross-mute over the control plane: acked, mutual, invisible to Alice.
+    bob.send(&ControlMessage::SetUserBlock {
+        user_id: uid_a,
+        blocked: true,
+    })
+    .await;
+    bob.expect("UserBlockChanged", |m| {
+        matches!(m, ControlMessage::UserBlockChanged { user_id, blocked: true } if *user_id == uid_a)
+    })
+    .await;
+    send_audio(&alice, channel_id, 300, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+    assert_eq!(audio_from(&carol, alice.ssrc, &hello).await.1, 10);
+    send_audio(&bob, channel_id, 1, &hello).await;
+    assert_eq!(audio_from(&alice, bob.ssrc, &hello).await.1, 0);
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await.1, 10);
+    while let Some(m) = alice.try_recv(Duration::from_millis(300)).await {
+        assert!(
+            !matches!(
+                m,
+                ControlMessage::MuteStateChanged { .. } | ControlMessage::UserBlockChanged { .. }
+            ),
+            "the blocked side must not be notified: {m:?}"
+        );
+    }
+
+    // Listed over REST, and persisted: a fresh session for Bob starts with the block loaded.
+    let list: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/blocks", env.api, uid_b))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["blocked_users"], serde_json::json!([uid_a]));
+
+    // Tenant isolation: an API key of another application cannot see, create or delete blocks
+    // that involve users of this application, and the same external ids map to different users
+    // (with their own, empty block lists) over there.
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let env2 = Env {
+            api_key: api_key2,
+            ..env.clone()
+        };
+        let r = http
+            .get(format!("{}/v1/users/{}/blocks", env2.api, uid_b))
+            .header("x-api-key", &env2.api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign tenant must not list blocks");
+        let r = http
+            .post(format!("{}/v1/users/{}/blocks", env2.api, uid_b))
+            .header("x-api-key", &env2.api_key)
+            .json(&serde_json::json!({"blocked_user_id": uid_a}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign tenant must not create blocks");
+        let r = http
+            .delete(format!("{}/v1/users/{}/blocks/{}", env2.api, uid_b, uid_a))
+            .header("x-api-key", &env2.api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign tenant must not delete blocks");
+
+        let channel2 = create_channel(&env2, &http).await;
+        let (tok_b2, uid_b2) = issue_token(&env2, &http, "e2e:mute-bob", "Bob", channel2).await;
+        assert_ne!(
+            uid_b2,
+            uid_b.to_string(),
+            "users are scoped per application"
+        );
+        let list2: serde_json::Value = http
+            .get(format!("{}/v1/users/{}/blocks", env2.api, uid_b2))
+            .header("x-api-key", &env2.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list2["blocked_users"], serde_json::json!([]));
+        let mut bob2 = connect(&env2, "bob-tenant2", tok_b2).await;
+        let prefs = bob2
+            .expect("ReceiverPreferences", |m| {
+                matches!(m, ControlMessage::ReceiverPreferences { .. })
+            })
+            .await;
+        assert!(
+            matches!(&prefs, ControlMessage::ReceiverPreferences { blocked_users, .. } if blocked_users.is_empty()),
+            "blocks must not leak across tenants: {prefs:?}"
+        );
+        let _ = bob2.ws.close(None).await;
+        // The original tenant's block is untouched by the foreign attempts above.
+        let list: serde_json::Value = http
+            .get(format!("{}/v1/users/{}/blocks", env.api, uid_b))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list["blocked_users"], serde_json::json!([uid_a]));
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    bob.ws.close(None).await.unwrap();
+    let mut bob = connect(&env, "bob2", tok_b).await;
+    let prefs = bob
+        .expect("ReceiverPreferences", |m| {
+            matches!(m, ControlMessage::ReceiverPreferences { .. })
+        })
+        .await;
+    assert!(
+        matches!(&prefs, ControlMessage::ReceiverPreferences { blocked_users, .. } if blocked_users == &vec![uid_a]),
+        "block list must be loaded at login: {prefs:?}"
+    );
+    bind_media(&mut bob).await;
+    join(&mut bob, channel_id).await;
+    send_audio(&alice, channel_id, 400, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+
+    // Unblock through REST: Bob's live session gets the ack and both hear each other again.
+    http.delete(format!("{}/v1/users/{}/blocks/{}", env.api, uid_b, uid_a))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    bob.expect("UserBlockChanged(false)", |m| {
+        matches!(m, ControlMessage::UserBlockChanged { user_id, blocked: false } if *user_id == uid_a)
+    })
+    .await;
+    send_audio(&alice, channel_id, 500, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 10);
+    send_audio(&bob, channel_id, 100, &hello).await;
+    assert_eq!(audio_from(&alice, bob.ssrc, &hello).await.1, 10);
+
+    // Blocking yourself is refused on both surfaces.
+    bob.send(&ControlMessage::SetUserBlock {
+        user_id: uid_b,
+        blocked: true,
+    })
+    .await;
+    bob.expect(
+        "VALIDATION_ERROR",
+        |m| matches!(m, ControlMessage::Error { code, .. } if code == "VALIDATION_ERROR"),
+    )
+    .await;
+    let r = http
+        .post(format!("{}/v1/users/{}/blocks", env.api, uid_b))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"blocked_user_id": uid_b}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    for mut p in [alice, bob, carol] {
+        let _ = p.ws.close(None).await;
+    }
 }

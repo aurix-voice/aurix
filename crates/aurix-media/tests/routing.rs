@@ -352,3 +352,114 @@ async fn cross_app_sessions_cannot_join_channel() {
         )
         .is_err());
 }
+
+/// Receiver-side preferences: a local mute (per channel or everywhere), a per-participant gain
+/// and a cross-mute all shape the downlink of the receiver only; other listeners and the
+/// sender's own state are untouched.
+#[tokio::test]
+async fn receiver_preferences_filter_and_scale_downlink() {
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let team = ChannelId::new();
+    let party = ChannelId::new();
+
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    for s in [&s_a, &s_b, &s_c] {
+        for ch in [team, party] {
+            sfu.join_channel(
+                &s.session_id,
+                ch,
+                ChannelConfig::default(),
+                ChannelRole::Speaker,
+            )
+            .unwrap();
+        }
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+    c.bind(addr).await;
+
+    async fn hears(client: &Client, sender: &Client) -> Option<AurixPacket> {
+        client
+            .recv()
+            .await
+            .filter(|p| p.header.ssrc == sender.session.ssrc)
+    }
+
+    // Baseline: both hear A at full volume.
+    a.send_audio(addr, &team, b"t1").await;
+    assert_eq!(&hears(&b, &a).await.unwrap().payload[..], b"t1");
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"t1");
+
+    // B mutes A in `team` only: silence in team, still audible in party; C unaffected.
+    s_b.prefs.write().set_muted(s_a.user_id, Some(team), true);
+    a.send_audio(addr, &team, b"t2").await;
+    assert!(hears(&b, &a).await.is_none(), "channel-scoped local mute");
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"t2");
+    a.send_audio(addr, &party, b"p1").await;
+    assert_eq!(&hears(&b, &a).await.unwrap().payload[..], b"p1");
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"p1");
+    assert!(
+        s_a.is_transmitting_allowed(),
+        "a local mute must not touch the sender's own mute state"
+    );
+
+    // Mute everywhere, then clearing the global mute also clears the channel-scoped one.
+    s_b.prefs.write().set_muted(s_a.user_id, None, true);
+    a.send_audio(addr, &party, b"p2").await;
+    assert!(hears(&b, &a).await.is_none(), "all-channel local mute");
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"p2");
+    s_b.prefs.write().set_muted(s_a.user_id, None, false);
+    a.send_audio(addr, &team, b"t3").await;
+    assert_eq!(&hears(&b, &a).await.unwrap().payload[..], b"t3");
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"t3");
+
+    // Per-participant gain rides in the VolumeAttenuated byte, for B only.
+    s_b.prefs.write().set_gain(s_a.user_id, 0.5);
+    a.send_audio(addr, &team, b"t4").await;
+    let got = hears(&b, &a).await.unwrap();
+    assert!(got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(got.payload[0], encode_volume_byte(0.5));
+    assert_eq!(&got.payload[1..], b"t4");
+    let got = hears(&c, &a).await.unwrap();
+    assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(&got.payload[..], b"t4");
+    // Boost above unity is allowed up to the cap, out-of-range values are clamped.
+    s_b.prefs.write().set_gain(s_a.user_id, 9.0);
+    a.send_audio(addr, &team, b"t5").await;
+    assert_eq!(hears(&b, &a).await.unwrap().payload[0], 255);
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"t5");
+    s_b.prefs.write().set_gain(s_a.user_id, 1.0);
+
+    // Cross-mute is mutual: B blocked A -> B hears nothing from A and A hears nothing from B.
+    s_b.prefs.write().set_blocked(s_a.user_id, true);
+    s_a.prefs.write().set_blocked_by(s_b.user_id, true);
+    a.send_audio(addr, &party, b"p3").await;
+    assert!(
+        hears(&b, &a).await.is_none(),
+        "blocker does not hear target"
+    );
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"p3");
+    b.send_audio(addr, &party, b"from-b").await;
+    assert!(
+        hears(&a, &b).await.is_none(),
+        "target does not hear blocker"
+    );
+    assert_eq!(&hears(&c, &b).await.unwrap().payload[..], b"from-b");
+    s_b.prefs.write().set_blocked(s_a.user_id, false);
+    s_a.prefs.write().set_blocked_by(s_b.user_id, false);
+    a.send_audio(addr, &party, b"p4").await;
+    assert_eq!(&hears(&b, &a).await.unwrap().payload[..], b"p4");
+    assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"p4");
+}

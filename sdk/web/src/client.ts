@@ -1,10 +1,13 @@
 import {
   AURIX_SUBPROTOCOL,
   BEARER_SUBPROTOCOL_PREFIX,
+  MAX_PARTICIPANT_VOLUME,
   RESUME_SUBPROTOCOL_PREFIX,
   parseServerMessage,
   type ClientMessage,
+  type LocalMute,
   type ParticipantBrief,
+  type ParticipantVolume,
   type RecordingConsent,
   type ServerMessage,
   type TurnCredentials,
@@ -109,6 +112,13 @@ export interface AurixEvents {
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string) => void;
   bitrate: (targetKbps: number, reason: string) => void;
   kicked: (channelId: string, reason: string) => void;
+  /**
+   * Server-side snapshot of this user's receiver preferences, sent right after the session
+   * is established: persistent cross-mutes plus (on a resumed session) local mutes/volumes.
+   */
+  receiverPreferences: (prefs: ReceiverPreferences) => void;
+  /** A cross-mute placed or lifted by this user (from this or any other device/REST). */
+  userBlockChanged: (userId: string, blocked: boolean) => void;
   /** Connection lost unexpectedly; attempt `attempt` (1-based) is scheduled in `delayMs`. */
   recovering: (attempt: number, delayMs: number, cause: string) => void;
   /**
@@ -127,6 +137,16 @@ export interface AurixEvents {
 
 type Listener<K extends keyof AurixEvents> = AurixEvents[K];
 type AnyListener = (...args: unknown[]) => void;
+
+export interface ReceiverPreferences {
+  /** Users this user has cross-muted; the server drops their audio in every channel. */
+  blockedUsers: string[];
+  localMutes: LocalMute[];
+  volumes: ParticipantVolume[];
+}
+
+/** Marker for "in every channel" in the local-mute table. */
+const ALL_CHANNELS = '*';
 
 interface Pending<T> {
   resolve: (value: T) => void;
@@ -184,6 +204,11 @@ export class AurixClient {
   private userId: string | undefined;
   private channels = new Map<string, Map<string, Participant>>();
   private muted = false;
+  /** user_id → channel ids (or `ALL_CHANNELS`) this client has locally muted. */
+  private localMutes = new Map<string, Set<string>>();
+  /** user_id → receiver-local gain (unity entries are not stored). */
+  private volumes = new Map<string, number>();
+  private blockedUsers = new Set<string>();
   private closedByUser = false;
   private readonly reconnectPolicy: ReconnectPolicy;
   private resumeToken: string | undefined;
@@ -272,6 +297,100 @@ export class AurixClient {
     return this.pc;
   }
 
+  // ── Receiver-side controls (affect only what *this* client hears) ──
+
+  /**
+   * Stop hearing `userId` in `channelId`, or in every channel when `channelId` is omitted.
+   * The other participant is not told. Survives reconnects (re-applied by the client).
+   */
+  setParticipantMuted(userId: string, muted: boolean, channelId?: string): void {
+    const key = channelId ?? ALL_CHANNELS;
+    const scopes = this.localMutes.get(userId) ?? new Set<string>();
+    if (muted) {
+      scopes.add(key);
+    } else if (channelId === undefined) {
+      scopes.clear();
+    } else {
+      scopes.delete(key);
+    }
+    if (scopes.size === 0) this.localMutes.delete(userId);
+    else this.localMutes.set(userId, scopes);
+    if (channelId !== undefined && !this.channels.has(channelId)) return;
+    this.trySend({
+      type: 'SetParticipantMute',
+      data: { user_id: userId, channel_id: channelId ?? null, muted },
+    });
+  }
+
+  /** `true` when this client muted `userId` in `channelId` (or everywhere). */
+  isParticipantMuted(userId: string, channelId?: string): boolean {
+    const scopes = this.localMutes.get(userId);
+    if (!scopes) return false;
+    if (scopes.has(ALL_CHANNELS)) return true;
+    return channelId !== undefined && scopes.has(channelId);
+  }
+
+  /**
+   * Receiver-local gain for `userId`: `0` silence, `1` as sent, up to `2` (≈ +6 dB).
+   * Multiplies positional attenuation; applied by the server before mixing.
+   */
+  setParticipantVolume(userId: string, volume: number): void {
+    if (!Number.isFinite(volume) || volume < 0 || volume > MAX_PARTICIPANT_VOLUME) {
+      throw new RangeError(`volume must be within 0..${MAX_PARTICIPANT_VOLUME}`);
+    }
+    if (volume === 1) this.volumes.delete(userId);
+    else this.volumes.set(userId, volume);
+    this.trySend({ type: 'SetParticipantVolume', data: { user_id: userId, volume } });
+  }
+
+  getParticipantVolume(userId: string): number {
+    return this.volumes.get(userId) ?? 1;
+  }
+
+  /**
+   * Persistent, mutual cross-mute: neither side hears the other in any channel, on any
+   * device, until lifted. Stored server-side; confirmed via `userBlockChanged`.
+   */
+  setUserBlocked(userId: string, blocked: boolean): void {
+    this.requireOpen();
+    this.send({ type: 'SetUserBlock', data: { user_id: userId, blocked } });
+  }
+
+  isUserBlocked(userId: string): boolean {
+    return this.blockedUsers.has(userId);
+  }
+
+  getBlockedUsers(): string[] {
+    return Array.from(this.blockedUsers);
+  }
+
+  /** Re-send the client-held local mutes/volumes after a fresh (non-resumed) session. */
+  private replayReceiverPrefs(): void {
+    for (const [userId, scopes] of this.localMutes) {
+      if (scopes.has(ALL_CHANNELS)) {
+        this.trySend({
+          type: 'SetParticipantMute',
+          data: { user_id: userId, channel_id: null, muted: true },
+        });
+      }
+    }
+    for (const [userId, volume] of this.volumes) {
+      this.trySend({ type: 'SetParticipantVolume', data: { user_id: userId, volume } });
+    }
+  }
+
+  /** Channel-scoped mutes need membership, so they are re-sent per `ChannelJoinAck`. */
+  private replayChannelMutes(channelId: string): void {
+    for (const [userId, scopes] of this.localMutes) {
+      if (scopes.has(channelId) && !scopes.has(ALL_CHANNELS)) {
+        this.trySend({
+          type: 'SetParticipantMute',
+          data: { user_id: userId, channel_id: channelId, muted: true },
+        });
+      }
+    }
+  }
+
   // ── Lifecycle ──
 
   /**
@@ -291,6 +410,7 @@ export class AurixClient {
     this.setState('connected');
     this.emit('sessionReady', info);
     this.startPing();
+    this.replayReceiverPrefs();
 
     try {
       await this.startMedia();
@@ -542,6 +662,7 @@ export class AurixClient {
       for (const channelId of wanted) {
         if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
       }
+      this.replayReceiverPrefs();
     }
     this.setState('connected');
     try {
@@ -637,6 +758,7 @@ export class AurixClient {
         }
         this.emit('channelJoined', d.channel_id, list);
         if (this.muted) this.setMuted(true);
+        this.replayChannelMutes(d.channel_id);
         return;
       }
       case 'ParticipantJoined': {
@@ -701,6 +823,34 @@ export class AurixClient {
         const d = (msg as Extract<ServerMessage, { type: 'Kick' }>).data;
         if (this.channels.delete(d.channel_id)) this.emit('channelLeft', d.channel_id);
         this.emit('kicked', d.channel_id, d.reason);
+        return;
+      }
+      case 'UserBlockChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'UserBlockChanged' }>).data;
+        if (d.blocked) this.blockedUsers.add(d.user_id);
+        else this.blockedUsers.delete(d.user_id);
+        this.emit('userBlockChanged', d.user_id, d.blocked);
+        return;
+      }
+      case 'ReceiverPreferences': {
+        const d = (msg as Extract<ServerMessage, { type: 'ReceiverPreferences' }>).data;
+        this.blockedUsers = new Set(d.blocked_users);
+        // A resumed session already holds our mutes/volumes; a fresh one is replayed by
+        // `replayReceiverPrefs`, so only merge what the server reports on top.
+        for (const m of d.local_mutes) {
+          const scopes = this.localMutes.get(m.user_id) ?? new Set<string>();
+          scopes.add(m.channel_id ?? ALL_CHANNELS);
+          this.localMutes.set(m.user_id, scopes);
+        }
+        for (const v of d.volumes) {
+          if (v.volume === 1) this.volumes.delete(v.user_id);
+          else this.volumes.set(v.user_id, v.volume);
+        }
+        this.emit('receiverPreferences', {
+          blockedUsers: d.blocked_users,
+          localMutes: d.local_mutes,
+          volumes: d.volumes,
+        });
         return;
       }
       case 'WebRtcAnswer': {

@@ -104,7 +104,9 @@ impl OpusMixer {
                 continue;
             }
             any = true;
-            let vol = state.volume.clamp(0.0, 1.0);
+            let vol = state
+                .volume
+                .clamp(0.0, crate::session::MAX_PARTICIPANT_GAIN);
             for slot in self.mix_buf.iter_mut() {
                 match state.queue.pop_front() {
                     Some(sample) => *slot += (sample as f32 * vol) as i32,

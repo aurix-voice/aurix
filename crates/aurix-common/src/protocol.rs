@@ -78,6 +78,18 @@ impl PacketType {
     }
 }
 
+/// Gain factor carried by a `VolumeAttenuated` payload: fixed point with `VOLUME_UNITY` = 1.0,
+/// so 0 is silence, 128 is unchanged and 255 is ~2.0 (+6 dB).
+pub const VOLUME_UNITY: f32 = 128.0;
+
+pub fn encode_volume_byte(volume: f32) -> u8 {
+    (volume.clamp(0.0, 255.0 / VOLUME_UNITY) * VOLUME_UNITY).round() as u8
+}
+
+pub fn decode_volume_byte(byte: u8) -> f32 {
+    byte as f32 / VOLUME_UNITY
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketHeader {
     pub version: u8,
@@ -169,6 +181,7 @@ pub enum PacketFlags {
     KeyFrame = 0x0010,
     Priority = 0x0020,
     Relay = 0x0040,
+    /// Payload starts with one gain byte (see `encode_volume_byte`) followed by the Opus frame.
     VolumeAttenuated = 0x0080,
     E2ee = 0x0100,
     Rtp = 0x0200,
@@ -404,7 +417,14 @@ impl AurixPacket {
     /// Wrap a plaintext client packet into a cascade `Relay` envelope. `relay_ssrc` identifies
     /// the sending node (random per process) and `counter` is its 64-bit send counter, split
     /// across the sequence (low) and timestamp (high) fields so envelope IVs never repeat.
-    pub fn relay_envelope(inner: &AurixPacket, relay_ssrc: u32, counter: u64) -> Self {
+    /// The payload is `sender` (16 bytes) followed by the encoded client packet, so the
+    /// receiving node can apply receiver preferences without knowing the remote SSRC map.
+    pub fn relay_envelope(
+        inner: &AurixPacket,
+        relay_ssrc: u32,
+        counter: u64,
+        sender: &UserId,
+    ) -> Self {
         let mut hdr = PacketHeader::new(
             PacketType::Relay,
             counter as u32,
@@ -413,15 +433,26 @@ impl AurixPacket {
         );
         hdr.set_flag(PacketFlags::Relay);
         hdr.channel_id_hash = inner.header.channel_id_hash;
-        Self::new(hdr, inner.encode().freeze())
+        let encoded = inner.encode();
+        let mut payload = BytesMut::with_capacity(16 + encoded.len());
+        payload.put_slice(sender.0.as_bytes());
+        payload.put_slice(&encoded);
+        Self::new(hdr, payload.freeze())
     }
 
-    /// Extract the client packet carried by an opened `Relay` envelope.
-    pub fn relay_inner(&self) -> Result<AurixPacket> {
+    /// Extract the sending user and the client packet carried by an opened `Relay` envelope.
+    pub fn relay_inner(&self) -> Result<(UserId, AurixPacket)> {
         if self.header.packet_type != PacketType::Relay {
             return Err(AurixError::Transport("Not a Relay packet".into()));
         }
-        AurixPacket::decode(&self.payload)
+        if self.payload.len() < 16 + HEADER_SIZE {
+            return Err(AurixError::Transport("Relay envelope too short".into()));
+        }
+        let sender = UserId(
+            uuid::Uuid::from_slice(&self.payload[..16])
+                .map_err(|_| AurixError::Transport("Invalid relay sender id".into()))?,
+        );
+        Ok((sender, AurixPacket::decode(&self.payload[16..])?))
     }
 }
 
@@ -618,6 +649,38 @@ pub enum ControlMessage {
         muted: bool,
         server_muted: bool,
     },
+    /// Client→server: stop hearing `user_id` — in one channel or, with `channel_id: None`,
+    /// everywhere. Affects only this session; the sender is not told.
+    SetParticipantMute {
+        user_id: UserId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        muted: bool,
+    },
+    /// Client→server: gain applied to `user_id`'s audio for this session only
+    /// (0.0 = silent, 1.0 = as sent, up to 2.0 = +6 dB; combined with positional attenuation).
+    SetParticipantVolume {
+        user_id: UserId,
+        volume: f32,
+    },
+    /// Client→server: persistent, mutual cross-mute with `user_id` (survives sessions).
+    SetUserBlock {
+        user_id: UserId,
+        blocked: bool,
+    },
+    /// Server→client: a block placed by this user changed (ack, or sync from another session /
+    /// the REST API).
+    UserBlockChanged {
+        user_id: UserId,
+        blocked: bool,
+    },
+    /// Server→client, after `SessionInitAck`: everything this session is currently not hearing
+    /// or hearing at a non-default gain. Local mutes and volumes survive a resume only.
+    ReceiverPreferences {
+        blocked_users: Vec<UserId>,
+        local_mutes: Vec<LocalMute>,
+        volumes: Vec<ParticipantVolume>,
+    },
     SpeakingStateChanged {
         channel_id: ChannelId,
         user_id: UserId,
@@ -677,6 +740,20 @@ pub enum ControlMessage {
     Pong {
         nonce: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalMute {
+    pub user_id: UserId,
+    /// `None` = muted in every channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<ChannelId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParticipantVolume {
+    pub user_id: UserId,
+    pub volume: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,17 +876,31 @@ mod tests {
     }
 
     #[test]
+    fn volume_byte_is_fixed_point_with_unity_at_128() {
+        assert_eq!(encode_volume_byte(1.0), 128);
+        assert_eq!(encode_volume_byte(0.5), 64);
+        assert_eq!(encode_volume_byte(0.0), 0);
+        assert_eq!(encode_volume_byte(2.0), 255);
+        assert_eq!(encode_volume_byte(7.0), 255);
+        assert_eq!(decode_volume_byte(128), 1.0);
+        assert_eq!(decode_volume_byte(64), 0.5);
+        assert!((decode_volume_byte(255) - 1.992).abs() < 0.001);
+    }
+
+    #[test]
     fn relay_envelope_roundtrip() {
         let keys = MediaKeys::derive(b"cluster-cascade-secret");
         let inner = AurixPacket::audio(5, 960, 77, 88, Bytes::from_static(b"frame"));
-        let env = AurixPacket::relay_envelope(&inner, 0xDEAD_BEEF, (3u64 << 32) | 9);
+        let sender = UserId::new();
+        let env = AurixPacket::relay_envelope(&inner, 0xDEAD_BEEF, (3u64 << 32) | 9, &sender);
         assert_eq!(env.header.sequence, 9);
         assert_eq!(env.header.timestamp, 3);
         assert!(env.header.has_flag(PacketFlags::Relay));
         let wire = env.seal(&keys);
         let mut got = AurixPacket::decode_bounded(&wire, MAX_RELAY_PACKET_SIZE).unwrap();
         assert!(got.open(&keys));
-        let back = got.relay_inner().unwrap();
+        let (from, back) = got.relay_inner().unwrap();
+        assert_eq!(from, sender);
         assert_eq!(back.header.sequence, 5);
         assert_eq!(back.header.ssrc, 77);
         assert_eq!(back.header.channel_id_hash, 88);

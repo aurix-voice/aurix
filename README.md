@@ -133,6 +133,17 @@ curl -X POST localhost:8080/v1/tokens -H "x-api-key: $KEY" -H 'content-type: app
    grace period expired; then the same handshake simply yields a fresh session. Native clients
    re-send `SessionBind` from their (possibly new) UDP port. The SDKs do this automatically with
    exponential backoff and expose `Recovering` / `Recovered` / `FailedToRecover` events.
+6. **Receiver-local mute / volume / block**: `SetParticipantMute { user_id, channel_id?, muted }`
+   silences one player for *you only* (in one channel or, with `channel_id: null`, everywhere),
+   `SetParticipantVolume { user_id, volume }` scales them for you (`0.0`–`2.0`, `1.0` = unity,
+   multiplied with positional attenuation into the per-packet volume byte / WebRTC gain), and
+   `SetUserBlock { user_id, blocked }` is a persistent, mutual cross-mute stored in `user_blocks`
+   per application: neither side hears the other in any channel, on any node, in any future
+   session. All three are enforced on the server before media is forwarded (native, WebRTC and
+   cascade paths alike) and never reach the affected sender — no `MuteStateChanged` is
+   broadcast, unlike the sender-side `SetMute` and the moderator mute. A fresh session starts
+   with `ReceiverPreferences { blocked_users, local_mutes, volumes }` (blocks come from the
+   database; mutes/volumes are replayed by the SDKs), the blocker gets `UserBlockChanged` acks.
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 
@@ -150,12 +161,13 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
+| API key | `GET|POST /v1/users/:id/blocks`, `DELETE /v1/users/:id/blocks/:blocked_id` | persistent cross-mute (applied to live sessions on every node) |
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | player JWT | `GET /v1/me/turn-credentials`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users |
 
-API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read`,
+API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
 `moderation:read|write`, `recordings:read|write`, `keys:manage`. A key can only mint keys with a
 subset of its own permissions. Errors are `{"error":{"code":"…","message":"…"}}`.
 

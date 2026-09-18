@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -48,6 +49,7 @@ namespace Aurix.Demo
             }
             var channelId = Guid.Parse(channel);
             if (Get(opt, "scenario", "audio") == "reconnect") return await ReconnectScenario(ws, channelId, tokenA, tokenB);
+            if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
 
             var log = new List<string>();
             var alice = new AurixVoiceClient(ws, tokenA);
@@ -119,6 +121,105 @@ namespace Aurix.Demo
 
             bool ok = received > frames / 4 && rms > 0.2 && badAuth == 0
                       && log.Contains("bob: speaking alice true") && log.Contains("bob: mute alice muted=True");
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Receiver-side controls over real UDP: bob locally mutes alice (channel, then everywhere),
+        /// lowers her volume, and finally cross-mutes her; alice never learns about any of it and a
+        /// fresh bob session starts with the block already loaded.
+        /// </summary>
+        private static async Task<int> PrefsScenario(string ws, Guid channelId, string tokenA, string tokenB)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA);
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            var prefsEvents = new List<Protocol.ReceiverPreferences>();
+            bob.OnReceiverPreferences += p => { lock (prefsEvents) prefsEvents.Add(p); };
+            bob.OnUserBlockChanged += (u, b) => Add(log, $"bob: block {u} {b}");
+
+            var a = await alice.ConnectAsync();
+            await bob.ConnectAsync();
+            await alice.JoinChannelAsync(channelId);
+            var roster = await bob.JoinChannelAsync(channelId);
+            var aliceId = roster.First(p => p.Ssrc == a.Ssrc).UserId;
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            var hash = AurixVoiceClient.ChannelHash(channelId);
+            var opus = new byte[] { 0xf8, 0xff, 0xfe };
+
+            // Streams 25 frames from alice and reports how many bob received and at which gain byte.
+            async Task<(int count, float volume)> Probe()
+            {
+                await Task.Delay(250);
+                while (bob.TryDequeueAudio(out _)) { }
+                for (int i = 0; i < 25; i++) { alice.SendOpusFrame(hash, opus); await Task.Delay(20); }
+                await Task.Delay(300);
+                int n = 0; float vol = 1f;
+                while (bob.TryDequeueAudio(out var inc)) { n++; vol = inc.Volume; }
+                return (n, vol);
+            }
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+
+            await Task.Delay(300);
+            Check(prefsEvents.Count == 1 && prefsEvents[0].BlockedUsers.Count == 0, "fresh session announces empty receiver preferences");
+            var baseline = await Probe();
+            Check(baseline.count >= 20 && Math.Abs(baseline.volume - 1f) < 1e-3, $"baseline: bob hears alice ({baseline.count} pkts, gain {baseline.volume})");
+
+            await bob.SetParticipantMutedAsync(aliceId, true, channelId);
+            Check(bob.IsParticipantMuted(aliceId, channelId) && !bob.IsParticipantMuted(aliceId, Guid.NewGuid()), "channel-scoped mute tracked locally");
+            var muted = await Probe();
+            Check(muted.count == 0, $"channel mute: bob hears nothing ({muted.count} pkts)");
+            await bob.SetParticipantMutedAsync(aliceId, false, channelId);
+            await bob.SetParticipantMutedAsync(aliceId, true);
+            var mutedAll = await Probe();
+            Check(mutedAll.count == 0, $"all-channel mute: bob hears nothing ({mutedAll.count} pkts)");
+            await bob.SetParticipantMutedAsync(aliceId, false);
+            var unmuted = await Probe();
+            Check(unmuted.count >= 20, $"unmute restores audio ({unmuted.count} pkts)");
+
+            await bob.SetParticipantVolumeAsync(aliceId, 0.5f);
+            var half = await Probe();
+            Check(half.count >= 20 && Math.Abs(half.volume - 0.5f) < 0.01f, $"volume 0.5: gain byte decodes to {half.volume}");
+            await bob.SetParticipantVolumeAsync(aliceId, 2f);
+            var boost = await Probe();
+            Check(boost.count >= 20 && boost.volume > 1.9f, $"volume 2.0: gain byte decodes to {boost.volume}");
+            await bob.SetParticipantVolumeAsync(aliceId, 1f);
+            bool threw = false;
+            try { await bob.SetParticipantVolumeAsync(aliceId, 2.5f); } catch (ArgumentOutOfRangeException) { threw = true; }
+            Check(threw, "volume above 2.0 rejected client-side");
+
+            await bob.SetUserBlockedAsync(aliceId, true);
+            await Task.Delay(300);
+            Check(bob.IsUserBlocked(aliceId), "block acknowledged by the server");
+            var blocked = await Probe();
+            Check(blocked.count == 0, $"blocked: bob hears nothing ({blocked.count} pkts)");
+            bool aliceHeard;
+            lock (log) aliceHeard = log.Any(l => l.StartsWith("alice: mute") || l.StartsWith("alice: block"));
+            Check(!aliceHeard, "alice was never told about bob's local mute / volume / block");
+
+            // Fresh bob session: the block is persistent and arrives with ReceiverPreferences.
+            await bob.DisconnectAsync();
+            var bob2 = new AurixVoiceClient(ws, tokenB);
+            var prefs2 = new TaskCompletionSource<Protocol.ReceiverPreferences>(TaskCreationOptions.RunContinuationsAsynchronously);
+            bob2.OnReceiverPreferences += p => prefs2.TrySetResult(p);
+            await bob2.ConnectAsync();
+            var pump2 = Task.Run(async () => { while (!cts.IsCancellationRequested) { bob2.Update(); await Task.Delay(10); } });
+            var loaded = await Task.WhenAny(prefs2.Task, Task.Delay(3000)) == prefs2.Task ? prefs2.Task.Result : null;
+            Check(loaded != null && loaded.BlockedUsers.Contains(aliceId) && bob2.IsUserBlocked(aliceId), "persistent block loaded on a new session");
+            await bob2.SetUserBlockedAsync(aliceId, false);
+            await Task.Delay(300);
+            Check(!bob2.IsUserBlocked(aliceId), "unblock acknowledged");
+
+            cts.Cancel();
+            await pump; await pump2;
+            await alice.DisconnectAsync();
+            await bob2.DisconnectAsync();
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }

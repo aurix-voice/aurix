@@ -469,6 +469,97 @@ pub async fn get_user_channels(
     .await
 }
 
+// ── User block (cross-mute) Queries ──
+
+/// Adds a block; returns `false` if it already existed.
+pub async fn add_user_block(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    blocked_user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "INSERT INTO user_blocks (app_id, user_id, blocked_user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(app_id).bind(user_id).bind(blocked_user_id)
+    .execute(pool).await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn remove_user_block(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    blocked_user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "DELETE FROM user_blocks WHERE app_id = $1 AND user_id = $2 AND blocked_user_id = $3",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(blocked_user_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Removes every block `user_id` placed; returns the users that were blocked.
+pub async fn clear_user_blocks(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "DELETE FROM user_blocks WHERE app_id = $1 AND user_id = $2 RETURNING blocked_user_id",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Users blocked by `user_id`.
+pub async fn list_user_blocks(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT blocked_user_id FROM user_blocks WHERE app_id = $1 AND user_id = $2 ORDER BY created_at",
+    )
+    .bind(app_id).bind(user_id)
+    .fetch_all(pool).await
+}
+
+/// Users who blocked `user_id`.
+pub async fn list_user_blocked_by(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM user_blocks WHERE app_id = $1 AND blocked_user_id = $2",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_user_blocks(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM user_blocks WHERE app_id = $1 AND user_id = $2",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+}
+
 // ── Ban Queries ──
 
 pub async fn create_ban(pool: &DbPool, ban: &BanRow) -> Result<BanRow, sqlx::Error> {

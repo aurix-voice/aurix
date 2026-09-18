@@ -40,6 +40,21 @@ export interface UserPosition {
   orientation: Orientation3D;
 }
 
+/** Receiver-local mute of one participant; `channel_id: null` means in every channel. */
+export interface LocalMute {
+  user_id: string;
+  channel_id: string | null;
+}
+
+/** Receiver-local gain for one participant: `0` silence, `1` as sent, up to `2` (+6 dB). */
+export interface ParticipantVolume {
+  user_id: string;
+  volume: number;
+}
+
+/** Upper bound the server accepts for `SetParticipantVolume`. */
+export const MAX_PARTICIPANT_VOLUME = 2.0;
+
 /** Messages the client may send. */
 export type ClientMessage =
   | { type: 'ChannelJoin'; data: { channel_id: string; token: string } }
@@ -48,6 +63,12 @@ export type ClientMessage =
       type: 'MuteStateChanged';
       data: { channel_id: string; user_id: string; muted: boolean; server_muted: boolean };
     }
+  | {
+      type: 'SetParticipantMute';
+      data: { user_id: string; channel_id: string | null; muted: boolean };
+    }
+  | { type: 'SetParticipantVolume'; data: { user_id: string; volume: number } }
+  | { type: 'SetUserBlock'; data: { user_id: string; blocked: boolean } }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number } }
   | { type: 'RecordingConsentResponse'; data: { recording_id: string; consent: RecordingConsent } }
@@ -87,6 +108,11 @@ export type ServerMessage =
   | { type: 'SpeakingStateChanged'; data: { channel_id: string; user_id: string; speaking: boolean } }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'BitrateCommand'; data: { target_bitrate_kbps: number; reason: string } }
+  | { type: 'UserBlockChanged'; data: { user_id: string; blocked: boolean } }
+  | {
+      type: 'ReceiverPreferences';
+      data: { blocked_users: string[]; local_mutes: LocalMute[]; volumes: ParticipantVolume[] };
+    }
   | {
       type: 'RecordingNotification';
       data: { channel_id: string; recording_id: string; active: boolean; initiated_by: string };

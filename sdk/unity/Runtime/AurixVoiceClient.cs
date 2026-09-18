@@ -64,6 +64,10 @@ namespace Aurix
         private readonly Dictionary<uint, Participant> _bySsrc = new Dictionary<uint, Participant>();
         private readonly Queue<Action> _mainThreadQueue = new Queue<Action>();
         private readonly HashSet<Guid> _joinedChannels = new HashSet<Guid>();
+        /// <summary>Receiver-local mutes held by this client: user → channels (Guid.Empty = every channel).</summary>
+        private readonly Dictionary<Guid, HashSet<Guid>> _localMutes = new Dictionary<Guid, HashSet<Guid>>();
+        private readonly Dictionary<Guid, float> _volumes = new Dictionary<Guid, float>();
+        private readonly HashSet<Guid> _blockedUsers = new HashSet<Guid>();
         private readonly Random _random = new Random();
         private ControlChannel _control;
         private MediaTransport _media;
@@ -113,6 +117,10 @@ namespace Aurix
         public event Action<RecordingNotice> OnRecording;
         public event Action<uint, string> OnBitrateCommand;
         public event Action<Guid, string> OnKicked;
+        /// <summary>Snapshot of persistent cross-mutes (and, on a resumed session, local mutes/volumes) from the server.</summary>
+        public event Action<ReceiverPreferences> OnReceiverPreferences;
+        /// <summary>A cross-mute placed or lifted by this user, from this or any other device / the REST API.</summary>
+        public event Action<Guid, bool> OnUserBlockChanged;
         public event Action<string, string> OnServerError;
         /// <summary>Connection closed for good: after <see cref="DisconnectAsync"/>, a server <c>SessionClose</c>, or when reconnecting gave up.</summary>
         public event Action<string> OnDisconnected;
@@ -151,6 +159,7 @@ namespace Aurix
             {
                 var info = await OpenSessionAsync(null, _cts.Token).ConfigureAwait(false);
                 Post(() => OnSessionReady?.Invoke(info));
+                await ReplayReceiverPrefsAsync(_cts.Token).ConfigureAwait(false);
                 await BindMediaAsync(info, _cts.Token).ConfigureAwait(false);
                 return info;
             }
@@ -254,6 +263,7 @@ namespace Aurix
                 {
                     var roster = await tcs.Task.ConfigureAwait(false);
                     lock (_channels) _joinedChannels.Add(channelId);
+                    await ReplayChannelMutesAsync(channelId, ct).ConfigureAwait(false);
                     return roster;
                 }
                 finally { _joinTcs = null; _pendingChannelJoin = null; }
@@ -282,6 +292,109 @@ namespace Aurix
         {
             _muted = muted;
             _media?.SendMuteState(muted);
+        }
+
+        // ---- receiver-side controls: affect only what *this* client hears ----------------------
+
+        /// <summary>Upper bound the server accepts for <see cref="SetParticipantVolumeAsync"/>.</summary>
+        public const float MaxParticipantVolume = 2.0f;
+
+        /// <summary>
+        /// Stop hearing <paramref name="userId"/> in <paramref name="channelId"/>, or in every channel
+        /// when null. The other participant is not told. Re-applied by the client after a reconnect.
+        /// </summary>
+        public Task SetParticipantMutedAsync(Guid userId, bool muted, Guid? channelId = null, CancellationToken ct = default)
+        {
+            var key = channelId ?? Guid.Empty;
+            lock (_localMutes)
+            {
+                if (!_localMutes.TryGetValue(userId, out var scopes)) _localMutes[userId] = scopes = new HashSet<Guid>();
+                if (muted) scopes.Add(key);
+                else if (channelId == null) scopes.Clear();
+                else scopes.Remove(key);
+                if (scopes.Count == 0) _localMutes.Remove(userId);
+            }
+            if (_control == null) return Task.CompletedTask;
+            if (channelId != null) lock (_channels) { if (!_joinedChannels.Contains(channelId.Value)) return Task.CompletedTask; }
+            return _control.SendAsync(ControlMessage.SetParticipantMute(userId, channelId, muted), ct);
+        }
+
+        /// <summary>True when this client muted <paramref name="userId"/> in <paramref name="channelId"/> (or everywhere).</summary>
+        public bool IsParticipantMuted(Guid userId, Guid? channelId = null)
+        {
+            lock (_localMutes)
+                return _localMutes.TryGetValue(userId, out var scopes)
+                    && (scopes.Contains(Guid.Empty) || (channelId != null && scopes.Contains(channelId.Value)));
+        }
+
+        /// <summary>
+        /// Receiver-local gain for <paramref name="userId"/>: 0 silence, 1 as sent, up to
+        /// <see cref="MaxParticipantVolume"/>. Multiplies positional attenuation; applied by the server.
+        /// </summary>
+        public Task SetParticipantVolumeAsync(Guid userId, float volume, CancellationToken ct = default)
+        {
+            if (float.IsNaN(volume) || float.IsInfinity(volume) || volume < 0f || volume > MaxParticipantVolume)
+                throw new ArgumentOutOfRangeException(nameof(volume), $"volume must be within 0..{MaxParticipantVolume}");
+            lock (_volumes)
+            {
+                if (volume == 1f) _volumes.Remove(userId);
+                else _volumes[userId] = volume;
+            }
+            return _control == null ? Task.CompletedTask : _control.SendAsync(ControlMessage.SetParticipantVolume(userId, volume), ct);
+        }
+
+        public float GetParticipantVolume(Guid userId)
+        {
+            lock (_volumes) return _volumes.TryGetValue(userId, out var v) ? v : 1f;
+        }
+
+        /// <summary>
+        /// Persistent, mutual cross-mute: neither side hears the other in any channel, on any device,
+        /// until lifted. Stored server-side; confirmed through <see cref="OnUserBlockChanged"/>.
+        /// </summary>
+        public Task SetUserBlockedAsync(Guid userId, bool blocked, CancellationToken ct = default)
+        {
+            EnsureConnected();
+            return _control.SendAsync(ControlMessage.SetUserBlock(userId, blocked), ct);
+        }
+
+        public bool IsUserBlocked(Guid userId)
+        {
+            lock (_blockedUsers) return _blockedUsers.Contains(userId);
+        }
+
+        public IReadOnlyCollection<Guid> BlockedUsers { get { lock (_blockedUsers) return new List<Guid>(_blockedUsers); } }
+
+        /// <summary>A fresh (non-resumed) session forgot our local mutes/volumes: send them again.</summary>
+        private async Task ReplayReceiverPrefsAsync(CancellationToken ct)
+        {
+            var control = _control;
+            if (control == null) return;
+            List<Guid> everywhere;
+            List<KeyValuePair<Guid, float>> volumes;
+            lock (_localMutes)
+            {
+                everywhere = new List<Guid>();
+                foreach (var kv in _localMutes) if (kv.Value.Contains(Guid.Empty)) everywhere.Add(kv.Key);
+            }
+            lock (_volumes) volumes = new List<KeyValuePair<Guid, float>>(_volumes);
+            foreach (var user in everywhere)
+                await control.SendAsync(ControlMessage.SetParticipantMute(user, null, true), ct).ConfigureAwait(false);
+            foreach (var kv in volumes)
+                await control.SendAsync(ControlMessage.SetParticipantVolume(kv.Key, kv.Value), ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Channel-scoped mutes need membership, so they are re-sent after each successful join.</summary>
+        private async Task ReplayChannelMutesAsync(Guid channelId, CancellationToken ct)
+        {
+            var control = _control;
+            if (control == null) return;
+            var users = new List<Guid>();
+            lock (_localMutes)
+                foreach (var kv in _localMutes)
+                    if (kv.Value.Contains(channelId) && !kv.Value.Contains(Guid.Empty)) users.Add(kv.Key);
+            foreach (var user in users)
+                await control.SendAsync(ControlMessage.SetParticipantMute(user, channelId, true), ct).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -521,6 +634,7 @@ namespace Aurix
                     _bySsrc.Clear();
                 }
                 foreach (var ch in rejoin) { var id = ch; Post(() => OnChannelLeft?.Invoke(id)); }
+                await ReplayReceiverPrefsAsync(ct).ConfigureAwait(false);
             }
             await BindMediaAsync(info, ct).ConfigureAwait(false);
             if (rejoin != null)
@@ -625,6 +739,34 @@ namespace Aurix
                     var channelId = m.Id("channel_id");
                     lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); }
                     OnKicked?.Invoke(channelId, m.Str("reason") ?? string.Empty);
+                    break;
+                }
+                case "UserBlockChanged":
+                {
+                    var userId = m.Id("user_id");
+                    var blocked = m.Bool("blocked");
+                    lock (_blockedUsers) { if (blocked) _blockedUsers.Add(userId); else _blockedUsers.Remove(userId); }
+                    OnUserBlockChanged?.Invoke(userId, blocked);
+                    break;
+                }
+                case "ReceiverPreferences":
+                {
+                    var prefs = m.ReceiverPreferences();
+                    lock (_blockedUsers) { _blockedUsers.Clear(); foreach (var u in prefs.BlockedUsers) _blockedUsers.Add(u); }
+                    // A resumed session still holds our mutes/volumes; merge what the server reports.
+                    lock (_localMutes)
+                        foreach (var lm in prefs.LocalMutes)
+                        {
+                            if (!_localMutes.TryGetValue(lm.UserId, out var scopes)) _localMutes[lm.UserId] = scopes = new HashSet<Guid>();
+                            scopes.Add(lm.ChannelId ?? Guid.Empty);
+                        }
+                    lock (_volumes)
+                        foreach (var v in prefs.Volumes)
+                        {
+                            if (v.Volume == 1f) _volumes.Remove(v.UserId);
+                            else _volumes[v.UserId] = v.Volume;
+                        }
+                    OnReceiverPreferences?.Invoke(prefs);
                     break;
                 }
                 case "SessionClose":

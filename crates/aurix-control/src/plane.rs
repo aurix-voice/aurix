@@ -1,4 +1,5 @@
 use crate::analytics::AnalyticsCollector;
+use crate::block_manager::BlockManager;
 use crate::channel_manager::ChannelManager;
 use crate::event_bus::EventBus;
 use crate::node_manager::NodeManager;
@@ -25,6 +26,7 @@ pub struct ControlPlane {
     pub nodes: Arc<NodeManager>,
     pub channels: Arc<ChannelManager>,
     pub sessions: Arc<SessionManager>,
+    pub blocks: Arc<BlockManager>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -50,6 +52,7 @@ impl ControlPlane {
         }
         let channels = Arc::new(ChannelManager::new(pool.clone()));
         let sessions = Arc::new(SessionManager::new(pool.clone()));
+        let blocks = Arc::new(BlockManager::new(pool.clone()));
         let events = Arc::new(EventBus::new(10000));
 
         let (audit_tx, audit_rx) = flume::bounded(10000);
@@ -159,6 +162,7 @@ impl ControlPlane {
             nodes,
             channels,
             sessions,
+            blocks,
             events,
             audit,
             rate_limiter,

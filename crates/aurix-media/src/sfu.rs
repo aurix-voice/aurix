@@ -283,14 +283,16 @@ impl SfuNode {
 
         if let Some(ref cascade) = self.cascade {
             let router = router.clone();
-            cascade.clone().start_receiver(Arc::new(move |packet| {
-                let router = router.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = router.route_relayed_audio(&packet).await {
-                        warn!("Cascade relay route error: {}", e);
-                    }
-                });
-            }));
+            cascade
+                .clone()
+                .start_receiver(Arc::new(move |sender, packet| {
+                    let router = router.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = router.route_relayed_audio(&sender, &packet).await {
+                            warn!("Cascade relay route error: {}", e);
+                        }
+                    });
+                }));
         }
 
         // UDP receive workers. Several tasks drain the same socket so that per-packet work
