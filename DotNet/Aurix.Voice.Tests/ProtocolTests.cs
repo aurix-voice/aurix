@@ -147,9 +147,12 @@ namespace Aurix.Voice.Tests
         {
             var h = PacketHeader.Create(PacketType.Audio, 1, 0, 5);
             h.Flags |= PacketFlags.VolumeAttenuated;
-            var pkt = new AurxPacket(h, new byte[] { 128, 0xAA, 0xBB });
-            Assert.InRange(pkt.Volume, 0.5f, 0.51f);
+            var pkt = new AurxPacket(h, new byte[] { 64, 0xAA, 0xBB });
+            Assert.Equal(0.5f, pkt.Volume);
             Assert.Equal(new byte[] { 0xAA, 0xBB }, pkt.AudioPayload.ToArray());
+            Assert.Equal(1f, new AurxPacket(h, new byte[] { 128, 0xAA }).Volume);
+            Assert.InRange(new AurxPacket(h, new byte[] { 255, 0xAA }).Volume, 1.99f, 2f);
+            Assert.Equal(1f, new AurxPacket(PacketHeader.Create(PacketType.Audio, 1, 0, 5), new byte[] { 64 }).Volume);
         }
 
         [Fact]
@@ -193,6 +196,43 @@ namespace Aurix.Voice.Tests
             Assert.Equal(uint.MaxValue, ps[0].Ssrc);
             Assert.Equal(ChannelRole.Moderator, ps[0].Role);
             Assert.True(ps[0].IsMuted);
+        }
+
+        [Fact]
+        public void ReceiverPreferenceMessagesMatchServerWire()
+        {
+            var alice = Guid.Parse("11111111-2222-3333-4444-555555555556");
+            var team = Guid.Parse("11111111-2222-3333-4444-555555555555");
+
+            // Outbound: exactly the JSON shape serde expects (null channel_id = every channel).
+            Assert.Equal(
+                "{\"type\":\"SetParticipantMute\",\"data\":{\"user_id\":\"" + alice + "\",\"channel_id\":\"" + team + "\",\"muted\":true}}",
+                ControlMessage.SetParticipantMute(alice, team, true));
+            Assert.Equal(
+                "{\"type\":\"SetParticipantMute\",\"data\":{\"user_id\":\"" + alice + "\",\"channel_id\":null,\"muted\":false}}",
+                ControlMessage.SetParticipantMute(alice, null, false));
+            Assert.Equal(
+                "{\"type\":\"SetParticipantVolume\",\"data\":{\"user_id\":\"" + alice + "\",\"volume\":0.5}}",
+                ControlMessage.SetParticipantVolume(alice, 0.5f));
+            Assert.Equal(
+                "{\"type\":\"SetUserBlock\",\"data\":{\"user_id\":\"" + alice + "\",\"blocked\":true}}",
+                ControlMessage.SetUserBlock(alice, true));
+
+            // Inbound snapshot as the server sends it after SessionInitAck.
+            var prefs = ControlMessage.Parse("{\"type\":\"ReceiverPreferences\",\"data\":{\"blocked_users\":[\"" + alice + "\"]," +
+                "\"local_mutes\":[{\"user_id\":\"" + alice + "\",\"channel_id\":null},{\"user_id\":\"" + alice + "\",\"channel_id\":\"" + team + "\"}]," +
+                "\"volumes\":[{\"user_id\":\"" + alice + "\",\"volume\":1.5}]}}").ReceiverPreferences();
+            Assert.Equal(new[] { alice }, prefs.BlockedUsers);
+            Assert.Equal(2, prefs.LocalMutes.Count);
+            Assert.Null(prefs.LocalMutes[0].ChannelId);
+            Assert.Equal(team, prefs.LocalMutes[1].ChannelId);
+            Assert.Single(prefs.Volumes);
+            Assert.Equal(1.5f, prefs.Volumes[0].Volume);
+
+            var empty = ControlMessage.Parse("{\"type\":\"ReceiverPreferences\",\"data\":{}}").ReceiverPreferences();
+            Assert.Empty(empty.BlockedUsers);
+            Assert.Empty(empty.LocalMutes);
+            Assert.Empty(empty.Volumes);
         }
 
         [Fact]

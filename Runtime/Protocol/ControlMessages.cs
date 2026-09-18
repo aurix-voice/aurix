@@ -32,6 +32,28 @@ namespace Aurix.Protocol
         public Orientation3D Orientation;
     }
 
+    /// <summary>Receiver-local mute of one participant; <see cref="ChannelId"/> is null for "every channel".</summary>
+    public sealed class LocalMute
+    {
+        public Guid UserId;
+        public Guid? ChannelId;
+    }
+
+    /// <summary>Receiver-local gain for one participant: 0 silence, 1 as sent, up to 2 (about +6 dB).</summary>
+    public sealed class ParticipantVolume
+    {
+        public Guid UserId;
+        public float Volume;
+    }
+
+    /// <summary>Server-side snapshot of this user's receiver preferences, sent after <c>SessionInitAck</c>.</summary>
+    public sealed class ReceiverPreferences
+    {
+        public List<Guid> BlockedUsers = new List<Guid>();
+        public List<LocalMute> LocalMutes = new List<LocalMute>();
+        public List<ParticipantVolume> Volumes = new List<ParticipantVolume>();
+    }
+
     /// <summary>
     /// One WebSocket control message: <c>{"type": "&lt;Variant&gt;", "data": {...}}</c>, mirroring the
     /// Rust <c>ControlMessage</c> enum. <see cref="Data"/> is the raw parsed <c>data</c> object; typed
@@ -126,6 +148,38 @@ namespace Aurix.Protocol
             }
         }
 
+        public ReceiverPreferences ReceiverPreferences()
+        {
+            var prefs = new ReceiverPreferences();
+            if (Data == null) return prefs;
+            if (Data.TryGetValue("blocked_users", out var bv) && MiniJson.AsArray(bv) is List<object> blocked)
+                foreach (var item in blocked)
+                    if (Guid.TryParse(item as string, out var g)) prefs.BlockedUsers.Add(g);
+            if (Data.TryGetValue("local_mutes", out var mv) && MiniJson.AsArray(mv) is List<object> mutes)
+                foreach (var item in mutes)
+                {
+                    var o = MiniJson.AsObject(item);
+                    if (o == null) continue;
+                    prefs.LocalMutes.Add(new LocalMute
+                    {
+                        UserId = MiniJson.GetGuid(o, "user_id") ?? Guid.Empty,
+                        ChannelId = MiniJson.GetGuid(o, "channel_id"),
+                    });
+                }
+            if (Data.TryGetValue("volumes", out var vv) && MiniJson.AsArray(vv) is List<object> volumes)
+                foreach (var item in volumes)
+                {
+                    var o = MiniJson.AsObject(item);
+                    if (o == null) continue;
+                    prefs.Volumes.Add(new ParticipantVolume
+                    {
+                        UserId = MiniJson.GetGuid(o, "user_id") ?? Guid.Empty,
+                        Volume = (float)MiniJson.GetNumber(o, "volume", 1.0),
+                    });
+                }
+            return prefs;
+        }
+
         public static string ConsentToWire(RecordingConsent c)
         {
             switch (c)
@@ -158,6 +212,18 @@ namespace Aurix.Protocol
             {
                 { "recording_id", recordingId }, { "consent", ConsentToWire(consent) },
             });
+
+        public static string SetParticipantMute(Guid userId, Guid? channelId, bool muted) =>
+            Serialize("SetParticipantMute", new Dictionary<string, object>
+            {
+                { "user_id", userId }, { "channel_id", channelId.HasValue ? (object)channelId.Value : null }, { "muted", muted },
+            });
+
+        public static string SetParticipantVolume(Guid userId, float volume) =>
+            Serialize("SetParticipantVolume", new Dictionary<string, object> { { "user_id", userId }, { "volume", volume } });
+
+        public static string SetUserBlock(Guid userId, bool blocked) =>
+            Serialize("SetUserBlock", new Dictionary<string, object> { { "user_id", userId }, { "blocked", blocked } });
 
         public static string PositionUpdate(Guid channelId, Guid userId, Position3D pos, Orientation3D ori) =>
             Serialize("PositionUpdate", new Dictionary<string, object>
