@@ -3,8 +3,17 @@
 //! Every player connection owns exactly one media session. The connection lifecycle is persisted
 //! (sessions, channel memberships) and all fan-out (participant joins, speaking, mutes, kicks,
 //! recording notices) runs through two node-wide tasks so cost is per event, not per connection.
+//!
+//! Session resume: when a WebSocket drops without a client `Close` (network blip, NAT rebind,
+//! backgrounded app) the session is *detached* rather than destroyed. It keeps its SSRC, media
+//! key and channel memberships for `server.session_resume_grace_secs`; the client reconnects
+//! presenting `<session_id>.<resume_token>` (header `X-Aurix-Resume`, sub-protocol
+//! `resume.<session_id>.<token>` or query `resume=`) together with a valid JWT for the same
+//! user and receives `SessionInitAck { resumed: true }` plus one `ChannelJoinAck` per channel.
+//! Peers never see a leave/join pair. A failed resume falls back to a fresh session.
 
 use aurix_auth::ValidatedToken;
+use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{ControlMessage, ParticipantBrief};
 use aurix_common::types::*;
@@ -23,7 +32,7 @@ use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -34,7 +43,12 @@ const MAX_TEXT_FRAME: usize = 64 * 1024;
 const MAX_POSITIONS_PER_UPDATE: usize = 64;
 /// Sub-protocol prefix browsers use to pass the JWT (`Sec-WebSocket-Protocol: aurix, bearer.<jwt>`).
 const BEARER_SUBPROTOCOL_PREFIX: &str = "bearer.";
+/// Sub-protocol prefix carrying `<session_id>.<resume_token>` for session resume.
+const RESUME_SUBPROTOCOL_PREFIX: &str = "resume.";
+const RESUME_HEADER: &str = "x-aurix-resume";
 const AURIX_SUBPROTOCOL: &str = "aurix";
+/// Queued on a connection's outbound channel to make its send loop close the socket.
+const CLOSE_SENTINEL: &str = "";
 
 #[derive(Clone)]
 pub struct WsState {
@@ -55,6 +69,47 @@ pub struct ConnectionInfo {
     pub display_name: String,
     pub ssrc: u32,
     pub channels: Vec<ChannelId>,
+    resume_token_hash: [u8; 32],
+    /// Set while the socket is gone and the session waits for the client to resume.
+    detached_since: Option<Instant>,
+    /// Bumped on every (re)attach so a stale grace timer cannot close a resumed session.
+    generation: u64,
+    /// Server-initiated close (ban, shutdown); such sessions are never resumable.
+    closing: Option<String>,
+}
+
+impl ConnectionInfo {
+    /// Resume precondition check and claim; the caller holds the exclusive map entry, which makes
+    /// the check-then-claim atomic with respect to concurrent reconnects for the same session.
+    fn try_claim(&mut self, presented: &[u8; 32], jwt: &ValidatedToken) -> bool {
+        if self.detached_since.is_none()
+            || self.closing.is_some()
+            || self.user_id != jwt.user_id
+            || self.app_id != jwt.app_id
+            || !constant_time_eq(presented, &self.resume_token_hash)
+        {
+            return false;
+        }
+        self.detached_since = None;
+        self.generation += 1;
+        true
+    }
+}
+
+enum Disconnect {
+    /// Client sent a `Close` frame (or `SessionClose`): a deliberate logout.
+    ClientClose,
+    /// Socket error, EOF or idle timeout: the client may come back.
+    Dropped,
+}
+
+/// Outcome of the WebSocket handshake for a session (fresh or resumed).
+struct Attached {
+    session_id: SessionId,
+    ssrc: u32,
+    media_key: [u8; 32],
+    /// Channels restored from a detached session (`None` for a fresh session).
+    resumed_channels: Option<Vec<ChannelId>>,
 }
 
 impl WsState {
@@ -88,19 +143,103 @@ impl WsState {
         tokio::spawn(async move { st.run_media_event_fanout().await });
     }
 
-    /// Sends `SessionClose` to every player and drops their senders so the connection tasks end.
+    /// Sends `SessionClose` to every player and closes their sockets (non-resumable).
     pub fn close_all(&self, reason: &str) {
         let ids: Vec<SessionId> = self.connections.iter().map(|e| *e.key()).collect();
         for sid in ids {
-            self.send_to_session(
-                &sid,
-                &ControlMessage::SessionClose {
-                    session_id: sid,
-                    reason: reason.into(),
-                },
-            );
-            self.connections.remove(&sid);
+            self.request_close(sid, reason);
         }
+    }
+
+    /// Marks a session as closing by the server, tells the client and closes the socket. A
+    /// detached session is cleaned up right away since nobody is listening.
+    fn request_close(&self, session_id: SessionId, reason: &str) {
+        let Some(mut conn) = self.connections.get_mut(&session_id) else {
+            return;
+        };
+        conn.closing = Some(reason.to_string());
+        let msg = ControlMessage::SessionClose {
+            session_id,
+            reason: reason.into(),
+        };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = conn.tx.try_send(json);
+        }
+        let _ = conn.tx.try_send(CLOSE_SENTINEL.to_string());
+        let user_id = conn.user_id;
+        drop(conn);
+        // Attached sessions clean up when their socket task exits; detached ones have nobody
+        // to do it, so take over from the grace timer.
+        if self.take_detached(session_id) {
+            let st = self.clone();
+            let reason = reason.to_string();
+            tokio::spawn(async move {
+                cleanup_connection(&st, session_id, user_id, &reason).await;
+            });
+        }
+    }
+
+    /// Ends a session's detached state without resuming it (the caller must clean it up).
+    /// Returns `false` if the session is not detached, so the grace timer stays responsible.
+    fn take_detached(&self, session_id: SessionId) -> bool {
+        let Some(mut conn) = self.connections.get_mut(&session_id) else {
+            return false;
+        };
+        if conn.detached_since.take().is_none() {
+            return false;
+        }
+        conn.generation += 1;
+        aurix_metrics::WS_SESSIONS_DETACHED.dec();
+        true
+    }
+
+    /// Atomically claims a detached session for resume. The caller must hold a valid JWT for
+    /// the same tenant/user; the token is compared in constant time against the stored hash.
+    fn claim_resume(&self, session_id: SessionId, token: &str, jwt: &ValidatedToken) -> bool {
+        let Some(presented) = ResumeToken::hash_presented(token) else {
+            return false;
+        };
+        let Some(mut conn) = self.connections.get_mut(&session_id) else {
+            return false;
+        };
+        if !conn.try_claim(&presented, jwt) {
+            return false;
+        }
+        aurix_metrics::WS_SESSIONS_DETACHED.dec();
+        true
+    }
+
+    /// Parks a session whose socket dropped; destroys it if no resume happens within `grace`.
+    fn detach(&self, session_id: SessionId, user_id: UserId, grace: Duration) {
+        let generation = {
+            let Some(mut conn) = self.connections.get_mut(&session_id) else {
+                return;
+            };
+            conn.detached_since = Some(Instant::now());
+            conn.generation += 1;
+            conn.generation
+        };
+        aurix_metrics::WS_SESSIONS_DETACHED.inc();
+        info!(
+            "WS session {} detached for user {}; resumable for {:?}",
+            session_id, user_id, grace
+        );
+        let st = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let expired = st
+                .connections
+                .get_mut(&session_id)
+                .filter(|c| c.detached_since.is_some() && c.generation == generation)
+                .map(|mut c| {
+                    c.detached_since = None;
+                    aurix_metrics::WS_SESSIONS_DETACHED.dec();
+                })
+                .is_some();
+            if expired {
+                cleanup_connection(&st, session_id, user_id, "resume_timeout").await;
+            }
+        });
     }
 
     fn send_to_session(&self, session_id: &SessionId, msg: &ControlMessage) {
@@ -280,15 +419,7 @@ impl WsState {
                     ..
                 } => {
                     for sid in self.sessions_of_user(app_id, user_id) {
-                        self.send_to_session(
-                            &sid,
-                            &ControlMessage::SessionClose {
-                                session_id: sid,
-                                reason: format!("banned: {reason}"),
-                            },
-                        );
-                        // Dropping the sender closes the connection's send loop.
-                        self.connections.remove(&sid);
+                        self.request_close(sid, &format!("banned: {reason}"));
                     }
                 }
                 ServerEvent::RecordingStarted {
@@ -483,37 +614,61 @@ pub struct WsQuery {
     /// Deprecated fallback for clients that cannot set headers or sub-protocols. Tokens in URLs
     /// end up in proxy/access logs; prefer the `bearer.<jwt>` sub-protocol.
     pub token: Option<String>,
+    /// `<session_id>.<resume_token>` fallback for clients that cannot set headers/sub-protocols.
+    pub resume: Option<String>,
+}
+
+struct WsCredentials {
+    token: String,
+    echo_subprotocol: bool,
+    resume: Option<(SessionId, String)>,
+}
+
+fn parse_resume(value: &str) -> Option<(SessionId, String)> {
+    let (sid, tok) = value.split_once('.')?;
+    let sid = uuid::Uuid::parse_str(sid).ok()?;
+    (!tok.is_empty()).then(|| (SessionId::from_uuid(sid), tok.to_string()))
 }
 
 /// Extracts the JWT from (in order) `Authorization: Bearer`, the `bearer.<jwt>` sub-protocol,
-/// or the `token` query parameter. Returns the token and whether the `aurix` sub-protocol
-/// must be echoed back.
-fn extract_ws_token(headers: &HeaderMap, query: &WsQuery) -> Option<(String, bool)> {
-    if let Some(t) = headers
+/// or the `token` query parameter, plus the optional resume credential from the
+/// `X-Aurix-Resume` header, the `resume.<sid>.<token>` sub-protocol or the `resume` query.
+fn extract_ws_credentials(headers: &HeaderMap, query: &WsQuery) -> Option<WsCredentials> {
+    let mut resume = headers
+        .get(RESUME_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_resume);
+    let mut token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        return Some((t.to_string(), false));
-    }
+        .map(str::to_string);
+    let mut echo_subprotocol = false;
     if let Some(protocols) = headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
     {
-        let mut token = None;
-        let mut has_aurix = false;
         for p in protocols.split(',').map(str::trim) {
             if p == AURIX_SUBPROTOCOL {
-                has_aurix = true;
+                echo_subprotocol = true;
             } else if let Some(t) = p.strip_prefix(BEARER_SUBPROTOCOL_PREFIX) {
-                token = Some(t.to_string());
+                token.get_or_insert_with(|| t.to_string());
+            } else if let Some(r) = p.strip_prefix(RESUME_SUBPROTOCOL_PREFIX) {
+                if resume.is_none() {
+                    resume = parse_resume(r);
+                }
             }
         }
-        if let Some(t) = token {
-            return Some((t, has_aurix));
-        }
     }
-    query.token.clone().map(|t| (t, false))
+    let token = token.or_else(|| query.token.clone())?;
+    if resume.is_none() {
+        resume = query.resume.as_deref().and_then(parse_resume);
+    }
+    Some(WsCredentials {
+        token,
+        echo_subprotocol,
+        resume,
+    })
 }
 
 fn peer_ip(state: &WsState, headers: &HeaderMap, peer: Option<SocketAddr>) -> IpAddr {
@@ -533,13 +688,13 @@ pub async fn ws_handler(
     peer: Option<ConnectInfo<SocketAddr>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
-    let Some((token, echo_subprotocol)) = extract_ws_token(&headers, &query) else {
+    let Some(creds) = extract_ws_credentials(&headers, &query) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let ip = peer_ip(&state, &headers, peer.map(|p| p.0));
     let validated = match state
         .control
-        .authenticate_session(&token, &ip.to_string())
+        .authenticate_session(&creds.token, &ip.to_string())
         .await
     {
         Ok((v, _node)) => v,
@@ -556,27 +711,76 @@ pub async fn ws_handler(
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.chars().take(255).collect::<String>());
+    // Claimed before the upgrade so two racing reconnects cannot both take the session.
+    let resume = creds
+        .resume
+        .filter(|(sid, tok)| state.claim_resume(*sid, tok, &validated))
+        .map(|(sid, _)| sid);
     let ws = ws.max_message_size(MAX_TEXT_FRAME);
-    let ws = if echo_subprotocol {
+    let ws = if creds.echo_subprotocol {
         ws.protocols([AURIX_SUBPROTOCOL])
     } else {
         ws
     };
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, validated, ip, user_agent))
+    ws.on_upgrade(move |socket| {
+        handle_ws_connection(socket, state, validated, ip, user_agent, resume)
+    })
 }
 
-async fn handle_ws_connection(
-    socket: WebSocket,
-    state: WsState,
-    token: ValidatedToken,
-    ip: IpAddr,
-    user_agent: Option<String>,
+async fn send_direct(
+    ws_sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: &ControlMessage,
 ) {
-    state.start_fanout();
-    let session_id = SessionId::new();
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+    let _ = ws_sender
+        .send(Message::Text(
+            serde_json::to_string(msg).unwrap_or_default(),
+        ))
+        .await;
+}
 
+/// Reattaches a claimed (detached) session to a new socket. `None` if its media session is
+/// gone in the meantime (SFU timeout), in which case the caller opens a fresh session.
+fn reattach_session(
+    state: &WsState,
+    session_id: SessionId,
+    tx: &mpsc::Sender<String>,
+    resume_hash: [u8; 32],
+) -> Option<Attached> {
+    let media = {
+        let sfu = state.sfu.read();
+        sfu.get_session(&session_id).filter(|s| s.is_active())
+    }?;
+    let mut conn = state.connections.get_mut(&session_id)?;
+    conn.tx = tx.clone();
+    conn.resume_token_hash = resume_hash;
+    aurix_metrics::WS_SESSIONS_RESUMED.inc();
+    Some(Attached {
+        session_id,
+        ssrc: media.ssrc,
+        media_key: media.media_key,
+        resumed_channels: Some(conn.channels.clone()),
+    })
+}
+
+async fn open_session(
+    state: &WsState,
+    token: &ValidatedToken,
+    ip: IpAddr,
+    user_agent: Option<&str>,
+    tx: &mpsc::Sender<String>,
+    resume_hash: [u8; 32],
+) -> Result<Attached, ControlMessage> {
+    // One live session per user and node (`Sfu::create_session` tears down the media side of
+    // any previous one): close its control side too so channels and DB memberships follow.
+    for old in state.sessions_of_user(token.app_id, token.user_id) {
+        if state.take_detached(old) {
+            cleanup_connection(state, old, token.user_id, "replaced").await;
+        } else {
+            state.request_close(old, "replaced");
+        }
+    }
+
+    let session_id = SessionId::new();
     // Media session first: node capacity is the hard limit.
     let created = {
         let sfu = state.sfu.read();
@@ -587,22 +791,10 @@ async fn handle_ws_connection(
             token.display_name.clone(),
         )
     };
-    let media_session = match created {
-        Ok(s) => s,
-        Err(e) => {
-            let err = ControlMessage::Error {
-                code: e.error_code().into(),
-                message: e.public_message(),
-            };
-            let _ = ws_sender
-                .send(Message::Text(
-                    serde_json::to_string(&err).unwrap_or_default(),
-                ))
-                .await;
-            let _ = ws_sender.close().await;
-            return;
-        }
-    };
+    let media_session = created.map_err(|e| ControlMessage::Error {
+        code: e.error_code().into(),
+        message: e.public_message(),
+    })?;
 
     if let Err(e) = state
         .control
@@ -613,7 +805,7 @@ async fn handle_ws_connection(
             token.app_id,
             state.control.node_id,
             &ip.to_string(),
-            user_agent.as_deref(),
+            user_agent,
         )
         .await
     {
@@ -622,17 +814,10 @@ async fn handle_ws_connection(
             let sfu = state.sfu.read();
             let _ = sfu.destroy_session(&session_id);
         }
-        let err = ControlMessage::Error {
+        return Err(ControlMessage::Error {
             code: "INTERNAL_ERROR".into(),
             message: "Session could not be created".into(),
-        };
-        let _ = ws_sender
-            .send(Message::Text(
-                serde_json::to_string(&err).unwrap_or_default(),
-            ))
-            .await;
-        let _ = ws_sender.close().await;
-        return;
+        });
     }
 
     state.connections.insert(
@@ -644,8 +829,104 @@ async fn handle_ws_connection(
             display_name: token.display_name.clone(),
             ssrc: media_session.ssrc,
             channels: Vec::new(),
+            resume_token_hash: resume_hash,
+            detached_since: None,
+            generation: 0,
+            closing: None,
         },
     );
+    Ok(Attached {
+        session_id,
+        ssrc: media_session.ssrc,
+        media_key: media_session.media_key,
+        resumed_channels: None,
+    })
+}
+
+fn channel_snapshot(
+    state: &WsState,
+    session_id: &SessionId,
+    channel_id: &ChannelId,
+) -> Vec<ParticipantBrief> {
+    let sfu = state.sfu.read();
+    let Some(channel) = sfu.get_channel(channel_id) else {
+        return Vec::new();
+    };
+    channel
+        .get_all_participants()
+        .into_iter()
+        .filter(|s| s.session_id != *session_id)
+        .map(|s| ParticipantBrief {
+            user_id: s.user_id,
+            display_name: s.display_name.clone(),
+            ssrc: s.ssrc,
+            role: channel.get_role(&s.user_id),
+            is_muted: s.is_muted.load(Ordering::Relaxed)
+                || s.is_server_muted.load(Ordering::Relaxed),
+            is_speaking: s.is_speaking.load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
+async fn handle_ws_connection(
+    socket: WebSocket,
+    state: WsState,
+    token: ValidatedToken,
+    ip: IpAddr,
+    user_agent: Option<String>,
+    resume: Option<SessionId>,
+) {
+    state.start_fanout();
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+    let grace = Duration::from_secs(state.control.config.server.session_resume_grace_secs);
+    let resume_token = match ResumeToken::generate() {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("resume token generation failed: {e}");
+            send_direct(
+                &mut ws_sender,
+                &ControlMessage::Error {
+                    code: "INTERNAL_ERROR".into(),
+                    message: "Session could not be created".into(),
+                },
+            )
+            .await;
+            let _ = ws_sender.close().await;
+            return;
+        }
+    };
+
+    let mut attached = None;
+    if let Some(sid) = resume {
+        attached = reattach_session(&state, sid, &tx, resume_token.hash);
+        if attached.is_none() {
+            // Claimed, but the media session died meanwhile: release it and start over.
+            cleanup_connection(&state, sid, token.user_id, "resume_failed").await;
+        }
+    }
+    let attached = match attached {
+        Some(a) => a,
+        None => match open_session(
+            &state,
+            &token,
+            ip,
+            user_agent.as_deref(),
+            &tx,
+            resume_token.hash,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(err) => {
+                send_direct(&mut ws_sender, &err).await;
+                let _ = ws_sender.close().await;
+                return;
+            }
+        },
+    };
+    let session_id = attached.session_id;
+    let resumed = attached.resumed_channels.is_some();
 
     if let Some(ref redis) = state.control.redis {
         let _ = redis
@@ -666,22 +947,53 @@ async fn handle_ws_connection(
     );
     let init_ack = ControlMessage::SessionInitAck {
         session_id,
-        ssrc: media_session.ssrc,
+        ssrc: attached.ssrc,
         media_addr,
-        media_key: base64::engine::general_purpose::STANDARD.encode(media_session.media_key),
+        media_key: base64::engine::general_purpose::STANDARD.encode(attached.media_key),
+        resume_token: resume_token.token,
+        resume_grace_ms: grace.as_millis() as u64,
+        resumed,
     };
     if tx
         .send(serde_json::to_string(&init_ack).unwrap_or_default())
         .await
         .is_err()
     {
-        cleanup_connection(&state, session_id, &token, "send_failed").await;
+        cleanup_connection(&state, session_id, token.user_id, "send_failed").await;
         return;
+    }
+    // A resumed client reconciles its channel state from one ChannelJoinAck per channel.
+    for channel_id in attached.resumed_channels.iter().flatten() {
+        send_msg(
+            &tx,
+            &ControlMessage::ChannelJoinAck {
+                channel_id: *channel_id,
+                participants: channel_snapshot(&state, &session_id, channel_id),
+            },
+        )
+        .await;
+        if let Some(rec) = &state.recording {
+            for (recording_id, initiated_by) in rec.active_in_channel(channel_id) {
+                send_msg(
+                    &tx,
+                    &ControlMessage::RecordingNotification {
+                        channel_id: *channel_id,
+                        recording_id,
+                        active: true,
+                        initiated_by,
+                    },
+                )
+                .await;
+            }
+        }
     }
     aurix_metrics::WS_CONNECTIONS.inc();
     info!(
-        "WS session {} opened for user {} ({})",
-        session_id, token.user_id, ip
+        "WS session {} {} for user {} ({})",
+        session_id,
+        if resumed { "resumed" } else { "opened" },
+        token.user_id,
+        ip
     );
 
     let send_task = tokio::spawn(async move {
@@ -690,6 +1002,7 @@ async fn handle_ws_connection(
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
+                    Some(m) if m == CLOSE_SENTINEL => { let _ = ws_sender.close().await; break; }
                     Some(m) => { if ws_sender.send(Message::Text(m)).await.is_err() { break; } }
                     None => { let _ = ws_sender.close().await; break; }
                 },
@@ -706,14 +1019,15 @@ async fn handle_ws_connection(
             let frame = tokio::time::timeout(IDLE_TIMEOUT, ws_receiver.next()).await;
             let msg = match frame {
                 Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(_))) | Ok(None) => break,
+                Ok(Some(Err(_))) | Ok(None) => return Disconnect::Dropped,
                 Err(_) => {
                     debug!("WS session {session_id} idle timeout");
-                    break;
+                    return Disconnect::Dropped;
                 }
             };
             match msg {
                 Message::Text(text) => match serde_json::from_str::<ControlMessage>(&text) {
+                    Ok(ControlMessage::SessionClose { .. }) => return Disconnect::ClientClose,
                     Ok(cm) => {
                         handle_control_message(&recv_state, session_id, &recv_token, cm, &recv_tx)
                             .await
@@ -722,7 +1036,7 @@ async fn handle_ws_connection(
                         send_error(&recv_tx, "VALIDATION_ERROR", "Malformed control message").await
                     }
                 },
-                Message::Close(_) => break,
+                Message::Close(_) => return Disconnect::ClientClose,
                 _ => {}
             }
         }
@@ -745,17 +1059,31 @@ async fn handle_ws_connection(
         }
     });
 
-    tokio::select! { _ = send_task => {}, _ = recv_task => {} }
+    let disconnect = tokio::select! {
+        _ = send_task => Disconnect::Dropped,
+        r = recv_task => r.unwrap_or(Disconnect::Dropped),
+    };
     redis_task.abort();
-    cleanup_connection(&state, session_id, &token, "disconnected").await;
+    aurix_metrics::WS_CONNECTIONS.dec();
+
+    let closing = state
+        .connections
+        .get(&session_id)
+        .map(|c| c.closing.clone());
+    match closing {
+        // Server-initiated close (ban, shutdown) or the entry is already gone.
+        Some(Some(reason)) => cleanup_connection(&state, session_id, token.user_id, &reason).await,
+        None => cleanup_connection(&state, session_id, token.user_id, "disconnected").await,
+        Some(None) => match disconnect {
+            Disconnect::Dropped if !grace.is_zero() => {
+                state.detach(session_id, token.user_id, grace);
+            }
+            _ => cleanup_connection(&state, session_id, token.user_id, "disconnected").await,
+        },
+    }
 }
 
-async fn cleanup_connection(
-    state: &WsState,
-    session_id: SessionId,
-    token: &ValidatedToken,
-    reason: &str,
-) {
+async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: UserId, reason: &str) {
     let channels: Vec<ChannelId> = state
         .connections
         .get(&session_id)
@@ -786,10 +1114,9 @@ async fn cleanup_connection(
     {
         warn!("session close persistence failed: {e}");
     }
-    aurix_metrics::WS_CONNECTIONS.dec();
     info!(
         "WS session {} closed for user {} ({})",
-        session_id, token.user_id, reason
+        session_id, user_id, reason
     );
 }
 
@@ -1265,4 +1592,147 @@ async fn handle_event_stream(socket: WebSocket, state: WsState, app_id: AppId) {
     });
 
     tokio::select! { _ = send_task => {}, _ = recv_task => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jwt(user_id: UserId, app_id: AppId) -> ValidatedToken {
+        ValidatedToken {
+            user_id,
+            app_id,
+            display_name: "p".into(),
+            channels: vec![],
+            metadata: None,
+            jti: "j".into(),
+        }
+    }
+
+    fn detached(user_id: UserId, app_id: AppId, token: &ResumeToken) -> ConnectionInfo {
+        let (tx, _rx) = mpsc::channel(1);
+        ConnectionInfo {
+            tx,
+            user_id,
+            app_id,
+            display_name: "p".into(),
+            ssrc: 7,
+            channels: vec![],
+            resume_token_hash: token.hash,
+            detached_since: Some(Instant::now()),
+            generation: 1,
+            closing: None,
+        }
+    }
+
+    #[test]
+    fn claim_requires_detached_state_matching_identity_and_token() {
+        let (user, app) = (UserId::new(), AppId::new());
+        let token = ResumeToken::generate().unwrap();
+        let presented = ResumeToken::hash_presented(&token.token).unwrap();
+
+        let mut ok = detached(user, app, &token);
+        assert!(ok.try_claim(&presented, &jwt(user, app)));
+        assert!(ok.detached_since.is_none());
+        assert_eq!(ok.generation, 2);
+        // A claimed (attached) session cannot be claimed again with the same token.
+        assert!(!ok.try_claim(&presented, &jwt(user, app)));
+
+        let mut wrong_user = detached(user, app, &token);
+        assert!(!wrong_user.try_claim(&presented, &jwt(UserId::new(), app)));
+        assert!(wrong_user.detached_since.is_some());
+
+        let mut wrong_app = detached(user, app, &token);
+        assert!(!wrong_app.try_claim(&presented, &jwt(user, AppId::new())));
+
+        let other = ResumeToken::generate().unwrap();
+        let mut wrong_token = detached(user, app, &token);
+        assert!(!wrong_token.try_claim(
+            &ResumeToken::hash_presented(&other.token).unwrap(),
+            &jwt(user, app)
+        ));
+
+        let mut closing = detached(user, app, &token);
+        closing.closing = Some("banned".into());
+        assert!(!closing.try_claim(&presented, &jwt(user, app)));
+
+        let mut attached = detached(user, app, &token);
+        attached.detached_since = None;
+        assert!(!attached.try_claim(&presented, &jwt(user, app)));
+    }
+
+    #[test]
+    fn concurrent_claims_admit_exactly_one() {
+        let (user, app) = (UserId::new(), AppId::new());
+        let token = ResumeToken::generate().unwrap();
+        let sid = SessionId::new();
+        let map: Arc<DashMap<SessionId, ConnectionInfo>> = Arc::new(DashMap::new());
+        map.insert(sid, detached(user, app, &token));
+        let jwt = Arc::new(jwt(user, app));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (map, jwt, barrier, tok) = (
+                    map.clone(),
+                    jwt.clone(),
+                    barrier.clone(),
+                    token.token.clone(),
+                );
+                std::thread::spawn(move || {
+                    let presented = ResumeToken::hash_presented(&tok).unwrap();
+                    barrier.wait();
+                    map.get_mut(&sid).unwrap().try_claim(&presented, &jwt)
+                })
+            })
+            .collect();
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(wins, 1);
+    }
+
+    #[test]
+    fn parse_resume_accepts_only_uuid_dot_token() {
+        let sid = SessionId::new();
+        let parsed = parse_resume(&format!("{sid}.abc-DEF_123")).unwrap();
+        assert_eq!(parsed.0, sid);
+        assert_eq!(parsed.1, "abc-DEF_123");
+        assert!(parse_resume("").is_none());
+        assert!(parse_resume("not-a-uuid.tok").is_none());
+        assert!(parse_resume(&format!("{sid}.")).is_none());
+        assert!(parse_resume(&sid.to_string()).is_none());
+    }
+
+    #[test]
+    fn ws_credentials_prefer_header_then_subprotocol_then_query() {
+        let sid = SessionId::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            format!("aurix, bearer.JWT1, resume.{sid}.sub")
+                .parse()
+                .unwrap(),
+        );
+        let query = WsQuery {
+            token: Some("JWT2".into()),
+            resume: Some(format!("{sid}.query")),
+        };
+        let c = extract_ws_credentials(&headers, &query).unwrap();
+        assert_eq!(c.token, "JWT1");
+        assert!(c.echo_subprotocol);
+        assert_eq!(c.resume.as_ref().unwrap().1, "sub");
+
+        headers.insert(RESUME_HEADER, format!("{sid}.header").parse().unwrap());
+        let c = extract_ws_credentials(&headers, &query).unwrap();
+        assert_eq!(c.resume.as_ref().unwrap().1, "header");
+
+        let c = extract_ws_credentials(&HeaderMap::new(), &query).unwrap();
+        assert_eq!(c.token, "JWT2");
+        assert!(!c.echo_subprotocol);
+        assert_eq!(c.resume.as_ref().unwrap().1, "query");
+
+        assert!(extract_ws_credentials(&HeaderMap::new(), &WsQuery::default()).is_none());
+    }
 }

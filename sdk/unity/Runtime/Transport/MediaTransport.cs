@@ -58,11 +58,19 @@ namespace Aurix.Transport
         /// <summary>True when a HeartbeatAck arrived within the last 3 intervals.</summary>
         public bool IsAlive => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - Interlocked.Read(ref _lastAckUnixMs) < HeartbeatInterval.TotalMilliseconds * 3;
 
-        public MediaTransport(IPEndPoint server, Guid sessionId, uint ssrc, byte[] mediaKey)
+        /// <summary>Last uplink sequence number used; pass it as <c>initialSequence</c> when rebinding a resumed session.</summary>
+        public uint CurrentSequence { get { lock (_seqLock) return _seq; } }
+
+        /// <param name="initialSequence">
+        /// Sequence counter to continue from. A resumed session keeps its media key and the server's
+        /// replay window, so a fresh transport for it must not restart at zero.
+        /// </param>
+        public MediaTransport(IPEndPoint server, Guid sessionId, uint ssrc, byte[] mediaKey, uint initialSequence = 0)
         {
             _server = server ?? throw new ArgumentNullException(nameof(server));
             _sessionId = sessionId;
             _ssrc = ssrc;
+            _seq = initialSequence;
             if (mediaKey == null) throw new ArgumentNullException(nameof(mediaKey));
             _keys = MediaKeys.Derive(mediaKey);
             _udp = new UdpClient(server.AddressFamily);

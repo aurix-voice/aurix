@@ -7,7 +7,18 @@ using Aurix.Transport;
 
 namespace Aurix
 {
-    public enum VoiceConnectionState { Disconnected, Connecting, Connected, MediaBound, Failed }
+    public enum VoiceConnectionState { Disconnected, Connecting, Connected, MediaBound, Reconnecting, Failed }
+
+    /// <summary>Exponential backoff used by <see cref="AurixVoiceClient"/> after an unexpected connection loss.</summary>
+    public sealed class ReconnectPolicy
+    {
+        public TimeSpan InitialDelay = TimeSpan.FromMilliseconds(500);
+        public TimeSpan MaxDelay = TimeSpan.FromSeconds(8);
+        public double Factor = 2.0;
+        /// <summary>Random ±fraction applied to every delay (0.3 = ±30%).</summary>
+        public double Jitter = 0.3;
+        public int MaxAttempts = 10;
+    }
 
     public sealed class Participant
     {
@@ -25,6 +36,8 @@ namespace Aurix
         public Guid SessionId;
         public uint Ssrc;
         public string MediaAddr;
+        /// <summary>True when this is the same session as before a connection loss (same SSRC, channels kept).</summary>
+        public bool Resumed;
     }
 
     public sealed class RecordingNotice
@@ -50,14 +63,23 @@ namespace Aurix
         private readonly Dictionary<Guid, Dictionary<Guid, Participant>> _channels = new Dictionary<Guid, Dictionary<Guid, Participant>>();
         private readonly Dictionary<uint, Participant> _bySsrc = new Dictionary<uint, Participant>();
         private readonly Queue<Action> _mainThreadQueue = new Queue<Action>();
+        private readonly HashSet<Guid> _joinedChannels = new HashSet<Guid>();
+        private readonly Random _random = new Random();
         private ControlChannel _control;
         private MediaTransport _media;
         private CancellationTokenSource _cts;
         private DateTime _lastPing = DateTime.MinValue;
+        private DateTime _lastPong = DateTime.MinValue;
         private uint _rtpTimestamp;
         private bool _muted;
         private Guid? _pendingChannelJoin;
         private TaskCompletionSource<List<Participant>> _joinTcs;
+        private byte[] _mediaKey;
+        private string _resumeToken;
+        private uint _lastMediaSequence;
+        private bool _closedByUser;
+        private CancellationTokenSource _skipBackoff;
+        private int _reconnectLoopActive;
 
         public VoiceConnectionState State { get; private set; } = VoiceConnectionState.Disconnected;
         public SessionInfo Session { get; private set; }
@@ -67,6 +89,17 @@ namespace Aurix
         public float ControlRttMs { get; private set; }
         public TimeSpan PingInterval { get; set; } = TimeSpan.FromSeconds(15);
         public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(10);
+        /// <summary>
+        /// Reconnect automatically after an unexpected connection loss, resuming the same session when
+        /// the server still holds it (see <see cref="ResumeGrace"/>) and re-joining channels otherwise.
+        /// Never triggers after <see cref="DisconnectAsync"/> or a server-initiated <c>SessionClose</c>.
+        /// </summary>
+        public bool AutoReconnect { get; set; } = true;
+        public ReconnectPolicy Reconnect { get; } = new ReconnectPolicy();
+        /// <summary>How long the server keeps a dropped session resumable (zero = resume disabled).</summary>
+        public TimeSpan ResumeGrace { get; private set; }
+        /// <summary>Channels currently joined (restored across reconnects).</summary>
+        public IReadOnlyCollection<Guid> JoinedChannels { get { lock (_channels) return new List<Guid>(_joinedChannels); } }
 
         public event Action<VoiceConnectionState> OnStateChanged;
         public event Action<SessionInfo> OnSessionReady;
@@ -81,7 +114,16 @@ namespace Aurix
         public event Action<uint, string> OnBitrateCommand;
         public event Action<Guid, string> OnKicked;
         public event Action<string, string> OnServerError;
+        /// <summary>Connection closed for good: after <see cref="DisconnectAsync"/>, a server <c>SessionClose</c>, or when reconnecting gave up.</summary>
         public event Action<string> OnDisconnected;
+        /// <summary>Connection lost; reconnect attempt N will run after the given delay. (attempt, delay, cause)</summary>
+        public event Action<int, TimeSpan, string> OnRecovering;
+        /// <summary>Reconnected. <see cref="SessionInfo.Resumed"/> tells whether the old session (and SSRC) survived.</summary>
+        public event Action<SessionInfo> OnRecovered;
+        /// <summary>All reconnect attempts failed; the client is now <see cref="VoiceConnectionState.Failed"/>.</summary>
+        public event Action<Exception> OnFailedToRecover;
+        /// <summary>The server ended the session (kick, ban, shutdown, replaced by another login); no reconnect follows.</summary>
+        public event Action<string> OnSessionClosed;
         /// <summary>Verified downlink frame: (participant or null if unknown SSRC, frame).</summary>
         public event Action<Participant, IncomingAudio> OnAudio;
         /// <summary>Every raw control message, for diagnostics/extensions.</summary>
@@ -101,36 +143,15 @@ namespace Aurix
             if (State != VoiceConnectionState.Disconnected && State != VoiceConnectionState.Failed)
                 throw new InvalidOperationException("already connected");
             _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _closedByUser = false;
+            _resumeToken = null;
+            _lastMediaSequence = 0;
             SetState(VoiceConnectionState.Connecting);
             try
             {
-                _control = new ControlChannel();
-                _control.Closed += reason => Post(() => HandleClosed(reason));
-                _control.Received += CompletePendingJoin;
-                await _control.ConnectAsync(new Uri(_wsUrl), _token, _cts.Token).ConfigureAwait(false);
-
-                ControlMessage ack;
-                while (true)
-                {
-                    ack = await _control.NextAsync(RequestTimeout, _cts.Token).ConfigureAwait(false);
-                    if (ack.Type == "SessionInitAck") break;
-                    if (ack.Type == "Error") throw new InvalidOperationException($"{ack.Str("code")}: {ack.Str("message")}");
-                }
-                var info = new SessionInfo
-                {
-                    SessionId = ack.Id("session_id"),
-                    Ssrc = ack.U32("ssrc"),
-                    MediaAddr = ack.Str("media_addr"),
-                };
-                var mediaKey = Convert.FromBase64String(ack.Str("media_key") ?? throw new InvalidOperationException("SessionInitAck without media_key"));
-                Session = info;
-                SetState(VoiceConnectionState.Connected);
+                var info = await OpenSessionAsync(null, _cts.Token).ConfigureAwait(false);
                 Post(() => OnSessionReady?.Invoke(info));
-
-                var endpoint = await MediaTransport.ResolveAsync(info.MediaAddr).ConfigureAwait(false);
-                _media = new MediaTransport(endpoint, info.SessionId, info.Ssrc, mediaKey);
-                await _media.BindAsync(_cts.Token).ConfigureAwait(false);
-                SetState(VoiceConnectionState.MediaBound);
+                await BindMediaAsync(info, _cts.Token).ConfigureAwait(false);
                 return info;
             }
             catch
@@ -139,6 +160,81 @@ namespace Aurix
                 Teardown();
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Skip the current backoff delay and retry now (e.g. when the OS reports the network is back).
+        /// No-op unless the client is <see cref="VoiceConnectionState.Reconnecting"/>.
+        /// </summary>
+        public void ReconnectNow() => _skipBackoff?.Cancel();
+
+        /// <summary>Open a control channel (optionally resuming) and wait for <c>SessionInitAck</c>.</summary>
+        private async Task<SessionInfo> OpenSessionAsync(string resume, CancellationToken ct)
+        {
+            var control = new ControlChannel();
+            control.Closed += reason => Post(() => HandleClosed(control, reason));
+            control.Received += CompletePendingJoin;
+            try
+            {
+                await control.ConnectAsync(new Uri(_wsUrl), _token, ct, resume).ConfigureAwait(false);
+                ControlMessage ack;
+                while (true)
+                {
+                    ack = await control.NextAsync(RequestTimeout, ct).ConfigureAwait(false);
+                    if (ack.Type == "SessionInitAck") break;
+                    if (ack.Type == "Error") throw new InvalidOperationException($"{ack.Str("code")}: {ack.Str("message")}");
+                }
+                var info = new SessionInfo
+                {
+                    SessionId = ack.Id("session_id"),
+                    Ssrc = ack.U32("ssrc"),
+                    MediaAddr = ack.Str("media_addr"),
+                    Resumed = ack.Bool("resumed"),
+                };
+                _mediaKey = Convert.FromBase64String(ack.Str("media_key") ?? throw new InvalidOperationException("SessionInitAck without media_key"));
+                var token = ack.Str("resume_token");
+                _resumeToken = string.IsNullOrEmpty(token) ? null : token;
+                ResumeGrace = TimeSpan.FromMilliseconds(ack.Num("resume_grace_ms"));
+                Session = info;
+                // Publish only now so Update() cannot drain the handshake messages from under us.
+                _control = control;
+                _lastPing = DateTime.UtcNow;
+                _lastPong = _lastPing;
+                SetState(VoiceConnectionState.Connected);
+                return info;
+            }
+            catch
+            {
+                control.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>Bind (or rebind, from a fresh UDP port) the native media path for the current session.</summary>
+        private async Task BindMediaAsync(SessionInfo info, CancellationToken ct)
+        {
+            var old = _media;
+            _media = null;
+            if (old != null)
+            {
+                _lastMediaSequence = old.CurrentSequence;
+                old.Dispose();
+            }
+            uint firstSeq = info.Resumed ? _lastMediaSequence : 0;
+            var endpoint = await MediaTransport.ResolveAsync(info.MediaAddr).ConfigureAwait(false);
+            var media = new MediaTransport(endpoint, info.SessionId, info.Ssrc, _mediaKey, firstSeq);
+            try
+            {
+                await media.BindAsync(ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                media.Dispose();
+                throw;
+            }
+            _media = media;
+            if (_muted) media.SendMuteState(true);
+            SetState(VoiceConnectionState.MediaBound);
         }
 
         /// <summary>Join a channel the token grants access to. Returns the current roster.</summary>
@@ -154,7 +250,12 @@ namespace Aurix
             using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("ChannelJoinAck timeout"))))
             using (ct.Register(() => tcs.TrySetCanceled()))
             {
-                try { return await tcs.Task.ConfigureAwait(false); }
+                try
+                {
+                    var roster = await tcs.Task.ConfigureAwait(false);
+                    lock (_channels) _joinedChannels.Add(channelId);
+                    return roster;
+                }
                 finally { _joinTcs = null; _pendingChannelJoin = null; }
             }
         }
@@ -166,6 +267,7 @@ namespace Aurix
             await _control.SendAsync(ControlMessage.ChannelLeave(channelId), ct).ConfigureAwait(false);
             lock (_channels)
             {
+                _joinedChannels.Remove(channelId);
                 if (_channels.TryGetValue(channelId, out var map))
                 {
                     foreach (var p in map.Values) _bySsrc.Remove(p.Ssrc);
@@ -251,16 +353,28 @@ namespace Aurix
                 while (_media.TryDequeueAudio(out var a)) OnAudio?.Invoke(FindBySsrc(a.SenderSsrc), a);
             }
 
-            if (_control != null && _control.IsOpen && DateTime.UtcNow - _lastPing > PingInterval)
+            var control = _control;
+            if (control != null && control.IsOpen && PingInterval > TimeSpan.Zero)
             {
-                _lastPing = DateTime.UtcNow;
-                var nonce = (ulong)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() & 0x1F_FFFF_FFFF_FFFF);
-                _ = _control.SendAsync(ControlMessage.Ping(nonce));
+                var now = DateTime.UtcNow;
+                if (now - _lastPing > PingInterval)
+                {
+                    _lastPing = now;
+                    var nonce = (ulong)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() & 0x1F_FFFF_FFFF_FFFF);
+                    _ = control.SendAsync(ControlMessage.Ping(nonce));
+                }
+                // Two unanswered pings: the socket is half-open, treat it as lost so a reconnect can start.
+                if (_lastPong < _lastPing && now - _lastPong > PingInterval + PingInterval + PingInterval)
+                {
+                    control.Dispose();
+                    HandleClosed(control, "ping timeout");
+                }
             }
         }
 
         public async Task DisconnectAsync(string reason = "client disconnect")
         {
+            _closedByUser = true;
             var control = _control;
             Teardown();
             if (control != null) await control.CloseAsync(reason).ConfigureAwait(false);
@@ -268,7 +382,11 @@ namespace Aurix
             OnDisconnected?.Invoke(reason);
         }
 
-        public void Dispose() => Teardown();
+        public void Dispose()
+        {
+            _closedByUser = true;
+            Teardown();
+        }
 
         // ---- internals ----------------------------------------------------------------------
 
@@ -292,20 +410,122 @@ namespace Aurix
         private void Teardown()
         {
             _cts?.Cancel();
+            _skipBackoff?.Cancel();
             _media?.Dispose();
             _media = null;
             _control?.Dispose();
             _control = null;
+            _resumeToken = null;
             _joinTcs?.TrySetException(new OperationCanceledException("disconnected"));
-            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); }
+            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); }
         }
 
-        private void HandleClosed(string reason)
+        /// <summary>Runs on the Update thread when a control channel closes or fails.</summary>
+        private void HandleClosed(ControlChannel control, string reason)
         {
-            if (State == VoiceConnectionState.Disconnected) return;
-            Teardown();
-            SetState(VoiceConnectionState.Disconnected);
-            OnDisconnected?.Invoke(reason);
+            if (!ReferenceEquals(control, _control)) return; // stale channel from before a reconnect
+            _control = null;
+            control.Dispose();
+            _joinTcs?.TrySetException(new System.IO.IOException("connection lost"));
+            if (_closedByUser || State == VoiceConnectionState.Disconnected) return;
+            if (!AutoReconnect || Session == null || _cts == null || _cts.IsCancellationRequested)
+            {
+                Teardown();
+                SetState(VoiceConnectionState.Failed);
+                OnDisconnected?.Invoke(reason);
+                return;
+            }
+            SetState(VoiceConnectionState.Reconnecting);
+            // A loop may already be running (the socket dropped again mid-attempt); it will retry on its own.
+            if (Interlocked.CompareExchange(ref _reconnectLoopActive, 1, 0) == 0)
+                _ = ReconnectLoopAsync(reason, _cts.Token);
+        }
+
+        private async Task ReconnectLoopAsync(string cause, CancellationToken ct)
+        {
+            try { await ReconnectAttemptsAsync(cause, ct).ConfigureAwait(false); }
+            finally { Interlocked.Exchange(ref _reconnectLoopActive, 0); }
+        }
+
+        private async Task ReconnectAttemptsAsync(string cause, CancellationToken ct)
+        {
+            Exception last = new System.IO.IOException(cause);
+            for (int attempt = 1; attempt <= Reconnect.MaxAttempts; attempt++)
+            {
+                var delay = Backoff(attempt);
+                Post(() => OnRecovering?.Invoke(attempt, delay, cause));
+                using (var skip = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    _skipBackoff = skip;
+                    try { await Task.Delay(delay, skip.Token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { if (ct.IsCancellationRequested) return; }
+                    finally { _skipBackoff = null; }
+                }
+                if (_closedByUser) return;
+                try
+                {
+                    await ReattachAsync(ct).ConfigureAwait(false);
+                    return;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                catch (Exception e)
+                {
+                    last = e;
+                    cause = e.Message;
+                    var stale = _control;
+                    _control = null;
+                    stale?.Dispose();
+                    SetState(VoiceConnectionState.Reconnecting);
+                }
+            }
+            if (_closedByUser) return;
+            var error = new System.IO.IOException($"reconnect failed after {Reconnect.MaxAttempts} attempts ({last.Message})", last);
+            Post(() =>
+            {
+                if (_closedByUser) return;
+                OnFailedToRecover?.Invoke(error);
+                Teardown();
+                SetState(VoiceConnectionState.Failed);
+                OnDisconnected?.Invoke(error.Message);
+            });
+        }
+
+        private TimeSpan Backoff(int attempt)
+        {
+            double ms = Reconnect.InitialDelay.TotalMilliseconds * Math.Pow(Reconnect.Factor, attempt - 1);
+            ms = Math.Min(ms, Reconnect.MaxDelay.TotalMilliseconds);
+            double jitter;
+            lock (_random) jitter = (_random.NextDouble() * 2 - 1) * Reconnect.Jitter;
+            return TimeSpan.FromMilliseconds(Math.Max(0, ms * (1 + jitter)));
+        }
+
+        /// <summary>
+        /// One reconnect attempt: resume the previous session if the server still holds it, otherwise
+        /// accept the fresh session and re-join the channels we were in. Rebinds media either way,
+        /// since the UDP path may have changed with the network.
+        /// </summary>
+        private async Task ReattachAsync(CancellationToken ct)
+        {
+            var previous = Session;
+            string resume = previous != null && _resumeToken != null ? $"{previous.SessionId:D}.{_resumeToken}" : null;
+            var info = await OpenSessionAsync(resume, ct).ConfigureAwait(false);
+            List<Guid> rejoin = null;
+            if (!info.Resumed)
+            {
+                // New session: the old memberships are gone on the server; drop the stale rosters and re-join.
+                lock (_channels)
+                {
+                    rejoin = new List<Guid>(_joinedChannels);
+                    _joinedChannels.Clear();
+                    _channels.Clear();
+                    _bySsrc.Clear();
+                }
+                foreach (var ch in rejoin) { var id = ch; Post(() => OnChannelLeft?.Invoke(id)); }
+            }
+            await BindMediaAsync(info, ct).ConfigureAwait(false);
+            if (rejoin != null)
+                foreach (var ch in rejoin) await JoinChannelAsync(ch, ct).ConfigureAwait(false);
+            Post(() => OnRecovered?.Invoke(info));
         }
 
         private void HandleMessage(ControlMessage m)
@@ -332,6 +552,7 @@ namespace Aurix
                             roster.Add(p);
                         }
                         _channels[channelId] = map;
+                        _joinedChannels.Add(channelId);
                     }
                     OnChannelJoined?.Invoke(channelId, roster);
                     break;
@@ -402,13 +623,17 @@ namespace Aurix
                 case "Kick":
                 {
                     var channelId = m.Id("channel_id");
-                    lock (_channels) _channels.Remove(channelId);
+                    lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); }
                     OnKicked?.Invoke(channelId, m.Str("reason") ?? string.Empty);
                     break;
                 }
                 case "SessionClose":
-                    _ = DisconnectAsync(m.Str("reason") ?? "session closed");
+                {
+                    var reason = m.Str("reason") ?? "session closed";
+                    OnSessionClosed?.Invoke(reason);
+                    _ = DisconnectAsync(reason);
                     break;
+                }
                 case "Error":
                     OnServerError?.Invoke(m.Str("code") ?? "error", m.Str("message") ?? string.Empty);
                     break;
@@ -416,6 +641,7 @@ namespace Aurix
                 {
                     var sent = (long)m.Num("nonce");
                     ControlRttMs = Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - sent);
+                    _lastPong = DateTime.UtcNow;
                     break;
                 }
                 default:

@@ -1,6 +1,7 @@
 import {
   AURIX_SUBPROTOCOL,
   BEARER_SUBPROTOCOL_PREFIX,
+  RESUME_SUBPROTOCOL_PREFIX,
   parseServerMessage,
   type ClientMessage,
   type ParticipantBrief,
@@ -33,12 +34,44 @@ export interface AurixClientOptions {
   pingIntervalMs?: number;
   /** Timeout for request/response exchanges (join, offer) in ms. Default 10000. */
   requestTimeoutMs?: number;
+  /**
+   * Reconnect automatically when the control connection drops (default `true`). The client
+   * presents its resume token so the server hands the same session back (`recovered` with
+   * `resumed: true`); once the server-side grace period is over it gets a fresh session and
+   * re-joins the previous channels itself (`resumed: false`).
+   */
+  autoReconnect?: boolean;
+  /** Exponential backoff for reconnect attempts. */
+  reconnect?: Partial<ReconnectPolicy>;
 }
+
+export interface ReconnectPolicy {
+  /** Delay before the first attempt (ms). Default 500. */
+  initialDelayMs: number;
+  /** Upper bound for the delay between attempts (ms). Default 8000. */
+  maxDelayMs: number;
+  /** Multiplier applied after every failed attempt. Default 2. */
+  factor: number;
+  /** Random jitter as a fraction of the delay (0–1). Default 0.3. */
+  jitter: number;
+  /** Give up (`failedToRecover`) after this many failed attempts. Default 10. */
+  maxAttempts: number;
+}
+
+const DEFAULT_RECONNECT: ReconnectPolicy = {
+  initialDelayMs: 500,
+  maxDelayMs: 8_000,
+  factor: 2,
+  jitter: 0.3,
+  maxAttempts: 10,
+};
 
 export interface SessionInfo {
   sessionId: string;
   userId: string;
   ssrc: number;
+  /** `true` when this session was resumed after a dropped connection. */
+  resumed: boolean;
 }
 
 export interface Participant {
@@ -57,6 +90,8 @@ export type ConnectionState =
   | 'connected'
   | 'media-connecting'
   | 'media-connected'
+  /** Connection lost; automatic reconnect attempts are in progress. */
+  | 'reconnecting'
   | 'failed';
 
 export interface AurixEvents {
@@ -74,6 +109,17 @@ export interface AurixEvents {
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string) => void;
   bitrate: (targetKbps: number, reason: string) => void;
   kicked: (channelId: string, reason: string) => void;
+  /** Connection lost unexpectedly; attempt `attempt` (1-based) is scheduled in `delayMs`. */
+  recovering: (attempt: number, delayMs: number, cause: string) => void;
+  /**
+   * Reconnected. `info.resumed` tells whether the server handed back the same session
+   * (peers never noticed) or a fresh one that the client re-joined to its channels.
+   */
+  recovered: (info: SessionInfo) => void;
+  /** Reconnect attempts exhausted or a definite refusal; the client is now `failed`. */
+  failedToRecover: (error: Error) => void;
+  /** The server ended the session (kick from the platform, ban, shutdown). No reconnect. */
+  sessionClosed: (reason: string) => void;
   serverError: (code: string, message: string) => void;
   error: (error: Error) => void;
   message: (message: ServerMessage | UnknownMessage) => void;
@@ -139,14 +185,22 @@ export class AurixClient {
   private channels = new Map<string, Map<string, Participant>>();
   private muted = false;
   private closedByUser = false;
+  private readonly reconnectPolicy: ReconnectPolicy;
+  private resumeToken: string | undefined;
+  private resumeGraceMs = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconnectAttempt = 0;
+  private lastPongAt = 0;
 
   constructor(options: AurixClientOptions) {
     this.opts = {
       useTurn: true,
       pingIntervalMs: 15_000,
       requestTimeoutMs: 10_000,
+      autoReconnect: true,
       ...options,
     };
+    this.reconnectPolicy = { ...DEFAULT_RECONNECT, ...(options.reconnect ?? {}) };
     this.userId = decodeJwtSubject(options.token);
   }
 
@@ -182,6 +236,11 @@ export class AurixClient {
 
   get connectionState(): ConnectionState {
     return this.state;
+  }
+
+  /** Server-side resume window for this session (ms); `0` when resume is disabled. */
+  get resumeGrace(): number {
+    return this.resumeGraceMs;
   }
 
   get sessionInfo(): SessionInfo | undefined {
@@ -221,8 +280,10 @@ export class AurixClient {
    * asynchronously (`connectionState` → `media-connected`).
    */
   async connect(): Promise<SessionInfo> {
-    if (this.ws) throw new Error('already connected');
+    if (this.ws || this.reconnectTimer !== undefined) throw new Error('already connected');
     this.closedByUser = false;
+    this.resumeToken = undefined;
+    this.session = undefined;
     this.setState('connecting');
 
     const info = await this.openControlChannel();
@@ -236,26 +297,22 @@ export class AurixClient {
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       this.emit('error', err);
-      this.setState('failed');
-      this.disconnect('media setup failed');
+      this.teardown('media setup failed', 'failed');
       throw err;
     }
     return info;
   }
 
-  /** Leave all channels, close media and the control channel. */
+  /** Leave all channels, close media and the control channel. Cancels any reconnect. */
   disconnect(reason = 'client disconnect'): void {
+    this.teardown(reason, 'disconnected');
+  }
+
+  private teardown(reason: string, finalState: 'disconnected' | 'failed'): void {
     this.closedByUser = true;
+    this.cancelReconnect();
     this.stopPing();
-    for (const p of this.pendingJoins.values()) {
-      clearTimeout(p.timer);
-      p.reject(new Error('disconnected'));
-    }
-    this.pendingJoins.clear();
-    this.rejectPending(this.pendingAnswer, 'disconnected');
-    this.pendingAnswer = undefined;
-    this.rejectPending(this.pendingInit, 'disconnected');
-    this.pendingInit = undefined;
+    this.failPending('disconnected');
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.session) {
       this.trySend({
@@ -274,7 +331,31 @@ export class AurixClient {
     for (const channelId of this.channels.keys()) this.emit('channelLeft', channelId);
     this.channels.clear();
     this.session = undefined;
-    this.setState('disconnected');
+    this.resumeToken = undefined;
+    this.setState(finalState);
+  }
+
+  /**
+   * Reconnect now instead of waiting for the next scheduled attempt (e.g. when the app
+   * observes that the network is back). No-op unless the client is `reconnecting`.
+   */
+  reconnectNow(): void {
+    if (this.state !== 'reconnecting' || this.reconnectTimer === undefined) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    void this.attemptReconnect();
+  }
+
+  private failPending(reason: string): void {
+    for (const p of this.pendingJoins.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.pendingJoins.clear();
+    this.rejectPending(this.pendingAnswer, reason);
+    this.pendingAnswer = undefined;
+    this.rejectPending(this.pendingInit, reason);
+    this.pendingInit = undefined;
   }
 
   // ── Channels ──
@@ -356,11 +437,13 @@ export class AurixClient {
   private openControlChannel(): Promise<SessionInfo> {
     return new Promise<SessionInfo>((resolve, reject) => {
       // Browsers cannot set the Authorization header on a WebSocket upgrade; the server
-      // accepts the JWT as a `bearer.<jwt>` sub-protocol and echoes `aurix` back.
-      const ws = new WebSocket(this.opts.wsUrl, [
-        AURIX_SUBPROTOCOL,
-        `${BEARER_SUBPROTOCOL_PREFIX}${this.opts.token}`,
-      ]);
+      // accepts the JWT as a `bearer.<jwt>` sub-protocol and echoes `aurix` back. The
+      // resume credential travels the same way.
+      const protocols = [AURIX_SUBPROTOCOL, `${BEARER_SUBPROTOCOL_PREFIX}${this.opts.token}`];
+      if (this.session && this.resumeToken) {
+        protocols.push(`${RESUME_SUBPROTOCOL_PREFIX}${this.session.sessionId}.${this.resumeToken}`);
+      }
+      const ws = new WebSocket(this.opts.wsUrl, protocols);
       this.ws = ws;
       const timer = setTimeout(() => {
         this.pendingInit = undefined;
@@ -382,19 +465,127 @@ export class AurixClient {
       };
       ws.onerror = () => {
         this.emit('error', new Error('websocket error'));
-      };
-      ws.onclose = (ev) => {
-        const wasOpen = this.ws === ws;
-        if (wasOpen) this.ws = undefined;
-        this.rejectPending(this.pendingInit, `websocket closed (${ev.code}${ev.reason ? `: ${ev.reason}` : ''})`);
-        this.pendingInit = undefined;
-        if (wasOpen && !this.closedByUser) {
-          this.emit('error', new Error(`connection lost (${ev.code}${ev.reason ? `: ${ev.reason}` : ''})`));
-          this.disconnect('connection lost');
-          this.setState('failed');
+        // A failed handshake is definitive; do not wait for the init timeout.
+        if (this.pendingInit && this.ws === ws) {
+          this.ws = undefined;
+          this.rejectPending(this.pendingInit, 'websocket error');
+          this.pendingInit = undefined;
+          ws.close();
         }
       };
+      ws.onclose = (ev) => {
+        const wasCurrent = this.ws === ws;
+        if (wasCurrent) this.ws = undefined;
+        const cause = `websocket closed (${ev.code}${ev.reason ? `: ${ev.reason}` : ''})`;
+        const initWasPending = this.pendingInit !== undefined;
+        this.rejectPending(this.pendingInit, cause);
+        this.pendingInit = undefined;
+        // A drop before the first SessionInitAck fails `connect()` itself; a reconnect
+        // attempt that fails is handled by `attemptReconnect`.
+        if (!wasCurrent || this.closedByUser || initWasPending) return;
+        this.onConnectionLost(cause);
+      };
     });
+  }
+
+  // ── Internals: reconnect ──
+
+  private onConnectionLost(cause: string): void {
+    this.stopPing();
+    this.failPending('connection lost');
+    if (!this.opts.autoReconnect || !this.session) {
+      this.emit('error', new Error(`connection lost (${cause})`));
+      this.teardown('connection lost', 'failed');
+      return;
+    }
+    this.reconnectAttempt = 0;
+    this.setState('reconnecting');
+    this.scheduleReconnect(cause);
+  }
+
+  private scheduleReconnect(cause: string): void {
+    const policy = this.reconnectPolicy;
+    if (this.reconnectAttempt >= policy.maxAttempts) {
+      this.giveUp(new Error(`reconnect failed after ${this.reconnectAttempt} attempts (${cause})`));
+      return;
+    }
+    const attempt = this.reconnectAttempt + 1;
+    const base = Math.min(policy.maxDelayMs, policy.initialDelayMs * policy.factor ** (attempt - 1));
+    const delay = Math.round(base * (1 + policy.jitter * (Math.random() * 2 - 1)));
+    this.emit('recovering', attempt, delay, cause);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.attemptReconnect();
+    }, delay);
+  }
+
+  private async attemptReconnect(): Promise<void> {
+    if (this.closedByUser) return;
+    this.reconnectAttempt += 1;
+    const previous = this.session;
+    const wanted = Array.from(this.channels.keys());
+    let info: SessionInfo;
+    try {
+      info = await this.openControlChannel();
+    } catch (e) {
+      if (this.closedByUser) return;
+      this.scheduleReconnect(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (this.closedByUser) return;
+
+    this.session = info;
+    this.reconnectAttempt = 0;
+    this.startPing();
+    if (!info.resumed) {
+      // Fresh session: the server forgot our channels, so the roster below is stale.
+      for (const channelId of wanted) {
+        if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
+      }
+    }
+    this.setState('connected');
+    try {
+      await this.restoreMedia(info.resumed && previous?.ssrc === info.ssrc);
+      if (!info.resumed) {
+        for (const channelId of wanted) await this.joinChannel(channelId);
+      }
+    } catch (e) {
+      if (this.closedByUser) return;
+      const err = e instanceof Error ? e : new Error(String(e));
+      this.emit('error', err);
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        // Control plane is back but media/rejoin failed: retry the whole cycle.
+        this.ws.close(4000, 'restore failed');
+        this.ws = undefined;
+        this.stopPing();
+        this.setState('reconnecting');
+        this.scheduleReconnect(err.message);
+      }
+      return;
+    }
+    this.emit('recovered', info);
+  }
+
+  /** After a reconnect: keep a still-connected peer connection, otherwise renegotiate. */
+  private async restoreMedia(sameSession: boolean): Promise<void> {
+    if (sameSession && this.pc && this.pc.connectionState === 'connected') {
+      this.setState('media-connected');
+      return;
+    }
+    this.pc?.close();
+    this.pc = undefined;
+    await this.startMedia();
+  }
+
+  private giveUp(error: Error): void {
+    this.cancelReconnect();
+    this.emit('failedToRecover', error);
+    this.teardown('reconnect failed', 'failed');
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 
   private handleMessage(msg: ServerMessage | UnknownMessage): void {
@@ -406,7 +597,10 @@ export class AurixClient {
           sessionId: d.session_id,
           userId: this.userId ?? '',
           ssrc: d.ssrc,
+          resumed: d.resumed === true,
         };
+        this.resumeToken = d.resume_token || undefined;
+        this.resumeGraceMs = d.resume_grace_ms ?? 0;
         const pending = this.pendingInit;
         this.pendingInit = undefined;
         if (pending) {
@@ -521,8 +715,9 @@ export class AurixClient {
       }
       case 'Pong': {
         const d = (msg as Extract<ServerMessage, { type: 'Pong' }>).data;
+        this.lastPongAt = performance.now();
         if (d.nonce === this.pingNonce - 1 && this.lastPingSentAt > 0) {
-          this.rttMs = performance.now() - this.lastPingSentAt;
+          this.rttMs = this.lastPongAt - this.lastPingSentAt;
         }
         return;
       }
@@ -546,7 +741,7 @@ export class AurixClient {
       }
       case 'SessionClose': {
         const d = (msg as Extract<ServerMessage, { type: 'SessionClose' }>).data;
-        this.emit('error', new Error(`session closed by server: ${d.reason}`));
+        this.emit('sessionClosed', d.reason);
         this.disconnect('closed by server');
         return;
       }
@@ -568,7 +763,7 @@ export class AurixClient {
       }
     }
 
-    this.localStream =
+    this.localStream ??=
       this.opts.localStream ??
       (await navigator.mediaDevices.getUserMedia({
         audio: this.opts.audioConstraints ?? {
@@ -594,13 +789,25 @@ export class AurixClient {
       this.emit('remoteStream', stream);
     };
     pc.onconnectionstatechange = () => {
+      if (this.pc !== pc) return;
       switch (pc.connectionState) {
         case 'connected':
-          this.setState('media-connected');
+          if (this.state === 'connected' || this.state === 'media-connecting') {
+            this.setState('media-connected');
+          }
           break;
         case 'failed':
+          // ICE gave up while the control channel may still be fine: negotiate a new
+          // transport for the same session (the server replaces the old one).
           this.emit('error', new Error('WebRTC connection failed'));
-          this.setState('failed');
+          if (this.ws && this.ws.readyState === WebSocket.OPEN && this.opts.autoReconnect) {
+            void this.restoreMedia(false).catch((e: unknown) => {
+              this.emit('error', e instanceof Error ? e : new Error(String(e)));
+              this.teardown('media renegotiation failed', 'failed');
+            });
+          } else if (this.state !== 'reconnecting') {
+            this.setState('failed');
+          }
           break;
         case 'disconnected':
           if (this.state === 'media-connected') this.setState('connected');
@@ -689,9 +896,17 @@ export class AurixClient {
   // ── Internals: misc ──
 
   private startPing(): void {
+    this.stopPing();
     if (this.opts.pingIntervalMs <= 0) return;
+    this.lastPongAt = performance.now();
     this.pingTimer = setInterval(() => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // Two missed pongs: the TCP connection is probably dead without the browser noticing.
+      if (performance.now() - this.lastPongAt > 2.5 * this.opts.pingIntervalMs) {
+        ws.close(4001, 'keepalive timeout');
+        return;
+      }
       const nonce = this.pingNonce++;
       this.lastPingSentAt = performance.now();
       this.trySend({ type: 'Ping', data: { nonce } });

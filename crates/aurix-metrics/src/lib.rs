@@ -147,6 +147,22 @@ pub static WS_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+pub static WS_SESSIONS_DETACHED: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_ws_sessions_detached",
+        "Player sessions whose WebSocket dropped and that are waiting for a resume"
+    )
+    .unwrap()
+});
+
+pub static WS_SESSIONS_RESUMED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_ws_sessions_resumed_total",
+        "Player sessions successfully resumed after a WebSocket drop"
+    )
+    .unwrap()
+});
+
 pub static RATE_LIMIT_HITS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_rate_limit_hits_total", "Total rate limit hits").unwrap()
 });

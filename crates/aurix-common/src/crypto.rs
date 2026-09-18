@@ -172,6 +172,38 @@ pub fn hash_sha256(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(result)
 }
 
+/// One-time credential that lets a client reattach to its session after the control
+/// connection drops. The client keeps `token`; the server stores only `hash`.
+pub struct ResumeToken {
+    pub token: String,
+    pub hash: [u8; 32],
+}
+
+impl ResumeToken {
+    pub fn generate() -> Result<Self> {
+        let raw = CryptoProvider::new().generate_random_bytes(32)?;
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+        Ok(Self {
+            hash: Self::hash(&raw),
+            token,
+        })
+    }
+
+    /// Hash of a token as presented by a client; `None` if it is not a well-formed token.
+    pub fn hash_presented(token: &str) -> Option<[u8; 32]> {
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .ok()?;
+        (raw.len() == 32).then(|| Self::hash(&raw))
+    }
+
+    fn hash(raw: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(raw);
+        hasher.finalize().into()
+    }
+}
+
 pub fn compute_audit_hash(previous_hash: &str, data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(previous_hash.as_bytes());
@@ -278,6 +310,28 @@ mod tests {
             Some((1_700_000_600, "user-1"))
         );
         assert!(parse_turn_username("garbage").is_none());
+    }
+
+    #[test]
+    fn resume_token_roundtrip_and_rejections() {
+        let t = ResumeToken::generate().unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&t.token)
+            .unwrap();
+        assert_eq!(raw.len(), 32);
+        assert_eq!(ResumeToken::hash_presented(&t.token), Some(t.hash));
+        let raw32: [u8; 32] = raw[..].try_into().unwrap();
+        assert_ne!(t.hash, raw32, "hash must not be the raw token");
+        assert_ne!(ResumeToken::generate().unwrap().hash, t.hash);
+
+        assert!(ResumeToken::hash_presented("").is_none());
+        assert!(ResumeToken::hash_presented("not base64!!").is_none());
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1u8; 16]);
+        assert!(ResumeToken::hash_presented(&short).is_none());
+        let long = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1u8; 33]);
+        assert!(ResumeToken::hash_presented(&long).is_none());
+        let padded = base64::engine::general_purpose::URL_SAFE.encode([1u8; 32]);
+        assert!(ResumeToken::hash_presented(&padded).is_none());
     }
 
     #[test]

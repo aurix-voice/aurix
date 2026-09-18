@@ -566,11 +566,22 @@ pub enum ControlMessage {
     },
     /// `media_key` is a base64 per-session key used to authenticate AURX UDP packets
     /// (`SessionBind` first, then every audio/control packet).
+    ///
+    /// `resume_token` is a one-time secret: if the WebSocket drops, the client may reconnect
+    /// within `resume_grace_ms` presenting `session_id` + `resume_token` (see `aurix-ws`) and
+    /// gets the same session, SSRC, media key and channel memberships back (`resumed: true`,
+    /// followed by one `ChannelJoinAck` per channel still joined). Every ack rotates the token.
     SessionInitAck {
         session_id: SessionId,
         ssrc: u32,
         media_addr: String,
         media_key: String,
+        #[serde(default)]
+        resume_token: String,
+        #[serde(default)]
+        resume_grace_ms: u64,
+        #[serde(default)]
+        resumed: bool,
     },
     /// Sent by the server once the UDP source address has been authenticated via `SessionBind`.
     MediaBound {

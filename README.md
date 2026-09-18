@@ -113,7 +113,8 @@ curl -X POST localhost:8080/v1/tokens -H "x-api-key: $KEY" -H 'content-type: app
 
 1. Connect to `ws://host:8081/ws` with the player JWT (`Authorization: Bearer`, the
    `Sec-WebSocket-Protocol: aurix, bearer.<jwt>` sub-protocol for browsers, or `?token=` as last
-   resort). The server replies `SessionInitAck { session_id, ssrc, media_addr, media_key }`.
+   resort). The server replies `SessionInitAck { session_id, ssrc, media_addr, media_key,
+   resume_token, resume_grace_ms }`.
 2. **Native clients**: send an authenticated `SessionBind` datagram to `media_addr`
    (`AurixPacket::session_bind(...).encode_authenticated(media_key)`), wait for
    `SessionBindAck` / `MediaBound`, then `ChannelJoin { channel_id, token }` over WebSocket and
@@ -122,6 +123,16 @@ curl -X POST localhost:8080/v1/tokens -H "x-api-key: $KEY" -H 'content-type: app
    servers come from `GET /v1/me/turn-credentials`.
 4. Positional channels: send `PositionUpdate` (own position only); `SpeakingState`,
    `ParticipantJoined/Left`, `RecordingNotification`, `Kick`, `SessionClose` arrive as events.
+5. **Reconnect**: if the WebSocket drops without a Close frame the session stays alive for
+   `resume_grace_ms` (`AURIX__SERVER__SESSION_RESUME_GRACE_SECS`, default 30). Reconnect with the
+   same JWT plus `X-Aurix-Resume: <session_id>.<resume_token>` (browsers: sub-protocol
+   `resume.<session_id>.<resume_token>`) and the server answers `SessionInitAck { resumed: true }`
+   with the same session, SSRC and media key, followed by one `ChannelJoinAck` per channel still
+   joined — peers never see a leave. Tokens are one-time (rotated on every ack), bound to the
+   user/app of the JWT and useless once the server closed the session (kick/ban/shutdown) or the
+   grace period expired; then the same handshake simply yields a fresh session. Native clients
+   re-send `SessionBind` from their (possibly new) UDP port. The SDKs do this automatically with
+   exponential backoff and expose `Recovering` / `Recovered` / `FailedToRecover` events.
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 
@@ -181,6 +192,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__TURN__*` | `ENABLED`, `EXTERNAL_IP`, `REALM`, `AUTH_SECRET` (≥ 32 bytes), `MIN_PORT`/`MAX_PORT` relay range |
 | `AURIX__SERVER__CORS_ORIGINS` | explicit origins; `*` is rejected in production |
 | `AURIX__SERVER__TRUSTED_PROXIES` | CIDRs whose `X-Forwarded-For` is trusted for rate limiting / audit |
+| `AURIX__SERVER__SESSION_RESUME_GRACE_SECS` | how long a dropped session waits for a resume (default 30, `0` disables; must be ≤ `AURIX__MEDIA__SESSION_TIMEOUT_SECS`) |
 | `AURIX__SERVER__TLS_CERT_PATH`, `AURIX__SERVER__TLS_KEY_PATH` | native TLS for API + WebSocket (PEM). Otherwise terminate TLS on your proxy |
 | `AURIX__RECORDING__*` | `ENABLED`, `STORAGE_PATH`, `RETENTION_DAYS`, `REQUIRE_CONSENT`, `ENCRYPTION_ENABLED` + `ENCRYPTION_KEY` (≥ 32 chars), S3 settings |
 | `AURIX__RATE_LIMITING__*` | per-IP / per-key limits (Redis-backed when available) |
@@ -247,7 +259,8 @@ Migrations are embedded in the binary and applied at start when `database.run_mi
 ### Observability
 
 * `GET :4040/metrics` — `aurix_active_sessions`, `aurix_packets_*_total`, `aurix_bytes_*_total`,
-  `aurix_api_requests_total{method,path,status}`, `aurix_turn_allocations`, `aurix_rate_limit_hits_total`, …
+  `aurix_api_requests_total{method,path,status}`, `aurix_turn_allocations`, `aurix_rate_limit_hits_total`,
+  `aurix_ws_sessions_detached` / `aurix_ws_sessions_resumed_total` (reconnects), …
 * Grafana dashboard: `deploy/grafana/dashboards/aurix-overview.json`.
 * Logs: JSON (`AURIX__TRACING__LOG_FORMAT=json`), OTLP export via `AURIX__TRACING__OTLP_ENDPOINT`.
 * Every privileged action (admin login, app/key changes, bans, kicks, recording access) is written

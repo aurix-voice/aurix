@@ -119,6 +119,10 @@ $('connect').onclick = async () => {
   });
   client.on('bitrate', (kbps, why) => log('bitrate', kbps, why));
   client.on('kicked', (ch, why) => log('kicked from', ch, why));
+  client.on('recovering', (attempt, delay, cause) => log(`connection lost (${cause}); reconnect #${attempt} in ${delay} ms`));
+  client.on('recovered', (i) => log(i.resumed ? 'session resumed' : 'fresh session, channels re-joined', i.sessionId));
+  client.on('failedToRecover', (e) => log('gave up reconnecting:', e.message));
+  client.on('sessionClosed', (why) => log('session closed by server:', why));
   client.on('serverError', (code, msg) => log('server error', code, msg));
   client.on('error', (e) => log('error', e.message));
   try {

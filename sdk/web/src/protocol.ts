@@ -59,7 +59,18 @@ export type ClientMessage =
 export type ServerMessage =
   | {
       type: 'SessionInitAck';
-      data: { session_id: string; ssrc: number; media_addr: string; media_key: string };
+      data: {
+        session_id: string;
+        ssrc: number;
+        media_addr: string;
+        media_key: string;
+        /** One-time credential for reattaching to this session after a dropped connection. */
+        resume_token?: string;
+        /** How long the server keeps a dropped session resumable (ms); 0 = resume disabled. */
+        resume_grace_ms?: number;
+        /** `true` when this ack reattached an existing session (channels are replayed). */
+        resumed?: boolean;
+      };
     }
   | { type: 'MediaBound'; data: { session_id: string } }
   | { type: 'SessionClose'; data: { session_id: string; reason: string } }
@@ -101,6 +112,8 @@ export interface TurnCredentials {
 /** Sub-protocol names understood by the server's WebSocket upgrade handler. */
 export const AURIX_SUBPROTOCOL = 'aurix';
 export const BEARER_SUBPROTOCOL_PREFIX = 'bearer.';
+/** `resume.<session_id>.<resume_token>` sub-protocol carries the resume credential. */
+export const RESUME_SUBPROTOCOL_PREFIX = 'resume.';
 
 export function parseServerMessage(raw: string): ServerMessage | UnknownMessage {
   const value: unknown = JSON.parse(raw);

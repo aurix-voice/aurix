@@ -1,7 +1,7 @@
 //! End-to-end smoke test against a *running* Aurix server (PostgreSQL + Redis required).
 //!
-//! Skipped unless `AURIX_E2E_API_KEY` is set; see `scripts/e2e.sh` which boots the stack,
-//! bootstraps an admin/app and then runs this test:
+//! Skipped unless `AURIX_E2E_API_KEY` is set; see the `e2e` job in `.github/workflows/ci.yml`
+//! which boots the stack, bootstraps an admin/app and then runs this test:
 //!
 //! ```text
 //! AURIX_E2E_API=http://127.0.0.1:8080 AURIX_E2E_WS=ws://127.0.0.1:8081 \
@@ -53,6 +53,10 @@ struct Player {
     keys: MediaKeys,
     media_addr: SocketAddr,
     udp: UdpSocket,
+    media_key: Vec<u8>,
+    resume_token: String,
+    resume_grace: Duration,
+    resumed: bool,
 }
 
 impl Player {
@@ -77,6 +81,22 @@ impl Player {
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
                 other => panic!("{}: unexpected frame {other:?}", self.name),
+            }
+        }
+    }
+
+    /// Next message within `wait`, or `None` when the connection stays silent.
+    async fn try_recv(&mut self, wait: Duration) -> Option<ControlMessage> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let m = tokio::time::timeout_at(deadline, self.ws.next())
+                .await
+                .ok()??
+                .ok()?;
+            match m {
+                Message::Text(t) => return serde_json::from_str(&t).ok(),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                _ => return None,
             }
         }
     }
@@ -154,9 +174,23 @@ async fn issue_token(
 }
 
 async fn connect(env: &Env, name: &'static str, token: String) -> Player {
+    connect_with(env, name, token, None).await
+}
+
+/// Connects, optionally presenting `<session_id>.<resume_token>` to reattach to a session.
+async fn connect_with(
+    env: &Env,
+    name: &'static str,
+    token: String,
+    resume: Option<(SessionId, &str)>,
+) -> Player {
     let mut req = format!("{}/ws", env.ws).into_client_request().unwrap();
     req.headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    if let Some((sid, tok)) = resume {
+        req.headers_mut()
+            .insert("x-aurix-resume", format!("{sid}.{tok}").parse().unwrap());
+    }
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws connect");
@@ -175,6 +209,9 @@ async fn connect(env: &Env, name: &'static str, token: String) -> Player {
         ssrc,
         media_addr,
         media_key,
+        resume_token,
+        resume_grace_ms,
+        resumed,
     } = msg
     else {
         panic!("{name}: expected SessionInitAck, got {t}");
@@ -183,6 +220,10 @@ async fn connect(env: &Env, name: &'static str, token: String) -> Player {
         .decode(media_key)
         .unwrap();
     assert_eq!(media_key.len(), 32);
+    assert!(
+        !resume_token.is_empty(),
+        "{name}: ack must carry a resume token"
+    );
     let udp = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     Player {
         name,
@@ -193,6 +234,10 @@ async fn connect(env: &Env, name: &'static str, token: String) -> Player {
         keys: MediaKeys::derive(&media_key),
         media_addr: media_addr.parse().unwrap(),
         udp,
+        media_key,
+        resume_token,
+        resume_grace: Duration::from_millis(resume_grace_ms),
+        resumed,
     }
 }
 
@@ -218,7 +263,7 @@ async fn bind_media(p: &mut Player) {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Aurix server; see scripts/e2e.sh"]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
 async fn full_stack_two_players_udp_audio_and_turn() {
     let Some(env) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
@@ -539,6 +584,252 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         Some(0),
         "session must be closed in the database after WS disconnect: {user}"
     );
+}
+
+async fn create_channel(env: &Env, http: &reqwest::Client) -> ChannelId {
+    let ch: serde_json::Value = http
+        .post(format!("{}/v1/channels", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"name": format!("e2e-{}", uuid::Uuid::now_v7())}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ChannelId::from_uuid(ch["id"].as_str().unwrap().parse().unwrap())
+}
+
+async fn membership_count(env: &Env, http: &reqwest::Client, channel_id: ChannelId) -> usize {
+    let parts: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{}/participants",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    parts["memberships"].as_array().map(|a| a.len()).unwrap()
+}
+
+async fn join(p: &mut Player, channel_id: ChannelId) {
+    let tok = p.token.clone();
+    p.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: tok,
+    })
+    .await;
+    p.expect(
+        "ChannelJoinAck",
+        |m| matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id),
+    )
+    .await;
+}
+
+async fn send_audio(from: &Player, channel_id: ChannelId, first_seq: u32, payload: &Bytes) {
+    let hash = channel_id_hash(&channel_id);
+    for i in 0..10u32 {
+        let seq = first_seq + i;
+        let pkt = AurixPacket::audio(seq, seq * 960, from.ssrc, hash, payload.clone());
+        from.udp
+            .send_to(&pkt.seal(&from.keys), from.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn count_audio_from(to: &Player, ssrc: u32, payload: &Bytes) -> usize {
+    let mut got = 0;
+    while let Some(p) = to.recv_udp().await {
+        if p.header.packet_type == PacketType::Audio && p.header.ssrc == ssrc {
+            assert_eq!(&p.payload[..], &payload[..]);
+            got += 1;
+        }
+        if got >= 5 {
+            break;
+        }
+    }
+    got
+}
+
+/// A WebSocket that dies without a Close frame keeps the session alive for the grace period;
+/// reconnecting with the resume token restores the same session/SSRC/key and the channel
+/// membership without peers seeing a leave. Wrong tokens fall back to a fresh session, and
+/// an expired grace period closes the session for real.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn session_resume_after_ws_drop() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, _) = issue_token(&env, &http, "e2e:resume-alice", "Alice", channel_id).await;
+    let (tok_b, _) = issue_token(&env, &http, "e2e:resume-bob", "Bob", channel_id).await;
+
+    let alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    assert!(!alice.resumed && !bob.resumed);
+    assert!(
+        alice.resume_grace >= Duration::from_secs(1),
+        "server must advertise a resume grace period (got {:?})",
+        alice.resume_grace
+    );
+    let mut alice = alice;
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    join(&mut alice, channel_id).await;
+    join(&mut bob, channel_id).await;
+    alice
+        .expect("ParticipantJoined", |m| {
+            matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == "Bob")
+        })
+        .await;
+
+    // Alice's socket dies without a Close frame (network blip).
+    let Player {
+        session_id: sid_a,
+        ssrc: ssrc_a,
+        media_key: key_a,
+        resume_token: first_token,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Bob sees nothing, the membership is still persisted.
+    assert!(
+        bob.try_recv(Duration::from_millis(700)).await.is_none(),
+        "peers must not be notified while the session is detached"
+    );
+    assert_eq!(membership_count(&env, &http, channel_id).await, 2);
+
+    // Another user's JWT cannot resume Alice's session even with the right resume token.
+    let (tok_c, _) = issue_token(&env, &http, "e2e:resume-carol", "Carol", channel_id).await;
+    let mut hijack = connect_with(
+        &env,
+        "carol-as-alice",
+        tok_c.clone(),
+        Some((sid_a, &first_token)),
+    )
+    .await;
+    assert!(!hijack.resumed);
+    assert_ne!(hijack.session_id, sid_a);
+    hijack.ws.close(None).await.unwrap();
+
+    // The real resume: same session, SSRC and key; channel state replayed; token rotated.
+    let mut alice = connect_with(&env, "alice", tok_a.clone(), Some((sid_a, &first_token))).await;
+    assert!(alice.resumed, "expected resumed session");
+    assert_eq!(alice.session_id, sid_a);
+    assert_eq!(alice.ssrc, ssrc_a);
+    assert_eq!(alice.media_key, key_a);
+    assert_ne!(alice.resume_token, first_token, "resume token must rotate");
+    let ack = alice
+        .expect("ChannelJoinAck (replayed)", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    let ControlMessage::ChannelJoinAck {
+        channel_id: c,
+        participants,
+    } = ack
+    else {
+        unreachable!()
+    };
+    assert_eq!(c, channel_id);
+    assert_eq!(participants.len(), 1, "{participants:?}");
+    assert_eq!(participants[0].display_name, "Bob");
+    assert_eq!(participants[0].ssrc, bob.ssrc);
+
+    // Media re-binds from a new port and audio flows with the old SSRC.
+    bind_media(&mut alice).await;
+    let payload = Bytes::from_static(&[0xFC, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+    send_audio(&alice, channel_id, 1000, &payload).await;
+    let got = count_audio_from(&bob, ssrc_a, &payload).await;
+    assert!(got >= 5, "Bob received only {got} packets after resume");
+    assert_eq!(membership_count(&env, &http, channel_id).await, 2);
+
+    // The used token is dead and the session is attached: Carol can claim nothing with either.
+    for tok in [&first_token, &alice.resume_token.clone()] {
+        let mut c = connect_with(&env, "carol-replay", tok_c.clone(), Some((sid_a, tok))).await;
+        assert!(!c.resumed);
+        c.ws.close(None).await.unwrap();
+    }
+    let second_token = alice.resume_token.clone();
+
+    // Grace expiry closes the session for real (only exercised with a short configured grace).
+    if alice.resume_grace <= Duration::from_secs(10) {
+        let grace = alice.resume_grace;
+        drop(alice.ws);
+        tokio::time::timeout(grace + Duration::from_secs(3), async {
+            loop {
+                if let ControlMessage::ParticipantLeft { .. } = bob.recv().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Bob never saw Alice leave after the grace period");
+        assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+        let mut late = connect_with(
+            &env,
+            "alice-late",
+            tok_a.clone(),
+            Some((sid_a, &second_token)),
+        )
+        .await;
+        assert!(!late.resumed, "expired sessions must not be resumable");
+        assert_ne!(late.session_id, sid_a);
+        late.ws.close(None).await.unwrap();
+    } else {
+        eprintln!(
+            "resume grace is {:?}; set AURIX__SERVER__SESSION_RESUME_GRACE_SECS<=10 to test expiry",
+            alice.resume_grace
+        );
+        alice.ws.close(None).await.unwrap();
+        bob.expect("ParticipantLeft", |m| {
+            matches!(m, ControlMessage::ParticipantLeft { .. })
+        })
+        .await;
+    }
+
+    // A stale/wrong token gives the same user a fresh session, which replaces the detached one
+    // right away instead of leaving it to the grace timer.
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let sid_a2 = alice.session_id;
+    join(&mut alice, channel_id).await;
+    bob.expect("ParticipantJoined", |m| {
+        matches!(m, ControlMessage::ParticipantJoined { .. })
+    })
+    .await;
+    drop(alice.ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut fresh = connect_with(&env, "alice-wrong-token", tok_a, Some((sid_a2, "AAAA"))).await;
+    assert!(!fresh.resumed);
+    assert_ne!(fresh.session_id, sid_a2);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let ControlMessage::ParticipantLeft { .. } = bob.recv().await {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("replaced session must leave its channels immediately");
+    assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+    fresh.ws.close(None).await.unwrap();
+    bob.ws.close(None).await.unwrap();
 }
 
 /// Two Aurix nodes sharing one PostgreSQL/Redis, no `cascade_peers` configured: the second node

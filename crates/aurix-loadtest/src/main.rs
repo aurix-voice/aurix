@@ -195,6 +195,7 @@ async fn setup_session(args: &Args, token: String, channel_id: ChannelId) -> Res
             ssrc,
             media_addr,
             media_key,
+            ..
         } => {
             s.session_id = session_id;
             s.ssrc = ssrc;

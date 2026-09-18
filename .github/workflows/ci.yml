@@ -65,6 +65,7 @@ jobs:
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
           AURIX__RECORDING__ENABLED: "true"
           AURIX__RECORDING__STORAGE_PATH: ${{ runner.temp }}/recordings
+          AURIX__SERVER__SESSION_RESUME_GRACE_SECS: "4"
           AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
           AURIX__TRACING__LOG_FORMAT: text
         run: |

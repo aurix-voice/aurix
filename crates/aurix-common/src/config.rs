@@ -84,6 +84,12 @@ impl AurixConfig {
         if self.turn.min_port > self.turn.max_port {
             anyhow::bail!("turn.min_port must be <= turn.max_port");
         }
+        if self.server.session_resume_grace_secs > self.media.session_timeout_secs {
+            anyhow::bail!(
+                "server.session_resume_grace_secs must be <= media.session_timeout_secs, otherwise \
+                 the media session is reaped before the client can resume"
+            );
+        }
         for cidr in &self.server.trusted_proxies {
             cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
                 anyhow::anyhow!("server.trusted_proxies entry '{cidr}' is not a valid CIDR: {e}")
@@ -175,6 +181,10 @@ pub struct ServerConfig {
     /// Per-request timeout for REST handlers (seconds).
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// How long a player session survives after its WebSocket drops unexpectedly, waiting for
+    /// the client to reconnect with its resume token (seconds). `0` disables session resume.
+    #[serde(default = "default_session_resume_grace_secs")]
+    pub session_resume_grace_secs: u64,
 }
 
 fn default_environment() -> String {
@@ -184,6 +194,9 @@ fn default_max_body_bytes() -> usize {
     1024 * 1024
 }
 fn default_request_timeout_secs() -> u64 {
+    30
+}
+fn default_session_resume_grace_secs() -> u64 {
     30
 }
 
@@ -203,6 +216,7 @@ impl Default for ServerConfig {
             trusted_proxies: Vec::new(),
             max_body_bytes: default_max_body_bytes(),
             request_timeout_secs: default_request_timeout_secs(),
+            session_resume_grace_secs: default_session_resume_grace_secs(),
         }
     }
 }

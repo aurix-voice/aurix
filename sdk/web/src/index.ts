@@ -4,6 +4,7 @@ export type {
   AurixEvents,
   ConnectionState,
   Participant,
+  ReconnectPolicy,
   SessionInfo,
 } from './client.js';
 export type {
@@ -18,4 +19,9 @@ export type {
   UnknownMessage,
   UserPosition,
 } from './protocol.js';
-export { AURIX_SUBPROTOCOL, BEARER_SUBPROTOCOL_PREFIX, parseServerMessage } from './protocol.js';
+export {
+  AURIX_SUBPROTOCOL,
+  BEARER_SUBPROTOCOL_PREFIX,
+  RESUME_SUBPROTOCOL_PREFIX,
+  parseServerMessage,
+} from './protocol.js';
