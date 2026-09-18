@@ -545,6 +545,50 @@ pub struct ChannelPermission {
     pub moderate: bool,
 }
 
+/// Operation a one-time action token (`POST /v1/tokens/action`) authorises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Open a WebSocket session (no channel rights of its own).
+    Login,
+    /// Join one channel with the permissions carried in the token.
+    Join,
+    /// Remove `target_user_id` from `channel_id`.
+    Kick,
+    /// Server-mute `target_user_id` in `channel_id`.
+    Mute,
+    /// Lift a server-mute of `target_user_id` in `channel_id`.
+    Unmute,
+}
+
+impl ActionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Join => "join",
+            Self::Kick => "kick",
+            Self::Mute => "mute",
+            Self::Unmute => "unmute",
+        }
+    }
+
+    /// Actions that require a channel.
+    pub fn needs_channel(&self) -> bool {
+        !matches!(self, Self::Login)
+    }
+
+    /// Actions that are performed on another player.
+    pub fn needs_target(&self) -> bool {
+        matches!(self, Self::Kick | Self::Mute | Self::Unmute)
+    }
+}
+
+impl std::fmt::Display for ActionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn default_true() -> bool {
     true
 }

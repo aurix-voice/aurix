@@ -65,6 +65,12 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
   read another participant's packets even on a shared network.
 * WebRTC uses DTLS-SRTP; the browser's SSRCs are mapped to the authenticated session.
 * Tenant identity always comes from the validated API key / JWT — never from request bodies.
+* **One-time action tokens** (`POST /v1/tokens/action`): short-lived (90 s by default) JWTs with a
+  unique `jti` that authorise exactly one `login`, `join`, `kick`, `mute` or `unmute`. The first
+  presentation claims the `jti` atomically in Redis (`SET NX EX`, key scoped to the tenant); a
+  replay — on any node — is refused with `TOKEN_REUSED`. Without Redis the claim registry is
+  node-local. `AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` makes them mandatory for opening a
+  session and joining a channel, so a leaked player JWT can no longer be used to log in or join.
 * TURN requires MESSAGE-INTEGRITY with long-term credentials derived from the API-issued
   time-limited username/password (HMAC-SHA1 shared secret, RFC 5389 §15.4); nonces, allocation
   ownership, permissions and channel bindings are enforced. No open relay.
@@ -107,22 +113,33 @@ curl -X POST localhost:8080/v1/channels -H "x-api-key: $KEY" -H 'content-type: a
 curl -X POST localhost:8080/v1/tokens -H "x-api-key: $KEY" -H 'content-type: application/json' \
   -d '{"external_id":"steam:7656119","display_name":"Alice",
        "channels":[{"channel_id":"<channel uuid>","speak":true,"receive":true}]}'
+
+# one-time action token (login | join | kick | mute | unmute), single use, 90 s
+curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-type: application/json' \
+  -d '{"action":"join","external_id":"steam:7656119","channel_id":"<channel uuid>","speak":true}'
+# kick/mute/unmute additionally need moderation:write, a target and the acting user:
+#   {"action":"kick","user_id":"<moderator uuid>","channel_id":"<channel>","target_user_id":"<player>"}
 ```
 
 ### Client flow
 
 1. Connect to `ws://host:8081/ws` with the player JWT (`Authorization: Bearer`, the
    `Sec-WebSocket-Protocol: aurix, bearer.<jwt>` sub-protocol for browsers, or `?token=` as last
-   resort). The server replies `SessionInitAck { session_id, ssrc, media_addr, media_key,
-   resume_token, resume_grace_ms }`.
+   resort) or with a one-time `login` action token. The server replies
+   `SessionInitAck { session_id, ssrc, media_addr, media_key, resume_token, resume_grace_ms }`.
 2. **Native clients**: send an authenticated `SessionBind` datagram to `media_addr`
    (`AurixPacket::session_bind(...).encode_authenticated(media_key)`), wait for
    `SessionBindAck` / `MediaBound`, then `ChannelJoin { channel_id, token }` over WebSocket and
-   start sending `Audio` packets (Opus, 20 ms, `encode_authenticated`).
+   start sending `Audio` packets (Opus, 20 ms, `encode_authenticated`). `token` is either the
+   player JWT (must list the channel) or a one-time `join` action token for exactly that channel.
 3. **Browsers**: `ChannelJoin`, then `WebRtcOffer { sdp }` → `WebRtcAnswer { sdp }`; ICE
    servers come from `GET /v1/me/turn-credentials`.
 4. Positional channels: send `PositionUpdate` (own position only); `SpeakingState`,
    `ParticipantJoined/Left`, `RecordingNotification`, `Kick`, `SessionClose` arrive as events.
+5. In-game moderation: `ModerateParticipant { channel_id, user_id, action, token }` with a
+   `kick`/`mute`/`unmute` action token minted by your backend for the acting player →
+   `ModerateParticipantAck` (or `Error`). The token binds actor, channel and target, so a
+   client cannot redirect it.
 5. **Reconnect**: if the WebSocket drops without a Close frame the session stays alive for
    `resume_grace_ms` (`AURIX__SERVER__SESSION_RESUME_GRACE_SECS`, default 30). Reconnect with the
    same JWT plus `X-Aurix-Resume: <session_id>.<resume_token>` (browsers: sub-protocol
@@ -158,6 +175,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | admin JWT | `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log` | operators |
 | admin JWT | `POST|GET /v1/apps`, `GET|DELETE /v1/apps/:id`, `POST /v1/apps/:id/rotate-key`, `GET /v1/nodes` | tenants & fleet |
 | API key | `POST /v1/tokens` | issue player JWT |
+| API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`) |
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
@@ -197,6 +215,8 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__DATABASE__URL`, `AURIX__REDIS__URL` | Redis is optional for a single node but required for multi-node events / distributed rate limits |
 | `AURIX__AUTH__JWT_SECRET` | ≥ 32 random bytes; or `AURIX__AUTH__JWT_PUBLIC_KEY_PATH` for RS256 |
 | `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN` | allows `/admin/setup` after the first admin exists; unset after use |
+| `AURIX__AUTH__ACTION_TOKEN_TTL_SECS`, `AURIX__AUTH__ACTION_TOKEN_MAX_TTL_SECS` | default (90) and maximum (600) lifetime of one-time action tokens |
+| `AURIX__AUTH__REQUIRE_ACTION_TOKENS` | `true` — WebSocket login and `ChannelJoin` accept only one-time action tokens (player JWTs stay valid for REST) |
 | `AURIX__MEDIA__EXTERNAL_IP` | public IP advertised to clients for UDP media |
 | `AURIX__MEDIA__REQUIRE_PACKET_AUTH` | `true` (default) — drop unauthenticated media |
 | `AURIX__MEDIA__RX_WORKERS` | concurrent UDP receive workers on the SFU socket; `0` (default) = CPU count clamped to 2–8 |

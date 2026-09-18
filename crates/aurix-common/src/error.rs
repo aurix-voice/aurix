@@ -14,6 +14,12 @@ pub enum AurixError {
     #[error("Token invalid: {0}")]
     TokenInvalid(String),
 
+    #[error("Token already used")]
+    TokenReused,
+
+    #[error("Action token required: {0}")]
+    ActionTokenRequired(String),
+
     #[error("Channel not found: {0}")]
     ChannelNotFound(String),
 
@@ -123,6 +129,8 @@ impl AurixError {
             Self::AuthorizationDenied(_) => 403,
             Self::TokenExpired => 401,
             Self::TokenInvalid(_) => 401,
+            Self::TokenReused => 401,
+            Self::ActionTokenRequired(_) => 403,
             Self::ChannelNotFound(_) => 404,
             Self::UserNotFound(_) => 404,
             Self::SessionNotFound(_) => 404,
@@ -147,6 +155,8 @@ impl AurixError {
             Self::AuthorizationDenied(_) => "AUTH_DENIED",
             Self::TokenExpired => "TOKEN_EXPIRED",
             Self::TokenInvalid(_) => "TOKEN_INVALID",
+            Self::TokenReused => "TOKEN_REUSED",
+            Self::ActionTokenRequired(_) => "ACTION_TOKEN_REQUIRED",
             Self::ChannelNotFound(_) => "CHANNEL_NOT_FOUND",
             Self::ChannelFull(_) => "CHANNEL_FULL",
             Self::UserNotFound(_) => "USER_NOT_FOUND",

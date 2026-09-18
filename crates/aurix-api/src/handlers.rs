@@ -4,6 +4,7 @@ use crate::state::AppState;
 use aurix_auth::ValidatedToken;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
+use aurix_control::moderation_actions::{self, ModerationTarget};
 use axum::{
     extract::{Extension, State},
     http::HeaderMap,
@@ -163,6 +164,197 @@ pub async fn generate_token(
         token,
         user_id,
         expires_at: expires_at.to_rfc3339(),
+    }))
+}
+
+/// Subject of `POST /v1/tokens/action`: either an existing user by id or an
+/// external identity that is upserted like `POST /v1/tokens` does.
+#[derive(Deserialize)]
+pub struct ActionTokenRequest {
+    pub action: ActionKind,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub target_user_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub speak: bool,
+    #[serde(default = "default_true")]
+    pub receive: bool,
+    #[serde(default)]
+    pub moderate: bool,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+pub struct ActionTokenResponse {
+    pub token: String,
+    pub jti: String,
+    pub action: ActionKind,
+    pub user_id: UserId,
+    pub expires_at: String,
+}
+
+async fn ensure_not_banned(
+    state: &AppState,
+    app_id: AppId,
+    user: &aurix_db::models::UserRow,
+) -> Result<(), ApiError> {
+    if user.is_banned && user.ban_expires_at.map(|t| t > Utc::now()).unwrap_or(true) {
+        return Err(AurixError::UserBanned(
+            user.ban_reason
+                .clone()
+                .unwrap_or_else(|| "User is banned".into()),
+        )
+        .into());
+    }
+    if state.moderation.is_banned(app_id, UserId(user.id)).await? {
+        return Err(AurixError::UserBanned("User is banned".into()).into());
+    }
+    Ok(())
+}
+
+/// Issues a one-time action token. `login`/`join` need `tokens:issue`; `kick`/`mute`/`unmute`
+/// additionally need `moderation:write` because the bearer performs a moderation act.
+pub async fn generate_action_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Json(req): Json<ActionTokenRequest>,
+) -> Result<Json<ActionTokenResponse>, ApiError> {
+    ctx.require("tokens:issue")?;
+    if req.action.needs_target() {
+        ctx.require("moderation:write")?;
+    }
+    let app_id = ctx.app_id;
+    let svc = &state.control.action_tokens;
+    let ttl_secs = svc.resolve_ttl(req.ttl_secs)?;
+
+    let user = match (&req.user_id, &req.external_id) {
+        (Some(raw), _) => {
+            let id = parse_uuid(raw, "user_id")?;
+            aurix_db::queries::get_user(&state.control.pool, app_id.0, id)
+                .await?
+                .ok_or_else(|| AurixError::UserNotFound(raw.clone()))?
+        }
+        (None, Some(external_id)) => {
+            let external_id = external_id.trim();
+            if external_id.is_empty() || external_id.len() > 255 {
+                return Err(AurixError::Validation(
+                    "external_id must be 1..=255 characters".into(),
+                )
+                .into());
+            }
+            let display_name = req.display_name.as_deref().unwrap_or("").trim();
+            if display_name.is_empty() || display_name.len() > 64 {
+                return Err(AurixError::Validation(
+                    "display_name must be 1..=64 characters when external_id is used".into(),
+                )
+                .into());
+            }
+            let row = aurix_db::models::UserRow {
+                id: Uuid::now_v7(),
+                app_id: app_id.0,
+                external_id: external_id.to_string(),
+                display_name: display_name.to_string(),
+                metadata: req.metadata.clone(),
+                is_banned: false,
+                ban_reason: None,
+                ban_expires_at: None,
+                device_ids: Vec::new(),
+                total_session_minutes: 0,
+                last_seen_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            aurix_db::queries::upsert_user(&state.control.pool, &row).await?
+        }
+        (None, None) => {
+            return Err(
+                AurixError::Validation("Either user_id or external_id is required".into()).into(),
+            );
+        }
+    };
+    ensure_not_banned(&state, app_id, &user).await?;
+    let user_id = UserId(user.id);
+    let display_name = req
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .unwrap_or(&user.display_name)
+        .to_string();
+
+    let channel_id = match &req.channel_id {
+        Some(raw) => {
+            let id = ChannelId::from_uuid(parse_uuid(raw, "channel_id")?);
+            state.control.channels.require_channel(app_id, id).await?;
+            Some(id)
+        }
+        None if req.action.needs_channel() => {
+            return Err(AurixError::Validation(format!(
+                "channel_id is required for action '{}'",
+                req.action
+            ))
+            .into());
+        }
+        None => None,
+    };
+    let target_user_id = match &req.target_user_id {
+        Some(raw) => {
+            let id = UserId::from_uuid(parse_uuid(raw, "target_user_id")?);
+            if id == user_id {
+                return Err(
+                    AurixError::Validation("target_user_id must differ from user".into()).into(),
+                );
+            }
+            require_user(&state, app_id, id).await?;
+            Some(id)
+        }
+        None if req.action.needs_target() => {
+            return Err(AurixError::Validation(format!(
+                "target_user_id is required for action '{}'",
+                req.action
+            ))
+            .into());
+        }
+        None => None,
+    };
+
+    let spec = aurix_auth::ActionTokenSpec {
+        action: req.action,
+        user_id,
+        app_id,
+        display_name,
+        channel_id,
+        target_user_id,
+        speak: req.speak,
+        receive: req.receive,
+        moderate: req.moderate,
+        metadata: req.metadata,
+        ttl_secs,
+    };
+    let (token, jti, exp) = svc.mint(&spec)?;
+    let expires_at = chrono::DateTime::<Utc>::from_timestamp(exp, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    Ok(Json(ActionTokenResponse {
+        token,
+        jti,
+        action: req.action,
+        user_id,
+        expires_at,
     }))
 }
 
@@ -705,57 +897,19 @@ pub async fn server_mute(
         .await?;
     require_user(&state, app_id, user_id).await?;
     let actor = resolve_actor(&state, &ctx, req.moderator_user_id.as_deref()).await?;
-
-    state
-        .control
-        .sessions
-        .set_server_mute(app_id, channel_id, user_id, req.muted)
-        .await?;
-    {
-        let sfu = state.sfu.read();
-        for s in sfu.sessions_for_user(&user_id) {
-            if s.app_id == app_id {
-                s.is_server_muted
-                    .store(req.muted, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
-    if let Some(ref redis) = state.control.redis {
-        let _ = redis.set_global_mute(user_id, req.muted).await;
-    }
-    let action = if req.muted {
-        AuditAction::UserMuted
-    } else {
-        AuditAction::UserUnmuted
-    };
-    state.control.audit.log(
-        Some(app_id),
-        actor,
-        action,
-        "user",
-        &user_id.to_string(),
-        serde_json::json!({"channel_id": channel_id, "muted": req.muted}),
-        client_ip_string(ip),
-    );
-    let event = if req.muted {
-        aurix_control::ServerEvent::UserMuted {
+    moderation_actions::set_server_mute(
+        &state.control,
+        &state.sfu,
+        ModerationTarget {
             app_id,
             channel_id,
             user_id,
-            muted_by: actor,
-            server_mute: true,
-            timestamp: Utc::now(),
-        }
-    } else {
-        aurix_control::ServerEvent::UserUnmuted {
-            app_id,
-            channel_id,
-            user_id,
-            unmuted_by: actor,
-            timestamp: Utc::now(),
-        }
-    };
-    state.control.events.publish(event);
+            actor,
+            ip: client_ip_string(ip),
+        },
+        req.muted,
+    )
+    .await?;
     Ok(Json(serde_json::json!({"muted": req.muted})))
 }
 
@@ -784,36 +938,19 @@ pub async fn kick_user(
         .await?;
     require_user(&state, app_id, user_id).await?;
     let actor = resolve_actor(&state, &ctx, req.moderator_user_id.as_deref()).await?;
-
-    {
-        let sfu = state.sfu.read();
-        let _ = sfu.kick_user_from_channel(&user_id, &channel_id);
-    }
-    let removed = state
-        .control
-        .sessions
-        .remove_user_from_channel(app_id, channel_id, user_id)
-        .await?;
-    state.control.audit.log(
-        Some(app_id),
-        actor,
-        AuditAction::UserKicked,
-        "user",
-        &user_id.to_string(),
-        serde_json::json!({"channel_id": channel_id, "reason": req.reason}),
-        client_ip_string(ip),
-    );
-    state
-        .control
-        .events
-        .publish(aurix_control::ServerEvent::UserKicked {
+    let removed = moderation_actions::kick_from_channel(
+        &state.control,
+        &state.sfu,
+        ModerationTarget {
             app_id,
             channel_id,
             user_id,
-            kicked_by: actor,
-            reason: req.reason,
-            timestamp: Utc::now(),
-        });
+            actor,
+            ip: client_ip_string(ip),
+        },
+        req.reason,
+    )
+    .await?;
     Ok(Json(
         serde_json::json!({"kicked": true, "memberships_closed": removed}),
     ))

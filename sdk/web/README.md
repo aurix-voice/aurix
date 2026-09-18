@@ -77,6 +77,37 @@ client.on('sessionClosed', (reason) => { /* kicked/banned/shutdown: no reconnect
   ~2.5 × `pingIntervalMs`. `reconnectNow()` skips the current backoff delay (e.g. on `online`).
 * `disconnect()` cancels any pending reconnect; a `SessionClose` from the server never reconnects.
 
+### One-time action tokens
+
+Your backend can mint single-use tokens with `POST /v1/tokens/action` (90 s by default) instead
+of handing the reusable player JWT to the client. Each token authorises exactly one `login`,
+`join`, `kick`, `mute` or `unmute`; a replay — on any node — fails with `TOKEN_REUSED`. When the
+server runs with `auth.require_action_tokens = true` they are mandatory for `connect()` and
+`joinChannel()`.
+
+```ts
+const client = new AurixClient({
+  apiUrl, wsUrl,
+  token: await backend.actionToken({ action: 'login' }),          // one-time login credential
+  refreshToken: () => backend.actionToken({ action: 'login' }),   // fresh one before each reconnect
+  joinToken: (channelId) => backend.actionToken({ action: 'join', channel_id: channelId, speak: true }),
+});
+await client.connect();
+await client.joinChannel(channelId);                 // uses joinToken(channelId)
+await client.joinChannel(channelId, explicitToken);  // …or pass one yourself
+
+// in-game moderation: the backend mints a kick/mute/unmute token bound to actor + channel + target
+const kick = await backend.actionToken({ action: 'kick', channel_id, target_user_id: userId });
+await client.moderate(channelId, userId, 'kick', kick, 'afk');    // resolves on ModerateParticipantAck
+```
+
+A `login` token that opened a session may still be presented for a *resume* of that same session
+within the grace window; `refreshToken` is only needed when the resume fails and a fresh session
+has to be opened (the client calls it before every reconnect attempt, so keep it cheap). Without
+`refreshToken` the current `token` is reused — fine for player JWTs, not for consumed action
+tokens. A `login` token also authenticates `GET /v1/me/*` (TURN credentials) while it is within
+its TTL, which is exactly when the SDK fetches them.
+
 ## How it maps to the server
 
 | SDK | server |

@@ -78,6 +78,13 @@ impl AurixConfig {
         if self.auth.jwt_secret.is_empty() && self.auth.jwt_public_key_path.is_none() {
             anyhow::bail!("Either jwt_secret or jwt_public_key_path must be set");
         }
+        if self.auth.action_token_ttl_secs < 1
+            || self.auth.action_token_ttl_secs > self.auth.action_token_max_ttl_secs
+        {
+            anyhow::bail!(
+                "auth.action_token_ttl_secs must be within 1..=auth.action_token_max_ttl_secs"
+            );
+        }
         if self.media.max_participants_per_node == 0 {
             anyhow::bail!("max_participants_per_node must be > 0");
         }
@@ -273,6 +280,17 @@ pub struct AuthConfig {
     /// only permitted while no admin user exists yet (first-run bootstrap).
     #[serde(default)]
     pub admin_bootstrap_token: Option<String>,
+    /// Default lifetime of one-time action tokens (`POST /v1/tokens/action`).
+    #[serde(default = "default_action_token_ttl_secs")]
+    pub action_token_ttl_secs: i64,
+    /// Upper bound a caller may request for an action token lifetime.
+    #[serde(default = "default_action_token_max_ttl_secs")]
+    pub action_token_max_ttl_secs: i64,
+    /// When true, WebSocket sessions may only be opened with `login` action tokens and channels
+    /// may only be joined with `join` action tokens; the multi-use session JWT from
+    /// `POST /v1/tokens` is refused for both (it stays valid for end-user REST calls).
+    #[serde(default)]
+    pub require_action_tokens: bool,
     pub oauth_enabled: bool,
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret: Option<String>,
@@ -281,6 +299,14 @@ pub struct AuthConfig {
 
 fn default_admin_token_ttl_secs() -> i64 {
     8 * 3600
+}
+
+fn default_action_token_ttl_secs() -> i64 {
+    90
+}
+
+fn default_action_token_max_ttl_secs() -> i64 {
+    600
 }
 
 impl Default for AuthConfig {
@@ -293,6 +319,9 @@ impl Default for AuthConfig {
             token_ttl_secs: 3600,
             admin_token_ttl_secs: default_admin_token_ttl_secs(),
             admin_bootstrap_token: None,
+            action_token_ttl_secs: default_action_token_ttl_secs(),
+            action_token_max_ttl_secs: default_action_token_max_ttl_secs(),
+            require_action_tokens: false,
             oauth_enabled: false,
             oauth_client_id: None,
             oauth_client_secret: None,

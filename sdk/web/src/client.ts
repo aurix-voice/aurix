@@ -6,6 +6,7 @@ import {
   parseServerMessage,
   type ClientMessage,
   type LocalMute,
+  type ModerationAction,
   type ParticipantBrief,
   type ParticipantVolume,
   type RecordingConsent,
@@ -20,8 +21,24 @@ export interface AurixClientOptions {
   apiUrl: string;
   /** WebSocket URL of the control channel, e.g. `wss://voice.example.com/ws`. */
   wsUrl: string;
-  /** Player JWT issued by your backend via `POST /v1/tokens`. */
+  /**
+   * Player credential issued by your backend: a session JWT (`POST /v1/tokens`) or a one-time
+   * `login` action token (`POST /v1/tokens/action`). Also used for `GET /v1/me/*` calls (TURN
+   * credentials are fetched right after the session opens, within a login token's TTL).
+   */
   token: string;
+  /**
+   * Called before every reconnect attempt; return a fresh credential for `token`. Required
+   * when `token` is a one-time `login` action token: it is spent by the first connection (and
+   * expires within its short TTL), so a fresh session after the resume window needs a new one.
+   */
+  refreshToken?: () => Promise<string>;
+  /**
+   * Called by `joinChannel` when no explicit join token is passed; return a one-time `join`
+   * action token for `channelId`. Required when the server enforces
+   * `auth.require_action_tokens`. Without it, `token` itself authorises the join.
+   */
+  joinToken?: (channelId: string) => Promise<string>;
   /**
    * Fetch TURN credentials from `GET /v1/me/turn-credentials` and add them to the ICE
    * configuration. Defaults to `true`; failures are non-fatal (host/STUN only).
@@ -193,6 +210,7 @@ export class AurixClient {
   private localStream: MediaStream | undefined;
   private listeners = new Map<keyof AurixEvents, Set<AnyListener>>();
   private pendingJoins = new Map<string, Pending<Participant[]>>();
+  private pendingModerations = new Map<string, Pending<void>>();
   private pendingAnswer: Pending<string> | undefined;
   private pendingInit: Pending<SessionInfo> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
@@ -472,6 +490,11 @@ export class AurixClient {
       p.reject(new Error(reason));
     }
     this.pendingJoins.clear();
+    for (const p of this.pendingModerations.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.pendingModerations.clear();
     this.rejectPending(this.pendingAnswer, reason);
     this.pendingAnswer = undefined;
     this.rejectPending(this.pendingInit, reason);
@@ -480,17 +503,47 @@ export class AurixClient {
 
   // ── Channels ──
 
-  /** Join a channel the token authorises. Resolves with the current participant list. */
-  joinChannel(channelId: string): Promise<Participant[]> {
+  /**
+   * Join a channel. Resolves with the current participant list. `joinToken` is a one-time
+   * `join` action token for this channel; when omitted the `joinToken` option is consulted
+   * and finally the session credential itself is presented.
+   */
+  async joinChannel(channelId: string, joinToken?: string): Promise<Participant[]> {
     this.requireOpen();
-    if (this.pendingJoins.has(channelId)) return Promise.reject(new Error('join already pending'));
+    if (this.pendingJoins.has(channelId)) throw new Error('join already pending');
+    const token = joinToken ?? (this.opts.joinToken ? await this.opts.joinToken(channelId) : this.opts.token);
+    this.requireOpen();
+    if (this.pendingJoins.has(channelId)) throw new Error('join already pending');
     return new Promise<Participant[]>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingJoins.delete(channelId);
         reject(new Error(`join ${channelId} timed out`));
       }, this.opts.requestTimeoutMs);
       this.pendingJoins.set(channelId, { resolve, reject, timer });
-      this.send({ type: 'ChannelJoin', data: { channel_id: channelId, token: this.opts.token } });
+      this.send({ type: 'ChannelJoin', data: { channel_id: channelId, token } });
+    });
+  }
+
+  /**
+   * Kick or server-mute/unmute `userId` in `channelId` with a one-time `kick`/`mute`/`unmute`
+   * action token minted for this user (`POST /v1/tokens/action`). The token is spent whether
+   * or not the operation succeeds after the server accepted it; a mismatch (other actor,
+   * target, channel or action) leaves it unused and rejects with `AUTH_DENIED`.
+   */
+  moderate(channelId: string, userId: string, action: ModerationAction, token: string, reason?: string): Promise<void> {
+    this.requireOpen();
+    const key = `${channelId}/${userId}/${action}`;
+    if (this.pendingModerations.has(key)) return Promise.reject(new Error('moderation already pending'));
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingModerations.delete(key);
+        reject(new Error(`${action} ${userId} timed out`));
+      }, this.opts.requestTimeoutMs);
+      this.pendingModerations.set(key, { resolve, reject, timer });
+      this.send({
+        type: 'ModerateParticipant',
+        data: { channel_id: channelId, user_id: userId, action, token, reason: reason ?? null },
+      });
     });
   }
 
@@ -646,6 +699,10 @@ export class AurixClient {
     const wanted = Array.from(this.channels.keys());
     let info: SessionInfo;
     try {
+      if (this.opts.refreshToken) {
+        this.opts.token = await this.opts.refreshToken();
+        if (this.closedByUser) return;
+      }
       info = await this.openControlChannel();
     } catch (e) {
       if (this.closedByUser) return;
@@ -873,12 +930,19 @@ export class AurixClient {
       }
       case 'Error': {
         const d = (msg as Extract<ServerMessage, { type: 'Error' }>).data;
-        // A failed join/offer is reported as a generic Error; fail the oldest pending request.
+        // A failed join/moderation/offer is reported as a generic Error; fail the oldest
+        // pending request.
         const join = this.pendingJoins.entries().next();
+        const moderation = this.pendingModerations.entries().next();
         if (!join.done) {
           const [channelId, pending] = join.value;
           clearTimeout(pending.timer);
           this.pendingJoins.delete(channelId);
+          pending.reject(new Error(`${d.code}: ${d.message}`));
+        } else if (!moderation.done) {
+          const [key, pending] = moderation.value;
+          clearTimeout(pending.timer);
+          this.pendingModerations.delete(key);
           pending.reject(new Error(`${d.code}: ${d.message}`));
         } else if (this.pendingAnswer) {
           const pending = this.pendingAnswer;
@@ -887,6 +951,17 @@ export class AurixClient {
           pending.reject(new Error(`${d.code}: ${d.message}`));
         }
         this.emit('serverError', d.code, d.message);
+        return;
+      }
+      case 'ModerateParticipantAck': {
+        const d = (msg as Extract<ServerMessage, { type: 'ModerateParticipantAck' }>).data;
+        const key = `${d.channel_id}/${d.user_id}/${d.action}`;
+        const pending = this.pendingModerations.get(key);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingModerations.delete(key);
+          pending.resolve();
+        }
         return;
       }
       case 'SessionClose': {

@@ -55,10 +55,23 @@ export interface ParticipantVolume {
 /** Upper bound the server accepts for `SetParticipantVolume`. */
 export const MAX_PARTICIPANT_VOLUME = 2.0;
 
+/** Moderation performed by a player with a one-time action token (`POST /v1/tokens/action`). */
+export type ModerationAction = 'kick' | 'mute' | 'unmute';
+
 /** Messages the client may send. */
 export type ClientMessage =
   | { type: 'ChannelJoin'; data: { channel_id: string; token: string } }
   | { type: 'ChannelLeave'; data: { channel_id: string } }
+  | {
+      type: 'ModerateParticipant';
+      data: {
+        channel_id: string;
+        user_id: string;
+        action: ModerationAction;
+        token: string;
+        reason?: string | null;
+      };
+    }
   | {
       type: 'MuteStateChanged';
       data: { channel_id: string; user_id: string; muted: boolean; server_muted: boolean };
@@ -119,6 +132,10 @@ export type ServerMessage =
     }
   | { type: 'Error'; data: { code: string; message: string } }
   | { type: 'Kick'; data: { channel_id: string; user_id: string; reason: string } }
+  | {
+      type: 'ModerateParticipantAck';
+      data: { channel_id: string; user_id: string; action: ModerationAction };
+    }
   | { type: 'WebRtcAnswer'; data: { sdp: string } }
   | { type: 'Pong'; data: { nonce: number } };
 

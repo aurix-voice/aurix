@@ -1,3 +1,4 @@
+use crate::action_tokens::{ActionTokenService, PendingClaim};
 use crate::analytics::AnalyticsCollector;
 use crate::block_manager::BlockManager;
 use crate::channel_manager::ChannelManager;
@@ -6,7 +7,7 @@ use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
 use crate::session_manager::SessionManager;
 use aurix_auth::admin::AdminAuthService;
-use aurix_auth::{ApiKeyService, JwtService, RbacService};
+use aurix_auth::{AnyToken, ApiKeyService, JwtService, RbacService, ValidatedToken};
 use aurix_common::audit::AuditLogger;
 use aurix_common::config::AurixConfig;
 use aurix_common::error::{AurixError, Result};
@@ -27,6 +28,7 @@ pub struct ControlPlane {
     pub channels: Arc<ChannelManager>,
     pub sessions: Arc<SessionManager>,
     pub blocks: Arc<BlockManager>,
+    pub action_tokens: Arc<ActionTokenService>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -151,6 +153,12 @@ impl ControlPlane {
             }
         });
 
+        let action_tokens = Arc::new(ActionTokenService::new(
+            jwt.clone(),
+            redis.clone(),
+            &config.auth,
+        ));
+
         Ok(Self {
             node_id,
             config: Arc::new(config),
@@ -162,6 +170,7 @@ impl ControlPlane {
             nodes,
             channels,
             sessions,
+            action_tokens,
             blocks,
             events,
             audit,
@@ -170,8 +179,19 @@ impl ControlPlane {
         })
     }
 
-    pub fn validate_token(&self, token: &str) -> Result<aurix_auth::ValidatedToken> {
-        self.jwt.validate_token(token)
+    /// End-user REST authentication. Accepts the session JWT and — because a client that
+    /// opened its session with a `login` action token holds nothing else — `login` action
+    /// tokens as well (not consumed here: REST reads are idempotent and the token stays
+    /// short-lived). Any other action token is refused.
+    pub fn validate_token(&self, token: &str) -> Result<ValidatedToken> {
+        match self.jwt.validate_any(token)? {
+            AnyToken::Session(v) => Ok(v),
+            AnyToken::Action(a) if a.action == ActionKind::Login => Ok(a.as_session()),
+            AnyToken::Action(a) => Err(AurixError::AuthorizationDenied(format!(
+                "Action token authorises '{}', not API access",
+                a.action
+            ))),
+        }
     }
 
     /// Validate an admin JWT and confirm the account is still active.
@@ -181,12 +201,36 @@ impl ControlPlane {
         Ok(ctx)
     }
 
+    /// Validates the credential a client opens a WebSocket session with, runs the ban and
+    /// rate-limit checks and picks a media node. `one_time` is set when the credential was a
+    /// `login` action token; the caller must [`consume_login`](Self::consume_login) it once
+    /// it decides to open a *fresh* session (a resume of the session that token already
+    /// opened does not consume it again).
     pub async fn authenticate_session(
         &self,
         token: &str,
         ip_address: &str,
-    ) -> Result<(aurix_auth::ValidatedToken, MediaNodeInfo)> {
-        let validated = self.jwt.validate_token(token)?;
+    ) -> Result<(ValidatedToken, MediaNodeInfo, Option<PendingClaim>)> {
+        let (validated, one_time) = match self.jwt.validate_any(token)? {
+            AnyToken::Session(v) => {
+                if self.action_tokens.required() {
+                    return Err(AurixError::ActionTokenRequired(
+                        "This server only accepts 'login' action tokens for sessions".into(),
+                    ));
+                }
+                (v, None)
+            }
+            AnyToken::Action(a) if a.action == ActionKind::Login => {
+                let claim = ActionTokenService::pending(&a);
+                (a.as_session(), Some(claim))
+            }
+            AnyToken::Action(a) => {
+                return Err(AurixError::AuthorizationDenied(format!(
+                    "Action token authorises '{}', not login",
+                    a.action
+                )));
+            }
+        };
 
         let key = format!("session:{}", validated.user_id);
         if !self.rate_limiter.check(&key) {
@@ -240,6 +284,11 @@ impl ControlPlane {
         let _ = ip_address;
         let _ = aurix_db::queries::update_user_last_seen(&self.pool, validated.user_id.0).await;
 
-        Ok((validated, node))
+        Ok((validated, node, one_time))
+    }
+
+    /// Consumes the `jti` of a `login` action token; `Err(TokenReused)` on replay.
+    pub async fn consume_login(&self, claim: &PendingClaim) -> Result<()> {
+        self.action_tokens.consume(claim).await
     }
 }

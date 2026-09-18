@@ -80,6 +80,7 @@ pub fn create_router(state: AppState) -> Router {
     // Server-to-server (API key). Fine-grained permissions are enforced per handler.
     let api_routes = Router::new()
         .route("/v1/tokens", post(handlers::generate_token))
+        .route("/v1/tokens/action", post(handlers::generate_action_token))
         .route("/v1/turn/credentials", post(handlers::get_turn_credentials))
         .route(
             "/v1/channels",

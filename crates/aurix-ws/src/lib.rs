@@ -12,12 +12,13 @@
 //! user and receives `SessionInitAck { resumed: true }` plus one `ChannelJoinAck` per channel.
 //! Peers never see a leave/join pair. A failed resume falls back to a fresh session.
 
-use aurix_auth::ValidatedToken;
+use aurix_auth::{JwtService, ValidatedToken};
 use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{ControlMessage, LocalMute, ParticipantBrief, ParticipantVolume};
 use aurix_common::types::*;
-use aurix_control::{ControlPlane, ServerEvent};
+use aurix_control::moderation_actions::{self, ModerationTarget};
+use aurix_control::{ActionTokenService, ControlPlane, ServerEvent};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
 use aurix_media::{MediaEvent, SfuNode};
 use aurix_recording::RecordingService;
@@ -729,13 +730,15 @@ pub async fn ws_handler(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let ip = peer_ip(&state, &headers, peer.map(|p| p.0));
-    let validated = match state
+    let (validated, one_time) = match state
         .control
         .authenticate_session(&creds.token, &ip.to_string())
         .await
     {
-        Ok((v, _node)) => v,
-        Err(AurixError::UserBanned(_)) => return StatusCode::FORBIDDEN.into_response(),
+        Ok((v, _node, one_time)) => (v, one_time),
+        Err(AurixError::UserBanned(_)) | Err(AurixError::ActionTokenRequired(_)) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
         Err(AurixError::RateLimitExceeded(_)) => {
             return StatusCode::TOO_MANY_REQUESTS.into_response()
         }
@@ -748,11 +751,29 @@ pub async fn ws_handler(
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.chars().take(255).collect::<String>());
+    // A `login` action token opens exactly one fresh session. It is claimed on a resume as
+    // well (so a token presented for a resume cannot open a second session later), and an
+    // already-spent token is honoured only for reattaching a session it proves ownership of.
+    let mut fresh_allowed = true;
+    if let Some(claim) = one_time {
+        match state.control.consume_login(&claim).await {
+            Ok(()) => {}
+            Err(AurixError::TokenReused) if creds.resume.is_some() => fresh_allowed = false,
+            Err(AurixError::TokenReused) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(e) => {
+                warn!("login token claim failed: {e}");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+    }
     // Claimed before the upgrade so two racing reconnects cannot both take the session.
     let resume = creds
         .resume
         .filter(|(sid, tok)| state.claim_resume(*sid, tok, &validated))
         .map(|(sid, _)| sid);
+    if !fresh_allowed && resume.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let ws = ws.max_message_size(MAX_TEXT_FRAME);
     let ws = if creds.echo_subprotocol {
         ws.protocols([AURIX_SUBPROTOCOL])
@@ -1087,6 +1108,7 @@ async fn handle_ws_connection(
     let recv_state = state.clone();
     let recv_token = token.clone();
     let recv_tx = tx.clone();
+    let recv_ip = ip;
     let recv_task = tokio::spawn(async move {
         loop {
             let frame = tokio::time::timeout(IDLE_TIMEOUT, ws_receiver.next()).await;
@@ -1102,8 +1124,15 @@ async fn handle_ws_connection(
                 Message::Text(text) => match serde_json::from_str::<ControlMessage>(&text) {
                     Ok(ControlMessage::SessionClose { .. }) => return Disconnect::ClientClose,
                     Ok(cm) => {
-                        handle_control_message(&recv_state, session_id, &recv_token, cm, &recv_tx)
-                            .await
+                        handle_control_message(
+                            &recv_state,
+                            session_id,
+                            &recv_token,
+                            recv_ip,
+                            cm,
+                            &recv_tx,
+                        )
+                        .await
                     }
                     Err(_) => {
                         send_error(&recv_tx, "VALIDATION_ERROR", "Malformed control message").await
@@ -1227,11 +1256,15 @@ async fn handle_control_message(
     state: &WsState,
     session_id: SessionId,
     token: &ValidatedToken,
+    ip: IpAddr,
     msg: ControlMessage,
     tx: &mpsc::Sender<String>,
 ) {
     match msg {
-        ControlMessage::ChannelJoin { channel_id, .. } => {
+        ControlMessage::ChannelJoin {
+            channel_id,
+            token: join_token,
+        } => {
             let key = format!("join:{}", token.user_id);
             let per_minute = state
                 .control
@@ -1247,11 +1280,38 @@ async fn handle_control_message(
             {
                 return send_error(tx, "RATE_LIMIT_EXCEEDED", "Too many channel joins").await;
             }
-            if let Err(e) = state
-                .control
-                .rbac
-                .check_channel_join(&channel_id, &token.channels)
-            {
+            // Permissions come from a one-time `join` action token when the client presents
+            // one, otherwise from the session JWT's channel claims (unless the server
+            // requires action tokens).
+            let (perms, claim) = if JwtService::is_action_token(&join_token) {
+                let v = match state
+                    .control
+                    .action_tokens
+                    .verify(&join_token, &[ActionKind::Join])
+                {
+                    Ok(v) => v,
+                    Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+                };
+                if v.app_id != token.app_id || v.user_id != token.user_id {
+                    return send_error(tx, "AUTH_DENIED", "Join token is for another user").await;
+                }
+                if v.channel_id != Some(channel_id) {
+                    return send_error(tx, "AUTH_DENIED", "Join token is for another channel")
+                        .await;
+                }
+                let claim = ActionTokenService::pending(&v);
+                (v.channel_permission().into_iter().collect(), Some(claim))
+            } else if state.control.action_tokens.required() {
+                return send_error(
+                    tx,
+                    "ACTION_TOKEN_REQUIRED",
+                    "This server requires a 'join' action token",
+                )
+                .await;
+            } else {
+                (token.channels.clone(), None)
+            };
+            if let Err(e) = state.control.rbac.check_channel_join(&channel_id, &perms) {
                 return send_error(tx, e.error_code(), &e.public_message()).await;
             }
             // Tenant check + persisted configuration (limits, spatial settings, codec).
@@ -1267,7 +1327,12 @@ async fn handle_control_message(
             let role = state
                 .control
                 .rbac
-                .role_from_permissions(&channel_id, &token.channels);
+                .role_from_permissions(&channel_id, &perms);
+            if let Some(claim) = claim {
+                if let Err(e) = state.control.action_tokens.consume(&claim).await {
+                    return send_error(tx, e.error_code(), &e.public_message()).await;
+                }
+            }
             let join_result = {
                 let sfu = state.sfu.read();
                 sfu.join_channel(&session_id, channel_id, config, role)
@@ -1363,6 +1428,84 @@ async fn handle_control_message(
                         .unwrap_or(0),
                     timestamp: chrono::Utc::now(),
                 });
+        }
+
+        ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id,
+            action,
+            token: action_token,
+            reason,
+        } => {
+            let v = match state.control.action_tokens.verify(
+                &action_token,
+                &[ActionKind::Kick, ActionKind::Mute, ActionKind::Unmute],
+            ) {
+                Ok(v) => v,
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+            };
+            if v.action != action
+                || v.app_id != token.app_id
+                || v.user_id != token.user_id
+                || v.channel_id != Some(channel_id)
+                || v.target_user_id != Some(user_id)
+            {
+                return send_error(
+                    tx,
+                    "AUTH_DENIED",
+                    "Action token does not match this request",
+                )
+                .await;
+            }
+            if let Err(e) = state
+                .control
+                .action_tokens
+                .consume(&ActionTokenService::pending(&v))
+                .await
+            {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+            let target = ModerationTarget {
+                app_id: token.app_id,
+                channel_id,
+                user_id,
+                actor: token.user_id,
+                ip: Some(ip.to_string()),
+            };
+            let result = match action {
+                ActionKind::Kick => moderation_actions::kick_from_channel(
+                    &state.control,
+                    &state.sfu,
+                    target,
+                    reason.unwrap_or_else(|| "kicked by moderator".into()),
+                )
+                .await
+                .map(|_| ()),
+                ActionKind::Mute | ActionKind::Unmute => {
+                    moderation_actions::set_server_mute(
+                        &state.control,
+                        &state.sfu,
+                        target,
+                        action == ActionKind::Mute,
+                    )
+                    .await
+                }
+                ActionKind::Login | ActionKind::Join => unreachable!("filtered by verify"),
+            };
+            match result {
+                Ok(()) => {
+                    send_msg(
+                        tx,
+                        &ControlMessage::ModerateParticipantAck {
+                            channel_id,
+                            user_id,
+                            action,
+                        },
+                    )
+                    .await
+                }
+                Err(e) => send_error(tx, e.error_code(), &e.public_message()).await,
+            }
         }
 
         ControlMessage::SetParticipantMute {
@@ -1664,6 +1807,7 @@ async fn handle_control_message(
         | ControlMessage::RecordingNotification { .. }
         | ControlMessage::Error { .. }
         | ControlMessage::Kick { .. }
+        | ControlMessage::ModerateParticipantAck { .. }
         | ControlMessage::WebRtcAnswer { .. }
         | ControlMessage::Pong { .. } => {
             send_error(

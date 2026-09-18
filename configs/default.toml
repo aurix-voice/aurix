@@ -22,6 +22,11 @@ pool_size = 20
 jwt_secret = "change-me-in-production-this-is-not-secure-32bytes!"
 jwt_algorithm = "HS256"
 token_ttl_secs = 3600
+# One-time action tokens (POST /v1/tokens/action): default / maximum lifetime in seconds.
+action_token_ttl_secs = 90
+action_token_max_ttl_secs = 600
+# true: WebSocket login and ChannelJoin accept only one-time `login` / `join` action tokens.
+require_action_tokens = false
 oauth_enabled = false
 
 [media]

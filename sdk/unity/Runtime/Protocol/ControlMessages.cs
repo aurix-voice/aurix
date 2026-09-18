@@ -33,6 +33,9 @@ namespace Aurix.Protocol
     }
 
     /// <summary>Receiver-local mute of one participant; <see cref="ChannelId"/> is null for "every channel".</summary>
+    /// <summary>Moderation a player may perform with a one-time action token (<c>POST /v1/tokens/action</c>).</summary>
+    public enum ModerationAction { Kick, Mute, Unmute }
+
     public sealed class LocalMute
     {
         public Guid UserId;
@@ -194,6 +197,35 @@ namespace Aurix.Protocol
 
         public static string ChannelJoin(Guid channelId, string token) =>
             Serialize("ChannelJoin", new Dictionary<string, object> { { "channel_id", channelId }, { "token", token } });
+
+        public static string ModerationActionToWire(ModerationAction a)
+        {
+            switch (a)
+            {
+                case ModerationAction.Kick: return "kick";
+                case ModerationAction.Mute: return "mute";
+                case ModerationAction.Unmute: return "unmute";
+                default: throw new ArgumentOutOfRangeException(nameof(a));
+            }
+        }
+
+        public static ModerationAction? ParseModerationAction(string s)
+        {
+            switch (s)
+            {
+                case "kick": return ModerationAction.Kick;
+                case "mute": return ModerationAction.Mute;
+                case "unmute": return ModerationAction.Unmute;
+                default: return null;
+            }
+        }
+
+        public static string ModerateParticipant(Guid channelId, Guid userId, ModerationAction action, string token, string reason) =>
+            Serialize("ModerateParticipant", new Dictionary<string, object>
+            {
+                { "channel_id", channelId }, { "user_id", userId }, { "action", ModerationActionToWire(action) },
+                { "token", token }, { "reason", reason },
+            });
 
         public static string ChannelLeave(Guid channelId) =>
             Serialize("ChannelLeave", new Dictionary<string, object> { { "channel_id", channelId } });

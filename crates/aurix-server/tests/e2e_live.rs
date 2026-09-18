@@ -1362,3 +1362,612 @@ async fn local_mute_volume_and_persistent_cross_mute() {
         let _ = p.ws.close(None).await;
     }
 }
+
+async fn action_token(
+    env: &Env,
+    http: &reqwest::Client,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, u16> {
+    let r = http
+        .post(format!("{}/v1/tokens/action", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    if !r.status().is_success() {
+        return Err(r.status().as_u16());
+    }
+    Ok(r.json().await.unwrap())
+}
+
+/// WebSocket connect that surfaces the HTTP status of a refused upgrade.
+async fn try_connect(
+    env: &Env,
+    token: &str,
+    resume: Option<(SessionId, &str)>,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u16,
+> {
+    let mut req = format!("{}/ws", env.ws).into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    if let Some((sid, tok)) = resume {
+        req.headers_mut()
+            .insert("x-aurix-resume", format!("{sid}.{tok}").parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("ws connect failed unexpectedly: {e}"),
+    }
+}
+
+async fn expect_error(p: &mut Player, what: &str, code: &str) {
+    let m = p
+        .expect(what, |m| matches!(m, ControlMessage::Error { .. }))
+        .await;
+    let ControlMessage::Error { code: got, message } = m else {
+        unreachable!()
+    };
+    assert_eq!(got, code, "{}: {what}: {message}", p.name);
+}
+
+/// One-time action tokens: `login` opens exactly one fresh session (a resume of that session
+/// is not a second use), `join` grants one channel entry to one user, `kick`/`mute`/`unmute`
+/// let a player moderate one target once. Every replay is refused with TOKEN_REUSED and
+/// every mismatch (other user, channel, target or action) with AUTH_DENIED.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn action_tokens_are_single_use() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let other_channel = create_channel(&env, &http).await;
+
+    // ── issuance validation ──
+    let login_a = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "login", "external_id": "e2e:act-alice", "display_name": "Alice"}),
+    )
+    .await
+    .unwrap();
+    let uid_a = UserId::from_uuid(login_a["user_id"].as_str().unwrap().parse().unwrap());
+    assert_eq!(login_a["action"], "login");
+    assert!(!login_a["jti"].as_str().unwrap().is_empty());
+    let login_b = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "login", "external_id": "e2e:act-bob", "display_name": "Bob"}),
+    )
+    .await
+    .unwrap();
+    let uid_b = UserId::from_uuid(login_b["user_id"].as_str().unwrap().parse().unwrap());
+    assert_eq!(
+        action_token(
+            &env,
+            &http,
+            serde_json::json!({"action": "join", "user_id": uid_a})
+        )
+        .await,
+        Err(400),
+        "join needs channel_id"
+    );
+    assert_eq!(
+        action_token(
+            &env,
+            &http,
+            serde_json::json!({"action": "kick", "user_id": uid_a, "channel_id": channel_id})
+        )
+        .await,
+        Err(400),
+        "kick needs target_user_id"
+    );
+    assert_eq!(
+        action_token(
+            &env,
+            &http,
+            serde_json::json!({"action": "login", "user_id": uid_a, "ttl_secs": 100000})
+        )
+        .await,
+        Err(400),
+        "ttl above the configured maximum"
+    );
+    assert_eq!(
+        action_token(
+            &env,
+            &http,
+            serde_json::json!({"action": "join", "user_id": uid_a, "channel_id": uuid::Uuid::now_v7()})
+        )
+        .await,
+        Err(404),
+        "unknown channel"
+    );
+    assert_eq!(
+        action_token(
+            &env,
+            &http,
+            serde_json::json!({"action": "login", "user_id": uuid::Uuid::now_v7()})
+        )
+        .await,
+        Err(404),
+        "unknown user"
+    );
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let env2 = Env {
+            api_key: api_key2,
+            ..env.clone()
+        };
+        assert_eq!(
+            action_token(
+                &env2,
+                &http,
+                serde_json::json!({"action": "join", "user_id": uid_a, "channel_id": channel_id})
+            )
+            .await,
+            Err(404),
+            "foreign tenant must not mint tokens for our users/channels"
+        );
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation check");
+    }
+
+    // ── login: exactly one fresh session ──
+    let login_tok_a = login_a["token"].as_str().unwrap().to_string();
+    let mut alice = connect(&env, "alice", login_tok_a.clone()).await;
+    assert!(!alice.resumed);
+    assert_eq!(
+        try_connect(&env, &login_tok_a, None).await.err(),
+        Some(401),
+        "second login with the same token must be refused"
+    );
+    let mut bob = connect(&env, "bob", login_b["token"].as_str().unwrap().to_string()).await;
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+
+    // The login token carries no channel rights and a join token is bound to its channel.
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: login_tok_a.clone(),
+        })
+        .await;
+    expect_error(&mut alice, "join without rights", "AUTH_DENIED").await;
+    let join_wrong = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "join", "user_id": uid_a, "channel_id": other_channel}),
+    )
+    .await
+    .unwrap();
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: join_wrong["token"].as_str().unwrap().to_string(),
+        })
+        .await;
+    expect_error(&mut alice, "join with other channel's token", "AUTH_DENIED").await;
+    // Moderation tokens cannot be used to join.
+    let kick_tok = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "kick", "user_id": uid_a, "channel_id": channel_id, "target_user_id": uid_b}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: kick_tok.clone(),
+        })
+        .await;
+    expect_error(&mut alice, "join with kick token", "AUTH_DENIED").await;
+
+    // ── join: one entry, bound to the user ──
+    let join_a = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "join", "user_id": uid_a, "channel_id": channel_id, "moderate": true}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bob.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: join_a.clone(),
+    })
+    .await;
+    expect_error(&mut bob, "bob using alice's join token", "AUTH_DENIED").await;
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: join_a.clone(),
+        })
+        .await;
+    alice
+        .expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id)
+        })
+        .await;
+    alice
+        .send(&ControlMessage::ChannelLeave { channel_id })
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: join_a.clone(),
+        })
+        .await;
+    expect_error(&mut alice, "replayed join token", "TOKEN_REUSED").await;
+    let join_a2 = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "join", "user_id": uid_a, "channel_id": channel_id, "moderate": true}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: join_a2,
+        })
+        .await;
+    alice
+        .expect("ChannelJoinAck (fresh token)", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    let join_b = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "join", "user_id": uid_b, "channel_id": channel_id}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bob.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: join_b,
+    })
+    .await;
+    bob.expect("ChannelJoinAck", |m| {
+        matches!(m, ControlMessage::ChannelJoinAck { .. })
+    })
+    .await;
+    alice
+        .expect(
+            "ParticipantJoined",
+            |m| matches!(m, ControlMessage::ParticipantJoined { user_id, .. } if *user_id == uid_b),
+        )
+        .await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 2);
+
+    // ── mute / unmute via one-time tokens ──
+    let mute_tok = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "mute", "user_id": uid_a, "channel_id": channel_id, "target_user_id": uid_b}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Wrong action for the token, wrong target, wrong actor: all refused, token untouched.
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_b,
+            action: aurix_common::types::ActionKind::Unmute,
+            token: mute_tok.clone(),
+            reason: None,
+        })
+        .await;
+    expect_error(&mut alice, "mute token used for unmute", "AUTH_DENIED").await;
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_a,
+            action: aurix_common::types::ActionKind::Mute,
+            token: mute_tok.clone(),
+            reason: None,
+        })
+        .await;
+    expect_error(
+        &mut alice,
+        "mute token used on another target",
+        "AUTH_DENIED",
+    )
+    .await;
+    bob.send(&ControlMessage::ModerateParticipant {
+        channel_id,
+        user_id: uid_b,
+        action: aurix_common::types::ActionKind::Mute,
+        token: mute_tok.clone(),
+        reason: None,
+    })
+    .await;
+    expect_error(&mut bob, "bob using alice's mute token", "AUTH_DENIED").await;
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_b,
+            action: aurix_common::types::ActionKind::Mute,
+            token: mute_tok.clone(),
+            reason: None,
+        })
+        .await;
+    alice
+        .expect("ModerateParticipantAck", |m| {
+            matches!(
+                m,
+                ControlMessage::ModerateParticipantAck { action: aurix_common::types::ActionKind::Mute, user_id, .. } if *user_id == uid_b
+            )
+        })
+        .await;
+    bob.expect("MuteStateChanged", |m| {
+        matches!(
+            m,
+            ControlMessage::MuteStateChanged { user_id, muted: true, server_muted: true, .. } if *user_id == uid_b
+        )
+    })
+    .await;
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_b,
+            action: aurix_common::types::ActionKind::Mute,
+            token: mute_tok,
+            reason: None,
+        })
+        .await;
+    expect_error(&mut alice, "replayed mute token", "TOKEN_REUSED").await;
+    let unmute_tok = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "unmute", "user_id": uid_a, "channel_id": channel_id, "target_user_id": uid_b}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_b,
+            action: aurix_common::types::ActionKind::Unmute,
+            token: unmute_tok,
+            reason: None,
+        })
+        .await;
+    alice
+        .expect("ModerateParticipantAck (unmute)", |m| {
+            matches!(
+                m,
+                ControlMessage::ModerateParticipantAck {
+                    action: aurix_common::types::ActionKind::Unmute,
+                    ..
+                }
+            )
+        })
+        .await;
+    bob.expect("MuteStateChanged (unmuted)", |m| {
+        matches!(
+            m,
+            ControlMessage::MuteStateChanged { user_id, muted: false, .. } if *user_id == uid_b
+        )
+    })
+    .await;
+
+    // ── kick via one-time token ──
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_b,
+            action: aurix_common::types::ActionKind::Kick,
+            token: kick_tok.clone(),
+            reason: Some("e2e".into()),
+        })
+        .await;
+    alice
+        .expect("ModerateParticipantAck (kick)", |m| {
+            matches!(
+                m,
+                ControlMessage::ModerateParticipantAck {
+                    action: aurix_common::types::ActionKind::Kick,
+                    ..
+                }
+            )
+        })
+        .await;
+    bob.expect("Kick", |m| {
+        matches!(m, ControlMessage::Kick { user_id, reason, .. } if *user_id == uid_b && reason == "e2e")
+    })
+    .await;
+    alice
+        .expect(
+            "ParticipantLeft",
+            |m| matches!(m, ControlMessage::ParticipantLeft { user_id, .. } if *user_id == uid_b),
+        )
+        .await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+    alice
+        .send(&ControlMessage::ModerateParticipant {
+            channel_id,
+            user_id: uid_b,
+            action: aurix_common::types::ActionKind::Kick,
+            token: kick_tok,
+            reason: None,
+        })
+        .await;
+    expect_error(&mut alice, "replayed kick token", "TOKEN_REUSED").await;
+
+    // ── login token + resume: reattaching the session it opened is not a second use ──
+    let Player {
+        session_id: sid_a,
+        resume_token,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let alice = connect_with(
+        &env,
+        "alice",
+        login_tok_a.clone(),
+        Some((sid_a, &resume_token)),
+    )
+    .await;
+    assert!(
+        alice.resumed,
+        "login token must still resume its own session"
+    );
+    assert_eq!(alice.session_id, sid_a);
+    // A newly issued login token may resume too (the old one may have expired by then) and
+    // is spent by doing so.
+    let Player {
+        resume_token,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let login_tok_a2 = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "login", "user_id": uid_a}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut alice = connect_with(
+        &env,
+        "alice",
+        login_tok_a2.clone(),
+        Some((sid_a, &resume_token)),
+    )
+    .await;
+    assert!(alice.resumed);
+    assert_eq!(alice.session_id, sid_a);
+    alice.ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        try_connect(&env, &login_tok_a, None).await.err(),
+        Some(401),
+        "after the session is gone the login token stays consumed"
+    );
+    assert_eq!(
+        try_connect(&env, &login_tok_a2, None).await.err(),
+        Some(401),
+        "a login token spent on a resume cannot open a fresh session"
+    );
+
+    // Login action tokens still authenticate end-user REST reads for the session's lifetime.
+    let me = http
+        .get(format!("{}/v1/me/turn-credentials", env.api))
+        .header("authorization", format!("Bearer {login_tok_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        me.status().is_success(),
+        "login token must be accepted by end-user REST (got {})",
+        me.status()
+    );
+    // ...but a moderation token is not an API credential.
+    let denied = http
+        .get(format!("{}/v1/me/turn-credentials", env.api))
+        .header(
+            "authorization",
+            format!("Bearer {}", join_wrong["token"].as_str().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status().as_u16(), 403);
+    bob.ws.close(None).await.unwrap();
+}
+
+/// With `auth.require_action_tokens = true` the reusable session JWT is refused everywhere a
+/// one-time token exists: as a WebSocket login and as a join credential. Run against a node
+/// started with `AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` and `AURIX_E2E_STRICT=1`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server in strict mode (AURIX_E2E_STRICT=1)"]
+async fn strict_mode_requires_action_tokens() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    if std::env::var("AURIX_E2E_STRICT").is_err() {
+        eprintln!("AURIX_E2E_STRICT not set; skipping");
+        return;
+    }
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let (session_jwt, uid) =
+        issue_token(&env, &http, "e2e:strict-alice", "Alice", channel_id).await;
+    assert_eq!(
+        try_connect(&env, &session_jwt, None).await.err(),
+        Some(403),
+        "session JWT must not open a WebSocket session in strict mode"
+    );
+    let login = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "login", "user_id": uid}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut alice = connect(&env, "alice", login).await;
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: session_jwt,
+        })
+        .await;
+    expect_error(&mut alice, "join with session JWT", "ACTION_TOKEN_REQUIRED").await;
+    let join = action_token(
+        &env,
+        &http,
+        serde_json::json!({"action": "join", "user_id": uid, "channel_id": channel_id}),
+    )
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    alice
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: join,
+        })
+        .await;
+    alice
+        .expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    alice.ws.close(None).await.unwrap();
+}

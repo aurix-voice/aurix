@@ -4,5 +4,5 @@ pub mod jwt;
 pub mod rbac;
 
 pub use api_key::ApiKeyService;
-pub use jwt::{JwtService, ValidatedToken};
+pub use jwt::{ActionTokenSpec, AnyToken, JwtService, ValidatedActionToken, ValidatedToken};
 pub use rbac::RbacService;

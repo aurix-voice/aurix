@@ -96,8 +96,28 @@ jobs:
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
           AURIX_E2E_API_KEY2: ${{ steps.bootstrap.outputs.key2 }}
         run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture
+      - name: E2E (strict action tokens)
+        env:
+          AURIX__TURN__ENABLED: "false"
+          AURIX__RECORDING__ENABLED: "false"
+          AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          AURIX__AUTH__REQUIRE_ACTION_TOKENS: "true"
+          AURIX__SERVER__API_PORT: "8090"
+          AURIX__SERVER__WS_PORT: "8091"
+          AURIX__MEDIA__PORT: "10002"
+          AURIX__METRICS__PORT: "9091"
+          AURIX__TRACING__LOG_FORMAT: text
+          AURIX_E2E_STRICT: "1"
+          AURIX_E2E_API: http://127.0.0.1:8090
+          AURIX_E2E_WS: ws://127.0.0.1:8091
+          AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
+        run: |
+          nohup ./target/debug/aurix-server > server-strict.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8090/ready && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8090/ready
+          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture strict_mode
       - if: failure()
-        run: tail -n 200 server.log
+        run: tail -n 200 server.log; tail -n 100 server-strict.log || true
 
   audit:
     name: cargo audit / deny

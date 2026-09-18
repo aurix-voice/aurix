@@ -238,6 +238,25 @@ impl RedisStore {
         Ok(count <= limit as i64)
     }
 
+    /// Atomically claims `key` for `ttl_secs` (`SET NX EX`). Returns `false` when it was
+    /// already claimed. Used for one-time `jti` consumption across nodes.
+    pub async fn claim_once(&self, key: &str, ttl_secs: u64) -> Result<bool> {
+        let mut conn = self.conn().await?;
+        let redis_key = format!("once:{}", key);
+        let res: Option<String> = Self::with_timeout(
+            redis::cmd("SET")
+                .arg(&redis_key)
+                .arg(1u8)
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl_secs.max(1))
+                .query_async(&mut conn),
+            "claim_once",
+        )
+        .await?;
+        Ok(res.is_some())
+    }
+
     /// Global server-mute: set flag in Redis so all nodes can enforce it.
     pub async fn set_global_mute(&self, user_id: UserId, muted: bool) -> Result<()> {
         let mut conn = self.conn().await?;

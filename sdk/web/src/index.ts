@@ -12,6 +12,7 @@ export type {
   ChannelRole,
   ClientMessage,
   LocalMute,
+  ModerationAction,
   Orientation3D,
   ParticipantBrief,
   ParticipantVolume,

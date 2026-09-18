@@ -1,7 +1,8 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
-    ChannelId, ChannelRole, Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
+    ActionKind, ChannelId, ChannelRole, Orientation3D, Position3D, ReverbDescriptor, SessionId,
+    UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -624,6 +625,7 @@ pub enum ControlMessage {
     },
     ChannelJoin {
         channel_id: ChannelId,
+        /// Session JWT (legacy, ignored) or a one-time `join` action token for this channel.
         token: String,
     },
     ChannelJoinAck {
@@ -726,6 +728,21 @@ pub enum ControlMessage {
         channel_id: ChannelId,
         user_id: UserId,
         reason: String,
+    },
+    /// Client-initiated moderation backed by a one-time `kick` / `mute` / `unmute` action
+    /// token minted by the game backend for this actor, channel and target.
+    ModerateParticipant {
+        channel_id: ChannelId,
+        user_id: UserId,
+        action: ActionKind,
+        token: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    ModerateParticipantAck {
+        channel_id: ChannelId,
+        user_id: UserId,
+        action: ActionKind,
     },
     /// Browser clients: SDP offer for this session; the server replies with `WebRtcAnswer`.
     WebRtcOffer {
