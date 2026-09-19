@@ -3,6 +3,9 @@
 //   c++ -std=c++11 voice_loop.cpp -I../../include -L../../../../target/release -laurix_client -lpthread -o voice_loop
 //   ./voice_loop ws://127.0.0.1:8081/ws "$SESSION_JWT" "$CHANNEL_ID" [seconds]
 //
+// With AURIX_REGIONS_JSON set to a `GET /v1/me/regions` body the ranked regions are printed
+// first (the discovery itself is the host's HTTP call; see aurix::Regions).
+//
 // Exit codes: 0 ok, 2 bad arguments, 3 connect failed, 4 join failed.
 #include <chrono>
 #include <cmath>
@@ -74,6 +77,21 @@ int main(int argc, char** argv) {
         return 2;
     }
     const unsigned seconds = argc > 4 ? static_cast<unsigned>(std::atoi(argv[4])) : 5;
+
+    if (const char* regions_json = std::getenv("AURIX_REGIONS_JSON")) {
+        aurix::Regions regions = aurix::Regions::parse(regions_json);
+        if (!regions.valid()) {
+            std::fprintf(stderr, "bad regions JSON: %s\n", aurix::last_error().c_str());
+            return 2;
+        }
+        // A real client would GET each probe_url a few times here and call set_rtt().
+        regions.rank();
+        std::printf("discovery url: %s\n", aurix::Regions::discovery_url("https://voice.example.com", "").c_str());
+        for (const AurixRegionEndpoint& r : regions.all()) {
+            std::printf("region %s node=%s ws=%s nodes=%u load=%.2f\n", r.region, aurix::Uuid(r.node_id).str().c_str(),
+                        r.ws_url, r.nodes, r.load_factor);
+        }
+    }
 
     aurix::Uuid channel;
     if (!aurix::Uuid::parse(argv[3], channel)) {

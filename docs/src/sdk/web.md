@@ -41,6 +41,34 @@ Requirements: the page origin must be in `AURIX__SERVER__CORS_ORIGINS`; `getUser
 `https://` or `http://localhost`; the browser must reach `media.external_ip:media.port` over UDP
 or a TURN server (built-in `[turn]` or your own).
 
+## Region selection
+
+Players should connect to the nearest node with capacity — and reconnect to the *same* node,
+because session resume is node-local. Either pass the `endpoint.ws_url` your backend receives
+from `POST /v1/tokens` (with `region` / `location` hints), or let the browser choose:
+
+```ts
+import { AurixClient, discoverRegions } from '@aurix/web-sdk';
+
+const { recommended, regions } = await discoverRegions({
+  apiUrl: 'https://voice.example.com',          // any node / shared API hostname
+  token,                                        // player JWT → GET /v1/me/regions
+  region: partyLeaderRegion,                    // optional: ranks first when reachable
+  location: { latitude: 48.9, longitude: 2.3 }, // optional: server orders by distance
+  // probe: true (default) → GET each region's probe_url a few times, best RTT wins
+});
+const client = new AurixClient({ apiUrl, wsUrl: recommended!.ws_url, token });
+```
+
+`discoverRegions` calls `GET /v1/me/regions`, then (unless `probe: false`) fetches each entry's
+`probe_url` (`/health` of that node) — one warm-up request discarded, `probeSamples` (3) timed,
+the minimum kept. Ranking: preferred region if its probe succeeded → measured RTT in 15 ms
+buckets (ties keep the server's distance/load order) → unprobed regions → regions whose probe
+failed. `rankRegions` / `probeRtt` / `parseRegionsResponse` are exported for custom policies.
+Only healthy nodes with a public `wss://` URL are advertised (`regions: []` means none is
+configured for discovery); probes are cross-origin requests, so the node's `cors_origins` applies
+to them as it does to the REST calls. Details on the server side: [Regions](../operations/scaling.md#regions).
+
 ## Feature map
 
 | Feature | API | Notes |

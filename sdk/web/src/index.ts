@@ -82,3 +82,22 @@ export type {
   AudioInjectionOptions,
   AudioInjectionSource,
 } from './devices.js';
+export {
+  DEFAULT_PROBE_SAMPLES,
+  DEFAULT_PROBE_TIMEOUT_MS,
+  DEFAULT_RTT_TOLERANCE_MS,
+  discoverRegions,
+  parseRegionsResponse,
+  probeRtt,
+  rankRegions,
+} from './regions.js';
+export type {
+  DiscoverRegionsOptions,
+  DiscoveredRegions,
+  GeoLocation,
+  ProbeOptions,
+  ProbedRegion,
+  RankOptions,
+  RegionEndpoint,
+  RegionsResponse,
+} from './regions.js';

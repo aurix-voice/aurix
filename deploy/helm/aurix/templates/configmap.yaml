@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aurix.fullname" . }}-entrypoint
+  labels:
+    {{- include "aurix.labels" . | nindent 4 }}
+data:
+  # Resolves the public media IP of this pod and starts the server. The IP is per node, so it
+  # cannot be a plain Deployment-wide environment value.
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    case "${AURIX_EXTERNAL_IP_SOURCE:-static}" in
+      static)
+        if [ -n "${AURIX_EXTERNAL_IPS:-}" ]; then
+          ordinal="${POD_NAME##*-}"
+          ip=$(printf '%s' "$AURIX_EXTERNAL_IPS" | tr ',' '\n' | sed -n "$((ordinal + 1))p")
+        else
+          ip="${AURIX_EXTERNAL_IP:-}"
+        fi
+        ;;
+      hostIP)
+        ip="${HOST_IP:-}"
+        ;;
+      script)
+        ip=$(cat /aurix-runtime/external_ip)
+        ;;
+      *)
+        echo "unknown AURIX_EXTERNAL_IP_SOURCE: ${AURIX_EXTERNAL_IP_SOURCE}" >&2
+        exit 1
+        ;;
+    esac
+    if [ -z "$ip" ]; then
+      echo "could not determine the public media IP for ${POD_NAME}" >&2
+      exit 1
+    fi
+    echo "advertising media IP ${ip}"
+    export AURIX__MEDIA__EXTERNAL_IP="$ip"
+    export AURIX__TURN__EXTERNAL_IP="$ip"
+    exec /usr/bin/tini -- /usr/local/bin/aurix-server "$@"
+  {{- if eq .Values.config.externalIpSource "script" }}
+  resolve-ip.sh: |
+    #!/bin/sh
+    set -eu
+    {{- .Values.config.externalIpScript | nindent 4 }}
+  {{- end }}

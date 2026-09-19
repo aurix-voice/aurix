@@ -2155,6 +2155,241 @@ pub unsafe extern "C" fn aurix_event_network_quality(
     }
 }
 
+// ------------------------------------------------------------------------------- regions
+
+/// Capacity of fixed-size URL buffers in this ABI (including the NUL).
+pub const AURIX_URL_LEN: usize = 512;
+
+/// One advertised region (`GET /v1/me/regions`, `endpoint` of `POST /v1/tokens`): the
+/// least-loaded healthy node of the region that has a public WebSocket URL.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AurixRegionEndpoint {
+    /// Region name as the API spells it (`us_east`, `eu_west`, ...), NUL-terminated.
+    pub region: [c_char; AURIX_NAME_LEN],
+    pub node_id: AurixUuid,
+    /// Direct `wss://` URL of the node; use it as `AurixClientConfig::ws_url`.
+    pub ws_url: [c_char; AURIX_URL_LEN],
+    /// `GET` target for RTT probing (answered by exactly this node); empty when not public.
+    pub probe_url: [c_char; AURIX_URL_LEN],
+    pub has_location: bool,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Great-circle distance from the location hint when both were known, else `false`.
+    pub has_distance: bool,
+    pub distance_km: f64,
+    /// Nodes with capacity in the region.
+    pub nodes: u32,
+    /// Load of the advertised node, `0..1`.
+    pub load_factor: f32,
+    /// `true` after `aurix_regions_set_rtt` with a non-negative value.
+    pub has_rtt: bool,
+    pub rtt_ms: f64,
+    /// `true` after `aurix_regions_set_rtt` with a negative value (unreachable).
+    pub probe_failed: bool,
+}
+
+/// Opaque, mutable list of regions; release with `aurix_regions_free`.
+pub struct AurixRegionList {
+    regions: Vec<crate::regions::ProbedRegion>,
+}
+
+fn url_buf(s: &str) -> [c_char; AURIX_URL_LEN] {
+    let mut out = [0 as c_char; AURIX_URL_LEN];
+    let mut end = s.len().min(AURIX_URL_LEN - 1);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    for (dst, src) in out.iter_mut().zip(s.as_bytes()[..end].iter()) {
+        *dst = *src as c_char;
+    }
+    out
+}
+
+fn region_to_c(r: &crate::regions::ProbedRegion) -> AurixRegionEndpoint {
+    let e = &r.endpoint;
+    AurixRegionEndpoint {
+        region: name_buf(&e.region.as_str().replace('-', "_")),
+        node_id: e.node_id.0.into(),
+        ws_url: url_buf(&e.ws_url),
+        probe_url: url_buf(e.probe_url.as_deref().unwrap_or("")),
+        has_location: e.location.is_some(),
+        latitude: e.location.map(|l| l.latitude).unwrap_or(0.0),
+        longitude: e.location.map(|l| l.longitude).unwrap_or(0.0),
+        has_distance: e.distance_km.is_some(),
+        distance_km: e.distance_km.unwrap_or(0.0),
+        nodes: e.nodes,
+        load_factor: e.load_factor,
+        has_rtt: r.rtt_ms.is_some(),
+        rtt_ms: r.rtt_ms.unwrap_or(0.0),
+        probe_failed: r.probe_failed,
+    }
+}
+
+unsafe fn regions<'a>(h: *const AurixRegionList) -> Result<&'a AurixRegionList, AurixResult> {
+    if h.is_null() {
+        Err(null_ptr("regions"))
+    } else {
+        Ok(&*h)
+    }
+}
+
+/// Player-scoped discovery URL: `<api_url>/v1/me/regions` with optional `region` and
+/// `latitude`/`longitude` hints (`has_location`). `preferred_region` may be `NULL`. Send it with
+/// `Authorization: Bearer <player token>` from the engine's HTTP client, then pass the body to
+/// `aurix_regions_parse`. Returns the number of bytes needed (excluding NUL); `buf` may be `NULL`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_discovery_url(
+    api_url: *const c_char,
+    preferred_region: *const c_char,
+    has_location: bool,
+    latitude: f64,
+    longitude: f64,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    let Ok(api) = cstr_arg(api_url, "api_url") else {
+        return 0;
+    };
+    let Ok(preferred) = opt_cstr_arg(preferred_region, "preferred_region") else {
+        return 0;
+    };
+    let preferred = match preferred {
+        Some(name) => match crate::regions::parse_region(&name) {
+            Some(r) => Some(r),
+            None => {
+                set_error(&format!("unknown region {name:?}"));
+                return 0;
+            }
+        },
+        None => None,
+    };
+    let location = has_location.then_some(crate::regions::GeoLocation {
+        latitude,
+        longitude,
+    });
+    let url = crate::regions::discovery_url(&api, preferred, location);
+    if !buf.is_null() && capacity > 0 {
+        let n = url.len().min(capacity - 1);
+        ptr::copy_nonoverlapping(url.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    url.len()
+}
+
+/// Parse a `GET /v1/me/regions` (or `/v1/regions`) body. Returns `NULL` (see `aurix_last_error`)
+/// on malformed input. The list keeps the server order: preferred region first, then distance
+/// (when a location hint was sent), then load.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_parse(json: *const c_char) -> *mut AurixRegionList {
+    let Ok(body) = cstr_arg(json, "json") else {
+        return ptr::null_mut();
+    };
+    match crate::regions::parse_regions(&body) {
+        Ok(parsed) => Box::into_raw(Box::new(AurixRegionList {
+            regions: parsed
+                .regions
+                .into_iter()
+                .map(crate::regions::ProbedRegion::unprobed)
+                .collect(),
+        })),
+        Err(e) => {
+            fail(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_free(regions: *mut AurixRegionList) {
+    if !regions.is_null() {
+        drop(Box::from_raw(regions));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_len(regions: *const AurixRegionList) -> usize {
+    self::regions(regions).map(|l| l.regions.len()).unwrap_or(0)
+}
+
+/// Copy entry `index` into `out`; `false` when out of range.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_get(
+    regions: *const AurixRegionList,
+    index: usize,
+    out: *mut AurixRegionEndpoint,
+) -> bool {
+    let Ok(l) = self::regions(regions) else {
+        return false;
+    };
+    match l.regions.get(index) {
+        Some(r) if !out.is_null() => {
+            *out = region_to_c(r);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Record the host's probe of entry `index` (best of a few `GET probe_url` samples after one
+/// discarded warm-up): `rtt_ms >= 0` for a measurement, negative when every request failed.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_set_rtt(
+    regions: *mut AurixRegionList,
+    index: usize,
+    rtt_ms: f64,
+) -> AurixResult {
+    if regions.is_null() {
+        return null_ptr("regions");
+    }
+    let list = &mut *regions;
+    match list.regions.get_mut(index) {
+        Some(r) => {
+            r.set_rtt((rtt_ms >= 0.0).then_some(rtt_ms));
+            AurixResult::AurixOk
+        }
+        None => {
+            set_error("region index out of range");
+            AurixResult::AurixInvalidArgument
+        }
+    }
+}
+
+/// Re-rank in place after probing: `preferred_region` (may be `NULL`) first unless its probe
+/// failed, then measured regions in ascending `rtt_tolerance_ms` buckets (`<= 0` selects the
+/// default 15 ms), then unprobed regions, then unreachable ones; ties keep the server order.
+/// Entry 0 is the recommendation.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_rank(
+    regions: *mut AurixRegionList,
+    preferred_region: *const c_char,
+    rtt_tolerance_ms: f64,
+) -> AurixResult {
+    if regions.is_null() {
+        return null_ptr("regions");
+    }
+    let preferred = match opt_cstr_arg(preferred_region, "preferred_region") {
+        Ok(Some(name)) => match crate::regions::parse_region(&name) {
+            Some(r) => Some(r),
+            None => {
+                set_error(&format!("unknown region {name:?}"));
+                return AurixResult::AurixInvalidArgument;
+            }
+        },
+        Ok(None) => None,
+        Err(r) => return r,
+    };
+    let tolerance = if rtt_tolerance_ms > 0.0 {
+        rtt_tolerance_ms
+    } else {
+        crate::regions::DEFAULT_RTT_TOLERANCE_MS
+    };
+    let list = &mut *regions;
+    list.regions =
+        crate::regions::rank_regions(std::mem::take(&mut list.regions), preferred, tolerance);
+    AurixResult::AurixOk
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2280,6 +2515,126 @@ mod tests {
             assert!(json.contains("\"type\":\"chat_message\""), "{json}");
             assert!(!aurix_event_transcript(ev, ptr::null_mut()));
             aurix_event_free(ev);
+        }
+    }
+
+    #[test]
+    fn regions_parse_probe_and_rank() {
+        let body = CString::new(format!(
+            r#"{{"regions":[
+                {{"region":"eu_west","node_id":"{}","ws_url":"wss://eu1.example/ws","probe_url":"https://eu1.example/health","location":{{"latitude":48.8,"longitude":2.3}},"distance_km":12.5,"nodes":2,"load_factor":0.25}},
+                {{"region":"us_east","node_id":"{}","ws_url":"wss://us1.example/ws","probe_url":"https://us1.example/health","location":null,"distance_km":null,"nodes":1,"load_factor":0.5}},
+                {{"region":"africa","node_id":"{}","ws_url":"wss://af1.example/ws","probe_url":null,"location":null,"distance_km":null,"nodes":1,"load_factor":0.0}}],
+                "recommended":null}}"#,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        ))
+        .unwrap();
+        let region_of = |ep: &AurixRegionEndpoint| unsafe {
+            CStr::from_ptr(ep.region.as_ptr())
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        unsafe {
+            assert!(aurix_regions_parse(ptr::null()).is_null());
+            let bad = CString::new("{}").unwrap();
+            assert!(aurix_regions_parse(bad.as_ptr()).is_null());
+            assert!(!CStr::from_ptr(aurix_last_error()).to_bytes().is_empty());
+
+            let list = aurix_regions_parse(body.as_ptr());
+            assert!(!list.is_null());
+            assert_eq!(aurix_regions_len(list), 3);
+            let mut ep = std::mem::MaybeUninit::<AurixRegionEndpoint>::uninit();
+            assert!(aurix_regions_get(list, 0, ep.as_mut_ptr()));
+            let ep0 = ep.assume_init();
+            assert_eq!(region_of(&ep0), "eu_west");
+            assert_eq!(
+                CStr::from_ptr(ep0.ws_url.as_ptr()).to_str().unwrap(),
+                "wss://eu1.example/ws"
+            );
+            assert!(ep0.has_location && ep0.latitude == 48.8);
+            assert!(ep0.has_distance && ep0.distance_km == 12.5);
+            assert_eq!(ep0.nodes, 2);
+            assert!(!ep0.has_rtt && !ep0.probe_failed);
+            assert!(!aurix_regions_get(list, 3, ep.as_mut_ptr()));
+
+            assert_eq!(aurix_regions_set_rtt(list, 0, 80.0), AurixResult::AurixOk);
+            assert_eq!(aurix_regions_set_rtt(list, 1, 20.0), AurixResult::AurixOk);
+            assert_eq!(
+                aurix_regions_set_rtt(list, 9, 1.0),
+                AurixResult::AurixInvalidArgument
+            );
+            assert_eq!(
+                aurix_regions_rank(list, ptr::null(), 0.0),
+                AurixResult::AurixOk
+            );
+            let order = |list: *const AurixRegionList| -> Vec<String> {
+                (0..aurix_regions_len(list))
+                    .map(|i| {
+                        let mut ep = std::mem::MaybeUninit::<AurixRegionEndpoint>::uninit();
+                        assert!(aurix_regions_get(list, i, ep.as_mut_ptr()));
+                        region_of(&ep.assume_init())
+                    })
+                    .collect()
+            };
+            assert_eq!(order(list), ["us_east", "eu_west", "africa"]);
+
+            let pref = CString::new("eu-west").unwrap();
+            assert_eq!(
+                aurix_regions_rank(list, pref.as_ptr(), 0.0),
+                AurixResult::AurixOk
+            );
+            assert_eq!(order(list), ["eu_west", "us_east", "africa"]);
+            let unknown = CString::new("mars").unwrap();
+            assert_eq!(
+                aurix_regions_rank(list, unknown.as_ptr(), 0.0),
+                AurixResult::AurixInvalidArgument
+            );
+
+            // The preferred region loses its bonus once its probe fails; unreachable ranks last.
+            assert_eq!(aurix_regions_set_rtt(list, 0, -1.0), AurixResult::AurixOk);
+            assert_eq!(
+                aurix_regions_rank(list, pref.as_ptr(), 0.0),
+                AurixResult::AurixOk
+            );
+            assert_eq!(order(list), ["us_east", "africa", "eu_west"]);
+            assert!(aurix_regions_get(list, 2, ep.as_mut_ptr()));
+            assert!(ep.assume_init().probe_failed);
+            aurix_regions_free(list);
+            aurix_regions_free(ptr::null_mut());
+
+            let api = CString::new("https://api.example/").unwrap();
+            let pref = CString::new("us_east").unwrap();
+            let mut buf = [0 as c_char; 128];
+            let n = aurix_regions_discovery_url(
+                api.as_ptr(),
+                pref.as_ptr(),
+                true,
+                1.5,
+                -2.0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+            let url = CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+            assert_eq!(
+                url,
+                "https://api.example/v1/me/regions?region=us_east&latitude=1.5&longitude=-2"
+            );
+            assert_eq!(n, url.len());
+            assert_eq!(
+                aurix_regions_discovery_url(
+                    api.as_ptr(),
+                    unknown.as_ptr(),
+                    false,
+                    0.0,
+                    0.0,
+                    ptr::null_mut(),
+                    0
+                ),
+                0
+            );
         }
     }
 }

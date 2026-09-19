@@ -260,6 +260,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/tokens` | issue player JWT; a channel grant is `{"channel_id":…}` or `{"ad_hoc":{"name":…,"channel_type":…,"max_participants":…}}` (created on first join, dropped when empty; `max_participants` is clamped to the app limit, creation counts against the app's channel quota) |
 | API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`; `join` accepts `ad_hoc` too) |
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
+| API key | `GET /v1/regions[?region=…&latitude=…&longitude=…]` | region discovery for your matchmaking: one entry per region with a healthy, non-saturated node that advertises a public `wss://` URL — `ws_url`, `probe_url`, coordinates, `distance_km`, `nodes`, `load_factor`, best first (`tokens:issue`); `POST /v1/tokens` takes the same `region`/`location` hints and returns the chosen `endpoint` (see [Scaling out](#scaling-out)) |
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
 | API key | `GET /v1/sessions/:id/stats` | media-plane statistics of one live session on this node: packet/byte counters, the client's last `QualityReport` and the merged `quality` (1–5 bars; see [Network quality and client statistics](#network-quality-and-client-statistics)) (`channels:read`) |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
@@ -275,7 +276,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
 | API key | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | live server event stream for game servers (`events:read`) |
-| player JWT | `GET /v1/me/turn-credentials`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users |
+| player JWT | `GET /v1/me/turn-credentials`, `GET /v1/me/regions`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users (`/me/regions` is the same discovery list for the SDKs' RTT probing) |
 
 API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
 `moderation:read|write`, `recordings:read|write`, `chat:read|write`, `webhooks:read|write`, `events:read`,
@@ -631,6 +632,19 @@ directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regard
   register is what peers dial).
 * Put the API/WS behind a load balancer; UDP media must reach the node the session was created on
   (`media_addr` in `SessionInitAck` already points there).
+* **Regions.** Label nodes with `server.region` and `server.location = { latitude, longitude }`,
+  give each node a public hostname (`server.external_url` / `external_ws_url`, `wss://` in
+  production) and clients pick the nearest node: `GET /v1/regions` / `GET /v1/me/regions` order
+  regions by requested region → distance → load and hand out the least-loaded node's own
+  `ws_url` plus a `probe_url`; the Web, Unity, native and Unreal SDKs probe the RTT and connect
+  to the winner (`discoverRegions`, `RegionDiscovery.DiscoverAsync`, `aurix_regions_*` /
+  `aurix::Regions`, `DiscoverRegions`). Direct node URLs are deliberate: session resume is
+  node-local. Nodes without an advertised `wss://` URL keep serving but are not offered.
+* **Kubernetes / cloud.** `deploy/helm/aurix` deploys a regional pool as a host-network
+  `StatefulSet` (per-pod public IP for UDP media/TURN, per-pod hostname for discovery and resume,
+  external PostgreSQL/Redis, secrets from an existing `Secret`); `deploy/terraform/aws` is a
+  documented example of one region on EC2 + EIPs behind Caddy with RDS PostgreSQL, ElastiCache
+  Redis, Route 53 and Secrets Manager. Both are linted/validated in CI (not applied).
 
 ### Backup & restore
 

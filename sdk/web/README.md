@@ -35,6 +35,31 @@ client.updatePosition(channelId, { x: 0, y: 0, z: 0 }, { forward_x: 0, forward_y
 client.disconnect();
 ```
 
+### Choosing a region
+
+Players should talk to the nearest node with capacity — and reconnect to the *same* node, since
+session resume is node-local. Either take the `endpoint` your backend gets from `POST /v1/tokens`
+(pass `region`/`location` hints there), or let the browser measure:
+
+```ts
+import { AurixClient, discoverRegions } from '@aurix/web-sdk';
+
+const { recommended, regions } = await discoverRegions({
+  apiUrl: 'https://voice.example.com',   // any node / shared API hostname
+  token,                                 // player JWT → GET /v1/me/regions
+  region: partyLeaderRegion,             // optional: ranks first when reachable
+  location: { latitude: 48.9, longitude: 2.3 }, // optional: server orders by distance
+  // probe: true (default) → GET each region's probe_url a few times, best RTT wins
+});
+// regions[i] = { region, node_id, ws_url, probe_url, distance_km, nodes, load_factor, rttMs }
+const client = new AurixClient({ apiUrl, wsUrl: recommended!.ws_url, token });
+```
+
+Ranking: preferred region (if its probe succeeded) → measured RTT in 15 ms buckets (ties keep the
+server's distance/load order) → unprobed regions. Regions whose probe failed rank last.
+`rankRegions`/`probeRtt` are exported for custom policies. Only healthy nodes with a public
+`wss://` URL are advertised; an empty list means no node is configured for discovery.
+
 ### Local mute, per-participant volume, block
 
 These are *receiver-local*: they change what you hear, are enforced on the server before the
@@ -337,6 +362,7 @@ counters are cumulative for the peer connection. The same helpers (`rFactor`, `m
 | `new WebSocket(wsUrl, ['aurix', 'bearer.<jwt>'])` | JWT authenticated at upgrade; `SessionInitAck` carries `session_id`/`ssrc` |
 | `connect()` → `WebRtcOffer` over WS | `SfuNode::attach_webrtc` (str0m, ICE-lite, host candidate = `media.external_ip:media.port`) |
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's own relay candidates |
+| `discoverRegions()` → `GET /v1/me/regions` + `GET <probe_url>` | `NodeManager::regions`: healthy, non-saturated nodes with a public `ws_url`, least-loaded node per region |
 | `joinChannel()` → `ChannelJoin{channel_id, token}` | membership check against the token's channel claims |
 | `setMuted()` → track `enabled` + `MuteStateChanged` | broadcast to channel members |
 | `setTransmission()` → `SetTransmission{mode}` | `MediaSession::set_transmission`; routers drop frames outside the policy |

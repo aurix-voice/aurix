@@ -858,6 +858,83 @@
         ]
       }
     },
+    "/v1/regions": {
+      "get": {
+        "tags": [
+          "Tokens"
+        ],
+        "summary": "Region discovery for the game backend",
+        "operationId": "listRegions",
+        "description": "One entry per region with at least one healthy, non-saturated node that advertises a public WebSocket URL, carrying that region's least-loaded node. Use it to choose the region before minting a token, or pass `region`/`location` straight to `POST /v1/tokens` and read `endpoint`. Served from the node registry, which follows the fleet's heartbeats with at most ~15 s of lag.",
+        "parameters": [
+          {
+            "name": "region",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Region"
+            },
+            "description": "Preferred region; listed first when it has capacity."
+          },
+          {
+            "name": "latitude",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "minimum": -90,
+              "maximum": 90
+            },
+            "description": "Caller's approximate latitude; must be given together with `longitude`."
+          },
+          {
+            "name": "longitude",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "minimum": -180,
+              "maximum": 180
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "tokens:issue"
+        ]
+      }
+    },
     "/v1/turn/credentials": {
       "post": {
         "tags": [
@@ -4958,6 +5035,77 @@
         ]
       }
     },
+    "/v1/me/regions": {
+      "get": {
+        "tags": [
+          "Player"
+        ],
+        "summary": "Region discovery for the calling player",
+        "operationId": "myRegions",
+        "description": "Same list as `GET /v1/regions`, for the SDKs: they probe every `probe_url`, connect to the node with the lowest RTT and fall back to the server's order when probing is impossible. Requires only a session token.",
+        "parameters": [
+          {
+            "name": "region",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Region"
+            },
+            "description": "Preferred region; listed first when it has capacity."
+          },
+          {
+            "name": "latitude",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "minimum": -90,
+              "maximum": 90
+            },
+            "description": "Caller's approximate latitude; must be given together with `longitude`."
+          },
+          {
+            "name": "longitude",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "minimum": -180,
+              "maximum": 180
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "PlayerToken": []
+          }
+        ]
+      }
+    },
     "/v1/me/reports": {
       "post": {
         "tags": [
@@ -6801,6 +6949,28 @@
               "null"
             ],
             "additionalProperties": true
+          },
+          "region": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Region"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Region the game wants the player in (e.g. the match's region). Wins in `endpoint` when it has capacity."
+          },
+          "location": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GeoLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Player's approximate coordinates from the game's own geo data, used to order regions by distance."
           }
         },
         "required": [
@@ -7094,6 +7264,31 @@
           "registered_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "ws_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri",
+            "description": "Public WebSocket URL advertised for region discovery; `null` when the node is not advertised."
+          },
+          "api_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri"
+          },
+          "location": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GeoLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -7799,13 +7994,25 @@
             "items": {
               "$ref": "#/components/schemas/ChannelPermission"
             }
+          },
+          "endpoint": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RegionEndpoint"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Recommended node for this player (preferred `region` → nearest to `location` → least loaded). Hand `ws_url` to the client together with the token; `null` when no node advertises a public WebSocket URL, in which case clients use your configured URL."
           }
         },
         "required": [
           "token",
           "user_id",
           "expires_at",
-          "channels"
+          "channels",
+          "endpoint"
         ]
       },
       "TurnCredentials": {
@@ -8340,6 +8547,126 @@
           "attempts",
           "created_at",
           "payload"
+        ]
+      },
+      "Region": {
+        "type": "string",
+        "enum": [
+          "us_east",
+          "us_west",
+          "eu_west",
+          "eu_central",
+          "asia_pacific",
+          "south_america",
+          "australia",
+          "middle_east",
+          "africa"
+        ],
+        "description": "Deployment region label configured per node (`server.region`)."
+      },
+      "GeoLocation": {
+        "type": "object",
+        "description": "WGS-84 coordinates in degrees.",
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          }
+        },
+        "required": [
+          "latitude",
+          "longitude"
+        ]
+      },
+      "RegionEndpoint": {
+        "type": "object",
+        "description": "The least-loaded healthy node of one region that advertises a public WebSocket URL (`server.external_ws_url`). Connect the SDK to `ws_url`; `GET probe_url` is a cheap public request answered by exactly this node, so its round-trip time is a fair RTT estimate.",
+        "properties": {
+          "region": {
+            "$ref": "#/components/schemas/Region"
+          },
+          "node_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "ws_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "WebSocket control-plane URL of the node (`wss://…/ws`). Session resume must reach the same node, so this is a per-node URL, not a load balancer."
+          },
+          "probe_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri",
+            "description": "`<api_url>/health` of the node, for client-side RTT measurement."
+          },
+          "location": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GeoLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "distance_km": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Great-circle distance from the caller's declared location, when both are known."
+          },
+          "nodes": {
+            "type": "integer",
+            "description": "Healthy, non-saturated nodes advertising a WebSocket URL in this region."
+          },
+          "load_factor": {
+            "type": "number",
+            "description": "`active_participants / capacity` of the selected node (0–1)."
+          }
+        },
+        "required": [
+          "region",
+          "node_id",
+          "ws_url",
+          "nodes",
+          "load_factor"
+        ]
+      },
+      "RegionsResponse": {
+        "type": "object",
+        "properties": {
+          "regions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RegionEndpoint"
+            },
+            "description": "Best-first: the preferred region if it has capacity, then by distance to the declared location (regions without coordinates last), then by load. Clients that can measure RTT should probe every `probe_url` and pick the lowest; this order is the fallback."
+          },
+          "recommended": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RegionEndpoint"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "First entry of `regions`, or `null` when no node advertises a WebSocket URL."
+          }
+        },
+        "required": [
+          "regions",
+          "recommended"
         ]
       }
     }

@@ -10,7 +10,7 @@ use aurix_ws::WsState;
 use clap::Parser;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -199,10 +199,32 @@ async fn main() -> anyhow::Result<()> {
         .external_ip
         .clone()
         .unwrap_or_else(|| config.server.host.clone());
+    let advertised_ws_url = config.server.advertised_ws_url(config.is_production());
+    let advertised_api_url = config.server.advertised_api_url();
+    match &advertised_ws_url {
+        Some(ws) => info!("Advertising WebSocket endpoint {ws} for region discovery"),
+        None => warn!(
+            "no public wss:// endpoint to advertise (set server.external_ws_url, or an https \
+             server.external_url): this node will not be offered by region discovery"
+        ),
+    }
+    let advertise = {
+        let ws_url = advertised_ws_url.clone();
+        let api_url = advertised_api_url.clone();
+        let location = config.server.location;
+        move |mut info: aurix_common::types::MediaNodeInfo| {
+            info.ws_url = ws_url.clone();
+            info.api_url = api_url.clone();
+            info.location = location;
+            info
+        }
+    };
     {
-        let node_info =
-            sfu.read()
-                .node_info(&node_address, config.media.port, config.server.api_port);
+        let node_info = advertise(sfu.read().node_info(
+            &node_address,
+            config.media.port,
+            config.server.api_port,
+        ));
         control.nodes.register_node(node_info).await?;
     }
 
@@ -285,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
         let sfu = sfu.clone();
         let config = config.clone();
         let node_address = node_address.clone();
+        let advertise = advertise.clone();
         let cancel = shutdown.clone();
         tasks.spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -299,7 +322,11 @@ async fn main() -> anyhow::Result<()> {
                     let sfu = sfu.read();
                     aurix_metrics::ACTIVE_SESSIONS.set(sfu.active_participants() as i64);
                     aurix_metrics::ACTIVE_CHANNELS.set(sfu.active_channels() as i64);
-                    sfu.node_info(&node_address, config.media.port, config.server.api_port)
+                    advertise(sfu.node_info(
+                        &node_address,
+                        config.media.port,
+                        config.server.api_port,
+                    ))
                 };
                 if let Err(e) = control.nodes.heartbeat(info.id, info).await {
                     error!("Heartbeat failed: {}", e);

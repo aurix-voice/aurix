@@ -1,0 +1,49 @@
+# Three nodes with per-node hostnames, cloud metadata for the media IP, chart-managed Secret.
+replicaCount: 3
+hostNetwork: true
+config:
+  corsOrigins: [https://game.example.com]
+  trustedProxies: [10.0.0.0/8]
+  region: us_east
+  location:
+    latitude: "38.9"
+    longitude: "-77.0"
+  externalIpSource: script
+  turn:
+    enabled: true
+    realm: voice.example.com
+  recording:
+    enabled: true
+    encryptionEnabled: true
+    s3:
+      bucket: aurix-recordings
+      region: us-east-1
+perNode:
+  enabled: true
+  domain: voice.example.com
+ingress:
+  enabled: true
+  className: nginx
+  host: api.voice.example.com
+  tls:
+    secretName: voice-example-com-tls
+secrets:
+  databaseUrl: postgres://aurix:REPLACE_ME@db.internal:5432/aurix
+  redisUrl: rediss://redis.internal:6379
+  jwtSecret: REPLACE_ME_WITH_48_RANDOM_BYTES_BASE64_xxxxxxxxxxxxxxxx
+  turnAuthSecret: REPLACE_ME_WITH_48_RANDOM_BYTES_BASE64_xxxxxxxxxxxxxxxx
+  cascadeSecret: REPLACE_ME_WITH_32_RANDOM_BYTES
+  recordingEncryptionKey: REPLACE_ME_WITH_32_RANDOM_BYTES_xxxxxxxx
+  s3AccessKey: REPLACE_ME
+  s3SecretKey: REPLACE_ME
+metrics:
+  serviceMonitor:
+    enabled: true
+networkPolicy:
+  enabled: true
+  apiFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+podDisruptionBudget:
+  enabled: true

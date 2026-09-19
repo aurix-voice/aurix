@@ -81,6 +81,33 @@ frame, `TryDequeueAudio(out IncomingAudio)` → `RemoteMixer.Push(...)` and `Mix
 `OnAudioFilterRead`, and call `Client.Update()` every frame — all events are raised from
 `Update()` on the calling thread.
 
+## Region selection
+
+Session resume is node-local, so connect to the nearest node with capacity and keep its direct
+URL. Either use the `endpoint.ws_url` your backend receives from `POST /v1/tokens` (with
+`region` / `location` hints), or measure from the device:
+
+```csharp
+using var http = new HttpClient();
+var regions = await RegionDiscovery.DiscoverAsync(http, "https://voice.example.com", jwt,
+    new RegionDiscoveryOptions
+    {
+        PreferredRegion = partyLeaderRegion,   // optional: ranks first when reachable
+        Latitude = 48.9, Longitude = 2.3,      // optional: server orders by distance
+        // Probe = true (default): GET each region's ProbeUrl, best RTT wins
+    });
+var best = regions.FirstOrDefault();           // null → no node advertised for discovery
+voice.WebSocketUrl = best.WsUrl;
+```
+
+`DiscoverAsync` calls `GET /v1/me/regions` with the player JWT, then probes each `ProbeUrl`
+(one warm-up discarded, `ProbeSamples` = 3 timed, minimum kept, `ProbeTimeout` = 2 s). Ranking:
+preferred region unless its probe failed → RTT in `RttToleranceMs` (15) buckets, ties keeping
+the server's distance/load order → unprobed regions → regions whose probe failed
+(`ProbeFailed`). `RegionDiscovery.Rank` / `ProbeRttAsync` / `ParseResponse` are public for
+custom policies; every `RegionEndpoint` carries `Nodes`, `LoadFactor`, `DistanceKm` and `RttMs`.
+Server side: [Regions](../operations/scaling.md#regions).
+
 ## Feature map
 
 | Feature | API |

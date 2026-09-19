@@ -37,6 +37,16 @@
 #define AURIX_FRAME_SAMPLES 960
 
 /**
+ * Capacity of fixed-size URL buffers in this ABI (including the NUL).
+ */
+#define AURIX_URL_LEN 512
+
+/**
+ * RTT differences below this are treated as ties (network noise, not a better region).
+ */
+#define DEFAULT_RTT_TOLERANCE_MS 15.0
+
+/**
  * Return code of fallible calls; details via `aurix_last_error`.
  */
 typedef enum AurixResult {
@@ -246,6 +256,11 @@ typedef struct AurixClient AurixClient;
  * Opaque event; read with the `aurix_event_*` accessors and release with `aurix_event_free`.
  */
 typedef struct AurixEvent AurixEvent;
+
+/**
+ * Opaque, mutable list of regions; release with `aurix_regions_free`.
+ */
+typedef struct AurixRegionList AurixRegionList;
 
 /**
  * 128-bit id (session, channel, user, recording) in RFC 4122 byte order.
@@ -489,6 +504,51 @@ typedef struct AurixStats {
    */
   uint32_t active_streams;
 } AurixStats;
+
+/**
+ * One advertised region (`GET /v1/me/regions`, `endpoint` of `POST /v1/tokens`): the
+ * least-loaded healthy node of the region that has a public WebSocket URL.
+ */
+typedef struct AurixRegionEndpoint {
+  /**
+   * Region name as the API spells it (`us_east`, `eu_west`, ...), NUL-terminated.
+   */
+  char region[AURIX_NAME_LEN];
+  struct AurixUuid node_id;
+  /**
+   * Direct `wss://` URL of the node; use it as `AurixClientConfig::ws_url`.
+   */
+  char ws_url[AURIX_URL_LEN];
+  /**
+   * `GET` target for RTT probing (answered by exactly this node); empty when not public.
+   */
+  char probe_url[AURIX_URL_LEN];
+  bool has_location;
+  double latitude;
+  double longitude;
+  /**
+   * Great-circle distance from the location hint when both were known, else `false`.
+   */
+  bool has_distance;
+  double distance_km;
+  /**
+   * Nodes with capacity in the region.
+   */
+  uint32_t nodes;
+  /**
+   * Load of the advertised node, `0..1`.
+   */
+  float load_factor;
+  /**
+   * `true` after `aurix_regions_set_rtt` with a non-negative value.
+   */
+  bool has_rtt;
+  double rtt_ms;
+  /**
+   * `true` after `aurix_regions_set_rtt` with a negative value (unreachable).
+   */
+  bool probe_failed;
+} AurixRegionEndpoint;
 
 #ifdef __cplusplus
 extern "C" {
@@ -893,6 +953,56 @@ bool aurix_client_network_quality(const struct AurixClient *client,
  * Payload of `AurixEventNetworkQuality`.
  */
 bool aurix_event_network_quality(const struct AurixEvent *event, struct AurixNetworkQuality *out);
+
+/**
+ * Player-scoped discovery URL: `<api_url>/v1/me/regions` with optional `region` and
+ * `latitude`/`longitude` hints (`has_location`). `preferred_region` may be `NULL`. Send it with
+ * `Authorization: Bearer <player token>` from the engine's HTTP client, then pass the body to
+ * `aurix_regions_parse`. Returns the number of bytes needed (excluding NUL); `buf` may be `NULL`.
+ */
+size_t aurix_regions_discovery_url(const char *api_url,
+                                   const char *preferred_region,
+                                   bool has_location,
+                                   double latitude,
+                                   double longitude,
+                                   char *buf,
+                                   size_t capacity);
+
+/**
+ * Parse a `GET /v1/me/regions` (or `/v1/regions`) body. Returns `NULL` (see `aurix_last_error`)
+ * on malformed input. The list keeps the server order: preferred region first, then distance
+ * (when a location hint was sent), then load.
+ */
+struct AurixRegionList *aurix_regions_parse(const char *json);
+
+void aurix_regions_free(struct AurixRegionList *regions);
+
+size_t aurix_regions_len(const struct AurixRegionList *regions);
+
+/**
+ * Copy entry `index` into `out`; `false` when out of range.
+ */
+bool aurix_regions_get(const struct AurixRegionList *regions,
+                       size_t index,
+                       struct AurixRegionEndpoint *out);
+
+/**
+ * Record the host's probe of entry `index` (best of a few `GET probe_url` samples after one
+ * discarded warm-up): `rtt_ms >= 0` for a measurement, negative when every request failed.
+ */
+enum AurixResult aurix_regions_set_rtt(struct AurixRegionList *regions,
+                                       size_t index,
+                                       double rtt_ms);
+
+/**
+ * Re-rank in place after probing: `preferred_region` (may be `NULL`) first unless its probe
+ * failed, then measured regions in ascending `rtt_tolerance_ms` buckets (`<= 0` selects the
+ * default 15 ms), then unprobed regions, then unreachable ones; ties keep the server order.
+ * Entry 0 is the recommendation.
+ */
+enum AurixResult aurix_regions_rank(struct AurixRegionList *regions,
+                                    const char *preferred_region,
+                                    double rtt_tolerance_ms);
 
 #ifdef __cplusplus
 }  // extern "C"

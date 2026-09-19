@@ -1,6 +1,8 @@
 #include "AurixVoiceSubsystem.h"
 
 #include "AurixAudioCapture.h"
+#include "AurixNativeConversions.h"
+#include "AurixRegionDiscovery.h"
 #include "AurixVoiceLog.h"
 #include "AurixVoiceSoundWave.h"
 #include "Components/AudioComponent.h"
@@ -19,39 +21,6 @@ struct FAurixNativeClient
 namespace
 {
 constexpr int32 MaxEventsPerTick = 256;
-
-FGuid ToGuid(const AurixUuid& U)
-{
-	auto Read = [&U](int32 Offset) {
-		return (uint32(U.bytes[Offset]) << 24) | (uint32(U.bytes[Offset + 1]) << 16) | (uint32(U.bytes[Offset + 2]) << 8) | uint32(U.bytes[Offset + 3]);
-	};
-	return FGuid(Read(0), Read(4), Read(8), Read(12));
-}
-
-aurix::Uuid ToUuid(const FGuid& G)
-{
-	aurix::Uuid U;
-	const uint32 Parts[4] = {G.A, G.B, G.C, G.D};
-	for (int32 i = 0; i < 4; ++i)
-	{
-		U.raw.bytes[i * 4 + 0] = uint8(Parts[i] >> 24);
-		U.raw.bytes[i * 4 + 1] = uint8(Parts[i] >> 16);
-		U.raw.bytes[i * 4 + 2] = uint8(Parts[i] >> 8);
-		U.raw.bytes[i * 4 + 3] = uint8(Parts[i]);
-	}
-	return U;
-}
-
-FString FromUtf8(const char* S)
-{
-	return S ? FString(UTF8_TO_TCHAR(S)) : FString();
-}
-
-std::string ToUtf8(const FString& S)
-{
-	FTCHARToUTF8 Conv(*S);
-	return std::string(reinterpret_cast<const char*>(Conv.Get()), static_cast<size_t>(Conv.Length()));
-}
 
 FDateTime FromUnixMs(int64 Ms)
 {
@@ -279,6 +248,7 @@ void UAurixVoiceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 void UAurixVoiceSubsystem::Deinitialize()
 {
 	FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapHandle);
+	CancelRegionDiscovery();
 	ReleaseNative();
 	Super::Deinitialize();
 }
@@ -833,6 +803,43 @@ bool UAurixVoiceSubsystem::GetNetworkQuality(FAurixNetworkQuality& OutQuality) c
 	}
 	OutQuality = ToNetworkQuality(Raw);
 	return true;
+}
+
+// ---- regions ---------------------------------------------------------------------------------
+
+void UAurixVoiceSubsystem::DiscoverRegions(const FAurixRegionDiscoveryRequest& Request, FAurixRegionsDiscovered OnComplete)
+{
+	CancelRegionDiscovery();
+
+	TWeakObjectPtr<UAurixVoiceSubsystem> WeakThis(this);
+	TSharedPtr<FAurixRegionDiscovery> Discovery = MakeShared<FAurixRegionDiscovery>(
+		Request,
+		FAurixRegionDiscovery::FOnComplete::CreateLambda(
+			[WeakThis, OnComplete](bool bSuccess, const TArray<FAurixRegionEndpoint>& Regions, const FString& Error) {
+				if (UAurixVoiceSubsystem* Self = WeakThis.Get())
+				{
+					Self->RegionDiscovery.Reset();
+				}
+				OnComplete.ExecuteIfBound(bSuccess, Regions, Error);
+			}));
+
+	FString Error;
+	if (!Discovery->Start(Error))
+	{
+		UE_LOG(LogAurixVoice, Warning, TEXT("DiscoverRegions: %s"), *Error);
+		OnComplete.ExecuteIfBound(false, TArray<FAurixRegionEndpoint>(), Error);
+		return;
+	}
+	RegionDiscovery = MoveTemp(Discovery);
+}
+
+void UAurixVoiceSubsystem::CancelRegionDiscovery()
+{
+	if (RegionDiscovery.IsValid())
+	{
+		RegionDiscovery->Cancel();
+		RegionDiscovery.Reset();
+	}
 }
 
 // ---- conversions ---------------------------------------------------------------------------

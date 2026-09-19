@@ -1,0 +1,22 @@
+Aurix {{ .Chart.AppVersion }} — release {{ .Release.Name }} in {{ .Release.Namespace }}
+region: {{ .Values.config.region }}  nodes: {{ .Values.replicaCount }}  media IP source: {{ .Values.config.externalIpSource }}
+
+Pods bind UDP {{ .Values.ports.media }} (media), {{ add .Values.ports.media 1 }} (cascade){{ if .Values.config.turn.enabled }}, {{ .Values.ports.turn }} UDP+TCP and {{ .Values.config.turn.minPort }}-{{ .Values.config.turn.maxPort }}/UDP (TURN){{ end }}
+on {{ if .Values.hostNetwork }}the node network (hostNetwork){{ else }}hostPorts{{ end }}. Open them on the node firewall / security group.
+
+{{- if .Values.perNode.enabled }}
+Per-node hostnames (create DNS records pointing at each node's public IP):
+{{- range $i := until (int .Values.replicaCount) }}
+  {{ include "aurix.perNodeHost" (dict "root" $ "ordinal" $i) }}  ->  wss://{{ include "aurix.perNodeHost" (dict "root" $ "ordinal" $i) }}/ws
+{{- end }}
+{{- else }}
+Discovery advertises the WebSocket URL derived from config.externalUrl. For session resume and
+GET /v1/regions to address one node, enable perNode with a domain.
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+REST API: https://{{ .Values.ingress.host }}   (OpenAPI: /openapi.json)
+{{- end }}
+
+Check the fleet:  kubectl -n {{ .Release.Namespace }} logs statefulset/{{ include "aurix.fullname" . }} | grep -i "advertising"
+First admin:      POST https://<api>/admin/setup with X-Bootstrap-Token (then drop the token from the secret).

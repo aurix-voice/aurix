@@ -1,0 +1,208 @@
+{{- if .Values.perNode.enabled }}
+{{- $_ := required "perNode.domain is required when perNode.enabled" .Values.perNode.domain }}
+{{- end }}
+{{- if and (eq .Values.config.externalIpSource "static") (not .Values.config.externalIp) (not .Values.config.externalIps) }}
+{{- fail "config.externalIp or config.externalIps is required with externalIpSource=static" }}
+{{- end }}
+{{- if and (eq .Values.config.externalIpSource "static") .Values.config.externalIps (lt (len .Values.config.externalIps) (int .Values.replicaCount)) }}
+{{- fail "config.externalIps must list one IP per replica" }}
+{{- end }}
+{{- if not (has .Values.config.externalIpSource (list "static" "hostIP" "script")) }}
+{{- fail "config.externalIpSource must be static, hostIP or script" }}
+{{- end }}
+{{- if and (not .Values.perNode.enabled) (not .Values.config.externalUrl) }}
+{{- fail "config.externalUrl is required (or enable perNode)" }}
+{{- end }}
+{{- if not .Values.config.corsOrigins }}
+{{- fail "config.corsOrigins must list the allowed browser origins" }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "aurix.fullname" . }}
+  labels:
+    {{- include "aurix.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "aurix.headlessServiceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "aurix.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aurix.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/entrypoint: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "aurix.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      {{- if .Values.hostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if eq .Values.config.externalIpSource "script" }}
+      initContainers:
+        - name: resolve-external-ip
+          image: {{ include "aurix.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec", "/bin/sh /aurix-entrypoint/resolve-ip.sh | tr -d '[:space:]' > /aurix-runtime/external_ip"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /aurix-entrypoint
+              readOnly: true
+            - name: runtime
+              mountPath: /aurix-runtime
+      {{- end }}
+      containers:
+        - name: aurix
+          image: {{ include "aurix.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "/aurix-entrypoint/run.sh"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: AURIX_EXTERNAL_IP_SOURCE
+              value: {{ .Values.config.externalIpSource | quote }}
+            - name: AURIX_EXTERNAL_IP
+              value: {{ .Values.config.externalIp | quote }}
+            - name: AURIX_EXTERNAL_IPS
+              value: {{ join "," .Values.config.externalIps | quote }}
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- include "aurix.env" (dict "root" $ "job" false) | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: {{ include "aurix.secretName" . }}
+          ports:
+            - name: api
+              containerPort: {{ .Values.ports.api }}
+              protocol: TCP
+            - name: ws
+              containerPort: {{ .Values.ports.ws }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+              protocol: TCP
+            - name: media
+              containerPort: {{ .Values.ports.media }}
+              protocol: UDP
+              {{- if not .Values.hostNetwork }}
+              hostPort: {{ .Values.ports.media }}
+              {{- end }}
+            - name: cascade
+              containerPort: {{ add .Values.ports.media 1 }}
+              protocol: UDP
+              {{- if not .Values.hostNetwork }}
+              hostPort: {{ add .Values.ports.media 1 }}
+              {{- end }}
+            {{- if .Values.config.turn.enabled }}
+            - name: turn-udp
+              containerPort: {{ .Values.ports.turn }}
+              protocol: UDP
+              {{- if not .Values.hostNetwork }}
+              hostPort: {{ .Values.ports.turn }}
+              {{- end }}
+            - name: turn-tcp
+              containerPort: {{ .Values.ports.turn }}
+              protocol: TCP
+              {{- if not .Values.hostNetwork }}
+              hostPort: {{ .Values.ports.turn }}
+              {{- end }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /aurix-entrypoint
+              readOnly: true
+            - name: runtime
+              mountPath: /aurix-runtime
+            - name: tmp
+              mountPath: /tmp
+            - name: recordings
+              mountPath: /var/lib/aurix/recordings
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: {{ include "aurix.fullname" . }}-entrypoint
+            defaultMode: 0555
+        - name: runtime
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: recordings
+          emptyDir: {}
+        {{- end }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "aurix.selectorLabels" . | nindent 18 }}
+        {{- with .Values.affinity.nodeAffinity }}
+        nodeAffinity:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.affinity.podAffinity }}
+        podAffinity:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: recordings
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

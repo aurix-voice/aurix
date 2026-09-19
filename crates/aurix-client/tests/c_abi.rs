@@ -105,7 +105,11 @@ fn build_and_run_sample(compiler: &str, std_flag: &str, source: &str, exe_name: 
     ]);
     let lib_dir = lib.parent().unwrap();
     run.env("LD_LIBRARY_PATH", lib_dir)
-        .env("DYLD_LIBRARY_PATH", lib_dir);
+        .env("DYLD_LIBRARY_PATH", lib_dir)
+        .env(
+            "AURIX_REGIONS_JSON",
+            r#"{"regions":[{"region":"eu_west","node_id":"11111111-1111-1111-1111-111111111111","ws_url":"wss://eu1.example/ws","probe_url":"https://eu1.example/health","location":null,"distance_km":null,"nodes":2,"load_factor":0.25}],"recommended":null}"#,
+        );
     let output = run.output().expect("run sample");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -115,6 +119,12 @@ fn build_and_run_sample(compiler: &str, std_flag: &str, source: &str, exe_name: 
         "expected connect failure exit code 3\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("aurix_client "), "{stdout}");
+    if source.ends_with(".cpp") {
+        assert!(
+            stdout.contains("region eu_west node=11111111-1111-1111-1111-111111111111 ws=wss://eu1.example/ws nodes=2"),
+            "{stdout}"
+        );
+    }
     assert!(stderr.contains("connect failed:"), "{stderr}");
 }
 
@@ -231,6 +241,17 @@ fn unreal_plugin_uses_only_existing_abi() {
             assert!(
                 wrapper.contains(&format!(" {method}(")),
                 "{} calls aurix::Client::{method}, which include/aurix_client.hpp does not define",
+                path.display()
+            );
+            checked += 1;
+        }
+        for method in identifiers(&text, "Regions.", false, &['('])
+            .into_iter()
+            .chain(identifiers(&text, "aurix::Regions::", false, &['(']))
+        {
+            assert!(
+                wrapper.contains(&format!(" {method}(")),
+                "{} calls aurix::Regions::{method}, which include/aurix_client.hpp does not define",
                 path.display()
             );
             checked += 1;

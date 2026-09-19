@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "hostNetwork": { "type": "boolean" },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      },
+      "required": ["repository"]
+    },
+    "ports": {
+      "type": "object",
+      "properties": {
+        "api": { "$ref": "#/$defs/port" },
+        "ws": { "$ref": "#/$defs/port" },
+        "media": { "$ref": "#/$defs/port" },
+        "turn": { "$ref": "#/$defs/port" },
+        "metrics": { "$ref": "#/$defs/port" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "externalUrl": { "type": "string" },
+        "externalWsUrl": { "type": "string" },
+        "corsOrigins": { "type": "array", "items": { "type": "string" } },
+        "trustedProxies": { "type": "array", "items": { "type": "string" } },
+        "region": {
+          "type": "string",
+          "enum": ["us_east", "us_west", "eu_west", "eu_central", "asia_pacific", "south_america", "australia", "middle_east", "africa"]
+        },
+        "location": {
+          "type": "object",
+          "properties": {
+            "latitude": { "type": ["string", "number"] },
+            "longitude": { "type": ["string", "number"] }
+          }
+        },
+        "externalIpSource": { "type": "string", "enum": ["static", "hostIP", "script"] },
+        "externalIp": { "type": "string" },
+        "externalIps": { "type": "array", "items": { "type": "string" } },
+        "externalIpScript": { "type": "string" },
+        "logLevel": { "type": "string" },
+        "turn": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "realm": { "type": "string" },
+            "minPort": { "$ref": "#/$defs/port" },
+            "maxPort": { "$ref": "#/$defs/port" }
+          }
+        },
+        "recording": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "encryptionEnabled": { "type": "boolean" },
+            "s3": {
+              "type": "object",
+              "properties": {
+                "bucket": { "type": "string" },
+                "region": { "type": "string" },
+                "endpoint": { "type": "string" }
+              }
+            }
+          }
+        },
+        "extraEnv": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "existingSecret": { "type": "string" },
+    "secrets": { "type": "object", "additionalProperties": { "type": "string" } },
+    "migrations": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "backoffLimit": { "type": "integer", "minimum": 0 },
+        "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "perNode": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "domain": { "type": "string" },
+        "setExternalUrls": { "type": "boolean" }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "storageClass": { "type": "string" },
+        "size": { "type": "string" },
+        "accessModes": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+  }
+}

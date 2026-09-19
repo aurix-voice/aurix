@@ -71,6 +71,36 @@ transport on every heartbeat (`ClientConfig::heartbeat_interval`, 5 s), which al
 server's adaptive downlink bitrate. In C: `aurix_client_stats`,
 `aurix_client_network_quality`, `aurix_event_network_quality`.
 
+### Region discovery
+
+The core deliberately has no HTTP client — the host (engine, launcher) does the two HTTP steps
+and the core does everything that must be identical across SDKs:
+
+```rust
+use aurix_client::regions::{discovery_url, parse_regions, rank_regions, ProbedRegion};
+
+let url = discovery_url(api_url, preferred_region, player_location);   // GET with `Authorization: Bearer <jwt>`
+let body = parse_regions(&http_get(&url, jwt)?)?;                      // GET /v1/me/regions
+let probed = body.regions.into_iter()
+    .map(|ep| { let rtt = ep.probe_url.as_deref().and_then(|u| min_rtt_ms(u, 3)); ProbedRegion::unprobed(ep).with_rtt(rtt) })
+    .collect();
+let ranked = rank_regions(probed, preferred_region, 15.0);
+let ws_url = &ranked[0].endpoint.ws_url;                                // node-local: resume lands on the same node
+```
+
+`rank_regions`: preferred region first unless its probe failed → RTT in `tolerance_ms` buckets
+(ties keep the server's distance/load order) → unprobed regions → regions whose probe failed
+(`ProbedRegion::probe_failed`). Only healthy nodes with a public `wss://` URL are returned by
+the server; an empty list means none is configured for discovery.
+
+In C the same flow is `aurix_regions_discovery_url` → *host GET* → `aurix_regions_parse`
+(opaque `AurixRegionList`, freed with `aurix_regions_free`) → *host probes each
+`AurixRegionEndpoint.probe_url`* → `aurix_regions_set_rtt(list, i, rtt_ms | -1.0 for
+unreachable)` → `aurix_regions_rank(list, preferred_or_NULL, tolerance_ms)` →
+`aurix_regions_get(list, 0, &out)`; C++: `aurix::Regions` (RAII, `parse` / `set_rtt` / `rank` /
+`all`). `examples/cpp/voice_loop.cpp` prints the ranking of a JSON body passed in
+`AURIX_REGIONS_JSON`.
+
 ## C ABI
 
 The header is generated with cbindgen and committed; `tests/c_abi.rs` fails if it drifts:

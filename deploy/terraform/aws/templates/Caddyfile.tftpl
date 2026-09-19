@@ -1,0 +1,19 @@
+{
+	email ${acme_email}
+}
+
+${node_host}, ${api_host} {
+	encode zstd gzip
+
+	@ws path /ws /ws/*
+	reverse_proxy @ws 127.0.0.1:8081 {
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}

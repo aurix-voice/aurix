@@ -6,6 +6,7 @@ use aurix_common::error::AurixError;
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
+use aurix_control::SelectionHint;
 use axum::{
     extract::{Extension, State},
     http::HeaderMap,
@@ -113,6 +114,12 @@ pub struct GenerateTokenRequest {
     #[serde(default)]
     pub channels: Vec<ChannelGrant>,
     pub metadata: Option<serde_json::Value>,
+    /// Region the game wants the player in (matchmaking region); see `endpoint` in the response.
+    #[serde(default)]
+    pub region: Option<Region>,
+    /// Player's approximate coordinates, if the game knows them; used to order regions.
+    #[serde(default)]
+    pub location: Option<GeoLocation>,
 }
 
 /// One channel entry of a token request. Either an existing `channel_id` or an `ad_hoc`
@@ -185,6 +192,9 @@ pub struct TokenResponse {
     /// Resolved grants; ad-hoc entries carry the derived `channel_id` the game server can
     /// use for moderation calls before anyone has joined.
     pub channels: Vec<ChannelPermission>,
+    /// Recommended node for this player (preferred region → nearest → least loaded). `null`
+    /// when no node advertises a public WebSocket URL; clients then use a configured URL.
+    pub endpoint: Option<RegionEndpoint>,
 }
 
 /// Issues an end-user JWT bound to the API key's app. The user row is upserted so bans, sessions
@@ -202,6 +212,12 @@ pub async fn generate_token(
     let display_name = req.display_name.trim();
     if display_name.is_empty() || display_name.len() > 64 {
         return Err(AurixError::Validation("display_name must be 1..=64 characters".into()).into());
+    }
+    if req.location.is_some_and(|loc| !loc.is_valid()) {
+        return Err(AurixError::Validation(
+            "location.latitude must be within -90..=90 and longitude within -180..=180".into(),
+        )
+        .into());
     }
     let app_id = ctx.app_id;
     let user = aurix_db::models::UserRow {
@@ -254,12 +270,98 @@ pub async fn generate_token(
         req.metadata,
     )?;
     let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs);
+    let endpoint = state.control.nodes.recommend(&SelectionHint {
+        region: req.region,
+        location: req.location,
+    });
     Ok(Json(TokenResponse {
         token,
         user_id,
         expires_at: expires_at.to_rfc3339(),
         channels,
+        endpoint,
     }))
+}
+
+// ── Region discovery ──
+
+#[derive(Deserialize)]
+pub struct RegionsQuery {
+    #[serde(default)]
+    pub region: Option<Region>,
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
+}
+
+impl RegionsQuery {
+    fn hint(&self) -> Result<SelectionHint, ApiError> {
+        let location = match (self.latitude, self.longitude) {
+            (None, None) => None,
+            (Some(latitude), Some(longitude)) => {
+                let loc = GeoLocation {
+                    latitude,
+                    longitude,
+                };
+                if !loc.is_valid() {
+                    return Err(AurixError::Validation(
+                        "latitude must be within -90..=90 and longitude within -180..=180".into(),
+                    )
+                    .into());
+                }
+                Some(loc)
+            }
+            _ => {
+                return Err(AurixError::Validation(
+                    "latitude and longitude must be given together".into(),
+                )
+                .into())
+            }
+        };
+        Ok(SelectionHint {
+            region: self.region,
+            location,
+        })
+    }
+}
+
+#[derive(Serialize)]
+pub struct RegionsResponse {
+    /// Best-first. Clients that can measure RTT should probe `probe_url` of each entry and
+    /// connect to the lowest; the order is the server's fallback when they cannot.
+    pub regions: Vec<RegionEndpoint>,
+    pub recommended: Option<RegionEndpoint>,
+}
+
+fn regions_response(state: &AppState, hint: &SelectionHint) -> RegionsResponse {
+    let regions = state.control.nodes.regions(hint);
+    RegionsResponse {
+        recommended: regions.first().cloned(),
+        regions,
+    }
+}
+
+/// Server-to-server region discovery (`tokens:issue`): lets the game backend pick the node
+/// before minting a token, or list regions for its own matchmaking. Served from the node
+/// registry, which follows the fleet's heartbeats with at most ~15 s of lag.
+pub async fn list_regions(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Query(query): Query<RegionsQuery>,
+) -> Result<Json<RegionsResponse>, ApiError> {
+    ctx.require("tokens:issue")?;
+    Ok(Json(regions_response(&state, &query.hint()?)))
+}
+
+/// Player-facing region discovery: the SDKs call this with the session token, probe every
+/// `probe_url` and connect to the fastest node.
+pub async fn list_regions_self(
+    State(state): State<AppState>,
+    Extension(_token): Extension<ValidatedToken>,
+    Query(query): Query<RegionsQuery>,
+) -> Result<Json<RegionsResponse>, ApiError> {
+    Ok(Json(regions_response(&state, &query.hint()?)))
 }
 
 /// Subject of `POST /v1/tokens/action`: either an existing user by id or an

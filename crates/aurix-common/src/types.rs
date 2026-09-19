@@ -554,6 +554,16 @@ pub struct MediaNodeInfo {
     pub api_port: u16,
     /// UDP port of the node-to-node relay (None when cascade is disabled on that node).
     pub cascade_port: Option<u16>,
+    /// Public WebSocket endpoint clients connect to (`wss://host/ws`). Nodes without one are
+    /// never advertised by region discovery.
+    #[serde(default)]
+    pub ws_url: Option<String>,
+    /// Public REST base URL of this node (`https://host`); `<api_url>/health` is the RTT probe.
+    #[serde(default)]
+    pub api_url: Option<String>,
+    /// Approximate geographic position of the node, for distance-based selection.
+    #[serde(default)]
+    pub location: Option<GeoLocation>,
     pub active_channels: u32,
     pub active_participants: u32,
     pub cpu_usage: f32,
@@ -576,6 +586,51 @@ impl MediaNodeInfo {
     pub fn is_available(&self) -> bool {
         self.healthy && self.load_factor() < 0.9
     }
+}
+
+/// WGS-84 coordinates in degrees.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+impl GeoLocation {
+    pub fn is_valid(&self) -> bool {
+        self.latitude.is_finite()
+            && self.longitude.is_finite()
+            && (-90.0..=90.0).contains(&self.latitude)
+            && (-180.0..=180.0).contains(&self.longitude)
+    }
+
+    /// Great-circle distance in kilometres (haversine, mean Earth radius).
+    pub fn distance_km(&self, other: &GeoLocation) -> f64 {
+        const EARTH_RADIUS_KM: f64 = 6371.0088;
+        let (lat1, lon1) = (self.latitude.to_radians(), self.longitude.to_radians());
+        let (lat2, lon2) = (other.latitude.to_radians(), other.longitude.to_radians());
+        let dlat = lat2 - lat1;
+        let dlon = lon2 - lon1;
+        let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+        2.0 * EARTH_RADIUS_KM * a.sqrt().asin()
+    }
+}
+
+/// One entry of region discovery: the least-loaded healthy node of a region that advertises a
+/// public WebSocket URL. Clients connect to `ws_url` and probe `probe_url` for RTT.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionEndpoint {
+    pub region: Region,
+    pub node_id: MediaNodeId,
+    pub ws_url: String,
+    /// `GET <probe_url>` is public, cheap and answered by exactly this node.
+    pub probe_url: Option<String>,
+    pub location: Option<GeoLocation>,
+    /// Distance from the client's declared location, when both are known.
+    pub distance_km: Option<f64>,
+    /// Healthy nodes advertising a WebSocket URL in this region.
+    pub nodes: u32,
+    /// `active_participants / capacity` of the selected node.
+    pub load_factor: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

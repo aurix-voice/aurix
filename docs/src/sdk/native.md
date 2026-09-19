@@ -87,6 +87,27 @@ Statistics: `aurix_client_stats` (`AurixStats`: media counters, `bad_auth`, `rep
 `aurix_client_network_quality` and the `NETWORK_QUALITY` event — see
 [Network quality](../features/quality.md).
 
+## Region selection
+
+The core has no HTTP client, so region discovery is split: the host performs the HTTP requests,
+the core parses, stores probe results and ranks — identically to the Web and Unity SDKs.
+
+1. `aurix_regions_discovery_url(api_url, preferred_region | NULL, has_location, lat, lon, buf, cap)`
+   → `GET` it with `Authorization: Bearer <player JWT>` (`/v1/me/regions`).
+2. `aurix_regions_parse(json)` → opaque `AurixRegionList` (`aurix_regions_len` / `aurix_regions_get`
+   fill `AurixRegionEndpoint`: `region`, `node_id`, `ws_url`, `probe_url`, coordinates,
+   `distance_km`, `nodes`, `load_factor`).
+3. Probe each `probe_url` (a few GETs, discard the first, keep the minimum) and record it with
+   `aurix_regions_set_rtt(list, i, rtt_ms)` — `-1.0` marks an unreachable node.
+4. `aurix_regions_rank(list, preferred_region | NULL, tolerance_ms)`: preferred region first
+   unless its probe failed → RTT in `tolerance_ms` buckets (ties keep the server's distance/load
+   order) → unprobed → failed (`probe_failed`).
+5. Use entry 0's `ws_url` as the WebSocket URL; `aurix_regions_free` when done.
+
+Rust: `aurix_client::regions::{discovery_url, parse_regions, rank_regions, ProbedRegion}`;
+C++: `aurix::Regions` (RAII: `discovery_url`, `parse`, `set_rtt`, `rank`, `all`). Server side:
+[Regions](../operations/scaling.md#regions).
+
 ## Unreal plugin
 
 `sdk/unreal/AurixVoice` is a runtime plugin for UE 5.3+ (Win64 / Linux / Mac). It contains no
@@ -143,6 +164,13 @@ through your mixer/ducking); or `PushCaptureAudio` from your own capture path an
 expose the shared quality model; `OnRawEvent` delivers every event as JSON for anything without
 a typed delegate. Events are dispatched from the subsystem tick, up to 256 per tick, nothing
 dropped.
+
+**Regions.** `DiscoverRegions(FAurixRegionDiscoveryRequest, OnComplete)` runs the whole flow
+above with the engine's `HTTP` module (bearer `GET /v1/me/regions`, optional probes with
+`ProbeSamples` / `ProbeTimeoutSeconds`, native ranking) and delivers a best-first
+`TArray<FAurixRegionEndpoint>` to a Blueprint delegate; put `Regions[0].WsUrl` into
+`FAurixVoiceSettings.WebSocketUrl`. `CancelRegionDiscovery()` drops an in-flight request; a new
+`DiscoverRegions` cancels the previous one.
 
 ### Verification status
 

@@ -1,0 +1,25 @@
+# One node behind an Ingress; secrets provided by an existing Secret. Rendering example only.
+replicaCount: 1
+hostNetwork: true
+existingSecret: aurix-secrets
+config:
+  externalUrl: https://voice.example.com
+  corsOrigins: [https://game.example.com]
+  trustedProxies: [10.0.0.0/8]
+  region: eu_central
+  location:
+    latitude: "50.11"
+    longitude: "8.68"
+  externalIpSource: static
+  externalIp: 203.0.113.10
+  turn:
+    realm: voice.example.com
+ingress:
+  enabled: true
+  className: nginx
+  host: voice.example.com
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  tls:
+    secretName: voice-example-com-tls

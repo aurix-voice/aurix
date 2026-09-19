@@ -1,0 +1,73 @@
+#!/bin/bash
+# Bootstraps one Aurix node: Docker, secrets from Secrets Manager, Caddy for TLS, systemd unit.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -q
+apt-get install -y -q ca-certificates curl gnupg jq awscli
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+apt-get update -q
+apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Kernel/network tuning for many small UDP flows.
+cat > /etc/sysctl.d/90-aurix.conf <<'SYSCTL'
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 16384
+net.ipv4.udp_mem = 262144 524288 1048576
+SYSCTL
+sysctl --system >/dev/null
+
+install -d -m 0750 /etc/aurix
+install -d -m 0750 -o 10001 -g 10001 /var/lib/aurix/recordings
+
+fleet=$(aws --region "${aws_region}" secretsmanager get-secret-value --secret-id "${secrets_arn}" --query SecretString --output text)
+pool=$(aws --region "${aws_region}" secretsmanager get-secret-value --secret-id "${pool_arn}" --query SecretString --output text)
+
+umask 077
+{
+%{ for k, v in env ~}
+  printf '%s=%s\n' '${k}' '${v}'
+%{ endfor ~}
+  printf 'AURIX__DATABASE__URL=%s\n' "$(jq -r .database_url <<<"$pool")"
+  printf 'AURIX__REDIS__URL=%s\n' "$(jq -r .redis_url <<<"$pool")"
+  printf 'AURIX__AUTH__JWT_SECRET=%s\n' "$(jq -r .jwt_secret <<<"$fleet")"
+  printf 'AURIX__TURN__AUTH_SECRET=%s\n' "$(jq -r .turn_secret <<<"$fleet")"
+  printf 'AURIX__MEDIA__CASCADE_SECRET=%s\n' "$(jq -r .cascade_secret <<<"$fleet")"
+  printf 'AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN=%s\n' "$(jq -r .admin_bootstrap_token <<<"$fleet")"
+} > /etc/aurix/aurix.env
+unset fleet pool
+umask 022
+
+cat > /etc/aurix/docker-compose.yml <<'COMPOSE'
+${compose}
+COMPOSE
+
+cat > /etc/aurix/Caddyfile <<'CADDY'
+${caddyfile}
+CADDY
+
+cat > /etc/systemd/system/aurix.service <<'UNIT'
+[Unit]
+Description=Aurix voice node (${node_host})
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/etc/aurix
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now aurix.service

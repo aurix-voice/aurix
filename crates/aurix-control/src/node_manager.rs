@@ -4,11 +4,22 @@ use aurix_db::models::MediaNodeRow;
 use aurix_db::DbPool;
 use chrono::Utc;
 use dashmap::DashMap;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 const STALE_NODE_RETENTION_SECS: i64 = 24 * 3600;
 const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
+
+/// What the caller knows about the client when asking for a region.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelectionHint {
+    /// Region the game prefers (matchmaking region, player setting). Wins when it has capacity.
+    pub region: Option<Region>,
+    /// Client's approximate coordinates (from the game's own geo data); ignored when invalid.
+    pub location: Option<GeoLocation>,
+}
 
 pub struct NodeManager {
     pool: DbPool,
@@ -69,6 +80,15 @@ impl NodeManager {
             media_port: row.media_port as u16,
             api_port: row.api_port as u16,
             cascade_port: row.cascade_port.map(|p| p as u16),
+            ws_url: row.ws_url.clone().filter(|u| !u.is_empty()),
+            api_url: row.api_url.clone().filter(|u| !u.is_empty()),
+            location: match (row.latitude, row.longitude) {
+                (Some(latitude), Some(longitude)) => Some(GeoLocation {
+                    latitude,
+                    longitude,
+                }),
+                _ => None,
+            },
             active_channels: row.active_channels.max(0) as u32,
             active_participants: row.active_participants.max(0) as u32,
             cpu_usage: row.cpu_usage as f32,
@@ -81,14 +101,18 @@ impl NodeManager {
         }
     }
 
-    pub async fn register_node(&self, info: MediaNodeInfo) -> Result<()> {
-        let row = MediaNodeRow {
+    fn row_from_info(info: &MediaNodeInfo) -> MediaNodeRow {
+        MediaNodeRow {
             id: info.id.0,
             region: info.region.as_str().to_string(),
             address: info.address.clone(),
             media_port: info.media_port as i32,
             api_port: info.api_port as i32,
             cascade_port: info.cascade_port.map(i32::from),
+            ws_url: info.ws_url.clone(),
+            api_url: info.api_url.clone(),
+            latitude: info.location.map(|l| l.latitude),
+            longitude: info.location.map(|l| l.longitude),
             capacity: info.capacity as i32,
             active_channels: info.active_channels as i32,
             active_participants: info.active_participants as i32,
@@ -100,7 +124,11 @@ impl NodeManager {
             version: env!("CARGO_PKG_VERSION").to_string(),
             last_heartbeat: Utc::now(),
             registered_at: Utc::now(),
-        };
+        }
+    }
+
+    pub async fn register_node(&self, info: MediaNodeInfo) -> Result<()> {
+        let row = Self::row_from_info(&info);
 
         aurix_db::queries::upsert_media_node(&self.pool, &row)
             .await
@@ -111,27 +139,8 @@ impl NodeManager {
     }
 
     pub async fn heartbeat(&self, node_id: MediaNodeId, info: MediaNodeInfo) -> Result<()> {
-        self.nodes.insert(node_id, info.clone());
-
-        let row = MediaNodeRow {
-            id: info.id.0,
-            region: info.region.as_str().to_string(),
-            address: info.address,
-            media_port: info.media_port as i32,
-            api_port: info.api_port as i32,
-            cascade_port: info.cascade_port.map(i32::from),
-            capacity: info.capacity as i32,
-            active_channels: info.active_channels as i32,
-            active_participants: info.active_participants as i32,
-            cpu_usage: info.cpu_usage as f64,
-            memory_usage: info.memory_usage as f64,
-            bandwidth_in_mbps: info.bandwidth_in_mbps as f64,
-            bandwidth_out_mbps: info.bandwidth_out_mbps as f64,
-            healthy: info.healthy,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            last_heartbeat: Utc::now(),
-            registered_at: Utc::now(),
-        };
+        let row = Self::row_from_info(&info);
+        self.nodes.insert(node_id, info);
 
         aurix_db::queries::upsert_media_node(&self.pool, &row)
             .await
@@ -170,6 +179,73 @@ impl NodeManager {
         }
 
         best.ok_or_else(|| AurixError::MediaNodeUnavailable("No available media nodes".into()))
+    }
+
+    /// Region discovery for clients. One entry per region that has at least one healthy,
+    /// non-saturated node advertising a public WebSocket URL; the entry carries that region's
+    /// least-loaded node. Ordered best-first: the preferred region (if it has capacity), then by
+    /// distance to the client's declared location (nodes without coordinates sort last), then
+    /// by load. Callers that can measure RTT should still probe `probe_url` and pick the lowest.
+    pub fn regions(&self, hint: &SelectionHint) -> Vec<RegionEndpoint> {
+        let mut per_region: HashMap<Region, (MediaNodeInfo, u32)> = HashMap::new();
+        for entry in self.nodes.iter() {
+            let node = entry.value();
+            let Some(ws_url) = node.ws_url.as_deref() else {
+                continue;
+            };
+            if ws_url.is_empty() || !node.is_available() {
+                continue;
+            }
+            match per_region.get_mut(&node.region) {
+                Some((best, count)) => {
+                    *count += 1;
+                    if node.load_factor() < best.load_factor() {
+                        *best = node.clone();
+                    }
+                }
+                None => {
+                    per_region.insert(node.region, (node.clone(), 1));
+                }
+            }
+        }
+
+        let client = hint.location.filter(GeoLocation::is_valid);
+        let mut endpoints: Vec<RegionEndpoint> = per_region
+            .into_values()
+            .map(|(node, count)| RegionEndpoint {
+                region: node.region,
+                node_id: node.id,
+                probe_url: node.api_url.as_deref().map(|api| format!("{api}/health")),
+                distance_km: match (client, node.location) {
+                    (Some(c), Some(n)) => Some(c.distance_km(&n)),
+                    _ => None,
+                },
+                location: node.location,
+                nodes: count,
+                load_factor: node.load_factor(),
+                ws_url: node.ws_url.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        endpoints.sort_by(|a, b| {
+            let pref = |e: &RegionEndpoint| hint.region != Some(e.region);
+            pref(a)
+                .cmp(&pref(b))
+                .then_with(|| match (a.distance_km, b.distance_km) {
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                })
+                .then_with(|| a.load_factor.total_cmp(&b.load_factor))
+                .then_with(|| a.region.as_str().cmp(b.region.as_str()))
+        });
+        endpoints
+    }
+
+    /// The best entry of [`Self::regions`], if any node is advertising an endpoint.
+    pub fn recommend(&self, hint: &SelectionHint) -> Option<RegionEndpoint> {
+        self.regions(hint).into_iter().next()
     }
 
     pub fn get_all_nodes(&self) -> Vec<MediaNodeInfo> {
@@ -226,5 +302,190 @@ impl NodeManager {
                 info!("Pruned stale media node {node_id}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> NodeManager {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        NodeManager::new(pool)
+    }
+
+    fn node(region: Region, ws: Option<&str>, load: u32, loc: Option<(f64, f64)>) -> MediaNodeInfo {
+        MediaNodeInfo {
+            id: MediaNodeId::new(),
+            region,
+            address: "10.0.0.1".into(),
+            media_port: 10000,
+            api_port: 8080,
+            cascade_port: None,
+            ws_url: ws.map(str::to_string),
+            api_url: ws.map(|_| format!("https://{}.example", region.as_str())),
+            location: loc.map(|(latitude, longitude)| GeoLocation {
+                latitude,
+                longitude,
+            }),
+            active_channels: 0,
+            active_participants: load,
+            cpu_usage: 0.0,
+            memory_usage: 0.0,
+            bandwidth_in_mbps: 0.0,
+            bandwidth_out_mbps: 0.0,
+            healthy: true,
+            last_heartbeat: Utc::now(),
+            capacity: 100,
+        }
+    }
+
+    fn insert(m: &NodeManager, n: MediaNodeInfo) -> MediaNodeId {
+        let id = n.id;
+        m.nodes.insert(id, n);
+        id
+    }
+
+    #[tokio::test]
+    async fn only_nodes_with_ws_url_and_capacity_are_advertised() {
+        let m = manager();
+        insert(&m, node(Region::EuWest, None, 0, None));
+        insert(
+            &m,
+            node(Region::UsEast, Some("wss://us.example/ws"), 95, None),
+        );
+        let mut unhealthy = node(Region::UsWest, Some("wss://usw.example/ws"), 0, None);
+        unhealthy.healthy = false;
+        insert(&m, unhealthy);
+        assert!(m.regions(&SelectionHint::default()).is_empty());
+        assert!(m.recommend(&SelectionHint::default()).is_none());
+    }
+
+    #[tokio::test]
+    async fn least_loaded_node_per_region_and_node_count() {
+        let m = manager();
+        insert(
+            &m,
+            node(Region::EuWest, Some("wss://eu1.example/ws"), 50, None),
+        );
+        let best = insert(
+            &m,
+            node(Region::EuWest, Some("wss://eu2.example/ws"), 10, None),
+        );
+        let regions = m.regions(&SelectionHint::default());
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].node_id, best);
+        assert_eq!(regions[0].nodes, 2);
+        assert_eq!(regions[0].ws_url, "wss://eu2.example/ws");
+        assert_eq!(
+            regions[0].probe_url.as_deref(),
+            Some("https://eu-west.example/health")
+        );
+        assert!((regions[0].load_factor - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn preferred_region_wins_then_distance_then_load() {
+        let m = manager();
+        // Frankfurt, Virginia, Sydney, plus a region without coordinates.
+        insert(
+            &m,
+            node(
+                Region::EuCentral,
+                Some("wss://eu/ws"),
+                80,
+                Some((50.11, 8.68)),
+            ),
+        );
+        insert(
+            &m,
+            node(Region::UsEast, Some("wss://us/ws"), 5, Some((38.9, -77.0))),
+        );
+        insert(
+            &m,
+            node(
+                Region::Australia,
+                Some("wss://au/ws"),
+                1,
+                Some((-33.87, 151.21)),
+            ),
+        );
+        insert(&m, node(Region::Africa, Some("wss://af/ws"), 0, None));
+
+        // Client in Paris, no preference: nearest first, coordinate-less region last.
+        let paris = SelectionHint {
+            region: None,
+            location: Some(GeoLocation {
+                latitude: 48.85,
+                longitude: 2.35,
+            }),
+        };
+        let order: Vec<Region> = m.regions(&paris).iter().map(|r| r.region).collect();
+        assert_eq!(
+            order,
+            vec![
+                Region::EuCentral,
+                Region::UsEast,
+                Region::Australia,
+                Region::Africa
+            ]
+        );
+        let eu = &m.regions(&paris)[0];
+        let d = eu.distance_km.expect("distance");
+        assert!(
+            (400.0..600.0).contains(&d),
+            "Paris–Frankfurt ≈ 480 km, got {d}"
+        );
+
+        // Preferred region beats distance.
+        let prefer_au = SelectionHint {
+            region: Some(Region::Australia),
+            ..paris
+        };
+        assert_eq!(m.recommend(&prefer_au).unwrap().region, Region::Australia);
+
+        // Without a location: load order, and a saturated preferred region is skipped.
+        let by_load: Vec<Region> = m
+            .regions(&SelectionHint::default())
+            .iter()
+            .map(|r| r.region)
+            .collect();
+        assert_eq!(
+            by_load,
+            vec![
+                Region::Africa,
+                Region::Australia,
+                Region::UsEast,
+                Region::EuCentral
+            ]
+        );
+        insert(
+            &m,
+            node(Region::SouthAmerica, Some("wss://sa/ws"), 99, None),
+        );
+        let hint = SelectionHint {
+            region: Some(Region::SouthAmerica),
+            location: None,
+        };
+        assert_eq!(m.recommend(&hint).unwrap().region, Region::Africa);
+    }
+
+    #[tokio::test]
+    async fn invalid_client_location_is_ignored() {
+        let m = manager();
+        insert(
+            &m,
+            node(Region::EuWest, Some("wss://eu/ws"), 0, Some((51.5, -0.12))),
+        );
+        let hint = SelectionHint {
+            region: None,
+            location: Some(GeoLocation {
+                latitude: 200.0,
+                longitude: 0.0,
+            }),
+        };
+        assert!(m.recommend(&hint).unwrap().distance_km.is_none());
     }
 }

@@ -175,6 +175,41 @@ jobs:
       - run: mdbook build docs
       - run: test -f docs/book/api/openapi.json && test -f docs/book/index.html
 
+  deploy:
+    name: Helm chart + Terraform example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Helm lint + template (every ci/ values file)
+        working-directory: deploy/helm/aurix
+        run: |
+          set -e
+          for values in ci/*.yaml; do
+            helm lint . --strict -f "$values"
+            helm template aurix . -f "$values" > /dev/null
+          done
+      - name: kubeconform (rendered manifests)
+        working-directory: deploy/helm/aurix
+        run: |
+          set -e
+          curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          for values in ci/*.yaml; do
+            helm template aurix . -f "$values" \
+              | ./kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.29.0
+          done
+      - name: Terraform fmt + validate
+        working-directory: deploy/terraform/aws
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
   docker:
     name: docker build + healthcheck
     runs-on: ubuntu-latest

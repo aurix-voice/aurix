@@ -63,10 +63,29 @@ reachability on `media.port + 1`/UDP.
 ## Regions
 
 `server.region` (`us_east`, `us_west`, `eu_west`, `eu_central`, `asia_pacific`, `south_america`,
-`australia`, `middle_east`, `africa`) is stored per node and reported in `GET /v1/nodes`. Today
-the client talks to whichever node its WebSocket reached, so **region placement is done at the
-load balancer / DNS layer** (a regional hostname per pool of nodes); cross-region channels work
-through cascade. Node selection by geography inside Aurix is a roadmap item.
+`australia`, `middle_east`, `africa`) is stored per node and reported in `GET /v1/nodes`. Nodes
+also advertise their public endpoints (`server.external_ws_url`, or `wss://…/ws` derived from
+`server.external_url`; the REST base URL; optional `server.location` coordinates), and the
+registry turns that into **region discovery**:
+
+* `GET /v1/regions` (API key) and `GET /v1/me/regions` (player JWT) return one entry per region
+  that has a healthy, non-saturated node with a public WebSocket URL: the least-loaded node's
+  `ws_url`, a `probe_url` (`<api_url>/health`), the node's coordinates, `nodes` available,
+  `load_factor` and, when the caller sent `latitude`/`longitude`, `distance_km`. Order:
+  requested `region` first, then distance, then load. Nodes without an advertised `wss://` URL
+  (plain `http` `external_url` in production, or none) still serve traffic — they are simply
+  not offered.
+* `POST /v1/tokens` accepts the same `region` / `location` hints and returns the chosen
+  `endpoint`, so a backend that knows where the player is can hand the SDK a node directly.
+* SDKs ([Web](../sdk/web.md#region-selection), [Unity](../sdk/unity.md#region-selection),
+  [native / Unreal](../sdk/native.md#region-selection)) probe each `probe_url` over HTTP and
+  rank by measured RTT, so a mis-set `location` or a routing detour is corrected client-side.
+
+Discovery returns **node** URLs rather than a regional balancer on purpose: sessions and resume
+are node-local (above), so the client should connect where it will reconnect. Put a per-node
+DNS name and TLS certificate in front of every node (the Helm chart and Terraform example do
+this) and keep the shared hostname for the REST API. Cross-region channels still work through
+cascade — with WAN latency between the nodes, so let players of one party land in one region.
 
 ## Capacity
 

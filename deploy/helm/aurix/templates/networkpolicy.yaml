@@ -1,0 +1,42 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aurix.fullname" . }}
+  labels:
+    {{- include "aurix.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aurix.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: api
+          protocol: TCP
+        - port: ws
+          protocol: TCP
+      {{- with .Values.networkPolicy.apiFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    - ports:
+        - port: metrics
+          protocol: TCP
+      {{- with .Values.networkPolicy.metricsFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    # UDP media, cascade and TURN are open: players and peer nodes come from the internet.
+    - ports:
+        - port: media
+          protocol: UDP
+        - port: cascade
+          protocol: UDP
+        {{- if .Values.config.turn.enabled }}
+        - port: turn-udp
+          protocol: UDP
+        - port: turn-tcp
+          protocol: TCP
+        {{- end }}
+{{- end }}

@@ -428,3 +428,102 @@ struct AURIXVOICE_API FAurixStats
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int32 ActiveStreams = 0;
 };
+
+/** Parameters for UAurixVoiceSubsystem::DiscoverRegions (GET /v1/me/regions + optional RTT probes). */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixRegionDiscoveryRequest
+{
+	GENERATED_BODY()
+
+	/** Base REST URL of any node or the shared API name, e.g. https://voice.example.com */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	FString ApiUrl;
+
+	/** The player's session JWT; discovery is player-scoped. Never bake tokens into assets. */
+	UPROPERTY(BlueprintReadWrite, Category = "Aurix")
+	FString Token;
+
+	/** Region to put first when it is reachable (for example the party leader's region). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	FString PreferredRegion;
+
+	/** Send Latitude/Longitude so the server can order regions by distance. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bHasLocation = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	double Latitude = 0.0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	double Longitude = 0.0;
+
+	/** Measure HTTP round-trip time to each region's probe URL and rank by it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Probe")
+	bool bProbe = true;
+
+	/** Successful samples per region (one extra warm-up request is discarded). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Probe")
+	int32 ProbeSamples = 3;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Probe")
+	float ProbeTimeoutSeconds = 2.f;
+
+	/** Regions whose RTT differs by less than this keep the server's order. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Probe")
+	float RttToleranceMs = 15.f;
+};
+
+/** One region as advertised by the server, plus the local probe result. Pass WsUrl to Connect. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixRegionEndpoint
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString Region;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid NodeId;
+
+	/** Public WebSocket URL of the least-loaded node in the region (sessions are node-local). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString WsUrl;
+
+	/** HTTP URL suitable for RTT probing; empty when the node advertises none. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString ProbeUrl;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bHasLocation = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	double Latitude = 0.0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	double Longitude = 0.0;
+
+	/** Great-circle distance from the location sent with the request. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bHasDistance = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float DistanceKm = 0.f;
+
+	/** Healthy nodes with spare capacity in the region. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 Nodes = 0;
+
+	/** Load of the advertised node, 0..1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float LoadFactor = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bHasRtt = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RttMs = 0.f;
+
+	/** Every probe of this region failed; such regions rank last. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bProbeFailed = false;
+};

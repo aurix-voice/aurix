@@ -1,0 +1,216 @@
+# Default values for the Aurix chart.
+#
+# Deployment shape: one StatefulSet, one pod per Kubernetes node (required anti-affinity).
+# Every pod is a full Aurix node: REST + WebSocket + SFU (+ TURN). Players must reach a
+# node's UDP media port *directly*, so media and TURN bind on the node's network
+# (hostNetwork or hostPort) and each node needs a public IP and its own hostname.
+#
+# The defaults deliberately do not render: `config.externalUrl`, `config.corsOrigins`,
+# `config.externalIp` and `secrets` (or `existingSecret`) are required. `ci/*-values.yaml`
+# are complete examples (`helm template aurix . -f ci/single-node-values.yaml`).
+
+image:
+  # Build with `docker build -t <registry>/aurix-server:<tag> .` from the repository root
+  # and push it to your registry.
+  repository: aurix-server
+  # Defaults to .Chart.AppVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Nodes per release. Each pod must land on a different Kubernetes node (see affinity).
+replicaCount: 1
+
+# hostNetwork: the pod uses the node's network namespace, so UDP media, cascade and TURN
+# (including the relay port range) are reachable on the node's IP with no extra mapping.
+# Recommended for production; the API/WS ports bind on the node too, so keep them
+# firewalled and reach them through the Service/Ingress.
+# With hostNetwork=false the UDP ports are published with hostPort (one pod per node),
+# and the TURN relay range is NOT reachable - keep TURN disabled or use hostNetwork.
+hostNetwork: false
+
+ports:
+  api: 8080
+  ws: 8081
+  media: 10000        # native AURX + WebRTC ICE, UDP. Cascade uses media + 1.
+  turn: 3478          # UDP + TCP
+  metrics: 4040
+
+config:
+  # Public base URL of the API. In production the node advertises wss://<host>/ws derived
+  # from it. Prefer a per-node value, see perNode.
+  externalUrl: ""
+  # Explicit public WebSocket URL of this node (overrides the derived one). Supports
+  # $(POD_NAME) expansion, e.g. "wss://$(POD_NAME).voice.example.com/ws".
+  externalWsUrl: ""
+  # Allowed browser origins (list). Wildcard is rejected in production.
+  corsOrigins: []
+  # CIDRs of the ingress controller / load balancer whose X-Forwarded-For is trusted.
+  trustedProxies: []
+  # Region label of this release: us_east, us_west, eu_west, eu_central, asia_pacific,
+  # south_america, australia, middle_east, africa.
+  region: us_east
+  # Optional WGS-84 coordinates of the site, used by region discovery to order regions by
+  # distance. Leave empty to skip distance ordering.
+  location:
+    latitude: ""
+    longitude: ""
+  # Public IP players send media to.
+  #   static: use config.externalIp for every pod (only sensible with replicaCount=1) or
+  #           the per-ordinal list config.externalIps
+  #   hostIP: the Kubernetes node's status.hostIP (works when nodes have public addresses)
+  #   script: run config.externalIpScript in an init container; it must print the IP
+  externalIpSource: static
+  externalIp: ""
+  externalIps: []
+  # Example for AWS IMDSv2; GCP: curl -fsS -H 'Metadata-Flavor: Google'
+  #   http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip
+  externalIpScript: |
+    TOKEN=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+    curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4
+  logLevel: info
+  turn:
+    enabled: true
+    realm: ""
+    minPort: 49152
+    maxPort: 65535
+  recording:
+    enabled: false
+    # Requires secrets.recordingEncryptionKey (or the key in existingSecret).
+    encryptionEnabled: false
+    # Shared object storage lets recordings survive pod moves and be served from any node.
+    s3:
+      bucket: ""
+      region: ""
+      endpoint: ""
+  # Any additional AURIX__* variables (non-secret). Example:
+  #   AURIX__MEDIA__MAX_PARTICIPANTS_PER_NODE: "20000"
+  extraEnv: {}
+
+# Secret material. Either set `existingSecret` to a Secret that already carries the keys
+# below, or fill `secrets` and let the chart create one (values end up in your release
+# history - prefer existingSecret with an external secret manager in production).
+existingSecret: ""
+secrets:
+  # postgres://user:password@host:5432/aurix
+  databaseUrl: ""
+  # redis://host:6379 or rediss://...
+  redisUrl: ""
+  # >= 32 random bytes: openssl rand -base64 48
+  jwtSecret: ""
+  turnAuthSecret: ""
+  # Same on every node in every region; enables SFU-to-SFU cascade.
+  cascadeSecret: ""
+  # One-time token for POST /admin/setup; remove after the first admin exists.
+  adminBootstrapToken: ""
+  recordingEncryptionKey: ""
+  s3AccessKey: ""
+  s3SecretKey: ""
+
+# Runs `aurix-server --migrate-only` as a pre-install/pre-upgrade hook so the pods never
+# race on the schema.
+migrations:
+  enabled: true
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+
+# Per-node hostnames: <pod>.<domain> gets its own Service and Ingress rule so region
+# discovery and session resume address exactly one node. Requires DNS for the hosts.
+perNode:
+  enabled: false
+  domain: ""
+  # Sets config.externalUrl / externalWsUrl per pod when true.
+  setExternalUrls: true
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # Shared hostname for the REST API (the WebSocket is served on the same host under /ws).
+  host: ""
+  tls:
+    enabled: true
+    secretName: ""
+
+persistence:
+  # Local recordings volume per pod (volumeClaimTemplate). Irrelevant when recordings are
+  # disabled or S3 is configured.
+  enabled: false
+  storageClass: ""
+  size: 20Gi
+  accessModes: [ReadWriteOnce]
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 1Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+networkPolicy:
+  # Restricts ingress to the API/WS/metrics ports from selected namespaces/pods; UDP media on
+  # the host network is outside its reach.
+  enabled: false
+  apiFrom: []
+  metricsFrom: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+terminationGracePeriodSeconds: 60
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+# Required one-pod-per-node anti-affinity is always added; extra rules go here.
+affinity: {}
+topologySpreadConstraints: []
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: api
+  initialDelaySeconds: 10
+  periodSeconds: 15
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: api
+  initialDelaySeconds: 5
+  periodSeconds: 10

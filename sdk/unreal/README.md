@@ -89,6 +89,9 @@ files and build. The plugin enables the engine's `AudioCapture` plugin as a depe
    `On Recovering` / `On Recovered` / `On Failed To Recover` for connection UI.
 5. For a positional channel call **Update Own Position** every tick (or on movement) with the
    listener's location and rotation; `WorldToMeters` converts Unreal units (default 100 uu/m).
+6. Optional, before **Connect**: **Discover Regions** with `Aurix Region Discovery Request`
+   (Api Url, Token, optional Preferred Region / coordinates) and, in the completion delegate,
+   take `Regions[0].WsUrl` as the WebSocket URL — see *Choosing a region* below.
 
 ### C++
 
@@ -157,6 +160,39 @@ stops capture, unbinds the sound wave and only then destroys the client.
 uplink loss/jitter/bitrate the SFU measured); `OnNetworkQuality` fires when the server's bars
 change. Bars use the same thresholds on every SDK and the server, so a HUD can show either.
 
+### Choosing a region
+
+Session resume is node-local, so a player should connect to the nearest node with capacity and
+keep its direct URL. Either use the `endpoint.ws_url` your backend receives from
+`POST /v1/tokens`, or let the client measure:
+
+```cpp
+FAurixRegionDiscoveryRequest Req;
+Req.ApiUrl = TEXT("https://voice.example.com");   // any node / shared API hostname
+Req.Token = Jwt;                                  // player JWT → GET /v1/me/regions
+Req.PreferredRegion = PartyLeaderRegion;          // optional: ranks first when reachable
+Req.bHasLocation = true; Req.Latitude = 48.9; Req.Longitude = 2.3;   // optional
+// Req.bProbe = true (default): GET each region's probe URL ProbeSamples times, best RTT wins
+
+FAurixRegionsDiscovered OnDone;
+OnDone.BindDynamic(this, &AMyPlayerController::OnRegions);   // OnRegions must be a UFUNCTION()
+Voice->DiscoverRegions(Req, OnDone);
+
+void AMyPlayerController::OnRegions(bool bSuccess, const TArray<FAurixRegionEndpoint>& Regions, const FString& Error)
+{
+	if (!bSuccess || Regions.IsEmpty()) { /* fall back to the configured URL */ return; }
+	Settings.WebSocketUrl = Regions[0].WsUrl;     // Regions[0].Region, RttMs, Nodes, LoadFactor for UI
+	Voice->Connect(Settings);
+}
+```
+
+Discovery uses the engine `HTTP` module (the plugin depends on it); parsing and ranking are done
+by the native core, so the policy matches the Web and Unity SDKs: preferred region unless its
+probe failed → RTT in `RttToleranceMs` buckets (ties keep the server's distance/load order) →
+unprobed → `bProbeFailed`. `CancelRegionDiscovery()` aborts an in-flight discovery; starting a new
+one cancels the previous; the subsystem cancels on shutdown. Only healthy nodes with a public
+`wss://` URL are returned; an empty array means no node is configured for discovery.
+
 ### Events
 
 Typed delegates cover connection state, session, media binding, channel/participant roster,
@@ -177,13 +213,16 @@ What has been verified in this repository:
   `libaurix_client.so`), headers and library land in the expected ThirdParty layout.
 * `cargo test -p aurix-client --test c_abi` includes `unreal_plugin_uses_only_existing_abi`,
   which parses the `.uplugin`, checks the module/Build.cs layout and verifies that every
-  `aurix_*` function, `AURIX_*` constant and `aurix::Client` method the plugin sources call is
-  declared in the committed headers — ABI drift breaks CI, not the game build.
+  `aurix_*` function, `AURIX_*` constant and `aurix::Client` / `aurix::Regions` method the
+  plugin sources call is declared in the committed headers — ABI drift breaks CI, not the game
+  build.
 
 What has **not** been run here, because no Unreal Engine installation is available in the
 development environment: Unreal Header Tool and the actual module compile on UE 5.3+, the
 `AudioCaptureCore` stream callback signature (`Audio::FOnAudioCaptureFunction`,
 `OpenAudioCaptureStream`) and `USoundWaveProcedural::GeneratePCMData` semantics against a live
-engine, packaging on Windows/macOS. Treat the first build in your project as a required
+engine, the `HTTP` module request/response API used by `AurixRegionDiscovery.cpp`, packaging on
+Windows/macOS. Treat the first build in your project as a required
 verification step; the plugin sources are small and any mismatch surfaces as a compile error
-in one of the two bridge files (`AurixAudioCapture.cpp`, `AurixVoiceSoundWave.cpp`).
+in one of the three bridge files (`AurixAudioCapture.cpp`, `AurixVoiceSoundWave.cpp`,
+`AurixRegionDiscovery.cpp`).

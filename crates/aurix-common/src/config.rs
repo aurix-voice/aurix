@@ -63,6 +63,7 @@ impl AurixConfig {
         clean(&mut self.server.trusted_proxies);
         clean(&mut self.media.cascade_peers);
         for opt in [
+            &mut self.server.external_ws_url,
             &mut self.media.external_ip,
             &mut self.turn.external_ip,
             &mut self.media.cascade_secret,
@@ -298,6 +299,25 @@ impl AurixConfig {
             if self.database.url.contains("aurix:aurix@") {
                 anyhow::bail!("database.url uses the development default credentials; set real credentials in production");
             }
+            if let Some(ws) = &self.server.external_ws_url {
+                if !ws.trim().starts_with("wss://") {
+                    anyhow::bail!("server.external_ws_url must use wss:// in production");
+                }
+            }
+        }
+        if let Some(ws) = &self.server.external_ws_url {
+            let parsed = url::Url::parse(ws)
+                .map_err(|e| anyhow::anyhow!("server.external_ws_url is not a valid URL: {e}"))?;
+            if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
+                anyhow::bail!("server.external_ws_url must be a ws:// or wss:// URL with a host");
+            }
+        }
+        if let Some(loc) = &self.server.location {
+            if !loc.is_valid() {
+                anyhow::bail!(
+                    "server.location must be latitude within -90..=90 and longitude within -180..=180"
+                );
+            }
         }
         Ok(())
     }
@@ -322,6 +342,15 @@ pub struct ServerConfig {
     pub region: Region,
     pub node_id: Option<String>,
     pub external_url: String,
+    /// Public WebSocket URL of *this* node (`wss://eu1.voice.example.com/ws`), advertised to
+    /// clients by region discovery. Derived from `external_url` (`http→ws`, `https→wss`,
+    /// explicit port → `ws_port`, path `/ws`) when unset. Point it at the node itself, not at
+    /// a shared load balancer: session resume must reach the node that holds the session.
+    #[serde(default)]
+    pub external_ws_url: Option<String>,
+    /// Approximate coordinates of the node for distance-based region selection.
+    #[serde(default)]
+    pub location: Option<crate::types::GeoLocation>,
     pub cors_origins: Vec<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
@@ -356,6 +385,45 @@ fn default_session_resume_grace_secs() -> u64 {
     30
 }
 
+impl ServerConfig {
+    /// Public WebSocket URL advertised to clients: `external_ws_url`, or one derived from
+    /// `external_url` (`http→ws`, `https→wss`, an explicit port becomes `ws_port`, path `/ws`).
+    /// `None` when `external_url` is not a parseable http(s) URL, or when the derived URL
+    /// would be plain `ws://` in production (browsers on https pages cannot use it, and it
+    /// would leak tokens): such a node still serves, it is just not offered by discovery.
+    pub fn advertised_ws_url(&self, production: bool) -> Option<String> {
+        if let Some(explicit) = self.external_ws_url.as_deref() {
+            let trimmed = explicit.trim();
+            return (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
+        let mut url = url::Url::parse(self.external_url.trim()).ok()?;
+        let scheme = match url.scheme() {
+            "http" if !production => "ws",
+            "https" => "wss",
+            _ => return None,
+        };
+        url.host_str()?;
+        let had_port = url.port().is_some();
+        url.set_scheme(scheme).ok()?;
+        if had_port {
+            url.set_port(Some(self.ws_port)).ok()?;
+        }
+        url.set_path("/ws");
+        url.set_query(None);
+        url.set_fragment(None);
+        Some(url.to_string())
+    }
+
+    /// Public REST base URL of this node without a trailing slash, if `external_url` parses.
+    pub fn advertised_api_url(&self) -> Option<String> {
+        let url = url::Url::parse(self.external_url.trim()).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return None;
+        }
+        Some(url.to_string().trim_end_matches('/').to_string())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -365,6 +433,8 @@ impl Default for ServerConfig {
             region: Region::UsEast,
             node_id: None,
             external_url: "http://localhost:8080".into(),
+            external_ws_url: None,
+            location: None,
             cors_origins: vec!["http://localhost:3000".into()],
             tls_cert_path: None,
             tls_key_path: None,
@@ -1242,6 +1312,72 @@ mod tests {
         assert!(err.contains("cors_origins"), "{err}");
 
         cfg.server.cors_origins = vec!["https://game.example.com".into()];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn advertised_urls_derive_from_external_url() {
+        let mut cfg = dev_config();
+        assert_eq!(
+            cfg.server.advertised_ws_url(false).as_deref(),
+            Some("ws://localhost:8081/ws")
+        );
+        assert_eq!(
+            cfg.server.advertised_api_url().as_deref(),
+            Some("http://localhost:8080")
+        );
+        // Plain http is never advertised as ws:// in production.
+        assert_eq!(cfg.server.advertised_ws_url(true), None);
+
+        cfg.server.external_url = "https://eu1.voice.example.com/".into();
+        assert_eq!(
+            cfg.server.advertised_ws_url(true).as_deref(),
+            Some("wss://eu1.voice.example.com/ws")
+        );
+        assert_eq!(
+            cfg.server.advertised_api_url().as_deref(),
+            Some("https://eu1.voice.example.com")
+        );
+
+        cfg.server.external_ws_url = Some("wss://ws.example.com:4443/voice".into());
+        assert_eq!(
+            cfg.server.advertised_ws_url(true).as_deref(),
+            Some("wss://ws.example.com:4443/voice")
+        );
+        assert!(cfg.validate().is_ok());
+
+        cfg.server.external_ws_url = Some("https://not-a-ws-url".into());
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("external_ws_url"));
+
+        cfg.server.external_ws_url = None;
+        cfg.server.location = Some(crate::types::GeoLocation {
+            latitude: 91.0,
+            longitude: 0.0,
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("server.location"));
+    }
+
+    #[test]
+    fn production_requires_wss_for_explicit_ws_url() {
+        let mut cfg = dev_config();
+        cfg.server.environment = "production".into();
+        cfg.turn.enabled = false;
+        cfg.media.external_ip = Some("203.0.113.10".into());
+        cfg.database.url = "postgres://prod:s3cret@db/aurix".into();
+        cfg.auth.jwt_secret = "a".repeat(48);
+        cfg.server.cors_origins = vec!["https://game.example.com".into()];
+        cfg.server.external_ws_url = Some("ws://eu1.voice.example.com/ws".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("wss://"), "{err}");
+        cfg.server.external_ws_url = Some("wss://eu1.voice.example.com/ws".into());
         assert!(cfg.validate().is_ok());
     }
 

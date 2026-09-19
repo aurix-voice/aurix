@@ -1,0 +1,28 @@
+services:
+  aurix:
+    image: ${image}
+    restart: unless-stopped
+    network_mode: host
+    env_file: /etc/aurix/aurix.env
+    volumes:
+      - /var/lib/aurix/recordings:/var/lib/aurix/recordings
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: journald
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /etc/aurix/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging:
+      driver: journald
+volumes:
+  caddy-data:
+  caddy-config:

@@ -4,6 +4,13 @@ api_port = 8080
 ws_port = 8081
 region = "us_east"
 external_url = "http://localhost:8080"
+# Public WebSocket URL of *this* node for region discovery (GET /v1/regions, /v1/me/regions,
+# `endpoint` in POST /v1/tokens). Derived from external_url when unset (https -> wss, /ws);
+# plain http is never advertised as ws:// in production. Point it at the node itself, not a
+# shared load balancer: session resume must land on the node that holds the session.
+# external_ws_url = "wss://eu1.voice.example.com/ws"
+# Approximate node coordinates (WGS-84) for distance-based ordering of regions.
+# location = { latitude = 50.11, longitude = 8.68 }
 cors_origins = ["*"]
 
 [database]

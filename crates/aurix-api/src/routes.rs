@@ -89,6 +89,7 @@ pub fn create_router(state: AppState) -> Router {
     let api_routes = Router::new()
         .route("/v1/tokens", post(handlers::generate_token))
         .route("/v1/tokens/action", post(handlers::generate_action_token))
+        .route("/v1/regions", get(handlers::list_regions))
         .route("/v1/turn/credentials", post(handlers::get_turn_credentials))
         .route(
             "/v1/channels",
@@ -240,6 +241,7 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/me/turn-credentials",
             get(handlers::get_turn_credentials_self),
         )
+        .route("/v1/me/regions", get(handlers::list_regions_self))
         .route("/v1/me/reports", post(handlers::report_user_self))
         .route(
             "/v1/me/recordings/:recording_id/consent",

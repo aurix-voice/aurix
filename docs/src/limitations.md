@@ -53,9 +53,16 @@ the chapter that explains the boundary.
   bans, session registry); a client hopping between nodes can exceed a per-node limit.
 * **TLS**: native rustls with PEM files, or terminate at your proxy; ACME/auto-renewal is left to
   the proxy ([Deployment](operations/deployment.md)).
+* **Region discovery is per node, not per player location service**: nodes are placed by
+  `server.region` / `server.location`, and the server orders by preference, distance to the
+  coordinates the client sends, and load; the client-side RTT probe is what actually picks the
+  nearest node. Discovery hands out a node's own `wss://` URL, so every node needs a public
+  hostname and certificate ([Regions](operations/scaling.md#regions)).
 
 ## Not verified in this repository's CI
 
+* **Helm chart and Terraform example** are linted, rendered, schema-validated (`kubeconform`)
+  and `terraform validate`d in CI, but not applied against a live cluster or AWS account.
 * **Unreal plugin compile.** The `AurixVoice` plugin is checked against the C ABI header and
   the native library builds on Linux, but Unreal Header Tool and a real engine compile have not
   run — the first build in your project is the verification step ([Native core and
@@ -69,7 +76,6 @@ the chapter that explains the boundary.
 
 ## Planned
 
-Helm chart and Terraform example, geographic node selection for players, Opus
-complexity/bandwidth controls with an optional native libopus binding, safety adapters
+Opus complexity/bandwidth controls with an optional native libopus binding, safety adapters
 (STT → toxicity, evidence export), PCMU fallback, and ambient/radius visibility. The operator web
 panel is tracked separately.

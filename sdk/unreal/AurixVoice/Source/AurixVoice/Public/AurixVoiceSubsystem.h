@@ -9,6 +9,7 @@
 class UAudioComponent;
 class UAurixVoiceSoundWave;
 class FAurixAudioCapture;
+class FAurixRegionDiscovery;
 struct FAurixNativeClient;
 struct AurixEvent;
 
@@ -42,6 +43,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRecovering, int32, Attempt,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRecovered, bool, bResumed);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixConnectionEnded, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRawEvent, const FString&, Json);
+DECLARE_DYNAMIC_DELEGATE_ThreeParams(FAurixRegionsDiscovered, bool, bSuccess, const TArray<FAurixRegionEndpoint>&, Regions, const FString&, Error);
 
 /**
  * One voice session per game instance: connects to an Aurix node with the player's JWT, binds
@@ -263,6 +265,22 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice")
 	bool GetNetworkQuality(FAurixNetworkQuality& OutQuality) const;
 
+	// ---- regions ---------------------------------------------------------------------------
+
+	/**
+	 * Fetch the regions the player may connect to (GET /v1/me/regions with the player's JWT),
+	 * optionally probe each region's RTT over HTTP and return them best-first: the preferred
+	 * region when reachable, then by RTT (server order within RttToleranceMs), unprobed regions,
+	 * unreachable ones last. Connect with Regions[0].WsUrl. Runs asynchronously; OnComplete fires
+	 * on the game thread. Only one discovery runs at a time — a new call cancels the previous one.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Regions")
+	void DiscoverRegions(const FAurixRegionDiscoveryRequest& Request, FAurixRegionsDiscovered OnComplete);
+
+	/** Abort an in-flight DiscoverRegions; its OnComplete is not called. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Regions")
+	void CancelRegionDiscovery();
+
 	// ---- events ----------------------------------------------------------------------------
 
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixStateChanged OnConnectionStateChanged;
@@ -316,6 +334,7 @@ private:
 
 	TUniquePtr<FAurixNativeClient> Native;
 	TUniquePtr<FAurixAudioCapture> Capture;
+	TSharedPtr<FAurixRegionDiscovery> RegionDiscovery;
 	FAurixVoiceSettings ActiveSettings;
 
 	UPROPERTY(Transient)

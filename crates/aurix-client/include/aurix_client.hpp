@@ -309,6 +309,73 @@ private:
     AurixClient* c_;
 };
 
+/// Region discovery (`GET /v1/me/regions`): the host fetches the JSON with its own HTTP client,
+/// parses it here, records one RTT per region and ranks. Entry 0 after `rank()` is the node to
+/// connect to (`ws_url` → `Config::ws_url`). Move-only.
+class Regions {
+public:
+    /// Request URL with optional preferred region and location hints (empty string = none).
+    static std::string discovery_url(const std::string& api_url, const std::string& preferred_region,
+                                     const double* latitude = nullptr, const double* longitude = nullptr) {
+        const bool has_loc = latitude != nullptr && longitude != nullptr;
+        const char* pref = preferred_region.empty() ? nullptr : preferred_region.c_str();
+        const std::size_t n = aurix_regions_discovery_url(api_url.c_str(), pref, has_loc, has_loc ? *latitude : 0.0,
+                                                          has_loc ? *longitude : 0.0, nullptr, 0);
+        if (n == 0) {
+            return std::string();
+        }
+        std::string out(n + 1, '\0');
+        aurix_regions_discovery_url(api_url.c_str(), pref, has_loc, has_loc ? *latitude : 0.0,
+                                    has_loc ? *longitude : 0.0, &out[0], out.size());
+        out.resize(n);
+        return out;
+    }
+
+    /// Parse a response body; `valid()` is false (see `last_error()`) on malformed input.
+    static Regions parse(const std::string& json) { return Regions(aurix_regions_parse(json.c_str())); }
+
+    Regions() : r_(nullptr) {}
+    Regions(Regions&& o) noexcept : r_(o.r_) { o.r_ = nullptr; }
+    Regions& operator=(Regions&& o) noexcept {
+        if (this != &o) {
+            reset();
+            r_ = o.r_;
+            o.r_ = nullptr;
+        }
+        return *this;
+    }
+    ~Regions() { reset(); }
+    Regions(const Regions&) = delete;
+    Regions& operator=(const Regions&) = delete;
+
+    bool valid() const { return r_ != nullptr; }
+    std::size_t size() const { return aurix_regions_len(r_); }
+    bool get(std::size_t index, AurixRegionEndpoint& out) const { return aurix_regions_get(r_, index, &out); }
+    std::vector<AurixRegionEndpoint> all() const {
+        std::vector<AurixRegionEndpoint> out(size());
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            aurix_regions_get(r_, i, &out[i]);
+        }
+        return out;
+    }
+    /// Best RTT sample in ms for entry `index`; negative when every probe request failed.
+    AurixResult set_rtt(std::size_t index, double rtt_ms) { return aurix_regions_set_rtt(r_, index, rtt_ms); }
+    /// Re-rank in place; `rtt_tolerance_ms <= 0` selects the default (15 ms).
+    AurixResult rank(const std::string& preferred_region = std::string(), double rtt_tolerance_ms = 0.0) {
+        return aurix_regions_rank(r_, preferred_region.empty() ? nullptr : preferred_region.c_str(), rtt_tolerance_ms);
+    }
+
+private:
+    explicit Regions(AurixRegionList* r) : r_(r) {}
+    void reset() {
+        if (r_) {
+            aurix_regions_free(r_);
+            r_ = nullptr;
+        }
+    }
+    AurixRegionList* r_;
+};
+
 }  // namespace aurix
 
 #endif  // AURIX_CLIENT_HPP

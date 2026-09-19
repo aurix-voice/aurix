@@ -1,0 +1,14 @@
+# No hostNetwork: UDP media/cascade via hostPort, TURN disabled, node IPs listed per ordinal.
+replicaCount: 2
+hostNetwork: false
+existingSecret: aurix-secrets
+config:
+  externalUrl: https://voice.example.com
+  corsOrigins: [https://game.example.com]
+  externalIpSource: static
+  externalIps: [203.0.113.10, 203.0.113.11]
+  turn:
+    enabled: false
+persistence:
+  enabled: true
+  size: 50Gi

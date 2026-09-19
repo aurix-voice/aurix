@@ -1,0 +1,73 @@
+{{- if or .Values.ingress.enabled .Values.perNode.enabled }}
+{{- $root := . }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "aurix.fullname" . }}
+  labels:
+    {{- include "aurix.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        {{- if .Values.ingress.enabled }}
+        - {{ required "ingress.host is required when ingress.enabled" .Values.ingress.host | quote }}
+        {{- end }}
+        {{- if .Values.perNode.enabled }}
+        {{- range $i := until (int .Values.replicaCount) }}
+        - {{ include "aurix.perNodeHost" (dict "root" $root "ordinal" $i) | quote }}
+        {{- end }}
+        {{- end }}
+      {{- with .Values.ingress.tls.secretName }}
+      secretName: {{ . }}
+      {{- end }}
+  {{- end }}
+  rules:
+    {{- if .Values.ingress.enabled }}
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aurix.fullname" . }}
+                port:
+                  name: ws
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aurix.fullname" . }}
+                port:
+                  name: api
+    {{- end }}
+    {{- if .Values.perNode.enabled }}
+    {{- range $i := until (int .Values.replicaCount) }}
+    - host: {{ include "aurix.perNodeHost" (dict "root" $root "ordinal" $i) | quote }}
+      http:
+        paths:
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aurix.fullname" $root }}-{{ $i }}
+                port:
+                  name: ws
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aurix.fullname" $root }}-{{ $i }}
+                port:
+                  name: api
+    {{- end }}
+    {{- end }}
+{{- end }}

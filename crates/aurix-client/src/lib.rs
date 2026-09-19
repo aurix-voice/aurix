@@ -9,6 +9,8 @@
 //!   moderation, transcripts, TTS) as typed `ControlMessage`s;
 //! * [`client`] — `Client`: one voice session that ties the layers together, reconnects with
 //!   resume, re-joins channels and exposes a poll-based [`events::Event`] queue;
+//! * [`regions`] — region discovery: parse `GET /v1/me/regions`, rank by measured RTT (the host
+//!   does the HTTP);
 //! * [`ffi`] — the stable C ABI (`aurix_*`), generated into `include/aurix_client.h` by
 //!   cbindgen.
 
@@ -23,6 +25,7 @@ pub mod events;
 pub mod ffi;
 
 pub mod media;
+pub mod regions;
 
 pub use aurix_common::protocol::{
     ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsDestination, TtsState,
@@ -37,6 +40,7 @@ pub use config::{ClientConfig, ReconnectPolicy};
 pub use error::{ClientError, Result};
 pub use events::{ConnectionState, Event, Participant, RequestId, SessionInfo};
 pub use media::{IncomingAudio, MediaStats};
+pub use regions::{GeoLocation, ProbedRegion, Region, RegionEndpoint, RegionsResponse};
 
 /// Top bit of a synthesized (TTS / announcement) stream SSRC; session SSRCs never have it.
 pub const SYNTH_SSRC_FLAG: u32 = 0x8000_0000;
