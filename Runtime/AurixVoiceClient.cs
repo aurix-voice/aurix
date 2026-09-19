@@ -34,6 +34,22 @@ namespace Aurix
         public float Energy;
     }
 
+    /// <summary>
+    /// How far presence and text reach in a positional channel (<c>PositionalConfig.roster_radius</c> /
+    /// <c>text_radius</c>, from <c>ChannelJoinAck</c>). <c>null</c> = the whole channel.
+    /// </summary>
+    public struct ChannelScope
+    {
+        /// <summary>
+        /// With a roster radius the roster only lists members within this distance of you (once both
+        /// positions are known); <see cref="AurixVoiceClient.OnParticipantJoined"/> / <see cref="AurixVoiceClient.OnParticipantLeft"/>
+        /// also fire when someone moves in or out of range (leaving uses a 10 % wider radius so the edge does not flicker).
+        /// </summary>
+        public float? RosterRadius;
+        /// <summary>Channel chat, typing and transcripts reach only members within this distance.</summary>
+        public float? TextRadius;
+    }
+
     /// <summary>A queued text-to-speech request; see <see cref="AurixVoiceClient.SpeakAsync"/>.</summary>
     public sealed class SpeechRequest
     {
@@ -123,6 +139,7 @@ namespace Aurix
         private AudioCodec _activeCodec = AudioCodec.Opus;
         private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
         private readonly HashSet<Guid> _monitoredChannels = new HashSet<Guid>();
+        private readonly Dictionary<Guid, ChannelScope> _channelScopes = new Dictionary<Guid, ChannelScope>();
         /// <summary>Audio policy of every joined channel (from <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>).</summary>
         private readonly Dictionary<Guid, AudioPolicy> _channelPolicies = new Dictionary<Guid, AudioPolicy>();
         private AudioPolicy? _audioPolicy;
@@ -603,6 +620,7 @@ namespace Aurix
                 _joinedChannels.Remove(channelId);
                 _transcribedChannels.Remove(channelId);
                 _monitoredChannels.Remove(channelId);
+                _channelScopes.Remove(channelId);
                 _channelPolicies.Remove(channelId);
                 if (_channels.TryGetValue(channelId, out var map))
                 {
@@ -804,6 +822,15 @@ namespace Aurix
             lock (_channels) return _monitoredChannels.Contains(channelId);
         }
 
+        /// <summary>
+        /// Presence / text range of a joined positional channel (see <see cref="ChannelScope"/>); both radii are
+        /// <c>null</c> for unscoped channels, and the method returns <c>null</c> before the join is acknowledged.
+        /// </summary>
+        public ChannelScope? GetChannelScope(Guid channelId)
+        {
+            lock (_channels) return _channelScopes.TryGetValue(channelId, out var s) ? s : (ChannelScope?)null;
+        }
+
         /// <summary>Whether this client receives <see cref="OnTranscript"/> (default true).</summary>
         public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
 
@@ -929,6 +956,7 @@ namespace Aurix
             {
                 _transcribedChannels.Clear();
                 _monitoredChannels.Clear();
+                _channelScopes.Clear();
             }
         }
 
@@ -1393,6 +1421,11 @@ namespace Aurix
                         _joinedChannels.Add(channelId);
                         if (m.Bool("transcription")) _transcribedChannels.Add(channelId); else _transcribedChannels.Remove(channelId);
                         if (m.Bool("safety_voice")) _monitoredChannels.Add(channelId); else _monitoredChannels.Remove(channelId);
+                        _channelScopes[channelId] = new ChannelScope
+                        {
+                            RosterRadius = m.Has("roster_radius") ? (float?)m.Num("roster_radius") : null,
+                            TextRadius = m.Has("text_radius") ? (float?)m.Num("text_radius") : null,
+                        };
                         var policy = Audio.AudioPolicy.FromMessage(m);
                         if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
                     }
@@ -1419,7 +1452,9 @@ namespace Aurix
                     var p = new Participant
                     {
                         UserId = m.Id("user_id"), DisplayName = m.Str("display_name") ?? string.Empty,
-                        Ssrc = m.U32("ssrc"), Role = ChannelRole.Speaker,
+                        Ssrc = m.U32("ssrc"),
+                        Role = m.Has("role") ? ControlMessage.ParseRole(m.Str("role")) : ChannelRole.Speaker,
+                        IsMuted = m.Bool("is_muted"),
                     };
                     lock (_channels)
                     {
