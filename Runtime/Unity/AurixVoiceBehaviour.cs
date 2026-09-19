@@ -26,11 +26,25 @@ namespace Aurix.Unity
         [Range(6000, 128000)] public int BitrateBps = 32000;
         public bool AutoConnectOnStart = false;
 
+        [Header("Voice activity")]
+        [Tooltip("RMS level (0..1) above which a frame counts as speech. 0.01 ≈ -40 dBov.")]
+        [Range(0f, 0.2f)] public float VadThreshold = 0.01f;
+        [Tooltip("Quiet frames (20 ms each) before local speech is considered over.")]
+        [Range(1, 100)] public int VadHangoverFrames = 15;
+        [Tooltip("Do not send frames while the local VAD says silence (saves uplink; DTX-like). " +
+                 "Off: every frame is sent, tagged with its level, and the server decides who is speaking.")]
+        public bool GateOnVad = false;
+
         /// <summary>Creates encoder/decoder instances. Must be set by your code (platform/licensing choice).</summary>
         public Func<IOpusCodec> CodecFactory;
 
         public AurixVoiceClient Client { get; private set; }
         public bool IsConnected => Client != null && Client.State == VoiceConnectionState.MediaBound;
+
+        /// <summary>Local microphone meter/VAD; read <see cref="VoiceActivityDetector.Energy"/> for a level bar.</summary>
+        public VoiceActivityDetector Vad { get; } = new VoiceActivityDetector();
+        /// <summary>Local VAD edge (true = started speaking). Fired from the Unity main thread.</summary>
+        public event Action<bool> OnLocalSpeaking;
 
         private AudioClip _micClip;
         private int _micReadPos;
@@ -130,8 +144,16 @@ namespace Aurix.Unity
 
                 if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
                 Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
+                Vad.Threshold = VadThreshold;
+                Vad.HangoverFrames = VadHangoverFrames;
+                if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
+                if (GateOnVad && !Vad.Speaking)
+                {
+                    Client.SkipFrame(AudioFormat.FrameSamples);
+                    continue;
+                }
                 int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
-                if (n > 0) Client.SendOpusFrame(_channelHash, _opusOut, n);
+                if (n > 0) Client.SendOpusFrame(_channelHash, _opusOut, n, AudioFormat.FrameSamples, Vad.Level);
             }
         }
 

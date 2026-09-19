@@ -49,6 +49,13 @@ namespace Aurix.Protocol
         public float Volume;
     }
 
+    /// <summary>One entry of a <c>ChannelEnergy</c> report: linear audio energy 0..1 (0 = silent).</summary>
+    public sealed class ParticipantEnergy
+    {
+        public Guid UserId;
+        public float Energy;
+    }
+
     /// <summary>Server-side snapshot of this user's receiver preferences, sent after <c>SessionInitAck</c>.</summary>
     public sealed class ReceiverPreferences
     {
@@ -208,6 +215,24 @@ namespace Aurix.Protocol
                     });
                 }
             return prefs;
+        }
+
+        /// <summary>Typed view of a <c>ChannelEnergy</c> payload (<c>data.levels</c>).</summary>
+        public List<ParticipantEnergy> Levels()
+        {
+            var list = new List<ParticipantEnergy>();
+            if (Data == null || !Data.TryGetValue("levels", out var lv) || !(MiniJson.AsArray(lv) is List<object> levels))
+                return list;
+            foreach (var item in levels)
+            {
+                var o = MiniJson.AsObject(item);
+                if (o == null) continue;
+                var user = MiniJson.GetGuid(o, "user_id");
+                if (!user.HasValue) continue;
+                float e = (float)MiniJson.GetNumber(o, "energy", 0.0);
+                list.Add(new ParticipantEnergy { UserId = user.Value, Energy = Math.Max(0f, Math.Min(1f, e)) });
+            }
+            return list;
         }
 
         /// <summary>Typed view of a <c>ChatMessageReceived</c> payload (<c>data.message</c>); null if absent.</summary>

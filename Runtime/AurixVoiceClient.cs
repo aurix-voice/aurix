@@ -29,6 +29,8 @@ namespace Aurix
         public bool IsMuted;
         public bool IsServerMuted;
         public bool IsSpeaking;
+        /// <summary>Last reported audio energy 0..1 (from <c>ChannelEnergy</c>; decays to 0 when silent).</summary>
+        public float Energy;
     }
 
     public sealed class SessionInfo
@@ -147,6 +149,12 @@ namespace Aurix
         public event Action<ChatMessage> OnChatMessage;
         /// <summary>Another member of the channel started/stopped typing (channel, user, typing).</summary>
         public event Action<Guid, Guid, bool> OnParticipantTyping;
+        /// <summary>
+        /// Periodic audio levels of channel members whose energy changed (channel, levels). Participants'
+        /// <see cref="Participant.Energy"/> is updated before the event fires. Level meters should decay
+        /// on their own between reports; a participant that went silent is reported once with 0.
+        /// </summary>
+        public event Action<Guid, IReadOnlyList<ParticipantEnergy>> OnChannelEnergy;
         public event Action<string, string> OnServerError;
         /// <summary>Connection closed for good: after <see cref="DisconnectAsync"/>, a server <c>SessionClose</c>, or when reconnecting gave up.</summary>
         public event Action<string> OnDisconnected;
@@ -538,13 +546,25 @@ namespace Aurix
         /// <summary>
         /// Send one encoded Opus frame (20 ms @ 48 kHz recommended) to a channel. No-op while muted.
         /// <paramref name="channelHash"/> comes from <see cref="ChannelHash"/>.
+        /// <paramref name="level"/> is the frame's measured <see cref="Audio.AudioLevel"/> (e.g. from a
+        /// <see cref="Audio.VoiceActivityDetector"/>); when given, the server uses it for speaking detection and
+        /// energy reports instead of mere packet arrival.
         /// </summary>
-        public void SendOpusFrame(uint channelHash, byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples)
+        public void SendOpusFrame(uint channelHash, byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null)
         {
             if (_media == null || State != VoiceConnectionState.MediaBound) return;
             _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
             if (_muted) return;
-            _media.SendAudio(channelHash, _rtpTimestamp, opus, length);
+            _media.SendAudio(channelHash, _rtpTimestamp, opus, length, level);
+        }
+
+        /// <summary>
+        /// Account for a captured frame that is deliberately not sent (client-side VAD gating / DTX) so the
+        /// RTP clock of the next frame still reflects wall time.
+        /// </summary>
+        public void SkipFrame(int samplesPerChannel = Audio.AudioFormat.FrameSamples)
+        {
+            _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
         }
 
         public static uint ChannelHash(Guid channelId) => AurxPacket.ChannelIdHash(channelId);
@@ -935,6 +955,18 @@ namespace Aurix
                 case "ParticipantTyping":
                     OnParticipantTyping?.Invoke(m.Id("channel_id"), m.Id("user_id"), m.Bool("typing"));
                     break;
+                case "ChannelEnergy":
+                {
+                    var channelId = m.Id("channel_id");
+                    var levels = m.Levels();
+                    foreach (var l in levels)
+                    {
+                        var p = Lookup(channelId, l.UserId);
+                        if (p != null) p.Energy = l.Energy;
+                    }
+                    OnChannelEnergy?.Invoke(channelId, levels);
+                    break;
+                }
                 case "Pong":
                 {
                     var sent = (long)m.Num("nonce");

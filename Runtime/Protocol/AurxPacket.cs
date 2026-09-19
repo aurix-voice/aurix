@@ -1,5 +1,6 @@
 using System;
 using System.Buffers.Binary;
+using Aurix.Audio;
 
 namespace Aurix.Protocol
 {
@@ -44,6 +45,8 @@ namespace Aurix.Protocol
         E2ee = 0x0100,
         Rtp = 0x0200,
         Authenticated = 0x0400,
+        /// <summary>First payload byte is an RFC 6464-style audio level (-dBov, 127 = silence).</summary>
+        Energy = 0x0800,
     }
 
     /// <summary>
@@ -263,6 +266,34 @@ namespace Aurix.Protocol
             var h = PacketHeader.Create(PacketType.Audio, seq, ts, ssrc);
             h.ChannelIdHash = channelHash;
             return new AurxPacket(h, opusFrame);
+        }
+
+        /// <summary>Audio frame prefixed with the sender's measured level (see <see cref="AudioLevel"/>).</summary>
+        public static AurxPacket AudioWithLevel(uint seq, uint ts, uint ssrc, uint channelHash, byte level, byte[] opusFrame)
+        {
+            var payload = new byte[opusFrame.Length + 1];
+            payload[0] = Math.Min(level, AudioLevel.Silence);
+            Buffer.BlockCopy(opusFrame, 0, payload, 1, opusFrame.Length);
+            var p = Audio(seq, ts, ssrc, channelHash, payload);
+            p.Header.Flags |= PacketFlags.Energy;
+            return p;
+        }
+
+        /// <summary>
+        /// Strips the leading level byte of an <see cref="PacketFlags.Energy"/> packet; returns null when
+        /// the packet carries no level. Header length/flags are updated to describe the bare Opus frame.
+        /// </summary>
+        public byte? TakeAudioLevel()
+        {
+            if ((Header.Flags & PacketFlags.Energy) == 0) return null;
+            Header.Flags &= ~PacketFlags.Energy;
+            if (Payload.Length == 0) return AudioLevel.Silence;
+            byte level = Math.Min(Payload[0], AudioLevel.Silence);
+            var rest = new byte[Payload.Length - 1];
+            Buffer.BlockCopy(Payload, 1, rest, 0, rest.Length);
+            Payload = rest;
+            Header.PayloadLength = (ushort)rest.Length;
+            return level;
         }
 
         public static AurxPacket Heartbeat(uint seq, uint ssrc, uint ts) =>
