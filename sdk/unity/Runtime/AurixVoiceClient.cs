@@ -96,7 +96,7 @@ namespace Aurix
     /// </summary>
     public sealed class AurixVoiceClient : IDisposable
     {
-        public const string SdkVersion = "1.0.0";
+        public const string SdkVersion = "1.2.0";
 
         private readonly string _wsUrl;
         private string _token;

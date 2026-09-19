@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
   "Version": 1,
-  "VersionName": "1.0.0",
+  "VersionName": "1.2.0",
   "FriendlyName": "Aurix Voice",
   "Description": "Self-hosted game voice chat (Aurix): encrypted native AURX audio over UDP, WebSocket control plane, positional audio, text chat, moderation, transcripts and TTS. Wraps the aurix-client C ABI.",
   "Category": "Audio",

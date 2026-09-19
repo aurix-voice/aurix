@@ -7,7 +7,12 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
   **WebRTC** (for browsers / Unity WebGL), bridged by one SFU with per-participant volumes.
 * **Multi-tenant**: apps, API keys with fine-grained permissions, per-app users, channels,
   recordings, bans and audit log are strictly isolated.
-* **Positional / 3D audio, whisper, command & echo (mic test) channels, audio injection, server mute, kick, ban, reports.**
+* **Positional / 3D audio** with directional panning, radius-scoped presence and text, ambient
+  (cocktail-party) mixing; whisper, command & echo (mic test) channels, audio injection, server
+  mute, kick, ban, reports, channel-wide mute-all / kick-all.
+* **Player features**: auto-reconnect with session resume, text chat lite, energy/VAD,
+  receiver-local mute/volume/blocks, transmission modes & channel focus, network-quality bars,
+  live transcripts and TTS, single-use action tokens, per-app webhooks and an SSE event stream.
 * **Recording** (Ogg/Opus, consent-gated, optional AES-GCM at rest, S3 / local storage).
 * **Built-in TURN/STUN** with time-limited HMAC credentials issued by the API.
 * **Horizontal scale**: PostgreSQL + Redis control plane, media nodes register and heartbeat,
@@ -15,7 +20,10 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 * **Ops**: Prometheus metrics, JSON logs, OpenTelemetry tracing, graceful drain, health/readiness,
   distroless-ish non-root container, CI with a live end-to-end test.
 
-> Status: 1.0 — production-hardened core (auth, tenant isolation, media auth, TURN, recording).
+> Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
+> the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
+> audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
+> PCMU fallback, and Web / Unity / native (C ABI) / Unreal SDKs.
 > See [Limitations](#limitations) before deploying at scale.
 
 **Documentation**: the full book lives in [`docs/`](docs/src/SUMMARY.md) (`mdbook serve docs`) —

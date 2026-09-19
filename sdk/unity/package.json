@@ -1,6 +1,6 @@
 {
   "name": "com.aurix.voice",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "displayName": "Aurix Voice SDK",
   "description": "Native AURX/UDP voice client for Aurix Voice Platform: WebSocket control plane, HMAC-authenticated media, jitter buffer and Unity microphone/playback components.",
   "unity": "2021.3",

@@ -39,8 +39,9 @@ the chapter that explains the boundary.
   (libopus), channel configs at `media.max_bitrate`.
 * **Cascade is a one-hop mesh** between the nodes that host a channel — no relay trees; nodes
   must reach each other directly on `media.port + 1`/UDP ([Scaling](operations/scaling.md)).
-* **Positional audio is server-side attenuation and panning** from client-reported positions;
-  there is no occlusion, reverb or HRTF. Directional panning applies to native and WebRTC
+* **Positional audio is server-side attenuation, panning and radius scoping** from
+  client-reported positions; there is no occlusion, reverb or HRTF, and the ambient mix ranks by
+  reported loudness only (no server-side voice-activity analysis of the payload). Directional panning applies to native and WebRTC
   downlinks; TTS/echo follow the same routing.
 
 ## Server behaviour

@@ -17,7 +17,10 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 * **Ops**: Prometheus metrics, JSON logs, OpenTelemetry tracing, graceful drain, health/readiness,
   non-root container, CI with a live end-to-end test.
 
-> Status: 1.0 — production-hardened core (auth, tenant isolation, media auth, TURN, recording).
+> Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
+> the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
+> audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
+> PCMU fallback, and Web / Unity / native (C ABI) / Unreal SDKs.
 > Read [Limitations](limitations.md) before deploying at scale.
 
 ## How to read this book
