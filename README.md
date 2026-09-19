@@ -75,6 +75,29 @@ void OnAudioFilterRead(float[] data, int ch) => mixer.Mix(data, ch);
 `UpdatePositionAsync` sends the player's pose for server-side positional audio (see below),
 `RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's bitrate adaptation.
 
+### Choosing a region
+
+Session resume is node-local, so a player should connect to the *nearest node with capacity* and keep its
+direct URL. Either use the `endpoint` your backend receives from `POST /v1/tokens` (pass `region` /
+`location` hints there), or measure from the device:
+
+```csharp
+using var http = new HttpClient();
+var regions = await RegionDiscovery.DiscoverAsync(http, "https://voice.example.com", jwt, new RegionDiscoveryOptions
+{
+    PreferredRegion = partyLeaderRegion,           // optional: ranks first when reachable
+    Latitude = 48.9, Longitude = 2.3,              // optional: server orders by distance
+    // Probe = true (default): GET each region's ProbeUrl a few times, best RTT wins
+});
+var best = regions.FirstOrDefault();               // null → no node advertised for discovery
+var client = new AurixVoiceClient(best.WsUrl, jwt);
+```
+
+Ranking: preferred region (unless its probe failed) → measured RTT in 15 ms buckets (ties keep the
+server's distance/load order) → unprobed regions → regions whose probe failed. `RegionDiscovery.Rank` and
+`ProbeRttAsync` are public for custom policies; each `RegionEndpoint` also carries `Nodes`,
+`LoadFactor` and `DistanceKm`.
+
 ### Statistics and network quality bars
 
 `client.GetStats()` returns a `VoiceStats` snapshot; `AurixVoiceBehaviour` wires its `RemoteMixer` into
