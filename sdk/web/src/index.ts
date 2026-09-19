@@ -1,4 +1,13 @@
 export { AurixClient } from './client.js';
+export {
+  AUDIO_LEVEL_SILENCE,
+  AudioLevelMeter,
+  VoiceActivityDetector,
+  decodeAudioLevel,
+  encodeAudioLevel,
+  rms,
+} from './audio.js';
+export type { AudioLevelMeterOptions, AudioLevelSample } from './audio.js';
 export type {
   AurixClientOptions,
   AurixEvents,
@@ -19,6 +28,7 @@ export type {
   ModerationAction,
   Orientation3D,
   ParticipantBrief,
+  ParticipantEnergy,
   ParticipantVolume,
   Position3D,
   RecordingConsent,

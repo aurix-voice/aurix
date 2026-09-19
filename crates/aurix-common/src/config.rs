@@ -91,6 +91,12 @@ impl AurixConfig {
         if self.media.max_participants_per_node == 0 {
             anyhow::bail!("max_participants_per_node must be > 0");
         }
+        if !(0.0..=1.0).contains(&self.media.speaking_energy_threshold) {
+            anyhow::bail!("media.speaking_energy_threshold must be within 0.0..=1.0");
+        }
+        if self.media.energy_interval_ms != 0 && self.media.energy_interval_ms < 50 {
+            anyhow::bail!("media.energy_interval_ms must be 0 (off) or >= 50");
+        }
         if self.chat.enabled {
             if self.chat.max_message_bytes == 0 || self.chat.max_message_bytes > 16 * 1024 {
                 anyhow::bail!("chat.max_message_bytes must be within 1..=16384");
@@ -370,6 +376,14 @@ pub struct MediaConfig {
     /// Milliseconds without audio after which a participant stops being "speaking".
     #[serde(default = "default_speaking_timeout_ms")]
     pub speaking_timeout_ms: u64,
+    /// Linear audio level (`0.0..=1.0`, see `protocol::decode_audio_level`) a frame must
+    /// reach to count as voice for the speaking indicator. Only applies to frames that carry a
+    /// level (AURX `Energy` flag / RTP audio-level extension); unlabeled frames always count.
+    #[serde(default = "default_speaking_energy_threshold")]
+    pub speaking_energy_threshold: f32,
+    /// How often (ms) `ChannelEnergy` level reports are sent to channel members (0 = never).
+    #[serde(default = "default_energy_interval_ms")]
+    pub energy_interval_ms: u64,
     /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
     #[serde(default)]
     pub rx_workers: usize,
@@ -398,6 +412,12 @@ fn default_cascade_discovery_interval_ms() -> u64 {
 fn default_speaking_timeout_ms() -> u64 {
     400
 }
+fn default_speaking_energy_threshold() -> f32 {
+    0.01
+}
+fn default_energy_interval_ms() -> u64 {
+    200
+}
 
 impl Default for MediaConfig {
     fn default() -> Self {
@@ -420,6 +440,8 @@ impl Default for MediaConfig {
             worker_threads: 4,
             require_packet_auth: true,
             speaking_timeout_ms: default_speaking_timeout_ms(),
+            speaking_energy_threshold: default_speaking_energy_threshold(),
+            energy_interval_ms: default_energy_interval_ms(),
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

@@ -11,6 +11,7 @@ import {
   type LocalMute,
   type ModerationAction,
   type ParticipantBrief,
+  type ParticipantEnergy,
   type ParticipantVolume,
   type RecordingConsent,
   type ServerMessage,
@@ -18,6 +19,7 @@ import {
   type UnknownMessage,
   type UserPosition,
 } from './protocol.js';
+import { AudioLevelMeter, type AudioLevelMeterOptions, type AudioLevelSample } from './audio.js';
 
 export interface AurixClientOptions {
   /** REST base URL, e.g. `https://voice.example.com` (used for TURN credentials). */
@@ -53,6 +55,11 @@ export interface AurixClientOptions {
   audioConstraints?: MediaTrackConstraints;
   /** Use this stream instead of calling `getUserMedia` (device management done by the app). */
   localStream?: MediaStream;
+  /**
+   * Meter the local microphone with Web Audio and emit `localEnergy` / `localSpeaking`
+   * (default `true`). Pass an object to tune the VAD, `false` to disable.
+   */
+  localVoiceActivity?: boolean | AudioLevelMeterOptions;
   /** Application-level keepalive interval in ms (`Ping`/`Pong`). Default 15000, 0 disables. */
   pingIntervalMs?: number;
   /** Timeout for request/response exchanges (join, offer) in ms. Default 10000. */
@@ -105,6 +112,8 @@ export interface Participant {
   muted: boolean;
   serverMuted: boolean;
   speaking: boolean;
+  /** Last server-reported audio energy 0..1 (`0` when silent). */
+  energy: number;
 }
 
 /** A text-chat message; see {@link AurixEvents.chatMessage}. */
@@ -159,6 +168,16 @@ export interface AurixEvents {
   participantLeft: (channelId: string, userId: string) => void;
   participantUpdated: (channelId: string, participant: Participant) => void;
   speaking: (channelId: string, userId: string, speaking: boolean) => void;
+  /**
+   * Periodic audio levels (0..1) of channel members whose energy changed since the last
+   * report; `Participant.energy` is updated before the event fires. A participant that went
+   * silent is reported once with `0`, so meters should decay on their own between reports.
+   */
+  energy: (channelId: string, levels: ParticipantEnergy[]) => void;
+  /** Local microphone level sample (see `localVoiceActivity`), every ~50 ms while media is up. */
+  localEnergy: (sample: AudioLevelSample) => void;
+  /** Local VAD edge: the user started (`true`) / stopped (`false`) speaking. */
+  localSpeaking: (speaking: boolean) => void;
   positions: (channelId: string, positions: UserPosition[]) => void;
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string) => void;
   bitrate: (targetKbps: number, reason: string) => void;
@@ -249,6 +268,7 @@ export class AurixClient {
   private ws: WebSocket | undefined;
   private pc: RTCPeerConnection | undefined;
   private localStream: MediaStream | undefined;
+  private localMeter: AudioLevelMeter | undefined;
   private listeners = new Map<keyof AurixEvents, Set<AnyListener>>();
   private pendingJoins = new Map<string, Pending<Participant[]>>();
   private pendingModerations = new Map<string, Pending<void>>();
@@ -355,6 +375,16 @@ export class AurixClient {
 
   get localMediaStream(): MediaStream | undefined {
     return this.localStream;
+  }
+
+  /** Smoothed local microphone energy 0..1 (0 when metering is off or media is down). */
+  get localEnergy(): number {
+    return this.localMeter?.energy ?? 0;
+  }
+
+  /** Local VAD state (false when metering is off or media is down). */
+  get localSpeaking(): boolean {
+    return this.localMeter?.speaking ?? false;
   }
 
   get peerConnection(): RTCPeerConnection | undefined {
@@ -506,6 +536,7 @@ export class AurixClient {
     }
     this.ws?.close(1000, reason);
     this.ws = undefined;
+    this.stopLocalMeter();
     this.pc?.close();
     this.pc = undefined;
     if (this.localStream && this.localStream !== this.opts.localStream) {
@@ -880,6 +911,28 @@ export class AurixClient {
     this.teardown('reconnect failed', 'failed');
   }
 
+  private startLocalMeter(stream: MediaStream): void {
+    const cfg = this.opts.localVoiceActivity ?? true;
+    if (cfg === false || this.localMeter) return;
+    const meter = new AudioLevelMeter(
+      stream,
+      (sample) => {
+        this.emit('localEnergy', sample);
+        if (sample.changed) this.emit('localSpeaking', sample.speaking);
+      },
+      cfg === true ? {} : cfg,
+    );
+    if (meter.start()) this.localMeter = meter;
+  }
+
+  private stopLocalMeter(): void {
+    if (!this.localMeter) return;
+    const wasSpeaking = this.localMeter.speaking;
+    this.localMeter.stop();
+    this.localMeter = undefined;
+    if (wasSpeaking) this.emit('localSpeaking', false);
+  }
+
   private cancelReconnect(): void {
     if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -918,6 +971,7 @@ export class AurixClient {
             muted: p.is_muted,
             serverMuted: false,
             speaking: p.is_speaking,
+            energy: 0,
           });
         }
         if (!this.userId && this.session) {
@@ -949,6 +1003,7 @@ export class AurixClient {
           muted: false,
           serverMuted: false,
           speaking: false,
+          energy: 0,
         };
         roster.set(d.user_id, p);
         this.emit('participantJoined', d.channel_id, p);
@@ -974,9 +1029,21 @@ export class AurixClient {
         const p = this.channels.get(d.channel_id)?.get(d.user_id);
         if (p) {
           p.speaking = d.speaking;
+          if (!d.speaking) p.energy = 0;
           this.emit('participantUpdated', d.channel_id, p);
         }
         this.emit('speaking', d.channel_id, d.user_id, d.speaking);
+        return;
+      }
+      case 'ChannelEnergy': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChannelEnergy' }>).data;
+        const roster = this.channels.get(d.channel_id);
+        if (!roster) return;
+        for (const l of d.levels) {
+          const p = roster.get(l.user_id);
+          if (p) p.energy = Math.min(1, Math.max(0, l.energy));
+        }
+        this.emit('energy', d.channel_id, d.levels);
         return;
       }
       case 'PositionUpdate': {
@@ -1149,6 +1216,7 @@ export class AurixClient {
     this.localStream.getAudioTracks().forEach((t) => {
       t.enabled = !this.muted;
     });
+    this.startLocalMeter(this.localStream);
 
     const pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' });
     this.pc = pc;

@@ -45,6 +45,12 @@ heartbeat_interval_ms = 5000
 session_timeout_secs = 60
 packet_buffer_size = 4096
 worker_threads = 4
+# Speaking indicator: ms of silence before "not speaking", and the minimum level (0..1 linear,
+# 0.01 = -40 dBov) a level-tagged frame needs to count as voice.
+speaking_timeout_ms = 400
+speaking_energy_threshold = 0.01
+# Period of ChannelEnergy level reports to channel members (0 disables them).
+energy_interval_ms = 200
 
 [turn]
 enabled = false

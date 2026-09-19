@@ -48,6 +48,8 @@ pub enum WebRtcMediaEvent {
         user_id: UserId,
         rtp_time: u32,
         payload: Vec<u8>,
+        /// RFC 6464 audio level (`-dBov`, 0..=127) from the RTP header extension.
+        level: Option<u8>,
     },
     /// ICE/DTLS connected; `remote` is the authenticated peer address.
     Connected {
@@ -455,6 +457,10 @@ async fn poll_outputs(
                             user_id: ctx.user_id,
                             rtp_time: data.time.numer() as u32,
                             payload: data.data.to_vec(),
+                            level: data
+                                .ext_vals
+                                .audio_level
+                                .map(|dbov| dbov.unsigned_abs().min(127)),
                         })
                         .await;
                 }

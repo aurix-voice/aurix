@@ -372,6 +372,63 @@ async fn full_stack_two_players_udp_audio_and_turn() {
     }
     assert!(got >= 5, "Bob received only {got} audio packets from Alice");
 
+    // Labelled audio (-6 dBov): the level byte is stripped from the downlink, Bob is told
+    // Alice is speaking and receives her level over the control plane.
+    for i in 0..10u32 {
+        let seq = 20 + i;
+        let pkt = AurixPacket::audio_with_level(seq, seq * 960, alice.ssrc, hash, 6, &payload);
+        alice
+            .udp
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut labelled = 0;
+    while let Some(p) = bob.recv_udp().await {
+        if p.header.packet_type == PacketType::Audio && p.header.sequence >= 20 {
+            assert!(
+                !p.header.has_flag(PacketFlags::Energy),
+                "level metadata must not be forwarded to listeners"
+            );
+            assert_eq!(&p.payload[..], &payload[..]);
+            labelled += 1;
+        }
+        if labelled >= 5 {
+            break;
+        }
+    }
+    assert!(
+        labelled >= 5,
+        "Bob received only {labelled} labelled packets"
+    );
+    let alice_uid = UserId::from_uuid(uid_a.parse().unwrap());
+    bob.expect("SpeakingStateChanged(alice)", |m| {
+        matches!(
+            m,
+            ControlMessage::SpeakingStateChanged { channel_id: c, user_id, speaking: true }
+                if *c == channel_id && *user_id == alice_uid
+        )
+    })
+    .await;
+    let energy = bob
+        .expect("ChannelEnergy(alice)", |m| {
+            matches!(
+                m,
+                ControlMessage::ChannelEnergy { channel_id: c, levels }
+                    if *c == channel_id && levels.iter().any(|l| l.user_id == alice_uid && l.energy > 0.0)
+            )
+        })
+        .await;
+    if let ControlMessage::ChannelEnergy { levels, .. } = energy {
+        let alice_level = levels.iter().find(|l| l.user_id == alice_uid).unwrap();
+        assert!(
+            (alice_level.energy - 0.501).abs() < 0.01,
+            "-6 dBov must decode to ~0.5, got {}",
+            alice_level.energy
+        );
+    }
+
     // Forged audio (wrong key) or a spoofed SSRC must not be forwarded.
     let forged = AurixPacket::audio(
         100,

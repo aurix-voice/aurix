@@ -91,6 +91,27 @@ pub fn decode_volume_byte(byte: u8) -> f32 {
     byte as f32 / VOLUME_UNITY
 }
 
+/// Audio level byte carried by an `Energy` uplink payload: `-dBov` as in RFC 6464, so 0 is a
+/// full-scale signal and `AUDIO_LEVEL_SILENCE` (127) means no signal at all.
+pub const AUDIO_LEVEL_SILENCE: u8 = 127;
+
+/// Convert a linear energy (RMS of PCM in `-1.0..=1.0`) to the wire level byte.
+pub fn encode_audio_level(energy: f32) -> u8 {
+    if energy.is_nan() || energy <= 0.0 {
+        return AUDIO_LEVEL_SILENCE;
+    }
+    let dbov = -(20.0 * energy.log10());
+    dbov.round().clamp(0.0, AUDIO_LEVEL_SILENCE as f32) as u8
+}
+
+/// Inverse of `encode_audio_level`: linear energy in `0.0..=1.0` (`0.0` for silence).
+pub fn decode_audio_level(level: u8) -> f32 {
+    if level >= AUDIO_LEVEL_SILENCE {
+        return 0.0;
+    }
+    10f32.powf(-(level as f32) / 20.0)
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketHeader {
     pub version: u8,
@@ -188,6 +209,9 @@ pub enum PacketFlags {
     Rtp = 0x0200,
     /// Packet carries a trailing `AUTH_TAG_SIZE` HMAC tag over header + payload.
     Authenticated = 0x0400,
+    /// Uplink payload starts with one audio level byte (see `encode_audio_level`) followed by
+    /// the Opus frame. The server strips it before fan-out.
+    Energy = 0x0800,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +381,40 @@ impl AurixPacket {
         let mut hdr = PacketHeader::new(PacketType::Audio, seq, ts, ssrc);
         hdr.channel_id_hash = ch_hash;
         Self::new(hdr, data)
+    }
+
+    /// Uplink audio packet carrying the sender-measured level of this frame.
+    pub fn audio_with_level(
+        seq: u32,
+        ts: u32,
+        ssrc: u32,
+        ch_hash: u32,
+        level: u8,
+        data: &[u8],
+    ) -> Self {
+        let mut hdr = PacketHeader::new(PacketType::Audio, seq, ts, ssrc);
+        hdr.channel_id_hash = ch_hash;
+        hdr.flags |= PacketFlags::Energy as u16;
+        let mut payload = BytesMut::with_capacity(1 + data.len());
+        payload.put_u8(level.min(AUDIO_LEVEL_SILENCE));
+        payload.put_slice(data);
+        Self::new(hdr, payload.freeze())
+    }
+
+    /// Remove the leading audio level byte of an `Energy` payload, returning it (`None` when
+    /// the flag is not set). Leaves a plain audio packet behind.
+    pub fn take_audio_level(&mut self) -> Option<u8> {
+        if !self.header.has_flag(PacketFlags::Energy) {
+            return None;
+        }
+        self.header.flags &= !(PacketFlags::Energy as u16);
+        if self.payload.is_empty() {
+            return Some(AUDIO_LEVEL_SILENCE);
+        }
+        let level = self.payload[0].min(AUDIO_LEVEL_SILENCE);
+        self.payload = self.payload.slice(1..);
+        self.header.payload_length = self.payload.len() as u16;
+        Some(level)
     }
 
     pub fn heartbeat(ssrc: u32, ts: u32) -> Self {
@@ -688,6 +746,13 @@ pub enum ControlMessage {
         user_id: UserId,
         speaking: bool,
     },
+    /// Server→client, periodic (`media.energy_interval_ms`): audio level of every channel
+    /// member whose level changed since the last report; `energy` is linear `0.0..=1.0`
+    /// (see `decode_audio_level`). A participant that went quiet is reported once with `0.0`.
+    ChannelEnergy {
+        channel_id: ChannelId,
+        levels: Vec<ParticipantEnergy>,
+    },
     PositionUpdate {
         channel_id: ChannelId,
         positions: Vec<UserPosition>,
@@ -830,6 +895,12 @@ pub struct ParticipantVolume {
     pub volume: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParticipantEnergy {
+    pub user_id: UserId,
+    pub energy: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParticipantBrief {
     pub user_id: UserId,
@@ -959,6 +1030,47 @@ mod tests {
         assert_eq!(decode_volume_byte(128), 1.0);
         assert_eq!(decode_volume_byte(64), 0.5);
         assert!((decode_volume_byte(255) - 1.992).abs() < 0.001);
+    }
+
+    #[test]
+    fn audio_level_byte_is_negative_dbov() {
+        assert_eq!(encode_audio_level(1.0), 0);
+        assert_eq!(encode_audio_level(0.1), 20);
+        assert_eq!(encode_audio_level(0.01), 40);
+        assert_eq!(encode_audio_level(0.0), AUDIO_LEVEL_SILENCE);
+        assert_eq!(encode_audio_level(-1.0), AUDIO_LEVEL_SILENCE);
+        assert_eq!(encode_audio_level(f32::NAN), AUDIO_LEVEL_SILENCE);
+        assert_eq!(encode_audio_level(1e-9), AUDIO_LEVEL_SILENCE);
+        assert_eq!(decode_audio_level(0), 1.0);
+        assert!((decode_audio_level(20) - 0.1).abs() < 1e-6);
+        assert_eq!(decode_audio_level(AUDIO_LEVEL_SILENCE), 0.0);
+        assert_eq!(decode_audio_level(200), 0.0);
+    }
+
+    #[test]
+    fn energy_packet_roundtrip_and_strip() {
+        let keys = MediaKeys::derive(b"energy-test");
+        let packet = AurixPacket::audio_with_level(7, 960, 42, 99, 23, b"opus");
+        assert!(packet.header.has_flag(PacketFlags::Energy));
+        assert_eq!(&packet.payload[..], &[23, b'o', b'p', b'u', b's']);
+
+        let wire = packet.seal(&keys);
+        let mut decoded = AurixPacket::decode(&wire).unwrap();
+        assert!(decoded.open(&keys));
+        assert_eq!(decoded.take_audio_level(), Some(23));
+        assert!(!decoded.header.has_flag(PacketFlags::Energy));
+        assert_eq!(&decoded.payload[..], b"opus");
+        assert_eq!(decoded.header.payload_length, 4);
+        assert_eq!(decoded.take_audio_level(), None);
+
+        let mut plain = AurixPacket::audio(1, 0, 42, 99, Bytes::from_static(b"x"));
+        assert_eq!(plain.take_audio_level(), None);
+        assert_eq!(&plain.payload[..], b"x");
+
+        let mut empty = AurixPacket::audio_with_level(1, 0, 42, 99, 200, b"");
+        assert_eq!(&empty.payload[..], &[AUDIO_LEVEL_SILENCE]);
+        assert_eq!(empty.take_audio_level(), Some(AUDIO_LEVEL_SILENCE));
+        assert!(empty.payload.is_empty());
     }
 
     #[test]

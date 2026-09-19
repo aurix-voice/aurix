@@ -14,6 +14,8 @@
   #roster li { list-style: none; padding: .3rem .5rem; border-radius: 6px; margin: .2rem 0; background: #8881; }
   #roster li.speaking { background: #2c82; }
   #roster li.muted { opacity: .6; }
+  .meter { display: inline-block; width: 6rem; height: .6rem; vertical-align: middle; margin-left: .5rem; background: #8883; border-radius: 3px; overflow: hidden; }
+  .meter i { display: block; height: 100%; background: #2c8; transition: width .1s linear; }
   #log { height: 12rem; overflow: auto; font: 12px/1.35 ui-monospace, monospace; background: #0001; padding: .5rem; white-space: pre-wrap; }
   #chat { height: 10rem; overflow: auto; background: #0001; padding: .5rem; }
   #chat div { margin: .15rem 0; }
@@ -58,6 +60,7 @@
   <button id="mute" disabled>Mute</button>
   <button id="disconnect" disabled>Disconnect</button>
   <span id="rtt"></span>
+  <span title="local microphone level">mic <span class="meter"><i id="micmeter" style="width:0"></i></span> <span id="micvad"></span></span>
   <audio id="remote" autoplay></audio>
 </fieldset>
 
@@ -82,6 +85,8 @@
 import { AurixClient } from '../dist/index.js';
 
 const $ = (id) => document.getElementById(id);
+// Linear energy → bar width on a dB-ish scale (-60 dBov = empty, 0 dBov = full).
+const meterWidth = (energy) => energy > 0 ? Math.min(100, Math.max(0, 100 + (20 * Math.log10(energy)) / 0.6)) : 0;
 const log = (...a) => { $('log').textContent += a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n'; $('log').scrollTop = 1e9; };
 
 for (const id of ['api', 'ws', 'token', 'channel', 'apikey', 'name']) {
@@ -104,6 +109,13 @@ function renderRoster() {
       li.textContent = `${p.displayName} (${p.userId.slice(0, 8)}) ${p.role !== 'unknown' ? p.role : ''}` +
         `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.speaking ? ' 🔊' : ''}` +
         `${client.isUserBlocked(p.userId) ? ' [blocked]' : ''}`;
+      const meter = document.createElement('span');
+      meter.className = 'meter';
+      const bar = document.createElement('i');
+      bar.dataset.user = p.userId;
+      bar.style.width = `${meterWidth(p.energy)}%`;
+      meter.appendChild(bar);
+      li.appendChild(meter);
       if (p.userId !== client.sessionInfo?.userId) {
         const mute = document.createElement('button');
         const locallyMuted = client.isParticipantMuted(p.userId, ch);
@@ -189,6 +201,13 @@ $('connect').onclick = async () => {
   client.on('participantJoined', (ch, p) => { log('+', p.displayName); renderRoster(); });
   client.on('participantLeft', (ch, u) => { log('-', u); renderRoster(); });
   client.on('participantUpdated', renderRoster);
+  client.on('energy', (ch, levels) => {
+    for (const l of levels) {
+      for (const bar of document.querySelectorAll(`#roster i[data-user="${l.user_id}"]`)) bar.style.width = `${meterWidth(l.energy)}%`;
+    }
+  });
+  client.on('localEnergy', (s) => { $('micmeter').style.width = `${meterWidth(s.energy)}%`; });
+  client.on('localSpeaking', (on) => { $('micvad').textContent = on ? '🎙️' : ''; });
   client.on('receiverPreferences', (prefs) => { log('receiver prefs', prefs); renderRoster(); });
   client.on('userBlockChanged', (u, blocked) => { log(blocked ? 'blocked' : 'unblocked', u); renderRoster(); });
   client.on('recording', (ch, id, active, by) => {

@@ -46,6 +46,13 @@ pub enum MediaEvent {
         channels: Vec<ChannelId>,
         muted: bool,
     },
+    /// Periodic level report for one channel: `(user, -dBov level)` of every local member whose
+    /// level changed since the last report.
+    ChannelEnergy {
+        app_id: AppId,
+        channel_id: ChannelId,
+        levels: Vec<(UserId, u8)>,
+    },
 }
 
 pub struct RouterShared {
@@ -63,6 +70,7 @@ pub struct PacketRouter {
     webrtc: Option<Arc<WebRtcManager>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
     require_packet_auth: bool,
+    speaking_energy_threshold: f32,
     events: broadcast::Sender<MediaEvent>,
 }
 
@@ -76,6 +84,7 @@ impl PacketRouter {
         webrtc: Option<Arc<WebRtcManager>>,
         audio_sink: Option<Arc<dyn AudioSink>>,
         require_packet_auth: bool,
+        speaking_energy_threshold: f32,
         events: broadcast::Sender<MediaEvent>,
     ) -> Self {
         Self {
@@ -86,6 +95,7 @@ impl PacketRouter {
             webrtc,
             audio_sink,
             require_packet_auth,
+            speaking_energy_threshold,
             events,
         }
     }
@@ -99,7 +109,8 @@ impl PacketRouter {
         let session = self.authenticate(&mut packet, src_addr)?;
         match packet.header.packet_type {
             PacketType::Audio | PacketType::AudioFec => {
-                self.route_audio_packet(&packet, &session).await
+                let level = packet.take_audio_level();
+                self.route_audio_packet(&packet, &session, level).await
             }
             PacketType::Heartbeat => self.handle_heartbeat(&packet, &session, src_addr).await,
             PacketType::QualityReport => {
@@ -242,6 +253,7 @@ impl PacketRouter {
         &self,
         packet: &AurixPacket,
         sender: &Arc<MediaSession>,
+        level: Option<u8>,
     ) -> Result<()> {
         sender.record_packet_received(packet.payload.len() as u64);
         sender.update_heartbeat();
@@ -270,7 +282,7 @@ impl PacketRouter {
             ));
         }
 
-        if sender.mark_audio_activity() {
+        if sender.record_audio_level(level, self.speaking_energy_threshold) {
             let _ = self.events.send(MediaEvent::SpeakingChanged {
                 session_id: sender.session_id,
                 user_id: sender.user_id,
@@ -289,12 +301,14 @@ impl PacketRouter {
         Ok(())
     }
 
-    /// Route depayloaded Opus audio received from a WebRTC session.
+    /// Route depayloaded Opus audio received from a WebRTC session; `level` is the RTP
+    /// audio-level extension (`-dBov`) when the browser sent one.
     pub async fn route_webrtc_audio(
         &self,
         sender: &Arc<MediaSession>,
         rtp_time: u32,
         payload: Vec<u8>,
+        level: Option<u8>,
     ) -> Result<()> {
         sender.record_packet_received(payload.len() as u64);
         sender.update_heartbeat();
@@ -307,7 +321,7 @@ impl PacketRouter {
         if channels.is_empty() {
             return Ok(());
         }
-        if sender.mark_audio_activity() {
+        if sender.record_audio_level(level, self.speaking_energy_threshold) {
             let _ = self.events.send(MediaEvent::SpeakingChanged {
                 session_id: sender.session_id,
                 user_id: sender.user_id,

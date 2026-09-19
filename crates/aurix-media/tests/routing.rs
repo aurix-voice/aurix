@@ -68,6 +68,28 @@ impl Client {
             .unwrap();
     }
 
+    async fn send_audio_with_level(
+        &mut self,
+        sfu: SocketAddr,
+        channel: &ChannelId,
+        level: u8,
+        payload: &[u8],
+    ) {
+        let seq = self.next_seq();
+        let pkt = AurixPacket::audio_with_level(
+            seq,
+            seq * 960,
+            self.session.ssrc,
+            channel_id_hash(channel),
+            level,
+            payload,
+        );
+        self.sock
+            .send_to(&pkt.seal(&self.session.keys), sfu)
+            .await
+            .unwrap();
+    }
+
     /// Receive one downlink packet, asserting it is sealed for this session, and return the
     /// opened (plaintext) packet together with the ciphertext bytes as seen on the wire.
     async fn recv_raw(&self) -> Option<(AurixPacket, Vec<u8>)> {
@@ -462,4 +484,122 @@ async fn receiver_preferences_filter_and_scale_downlink() {
     a.send_audio(addr, &party, b"p4").await;
     assert_eq!(&hears(&b, &a).await.unwrap().payload[..], b"p4");
     assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"p4");
+}
+
+/// Client-measured audio levels: the level byte never reaches other participants, quiet frames
+/// keep the sender out of the speaking state, loud ones put it in, and the node periodically
+/// reports changed levels per channel (including the drop back to silence).
+#[tokio::test]
+async fn audio_levels_drive_speaking_and_energy_reports() {
+    let mut sfu = SfuNode::new(
+        MediaNodeId::new(),
+        Region::EuWest,
+        SfuOptions {
+            max_participants: 3,
+            speaking_timeout_ms: 200,
+            speaking_energy_threshold: 0.01, // -40 dBov
+            energy_interval_ms: 50,
+            ..SfuOptions::default()
+        },
+    );
+    sfu.start("127.0.0.1:0").await.unwrap();
+    let addr = sfu.local_addr().unwrap();
+    let app = AppId::new();
+    let channel = ChannelId::new();
+
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    for s in [&s_a, &s_b] {
+        sfu.join_channel(
+            &s.session_id,
+            channel,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut events = sfu.subscribe_events();
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+
+    async fn drain(
+        events: &mut tokio::sync::broadcast::Receiver<MediaEvent>,
+        for_ms: u64,
+    ) -> Vec<MediaEvent> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(for_ms);
+        while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
+            out.push(ev);
+        }
+        out
+    }
+    fn speaking_of(events: &[MediaEvent], user: UserId) -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                MediaEvent::SpeakingChanged {
+                    user_id, speaking, ..
+                } if *user_id == user => Some(*speaking),
+                _ => None,
+            })
+            .collect()
+    }
+    fn energy_of(events: &[MediaEvent], ch: ChannelId, user: UserId) -> Vec<u8> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                MediaEvent::ChannelEnergy {
+                    channel_id, levels, ..
+                } if *channel_id == ch => levels.iter().find(|(u, _)| *u == user).map(|(_, l)| *l),
+                _ => None,
+            })
+            .collect()
+    }
+    drain(&mut events, 100).await; // SessionBound etc.
+
+    // Quiet frames (-60 dBov): forwarded as audio, level byte stripped, but not "speaking".
+    for _ in 0..5 {
+        a.send_audio_with_level(addr, &channel, 60, b"quiet-opus")
+            .await;
+    }
+    let got = b.recv().await.expect("b hears quiet audio");
+    assert!(!got.header.has_flag(PacketFlags::Energy));
+    assert_eq!(&got.payload[..], b"quiet-opus");
+    let evs = drain(&mut events, 150).await;
+    assert!(
+        speaking_of(&evs, s_a.user_id).is_empty(),
+        "quiet labelled frames must not flip speaking: {evs:?}"
+    );
+    let quiet = energy_of(&evs, channel, s_a.user_id);
+    assert!(
+        quiet.first() == Some(&60) && quiet.iter().skip(1).all(|l| *l == 127),
+        "level of quiet frames is still reported: {quiet:?}"
+    );
+    assert!(
+        energy_of(&evs, channel, s_b.user_id).is_empty(),
+        "silent participants are not reported"
+    );
+
+    // Loud frames (-6 dBov): speaking starts and the level is reported once; when the frames
+    // stop, speaking times out and the level decays to a single silence (127) report.
+    for _ in 0..5 {
+        a.send_audio_with_level(addr, &channel, 6, b"loud-opus")
+            .await;
+    }
+    while b.recv().await.is_some() {}
+    let evs = drain(&mut events, 600).await;
+    assert_eq!(speaking_of(&evs, s_a.user_id), vec![true, false]);
+    assert_eq!(energy_of(&evs, channel, s_a.user_id), vec![6, 127]);
+
+    // Unlabelled frames keep the legacy behaviour: speaking by arrival, no level report.
+    a.send_audio(addr, &channel, b"legacy").await;
+    let evs = drain(&mut events, 150).await;
+    assert_eq!(speaking_of(&evs, s_a.user_id), vec![true]);
+    assert!(energy_of(&evs, channel, s_a.user_id).is_empty());
 }

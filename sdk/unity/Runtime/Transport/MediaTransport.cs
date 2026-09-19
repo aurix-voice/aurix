@@ -128,14 +128,21 @@ namespace Aurix.Transport
             lock (_seqLock) return ++_seq;
         }
 
-        /// <summary>Send one encoded Opus frame. <paramref name="rtpTimestamp"/> advances by 960 per 20 ms at 48 kHz.</summary>
-        public void SendAudio(uint channelHash, uint rtpTimestamp, byte[] opusFrame, int length = -1)
+        /// <summary>
+        /// Send one encoded Opus frame. <paramref name="rtpTimestamp"/> advances by 960 per 20 ms at 48 kHz.
+        /// <paramref name="level"/> is the sender's measured <see cref="Aurix.Audio.AudioLevel"/> of the
+        /// frame (null = not measured; the server then infers speaking from packet arrival only).
+        /// </summary>
+        public void SendAudio(uint channelHash, uint rtpTimestamp, byte[] opusFrame, int length = -1, byte? level = null)
         {
             if (length < 0) length = opusFrame.Length;
             var payload = length == opusFrame.Length ? opusFrame : Slice(opusFrame, length);
-            if (AurxPacket.HeaderSize + payload.Length + AurxPacket.AuthTagSize > AurxPacket.MaxPacketSize)
+            int extra = level.HasValue ? 1 : 0;
+            if (AurxPacket.HeaderSize + payload.Length + extra + AurxPacket.AuthTagSize > AurxPacket.MaxPacketSize)
                 throw new ArgumentException("Opus frame too large for one AURX packet");
-            Send(AurxPacket.Audio(NextSeq(), rtpTimestamp, _ssrc, channelHash, payload));
+            Send(level.HasValue
+                ? AurxPacket.AudioWithLevel(NextSeq(), rtpTimestamp, _ssrc, channelHash, level.Value, payload)
+                : AurxPacket.Audio(NextSeq(), rtpTimestamp, _ssrc, channelHash, payload));
         }
 
         public void SendMuteState(bool muted) => Send(AurxPacket.MuteState(NextSeq(), _ssrc, muted));
@@ -198,6 +205,7 @@ namespace Aurix.Transport
                         lock (window) fresh = window.CheckAndUpdate(pkt.Header.Sequence);
                         if (!fresh) { Interlocked.Increment(ref _packetsReplayed); continue; }
                         Interlocked.Increment(ref _packetsReceived);
+                        pkt.TakeAudioLevel();
                         _audioInbox.Enqueue(new IncomingAudio
                         {
                             SenderSsrc = pkt.Header.Ssrc,

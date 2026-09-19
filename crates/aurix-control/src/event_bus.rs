@@ -133,6 +133,20 @@ pub enum ServerEvent {
         session_id: SessionId,
         typing: bool,
     },
+    /// Voice activity edge detected by the media node hosting the participant.
+    ParticipantSpeaking {
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        speaking: bool,
+    },
+    /// Periodic audio levels (`0.0..=1.0`) of channel members hosted on the origin node whose
+    /// level changed since the previous report.
+    ChannelEnergy {
+        app_id: AppId,
+        channel_id: ChannelId,
+        levels: Vec<aurix_common::protocol::ParticipantEnergy>,
+    },
 }
 
 impl ServerEvent {
@@ -154,9 +168,21 @@ impl ServerEvent {
             | Self::RecordingConsentRequired { app_id, .. }
             | Self::UserBlockChanged { app_id, .. }
             | Self::ChatMessage { app_id, .. }
-            | Self::ParticipantTyping { app_id, .. } => Some(*app_id),
+            | Self::ParticipantTyping { app_id, .. }
+            | Self::ParticipantSpeaking { app_id, .. }
+            | Self::ChannelEnergy { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } => None,
         }
+    }
+
+    /// High-frequency client UX signals that are not meaningful to a backend event consumer.
+    pub fn is_realtime_noise(&self) -> bool {
+        matches!(
+            self,
+            Self::ParticipantTyping { .. }
+                | Self::ParticipantSpeaking { .. }
+                | Self::ChannelEnergy { .. }
+        )
     }
 }
 

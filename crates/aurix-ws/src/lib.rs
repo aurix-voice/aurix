@@ -16,7 +16,8 @@ use aurix_auth::{JwtService, ValidatedToken};
 use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
-    ChatMessage, ControlMessage, LocalMute, ParticipantBrief, ParticipantVolume,
+    decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
+    ParticipantEnergy, ParticipantVolume,
 };
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
@@ -286,6 +287,30 @@ impl WsState {
             .collect()
     }
 
+    /// `broadcast_channel` for events that may originate on another node: members are only
+    /// addressed when their connection belongs to the event's tenant.
+    fn broadcast_channel_in_app(
+        &self,
+        app_id: AppId,
+        channel_id: &ChannelId,
+        msg: &ControlMessage,
+    ) {
+        let Ok(json) = serde_json::to_string(msg) else {
+            return;
+        };
+        let Some(members) = self.channel_members.get(channel_id) else {
+            return;
+        };
+        for sid in members.iter() {
+            if let Some(conn) = self.connections.get(&sid) {
+                if conn.app_id != app_id {
+                    continue;
+                }
+                let _ = conn.tx.try_send(json.clone());
+            }
+        }
+    }
+
     fn index_join(&self, channel_id: ChannelId, session_id: SessionId) {
         self.channel_members
             .entry(channel_id)
@@ -423,6 +448,33 @@ impl WsState {
                     typing,
                 } => {
                     self.deliver_typing(app_id, channel_id, user_id, session_id, typing);
+                }
+                ServerEvent::ParticipantSpeaking {
+                    app_id,
+                    channel_id,
+                    user_id,
+                    speaking,
+                } => {
+                    self.broadcast_channel_in_app(
+                        app_id,
+                        &channel_id,
+                        &ControlMessage::SpeakingStateChanged {
+                            channel_id,
+                            user_id,
+                            speaking,
+                        },
+                    );
+                }
+                ServerEvent::ChannelEnergy {
+                    app_id,
+                    channel_id,
+                    levels,
+                } => {
+                    self.broadcast_channel_in_app(
+                        app_id,
+                        &channel_id,
+                        &ControlMessage::ChannelEnergy { channel_id, levels },
+                    );
                 }
                 ServerEvent::UserKicked {
                     app_id,
@@ -673,22 +725,43 @@ impl WsState {
                     self.send_to_session(&session_id, &ControlMessage::MediaBound { session_id });
                 }
                 MediaEvent::SpeakingChanged {
+                    session_id,
                     user_id,
                     channels,
                     speaking,
-                    ..
                 } => {
+                    // Published (not just broadcast) so members hosted on other nodes see
+                    // the indicator too; local delivery happens in the ServerEvent fan-out.
+                    let Some(app_id) = self.connections.get(&session_id).map(|c| c.app_id) else {
+                        continue;
+                    };
                     for channel_id in channels {
-                        self.broadcast_channel(
-                            &channel_id,
-                            &ControlMessage::SpeakingStateChanged {
+                        self.control
+                            .events
+                            .publish(ServerEvent::ParticipantSpeaking {
+                                app_id,
                                 channel_id,
                                 user_id,
                                 speaking,
-                            },
-                            None,
-                        );
+                            });
                     }
+                }
+                MediaEvent::ChannelEnergy {
+                    app_id,
+                    channel_id,
+                    levels,
+                } => {
+                    self.control.events.publish(ServerEvent::ChannelEnergy {
+                        app_id,
+                        channel_id,
+                        levels: levels
+                            .into_iter()
+                            .map(|(user_id, level)| ParticipantEnergy {
+                                user_id,
+                                energy: decode_audio_level(level),
+                            })
+                            .collect(),
+                    });
                 }
                 MediaEvent::MuteChanged {
                     session_id,
@@ -2085,6 +2158,7 @@ async fn handle_control_message(
         | ControlMessage::ModerateParticipantAck { .. }
         | ControlMessage::ChatMessageReceived { .. }
         | ControlMessage::ParticipantTyping { .. }
+        | ControlMessage::ChannelEnergy { .. }
         | ControlMessage::WebRtcAnswer { .. }
         | ControlMessage::Pong { .. } => {
             send_error(
@@ -2158,8 +2232,7 @@ async fn handle_event_stream(socket: WebSocket, state: WsState, app_id: AppId) {
             if event.app_id() != Some(app_id) {
                 continue;
             }
-            // Typing indicators are pure client UX noise for a backend consumer.
-            if matches!(event, ServerEvent::ParticipantTyping { .. }) {
+            if event.is_realtime_noise() {
                 continue;
             }
             let json = serde_json::to_string(&event).unwrap_or_default();

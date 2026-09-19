@@ -141,6 +141,28 @@ per session), `MESSAGE_BLOCKED` (content filter), `CHAT_DISABLED`. The server co
 `client_ref`, so only that promise fails — an unrelated `Error` frame is emitted as `serverError`.
 Messages from the same sender arrive in order; you are not told about your own typing.
 
+### Audio energy / voice activity
+
+Remote levels come from the server (`ChannelEnergy`, derived from the `ssrc-audio-level` RTP
+header extension the browser already sends): `participant.energy` is the last linear RMS `0..1`
+(`0` = silent; decays to `0` about two intervals after the last frame) and the `energy` event
+carries only the levels that changed (≥ 3 dB or a silence transition). Your own microphone can
+be metered locally with Web Audio — no server round-trip, works while muted-by-server too:
+
+```ts
+const client = new AurixClient({ …, localVoiceActivity: true });
+// or: localVoiceActivity: { threshold: 0.02, hangoverMs: 250, intervalMs: 50, smoothing: 0.5 }
+client.on('energy', (channelId, levels) => levels.forEach(l => bar(l.user_id).width = toDb(l.energy)));
+client.on('localEnergy', (s) => micMeter.width = toDb(s.energy));  // { energy, rms, speaking, changed }
+client.on('localSpeaking', (on) => micIcon.hidden = !on);
+client.localEnergy; client.localSpeaking;                          // current values
+```
+
+`encodeAudioLevel` / `decodeAudioLevel` convert between linear RMS and the RFC 6464 byte
+(`0` = full scale, `127` = silence, else `-dBov`) if you want to display the same scale as the
+server, and `VoiceActivityDetector` / `AudioLevelMeter` are exported for custom pipelines. The
+meter is skipped silently where `AudioContext` is unavailable.
+
 ## How it maps to the server
 
 | SDK | server |

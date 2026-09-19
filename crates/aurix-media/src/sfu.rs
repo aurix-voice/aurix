@@ -11,12 +11,16 @@ use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
 use chrono::Utc;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
+
+/// Level change (dB) below which a participant is left out of the next `ChannelEnergy` report.
+const ENERGY_REPORT_MIN_STEP_DB: u8 = 3;
 
 /// Media-plane tunables taken from `MediaConfig`.
 #[derive(Debug, Clone)]
@@ -25,6 +29,10 @@ pub struct SfuOptions {
     pub max_channels: u32,
     pub require_packet_auth: bool,
     pub speaking_timeout_ms: u64,
+    /// Minimum linear level of a labeled frame to count as voice (see `MediaConfig`).
+    pub speaking_energy_threshold: f32,
+    /// Period of `MediaEvent::ChannelEnergy` reports (0 = disabled).
+    pub energy_interval_ms: u64,
     pub session_timeout_secs: u64,
     pub cascade_secret: Option<String>,
     pub cascade_peers: Vec<String>,
@@ -42,6 +50,8 @@ impl Default for SfuOptions {
             max_channels: 1000,
             require_packet_auth: true,
             speaking_timeout_ms: 400,
+            speaking_energy_threshold: 0.01,
+            energy_interval_ms: 200,
             session_timeout_secs: 60,
             cascade_secret: None,
             cascade_peers: Vec::new(),
@@ -220,6 +230,7 @@ impl SfuNode {
             Some(webrtc_mgr.clone()),
             self.audio_sink.clone(),
             self.options.require_packet_auth,
+            self.options.speaking_energy_threshold,
             self.events.clone(),
         ));
 
@@ -237,6 +248,7 @@ impl SfuNode {
                             user_id,
                             rtp_time,
                             payload,
+                            level,
                         } => {
                             let session =
                                 sessions_by_id.get(&session_id).map(|s| s.value().clone());
@@ -246,8 +258,9 @@ impl SfuNode {
                             {
                                 continue;
                             }
-                            if let Err(e) =
-                                router.route_webrtc_audio(&session, rtp_time, payload).await
+                            if let Err(e) = router
+                                .route_webrtc_audio(&session, rtp_time, payload, level)
+                                .await
                             {
                                 warn!("WebRTC audio route error: {}", e);
                             }
@@ -329,6 +342,7 @@ impl SfuNode {
 
         self.start_session_cleanup();
         self.start_speaking_timeout();
+        self.start_energy_reports();
         self.local_addr = Some(local_addr);
         self.started = true;
         info!(
@@ -701,6 +715,52 @@ impl SfuNode {
                         user_id: s.user_id,
                         channels: s.get_channels(),
                         speaking: false,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Every `energy_interval_ms`, gather the level of each session that moved since the last
+    /// report and emit one `ChannelEnergy` per channel those sessions are in.
+    fn start_energy_reports(&self) {
+        let interval_ms = self.options.energy_interval_ms;
+        if interval_ms == 0 {
+            return;
+        }
+        let sessions = self.sessions_by_id.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // A level older than two report periods means the sender stopped labelling frames.
+            let stale_ms = (interval_ms * 2) as i64;
+            loop {
+                interval.tick().await;
+                let mut per_channel: HashMap<ChannelId, (AppId, Vec<(UserId, u8)>)> =
+                    HashMap::new();
+                for entry in sessions.iter() {
+                    let s = entry.value();
+                    if !s.is_active() {
+                        continue;
+                    }
+                    let Some(level) = s.take_energy_report(stale_ms, ENERGY_REPORT_MIN_STEP_DB)
+                    else {
+                        continue;
+                    };
+                    for channel_id in s.get_channels() {
+                        per_channel
+                            .entry(channel_id)
+                            .or_insert_with(|| (s.app_id, Vec::new()))
+                            .1
+                            .push((s.user_id, level));
+                    }
+                }
+                for (channel_id, (app_id, levels)) in per_channel {
+                    let _ = events.send(MediaEvent::ChannelEnergy {
+                        app_id,
+                        channel_id,
+                        levels,
                     });
                 }
             }

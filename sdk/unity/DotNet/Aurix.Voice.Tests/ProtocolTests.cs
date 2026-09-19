@@ -318,6 +318,92 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void AudioLevelMatchesServerEncoding()
+        {
+            // Same vectors as encode_audio_level / decode_audio_level in crates/aurix-common/src/protocol.rs.
+            Assert.Equal(0, AudioLevel.Encode(1f));
+            Assert.Equal(20, AudioLevel.Encode(0.1f));
+            Assert.Equal(40, AudioLevel.Encode(0.01f));
+            Assert.Equal(AudioLevel.Silence, AudioLevel.Encode(0f));
+            Assert.Equal(AudioLevel.Silence, AudioLevel.Encode(float.NaN));
+            Assert.Equal(AudioLevel.Silence, AudioLevel.Encode(1e-9f));
+            Assert.Equal(0, AudioLevel.Encode(4f)); // clipped input clamps to full scale
+            Assert.Equal(1f, AudioLevel.Decode(0));
+            Assert.InRange(AudioLevel.Decode(20), 0.0999f, 0.1001f);
+            Assert.Equal(0f, AudioLevel.Decode(AudioLevel.Silence));
+            Assert.Equal(0f, AudioLevel.Decode(255));
+
+            var tone = new float[960];
+            for (int i = 0; i < tone.Length; i++) tone[i] = 0.5f * (float)Math.Sin(2 * Math.PI * 440 * i / 48000.0);
+            Assert.InRange(AudioLevel.Rms(tone, tone.Length), 0.35f, 0.36f);
+        }
+
+        [Fact]
+        public void EnergyPacketCarriesLevelByteAndServerStripsIt()
+        {
+            var key = Keys(3);
+            var opus = new byte[] { 0xF8, 0x01, 0x02 };
+            var pkt = AurxPacket.AudioWithLevel(1, 960, 5, 0xAB, level: 42, opus);
+            Assert.True((pkt.Header.Flags & PacketFlags.Energy) != 0);
+            Assert.Equal(new byte[] { 42, 0xF8, 0x01, 0x02 }, pkt.Payload);
+
+            Assert.True(AurxPacket.TryDecode(pkt.Seal(key), out var decoded, out _));
+            Assert.True(decoded.Open(key));
+            Assert.Equal((byte)42, decoded.TakeAudioLevel());
+            Assert.True((decoded.Header.Flags & PacketFlags.Energy) == 0);
+            Assert.Equal(opus, decoded.Payload);
+            Assert.Equal(3, decoded.Header.PayloadLength);
+            Assert.Null(decoded.TakeAudioLevel());
+
+            // Out-of-range level bytes clamp to silence; a bare frame has no level.
+            Assert.Equal(AudioLevel.Silence, AurxPacket.AudioWithLevel(1, 0, 5, 1, 200, opus).Payload[0]);
+            Assert.Null(AurxPacket.Audio(1, 0, 5, 1, opus).TakeAudioLevel());
+        }
+
+        [Fact]
+        public void VoiceActivityDetectorHasHangover()
+        {
+            var vad = new VoiceActivityDetector { Threshold = 0.01f, HangoverFrames = 3, Smoothing = 0f };
+            var loud = new float[960]; for (int i = 0; i < loud.Length; i++) loud[i] = 0.2f;
+            var quiet = new float[960];
+
+            Assert.False(vad.Process(quiet, quiet.Length));
+            Assert.False(vad.Speaking);
+            Assert.Equal(AudioLevel.Silence, vad.Level);
+
+            Assert.True(vad.Process(loud, loud.Length));
+            Assert.True(vad.Speaking);
+            Assert.Equal(14, vad.Level); // -20*log10(0.2) ≈ 13.98
+            Assert.InRange(vad.Energy, 0.199f, 0.201f);
+
+            Assert.False(vad.Process(quiet, quiet.Length)); // 1 quiet frame: still speaking
+            Assert.False(vad.Process(quiet, quiet.Length)); // 2
+            Assert.True(vad.Process(quiet, quiet.Length));  // 3 → speech over
+            Assert.False(vad.Speaking);
+
+            vad.Process(loud, loud.Length);
+            vad.Reset();
+            Assert.False(vad.Speaking);
+            Assert.Equal(0f, vad.Energy);
+        }
+
+        [Fact]
+        public void ChannelEnergyMessageParses()
+        {
+            var team = Guid.Parse("aaaaaaaa-0000-0000-0000-000000000001");
+            var bob = Guid.Parse("bbbbbbbb-0000-0000-0000-000000000002");
+            var msg = ControlMessage.Parse("{\"type\":\"ChannelEnergy\",\"data\":{\"channel_id\":\"" + team + "\",\"levels\":[" +
+                "{\"user_id\":\"" + bob + "\",\"energy\":0.25},{\"user_id\":\"not-a-uuid\",\"energy\":0.5},{\"user_id\":\"" + team + "\",\"energy\":7}]}}");
+            Assert.Equal(team, msg.Id("channel_id"));
+            var levels = msg.Levels();
+            Assert.Equal(2, levels.Count);
+            Assert.Equal(bob, levels[0].UserId);
+            Assert.Equal(0.25f, levels[0].Energy);
+            Assert.Equal(1f, levels[1].Energy); // clamped
+            Assert.Empty(ControlMessage.Parse("{\"type\":\"ChannelEnergy\",\"data\":{\"channel_id\":\"" + team + "\"}}").Levels());
+        }
+
+        [Fact]
         public void JitterBufferReordersAndFlagsLoss()
         {
             var jb = new JitterBuffer(targetDepthFrames: 2);

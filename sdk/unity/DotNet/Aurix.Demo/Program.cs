@@ -82,6 +82,16 @@ namespace Aurix.Demo
             var mixer = new RemoteMixer(() => new ConcentusOpusCodec());
             var outBuf = new float[AudioFormat.FrameSamples];
             double energy = 0; long samples = 0; int framesWithSignal = 0;
+            var vad = new VoiceActivityDetector();
+            float bobSeesAliceEnergy = 0f; int energyReports = 0;
+            bob.OnChannelEnergy += (ch, levels) =>
+            {
+                foreach (var l in levels)
+                {
+                    var p = bob.GetParticipants(ch).FirstOrDefault(x => x.UserId == l.UserId);
+                    if (p != null && p.Ssrc == a.Ssrc) { bobSeesAliceEnergy = Math.Max(bobSeesAliceEnergy, l.Energy); energyReports++; }
+                }
+            };
 
             int frames = seconds * 50;
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -89,7 +99,8 @@ namespace Aurix.Demo
             {
                 for (int n = 0; n < pcm.Length; n++) { pcm[n] = (float)(0.5 * Math.Sin(phase)); phase += 2 * Math.PI * 440 / AudioFormat.SampleRate; }
                 int len = enc.Encode(pcm, AudioFormat.FrameSamples, opus);
-                alice.SendOpusFrame(hash, opus, len);
+                vad.Process(pcm, AudioFormat.FrameSamples);
+                alice.SendOpusFrame(hash, opus, len, AudioFormat.FrameSamples, vad.Level);
                 if (i == frames / 2) alice.SetMuted(true);       // second half: muted → bob should hear silence
 
                 while (bob.TryDequeueAudio(out var incoming)) mixer.Push(incoming.SenderSsrc, incoming.Sequence, incoming.Volume, incoming.Opus);
@@ -111,6 +122,7 @@ namespace Aurix.Demo
             Console.WriteLine($"alice sent {alice.Media.PacketsSent} pkts; bob received {bob.Media.PacketsReceived} verified, {bob.Media.PacketsBadAuth} bad auth, {bob.Media.PacketsReplayed} replayed");
             Console.WriteLine($"bob decoded RMS while alice talked: {rms:F3} (expect ≈0.35 for a 0.5-amplitude sine); frames with signal: {framesWithSignal}/{frames}");
             Console.WriteLine($"heartbeat acks {alice.Media.HeartbeatAcks} (every 5 s), RTT {alice.Media.LastRttMs} ms, alive={alice.Media.IsAlive}, control RTT {alice.ControlRttMs} ms");
+            Console.WriteLine($"alice local VAD: level {vad.Level} (-dBov), speaking={vad.Speaking}; bob got {energyReports} energy report(s) for alice, peak {bobSeesAliceEnergy:F3} (expect ≈0.35)");
             long received = bob.Media.PacketsReceived, badAuth = bob.Media.PacketsBadAuth;
             await alice.LeaveChannelAsync(channelId);
             await Task.Delay(200);
@@ -121,7 +133,8 @@ namespace Aurix.Demo
             foreach (var l in log) Console.WriteLine("  " + l);
 
             bool ok = received > frames / 4 && rms > 0.2 && badAuth == 0
-                      && log.Contains("bob: speaking alice true") && log.Contains("bob: mute alice muted=True");
+                      && log.Contains("bob: speaking alice true") && log.Contains("bob: mute alice muted=True")
+                      && vad.Speaking && bobSeesAliceEnergy > 0.2f;
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }

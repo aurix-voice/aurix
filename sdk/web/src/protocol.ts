@@ -52,6 +52,12 @@ export interface ParticipantVolume {
   volume: number;
 }
 
+/** One entry of a `ChannelEnergy` report: linear audio energy `0..1` (`0` = silent). */
+export interface ParticipantEnergy {
+  user_id: string;
+  energy: number;
+}
+
 /** Upper bound the server accepts for `SetParticipantVolume`. */
 export const MAX_PARTICIPANT_VOLUME = 2.0;
 
@@ -156,6 +162,7 @@ export type ServerMessage =
   | { type: 'UserBlockChanged'; data: { user_id: string; blocked: boolean } }
   | { type: 'ChatMessageReceived'; data: { message: ChatMessageWire } }
   | { type: 'ParticipantTyping'; data: { channel_id: string; user_id: string; typing: boolean } }
+  | { type: 'ChannelEnergy'; data: { channel_id: string; levels: ParticipantEnergy[] } }
   | {
       type: 'ReceiverPreferences';
       data: { blocked_users: string[]; local_mutes: LocalMute[]; volumes: ParticipantVolume[] };

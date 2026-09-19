@@ -1,11 +1,11 @@
 use aurix_common::crypto::MediaKeys;
-use aurix_common::protocol::ReplayWindow;
+use aurix_common::protocol::{decode_audio_level, ReplayWindow, AUDIO_LEVEL_SILENCE};
 use aurix_common::types::*;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Upper bound for a per-participant gain (1.0 = as sent, 2.0 = +6 dB).
@@ -159,6 +159,11 @@ pub struct MediaSession {
     pub last_audio_timestamp: AtomicU64,
     /// Wall-clock ms of the last audio packet, used for the speaking timeout.
     pub last_audio_at_ms: AtomicI64,
+    /// Latest sender-reported audio level (`-dBov`, `AUDIO_LEVEL_SILENCE` when unknown/quiet)
+    /// and when it was measured; `energy_reported` is the last level sent in `ChannelEnergy`.
+    pub audio_level: AtomicU8,
+    pub audio_level_at_ms: AtomicI64,
+    pub energy_reported: AtomicU8,
     pub last_heartbeat: RwLock<DateTime<Utc>>,
     pub quality: RwLock<QualityMetrics>,
     pub created_at: DateTime<Utc>,
@@ -202,6 +207,9 @@ impl MediaSession {
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
             last_audio_at_ms: AtomicI64::new(0),
+            audio_level: AtomicU8::new(AUDIO_LEVEL_SILENCE),
+            audio_level_at_ms: AtomicI64::new(0),
+            energy_reported: AtomicU8::new(AUDIO_LEVEL_SILENCE),
             last_heartbeat: RwLock::new(Utc::now()),
             quality: RwLock::new(QualityMetrics {
                 rtt_ms: 0.0,
@@ -305,11 +313,59 @@ impl MediaSession {
         self.replay.lock().check_and_update(seq)
     }
 
-    /// Mark audio activity now. Returns `true` if the speaking state flipped to true.
+    /// Record an audio frame that counts as voice. Returns `true` if the speaking state
+    /// flipped to true.
     pub fn mark_audio_activity(&self) -> bool {
         self.last_audio_at_ms
             .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
         !self.is_speaking.swap(true, Ordering::Relaxed)
+    }
+
+    /// Record the sender-measured level of an incoming frame (`None` = unlabeled frame). Returns
+    /// `true` if the speaking state flipped to true. Labeled frames below `threshold` (linear
+    /// energy) are silence: they refresh the level but let the speaking state expire.
+    pub fn record_audio_level(&self, level: Option<u8>, threshold: f32) -> bool {
+        let now = Utc::now().timestamp_millis();
+        match level {
+            None => self.mark_audio_activity(),
+            Some(level) => {
+                let level = level.min(AUDIO_LEVEL_SILENCE);
+                self.audio_level.store(level, Ordering::Relaxed);
+                self.audio_level_at_ms.store(now, Ordering::Relaxed);
+                if decode_audio_level(level) >= threshold && level < AUDIO_LEVEL_SILENCE {
+                    self.mark_audio_activity()
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Current level for reporting: the last measured one, or silence once no labeled frame
+    /// arrived within `stale_ms`.
+    pub fn current_audio_level(&self, stale_ms: i64) -> u8 {
+        let at = self.audio_level_at_ms.load(Ordering::Relaxed);
+        if Utc::now().timestamp_millis() - at > stale_ms {
+            AUDIO_LEVEL_SILENCE
+        } else {
+            self.audio_level.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Level to include in the next `ChannelEnergy` report, if it moved enough since the last
+    /// one (>= `min_step` dB, or any transition to/from silence).
+    pub fn take_energy_report(&self, stale_ms: i64, min_step: u8) -> Option<u8> {
+        let current = self.current_audio_level(stale_ms);
+        let reported = self.energy_reported.load(Ordering::Relaxed);
+        if current == reported {
+            return None;
+        }
+        let silence_edge = (current == AUDIO_LEVEL_SILENCE) != (reported == AUDIO_LEVEL_SILENCE);
+        if !silence_edge && current.abs_diff(reported) < min_step {
+            return None;
+        }
+        self.energy_reported.store(current, Ordering::Relaxed);
+        Some(current)
     }
 
     /// Clear speaking if no audio arrived within `timeout_ms`. Returns `true` if it flipped to false.
@@ -371,6 +427,54 @@ pub struct SessionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session() -> Arc<MediaSession> {
+        MediaSession::new(
+            SessionId::new(),
+            UserId::new(),
+            AppId::new(),
+            "t".into(),
+            1,
+            [7u8; 32],
+        )
+    }
+
+    #[test]
+    fn labeled_frames_below_threshold_do_not_start_speaking() {
+        let s = session();
+        // 0.01 threshold = 40 dBov: 41 is quieter, 39 louder.
+        assert!(!s.record_audio_level(Some(41), 0.01));
+        assert!(!s.is_speaking.load(Ordering::Relaxed));
+        assert_eq!(s.current_audio_level(1000), 41);
+        assert!(!s.record_audio_level(Some(AUDIO_LEVEL_SILENCE), 0.0));
+        assert!(s.record_audio_level(Some(39), 0.01));
+        assert!(!s.record_audio_level(Some(39), 0.01));
+        assert!(s.is_speaking.load(Ordering::Relaxed));
+        // Unlabeled frames keep the legacy behaviour: any packet is voice.
+        let u = session();
+        assert!(u.record_audio_level(None, 0.01));
+        assert_eq!(u.current_audio_level(1000), AUDIO_LEVEL_SILENCE);
+    }
+
+    #[test]
+    fn energy_reports_only_on_meaningful_change() {
+        let s = session();
+        assert_eq!(s.take_energy_report(1000, 3), None);
+        s.record_audio_level(Some(30), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), Some(30));
+        s.record_audio_level(Some(32), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), None);
+        s.record_audio_level(Some(33), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), Some(33));
+        s.record_audio_level(Some(AUDIO_LEVEL_SILENCE), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), Some(AUDIO_LEVEL_SILENCE));
+        assert_eq!(s.take_energy_report(1000, 3), None);
+        // A stale level decays to silence and is reported once.
+        s.record_audio_level(Some(20), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), Some(20));
+        s.audio_level_at_ms.fetch_sub(5000, Ordering::Relaxed);
+        assert_eq!(s.take_energy_report(1000, 3), Some(AUDIO_LEVEL_SILENCE));
+    }
 
     #[test]
     fn prefs_scopes_and_precedence() {

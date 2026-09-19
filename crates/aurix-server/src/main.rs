@@ -86,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
             max_channels: config.media.max_channels_per_node,
             require_packet_auth: config.media.require_packet_auth,
             speaking_timeout_ms: config.media.speaking_timeout_ms,
+            speaking_energy_threshold: config.media.speaking_energy_threshold,
+            energy_interval_ms: config.media.energy_interval_ms,
             session_timeout_secs: config.media.session_timeout_secs,
             cascade_secret: config.media.cascade_secret.clone(),
             cascade_peers: config.media.cascade_peers.clone(),

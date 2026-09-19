@@ -179,6 +179,30 @@ the two users), `USER_MUTED` (server-muted while `chat.server_mute_blocks_text`)
 `CHAT_DISABLED`. Only the send whose `client_ref` the server echoes back fails; unrelated `Error`
 frames go to `OnServerError`. Events fire from `Update()` like everything else.
 
+### Audio energy / voice activity
+
+`AurixVoiceBehaviour` runs a `VoiceActivityDetector` on the mono PCM it captures (inspector:
+`VadThreshold` — linear RMS, 0.01 ≈ −40 dBov; `VadHangoverFrames` — 20 ms frames of silence before
+speech ends, 15 ≈ 300 ms; `GateOnVad` — stop sending frames while silent, off by default) and
+raises `OnLocalSpeaking`. Every frame is labelled with the measured level: the AURX packet gets
+`PacketFlags.Energy` and a leading RFC 6464 byte (`0` = full scale, `127` = silence, else `-dBov`),
+which the server strips before forwarding and uses for `SpeakingStateChanged` (only frames at or
+above `media.speaking_energy_threshold` count) and for `ChannelEnergy`. With your own pipeline:
+
+```csharp
+var vad = new VoiceActivityDetector { Threshold = 0.01f, HangoverFrames = 15 };
+if (vad.Process(monoPcm, AudioFormat.FrameSamples)) OnMicActivity(vad.Speaking);
+if (gate && !vad.Speaking) client.SkipFrame();            // keep the RTP clock running without sending
+else client.SendOpusFrame(hash, opus, len, AudioFormat.FrameSamples, vad.Level);
+
+client.OnChannelEnergy += (channel, levels) => { foreach (var l in levels) SetBar(l.UserId, l.Energy); };
+// participant.Energy holds the last reported linear level 0..1 (0 when silent / decayed)
+```
+
+`AudioLevel.Encode/Decode/Rms` convert between linear RMS and the wire byte. Frames sent without a
+level (`SendOpusFrame(hash, opus, len)`) still work — the server then treats every arriving frame as
+speech, as before.
+
 ## .NET: build, test, end-to-end demo
 
 ```bash
@@ -190,7 +214,8 @@ AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1
 
 The demo creates a channel, issues two tokens, connects "alice" and "bob" over real UDP, streams an Opus-encoded
 440 Hz tone for half the run and mutes for the other half, and asserts: all packets verified (0 bad auth / replays),
-decoded RMS ≈ 0.35, speaking / mute / leave events observed by the peer. It prints `RESULT: PASS` and exits 0.
+decoded RMS ≈ 0.35, speaking / mute / leave events observed by the peer, the local VAD reports speech and the peer
+receives a matching `ChannelEnergy` level (≈ 0.35). It prints `RESULT: PASS` and exits 0.
 
 `--scenario reconnect` runs the reconnect check instead: alice's control connection goes through a local
 TCP proxy that is cut abruptly — once within the grace window (same session and SSRC must resume, audio

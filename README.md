@@ -174,6 +174,19 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
    to text exactly as to voice; delivery crosses nodes through the same Redis event bus as
    presence events. Metadata is arbitrary JSON (`/`-commands, map pings, …) and counts toward
    `chat.max_message_bytes`.
+8. **Audio energy / voice activity**: clients measure their own microphone level and label each
+   audio frame with it — native AURX sets `PacketFlags::Energy` and prefixes the payload with one
+   RFC 6464-style byte (`0` = full scale … `127` = silence, otherwise `-dBov`;
+   `AurixPacket::audio_with_level`), browsers rely on the standard `ssrc-audio-level` RTP header
+   extension that WebRTC sends anyway. The server strips the byte before forwarding (listeners
+   receive plain Opus), turns labelled frames into `SpeakingStateChanged` only when the level
+   reaches `media.speaking_energy_threshold` (unlabelled frames keep counting as speech by
+   arrival) and every `media.energy_interval_ms` broadcasts `ChannelEnergy { channel_id, levels:
+   [{ user_id, energy }] }` to the channel with the *changed* levels (≥ 3 dB step or a transition
+   to/from silence; `energy` is linear `0..1`, a stale level decays to `0`). Both events travel
+   across nodes with the other presence events and are never persisted. The SDKs expose a local
+   VAD (`localSpeaking`/`localEnergy` in the Web SDK, `VoiceActivityDetector` + optional
+   `GateOnVad` transmit gating in Unity) and the remote `energy` / `OnChannelEnergy` events.
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 
@@ -235,6 +248,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__MEDIA__EXTERNAL_IP` | public IP advertised to clients for UDP media |
 | `AURIX__MEDIA__REQUIRE_PACKET_AUTH` | `true` (default) — drop unauthenticated media |
 | `AURIX__MEDIA__RX_WORKERS` | concurrent UDP receive workers on the SFU socket; `0` (default) = CPU count clamped to 2–8 |
+| `AURIX__MEDIA__SPEAKING_TIMEOUT_MS`, `AURIX__MEDIA__SPEAKING_ENERGY_THRESHOLD`, `AURIX__MEDIA__ENERGY_INTERVAL_MS` | speaking indicator hangover (400), linear RMS level a labelled frame must reach to count as speech (0.01 ≈ −40 dBov), period of `ChannelEnergy` reports (200; `0` disables them) |
 | `AURIX__MEDIA__CASCADE_SECRET`, `AURIX__MEDIA__CASCADE_PEERS` | shared secret + allow-list for SFU↔SFU relay |
 | `AURIX__TURN__*` | `ENABLED`, `EXTERNAL_IP`, `REALM`, `AUTH_SECRET` (≥ 32 bytes), `MIN_PORT`/`MAX_PORT` relay range |
 | `AURIX__SERVER__CORS_ORIGINS` | explicit origins; `*` is rejected in production |
