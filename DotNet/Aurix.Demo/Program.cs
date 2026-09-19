@@ -51,6 +51,7 @@ namespace Aurix.Demo
             if (Get(opt, "scenario", "audio") == "reconnect") return await ReconnectScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "chat") return await ChatScenario(ws, channelId, tokenA, tokenB);
+            if (Get(opt, "scenario", "audio") == "pcmu") return await PcmuScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "transmission")
             {
                 if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the transmission scenario needs --api-key (second channel + multi-channel tokens)"); return 2; }
@@ -157,7 +158,7 @@ namespace Aurix.Demo
 
                 bool spkMuted = i >= spkMuteFrom && i < spkMuteTo;
                 mixer.OutputMuted = spkMuted;
-                while (bob.TryDequeueAudio(out var incoming)) mixer.Push(incoming.SenderSsrc, incoming.Sequence, incoming.Volume, incoming.Opus);
+                while (bob.TryDequeueAudio(out var incoming)) mixer.Push(incoming.SenderSsrc, incoming.Sequence, incoming.Volume, null, incoming.Codec, incoming.Payload);
                 Array.Clear(outBuf, 0, outBuf.Length);
                 mixer.Mix(outBuf, 1);
                 double e = 0; foreach (var v in outBuf) e += v * v;
@@ -355,7 +356,7 @@ namespace Aurix.Demo
                     while (bob.TryDequeueAudio(out var inc))
                     {
                         got++; vol = inc.Volume; az = inc.Direction?.Azimuth;
-                        mixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Opus);
+                        mixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Codec, inc.Payload);
                     }
                     Array.Clear(stereo, 0, stereo.Length);
                     mixer.Mix(stereo, 2);
@@ -421,6 +422,118 @@ namespace Aurix.Demo
         /// 440 Hz clip through <see cref="AudioInjector"/>; the echo channel loops her own audio
         /// back to her — and only to her — while bob, in the same channel, hears nothing.
         /// </summary>
+        /// <summary>
+        /// Alice negotiates the PCMU fallback and speaks μ-law; Bob stays on Opus. The server transcodes at the
+        /// edge in both directions, so each hears the other's tone at the expected level, Alice's downlink
+        /// arrives flagged PCMU and Bob's stays Opus. Then Alice switches back to Opus mid-stream.
+        /// </summary>
+        private static async Task<int> PcmuScenario(string ws, Guid channelId, string tokenA, string tokenB)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA);
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            var codecEvents = new List<AudioCodec>();
+            alice.OnAudioCodecChanged += c => { lock (codecEvents) codecEvents.Add(c); };
+            var a = await alice.ConnectAsync();
+            var b = await bob.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            await alice.JoinChannelAsync(channelId);
+            await bob.JoinChannelAsync(channelId);
+            var hash = AurixVoiceClient.ChannelHash(channelId);
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+
+            await alice.SetAudioCodecAsync(AudioCodec.Pcmu);
+            for (int i = 0; i < 100 && alice.AudioCodec != AudioCodec.Pcmu; i++) await Task.Delay(20);
+            Check(alice.AudioCodec == AudioCodec.Pcmu, $"alice negotiated PCMU (active codec {alice.AudioCodec})");
+            Check(bob.AudioCodec == AudioCodec.Opus, "bob stays on Opus");
+
+            var pcmuEnc = new PcmuCodec();
+            using var opusEnc = new ConcentusOpusCodec();
+            var aliceMixer = new RemoteMixer(() => new ConcentusOpusCodec());
+            var bobMixer = new RemoteMixer(() => new ConcentusOpusCodec());
+            var pcm = new float[AudioFormat.FrameSamples];
+            var ulaw = new byte[G711.FrameSamples];
+            var opus = new byte[1275];
+            var outBuf = new float[AudioFormat.FrameSamples];
+            var vad = new VoiceActivityDetector();
+            double aliceEnergy = 0, bobEnergy = 0; long aliceSamples = 0, bobSamples = 0;
+            int aliceFrames = 0, alicePcmu = 0, bobFrames = 0, bobPcmu = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < 60; i++)
+            {
+                // Alice: 440 Hz at 0.5 through G.711; Bob: 660 Hz at 0.3 through Opus.
+                for (int k = 0; k < pcm.Length; k++) pcm[k] = (float)(0.5 * Math.Sin(2 * Math.PI * 440 * (i * pcm.Length + k) / 48000.0));
+                vad.Process(pcm, AudioFormat.FrameSamples);
+                int n = pcmuEnc.Encode(pcm, AudioFormat.FrameSamples, ulaw);
+                alice.TransmitAudioFrame(AudioCodec.Pcmu, ulaw, n, AudioFormat.FrameSamples, vad.Level);
+                for (int k = 0; k < pcm.Length; k++) pcm[k] = (float)(0.3 * Math.Sin(2 * Math.PI * 660 * (i * pcm.Length + k) / 48000.0));
+                int len = opusEnc.Encode(pcm, AudioFormat.FrameSamples, opus);
+                bob.SendOpusFrame(hash, opus, len);
+                while (alice.TryDequeueAudio(out var inc))
+                {
+                    aliceFrames++;
+                    if (inc.Codec == AudioCodec.Pcmu) alicePcmu++;
+                    aliceMixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Codec, inc.Payload);
+                }
+                while (bob.TryDequeueAudio(out var inc))
+                {
+                    bobFrames++;
+                    if (inc.Codec == AudioCodec.Pcmu) bobPcmu++;
+                    bobMixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Codec, inc.Payload);
+                }
+                Array.Clear(outBuf, 0, outBuf.Length);
+                aliceMixer.Mix(outBuf, 1);
+                if (i >= 10) { foreach (var v in outBuf) aliceEnergy += v * v; aliceSamples += outBuf.Length; }
+                Array.Clear(outBuf, 0, outBuf.Length);
+                bobMixer.Mix(outBuf, 1);
+                if (i >= 10) { foreach (var v in outBuf) bobEnergy += v * v; bobSamples += outBuf.Length; }
+                var wait = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs) - sw.Elapsed;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait);
+            }
+            double aliceRms = Math.Sqrt(aliceEnergy / Math.Max(1, aliceSamples)), bobRms = Math.Sqrt(bobEnergy / Math.Max(1, bobSamples));
+            Check(aliceFrames >= 45 && alicePcmu == aliceFrames, $"alice received {aliceFrames} frames, {alicePcmu} flagged PCMU (all of them expected)");
+            Check(bobFrames >= 45 && bobPcmu == 0, $"bob received {bobFrames} frames, {bobPcmu} flagged PCMU (expect 0: Opus after transcoding)");
+            Check(aliceRms > 0.15 && aliceRms < 0.27, $"alice hears bob's 0.3 tone through μ-law: RMS {aliceRms:F3} (expect ≈0.21)");
+            Check(bobRms > 0.28 && bobRms < 0.42, $"bob hears alice's 0.5 tone after PCMU→Opus: RMS {bobRms:F3} (expect ≈0.35)");
+
+            // Back to Opus: the downlink follows within a few frames.
+            await alice.SetAudioCodecAsync(AudioCodec.Opus);
+            for (int i = 0; i < 100 && alice.AudioCodec != AudioCodec.Opus; i++) await Task.Delay(20);
+            Check(alice.AudioCodec == AudioCodec.Opus, "alice switched back to Opus");
+            int opusAfter = 0, pcmuAfter = 0;
+            sw.Restart();
+            for (int i = 0; i < 20; i++)
+            {
+                int len = opusEnc.Encode(pcm, AudioFormat.FrameSamples, opus);
+                bob.SendOpusFrame(hash, opus, len);
+                while (alice.TryDequeueAudio(out var inc)) { if (inc.Codec == AudioCodec.Pcmu) pcmuAfter++; else opusAfter++; }
+                var wait = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs) - sw.Elapsed;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait);
+            }
+            await Task.Delay(100);
+            while (alice.TryDequeueAudio(out var inc)) { if (inc.Codec == AudioCodec.Pcmu) pcmuAfter++; else opusAfter++; }
+            Check(opusAfter >= 12 && pcmuAfter <= 3, $"after the switch alice gets Opus again: {opusAfter} Opus / {pcmuAfter} PCMU frames");
+            List<AudioCodec> events; lock (codecEvents) events = new List<AudioCodec>(codecEvents);
+            Check(events.Count == 2 && events[0] == AudioCodec.Pcmu && events[1] == AudioCodec.Opus, $"OnAudioCodecChanged: {string.Join(",", events)}");
+            Check(alice.Media.PacketsBadAuth == 0 && bob.Media.PacketsBadAuth == 0, "no auth failures");
+
+            cts.Cancel();
+            await pump;
+            await alice.DisconnectAsync();
+            await bob.DisconnectAsync();
+            aliceMixer.Dispose();
+            bobMixer.Dispose();
+            Console.WriteLine("events:");
+            foreach (var l in log) Console.WriteLine("  " + l);
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
+            return ok ? 0 : 1;
+        }
+
         private static async Task<int> EchoScenario(string ws, Guid echo, string tokenA, string tokenB)
         {
             var log = new List<string>();
@@ -467,7 +580,7 @@ namespace Aurix.Demo
                     aliceFrames++;
                     if (i >= 36) afterMute++;
                     if (inc.SenderSsrc != a.Ssrc) wrongSsrc++;
-                    mixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Opus);
+                    mixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Codec, inc.Payload);
                 }
                 while (bob.TryDequeueAudio(out _)) bobFrames++;
                 Array.Clear(outBuf, 0, outBuf.Length);
@@ -707,12 +820,14 @@ namespace Aurix.Demo
             await bob.ConnectAsync();
             await alice.JoinChannelAsync(channelId);
             await bob.JoinChannelAsync(channelId);
+            await alice.SetAudioCodecAsync(AudioCodec.Pcmu); // preference must survive resume and a fresh session
             Console.WriteLine($"alice session {a.SessionId} ssrc {a.Ssrc}; server resume grace {alice.ResumeGrace.TotalSeconds:F0} s");
             using var cts = new CancellationTokenSource();
             var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
             var hash = AurixVoiceClient.ChannelHash(channelId);
-            var opus = new byte[] { 0xf8, 0xff, 0xfe }; // Opus silence frame
-            async Task Stream(int frames) { for (int i = 0; i < frames; i++) { alice.SendOpusFrame(hash, opus); await Task.Delay(20); } }
+            var ulaw = new byte[G711.FrameSamples]; // 20 ms of μ-law "zero" (0xff)
+            Array.Fill(ulaw, (byte)0xff);
+            async Task Stream(int frames) { for (int i = 0; i < frames; i++) { alice.SendAudioFrame(hash, AudioCodec.Pcmu, ulaw); await Task.Delay(20); } }
             async Task<bool> WaitState(AurixVoiceClient c, VoiceConnectionState st, TimeSpan timeout)
             {
                 var deadline = DateTime.UtcNow + timeout;
@@ -729,13 +844,14 @@ namespace Aurix.Demo
             bool reconnecting = await WaitState(alice, VoiceConnectionState.Reconnecting, TimeSpan.FromSeconds(5));
             bool back = await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(10));
             bool sameSession = alice.Session.SessionId == a.SessionId && alice.Session.Ssrc == a.Ssrc && alice.Session.Resumed;
+            bool codecAfterResume = alice.AudioCodec == AudioCodec.Pcmu;
             await Task.Delay(200);
             await Stream(25);
             await Task.Delay(300);
             // alice.Media is a fresh transport after the rebind, so its counter restarts; bob's does not.
             bool audioAfterResume = bob.Media.PacketsReceived > bobBefore && alice.Media.PacketsSent > 0 && alice.Media.CurrentSequence > sentBefore;
             bool bobSawLeave; lock (log) bobSawLeave = log.Contains("bob: left alice");
-            Console.WriteLine($"reconnecting={reconnecting} back={back} sameSession={sameSession} audioAfterResume={audioAfterResume} " +
+            Console.WriteLine($"reconnecting={reconnecting} back={back} sameSession={sameSession} codec={alice.AudioCodec} audioAfterResume={audioAfterResume} " +
                               $"(bob {bobBefore}→{bob.Media.PacketsReceived}, alice seq {sentBefore}→{alice.Media.CurrentSequence}) bobSawLeave={bobSawLeave}");
 
             // 1b. Mobile: the app knows the network path changed (Wi-Fi → cellular) → ForceReconnect on a
@@ -773,7 +889,7 @@ namespace Aurix.Demo
             Console.WriteLine($"probe: reconnecting={probeReconnecting} after {probeTook.TotalMilliseconds:F0} ms back={probeBack} sameSession={probeSame} — {probeReason}");
 
             // 2. Cut for longer than grace → fresh session, channel re-joined.
-            bool freshOk = true, rejoined = true, bobSawRejoin = true;
+            bool freshOk = true, rejoined = true, bobSawRejoin = true, codecAfterFresh = true;
             if (alice.ResumeGrace <= TimeSpan.FromSeconds(10))
             {
                 Console.WriteLine($"cutting for {alice.ResumeGrace.TotalSeconds + 1:F0} s (beyond grace)");
@@ -785,9 +901,11 @@ namespace Aurix.Demo
                 await Task.Delay(500);
                 freshOk = back && alice.Session.SessionId != a.SessionId && !alice.Session.Resumed;
                 rejoined = alice.JoinedChannels.Count == 1;
+                for (int i = 0; i < 50 && alice.AudioCodec != AudioCodec.Pcmu; i++) await Task.Delay(20);
+                codecAfterFresh = alice.AudioCodec == AudioCodec.Pcmu;
                 lock (log) bobSawRejoin = log.Contains("bob: left alice") && log.FindLastIndex(l => l == "bob: joined alice") > log.LastIndexOf("bob: left alice");
                 await Stream(25);
-                Console.WriteLine($"fresh={freshOk} rejoined={rejoined} bobSawLeaveThenJoin={bobSawRejoin}");
+                Console.WriteLine($"fresh={freshOk} rejoined={rejoined} codec={alice.AudioCodec} bobSawLeaveThenJoin={bobSawRejoin}");
             }
             else Console.WriteLine("resume grace > 10 s, skipping the expiry scenario (set AURIX__SERVER__SESSION_RESUME_GRACE_SECS=4)");
 
@@ -803,10 +921,10 @@ namespace Aurix.Demo
             await bob.DisconnectAsync();
             Console.WriteLine("events:");
             lock (log) foreach (var l in log) Console.WriteLine("  " + l);
-            bool ok = reconnecting && sameSession && audioAfterResume && !bobSawLeave
+            bool ok = reconnecting && sameSession && codecAfterResume && audioAfterResume && !bobSawLeave
                       && forcedReconnecting && forcedBack && forcedSame && audioAfterForce
                       && probeFast && probeBack && probeSame && probeReason.Contains("probe timeout")
-                      && freshOk && rejoined && bobSawRejoin && failed && failedEvent;
+                      && freshOk && rejoined && codecAfterFresh && bobSawRejoin && failed && failedEvent;
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }

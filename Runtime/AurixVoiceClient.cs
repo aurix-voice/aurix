@@ -119,6 +119,8 @@ namespace Aurix
         private readonly Dictionary<string, TaskCompletionSource<TtsStatus>> _speechDone = new Dictionary<string, TaskCompletionSource<TtsStatus>>();
         private int _speakRefCounter;
         private bool _wantTranscripts = true;
+        private AudioCodec _preferredCodec = AudioCodec.Opus;
+        private AudioCodec _activeCodec = AudioCodec.Opus;
         private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
         private readonly HashSet<Guid> _monitoredChannels = new HashSet<Guid>();
         /// <summary>Audio policy of every joined channel (from <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>).</summary>
@@ -333,6 +335,12 @@ namespace Aurix
         public event Action<TransmissionMode> OnTransmissionChanged;
         /// <summary>Channel focus confirmed by the server; null when cleared (explicitly or by leaving the focused channel).</summary>
         public event Action<Guid?> OnChannelFocusChanged;
+        /// <summary>
+        /// The server switched this session's media codec (acknowledging <see cref="SetAudioCodecAsync"/>, or
+        /// back to Opus on a fresh session). From this point capture must encode with the new codec and every
+        /// downlink frame arrives in it (<see cref="IncomingAudio.Codec"/>).
+        /// </summary>
+        public event Action<AudioCodec> OnAudioCodecChanged;
         /// <summary>
         /// A text message for this client: channel message of a joined channel, directed message addressed to
         /// this user, or the echo of a message this client sent (<see cref="ChatMessage.IsOwn"/>).
@@ -812,6 +820,36 @@ namespace Aurix
         }
 
         /// <summary>
+        /// Codec currently negotiated for this session's native media path (what to encode with and what
+        /// <see cref="TryDequeueAudio"/> delivers). Opus until the server acknowledges a PCMU request.
+        /// </summary>
+        public AudioCodec AudioCodec { get { lock (_channels) return _activeCodec; } }
+
+        /// <summary>Codec requested with <see cref="SetAudioCodecAsync"/>; re-negotiated after a fresh reconnect.</summary>
+        public AudioCodec PreferredAudioCodec { get { lock (_channels) return _preferredCodec; } }
+
+        /// <summary>
+        /// Negotiate the session codec: <see cref="AudioCodec.Pcmu"/> (G.711 μ-law, 8 kHz, 64 kbit/s, no Opus
+        /// needed on this device) or back to <see cref="AudioCodec.Opus"/>. Session-wide, not per channel: the
+        /// server transcodes at the edge, so other participants keep hearing Opus. Keep encoding with
+        /// <see cref="AudioCodec"/> until <see cref="OnAudioCodecChanged"/> confirms the switch; the request fails
+        /// with <see cref="OnServerError"/> <c>CODEC_NOT_AVAILABLE</c> when the node disables the fallback
+        /// (<c>media.pcmu_fallback = false</c>). Client-held: survives reconnects.
+        /// </summary>
+        public Task SetAudioCodecAsync(AudioCodec codec, CancellationToken ct = default)
+        {
+            bool send;
+            lock (_channels)
+            {
+                _preferredCodec = codec;
+                send = codec != _activeCodec;
+            }
+            var control = _control;
+            if (control == null || !control.IsOpen || !send) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetAudioCodec(codec), ct);
+        }
+
+        /// <summary>
         /// Have the server synthesize <paramref name="text"/> and play it as this user's voice. Completes once
         /// the request is queued; <see cref="SpeechRequest.Done"/> and <see cref="OnTtsStatus"/> follow playback.
         /// <paramref name="channelId"/> may be null when the session transmits to exactly one channel. Faults with
@@ -917,9 +955,13 @@ namespace Aurix
             if (transmission.Kind == TransmissionKind.None)
                 await control.SendAsync(ControlMessage.SetTransmission(transmission), ct).ConfigureAwait(false);
             bool wantTranscripts;
-            lock (_channels) wantTranscripts = _wantTranscripts;
+            AudioCodec codec;
+            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; }
             if (!wantTranscripts)
                 await control.SendAsync(ControlMessage.SetTranscripts(false), ct).ConfigureAwait(false);
+            // A fresh session is Opus; the server confirms the switch with AudioCodecChanged.
+            if (codec != AudioCodec.Opus)
+                await control.SendAsync(ControlMessage.SetAudioCodec(codec), ct).ConfigureAwait(false);
         }
 
         /// <summary>Channel-scoped mutes, a <c>Single</c> target and the focus need membership, so they are (re-)sent after each successful join.</summary>
@@ -950,12 +992,21 @@ namespace Aurix
         /// <see cref="Audio.VoiceActivityDetector"/>); when given, the server uses it for speaking detection and
         /// energy reports instead of mere packet arrival.
         /// </summary>
-        public void SendOpusFrame(uint channelHash, byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null)
+        public void SendOpusFrame(uint channelHash, byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null) =>
+            SendAudioFrame(channelHash, AudioCodec.Opus, opus, length, samplesPerChannel, level);
+
+        /// <summary>
+        /// <see cref="SendOpusFrame"/> for a frame of <paramref name="codec"/>. Encode with whatever
+        /// <see cref="AudioCodec"/> reports: a μ-law frame on an Opus session (or the reverse) is dropped by the
+        /// server. <paramref name="samplesPerChannel"/> is still the 48 kHz duration (960 for 20 ms) so the RTP
+        /// clock is codec-independent.
+        /// </summary>
+        public void SendAudioFrame(uint channelHash, AudioCodec codec, byte[] frame, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null)
         {
             if (_media == null || State != VoiceConnectionState.MediaBound) return;
             _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
             if (_muted || !AllowsHash(channelHash)) return;
-            _media.SendAudio(channelHash, _rtpTimestamp, opus, length, level);
+            _media.SendAudio(channelHash, _rtpTimestamp, codec, frame, length, level);
         }
 
         /// <summary>
@@ -964,7 +1015,11 @@ namespace Aurix
         /// <see cref="TransmissionMode.None"/>). The RTP clock advances once per call. Returns the number of
         /// channels the frame was sent to.
         /// </summary>
-        public int TransmitOpusFrame(byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null)
+        public int TransmitOpusFrame(byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null) =>
+            TransmitAudioFrame(AudioCodec.Opus, opus, length, samplesPerChannel, level);
+
+        /// <summary><see cref="TransmitOpusFrame"/> for a frame of <paramref name="codec"/> (see <see cref="SendAudioFrame"/>).</summary>
+        public int TransmitAudioFrame(AudioCodec codec, byte[] frame, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null)
         {
             if (_media == null || State != VoiceConnectionState.MediaBound) return 0;
             _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
@@ -974,7 +1029,7 @@ namespace Aurix
                 foreach (var ch in _joinedChannels)
                     if (_transmission.Allows(ch)) targets.Add(ch);
             foreach (var ch in targets)
-                _media.SendAudio(ChannelHash(ch), _rtpTimestamp, opus, length, level);
+                _media.SendAudio(ChannelHash(ch), _rtpTimestamp, codec, frame, length, level);
             return targets.Count;
         }
 
@@ -1190,7 +1245,7 @@ namespace Aurix
             _resumeToken = null;
             _joinTcs?.TrySetException(new OperationCanceledException("disconnected"));
             FailPendingChat(new OperationCanceledException("disconnected"));
-            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); }
+            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; }
         }
 
         /// <summary>Runs on the Update thread when a control channel closes or fails.</summary>
@@ -1483,7 +1538,19 @@ namespace Aurix
                     var session = Session;
                     if (session != null && session.Resumed)
                         lock (_channels) { _transmission = prefs.Transmission; _focusChannel = prefs.FocusChannel; }
+                    // The codec is authoritative either way: a fresh session reports Opus and our replay of a
+                    // PCMU preference is answered by AudioCodecChanged afterwards.
+                    bool codecChanged;
+                    lock (_channels) { codecChanged = _activeCodec != prefs.Codec; _activeCodec = prefs.Codec; }
                     OnReceiverPreferences?.Invoke(prefs);
+                    if (codecChanged) OnAudioCodecChanged?.Invoke(prefs.Codec);
+                    break;
+                }
+                case "AudioCodecChanged":
+                {
+                    var codec = m.AudioCodec();
+                    lock (_channels) _activeCodec = codec;
+                    OnAudioCodecChanged?.Invoke(codec);
                     break;
                 }
                 case "TransmissionChanged":

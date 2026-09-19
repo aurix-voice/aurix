@@ -31,7 +31,12 @@ namespace Aurix.Transport
         public float Volume;
         /// <summary>Speaker direction in this listener's frame (directional positional channels), or null.</summary>
         public Direction? Direction;
-        public byte[] Opus;
+        /// <summary>Codec of <see cref="Payload"/>: Opus unless this session negotiated PCMU.</summary>
+        public AudioCodec Codec;
+        /// <summary>The encoded frame (Opus, or μ-law when <see cref="Codec"/> is <see cref="AudioCodec.Pcmu"/>).</summary>
+        public byte[] Payload;
+        [Obsolete("Use Payload and check Codec; the frame is not Opus on a PCMU session.")]
+        public byte[] Opus => Payload;
     }
 
     /// <summary>
@@ -168,16 +173,26 @@ namespace Aurix.Transport
         /// <paramref name="level"/> is the sender's measured <see cref="Aurix.Audio.AudioLevel"/> of the
         /// frame (null = not measured; the server then infers speaking from packet arrival only).
         /// </summary>
-        public void SendAudio(uint channelHash, uint rtpTimestamp, byte[] opusFrame, int length = -1, byte? level = null)
+        public void SendAudio(uint channelHash, uint rtpTimestamp, byte[] opusFrame, int length = -1, byte? level = null) =>
+            SendAudio(channelHash, rtpTimestamp, AudioCodec.Opus, opusFrame, length, level);
+
+        /// <summary>
+        /// Send one encoded frame of <paramref name="codec"/>. The RTP clock stays at 48 kHz for both
+        /// codecs; a μ-law frame is flagged <see cref="PacketFlags.Pcmu"/> and must be 10/20/40/60 ms
+        /// (80/160/320/480 bytes) — anything else is dropped by the server.
+        /// </summary>
+        public void SendAudio(uint channelHash, uint rtpTimestamp, AudioCodec codec, byte[] frame, int length = -1, byte? level = null)
         {
-            if (length < 0) length = opusFrame.Length;
-            var payload = length == opusFrame.Length ? opusFrame : Slice(opusFrame, length);
+            if (length < 0) length = frame.Length;
+            var payload = length == frame.Length ? frame : Slice(frame, length);
             int extra = level.HasValue ? 1 : 0;
             if (AurxPacket.HeaderSize + payload.Length + extra + AurxPacket.AuthTagSize > AurxPacket.MaxPacketSize)
-                throw new ArgumentException("Opus frame too large for one AURX packet");
-            Send(level.HasValue
+                throw new ArgumentException("audio frame too large for one AURX packet");
+            var pkt = level.HasValue
                 ? AurxPacket.AudioWithLevel(NextSeq(), rtpTimestamp, _ssrc, channelHash, level.Value, payload)
-                : AurxPacket.Audio(NextSeq(), rtpTimestamp, _ssrc, channelHash, payload));
+                : AurxPacket.Audio(NextSeq(), rtpTimestamp, _ssrc, channelHash, payload);
+            if (codec == AudioCodec.Pcmu) pkt.Header.Flags |= PacketFlags.Pcmu;
+            Send(pkt);
         }
 
         public void SendMuteState(bool muted) => Send(AurxPacket.MuteState(NextSeq(), _ssrc, muted));
@@ -256,7 +271,8 @@ namespace Aurix.Transport
                             ChannelHash = pkt.Header.ChannelIdHash,
                             Volume = volume,
                             Direction = direction,
-                            Opus = pkt.Payload,
+                            Codec = (pkt.Header.Flags & PacketFlags.Pcmu) != 0 ? AudioCodec.Pcmu : AudioCodec.Opus,
+                            Payload = pkt.Payload,
                         });
                         break;
                     case PacketType.HeartbeatAck:

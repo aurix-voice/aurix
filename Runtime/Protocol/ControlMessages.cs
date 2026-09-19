@@ -132,6 +132,8 @@ namespace Aurix.Protocol
         public TransmissionMode Transmission = TransmissionMode.All;
         /// <summary>Channel heard at full volume while the others are attenuated; null when unfocused.</summary>
         public Guid? FocusChannel;
+        /// <summary>Codec this session sends and receives on the native media path (Opus unless negotiated).</summary>
+        public Aurix.Audio.AudioCodec Codec = Aurix.Audio.AudioCodec.Opus;
     }
 
     /// <summary>
@@ -335,8 +337,18 @@ namespace Aurix.Protocol
                 }
             if (Data.TryGetValue("transmission", out var tv)) prefs.Transmission = TransmissionMode.FromWire(tv);
             prefs.FocusChannel = MiniJson.GetGuid(Data, "focus_channel");
+            prefs.Codec = AudioCodecFromWire(MiniJson.GetString(Data, "codec"));
             return prefs;
         }
+
+        /// <summary>Typed view of an <c>AudioCodecChanged</c> payload.</summary>
+        public Aurix.Audio.AudioCodec AudioCodec() => AudioCodecFromWire(MiniJson.GetString(Data, "codec"));
+
+        internal static Aurix.Audio.AudioCodec AudioCodecFromWire(string s) =>
+            s == "pcmu" ? Aurix.Audio.AudioCodec.Pcmu : Aurix.Audio.AudioCodec.Opus;
+
+        internal static string AudioCodecToWire(Aurix.Audio.AudioCodec codec) =>
+            codec == Aurix.Audio.AudioCodec.Pcmu ? "pcmu" : "opus";
 
         /// <summary>Typed view of a <c>TransmissionChanged</c> payload.</summary>
         public TransmissionMode Transmission() =>
@@ -556,6 +568,9 @@ namespace Aurix.Protocol
 
         public static string SetTranscripts(bool enabled) =>
             Serialize("SetTranscripts", new Dictionary<string, object> { { "enabled", enabled } });
+
+        public static string SetAudioCodec(Aurix.Audio.AudioCodec codec) =>
+            Serialize("SetAudioCodec", new Dictionary<string, object> { { "codec", AudioCodecToWire(codec) } });
 
         public static string TtsSpeak(Guid? channelId, string text, string voice, TtsDestination destination, string clientRef)
         {
