@@ -9,6 +9,7 @@ use aurix_control::moderation_actions::{self, ModerationTarget};
 use axum::{
     extract::{Extension, State},
     http::HeaderMap,
+    response::IntoResponse,
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,17 @@ fn client_ip_string(ip: Option<Extension<ClientIp>>) -> Option<String> {
 }
 
 // ── Health / readiness ──
+
+/// The OpenAPI 3.1 description of this API (`api/openapi.json` in the repository), served
+/// unauthenticated so tooling can be pointed straight at a running node.
+pub const OPENAPI_JSON: &str = include_str!("../../../api/openapi.json");
+
+pub async fn openapi() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        OPENAPI_JSON,
+    )
+}
 
 pub async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let (participants, channels) = {
@@ -1698,7 +1710,9 @@ pub async fn get_analytics(
 // ── API keys ──
 
 pub const DEFAULT_KEY_PERMISSIONS: &[&str] = &["*"];
-const KNOWN_PERMISSIONS: &[&str] = &[
+/// Every permission an API key can carry; `ctx.require(...)` calls must use one of these,
+/// otherwise scoped keys could never be granted the right (see `tests/openapi_contract.rs`).
+pub const KNOWN_PERMISSIONS: &[&str] = &[
     "*",
     "tokens:issue",
     "turn:issue",
@@ -1716,6 +1730,7 @@ const KNOWN_PERMISSIONS: &[&str] = &[
     "audio_streams:write",
     "chat:read",
     "chat:write",
+    "tts:write",
     "keys:manage",
     "analytics:read",
     "audit:read",

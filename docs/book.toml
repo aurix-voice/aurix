@@ -1,0 +1,24 @@
+[book]
+title = "Aurix Voice Platform"
+description = "Self-hosted low-latency voice for games: server, protocols, SDKs and operations."
+authors = ["Aurix contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+limit-results = 20
+
+[output.html.print]
+enable = true

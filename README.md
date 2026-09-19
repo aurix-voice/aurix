@@ -18,6 +18,10 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > Status: 1.0 — production-hardened core (auth, tenant isolation, media auth, TURN, recording).
 > See [Limitations](#limitations) before deploying at scale.
 
+**Documentation**: the full book lives in [`docs/`](docs/src/SUMMARY.md) (`mdbook serve docs`) —
+quick start, protocols, SDK guides, operations. The REST contract is
+[`api/openapi.json`](api/openapi.json) (OpenAPI 3.1), also served by every node at `GET /openapi.json`.
+
 ---
 
 ## Architecture

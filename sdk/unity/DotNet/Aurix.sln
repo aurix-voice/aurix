@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Voice", "Aurix.Voice\
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Voice.Tests", "Aurix.Voice.Tests\Aurix.Voice.Tests.csproj", "{A9BD1E36-704B-4496-8D3E-03F66A1B39A7}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Voice.UnityCheck", "Aurix.Voice.UnityCheck\Aurix.Voice.UnityCheck.csproj", "{48C537AE-53C8-450C-955A-F1A16E6ADBB3}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aurix.Demo", "Aurix.Demo\Aurix.Demo.csproj", "{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}"
 EndProject
 Global
@@ -30,5 +32,9 @@ Global
 		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{6CCF89EC-495D-4DBD-A96D-EC0CBA477584}.Release|Any CPU.Build.0 = Release|Any CPU
+		{48C537AE-53C8-450C-955A-F1A16E6ADBB3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{48C537AE-53C8-450C-955A-F1A16E6ADBB3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{48C537AE-53C8-450C-955A-F1A16E6ADBB3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{48C537AE-53C8-450C-955A-F1A16E6ADBB3}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

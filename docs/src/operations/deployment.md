@@ -1,0 +1,112 @@
+# Deployment and configuration
+
+One binary (`aurix-server`) serves the REST API, the WebSocket control plane, the UDP media
+socket, the optional TURN server and the Prometheus endpoint. Durable state is PostgreSQL;
+Redis carries cross-node events, one-time token claims and distributed rate limits (optional
+for a single node, required for a fleet).
+
+## Docker Compose (single node)
+
+```bash
+cp .env.example .env        # fill in secrets: openssl rand -base64 48
+docker compose up -d --build
+docker compose --profile observability up -d   # + Prometheus & Grafana on localhost
+```
+
+The image runs as uid 10001 with a read-only root filesystem, drops all capabilities and has a
+`/ready` healthcheck; secrets come only from the environment. `.env.example` lists what you must
+fill in: PostgreSQL credentials, `AURIX_EXTERNAL_URL`, `AURIX_CORS_ORIGINS`, `AURIX_PUBLIC_IP`,
+`AURIX_JWT_SECRET`, `AURIX_ADMIN_BOOTSTRAP_TOKEN` (remove after the first admin exists),
+`AURIX_CASCADE_SECRET` (same on every node), TURN realm/secret/port range, recording switches.
+`docker-compose.yml` maps them onto `AURIX__*` variables and sets
+`AURIX__SERVER__ENVIRONMENT=production`.
+
+## Configuration model
+
+`configs/default.toml` holds **development** defaults. Override any key with an environment
+variable `AURIX__<SECTION>__<KEY>` (lists are comma-separated), or pass `--config path.toml`.
+Validation runs at start-up and refuses to boot on an invalid combination; with
+`server.environment = production` it additionally rejects:
+
+* `auth.jwt_secret` shorter than 32 bytes or a placeholder (`change-me`, `example`, …) unless
+  `auth.jwt_public_key_path` (RS256) is set;
+* `turn.auth_secret` shorter than 32 bytes / placeholder, or TURN enabled without an external IP;
+* `*` in `server.cors_origins`;
+* a missing `media.external_ip`;
+* the development database credentials.
+
+Secrets (`AURIX__AUTH__JWT_SECRET`, `AURIX__TURN__AUTH_SECRET`, `AURIX__MEDIA__CASCADE_SECRET`,
+`AURIX__RECORDING__ENCRYPTION_KEY`, `AURIX__STT__API_KEY`, `AURIX__TTS__API_KEY`, S3 credentials)
+are never echoed back by the API or logs.
+
+### Key settings
+
+| section | keys worth setting |
+|---|---|
+| `server` | `environment`, `external_url`, `cors_origins`, `trusted_proxies` (CIDRs whose `X-Forwarded-For` is trusted), `session_resume_grace_secs` (30; `0` disables resume; ≤ `media.session_timeout_secs`), `tls_cert_path` / `tls_key_path` (native TLS, PEM), `region`, `node_id` |
+| `database` | `url`, pool sizes, `run_migrations` (`true`: embedded migrations run at start; the server refuses to start on an outdated schema) |
+| `redis` | `url`, `pool_size` |
+| `auth` | `jwt_secret` or `jwt_public_key_path`, `token_ttl_secs` (3600), `action_token_ttl_secs` (90) / `action_token_max_ttl_secs` (600), `require_action_tokens`, `admin_bootstrap_token` |
+| `media` | `external_ip`, `port` (10000; cascade uses `port + 1`), `require_packet_auth` (`true`), `rx_workers` (`0` = CPUs clamped 2–8), `session_timeout_secs` (60), `speaking_timeout_ms` (400), `speaking_energy_threshold` (0.01), `energy_interval_ms` (200), `quality_interval_ms` (2000), `unfocused_channel_gain` (0.5), `max_channels_per_session` (10), `max_positional_channels_per_session` (1), `cascade_secret`, `cascade_discovery` (`true`), `cascade_discovery_interval_ms` (3000), `cascade_peers` |
+| `turn` | `enabled`, `external_ip`, `realm`, `auth_secret`, `udp_port` / `tcp_port` (3478), `min_port` / `max_port` relay range, `allocation_lifetime_secs`, `max_allocations` |
+| `recording` | `enabled`, `storage_path`, `max_recording_duration_secs` (7200), `retention_days` (90), `require_consent` (`true`), `encryption_enabled` + `encryption_key` (≥ 32 chars), `s3.*`; `recording.live.*` for [live streams](../features/recordings.md#live-audio-streams) |
+| `rate_limiting` | `enabled`, `requests_per_second` / `burst_size`, `channel_joins_per_minute`, `messages_per_second` (Redis-backed when available) |
+| `chat` | see [Text chat](../features/chat.md) — `enabled`, `max_message_bytes`, flood limits, `filter_webhook`, `persist` |
+| `webhooks` | `enabled`, `timeout_ms`, `retry_delays_secs`, `concurrency`, `batch_size`, `max_pending_per_subscription`, `retention_hours`, `max_subscriptions_per_app`, `require_https` / `allow_private_urls` (strict in production), `sse_keepalive_secs` |
+| `retention` | see [Moderation and lifecycle](../features/moderation.md#retention-sweep) |
+| `stt`, `tts` | see [Transcripts and TTS](../features/speech.md) |
+| `metrics` | `enabled`, `port` (4040), `path` |
+| `tracing` | `log_level`, `log_format` (`json` / `pretty`), `otlp_endpoint`, `service_name` |
+
+The complete key list with defaults is `configs/default.toml`; the validation rules are in
+`crates/aurix-common/src/config.rs`.
+
+## Network and firewall
+
+| port | proto | purpose |
+|---|---|---|
+| 8080 | TCP | REST API (behind a TLS proxy or native TLS) |
+| 8081 | TCP | WebSocket control plane (same TLS advice) |
+| 10000 | UDP | native AURX media + WebRTC ICE/DTLS-SRTP (`media.port`) |
+| 10001 | UDP | SFU↔SFU cascade relay (`media.port + 1`) — node-to-node only |
+| 3478 | UDP+TCP | TURN/STUN |
+| `turn.min_port`–`turn.max_port` | UDP | TURN relay allocations — reachable from the internet |
+| 4040 | TCP | Prometheus metrics — **internal only** |
+
+For large TURN ranges run the container with `network_mode: host` instead of publishing
+thousands of ports. Clients must reach `media.external_ip:media.port` directly; when they
+cannot (symmetric NAT, corporate networks) browsers fall back to TURN, native clients need the
+UDP path.
+
+## TLS
+
+Either terminate TLS at a reverse proxy (nginx / Caddy / cloud LB — set `server.trusted_proxies`
+so client IPs are right for rate limits and the audit log), or point
+`server.tls_cert_path` / `tls_key_path` at PEM files and expose 8080/8081 directly (rustls; no
+ACME — renew with your tooling and restart). Media is protected independently of TLS: AURX v2
+encryption + HMAC, DTLS-SRTP for WebRTC, encrypted relay envelopes between nodes.
+
+## First start
+
+1. Start PostgreSQL and Redis, then the server; migrations apply automatically.
+2. `POST /admin/setup` with `X-Bootstrap-Token` creates the first administrator — then unset
+   `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN`.
+3. `POST /admin/login` → admin JWT → `POST /v1/apps` → `POST /v1/apps/{app_id}/api-keys` with the
+   permissions your backend needs.
+4. Your backend mints player tokens (`POST /v1/tokens`) — the API key never reaches a client.
+
+The [Quick start](../getting-started/quick-start.md) walks through the same steps with `curl`.
+
+## Upgrades
+
+Deploy the new image node by node. Migrations are embedded in the binary and run at start when
+`database.run_migrations = true` (default); with it off, or when you prefer to migrate
+explicitly, run `aurix-server --migrate-only` first — a node whose schema is behind the compiled
+migrations refuses to start. Migrations are additive, so an older node keeps working against a
+newer schema during the roll-out.
+
+On `SIGTERM` a node marks itself offline in `media_nodes`, sends every connected player a
+`SessionClose {reason: "server_shutdown"}` (final — SDKs do not try to resume; they open a fresh
+session through the load balancer and re-join, `recovered {resumed: false}`), ends live audio
+streams, drains background tasks for up to 20 s (webhook workers, retention, recordings are
+finalised as their sessions close), cleans up its session rows and closes the pool.

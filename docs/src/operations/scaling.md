@@ -1,0 +1,79 @@
+# Scaling out
+
+Aurix scales horizontally: run N identical `aurix-server` nodes against one PostgreSQL and one
+Redis. There is no coordinator process — every node is API + control plane + SFU, and the
+database is the registry.
+
+## Fleet registry
+
+Each node registers itself in `media_nodes` (`server.node_id` or a generated UUID, `region`,
+`media.external_ip`, media/API/cascade ports, capacity, load) and heartbeats. Nodes silent for
+**30 s** are marked unhealthy; rows are forgotten after **24 h**. `GET /v1/nodes` (admin) lists
+the fleet with load, CPU, memory and bandwidth. When a node goes away its sessions are cleaned
+up (`recover_node_state`) and channels that only lived there emit `channel.deactivated`.
+
+## Where a session lives
+
+A session is anchored to the node that accepted its **WebSocket**: `SessionInitAck.media_addr`
+points to that node's `media.external_ip:media.port`, its media key lives in that node's SFU, and
+node-local resources (WebRTC peer connection, recordings, live audio streams, per-session REST
+stats) are served there. Consequences:
+
+* Put the REST API and the WebSocket behind an ordinary L7 load balancer — no sticky sessions
+  are required for the API. A WebSocket stays on the node it landed on; a **resume** must hit
+  the same node, so either enable client-IP affinity on the balancer for `/ws`, or accept that
+  a resume that lands elsewhere becomes a fresh session (`recovered {resumed: false}`) — the
+  SDKs handle both.
+* UDP media must reach the node directly (`media.external_ip`), not through the balancer.
+* REST calls that touch live media are node-local: `GET /v1/sessions/{id}/stats` answers `404`
+  for a session hosted elsewhere, live-stream routes answer `409` when the channel's media is
+  on another node, and a recording follows the participant's node. `GET
+  /v1/channels/{id}/participants` reports `live_on_this_node`, `GET /v1/nodes` gives each node's
+  address — an operator tool retries against the right node or relies on webhooks/SSE, which
+  are fleet-wide.
+
+## Cross-node events
+
+Channel/participant events (join, leave, mute, ban, kick, block, chat, transcripts, energy,
+webhook-subscription invalidation, `user.deleted`) are published on Redis pub/sub with the
+origin node id; a node never re-applies its own events. Redis also holds one-time token claims
+(`jti`), session→node mapping, global mutes and distributed rate limits. Without Redis a single
+node works; a fleet does not.
+
+## Cascade (SFU-to-SFU relay)
+
+Channels whose members sit on different nodes are relayed **automatically**:
+
+1. Set the same `media.cascade_secret` (≥ 16 chars) on every node. Nothing else is required.
+2. Every node advertises its cascade UDP port (`media.port + 1`) in `media_nodes`.
+3. Every `media.cascade_discovery_interval_ms` (3 s) and immediately after a remote join/leave a
+   node reconciles the topology from the database: accepted peers are the healthy nodes, and
+   each channel is forwarded only to nodes that actually hold live memberships for it.
+4. Packets travel inside a `Relay` envelope encrypted and authenticated with keys derived from
+   `cascade_secret` (the client's plaintext is never on the wire between nodes) and pass a
+   per-peer anti-replay window; unknown source addresses are dropped. Receiver preferences
+   (mute / volume / block / focus) are applied on the receiving node, so they work across
+   nodes; echo channels are never relayed.
+
+`media.cascade_peers` is an optional static allow-list (nodes outside the registry), and
+`media.cascade_discovery = false` switches to a fully static full mesh. Cascade is a one-hop
+mesh between the nodes hosting a channel — there are no relay trees — and it needs node-to-node
+reachability on `media.port + 1`/UDP.
+
+## Regions
+
+`server.region` (`us_east`, `us_west`, `eu_west`, `eu_central`, `asia_pacific`, `south_america`,
+`australia`, `middle_east`, `africa`) is stored per node and reported in `GET /v1/nodes`. Today
+the client talks to whichever node its WebSocket reached, so **region placement is done at the
+load balancer / DNS layer** (a regional hostname per pool of nodes); cross-region channels work
+through cascade. Node selection by geography inside Aurix is a roadmap item.
+
+## Capacity
+
+A node's cost is dominated by the SFU fan-out (`speakers × (members − 1)` sealed packets per
+frame). Reference numbers from the [load test](development.md#load-testing): 1000 sessions /
+100 channels / 2 speakers → 90k pps out at ~0.4 core; 2000 sessions / 4 speakers → 360k pps at
+~1.4 cores, 70 MB RSS. Tune `media.rx_workers` (UDP receive workers), the kernel receive buffers
+(`net.core.rmem_max`, watch `Udp: RcvbufErrors` in `/proc/net/snmp`) and `ulimit -n` on the
+host. `media.max_participants_per_node` / `max_channels_per_node` cap a node and feed the load
+factor used by the registry (`available` = healthy and below 90 % of capacity).

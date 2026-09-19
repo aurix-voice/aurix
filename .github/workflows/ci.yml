@@ -160,6 +160,21 @@ jobs:
       - run: dotnet test Aurix.sln -v q --nologo
         working-directory: sdk/unity/DotNet
 
+  docs:
+    name: OpenAPI + mdBook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npx --yes @redocly/cli@1 lint api/openapi.json --skip-rule no-unused-components
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: '0.5.4'
+      - run: mdbook build docs
+      - run: test -f docs/book/api/openapi.json && test -f docs/book/index.html
+
   docker:
     name: docker build + healthcheck
     runs-on: ubuntu-latest

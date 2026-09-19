@@ -51,7 +51,8 @@ pub fn create_router(state: AppState) -> Router {
 
     let public_routes = Router::new()
         .route("/health", get(handlers::health))
-        .route("/ready", get(handlers::ready));
+        .route("/ready", get(handlers::ready))
+        .route("/openapi.json", get(handlers::openapi));
 
     // Bootstrap is gated inside the handler (no admins yet, or X-Bootstrap-Token).
     let admin_public = Router::new()

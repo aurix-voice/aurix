@@ -1,0 +1,70 @@
+# Backups and observability
+
+## What is durable
+
+Everything durable lives in **PostgreSQL** and, if enabled, the **recording store** (local
+volume or S3). Redis holds only ephemeral state (events, one-time token claims, session→node
+mapping, rate limits, global mutes) and needs no backup — after a Redis loss, clients reconnect
+and state rebuilds.
+
+```bash
+docker compose exec db pg_dump -U "$POSTGRES_USER" -Fc aurix > aurix-$(date +%F).dump
+docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < aurix-2025-01-01.dump
+```
+
+* Recordings: back up the `recordings` volume, or use S3 with versioning. If recording
+  encryption is on, `AURIX__RECORDING__ENCRYPTION_KEY` **must** be backed up separately — files
+  are unreadable without it (see [Recordings](../features/recordings.md)).
+* Backups outlive user erasure (`DELETE /v1/users/{id}`): keep backup retention in line with
+  your privacy commitments, and note that tombstones in a restored database still block tokens
+  issued before the erasure.
+* Migrations are embedded and applied on start (`database.run_migrations = true`), or
+  explicitly with `aurix-server --migrate-only`.
+
+## Metrics
+
+`GET :4040/metrics` (`[metrics]`; **internal only**) exports Prometheus text. Notable series:
+
+| metric | meaning |
+|---|---|
+| `aurix_active_sessions`, `aurix_sessions_total`, `aurix_session_duration_seconds` | sessions on this node |
+| `aurix_active_channels`, `aurix_active_participants`, `aurix_active_bans` | live gauges |
+| `aurix_packets_received_total`, `aurix_packets_sent_total`, `aurix_bytes_*_total` | SFU traffic |
+| `aurix_packets_dropped_total` | packets rejected before routing: bad authentication tag, replay, unknown session, malformed |
+| `aurix_packet_loss_rate`, `aurix_jitter_milliseconds`, `aurix_rtt_milliseconds` | quality aggregates |
+| `aurix_api_requests_total{method,path,status}`, `aurix_api_request_duration_seconds` | REST (path templated, ids collapsed) |
+| `aurix_ws_connections`, `aurix_ws_sessions_detached`, `aurix_ws_sessions_resumed_total` | control plane and reconnects |
+| `aurix_rate_limit_hits_total`, `aurix_moderation_events_total` | abuse signals |
+| `aurix_turn_allocations`, `aurix_stun_requests_total` | TURN |
+| `aurix_webhook_deliveries_total{result}`, `aurix_webhook_deliveries_leased`, `aurix_event_stream_clients` | webhooks / SSE |
+| `aurix_node_cpu_usage`, `aurix_node_memory_usage`, `aurix_node_bandwidth_in_mbps` / `_out_mbps` | node health as reported to the registry |
+
+`deploy/prometheus.yml` scrapes the node; `deploy/grafana/dashboards/aurix-overview.json` is a
+ready dashboard (`docker compose --profile observability up -d`). Alert on
+`aurix_packets_dropped_total` rising (forged or misconfigured clients),
+`aurix_packet_loss_rate`, webhook failures and `aurix_ws_sessions_detached` staying high
+(clients that cannot resume).
+
+## Logs and traces
+
+Structured logs via `tracing`: `tracing.log_format = json` (default) or `pretty`,
+`tracing.log_level` (`info`; `debug` per crate with `RUST_LOG=aurix_media=debug,info`). Set
+`tracing.otlp_endpoint` to export spans over OTLP/gRPC (`tracing.service_name`). Secrets and
+tokens are never logged; media payloads never leave the SFU.
+
+## Audit log
+
+Every privileged action — admin login, application/API-key changes, bans, mutes, kicks
+(single and channel-wide), recording start/stop/download/delete, live-stream start/stop,
+webhook changes, user export and erasure, retention sweeps — is written to `audit_log` with
+actor, target, IP and a JSON detail blob, and readable
+per application with `GET /v1/audit-log` (`audit:read`) or fleet-wide with
+`GET /admin/audit-log`. `retention.audit_log_days = 0` keeps it forever. See
+[Moderation and lifecycle](../features/moderation.md#audit-log).
+
+## Health
+
+* `GET /health` — process is up.
+* `GET /ready` — PostgreSQL (and Redis when configured) reachable; used by the container
+  healthcheck and by load balancers.
+* `GET /v1/nodes` (admin) — registry view of every node: healthy flag, load, last heartbeat.

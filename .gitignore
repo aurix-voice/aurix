@@ -10,3 +10,6 @@ sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/include/
 sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/
 sdk/unreal/AurixVoice/Binaries/
 sdk/unreal/AurixVoice/Intermediate/
+
+# mdBook output
+docs/book/
