@@ -18,12 +18,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use str0m::change::SdpOffer;
-use str0m::format::Codec;
-use str0m::media::{MediaKind, MediaTime, Mid, Pt};
+use str0m::format::{Codec, FormatParams};
+use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
 use crate::mixer::{OpusMixer, FRAME_SAMPLES};
+
+/// Dynamic payload type offered for Opus (the same one browsers use by default).
+const OPUS_PT: Pt = Pt::new_with_value(111);
 
 /// Handle to communicate with a running WebRTC session task.
 struct SessionHandle {
@@ -36,6 +39,8 @@ struct SessionHandle {
 pub struct ForwardMedia {
     pub sender_ssrc: u32,
     pub volume: f32,
+    /// Where the sender is relative to this listener (directional positional channels).
+    pub direction: Option<Direction>,
     pub payload: Vec<u8>,
 }
 
@@ -115,12 +120,27 @@ impl WebRtcManager {
         session_id: SessionId,
         user_id: UserId,
     ) -> Result<String> {
-        let mut rtc = Rtc::builder()
+        let mut config = Rtc::builder()
             .set_ice_lite(true)
             .clear_codecs()
-            .enable_opus(true)
-            .set_stats_interval(Some(Duration::from_secs(5)))
-            .build(Instant::now());
+            .set_stats_interval(Some(Duration::from_secs(5)));
+        // `sprop-stereo=1`: the downlink mix is stereo (speakers panned by direction). No
+        // `stereo=1`: we prefer to *receive* mono, so browsers keep encoding their mic in mono
+        // (RFC 7587 §6.1); decoding both channels is the receiver's `stereo=1` in its offer.
+        config.codec_config().add_config(
+            OPUS_PT,
+            None,
+            Codec::Opus,
+            Frequency::FORTY_EIGHT_KHZ,
+            Some(2),
+            FormatParams {
+                min_p_time: Some(10),
+                use_inband_fec: Some(true),
+                sprop_stereo: Some(true),
+                ..FormatParams::default()
+            },
+        );
+        let mut rtc = config.build(Instant::now());
 
         let candidate = Candidate::host(self.advertised_addr, "udp")
             .map_err(|e| AurixError::Transport(format!("ICE candidate: {e}")))?;
@@ -314,7 +334,12 @@ async fn session_task(
                 }
             }
             Some(media) = media_rx.recv() => {
-                if let Err(e) = mixer.push_opus(media.sender_ssrc, media.volume, &media.payload) {
+                if let Err(e) = mixer.push_opus(
+                    media.sender_ssrc,
+                    media.volume,
+                    media.direction,
+                    &media.payload,
+                ) {
                     debug!("mixer decode error for {}: {}", ctx.session_id, e);
                 }
                 continue;
@@ -325,7 +350,7 @@ async fn session_task(
                         match mixer.mix_frame() {
                             Ok(Some(frame)) => {
                                 let data = frame.to_vec();
-                                let ts = MediaTime::new(downlink.rtp_time, str0m::media::Frequency::FORTY_EIGHT_KHZ);
+                                let ts = MediaTime::new(downlink.rtp_time, Frequency::FORTY_EIGHT_KHZ);
                                 if let Some(writer) = rtc.writer(mid) {
                                     if let Err(e) = writer.write(pt, Instant::now(), ts, data) {
                                         debug!("downlink write error for {}: {}", ctx.session_id, e);

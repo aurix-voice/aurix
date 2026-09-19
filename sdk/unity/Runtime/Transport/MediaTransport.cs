@@ -18,6 +18,8 @@ namespace Aurix.Transport
         /// <summary>Channel the frame was forwarded through (<see cref="AurxPacket.ChannelIdHash(Guid)"/> of its id).</summary>
         public uint ChannelHash;
         public float Volume;
+        /// <summary>Speaker direction in this listener's frame (directional positional channels), or null.</summary>
+        public Direction? Direction;
         public byte[] Opus;
     }
 
@@ -207,6 +209,7 @@ namespace Aurix.Transport
                         lock (window) fresh = window.CheckAndUpdate(pkt.Header.Sequence);
                         if (!fresh) { Interlocked.Increment(ref _packetsReplayed); continue; }
                         Interlocked.Increment(ref _packetsReceived);
+                        var (volume, direction) = pkt.TakeDownlinkMeta();
                         pkt.TakeAudioLevel();
                         _audioInbox.Enqueue(new IncomingAudio
                         {
@@ -214,8 +217,9 @@ namespace Aurix.Transport
                             Sequence = pkt.Header.Sequence,
                             Timestamp = pkt.Header.Timestamp,
                             ChannelHash = pkt.Header.ChannelIdHash,
-                            Volume = pkt.Volume,
-                            Opus = pkt.AudioPayload.ToArray(),
+                            Volume = volume,
+                            Direction = direction,
+                            Opus = pkt.Payload,
                         });
                         break;
                     case PacketType.HeartbeatAck:

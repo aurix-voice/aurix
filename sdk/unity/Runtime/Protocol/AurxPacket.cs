@@ -47,6 +47,58 @@ namespace Aurix.Protocol
         Authenticated = 0x0400,
         /// <summary>First payload byte is an RFC 6464-style audio level (-dBov, 127 = silence).</summary>
         Energy = 0x0800,
+        /// <summary>Downlink frame carries a 2-byte <see cref="Direction"/> (after the volume byte, if any).</summary>
+        Directional = 0x1000,
+    }
+
+    /// <summary>
+    /// Where a speaker is relative to this listener, in the listener's own frame: azimuth 0 is
+    /// straight ahead, positive is to the right (radians, -π..π); elevation positive is above
+    /// (-π/2..π/2). Sent by the server for directional positional channels.
+    /// </summary>
+    public readonly struct Direction : IEquatable<Direction>
+    {
+        public const int WireSize = 2;
+        private const float AzimuthScale = 127f / MathF.PI;
+        private const float ElevationScale = 127f / (MathF.PI / 2f);
+
+        public readonly float Azimuth;
+        public readonly float Elevation;
+
+        public Direction(float azimuth, float elevation)
+        {
+            Azimuth = azimuth;
+            Elevation = elevation;
+        }
+
+        public static readonly Direction Ahead = new Direction(0f, 0f);
+
+        public static Direction Decode(byte azimuth, byte elevation) =>
+            new Direction((sbyte)azimuth / AzimuthScale, (sbyte)elevation / ElevationScale);
+
+        public void Encode(Span<byte> dst)
+        {
+            dst[0] = (byte)(sbyte)Math.Clamp(MathF.Round(Azimuth * AzimuthScale), -127f, 127f);
+            dst[1] = (byte)(sbyte)Math.Clamp(MathF.Round(Elevation * ElevationScale), -127f, 127f);
+        }
+
+        /// <summary>
+        /// Constant-power stereo gains (left, right), normalised so a centred source is unity in
+        /// both ears and a hard-panned one is +3 dB in one ear and silent in the other. Stereo has
+        /// no front/back cue: a source behind pans like one in front.
+        /// </summary>
+        public (float Left, float Right) StereoGains()
+        {
+            float pan = Math.Clamp(MathF.Sin(Azimuth), -1f, 1f);
+            float theta = (pan + 1f) * (MathF.PI / 4f);
+            const float sqrt2 = 1.41421356f;
+            return (MathF.Cos(theta) * sqrt2, MathF.Sin(theta) * sqrt2);
+        }
+
+        public bool Equals(Direction other) => Azimuth == other.Azimuth && Elevation == other.Elevation;
+        public override bool Equals(object obj) => obj is Direction d && Equals(d);
+        public override int GetHashCode() => HashCode.Combine(Azimuth, Elevation);
+        public override string ToString() => $"az={Azimuth:F3} el={Elevation:F3}";
     }
 
     /// <summary>
@@ -150,10 +202,51 @@ namespace Aurix.Protocol
             ? Payload[0] / VolumeUnity
             : 1f;
 
-        /// <summary>Audio bytes without the optional leading volume byte.</summary>
-        public ReadOnlySpan<byte> AudioPayload => (Header.Flags & PacketFlags.VolumeAttenuated) != 0 && Payload.Length > 0
-            ? new ReadOnlySpan<byte>(Payload, 1, Payload.Length - 1)
-            : Payload;
+        private int VolumeBytes => (Header.Flags & PacketFlags.VolumeAttenuated) != 0 && Payload.Length > 0 ? 1 : 0;
+
+        private int DirectionBytes =>
+            (Header.Flags & PacketFlags.Directional) != 0 && Payload.Length >= VolumeBytes + Protocol.Direction.WireSize
+                ? Protocol.Direction.WireSize
+                : 0;
+
+        /// <summary>Speaker direction in this listener's frame (directional positional channels), or null.</summary>
+        public Direction? Direction
+        {
+            get
+            {
+                if (DirectionBytes == 0) return null;
+                int at = VolumeBytes;
+                return Protocol.Direction.Decode(Payload[at], Payload[at + 1]);
+            }
+        }
+
+        /// <summary>Audio bytes without the optional leading volume and direction metadata.</summary>
+        public ReadOnlySpan<byte> AudioPayload
+        {
+            get
+            {
+                int skip = VolumeBytes + DirectionBytes;
+                return skip == 0 ? Payload : new ReadOnlySpan<byte>(Payload, skip, Payload.Length - skip);
+            }
+        }
+
+        /// <summary>
+        /// Strips the server's downlink metadata (volume byte, direction) from the payload, returning
+        /// them; header length/flags are updated to describe the bare Opus frame.
+        /// </summary>
+        public (float Volume, Direction? Direction) TakeDownlinkMeta()
+        {
+            float volume = Volume;
+            Direction? direction = Direction;
+            int skip = VolumeBytes + DirectionBytes;
+            Header.Flags &= ~(PacketFlags.VolumeAttenuated | PacketFlags.Directional);
+            if (skip == 0) return (volume, direction);
+            var rest = new byte[Payload.Length - skip];
+            Buffer.BlockCopy(Payload, skip, rest, 0, rest.Length);
+            Payload = rest;
+            Header.PayloadLength = (ushort)rest.Length;
+            return (volume, direction);
+        }
 
         /// <summary>
         /// Encode signed but NOT encrypted: header + plaintext payload + truncated HMAC tag.

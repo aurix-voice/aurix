@@ -1,8 +1,8 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
-    ActionKind, ChannelId, ChannelRole, Orientation3D, Position3D, ReverbDescriptor, SessionId,
-    UserId,
+    ActionKind, ChannelId, ChannelRole, Direction, Orientation3D, Position3D, ReverbDescriptor,
+    SessionId, UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,29 @@ pub fn encode_volume_byte(volume: f32) -> u8 {
 
 pub fn decode_volume_byte(byte: u8) -> f32 {
     byte as f32 / VOLUME_UNITY
+}
+
+/// Two signed bytes carried by a `Directional` downlink payload: azimuth in units of `π/127`
+/// (positive = listener's right) and elevation in units of `π/254` (positive = above).
+pub const DIRECTION_SIZE: usize = 2;
+const AZIMUTH_SCALE: f32 = 127.0 / std::f32::consts::PI;
+const ELEVATION_SCALE: f32 = 127.0 / std::f32::consts::FRAC_PI_2;
+
+pub fn encode_direction(direction: &Direction) -> [u8; DIRECTION_SIZE] {
+    let az = (direction.azimuth * AZIMUTH_SCALE)
+        .round()
+        .clamp(-127.0, 127.0) as i8;
+    let el = (direction.elevation * ELEVATION_SCALE)
+        .round()
+        .clamp(-127.0, 127.0) as i8;
+    [az as u8, el as u8]
+}
+
+pub fn decode_direction(bytes: [u8; DIRECTION_SIZE]) -> Direction {
+    Direction {
+        azimuth: (bytes[0] as i8) as f32 / AZIMUTH_SCALE,
+        elevation: (bytes[1] as i8) as f32 / ELEVATION_SCALE,
+    }
 }
 
 /// Audio level byte carried by an `Energy` uplink payload: `-dBov` as in RFC 6464, so 0 is a
@@ -212,6 +235,10 @@ pub enum PacketFlags {
     /// Uplink payload starts with one audio level byte (see `encode_audio_level`) followed by
     /// the Opus frame. The server strips it before fan-out.
     Energy = 0x0800,
+    /// Downlink payload carries `DIRECTION_SIZE` bytes (see `encode_direction`) placing the
+    /// speaker relative to this receiver, after the `VolumeAttenuated` gain byte when present
+    /// and before the Opus frame.
+    Directional = 0x1000,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +442,55 @@ impl AurixPacket {
         self.payload = self.payload.slice(1..);
         self.header.payload_length = self.payload.len() as u16;
         Some(level)
+    }
+
+    /// Header and payload of the downlink copy of this audio packet for one receiver: the gain
+    /// byte is prepended when `volume` is not unity, the direction bytes when `direction` is
+    /// given (`VolumeAttenuated` / `Directional` flags set accordingly).
+    pub fn downlink_parts(
+        &self,
+        volume: f32,
+        direction: Option<&Direction>,
+    ) -> (PacketHeader, Bytes) {
+        let attenuated = (volume - 1.0).abs() > 0.01;
+        if !attenuated && direction.is_none() {
+            return (self.header.clone(), self.payload.clone());
+        }
+        let mut header = self.header.clone();
+        let mut body = BytesMut::with_capacity(1 + DIRECTION_SIZE + self.payload.len());
+        if attenuated {
+            header.flags |= PacketFlags::VolumeAttenuated as u16;
+            body.put_u8(encode_volume_byte(volume));
+        }
+        if let Some(direction) = direction {
+            header.flags |= PacketFlags::Directional as u16;
+            body.put_slice(&encode_direction(direction));
+        }
+        body.put_slice(&self.payload);
+        (header, body.freeze())
+    }
+
+    /// Strip the receiver-specific metadata of a downlink audio packet, returning the gain
+    /// (`1.0` when absent) and direction (`None` when absent). Leaves the bare Opus frame.
+    pub fn take_downlink_meta(&mut self) -> (f32, Option<Direction>) {
+        let mut volume = 1.0;
+        if self.header.has_flag(PacketFlags::VolumeAttenuated) {
+            self.header.flags &= !(PacketFlags::VolumeAttenuated as u16);
+            if !self.payload.is_empty() {
+                volume = decode_volume_byte(self.payload[0]);
+                self.payload = self.payload.slice(1..);
+            }
+        }
+        let mut direction = None;
+        if self.header.has_flag(PacketFlags::Directional) {
+            self.header.flags &= !(PacketFlags::Directional as u16);
+            if self.payload.len() >= DIRECTION_SIZE {
+                direction = Some(decode_direction([self.payload[0], self.payload[1]]));
+                self.payload = self.payload.slice(DIRECTION_SIZE..);
+            }
+        }
+        self.header.payload_length = self.payload.len() as u16;
+        (volume, direction)
     }
 
     pub fn heartbeat(ssrc: u32, ts: u32) -> Self {
@@ -1093,6 +1169,85 @@ mod tests {
         assert!((decode_audio_level(20) - 0.1).abs() < 1e-6);
         assert_eq!(decode_audio_level(AUDIO_LEVEL_SILENCE), 0.0);
         assert_eq!(decode_audio_level(200), 0.0);
+    }
+
+    #[test]
+    fn direction_bytes_roundtrip_with_fixed_wire_values() {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        assert_eq!(encode_direction(&Direction::AHEAD), [0, 0]);
+        assert_eq!(
+            encode_direction(&Direction {
+                azimuth: FRAC_PI_2,
+                elevation: 0.0
+            }),
+            [64, 0]
+        );
+        assert_eq!(
+            encode_direction(&Direction {
+                azimuth: -FRAC_PI_2,
+                elevation: -FRAC_PI_2
+            }),
+            [0xC0, 0x81]
+        );
+        assert_eq!(
+            encode_direction(&Direction {
+                azimuth: PI,
+                elevation: FRAC_PI_2
+            }),
+            [127, 127]
+        );
+        // Out-of-range values saturate instead of wrapping to the other side.
+        assert_eq!(
+            encode_direction(&Direction {
+                azimuth: -4.0,
+                elevation: 9.0
+            }),
+            [0x81, 127]
+        );
+        let d = decode_direction([64, 0xC0]);
+        assert!((d.azimuth - FRAC_PI_2).abs() < 0.02);
+        // -64/127 of π/2 ≈ -45°
+        assert!((d.elevation + std::f32::consts::FRAC_PI_4).abs() < 0.02);
+    }
+
+    #[test]
+    fn downlink_parts_carry_volume_and_direction_in_order() {
+        let keys = MediaKeys::derive(b"directional");
+        let packet = AurixPacket::audio(3, 1920, 7, 8, Bytes::from_static(b"opus"));
+        let dir = Direction {
+            azimuth: std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+        };
+
+        let (header, body) = packet.downlink_parts(1.0, None);
+        assert_eq!(header.flags, packet.header.flags);
+        assert_eq!(&body[..], b"opus");
+
+        let (header, body) = packet.downlink_parts(1.0, Some(&dir));
+        assert!(header.has_flag(PacketFlags::Directional));
+        assert!(!header.has_flag(PacketFlags::VolumeAttenuated));
+        assert_eq!(&body[..], &[64, 0, b'o', b'p', b'u', b's']);
+
+        let (header, body) = packet.downlink_parts(0.5, Some(&dir));
+        assert!(header.has_flag(PacketFlags::Directional));
+        assert!(header.has_flag(PacketFlags::VolumeAttenuated));
+        assert_eq!(&body[..], &[64, 64, 0, b'o', b'p', b'u', b's']);
+
+        let wire = AurixPacket::seal_parts(&header, &body, &keys);
+        let mut decoded = AurixPacket::decode(&wire).unwrap();
+        assert!(decoded.open(&keys));
+        let (volume, direction) = decoded.take_downlink_meta();
+        assert_eq!(volume, 0.5);
+        let direction = direction.expect("direction");
+        assert!((direction.azimuth - dir.azimuth).abs() < 0.02);
+        assert_eq!(&decoded.payload[..], b"opus");
+        assert_eq!(decoded.header.payload_length, 4);
+        assert!(!decoded.header.has_flag(PacketFlags::Directional));
+        assert!(!decoded.header.has_flag(PacketFlags::VolumeAttenuated));
+
+        let mut plain = AurixPacket::audio(1, 0, 7, 8, Bytes::from_static(b"x"));
+        assert_eq!(plain.take_downlink_meta(), (1.0, None));
+        assert_eq!(&plain.payload[..], b"x");
     }
 
     #[test]

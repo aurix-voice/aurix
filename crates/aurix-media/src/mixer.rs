@@ -2,15 +2,20 @@
 //!
 //! A browser negotiates a single audio track with the SFU, so audio from every other
 //! participant in the channel is decoded, summed with per-sender volume (positional
-//! attenuation, whisper, etc.) and re-encoded as one Opus stream.
+//! attenuation, whisper, etc.) and re-encoded as one stereo Opus stream. Senders in a
+//! directional positional channel are panned across the stereo field by their direction
+//! relative to the listener; everybody else sits in the centre.
 
 use aurix_common::error::{AurixError, Result};
+use aurix_common::types::Direction;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 pub const SAMPLE_RATE: u32 = 48_000;
-/// 20 ms at 48 kHz mono.
+/// 20 ms at 48 kHz, per channel.
 pub const FRAME_SAMPLES: usize = 960;
+/// Channels in the encoded downlink.
+pub const OUTPUT_CHANNELS: usize = 2;
 /// Largest Opus frame we accept from a single packet (120 ms @ 48 kHz).
 const MAX_DECODE_SAMPLES: usize = 5760;
 /// Drop a sender's queued PCM if it grows past this (network burst / clock drift).
@@ -22,12 +27,15 @@ struct SenderState {
     decoder: opus::Decoder,
     queue: VecDeque<i16>,
     volume: f32,
+    /// Constant-power `(left, right)` gains from the sender's direction.
+    pan: (f32, f32),
     last_seen: Instant,
 }
 
 pub struct OpusMixer {
     senders: HashMap<u32, SenderState>,
     encoder: opus::Encoder,
+    /// Interleaved stereo accumulator.
     mix_buf: Vec<i32>,
     frame_buf: Vec<i16>,
     decode_buf: Vec<i16>,
@@ -38,7 +46,7 @@ pub struct OpusMixer {
 impl OpusMixer {
     pub fn new(bitrate_bps: i32) -> Result<Self> {
         let mut encoder =
-            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, opus::Application::Voip)
                 .map_err(|e| AurixError::Codec(format!("opus encoder: {e}")))?;
         encoder
             .set_bitrate(opus::Bitrate::Bits(bitrate_bps.clamp(6_000, 128_000)))
@@ -48,19 +56,27 @@ impl OpusMixer {
         Ok(Self {
             senders: HashMap::new(),
             encoder,
-            mix_buf: vec![0i32; FRAME_SAMPLES],
-            frame_buf: vec![0i16; FRAME_SAMPLES],
+            mix_buf: vec![0i32; FRAME_SAMPLES * OUTPUT_CHANNELS],
+            frame_buf: vec![0i16; FRAME_SAMPLES * OUTPUT_CHANNELS],
             decode_buf: vec![0i16; MAX_DECODE_SAMPLES],
             out_buf: vec![0u8; 1275],
             frames_mixed: 0,
         })
     }
 
-    /// Decode one Opus packet from `sender` and queue its PCM for the next mix.
-    pub fn push_opus(&mut self, sender: u32, volume: f32, packet: &[u8]) -> Result<()> {
+    /// Decode one Opus packet from `sender` and queue its PCM for the next mix, remembering
+    /// the gain and direction the sender should be rendered with.
+    pub fn push_opus(
+        &mut self,
+        sender: u32,
+        volume: f32,
+        direction: Option<Direction>,
+        packet: &[u8],
+    ) -> Result<()> {
         if packet.is_empty() {
             return Ok(());
         }
+        let pan = direction.as_ref().map_or(CENTRE, Direction::stereo_gains);
         let state = match self.senders.get_mut(&sender) {
             Some(s) => s,
             None => {
@@ -72,6 +88,7 @@ impl OpusMixer {
                         decoder,
                         queue: VecDeque::new(),
                         volume,
+                        pan,
                         last_seen: Instant::now(),
                     },
                 );
@@ -79,6 +96,7 @@ impl OpusMixer {
             }
         };
         state.volume = volume;
+        state.pan = pan;
         state.last_seen = Instant::now();
         let n = state
             .decoder
@@ -91,7 +109,7 @@ impl OpusMixer {
         Ok(())
     }
 
-    /// Mix one 20 ms frame from all senders with queued audio. Returns `None` when silent.
+    /// Mix one 20 ms stereo frame from all senders with queued audio. Returns `None` when silent.
     pub fn mix_frame(&mut self) -> Result<Option<&[u8]>> {
         let now = Instant::now();
         self.senders
@@ -107,9 +125,13 @@ impl OpusMixer {
             let vol = state
                 .volume
                 .clamp(0.0, crate::session::MAX_PARTICIPANT_GAIN);
-            for slot in self.mix_buf.iter_mut() {
+            let (left, right) = (state.pan.0 * vol, state.pan.1 * vol);
+            for frame in self.mix_buf.as_chunks_mut::<OUTPUT_CHANNELS>().0 {
                 match state.queue.pop_front() {
-                    Some(sample) => *slot += (sample as f32 * vol) as i32,
+                    Some(sample) => {
+                        frame[0] += (sample as f32 * left) as i32;
+                        frame[1] += (sample as f32 * right) as i32;
+                    }
                     None => break,
                 }
             }
@@ -132,6 +154,9 @@ impl OpusMixer {
         self.senders.len()
     }
 }
+
+/// Pan of a sender without a direction: unchanged in both ears.
+const CENTRE: (f32, f32) = (1.0, 1.0);
 
 /// Encode a 20 ms PCM frame — used by tests and tooling to synthesize valid Opus packets.
 pub fn encode_pcm_frame(pcm: &[i16]) -> Result<Vec<u8>> {
@@ -169,26 +194,84 @@ mod tests {
 
         let a = encode_pcm_frame(&tone(440.0, 0.3)).unwrap();
         let b = encode_pcm_frame(&tone(880.0, 0.3)).unwrap();
-        mixer.push_opus(1, 1.0, &a).unwrap();
-        mixer.push_opus(2, 0.5, &b).unwrap();
+        mixer.push_opus(1, 1.0, None, &a).unwrap();
+        mixer.push_opus(2, 0.5, None, &b).unwrap();
         assert_eq!(mixer.active_senders(), 2);
 
         let frame = mixer.mix_frame().unwrap().expect("mixed frame");
         assert!(!frame.is_empty() && frame.len() <= 1275);
 
-        // Decoding the mixed frame yields a full 20 ms of non-silent audio.
-        let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
-        let mut pcm = vec![0i16; FRAME_SAMPLES];
-        let n = dec.decode(frame, &mut pcm, false).unwrap();
-        assert_eq!(n, FRAME_SAMPLES);
-        assert!(pcm.iter().any(|s| s.abs() > 100));
+        // Decoding the mixed frame yields a full 20 ms of non-silent stereo audio, identical in
+        // both ears for centred senders.
+        let (l, r) = decode_stereo(frame);
+        assert!(l.iter().any(|s| s.abs() > 100));
+        assert!((rms(&l) - rms(&r)).abs() / rms(&l) < 0.05);
 
         assert!(mixer.mix_frame().unwrap().is_none(), "queues drained");
+    }
+
+    fn decode_stereo(frame: &[u8]) -> (Vec<i16>, Vec<i16>) {
+        let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
+        let mut pcm = vec![0i16; FRAME_SAMPLES * OUTPUT_CHANNELS];
+        let n = dec.decode(frame, &mut pcm, false).unwrap();
+        assert_eq!(n, FRAME_SAMPLES);
+        let left = pcm.iter().step_by(2).copied().collect();
+        let right = pcm.iter().skip(1).step_by(2).copied().collect();
+        (left, right)
+    }
+
+    fn rms(pcm: &[i16]) -> f32 {
+        (pcm.iter().map(|s| (*s as f32).powi(2)).sum::<f32>() / pcm.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn directional_sender_is_panned_and_mono_decoders_still_hear_it() {
+        let mut mixer = OpusMixer::new(48_000).unwrap();
+        let a = encode_pcm_frame(&tone(440.0, 0.3)).unwrap();
+        let right = Direction {
+            azimuth: std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+        };
+        // Prime the encoder/decoder (the first Opus frame carries codec warm-up).
+        for _ in 0..3 {
+            mixer.push_opus(1, 1.0, Some(right), &a).unwrap();
+            mixer.mix_frame().unwrap().unwrap();
+        }
+        mixer.push_opus(1, 1.0, Some(right), &a).unwrap();
+        let frame = mixer.mix_frame().unwrap().unwrap().to_vec();
+        let (l, r) = decode_stereo(&frame);
+        assert!(
+            rms(&l) < rms(&r) * 0.25,
+            "hard right: left {} vs right {}",
+            rms(&l),
+            rms(&r)
+        );
+
+        // Pan follows the latest direction for the sender.
+        let left = Direction {
+            azimuth: -std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+        };
+        for _ in 0..3 {
+            mixer.push_opus(1, 1.0, Some(left), &a).unwrap();
+            mixer.mix_frame().unwrap().unwrap();
+        }
+        mixer.push_opus(1, 1.0, Some(left), &a).unwrap();
+        let frame = mixer.mix_frame().unwrap().unwrap().to_vec();
+        let (l, r) = decode_stereo(&frame);
+        assert!(rms(&r) < rms(&l) * 0.25, "hard left");
+
+        // A legacy mono decoder still gets the voice (Opus downmixes).
+        let mut mono = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+        let mut pcm = vec![0i16; FRAME_SAMPLES];
+        let n = mono.decode(&frame, &mut pcm, false).unwrap();
+        assert_eq!(n, FRAME_SAMPLES);
+        assert!(rms(&pcm) > 1000.0);
     }
 
     #[test]
     fn rejects_garbage_packets() {
         let mut mixer = OpusMixer::new(32_000).unwrap();
-        assert!(mixer.push_opus(7, 1.0, &[0xff; 3]).is_err());
+        assert!(mixer.push_opus(7, 1.0, None, &[0xff; 3]).is_err());
     }
 }

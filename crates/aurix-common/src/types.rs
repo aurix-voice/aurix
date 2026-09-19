@@ -315,6 +315,88 @@ impl Orientation3D {
         .iter()
         .all(|v| v.is_finite())
     }
+
+    /// Orthonormal listener basis `(forward, up, right)`; `None` when `forward` is zero or
+    /// `up` is parallel to it (the game sent a degenerate orientation).
+    fn basis(&self, coords: CoordinateSystem) -> Option<([f32; 3], [f32; 3], [f32; 3])> {
+        let f = normalize([self.forward_x, self.forward_y, self.forward_z])?;
+        let up = [self.up_x, self.up_y, self.up_z];
+        let d = dot(up, f);
+        let u = normalize([up[0] - d * f[0], up[1] - d * f[1], up[2] - d * f[2]])?;
+        let r = match coords {
+            CoordinateSystem::LeftHanded => cross(u, f),
+            CoordinateSystem::RightHanded => cross(f, u),
+        };
+        Some((f, u, r))
+    }
+}
+
+/// Where a sound source sits relative to a listener, in the listener's own frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Direction {
+    /// Radians in `-π..=π`: `0` straight ahead, positive to the listener's right, `±π` behind.
+    pub azimuth: f32,
+    /// Radians in `-π/2..=π/2`: positive above the listener.
+    pub elevation: f32,
+}
+
+impl Direction {
+    pub const AHEAD: Direction = Direction {
+        azimuth: 0.0,
+        elevation: 0.0,
+    };
+
+    /// Direction from `listener` (facing `orientation`) to `source`. `None` when they share a
+    /// position (no direction exists) or the orientation is degenerate.
+    pub fn from_listener(
+        listener: &Position3D,
+        orientation: &Orientation3D,
+        source: &Position3D,
+        coords: CoordinateSystem,
+    ) -> Option<Direction> {
+        let (f, u, r) = orientation.basis(coords)?;
+        let d = normalize([
+            source.x - listener.x,
+            source.y - listener.y,
+            source.z - listener.z,
+        ])?;
+        let azimuth = dot(d, r).atan2(dot(d, f));
+        let elevation = dot(d, u).clamp(-1.0, 1.0).asin();
+        Some(Direction { azimuth, elevation })
+    }
+
+    /// Constant-power stereo gains `(left, right)` for a source at this direction, normalised
+    /// so a centred source is unity in both channels (a hard-panned one is +3 dB in one ear and
+    /// silent in the other). Stereo has no front/back cue, so a source behind the listener pans
+    /// like one in front of it.
+    pub fn stereo_gains(&self) -> (f32, f32) {
+        let pan = self.azimuth.sin().clamp(-1.0, 1.0);
+        let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        (
+            theta.cos() * std::f32::consts::SQRT_2,
+            theta.sin() * std::f32::consts::SQRT_2,
+        )
+    }
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
+    let len = dot(v, v).sqrt();
+    if !len.is_finite() || len <= 1e-6 {
+        return None;
+    }
+    Some([v[0] / len, v[1] / len, v[2] / len])
 }
 
 impl Default for Orientation3D {
@@ -367,11 +449,18 @@ impl Default for ChannelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PositionalConfig {
     pub near_distance: f32,
     pub far_distance: f32,
     pub rolloff: RolloffCurve,
     pub max_radius: f32,
+    /// Pan each speaker across the listener's stereo field by where they stand relative to
+    /// the listener's reported orientation (native clients get the direction per frame, the
+    /// WebRTC downlink is mixed in stereo). Off: mono, distance attenuation only.
+    pub directional: bool,
+    /// Handedness of the game's world coordinates, needed to tell left from right.
+    pub coordinate_system: CoordinateSystem,
 }
 
 impl Default for PositionalConfig {
@@ -381,8 +470,21 @@ impl Default for PositionalConfig {
             far_distance: 50.0,
             rolloff: RolloffCurve::Logarithmic,
             max_radius: 100.0,
+            directional: true,
+            coordinate_system: CoordinateSystem::LeftHanded,
         }
     }
+}
+
+/// Handedness of the world coordinate system positions/orientations are reported in.
+/// Left-handed: Unity (`X` right, `Y` up, `Z` forward), Unreal (`X` forward, `Y` right, `Z` up).
+/// Right-handed: OpenGL/Three.js/Godot (`X` right, `Y` up, `-Z` forward).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinateSystem {
+    #[default]
+    LeftHanded,
+    RightHanded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -719,4 +821,121 @@ pub struct AdminContext {
     pub admin_id: uuid::Uuid,
     pub email: String,
     pub role: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    fn dir(listener: (f32, f32, f32), source: (f32, f32, f32), o: Orientation3D) -> Direction {
+        Direction::from_listener(
+            &Position3D::new(listener.0, listener.1, listener.2),
+            &o,
+            &Position3D::new(source.0, source.1, source.2),
+            CoordinateSystem::LeftHanded,
+        )
+        .expect("direction")
+    }
+
+    #[test]
+    fn direction_follows_unity_conventions() {
+        let o = Orientation3D::default(); // facing +Z, up +Y → right is +X
+        let ahead = dir((0.0, 0.0, 0.0), (0.0, 0.0, 5.0), o.clone());
+        assert!(ahead.azimuth.abs() < 1e-5 && ahead.elevation.abs() < 1e-5);
+        let right = dir((0.0, 0.0, 0.0), (3.0, 0.0, 0.0), o.clone());
+        assert!((right.azimuth - FRAC_PI_2).abs() < 1e-5);
+        let left = dir((0.0, 0.0, 0.0), (-3.0, 0.0, 0.0), o.clone());
+        assert!((left.azimuth + FRAC_PI_2).abs() < 1e-5);
+        let behind = dir((0.0, 0.0, 0.0), (0.0, 0.0, -1.0), o.clone());
+        assert!((behind.azimuth.abs() - PI).abs() < 1e-5);
+        let above = dir((0.0, 0.0, 0.0), (0.0, 4.0, 0.0), o);
+        assert!((above.elevation - FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn direction_is_relative_to_listener_orientation() {
+        // Listener turned to face +X: a source at +X is now ahead, one at +Z is on the left.
+        let facing_x = Orientation3D {
+            forward_x: 1.0,
+            forward_y: 0.0,
+            forward_z: 0.0,
+            up_x: 0.0,
+            up_y: 1.0,
+            up_z: 0.0,
+        };
+        let ahead = dir((10.0, 0.0, 10.0), (20.0, 0.0, 10.0), facing_x.clone());
+        assert!(ahead.azimuth.abs() < 1e-5);
+        let left = dir((10.0, 0.0, 10.0), (10.0, 0.0, 20.0), facing_x);
+        assert!((left.azimuth + FRAC_PI_2).abs() < 1e-5);
+
+        // Right-handed worlds mirror left/right.
+        let rh = Direction::from_listener(
+            &Position3D::new(0.0, 0.0, 0.0),
+            &Orientation3D::default(),
+            &Position3D::new(3.0, 0.0, 0.0),
+            CoordinateSystem::RightHanded,
+        )
+        .unwrap();
+        assert!((rh.azimuth + FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn degenerate_inputs_have_no_direction() {
+        let o = Orientation3D::default();
+        let p = Position3D::new(1.0, 2.0, 3.0);
+        assert!(Direction::from_listener(&p, &o, &p, CoordinateSystem::LeftHanded).is_none());
+        let zero_forward = Orientation3D {
+            forward_x: 0.0,
+            forward_y: 0.0,
+            forward_z: 0.0,
+            ..Orientation3D::default()
+        };
+        let q = Position3D::new(0.0, 0.0, 0.0);
+        assert!(
+            Direction::from_listener(&q, &zero_forward, &p, CoordinateSystem::LeftHanded).is_none()
+        );
+        let up_is_forward = Orientation3D {
+            up_x: 0.0,
+            up_y: 0.0,
+            up_z: 1.0,
+            ..Orientation3D::default()
+        };
+        assert!(
+            Direction::from_listener(&q, &up_is_forward, &p, CoordinateSystem::LeftHanded)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stereo_pan_is_constant_power() {
+        let (l, r) = Direction::AHEAD.stereo_gains();
+        assert!((l - 1.0).abs() < 1e-5 && (r - 1.0).abs() < 1e-5);
+        let (l, r) = Direction {
+            azimuth: FRAC_PI_2,
+            elevation: 0.0,
+        }
+        .stereo_gains();
+        assert!(l.abs() < 1e-5 && (r - std::f32::consts::SQRT_2).abs() < 1e-5);
+        let (l, r) = Direction {
+            azimuth: -FRAC_PI_2,
+            elevation: 0.0,
+        }
+        .stereo_gains();
+        assert!((l - std::f32::consts::SQRT_2).abs() < 1e-5 && r.abs() < 1e-5);
+        // Power is constant along the arc.
+        let (l, r) = Direction {
+            azimuth: 0.4,
+            elevation: 0.0,
+        }
+        .stereo_gains();
+        assert!((l * l + r * r - 2.0).abs() < 1e-5);
+        // Behind-right pans right just like front-right.
+        let (l, r) = Direction {
+            azimuth: 3.0 * PI / 4.0,
+            elevation: 0.0,
+        }
+        .stereo_gains();
+        assert!(r > l);
+    }
 }

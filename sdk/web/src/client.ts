@@ -324,6 +324,43 @@ function decodeJwtSubject(token: string): string | undefined {
 }
 
 /**
+ * Ask the browser to *decode* Opus in stereo (`stereo=1` = our receive preference, RFC 7587).
+ * libwebrtc sizes its decoder from that parameter of the local description, not from the
+ * packets, so without it the server's stereo downlink (directional positional channels) is
+ * downmixed to mono before playout. The microphone uplink stays mono.
+ */
+function preferStereoOpus(sdp: string): string {
+  const lines = sdp.split(/\r?\n/);
+  const opusPts = new Set<string>();
+  for (const line of lines) {
+    const m = /^a=rtpmap:(\d+) opus\/48000\/2/i.exec(line);
+    if (m?.[1] !== undefined) opusPts.add(m[1]);
+  }
+  if (opusPts.size === 0) return sdp;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of lines) {
+    const m = /^a=fmtp:(\d+) (.*)$/.exec(line);
+    if (m?.[1] !== undefined && m[2] !== undefined && opusPts.has(m[1])) {
+      seen.add(m[1]);
+      const params = m[2].split(';').filter((p) => !/^\s*stereo=/.test(p));
+      params.push('stereo=1');
+      out.push(`a=fmtp:${m[1]} ${params.join(';')}`);
+      continue;
+    }
+    out.push(line);
+  }
+  // No fmtp line yet: append one right after the rtpmap.
+  const result: string[] = [];
+  for (const line of out) {
+    result.push(line);
+    const m = /^a=rtpmap:(\d+) opus\/48000\/2/i.exec(line);
+    if (m?.[1] !== undefined && !seen.has(m[1])) result.push(`a=fmtp:${m[1]} stereo=1`);
+  }
+  return result.join(sdp.includes('\r\n') ? '\r\n' : '\n');
+}
+
+/**
  * Browser client for Aurix: authenticated WebSocket control channel plus one WebRTC
  * peer connection carrying the microphone uplink and the server-mixed downlink.
  *
@@ -1655,7 +1692,7 @@ export class AurixClient {
     };
 
     const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    await pc.setLocalDescription({ type: 'offer', sdp: preferStereoOpus(offer.sdp ?? '') });
     // The server is ICE-lite and answers with its own host candidate, so no trickle needed:
     // wait for local gathering to finish so the offer carries our candidates.
     await this.waitForIceGathering(pc);

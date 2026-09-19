@@ -3,7 +3,7 @@
 
 use aurix_common::protocol::*;
 use aurix_common::types::*;
-use aurix_media::mixer::{encode_pcm_frame, FRAME_SAMPLES, SAMPLE_RATE};
+use aurix_media::mixer::{encode_pcm_frame, FRAME_SAMPLES, OUTPUT_CHANNELS, SAMPLE_RATE};
 use aurix_media::{SfuNode, SfuOptions};
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -186,7 +186,15 @@ async fn browser_and_aurx_client_hear_each_other() {
         .attach_webrtc(&browser_session.session_id, &offer)
         .unwrap();
     assert!(answer.contains("a=ice-lite"), "SFU answers as ICE-lite");
-    assert!(answer.contains("opus/48000"), "answer negotiates Opus");
+    assert!(answer.contains("opus/48000/2"), "answer negotiates Opus");
+    let fmtp = answer
+        .lines()
+        .find(|l| l.starts_with("a=fmtp:") && l.contains("sprop-stereo=1"))
+        .expect("answer announces a stereo downlink");
+    assert!(
+        fmtp.contains("useinbandfec=1") && !fmtp.contains(";stereo=1"),
+        "uplink stays mono: {fmtp}"
+    );
     browser.accept_answer(&answer);
 
     // ICE + DTLS handshake
@@ -252,8 +260,8 @@ async fn browser_and_aurx_client_hear_each_other() {
         "browser received {} mixed frames",
         browser.received.len()
     );
-    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
-    let mut pcm = vec![0i16; FRAME_SAMPLES];
+    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0i16; FRAME_SAMPLES * OUTPUT_CHANNELS];
     let n = dec.decode(&browser.received[1], &mut pcm, false).unwrap();
     assert_eq!(n, FRAME_SAMPLES);
     assert!(

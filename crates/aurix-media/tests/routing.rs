@@ -634,6 +634,161 @@ async fn transmission_mode_focus_and_session_channel_limits() {
     assert_eq!(s_a.get_channels().len(), 3);
 }
 
+/// In a directional positional channel every receiver gets the speaker's direction in its own
+/// frame of reference (`Directional` metadata ahead of the frame), stacked with distance and
+/// per-participant gain in the `VolumeAttenuated` byte. E2EE frames are forwarded untouched.
+#[tokio::test]
+async fn directional_positional_downlink_carries_listener_relative_direction() {
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let world = ChannelId::new();
+    let cfg = ChannelConfig {
+        channel_type: ChannelType::Positional,
+        positional_config: Some(PositionalConfig {
+            near_distance: 10.0,
+            far_distance: 50.0,
+            rolloff: RolloffCurve::Linear,
+            max_radius: 100.0,
+            ..PositionalConfig::default()
+        }),
+        ..ChannelConfig::default()
+    };
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    for s in [&s_a, &s_b, &s_c] {
+        sfu.join_channel(&s.session_id, world, cfg.clone(), ChannelRole::Speaker)
+            .unwrap();
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+    c.bind(addr).await;
+
+    let facing = |x: f32, z: f32| Orientation3D {
+        forward_x: x,
+        forward_y: 0.0,
+        forward_z: z,
+        up_x: 0.0,
+        up_y: 1.0,
+        up_z: 0.0,
+    };
+    // Nobody has a pose yet: a positional channel cannot place the speaker, nothing is sent.
+    a.send_audio(addr, &world, b"d0").await;
+    assert!(b.recv().await.is_none());
+    assert!(c.recv().await.is_none());
+
+    // A stands 5 m to +X of the origin; B looks down +Z (A on the right), C looks down +X
+    // (A straight ahead).
+    sfu.update_position(
+        &s_a.user_id,
+        &world,
+        Position3D::new(5.0, 0.0, 0.0),
+        facing(0.0, 1.0),
+    );
+    sfu.update_position(
+        &s_b.user_id,
+        &world,
+        Position3D::new(0.0, 0.0, 0.0),
+        facing(0.0, 1.0),
+    );
+    sfu.update_position(
+        &s_c.user_id,
+        &world,
+        Position3D::new(0.0, 0.0, 0.0),
+        facing(1.0, 0.0),
+    );
+    a.send_audio(addr, &world, b"d1").await;
+    let got = b.recv().await.unwrap();
+    assert!(got.header.has_flag(PacketFlags::Directional));
+    assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+    let dir = decode_direction([got.payload[0], got.payload[1]]);
+    assert!(
+        (dir.azimuth - std::f32::consts::FRAC_PI_2).abs() < 0.03,
+        "{dir:?}"
+    );
+    assert!(dir.elevation.abs() < 0.03);
+    assert_eq!(&got.payload[2..], b"d1");
+    let got = c.recv().await.unwrap();
+    let dir = decode_direction([got.payload[0], got.payload[1]]);
+    assert!(dir.azimuth.abs() < 0.03, "{dir:?}");
+    assert_eq!(&got.payload[2..], b"d1");
+
+    // The receiver's own helper strips both kinds of metadata in one go.
+    let mut got = got;
+    let (vol, d) = got.take_downlink_meta();
+    assert_eq!(vol, 1.0);
+    assert!(d.unwrap().azimuth.abs() < 0.03);
+    assert_eq!(&got.payload[..], b"d1");
+
+    // Move A behind-left of B and out to 30 m: linear rolloff 0.5 x B's gain 0.5 = 0.25,
+    // direction in front of the gain byte.
+    s_b.prefs.write().set_gain(s_a.user_id, 0.5);
+    sfu.update_position(
+        &s_a.user_id,
+        &world,
+        Position3D::new(-30.0, 0.0, 0.0),
+        facing(0.0, 1.0),
+    );
+    a.send_audio(addr, &world, b"d2").await;
+    let mut got = b.recv().await.unwrap();
+    assert!(got.header.has_flag(PacketFlags::Directional));
+    assert!(got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(got.payload[0], encode_volume_byte(0.25));
+    let (vol, d) = got.take_downlink_meta();
+    assert!((vol - 0.25).abs() < 0.01, "{vol}");
+    assert!((d.unwrap().azimuth + std::f32::consts::FRAC_PI_2).abs() < 0.03);
+    assert_eq!(&got.payload[..], b"d2");
+    assert!(
+        !got.header.has_flag(PacketFlags::Directional)
+            && !got.header.has_flag(PacketFlags::VolumeAttenuated)
+    );
+    let (vol, _) = c.recv().await.unwrap().take_downlink_meta();
+    assert!((vol - 0.5).abs() < 0.01, "C has no local gain: {vol}");
+
+    // Beyond max_radius nobody hears A at all.
+    sfu.update_position(
+        &s_a.user_id,
+        &world,
+        Position3D::new(500.0, 0.0, 0.0),
+        facing(0.0, 1.0),
+    );
+    a.send_audio(addr, &world, b"d3").await;
+    assert!(b.recv().await.is_none());
+    assert!(c.recv().await.is_none());
+
+    // E2EE frames cannot be re-scaled and carry no server metadata.
+    sfu.update_position(
+        &s_a.user_id,
+        &world,
+        Position3D::new(5.0, 0.0, 0.0),
+        facing(0.0, 1.0),
+    );
+    let seq = a.next_seq();
+    let mut pkt = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_a.ssrc,
+        channel_id_hash(&world),
+        Bytes::from_static(b"e2ee"),
+    );
+    pkt.header.flags |= PacketFlags::E2ee as u16;
+    a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+    let got = b.recv().await.unwrap();
+    assert!(got.header.has_flag(PacketFlags::E2ee));
+    assert!(!got.header.has_flag(PacketFlags::Directional));
+    assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(&got.payload[..], b"e2ee");
+}
+
 /// A WebRTC uplink carries one frame for every channel the browser transmits to. A receiver
 /// sharing several of those channels with the sender must hear it exactly once — via the
 /// channel where it is loudest for that receiver — and the transmission mode decides which

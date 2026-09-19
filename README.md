@@ -134,7 +134,8 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
    player JWT (must list the channel) or a one-time `join` action token for exactly that channel.
 3. **Browsers**: `ChannelJoin`, then `WebRtcOffer { sdp }` → `WebRtcAnswer { sdp }`; ICE
    servers come from `GET /v1/me/turn-credentials`.
-4. Positional channels: send `PositionUpdate` (own position only); `SpeakingState`,
+4. Positional channels: send `PositionUpdate` (own position + orientation; moderators may move
+   anyone) — see *Positional / directional audio* below. `SpeakingState`,
    `ParticipantJoined/Left`, `RecordingNotification`, `Kick`, `SessionClose` arrive as events.
 5. In-game moderation: `ModerateParticipant { channel_id, user_id, action, token }` with a
    `kick`/`mute`/`unmute` action token minted by your backend for the acting player →
@@ -196,6 +197,24 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
    elements; the Unity SDK does the same with `Microphone.devices` (hot-swap with fallback to the
    default device), `AudioLevel.ApplyGain` before VAD/Opus and `RemoteMixer.OutputVolume` /
    `OutputMuted` (decoding continues while muted so jitter buffers stay in sync).
+10. **Positional / directional audio**: a `positional` channel routes each frame per listener
+    from the poses last reported with `PositionUpdate { channel_id, positions: [{ user_id,
+    position, orientation }] }` — nothing is forwarded until both the speaker's and the
+    listener's pose are known, nothing beyond `positional_config.max_radius`, and the distance
+    gain (`near_distance`/`far_distance`/`rolloff`, multiplied with the receiver's participant
+    volume and channel focus) travels in the volume byte / WebRTC gain like everywhere else.
+    With `positional_config.directional: true` the server also resolves *where the speaker is
+    relative to the listener's orientation*: azimuth (`0` ahead, `+π/2` right, `±π` behind) and
+    elevation (`+π/2` above), computed from the listener's `forward`/`up` vectors in the game's
+    own coordinates — `coordinate_system: left_handed` (default; Unity `X` right/`Y` up/`Z`
+    forward, Unreal) or `right_handed` (OpenGL/Three.js/Godot, mirrors left and right).
+    Co-located or degenerate poses resolve to "ahead". Native AURX downlink frames then carry
+    `PacketFlags::Directional` and two signed bytes (azimuth `-127..127` ≙ `-π..π`, elevation ≙
+    `-π/2..π/2`) after the optional volume byte and before the Opus payload
+    (`AurixPacket::take_downlink_meta`); the Unity mixer pans each stream with constant-power
+    gains. The WebRTC downlink is mixed in stereo on the server (Opus `sprop-stereo=1`, the Web
+    SDK offers `stereo=1` so browsers decode both channels; uplinks stay mono). End-to-end
+    encrypted native frames are forwarded untouched (no server-side metadata).
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 

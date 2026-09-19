@@ -85,6 +85,30 @@ The server caps memberships per session (`media.max_channels_per_session`, defau
 `media.max_positional_channels_per_session`, default 1); `joinChannel` rejects with
 `CHANNEL_LIMIT_EXCEEDED: …` when the cap is reached.
 
+### Positional / directional audio
+
+In a `positional` channel the server places every speaker for every listener from the poses
+the clients publish, so call `updatePosition` whenever the local player moves or turns (a few
+times per second is plenty):
+
+```ts
+// position in world units, orientation = the player's forward and up vectors
+client.updatePosition(arenaId, { x: 12.5, y: 0, z: -3 },
+  { forward_x: 0, forward_y: 0, forward_z: 1, up_x: 0, up_y: 1, up_z: 0 });
+client.on('positions', (channelId, positions) => { /* others' poses, if you want to mirror them */ });
+```
+
+Nothing is heard until both sides have reported a pose, nothing beyond the channel's
+`max_radius`, and the distance roll-off (`near_distance` → `far_distance`) is applied on the
+server together with your participant volumes and channel focus. When the channel was created
+with `positional_config.directional: true` the downlink is a **stereo** mix: each speaker is
+panned by their azimuth relative to your orientation (constant-power, elevation is reported but
+not rendered), so a teammate on your right stays on your right when you turn. Left/right follow
+the channel's `coordinate_system` (`left_handed` — Unity/Unreal — by default, `right_handed` for
+OpenGL/Three.js/Godot conventions). The SDK offers Opus with `stereo=1` so the browser decodes
+both channels; play the remote stream through a stereo output (or `attachAudioOutput`) and do
+not re-pan it yourself. Your microphone is still sent in mono.
+
 ### Reconnect / session resume
 
 Enabled by default (`autoReconnect: true`). When the control connection drops the client keeps

@@ -68,9 +68,35 @@ void Update() {
 void OnAudioFilterRead(float[] data, int ch) => mixer.Mix(data, ch);
 ```
 
-`UpdatePositionAsync` sends 3D positions for server-side attenuation (the downlink carries a per-packet volume byte
-the mixer applies), `RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's
-bitrate adaptation.
+`UpdatePositionAsync` sends the player's pose for server-side positional audio (see below),
+`RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's bitrate adaptation.
+
+### Positional / directional audio
+
+In a `positional` channel the server places every speaker for every listener from the poses the clients publish.
+Send the local player's transform whenever it changes (a few times per second is enough); the orientation is the
+listener's forward and up vectors in the game's own coordinates:
+
+```csharp
+var t = playerTransform;
+await client.UpdatePositionAsync(arenaId, myUserId,
+    new Position3D { X = t.position.x, Y = t.position.y, Z = t.position.z },
+    new Orientation3D { ForwardX = t.forward.x, ForwardY = t.forward.y, ForwardZ = t.forward.z,
+                        UpX = t.up.x, UpY = t.up.y, UpZ = t.up.z });
+client.OnPositions += (channelId, poses) => { /* others' poses, if you want to mirror them */ };
+```
+
+Nothing is heard until both sides have reported a pose, nothing beyond the channel's `max_radius`, and the distance
+roll-off (`near_distance` → `far_distance`) arrives in the per-packet volume byte together with your participant
+volumes and channel focus. When the channel was created with `positional_config.directional: true` every downlink
+packet also carries `PacketFlags.Directional` + two bytes — azimuth (`0` ahead, `+π/2` right, `±π` behind) and
+elevation (`+π/2` above) of the speaker relative to *your* orientation, quantised to `-127..127`
+(`AurxPacket.TakeDownlinkMeta` → `Direction`). `RemoteMixer.Push(ssrc, seq, volume, direction, opus)` pans the
+decoded mono stream across the first two output channels with constant-power gains (`Direction.StereoGains`:
+centre `(1, 1)`, hard right `(0, √2)`), so a teammate on your right stays on your right when you turn; elevation is
+exposed but not rendered. Left/right follow the channel's `coordinate_system` (`left_handed`, Unity's `X` right /
+`Y` up / `Z` forward, by default; `right_handed` mirrors them). Keep the `AudioSource` non-spatialised (2D) — the
+server already did the panning; packets without the flag stay centred, and a mono output ignores the pan.
 
 ### Local mute, per-participant volume, block
 
@@ -292,6 +318,12 @@ multi-channel controls over real UDP: `Single(party)` set before the party join 
 the join, then only party frames arrive; `All` reaches both channels; `None` reaches nobody and `SendOpusFrame`
 drops locally; bob's `focus(team)` turns the party volume byte into 0.5 while alice's focus stays untouched;
 leaving the target / focused channel resets both through server events.
+
+`--scenario positional` (needs the API key: it creates a directional positional channel) checks directional audio
+over real UDP: no frames before both poses are known; alice 2 m to bob's right → azimuth `+π/2` and the decoded
+stereo mix lands entirely in the right channel; bob turns to face her → azimuth `0`, both channels equal;
+alice behind-left at 12 m with bob's local volume 0.5 → azimuth `-3π/4`, volume byte 0.25 and a left-heavy mix;
+beyond `max_radius` → nothing.
 
 ## Notes
 

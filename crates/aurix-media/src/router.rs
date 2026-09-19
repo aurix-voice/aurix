@@ -12,7 +12,7 @@ use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::*;
 use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
-use crate::channel::MediaChannel;
+use crate::channel::{MediaChannel, Mix};
 use crate::session::{MediaSession, Transport};
 use crate::webrtc::{ForwardMedia, WebRtcManager};
 
@@ -346,7 +346,7 @@ impl PacketRouter {
         // with the sender must get it exactly once — through the channel where it hears the
         // sender loudest (focus / positional attenuation) — or the mixers would double the audio.
         let mut per_channel: Vec<(Arc<MediaChannel>, AurixPacket)> = Vec::new();
-        let mut best: HashMap<SessionId, (usize, Arc<MediaSession>, f32)> = HashMap::new();
+        let mut best: HashMap<SessionId, (usize, Arc<MediaSession>, Mix)> = HashMap::new();
         for channel_id in channels {
             let channel = match self.shared.channels.get(&channel_id) {
                 Some(c) => c.value().clone(),
@@ -364,12 +364,12 @@ impl PacketRouter {
             );
             self.tap_audio(&channel, sender, &packet);
             let idx = per_channel.len();
-            for (receiver, volume) in channel.get_receivers_for_audio(sender.ssrc) {
+            for (receiver, mix) in channel.get_receivers_for_audio(sender.ssrc) {
                 match best.get_mut(&receiver.session_id) {
-                    Some(slot) if slot.2 >= volume => {}
-                    Some(slot) => *slot = (idx, receiver, volume),
+                    Some(slot) if slot.2.volume >= mix.volume => {}
+                    Some(slot) => *slot = (idx, receiver, mix),
                     None => {
-                        best.insert(receiver.session_id, (idx, receiver, volume));
+                        best.insert(receiver.session_id, (idx, receiver, mix));
                     }
                 }
             }
@@ -380,9 +380,9 @@ impl PacketRouter {
             }
             per_channel.push((channel, packet));
         }
-        let mut receivers: Vec<Vec<(Arc<MediaSession>, f32)>> = vec![Vec::new(); per_channel.len()];
-        for (idx, receiver, volume) in best.into_values() {
-            receivers[idx].push((receiver, volume));
+        let mut receivers: Vec<Vec<(Arc<MediaSession>, Mix)>> = vec![Vec::new(); per_channel.len()];
+        for (idx, receiver, mix) in best.into_values() {
+            receivers[idx].push((receiver, mix));
         }
         for ((channel, packet), receivers) in per_channel.iter().zip(receivers) {
             if !receivers.is_empty() {
@@ -464,13 +464,13 @@ impl PacketRouter {
     async fn deliver(
         &self,
         channel: &Arc<MediaChannel>,
-        receivers: Vec<(Arc<MediaSession>, f32)>,
+        receivers: Vec<(Arc<MediaSession>, Mix)>,
         packet: &AurixPacket,
     ) {
         // Downlink packets are sealed per receiver (encrypted + authenticated with the receiver's
-        // session keys); the volume-attenuated body is built once per distinct volume on demand.
+        // session keys) with that receiver's gain/direction metadata in front of the frame.
         let e2ee = packet.header.has_flag(PacketFlags::E2ee);
-        for (receiver, volume) in receivers {
+        for (receiver, mix) in receivers {
             if !receiver.is_active() {
                 continue;
             }
@@ -484,7 +484,8 @@ impl PacketRouter {
                             &receiver.session_id,
                             ForwardMedia {
                                 sender_ssrc: packet.header.ssrc,
-                                volume,
+                                volume: mix.volume,
+                                direction: mix.direction,
                                 payload: packet.payload.to_vec(),
                             },
                         );
@@ -499,11 +500,12 @@ impl PacketRouter {
                     let Some(addr) = receiver.get_remote_addr() else {
                         continue;
                     };
-                    let out = if !e2ee && (volume - 1.0).abs() > 0.01 {
-                        let (header, body) = Self::attenuated_body(packet, volume);
-                        AurixPacket::seal_parts(&header, &body, &receiver.keys)
-                    } else {
+                    let out = if e2ee {
                         AurixPacket::seal_parts(&packet.header, &packet.payload, &receiver.keys)
+                    } else {
+                        let (header, body) =
+                            packet.downlink_parts(mix.volume, mix.direction.as_ref());
+                        AurixPacket::seal_parts(&header, &body, &receiver.keys)
                     };
                     match self.send_udp(&out, addr).await {
                         Ok(n) => {
@@ -522,16 +524,6 @@ impl PacketRouter {
                 }
             }
         }
-    }
-
-    /// Payload with a leading one-byte gain factor and a header carrying `VolumeAttenuated`.
-    fn attenuated_body(packet: &AurixPacket, volume: f32) -> (PacketHeader, BytesMut) {
-        let mut header = packet.header.clone();
-        header.flags |= PacketFlags::VolumeAttenuated as u16;
-        let mut body = BytesMut::with_capacity(1 + packet.payload.len());
-        body.put_u8(encode_volume_byte(volume));
-        body.put_slice(&packet.payload);
-        (header, body)
     }
 
     async fn handle_heartbeat(

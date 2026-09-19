@@ -610,9 +610,15 @@ impl SfuNode {
         Ok(())
     }
 
-    pub fn update_position(&self, user_id: &UserId, channel_id: &ChannelId, position: Position3D) {
+    pub fn update_position(
+        &self,
+        user_id: &UserId,
+        channel_id: &ChannelId,
+        position: Position3D,
+        orientation: Orientation3D,
+    ) {
         if let Some(channel) = self.channels.get(channel_id) {
-            channel.update_position(user_id, position);
+            channel.update_position(user_id, position, orientation);
         }
     }
 

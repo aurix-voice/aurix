@@ -1963,7 +1963,12 @@ async fn handle_control_message(
             {
                 let sfu = state.sfu.read();
                 for up in &accepted {
-                    sfu.update_position(&up.user_id, &channel_id, up.position.clone());
+                    sfu.update_position(
+                        &up.user_id,
+                        &channel_id,
+                        up.position.clone(),
+                        up.orientation.clone(),
+                    );
                 }
             }
             state.broadcast_channel(

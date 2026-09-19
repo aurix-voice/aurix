@@ -15,9 +15,11 @@
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{
     channel_id_hash, encode_volume_byte, AurixPacket, ControlMessage, PacketFlags, PacketType,
-    TransmissionMode,
+    TransmissionMode, UserPosition,
 };
-use aurix_common::types::{ChannelId, RecordingConsent, SessionId, UserId};
+use aurix_common::types::{
+    ChannelId, Direction, Orientation3D, Position3D, RecordingConsent, SessionId, UserId,
+};
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use base64::Engine;
 use bytes::Bytes;
@@ -2758,4 +2760,253 @@ async fn transmission_mode_channel_focus_and_channel_limit() {
 
     let _ = alice.ws.close(None).await;
     let _ = bob.ws.close(None).await;
+}
+
+async fn create_channel_with(
+    env: &Env,
+    http: &reqwest::Client,
+    config: serde_json::Value,
+) -> ChannelId {
+    let ch: serde_json::Value = http
+        .post(format!("{}/v1/channels", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(
+            &serde_json::json!({"name": format!("e2e-{}", uuid::Uuid::now_v7()), "config": config}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ChannelId::from_uuid(ch["id"].as_str().unwrap().parse().unwrap())
+}
+
+/// Publishes `who`'s pose and waits until `peer` saw the broadcast, so the SFU has it.
+async fn move_to(
+    who: &mut Player,
+    peer: &mut Player,
+    channel_id: ChannelId,
+    user_id: UserId,
+    position: Position3D,
+    orientation: Orientation3D,
+) {
+    who.send(&ControlMessage::PositionUpdate {
+        channel_id,
+        positions: vec![UserPosition {
+            user_id,
+            position,
+            orientation,
+        }],
+    })
+    .await;
+    peer.expect("PositionUpdate", |m| {
+        matches!(m, ControlMessage::PositionUpdate { positions, .. }
+            if positions.iter().any(|p| p.user_id == user_id))
+    })
+    .await;
+}
+
+/// Collects the downlink metadata of Alice's frames at `to`: `(volume, direction)` of the first
+/// frame plus the count.
+async fn directional_audio_from(
+    to: &Player,
+    ssrc: u32,
+    payload: &Bytes,
+) -> (Option<(f32, Option<Direction>)>, usize) {
+    let mut got = 0;
+    let mut meta = None;
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
+        if p.header.packet_type != PacketType::Audio || p.header.ssrc != ssrc {
+            continue;
+        }
+        let m = p.take_downlink_meta();
+        assert_eq!(&p.payload[..], &payload[..]);
+        meta.get_or_insert(m);
+        got += 1;
+    }
+    (meta, got)
+}
+
+fn facing(fx: f32, fy: f32, fz: f32) -> Orientation3D {
+    Orientation3D {
+        forward_x: fx,
+        forward_y: fy,
+        forward_z: fz,
+        up_x: 0.0,
+        up_y: 1.0,
+        up_z: 0.0,
+    }
+}
+
+fn at(x: f32, y: f32, z: f32) -> Position3D {
+    Position3D { x, y, z }
+}
+
+/// Directional positional channel over native AURX: the server prefixes each downlink frame
+/// with the source's azimuth/elevation *relative to the listener's orientation* (and the
+/// distance gain when attenuated); turning the listener rotates the sound, distance and a
+/// receiver-local volume still combine into the gain byte, and nothing is delivered before
+/// both poses are known or beyond `max_radius`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn directional_positional_audio_follows_listener_orientation() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let arena = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "channel_type": "positional",
+            "positional_config": {
+                "near_distance": 2.0, "far_distance": 22.0, "rolloff": "linear",
+                "max_radius": 30.0, "directional": true, "coordinate_system": "left_handed"
+            }
+        }),
+    )
+    .await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "e2e:dir-alice", "Alice", arena).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e:dir-bob", "Bob", arena).await;
+    let uid_a: UserId = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b: UserId = UserId::from_uuid(uid_b.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    for p in [&mut alice, &mut bob] {
+        bind_media(p).await;
+        join(p, arena).await;
+    }
+    let hello = Bytes::from_static(b"hello");
+
+    // No poses yet: positional routing has nothing to place, nothing is forwarded.
+    send_audio(&alice, arena, 1, &hello).await;
+    assert_eq!(directional_audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+
+    // Bob at the origin facing +Z (Unity forward), Alice 1 m to his right: azimuth +π/2, unity gain.
+    move_to(
+        &mut bob,
+        &mut alice,
+        arena,
+        uid_b,
+        at(0.0, 0.0, 0.0),
+        facing(0.0, 0.0, 1.0),
+    )
+    .await;
+    move_to(
+        &mut alice,
+        &mut bob,
+        arena,
+        uid_a,
+        at(1.0, 0.0, 0.0),
+        facing(0.0, 0.0, 1.0),
+    )
+    .await;
+    send_audio(&alice, arena, 100, &hello).await;
+    let (meta, n) = directional_audio_from(&bob, alice.ssrc, &hello).await;
+    assert_eq!(n, 10);
+    let (volume, direction) = meta.unwrap();
+    assert_eq!(volume, 1.0, "within near_distance: no gain byte");
+    let d = direction.expect("directional channel must carry a direction");
+    assert!(
+        (d.azimuth - std::f32::consts::FRAC_PI_2).abs() < 0.03,
+        "{d:?}"
+    );
+    assert!(d.elevation.abs() < 0.03, "{d:?}");
+
+    // Bob turns to face +X: Alice is now straight ahead. The sender did not move.
+    move_to(
+        &mut bob,
+        &mut alice,
+        arena,
+        uid_b,
+        at(0.0, 0.0, 0.0),
+        facing(1.0, 0.0, 0.0),
+    )
+    .await;
+    send_audio(&alice, arena, 200, &hello).await;
+    let (meta, n) = directional_audio_from(&bob, alice.ssrc, &hello).await;
+    assert_eq!(n, 10);
+    let d = meta.unwrap().1.unwrap();
+    assert!(d.azimuth.abs() < 0.03, "{d:?}");
+
+    // Bob turns back and Alice walks 12 m behind-left: azimuth ≈ -3π/4, linear gain 0.5, and a
+    // receiver-local volume of 0.5 multiplies in.
+    move_to(
+        &mut bob,
+        &mut alice,
+        arena,
+        uid_b,
+        at(0.0, 0.0, 0.0),
+        facing(0.0, 0.0, 1.0),
+    )
+    .await;
+    let back_left = 12.0 / std::f32::consts::SQRT_2;
+    move_to(
+        &mut alice,
+        &mut bob,
+        arena,
+        uid_a,
+        at(-back_left, 0.0, -back_left),
+        facing(0.0, 0.0, 1.0),
+    )
+    .await;
+    bob.send(&ControlMessage::SetParticipantVolume {
+        user_id: uid_a,
+        volume: 0.5,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&alice, arena, 300, &hello).await;
+    let (meta, n) = directional_audio_from(&bob, alice.ssrc, &hello).await;
+    assert_eq!(n, 10);
+    let (volume, direction) = meta.unwrap();
+    let d = direction.unwrap();
+    assert!(
+        (d.azimuth + 3.0 * std::f32::consts::FRAC_PI_4).abs() < 0.03,
+        "{d:?}"
+    );
+    assert!(
+        (volume - 0.25).abs() < 0.02,
+        "distance 0.5 × local 0.5, got {volume}"
+    );
+
+    // Alice hears Bob too, mirrored: Bob is ahead-right of her, at the same distance gain.
+    send_audio(&bob, arena, 400, &hello).await;
+    let (meta, n) = directional_audio_from(&alice, bob.ssrc, &hello).await;
+    assert_eq!(n, 10);
+    let (volume, direction) = meta.unwrap();
+    let d = direction.unwrap();
+    assert!(
+        (d.azimuth - std::f32::consts::FRAC_PI_4).abs() < 0.03,
+        "{d:?}"
+    );
+    assert!((volume - 0.5).abs() < 0.02, "distance only, got {volume}");
+
+    // Beyond max_radius nothing is forwarded at all.
+    move_to(
+        &mut alice,
+        &mut bob,
+        arena,
+        uid_a,
+        at(0.0, 0.0, 40.0),
+        facing(0.0, 0.0, 1.0),
+    )
+    .await;
+    send_audio(&alice, arena, 500, &hello).await;
+    assert_eq!(directional_audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+
+    for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::ChannelLeave { channel_id: arena })
+            .await;
+    }
 }

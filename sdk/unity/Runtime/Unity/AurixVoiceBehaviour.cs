@@ -266,7 +266,7 @@ namespace Aurix.Unity
         private void PumpDownlink()
         {
             if (Client == null || _mixer == null) return;
-            while (Client.TryDequeueAudio(out var a)) _mixer.Push(a.SenderSsrc, a.Sequence, a.Volume, a.Opus);
+            while (Client.TryDequeueAudio(out var a)) _mixer.Push(a.SenderSsrc, a.Sequence, a.Volume, a.Direction, a.Opus);
         }
 
         // Runs on Unity's audio thread; the AudioSource plays silence which we fill with the mix.
