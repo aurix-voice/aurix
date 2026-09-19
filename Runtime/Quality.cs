@@ -137,7 +137,9 @@ namespace Aurix
     public struct VoiceStats
     {
         public VoiceConnectionState State;
-        // Transport (native AURX over UDP).
+        // Transport (native AURX over UDP or the WebSocket tunnel).
+        /// <summary>Link the media currently uses.</summary>
+        public Transport.MediaPath MediaPath;
         public long PacketsSent;
         public long BytesSent;
         public long PacketsReceived;
@@ -147,6 +149,10 @@ namespace Aurix
         /// <summary>Downlink packets rejected by the replay window.</summary>
         public long Replayed;
         public long HeartbeatsLost;
+        /// <summary>Heartbeats lost in a row (reset by every ack).</summary>
+        public int HeartbeatsLostConsecutive;
+        /// <summary>Uplink packets dropped because the tunnel's send queue was full (0 on UDP).</summary>
+        public long UplinkDropped;
         /// <summary>Heartbeat RTT (media path), current and session min/avg/max.</summary>
         public float RttMs;
         public float RttMinMs;

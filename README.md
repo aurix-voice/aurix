@@ -154,6 +154,31 @@ await client.SetAudioCodecAsync(AudioCodec.Opus);                       // back 
   while PCMU is active. Not available on WebRTC sessions or for E2EE frames; the node may refuse with
   `CODEC_NOT_AVAILABLE` (`media.pcmu_fallback = false`).
 
+### When UDP is blocked: the WebSocket tunnel
+
+`MediaPathPolicy.Auto` (default) binds media over UDP and, if the node never answers, sends the very same
+sealed AURX packets as binary frames over the control WebSocket instead — no extra connection or
+credential. While on UDP, `UdpFallbackLostHeartbeats` (3) unanswered heartbeats (`MediaHeartbeatInterval`,
+5 s) switch to the tunnel mid-call; while tunnelled, every `UdpReprobeInterval` (30 s, `TimeSpan.Zero` =
+never) UDP is tried again and taken back the moment it answers. `UdpOnly` keeps the old behaviour,
+`TunnelOnly` never opens a socket. The behaviour exposes the same three knobs (`MediaPath`,
+`UdpFallbackLostHeartbeats`, `UdpReprobeIntervalSeconds`).
+
+```csharp
+client.OnMediaPathChanged += (path, why) => Debug.Log($"media over {path}: {why}");
+client.ActiveMediaPath;                       // MediaPath.Udp / Tunnel (None before the first bind)
+client.Session.MediaTunnel;                   // node advertises the tunnel (media.media_tunnel)
+var s = client.GetStats();                    // s.MediaPath, s.HeartbeatsLostConsecutive, s.UplinkDropped
+```
+
+* One `SequenceCounter` is shared by both links, so a switch is invisible to the server's replay window
+  and to other players' jitter buffers; codecs, mute, quality reports, reconnect and resume work the same.
+* `UplinkDropped` counts frames the tunnel's bounded outbox (`ControlChannel.MediaQueueLength` = 64)
+  refused while TCP was stalled — audio never blocks the game thread. The tunnel inherits TCP head-of-line
+  blocking: it keeps the player in the call, UDP remains the path to be on.
+* Custom pipelines: `MediaTransport.OverTunnel(IMediaTunnel, sessionId, ssrc, mediaKey, sequence)`;
+  `ControlChannel` implements `IMediaTunnel`.
+
 ### Choosing a region
 
 Session resume is node-local, so a player should connect to the *nearest node with capacity* and keep its
@@ -615,6 +640,13 @@ only her own SSRC back (RMS ≈ 0.35, `Ended` fired once), nothing after `SetMut
 tone, alice switches back to Opus and the frames follow, `OnAudioCodecChanged` fires `Pcmu, Opus`, 0 auth
 failures. `--scenario reconnect` also negotiates PCMU first and checks the codec survives a resume and is
 re-negotiated after a fresh session.
+
+`--scenario tunnel` puts alice on `TunnelOnly` and bob on `Auto`/UDP: the node advertises `media_tunnel`,
+alice's binary-frame uplink reaches bob over UDP and bob's UDP uplink reaches alice over the tunnel (both
+RMS ≈ 0.21), tunnel heartbeats are acked, a forced reconnect resumes the session still tunnelled with the
+sequence continuing, 0 auth/replay failures. `--udp-block 1` (needs passwordless `sudo iptables`) adds carol
+on `Auto` behind a UDP black hole scoped to her port: fallback at bind, audio through the tunnel, return to
+UDP on the re-probe once the rule is lifted, fallback again on heartbeat loss when it comes back.
 
 ## Notes
 

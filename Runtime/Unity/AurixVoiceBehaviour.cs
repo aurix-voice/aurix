@@ -4,6 +4,7 @@ using System.Collections;
 using System.Threading.Tasks;
 using Aurix.Audio;
 using Aurix.Protocol;
+using Aurix.Transport;
 using UnityEngine;
 #if UNITY_ANDROID
 using UnityEngine.Android;
@@ -107,6 +108,16 @@ namespace Aurix.Unity
         [Tooltip("Reconnect (resume + UDP rebind) when Application.internetReachability changes, e.g. Wi-Fi ↔ cellular: " +
                  "the media session is bound to the old source address, so nothing is heard until the rebind.")]
         public bool ReconnectOnNetworkChange = true;
+
+        [Header("Media path")]
+        [Tooltip("Auto: UDP, falling back to the same sealed AURX packets as binary frames on the control WebSocket " +
+                 "when UDP does not bind or its heartbeats die (re-probing UDP periodically). UdpOnly: the classic behaviour. " +
+                 "TunnelOnly: always tunnel (testing / networks known to drop UDP). The tunnel is TCP — more latency under loss.")]
+        public MediaPathPolicy MediaPath = MediaPathPolicy.Auto;
+        [Tooltip("Consecutive unanswered UDP heartbeats (5 s apart) before Auto moves to the tunnel. 0 = never.")]
+        [Range(0, 10)] public int UdpFallbackLostHeartbeats = 3;
+        [Tooltip("Seconds between UDP re-probes while tunnelled; the media moves back to UDP as soon as one is answered. 0 = never.")]
+        [Range(0f, 600f)] public float UdpReprobeIntervalSeconds = 30f;
 
         /// <summary>Creates encoder/decoder instances. Must be set by your code (platform/licensing choice).</summary>
         public Func<IOpusCodec> CodecFactory;
@@ -261,6 +272,9 @@ namespace Aurix.Unity
             Client = new AurixVoiceClient(WebSocketUrl, Token);
             Client.Mixer = _mixer;
             Client.FollowChannelPolicy = FollowChannelPolicy;
+            Client.MediaPathPolicy = MediaPath;
+            Client.UdpFallbackLostHeartbeats = UdpFallbackLostHeartbeats;
+            Client.UdpReprobeInterval = TimeSpan.FromSeconds(Math.Max(0f, UdpReprobeIntervalSeconds));
             Client.SetEncoderSettings(EncoderSettingsFromInspector());
             Client.SetComplexity(Complexity);
             Client.Encoder = _encoder;

@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using Aurix;
 using Aurix.Audio;
 using Aurix.Protocol;
+using Aurix.Transport;
 using Aurix.Samples;
 
 namespace Aurix.Demo
@@ -52,6 +53,7 @@ namespace Aurix.Demo
             if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "chat") return await ChatScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "pcmu") return await PcmuScenario(ws, channelId, tokenA, tokenB);
+            if (Get(opt, "scenario", "audio") == "tunnel") return await TunnelScenario(ws, channelId, tokenA, tokenB, opt.ContainsKey("udp-block"));
             if (Get(opt, "scenario", "audio") == "transmission")
             {
                 if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the transmission scenario needs --api-key (second channel + multi-channel tokens)"); return 2; }
@@ -534,6 +536,205 @@ namespace Aurix.Demo
             return ok ? 0 : 1;
         }
 
+        /// <summary>
+        /// Media over the control WebSocket instead of UDP: alice is forced onto the tunnel while bob
+        /// stays on UDP, audio flows both ways, a resume keeps the tunnel, and with <c>--udp-block</c>
+        /// (needs passwordless <c>sudo iptables</c>) a third client in Auto mode meets a UDP black hole:
+        /// falls back at bind, returns to UDP when the re-probe answers, falls back again when the
+        /// heartbeats die mid-session.
+        /// </summary>
+        private static async Task<int> TunnelScenario(string ws, Guid channelId, string tokenA, string tokenB, bool udpBlock)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA) { MediaPathPolicy = MediaPathPolicy.TunnelOnly, MediaHeartbeatInterval = TimeSpan.FromSeconds(1) };
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            var paths = new List<(MediaPath, string)>();
+            alice.OnMediaPathChanged += (p, why) => { lock (paths) paths.Add((p, why)); Add(log, $"alice: media path {p} ({why})"); };
+            bob.OnMediaPathChanged += (p, why) => Add(log, $"bob: media path {p} ({why})");
+            alice.OnRecovered += i => Add(log, $"alice: recovered resumed={i.Resumed}");
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+
+            var a = await alice.ConnectAsync();
+            var b = await bob.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var clients = new List<AurixVoiceClient> { alice, bob };
+            var pump = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    AurixVoiceClient[] snapshot; lock (clients) snapshot = clients.ToArray();
+                    foreach (var c in snapshot) c.Update();
+                    await Task.Delay(10);
+                }
+            });
+            await alice.JoinChannelAsync(channelId);
+            await bob.JoinChannelAsync(channelId);
+            var hash = AurixVoiceClient.ChannelHash(channelId);
+
+            Check(a.MediaTunnel, "node advertises media_tunnel in SessionInitAck");
+            Check(alice.ActiveMediaPath == MediaPath.Tunnel, $"alice (TunnelOnly) is on {alice.ActiveMediaPath}");
+            Check(bob.ActiveMediaPath == MediaPath.Udp, $"bob (Auto) is on {bob.ActiveMediaPath}");
+            (MediaPath, string) firstPath; lock (paths) firstPath = paths.Count > 0 ? paths[0] : default;
+            Check(firstPath.Item1 == MediaPath.Tunnel && firstPath.Item2 == "tunnel-only policy", $"OnMediaPathChanged: {firstPath}");
+
+            var (aliceRms, bobRms) = await Exchange(alice, bob, hash, 60);
+            Check(aliceRms > 0.15 && aliceRms < 0.27, $"alice hears bob over the tunnel: RMS {aliceRms:F3} (expect ≈0.21)");
+            Check(bobRms > 0.15 && bobRms < 0.27, $"bob hears alice's tunnelled uplink over UDP: RMS {bobRms:F3} (expect ≈0.21)");
+            var stats = alice.GetStats();
+            Check(stats.MediaPath == MediaPath.Tunnel && stats.UplinkDropped == 0 && stats.BadAuth == 0 && stats.Replayed == 0,
+                $"stats: path={stats.MediaPath} uplinkDropped={stats.UplinkDropped} badAuth={stats.BadAuth} replayed={stats.Replayed}");
+            Check(stats.RttMs > 0 && alice.Media.HeartbeatAcks > 0, $"tunnel heartbeats answered: {alice.Media.HeartbeatAcks} acks, RTT {stats.RttMs:F1} ms");
+
+            // Resume while tunnelled: the new control socket carries the media again, sequence numbers continue.
+            uint seqBefore = alice.Media.CurrentSequence;
+            alice.ForceReconnect("tunnel resume");
+            bool back = await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(10));
+            Check(back && alice.Session.Resumed && alice.Session.SessionId == a.SessionId, $"resumed same session over a new socket (back={back} resumed={alice.Session?.Resumed})");
+            Check(alice.ActiveMediaPath == MediaPath.Tunnel, $"still tunnelled after the resume ({alice.ActiveMediaPath})");
+            await Task.Delay(200);
+            var (aliceRms2, bobRms2) = await Exchange(alice, bob, hash, 40);
+            Check(aliceRms2 > 0.15 && bobRms2 > 0.15, $"audio after the resume: alice {aliceRms2:F3} bob {bobRms2:F3}");
+            Check(alice.Media.CurrentSequence > seqBefore, $"uplink sequence continued {seqBefore} → {alice.Media.CurrentSequence}");
+            Check(alice.Media.PacketsBadAuth == 0 && bob.Media.PacketsBadAuth == 0 && bob.Media.PacketsReplayed == 0, "no auth/replay failures on either side");
+
+            if (udpBlock)
+            {
+                int port = int.Parse(a.MediaAddr.Substring(a.MediaAddr.LastIndexOf(':') + 1));
+                // Bob shares this host, so the rule spares his UDP socket: only carol falls into the hole.
+                int bobPort = bob.Media.LocalEndPoint.Port;
+                using var block = new UdpBlock(port, bobPort);
+                Console.WriteLine($"blocking inbound UDP from the node's media port {port} except towards bob's port {bobPort} (sudo iptables)");
+                block.Set(true);
+                var carol = new AurixVoiceClient(ws, tokenA)
+                {
+                    MediaHeartbeatInterval = TimeSpan.FromMilliseconds(500),
+                    UdpFallbackLostHeartbeats = 3,
+                    UdpReprobeInterval = TimeSpan.FromSeconds(3),
+                };
+                var carolPaths = new List<(MediaPath, string)>();
+                carol.OnMediaPathChanged += (p, why) => { lock (carolPaths) carolPaths.Add((p, why)); Add(log, $"carol: media path {p} ({why})"); };
+                async Task<(MediaPath, string)?> WaitPath(int from, MediaPath want, TimeSpan timeout)
+                {
+                    var deadline = DateTime.UtcNow + timeout;
+                    while (DateTime.UtcNow < deadline)
+                    {
+                        lock (carolPaths) for (int i = from; i < carolPaths.Count; i++) if (carolPaths[i].Item1 == want) return carolPaths[i];
+                        await Task.Delay(20);
+                    }
+                    return null;
+                }
+                await alice.DisconnectAsync(); // same user as carol: one session per token keeps the roster simple
+                lock (clients) { clients.Remove(alice); clients.Add(carol); }
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                await carol.ConnectAsync();
+                await carol.JoinChannelAsync(channelId);
+                var atBind = await WaitPath(0, MediaPath.Tunnel, TimeSpan.FromSeconds(5));
+                Check(atBind != null && atBind.Value.Item2.StartsWith("UDP bind failed"), $"Auto fell back at bind in {sw.ElapsedMilliseconds} ms: {atBind}");
+                var (carolRms, bobRms3) = await Exchange(carol, bob, hash, 50);
+                Check(carolRms > 0.15 && bobRms3 > 0.15, $"audio through the black hole: carol {carolRms:F3} bob {bobRms3:F3}");
+
+                block.Set(false);
+                Console.WriteLine("UDP open again: waiting for the re-probe");
+                sw.Restart();
+                int seen; lock (carolPaths) seen = carolPaths.Count;
+                var backToUdp = await WaitPath(seen, MediaPath.Udp, TimeSpan.FromSeconds(10));
+                Check(backToUdp != null && backToUdp.Value.Item2 == "UDP re-probe answered", $"moved back to UDP in {sw.ElapsedMilliseconds} ms: {backToUdp}");
+                var (carolRms2, bobRms4) = await Exchange(carol, bob, hash, 50);
+                Check(carolRms2 > 0.15 && bobRms4 > 0.15, $"audio back on UDP: carol {carolRms2:F3} bob {bobRms4:F3}");
+
+                block.Set(true);
+                Console.WriteLine("UDP black-holed mid-session: waiting for the heartbeat fallback");
+                sw.Restart();
+                lock (carolPaths) seen = carolPaths.Count;
+                var onLoss = await WaitPath(seen, MediaPath.Tunnel, TimeSpan.FromSeconds(10));
+                Check(onLoss != null && onLoss.Value.Item2.Contains("heartbeats unanswered"), $"heartbeat fallback in {sw.ElapsedMilliseconds} ms: {onLoss}");
+                var (carolRms3, bobRms5) = await Exchange(carol, bob, hash, 50);
+                Check(carolRms3 > 0.15 && bobRms5 > 0.15, $"audio after the mid-session fallback: carol {carolRms3:F3} bob {bobRms5:F3}");
+                var cs = carol.GetStats();
+                Check(cs.BadAuth == 0 && cs.Replayed == 0 && cs.UplinkDropped == 0 && bob.Media.PacketsReplayed == 0,
+                    $"carol stats after three path changes: badAuth={cs.BadAuth} replayed={cs.Replayed} uplinkDropped={cs.UplinkDropped} lostHb={cs.HeartbeatsLost}");
+                block.Set(false);
+                await carol.DisconnectAsync();
+            }
+            else
+            {
+                Console.WriteLine("(add --udp-block to also exercise the Auto fallback against an iptables UDP black hole)");
+                await alice.DisconnectAsync();
+            }
+
+            cts.Cancel();
+            await pump;
+            await bob.DisconnectAsync();
+            Console.WriteLine("events:");
+            foreach (var l in log) Console.WriteLine("  " + l);
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>Both clients send a 440/660 Hz tone at 0.3 for <paramref name="frames"/> × 20 ms; returns the RMS each one hears (≈0.21 expected).</summary>
+        private static async Task<(double, double)> Exchange(AurixVoiceClient x, AurixVoiceClient y, uint hash, int frames)
+        {
+            using var encX = new ConcentusOpusCodec();
+            using var encY = new ConcentusOpusCodec();
+            var mixX = new RemoteMixer(() => new ConcentusOpusCodec());
+            var mixY = new RemoteMixer(() => new ConcentusOpusCodec());
+            var pcm = new float[AudioFormat.FrameSamples];
+            var opus = new byte[1275];
+            var outBuf = new float[AudioFormat.FrameSamples];
+            double ex = 0, ey = 0; long nx = 0, ny = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < frames; i++)
+            {
+                for (int k = 0; k < pcm.Length; k++) pcm[k] = (float)(0.3 * Math.Sin(2 * Math.PI * 440 * (i * pcm.Length + k) / 48000.0));
+                x.SendOpusFrame(hash, opus, encX.Encode(pcm, AudioFormat.FrameSamples, opus));
+                for (int k = 0; k < pcm.Length; k++) pcm[k] = (float)(0.3 * Math.Sin(2 * Math.PI * 660 * (i * pcm.Length + k) / 48000.0));
+                y.SendOpusFrame(hash, opus, encY.Encode(pcm, AudioFormat.FrameSamples, opus));
+                while (x.TryDequeueAudio(out var inc)) mixX.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Codec, inc.Payload);
+                while (y.TryDequeueAudio(out var inc)) mixY.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Codec, inc.Payload);
+                Array.Clear(outBuf, 0, outBuf.Length);
+                mixX.Mix(outBuf, 1);
+                if (i >= 10) { foreach (var v in outBuf) ex += v * v; nx += outBuf.Length; }
+                Array.Clear(outBuf, 0, outBuf.Length);
+                mixY.Mix(outBuf, 1);
+                if (i >= 10) { foreach (var v in outBuf) ey += v * v; ny += outBuf.Length; }
+                var wait = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs) - sw.Elapsed;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait);
+            }
+            mixX.Dispose();
+            mixY.Dispose();
+            return (Math.Sqrt(ex / Math.Max(1, nx)), Math.Sqrt(ey / Math.Max(1, ny)));
+        }
+
+        private static async Task<bool> WaitState(AurixVoiceClient c, VoiceConnectionState st, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline) { if (c.State == st) return true; await Task.Delay(20); }
+            return false;
+        }
+
+        /// <summary>Drops inbound UDP from the node's media port (a black hole: our datagrams leave, nothing comes back), sparing one local port.</summary>
+        private sealed class UdpBlock : IDisposable
+        {
+            private readonly int _port, _exceptDport;
+            private bool _active;
+            public UdpBlock(int port, int exceptDport) { _port = port; _exceptDport = exceptDport; }
+            public void Set(bool on)
+            {
+                if (on == _active) return;
+                var psi = new System.Diagnostics.ProcessStartInfo("sudo", $"-n iptables {(on ? "-A" : "-D")} INPUT -p udp --sport {_port} ! --dport {_exceptDport} -j DROP") { RedirectStandardError = true };
+                using var p = System.Diagnostics.Process.Start(psi);
+                string err = p.StandardError.ReadToEnd();
+                p.WaitForExit();
+                if (p.ExitCode != 0) throw new InvalidOperationException($"iptables failed ({p.ExitCode}): {err.Trim()}");
+                _active = on;
+            }
+            public void Dispose() { try { Set(false); } catch (Exception e) { Console.Error.WriteLine(e.Message); } }
+        }
+
         private static async Task<int> EchoScenario(string ws, Guid echo, string tokenA, string tokenB)
         {
             var log = new List<string>();
@@ -828,13 +1029,6 @@ namespace Aurix.Demo
             var ulaw = new byte[G711.FrameSamples]; // 20 ms of μ-law "zero" (0xff)
             Array.Fill(ulaw, (byte)0xff);
             async Task Stream(int frames) { for (int i = 0; i < frames; i++) { alice.SendAudioFrame(hash, AudioCodec.Pcmu, ulaw); await Task.Delay(20); } }
-            async Task<bool> WaitState(AurixVoiceClient c, VoiceConnectionState st, TimeSpan timeout)
-            {
-                var deadline = DateTime.UtcNow + timeout;
-                while (DateTime.UtcNow < deadline) { if (c.State == st) return true; await Task.Delay(20); }
-                return false;
-            }
-
             await Stream(25);
             long sentBefore = alice.Media.PacketsSent, bobBefore = bob.Media.PacketsReceived;
 
