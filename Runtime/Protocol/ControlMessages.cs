@@ -161,6 +161,55 @@ namespace Aurix.Protocol
         public bool IsOwn => ClientRef != null;
     }
 
+    /// <summary>Server-side speech-to-text of one utterance in a channel with transcription enabled (never stored).</summary>
+    public sealed class Transcript
+    {
+        public Guid Id;
+        public Guid ChannelId;
+        public Guid UserId;
+        public string Text;
+        /// <summary>Language the provider detected, or null.</summary>
+        public string Language;
+        public DateTimeOffset StartedAt;
+        public ulong DurationMs;
+        /// <summary>Word timings relative to <see cref="StartedAt"/>; empty unless the server enables them.</summary>
+        public List<TranscriptWord> Words = new List<TranscriptWord>();
+    }
+
+    public struct TranscriptWord
+    {
+        public string Word;
+        public ulong StartMs;
+        public ulong EndMs;
+    }
+
+    /// <summary>Who hears a synthesized utterance requested by this client.</summary>
+    public enum TtsDestination
+    {
+        /// <summary>The other channel members (the requester does not hear itself).</summary>
+        Channel,
+        /// <summary>Only this client.</summary>
+        Local,
+        /// <summary>Everyone including this client.</summary>
+        Both,
+    }
+
+    public enum TtsState { Queued, Playing, Finished, Cancelled, Failed }
+
+    /// <summary>Lifecycle update of a text-to-speech request.</summary>
+    public sealed class TtsStatus
+    {
+        public Guid RequestId;
+        public string ClientRef;
+        public TtsState State;
+        /// <summary>Audio length in ms once synthesis succeeded.</summary>
+        public ulong? DurationMs;
+        /// <summary>Sanitized failure reason for <see cref="TtsState.Failed"/>.</summary>
+        public string Message;
+
+        public bool IsTerminal => State == TtsState.Finished || State == TtsState.Cancelled || State == TtsState.Failed;
+    }
+
     /// <summary>
     /// One WebSocket control message: <c>{"type": "&lt;Variant&gt;", "data": {...}}</c>, mirroring the
     /// Rust <c>ControlMessage</c> enum. <see cref="Data"/> is the raw parsed <c>data</c> object; typed
@@ -295,6 +344,74 @@ namespace Aurix.Protocol
 
         /// <summary>Typed view of a <c>ChannelFocusChanged</c> payload (null = focus cleared).</summary>
         public Guid? FocusChannel() => MiniJson.GetGuid(Data, "channel_id");
+
+        /// <summary>Typed view of a <c>Transcript</c> payload (<c>data.transcript</c>); null if absent.</summary>
+        public Transcript Transcript()
+        {
+            var o = MiniJson.AsObject(Data != null && Data.TryGetValue("transcript", out var v) ? v : null);
+            if (o == null) return null;
+            var startedAt = MiniJson.GetString(o, "started_at");
+            var t = new Transcript
+            {
+                Id = MiniJson.GetGuid(o, "id") ?? Guid.Empty,
+                ChannelId = MiniJson.GetGuid(o, "channel_id") ?? Guid.Empty,
+                UserId = MiniJson.GetGuid(o, "user_id") ?? Guid.Empty,
+                Text = MiniJson.GetString(o, "text") ?? string.Empty,
+                Language = MiniJson.GetString(o, "language"),
+                StartedAt = startedAt != null && DateTimeOffset.TryParse(startedAt, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTimeOffset.MinValue,
+                DurationMs = (ulong)Math.Max(0, MiniJson.GetNumber(o, "duration_ms", 0)),
+            };
+            if (o.TryGetValue("words", out var wv) && MiniJson.AsArray(wv) is List<object> words)
+                foreach (var item in words)
+                {
+                    var w = MiniJson.AsObject(item);
+                    if (w == null) continue;
+                    t.Words.Add(new TranscriptWord
+                    {
+                        Word = MiniJson.GetString(w, "word") ?? string.Empty,
+                        StartMs = (ulong)Math.Max(0, MiniJson.GetNumber(w, "start_ms", 0)),
+                        EndMs = (ulong)Math.Max(0, MiniJson.GetNumber(w, "end_ms", 0)),
+                    });
+                }
+            return t;
+        }
+
+        /// <summary>Typed view of a <c>TtsStatus</c> payload.</summary>
+        public TtsStatus TtsStatus()
+        {
+            if (Data == null) return null;
+            return new TtsStatus
+            {
+                RequestId = MiniJson.GetGuid(Data, "request_id") ?? Guid.Empty,
+                ClientRef = MiniJson.GetString(Data, "client_ref"),
+                State = TtsStateFromWire(MiniJson.GetString(Data, "state")),
+                DurationMs = Data.TryGetValue("duration_ms", out var d) && d is double dm ? (ulong?)Math.Max(0, dm) : null,
+                Message = MiniJson.GetString(Data, "message"),
+            };
+        }
+
+        public static TtsState TtsStateFromWire(string s)
+        {
+            switch (s)
+            {
+                case "playing": return TtsState.Playing;
+                case "finished": return TtsState.Finished;
+                case "cancelled": return TtsState.Cancelled;
+                case "failed": return TtsState.Failed;
+                default: return TtsState.Queued;
+            }
+        }
+
+        public static string TtsDestinationToWire(TtsDestination d)
+        {
+            switch (d)
+            {
+                case TtsDestination.Local: return "local";
+                case TtsDestination.Both: return "both";
+                default: return "channel";
+            }
+        }
 
         /// <summary>Typed view of a <c>ChannelEnergy</c> payload (<c>data.levels</c>).</summary>
         public List<ParticipantEnergy> Levels()
@@ -436,6 +553,21 @@ namespace Aurix.Protocol
 
         public static string ChatTyping(Guid channelId, bool typing) =>
             Serialize("ChatTyping", new Dictionary<string, object> { { "channel_id", channelId }, { "typing", typing } });
+
+        public static string SetTranscripts(bool enabled) =>
+            Serialize("SetTranscripts", new Dictionary<string, object> { { "enabled", enabled } });
+
+        public static string TtsSpeak(Guid? channelId, string text, string voice, TtsDestination destination, string clientRef)
+        {
+            var d = new Dictionary<string, object> { { "text", text }, { "destination", TtsDestinationToWire(destination) } };
+            if (channelId.HasValue) d["channel_id"] = channelId.Value;
+            if (voice != null) d["voice"] = voice;
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("TtsSpeak", d);
+        }
+
+        public static string TtsCancel() =>
+            MiniJson.Serialize(new Dictionary<string, object> { { "type", "TtsCancel" } });
 
         public static string PositionUpdate(Guid channelId, Guid userId, Position3D pos, Orientation3D ori) =>
             Serialize("PositionUpdate", new Dictionary<string, object>

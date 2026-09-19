@@ -173,6 +173,12 @@ namespace Aurix.Protocol
     public sealed class AurxPacket
     {
         public const byte ProtocolVersion = 2;
+        /// <summary>
+        /// Set on the SSRC of server-synthesized speech: a participant's TTS voice is <c>participant.Ssrc | SynthSsrcFlag</c>,
+        /// channel announcements use a per-channel SSRC with the flag set. Such streams are mixed like any other
+        /// but never carry energy/speaking state of a real microphone.
+        /// </summary>
+        public const uint SynthSsrcFlag = 0x80000000u;
         public static readonly byte[] Magic = { 0x41, 0x55, 0x52, 0x58 }; // "AURX"
         public const int MaxPacketSize = 1400;
         public const int HeaderSize = 30;

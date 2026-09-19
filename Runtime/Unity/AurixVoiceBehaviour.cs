@@ -2,6 +2,7 @@
 using System;
 using System.Threading.Tasks;
 using Aurix.Audio;
+using Aurix.Protocol;
 using UnityEngine;
 
 namespace Aurix.Unity
@@ -107,7 +108,7 @@ namespace Aurix.Unity
 
             Client = new AurixVoiceClient(WebSocketUrl, Token);
             Client.OnBitrateCommand += (kbps, _) => _encoder?.SetBitrate((int)kbps * 1000);
-            Client.OnParticipantLeft += (_, p) => _mixer?.Remove(p.Ssrc);
+            Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();
             await Client.ConnectAsync();
 
