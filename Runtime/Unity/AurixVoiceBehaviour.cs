@@ -38,8 +38,33 @@ namespace Aurix.Unity
         [Range(0f, 2f)] public float OutputVolume = 1f;
         [Tooltip("Speaker mute: hear nobody, without telling the server or affecting your microphone.")]
         public bool OutputMuted = false;
-        [Range(6000, 128000)] public int BitrateBps = 32000;
         public bool AutoConnectOnStart = false;
+
+        [Header("Opus encoder")]
+        [Tooltip("Baseline uplink bitrate. The channel's audio policy (when followed) and the server's adaptive " +
+                 "bitrate commands are layered on top; see Client.EffectiveEncoderSettings for what actually runs.")]
+        [Range(6000, 128000)] public int BitrateBps = 32000;
+        [Tooltip("Opus complexity 0..10 (CPU vs. quality). Pinned: channel policy hints do not override it. " +
+                 "Concentus (pure C#) is ~5–10× slower than libopus — keep ≤ 5 on mobile.")]
+        [Range(0, 10)] public int Complexity = 9;
+        [Tooltip("Widest audio band the encoder may use; the channel policy can narrow it. Fullband = 20 kHz.")]
+        public OpusBandwidth MaxBandwidth = OpusBandwidth.Fullband;
+        [Tooltip("Content hint: Voice enables the speech-tuned modes, Music keeps CELT/fullband, Auto lets Opus decide.")]
+        public OpusSignal Signal = OpusSignal.Voice;
+        [Tooltip("Variable bitrate (off = hard CBR).")]
+        public bool Vbr = true;
+        [Tooltip("Keep VBR frames within the bitrate's byte budget (steadier packet sizes).")]
+        public bool ConstrainedVbr = true;
+        [Tooltip("In-band forward error correction; the receiver rebuilds a lost frame from the next one " +
+                 "(codecs implementing IOpusFecDecoder). Costs bitrate, the channel policy may force it on.")]
+        public bool Fec = true;
+        [Tooltip("Packet loss the FEC is tuned for (%). The server raises it with its BitrateCommand when it sees loss.")]
+        [Range(0, 100)] public int ExpectedLossPercent = 5;
+        [Tooltip("Opus discontinuous transmission: ~1 packet per 400 ms during silence. GateOnVad is the stronger variant.")]
+        public bool Dtx = false;
+        [Tooltip("Retune the encoder from the joined channels' audio policy (bitrate, bandwidth, FEC, DTX, signal). " +
+                 "Off: the settings above are used verbatim.")]
+        public bool FollowChannelPolicy = true;
 
         [Header("Voice activity")]
         [Tooltip("RMS level (0..1) above which a frame counts as speech. 0.01 ≈ -40 dBov.")]
@@ -160,12 +185,14 @@ namespace Aurix.Unity
             if (Client != null) await Disconnect();
 
             _encoder = CodecFactory();
-            _encoder.SetBitrate(BitrateBps);
             _mixer = new RemoteMixer(CodecFactory);
 
             Client = new AurixVoiceClient(WebSocketUrl, Token);
             Client.Mixer = _mixer;
-            Client.OnBitrateCommand += (kbps, _) => _encoder?.SetBitrate((int)kbps * 1000);
+            Client.FollowChannelPolicy = FollowChannelPolicy;
+            Client.SetEncoderSettings(EncoderSettingsFromInspector());
+            Client.SetComplexity(Complexity);
+            Client.Encoder = _encoder;
             Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();
             await Client.ConnectAsync();
@@ -182,6 +209,32 @@ namespace Aurix.Unity
             src.loop = true;
             src.spatialBlend = 0f;
             if (!src.isPlaying) src.Play();
+        }
+
+        /// <summary>The inspector's encoder fields as a settings block (before policy / bitrate commands).</summary>
+        public OpusEncoderSettings EncoderSettingsFromInspector() => new OpusEncoderSettings
+        {
+            BitrateBps = BitrateBps,
+            Complexity = Complexity,
+            MaxBandwidth = MaxBandwidth,
+            Signal = Signal,
+            Vbr = Vbr,
+            ConstrainedVbr = ConstrainedVbr,
+            Fec = Fec,
+            ExpectedLossPercent = ExpectedLossPercent,
+            Dtx = Dtx,
+        }.Clamped();
+
+        /// <summary>
+        /// Re-read the encoder fields at runtime (e.g. from a settings menu) and push them to the codec.
+        /// Forgets the last server bitrate command; the channel policy is layered on again if followed.
+        /// </summary>
+        public void ApplyEncoderSettings()
+        {
+            if (Client == null) return;
+            Client.FollowChannelPolicy = FollowChannelPolicy;
+            Client.SetComplexity(Complexity);
+            Client.SetEncoderSettings(EncoderSettingsFromInspector());
         }
 
         public async Task Disconnect()

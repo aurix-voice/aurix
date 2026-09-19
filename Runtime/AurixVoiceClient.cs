@@ -62,6 +62,16 @@ namespace Aurix
         public bool Live;
     }
 
+    /// <summary>Server request to change the uplink bitrate (adaptive bitrate over the quality reports).</summary>
+    public struct BitrateCommand
+    {
+        public uint TargetBitrateKbps;
+        public string Reason;
+        /// <summary>Loss the server observed, for tuning the encoder's FEC (<c>0..100</c>).</summary>
+        public int ExpectedLossPercent;
+        public int TargetBitrateBps => (int)Math.Min(TargetBitrateKbps * 1000UL, int.MaxValue);
+    }
+
     /// <summary>
     /// High-level Aurix client for .NET / Unity: WebSocket control plane + native AURX/UDP media.
     /// Thread model: network I/O runs on background tasks; all events are raised from
@@ -110,6 +120,15 @@ namespace Aurix
         private int _speakRefCounter;
         private bool _wantTranscripts = true;
         private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
+        /// <summary>Audio policy of every joined channel (from <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>).</summary>
+        private readonly Dictionary<Guid, AudioPolicy> _channelPolicies = new Dictionary<Guid, AudioPolicy>();
+        private AudioPolicy? _audioPolicy;
+        private OpusEncoderSettings _encoderSettings = OpusEncoderSettings.Default;
+        private int? _complexityPin;
+        private bool _followChannelPolicy = true;
+        private BitrateCommand? _bitrateCommand;
+        private IOpusCodec _encoder;
+        private OpusEncoderSettings? _appliedEncoderSettings;
         private byte[] _mediaKey;
         private string _resumeToken;
         private uint _lastMediaSequence;
@@ -165,6 +184,113 @@ namespace Aurix
         /// <summary>Channels currently joined (restored across reconnects).</summary>
         public IReadOnlyCollection<Guid> JoinedChannels { get { lock (_channels) return new List<Guid>(_joinedChannels); } }
 
+        /// <summary>Merged audio policy of the joined channels (kept after leaving the last one); <c>null</c> before the first join.</summary>
+        public AudioPolicy? AudioPolicy { get { lock (_channels) return _audioPolicy; } }
+
+        /// <summary>
+        /// Retune the encoder from the channels' audio policy (bitrate, bandwidth, FEC, DTX, signal and
+        /// complexity hint). Off = the baseline from <see cref="SetEncoderSettings"/> is used verbatim.
+        /// </summary>
+        public bool FollowChannelPolicy
+        {
+            get { lock (_channels) return _followChannelPolicy; }
+            set
+            {
+                lock (_channels) { if (_followChannelPolicy == value) return; _followChannelPolicy = value; }
+                ReapplyEncoder();
+            }
+        }
+
+        /// <summary>Baseline encoder settings (what the policy and bitrate commands are layered over).</summary>
+        public OpusEncoderSettings EncoderSettings { get { lock (_channels) return _encoderSettings; } }
+
+        /// <summary>
+        /// Settings the uplink encoder should be running with right now: the baseline with the channel
+        /// policy applied (if followed), the complexity pin, and the last server bitrate command.
+        /// </summary>
+        public OpusEncoderSettings EffectiveEncoderSettings { get { lock (_channels) return EffectiveEncoderSettingsLocked(); } }
+
+        /// <summary>
+        /// Replace the baseline (mirrors <c>aurix_client_set_encoder_settings</c>). Clears any transient
+        /// bitrate command; the policy of joined channels is re-applied on top when followed.
+        /// </summary>
+        public void SetEncoderSettings(OpusEncoderSettings settings)
+        {
+            lock (_channels) { _encoderSettings = settings.Clamped(); _bitrateCommand = null; }
+            ReapplyEncoder();
+        }
+
+        /// <summary>
+        /// Pin the Opus complexity (0..10) regardless of channel policy hints — the CPU budget is the
+        /// game's call, not the operator's. <c>null</c> un-pins.
+        /// </summary>
+        public void SetComplexity(int? complexity)
+        {
+            lock (_channels) _complexityPin = complexity.HasValue ? (int?)Math.Max(0, Math.Min(OpusEncoderSettings.MaxComplexity, complexity.Value)) : null;
+            ReapplyEncoder();
+        }
+
+        /// <summary>
+        /// The uplink codec this client keeps tuned. Set it once after constructing the codec; every
+        /// policy/bitrate change is pushed through <see cref="IOpusEncoderControls.Apply"/> (or
+        /// <see cref="IOpusCodec.SetBitrate"/> for codecs without full controls).
+        /// </summary>
+        public IOpusCodec Encoder
+        {
+            get { lock (_channels) return _encoder; }
+            set
+            {
+                lock (_channels) { _encoder = value; _appliedEncoderSettings = null; }
+                ReapplyEncoder();
+            }
+        }
+
+        private OpusEncoderSettings EffectiveEncoderSettingsLocked()
+        {
+            bool followed = _followChannelPolicy && _audioPolicy.HasValue;
+            var s = followed ? _encoderSettings.WithPolicy(_audioPolicy.Value, _complexityPin) : _encoderSettings;
+            if (!followed && _complexityPin.HasValue) s.Complexity = _complexityPin.Value;
+            if (_bitrateCommand.HasValue)
+            {
+                var cmd = _bitrateCommand.Value;
+                s.BitrateBps = cmd.TargetBitrateBps;
+                s.ExpectedLossPercent = Math.Max(s.ExpectedLossPercent, cmd.ExpectedLossPercent);
+            }
+            return s.Clamped();
+        }
+
+        /// <summary>Push the effective settings to the bound codec and notify, if they changed.</summary>
+        private void ReapplyEncoder()
+        {
+            OpusEncoderSettings s;
+            IOpusCodec codec;
+            lock (_channels)
+            {
+                s = EffectiveEncoderSettingsLocked();
+                if (_appliedEncoderSettings.HasValue && _appliedEncoderSettings.Value.Equals(s)) return;
+                _appliedEncoderSettings = s;
+                codec = _encoder;
+            }
+            if (codec is IOpusEncoderControls full) full.Apply(s);
+            else codec?.SetBitrate(s.BitrateBps);
+            OnEncoderSettingsChanged?.Invoke(s);
+        }
+
+        /// <summary>Recompute the merged policy; on change retune the encoder and raise <see cref="OnAudioPolicyChanged"/>.</summary>
+        private void RefreshAudioPolicy()
+        {
+            AudioPolicy merged;
+            lock (_channels)
+            {
+                if (_channelPolicies.Count == 0) return;
+                merged = Audio.AudioPolicy.MergeAll(_channelPolicies.Values);
+                if (_audioPolicy.HasValue && _audioPolicy.Value.Equals(merged)) return;
+                _audioPolicy = merged;
+            }
+            ReapplyEncoder();
+            OnAudioPolicyChanged?.Invoke(merged);
+        }
+
         public event Action<VoiceConnectionState> OnStateChanged;
         public event Action<SessionInfo> OnSessionReady;
         public event Action<Guid, IReadOnlyList<Participant>> OnChannelJoined;
@@ -175,7 +301,21 @@ namespace Aurix
         public event Action<Guid, Participant, bool> OnSpeaking;
         public event Action<Guid, IReadOnlyList<UserPosition>> OnPositions;
         public event Action<RecordingNotice> OnRecording;
-        public event Action<uint, string> OnBitrateCommand;
+        /// <summary>
+        /// Adaptive-bitrate request from the server. Already applied to <see cref="Encoder"/> when one is
+        /// bound; subscribe only to observe or to drive a codec the client does not own.
+        /// </summary>
+        public event Action<BitrateCommand> OnBitrateCommand;
+        /// <summary>
+        /// The merged audio policy of the joined channels changed (join, leave, or an operator edited a
+        /// channel). With <see cref="FollowChannelPolicy"/> the encoder is already retuned.
+        /// </summary>
+        public event Action<AudioPolicy> OnAudioPolicyChanged;
+        /// <summary>
+        /// The settings the uplink encoder should run with changed (baseline, policy, complexity pin or
+        /// bitrate command). Applied to <see cref="Encoder"/> automatically when one is bound.
+        /// </summary>
+        public event Action<OpusEncoderSettings> OnEncoderSettingsChanged;
         /// <summary>
         /// Server-side view of this connection (downlink from our reports + uplink as measured by the SFU),
         /// sent when the 1–5 bars change and periodically as a summary.
@@ -453,12 +593,14 @@ namespace Aurix
             {
                 _joinedChannels.Remove(channelId);
                 _transcribedChannels.Remove(channelId);
+                _channelPolicies.Remove(channelId);
                 if (_channels.TryGetValue(channelId, out var map))
                 {
                     foreach (var p in map.Values) _bySsrc.Remove(p.Ssrc);
                     _channels.Remove(channelId);
                 }
             }
+            RefreshAudioPolicy();
             Post(() => OnChannelLeft?.Invoke(channelId));
         }
 
@@ -901,6 +1043,7 @@ namespace Aurix
             {
                 var t = mixer.Totals;
                 s.FramesLost = t.Lost;
+                s.FramesFecRecovered = t.FecRecovered;
                 s.FramesLate = t.Late;
                 s.Underruns = t.Underruns;
                 s.ActiveStreams = mixer.ActiveStreams;
@@ -1141,6 +1284,7 @@ namespace Aurix
                     _joinedChannels.Clear();
                     _channels.Clear();
                     _bySsrc.Clear();
+                    _channelPolicies.Clear();
                 }
                 foreach (var ch in rejoin) { var id = ch; Post(() => OnChannelLeft?.Invoke(id)); }
                 await ReplayReceiverPrefsAsync(ct).ConfigureAwait(false);
@@ -1151,7 +1295,7 @@ namespace Aurix
             Post(() => OnRecovered?.Invoke(info));
         }
 
-        private void HandleMessage(ControlMessage m)
+        internal void HandleMessage(ControlMessage m)
         {
             OnControlMessage?.Invoke(m);
             switch (m.Type)
@@ -1177,8 +1321,24 @@ namespace Aurix
                         _channels[channelId] = map;
                         _joinedChannels.Add(channelId);
                         if (m.Bool("transcription")) _transcribedChannels.Add(channelId); else _transcribedChannels.Remove(channelId);
+                        var policy = Audio.AudioPolicy.FromMessage(m);
+                        if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
                     }
+                    RefreshAudioPolicy();
                     OnChannelJoined?.Invoke(channelId, roster);
+                    break;
+                }
+                case "ChannelAudioPolicy":
+                {
+                    var channelId = m.Id("channel_id");
+                    var policy = Audio.AudioPolicy.FromMessage(m);
+                    if (!policy.HasValue) break;
+                    lock (_channels)
+                    {
+                        if (!_joinedChannels.Contains(channelId)) break;
+                        _channelPolicies[channelId] = policy.Value;
+                    }
+                    RefreshAudioPolicy();
                     break;
                 }
                 case "ParticipantJoined":
@@ -1243,8 +1403,21 @@ namespace Aurix
                     });
                     break;
                 case "BitrateCommand":
-                    OnBitrateCommand?.Invoke(m.U32("target_bitrate_kbps"), m.Str("reason") ?? string.Empty);
+                {
+                    var cmd = new BitrateCommand
+                    {
+                        TargetBitrateKbps = m.U32("target_bitrate_kbps"),
+                        Reason = m.Str("reason") ?? string.Empty,
+                        ExpectedLossPercent = (int)m.U32("expected_loss_percent"),
+                    };
+                    if (cmd.TargetBitrateKbps > 0)
+                    {
+                        lock (_channels) _bitrateCommand = cmd;
+                        ReapplyEncoder();
+                    }
+                    OnBitrateCommand?.Invoke(cmd);
                     break;
+                }
                 case "NetworkQuality":
                 {
                     var q = NetworkQuality.FromMessage(m);
@@ -1258,7 +1431,8 @@ namespace Aurix
                 case "Kick":
                 {
                     var channelId = m.Id("channel_id");
-                    lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); }
+                    lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); _channelPolicies.Remove(channelId); }
+                    RefreshAudioPolicy();
                     OnKicked?.Invoke(channelId, m.Str("reason") ?? string.Empty);
                     break;
                 }

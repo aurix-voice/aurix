@@ -38,7 +38,8 @@ it is a complete, IMGUI-driven client you can copy from. The manual route:
 
 1. Add the package (`Window ▸ Package Manager ▸ + ▸ Add package from disk… ▸ sdk/unity/package.json`).
 2. Provide an Opus codec: import the **Concentus** sample from the package and drop the `Concentus` 2.x DLL
-   (netstandard2.0 build from NuGet) into `Assets/Plugins/`, or write your own `IOpusCodec` around libopus/UnityOpus.
+   (netstandard2.0 build from NuGet) into `Assets/Plugins/` (pure C#, works everywhere), or ship the native
+   core for libopus quality/CPU (`NativeOpusCodec`, see [Opus codec and encoder controls](#opus-codec-and-encoder-controls)).
 3. Set *Project Settings ▸ Audio ▸ System Sample Rate* to **48000**.
 4. Add `AurixVoiceBehaviour` to a GameObject with an `AudioSource`, then from your code:
 
@@ -59,7 +60,7 @@ var client = new AurixVoiceClient(wsUrl, jwt);
 client.OnParticipantJoined += (channel, p) => Debug.Log($"{p.DisplayName} joined (ssrc {p.Ssrc})");
 client.OnSpeaking += (channel, p, speaking) => ShowIndicator(p.UserId, speaking);
 client.OnRecordingNotification += (rec, ch, state) => { if (state == "consent_requested") Prompt(rec); };
-client.OnBitrateCommand += (kbps, _) => encoder.SetBitrate((int)kbps * 1000);
+client.Encoder = encoder;                                // policy + BitrateCommand retune it for you
 
 var session = await client.ConnectAsync();              // WS auth + UDP SessionBind
 var roster  = await client.JoinChannelAsync(channelId);  // ChannelJoinAck roster
@@ -74,6 +75,52 @@ void OnAudioFilterRead(float[] data, int ch) => mixer.Mix(data, ch);
 
 `UpdatePositionAsync` sends the player's pose for server-side positional audio (see below),
 `RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's bitrate adaptation.
+
+### Opus codec and encoder controls
+
+Two codecs implement `IOpusCodec` (plus the optional `IOpusEncoderControls` / `IOpusFecDecoder`):
+
+| | `ConcentusOpusCodec` (sample) | `NativeOpusCodec` |
+|---|---|---|
+| implementation | pure C# Concentus 2.x, no native binaries | libopus statically linked into the Aurix native core (`aurix_client`) |
+| CPU | ~5–10× libopus; keep complexity ≤ 5 on mobile | libopus |
+| controls | all of `OpusEncoderSettings` | all of `OpusEncoderSettings` |
+| FEC decode | yes | yes |
+| platforms | everything Unity runs C# on | wherever you build the core: `cargo build -p aurix-client --release` or `sdk/unreal/AurixVoice/build_native.*` |
+
+Native binaries go where Unity's P/Invoke finds them (`Assets/Plugins/x86_64/aurix_client.dll`,
+`Assets/Plugins/Linux/x86_64/libaurix_client.so`, `Assets/Plugins/macOS/libaurix_client.dylib`,
+`Assets/Plugins/Android/<abi>/libaurix_client.so`; on iOS link the static `libaurix_client.a` — the
+symbols resolve through `__Internal`). Projects that ship no binary are untouched: `NativeOpusCodec.IsAvailable`
+probes once and lets you fall back to Concentus:
+
+```csharp
+voice.CodecFactory = NativeOpusCodec.IsAvailable
+    ? () => new NativeOpusCodec(AudioFormat.SampleRate, 1, voice.EncoderSettingsFromInspector())
+    : () => new ConcentusOpusCodec();
+```
+
+`OpusEncoderSettings` carries every libopus encoder control: `BitrateBps` (6 000..300 000), `Complexity` (0..10),
+`MaxBandwidth` (narrowband 4 kHz … fullband 20 kHz), `Signal` (Auto/Voice/Music → application + signal hint),
+`Vbr`, `ConstrainedVbr`, `Fec`, `ExpectedLossPercent` and `Dtx`. `AurixVoiceBehaviour` exposes them in the
+inspector (*Opus encoder*); `ApplyEncoderSettings()` re-reads them at runtime. Three layers decide what the
+encoder actually runs (`client.EffectiveEncoderSettings`):
+
+1. **baseline** — `client.SetEncoderSettings(...)` (the inspector fields);
+2. **channel audio policy** — the operator's `ChannelConfig` (bitrate, min bitrate, FEC, DTX, max bandwidth,
+   complexity hint, signal), delivered in `ChannelJoinAck.audio` and live via `ChannelAudioPolicy` when the
+   channel is edited over REST. Policies of all joined channels are merged (max bitrate, widest bandwidth,
+   FEC if any wants it, DTX only if all allow it, Music > Voice > Auto) and raised as `client.OnAudioPolicyChanged`;
+   `FollowChannelPolicy = false` ignores it. `client.SetComplexity(n)` pins the complexity — the CPU budget is
+   the game's decision, so the behaviour always pins its inspector value;
+3. **server bitrate command** — the adaptive `BitrateCommand{TargetBitrateKbps, Reason, ExpectedLossPercent}`
+   (`client.OnBitrateCommand`), transient and clamped by the server to the policy's `MinBitrateBps..=BitrateBps`;
+   it also raises `ExpectedLossPercent` so FEC covers the observed loss. Cleared by `SetEncoderSettings`.
+
+Set `client.Encoder = codec` and the client pushes every change through `IOpusEncoderControls.Apply`
+(or `SetBitrate` for a codec without controls); `client.OnEncoderSettingsChanged` reports what was applied.
+`RemoteMixer` uses `IOpusFecDecoder` when a packet is missing and its successor has already arrived
+(`VoiceStats.FramesFecRecovered`), and falls back to PLC otherwise.
 
 ### Choosing a region
 

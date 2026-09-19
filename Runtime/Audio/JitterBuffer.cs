@@ -18,6 +18,8 @@ namespace Aurix.Audio
         public int Count => _frames.Count;
         public int Lost { get; private set; }
         public int Late { get; private set; }
+        /// <summary>Lost slots for which the following packet was already here (FEC recovery possible).</summary>
+        public int Recoverable { get; private set; }
 
         /// <param name="targetDepthFrames">Frames buffered before playout starts (2 ≈ 40 ms).</param>
         /// <param name="maxDepthFrames">Hard cap; older frames are skipped when exceeded.</param>
@@ -54,9 +56,17 @@ namespace Aurix.Audio
         /// (buffer still filling). <paramref name="opus"/> is null when the slot's packet is lost
         /// and the decoder should run PLC.
         /// </summary>
-        public bool Pop(out byte[] opus)
+        public bool Pop(out byte[] opus) => Pop(out opus, out _);
+
+        /// <summary>
+        /// <see cref="Pop(out byte[])"/> that, for a lost slot, also hands out the packet of the next slot
+        /// when it is already buffered (<paramref name="fecFrom"/>), so an <see cref="IOpusFecDecoder"/>
+        /// can rebuild the lost frame from its in-band FEC instead of running PLC.
+        /// </summary>
+        public bool Pop(out byte[] opus, out byte[] fecFrom)
         {
             opus = null;
+            fecFrom = null;
             lock (_frames)
             {
                 if (_frames.Count == 0) return false;
@@ -81,6 +91,7 @@ namespace Aurix.Audio
                 {
                     Lost++;
                     _nextSeq++;
+                    if (_frames.TryGetValue(_nextSeq, out fecFrom)) Recoverable++;
                     return true; // opus == null → PLC
                 }
                 return false;
@@ -107,6 +118,8 @@ namespace Aurix.Audio
     {
         /// <summary>Frames declared lost by the jitter buffers (concealed with PLC).</summary>
         public long Lost;
+        /// <summary>Lost frames rebuilt from the next packet's in-band FEC (a subset of <see cref="Lost"/>).</summary>
+        public long FecRecovered;
         /// <summary>Frames that arrived after their playout slot and were dropped.</summary>
         public long Late;
         /// <summary>
@@ -130,6 +143,8 @@ namespace Aurix.Audio
         {
             public JitterBuffer Jitter = new JitterBuffer();
             public IOpusCodec Decoder;
+            public IOpusFecDecoder Fec;
+            public long FecRecovered;
             public float Volume = 1f;
             public float LeftGain = 1f;
             public float RightGain = 1f;
@@ -146,7 +161,7 @@ namespace Aurix.Audio
         private readonly List<uint> _stale = new List<uint>();
         private float _outputVolume = 1f;
         private volatile bool _outputMuted;
-        private long _retiredLost, _retiredLate, _underruns;
+        private long _retiredLost, _retiredLate, _retiredFec, _underruns;
 
         public RemoteMixer(Func<IOpusCodec> decoderFactory)
         {
@@ -188,7 +203,8 @@ namespace Aurix.Audio
             {
                 if (!_streams.TryGetValue(ssrc, out s))
                 {
-                    s = new Stream { Decoder = _decoderFactory() };
+                    var decoder = _decoderFactory();
+                    s = new Stream { Decoder = decoder, Fec = decoder as IOpusFecDecoder };
                     _streams[ssrc] = s;
                 }
                 s.Volume = volume;
@@ -226,8 +242,8 @@ namespace Aurix.Audio
             {
                 lock (_streams)
                 {
-                    var t = new MixerTotals { Lost = _retiredLost, Late = _retiredLate, Underruns = _underruns };
-                    foreach (var s in _streams.Values) { t.Lost += s.Jitter.Lost; t.Late += s.Jitter.Late; }
+                    var t = new MixerTotals { Lost = _retiredLost, Late = _retiredLate, FecRecovered = _retiredFec, Underruns = _underruns };
+                    foreach (var s in _streams.Values) { t.Lost += s.Jitter.Lost; t.Late += s.Jitter.Late; t.FecRecovered += s.FecRecovered; }
                     return t;
                 }
             }
@@ -240,6 +256,7 @@ namespace Aurix.Audio
         {
             _retiredLost += s.Jitter.Lost;
             _retiredLate += s.Jitter.Late;
+            _retiredFec += s.FecRecovered;
             s.Decoder.Dispose();
         }
 
@@ -271,7 +288,7 @@ namespace Aurix.Audio
                     {
                         if (s.FramePos >= s.FrameLen)
                         {
-                            if (!s.Jitter.Pop(out var opus))
+                            if (!s.Jitter.Pop(out var opus, out var fecFrom))
                             {
                                 if (s.Jitter.Count == 0 && !s.Starved) { s.Starved = true; s.StarvedAtTicks = now; }
                                 break;
@@ -279,9 +296,17 @@ namespace Aurix.Audio
                             int dc = s.Decoder.Channels;
                             int cap = AudioFormat.FrameSamples * 3 * dc; // up to 60 ms frames
                             if (s.Frame == null || s.Frame.Length < cap) s.Frame = new float[cap];
-                            int n = opus != null
-                                ? s.Decoder.Decode(opus, s.Frame, AudioFormat.FrameSamples * 3)
-                                : s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
+                            int n;
+                            if (opus != null)
+                                n = s.Decoder.Decode(opus, s.Frame, AudioFormat.FrameSamples * 3);
+                            else if (fecFrom != null && s.Fec != null)
+                            {
+                                n = s.Fec.DecodeFec(fecFrom, s.Frame, AudioFormat.FrameSamples);
+                                if (n > 0) s.FecRecovered++;
+                                else n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
+                            }
+                            else
+                                n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
                             s.FrameLen = Math.Max(0, n) * dc;
                             s.FramePos = 0;
                             if (s.FrameLen == 0) break;

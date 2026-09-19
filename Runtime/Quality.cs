@@ -160,6 +160,8 @@ namespace Aurix
         public float LossPercent;
         // Playout (jitter buffers / mixer), lifetime.
         public long FramesLost;
+        /// <summary>Lost frames rebuilt from in-band FEC instead of PLC (subset of <see cref="FramesLost"/>).</summary>
+        public long FramesFecRecovered;
         public long FramesLate;
         public long Underruns;
         public int ActiveStreams;

@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Aurix.Audio;
 using Aurix.Protocol;
 using Aurix.Unity;
 using UnityEngine;
@@ -53,7 +54,10 @@ namespace Aurix.Samples
         {
             Voice = GetComponent<AurixVoiceBehaviour>();
             if (Voice == null) Voice = gameObject.AddComponent<AurixVoiceBehaviour>();
-            Voice.CodecFactory = () => new ConcentusOpusCodec();
+            // libopus through the native core when its binary is in Plugins/, pure C# Concentus otherwise.
+            Voice.CodecFactory = NativeOpusCodec.IsAvailable
+                ? (Func<IOpusCodec>)(() => new NativeOpusCodec(AudioFormat.SampleRate, 1, Voice.EncoderSettingsFromInspector()))
+                : () => new ConcentusOpusCodec();
             Voice.AutoConnectOnStart = false;
             Voice.OnLocalSpeaking += speaking => Log(speaking ? "you started speaking" : "you stopped speaking");
             Voice.OnMicrophonePermissionDenied += () => Log("microphone permission denied — listening only");
