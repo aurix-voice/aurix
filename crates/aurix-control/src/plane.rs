@@ -7,6 +7,7 @@ use crate::event_bus::{EventBus, ServerEvent};
 use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
 use crate::session_manager::SessionManager;
+use crate::user_lifecycle::{RetentionService, UserLifecycle};
 use crate::webhooks::WebhookService;
 use aurix_auth::admin::AdminAuthService;
 use aurix_auth::{AnyToken, ApiKeyService, JwtService, RbacService, ValidatedToken};
@@ -33,6 +34,8 @@ pub struct ControlPlane {
     pub action_tokens: Arc<ActionTokenService>,
     pub chat: Arc<ChatService>,
     pub webhooks: Arc<WebhookService>,
+    pub users: Arc<UserLifecycle>,
+    pub retention: Arc<RetentionService>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -174,6 +177,18 @@ impl ControlPlane {
             pool.clone(),
             events.clone(),
         )?);
+        let users = Arc::new(UserLifecycle::new(
+            pool.clone(),
+            events.clone(),
+            audit.clone(),
+            redis.clone(),
+        ));
+        let retention = Arc::new(RetentionService::new(
+            config.retention.clone(),
+            pool.clone(),
+            users.clone(),
+            audit.clone(),
+        ));
 
         Ok(Self {
             node_id,
@@ -189,6 +204,8 @@ impl ControlPlane {
             action_tokens,
             chat,
             webhooks,
+            users,
+            retention,
             blocks,
             events,
             audit,
@@ -200,15 +217,36 @@ impl ControlPlane {
     /// End-user REST authentication. Accepts the session JWT and — because a client that
     /// opened its session with a `login` action token holds nothing else — `login` action
     /// tokens as well (not consumed here: REST reads are idempotent and the token stays
-    /// short-lived). Any other action token is refused.
-    pub fn validate_token(&self, token: &str) -> Result<ValidatedToken> {
-        match self.jwt.validate_any(token)? {
-            AnyToken::Session(v) => Ok(v),
-            AnyToken::Action(a) if a.action == ActionKind::Login => Ok(a.as_session()),
+    /// short-lived). Any other action token is refused, as is a token minted before its user
+    /// was erased.
+    pub async fn validate_token(&self, token: &str) -> Result<ValidatedToken> {
+        let validated = match self.jwt.validate_any(token)? {
+            AnyToken::Session(v) => v,
+            AnyToken::Action(a) if a.action == ActionKind::Login => a.as_session(),
             AnyToken::Action(a) => Err(AurixError::AuthorizationDenied(format!(
                 "Action token authorises '{}', not API access",
                 a.action
-            ))),
+            )))?,
+        };
+        self.reject_if_erased(&validated).await?;
+        Ok(validated)
+    }
+
+    /// Refuses tokens issued at or before the user's erasure; a user re-created afterwards
+    /// (new `POST /v1/tokens`) gets a fresh id, so only stale credentials are affected.
+    async fn reject_if_erased(&self, validated: &ValidatedToken) -> Result<()> {
+        let deleted_at = aurix_db::queries::get_user_tombstone(
+            &self.pool,
+            validated.app_id.0,
+            validated.user_id.0,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Tombstone check failed: {e}")))?;
+        match deleted_at {
+            Some(t) if validated.issued_at <= t.timestamp() => Err(AurixError::TokenInvalid(
+                "Token was issued before the user was deleted".into(),
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -269,21 +307,21 @@ impl ControlPlane {
             return Err(AurixError::UserBanned("User is banned".into()));
         }
 
-        if let Some(user) =
-            aurix_db::queries::get_user(&self.pool, validated.app_id.0, validated.user_id.0)
-                .await
-                .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
-        {
-            let ban_active = user.is_banned
-                && user
-                    .ban_expires_at
-                    .map(|t| t > chrono::Utc::now())
-                    .unwrap_or(true);
-            if ban_active {
-                return Err(AurixError::UserBanned(
-                    user.ban_reason.unwrap_or_else(|| "User is banned".into()),
-                ));
-            }
+        self.reject_if_erased(&validated).await?;
+
+        let user = aurix_db::queries::get_user(&self.pool, validated.app_id.0, validated.user_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
+            .ok_or_else(|| AurixError::UserNotFound(validated.user_id.to_string()))?;
+        let ban_active = user.is_banned
+            && user
+                .ban_expires_at
+                .map(|t| t > chrono::Utc::now())
+                .unwrap_or(true);
+        if ban_active {
+            return Err(AurixError::UserBanned(
+                user.ban_reason.unwrap_or_else(|| "User is banned".into()),
+            ));
         }
 
         // Check global mute via Redis

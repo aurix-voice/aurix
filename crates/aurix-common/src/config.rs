@@ -19,6 +19,8 @@ pub struct AurixConfig {
     pub chat: ChatConfig,
     #[serde(default)]
     pub webhooks: WebhooksConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 impl AurixConfig {
@@ -138,6 +140,26 @@ impl AurixConfig {
         }
         if self.turn.min_port > self.turn.max_port {
             anyhow::bail!("turn.min_port must be <= turn.max_port");
+        }
+        if self.retention.enabled {
+            if self.retention.batch_size == 0 || self.retention.batch_size > 100_000 {
+                anyhow::bail!("retention.batch_size must be within 1..=100000");
+            }
+            if self.retention.interval_secs < 60 {
+                anyhow::bail!("retention.interval_secs must be >= 60");
+            }
+            let tombstone_secs = i64::from(self.retention.tombstones_days) * 86_400;
+            if tombstone_secs
+                < self
+                    .auth
+                    .token_ttl_secs
+                    .max(self.auth.action_token_max_ttl_secs)
+            {
+                anyhow::bail!(
+                    "retention.tombstones_days must cover the longest token lifetime \
+                     (auth.token_ttl_secs / auth.action_token_max_ttl_secs)"
+                );
+            }
         }
         if self.server.session_resume_grace_secs > self.media.session_timeout_secs {
             anyhow::bail!(
@@ -836,6 +858,78 @@ impl WebhooksConfig {
 
     pub fn https_required(&self, production: bool) -> bool {
         self.require_https.unwrap_or(production)
+    }
+}
+
+/// Data retention: how long operational rows about players are kept before the hourly sweep
+/// removes them. `0` disables a rule (keep forever). Recording and chat retention live in
+/// their own sections (`recording.retention_days`, `chat.retention_days`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetentionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Closed sessions and their channel memberships.
+    #[serde(default = "default_retention_sessions_days")]
+    pub sessions_days: u32,
+    /// Resolved moderation events (open ones are kept).
+    #[serde(default = "default_retention_moderation_days")]
+    pub moderation_events_days: u32,
+    /// Hash-chained audit log. Trimming cuts the chain at the oldest kept row.
+    #[serde(default = "default_retention_audit_days")]
+    pub audit_log_days: u32,
+    #[serde(default = "default_retention_analytics_days")]
+    pub analytics_days: u32,
+    /// Erase users (with everything `DELETE /v1/users/:id` removes) that have not connected for
+    /// this long. Banned users and users with an open session are never auto-erased.
+    #[serde(default)]
+    pub inactive_users_days: u32,
+    /// How long a deleted user's tombstone blocks tokens minted before the deletion. Must cover
+    /// the longest session-token lifetime.
+    #[serde(default = "default_retention_tombstones_days")]
+    pub tombstones_days: u32,
+    /// Rows removed per table per sweep iteration; the sweep repeats until a table is clean.
+    #[serde(default = "default_retention_batch_size")]
+    pub batch_size: u32,
+    /// Seconds between sweeps.
+    #[serde(default = "default_retention_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_retention_sessions_days() -> u32 {
+    90
+}
+fn default_retention_moderation_days() -> u32 {
+    365
+}
+fn default_retention_audit_days() -> u32 {
+    0
+}
+fn default_retention_analytics_days() -> u32 {
+    400
+}
+fn default_retention_tombstones_days() -> u32 {
+    30
+}
+fn default_retention_batch_size() -> u32 {
+    5000
+}
+fn default_retention_interval_secs() -> u64 {
+    3600
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sessions_days: default_retention_sessions_days(),
+            moderation_events_days: default_retention_moderation_days(),
+            audit_log_days: default_retention_audit_days(),
+            analytics_days: default_retention_analytics_days(),
+            inactive_users_days: 0,
+            tombstones_days: default_retention_tombstones_days(),
+            batch_size: default_retention_batch_size(),
+            interval_secs: default_retention_interval_secs(),
+        }
     }
 }
 

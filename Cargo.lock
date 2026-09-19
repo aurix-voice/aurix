@@ -510,6 +510,7 @@ name = "aurix-recording"
 version = "1.0.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "aurix-common",
  "aurix-db",
  "base64 0.22.1",

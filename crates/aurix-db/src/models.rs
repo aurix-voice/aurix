@@ -240,6 +240,20 @@ pub struct AuditLogRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Rows removed by a user erasure, per table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserErasureCounts {
+    pub channel_memberships: u64,
+    pub sessions: u64,
+    pub chat_messages: u64,
+    pub user_blocks: u64,
+    /// Rows the recording service had not already removed together with their files.
+    pub recordings: u64,
+    pub moderation_events: u64,
+    pub bans: u64,
+    pub users: u64,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ApiKeyRow {
     pub id: Uuid,

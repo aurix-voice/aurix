@@ -62,6 +62,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/admins", post(handlers::create_admin))
         .route("/admin/audit-log", get(handlers::admin_list_audit_logs))
         .route(
+            "/admin/retention/sweep",
+            post(handlers::admin_retention_sweep),
+        )
+        .route(
             "/v1/apps",
             post(handlers::create_app).get(handlers::list_apps),
         )
@@ -101,7 +105,11 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::get_channel_participants),
         )
         .route("/v1/users", get(handlers::search_users))
-        .route("/v1/users/:user_id", get(handlers::get_user))
+        .route(
+            "/v1/users/:user_id",
+            get(handlers::get_user).delete(handlers::delete_user),
+        )
+        .route("/v1/users/:user_id/export", get(handlers::export_user))
         .route("/v1/users/:user_id/unban", post(handlers::unban_user_all))
         .route(
             "/v1/users/:user_id/blocks",

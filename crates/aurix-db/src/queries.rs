@@ -172,6 +172,375 @@ pub async fn count_users(pool: &DbPool, app_id: Uuid) -> Result<i64, sqlx::Error
     Ok(row.0)
 }
 
+// ── User erasure / export ──
+
+/// Removes a user and everything keyed to them in one transaction: open and past sessions
+/// with their memberships, stored chat (sent and received), cross-mute blocks in both
+/// directions and recording rows (artifacts are the caller's job). Moderation events about the
+/// user and their bans are kept unless `purge_moderation`; reports they filed are anonymised.
+/// A tombstone is written so tokens minted before the deletion cannot re-create the user.
+/// Returns `None` when the user does not exist in `app_id`.
+pub async fn erase_user(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    purge_moderation: bool,
+) -> Result<Option<UserErasureCounts>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE app_id = $1 AND id = $2 FOR UPDATE")
+            .bind(app_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if exists.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let channel_memberships = delete_user_rows(
+        &mut tx,
+        "DELETE FROM channel_memberships cm USING channels c \
+         WHERE cm.channel_id = c.id AND c.app_id = $1 AND cm.user_id = $2",
+        app_id,
+        user_id,
+    )
+    .await?;
+    let sessions = delete_user_rows(
+        &mut tx,
+        "DELETE FROM sessions WHERE app_id = $1 AND user_id = $2",
+        app_id,
+        user_id,
+    )
+    .await?;
+    let chat_messages = delete_user_rows(
+        &mut tx,
+        "DELETE FROM chat_messages WHERE app_id = $1 AND (from_user_id = $2 OR to_user_id = $2)",
+        app_id,
+        user_id,
+    )
+    .await?;
+    let user_blocks = delete_user_rows(
+        &mut tx,
+        "DELETE FROM user_blocks WHERE app_id = $1 AND (user_id = $2 OR blocked_user_id = $2)",
+        app_id,
+        user_id,
+    )
+    .await?;
+    let recordings = delete_user_rows(
+        &mut tx,
+        "DELETE FROM recordings WHERE app_id = $1 AND user_id = $2",
+        app_id,
+        user_id,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE moderation_events SET reporter_user_id = NULL WHERE app_id = $1 AND reporter_user_id = $2",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    let (moderation_events, bans) = if purge_moderation {
+        (
+            delete_user_rows(
+                &mut tx,
+                "DELETE FROM moderation_events WHERE app_id = $1 AND target_user_id = $2",
+                app_id,
+                user_id,
+            )
+            .await?,
+            delete_user_rows(
+                &mut tx,
+                "DELETE FROM bans WHERE app_id = $1 AND user_id = $2",
+                app_id,
+                user_id,
+            )
+            .await?,
+        )
+    } else {
+        (0, 0)
+    };
+    sqlx::query(
+        r#"INSERT INTO user_tombstones (app_id, user_id, deleted_at) VALUES ($1, $2, NOW())
+           ON CONFLICT (app_id, user_id) DO UPDATE SET deleted_at = NOW()"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    let users = delete_user_rows(
+        &mut tx,
+        "DELETE FROM users WHERE app_id = $1 AND id = $2",
+        app_id,
+        user_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(UserErasureCounts {
+        channel_memberships,
+        sessions,
+        chat_messages,
+        user_blocks,
+        recordings,
+        moderation_events,
+        bans,
+        users,
+    }))
+}
+
+async fn delete_user_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sql: &str,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(sql)
+        .bind(app_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected())
+}
+
+/// When `user_id` was erased from `app_id` (most recent erasure), if ever.
+pub async fn get_user_tombstone(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar::<_, DateTime<Utc>>(
+        "SELECT deleted_at FROM user_tombstones WHERE app_id = $1 AND user_id = $2",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_tombstones_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM user_tombstones WHERE deleted_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn export_user_sessions(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<SessionRow>, sqlx::Error> {
+    sqlx::query_as::<_, SessionRow>(
+        "SELECT * FROM sessions WHERE app_id = $1 AND user_id = $2 ORDER BY connected_at DESC LIMIT $3",
+    )
+    .bind(app_id).bind(user_id).bind(limit)
+    .fetch_all(pool).await
+}
+
+pub async fn export_user_memberships(
+    pool: &DbPool,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ChannelMembershipRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChannelMembershipRow>(
+        "SELECT * FROM channel_memberships WHERE user_id = $1 ORDER BY joined_at DESC LIMIT $2",
+    )
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn export_user_chat_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(
+        r#"SELECT * FROM chat_messages WHERE app_id = $1 AND (from_user_id = $2 OR to_user_id = $2)
+           ORDER BY sent_at DESC LIMIT $3"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn export_user_bans(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<BanRow>, sqlx::Error> {
+    sqlx::query_as::<_, BanRow>(
+        "SELECT * FROM bans WHERE app_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT $3",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn export_moderation_events_about(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ModerationEventRow>, sqlx::Error> {
+    sqlx::query_as::<_, ModerationEventRow>(
+        "SELECT * FROM moderation_events WHERE app_id = $1 AND target_user_id = $2 ORDER BY created_at DESC LIMIT $3",
+    )
+    .bind(app_id).bind(user_id).bind(limit)
+    .fetch_all(pool).await
+}
+
+pub async fn export_moderation_events_reported_by(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ModerationEventRow>, sqlx::Error> {
+    sqlx::query_as::<_, ModerationEventRow>(
+        "SELECT * FROM moderation_events WHERE app_id = $1 AND reporter_user_id = $2 ORDER BY created_at DESC LIMIT $3",
+    )
+    .bind(app_id).bind(user_id).bind(limit)
+    .fetch_all(pool).await
+}
+
+pub async fn list_recordings_for_user(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>(
+        "SELECT * FROM recordings WHERE app_id = $1 AND user_id = $2 ORDER BY started_at DESC LIMIT $3",
+    )
+    .bind(app_id).bind(user_id).bind(limit)
+    .fetch_all(pool).await
+}
+
+// ── Retention sweeps (batched; each call removes at most `batch` parent rows) ──
+
+/// Session-level advisory lock so a cluster-wide job runs on one node at a time. The lock is
+/// tied to `conn`; drop the connection (or call [`advisory_unlock`]) to release it.
+pub async fn try_advisory_lock(
+    conn: &mut sqlx::PgConnection,
+    key: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(conn)
+        .await
+}
+
+pub async fn advisory_unlock(conn: &mut sqlx::PgConnection, key: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Closed sessions older than `cutoff`, together with their membership rows.
+pub async fn delete_closed_sessions_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"WITH victims AS (
+               SELECT id FROM sessions WHERE disconnected_at IS NOT NULL AND disconnected_at < $1 LIMIT $2
+           ),
+           members AS (
+               DELETE FROM channel_memberships WHERE session_id IN (SELECT id FROM victims)
+           )
+           DELETE FROM sessions WHERE id IN (SELECT id FROM victims)"#,
+    )
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_resolved_moderation_events_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"DELETE FROM moderation_events WHERE id IN (
+               SELECT id FROM moderation_events WHERE resolved_at IS NOT NULL AND resolved_at < $1 LIMIT $2
+           )"#,
+    )
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_audit_log_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        "DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < $1 LIMIT $2)",
+    )
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_analytics_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"DELETE FROM analytics_snapshots WHERE id IN (
+               SELECT id FROM analytics_snapshots WHERE timestamp < $1 LIMIT $2
+           )"#,
+    )
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Users not seen since `cutoff` (never-seen users count from creation) with no open session
+/// and no standing ban, as `(app_id, user_id)`.
+pub async fn list_inactive_users(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        r#"SELECT u.app_id, u.id FROM users u
+           WHERE COALESCE(u.last_seen_at, u.created_at) < $1
+             AND NOT u.is_banned
+             AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.disconnected_at IS NULL)
+           ORDER BY COALESCE(u.last_seen_at, u.created_at)
+           LIMIT $2"#,
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 // ── Channel Queries ──
 
 pub async fn create_channel(pool: &DbPool, ch: &ChannelRow) -> Result<ChannelRow, sqlx::Error> {
@@ -870,15 +1239,16 @@ pub async fn list_recordings(
     .bind(app_id).bind(channel_id).bind(limit).bind(offset).fetch_all(pool).await
 }
 
+/// Returns `false` when the row no longer exists (erased while the recording was live).
 pub async fn finish_recording(
     pool: &DbPool,
     id: Uuid,
     size: i64,
     duration: f64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE recordings SET ended_at = NOW(), file_size_bytes = $2, duration_secs = $3 WHERE id = $1")
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("UPDATE recordings SET ended_at = NOW(), file_size_bytes = $2, duration_secs = $3 WHERE id = $1")
         .bind(id).bind(size).bind(duration).execute(pool).await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }
 
 pub async fn delete_expired_recordings(pool: &DbPool) -> Result<u64, sqlx::Error> {

@@ -276,4 +276,15 @@ impl RedisStore {
         let val: Option<String> = Self::with_timeout(conn.get(&key), "is_globally_muted").await?;
         Ok(val.is_some())
     }
+
+    /// Drops every per-user key (user erasure).
+    pub async fn forget_user(&self, user_id: UserId) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let keys = [
+            format!("user:{}:server_muted", user_id),
+            format!("user:{}:channels", user_id),
+        ];
+        Self::with_timeout(conn.del::<_, ()>(&keys[..]), "forget_user").await?;
+        Ok(())
+    }
 }

@@ -123,3 +123,13 @@ max_subscriptions_per_app = 20
 # require_https = true
 # allow_private_urls = false
 sse_keepalive_secs = 15
+[retention]
+enabled = true
+sessions_days = 90
+moderation_events_days = 365
+audit_log_days = 0          # 0 = keep forever
+analytics_days = 400
+inactive_users_days = 0     # 0 = never auto-erase idle users
+tombstones_days = 30
+batch_size = 5000
+interval_secs = 3600

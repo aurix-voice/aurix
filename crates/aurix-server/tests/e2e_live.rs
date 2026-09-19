@@ -4319,3 +4319,302 @@ async fn ad_hoc_channels_and_channel_wide_moderation() {
     alice.ws.close(None).await.unwrap();
     bob.ws.close(None).await.unwrap();
 }
+
+async fn status_of(env: &Env, http: &reqwest::Client, path: &str) -> u16 {
+    http.get(format!("{}{path}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// `DELETE /v1/users/:id` erases everything keyed to the player — sessions and memberships
+/// (live ones are closed on every node), blocks in both directions, chat, recordings
+/// (including one still in progress, whose file must not survive) — and leaves a tombstone so
+/// credentials minted before the deletion are refused. `GET /v1/users/:id/export` shows the
+/// same data beforehand; both are tenant-scoped and 404 for unknown users.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn user_erasure_export_and_stale_token_rejection() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let ext_a = format!("e2e:erase-{}", uuid::Uuid::now_v7().simple());
+    let (tok_a, uid_a) = issue_token(&env, &http, &ext_a, "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e:erase-bob", "Bob", channel_id).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    bind_media(&mut alice).await;
+    join(&mut alice, channel_id).await;
+    join(&mut bob, channel_id).await;
+    // A second session of Alice on the other node, when the cluster has one.
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let mut alice2 = match &env2 {
+        Some(e2) => {
+            let mut p = connect(e2, "alice@node2", tok_a.clone()).await;
+            join(&mut p, channel_id).await;
+            Some(p)
+        }
+        None => None,
+    };
+    let expected_sessions = if alice2.is_some() { 2 } else { 1 };
+    let expected_left = expected_sessions + 1; // + bob
+    assert_eq!(
+        membership_count(&env, &http, channel_id).await,
+        expected_left
+    );
+
+    // Bob blocks Alice; a recording of Alice is running when she is erased.
+    http.post(format!("{}/v1/users/{}/blocks", env.api, uid_b))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"blocked_user_id": uid_a}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let rec: serde_json::Value = http
+        .post(format!("{}/v1/recordings/start", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel_id, "user_id": uid_a}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let recording_id: uuid::Uuid = rec["id"].as_str().unwrap().parse().unwrap();
+    alice
+        .expect("RecordingNotification", |m| {
+            matches!(
+                m,
+                ControlMessage::RecordingNotification { active: true, .. }
+            )
+        })
+        .await;
+    alice
+        .send(&ControlMessage::RecordingConsentResponse {
+            recording_id,
+            consent: RecordingConsent::Accepted,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let hash = channel_id_hash(&channel_id);
+    let payload = Bytes::from_static(&[0xfc, 0xff, 0xfe, 0x01, 0x02, 0x03]);
+    for i in 0..10u32 {
+        let pkt = AurixPacket::audio(i + 1, (i + 1) * 960, alice.ssrc, hash, payload.clone());
+        alice
+            .udp
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{recording_id}")).await,
+        200
+    );
+
+    // ── export ──
+    let export: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/export", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(export["format"], "aurix.user_export.v1");
+    assert_eq!(export["user"]["id"], uid_a.to_string());
+    assert_eq!(export["user"]["external_id"], ext_a);
+    assert_eq!(
+        export["sessions"].as_array().map(|a| a.len()),
+        Some(expected_sessions),
+        "{export}"
+    );
+    assert_eq!(
+        export["channel_memberships"].as_array().map(|a| a.len()),
+        Some(expected_sessions),
+        "{export}"
+    );
+    assert_eq!(
+        id_list(&export["blocks"]["blocked_by"]),
+        vec![uid_b.to_string()],
+        "{export}"
+    );
+    assert!(
+        export["recordings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == recording_id.to_string()),
+        "{export}"
+    );
+    assert_eq!(export["truncated"], serde_json::json!([]));
+
+    // ── tenant isolation: another app sees neither export nor delete ──
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let other = Env {
+            api: env.api.clone(),
+            ws: env.ws.clone(),
+            api_key: api_key2,
+        };
+        assert_eq!(
+            status_of(&other, &http, &format!("/v1/users/{uid_a}/export")).await,
+            404
+        );
+        let r = http
+            .delete(format!("{}/v1/users/{}", other.api, uid_a))
+            .header("x-api-key", &other.api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+        assert_eq!(
+            status_of(&env, &http, &format!("/v1/users/{uid_a}")).await,
+            200,
+            "foreign tenant must not erase the user"
+        );
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    // ── erase ──
+    let deleted: serde_json::Value = http
+        .delete(format!("{}/v1/users/{}", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["user_id"], uid_a.to_string());
+    assert_eq!(deleted["recordings_removed"], 1, "{deleted}");
+    let rows = &deleted["rows_removed"];
+    assert_eq!(rows["users"], 1, "{deleted}");
+    assert_eq!(rows["user_blocks"], 1, "{deleted}");
+    assert_eq!(
+        rows["recordings"], 0,
+        "recording rows go with their files, not with the transaction: {deleted}"
+    );
+    assert_eq!(rows["sessions"], expected_sessions, "{deleted}");
+    assert_eq!(rows["channel_memberships"], expected_sessions, "{deleted}");
+
+    // Every live session of Alice is closed, on both nodes; Bob sees her leave.
+    for p in std::iter::once(&mut alice).chain(alice2.iter_mut()) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, p.ws.next()).await {
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(_))) => continue,
+                Err(_) => panic!("{}: session survived the erasure", p.name),
+            }
+        }
+    }
+    for _ in 0..expected_sessions {
+        bob.expect(
+            "ParticipantLeft for alice",
+            |m| matches!(m, ControlMessage::ParticipantLeft { user_id, .. } if *user_id == uid_a),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+
+    // Nothing about Alice remains.
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/users/{uid_a}")).await,
+        404
+    );
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/users/{uid_a}/export")).await,
+        404
+    );
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{recording_id}")).await,
+        404
+    );
+    assert_eq!(
+        status_of(
+            &env,
+            &http,
+            &format!("/v1/recordings/{recording_id}/download")
+        )
+        .await,
+        404
+    );
+    let blocks: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/blocks", env.api, uid_b))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !id_list(&blocks["blocked_users"]).contains(&uid_a.to_string()),
+        "{blocks}"
+    );
+    let r = http
+        .delete(format!("{}/v1/users/{}", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "second erasure is a clean not-found");
+
+    // Credentials minted before the erasure are dead: fresh connect, resume and REST.
+    assert_eq!(try_connect(&env, &tok_a, None).await.err(), Some(401));
+    assert_eq!(
+        try_connect(&env, &tok_a, Some((alice.session_id, &alice.resume_token)))
+            .await
+            .err(),
+        Some(401)
+    );
+    let r = http
+        .get(format!("{}/v1/me/turn-credentials", env.api))
+        .bearer_auth(&tok_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+
+    // The same player can come back: a new token means a new user with a new id.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (tok_a2, uid_a2) = issue_token(&env, &http, &ext_a, "Alice", channel_id).await;
+    assert_ne!(uid_a2, uid_a.to_string());
+    let mut alice_again = connect(&env, "alice-again", tok_a2).await;
+    join(&mut alice_again, channel_id).await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 2);
+
+    alice_again.ws.close(None).await.unwrap();
+    bob.ws.close(None).await.unwrap();
+    if let Some(mut p) = alice2.take() {
+        let _ = p.ws.close(None).await;
+    }
+    let _ = alice.ws.close(None).await;
+}

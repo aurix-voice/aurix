@@ -722,6 +722,56 @@ pub async fn get_user(
     ))
 }
 
+#[derive(Deserialize, Default)]
+pub struct DeleteUserQuery {
+    /// Also remove moderation events about the user and their bans (kept by default as
+    /// operator evidence).
+    #[serde(default)]
+    pub purge_moderation: bool,
+}
+
+pub async fn delete_user(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<DeleteUserQuery>,
+) -> JsonResult {
+    ctx.require("users:erase")?;
+    let user_id = UserId::from_uuid(user_id);
+    let deletion = state
+        .control
+        .users
+        .delete_user(aurix_control::DeleteUserRequest {
+            app_id: ctx.app_id,
+            user_id,
+            actor: ctx.actor(),
+            ip: client_ip_string(ip),
+            purge_moderation: query.purge_moderation,
+            automatic: false,
+        })
+        .await?
+        .ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
+    to_json(deletion)
+}
+
+pub async fn export_user(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(user_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("users:export")?;
+    let user_id = UserId::from_uuid(user_id);
+    let export = state
+        .control
+        .users
+        .export_user(ctx.app_id, user_id, ctx.actor(), client_ip_string(ip))
+        .await?
+        .ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
+    to_json(export)
+}
+
 // ── Cross-mute (block list) ──
 
 pub async fn list_user_blocks(
@@ -1571,6 +1621,8 @@ const KNOWN_PERMISSIONS: &[&str] = &[
     "channels:write",
     "users:read",
     "users:write",
+    "users:erase",
+    "users:export",
     "moderation:read",
     "moderation:write",
     "recordings:read",
@@ -2228,6 +2280,24 @@ pub async fn admin_me(Extension(admin): Extension<AdminContext>) -> JsonResult {
     Ok(Json(
         serde_json::json!({ "id": admin.admin_id, "email": admin.email, "role": admin.role }),
     ))
+}
+
+/// Runs one retention sweep now (also when the periodic sweep is disabled). `409` while
+/// another node holds the sweep lock.
+pub async fn admin_retention_sweep(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+) -> JsonResult {
+    if admin.role != "superadmin" {
+        return Err(AurixError::AuthorizationDenied(
+            "Only superadmins can run retention sweeps".into(),
+        )
+        .into());
+    }
+    let report = state.control.retention.sweep_once().await?.ok_or_else(|| {
+        AurixError::Conflict("A retention sweep is already running on another node".into())
+    })?;
+    to_json(report)
 }
 
 // ── App management (admin) ──

@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             config.recording.clone(),
         )?);
         sfu.set_audio_sink(svc.clone());
+        control.users.set_media_purger(svc.clone());
         Some(svc)
     } else {
         None
@@ -262,6 +263,21 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    if control.retention.enabled() {
+        tasks.spawn(control.retention.clone().run(shutdown.clone()));
+        info!(
+            "Retention sweep enabled (every {}s; sessions {}d, moderation {}d, audit {}d, \
+             analytics {}d, tombstones {}d, inactive users {}d)",
+            config.retention.interval_secs,
+            config.retention.sessions_days,
+            config.retention.moderation_events_days,
+            config.retention.audit_log_days,
+            config.retention.analytics_days,
+            config.retention.tombstones_days,
+            config.retention.inactive_users_days
+        );
     }
 
     // Automatic cascade topology (peers + per-channel routing from the media_nodes registry).

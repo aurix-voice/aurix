@@ -432,7 +432,7 @@ impl RecordingService {
         let metadata = tokio::fs::metadata(&file_path)
             .await
             .map_err(|e| AurixError::Recording(format!("Metadata read failed: {e}")))?;
-        aurix_db::queries::finish_recording(
+        let row_present = aurix_db::queries::finish_recording(
             &self.pool,
             recording_id,
             metadata.len() as i64,
@@ -440,6 +440,12 @@ impl RecordingService {
         )
         .await
         .map_err(|e| AurixError::Database(format!("Recording finish failed: {e}")))?;
+        if !row_present {
+            discard_file(&file_path).await;
+            return Err(AurixError::Recording(
+                "Recording was erased while live; audio discarded".into(),
+            ));
+        }
 
         if let Some(ref s3) = self.s3 {
             let key = object_key(app_id, recording_id);
@@ -564,7 +570,7 @@ impl RecordingService {
         let row = self
             .get_recording(app_id, recording_id)
             .await?
-            .ok_or_else(|| AurixError::Recording("Recording not found".into()))?;
+            .ok_or_else(|| AurixError::NotFound("Recording not found".into()))?;
         if row.ended_at.is_none() {
             return Err(AurixError::Conflict(
                 "Recording is still in progress".into(),
@@ -609,7 +615,7 @@ impl RecordingService {
         let row = self
             .get_recording(app_id, recording_id)
             .await?
-            .ok_or_else(|| AurixError::Recording("Recording not found".into()))?;
+            .ok_or_else(|| AurixError::NotFound("Recording not found".into()))?;
         if self.active.lock().by_id.contains_key(&recording_id) {
             return Err(AurixError::Conflict(
                 "Stop the recording before deleting it".into(),
@@ -731,15 +737,63 @@ impl AudioSink for RecordingService {
                 .await
                 .map(|m| m.len() as i64)
                 .unwrap_or(0);
-            if let Err(e) = aurix_db::queries::finish_recording(&pool, id, size, secs).await {
-                warn!(
+            match aurix_db::queries::finish_recording(&pool, id, size, secs).await {
+                Ok(true) => info!("Recording {} finished: participant left", id),
+                Ok(false) => {
+                    discard_file(&path).await;
+                    info!("Recording {} erased while live; audio discarded", id);
+                }
+                Err(e) => warn!(
                     "Failed to finish recording {} after participant left: {e}",
                     id
-                );
-            } else {
-                info!("Recording {} finished: participant left", id);
+                ),
             }
         });
+    }
+}
+
+#[async_trait::async_trait]
+impl aurix_common::sink::UserMediaPurger for RecordingService {
+    async fn purge_user_media(&self, app_id: AppId, user_id: UserId) -> Result<u64> {
+        let live: Vec<Uuid> = {
+            let st = self.active.lock();
+            st.by_id
+                .iter()
+                .filter(|(_, r)| r.app_id == app_id.0 && r.user_id == user_id)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in live {
+            if let Err(e) = self.stop_recording(app_id, id).await {
+                warn!("Failed to stop recording {id} before erasing its owner: {e}");
+            }
+        }
+        let mut total = 0u64;
+        loop {
+            let rows =
+                aurix_db::queries::list_recordings_for_user(&self.pool, app_id.0, user_id.0, 100)
+                    .await
+                    .map_err(|e| AurixError::Database(format!("Recording list failed: {e}")))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                self.remove_artifacts(row).await;
+                aurix_db::queries::delete_recording(&self.pool, row.id)
+                    .await
+                    .map_err(|e| AurixError::Database(format!("Recording delete failed: {e}")))?;
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+}
+
+async fn discard_file(path: &str) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("Failed to discard recording file {path}: {e}"),
     }
 }
 

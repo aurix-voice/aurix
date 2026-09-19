@@ -108,7 +108,7 @@ pub async fn auth_middleware(
 ) -> Result<Response, ApiError> {
     let token = bearer_token(request.headers())
         .ok_or_else(|| AurixError::AuthenticationFailed("Missing bearer token".into()))?;
-    let validated = state.control.validate_token(token)?;
+    let validated = state.control.validate_token(token).await?;
     request.extensions_mut().insert(validated);
     Ok(next.run(request).await)
 }

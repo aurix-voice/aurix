@@ -7,6 +7,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::time::Duration;
 
 pub type DbPool = PgPool;
+pub type DbError = sqlx::Error;
+pub type DbConnection = sqlx::PgConnection;
 
 pub async fn create_pool(config: &DatabaseConfig) -> Result<DbPool, sqlx::Error> {
     let pool = PgPoolOptions::new()

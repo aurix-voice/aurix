@@ -251,13 +251,14 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 |---|---|---|
 | none | `GET /health`, `GET /ready` | liveness / readiness (DB + Redis) |
 | bootstrap | `POST /admin/setup` | first admin (see above) |
-| admin JWT | `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log` | operators |
+| admin JWT | `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log`, `POST /admin/retention/sweep` | operators (`sweep` runs one retention pass now, superadmin; `409` while another node holds the sweep lock) |
 | admin JWT | `POST|GET /v1/apps`, `GET|DELETE /v1/apps/:id`, `POST /v1/apps/:id/rotate-key`, `GET /v1/nodes` | tenants & fleet |
 | API key | `POST /v1/tokens` | issue player JWT; a channel grant is `{"channel_id":…}` or `{"ad_hoc":{"name":…,"channel_type":…,"max_participants":…}}` (created on first join, dropped when empty; `max_participants` is clamped to the app limit, creation counts against the app's channel quota) |
 | API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`; `join` accepts `ad_hoc` too) |
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
+| API key | `DELETE /v1/users/:id[?purge_moderation=true]`, `GET /v1/users/:id/export` | erase a user and everything they own / export it as JSON (`users:erase`, `users:export`; see [User erasure, export and retention](#user-erasure-export-and-retention)) |
 | API key | `GET|POST /v1/users/:id/blocks`, `DELETE /v1/users/:id/blocks/:blocked_id` | persistent cross-mute (applied to live sessions on every node) |
 | API key | `POST /v1/channels/:id/messages`, `POST /v1/users/:id/messages` | server/system text message into a channel or to one user's live sessions (`chat:write`; sender is the nil user id, bypasses the content filter; fire-and-forget — dropped if nobody is online unless persisted) |
 | API key | `GET /v1/channels/:id/messages`, `GET /v1/users/:id/messages` | history, newest first, `?before=<rfc3339>&limit=1..200` — only when `chat.persist = true`, otherwise `404 NOT_FOUND` (`chat:read`) |
@@ -271,7 +272,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 
 API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
 `moderation:read|write`, `recordings:read|write`, `chat:read|write`, `webhooks:read|write`, `events:read`,
-`keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
+`users:erase|export`, `keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
 `{"error":{"code":"…","message":"…"}}`.
 
 ### Webhooks and the event stream
@@ -361,6 +362,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__RECORDING__*` | `ENABLED`, `STORAGE_PATH`, `RETENTION_DAYS`, `REQUIRE_CONSENT`, `ENCRYPTION_ENABLED` + `ENCRYPTION_KEY` (≥ 32 chars), S3 settings |
 | `AURIX__RATE_LIMITING__*` | per-IP / per-key limits (Redis-backed when available) |
 | `AURIX__CHAT__*` | `ENABLED` (default `true`), `MAX_MESSAGE_BYTES` (1024, text + metadata, ≤ 16384), `MESSAGES_PER_SECOND`/`MESSAGE_BURST` (2 / 10 per session), `TYPING_INTERVAL_MS` (1500), `SERVER_MUTE_BLOCKS_TEXT` (`true`), `FILTER_WEBHOOK` + `FILTER_TIMEOUT_MS` (1500) + `FILTER_FAIL_OPEN` (`false`), `PERSIST` (`false`) + `RETENTION_DAYS` (30) |
+| `AURIX__RETENTION__*` | `ENABLED` (`true`), `SESSIONS_DAYS` (90), `MODERATION_EVENTS_DAYS` (365, resolved cases only), `AUDIT_LOG_DAYS` (0 = keep), `ANALYTICS_DAYS` (400), `TOMBSTONES_DAYS` (30, must cover the longest token lifetime), `INACTIVE_USERS_DAYS` (0 = never auto-erase), `BATCH_SIZE` (5000), `INTERVAL_SECS` (3600, ≥ 60) — see [User erasure, export and retention](#user-erasure-export-and-retention) |
 | `AURIX__WEBHOOKS__*` | `ENABLED` (`true`), `TIMEOUT_MS` (5000), `RETRY_DELAYS_SECS` (`5,30,120,600,1800,3600,7200`), `CONCURRENCY` (16), `BATCH_SIZE` (100), `MAX_PENDING_PER_SUBSCRIPTION` (10000 — older events are dropped for a dead endpoint), `RETENTION_HOURS` (72, delivery log), `MAX_SUBSCRIPTIONS_PER_APP` (20), `REQUIRE_HTTPS` / `ALLOW_PRIVATE_URLS` (default: strict in production), `SSE_KEEPALIVE_SECS` (15) |
 
 #### Chat content filter webhook
@@ -378,6 +380,62 @@ or `{"action":"block","reason":"…"}` (sender gets `MESSAGE_BLOCKED` with that 
 status, invalid body or timeout blocks the message unless `chat.filter_fail_open = true`. Storage
 is off by default; with `chat.persist = true` messages land in `chat_messages` (post-filter text,
 per application) and are swept hourly after `chat.retention_days`.
+
+### User erasure, export and retention
+
+Aurix keeps per-user data only in PostgreSQL, Redis and the recording store, so a "right to be
+forgotten" request is one call:
+
+```bash
+curl -X DELETE -H "X-API-Key: $KEY" "$API/v1/users/$USER_ID"            # 404 if unknown
+curl -X DELETE -H "X-API-Key: $KEY" "$API/v1/users/$USER_ID?purge_moderation=true"
+```
+
+`DELETE /v1/users/:id` (`users:erase`) is tenant-scoped and, in one transaction after the
+recording store has been purged:
+
+* closes the user's live sessions on **every** node (`user.deleted` travels over the event bus;
+  other participants get the usual `participant_left`) and drops their Redis state;
+* removes sessions, channel memberships, chat messages sent or received, cross-mute blocks in
+  both directions, recording rows **and files/objects** (an in-progress recording is stopped
+  first and its file discarded);
+* anonymises reports the user *filed* (the reporter becomes the nil user) but keeps moderation
+  events and bans *about* them, so an active ban survives the deletion — pass
+  `purge_moderation=true` to remove those too;
+* leaves a **tombstone** `(app_id, user_id, deleted_at)` and deletes the user row.
+
+Any player JWT, action token or resume token minted **before** `deleted_at` is refused from then
+on (WebSocket and REST alike), even if it has not expired. A token minted afterwards for the same
+external id simply creates a fresh user with a new id — the game decides whether that is allowed.
+Tombstones are dropped after `retention.tombstones_days`, which the config validator forces to be
+at least as long as the longest session / action token lifetime. The response reports what was
+removed; the action is audited as `user_deleted` and published as `user.deleted`.
+
+`GET /v1/users/:id/export` (`users:export`) returns JSON with the profile, sessions, channel
+memberships, chat messages (when persisted), blocks, bans, moderation events (as target and as
+reporter) and recording metadata (not the audio). Each collection is capped at 10 000 rows;
+`truncated` lists the ones that hit the cap. Exports are audited (`user_data_exported`).
+
+**Retention sweep.** Every node runs the sweep every `retention.interval_secs`, but only one
+performs it at a time (PostgreSQL advisory lock), in batches of `batch_size` rows, off the media
+path. Rules with `0` days are skipped:
+
+| rule | what goes |
+|---|---|
+| `sessions_days` | sessions **disconnected** longer ago than this, with their memberships (open sessions are never touched) |
+| `moderation_events_days` | **resolved** events older than this; open cases are kept indefinitely |
+| `audit_log_days` | audit entries (default `0`: keep forever — most compliance regimes want them) |
+| `analytics_days` | analytics snapshots |
+| `tombstones_days` | deletion tombstones (after which old tokens can no longer be recognised — hence the validator) |
+| `inactive_users_days` | full erasure (as above, `purge_moderation=false`) of users not seen for this long who are not banned and have no open session; default `0` = off |
+
+The first pass runs one interval after start; `POST /admin/retention/sweep` forces one and
+returns the per-rule counts. Sweeps that removed anything are audited as `retention_sweep`.
+
+**Caveats.** Erasure is not retroactive for backups: a `pg_dump` or object-store version taken
+before the request still contains the data — set your backup retention accordingly. Webhook
+deliveries already queued that mention the user are delivered as-is (the events happened), and
+nothing is recalled from game servers that consumed the event stream.
 
 ### Network / firewall
 
@@ -431,7 +489,8 @@ docker compose exec db pg_dump -U "$POSTGRES_USER" -Fc aurix > aurix-$(date +%F)
 docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < aurix-2025-01-01.dump
 ```
 
-Recordings: back up the `recordings` volume (or use S3 with versioning). If recording encryption
+Recordings: back up the `recordings` volume (or use S3 with versioning). Backups outlive user
+erasure (see above) — keep their retention in line with your privacy commitments. If recording encryption
 is enabled, the key (`AURIX__RECORDING__ENCRYPTION_KEY`) **must** be backed up separately — files
 are unreadable without it. Redis holds only ephemeral state and needs no backup.
 

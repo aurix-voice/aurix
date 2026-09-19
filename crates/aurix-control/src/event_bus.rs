@@ -70,6 +70,15 @@ pub enum ServerEvent {
         banned_by: UserId,
         timestamp: DateTime<Utc>,
     },
+    /// A user was erased (`DELETE /v1/users/:id` or the inactivity sweep). Every node closes
+    /// the user's live sessions; tenants drop cached profile data.
+    UserDeleted {
+        app_id: AppId,
+        user_id: UserId,
+        deleted_by: UserId,
+        automatic: bool,
+        timestamp: DateTime<Utc>,
+    },
     UserKicked {
         app_id: AppId,
         channel_id: ChannelId,
@@ -177,6 +186,7 @@ impl ServerEvent {
             | Self::UserMuted { app_id, .. }
             | Self::UserUnmuted { app_id, .. }
             | Self::UserBanned { app_id, .. }
+            | Self::UserDeleted { app_id, .. }
             | Self::UserKicked { app_id, .. }
             | Self::QualityAlert { app_id, .. }
             | Self::ModerationEvent { app_id, .. }
@@ -215,6 +225,7 @@ impl ServerEvent {
             Self::UserMuted { .. } => "participant.muted",
             Self::UserUnmuted { .. } => "participant.unmuted",
             Self::UserBanned { .. } => "user.banned",
+            Self::UserDeleted { .. } => "user.deleted",
             Self::UserKicked { .. } => "participant.kicked",
             Self::QualityAlert { .. } => "quality.alert",
             Self::ModerationEvent { .. } => "moderation.event",
@@ -242,6 +253,7 @@ impl ServerEvent {
         "participant.unmuted",
         "participant.kicked",
         "user.banned",
+        "user.deleted",
         "user.block_changed",
         "moderation.event",
         "recording.started",

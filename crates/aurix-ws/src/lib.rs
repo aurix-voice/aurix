@@ -505,6 +505,13 @@ impl WsState {
                         self.request_close(sid, &format!("banned: {reason}"));
                     }
                 }
+                ServerEvent::UserDeleted {
+                    app_id, user_id, ..
+                } => {
+                    for sid in self.sessions_of_user(app_id, user_id) {
+                        self.request_close(sid, "user deleted");
+                    }
+                }
                 ServerEvent::RecordingStarted {
                     channel_id,
                     recording_id,
@@ -2380,6 +2387,7 @@ mod tests {
             channels: vec![],
             metadata: None,
             jti: "j".into(),
+            issued_at: 0,
         }
     }
 

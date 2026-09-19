@@ -40,6 +40,8 @@ pub struct ValidatedToken {
     pub channels: Vec<ChannelPermission>,
     pub metadata: Option<serde_json::Value>,
     pub jti: String,
+    /// `iat` claim, unix seconds.
+    pub issued_at: i64,
 }
 
 /// Payload of a one-time action token. Distinguished from session tokens by `typ`.
@@ -103,6 +105,7 @@ pub struct ValidatedActionToken {
     pub ad_hoc: Option<AdHocChannel>,
     pub metadata: Option<serde_json::Value>,
     pub jti: String,
+    pub iat: i64,
     pub exp: i64,
 }
 
@@ -131,6 +134,7 @@ impl ValidatedActionToken {
             channels: Vec::new(),
             metadata: self.metadata.clone(),
             jti: self.jti.clone(),
+            issued_at: self.iat,
         }
     }
 }
@@ -309,6 +313,7 @@ impl JwtService {
             channels,
             metadata: claims.metadata,
             jti: claims.jti,
+            issued_at: claims.iat,
         })
     }
 
@@ -426,6 +431,7 @@ impl JwtService {
             ad_hoc: claims.ad_hoc,
             metadata: claims.metadata,
             jti: claims.jti,
+            iat: claims.iat,
             exp: claims.exp,
         })
     }

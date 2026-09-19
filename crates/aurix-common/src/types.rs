@@ -803,6 +803,9 @@ pub enum AuditAction {
     WebhookSecretRotated,
     ChannelMuteAll,
     ChannelKickAll,
+    UserDeleted,
+    UserDataExported,
+    RetentionSweep,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
