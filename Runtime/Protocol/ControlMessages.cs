@@ -56,12 +56,82 @@ namespace Aurix.Protocol
         public float Energy;
     }
 
+    public enum TransmissionKind { None, Single, All }
+
+    /// <summary>
+    /// Where this session's microphone audio is delivered: nowhere (<see cref="TransmissionKind.None"/>,
+    /// a server-side push-to-talk release), exactly one joined channel, or every joined channel (default).
+    /// Enforced by the server before fan-out.
+    /// </summary>
+    public readonly struct TransmissionMode : IEquatable<TransmissionMode>
+    {
+        public readonly TransmissionKind Kind;
+        /// <summary>Target channel for <see cref="TransmissionKind.Single"/>; <see cref="Guid.Empty"/> otherwise.</summary>
+        public readonly Guid ChannelId;
+
+        private TransmissionMode(TransmissionKind kind, Guid channelId) { Kind = kind; ChannelId = channelId; }
+
+        public static readonly TransmissionMode None = new TransmissionMode(TransmissionKind.None, Guid.Empty);
+        public static readonly TransmissionMode All = new TransmissionMode(TransmissionKind.All, Guid.Empty);
+        public static TransmissionMode Single(Guid channelId)
+        {
+            if (channelId == Guid.Empty) throw new ArgumentException("channel id required", nameof(channelId));
+            return new TransmissionMode(TransmissionKind.Single, channelId);
+        }
+
+        /// <summary>Would a frame addressed to <paramref name="channelId"/> be forwarded under this mode?</summary>
+        public bool Allows(Guid channelId)
+        {
+            switch (Kind)
+            {
+                case TransmissionKind.None: return false;
+                case TransmissionKind.Single: return ChannelId == channelId;
+                default: return true;
+            }
+        }
+
+        public Dictionary<string, object> ToWire()
+        {
+            switch (Kind)
+            {
+                case TransmissionKind.None: return new Dictionary<string, object> { { "mode", "none" } };
+                case TransmissionKind.Single: return new Dictionary<string, object> { { "mode", "single" }, { "channel_id", ChannelId } };
+                default: return new Dictionary<string, object> { { "mode", "all" } };
+            }
+        }
+
+        /// <summary>Parse the wire object; a missing/unknown value is <see cref="All"/> (the server default).</summary>
+        public static TransmissionMode FromWire(object wire)
+        {
+            var o = MiniJson.AsObject(wire);
+            if (o == null) return All;
+            switch (MiniJson.GetString(o, "mode"))
+            {
+                case "none": return None;
+                case "single":
+                    var id = MiniJson.GetGuid(o, "channel_id");
+                    return id.HasValue && id.Value != Guid.Empty ? Single(id.Value) : All;
+                default: return All;
+            }
+        }
+
+        public bool Equals(TransmissionMode other) => Kind == other.Kind && ChannelId == other.ChannelId;
+        public override bool Equals(object obj) => obj is TransmissionMode m && Equals(m);
+        public override int GetHashCode() => ((int)Kind * 397) ^ ChannelId.GetHashCode();
+        public static bool operator ==(TransmissionMode a, TransmissionMode b) => a.Equals(b);
+        public static bool operator !=(TransmissionMode a, TransmissionMode b) => !a.Equals(b);
+        public override string ToString() => Kind == TransmissionKind.Single ? $"Single({ChannelId})" : Kind.ToString();
+    }
+
     /// <summary>Server-side snapshot of this user's receiver preferences, sent after <c>SessionInitAck</c>.</summary>
     public sealed class ReceiverPreferences
     {
         public List<Guid> BlockedUsers = new List<Guid>();
         public List<LocalMute> LocalMutes = new List<LocalMute>();
         public List<ParticipantVolume> Volumes = new List<ParticipantVolume>();
+        public TransmissionMode Transmission = TransmissionMode.All;
+        /// <summary>Channel heard at full volume while the others are attenuated; null when unfocused.</summary>
+        public Guid? FocusChannel;
     }
 
     /// <summary>
@@ -214,8 +284,17 @@ namespace Aurix.Protocol
                         Volume = (float)MiniJson.GetNumber(o, "volume", 1.0),
                     });
                 }
+            if (Data.TryGetValue("transmission", out var tv)) prefs.Transmission = TransmissionMode.FromWire(tv);
+            prefs.FocusChannel = MiniJson.GetGuid(Data, "focus_channel");
             return prefs;
         }
+
+        /// <summary>Typed view of a <c>TransmissionChanged</c> payload.</summary>
+        public TransmissionMode Transmission() =>
+            TransmissionMode.FromWire(Data != null && Data.TryGetValue("mode", out var m) ? m : null);
+
+        /// <summary>Typed view of a <c>ChannelFocusChanged</c> payload (null = focus cleared).</summary>
+        public Guid? FocusChannel() => MiniJson.GetGuid(Data, "channel_id");
 
         /// <summary>Typed view of a <c>ChannelEnergy</c> payload (<c>data.levels</c>).</summary>
         public List<ParticipantEnergy> Levels()
@@ -329,6 +408,15 @@ namespace Aurix.Protocol
 
         public static string SetUserBlock(Guid userId, bool blocked) =>
             Serialize("SetUserBlock", new Dictionary<string, object> { { "user_id", userId }, { "blocked", blocked } });
+
+        public static string SetTransmission(TransmissionMode mode) =>
+            Serialize("SetTransmission", new Dictionary<string, object> { { "mode", mode.ToWire() } });
+
+        public static string SetChannelFocus(Guid? channelId) =>
+            Serialize("SetChannelFocus", new Dictionary<string, object>
+            {
+                { "channel_id", channelId.HasValue ? (object)channelId.Value : null },
+            });
 
         public static string ChatSend(Guid channelId, string text, object metadata, string clientRef)
         {

@@ -234,6 +234,52 @@ namespace Aurix.Voice.Tests
             Assert.Empty(empty.BlockedUsers);
             Assert.Empty(empty.LocalMutes);
             Assert.Empty(empty.Volumes);
+            Assert.Equal(TransmissionMode.All, empty.Transmission);
+            Assert.Null(empty.FocusChannel);
+        }
+
+        [Fact]
+        public void TransmissionAndFocusMessagesMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b6d1-131f-7160-afd2-056622380dd3");
+            var party = Guid.Parse("01a0b6d1-132a-7385-8e7a-9ac1eceaeb0c");
+
+            // Outbound, byte-exact with the Rust `TransmissionMode` (internally tagged `mode`).
+            Assert.Equal("{\"type\":\"SetTransmission\",\"data\":{\"mode\":{\"mode\":\"none\"}}}",
+                ControlMessage.SetTransmission(TransmissionMode.None));
+            Assert.Equal("{\"type\":\"SetTransmission\",\"data\":{\"mode\":{\"mode\":\"single\",\"channel_id\":\"" + team + "\"}}}",
+                ControlMessage.SetTransmission(TransmissionMode.Single(team)));
+            Assert.Equal("{\"type\":\"SetTransmission\",\"data\":{\"mode\":{\"mode\":\"all\"}}}",
+                ControlMessage.SetTransmission(TransmissionMode.All));
+            Assert.Equal("{\"type\":\"SetChannelFocus\",\"data\":{\"channel_id\":\"" + team + "\"}}",
+                ControlMessage.SetChannelFocus(team));
+            Assert.Equal("{\"type\":\"SetChannelFocus\",\"data\":{\"channel_id\":null}}",
+                ControlMessage.SetChannelFocus(null));
+            Assert.Throws<ArgumentException>(() => TransmissionMode.Single(Guid.Empty));
+
+            // Policy semantics mirror the server.
+            Assert.True(TransmissionMode.All.Allows(team) && TransmissionMode.All.Allows(party));
+            Assert.False(TransmissionMode.None.Allows(team));
+            Assert.True(TransmissionMode.Single(team).Allows(team));
+            Assert.False(TransmissionMode.Single(team).Allows(party));
+            Assert.Equal(TransmissionMode.Single(team), TransmissionMode.Single(team));
+            Assert.NotEqual(TransmissionMode.Single(team), TransmissionMode.Single(party));
+
+            // Inbound acks / resets and the snapshot fields.
+            var changed = ControlMessage.Parse("{\"type\":\"TransmissionChanged\",\"data\":{\"mode\":{\"mode\":\"single\",\"channel_id\":\"" + party + "\"}}}");
+            Assert.Equal(TransmissionMode.Single(party), changed.Transmission());
+            Assert.Equal(TransmissionMode.None,
+                ControlMessage.Parse("{\"type\":\"TransmissionChanged\",\"data\":{\"mode\":{\"mode\":\"none\"}}}").Transmission());
+            Assert.Equal(TransmissionMode.All,
+                ControlMessage.Parse("{\"type\":\"TransmissionChanged\",\"data\":{\"mode\":{\"mode\":\"weird\"}}}").Transmission());
+            Assert.Equal(team, ControlMessage.Parse("{\"type\":\"ChannelFocusChanged\",\"data\":{\"channel_id\":\"" + team + "\"}}").FocusChannel());
+            Assert.Null(ControlMessage.Parse("{\"type\":\"ChannelFocusChanged\",\"data\":{}}").FocusChannel());
+            Assert.Null(ControlMessage.Parse("{\"type\":\"ChannelFocusChanged\",\"data\":{\"channel_id\":null}}").FocusChannel());
+
+            var prefs = ControlMessage.Parse("{\"type\":\"ReceiverPreferences\",\"data\":{\"blocked_users\":[],\"local_mutes\":[],\"volumes\":[]," +
+                "\"transmission\":{\"mode\":\"single\",\"channel_id\":\"" + team + "\"},\"focus_channel\":\"" + party + "\"}}").ReceiverPreferences();
+            Assert.Equal(TransmissionMode.Single(team), prefs.Transmission);
+            Assert.Equal(party, prefs.FocusChannel);
         }
 
         [Fact]

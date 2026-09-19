@@ -19,6 +19,8 @@ namespace Aurix.Unity
         public string WebSocketUrl = "ws://127.0.0.1:8081/ws";
         [Tooltip("Per-user JWT from your game backend (POST /v1/tokens). Never embed API keys in builds.")]
         public string Token;
+        [Tooltip("Channel id(s) to join on connect, comma-separated. The microphone goes to every joined channel " +
+                 "unless Client.SetTransmissionAsync narrows it; Client.SetChannelFocusAsync picks the one heard at full volume.")]
         public string ChannelId;
 
         [Header("Audio")]
@@ -77,7 +79,6 @@ namespace Aurix.Unity
         private byte[] _opusOut = new byte[1275];
         private IOpusCodec _encoder;
         private RemoteMixer _mixer;
-        private uint _channelHash;
         private int _micRate;
         private int _micChannels;
 
@@ -101,9 +102,11 @@ namespace Aurix.Unity
             Client.OnDisconnected += _ => StopMic();
             await Client.ConnectAsync();
 
-            var channel = Guid.Parse(ChannelId);
-            _channelHash = AurixVoiceClient.ChannelHash(channel);
-            await Client.JoinChannelAsync(channel);
+            foreach (var id in (ChannelId ?? string.Empty).Split(','))
+            {
+                var trimmed = id.Trim();
+                if (trimmed.Length > 0) await Client.JoinChannelAsync(Guid.Parse(trimmed));
+            }
             StartMic();
 
             var src = GetComponent<AudioSource>();
@@ -241,7 +244,7 @@ namespace Aurix.Unity
                     continue;
                 }
                 int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
-                if (n > 0) Client.SendOpusFrame(_channelHash, _opusOut, n, AudioFormat.FrameSamples, Vad.Level);
+                if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
             }
         }
 

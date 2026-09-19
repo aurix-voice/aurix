@@ -15,6 +15,8 @@ namespace Aurix.Transport
         public uint SenderSsrc;
         public uint Sequence;
         public uint Timestamp;
+        /// <summary>Channel the frame was forwarded through (<see cref="AurxPacket.ChannelIdHash(Guid)"/> of its id).</summary>
+        public uint ChannelHash;
         public float Volume;
         public byte[] Opus;
     }
@@ -211,6 +213,7 @@ namespace Aurix.Transport
                             SenderSsrc = pkt.Header.Ssrc,
                             Sequence = pkt.Header.Sequence,
                             Timestamp = pkt.Header.Timestamp,
+                            ChannelHash = pkt.Header.ChannelIdHash,
                             Volume = pkt.Volume,
                             Opus = pkt.AudioPayload.ToArray(),
                         });

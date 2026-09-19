@@ -70,6 +70,8 @@ namespace Aurix
         private readonly Dictionary<Guid, HashSet<Guid>> _localMutes = new Dictionary<Guid, HashSet<Guid>>();
         private readonly Dictionary<Guid, float> _volumes = new Dictionary<Guid, float>();
         private readonly HashSet<Guid> _blockedUsers = new HashSet<Guid>();
+        private TransmissionMode _transmission = TransmissionMode.All;
+        private Guid? _focusChannel;
         private readonly Random _random = new Random();
         private ControlChannel _control;
         private MediaTransport _media;
@@ -142,6 +144,10 @@ namespace Aurix
         public event Action<ReceiverPreferences> OnReceiverPreferences;
         /// <summary>A cross-mute placed or lifted by this user, from this or any other device / the REST API.</summary>
         public event Action<Guid, bool> OnUserBlockChanged;
+        /// <summary>Transmission mode confirmed by the server (also raised when a left channel resets it to <see cref="TransmissionMode.None"/>).</summary>
+        public event Action<TransmissionMode> OnTransmissionChanged;
+        /// <summary>Channel focus confirmed by the server; null when cleared (explicitly or by leaving the focused channel).</summary>
+        public event Action<Guid?> OnChannelFocusChanged;
         /// <summary>
         /// A text message for this client: channel message of a joined channel, directed message addressed to
         /// this user, or the echo of a message this client sent (<see cref="ChatMessage.IsOwn"/>).
@@ -312,7 +318,7 @@ namespace Aurix
                 {
                     var roster = await tcs.Task.ConfigureAwait(false);
                     lock (_channels) _joinedChannels.Add(channelId);
-                    await ReplayChannelMutesAsync(channelId, ct).ConfigureAwait(false);
+                    await ReplayChannelPrefsAsync(channelId, ct).ConfigureAwait(false);
                     return roster;
                 }
                 finally { _joinTcs = null; _pendingChannelJoin = null; }
@@ -442,6 +448,62 @@ namespace Aurix
 
         public IReadOnlyCollection<Guid> BlockedUsers { get { lock (_blockedUsers) return new List<Guid>(_blockedUsers); } }
 
+        // ---- multi-channel: transmission policy (sender side) and focus (receiver side) ---------
+
+        /// <summary>Where this session's audio is delivered; <see cref="TransmissionMode.All"/> by default.</summary>
+        public TransmissionMode Transmission { get { lock (_channels) return _transmission; } }
+
+        /// <summary>Channel heard at full volume while the other joined channels are attenuated; null when unfocused.</summary>
+        public Guid? FocusChannel { get { lock (_channels) return _focusChannel; } }
+
+        /// <summary>
+        /// Choose which joined channels receive this session's voice: <see cref="TransmissionMode.All"/>,
+        /// <see cref="TransmissionMode.None"/> (server-side push-to-talk release) or
+        /// <see cref="TransmissionMode.Single"/>. Enforced by the server; frames for other channels are
+        /// dropped there and <see cref="SendOpusFrame"/> skips them locally too. A <c>Single</c> target that is
+        /// not joined yet is kept and sent once the channel is joined; leaving the target resets the mode to
+        /// <c>None</c> (reported through <see cref="OnTransmissionChanged"/>). Re-applied after a reconnect.
+        /// </summary>
+        public Task SetTransmissionAsync(TransmissionMode mode, CancellationToken ct = default)
+        {
+            bool send;
+            lock (_channels)
+            {
+                _transmission = mode;
+                send = mode.Kind != TransmissionKind.Single || _joinedChannels.Contains(mode.ChannelId);
+            }
+            var control = _control;
+            if (control == null || !send) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetTransmission(mode), ct);
+        }
+
+        /// <summary>Shortcut for <see cref="SetTransmissionAsync"/> with <see cref="TransmissionMode.Single"/>.</summary>
+        public Task TransmitToChannelAsync(Guid channelId, CancellationToken ct = default) =>
+            SetTransmissionAsync(TransmissionMode.Single(channelId), ct);
+
+        /// <summary>Would a frame addressed to <paramref name="channelId"/> be forwarded under the current mode?</summary>
+        public bool TransmitsTo(Guid channelId) => Transmission.Allows(channelId);
+
+        /// <summary>
+        /// Hear <paramref name="channelId"/> at full volume and every other joined channel attenuated by the
+        /// server's <c>media.unfocused_channel_gain</c> (0.5 by default); null restores full volume everywhere.
+        /// Receiver-local: multiplies per-participant volume, never overrides local mutes or blocks. A focus on a
+        /// channel not joined yet is sent once it is joined; leaving the focused channel clears it.
+        /// </summary>
+        public Task SetChannelFocusAsync(Guid? channelId, CancellationToken ct = default)
+        {
+            if (channelId == Guid.Empty) channelId = null;
+            bool send;
+            lock (_channels)
+            {
+                _focusChannel = channelId;
+                send = channelId == null || _joinedChannels.Contains(channelId.Value);
+            }
+            var control = _control;
+            if (control == null || !send) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetChannelFocus(channelId), ct);
+        }
+
         /// <summary>
         /// Send a text message to every member of a joined channel. Completes with the server's copy (id,
         /// timestamp) once accepted — also raised through <see cref="OnChatMessage"/> — or faults with
@@ -511,27 +573,32 @@ namespace Aurix
             lock (_typingSentAt) _typingSentAt.Clear();
         }
 
-        /// <summary>A fresh (non-resumed) session forgot our local mutes/volumes: send them again.</summary>
+        /// <summary>A fresh (non-resumed) session forgot our local mutes/volumes/transmission: send them again.</summary>
         private async Task ReplayReceiverPrefsAsync(CancellationToken ct)
         {
             var control = _control;
             if (control == null) return;
             List<Guid> everywhere;
             List<KeyValuePair<Guid, float>> volumes;
+            TransmissionMode transmission;
             lock (_localMutes)
             {
                 everywhere = new List<Guid>();
                 foreach (var kv in _localMutes) if (kv.Value.Contains(Guid.Empty)) everywhere.Add(kv.Key);
             }
             lock (_volumes) volumes = new List<KeyValuePair<Guid, float>>(_volumes);
+            lock (_channels) transmission = _transmission;
             foreach (var user in everywhere)
                 await control.SendAsync(ControlMessage.SetParticipantMute(user, null, true), ct).ConfigureAwait(false);
             foreach (var kv in volumes)
                 await control.SendAsync(ControlMessage.SetParticipantVolume(kv.Key, kv.Value), ct).ConfigureAwait(false);
+            // `All` is the server default; `Single`/focus need the channel and follow its ChannelJoinAck.
+            if (transmission.Kind == TransmissionKind.None)
+                await control.SendAsync(ControlMessage.SetTransmission(transmission), ct).ConfigureAwait(false);
         }
 
-        /// <summary>Channel-scoped mutes need membership, so they are re-sent after each successful join.</summary>
-        private async Task ReplayChannelMutesAsync(Guid channelId, CancellationToken ct)
+        /// <summary>Channel-scoped mutes, a <c>Single</c> target and the focus need membership, so they are (re-)sent after each successful join.</summary>
+        private async Task ReplayChannelPrefsAsync(Guid channelId, CancellationToken ct)
         {
             var control = _control;
             if (control == null) return;
@@ -541,10 +608,18 @@ namespace Aurix
                     if (kv.Value.Contains(channelId) && !kv.Value.Contains(Guid.Empty)) users.Add(kv.Key);
             foreach (var user in users)
                 await control.SendAsync(ControlMessage.SetParticipantMute(user, channelId, true), ct).ConfigureAwait(false);
+            TransmissionMode transmission;
+            Guid? focus;
+            lock (_channels) { transmission = _transmission; focus = _focusChannel; }
+            if (transmission.Kind == TransmissionKind.Single && transmission.ChannelId == channelId)
+                await control.SendAsync(ControlMessage.SetTransmission(transmission), ct).ConfigureAwait(false);
+            if (focus == channelId)
+                await control.SendAsync(ControlMessage.SetChannelFocus(channelId), ct).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// Send one encoded Opus frame (20 ms @ 48 kHz recommended) to a channel. No-op while muted.
+        /// Send one encoded Opus frame (20 ms @ 48 kHz recommended) to a channel. No-op while muted or when
+        /// the current <see cref="Transmission"/> mode excludes that channel (the server would drop it anyway).
         /// <paramref name="channelHash"/> comes from <see cref="ChannelHash"/>.
         /// <paramref name="level"/> is the frame's measured <see cref="Audio.AudioLevel"/> (e.g. from a
         /// <see cref="Audio.VoiceActivityDetector"/>); when given, the server uses it for speaking detection and
@@ -554,8 +629,40 @@ namespace Aurix
         {
             if (_media == null || State != VoiceConnectionState.MediaBound) return;
             _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
-            if (_muted) return;
+            if (_muted || !AllowsHash(channelHash)) return;
             _media.SendAudio(channelHash, _rtpTimestamp, opus, length, level);
+        }
+
+        /// <summary>
+        /// Send one encoded Opus frame to every joined channel the current <see cref="Transmission"/> mode allows
+        /// (all of them by default, one for <see cref="TransmissionMode.Single"/>, nothing for
+        /// <see cref="TransmissionMode.None"/>). The RTP clock advances once per call. Returns the number of
+        /// channels the frame was sent to.
+        /// </summary>
+        public int TransmitOpusFrame(byte[] opus, int length = -1, int samplesPerChannel = Audio.AudioFormat.FrameSamples, byte? level = null)
+        {
+            if (_media == null || State != VoiceConnectionState.MediaBound) return 0;
+            _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
+            if (_muted) return 0;
+            var targets = new List<Guid>();
+            lock (_channels)
+                foreach (var ch in _joinedChannels)
+                    if (_transmission.Allows(ch)) targets.Add(ch);
+            foreach (var ch in targets)
+                _media.SendAudio(ChannelHash(ch), _rtpTimestamp, opus, length, level);
+            return targets.Count;
+        }
+
+        private bool AllowsHash(uint channelHash)
+        {
+            TransmissionMode mode;
+            lock (_channels) mode = _transmission;
+            switch (mode.Kind)
+            {
+                case TransmissionKind.None: return false;
+                case TransmissionKind.Single: return ChannelHash(mode.ChannelId) == channelHash;
+                default: return true;
+            }
         }
 
         /// <summary>
@@ -933,7 +1040,26 @@ namespace Aurix
                             if (v.Volume == 1f) _volumes.Remove(v.UserId);
                             else _volumes[v.UserId] = v.Volume;
                         }
+                    // On a resumed session the server's transmission/focus are authoritative (fresh sessions
+                    // report the defaults and are followed by our replay).
+                    var session = Session;
+                    if (session != null && session.Resumed)
+                        lock (_channels) { _transmission = prefs.Transmission; _focusChannel = prefs.FocusChannel; }
                     OnReceiverPreferences?.Invoke(prefs);
+                    break;
+                }
+                case "TransmissionChanged":
+                {
+                    var mode = m.Transmission();
+                    lock (_channels) _transmission = mode;
+                    OnTransmissionChanged?.Invoke(mode);
+                    break;
+                }
+                case "ChannelFocusChanged":
+                {
+                    var focus = m.FocusChannel();
+                    lock (_channels) _focusChannel = focus;
+                    OnChannelFocusChanged?.Invoke(focus);
                     break;
                 }
                 case "SessionClose":

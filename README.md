@@ -92,6 +92,40 @@ positional attenuation). Mutes and volumes are session state and are replayed au
 reconnect (channel-scoped mutes when the channel is re-joined); blocks are stored per application on the server
 and can also be managed from your backend via `/v1/users/:id/blocks`.
 
+### Multiple channels: transmission policy, focus, channel limit
+
+A session may sit in several channels at once (team + party + proximity…). `AurixVoiceBehaviour.ChannelId`
+takes a comma-separated list and sends the microphone with `TransmitOpusFrame`, which addresses every joined
+channel the current transmission mode allows:
+
+```csharp
+await client.JoinChannelAsync(teamId);
+await client.JoinChannelAsync(partyId);
+
+await client.TransmitToChannelAsync(partyId);            // speak to the party only, keep hearing the team
+await client.SetTransmissionAsync(TransmissionMode.All);  // default: every joined channel
+await client.SetTransmissionAsync(TransmissionMode.None); // listen only (server-side push-to-talk release)
+bool reaches = client.TransmitsTo(teamId);
+client.OnTransmissionChanged += mode => pttIndicator.Set(mode);
+
+int sentTo = client.TransmitOpusFrame(opusBytes, opusLen, AudioFormat.FrameSamples, vad.Level);
+client.SendOpusFrame(AurixVoiceClient.ChannelHash(teamId), opusBytes, opusLen); // explicit target; skipped if the mode excludes it
+
+await client.SetChannelFocusAsync(teamId);                // team at full volume, the rest attenuated
+await client.SetChannelFocusAsync(null);                  // everything at full volume again
+client.OnChannelFocusChanged += channelId => Highlight(channelId);
+```
+
+The mode is enforced by the server (frames for channels outside it are dropped before fan-out), the client just
+saves the uplink. `Single` and the focus must point at a joined channel: set before the join they are sent with its
+`ChannelJoinAck`; leaving that channel resets them (`OnTransmissionChanged(None)` / `OnChannelFocusChanged(null)`).
+Focus is receiver-local — the other channels are scaled by the server's `media.unfocused_channel_gain` (0.5 by
+default) into the per-packet volume byte, on top of per-participant volume; mutes and blocks still win. Both are
+replayed after a reconnect. `IncomingAudio.ChannelHash` tells which channel a frame was forwarded through.
+
+The server caps memberships per session (`media.max_channels_per_session`, default 10; positional channels
+`media.max_positional_channels_per_session`, default 1) — `JoinChannelAsync` faults with `CHANNEL_LIMIT_EXCEEDED`.
+
 ### Reconnect / session resume
 
 `AutoReconnect` is on by default. When the control connection drops unexpectedly (Wi-Fi ↔ LTE
@@ -252,6 +286,12 @@ channel and everywhere (0 packets), unmutes (audio resumes), sets volume 0.5 and
 with `client_ref`, recipient copy without), rejections carried back to the right send (empty text, self-DM,
 offline target), a directed message, typing coalescing (3 calls → 1 frame, origin never notified) and the
 anti-flood limit (a 14-message burst: `message_burst` accepted, the rest `RATE_LIMIT_EXCEEDED`, none hanging).
+
+`--scenario transmission` (needs the API key: it creates a second channel and multi-channel tokens) checks the
+multi-channel controls over real UDP: `Single(party)` set before the party join sends nothing and is acked with
+the join, then only party frames arrive; `All` reaches both channels; `None` reaches nobody and `SendOpusFrame`
+drops locally; bob's `focus(team)` turns the party volume byte into 0.5 while alice's focus stays untouched;
+leaving the target / focused channel resets both through server events.
 
 ## Notes
 
