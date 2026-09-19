@@ -71,6 +71,19 @@ cc -std=c99 -Icrates/aurix-client/include crates/aurix-client/examples/c/voice_l
 `examples/c/voice_loop.c` is a complete integration: create → connect → wait for
 `AURIX_EVENT_SESSION_READY` → join → push a tone / mix output → print statistics → disconnect.
 
+### C++ wrapper
+
+`include/aurix_client.hpp` is a header-only C++11 layer over the C ABI: move-only RAII
+`aurix::Client` / `aurix::Event`, `aurix::Uuid` (parse/format), `aurix::Config`, and
+`std::string`/`std::vector` conveniences for every call. It adds no behaviour and no extra
+library; `examples/cpp/voice_loop.cpp` mirrors the C sample and is compiled and run by the same
+test. The Unreal plugin in [`sdk/unreal`](../../sdk/unreal) is built on this wrapper.
+
+```bash
+c++ -std=c++11 -Icrates/aurix-client/include crates/aurix-client/examples/cpp/voice_loop.cpp \
+    -Ltarget/release -laurix_client -lm -o voice_loop_cpp
+```
+
 ### Ownership and threading rules
 
 * `aurix_client_create` returns a handle owned by the caller; `aurix_client_destroy` disconnects
@@ -99,7 +112,8 @@ Rust enums never cross the ABI as-is; every event, mode and role has a `#[repr(C
 
 ```bash
 cargo test -p aurix-client                 # unit tests (audio, media with a fake server, ABI)
-cargo test -p aurix-client --test c_abi    # header is up to date, C sample compiles/links/runs
+cargo test -p aurix-client --test c_abi    # header is up to date, C/C++ samples compile/link/run,
+                                           # Unreal plugin references only declared ABI symbols
 AURIX_E2E_API_KEY=aurx_... cargo test -p aurix-client --test e2e_live -- --nocapture
 ```
 

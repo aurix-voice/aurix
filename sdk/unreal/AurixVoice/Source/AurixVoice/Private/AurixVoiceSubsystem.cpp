@@ -1,0 +1,1061 @@
+#include "AurixVoiceSubsystem.h"
+
+#include "AurixAudioCapture.h"
+#include "AurixVoiceLog.h"
+#include "AurixVoiceSoundWave.h"
+#include "Components/AudioComponent.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
+#include "Kismet/GameplayStatics.h"
+#include "Sound/SoundClass.h"
+
+#include "aurix_client.hpp"
+
+struct FAurixNativeClient
+{
+	aurix::Client Client;
+};
+
+namespace
+{
+constexpr int32 MaxEventsPerTick = 256;
+
+FGuid ToGuid(const AurixUuid& U)
+{
+	auto Read = [&U](int32 Offset) {
+		return (uint32(U.bytes[Offset]) << 24) | (uint32(U.bytes[Offset + 1]) << 16) | (uint32(U.bytes[Offset + 2]) << 8) | uint32(U.bytes[Offset + 3]);
+	};
+	return FGuid(Read(0), Read(4), Read(8), Read(12));
+}
+
+aurix::Uuid ToUuid(const FGuid& G)
+{
+	aurix::Uuid U;
+	const uint32 Parts[4] = {G.A, G.B, G.C, G.D};
+	for (int32 i = 0; i < 4; ++i)
+	{
+		U.raw.bytes[i * 4 + 0] = uint8(Parts[i] >> 24);
+		U.raw.bytes[i * 4 + 1] = uint8(Parts[i] >> 16);
+		U.raw.bytes[i * 4 + 2] = uint8(Parts[i] >> 8);
+		U.raw.bytes[i * 4 + 3] = uint8(Parts[i]);
+	}
+	return U;
+}
+
+FString FromUtf8(const char* S)
+{
+	return S ? FString(UTF8_TO_TCHAR(S)) : FString();
+}
+
+std::string ToUtf8(const FString& S)
+{
+	FTCHARToUTF8 Conv(*S);
+	return std::string(reinterpret_cast<const char*>(Conv.Get()), static_cast<size_t>(Conv.Length()));
+}
+
+FDateTime FromUnixMs(int64 Ms)
+{
+	return FDateTime::FromUnixTimestamp(Ms / 1000) + FTimespan::FromMilliseconds(static_cast<double>(Ms % 1000));
+}
+
+EAurixConnectionState ToState(AurixConnectionState S)
+{
+	switch (S)
+	{
+	case AURIX_STATE_CONNECTING: return EAurixConnectionState::Connecting;
+	case AURIX_STATE_CONNECTED: return EAurixConnectionState::Connected;
+	case AURIX_STATE_MEDIA_BOUND: return EAurixConnectionState::MediaBound;
+	case AURIX_STATE_RECONNECTING: return EAurixConnectionState::Reconnecting;
+	case AURIX_STATE_FAILED: return EAurixConnectionState::Failed;
+	case AURIX_STATE_DISCONNECTED:
+	default: return EAurixConnectionState::Disconnected;
+	}
+}
+
+EAurixRole ToRole(AurixRole R)
+{
+	switch (R)
+	{
+	case AURIX_ROLE_SPEAKER: return EAurixRole::Speaker;
+	case AURIX_ROLE_MODERATOR: return EAurixRole::Moderator;
+	case AURIX_ROLE_ADMINISTRATOR: return EAurixRole::Administrator;
+	case AURIX_ROLE_LISTENER:
+	default: return EAurixRole::Listener;
+	}
+}
+
+EAurixTransmissionMode ToTransmission(AurixTransmissionMode M)
+{
+	switch (M)
+	{
+	case AURIX_TRANSMIT_SINGLE: return EAurixTransmissionMode::Single;
+	case AURIX_TRANSMIT_ALL: return EAurixTransmissionMode::All;
+	case AURIX_TRANSMIT_NONE:
+	default: return EAurixTransmissionMode::None;
+	}
+}
+
+AurixTransmissionMode FromTransmission(EAurixTransmissionMode M)
+{
+	switch (M)
+	{
+	case EAurixTransmissionMode::Single: return AURIX_TRANSMIT_SINGLE;
+	case EAurixTransmissionMode::All: return AURIX_TRANSMIT_ALL;
+	case EAurixTransmissionMode::None:
+	default: return AURIX_TRANSMIT_NONE;
+	}
+}
+
+EAurixModerationAction ToModeration(AurixModerationAction A)
+{
+	switch (A)
+	{
+	case AURIX_MODERATION_MUTE: return EAurixModerationAction::Mute;
+	case AURIX_MODERATION_UNMUTE: return EAurixModerationAction::Unmute;
+	case AURIX_MODERATION_KICK:
+	default: return EAurixModerationAction::Kick;
+	}
+}
+
+AurixModerationAction FromModeration(EAurixModerationAction A)
+{
+	switch (A)
+	{
+	case EAurixModerationAction::Mute: return AURIX_MODERATION_MUTE;
+	case EAurixModerationAction::Unmute: return AURIX_MODERATION_UNMUTE;
+	case EAurixModerationAction::Kick:
+	default: return AURIX_MODERATION_KICK;
+	}
+}
+
+AurixTtsDestination FromTtsDestination(EAurixTtsDestination D)
+{
+	switch (D)
+	{
+	case EAurixTtsDestination::Channel: return AURIX_TTS_CHANNEL;
+	case EAurixTtsDestination::Local: return AURIX_TTS_LOCAL;
+	case EAurixTtsDestination::Both:
+	default: return AURIX_TTS_BOTH;
+	}
+}
+
+EAurixTtsState ToTtsState(AurixTtsState S)
+{
+	switch (S)
+	{
+	case AURIX_TTS_PLAYING: return EAurixTtsState::Playing;
+	case AURIX_TTS_FINISHED: return EAurixTtsState::Finished;
+	case AURIX_TTS_CANCELLED: return EAurixTtsState::Cancelled;
+	case AURIX_TTS_FAILED: return EAurixTtsState::Failed;
+	case AURIX_TTS_QUEUED:
+	default: return EAurixTtsState::Queued;
+	}
+}
+
+FAurixSessionInfo ToSession(const AurixSessionInfo& S)
+{
+	FAurixSessionInfo Out;
+	Out.SessionId = ToGuid(S.session_id);
+	Out.UserId = ToGuid(S.user_id);
+	Out.Ssrc = static_cast<int64>(S.ssrc);
+	Out.ResumeGraceMs = static_cast<int32>(S.resume_grace_ms);
+	Out.bResumed = S.resumed;
+	return Out;
+}
+
+FAurixParticipant ToParticipant(const AurixParticipant& P)
+{
+	FAurixParticipant Out;
+	Out.UserId = ToGuid(P.user_id);
+	Out.DisplayName = FromUtf8(P.display_name);
+	Out.Ssrc = static_cast<int64>(P.ssrc);
+	Out.Role = ToRole(P.role);
+	Out.bMuted = P.muted;
+	Out.bServerMuted = P.server_muted;
+	Out.bSpeaking = P.speaking;
+	Out.Energy = P.energy;
+	return Out;
+}
+
+TArray<FAurixParticipant> ToParticipants(const std::vector<AurixParticipant>& In)
+{
+	TArray<FAurixParticipant> Out;
+	Out.Reserve(static_cast<int32>(In.size()));
+	for (const AurixParticipant& P : In)
+	{
+		Out.Add(ToParticipant(P));
+	}
+	return Out;
+}
+
+FAurixStats ToStats(const AurixStats& S)
+{
+	FAurixStats Out;
+	Out.PacketsSent = static_cast<int64>(S.packets_sent);
+	Out.BytesSent = static_cast<int64>(S.bytes_sent);
+	Out.PacketsReceived = static_cast<int64>(S.packets_received);
+	Out.BytesReceived = static_cast<int64>(S.bytes_received);
+	Out.AudioFramesReceived = static_cast<int64>(S.audio_frames_received);
+	Out.BadAuth = static_cast<int64>(S.bad_auth);
+	Out.Replayed = static_cast<int64>(S.replayed);
+	Out.HeartbeatsLost = static_cast<int64>(S.heartbeats_lost);
+	Out.RttMs = S.rtt_ms;
+	Out.JitterMs = S.jitter_ms;
+	Out.LossPercent = S.loss_percent;
+	Out.FramesEncoded = static_cast<int64>(S.frames_encoded);
+	Out.FramesSent = static_cast<int64>(S.frames_sent);
+	Out.FramesGated = static_cast<int64>(S.frames_gated);
+	Out.ActiveStreams = static_cast<int32>(S.active_streams);
+	return Out;
+}
+
+const TCHAR* ResultName(AurixResult R)
+{
+	switch (R)
+	{
+	case AURIX_OK: return TEXT("ok");
+	case AURIX_NULL_POINTER: return TEXT("null pointer");
+	case AURIX_INVALID_ARGUMENT: return TEXT("invalid argument");
+	case AURIX_NOT_CONNECTED: return TEXT("not connected");
+	case AURIX_CLOSED: return TEXT("closed");
+	case AURIX_TRANSPORT: return TEXT("transport");
+	case AURIX_UNAUTHORIZED: return TEXT("unauthorized");
+	case AURIX_TIMEOUT: return TEXT("timeout");
+	case AURIX_SERVER_REJECTED: return TEXT("server rejected");
+	case AURIX_CODEC: return TEXT("codec");
+	case AURIX_PROTOCOL: return TEXT("protocol");
+	default: return TEXT("unknown");
+	}
+}
+
+bool Check(AurixResult R, const TCHAR* What)
+{
+	if (R == AURIX_OK)
+	{
+		return true;
+	}
+	UE_LOG(LogAurixVoice, Warning, TEXT("%s failed (%s): %s"), What, ResultName(R), *FromUtf8(aurix_last_error()));
+	return false;
+}
+} // namespace
+
+UAurixVoiceSubsystem::UAurixVoiceSubsystem() = default;
+UAurixVoiceSubsystem::~UAurixVoiceSubsystem() = default;
+
+void UAurixVoiceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+	PostLoadMapHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(this, &UAurixVoiceSubsystem::OnPostLoadMap);
+}
+
+void UAurixVoiceSubsystem::Deinitialize()
+{
+	FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapHandle);
+	ReleaseNative();
+	Super::Deinitialize();
+}
+
+bool UAurixVoiceSubsystem::IsTickable() const
+{
+	return !IsTemplate() && Native.IsValid();
+}
+
+void UAurixVoiceSubsystem::Tick(float /*DeltaTime*/)
+{
+	PumpEvents();
+}
+
+// ---- lifecycle -----------------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
+{
+	ReleaseNative();
+	ActiveSettings = Settings;
+
+	aurix::Config Cfg(ToUtf8(Settings.WebSocketUrl), ToUtf8(Settings.Token));
+	Cfg.raw.auto_reconnect = Settings.bAutoReconnect;
+	Cfg.raw.reconnect_max_attempts = static_cast<uint32_t>(FMath::Max(0, Settings.ReconnectMaxAttempts));
+	Cfg.raw.reconnect_initial_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectInitialDelayMs));
+	Cfg.raw.reconnect_max_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectMaxDelayMs));
+	Cfg.raw.request_timeout_ms = static_cast<uint32_t>(FMath::Max(1, Settings.RequestTimeoutMs));
+	Cfg.raw.bitrate_bps = static_cast<uint32_t>(FMath::Max(1, Settings.BitrateBps));
+	Cfg.raw.jitter_target_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterTargetFrames));
+	Cfg.raw.jitter_max_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterMaxFrames));
+	Cfg.raw.vad_gate = Settings.bVadGate;
+
+	TUniquePtr<FAurixNativeClient> Created = MakeUnique<FAurixNativeClient>();
+	Created->Client = aurix::Client::create(Cfg);
+	if (!Created->Client)
+	{
+		UE_LOG(LogAurixVoice, Error, TEXT("aurix_client_create failed: %s"), *FromUtf8(aurix_last_error()));
+		return false;
+	}
+	if (!Check(Created->Client.connect(), TEXT("connect")))
+	{
+		return false;
+	}
+	Native = MoveTemp(Created);
+
+	if (Settings.bAutoStartPlayback)
+	{
+		StartPlayback();
+	}
+	return true;
+}
+
+void UAurixVoiceSubsystem::Disconnect()
+{
+	ReleaseNative();
+}
+
+void UAurixVoiceSubsystem::ReleaseNative()
+{
+	bPlaybackRequested = false;
+	if (Capture)
+	{
+		Capture->Stop();
+	}
+	if (SoundWave)
+	{
+		SoundWave->SetClient(nullptr);
+	}
+	if (PlaybackComponent)
+	{
+		PlaybackComponent->Stop();
+	}
+	if (Native)
+	{
+		// Destroying the wrapper disconnects (brief wait for the server's ack) and frees the client.
+		Native.Reset();
+	}
+}
+
+bool UAurixVoiceSubsystem::SetToken(const FString& Token)
+{
+	ActiveSettings.Token = Token;
+	if (!Native)
+	{
+		return true;
+	}
+	return Check(Native->Client.set_token(ToUtf8(Token)), TEXT("set_token"));
+}
+
+EAurixConnectionState UAurixVoiceSubsystem::GetConnectionState() const
+{
+	return Native ? ToState(Native->Client.state()) : EAurixConnectionState::Disconnected;
+}
+
+bool UAurixVoiceSubsystem::IsConnected() const
+{
+	const EAurixConnectionState S = GetConnectionState();
+	return S == EAurixConnectionState::Connected || S == EAurixConnectionState::MediaBound;
+}
+
+bool UAurixVoiceSubsystem::GetSession(FAurixSessionInfo& OutSession) const
+{
+	AurixSessionInfo Raw;
+	if (!Native || !Native->Client.session(Raw))
+	{
+		OutSession = FAurixSessionInfo();
+		return false;
+	}
+	OutSession = ToSession(Raw);
+	return true;
+}
+
+FString UAurixVoiceSubsystem::GetLastError() const
+{
+	return FromUtf8(aurix_last_error());
+}
+
+FString UAurixVoiceSubsystem::GetNativeVersion()
+{
+	return FromUtf8(aurix_version());
+}
+
+// ---- channels ------------------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::JoinChannel(FGuid ChannelId, const FString& JoinToken, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string Token = ToUtf8(JoinToken);
+	const bool bOk = Check(Native->Client.join_channel(ToUuid(ChannelId), JoinToken.IsEmpty() ? nullptr : Token.c_str(), &Id), TEXT("join_channel"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::LeaveChannel(FGuid ChannelId)
+{
+	return Native && Check(Native->Client.leave_channel(ToUuid(ChannelId)), TEXT("leave_channel"));
+}
+
+TArray<FGuid> UAurixVoiceSubsystem::GetJoinedChannels() const
+{
+	TArray<FGuid> Out;
+	if (Native)
+	{
+		for (const aurix::Uuid& U : Native->Client.joined_channels())
+		{
+			Out.Add(ToGuid(U.raw));
+		}
+	}
+	return Out;
+}
+
+TArray<FAurixParticipant> UAurixVoiceSubsystem::GetParticipants(FGuid ChannelId) const
+{
+	return Native ? ToParticipants(Native->Client.participants(ToUuid(ChannelId))) : TArray<FAurixParticipant>();
+}
+
+bool UAurixVoiceSubsystem::GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const
+{
+	OutUserId.Invalidate();
+	aurix::Uuid U;
+	if (!Native || Ssrc < 0 || Ssrc > static_cast<int64>(MAX_uint32) || !Native->Client.user_for_ssrc(static_cast<uint32_t>(Ssrc), U))
+	{
+		return false;
+	}
+	OutUserId = ToGuid(U.raw);
+	return true;
+}
+
+// ---- microphone ----------------------------------------------------------------------------
+
+TArray<FString> UAurixVoiceSubsystem::GetCaptureDevices()
+{
+	return FAurixAudioCapture::ListDevices();
+}
+
+bool UAurixVoiceSubsystem::StartCapture(int32 DeviceIndex)
+{
+	if (!Native)
+	{
+		UE_LOG(LogAurixVoice, Warning, TEXT("StartCapture: not connected"));
+		return false;
+	}
+	if (!Capture)
+	{
+		Capture = MakeUnique<FAurixAudioCapture>();
+	}
+	Native->Client.reset_capture();
+	return Capture->Start(Native->Client.raw(), DeviceIndex);
+}
+
+void UAurixVoiceSubsystem::StopCapture()
+{
+	if (Capture)
+	{
+		Capture->Stop();
+	}
+}
+
+bool UAurixVoiceSubsystem::IsCapturing() const
+{
+	return Capture && Capture->IsCapturing();
+}
+
+void UAurixVoiceSubsystem::PushCaptureAudio(const TArray<float>& InterleavedPcm, int32 SampleRate, int32 Channels)
+{
+	if (Native && SampleRate > 0 && Channels > 0 && Channels <= 255 && InterleavedPcm.Num() > 0)
+	{
+		Native->Client.push_capture(InterleavedPcm.GetData(), static_cast<size_t>(InterleavedPcm.Num()), static_cast<uint32_t>(SampleRate), static_cast<uint8_t>(Channels));
+	}
+}
+
+void UAurixVoiceSubsystem::SetMuted(bool bMuted)
+{
+	if (Native)
+	{
+		Native->Client.set_muted(bMuted);
+	}
+}
+
+bool UAurixVoiceSubsystem::IsMuted() const
+{
+	return Native && Native->Client.is_muted();
+}
+
+bool UAurixVoiceSubsystem::IsSpeaking() const
+{
+	return Native && Native->Client.is_speaking();
+}
+
+void UAurixVoiceSubsystem::SetInputGain(float Gain)
+{
+	if (Native)
+	{
+		Native->Client.set_input_gain(Gain);
+	}
+}
+
+float UAurixVoiceSubsystem::GetInputEnergy() const
+{
+	return Native ? Native->Client.input_energy() : 0.f;
+}
+
+void UAurixVoiceSubsystem::SetVoiceActivityDetector(float Threshold, int32 HangoverFrames)
+{
+	if (Native)
+	{
+		Native->Client.set_vad(Threshold, static_cast<uint32_t>(FMath::Max(0, HangoverFrames)));
+	}
+}
+
+void UAurixVoiceSubsystem::SetVadGate(bool bEnabled)
+{
+	if (Native)
+	{
+		Native->Client.set_vad_gate(bEnabled);
+	}
+}
+
+bool UAurixVoiceSubsystem::SetBitrate(int32 BitrateBps)
+{
+	return Native && BitrateBps > 0 && Check(Native->Client.set_bitrate(static_cast<uint32_t>(BitrateBps)), TEXT("set_bitrate"));
+}
+
+// ---- playback ------------------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::StartPlayback()
+{
+	bPlaybackRequested = true;
+	if (!Native)
+	{
+		return false;
+	}
+	UGameInstance* GameInstance = GetGameInstance();
+	UWorld* World = GameInstance ? GameInstance->GetWorld() : nullptr;
+	if (!World)
+	{
+		// No world yet (Connect called during startup): OnPostLoadMap retries.
+		return false;
+	}
+	if (!SoundWave)
+	{
+		SoundWave = NewObject<UAurixVoiceSoundWave>(this, TEXT("AurixVoiceMix"));
+	}
+	SoundWave->SoundClassObject = ActiveSettings.PlaybackSoundClass;
+	SoundWave->SetClient(Native->Client.raw());
+
+	if (!IsValid(PlaybackComponent))
+	{
+		PlaybackComponent = nullptr;
+		PlaybackComponent = UGameplayStatics::CreateSound2D(World, SoundWave, 1.f, 1.f, 0.f, nullptr, /*bPersistAcrossLevelTransition*/ true, /*bAutoDestroy*/ false);
+		if (!PlaybackComponent)
+		{
+			UE_LOG(LogAurixVoice, Warning, TEXT("StartPlayback: CreateSound2D failed (no audio device?)"));
+			return false;
+		}
+		PlaybackComponent->bIsUISound = true;
+		PlaybackComponent->bAllowSpatialization = false;
+		PlaybackComponent->bAutoDestroy = false;
+	}
+	if (!PlaybackComponent->IsPlaying())
+	{
+		PlaybackComponent->Play();
+	}
+	return true;
+}
+
+void UAurixVoiceSubsystem::StopPlayback()
+{
+	bPlaybackRequested = false;
+	if (PlaybackComponent)
+	{
+		PlaybackComponent->Stop();
+	}
+	if (SoundWave)
+	{
+		SoundWave->SetClient(nullptr);
+	}
+}
+
+void UAurixVoiceSubsystem::OnPostLoadMap(UWorld* /*LoadedWorld*/)
+{
+	if (bPlaybackRequested && Native)
+	{
+		StartPlayback();
+	}
+}
+
+int32 UAurixVoiceSubsystem::MixOutputAudio(TArray<float>& InterleavedPcm, int32 Channels)
+{
+	if (!Native || Channels < 1 || Channels > 2 || InterleavedPcm.Num() == 0)
+	{
+		return 0;
+	}
+	return static_cast<int32>(Native->Client.mix_output(InterleavedPcm.GetData(), static_cast<size_t>(InterleavedPcm.Num()), static_cast<uint8_t>(Channels)));
+}
+
+void UAurixVoiceSubsystem::SetOutputVolume(float Volume)
+{
+	if (Native)
+	{
+		Native->Client.set_output_volume(Volume);
+	}
+}
+
+void UAurixVoiceSubsystem::SetOutputMuted(bool bMuted)
+{
+	if (Native)
+	{
+		Native->Client.set_output_muted(bMuted);
+	}
+}
+
+// ---- receiver preferences ------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::SetParticipantMuted(FGuid UserId, FGuid ChannelId, bool bMuted)
+{
+	if (!Native)
+	{
+		return false;
+	}
+	const aurix::Uuid Channel = ToUuid(ChannelId);
+	return Check(Native->Client.set_participant_mute(ToUuid(UserId), ChannelId.IsValid() ? &Channel : nullptr, bMuted), TEXT("set_participant_mute"));
+}
+
+bool UAurixVoiceSubsystem::SetParticipantVolume(FGuid UserId, float Volume)
+{
+	return Native && Check(Native->Client.set_participant_volume(ToUuid(UserId), Volume), TEXT("set_participant_volume"));
+}
+
+bool UAurixVoiceSubsystem::SetUserBlocked(FGuid UserId, bool bBlocked)
+{
+	return Native && Check(Native->Client.set_user_block(ToUuid(UserId), bBlocked), TEXT("set_user_block"));
+}
+
+bool UAurixVoiceSubsystem::SetTransmission(EAurixTransmissionMode Mode, FGuid ChannelId)
+{
+	if (!Native)
+	{
+		return false;
+	}
+	const aurix::Uuid Channel = ToUuid(ChannelId);
+	return Check(Native->Client.set_transmission(FromTransmission(Mode), ChannelId.IsValid() ? &Channel : nullptr), TEXT("set_transmission"));
+}
+
+bool UAurixVoiceSubsystem::SetChannelFocus(FGuid ChannelId)
+{
+	if (!Native)
+	{
+		return false;
+	}
+	const aurix::Uuid Channel = ToUuid(ChannelId);
+	return Check(Native->Client.set_channel_focus(ChannelId.IsValid() ? &Channel : nullptr), TEXT("set_channel_focus"));
+}
+
+bool UAurixVoiceSubsystem::SetTranscripts(bool bEnabled)
+{
+	return Native && Check(Native->Client.set_transcripts(bEnabled), TEXT("set_transcripts"));
+}
+
+// ---- positional audio ----------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::UpdatePositions(FGuid ChannelId, const TArray<FAurixPosition>& Positions)
+{
+	if (!Native || Positions.Num() == 0)
+	{
+		return false;
+	}
+	std::vector<AurixPosition> Raw;
+	Raw.reserve(static_cast<size_t>(Positions.Num()));
+	for (const FAurixPosition& P : Positions)
+	{
+		AurixPosition R;
+		R.user_id = ToUuid(P.UserId).raw;
+		R.x = static_cast<float>(P.Location.X);
+		R.y = static_cast<float>(P.Location.Y);
+		R.z = static_cast<float>(P.Location.Z);
+		R.forward_x = static_cast<float>(P.Forward.X);
+		R.forward_y = static_cast<float>(P.Forward.Y);
+		R.forward_z = static_cast<float>(P.Forward.Z);
+		R.up_x = static_cast<float>(P.Up.X);
+		R.up_y = static_cast<float>(P.Up.Y);
+		R.up_z = static_cast<float>(P.Up.Z);
+		Raw.push_back(R);
+	}
+	return Check(Native->Client.update_positions(ToUuid(ChannelId), Raw.data(), Raw.size()), TEXT("update_positions"));
+}
+
+bool UAurixVoiceSubsystem::UpdateOwnPosition(FGuid ChannelId, FVector Location, FRotator Rotation, float WorldToMeters)
+{
+	FAurixSessionInfo Session;
+	if (!GetSession(Session) || !Session.UserId.IsValid() || WorldToMeters <= 0.f)
+	{
+		return false;
+	}
+	FAurixPosition P;
+	P.UserId = Session.UserId;
+	P.Location = Location / WorldToMeters;
+	P.Forward = Rotation.Vector();
+	P.Up = Rotation.RotateVector(FVector::UpVector);
+	return UpdatePositions(ChannelId, {P});
+}
+
+// ---- recording / raw -----------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::RespondRecordingConsent(FGuid RecordingId, bool bAccept)
+{
+	return Native && Check(Native->Client.respond_recording_consent(ToUuid(RecordingId), bAccept ? AURIX_CONSENT_ACCEPTED : AURIX_CONSENT_DECLINED), TEXT("respond_recording_consent"));
+}
+
+bool UAurixVoiceSubsystem::SendControlJson(const FString& Json)
+{
+	return Native && Check(Native->Client.send_control_json(ToUtf8(Json)), TEXT("send_control_json"));
+}
+
+// ---- chat / moderation / speech ------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::Moderate(FGuid ChannelId, FGuid UserId, EAurixModerationAction Action, const FString& ActionToken, const FString& Reason, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string ReasonUtf8 = ToUtf8(Reason);
+	const bool bOk = Check(
+		Native->Client.moderate(ToUuid(ChannelId), ToUuid(UserId), FromModeration(Action), ToUtf8(ActionToken), Reason.IsEmpty() ? nullptr : ReasonUtf8.c_str(), &Id),
+		TEXT("moderate"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::SendChat(FGuid ChannelId, const FString& Text, const FString& MetadataJson, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string Meta = ToUtf8(MetadataJson);
+	const bool bOk = Check(Native->Client.send_chat(ToUuid(ChannelId), ToUtf8(Text), MetadataJson.IsEmpty() ? nullptr : Meta.c_str(), &Id), TEXT("send_chat"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::SendDirectChat(FGuid UserId, const FString& Text, const FString& MetadataJson, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string Meta = ToUtf8(MetadataJson);
+	const bool bOk = Check(Native->Client.send_direct_chat(ToUuid(UserId), ToUtf8(Text), MetadataJson.IsEmpty() ? nullptr : Meta.c_str(), &Id), TEXT("send_direct_chat"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::SetTyping(FGuid ChannelId, bool bTyping)
+{
+	return Native && Check(Native->Client.set_typing(ToUuid(ChannelId), bTyping), TEXT("set_typing"));
+}
+
+bool UAurixVoiceSubsystem::Speak(const FString& Text, FGuid ChannelId, EAurixTtsDestination Destination, const FString& Voice, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const aurix::Uuid Channel = ToUuid(ChannelId);
+	const std::string VoiceUtf8 = ToUtf8(Voice);
+	const bool bOk = Check(
+		Native->Client.speak(ToUtf8(Text), ChannelId.IsValid() ? &Channel : nullptr, FromTtsDestination(Destination), Voice.IsEmpty() ? nullptr : VoiceUtf8.c_str(), &Id),
+		TEXT("speak"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::CancelSpeech()
+{
+	return Native && Check(Native->Client.cancel_speech(), TEXT("cancel_speech"));
+}
+
+bool UAurixVoiceSubsystem::GetStats(FAurixStats& OutStats) const
+{
+	AurixStats Raw;
+	if (!Native || !Native->Client.stats(Raw))
+	{
+		OutStats = FAurixStats();
+		return false;
+	}
+	OutStats = ToStats(Raw);
+	return true;
+}
+
+// ---- conversions ---------------------------------------------------------------------------
+
+bool UAurixVoiceSubsystem::ParseUuid(const FString& Text, FGuid& OutGuid)
+{
+	aurix::Uuid U;
+	if (!aurix::Uuid::parse(ToUtf8(Text), U))
+	{
+		OutGuid.Invalidate();
+		return false;
+	}
+	OutGuid = ToGuid(U.raw);
+	return true;
+}
+
+FString UAurixVoiceSubsystem::FormatUuid(FGuid Guid)
+{
+	return FromUtf8(ToUuid(Guid).str().c_str());
+}
+
+// ---- events --------------------------------------------------------------------------------
+
+void UAurixVoiceSubsystem::PumpEvents()
+{
+	for (int32 i = 0; i < MaxEventsPerTick && Native; ++i)
+	{
+		aurix::Event Event = Native->Client.poll_event();
+		if (!Event)
+		{
+			break;
+		}
+		// A handler may call Disconnect(); `Event` owns its memory independently of the client.
+		DispatchEvent(Event.raw());
+	}
+}
+
+void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
+{
+	const AurixEventType Type = aurix_event_type(Raw);
+	const FGuid ChannelId = ToGuid(aurix_event_channel_id(Raw));
+	const FGuid UserId = ToGuid(aurix_event_user_id(Raw));
+
+	if (OnRawEvent.IsBound())
+	{
+		OnRawEvent.Broadcast(FromUtf8(aurix_event_json(Raw)));
+	}
+
+	switch (Type)
+	{
+	case AURIX_EVENT_STATE_CHANGED:
+		OnConnectionStateChanged.Broadcast(ToState(aurix_event_state(Raw)));
+		break;
+
+	case AURIX_EVENT_SESSION_READY:
+	{
+		AurixSessionInfo Info;
+		if (aurix_event_session(Raw, &Info))
+		{
+			if (ActiveSettings.bAutoStartCapture && !IsCapturing())
+			{
+				StartCapture(ActiveSettings.CaptureDeviceIndex);
+			}
+			if (bPlaybackRequested && (!PlaybackComponent || !PlaybackComponent->IsPlaying()))
+			{
+				StartPlayback();
+			}
+			OnSessionReady.Broadcast(ToSession(Info));
+		}
+		break;
+	}
+
+	case AURIX_EVENT_MEDIA_BOUND:
+		OnMediaBound.Broadcast();
+		break;
+
+	case AURIX_EVENT_CHANNEL_JOINED:
+	{
+		const size_t Count = aurix_event_participant_count(Raw);
+		TArray<FAurixParticipant> Participants;
+		Participants.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; i < Count; ++i)
+		{
+			AurixParticipant P;
+			if (aurix_event_participant(Raw, i, &P))
+			{
+				Participants.Add(ToParticipant(P));
+			}
+		}
+		OnChannelJoined.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), ChannelId, Participants, aurix_event_flag(Raw));
+		break;
+	}
+
+	case AURIX_EVENT_CHANNEL_LEFT:
+		OnChannelLeft.Broadcast(ChannelId);
+		break;
+
+	case AURIX_EVENT_PARTICIPANT_JOINED:
+	{
+		AurixParticipant P;
+		if (aurix_event_participant(Raw, 0, &P))
+		{
+			OnParticipantJoined.Broadcast(ChannelId, ToParticipant(P));
+		}
+		break;
+	}
+
+	case AURIX_EVENT_PARTICIPANT_LEFT:
+		OnParticipantLeft.Broadcast(ChannelId, UserId);
+		break;
+
+	case AURIX_EVENT_PARTICIPANT_MUTE_CHANGED:
+		OnParticipantMuteChanged.Broadcast(ChannelId, UserId, aurix_event_flag(Raw), aurix_event_flag2(Raw));
+		break;
+
+	case AURIX_EVENT_PARTICIPANT_SPEAKING:
+		OnParticipantSpeaking.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_CHANNEL_ENERGY:
+	{
+		const size_t Count = aurix_event_participant_count(Raw);
+		TArray<FAurixParticipant> Levels;
+		Levels.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; i < Count; ++i)
+		{
+			AurixParticipant P;
+			if (aurix_event_participant(Raw, i, &P))
+			{
+				FAurixParticipant Level;
+				Level.UserId = ToGuid(P.user_id);
+				Level.Energy = P.energy;
+				Levels.Add(Level);
+			}
+		}
+		OnChannelEnergy.Broadcast(ChannelId, Levels);
+		break;
+	}
+
+	case AURIX_EVENT_LOCAL_SPEAKING:
+		OnLocalSpeaking.Broadcast(aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_TRANSMISSION_CHANGED:
+		OnTransmissionChanged.Broadcast(ToTransmission(aurix_event_transmission(Raw)), ChannelId);
+		break;
+
+	case AURIX_EVENT_CHANNEL_FOCUS_CHANGED:
+		OnChannelFocusChanged.Broadcast(ChannelId);
+		break;
+
+	case AURIX_EVENT_USER_BLOCK_CHANGED:
+		OnUserBlockChanged.Broadcast(UserId, aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_RECORDING:
+		OnRecording.Broadcast(ChannelId, ToGuid(aurix_event_object_id(Raw)), aurix_event_flag(Raw), UserId);
+		break;
+
+	case AURIX_EVENT_BITRATE_CHANGED:
+		OnBitrateChanged.Broadcast(static_cast<int32>(aurix_event_number(Raw)), FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_KICKED:
+		OnKicked.Broadcast(ChannelId, FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_MODERATION_APPLIED:
+		OnModerationApplied.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), ChannelId, UserId, ToModeration(aurix_event_moderation_action(Raw)));
+		break;
+
+	case AURIX_EVENT_CHAT_MESSAGE:
+	{
+		AurixChatMessage M;
+		if (aurix_event_chat(Raw, &M))
+		{
+			FAurixChatMessage Out;
+			Out.MessageId = ToGuid(M.message_id);
+			Out.ChannelId = ToGuid(M.channel_id);
+			Out.SenderId = ToGuid(M.sender_id);
+			Out.RecipientId = ToGuid(M.recipient_id);
+			Out.SenderName = FromUtf8(M.sender_name);
+			Out.Text = FromUtf8(M.text);
+			Out.MetadataJson = FromUtf8(M.metadata_json);
+			Out.SentAt = FromUnixMs(M.sent_at_ms);
+			Out.RequestId = static_cast<int64>(M.request_id);
+			OnChatMessage.Broadcast(Out);
+		}
+		break;
+	}
+
+	case AURIX_EVENT_PARTICIPANT_TYPING:
+		OnParticipantTyping.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_TRANSCRIPT:
+	{
+		AurixTranscript T;
+		if (aurix_event_transcript(Raw, &T))
+		{
+			FAurixTranscript Out;
+			Out.ChannelId = ToGuid(T.channel_id);
+			Out.UserId = ToGuid(T.user_id);
+			Out.Text = FromUtf8(T.text);
+			Out.Language = FromUtf8(T.language);
+			Out.StartedAt = FromUnixMs(T.started_at_ms);
+			Out.DurationMs = static_cast<int32>(T.duration_ms);
+			OnTranscript.Broadcast(Out);
+		}
+		break;
+	}
+
+	case AURIX_EVENT_TTS_STATUS:
+	{
+		AurixTtsStatus S;
+		if (aurix_event_tts(Raw, &S))
+		{
+			FAurixTtsStatus Out;
+			Out.RequestId = static_cast<int64>(S.request_id);
+			Out.ServerRequestId = ToGuid(S.server_request_id);
+			Out.State = ToTtsState(S.state);
+			Out.DurationMs = static_cast<int32>(S.duration_ms);
+			Out.Message = FromUtf8(S.message);
+			OnTtsStatus.Broadcast(Out);
+		}
+		break;
+	}
+
+	case AURIX_EVENT_POSITIONS:
+		// Only exposed through OnRawEvent (JSON); games already know their own positions.
+		break;
+
+	case AURIX_EVENT_REJOIN_FAILED:
+		OnRejoinFailed.Broadcast(ChannelId, FromUtf8(aurix_event_code(Raw)), FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_REQUEST_FAILED:
+		OnRequestFailed.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), FromUtf8(aurix_event_code(Raw)), FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_SERVER_ERROR:
+		OnServerError.Broadcast(FromUtf8(aurix_event_code(Raw)), FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_RECOVERING:
+		OnRecovering.Broadcast(static_cast<int32>(aurix_event_number(Raw)), static_cast<int32>(aurix_event_number2(Raw)), FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_RECOVERED:
+		OnRecovered.Broadcast(aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_FAILED_TO_RECOVER:
+		OnFailedToRecover.Broadcast(FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_DISCONNECTED:
+		StopCapture();
+		OnDisconnected.Broadcast(FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	default:
+		UE_LOG(LogAurixVoice, Verbose, TEXT("unhandled native event %d"), static_cast<int32>(Type));
+		break;
+	}
+}

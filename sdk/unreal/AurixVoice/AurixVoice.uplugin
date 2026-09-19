@@ -1,0 +1,32 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "Aurix Voice",
+  "Description": "Self-hosted game voice chat (Aurix): encrypted native AURX audio over UDP, WebSocket control plane, positional audio, text chat, moderation, transcripts and TTS. Wraps the aurix-client C ABI.",
+  "Category": "Audio",
+  "CreatedBy": "Aurix contributors",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "EngineVersion": "5.3.0",
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "AurixVoice",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": ["Win64", "Linux", "Mac"]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "AudioCapture",
+      "Enabled": true
+    }
+  ]
+}

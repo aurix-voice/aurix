@@ -4,3 +4,9 @@ recordings/
 .env
 .env.*
 !.env.example
+
+# Unreal plugin: native artifacts staged by sdk/unreal/scripts/build_native.*, engine build output
+sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/include/
+sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/
+sdk/unreal/AurixVoice/Binaries/
+sdk/unreal/AurixVoice/Intermediate/
