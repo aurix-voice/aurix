@@ -248,6 +248,17 @@ impl AurixConfig {
                 _ => {}
             }
         }
+        if self.recording.live.enabled {
+            if self.recording.live.max_per_channel == 0 || self.recording.live.max_per_app == 0 {
+                anyhow::bail!("recording.live.max_per_channel/max_per_app must be >= 1");
+            }
+            if self.recording.live.queue_frames < 16 {
+                anyhow::bail!("recording.live.queue_frames must be >= 16");
+            }
+            if self.recording.live.connect_timeout_ms < 100 {
+                anyhow::bail!("recording.live.connect_timeout_ms must be >= 100");
+            }
+        }
 
         if self.is_production() {
             if self.auth.jwt_public_key_path.is_none() {
@@ -668,6 +679,11 @@ pub struct RecordingConfig {
     /// Require explicit consent from every participant before their audio is written.
     #[serde(default = "default_true")]
     pub require_consent: bool,
+    /// Live audio taps: stream a channel's Opus/PCM frames to an operator service in real time
+    /// (WebSocket pull from the node, or push to a `wss://` URL) instead of, or in addition to,
+    /// writing files.
+    #[serde(default)]
+    pub live: LiveStreamConfig,
 }
 
 impl Default for RecordingConfig {
@@ -685,7 +701,91 @@ impl Default for RecordingConfig {
             s3_access_key: None,
             s3_secret_key: None,
             require_consent: true,
+            live: LiveStreamConfig::default(),
         }
+    }
+}
+
+/// `[recording.live]` — real-time audio streams out of a node. Consent rules are the same as for
+/// file recordings (`recording.require_consent`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LiveStreamConfig {
+    /// Master switch for `GET /v1/channels/:id/audio/streams/pull` and `POST …/audio/streams`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Concurrent live streams per channel on one node.
+    #[serde(default = "default_live_max_per_channel")]
+    pub max_per_channel: u32,
+    /// Concurrent live streams per application on one node.
+    #[serde(default = "default_live_max_per_app")]
+    pub max_per_app: u32,
+    /// Frames buffered per stream while the consumer is slow; older frames are dropped (and the
+    /// consumer told how many) rather than stalling the media path. 20 ms per frame per talker.
+    #[serde(default = "default_live_queue_frames")]
+    pub queue_frames: usize,
+    /// Hard stop for a live stream (0 = only `recording.max_recording_duration_secs` applies).
+    #[serde(default)]
+    pub max_duration_secs: u64,
+    /// Allow `format=pcm_s16le` (decoded on the node; ~1 Opus decoder per active talker).
+    #[serde(default = "default_true")]
+    pub allow_pcm: bool,
+    /// Allow push streams (the node dials out to an operator WebSocket URL).
+    #[serde(default = "default_true")]
+    pub push_enabled: bool,
+    /// Push URLs may point at private/loopback addresses (default: only outside production).
+    #[serde(default)]
+    pub allow_private_urls: Option<bool>,
+    /// Push URLs must be `wss://` (default: required in production).
+    #[serde(default)]
+    pub require_tls: Option<bool>,
+    #[serde(default = "default_live_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Reconnect attempts (exponential backoff from 1 s) before a push stream is given up.
+    #[serde(default = "default_live_max_reconnects")]
+    pub max_reconnects: u32,
+}
+
+fn default_live_max_per_channel() -> u32 {
+    4
+}
+fn default_live_max_per_app() -> u32 {
+    64
+}
+fn default_live_queue_frames() -> usize {
+    512
+}
+fn default_live_connect_timeout_ms() -> u64 {
+    5000
+}
+fn default_live_max_reconnects() -> u32 {
+    5
+}
+
+impl Default for LiveStreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_per_channel: default_live_max_per_channel(),
+            max_per_app: default_live_max_per_app(),
+            queue_frames: default_live_queue_frames(),
+            max_duration_secs: 0,
+            allow_pcm: true,
+            push_enabled: true,
+            allow_private_urls: None,
+            require_tls: None,
+            connect_timeout_ms: default_live_connect_timeout_ms(),
+            max_reconnects: default_live_max_reconnects(),
+        }
+    }
+}
+
+impl LiveStreamConfig {
+    pub fn private_urls_allowed(&self, production: bool) -> bool {
+        self.allow_private_urls.unwrap_or(!production)
+    }
+
+    pub fn tls_required(&self, production: bool) -> bool {
+        self.require_tls.unwrap_or(production)
     }
 }
 

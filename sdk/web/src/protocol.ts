@@ -215,7 +215,7 @@ export type ServerMessage =
     }
   | {
       type: 'RecordingNotification';
-      data: { channel_id: string; recording_id: string; active: boolean; initiated_by: string };
+      data: { channel_id: string; recording_id: string; active: boolean; initiated_by: string; live?: boolean };
     }
   | { type: 'Error'; data: { code: string; message: string; client_ref?: string } }
   | { type: 'Kick'; data: { channel_id: string; user_id: string; reason: string } }

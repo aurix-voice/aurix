@@ -57,6 +57,8 @@ namespace Aurix
         public Guid RecordingId;
         public bool Active;
         public Guid InitiatedBy;
+        /// <summary>Real-time stream to an operator service rather than a stored file (same consent flow).</summary>
+        public bool Live;
     }
 
     /// <summary>
@@ -1155,6 +1157,7 @@ namespace Aurix
                     {
                         ChannelId = m.Id("channel_id"), RecordingId = m.Id("recording_id"),
                         Active = m.Bool("active"), InitiatedBy = m.Id("initiated_by"),
+                        Live = m.Bool("live"),
                     });
                     break;
                 case "BitrateCommand":

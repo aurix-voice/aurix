@@ -117,7 +117,8 @@ typedef enum AurixEventType {
    */
   AURIX_EVENT_USER_BLOCK_CHANGED = 13,
   /**
-   * `channel_id`, `recording_id`, `flag` = active, `user_id` = initiator.
+   * `channel_id`, `recording_id`, `flag` = active, `flag2` = live stream (not a stored
+   * file), `user_id` = initiator (zero UUID = operator).
    */
   AURIX_EVENT_RECORDING = 14,
   /**
@@ -567,7 +568,7 @@ struct AurixUuid aurix_event_object_id(const struct AurixEvent *event);
 bool aurix_event_flag(const struct AurixEvent *event);
 
 /**
- * Secondary boolean: `server_muted` for `ParticipantMuteChanged`.
+ * Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`.
  */
 bool aurix_event_flag2(const struct AurixEvent *event);
 

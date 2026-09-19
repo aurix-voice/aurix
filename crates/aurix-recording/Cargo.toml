@@ -28,4 +28,6 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 async-trait = { workspace = true }

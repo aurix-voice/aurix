@@ -381,6 +381,9 @@ impl WsState {
                     session_id,
                     ..
                 } => {
+                    if let Some(rec) = &self.recording {
+                        rec.live().on_participant_left(channel_id, user_id);
+                    }
                     self.broadcast_channel(
                         &channel_id,
                         &ControlMessage::ParticipantLeft {
@@ -568,23 +571,40 @@ impl WsState {
                     recording_id,
                     ..
                 } => {
-                    let initiated_by = self
-                        .recording
-                        .as_ref()
-                        .and_then(|r| {
-                            r.active_in_channel(&channel_id)
-                                .into_iter()
-                                .find(|(id, _)| *id == recording_id)
-                        })
-                        .map(|(_, u)| u)
-                        .unwrap_or(UserId(uuid::Uuid::nil()));
+                    let capture = self.recording.as_ref().and_then(|r| {
+                        r.active_in_channel(&channel_id)
+                            .into_iter()
+                            .find(|c| c.id == recording_id)
+                    });
                     self.broadcast_channel(
                         &channel_id,
                         &ControlMessage::RecordingNotification {
                             channel_id,
                             recording_id,
                             active: true,
-                            initiated_by,
+                            initiated_by: capture
+                                .map(|c| c.initiated_by)
+                                .unwrap_or(UserId(uuid::Uuid::nil())),
+                            live: capture.is_some_and(|c| c.live),
+                        },
+                        None,
+                    );
+                }
+                ServerEvent::LiveStreamStarted {
+                    channel_id,
+                    stream_id,
+                    ..
+                } => {
+                    // Only the node hosting the tap knows the stream; other nodes' members
+                    // of a cascaded channel are still told, so they can respond to consent.
+                    self.broadcast_channel(
+                        &channel_id,
+                        &ControlMessage::RecordingNotification {
+                            channel_id,
+                            recording_id: stream_id,
+                            active: true,
+                            initiated_by: UserId(uuid::Uuid::nil()),
+                            live: true,
                         },
                         None,
                     );
@@ -601,6 +621,45 @@ impl WsState {
                             recording_id,
                             active: false,
                             initiated_by: UserId(uuid::Uuid::nil()),
+                            live: false,
+                        },
+                        None,
+                    );
+                }
+                ServerEvent::RecordingConsentGiven {
+                    app_id,
+                    recording_id,
+                    user_id,
+                    consent,
+                } => {
+                    if let Some(rec) = self.recording.clone() {
+                        tokio::spawn(async move {
+                            match rec
+                                .set_consent(app_id, recording_id, user_id, consent)
+                                .await
+                            {
+                                Ok(()) | Err(AurixError::NotFound(_)) => {}
+                                Err(e) => warn!(
+                                    "Relayed consent for {} from {} rejected: {e}",
+                                    recording_id, user_id
+                                ),
+                            }
+                        });
+                    }
+                }
+                ServerEvent::LiveStreamStopped {
+                    channel_id,
+                    stream_id,
+                    ..
+                } => {
+                    self.broadcast_channel(
+                        &channel_id,
+                        &ControlMessage::RecordingNotification {
+                            channel_id,
+                            recording_id: stream_id,
+                            active: false,
+                            initiated_by: UserId(uuid::Uuid::nil()),
+                            live: true,
                         },
                         None,
                     );
@@ -1381,14 +1440,15 @@ async fn handle_ws_connection(
         )
         .await;
         if let Some(rec) = &state.recording {
-            for (recording_id, initiated_by) in rec.active_in_channel(channel_id) {
+            for capture in rec.active_in_channel(channel_id) {
                 send_msg(
                     &tx,
                     &ControlMessage::RecordingNotification {
                         channel_id: *channel_id,
-                        recording_id,
+                        recording_id: capture.id,
                         active: true,
-                        initiated_by,
+                        initiated_by: capture.initiated_by,
+                        live: capture.live,
                     },
                 )
                 .await;
@@ -1949,14 +2009,15 @@ async fn handle_control_message(
             .await;
             // Active recordings in the channel must be disclosed to the newcomer.
             if let Some(rec) = &state.recording {
-                for (recording_id, initiated_by) in rec.active_in_channel(&channel_id) {
+                for capture in rec.active_in_channel(&channel_id) {
                     send_msg(
                         tx,
                         &ControlMessage::RecordingNotification {
                             channel_id,
-                            recording_id,
+                            recording_id: capture.id,
                             active: true,
-                            initiated_by,
+                            initiated_by: capture.initiated_by,
+                            live: capture.live,
                         },
                     )
                     .await;
@@ -2280,11 +2341,25 @@ async fn handle_control_message(
             let Some(rec) = &state.recording else {
                 return send_error(tx, "INVALID_CONFIG", "Recording is not enabled").await;
             };
-            if let Err(e) = rec
+            match rec
                 .set_consent(token.app_id, recording_id, token.user_id, consent)
                 .await
             {
-                return send_error(tx, e.error_code(), &e.public_message()).await;
+                Ok(()) => {}
+                // The capture lives on another node of a cascaded channel: hand the decision
+                // over the bus; the hosting node applies it.
+                Err(AurixError::NotFound(_)) => {
+                    state
+                        .control
+                        .events
+                        .publish(ServerEvent::RecordingConsentGiven {
+                            app_id: token.app_id,
+                            recording_id,
+                            user_id: token.user_id,
+                            consent,
+                        });
+                }
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
             }
         }
 

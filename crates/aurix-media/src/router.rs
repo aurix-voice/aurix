@@ -431,6 +431,9 @@ impl PacketRouter {
             Some(c) => c.value().clone(),
             None => return Ok(()),
         };
+        if !packet.header.has_flag(PacketFlags::E2ee) {
+            self.tap_sink(&channel, *sender, packet.header.ssrc, packet);
+        }
         let receivers = channel.get_receivers_for_relayed_audio(sender);
         self.deliver(&channel, receivers, packet).await;
         Ok(())
@@ -545,19 +548,32 @@ impl PacketRouter {
         if packet.header.has_flag(PacketFlags::E2ee) {
             return;
         }
+        self.tap_sink(channel, sender.user_id, sender.ssrc, packet);
+        if let Some(ref pipeline) = self.audio_pipeline {
+            pipeline.process_opus_packet(channel, sender.user_id, &packet.payload);
+        }
+    }
+
+    /// Recording / live-stream sink only. Relayed audio from other nodes goes here too so a
+    /// tap sees every participant of a cascaded channel, while transcription stays with the
+    /// node that owns the speaker (each node publishes its own transcripts).
+    fn tap_sink(
+        &self,
+        channel: &Arc<MediaChannel>,
+        user_id: UserId,
+        ssrc: u32,
+        packet: &AurixPacket,
+    ) {
         if let Some(ref sink) = self.audio_sink {
             if sink.wants_channel(&channel.channel_id) {
                 sink.on_audio(
                     channel.channel_id,
-                    sender.user_id,
-                    sender.ssrc,
+                    user_id,
+                    ssrc,
                     packet.header.timestamp,
                     &packet.payload,
                 );
             }
-        }
-        if let Some(ref pipeline) = self.audio_pipeline {
-            pipeline.process_opus_packet(channel, sender.user_id, &packet.payload);
         }
     }
 

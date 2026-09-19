@@ -1,6 +1,7 @@
 use crate::handlers;
 use crate::middleware;
 use crate::state::AppState;
+use crate::streams;
 use crate::webhooks;
 use axum::{
     extract::DefaultBodyLimit,
@@ -172,6 +173,19 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/v1/recordings/:recording_id/stop",
             post(handlers::stop_recording),
+        )
+        .route("/v1/audio/streams", get(streams::list_streams))
+        .route(
+            "/v1/channels/:channel_id/audio/streams",
+            post(streams::create_stream).get(streams::list_channel_streams),
+        )
+        .route(
+            "/v1/channels/:channel_id/audio/streams/pull",
+            get(streams::pull_stream),
+        )
+        .route(
+            "/v1/channels/:channel_id/audio/streams/:stream_id",
+            get(streams::get_stream).delete(streams::delete_stream),
         )
         .route(
             "/v1/webhooks",

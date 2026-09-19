@@ -1681,6 +1681,8 @@ const KNOWN_PERMISSIONS: &[&str] = &[
     "moderation:write",
     "recordings:read",
     "recordings:write",
+    "audio_streams:read",
+    "audio_streams:write",
     "chat:read",
     "chat:write",
     "keys:manage",

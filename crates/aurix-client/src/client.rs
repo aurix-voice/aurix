@@ -1903,11 +1903,13 @@ async fn handle_message(
             recording_id,
             active,
             initiated_by,
+            live,
         } => inner.emit(Event::Recording {
             channel_id,
             recording_id,
             active,
             initiated_by,
+            live,
         }),
         ControlMessage::Kick {
             channel_id,

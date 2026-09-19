@@ -162,13 +162,26 @@ async fn main() -> anyhow::Result<()> {
         info!("Speech-to-text enabled");
     }
 
-    let recording = if config.recording.enabled {
+    let recording = if config.recording.enabled || config.recording.live.enabled {
         let svc = Arc::new(RecordingService::new(
             pool.clone(),
             config.recording.clone(),
+            config.is_production(),
         )?);
         sfu.set_audio_sink(svc.clone());
         control.users.set_media_purger(svc.clone());
+        if config.recording.live.enabled {
+            info!(
+                "Live audio streams enabled (max {}/channel, {}/app, push {})",
+                config.recording.live.max_per_channel,
+                config.recording.live.max_per_app,
+                if config.recording.live.push_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
         Some(svc)
     } else {
         None
@@ -294,7 +307,35 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    if let Some(rec) = recording.clone() {
+    if let Some(rec) = recording.clone().filter(|r| r.live().enabled()) {
+        // Lifecycle notices → tenant events (webhooks/SSE, WS disclosure to channel members).
+        if let Some(mut notices) = rec.live().take_notices() {
+            let events = control.events.clone();
+            let cancel = shutdown.clone();
+            tasks.spawn(async move {
+                loop {
+                    let notice = tokio::select! {
+                        n = notices.recv() => match n { Some(n) => n, None => return },
+                        _ = cancel.cancelled() => return,
+                    };
+                    events.publish(live_stream_event(notice));
+                }
+            });
+        }
+        let cancel = shutdown.clone();
+        tasks.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = cancel.cancelled() => return,
+                }
+                rec.live().enforce_duration_limit();
+            }
+        });
+    }
+
+    if let Some(rec) = recording.clone().filter(|r| r.storage_enabled()) {
         let cancel = shutdown.clone();
         tasks.spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -406,6 +447,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Tell connected players to reconnect elsewhere, then wait (bounded) for tasks to drain.
     ws_state.close_all("server_shutdown");
+    if let Some(rec) = recording.as_ref() {
+        rec.live().close_all("server_shutdown");
+    }
     let drain = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         while tasks.join_next().await.is_some() {}
     });
@@ -452,6 +496,34 @@ fn spawn_http_server(
             error!("{name} server error: {e}");
         }
     });
+}
+
+fn live_stream_event(notice: aurix_recording::live::LiveNotice) -> aurix_control::ServerEvent {
+    use aurix_recording::live::LiveNotice;
+    match notice {
+        LiveNotice::Opened(info) => aurix_control::ServerEvent::LiveStreamStarted {
+            app_id: aurix_common::types::AppId::from_uuid(info.app_id),
+            channel_id: info.channel_id,
+            stream_id: info.id,
+            mode: info.mode.as_str().to_string(),
+            format: info.format.as_str().to_string(),
+            users: info.users,
+            timestamp: info.started_at,
+        },
+        LiveNotice::Closed { info, reason } => aurix_control::ServerEvent::LiveStreamStopped {
+            app_id: aurix_common::types::AppId::from_uuid(info.app_id),
+            channel_id: info.channel_id,
+            stream_id: info.id,
+            reason,
+            duration_secs: (chrono::Utc::now() - info.started_at)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1000.0,
+            frames_sent: info.frames_sent,
+            frames_dropped: info.frames_dropped,
+            timestamp: chrono::Utc::now(),
+        },
+    }
 }
 
 async fn shutdown_signal() {

@@ -606,7 +606,8 @@ pub enum AurixEventType {
     AurixEventChannelFocusChanged = 12,
     /// `user_id`, `flag` = blocked.
     AurixEventUserBlockChanged = 13,
-    /// `channel_id`, `recording_id`, `flag` = active, `user_id` = initiator.
+    /// `channel_id`, `recording_id`, `flag` = active, `flag2` = live stream (not a stored
+    /// file), `user_id` = initiator (zero UUID = operator).
     AurixEventRecording = 14,
     /// `number` = bitrate bps, `message` = reason.
     AurixEventBitrateChanged = 15,
@@ -1067,11 +1068,12 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
     }
 }
 
-/// Secondary boolean: `server_muted` for `ParticipantMuteChanged`.
+/// Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_flag2(event: *const AurixEvent) -> bool {
     match self::event(event).map(|e| &e.event) {
         Some(Event::ParticipantMuteChanged { server_muted, .. }) => *server_muted,
+        Some(Event::Recording { live, .. }) => *live,
         _ => false,
     }
 }

@@ -24,6 +24,7 @@ server = [
     "dep:flume",
     "dep:reqwest",
     "dep:sqlx",
+    "dep:url",
 ]
 
 [dependencies]
@@ -57,3 +58,4 @@ parking_lot = { workspace = true, optional = true }
 flume = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+url = { workspace = true, optional = true }

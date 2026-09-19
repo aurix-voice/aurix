@@ -99,11 +99,13 @@ pub enum Event {
         user_id: UserId,
         blocked: bool,
     },
+    /// `live` = real-time stream to an operator service rather than a stored file.
     Recording {
         channel_id: ChannelId,
         recording_id: uuid::Uuid,
         active: bool,
         initiated_by: UserId,
+        live: bool,
     },
     /// Server asked for a different uplink bitrate; applied automatically to the encoder.
     BitrateChanged {

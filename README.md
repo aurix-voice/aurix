@@ -266,6 +266,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/moderation/{mute-all,kick-all}` | channel-wide server mute / kick of everyone currently present minus `except: [user ids]`; response lists `affected`, `skipped`, `failed`; every target still gets its own `user.muted`/`user.kicked` event and audit entry plus one `channel_mute_all`/`channel_kick_all` summary |
 | API key | `POST /v1/channels/:id/tts`, `GET /v1/tts/voices` | speak a server announcement into a channel with the configured TTS provider (`tts:write`; `{"text":…,"voice":…}` → `request_id`, progress as `tts.status` events) / list voices and limits (see [Transcripts and text-to-speech](#transcripts-and-text-to-speech)) |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
+| API key | `GET /v1/channels/:id/audio/streams/pull` (WebSocket), `POST|GET /v1/channels/:id/audio/streams`, `GET|DELETE …/audio/streams/:sid`, `GET /v1/audio/streams` | real-time audio out of the node — pull it over a WebSocket or have the node push it to yours (`audio_streams:read|write`; see [Live audio streams](#live-audio-streams)) |
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
 | API key | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | live server event stream for game servers (`events:read`) |
@@ -273,7 +274,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 
 API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
 `moderation:read|write`, `recordings:read|write`, `chat:read|write`, `webhooks:read|write`, `events:read`,
-`users:erase|export`, `tts:write`, `keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
+`users:erase|export`, `tts:write`, `audio_streams:read|write`, `keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
 `{"error":{"code":"…","message":"…"}}`.
 
 ### Webhooks and the event stream
@@ -291,7 +292,7 @@ Event types (`GET /v1/webhooks/events` lists them): `channel.created|destroyed|a
 (activated = first participant in, deactivated = last one out — also emitted for channels a
 crashed node left behind), `participant.joined|left|muted|unmuted|kicked`, `user.banned`,
 `user.block_changed`, `moderation.event`, `recording.started|stopped|consent_required`,
-`quality.alert`, `chat.message`. `participant.typing`, `participant.speaking` and `channel.energy`
+`audio_stream.started|stopped`, `quality.alert`, `chat.message`. `participant.typing`, `participant.speaking` and `channel.energy`
 are high-frequency UX signals: SSE delivers them only when named in `?types=`, webhooks refuse them.
 
 **Webhooks.** `POST /v1/webhooks {"url","events":["*"]|[…],"description"}` returns the signing
@@ -481,6 +482,75 @@ channel plays the announcement to its participants on a per-channel system SSRC 
 participant attached), and progress is published as `tts.status` events. `GET /v1/tts/voices`
 lists the configured voices and limits.
 
+### Live audio streams
+
+Besides file recordings, a node can hand the audio of a channel to an external service **as it
+happens** — your own moderation/toxicity pipeline, a stream overlay, an archival or analytics
+sink. It is provider-neutral: the node speaks a small WebSocket protocol and you bridge it to
+whatever you run. Off by default; enable with `recording.live.enabled = true` (file recording
+`recording.enabled` may stay off).
+
+Two transports, same frames:
+
+* **Pull** — `GET /v1/channels/:id/audio/streams/pull[?format=opus|pcm_s16le&users=<id,id>&label=…]`
+  with an API key (`audio_streams:write`) upgrades to a WebSocket; frames flow until you close it.
+* **Push** — `POST /v1/channels/:id/audio/streams {"url":"wss://…","headers":{"Authorization":"…"},
+  "format":…,"users":[…],"label":…}` makes the node dial your endpoint (custom headers are sent
+  on the handshake, never echoed back), reconnect with exponential backoff up to
+  `recording.live.max_reconnects` (a fresh `hello` after each reconnect) and give up with reason
+  `push_unreachable`. `GET`/`DELETE …/audio/streams/:sid` show status (`frames_sent`,
+  `frames_dropped`, `reconnects`, `state`, per-participant consent) and stop it; header values
+  are never returned. URLs with embedded credentials are refused; in production they must be
+  `wss://` and public (`recording.live.require_tls` / `allow_private_urls` relax this for
+  development).
+
+The socket carries JSON text frames for control and binary frames for audio:
+
+```json
+{"type":"hello","stream_id":"…","channel_id":"…","format":"opus","sample_rate":48000,
+ "channels":1,"frame_ms":20,"frame_version":1,"users":null,"consent_required":true,…}
+{"type":"participant","user_id":"…","ssrc":123,"event":"audio_started|consent|left","consent":"accepted"}
+{"type":"dropped","frames":12}
+{"type":"end","reason":"consumer_disconnected|operator|duration_limit|channel_stopped|push_unreachable|shutdown","frames_sent":…,"frames_dropped":…}
+```
+
+Binary frame (36-byte header, big-endian, then the payload; `aurix_recording::live::decode_frame`
+is the reference parser):
+
+```
+ 0  version (1)      1  codec (1 = Opus, 2 = PCM s16le)    2  flags (bit0 gap, bit1 first)   3  reserved
+ 4  ssrc (u32)       8  rtp timestamp (u32, 48 kHz)       12  server receive time (i64, unix ms)
+20  participant user id (16 bytes, RFC 4122)             36  payload
+```
+
+`opus` forwards each participant's packets untouched (one 20 ms frame each; the `gap` flag
+marks a hole in the RTP timeline so a decoder can run PLC); `pcm_s16le` decodes on the node —
+mono 48 kHz, 960 samples per frame — with one Opus decoder per active talker
+(`recording.live.allow_pcm = false` disables it). Streams are **per participant, not mixed**;
+mixing, transcoding and container formats are your side's job.
+
+Semantics worth knowing:
+
+* **Consent** follows file recording: with `recording.require_consent` every participant is
+  `pending` until they answer the `RecordingNotification` (`live: true`) with
+  `RecordingConsentResponse`; only `accepted` participants' frames leave the node, `declined`
+  ones never do, and the consumer sees each decision as a `participant` control frame. This
+  works across cascaded nodes (the decision is relayed to the node hosting the stream).
+* **End-to-end-encrypted frames are never streamed** — the node cannot read them; the same
+  applies to file recordings and transcripts.
+* **Streams are node-local.** Open them against the node that hosts participants of the
+  channel (`409` otherwise); participants on other nodes of a cascaded channel are included
+  through the relay. Behind a load balancer, pin the operator connection to one node or use push.
+* **Backpressure never reaches players.** Each stream buffers `recording.live.queue_frames`
+  frames; a slow consumer loses the oldest ones and gets a `dropped` count, the media path is not
+  blocked. `max_per_channel` / `max_per_app` bound the number of streams per node,
+  `max_duration_secs` (and always `recording.max_recording_duration_secs`) their length.
+* **Lifecycle** is announced as `audio_stream.started|stopped` (webhooks/SSE, with the end
+  reason and frame counters, without URLs or headers), written to the audit log, and shown to
+  players like a recording (`RecordingNotification` with `live: true`). Streams end with the
+  channel and on node shutdown (`end` frame); erasing a user drops their per-stream state
+  (consent, decoder) while the stream itself keeps running.
+
 ### Network / firewall
 
 | port | proto | purpose |
@@ -621,6 +691,8 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
   delivery, conversations, read markers or attachments; history is an opt-in per deployment.
 * STT/TTS talk to OpenAI-compatible HTTP servers you host; no speech model ships with Aurix, and
   transcripts are not stored server-side.
+* Live audio streams are per participant (no server-side mix) and node-local; the node does not
+  buffer them across a consumer outage beyond `recording.live.queue_frames`.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
   it assumes nodes can reach each other directly on `media.port + 1`/UDP.
 * The Unreal plugin has not been compiled against a real engine install yet (none is available

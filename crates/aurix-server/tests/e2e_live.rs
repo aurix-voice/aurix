@@ -3277,6 +3277,25 @@ impl SseClient {
             }
         }
     }
+
+    /// Like `expect`, but skips frames of the same type about other streams (other tests of the
+    /// tenant may run concurrently).
+    async fn expect_stream(
+        &mut self,
+        event: &str,
+        stream_id: uuid::Uuid,
+        wait: Duration,
+    ) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + wait;
+        let want = stream_id.to_string();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let data = self.expect(event, remaining).await;
+            if data["data"]["stream_id"].as_str() == Some(want.as_str()) {
+                return data;
+            }
+        }
+    }
 }
 
 /// Webhook subscriptions get signed, retried, tenant-scoped deliveries for channel/participant
@@ -5287,4 +5306,635 @@ async fn speech_transcripts_and_text_to_speech() {
     for p in [&mut alice, &mut bob, &mut carol] {
         let _ = p.ws.close(None).await;
     }
+}
+
+type WsClient =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens the node-local pull WebSocket for `channel_id` with the tenant's API key.
+async fn open_pull(env: &Env, api_key: &str, channel_id: ChannelId, query: &str) -> WsClient {
+    let url = format!(
+        "{}/v1/channels/{channel_id}/audio/streams/pull{query}",
+        env.api.replacen("http", "ws", 1)
+    );
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("x-api-key", api_key.parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("pull websocket upgrade");
+    ws
+}
+
+/// Collects frames from a stream socket for `wait`, decoding binary ones.
+async fn collect_stream(
+    ws: &mut WsClient,
+    wait: Duration,
+) -> (
+    Vec<aurix_recording::live::ControlFrame>,
+    Vec<(UserId, u8, u8, Vec<u8>)>,
+) {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut control = Vec::new();
+    let mut audio = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                control.push(serde_json::from_str(&t).expect("control frame"));
+            }
+            Ok(Some(Ok(Message::Binary(b)))) => {
+                let f = aurix_recording::live::decode_frame(&b).expect("audio frame");
+                audio.push((f.user_id, f.codec, f.flags, f.payload.to_vec()));
+            }
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
+        }
+    }
+    (control, audio)
+}
+
+fn pcm_rms(payload: &[u8]) -> f32 {
+    let samples: Vec<f32> = payload
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c) as f32 / 32768.0)
+        .collect();
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
+}
+
+/// Local WebSocket ingest endpoint for push streams: records the `Authorization` header of
+/// each connection and forwards every message.
+#[allow(clippy::result_large_err)]
+async fn start_push_receiver() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+    tokio::sync::mpsc::UnboundedReceiver<Message>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ingest", listener.local_addr().unwrap());
+    let (auth_tx, auth_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let auth_tx = auth_tx.clone();
+            let msg_tx = msg_tx.clone();
+            tokio::spawn(async move {
+                let mut auth = None;
+                let ws = tokio_tungstenite::accept_hdr_async(
+                    tcp,
+                    |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                        auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        Ok(resp)
+                    },
+                )
+                .await
+                .unwrap();
+                let _ = auth_tx.send(auth);
+                let (_sink, mut source) = ws.split();
+                while let Some(Ok(m)) = source.next().await {
+                    let _ = msg_tx.send(m);
+                }
+            });
+        }
+    });
+    (url, auth_rx, msg_rx)
+}
+
+/// Live audio streams: a node-local pull WebSocket and a push connection to an operator
+/// endpoint receive framed Opus/PCM per participant, gated by consent (pending/declined
+/// participants and E2EE frames never leave the node), scoped to the tenant, announced over
+/// SSE, and closed when the consumer disconnects or the operator deletes the stream.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn live_audio_streams_pull_push_consent_and_isolation() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let probe = http
+        .get(format!("{}/v1/audio/streams", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    if probe.status() == 400 {
+        eprintln!("recording.live.enabled is false on this server; skipping");
+        return;
+    }
+    assert_eq!(probe.status(), 200, "{}", probe.text().await.unwrap());
+
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "live-alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "live-bob", "Bob", channel_id).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    join(&mut alice, channel_id).await;
+    join(&mut bob, channel_id).await;
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    drain_ws(&mut alice).await;
+    drain_ws(&mut bob).await;
+    let mut sse = SseClient::open(
+        &env,
+        &env.api_key,
+        Some("audio_stream.started,audio_stream.stopped"),
+    )
+    .await
+    .unwrap();
+
+    // No key -> 401; the upgrade must not open a stream.
+    let r = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/pull",
+            env.api
+        ))
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+
+    // ---- Pull (Opus) ----
+    let mut pull = open_pull(&env, &env.api_key, channel_id, "?format=opus&label=e2e").await;
+    let (ctl, _) = collect_stream(&mut pull, Duration::from_millis(500)).await;
+    let stream_id = match ctl.first() {
+        Some(aurix_recording::live::ControlFrame::Hello {
+            stream_id,
+            consent_required,
+            format,
+            label,
+            ..
+        }) => {
+            assert!(*consent_required, "dev server requires consent by default");
+            assert_eq!(*format, aurix_recording::live::StreamFormat::Opus);
+            assert_eq!(label.as_deref(), Some("e2e"));
+            *stream_id
+        }
+        other => panic!("expected hello, got {other:?}"),
+    };
+    let started = sse
+        .expect_stream("audio_stream.started", stream_id, Duration::from_secs(5))
+        .await;
+    assert_eq!(started["data"]["mode"], "pull");
+    for p in [&mut alice, &mut bob] {
+        expect_within(p, "live RecordingNotification", Duration::from_secs(3), |m| {
+            matches!(m, ControlMessage::RecordingNotification { active: true, live: true, recording_id, .. } if *recording_id == stream_id)
+        })
+        .await;
+    }
+
+    // Pending consent: Alice's audio stays on the node.
+    let tone = opus_tone(440.0, 400);
+    stream_frames(&alice, channel_id, 1, &tone[..5], false).await;
+    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(400)).await;
+    assert!(
+        audio.is_empty(),
+        "frames leaked before consent: {}",
+        audio.len()
+    );
+
+    alice
+        .send(&ControlMessage::RecordingConsentResponse {
+            recording_id: stream_id,
+            consent: RecordingConsent::Accepted,
+        })
+        .await;
+    bob.send(&ControlMessage::RecordingConsentResponse {
+        recording_id: stream_id,
+        consent: RecordingConsent::Declined,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (ctl, _) = collect_stream(&mut pull, Duration::from_millis(200)).await;
+    assert!(
+        ctl.iter().any(|c| matches!(c, aurix_recording::live::ControlFrame::Participant { user_id, consent: Some(RecordingConsent::Accepted), .. } if *user_id == uid_a)),
+        "consumer is told about Alice's consent: {ctl:?}"
+    );
+
+    // Alice (accepted) is forwarded as Opus; Bob (declined) and Alice's E2EE frames are not.
+    let e2ee_payload = Bytes::from_static(b"\xF8\xFF\xFEe2ee-secret");
+    tokio::join!(
+        async {
+            stream_frames(&alice, channel_id, 10, &tone[5..15], false).await;
+            stream_frames(
+                &alice,
+                channel_id,
+                20,
+                &[e2ee_payload.clone(), e2ee_payload.clone()],
+                true,
+            )
+            .await;
+        },
+        stream_frames(&bob, channel_id, 1, &tone[..10], false),
+    );
+    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(500)).await;
+    let from_alice: Vec<_> = audio.iter().filter(|a| a.0 == uid_a).collect();
+    assert!(
+        from_alice.len() >= 8,
+        "expected Alice's Opus frames, got {}",
+        from_alice.len()
+    );
+    assert!(from_alice
+        .iter()
+        .all(|a| a.1 == aurix_recording::live::CODEC_OPUS));
+    assert!(
+        from_alice[0].2 & aurix_recording::live::FLAG_FIRST != 0,
+        "first frame of a participant carries FLAG_FIRST"
+    );
+    assert!(
+        from_alice
+            .iter()
+            .any(|a| tone[5..15].contains(&Bytes::from(a.3.clone()))),
+        "forwarded payloads are the original Opus packets"
+    );
+    assert!(
+        audio.iter().all(|a| a.0 != uid_b),
+        "declined participant's audio leaked"
+    );
+    assert!(
+        audio.iter().all(|a| a.3 != e2ee_payload.as_ref()),
+        "E2EE frames leaked into the live stream"
+    );
+    while bob.recv_udp().await.is_some() {}
+    while alice.recv_udp().await.is_some() {}
+
+    // Status is tenant-scoped and never shows another tenant's streams.
+    let list: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let streams = list["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0]["id"], stream_id.to_string());
+    assert_eq!(streams[0]["state"], "streaming");
+    assert!(streams[0]["frames_sent"].as_u64().unwrap() >= 8);
+    assert_eq!(streams[0]["consent"][&uid_a.to_string()], "accepted");
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let r = http
+            .get(format!(
+                "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+                env.api
+            ))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "other tenant must not see the stream");
+        let r = http
+            .delete(format!(
+                "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+                env.api
+            ))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "other tenant must not close the stream");
+        let other: serde_json::Value = http
+            .get(format!("{}/v1/audio/streams", env.api))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(other["streams"].as_array().unwrap().len(), 0);
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    // ---- Push (PCM) to a local ingest endpoint ----
+    let (ingest_url, mut auth_rx, mut ingest_rx) = start_push_receiver().await;
+    let r = http
+        .post(format!(
+            "{}/v1/channels/{channel_id}/audio/streams",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "url": ingest_url.replacen("ws://", "ws://user:pw@", 1),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "URL credentials are rejected");
+    let r = http
+        .post(format!(
+            "{}/v1/channels/{channel_id}/audio/streams",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "url": format!("{ingest_url}?token=q"),
+            "headers": {"Authorization": "Bearer push-secret-123"},
+            "format": "pcm_s16le",
+            "users": [uid_a],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "{}", r.text().await.unwrap());
+    let body = r.text().await.unwrap();
+    assert!(
+        !body.contains("push-secret-123") && !body.contains("token=q"),
+        "push credentials leaked into the API response: {body}"
+    );
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let push_id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(created["mode"], "push");
+    assert_eq!(created["format"], "pcm_s16le");
+    assert_eq!(created["push_url"], ingest_url);
+    let started = sse
+        .expect_stream("audio_stream.started", push_id, Duration::from_secs(5))
+        .await;
+    assert_eq!(started["data"]["mode"], "push");
+    assert!(
+        started["data"].get("headers").is_none() && !started.to_string().contains("push-secret")
+    );
+
+    let auth = tokio::time::timeout(Duration::from_secs(5), auth_rx.recv())
+        .await
+        .expect("push connected")
+        .unwrap();
+    assert_eq!(auth.as_deref(), Some("Bearer push-secret-123"));
+    let hello = tokio::time::timeout(Duration::from_secs(5), ingest_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let hello: aurix_recording::live::ControlFrame =
+        serde_json::from_str(hello.to_text().unwrap()).unwrap();
+    assert!(matches!(
+        hello,
+        aurix_recording::live::ControlFrame::Hello { stream_id, format: aurix_recording::live::StreamFormat::PcmS16le, users: Some(ref u), .. }
+            if stream_id == push_id && u == &vec![uid_a]
+    ));
+    // A second capture means a second consent request for the participants.
+    expect_within(
+        &mut alice,
+        "push RecordingNotification",
+        Duration::from_secs(3),
+        |m| {
+            matches!(m, ControlMessage::RecordingNotification { active: true, live: true, recording_id, .. } if *recording_id == push_id)
+        },
+    )
+    .await;
+    alice
+        .send(&ControlMessage::RecordingConsentResponse {
+            recording_id: push_id,
+            consent: RecordingConsent::Accepted,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::join!(
+        stream_frames(&alice, channel_id, 200, &tone[..15], false),
+        stream_frames(&bob, channel_id, 200, &tone[..15], false),
+    );
+    while bob.recv_udp().await.is_some() {}
+    while alice.recv_udp().await.is_some() {}
+    let mut pcm_frames = Vec::new();
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(300), ingest_rx.recv()).await
+    {
+        if let Message::Binary(b) = m {
+            let f = aurix_recording::live::decode_frame(&b).unwrap();
+            assert_eq!(f.codec, aurix_recording::live::CODEC_PCM_S16LE);
+            assert_eq!(f.user_id, uid_a, "user filter admits only Alice");
+            assert_eq!(f.payload.len(), 960 * 2, "20 ms mono s16le");
+            pcm_frames.push(f.payload.to_vec());
+        }
+    }
+    assert!(
+        pcm_frames.len() >= 10,
+        "expected PCM frames over push, got {}",
+        pcm_frames.len()
+    );
+    let rms = pcm_rms(&pcm_frames[pcm_frames.len() - 1]);
+    assert!(
+        (0.2..0.3).contains(&rms),
+        "decoded PCM RMS {rms} should match the 0.35-amplitude tone (~0.247)"
+    );
+    // The pull consumer meanwhile also got Alice's Opus (both taps share the packet path).
+    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(300)).await;
+    assert!(audio.iter().any(|a| a.0 == uid_a));
+
+    // Delete the push stream: the ingest gets `end`, status disappears, SSE reports it.
+    let closed: serde_json::Value = http
+        .delete(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/{push_id}",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(closed["frames_sent"].as_u64().unwrap() >= 10);
+    let mut ended = false;
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(2), ingest_rx.recv()).await {
+        if let Message::Text(t) = m {
+            if let Ok(aurix_recording::live::ControlFrame::End { reason, .. }) =
+                serde_json::from_str(&t)
+            {
+                assert_eq!(reason, "operator");
+                ended = true;
+                break;
+            }
+        }
+    }
+    assert!(ended, "ingest endpoint did not receive the end frame");
+    let stopped = sse
+        .expect_stream("audio_stream.stopped", push_id, Duration::from_secs(5))
+        .await;
+    assert_eq!(stopped["data"]["reason"], "operator");
+    let r = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/{push_id}",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    for p in [&mut alice, &mut bob] {
+        expect_within(p, "push stream stopped notification", Duration::from_secs(3), |m| {
+            matches!(m, ControlMessage::RecordingNotification { active: false, recording_id, .. } if *recording_id == push_id)
+        })
+        .await;
+    }
+
+    // Closing the pull socket ends that stream too.
+    pull.close(None).await.unwrap();
+    let stopped = sse
+        .expect_stream("audio_stream.stopped", stream_id, Duration::from_secs(5))
+        .await;
+    assert_eq!(stopped["data"]["reason"], "consumer_disconnected");
+    let list: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["streams"].as_array().unwrap().len(), 0);
+
+    for p in [&mut alice, &mut bob] {
+        let _ = p.ws.close(None).await;
+    }
+}
+
+/// Live streams are node-local, but a cascaded channel is not: with Bob on node 1 and Alice
+/// on node 2, a pull stream opened on node 1 must receive Alice's relayed frames once her
+/// consent — given through node 2's control WebSocket — has been handed over the bus to the
+/// node hosting the stream. Opening a stream on a node that hosts none of the participants is
+/// refused with 409 instead of silently producing an empty stream.
+#[tokio::test]
+#[ignore = "requires two running Aurix nodes; see README (Scaling)"]
+async fn live_audio_stream_follows_cascaded_participants() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Ok(ws2) = std::env::var("AURIX_E2E_WS2") else {
+        eprintln!("AURIX_E2E_WS2 not set; skipping");
+        return;
+    };
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: ws2,
+        api_key: env.api_key.clone(),
+    };
+    let http = reqwest::Client::new();
+    let probe = http
+        .get(format!("{}/v1/audio/streams", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    if probe.status() == 400 {
+        eprintln!("recording.live.enabled is false on this server; skipping");
+        return;
+    }
+
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env2, &http, "xlive-alice", "Alice", channel_id).await;
+    let (tok_b, _) = issue_token(&env, &http, "xlive-bob", "Bob", channel_id).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let mut alice = connect(&env2, "alice", tok_a).await;
+    join(&mut alice, channel_id).await;
+    bind_media(&mut alice).await;
+    drain_ws(&mut alice).await;
+
+    // Only Alice (node 2) is in the channel: node 1 refuses to open a stream it cannot feed.
+    let r = http
+        .post(format!(
+            "{}/v1/channels/{channel_id}/audio/streams",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"url": "wss://example.invalid/sink"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409, "{}", r.text().await.unwrap());
+
+    let mut bob = connect(&env, "bob", tok_b).await;
+    assert_ne!(
+        alice.media_addr.port(),
+        bob.media_addr.port(),
+        "players must land on different nodes"
+    );
+    join(&mut bob, channel_id).await;
+    bind_media(&mut bob).await;
+    drain_ws(&mut bob).await;
+    drain_ws(&mut alice).await;
+
+    let mut pull = open_pull(&env, &env.api_key, channel_id, "").await;
+    let (ctl, _) = collect_stream(&mut pull, Duration::from_millis(500)).await;
+    let stream_id = match ctl.first() {
+        Some(aurix_recording::live::ControlFrame::Hello { stream_id, .. }) => *stream_id,
+        other => panic!("expected hello, got {other:?}"),
+    };
+    // Alice, on the other node, is told about the capture too.
+    expect_within(
+        &mut alice,
+        "live RecordingNotification on the remote node",
+        Duration::from_secs(5),
+        |m| {
+            matches!(m, ControlMessage::RecordingNotification { recording_id, active: true, live: true, .. } if *recording_id == stream_id)
+        },
+    )
+    .await;
+
+    let tone = opus_tone(440.0, 400);
+    stream_frames(&alice, channel_id, 1, &tone[..5], false).await;
+    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(400)).await;
+    assert!(audio.is_empty(), "relayed frames leaked before consent");
+
+    alice
+        .send(&ControlMessage::RecordingConsentResponse {
+            recording_id: stream_id,
+            consent: RecordingConsent::Accepted,
+        })
+        .await;
+    let (ctl, _) = collect_stream(&mut pull, Duration::from_secs(3)).await;
+    assert!(
+        ctl.iter().any(|c| matches!(c, aurix_recording::live::ControlFrame::Participant { user_id, consent: Some(RecordingConsent::Accepted), .. } if *user_id == uid_a)),
+        "consent relayed from node 2 reaches the hosting node: {ctl:?}"
+    );
+
+    stream_frames(&alice, channel_id, 10, &tone[5..15], false).await;
+    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(500)).await;
+    let from_alice = audio.iter().filter(|a| a.0 == uid_a).count();
+    assert!(
+        from_alice >= 8,
+        "expected Alice's relayed Opus frames, got {from_alice}"
+    );
+
+    // Alice leaving on node 2 ends her participant state on node 1's stream.
+    alice
+        .send(&ControlMessage::ChannelLeave { channel_id })
+        .await;
+    let (ctl, _) = collect_stream(&mut pull, Duration::from_secs(3)).await;
+    assert!(
+        ctl.iter().any(|c| matches!(c, aurix_recording::live::ControlFrame::Participant { user_id, event: aurix_recording::live::ParticipantEvent::Left, .. } if *user_id == uid_a)),
+        "participant-left from the remote node: {ctl:?}"
+    );
+    pull.close(None).await.ok();
+    bob.send(&ControlMessage::ChannelLeave { channel_id }).await;
 }

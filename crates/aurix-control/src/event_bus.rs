@@ -131,6 +131,34 @@ pub enum ServerEvent {
         initiated_by: UserId,
         timestamp: DateTime<Utc>,
     },
+    /// A live audio stream (WebSocket pull or push) of a channel was opened on a node.
+    LiveStreamStarted {
+        app_id: AppId,
+        channel_id: ChannelId,
+        stream_id: uuid::Uuid,
+        mode: String,
+        format: String,
+        users: Option<Vec<UserId>>,
+        timestamp: DateTime<Utc>,
+    },
+    LiveStreamStopped {
+        app_id: AppId,
+        channel_id: ChannelId,
+        stream_id: uuid::Uuid,
+        reason: String,
+        duration_secs: f64,
+        frames_sent: u64,
+        frames_dropped: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// A participant answered a recording/stream consent prompt on a node that does not host
+    /// the capture (cascaded channel); the hosting node applies it. Node-scoped.
+    RecordingConsentGiven {
+        app_id: AppId,
+        recording_id: uuid::Uuid,
+        user_id: UserId,
+        consent: aurix_common::types::RecordingConsent,
+    },
     /// Persistent cross-mute between two players changed; every node applies it to the live
     /// sessions of both parties.
     UserBlockChanged {
@@ -222,6 +250,9 @@ impl ServerEvent {
             | Self::RecordingStarted { app_id, .. }
             | Self::RecordingStopped { app_id, .. }
             | Self::RecordingConsentRequired { app_id, .. }
+            | Self::LiveStreamStarted { app_id, .. }
+            | Self::LiveStreamStopped { app_id, .. }
+            | Self::RecordingConsentGiven { app_id, .. }
             | Self::UserBlockChanged { app_id, .. }
             | Self::ChatMessage { app_id, .. }
             | Self::ParticipantTyping { app_id, .. }
@@ -264,6 +295,8 @@ impl ServerEvent {
             Self::RecordingStarted { .. } => "recording.started",
             Self::RecordingStopped { .. } => "recording.stopped",
             Self::RecordingConsentRequired { .. } => "recording.consent_required",
+            Self::LiveStreamStarted { .. } => "audio_stream.started",
+            Self::LiveStreamStopped { .. } => "audio_stream.stopped",
             Self::UserBlockChanged { .. } => "user.block_changed",
             Self::ChatMessage { .. } => "chat.message",
             Self::ParticipantTyping { .. } => "participant.typing",
@@ -273,6 +306,7 @@ impl ServerEvent {
             Self::TtsStatus { .. } => "tts.status",
             Self::NodeHealthChanged { .. }
             | Self::WebhooksChanged { .. }
+            | Self::RecordingConsentGiven { .. }
             | Self::TtsAnnouncement { .. } => return None,
         })
     }
@@ -295,6 +329,8 @@ impl ServerEvent {
         "recording.started",
         "recording.stopped",
         "recording.consent_required",
+        "audio_stream.started",
+        "audio_stream.stopped",
         "quality.alert",
         "chat.message",
         "participant.typing",

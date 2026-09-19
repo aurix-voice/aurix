@@ -272,7 +272,8 @@ export interface AurixEvents {
   /** Audio injection started (`true`) or ended (`false`: buffer finished, `stopAudioInjection`, media closed). */
   audioInjection: (active: boolean) => void;
   positions: (channelId: string, positions: UserPosition[]) => void;
-  recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string) => void;
+  /** `live` — a real-time stream to an operator service rather than a stored file; same consent flow. */
+  recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string, live: boolean) => void;
   bitrate: (targetKbps: number, reason: string) => void;
   kicked: (channelId: string, reason: string) => void;
   /**
@@ -1677,7 +1678,7 @@ export class AurixClient {
       }
       case 'RecordingNotification': {
         const d = (msg as Extract<ServerMessage, { type: 'RecordingNotification' }>).data;
-        this.emit('recording', d.channel_id, d.recording_id, d.active, d.initiated_by);
+        this.emit('recording', d.channel_id, d.recording_id, d.active, d.initiated_by, d.live === true);
         return;
       }
       case 'BitrateCommand': {

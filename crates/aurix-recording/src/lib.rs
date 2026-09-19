@@ -1,3 +1,4 @@
+pub mod live;
 pub mod ogg;
 pub mod s3;
 
@@ -13,6 +14,7 @@ use aurix_db::models::RecordingRow;
 use aurix_db::DbPool;
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
+use live::LiveStreams;
 use ogg::OggOpusWriter;
 use parking_lot::Mutex;
 use s3::{S3Client, S3Config};
@@ -151,10 +153,20 @@ pub struct RecordingService {
     encryption_key_id: Option<String>,
     s3: Option<S3Client>,
     active: Arc<Mutex<ActiveState>>,
+    live: Arc<LiveStreams>,
+}
+
+/// A capture (stored recording or live stream) active in a channel, for client disclosure.
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveCapture {
+    pub id: Uuid,
+    /// Nil for operator-started live streams.
+    pub initiated_by: UserId,
+    pub live: bool,
 }
 
 impl RecordingService {
-    pub fn new(pool: DbPool, config: RecordingConfig) -> Result<Self> {
+    pub fn new(pool: DbPool, config: RecordingConfig, production: bool) -> Result<Self> {
         let encryption_key = if config.encryption_enabled {
             let key_str = config.encryption_key.as_ref().ok_or_else(|| {
                 AurixError::InvalidConfiguration(
@@ -203,6 +215,13 @@ impl RecordingService {
             }
         };
 
+        let live = Arc::new(LiveStreams::new(
+            config.live.clone(),
+            config.require_consent,
+            production,
+            config.max_recording_duration_secs,
+        ));
+
         Ok(Self {
             pool,
             config,
@@ -210,11 +229,22 @@ impl RecordingService {
             encryption_key_id,
             s3,
             active: Arc::new(Mutex::new(ActiveState::default())),
+            live,
         })
     }
 
     pub fn require_consent(&self) -> bool {
         self.config.require_consent
+    }
+
+    /// Stored (file) recordings enabled on this node.
+    pub fn storage_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Real-time streams of channel audio to operator services.
+    pub fn live(&self) -> &Arc<LiveStreams> {
+        &self.live
     }
 
     /// Start recording one participant. Each participant gets a separate Ogg/Opus track.
@@ -228,6 +258,11 @@ impl RecordingService {
         sample_rate: u32,
         channels: u8,
     ) -> Result<RecordingRow> {
+        if !self.config.enabled {
+            return Err(AurixError::InvalidConfiguration(
+                "Stored recordings are disabled (recording.enabled)".into(),
+            ));
+        }
         if self
             .active
             .lock()
@@ -304,14 +339,31 @@ impl RecordingService {
         Ok(created)
     }
 
-    /// Active recordings for a channel, as `(recording_id, user_id)`.
-    pub fn active_in_channel(&self, channel_id: &ChannelId) -> Vec<(Uuid, UserId)> {
-        let st = self.active.lock();
-        st.by_id
-            .iter()
-            .filter(|(_, r)| r.channel_id == *channel_id)
-            .map(|(id, r)| (*id, r.user_id))
-            .collect()
+    /// Active stored recordings and live streams in a channel.
+    pub fn active_in_channel(&self, channel_id: &ChannelId) -> Vec<ActiveCapture> {
+        let mut out: Vec<ActiveCapture> = {
+            let st = self.active.lock();
+            st.by_id
+                .iter()
+                .filter(|(_, r)| r.channel_id == *channel_id)
+                .map(|(id, r)| ActiveCapture {
+                    id: *id,
+                    initiated_by: r.user_id,
+                    live: false,
+                })
+                .collect()
+        };
+        out.extend(
+            self.live
+                .active_in_channel(channel_id)
+                .into_iter()
+                .map(|id| ActiveCapture {
+                    id,
+                    initiated_by: UserId(Uuid::nil()),
+                    live: true,
+                }),
+        );
+        out
     }
 
     pub fn consent_state(&self, recording_id: &Uuid) -> Option<RecordingConsent> {
@@ -322,7 +374,8 @@ impl RecordingService {
             .map(|r| r.consent)
     }
 
-    /// Record a participant's consent decision. Declining stops their recording immediately.
+    /// Record a participant's consent decision for a stored recording or a live stream.
+    /// Declining stops their recording / their frames immediately.
     pub async fn set_consent(
         &self,
         app_id: AppId,
@@ -330,13 +383,22 @@ impl RecordingService {
         user_id: UserId,
         consent: RecordingConsent,
     ) -> Result<()> {
+        if self
+            .live
+            .set_consent(app_id, recording_id, user_id, consent)?
+        {
+            return Ok(());
+        }
         let stop = {
             let mut st = self.active.lock();
             let rec = st
                 .by_id
                 .get_mut(&recording_id)
-                .ok_or_else(|| AurixError::Recording("Recording not active".into()))?;
-            if rec.app_id != app_id.0 || rec.user_id != user_id {
+                .filter(|r| r.app_id == app_id.0)
+                .ok_or_else(|| {
+                    AurixError::NotFound("Recording is not active on this node".into())
+                })?;
+            if rec.user_id != user_id {
                 return Err(AurixError::AuthorizationDenied(
                     "Consent can only be given by the recorded user".into(),
                 ));
@@ -477,14 +539,20 @@ impl RecordingService {
             .ok_or_else(|| AurixError::Recording("Recording not found".into()))
     }
 
-    /// Stop every active recording in a channel (e.g. when the channel is destroyed).
+    /// Stop every active recording and live stream in a channel (e.g. when the channel is
+    /// destroyed).
     pub async fn stop_channel(&self, app_id: AppId, channel_id: &ChannelId) -> usize {
-        let ids: Vec<Uuid> = self
-            .active_in_channel(channel_id)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let mut n = 0;
+        let ids: Vec<Uuid> = {
+            let st = self.active.lock();
+            st.by_id
+                .iter()
+                .filter(|(_, r)| r.channel_id == *channel_id)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let mut n = self
+            .live
+            .stop_channel(app_id, channel_id, "channel_stopped");
         for id in ids {
             if self.stop_recording(app_id, id).await.is_ok() {
                 n += 1;
@@ -673,17 +741,19 @@ impl RecordingService {
 
 impl AudioSink for RecordingService {
     fn wants_channel(&self, channel_id: &ChannelId) -> bool {
-        self.active.lock().channels.contains(channel_id)
+        self.active.lock().channels.contains(channel_id) || self.live.wants_channel(channel_id)
     }
 
     fn on_audio(
         &self,
         channel_id: ChannelId,
         user_id: UserId,
-        _ssrc: u32,
+        ssrc: u32,
         rtp_timestamp: u32,
         payload: &[u8],
     ) {
+        self.live
+            .on_audio(channel_id, user_id, ssrc, rtp_timestamp, payload);
         if let Err(e) = self.write_opus_packet(channel_id, user_id, rtp_timestamp, payload) {
             warn!(
                 "Recording write failed for user {} in {}: {e}",
@@ -693,6 +763,7 @@ impl AudioSink for RecordingService {
     }
 
     fn on_participant_left(&self, channel_id: ChannelId, user_id: UserId) {
+        self.live.on_participant_left(channel_id, user_id);
         let has = self
             .active
             .lock()
@@ -755,6 +826,7 @@ impl AudioSink for RecordingService {
 #[async_trait::async_trait]
 impl aurix_common::sink::UserMediaPurger for RecordingService {
     async fn purge_user_media(&self, app_id: AppId, user_id: UserId) -> Result<u64> {
+        self.live.purge_user(user_id);
         let live: Vec<Uuid> = {
             let st = self.active.lock();
             st.by_id

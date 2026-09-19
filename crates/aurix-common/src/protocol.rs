@@ -879,11 +879,15 @@ pub enum ControlMessage {
         target_bitrate_kbps: u32,
         reason: String,
     },
+    /// `live` marks a real-time stream to an operator service (as opposed to a stored file);
+    /// `initiated_by` is the nil user id when an operator started it via the REST API.
     RecordingNotification {
         channel_id: ChannelId,
         recording_id: uuid::Uuid,
         active: bool,
         initiated_by: UserId,
+        #[serde(default)]
+        live: bool,
     },
     RecordingConsentResponse {
         recording_id: uuid::Uuid,

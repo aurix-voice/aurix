@@ -77,6 +77,22 @@ max_recording_duration_secs = 7200
 retention_days = 90
 encryption_enabled = false
 
+# Real-time audio out of the node (independent of file recording; works with `enabled = false`
+# above). Consent rules follow `require_consent`. Pull: an operator connects to
+# `GET /v1/channels/:id/audio/streams/pull`; push: `POST /v1/channels/:id/audio/streams` makes
+# the node dial an operator WebSocket. Push URLs must be wss:// and public in production
+# (`require_tls` / `allow_private_urls` override).
+[recording.live]
+enabled = false
+max_per_channel = 4
+max_per_app = 64
+queue_frames = 512
+max_duration_secs = 0
+allow_pcm = true
+push_enabled = true
+connect_timeout_ms = 5000
+max_reconnects = 5
+
 [metrics]
 enabled = true
 port = 4040

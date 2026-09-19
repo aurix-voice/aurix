@@ -15,6 +15,7 @@
 use crate::event_bus::{EventBus, ServerEvent};
 use aurix_common::config::WebhooksConfig;
 use aurix_common::error::AurixError;
+use aurix_common::net::{is_private_ip, validate_outbound_url};
 use aurix_common::types::*;
 use aurix_db::models::{WebhookDeliveryRow, WebhookSubscriptionRow};
 use aurix_db::DbPool;
@@ -47,7 +48,6 @@ pub const USER_AGENT: &str = concat!("aurix-webhooks/", env!("CARGO_PKG_VERSION"
 pub const TEST_EVENT: &str = "webhook.test";
 pub const RESYNC_EVENT: &str = "webhook.resync";
 
-const MAX_URL_LEN: usize = 2048;
 const MAX_EVENTS_PER_SUBSCRIPTION: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 256;
 const SUBSCRIPTION_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -163,30 +163,6 @@ fn generate_secret() -> String {
     format!("whsec_{}", hex::encode(bytes))
 }
 
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                // 100.64.0.0/10 (carrier NAT) and 169.254.169.254-style metadata ranges.
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-                || v4.octets()[0] == 0
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                // fc00::/7 unique local, fe80::/10 link local
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_ip(IpAddr::V4(v4)))
-        }
-    }
-}
-
 struct CachedSubscriptions {
     fetched: Instant,
     subs: Arc<Vec<WebhookSubscriptionRow>>,
@@ -260,57 +236,14 @@ impl WebhookService {
     /// delivery time (and pinned), so a name that later points at a private range is refused
     /// then.
     pub fn validate_url(&self, raw: &str) -> Result<Url, AurixError> {
-        if raw.len() > MAX_URL_LEN {
-            return Err(AurixError::Validation("url is too long".into()));
-        }
-        let url = Url::parse(raw).map_err(|e| AurixError::Validation(format!("url: {e}")))?;
-        match url.scheme() {
-            "https" => {}
-            "http" if !self.cfg.https_required(self.production) => {}
-            "http" => {
-                return Err(AurixError::Validation(
-                    "url must use https (webhooks.require_https)".into(),
-                ))
-            }
-            other => {
-                return Err(AurixError::Validation(format!(
-                    "url scheme '{other}' is not supported"
-                )))
-            }
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(AurixError::Validation(
-                "url must not embed credentials".into(),
-            ));
-        }
-        if url.fragment().is_some() {
-            return Err(AurixError::Validation(
-                "url must not have a fragment".into(),
-            ));
-        }
-        let Some(host) = url.host() else {
-            return Err(AurixError::Validation("url must have a host".into()));
-        };
-        if !self.private_urls_allowed() {
-            let literal = match host {
-                Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
-                Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
-                Host::Domain(d) => {
-                    if d.eq_ignore_ascii_case("localhost") || d.ends_with(".localhost") {
-                        return Err(AurixError::Validation(
-                            "url must not point at a private or loopback address".into(),
-                        ));
-                    }
-                    None
-                }
-            };
-            if literal.is_some_and(is_private_ip) {
-                return Err(AurixError::Validation(
-                    "url must not point at a private or loopback address".into(),
-                ));
-            }
-        }
-        Ok(url)
+        validate_outbound_url(
+            raw,
+            "https",
+            "http",
+            self.cfg.https_required(self.production),
+            self.private_urls_allowed(),
+            "webhooks.require_https",
+        )
     }
 
     fn validate_events(events: &[String]) -> Result<Vec<String>, AurixError> {

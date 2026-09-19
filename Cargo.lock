@@ -398,6 +398,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -543,6 +544,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
+ "futures-util",
  "hex",
  "hmac",
  "opus",
@@ -554,6 +556,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "url",
  "uuid",

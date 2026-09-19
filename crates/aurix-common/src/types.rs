@@ -808,6 +808,8 @@ pub enum AuditAction {
     ChannelMuteAll,
     ChannelKickAll,
     UserDeleted,
+    LiveStreamStarted,
+    LiveStreamStopped,
     UserDataExported,
     RetentionSweep,
 }
