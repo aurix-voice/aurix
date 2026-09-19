@@ -152,6 +152,94 @@ struct AURIXVOICE_API FAurixAudioPolicy
 	EAurixOpusSignal Signal = EAurixOpusSignal::Auto;
 };
 
+/** Strength of the RNNoise-derived neural noise suppressor in the capture chain. */
+UENUM(BlueprintType)
+enum class EAurixNoiseSuppression : uint8
+{
+	Off,
+	Low,
+	Moderate,
+	High,
+};
+
+/**
+ * Microphone processing in the native core, applied after resampling and before the input gain,
+ * VAD and encoder: high-pass → echo cancellation → noise suppression → AGC. Out-of-range values
+ * are clamped by the core.
+ */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixDspSettings
+{
+	GENERATED_BODY()
+
+	/** 80 Hz second-order high-pass: rumble, handling noise, DC offset. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bHighPass = true;
+
+	/**
+	 * Acoustic echo cancellation. The reference is whatever the core renders (MixOutputAudio /
+	 * the plugin's sound wave); feed other speaker audio with PushRenderAudio.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bEchoCancellation = true;
+
+	/** Longest echo path modelled, 40..500 ms (rounded to 10 ms). Headsets 100–200, open speakers 300–500. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "40", ClampMax = "500"))
+	int32 EchoTailMs = 200;
+
+	/** Known extra render→capture latency, 0..500 ms; 0 lets the delay estimator find it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "500"))
+	int32 StreamDelayMs = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	EAurixNoiseSuppression NoiseSuppression = EAurixNoiseSuppression::High;
+
+	/** Speech-gated automatic gain control with a soft limiter. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bAgc = true;
+
+	/** Speech level the AGC aims for, -30..-6 dBFS. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "-30", ClampMax = "-6"))
+	float AgcTargetDbfs = -18.f;
+
+	/** Most boost the AGC applies, 0..40 dB. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "40"))
+	float AgcMaxGainDb = 24.f;
+};
+
+/** Live diagnostics of the capture DSP. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixDspStats
+{
+	GENERATED_BODY()
+
+	/** Echo return loss enhancement of the canceller, dB (0 while idle). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float ErleDb = 0.f;
+
+	/** Render→capture delay the estimator locked on to, ms. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 EchoDelayMs = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bEchoConverged = false;
+
+	/** The speakers are currently playing something the canceller tracks. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bFarEndActive = false;
+
+	/** 0..1 from the noise suppressor's voice model (0.5 when it is off). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float SpeechProbability = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float AgcGainDb = 0.f;
+
+	/** Times the canceller needed render audio that had not been pushed yet. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 FarEndUnderruns = 0;
+};
+
 /**
  * How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
  * `text_radius`, from `ChannelJoinAck`). A radius of 0 means "the whole channel".
@@ -229,6 +317,10 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	/** Uplink Opus encoder before any channel policy applies. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	FAurixEncoderSettings Encoder;
+
+	/** Microphone processing (high-pass, echo cancellation, noise suppression, AGC). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	FAurixDspSettings Dsp;
 
 	/**
 	 * Adopt each joined channel's audio policy (bitrate, FEC/DTX, bandwidth, signal and the

@@ -197,6 +197,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	bool SetComplexity(int32 Complexity);
 
+	/** Replace the capture processing (high-pass / AEC / NS / AGC) at runtime, e.g. from a settings menu. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	bool SetDspSettings(const FAurixDspSettings& Settings);
+
+	/** Capture processing the core is running with (after clamping). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool GetDspSettings(FAurixDspSettings& OutSettings) const;
+
+	/** Echo canceller / noise suppressor / AGC diagnostics for an overlay. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool GetDspStats(FAurixDspStats& OutStats) const;
+
+	/**
+	 * Give the echo canceller speaker audio the core did not render itself (game audio, music):
+	 * interleaved 48 kHz float PCM, 1..2 channels, in playout order. Not needed for the remote
+	 * voice mix — MixOutputAudio and the plugin's sound wave feed it automatically.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	void PushRenderAudio(const TArray<float>& InterleavedPcm, int32 Channels);
+
 	/** Merged audio policy of the joined channels; false before the first join. */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool GetAudioPolicy(FAurixAudioPolicy& OutPolicy) const;

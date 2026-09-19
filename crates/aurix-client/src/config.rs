@@ -1,4 +1,5 @@
 use crate::audio::EncoderSettings;
+use crate::dsp::DspConfig;
 use std::time::Duration;
 
 /// Exponential backoff for automatic reconnects.
@@ -52,6 +53,10 @@ pub struct ClientConfig {
     /// Uplink Opus encoder before any channel policy applies (bitrate, complexity, bandwidth,
     /// VBR/FEC/DTX).
     pub encoder: EncoderSettings,
+    /// Capture DSP (high-pass, echo cancellation, noise suppression, AGC) applied before the
+    /// VAD and encoder; everything on by default, `DspConfig::BYPASS` for hosts with their own
+    /// processing. Changeable at runtime with `Client::set_dsp`.
+    pub dsp: DspConfig,
     /// Adopt each joined channel's `AudioPolicy` (bitrate, FEC/DTX, bandwidth, signal and the
     /// complexity hint unless pinned with `Client::set_complexity`). Off: the policy is only
     /// reported through `Event::AudioPolicyChanged`; server bitrate commands still apply.
@@ -78,6 +83,7 @@ impl ClientConfig {
             ping_interval: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(5),
             encoder: EncoderSettings::default(),
+            dsp: DspConfig::default(),
             follow_channel_policy: true,
             jitter_target_frames: 2,
             jitter_max_frames: 12,

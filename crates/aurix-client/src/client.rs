@@ -30,6 +30,7 @@ use crate::audio::{
 };
 use crate::config::ClientConfig;
 use crate::control::{token_identity, ws_host, ControlConnection, SessionAck, TokenIdentity};
+use crate::dsp::{DspConfig, DspStats, FarEndHandle};
 use crate::error::{ClientError, Result};
 use crate::events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
 use crate::media::{resolve_media_addr, IncomingAudio, MediaStats, MediaTransport};
@@ -163,6 +164,8 @@ struct Inner {
     media: RwLock<Option<Arc<MediaTransport>>>,
     mixer: Mutex<RemoteMixer>,
     encoder: Mutex<CaptureEncoder>,
+    /// AEC reference feed (rendered audio), written from the playback thread.
+    far_end: FarEndHandle,
     /// Merge of the joined channels' policies; kept after the last channel is left.
     audio_policy: Mutex<Option<AudioPolicy>>,
     /// App-pinned complexity, taking precedence over the channel hint.
@@ -353,7 +356,9 @@ impl Client {
         if cfg.ws_url.is_empty() {
             return Err(ClientError::InvalidArgument("ws_url is empty".into()));
         }
-        let encoder = CaptureEncoder::new(cfg.encoder)?;
+        let mut encoder = CaptureEncoder::new(cfg.encoder)?;
+        encoder.dsp.set_config(cfg.dsp);
+        let far_end = encoder.dsp.far_end();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(cfg.worker_threads.max(1))
             .thread_name("aurix-client")
@@ -367,6 +372,7 @@ impl Client {
                 cfg.jitter_max_frames,
             )),
             encoder: Mutex::new(encoder),
+            far_end,
             audio_policy: Mutex::new(None),
             complexity_pin: Mutex::new(None),
             cfg: RwLock::new(cfg),
@@ -675,12 +681,49 @@ impl Client {
     /// Mix every remote participant into `output` (interleaved, `channels` wide, **added** to
     /// the buffer). Returns the number of contributing streams. Call from the playback callback.
     pub fn mix_output_f32(&self, output: &mut [f32], channels: u8) -> usize {
-        self.inner.mixer.lock().mix(output, channels)
+        let active = self.inner.mixer.lock().mix(output, channels);
+        self.inner.far_end.push(output, channels);
+        active
     }
 
     /// [`Self::mix_output_f32`] into i16 (overwrites `output`).
     pub fn mix_output_i16(&self, output: &mut [i16], channels: u8) -> usize {
-        self.inner.mixer.lock().mix_i16(output, channels)
+        let active = self.inner.mixer.lock().mix_i16(output, channels);
+        if self.inner.encoder.lock().dsp.config().echo_cancellation {
+            let f: Vec<f32> = output.iter().map(|&s| s as f32 / 32768.0).collect();
+            self.inner.far_end.push(&f, channels);
+        }
+        active
+    }
+
+    /// Feed the AEC with audio the host plays through its own path (48 kHz interleaved), for
+    /// hosts that do not use `mix_output_*` or that want game audio cancelled as well. The
+    /// mixed downlink from `mix_output_*` is fed automatically; do not push it twice.
+    pub fn push_render_f32(&self, pcm: &[f32], channels: u8) {
+        self.inner.far_end.push(pcm, channels);
+    }
+
+    /// [`Self::push_render_f32`] for i16 samples.
+    pub fn push_render_i16(&self, pcm: &[i16], channels: u8) {
+        if self.inner.encoder.lock().dsp.config().echo_cancellation {
+            let f: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+            self.inner.far_end.push(&f, channels);
+        }
+    }
+
+    /// Capture DSP configuration (high-pass / AEC / noise suppression / AGC); applies to the
+    /// next frame. Values are clamped, read back with [`Self::dsp`].
+    pub fn set_dsp(&self, cfg: DspConfig) {
+        self.inner.encoder.lock().dsp.set_config(cfg);
+    }
+
+    pub fn dsp(&self) -> DspConfig {
+        self.inner.encoder.lock().dsp.config()
+    }
+
+    /// Runtime DSP diagnostics (ERLE, echo delay, speech probability, AGC gain).
+    pub fn dsp_stats(&self) -> DspStats {
+        self.inner.encoder.lock().dsp.stats()
     }
 
     /// Microphone mute: frames are still encoded (VAD/level keep working) but not sent, and

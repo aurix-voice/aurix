@@ -822,8 +822,8 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 | SDK | Path | Media path | Verified by |
 |-----|------|-----------|-------------|
 | Web (TypeScript) | [`sdk/web`](sdk/web) | WebRTC/Opus via the SFU, WS control plane, demo page | two-browser smoke test (ICE/DTLS, RTP both ways, decoded audio) |
-| Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
-| Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
+| Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane; capture DSP via the native core (AEC/NS/AGC) with a managed high-pass + AGC fallback | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
+| Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, capture DSP (high-pass, acoustic echo cancellation, RNNoise-derived noise suppression, AGC), reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
 | Unreal Engine 5.3+ (C++/Blueprint) | [`sdk/unreal`](sdk/unreal) | `AurixVoice` plugin over the `aurix-client` C ABI: `UAurixVoiceSubsystem` with typed Blueprint events, `AudioCapture` microphone bridge, procedural playback wave; static-Opus native library staged by `sdk/unreal/scripts/build_native.*` | native library build for Linux + ABI-reference test in CI; UHT/engine compile **not** run here (no Unreal in the dev environment — see the [README](sdk/unreal/README.md)) |
 
 All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
@@ -831,7 +831,7 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 ## Limitations
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
-* No SIP/PSTN gateway, no server-side noise suppression (clients do that).
+* No SIP/PSTN gateway, no server-side noise suppression (the native core / SDKs do it on the client).
 * Text chat is deliberately "lite": live channel/directed messages and typing only — no offline
   delivery, conversations, read markers or attachments; history is an opt-in per deployment.
 * STT/TTS and the content-safety classifier talk to OpenAI-compatible HTTP servers you host; no

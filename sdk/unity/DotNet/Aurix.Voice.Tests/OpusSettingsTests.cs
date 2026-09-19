@@ -316,34 +316,10 @@ namespace Aurix.Voice.Tests
             Assert.True(legacy.Settings.Fec);
         }
 
-        /// <summary>Resolve <c>aurix_client</c> from the Cargo target dir when running inside the repo.</summary>
-        private static bool TryLoadNativeLibrary()
-        {
-            var candidates = new List<string>();
-            var env = Environment.GetEnvironmentVariable("AURIX_NATIVE_LIB");
-            if (!string.IsNullOrEmpty(env)) candidates.Add(env);
-            string name = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "aurix_client.dll"
-                : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "libaurix_client.dylib" : "libaurix_client.so";
-            for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
-            {
-                candidates.Add(Path.Combine(dir.FullName, "target", "debug", name));
-                candidates.Add(Path.Combine(dir.FullName, "target", "release", name));
-            }
-            foreach (var c in candidates)
-            {
-                if (!File.Exists(c)) continue;
-                var path = c;
-                NativeLibrary.SetDllImportResolver(typeof(NativeOpusCodec).Assembly, (lib, asm, search) =>
-                    lib == "aurix_client" ? NativeLibrary.Load(path) : IntPtr.Zero);
-                return true;
-            }
-            return false;
-        }
-
         [Fact]
         public void NativeCodecHonoursAllControlsAndFec()
         {
-            if (!TryLoadNativeLibrary() || !NativeOpusCodec.IsAvailable)
+            if (!NativeLib.TryLoad() || !NativeOpusCodec.IsAvailable)
             {
                 // No native build around (e.g. SDK-only CI job): the pure C# path above is the contract.
                 Assert.NotEqual("1", Environment.GetEnvironmentVariable("AURIX_REQUIRE_NATIVE"));

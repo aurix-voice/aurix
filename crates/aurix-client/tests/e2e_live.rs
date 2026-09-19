@@ -12,7 +12,7 @@
 
 use aurix_client::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use aurix_client::events::{ConnectionState, Event};
-use aurix_client::{Client, ClientConfig, EncoderSettings};
+use aurix_client::{Client, ClientConfig, DspConfig, EncoderSettings};
 use aurix_common::types::{AudioPolicy, ChannelId, OpusBandwidth, OpusSignal, UserId};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -255,6 +255,7 @@ async fn native_clients_talk_chat_resume_and_leave() {
     let mut alice_cfg = ClientConfig::new(ws_url_via(&proxy, &ws_with_path(&env.ws)), alice_token);
     alice_cfg.heartbeat_interval = Duration::from_millis(500);
     alice_cfg.reconnect.initial_delay = Duration::from_millis(200);
+    alice_cfg.dsp = DspConfig::BYPASS;
     let mut bob_cfg = ClientConfig::new(ws_with_path(&env.ws), bob_token);
     bob_cfg.heartbeat_interval = Duration::from_millis(500);
 
@@ -316,11 +317,30 @@ async fn native_clients_talk_chat_resume_and_leave() {
     assert_eq!(alice.joined_channels(), vec![channel]);
     assert_eq!(bob.participants(channel).len(), 1);
 
-    // --- audio: Alice speaks, Bob hears a tone of the expected loudness and sees speaking.
+    // --- audio: Alice speaks (DSP bypassed), Bob hears the tone at its transmitted loudness.
     let (rms, active) = stream_tone(&alice, &bob, 1.6).await;
     eprintln!("bob heard rms={rms:.3} over {active} frames");
     assert!(active >= 50, "bob mixed only {active} active frames");
     assert!((0.15..0.35).contains(&rms), "unexpected rms {rms}");
+    // --- with the default capture DSP the AGC lands the same tone on its -18 dBFS target.
+    alice.set_dsp(DspConfig::default());
+    assert!(alice.dsp().agc);
+    let (rms_dsp, active_dsp) = stream_tone(&alice, &bob, 1.6).await;
+    let agc_db = alice.dsp_stats().agc_gain_db;
+    eprintln!("bob heard rms={rms_dsp:.3} over {active_dsp} frames with DSP (agc {agc_db:.1} dB)");
+    assert!(
+        active_dsp >= 50,
+        "bob mixed only {active_dsp} active frames with DSP"
+    );
+    assert!(
+        (0.09..0.16).contains(&rms_dsp),
+        "AGC did not settle on -18 dBFS: rms {rms_dsp}"
+    );
+    assert!(
+        agc_db < 0.0,
+        "AGC should attenuate a -10 dBFS tone, gain {agc_db} dB"
+    );
+    alice.set_dsp(DspConfig::BYPASS);
     wait_for(&bob, "alice speaking", Duration::from_secs(5), |e| {
         matches!(e, Event::ParticipantSpeaking { user_id, speaking: true, .. } if *user_id == alice_id)
     })

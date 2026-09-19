@@ -121,6 +121,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Presence / text range | `GetChannelScope(channel)` → `ChannelScope? { RosterRadius, TextRadius }`; `OnParticipantJoined` / `OnParticipantLeft` also fire as players move in and out of the roster radius (`Participant.Role` / `IsMuted` filled from the event) — see [radius-scoped presence](../features/channels.md#radius-scoped-presence-and-text) |
 | Energy / VAD | `VoiceActivityDetector` (`Speaking`, `Level`), `GateOnVad`, `OnChannelEnergy`, `participant.Energy` |
 | Devices | `InputDevices`, `SetInputDevice()`, `SetInputGain()`, `SetOutputVolume()`, `SetOutputMuted()`; `OutputResampler` for non-48 kHz mixers |
+| Capture DSP | `DspMode` (`Auto`/`Native`/`Managed`/`Off`), `HighPass`, `EchoCancellation`, `EchoTailMs`, `NoiseSuppression`, `Agc`, `AgcTargetDbfs`, `AgcMaxGainDb`, `ApplyDspSettings()`, `Dsp` (`ICaptureProcessor`: `Stats`, `PushRender`, `SupportsEchoCancellation`); `NativeCaptureDsp`, `ManagedCaptureDsp`, `CaptureDsp.Create` — [below](#capture-processing-echo-cancellation-noise-suppression-agc) |
 | Echo test / injection | echo channel + `InjectClip(clip, loop, gain, mixWithMicrophone)`, `Injector` (live PCM), `StopInjection()` |
 | Chat lite | `SendMessageAsync`, `SendDirectMessageAsync`, `SetTypingAsync`, `OnChatMessage`, `OnParticipantTyping` |
 | Transcripts / TTS | `OnTranscript`, `SetTranscriptsAsync`, `IsChannelMonitored`, `SpeakAsync(text, channel?, TtsDestination, voice, clientRef)` → `SpeechRequest`, `OnTtsStatus`, `CancelSpeechAsync`, `IsSynthesizedSsrc` |
@@ -129,6 +130,30 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Opus controls | `OpusEncoderSettings`, `SetEncoderSettings`, `SetComplexity`, `FollowChannelPolicy`, `Encoder`, `EffectiveEncoderSettings`, `AudioPolicy`, `OnAudioPolicyChanged`, `OnEncoderSettingsChanged`; `NativeOpusCodec` / `ConcentusOpusCodec`, `IOpusEncoderControls`, `IOpusFecDecoder` |
 | PCMU (G.711) fallback | `SetAudioCodecAsync(AudioCodec)`, `AudioCodec` / `PreferredAudioCodec`, `OnAudioCodecChanged`; behaviour `PreferredCodec`, `SetAudioCodec()`, `ActiveCodec`; `PcmuCodec`, `G711`, `TransmitAudioFrame(codec, …)`, `IncomingAudio.Codec` |
 | Mobile | runtime microphone permission (`PermissionState`, `OnMicrophonePermissionDenied`, `RetryMicrophonePermission()`), background/foreground handling, `ProbeConnection()`, reconnect on Wi-Fi ↔ cellular |
+
+## Capture processing: echo cancellation, noise suppression, AGC
+
+Microphone frames are cleaned after downmix/resampling and before `InputGain`, the injector,
+VAD and the encoder — the same position as in the [native core](native.md#capture-dsp-echo-cancellation-noise-suppression-agc):
+
+| `DspMode` | Implementation | High-pass | AEC | Noise suppression | AGC |
+|---|---|---|---|---|---|
+| `Native` | `NativeCaptureDsp` over `aurix_dsp_*` in the native core (`Plugins/`, same binary as `NativeOpusCodec`) | 80 Hz | frequency-domain, 40–500 ms tail, delay estimation | RNNoise-derived neural NS | speech-gated + soft limiter |
+| `Managed` | `ManagedCaptureDsp`, pure C# (IL2CPP-safe, no native dependency) | 80 Hz | — | — | speech-gated + soft limiter |
+
+`Auto` (default) takes the native chain when the library loads, the managed chain otherwise;
+`Off` skips the stage. Inspector fields map 1:1 onto `DspSettings`; `ApplyDspSettings()` pushes
+edits live and swaps the implementation when `DspMode` changed. `Dsp.Stats` (`DspStats`) shows
+ERLE, estimated echo delay, convergence, far-end activity, speech probability and AGC gain for
+an overlay.
+
+The canceller's reference is the remote mix this behaviour plays (`OnAudioFilterRead` pushes the
+48 kHz mixer output before the device-rate resampler). Voice through your own audio graph, or
+music/SFX you also want cancelled, goes through `voice.Dsp.PushRender(pcm, offset, count,
+channels)` from that graph's callback, in playout order. The managed chain reports what it does
+not do (`SupportsEchoCancellation == false`, `Settings.EchoCancellation == false`) rather than
+claiming an AEC it does not have. Own pipeline: `CaptureDsp.Create(mode, settings)` →
+`Process(mono48k, frames)` in whole 480-sample blocks.
 
 ## Opus codec and controls
 

@@ -151,6 +151,18 @@ void AMyPlayerController::Tick(float DeltaSeconds)
 Both native entry points are audio-thread safe and stay valid until `Disconnect()`, which
 stops capture, unbinds the sound wave and only then destroys the client.
 
+* **Capture processing (DSP):** `FAurixVoiceSettings.Dsp` (`FAurixDspSettings`) configures the
+  core's microphone chain — 80 Hz high-pass, acoustic echo cancellation (`EchoTailMs` 40–500,
+  `StreamDelayMs`), RNNoise-derived noise suppression (`Off/Low/Moderate/High`) and a
+  speech-gated AGC (`AgcTargetDbfs`, `AgcMaxGainDb`) — everything on by default. At runtime
+  `SetDspSettings` / `GetDspSettings`; `GetDspStats` (`FAurixDspStats`: ERLE, estimated delay,
+  converged, far-end active, speech probability, AGC gain, far-end underruns) for an overlay.
+  The canceller's reference is whatever the core renders (the plugin's sound wave or your
+  `MixOutputAudio` call); when the game plays other audio through the same speakers, pass it to
+  `PushRenderAudio(InterleavedPcm, Channels)` (48 kHz float, 1–2 channels, playout order) from
+  your submix so it is cancelled too. `bEchoCancellation = false` if you prefer the capture
+  device's hardware AEC.
+
 * **PCMU fallback:** `SetAudioCodec(EAurixAudioCodec::Pcmu)` negotiates G.711 μ-law for this
   session (8 kHz, no Opus CPU; the node transcodes at the edge, other participants keep Opus).
   `OnAudioCodecChanged` / `GetAudioCodec()` report what the server acknowledged; capture and

@@ -258,6 +258,70 @@ FAurixEncoderSettings FromNativeEncoderSettings(const AurixEncoderSettings& S)
 	return Out;
 }
 
+AurixNoiseSuppression ToNativeNoiseSuppression(EAurixNoiseSuppression N)
+{
+	switch (N)
+	{
+	case EAurixNoiseSuppression::Off: return AURIX_NOISE_SUPPRESSION_OFF;
+	case EAurixNoiseSuppression::Low: return AURIX_NOISE_SUPPRESSION_LOW;
+	case EAurixNoiseSuppression::Moderate: return AURIX_NOISE_SUPPRESSION_MODERATE;
+	default: return AURIX_NOISE_SUPPRESSION_HIGH;
+	}
+}
+
+EAurixNoiseSuppression FromNativeNoiseSuppression(AurixNoiseSuppression N)
+{
+	switch (N)
+	{
+	case AURIX_NOISE_SUPPRESSION_OFF: return EAurixNoiseSuppression::Off;
+	case AURIX_NOISE_SUPPRESSION_LOW: return EAurixNoiseSuppression::Low;
+	case AURIX_NOISE_SUPPRESSION_MODERATE: return EAurixNoiseSuppression::Moderate;
+	default: return EAurixNoiseSuppression::High;
+	}
+}
+
+AurixDspConfig ToNativeDspConfig(const FAurixDspSettings& S)
+{
+	AurixDspConfig Out;
+	aurix_dsp_config_default(&Out);
+	Out.high_pass = S.bHighPass;
+	Out.echo_cancellation = S.bEchoCancellation;
+	Out.echo_tail_ms = static_cast<uint32_t>(FMath::Max(0, S.EchoTailMs));
+	Out.stream_delay_ms = static_cast<uint32_t>(FMath::Max(0, S.StreamDelayMs));
+	Out.noise_suppression = ToNativeNoiseSuppression(S.NoiseSuppression);
+	Out.agc = S.bAgc;
+	Out.agc_target_dbfs = S.AgcTargetDbfs;
+	Out.agc_max_gain_db = S.AgcMaxGainDb;
+	return Out;
+}
+
+FAurixDspSettings FromNativeDspConfig(const AurixDspConfig& C)
+{
+	FAurixDspSettings Out;
+	Out.bHighPass = C.high_pass;
+	Out.bEchoCancellation = C.echo_cancellation;
+	Out.EchoTailMs = static_cast<int32>(C.echo_tail_ms);
+	Out.StreamDelayMs = static_cast<int32>(C.stream_delay_ms);
+	Out.NoiseSuppression = FromNativeNoiseSuppression(C.noise_suppression);
+	Out.bAgc = C.agc;
+	Out.AgcTargetDbfs = C.agc_target_dbfs;
+	Out.AgcMaxGainDb = C.agc_max_gain_db;
+	return Out;
+}
+
+FAurixDspStats ToDspStats(const AurixDspStats& S)
+{
+	FAurixDspStats Out;
+	Out.ErleDb = S.erle_db;
+	Out.EchoDelayMs = static_cast<int32>(S.echo_delay_ms);
+	Out.bEchoConverged = S.echo_converged;
+	Out.bFarEndActive = S.far_end_active;
+	Out.SpeechProbability = S.speech_probability;
+	Out.AgcGainDb = S.agc_gain_db;
+	Out.FarEndUnderruns = static_cast<int64>(S.far_end_underruns);
+	return Out;
+}
+
 FAurixAudioPolicy ToAudioPolicy(const AurixAudioPolicy& P)
 {
 	FAurixAudioPolicy Out;
@@ -374,6 +438,7 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.reconnect_max_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectMaxDelayMs));
 	Cfg.raw.request_timeout_ms = static_cast<uint32_t>(FMath::Max(1, Settings.RequestTimeoutMs));
 	Cfg.raw.encoder = ToNativeEncoderSettings(Settings.Encoder);
+	Cfg.raw.dsp = ToNativeDspConfig(Settings.Dsp);
 	Cfg.raw.follow_channel_policy = Settings.bFollowChannelPolicy;
 	Cfg.raw.jitter_target_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterTargetFrames));
 	Cfg.raw.jitter_max_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterMaxFrames));
@@ -659,6 +724,44 @@ bool UAurixVoiceSubsystem::SetComplexity(int32 Complexity)
 {
 	const int8_t Pinned = Complexity < 0 ? int8_t(-1) : static_cast<int8_t>(FMath::Min(Complexity, 10));
 	return Native && Check(Native->Client.set_complexity(Pinned), TEXT("set_complexity"));
+}
+
+bool UAurixVoiceSubsystem::SetDspSettings(const FAurixDspSettings& Settings)
+{
+	return Native && Check(Native->Client.set_dsp(ToNativeDspConfig(Settings)), TEXT("set_dsp"));
+}
+
+bool UAurixVoiceSubsystem::GetDspSettings(FAurixDspSettings& OutSettings) const
+{
+	AurixDspConfig Raw;
+	if (!Native || !Native->Client.dsp(Raw))
+	{
+		OutSettings = FAurixDspSettings();
+		return false;
+	}
+	OutSettings = FromNativeDspConfig(Raw);
+	return true;
+}
+
+bool UAurixVoiceSubsystem::GetDspStats(FAurixDspStats& OutStats) const
+{
+	AurixDspStats Raw;
+	if (!Native || !Native->Client.dsp_stats(Raw))
+	{
+		OutStats = FAurixDspStats();
+		return false;
+	}
+	OutStats = ToDspStats(Raw);
+	return true;
+}
+
+void UAurixVoiceSubsystem::PushRenderAudio(const TArray<float>& InterleavedPcm, int32 Channels)
+{
+	if (!Native || Channels < 1 || Channels > 2 || InterleavedPcm.Num() == 0)
+	{
+		return;
+	}
+	Native->Client.push_render(InterleavedPcm.GetData(), static_cast<size_t>(InterleavedPcm.Num()), static_cast<uint8_t>(Channels));
 }
 
 bool UAurixVoiceSubsystem::GetAudioPolicy(FAurixAudioPolicy& OutPolicy) const

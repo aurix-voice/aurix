@@ -253,6 +253,18 @@ public:
     std::size_t mix_output(std::int16_t* out, std::size_t samples, std::uint8_t channels) {
         return aurix_client_mix_output_i16(c_, out, samples, channels);
     }
+    /// Echo-canceller reference for audio played outside `mix_output` (48 kHz interleaved).
+    void push_render(const float* pcm, std::size_t samples, std::uint8_t channels) {
+        aurix_client_push_render_f32(c_, pcm, samples, channels);
+    }
+    void push_render(const std::int16_t* pcm, std::size_t samples, std::uint8_t channels) {
+        aurix_client_push_render_i16(c_, pcm, samples, channels);
+    }
+    /// Capture DSP (high-pass / AEC / noise suppression / AGC); `aurix_dsp_config_default()`
+    /// and `aurix_dsp_config_bypass()` give the two presets.
+    AurixResult set_dsp(const AurixDspConfig& config) { return aurix_client_set_dsp(c_, &config); }
+    bool dsp(AurixDspConfig& out) const { return aurix_client_dsp(c_, &out) == AURIX_OK; }
+    bool dsp_stats(AurixDspStats& out) const { return aurix_client_dsp_stats(c_, &out) == AURIX_OK; }
     void set_muted(bool muted) { aurix_client_set_muted(c_, muted); }
     bool is_muted() const { return aurix_client_is_muted(c_); }
     bool is_speaking() const { return aurix_client_is_speaking(c_); }

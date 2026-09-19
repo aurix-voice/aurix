@@ -110,6 +110,16 @@ typedef enum AurixOpusSignal {
   AURIX_SIGNAL_MUSIC = 2,
 } AurixOpusSignal;
 
+/**
+ * Noise suppression strength (dry/wet blend of the RNNoise output).
+ */
+typedef enum AurixNoiseSuppression {
+  AURIX_NOISE_SUPPRESSION_OFF = 0,
+  AURIX_NOISE_SUPPRESSION_LOW = 1,
+  AURIX_NOISE_SUPPRESSION_MODERATE = 2,
+  AURIX_NOISE_SUPPRESSION_HIGH = 3,
+} AurixNoiseSuppression;
+
 typedef enum AurixConnectionState {
   AURIX_STATE_DISCONNECTED = 0,
   AURIX_STATE_CONNECTING = 1,
@@ -323,6 +333,11 @@ typedef enum AurixTtsDestination {
 typedef struct AurixClient AurixClient;
 
 /**
+ * Opaque standalone DSP processor (see `aurix_dsp_create`).
+ */
+typedef struct AurixDsp AurixDsp;
+
+/**
  * Opaque event; read with the `aurix_event_*` accessors and release with `aurix_event_free`.
  */
 typedef struct AurixEvent AurixEvent;
@@ -386,6 +401,44 @@ typedef struct AurixEncoderSettings {
 } AurixEncoderSettings;
 
 /**
+ * Capture DSP configuration. Out-of-range values are clamped, never rejected. The chain adds
+ * 10 ms of latency when the echo canceller is on; everything off is a pass-through.
+ */
+typedef struct AurixDspConfig {
+  /**
+   * 80 Hz second-order high-pass.
+   */
+  bool high_pass;
+  /**
+   * Acoustic echo cancellation against the audio fed by `aurix_client_mix_output_*` /
+   * `aurix_client_push_render_*`.
+   */
+  bool echo_cancellation;
+  /**
+   * Echo tail modelled by the adaptive filter, 40..=`AURIX_DSP_MAX_ECHO_TAIL_MS`.
+   */
+  uint32_t echo_tail_ms;
+  /**
+   * Initial playback→capture delay hint, 0..=`AURIX_DSP_MAX_STREAM_DELAY_MS`; refined at
+   * runtime by the delay estimator.
+   */
+  uint32_t stream_delay_ms;
+  enum AurixNoiseSuppression noise_suppression;
+  /**
+   * Speech-gated automatic gain control with a soft limiter.
+   */
+  bool agc;
+  /**
+   * AGC target speech level, dBFS RMS, -30..=-6.
+   */
+  float agc_target_dbfs;
+  /**
+   * Maximum AGC boost, 0..=40 dB.
+   */
+  float agc_max_gain_db;
+} AurixDspConfig;
+
+/**
  * Connection parameters. Fill with `aurix_client_config_default`, then set `ws_url`/`token`.
  */
 typedef struct AurixClientConfig {
@@ -430,6 +483,12 @@ typedef struct AurixClientConfig {
    * Tokio worker threads for the control plane (1 is plenty).
    */
   uint32_t worker_threads;
+  /**
+   * Capture DSP (high-pass / echo cancellation / noise suppression / AGC) before the VAD
+   * and encoder; `aurix_dsp_config_default` = everything on, `aurix_dsp_config_bypass` for
+   * hosts with their own processing. Changeable later with `aurix_client_set_dsp`.
+   */
+  struct AurixDspConfig dsp;
 } AurixClientConfig;
 
 /**
@@ -554,6 +613,40 @@ typedef struct AurixChannelScope {
    */
   float text_radius;
 } AurixChannelScope;
+
+/**
+ * Runtime DSP diagnostics.
+ */
+typedef struct AurixDspStats {
+  /**
+   * Echo return loss enhancement of the linear filter (dB) while the far end is active.
+   */
+  float erle_db;
+  /**
+   * Playback→capture delay the echo canceller is aligned to (ms).
+   */
+  uint32_t echo_delay_ms;
+  /**
+   * The adaptive filter has seen enough far-end audio to have converged.
+   */
+  bool echo_converged;
+  /**
+   * Rendered audio was fed in the last second.
+   */
+  bool far_end_active;
+  /**
+   * Speech probability of the last 10 ms block (`0..=1`).
+   */
+  float speech_probability;
+  /**
+   * Current AGC gain (dB; 0 when AGC is off).
+   */
+  float agc_gain_db;
+  /**
+   * Blocks processed without reference audio while the AEC was on and being fed.
+   */
+  uint64_t far_end_underruns;
+} AurixDspStats;
 
 /**
  * A channel's audio policy as set by the operator (`ChannelConfig`), merged across the
@@ -709,6 +802,8 @@ typedef struct AurixRegionEndpoint {
   bool probe_failed;
 } AurixRegionEndpoint;
 
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -739,6 +834,16 @@ bool aurix_is_synthesized_ssrc(uint32_t ssrc);
 uint32_t aurix_source_ssrc(uint32_t ssrc);
 
 void aurix_client_config_default(struct AurixClientConfig *out);
+
+/**
+ * Everything on (high-pass, AEC with a 200 ms tail, high noise suppression, AGC to -18 dBFS).
+ */
+void aurix_dsp_config_default(struct AurixDspConfig *out);
+
+/**
+ * Everything off: the capture stream reaches the VAD/encoder untouched.
+ */
+void aurix_dsp_config_bypass(struct AurixDspConfig *out);
 
 /**
  * Create a client. Returns `NULL` (see `aurix_last_error`) if the config is invalid or the
@@ -1016,6 +1121,34 @@ float aurix_client_input_energy(const struct AurixClient *client);
 void aurix_client_set_vad(struct AurixClient *client, float threshold, uint32_t hangover_frames);
 
 void aurix_client_set_vad_gate(struct AurixClient *client, bool enabled);
+
+/**
+ * Replace the capture DSP configuration (applies to the next frame; values are clamped —
+ * read back with `aurix_client_dsp`). Changing the echo tail or delay hint resets the
+ * echo canceller's filter.
+ */
+enum AurixResult aurix_client_set_dsp(struct AurixClient *client,
+                                      const struct AurixDspConfig *config);
+
+enum AurixResult aurix_client_dsp(const struct AurixClient *client, struct AurixDspConfig *out);
+
+enum AurixResult aurix_client_dsp_stats(const struct AurixClient *client,
+                                        struct AurixDspStats *out);
+
+/**
+ * Feed the echo canceller with audio the host plays through its own path (48 kHz,
+ * interleaved, `sample_count` total samples). Audio the host obtains from
+ * `aurix_client_mix_output_*` is fed automatically — do not push it again. Audio-thread safe.
+ */
+void aurix_client_push_render_f32(struct AurixClient *client,
+                                  const float *pcm,
+                                  size_t sample_count,
+                                  uint8_t channels);
+
+void aurix_client_push_render_i16(struct AurixClient *client,
+                                  const int16_t *pcm,
+                                  size_t sample_count,
+                                  uint8_t channels);
 
 enum AurixResult aurix_client_set_bitrate(struct AurixClient *client, uint32_t bitrate_bps);
 
@@ -1311,6 +1444,38 @@ int32_t aurix_opus_decoder_decode_i16(struct AurixOpusDecoder *decoder,
                                       int16_t *pcm,
                                       size_t max_frame_samples_per_channel,
                                       bool fec);
+
+/**
+ * Create a standalone DSP processor with `config` (NULL = `aurix_dsp_config_default`).
+ */
+struct AurixDsp *aurix_dsp_create(const struct AurixDspConfig *config);
+
+void aurix_dsp_destroy(struct AurixDsp *dsp);
+
+/**
+ * Replace the configuration (clamped; read back with `aurix_dsp_config`).
+ */
+enum AurixResult aurix_dsp_set_config(struct AurixDsp *dsp, const struct AurixDspConfig *config);
+
+enum AurixResult aurix_dsp_config(const struct AurixDsp *dsp, struct AurixDspConfig *out);
+
+enum AurixResult aurix_dsp_stats(const struct AurixDsp *dsp, struct AurixDspStats *out);
+
+/**
+ * Process `sample_count` mono 48 kHz samples in place; `sample_count` must be a non-zero
+ * multiple of `AURIX_DSP_BLOCK_SAMPLES`. Not thread-safe against itself; safe to call
+ * concurrently with `aurix_dsp_push_render_f32`.
+ */
+enum AurixResult aurix_dsp_process_f32(struct AurixDsp *dsp, float *pcm, size_t sample_count);
+
+/**
+ * Echo-canceller reference: what the host is playing (48 kHz, interleaved `channels`,
+ * `sample_count` total samples). Real-time thread safe; no-op while AEC is off.
+ */
+void aurix_dsp_push_render_f32(const struct AurixDsp *dsp,
+                               const float *pcm,
+                               size_t sample_count,
+                               uint8_t channels);
 
 #ifdef __cplusplus
 }  // extern "C"

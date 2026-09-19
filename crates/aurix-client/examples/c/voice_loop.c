@@ -143,6 +143,8 @@ int main(int argc, char **argv) {
     cfg.ws_url = argv[1];
     cfg.token = argv[2];
     cfg.vad_gate = false; /* always send our test tone */
+    aurix_dsp_config_bypass(&cfg.dsp); /* synthetic tone: keep NS/AGC from shaping it */
+    cfg.dsp.high_pass = true;
     cfg.encoder.bitrate_bps = 24000;                   /* until the channel policy arrives */
     cfg.encoder.complexity = 5;                        /* cheap enough for a handheld */
     cfg.encoder.max_bandwidth = AURIX_BANDWIDTH_WIDEBAND;
@@ -216,6 +218,11 @@ int main(int argc, char **argv) {
                (unsigned long long)st.packets_sent, (unsigned long long)st.packets_received,
                (unsigned long long)st.audio_frames_received, st.rtt_ms, st.loss_percent,
                active_frames);
+    }
+    struct AurixDspStats dsp;
+    if (aurix_client_dsp_stats(client, &dsp) == AURIX_OK) {
+        printf("dsp: speech %.2f, agc %.1f dB, aec %s (erle %.1f dB, delay %u ms)\n", dsp.speech_probability,
+               dsp.agc_gain_db, dsp.echo_converged ? "converged" : "adapting", dsp.erle_db, dsp.echo_delay_ms);
     }
 
     aurix_client_leave_channel(client, &channel);

@@ -10,6 +10,8 @@ use aurix_common::types::{AudioCodec, AudioPolicy, Direction, OpusBandwidth, Opu
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use crate::dsp::{Dsp, DspConfig};
+
 /// Opus on the wire runs at 48 kHz; the mixer and the capture path work at this rate and
 /// PCMU frames are resampled to/from it at the edge.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -628,6 +630,8 @@ pub struct CaptureEncoder {
     pending: Vec<f32>,
     gain: f32,
     pub vad: VoiceActivityDetector,
+    /// Capture DSP (high-pass / AEC / NS / AGC), bypassed until configured.
+    pub dsp: Dsp,
     settings: EncoderSettings,
     out: [u8; 1275],
     ulaw: Vec<u8>,
@@ -646,6 +650,7 @@ impl CaptureEncoder {
             pending: Vec::with_capacity(FRAME_SAMPLES * 4),
             gain: 1.0,
             vad: VoiceActivityDetector::default(),
+            dsp: Dsp::new(DspConfig::BYPASS),
             settings: settings.clamped(),
             out: [0u8; 1275],
             ulaw: Vec::with_capacity(PCMU_FRAME_SAMPLES),
@@ -733,6 +738,7 @@ impl CaptureEncoder {
         let mut offset = 0;
         while self.pending.len() - offset >= FRAME_SAMPLES {
             let frame = &mut self.pending[offset..offset + FRAME_SAMPLES];
+            self.dsp.process_frame(frame);
             if self.gain != 1.0 {
                 for s in frame.iter_mut() {
                     *s = (*s * self.gain).clamp(-1.0, 1.0);

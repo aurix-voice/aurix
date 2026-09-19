@@ -3,6 +3,8 @@
 //! Layers, bottom up:
 //! * [`audio`] — Opus capture encoder with VAD/level metadata, per-sender jitter buffers and a
 //!   stereo mixer (`RemoteMixer`), pure CPU code with no I/O;
+//! * [`dsp`] — capture DSP: high-pass, acoustic echo cancellation, RNNoise-based noise
+//!   suppression and AGC, pure Rust;
 //! * [`media`] — AURX v2 over UDP: authenticated `SessionBind`, AES-256-CTR + HMAC per packet,
 //!   replay windows, heartbeats, quality reports;
 //! * [`control`] — the WebSocket control plane (session open/resume, channels, chat,
@@ -19,6 +21,7 @@ pub mod client;
 
 pub mod config;
 pub mod control;
+pub mod dsp;
 
 pub mod error;
 pub mod events;
@@ -39,6 +42,7 @@ pub use aurix_common::types::{
 
 pub use client::{Client, ClientStats, TransmitStats};
 pub use config::{ClientConfig, ReconnectPolicy};
+pub use dsp::{DspConfig, DspStats, NoiseSuppression};
 pub use error::{ClientError, Result};
 pub use events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
 pub use media::{IncomingAudio, MediaStats};

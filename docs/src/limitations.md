@@ -14,8 +14,11 @@ the chapter that explains the boundary.
   task, not a protocol one ([Native core](sdk/native.md)).
 * **No operator web dashboard.** Operations go through the REST API, the `aurix` CLI and the
   Grafana dashboards; a web panel is planned as a separate front end on top of the same API.
-* **No SIP/PSTN gateway**, no server-side noise suppression or echo cancellation (clients do
-  that: browsers via `getUserMedia` constraints, Unity/Unreal via their audio stacks).
+* **No SIP/PSTN gateway**, no server-side noise suppression or echo cancellation — that runs
+  on the client: browsers via `getUserMedia` constraints, the native core / Unity / Unreal via
+  the built-in capture DSP ([Native core](sdk/native.md#capture-dsp-echo-cancellation-noise-suppression-agc)).
+  The DSP is a pure-Rust implementation (frequency-domain AEC, RNNoise-derived NS); it has unit
+  and ABI coverage but no field tuning on a fleet of real devices yet.
 * **No speech models ship with Aurix.** STT/TTS talk to OpenAI-compatible HTTP endpoints you
   host; transcripts are delivered live and never stored server-side ([Speech](features/speech.md)).
 
@@ -88,6 +91,6 @@ the chapter that explains the boundary.
 
 ## Planned
 
-The operator web panel is tracked separately. Client-side noise suppression / echo cancellation
-in the native core, a TCP fallback for native AURX media, and per-receiver stream caps for very
-large channels are the next backlog items.
+The operator web panel is tracked separately. A TCP fallback for native AURX media,
+per-receiver stream caps / audience mode for very large channels and cross-node session
+failover are the next backlog items.

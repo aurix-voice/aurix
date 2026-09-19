@@ -23,6 +23,9 @@ Full reference: `crates/aurix-client/README.md` and `sdk/unreal/README.md`.
   resampling from any device rate, per-sender jitter buffers with PLC, stereo mixer with
   per-participant gain and directional panning, output volume/mute. Opus is linked statically —
   no system `libopus` in the shipped game.
+* **Capture DSP:** pure-Rust microphone processing — 80 Hz high-pass, acoustic echo
+  cancellation, RNNoise-derived neural noise suppression, speech-gated AGC — between resampling
+  and the input gain / VAD / encoder ([below](#capture-dsp-echo-cancellation-noise-suppression-agc)).
 * **Media:** signed `SessionBind`, AES-256-CTR + HMAC on every packet, replay windows,
   heartbeats with RTT, quality reports.
 * **Control:** `Authorization: Bearer` WebSocket, one-time resume tokens, typed
@@ -129,6 +132,47 @@ recover the previous lost frame from this packet's FEC data). None of these is v
 are safe P/Invoke targets — this is how the Unity SDK's `NativeOpusCodec` gets libopus. C++:
 `aurix::OpusEncoder` / `aurix::OpusDecoder` in `aurix_client.hpp`.
 
+## Capture DSP: echo cancellation, noise suppression, AGC
+
+The core cleans the microphone before anything else sees it, on 48 kHz mono after
+downmix/resampling and before input gain, VAD and the encoder:
+
+```text
+device PCM → downmix → resample → high-pass → AEC → noise suppression → AGC → gain → VAD → Opus/PCMU
+```
+
+* **High-pass** — second-order Butterworth at 80 Hz: rumble, desk thumps, DC offset.
+* **Acoustic echo cancellation** — frequency-domain adaptive filter over a 40–500 ms tail
+  (`echo_tail_ms`, 10 ms partitions) with a render→capture delay estimator (up to 500 ms plus
+  `stream_delay_ms`), double-talk protection and residual echo suppression. The far-end
+  reference is everything `mix_output_f32/i16` renders, so the default "core plays the remote
+  voices" setup needs no extra wiring; a game that plays the voice mix or other audio through
+  its own engine mixer feeds that speaker signal to `push_render_f32/i16` in playout order.
+* **Noise suppression** — RNNoise-derived recurrent network (`nnnoiseless`, pure Rust) at
+  `Low` / `Moderate` / `High` (dry/wet blend); keyboard, fans, traffic. Also yields the
+  `speech_probability` diagnostic.
+* **AGC** — speech-gated (silence is not pumped up), `agc_target_dbfs` −30…−6, at most
+  `agc_max_gain_db` (0–40) of boost, soft limiter so a shout never clips.
+
+```rust
+use aurix_client::{DspConfig, NoiseSuppression};
+
+cfg.dsp = DspConfig::default();            // everything on, tail 200 ms, NS High, AGC −18 dBFS / +24 dB
+cfg.dsp = DspConfig::BYPASS;               // nothing — bring your own processing
+client.set_dsp(DspConfig { noise_suppression: NoiseSuppression::Moderate, ..client.dsp() });
+let s = client.dsp_stats();                // erle_db, echo_delay_ms, echo_converged, far_end_active,
+                                           // speech_probability, agc_gain_db, far_end_underruns
+```
+
+C: `AurixConfig.dsp` (`AurixDspConfig`; `aurix_dsp_config_default` / `aurix_dsp_config_bypass`),
+`aurix_client_set_dsp` / `aurix_client_dsp` / `aurix_client_dsp_stats`,
+`aurix_client_push_render_f32/i16`. Standalone, for hosts with their own transport:
+`aurix_dsp_create/destroy/set_config/config/stats`, `aurix_dsp_process_f32` (mono 48 kHz in
+place, whole 480-sample blocks) and `aurix_dsp_push_render_f32` — the Unity SDK's
+`NativeCaptureDsp` is built on these ([Unity SDK](unity.md#capture-processing-echo-cancellation-noise-suppression-agc)).
+Out-of-range values are clamped rather than rejected. Everything is enabled by default; the
+browser SDK relies on the browser's own AEC/NS/AGC instead (`getUserMedia` constraints).
+
 ## PCMU (G.711) fallback
 
 `client.set_audio_codec(AudioCodec::Pcmu)` asks the server to run the session on G.711 μ-law
@@ -227,6 +271,13 @@ Audio options: default engine capture + 2D `UAudioComponent` (`PlaybackSoundClas
 through your mixer/ducking); or `PushCaptureAudio` from your own capture path and
 `MixOutputAudio` from your own procedural sound/submix — both audio-thread safe until
 `Disconnect()`.
+
+Capture processing: `FAurixVoiceSettings.Dsp` (`FAurixDspSettings`: high-pass, echo
+cancellation + tail, noise suppression strength, AGC target/max gain) is applied by the core;
+`SetDspSettings` / `GetDspSettings` change it live and `GetDspStats` (`FAurixDspStats`) feeds a
+diagnostics overlay. The echo canceller already hears what `MixOutputAudio` and the plugin's
+sound wave play; call `PushRenderAudio` with any other speaker audio (game mix, music) so it
+can cancel that too.
 
 Opus: `FAurixVoiceSettings.Encoder` (`FAurixEncoderSettings`: bitrate, complexity, max
 bandwidth, signal, VBR/constrained VBR, FEC, expected loss, DTX) and `bFollowChannelPolicy`;

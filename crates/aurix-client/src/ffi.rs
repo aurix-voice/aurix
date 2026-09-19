@@ -42,6 +42,7 @@ use uuid::Uuid;
 use crate::audio::EncoderSettings;
 use crate::client::Client;
 use crate::config::ClientConfig;
+use crate::dsp::{DspConfig, DspStats, NoiseSuppression};
 use crate::error::ClientError;
 use crate::events::{ChannelScope, ConnectionState, Event};
 
@@ -190,6 +191,10 @@ pub const AURIX_SYNTH_SSRC_FLAG: u32 = 0x8000_0000;
 pub const AURIX_SAMPLE_RATE: u32 = 48_000;
 /// Samples per channel in one 20 ms frame at `AURIX_SAMPLE_RATE`.
 pub const AURIX_FRAME_SAMPLES: u32 = 960;
+/// Longest echo tail `AurixDspConfig::echo_tail_ms` accepts (ms).
+pub const AURIX_DSP_MAX_ECHO_TAIL_MS: u32 = crate::dsp::MAX_ECHO_TAIL_MS;
+/// Largest `AurixDspConfig::stream_delay_ms` (ms).
+pub const AURIX_DSP_MAX_STREAM_DELAY_MS: u32 = crate::dsp::MAX_STREAM_DELAY_MS;
 
 #[no_mangle]
 pub extern "C" fn aurix_is_synthesized_ssrc(ssrc: u32) -> bool {
@@ -547,6 +552,10 @@ pub struct AurixClientConfig {
     pub vad_gate: bool,
     /// Tokio worker threads for the control plane (1 is plenty).
     pub worker_threads: u32,
+    /// Capture DSP (high-pass / echo cancellation / noise suppression / AGC) before the VAD
+    /// and encoder; `aurix_dsp_config_default` = everything on, `aurix_dsp_config_bypass` for
+    /// hosts with their own processing. Changeable later with `aurix_client_set_dsp`.
+    pub dsp: AurixDspConfig,
 }
 
 #[no_mangle]
@@ -571,7 +580,145 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         jitter_max_frames: d.jitter_max_frames as u32,
         vad_gate: d.vad_gate,
         worker_threads: d.worker_threads as u32,
+        dsp: d.dsp.into(),
     };
+}
+
+/// Noise suppression strength (dry/wet blend of the RNNoise output).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixNoiseSuppression {
+    AurixNoiseSuppressionOff = 0,
+    AurixNoiseSuppressionLow = 1,
+    AurixNoiseSuppressionModerate = 2,
+    AurixNoiseSuppressionHigh = 3,
+}
+
+impl From<NoiseSuppression> for AurixNoiseSuppression {
+    fn from(n: NoiseSuppression) -> Self {
+        match n {
+            NoiseSuppression::Off => Self::AurixNoiseSuppressionOff,
+            NoiseSuppression::Low => Self::AurixNoiseSuppressionLow,
+            NoiseSuppression::Moderate => Self::AurixNoiseSuppressionModerate,
+            NoiseSuppression::High => Self::AurixNoiseSuppressionHigh,
+        }
+    }
+}
+
+impl From<AurixNoiseSuppression> for NoiseSuppression {
+    fn from(n: AurixNoiseSuppression) -> Self {
+        match n {
+            AurixNoiseSuppression::AurixNoiseSuppressionOff => Self::Off,
+            AurixNoiseSuppression::AurixNoiseSuppressionLow => Self::Low,
+            AurixNoiseSuppression::AurixNoiseSuppressionModerate => Self::Moderate,
+            AurixNoiseSuppression::AurixNoiseSuppressionHigh => Self::High,
+        }
+    }
+}
+
+/// Capture DSP configuration. Out-of-range values are clamped, never rejected. The chain adds
+/// 10 ms of latency when the echo canceller is on; everything off is a pass-through.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AurixDspConfig {
+    /// 80 Hz second-order high-pass.
+    pub high_pass: bool,
+    /// Acoustic echo cancellation against the audio fed by `aurix_client_mix_output_*` /
+    /// `aurix_client_push_render_*`.
+    pub echo_cancellation: bool,
+    /// Echo tail modelled by the adaptive filter, 40..=`AURIX_DSP_MAX_ECHO_TAIL_MS`.
+    pub echo_tail_ms: u32,
+    /// Initial playback→capture delay hint, 0..=`AURIX_DSP_MAX_STREAM_DELAY_MS`; refined at
+    /// runtime by the delay estimator.
+    pub stream_delay_ms: u32,
+    pub noise_suppression: AurixNoiseSuppression,
+    /// Speech-gated automatic gain control with a soft limiter.
+    pub agc: bool,
+    /// AGC target speech level, dBFS RMS, -30..=-6.
+    pub agc_target_dbfs: f32,
+    /// Maximum AGC boost, 0..=40 dB.
+    pub agc_max_gain_db: f32,
+}
+
+impl From<DspConfig> for AurixDspConfig {
+    fn from(c: DspConfig) -> Self {
+        Self {
+            high_pass: c.high_pass,
+            echo_cancellation: c.echo_cancellation,
+            echo_tail_ms: c.echo_tail_ms,
+            stream_delay_ms: c.stream_delay_ms,
+            noise_suppression: c.noise_suppression.into(),
+            agc: c.agc,
+            agc_target_dbfs: c.agc_target_dbfs,
+            agc_max_gain_db: c.agc_max_gain_db,
+        }
+    }
+}
+
+impl From<AurixDspConfig> for DspConfig {
+    fn from(c: AurixDspConfig) -> Self {
+        Self {
+            high_pass: c.high_pass,
+            echo_cancellation: c.echo_cancellation,
+            echo_tail_ms: c.echo_tail_ms,
+            stream_delay_ms: c.stream_delay_ms,
+            noise_suppression: c.noise_suppression.into(),
+            agc: c.agc,
+            agc_target_dbfs: c.agc_target_dbfs,
+            agc_max_gain_db: c.agc_max_gain_db,
+        }
+        .clamped()
+    }
+}
+
+/// Everything on (high-pass, AEC with a 200 ms tail, high noise suppression, AGC to -18 dBFS).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_config_default(out: *mut AurixDspConfig) {
+    if !out.is_null() {
+        *out = DspConfig::default().into();
+    }
+}
+
+/// Everything off: the capture stream reaches the VAD/encoder untouched.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_config_bypass(out: *mut AurixDspConfig) {
+    if !out.is_null() {
+        *out = DspConfig::BYPASS.into();
+    }
+}
+
+/// Runtime DSP diagnostics.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AurixDspStats {
+    /// Echo return loss enhancement of the linear filter (dB) while the far end is active.
+    pub erle_db: f32,
+    /// Playback→capture delay the echo canceller is aligned to (ms).
+    pub echo_delay_ms: u32,
+    /// The adaptive filter has seen enough far-end audio to have converged.
+    pub echo_converged: bool,
+    /// Rendered audio was fed in the last second.
+    pub far_end_active: bool,
+    /// Speech probability of the last 10 ms block (`0..=1`).
+    pub speech_probability: f32,
+    /// Current AGC gain (dB; 0 when AGC is off).
+    pub agc_gain_db: f32,
+    /// Blocks processed without reference audio while the AEC was on and being fed.
+    pub far_end_underruns: u64,
+}
+
+impl From<DspStats> for AurixDspStats {
+    fn from(s: DspStats) -> Self {
+        Self {
+            erle_db: s.erle_db,
+            echo_delay_ms: s.echo_delay_ms,
+            echo_converged: s.echo_converged,
+            far_end_active: s.far_end_active,
+            speech_probability: s.speech_probability,
+            agc_gain_db: s.agc_gain_db,
+            far_end_underruns: s.far_end_underruns,
+        }
+    }
 }
 
 unsafe fn cstr_arg(p: *const c_char, what: &str) -> Result<String, AurixResult> {
@@ -634,6 +781,7 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
         .clamp(cfg.jitter_target_frames as u32, 100) as usize;
     cfg.vad_gate = c.vad_gate;
     cfg.worker_threads = c.worker_threads.clamp(1, 8) as usize;
+    cfg.dsp = c.dsp.into();
     Ok(cfg)
 }
 
@@ -1855,6 +2003,92 @@ pub unsafe extern "C" fn aurix_client_set_vad_gate(client: *mut AurixClient, ena
     }
 }
 
+/// Replace the capture DSP configuration (applies to the next frame; values are clamped —
+/// read back with `aurix_client_dsp`). Changing the echo tail or delay hint resets the
+/// echo canceller's filter.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_dsp(
+    client: *mut AurixClient,
+    config: *const AurixDspConfig,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if config.is_null() {
+        return null_ptr("config");
+    }
+    c.set_dsp((*config).into());
+    AurixResult::AurixOk
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_dsp(
+    client: *const AurixClient,
+    out: *mut AurixDspConfig,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if out.is_null() {
+        return null_ptr("out");
+    }
+    *out = c.dsp().into();
+    AurixResult::AurixOk
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_dsp_stats(
+    client: *const AurixClient,
+    out: *mut AurixDspStats,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if out.is_null() {
+        return null_ptr("out");
+    }
+    *out = c.dsp_stats().into();
+    AurixResult::AurixOk
+}
+
+/// Feed the echo canceller with audio the host plays through its own path (48 kHz,
+/// interleaved, `sample_count` total samples). Audio the host obtains from
+/// `aurix_client_mix_output_*` is fed automatically — do not push it again. Audio-thread safe.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_push_render_f32(
+    client: *mut AurixClient,
+    pcm: *const f32,
+    sample_count: usize,
+    channels: u8,
+) {
+    let Ok(c) = self::client(client) else {
+        return;
+    };
+    if pcm.is_null() || sample_count == 0 {
+        return;
+    }
+    c.push_render_f32(std::slice::from_raw_parts(pcm, sample_count), channels);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_push_render_i16(
+    client: *mut AurixClient,
+    pcm: *const i16,
+    sample_count: usize,
+    channels: u8,
+) {
+    let Ok(c) = self::client(client) else {
+        return;
+    };
+    if pcm.is_null() || sample_count == 0 {
+        return;
+    }
+    c.push_render_i16(std::slice::from_raw_parts(pcm, sample_count), channels);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_client_set_bitrate(
     client: *mut AurixClient,
@@ -3003,6 +3237,117 @@ pub unsafe extern "C" fn aurix_opus_decoder_decode_i16(
     }
 }
 
+// ---------------------------------------------------------------------- standalone DSP
+//
+// The capture DSP chain as a bare processor for hosts that run their own encoder (the Unity
+// SDK, engines with their own Opus path): mono 48 kHz in place, 10 ms granularity.
+
+/// Opaque standalone DSP processor (see `aurix_dsp_create`).
+pub struct AurixDsp {
+    inner: crate::dsp::Dsp,
+    far_end: crate::dsp::FarEndHandle,
+}
+
+/// Samples per 10 ms DSP block at `AURIX_SAMPLE_RATE`; `aurix_dsp_process_f32` takes whole
+/// multiples of this.
+pub const AURIX_DSP_BLOCK_SAMPLES: u32 = crate::dsp::BLOCK as u32;
+
+/// Create a standalone DSP processor with `config` (NULL = `aurix_dsp_config_default`).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_create(config: *const AurixDspConfig) -> *mut AurixDsp {
+    let cfg = if config.is_null() {
+        DspConfig::default()
+    } else {
+        (*config).into()
+    };
+    let inner = crate::dsp::Dsp::new(cfg);
+    let far_end = inner.far_end();
+    Box::into_raw(Box::new(AurixDsp { inner, far_end }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_destroy(dsp: *mut AurixDsp) {
+    if !dsp.is_null() {
+        drop(Box::from_raw(dsp));
+    }
+}
+
+/// Replace the configuration (clamped; read back with `aurix_dsp_config`).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_set_config(
+    dsp: *mut AurixDsp,
+    config: *const AurixDspConfig,
+) -> AurixResult {
+    if dsp.is_null() || config.is_null() {
+        return null_ptr("dsp/config");
+    }
+    (*dsp).inner.set_config((*config).into());
+    AurixResult::AurixOk
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_config(
+    dsp: *const AurixDsp,
+    out: *mut AurixDspConfig,
+) -> AurixResult {
+    if dsp.is_null() || out.is_null() {
+        return null_ptr("dsp/out");
+    }
+    *out = (*dsp).inner.config().into();
+    AurixResult::AurixOk
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_stats(
+    dsp: *const AurixDsp,
+    out: *mut AurixDspStats,
+) -> AurixResult {
+    if dsp.is_null() || out.is_null() {
+        return null_ptr("dsp/out");
+    }
+    *out = (*dsp).inner.stats().into();
+    AurixResult::AurixOk
+}
+
+/// Process `sample_count` mono 48 kHz samples in place; `sample_count` must be a non-zero
+/// multiple of `AURIX_DSP_BLOCK_SAMPLES`. Not thread-safe against itself; safe to call
+/// concurrently with `aurix_dsp_push_render_f32`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_process_f32(
+    dsp: *mut AurixDsp,
+    pcm: *mut f32,
+    sample_count: usize,
+) -> AurixResult {
+    if dsp.is_null() || pcm.is_null() {
+        return null_ptr("dsp/pcm");
+    }
+    if sample_count == 0 || !sample_count.is_multiple_of(crate::dsp::BLOCK) {
+        set_error("sample_count must be a non-zero multiple of AURIX_DSP_BLOCK_SAMPLES");
+        return AurixResult::AurixInvalidArgument;
+    }
+    (*dsp)
+        .inner
+        .process_frame(std::slice::from_raw_parts_mut(pcm, sample_count));
+    AurixResult::AurixOk
+}
+
+/// Echo-canceller reference: what the host is playing (48 kHz, interleaved `channels`,
+/// `sample_count` total samples). Real-time thread safe; no-op while AEC is off.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dsp_push_render_f32(
+    dsp: *const AurixDsp,
+    pcm: *const f32,
+    sample_count: usize,
+    channels: u8,
+) {
+    if dsp.is_null() || pcm.is_null() || sample_count == 0 {
+        return;
+    }
+    (*dsp)
+        .far_end
+        .push(std::slice::from_raw_parts(pcm, sample_count), channels);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3060,7 +3405,88 @@ mod tests {
                 aurix_client_mix_output_f32(client, out.as_mut_ptr(), out.len(), 2),
                 0
             );
+            let mut dsp = std::mem::MaybeUninit::<AurixDspConfig>::uninit();
+            assert_eq!(
+                aurix_client_dsp(client, dsp.as_mut_ptr()),
+                AurixResult::AurixOk
+            );
+            let mut dsp = dsp.assume_init();
+            assert_eq!(dsp, AurixDspConfig::from(DspConfig::default()));
+            dsp.echo_tail_ms = 5000;
+            dsp.noise_suppression = AurixNoiseSuppression::AurixNoiseSuppressionLow;
+            dsp.agc = false;
+            assert_eq!(aurix_client_set_dsp(client, &dsp), AurixResult::AurixOk);
+            let mut back = std::mem::MaybeUninit::<AurixDspConfig>::uninit();
+            assert_eq!(
+                aurix_client_dsp(client, back.as_mut_ptr()),
+                AurixResult::AurixOk
+            );
+            let back = back.assume_init();
+            assert_eq!(back.echo_tail_ms, AURIX_DSP_MAX_ECHO_TAIL_MS);
+            assert_eq!(
+                back.noise_suppression,
+                AurixNoiseSuppression::AurixNoiseSuppressionLow
+            );
+            assert!(!back.agc);
+            let mut stats = std::mem::MaybeUninit::<AurixDspStats>::uninit();
+            assert_eq!(
+                aurix_client_dsp_stats(client, stats.as_mut_ptr()),
+                AurixResult::AurixOk
+            );
+            assert_eq!(stats.assume_init().agc_gain_db, 0.0);
+            aurix_client_push_render_f32(client, out.as_ptr(), out.len(), 2);
             aurix_client_destroy(client);
+        }
+    }
+
+    #[test]
+    fn standalone_dsp_processes_blocks_and_rejects_partial_ones() {
+        unsafe {
+            let mut cfg = std::mem::MaybeUninit::<AurixDspConfig>::uninit();
+            aurix_dsp_config_bypass(cfg.as_mut_ptr());
+            let mut cfg = cfg.assume_init();
+            assert_eq!(cfg, AurixDspConfig::from(DspConfig::BYPASS));
+            cfg.high_pass = true;
+            let dsp = aurix_dsp_create(&cfg);
+            assert!(!dsp.is_null());
+
+            let mut back = std::mem::MaybeUninit::<AurixDspConfig>::uninit();
+            assert_eq!(
+                aurix_dsp_config(dsp, back.as_mut_ptr()),
+                AurixResult::AurixOk
+            );
+            assert!(back.assume_init().high_pass);
+
+            let mut pcm = vec![0.5f32; AURIX_DSP_BLOCK_SAMPLES as usize * 2];
+            assert_eq!(
+                aurix_dsp_process_f32(dsp, pcm.as_mut_ptr(), pcm.len() - 1),
+                AurixResult::AurixInvalidArgument
+            );
+            assert!(pcm.iter().all(|s| *s == 0.5));
+            for _ in 0..50 {
+                pcm.fill(0.5);
+                assert_eq!(
+                    aurix_dsp_process_f32(dsp, pcm.as_mut_ptr(), pcm.len()),
+                    AurixResult::AurixOk
+                );
+            }
+            let dc = pcm.iter().sum::<f32>() / pcm.len() as f32;
+            assert!(dc.abs() < 0.01, "high-pass left DC {dc}");
+
+            aurix_dsp_push_render_f32(dsp, pcm.as_ptr(), pcm.len(), 1);
+            let mut stats = std::mem::MaybeUninit::<AurixDspStats>::uninit();
+            assert_eq!(
+                aurix_dsp_stats(dsp, stats.as_mut_ptr()),
+                AurixResult::AurixOk
+            );
+            assert!(!stats.assume_init().far_end_active);
+
+            assert_eq!(
+                aurix_dsp_set_config(dsp, ptr::null()),
+                AurixResult::AurixNullPointer
+            );
+            aurix_dsp_destroy(dsp);
+            aurix_dsp_destroy(ptr::null_mut());
         }
     }
 

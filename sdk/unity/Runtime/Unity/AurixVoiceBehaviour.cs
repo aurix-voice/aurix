@@ -40,6 +40,25 @@ namespace Aurix.Unity
         public bool OutputMuted = false;
         public bool AutoConnectOnStart = false;
 
+        [Header("Capture processing")]
+        [Tooltip("Microphone processing before the input gain, VAD and encoder. Auto = the Aurix native core " +
+                 "(echo cancellation + neural noise suppression + AGC) when its binary is in Plugins/, otherwise the " +
+                 "pure C# chain (high-pass + AGC). Off = nothing (bring your own processing).")]
+        public CaptureDspMode DspMode = CaptureDspMode.Auto;
+        [Tooltip("80 Hz high-pass: rumble, handling noise, DC offset.")]
+        public bool HighPass = true;
+        [Tooltip("Acoustic echo cancellation against the remote voice mix this component plays (native core only). " +
+                 "Game audio played elsewhere is not cancelled unless you feed it with Dsp.PushRender.")]
+        public bool EchoCancellation = true;
+        [Tooltip("Longest echo path the canceller models (ms). Small rooms/headsets 100–200, open speakers 300–500.")]
+        [Range(DspSettings.MinEchoTailMs, DspSettings.MaxEchoTailMs)] public int EchoTailMs = 200;
+        [Tooltip("RNNoise-derived neural noise suppression (native core only).")]
+        public NoiseSuppression NoiseSuppression = NoiseSuppression.High;
+        [Tooltip("Automatic gain control: brings speech to AgcTargetDbfs with a soft limiter.")]
+        public bool Agc = true;
+        [Range(-30f, -6f)] public float AgcTargetDbfs = -18f;
+        [Range(0f, 40f)] public float AgcMaxGainDb = 24f;
+
         [Header("Opus encoder")]
         [Tooltip("Baseline uplink bitrate. The channel's audio policy (when followed) and the server's adaptive " +
                  "bitrate commands are layered on top; see Client.EffectiveEncoderSettings for what actually runs.")]
@@ -109,6 +128,47 @@ namespace Aurix.Unity
         /// </summary>
         public AudioInjector Injector { get; } = new AudioInjector();
         public bool IsInjecting => Injector.Active;
+
+        /// <summary>
+        /// The capture processor in use (<c>null</c> when <see cref="DspMode"/> is Off or before the first
+        /// <see cref="Connect"/>). Read <see cref="ICaptureProcessor.Stats"/> for a diagnostics overlay;
+        /// call <see cref="ICaptureProcessor.PushRender"/> from your own audio path to make the echo
+        /// canceller aware of sounds this component does not play.
+        /// </summary>
+        public ICaptureProcessor Dsp { get; private set; }
+
+        /// <summary>The inspector's capture-processing fields as a settings block.</summary>
+        public DspSettings DspSettingsFromInspector() => new DspSettings
+        {
+            HighPass = HighPass,
+            EchoCancellation = EchoCancellation,
+            EchoTailMs = EchoTailMs,
+            StreamDelayMs = 0,
+            NoiseSuppression = NoiseSuppression,
+            Agc = Agc,
+            AgcTargetDbfs = AgcTargetDbfs,
+            AgcMaxGainDb = AgcMaxGainDb,
+        }.Clamped();
+
+        /// <summary>
+        /// Re-read the capture-processing fields at runtime (a settings menu) and push them to the
+        /// processor; changing <see cref="DspMode"/> swaps the implementation.
+        /// </summary>
+        public void ApplyDspSettings()
+        {
+            var settings = DspSettingsFromInspector();
+            var current = Dsp;
+            bool sameKind = current == null ? DspMode == CaptureDspMode.Off
+                : DspMode == CaptureDspMode.Auto || (DspMode == CaptureDspMode.Native) == (current is NativeCaptureDsp);
+            if (current != null && sameKind)
+            {
+                current.Apply(settings);
+                return;
+            }
+            var next = CaptureDsp.Create(DspMode, settings);
+            Dsp = next;
+            current?.Dispose();
+        }
         /// <summary>Local VAD edge (true = started speaking). Fired from the Unity main thread.</summary>
         public event Action<bool> OnLocalSpeaking;
         /// <summary>
@@ -158,7 +218,11 @@ namespace Aurix.Unity
 
         private void Awake()
         {
-            _fillFromMixer = (buf, off, frames, ch) => _mixer?.Mix(buf, off, frames, ch);
+            _fillFromMixer = (buf, off, frames, ch) =>
+            {
+                _mixer?.Mix(buf, off, frames, ch);
+                Dsp?.PushRender(buf, off, frames * ch, ch);
+            };
             _outputRate = AudioSettings.outputSampleRate;
         }
 
@@ -192,6 +256,7 @@ namespace Aurix.Unity
 
             _encoder = CodecFactory();
             _mixer = new RemoteMixer(CodecFactory);
+            ApplyDspSettings();
 
             Client = new AurixVoiceClient(WebSocketUrl, Token);
             Client.Mixer = _mixer;
@@ -254,6 +319,9 @@ namespace Aurix.Unity
             if (c != null) await c.DisconnectAsync();
             _encoder?.Dispose(); _encoder = null;
             _mixer?.Dispose(); _mixer = null;
+            var dsp = Dsp;
+            Dsp = null;
+            dsp?.Dispose();
         }
 
         public void SetMuted(bool muted) => Client?.SetMuted(muted);
@@ -507,6 +575,7 @@ namespace Aurix.Unity
 
                 if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
                 Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
+                Dsp?.Process(_mono, AudioFormat.FrameSamples);
                 AudioLevel.ApplyGain(_mono, AudioFormat.FrameSamples, InputGain);
                 Injector.Fill(_mono, AudioFormat.FrameSamples);
                 EncodeAndSend();

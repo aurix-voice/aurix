@@ -25,6 +25,11 @@ Unreal plugin, mobile wrappers and any other native integration build on top of 
   `ChannelAudioPolicy`) and the server's transient `BitrateCommand`; complexity can be pinned.
   `OpusEncoder` / `OpusDecoder` are also exported standalone (C: `aurix_opus_*`) for hosts that
   only want libopus — the Unity SDK's `NativeOpusCodec` uses them.
+* **Capture DSP** (`dsp`): pure-Rust microphone processing between resampling and the input
+  gain/VAD/encoder — 80 Hz high-pass, frequency-domain acoustic echo cancellation (40–500 ms
+  tail, delay estimation, residual echo suppression) fed automatically by `mix_output_*`,
+  RNNoise-derived neural noise suppression (`nnnoiseless`) and a speech-gated AGC with a soft
+  limiter. `DspConfig` / `DspStats`; also exported standalone (C: `aurix_dsp_*`).
 * **Media** (`media`): AURX v2 over UDP — signed `SessionBind`, AES-256-CTR + HMAC on every
   packet, per-sender replay windows, heartbeats with RTT, quality reports, mute state.
 * **Control** (`control`): WebSocket with `Authorization: Bearer`, one-time resume tokens,
@@ -61,6 +66,38 @@ loop {
 `push_capture_*` and `mix_output_*` are lock-light and meant for the audio callback; everything
 else can be called from the game thread. `poll_event`/`wait_event` return owned events; the
 optional wake hook (`set_wake_hook`) lets an engine signal its main loop instead of polling.
+
+### Capture DSP: high-pass, echo cancellation, noise suppression, AGC
+
+```rust
+use aurix_client::{DspConfig, NoiseSuppression};
+
+let mut cfg = ClientConfig::new(ws_url, jwt);
+cfg.dsp = DspConfig {
+    high_pass: true,
+    echo_cancellation: true, echo_tail_ms: 200, stream_delay_ms: 0,
+    noise_suppression: NoiseSuppression::High,
+    agc: true, agc_target_dbfs: -18.0, agc_max_gain_db: 24.0,
+};                                        // == DspConfig::default(); DspConfig::BYPASS = off
+
+client.set_dsp(cfg.dsp);                  // live changes, no glitch
+let stats = client.dsp_stats();           // erle_db, echo_delay_ms, echo_converged,
+                                          // far_end_active, speech_probability, agc_gain_db
+// audio thread, only if the game plays sound the core did not render:
+client.push_render_f32(speaker_pcm, channels);
+```
+
+The chain runs on 48 kHz mono after downmix/resampling and before input gain, VAD and the
+encoder: high-pass → AEC → NS → AGC. Everything `mix_output_f32/i16` produces is the AEC's
+far-end reference, so the plain "core plays remote voices" setup needs nothing else; when the
+game routes voice through its own mixer or plays music through the same speakers, feed that
+output to `push_render_*` in playout order (the delay estimator absorbs up to 500 ms of
+buffering between render and capture; `stream_delay_ms` pre-loads a known offset). `DspStats`
+is what a diagnostics overlay shows — `echo_converged`/`erle_db` tell whether the canceller
+has locked, `far_end_underruns` counts render audio it needed but had not been given.
+
+Values are clamped, not rejected (tail 40–500 ms rounded to 10 ms, AGC target −30…−6 dBFS,
+max gain 0–40 dB). NS costs ≈ 1–2 % of a core at 48 kHz; AEC scales with the tail length.
 
 ### Statistics and network quality
 
@@ -119,6 +156,15 @@ cc -std=c99 -Icrates/aurix-client/include crates/aurix-client/examples/c/voice_l
 
 `examples/c/voice_loop.c` is a complete integration: create → connect → wait for
 `AURIX_EVENT_SESSION_READY` → join → push a tone / mix output → print statistics → disconnect.
+
+Capture DSP in C: `AurixDspConfig` in `AurixConfig.dsp` (`aurix_dsp_config_default` /
+`aurix_dsp_config_bypass` presets), `aurix_client_set_dsp` / `aurix_client_dsp`,
+`aurix_client_dsp_stats` (`AurixDspStats`), `aurix_client_push_render_f32/i16`. The processor is
+also available **standalone** for hosts with their own transport: `aurix_dsp_create` /
+`aurix_dsp_destroy`, `aurix_dsp_set_config` / `aurix_dsp_config` / `aurix_dsp_stats`,
+`aurix_dsp_process_f32` (mono 48 kHz, in place, any whole number of 480-sample blocks —
+`AURIX_INVALID_ARGUMENT` otherwise) and `aurix_dsp_push_render_f32`. None is variadic, so they
+are safe P/Invoke targets — the Unity SDK's `NativeCaptureDsp` is built on them.
 
 ### C++ wrapper
 
