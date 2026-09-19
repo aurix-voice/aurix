@@ -19,14 +19,16 @@ Immediately after the upgrade the server sends
 ```json
 {"type":"SessionInitAck","data":{"session_id":"…","ssrc":123456,"media_addr":"203.0.113.10:10000",
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
-  "media_tunnel":true}}
+  "media_tunnel":true,"downlink_mix":true}}
 ```
 
 `media_key` is the master secret for the [AURX media path](aurx.md); `media_addr` is the UDP
 endpoint of *this* node; `media_tunnel` says the node also accepts AURX packets as **binary
 frames on this very connection** when UDP is blocked
 ([tunnel](aurx.md#tunnel-aurx-over-the-control-websocket)) — text frames are always control
-messages, binary frames are always media. With `AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` a
+messages, binary frames are always media; `downlink_mix` says native sessions may ask for a
+[server-mixed downlink](../features/channels.md#server-mix-for-native-clients). With
+`AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` a
 plain player JWT is refused for the handshake (`ACTION_TOKEN_REQUIRED`).
 
 `Ping { nonce }` / `Pong { nonce }` keep the connection alive; the server also drops sessions
@@ -45,13 +47,14 @@ connection simply yields a new session and the client must re-join its channels.
 
 | Client → server | Server → client | Notes |
 | --- | --- | --- |
-| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, transcription, safety_voice, audio, roster_radius?, text_radius? }` | `token` = player JWT listing the channel, or a `join` action token; the radii are present only for [radius-scoped](../features/channels.md#radius-scoped-presence-and-text) positional channels |
+| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, role, participant_count, hidden_listeners, transcription, safety_voice, audio, roster_radius?, text_radius? }` | `token` = player JWT listing the channel, or a `join` action token; `role` is yours (`listener` = receive-only), `participant_count` the headcount across nodes including listeners hidden from `participants` when `hidden_listeners` is set ([audiences](../features/channels.md#large-channels-and-audiences)); the radii are present only for [radius-scoped](../features/channels.md#radius-scoped-presence-and-text) positional channels |
 | `ChannelLeave { channel_id }` | `ParticipantJoined { channel_id, user_id, display_name, ssrc, role, is_muted }`, `ParticipantLeft` | roster; `ssrc` identifies the sender's AURX packets; in a radius-scoped channel these also report players moving in and out of `roster_radius` |
 | — | `MediaBound { session_id, transport }` | the `SessionBind` was accepted; `transport` = `udp` or `tunnel` (the WebSocket itself) |
 | — | `SessionClose { session_id, reason }`, `Kick { channel_id, user_id, reason }` | session is gone / removed from a channel |
 | — | `MuteStateChanged { channel_id, user_id, muted, server_muted }` | sender-side and moderator mutes (never receiver-local ones) |
-| `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…, codec}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |
+| `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…, codec, downlink}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |
 | `SetAudioCodec { codec }` | `AudioCodecChanged { codec }` | native AURX only; `codec` = `opus` (default) / `pcmu` — G.711 fallback transcoded by the node, see [codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback); `CODEC_NOT_AVAILABLE` when `media.pcmu_fallback` is off or the session is WebRTC |
+| `SetDownlinkMode { mode }` | `DownlinkModeChanged { mode }` | native AURX only; `mode` = `streams` (default, one stream per speaker) / `mixed` (one server-mixed stereo stream per channel, `PacketFlags::Mixed`), see [server mix](../features/channels.md#server-mix-for-native-clients); `VALIDATION_ERROR` when `media.downlink_mix` is off or the session is WebRTC; frames already in flight may still be of the previous kind |
 | `SetTransmission { mode }`, `SetChannelFocus { channel_id? }` | `TransmissionChanged`, `ChannelFocusChanged` | `mode` = `none` / `single { channel_id }` / `all`; server resets both when the target channel is left |
 | — | `SpeakingStateChanged { channel_id, user_id, speaking }`, `ChannelEnergy { channel_id, levels }` | voice activity, see [Channels](../features/channels.md#speaking-energy-and-roster) |
 | `PositionUpdate { channel_id, positions }`, `OcclusionUpdate`, `ReverbZoneUpdate` | — | positional channels; players may only move themselves unless they hold a moderator role |

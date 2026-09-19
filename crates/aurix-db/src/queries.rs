@@ -55,6 +55,35 @@ pub async fn update_app_key_hash(
     Ok(())
 }
 
+/// Updates an app's editable settings; `None` keeps the current value.
+pub async fn update_app(
+    pool: &DbPool,
+    app_id: uuid::Uuid,
+    name: Option<&str>,
+    description: Option<Option<&str>>,
+    max_channels: Option<i32>,
+    max_participants_per_channel: Option<i32>,
+) -> Result<Option<AppRow>, sqlx::Error> {
+    sqlx::query_as::<_, AppRow>(
+        r#"UPDATE apps SET
+               name = COALESCE($2, name),
+               description = CASE WHEN $3 THEN $4 ELSE description END,
+               max_channels = COALESCE($5, max_channels),
+               max_participants_per_channel = COALESCE($6, max_participants_per_channel),
+               updated_at = NOW()
+           WHERE id = $1 AND active = true
+           RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(name)
+    .bind(description.is_some())
+    .bind(description.flatten())
+    .bind(max_channels)
+    .bind(max_participants_per_channel)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn delete_app(pool: &DbPool, app_id: uuid::Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE apps SET active = false, updated_at = NOW() WHERE id = $1")
         .bind(app_id)

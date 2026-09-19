@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             rx_workers: config.media.rx_workers,
             media_tunnel: config.media.media_tunnel,
             tunnel_queue_packets: config.media.tunnel_queue_packets,
+            downlink_mix: config.media.downlink_mix,
         },
     );
 

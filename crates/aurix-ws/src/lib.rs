@@ -349,7 +349,9 @@ impl WsState {
             return;
         };
         let channel = self.sfu.read().get_channel(channel_id);
-        let scoped = channel.as_ref().filter(|c| c.roster_radius().is_some());
+        let scoped = channel
+            .as_ref()
+            .filter(|c| c.roster_radius().is_some() || c.hides_listeners());
         for sid in members.iter() {
             if Some(&*sid) == exclude {
                 continue;
@@ -611,6 +613,9 @@ impl WsState {
                             // them) once their positions put them within the roster radius.
                             continue;
                         }
+                        if channel.is_hidden_listener(&user_id) {
+                            continue;
+                        }
                     }
                     self.broadcast_visible(
                         app_id,
@@ -632,6 +637,7 @@ impl WsState {
                     channel_id,
                     user_id,
                     session_id,
+                    hidden,
                     ..
                 } => {
                     if let Some(rec) = &self.recording {
@@ -640,9 +646,14 @@ impl WsState {
                     let channel = self.sfu.read().get_channel(&channel_id);
                     if let Some(channel) = &channel {
                         if channel.is_remote(&user_id) {
+                            let hidden = hidden || channel.is_hidden_listener(&user_id);
                             // Remote members leave the roster of whoever saw them; local
                             // leavers were announced by `leave_channel_full`.
-                            if let Some(observers) = channel.remove_remote(&user_id) {
+                            let observers = channel.remove_remote(&user_id);
+                            if hidden {
+                                continue;
+                            }
+                            if let Some(observers) = observers {
                                 let msg = ControlMessage::ParticipantLeft {
                                     channel_id,
                                     user_id,
@@ -657,6 +668,9 @@ impl WsState {
                         } else if channel.roster_radius().is_some() {
                             continue;
                         }
+                    }
+                    if hidden {
+                        continue;
                     }
                     self.broadcast_visible(
                         app_id,
@@ -1422,6 +1436,7 @@ impl WsState {
             user_id,
             session_id,
             reason: reason.into(),
+            hidden: left.hidden,
             timestamp: chrono::Utc::now(),
         });
         if let Ok(0) = count {
@@ -1713,6 +1728,7 @@ fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<Contr
         transmission,
         focus_channel: prefs.focus(),
         codec: session.codec(),
+        downlink: session.downlink_mode(),
     })
 }
 
@@ -1757,13 +1773,41 @@ fn parse_role(s: &str) -> ChannelRole {
 }
 
 /// Radii the joining client needs to interpret presence and text scoping.
-fn channel_radii(state: &WsState, channel_id: &ChannelId) -> (Option<f32>, Option<f32>) {
-    state
+/// The `ChannelJoinAck` for `user_id`'s session in `channel_id`: roster as they see it, the
+/// channel's policies and their own role.
+fn channel_join_ack(
+    state: &WsState,
+    session_id: &SessionId,
+    user_id: &UserId,
+    channel_id: &ChannelId,
+) -> ControlMessage {
+    let participants = channel_snapshot(state, session_id, channel_id);
+    let (role, participant_count, hidden_listeners, roster_radius, text_radius) = state
         .sfu
         .read()
         .get_channel(channel_id)
-        .map(|c| (c.roster_radius(), c.text_radius()))
-        .unwrap_or((None, None))
+        .map(|c| {
+            (
+                c.role_of(user_id),
+                (c.participant_count() as usize + c.remote_count()) as u32,
+                c.hides_listeners(),
+                c.roster_radius(),
+                c.text_radius(),
+            )
+        })
+        .unwrap_or((ChannelRole::Listener, 0, false, None, None));
+    ControlMessage::ChannelJoinAck {
+        channel_id: *channel_id,
+        participants,
+        transcription: channel_transcribes(state, channel_id),
+        safety_voice: channel_safety_monitored(state, channel_id),
+        audio: channel_audio_policy(state, channel_id),
+        roster_radius,
+        text_radius,
+        role,
+        participant_count,
+        hidden_listeners,
+    }
 }
 
 async fn handle_ws_connection(
@@ -1870,6 +1914,7 @@ async fn handle_ws_connection(
         resume_grace_ms: grace.as_millis() as u64,
         resumed,
         media_tunnel: tunnel.is_some(),
+        downlink_mix: state.sfu.read().downlink_mix_enabled(),
     };
     if tx
         .send(serde_json::to_string(&init_ack).unwrap_or_default())
@@ -1884,18 +1929,9 @@ async fn handle_ws_connection(
     }
     // A resumed client reconciles its channel state from one ChannelJoinAck per channel.
     for channel_id in attached.resumed_channels.iter().flatten() {
-        let (roster_radius, text_radius) = channel_radii(&state, channel_id);
         send_msg(
             &tx,
-            &ControlMessage::ChannelJoinAck {
-                channel_id: *channel_id,
-                participants: channel_snapshot(&state, &session_id, channel_id),
-                transcription: channel_transcribes(&state, channel_id),
-                safety_voice: channel_safety_monitored(&state, channel_id),
-                audio: channel_audio_policy(&state, channel_id),
-                roster_radius,
-                text_radius,
-            },
+            &channel_join_ack(&state, &session_id, &token.user_id, channel_id),
         )
         .await;
         if let Some(rec) = &state.recording {
@@ -2521,19 +2557,9 @@ async fn handle_control_message(
             }
             drop(existing);
             state.sync_remote_members(token.app_id, channel_id).await;
-            let participants = channel_snapshot(state, &session_id, &channel_id);
-            let (roster_radius, text_radius) = channel_radii(state, &channel_id);
             send_msg(
                 tx,
-                &ControlMessage::ChannelJoinAck {
-                    channel_id,
-                    participants,
-                    transcription: channel_transcribes(state, &channel_id),
-                    safety_voice: channel_safety_monitored(state, &channel_id),
-                    audio: channel_audio_policy(state, &channel_id),
-                    roster_radius,
-                    text_radius,
-                },
+                &channel_join_ack(state, &session_id, &token.user_id, &channel_id),
             )
             .await;
             // Active recordings in the channel must be disclosed to the newcomer.
@@ -2748,6 +2774,14 @@ async fn handle_control_message(
             };
             match result {
                 Ok(()) => send_msg(tx, &ControlMessage::AudioCodecChanged { codec }).await,
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+            }
+        }
+
+        ControlMessage::SetDownlinkMode { mode } => {
+            let result = state.sfu.read().set_downlink_mode(&session_id, mode);
+            match result {
+                Ok(()) => send_msg(tx, &ControlMessage::DownlinkModeChanged { mode }).await,
                 Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
             }
         }
@@ -3135,6 +3169,7 @@ async fn handle_control_message(
         | ControlMessage::TransmissionChanged { .. }
         | ControlMessage::ChannelFocusChanged { .. }
         | ControlMessage::AudioCodecChanged { .. }
+        | ControlMessage::DownlinkModeChanged { .. }
         | ControlMessage::BitrateCommand { .. }
         | ControlMessage::NetworkQuality { .. }
         | ControlMessage::RecordingNotification { .. }

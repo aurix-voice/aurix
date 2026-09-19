@@ -206,6 +206,19 @@ pub enum AudioCodec {
     Pcmu,
 }
 
+/// How a native AURX session receives channel audio (`SetDownlinkMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DownlinkMode {
+    /// One stream per speaker, each with its own SSRC, gain and direction; the client mixes.
+    #[default]
+    Streams,
+    /// One server-mixed stereo Opus stream per channel (`PacketFlags::Mixed`), with every
+    /// per-receiver rule (mutes, volumes, focus, positional attenuation, ambient slots)
+    /// already applied. End-to-end encrypted speakers still arrive as separate streams.
+    Mixed,
+}
+
 /// How a session's media reaches the node (`MediaBound.transport`, session stats).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -475,6 +488,9 @@ pub struct ChannelConfig {
     /// computed gain, every other concurrent speaker at `ambient_gain` (`0` drops them).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient: Option<AmbientConfig>,
+    /// Large-channel / audience settings (see [`AudienceConfig`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<AudienceConfig>,
     pub recording_enabled: bool,
     /// Transcribe participants' speech (when `[stt]` is configured on the node) and deliver
     /// `Transcript` events to the channel's participants.
@@ -503,6 +519,7 @@ impl Default for ChannelConfig {
             positional_config: None,
             audio_profile: AudioProfile::Voice,
             ambient: None,
+            audience: None,
             recording_enabled: false,
             transcription: false,
             safety_voice: false,
@@ -555,7 +572,21 @@ impl ChannelConfig {
         if let Some(a) = &self.ambient {
             a.validate()?;
         }
+        if let Some(a) = &self.audience {
+            a.validate(self.max_participants)?;
+        }
         Ok(())
+    }
+
+    /// Whether members without the `speak` permission are kept out of presence.
+    pub fn hides_listeners(&self) -> bool {
+        self.audience.is_some_and(|a| a.hide_listeners)
+    }
+
+    /// Whether native listeners get one server-mixed stream regardless of their own
+    /// `DownlinkMode`.
+    pub fn mixes_for_listeners(&self) -> bool {
+        self.audience.is_some_and(|a| a.mix_for_listeners)
     }
 
     /// The encoder policy this channel imposes on its participants.
@@ -772,6 +803,52 @@ impl AmbientConfig {
         }
         if !self.ambient_gain.is_finite() || !(0.0..=1.0).contains(&self.ambient_gain) {
             return Err("ambient.ambient_gain must be within 0.0..=1.0".into());
+        }
+        Ok(())
+    }
+}
+
+/// Audience (listen-only / large-channel) settings of a channel. A member whose permission
+/// grant has `speak: false` (`ChannelRole::Listener`) is receive-only in every channel type;
+/// this block controls how such listeners are presented and served so that a channel can
+/// hold thousands of them at the cost of a handful of speakers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudienceConfig {
+    /// Listeners are absent from the roster and from `ParticipantJoined` / `ParticipantLeft`
+    /// / mute / energy notifications of other members (they still see the speakers and
+    /// each other's text). `ChannelJoinAck.participant_count` carries the real headcount.
+    pub hide_listeners: bool,
+    /// Native listeners receive one server-mixed stream (`DownlinkMode::Mixed`) instead of a
+    /// stream per speaker, whatever their own downlink mode. Browsers are always mixed.
+    pub mix_for_listeners: bool,
+    /// Members that may speak (`speak: true`) the channel admits at once, `0` = no separate
+    /// limit (only `max_participants`). Counted over the members this node knows of (its own
+    /// and those learned through the cascade).
+    pub max_speakers: u32,
+    /// Concurrent voices a receiver hears at once, `0` = unlimited. Speakers are ranked per
+    /// receiver by what *that* receiver would hear (distance, volume, focus, ambient slot ×
+    /// the sender's reported level); holders keep their slot while they talk, the rest are
+    /// withheld until a slot frees. Bounds the per-receiver work everywhere: streams a native
+    /// client decodes, tracks a browser receives, voices a server mix decodes.
+    pub max_streams: u8,
+}
+
+impl Default for AudienceConfig {
+    fn default() -> Self {
+        Self {
+            hide_listeners: true,
+            mix_for_listeners: true,
+            max_speakers: 0,
+            max_streams: 0,
+        }
+    }
+}
+
+impl AudienceConfig {
+    pub fn validate(&self, max_participants: u32) -> std::result::Result<(), String> {
+        if self.max_speakers > max_participants {
+            return Err("audience.max_speakers must not exceed max_participants".into());
         }
         Ok(())
     }
@@ -1250,6 +1327,7 @@ pub enum AuditAction {
     AdminLogin,
     AdminCreated,
     AppCreated,
+    AppUpdated,
     AppDeleted,
     WebhookCreated,
     WebhookUpdated,

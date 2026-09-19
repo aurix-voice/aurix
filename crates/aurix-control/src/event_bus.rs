@@ -29,6 +29,10 @@ pub enum ServerEvent {
         user_id: UserId,
         session_id: SessionId,
         reason: String,
+        /// The leaver was a hidden listener (`audience.hide_listeners`); other members were
+        /// never told about them.
+        #[serde(default)]
+        hidden: bool,
         timestamp: DateTime<Utc>,
     },
     ChannelCreated {

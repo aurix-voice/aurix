@@ -15,7 +15,9 @@ and are created with `POST /v1/channels` (or on the fly, see [ad-hoc channels](#
 | `echo` | microphone test: every participant hears only their own audio, through the real uplink → server → downlink path; never relayed to other nodes |
 
 Roles (`listener < speaker < moderator < administrator`) come from the membership; the JWT grant or
-action token decides them at join time.
+action token decides them at join time. A grant with `speak: false` makes the member a
+**listener** in every channel type: its audio is dropped at the node, and
+[audience settings](#large-channels-and-audiences) decide how such members are presented.
 
 ## Configuration
 
@@ -47,7 +49,8 @@ action token decides them at join time.
       "roster_radius": 60.0,
       "text_radius": 20.0
     },
-    "ambient": { "max_voices": 4, "ambient_gain": 0.15 }
+    "ambient": { "max_voices": 4, "ambient_gain": 0.15 },
+    "audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 0, "max_streams": 0 }
   }
 }
 ```
@@ -83,6 +86,10 @@ action token decides them at join time.
   [Radius-scoped presence and text](#radius-scoped-presence-and-text).
 * `ambient` turns on [cocktail-party mixing](#ambient-cocktail-party-mode) for any channel
   type; absent (the default) every audible speaker arrives at full gain.
+* `audience` configures [large channels](#large-channels-and-audiences): hidden listeners, a
+  server mix for them, a speaker admission limit and a per-receiver cap on concurrent voices.
+  `max_participants` may go up to the application's `max_participants_per_channel` quota
+  (`PATCH /v1/apps/{app_id}` raises it; the hard ceiling is 100 000).
 
 `PUT /v1/channels/{id}/config` updates the configuration live; participants on every node hosting
 the channel pick it up (channel type changes take effect for subsequent frames).
@@ -218,6 +225,74 @@ first joiners converge on one row; the last leave soft-deletes it (`channel.deac
 `channel.destroyed`). Application channel quotas and `max_participants` apply as usual, and the
 creating join is rolled back if it fails half-way. Use this for parties and matches your backend
 does not want to pre-create.
+
+## Large channels and audiences
+
+A channel with thousands of members costs what its *speakers* cost, not its headcount, when
+three things hold: most members are listeners, listeners do not flood presence, and every
+receiver hears a bounded number of voices. `ChannelConfig.audience` controls all three:
+
+```json
+"audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 8, "max_streams": 4 }
+```
+
+* **Listeners.** A member whose grant has `speak: false` joins with `ChannelRole::Listener`
+  (`ChannelJoinAck.role = "listener"`). The node drops any audio it sends and it never counts
+  towards `max_speakers`; it hears speakers like anyone else, may chat, and receives the same
+  `ChannelJoinAck.audio` policy. SDKs expose it as `canSpeakIn` / `CanSpeakIn`.
+* **`hide_listeners`** (default `true` when the block is present) keeps listeners out of the
+  roster and out of `ParticipantJoined` / `ParticipantLeft` / mute / energy notifications sent to
+  other members, so a 5 000-listener stream does not cost 5 000 × 5 000 presence messages.
+  Listeners still see the speakers (and get their own join ack); `participant_count` in the
+  ack carries the real headcount across all nodes and `hidden_listeners: true` tells the client
+  the roster is partial. Game servers see the full membership over REST as usual.
+* **`mix_for_listeners`** (default `true`) serves native listeners one server-mixed stereo
+  stream per channel instead of a stream per speaker, whatever downlink mode they asked for —
+  see [server mix](#server-mix-for-native-clients). Browsers are always mixed.
+* **`max_speakers`** (`0` = no separate limit) caps how many members that *may* speak the
+  channel admits; the next speaker join fails with `CHANNEL_FULL` while listeners keep
+  joining up to `max_participants`. Counted over the members a node knows of (its own plus
+  those learned through the cascade), so the cap is approximate across nodes for a few
+  hundred milliseconds after a join.
+* **`max_streams`** (`0` = unlimited) bounds the concurrent voices *one receiver* hears. The
+  ranking is per receiver and uses what that receiver would actually hear — delivery gain
+  after local mute, block, volume, focus, distance attenuation and ambient dimming, times the
+  level the sender reported (RFC 6464) — with the same sticky slots and hold time as the
+  ambient mixer, so a burst of DTX does not reshuffle who you hear. Losers are withheld
+  (`aurix_streams_capped_total`), not dimmed. The cap runs before per-speaker delivery *and*
+  before the server mix, so it bounds what a native client decodes, what a browser mix decodes
+  and what a channel mixer decodes alike.
+
+### Server mix for native clients
+
+Native AURX sessions normally receive one stream per speaker and mix locally — that is what
+gives them per-participant positioning and E2EE. In large channels they can instead ask for
+one **server-mixed stereo Opus** stream per channel with `SetDownlinkMode { mode: "mixed" }`
+(ack `DownlinkModeChanged`; `media.downlink_mix` must be on — `SessionInitAck.downlink_mix`
+says so — and the session must be native, browsers are mixed anyway). The mix:
+
+* is built **per receiver rule set**: your local mutes, volumes, focus, positional
+  attenuation / direction and ambient slots are applied before summing, exactly as they would
+  be on per-speaker streams. Receivers of a `team` / `command` channel without ambient mixing
+  and without receiver-specific preferences share one mixer per channel (one decode per
+  speaker, one encode per channel); anyone with a local mute / volume / focus, and every
+  receiver of positional, whisper or ambient channels, gets a private mixer (one encode each,
+  bounded by `MAX_MIXERS` per node, idle mixers are torn down after 10 s);
+* arrives under a stable per-channel synthetic SSRC (top bit set, distinct from the channel's
+  TTS announcement SSRC) with `PacketFlags::Mixed`, its own sequence counter per receiver, and
+  is sealed with the receiver's session keys like every downlink frame. Mixed frames never
+  carry `Directional` (panning is baked in) and are re-encoded as μ-law for sessions that
+  negotiated [PCMU](#codecs-opus-and-the-pcmu-fallback) (`Mixed | Pcmu`);
+* **excludes `E2ee` speakers** — frames the server cannot decode keep arriving as separate
+  streams next to the mix, so end-to-end encrypted whispers still work in a mixed channel;
+* leaves recording, live streams, transcription, safety and the cascade untouched: they tap
+  the canonical per-speaker frames before fan-out, never the mix.
+
+Metrics: `aurix_downlink_mixers{kind="shared"|"private"}`,
+`aurix_downlink_mix_frames_total{outcome}`. A CPU-bound node can set
+`media.downlink_mix = false`; native clients then receive per-speaker streams (their request is
+refused with `VALIDATION_ERROR`, as it is for a WebRTC session) and `mix_for_listeners` has no
+effect on that node.
 
 ## Speaking, energy and roster
 

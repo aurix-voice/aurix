@@ -1,8 +1,8 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
-    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, MediaTransportKind,
-    Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, DownlinkMode,
+    MediaTransportKind, Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -243,6 +243,11 @@ pub enum PacketFlags {
     /// `AudioCodec::Pcmu` with `SetAudioCodec`; the server transcodes so everybody else still
     /// receives Opus, and sets it on the downlink copies sent to PCMU sessions.
     Pcmu = 0x2000,
+    /// Downlink only: the frame is the server's mix of a whole channel for this receiver
+    /// (`DownlinkMode::Mixed`) — stereo Opus under the channel's system-voice SSRC
+    /// (`system_voice_ssrc`), with the receiver's mutes, volumes, focus and positional /
+    /// ambient gains already applied. Never combined with `E2ee` or `Directional`.
+    Mixed = 0x4000,
 }
 
 #[derive(Debug, Clone)]
@@ -784,6 +789,10 @@ pub enum ControlMessage {
         resumed: bool,
         #[serde(default)]
         media_tunnel: bool,
+        /// The node can serve native sessions one server-mixed stream per channel
+        /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
+        #[serde(default)]
+        downlink_mix: bool,
     },
     /// Sent by the server once a media path has been authenticated via `SessionBind`:
     /// `transport` is `udp`, `tunnel` (AURX over this WebSocket) or `webrtc`.
@@ -823,6 +832,17 @@ pub enum ControlMessage {
         /// of the sender (`PositionalConfig.text_radius`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text_radius: Option<f32>,
+        /// Your role in this channel; `listener` means receive-only (the grant had
+        /// `speak: false`) and applies to every channel type.
+        #[serde(default = "default_participant_role")]
+        role: ChannelRole,
+        /// Members in the channel across all nodes, including listeners hidden from
+        /// `participants` by `ChannelConfig.audience.hide_listeners`.
+        #[serde(default)]
+        participant_count: u32,
+        /// Listeners are hidden from presence in this channel (`audience.hide_listeners`).
+        #[serde(default)]
+        hidden_listeners: bool,
     },
     /// Server→client: an operator changed the channel's audio settings while you are in it.
     ChannelAudioPolicy {
@@ -891,6 +911,10 @@ pub enum ControlMessage {
         /// Uplink/downlink codec of this session (`opus` unless negotiated otherwise).
         #[serde(default)]
         codec: AudioCodec,
+        /// How channel audio reaches this session (`streams` unless `SetDownlinkMode` said
+        /// otherwise).
+        #[serde(default)]
+        downlink: DownlinkMode,
     },
     /// Client→server (native AURX only): switch this session's own audio frames to `codec`.
     /// With `pcmu` the client sends G.711 μ-law frames flagged `PacketFlags::Pcmu` and receives
@@ -902,6 +926,18 @@ pub enum ControlMessage {
     /// Server→client: ack of `SetAudioCodec`; frames sent from now on must use `codec`.
     AudioCodecChanged {
         codec: AudioCodec,
+    },
+    /// Client→server (native AURX only): receive channel audio as one server-mixed stream per
+    /// channel (`mixed`, see `PacketFlags::Mixed`) or as one stream per speaker (`streams`,
+    /// the default). Rejected when the node disables `media.downlink_mix` or the session is
+    /// WebRTC (browsers are always mixed).
+    SetDownlinkMode {
+        mode: DownlinkMode,
+    },
+    /// Server→client: ack of `SetDownlinkMode`. Frames already in flight may still be of the
+    /// previous kind.
+    DownlinkModeChanged {
+        mode: DownlinkMode,
     },
     /// Client→server: which of the joined channels receive this session's microphone.
     /// `single` must name a joined channel; leaving that channel switches to `none`.

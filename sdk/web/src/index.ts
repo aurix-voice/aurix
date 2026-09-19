@@ -1,4 +1,9 @@
-export { AurixClient, transmissionFromWire, transmissionToWire } from './client.js';
+export {
+  AurixClient,
+  channelInfoFromJoinAck,
+  transmissionFromWire,
+  transmissionToWire,
+} from './client.js';
 export {
   AUDIO_LEVEL_SILENCE,
   AudioLevelMeter,
@@ -40,6 +45,7 @@ export type { ClientStats, NetworkQuality, NetworkQualityWire, RtcStatsInput, Rt
 export type {
   AurixClientOptions,
   AurixEvents,
+  ChannelInfo,
   ChannelScope,
   ChatMessage,
   ConnectionState,

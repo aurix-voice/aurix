@@ -1,6 +1,7 @@
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::MediaChannel;
+use crate::mix::MixHub;
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
 use crate::tunnel::MediaTunnel;
@@ -35,6 +36,9 @@ pub struct ChannelLeft {
     /// Local members that had the leaver in their roster when the channel scopes presence
     /// by `roster_radius` (`None`: no radius, every member saw them).
     pub roster_observers: Option<Vec<UserId>>,
+    /// The leaver was a hidden listener (`audience.hide_listeners`): nobody saw them join,
+    /// so nobody is told they left.
+    pub hidden: bool,
 }
 
 /// Media-plane tunables taken from `MediaConfig`.
@@ -68,6 +72,9 @@ pub struct SfuOptions {
     pub media_tunnel: bool,
     /// Downlink queue depth per tunneled session (see `MediaConfig::tunnel_queue_packets`).
     pub tunnel_queue_packets: usize,
+    /// Serve native sessions one server-mixed stream per channel on request
+    /// (see `MediaConfig::downlink_mix`).
+    pub downlink_mix: bool,
 }
 
 impl Default for SfuOptions {
@@ -91,6 +98,7 @@ impl Default for SfuOptions {
             rx_workers: 0,
             media_tunnel: true,
             tunnel_queue_packets: 128,
+            downlink_mix: true,
         }
     }
 }
@@ -272,6 +280,9 @@ impl SfuNode {
             self.options.require_packet_auth,
             self.options.speaking_energy_threshold,
             self.events.clone(),
+            self.options
+                .downlink_mix
+                .then(|| MixHub::new(socket.clone(), self.options.downlink_bitrate as i32)),
         ));
 
         // WebRTC media events -> router
@@ -485,6 +496,9 @@ impl SfuNode {
         if let Some(ref wm) = self.webrtc_manager {
             wm.remove_session(&session.session_id);
         }
+        if let Some(hub) = self.router.as_ref().and_then(|r| r.mix_hub()) {
+            hub.forget_session(&session.session_id, false);
+        }
         self.active_participant_count.fetch_sub(1, Ordering::AcqRel);
         aurix_metrics::ACTIVE_SESSIONS.dec();
         let elapsed = Utc::now()
@@ -504,14 +518,19 @@ impl SfuNode {
             transmission_reset,
             focus_reset,
             roster_observers: None,
+            hidden: false,
         };
         let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else {
             return left;
         };
+        left.hidden = channel.is_hidden_listener(&session.user_id);
         left.roster_observers = channel.observers_of(&session.user_id);
         channel.remove_participant(&session.user_id);
         if let Some(ref router) = self.router {
             router.forget_pcmu_downlinks(Some(session.ssrc), Some(channel_id_hash(channel_id)));
+            if let Some(hub) = router.mix_hub() {
+                hub.forget_receiver(&session.session_id, channel_id);
+            }
         }
         if let Some(ref sink) = self.audio_sink {
             sink.on_participant_left(*channel_id, session.user_id);
@@ -711,6 +730,32 @@ impl SfuNode {
             .get_session(session_id)
             .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
         Ok(self.remove_from_channel(channel_id, &session))
+    }
+
+    /// `SetDownlinkMode`: how a native session receives channel audio. `Mixed` needs
+    /// `media.downlink_mix`; switching back to `Streams` drops the session's mixed streams
+    /// (channels with `audience.mix_for_listeners` keep mixing for a listener regardless).
+    pub fn set_downlink_mode(&self, session_id: &SessionId, mode: DownlinkMode) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        if mode == DownlinkMode::Mixed && !self.options.downlink_mix {
+            return Err(AurixError::Validation(
+                "server-side downlink mixing is disabled on this node".into(),
+            ));
+        }
+        session.set_downlink_mode(mode)?;
+        if mode == DownlinkMode::Streams {
+            if let Some(hub) = self.router.as_ref().and_then(|r| r.mix_hub()) {
+                hub.forget_session(session_id, true);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this node serves server-mixed downlinks (`SessionInitAck.downlink_mix`).
+    pub fn downlink_mix_enabled(&self) -> bool {
+        self.options.downlink_mix
     }
 
     pub fn server_mute_user(&self, user_id: &UserId, muted: bool) -> Result<()> {

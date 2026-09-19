@@ -210,6 +210,29 @@ refused — always 0 on UDP). C: `AurixClientConfig.media_path` (`AURIX_MEDIA_PA
 Expect more latency on the tunnel (TCP retransmits stall everything behind a lost segment);
 it is a way to stay in the call, not a replacement for UDP.
 
+## Large channels: roles and the server mix
+
+`Event::ChannelJoined { role, participant_count, hidden_listeners, .. }` tells the host what
+kind of member it is ([large channels](../features/channels.md#large-channels-and-audiences)):
+`client.channel_role(id)` / `can_speak_in(id)` (a `Listener` may keep pushing capture — the
+node drops it), `participant_count(id)` (whole-fleet headcount, including listeners hidden from
+the roster) and `channel_hidden_listeners(id)`.
+
+`client.set_downlink_mode(DownlinkMode::Mixed)` asks the node for one server-mixed stereo
+stream per channel instead of a stream per speaker; `Event::DownlinkModeChanged(mode)` confirms
+it and `client.downlink_mode()` reports the acknowledged mode. Mixed frames (`PacketFlags::Mixed`,
+the channel's synthetic SSRC) are decoded as stereo and played without panning, so the same
+mixer output works in both modes; speakers with E2EE still arrive as separate streams. The
+request is refused with `VALIDATION_ERROR` when the node has `media.downlink_mix = false`
+(`SessionInfo::downlink_mix`); a fresh session reports `Streams` and re-applies the preferred
+mode. C: `AurixChannelInfo` (`role`, `participant_count`, `hidden_listeners`, `transcription`,
+`safety_voice`) via `aurix_client_channel_info` / `aurix_event_channel_info`,
+`aurix_event_participant_count`, `aurix_client_set_downlink_mode` /
+`aurix_client_downlink_mode`, `AURIX_EVENT_DOWNLINK_MODE_CHANGED` + `aurix_event_downlink_mode`,
+`AurixSessionInfo.downlink_mix`; C++ `channel_info`, `can_speak_in`, `set_downlink_mode`,
+`downlink_mode`; Unreal `GetChannelInfo`, `CanSpeakIn`, `SetDownlinkMode`, `GetDownlinkMode`,
+`OnDownlinkModeChanged`.
+
 ## Presence and text range
 
 `Event::ChannelJoined { scope, .. }` and `client.channel_scope(channel_id)` expose the

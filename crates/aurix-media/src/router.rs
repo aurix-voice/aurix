@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::{MediaChannel, Mix};
+use crate::mix::MixHub;
 use crate::session::{MediaEndpoint, MediaSession, Transport};
 use crate::transcode::{PcmuDownlink, PcmuUplink};
 use crate::tunnel::MediaTunnel;
@@ -130,6 +131,9 @@ pub struct PacketRouter {
     events: broadcast::Sender<MediaEvent>,
     /// Opus → μ-law decoders for PCMU receivers, per `(sender ssrc, channel hash)` stream.
     pcmu_downlinks: DashMap<(u32, u32), Mutex<PcmuDownlink>>,
+    /// Server-side mixers for native receivers in `DownlinkMode::Mixed`
+    /// (`None`: `media.downlink_mix = false`, everyone gets per-speaker streams).
+    mix: Option<Arc<MixHub>>,
 }
 
 impl PacketRouter {
@@ -144,6 +148,7 @@ impl PacketRouter {
         require_packet_auth: bool,
         speaking_energy_threshold: f32,
         events: broadcast::Sender<MediaEvent>,
+        mix: Option<Arc<MixHub>>,
     ) -> Self {
         Self {
             shared,
@@ -156,7 +161,13 @@ impl PacketRouter {
             speaking_energy_threshold,
             events,
             pcmu_downlinks: DashMap::new(),
+            mix,
         }
+    }
+
+    /// Server-side downlink mixers of this node, if enabled.
+    pub fn mix_hub(&self) -> Option<&Arc<MixHub>> {
+        self.mix.as_ref()
     }
 
     pub async fn route_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
@@ -631,7 +642,8 @@ impl PacketRouter {
             self.fan_out(&channel, sender, &packet).await;
         }
         if to_self {
-            self.deliver(&channel, vec![(sender.clone(), Mix::UNITY)], &packet)
+            // Meant for this receiver only: must never enter a mixer shared with others.
+            self.deliver_scoped(&channel, vec![(sender.clone(), Mix::UNITY)], &packet, false)
                 .await;
         }
         Ok(())
@@ -817,15 +829,63 @@ impl PacketRouter {
         self.deliver(channel, receivers, packet).await;
     }
 
+    /// Hands the native receivers served by a server mix (`DownlinkMode::Mixed` or listeners
+    /// of a `mix_for_listeners` channel) to the mix hub and returns the rest, which get
+    /// per-speaker streams. E2EE frames cannot be mixed and always go per-speaker.
+    /// `shared_ok = false` marks a frame meant for the listed receivers only (it may not
+    /// enter a mixer other members subscribe to).
+    fn split_mixed(
+        &self,
+        channel: &Arc<MediaChannel>,
+        receivers: Vec<(Arc<MediaSession>, Mix)>,
+        packet: &AurixPacket,
+        e2ee: bool,
+        shared_ok: bool,
+    ) -> Vec<(Arc<MediaSession>, Mix)> {
+        let Some(hub) = self.mix.as_ref().filter(|_| !e2ee) else {
+            return receivers;
+        };
+        if !channel.may_mix() {
+            return receivers;
+        }
+        let mut streams = Vec::with_capacity(receivers.len());
+        let mut mixed = Vec::new();
+        for (receiver, mix) in receivers {
+            if receiver.transport() == Transport::Aurx
+                && receiver.is_active()
+                && channel.wants_mix(&receiver)
+            {
+                mixed.push((receiver, mix));
+            } else {
+                streams.push((receiver, mix));
+            }
+        }
+        if !mixed.is_empty() {
+            streams.extend(hub.push(channel, mixed, packet, shared_ok));
+        }
+        streams
+    }
+
     async fn deliver(
         &self,
         channel: &Arc<MediaChannel>,
         receivers: Vec<(Arc<MediaSession>, Mix)>,
         packet: &AurixPacket,
     ) {
+        self.deliver_scoped(channel, receivers, packet, true).await;
+    }
+
+    async fn deliver_scoped(
+        &self,
+        channel: &Arc<MediaChannel>,
+        receivers: Vec<(Arc<MediaSession>, Mix)>,
+        packet: &AurixPacket,
+        shared_ok: bool,
+    ) {
         // Downlink packets are sealed per receiver (encrypted + authenticated with the receiver's
         // session keys) with that receiver's gain/direction metadata in front of the frame.
         let e2ee = packet.header.has_flag(PacketFlags::E2ee);
+        let receivers = self.split_mixed(channel, receivers, packet, e2ee, shared_ok);
         // Computed once per packet, on the first PCMU receiver.
         let mut pcmu_frame: Option<Option<Bytes>> = None;
         for (receiver, mix) in receivers {

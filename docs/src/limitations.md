@@ -46,6 +46,12 @@ the chapter that explains the boundary.
   and expected loss are only controllable in the native, Unity and Unreal SDKs
   ([Web SDK](sdk/web.md#opus-in-the-browser)). Native mono encoders are capped at 300 kbit/s
   (libopus), channel configs at `media.max_bitrate`.
+* **The native server mix is per hop, not end-to-end.** `E2ee` frames cannot enter a mix and
+  keep arriving as separate streams even in `mixed` downlink mode; a mix costs the node one Opus
+  decode per selected speaker plus one stereo encode per mixer, capped at `MAX_MIXERS` (8192)
+  per node. `audience.max_speakers` is enforced when a speaker joins — nobody is demoted once
+  admitted — and `max_streams` ranks by receiver gains and sender-reported level, not by
+  server-side voice analysis ([Large channels](features/channels.md#large-channels-and-audiences)).
 * **Cascade is a one-hop mesh** between the nodes that host a channel — no relay trees; nodes
   must reach each other directly on `media.port + 1`/UDP ([Scaling](operations/scaling.md)).
 * **Positional audio is server-side attenuation, panning and radius scoping** from
@@ -97,5 +103,5 @@ the chapter that explains the boundary.
 
 ## Planned
 
-The operator web panel is tracked separately. Per-receiver stream caps / audience mode for very
-large channels and cross-node session failover are the next backlog items.
+The operator web panel is tracked separately. Cross-node session failover (resuming on another
+node when the hosting node dies) is the next backlog item.

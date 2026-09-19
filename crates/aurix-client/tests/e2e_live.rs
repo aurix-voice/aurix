@@ -13,7 +13,9 @@
 use aurix_client::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use aurix_client::events::{ConnectionState, Event};
 use aurix_client::{Client, ClientConfig, DspConfig, EncoderSettings, MediaPath, MediaPathPolicy};
-use aurix_common::types::{AudioPolicy, ChannelId, OpusBandwidth, OpusSignal, UserId};
+use aurix_common::types::{
+    AudioPolicy, ChannelId, ChannelRole, DownlinkMode, OpusBandwidth, OpusSignal, UserId,
+};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -145,13 +147,24 @@ async fn issue_token(
     name: &str,
     ch: ChannelId,
 ) -> (String, UserId) {
+    issue_token_with(env, http, external_id, name, ch, true).await
+}
+
+async fn issue_token_with(
+    env: &Env,
+    http: &reqwest::Client,
+    external_id: &str,
+    name: &str,
+    ch: ChannelId,
+    speak: bool,
+) -> (String, UserId) {
     let r: serde_json::Value = http
         .post(format!("{}/v1/tokens", env.api))
         .header("x-api-key", &env.api_key)
         .json(&serde_json::json!({
             "external_id": external_id,
             "display_name": name,
-            "channels": [{"channel_id": ch, "join": true, "speak": true, "receive": true, "moderate": false}],
+            "channels": [{"channel_id": ch, "join": true, "speak": speak, "receive": true, "moderate": false}],
         }))
         .send()
         .await
@@ -1069,4 +1082,177 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     block.unblock();
     alice.disconnect();
     bob.disconnect();
+}
+
+/// Large-channel path end to end through the native core: Alice speaks, Bob asks for the
+/// server mix and hears the tone on one synthetic stereo stream (Alice's SSRC never reaches
+/// his mixer), Carol joins with `speak: false` and is a hidden listener — receive-only,
+/// counted in `participant_count`, absent from Alice's roster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_client_takes_a_server_mixed_downlink_and_listener_role() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "audience": {"hide_listeners": true, "mix_for_listeners": true, "max_speakers": 0, "max_streams": 2}
+        }),
+    )
+    .await;
+    let (alice_token, alice_id) = issue_token(&env, &http, "mix-alice", "Alice", channel).await;
+    let (bob_token, bob_id) = issue_token(&env, &http, "mix-bob", "Bob", channel).await;
+    let (carol_token, carol_id) =
+        issue_token_with(&env, &http, "mix-carol", "Carol", channel, false).await;
+
+    let mut alice_cfg = ClientConfig::new(ws_with_path(&env.ws), alice_token);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    let alice = Client::new(alice_cfg).unwrap();
+    let bob = Client::new(ClientConfig::new(ws_with_path(&env.ws), bob_token)).unwrap();
+    let carol = Client::new(ClientConfig::new(ws_with_path(&env.ws), carol_token)).unwrap();
+    alice.connect().unwrap();
+    bob.connect().unwrap();
+    carol.connect().unwrap();
+    for (c, who) in [(&alice, "alice"), (&bob, "bob"), (&carol, "carol")] {
+        let Event::SessionReady(info) = wait_for(c, who, Duration::from_secs(10), |e| {
+            matches!(e, Event::SessionReady(_))
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert!(info.downlink_mix, "node must advertise the downlink mix");
+        wait_for(c, who, Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaBound)
+        })
+        .await;
+    }
+    let alice_ssrc = alice.session().unwrap().ssrc;
+
+    // --- Bob switches to the mix before anyone speaks; the ack is authoritative.
+    assert_eq!(bob.downlink_mode(), DownlinkMode::Streams);
+    bob.set_downlink_mode(DownlinkMode::Mixed).unwrap();
+    wait_for(&bob, "bob mixed", Duration::from_secs(5), |e| {
+        matches!(e, Event::DownlinkModeChanged(DownlinkMode::Mixed))
+    })
+    .await;
+    assert_eq!(bob.downlink_mode(), DownlinkMode::Mixed);
+
+    alice.join_channel(channel, None).unwrap();
+    let Event::ChannelJoined {
+        role,
+        participant_count,
+        hidden_listeners,
+        ..
+    } = wait_for(&alice, "alice join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(role, ChannelRole::Speaker);
+    assert_eq!(participant_count, 1);
+    assert!(hidden_listeners);
+    assert!(alice.can_speak_in(channel));
+    bob.join_channel(channel, None).unwrap();
+    wait_for(&bob, "bob join", Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            Event::ChannelJoined {
+                participant_count: 2,
+                ..
+            }
+        )
+    })
+    .await;
+    wait_for(&alice, "bob joined", Duration::from_secs(10), |e| {
+        matches!(e, Event::ParticipantJoined { participant, .. } if participant.user_id == bob_id)
+    })
+    .await;
+
+    // --- Carol: listener, hidden from Alice, counted, cannot speak.
+    carol.join_channel(channel, None).unwrap();
+    let Event::ChannelJoined {
+        role,
+        participant_count,
+        participants,
+        ..
+    } = wait_for(&carol, "carol join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(role, ChannelRole::Listener);
+    assert_eq!(participant_count, 3);
+    assert_eq!(participants.len(), 2, "carol sees both speakers");
+    assert!(participants.iter().any(|p| p.user_id == alice_id));
+    assert!(!carol.can_speak_in(channel));
+    assert_eq!(carol.channel_role(channel), Some(ChannelRole::Listener));
+    assert_eq!(bob.participant_count(channel), Some(2));
+
+    // --- Alice speaks: Bob hears the tone on the channel's synthetic mixed stream only.
+    let (rms, active) = stream_tone(&alice, &bob, 1.6).await;
+    eprintln!("bob heard mixed rms={rms:.3} over {active} frames");
+    assert!(active >= 50, "bob mixed only {active} active frames");
+    assert!((0.10..0.35).contains(&rms), "unexpected mixed rms {rms}");
+    let bob_stats = bob.stats();
+    assert!(bob_stats.media.audio_frames_received >= 50, "{bob_stats:?}");
+    assert!(
+        bob_stats.streams.iter().all(|s| s.ssrc != alice_ssrc),
+        "per-speaker stream leaked into a mixed downlink: {bob_stats:?}"
+    );
+    let mix = bob_stats
+        .streams
+        .iter()
+        .find(|s| s.ssrc & 0x8000_0000 != 0)
+        .expect("synthetic mixed stream");
+    assert_eq!(mix.lost, 0, "mixed stream must be gapless: {mix:?}");
+    let quiet_until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < quiet_until {
+        while let Some(ev) = alice.poll_event() {
+            assert!(
+                !matches!(&ev, Event::ParticipantJoined { participant, .. } if participant.user_id == carol_id),
+                "hidden listener announced to a speaker"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // --- Carol hears Alice too (listeners in a mix_for_listeners channel are mixed), and
+    //     her own capture goes nowhere: Alice's mixer sees no Carol stream.
+    let (rms_c, active_c) = stream_tone(&alice, &carol, 1.0).await;
+    eprintln!("carol heard rms={rms_c:.3} over {active_c} frames");
+    assert!(active_c >= 30, "carol mixed only {active_c} active frames");
+    let carol_ssrc = carol.session().unwrap().ssrc;
+    let (_, _) = stream_tone(&carol, &alice, 0.6).await;
+    assert!(
+        alice.stats().streams.iter().all(|s| s.ssrc != carol_ssrc),
+        "listener audio reached a speaker: {:?}",
+        alice.stats()
+    );
+
+    // --- back to per-speaker streams: Alice's own SSRC shows up in Bob's mixer again.
+    bob.set_downlink_mode(DownlinkMode::Streams).unwrap();
+    wait_for(&bob, "bob streams", Duration::from_secs(5), |e| {
+        matches!(e, Event::DownlinkModeChanged(DownlinkMode::Streams))
+    })
+    .await;
+    let (rms2, active2) = stream_tone(&alice, &bob, 1.0).await;
+    eprintln!("bob heard per-speaker rms={rms2:.3} over {active2} frames");
+    assert!(active2 >= 30, "bob mixed only {active2} active frames");
+    assert!(
+        bob.stats().streams.iter().any(|s| s.ssrc == alice_ssrc),
+        "per-speaker stream expected after switching back: {:?}",
+        bob.stats()
+    );
+
+    alice.disconnect();
+    bob.disconnect();
+    carol.disconnect();
 }

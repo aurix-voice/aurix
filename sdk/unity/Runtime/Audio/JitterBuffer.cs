@@ -145,6 +145,7 @@ namespace Aurix.Audio
             public IOpusCodec Decoder;
             public IOpusFecDecoder Fec;
             public AudioCodec Codec;
+            public bool Mixed;
             public long FecRecovered;
             public float Volume = 1f;
             public float LeftGain = 1f;
@@ -158,15 +159,25 @@ namespace Aurix.Audio
         }
 
         private readonly Func<IOpusCodec> _decoderFactory;
+        private readonly Func<IOpusCodec> _stereoDecoderFactory;
         private readonly Dictionary<uint, Stream> _streams = new Dictionary<uint, Stream>();
         private readonly List<uint> _stale = new List<uint>();
         private float _outputVolume = 1f;
         private volatile bool _outputMuted;
         private long _retiredLost, _retiredLate, _retiredFec, _underruns;
 
-        public RemoteMixer(Func<IOpusCodec> decoderFactory)
+        public RemoteMixer(Func<IOpusCodec> decoderFactory) : this(decoderFactory, null) { }
+
+        /// <summary>
+        /// <paramref name="stereoDecoderFactory"/> creates 2-channel decoders for server-mixed channel streams
+        /// (<see cref="Transport.IncomingAudio.Mixed"/>, stereo Opus). Without one such frames go through
+        /// <paramref name="decoderFactory"/>, which — if it is mono — downmixes them: the server's panning is lost but
+        /// playback still works.
+        /// </summary>
+        public RemoteMixer(Func<IOpusCodec> decoderFactory, Func<IOpusCodec> stereoDecoderFactory)
         {
             _decoderFactory = decoderFactory ?? throw new ArgumentNullException(nameof(decoderFactory));
+            _stereoDecoderFactory = stereoDecoderFactory;
         }
 
         /// <summary>
@@ -206,6 +217,17 @@ namespace Aurix.Audio
         /// <see cref="PcmuCodec"/>; a codec change on a stream swaps its decoder and refills the jitter buffer.
         /// </summary>
         public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, AudioCodec codec, byte[] payload)
+            => Push(ssrc, seq, volume, direction, codec, false, payload);
+
+        /// <summary>Queue a frame delivered by <c>AurixVoiceClient.TryDequeueAudio</c>.</summary>
+        public void Push(in Transport.IncomingAudio audio)
+            => Push(audio.SenderSsrc, audio.Sequence, audio.Volume, audio.Direction, audio.Codec, audio.Mixed, audio.Payload);
+
+        /// <summary>
+        /// Queue a verified frame; <paramref name="mixed"/> marks a server-mixed channel stream
+        /// (<see cref="Transport.IncomingAudio.Mixed"/>), decoded as stereo when a stereo decoder factory was given.
+        /// </summary>
+        public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, AudioCodec codec, bool mixed, byte[] payload)
         {
             Stream s;
             lock (_streams)
@@ -213,16 +235,16 @@ namespace Aurix.Audio
                 if (!_streams.TryGetValue(ssrc, out s))
                 {
                     s = new Stream();
-                    Attach(s, codec);
+                    Attach(s, codec, mixed);
                     _streams[ssrc] = s;
                 }
-                else if (s.Codec != codec)
+                else if (s.Codec != codec || s.Mixed != mixed)
                 {
                     Retire(s);
                     s.Jitter = new JitterBuffer();
                     s.FecRecovered = 0;
                     s.FramePos = s.FrameLen = 0;
-                    Attach(s, codec);
+                    Attach(s, codec, mixed);
                 }
                 s.Volume = volume;
                 if (direction.HasValue) (s.LeftGain, s.RightGain) = direction.Value.StereoGains();
@@ -240,12 +262,15 @@ namespace Aurix.Audio
             s.Jitter.Push(seq, payload);
         }
 
-        private void Attach(Stream s, AudioCodec codec)
+        private void Attach(Stream s, AudioCodec codec, bool mixed)
         {
-            var decoder = codec == AudioCodec.Pcmu ? new PcmuCodec() : _decoderFactory();
+            var decoder = codec == AudioCodec.Pcmu ? new PcmuCodec()
+                : mixed && _stereoDecoderFactory != null ? _stereoDecoderFactory()
+                : _decoderFactory();
             s.Decoder = decoder;
             s.Fec = decoder as IOpusFecDecoder;
             s.Codec = codec;
+            s.Mixed = mixed;
         }
 
         public void Remove(uint ssrc)
@@ -343,8 +368,15 @@ namespace Aurix.Audio
                         if (gain != 0f)
                         {
                             bool pan = dch == 1 && outputChannels >= 2;
+                            bool downmix = dch == 2 && outputChannels == 1;
                             for (int f = 0; f < take; f++)
                             {
+                                if (downmix)
+                                {
+                                    int i = s.FramePos + f * 2;
+                                    output[offset + written + f] += (s.Frame[i] + s.Frame[i + 1]) * 0.5f * gain;
+                                    continue;
+                                }
                                 for (int c = 0; c < outputChannels; c++)
                                 {
                                     int srcC = dch == 1 ? 0 : Math.Min(c, dch - 1);

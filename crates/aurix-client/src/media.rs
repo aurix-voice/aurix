@@ -79,6 +79,9 @@ pub struct IncomingAudio {
     pub direction: Option<Direction>,
     /// Codec of `payload`: Opus, or PCMU when the packet carries `PacketFlags::Pcmu`.
     pub codec: AudioCodec,
+    /// Server-mixed channel downlink (`PacketFlags::Mixed`): stereo Opus with every
+    /// receiver-specific gain already applied; `sender_ssrc` is the channel's mix SSRC.
+    pub mixed: bool,
     pub payload: Bytes,
 }
 
@@ -468,6 +471,7 @@ impl MediaTransport {
                         volume,
                         direction,
                         codec,
+                        mixed: packet.header.has_flag(PacketFlags::Mixed),
                         payload: packet.payload,
                     });
                 }

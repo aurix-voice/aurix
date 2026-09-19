@@ -48,6 +48,19 @@ enum class EAurixRole : uint8
 	Administrator,
 };
 
+/** How the node delivers other speakers to this session (UAurixVoiceSubsystem::SetDownlinkMode). */
+UENUM(BlueprintType)
+enum class EAurixDownlinkMode : uint8
+{
+	/** Default: one stream per audible speaker, mixed by this client. */
+	Streams,
+	/**
+	 * One server-mixed stereo stream per channel: constant downlink bandwidth and decode cost in
+	 * large channels; mutes, volumes, focus and positional gains are applied by the node.
+	 */
+	Mixed,
+};
+
 /** Which link carries media (FAurixVoiceSettings::MediaPath). */
 UENUM(BlueprintType)
 enum class EAurixMediaPathPolicy : uint8
@@ -284,6 +297,33 @@ struct AURIXVOICE_API FAurixChannelScope
 	float TextRadius = 0.f;
 };
 
+/** This session's role and the roster policy of a joined channel (from `ChannelJoinAck`). */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixChannelInfo
+{
+	GENERATED_BODY()
+
+	/** Our role; Listener means receive-only (the grant had `speak: false`), whatever the channel type. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	EAurixRole Role = EAurixRole::Listener;
+
+	/** Members across all nodes, including listeners hidden from GetParticipants. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 ParticipantCount = 0;
+
+	/** Receive-only listeners are absent from the roster and never announced (`audience.hide_listeners`). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bHiddenListeners = false;
+
+	/** Speech in the channel is transcribed server-side. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bTranscription = false;
+
+	/** Speech in the channel is analysed by the server's content-safety classifier. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bSafetyVoice = false;
+};
+
 UENUM(BlueprintType)
 enum class EAurixTtsDestination : uint8
 {
@@ -421,6 +461,10 @@ struct AURIXVOICE_API FAurixSessionInfo
 	/** The node accepts media tunnelled over the control WebSocket (fallback when UDP is blocked). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bMediaTunnel = false;
+
+	/** The node can deliver one server-mixed stream per channel (SetDownlinkMode Mixed). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bDownlinkMix = false;
 };
 
 /** Channel member snapshot. For OnChannelEnergy only UserId and Energy are meaningful. */

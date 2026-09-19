@@ -1905,3 +1905,245 @@ async fn pcmu_sessions_are_transcoded_at_the_edge() {
     assert!(!got.header.has_flag(PacketFlags::Pcmu));
     assert_eq!(&got.payload[1..], &frame[..]);
 }
+
+#[tokio::test]
+async fn listeners_get_one_server_mixed_stream_per_channel() {
+    use aurix_common::g711::{self, PCMU_FRAME_SAMPLES};
+    use aurix_media::mix::channel_mix_ssrc;
+
+    fn tone_frame(enc: &mut opus::Encoder, frame: usize, hz: f32, amp: f32) -> Vec<u8> {
+        let pcm: Vec<i16> = (0..960)
+            .map(|k| {
+                let t = (frame * 960 + k) as f32 / 48_000.0;
+                ((t * hz * std::f32::consts::TAU).sin() * amp * 32767.0) as i16
+            })
+            .collect();
+        enc.encode_vec(&pcm, 1275).unwrap()
+    }
+    fn rms(pcm: &[i16]) -> f32 {
+        (pcm.iter()
+            .map(|&s| (s as f32 / 32768.0).powi(2))
+            .sum::<f32>()
+            / pcm.len().max(1) as f32)
+            .sqrt()
+    }
+    async fn drain_udp(c: &Client) -> Vec<AurixPacket> {
+        let mut out = Vec::new();
+        while let Some(p) = c.recv().await {
+            out.push(p);
+        }
+        out
+    }
+
+    let mut sfu = SfuNode::new(
+        MediaNodeId::new(),
+        Region::EuWest,
+        SfuOptions {
+            max_participants: 16,
+            ..SfuOptions::default()
+        },
+    );
+    sfu.start("127.0.0.1:0").await.unwrap();
+    let addr = sfu.local_addr().unwrap();
+    assert!(sfu.downlink_mix_enabled());
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let config = ChannelConfig {
+        channel_type: ChannelType::Team,
+        max_participants: 1000,
+        audience: Some(AudienceConfig::default()),
+        ..ChannelConfig::default()
+    };
+    let mk = |name: &str| {
+        sfu.create_session(SessionId::new(), UserId::new(), app, name.into())
+            .unwrap()
+    };
+    let s_a = mk("a");
+    let s_b = mk("b");
+    let s_c = mk("c");
+    let s_l = mk("l");
+    let s_t = mk("t");
+    let s_p = mk("p");
+    for (s, role) in [
+        (&s_a, ChannelRole::Speaker),
+        (&s_b, ChannelRole::Speaker),
+        (&s_c, ChannelRole::Speaker),
+        (&s_l, ChannelRole::Listener),
+        (&s_t, ChannelRole::Listener),
+        (&s_p, ChannelRole::Listener),
+    ] {
+        sfu.join_channel(&s.session_id, channel, config.clone(), role)
+            .unwrap();
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    let mut l = Client::new(s_l.clone()).await;
+    let mut t = TunnelClient::open(&sfu, s_t.clone());
+    let mut p = Client::new(s_p.clone()).await;
+    for cl in [&mut a, &mut b, &mut c, &mut l, &mut p] {
+        cl.bind(addr).await;
+    }
+    t.bind(&sfu).await;
+    s_p.set_codec(AudioCodec::Pcmu).unwrap();
+    // C is a speaker who asked for a mixed downlink; the listeners are mixed by the
+    // channel's `mix_for_listeners`.
+    sfu.set_downlink_mode(&s_c.session_id, DownlinkMode::Mixed)
+        .unwrap();
+    assert_eq!(s_c.downlink_mode(), DownlinkMode::Mixed);
+
+    // A listener may not transmit: the frame is refused before it reaches anyone.
+    l.send_audio(addr, &channel, b"listener").await;
+    assert!(a.recv().await.is_none());
+    assert!(b.recv().await.is_none());
+
+    // A (440 Hz) and B (660 Hz) talk together, paced like real clients.
+    let mut enc_a =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let mut enc_b =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    for i in 0..25 {
+        a.send_audio(addr, &channel, &tone_frame(&mut enc_a, i, 440.0, 0.3))
+            .await;
+        b.send_audio(addr, &channel, &tone_frame(&mut enc_b, i, 660.0, 0.3))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mix_ssrc = channel_mix_ssrc(&channel);
+    assert_ne!(mix_ssrc, s_a.ssrc);
+    assert_ne!(mix_ssrc, s_b.ssrc);
+
+    // The UDP listener: one stereo Opus stream from the channel's mix SSRC, contiguous
+    // sequence, both voices audible, never the speakers' own SSRCs.
+    let got = drain_udp(&l).await;
+    assert!(got.len() >= 15, "listener got {} mixed frames", got.len());
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0i16; 960 * 2];
+    let mut level = 0.0f32;
+    let mut prev_seq = None;
+    for pkt in &got {
+        assert_eq!(pkt.header.ssrc, mix_ssrc);
+        assert!(pkt.header.has_flag(PacketFlags::Mixed));
+        assert!(!pkt.header.has_flag(PacketFlags::E2ee));
+        assert!(!pkt.header.has_flag(PacketFlags::Pcmu));
+        assert_eq!(pkt.header.channel_id_hash, channel_id_hash(&channel));
+        if let Some(prev) = prev_seq {
+            assert_eq!(pkt.header.sequence, prev + 1, "contiguous mixed sequence");
+        }
+        prev_seq = Some(pkt.header.sequence);
+        let n = dec.decode(&pkt.payload, &mut pcm, false).unwrap();
+        assert_eq!(n, 960, "20 ms stereo frame");
+        level = level.max(rms(&pcm[..n * 2]));
+    }
+    // Two 0.3-amplitude tones summed: ~0.3 RMS (each contributes 0.3/√2 in power).
+    assert!((0.2..0.45).contains(&level), "mixed level {level}");
+
+    // The tunneled listener gets the same mix, sealed with its own keys, over the tunnel.
+    let mut tunneled = Vec::new();
+    while let Some(pkt) = t.recv_open().await {
+        tunneled.push(pkt);
+    }
+    assert!(tunneled.len() >= 15, "tunnel got {} frames", tunneled.len());
+    assert!(tunneled
+        .iter()
+        .all(|p| p.header.ssrc == mix_ssrc && p.header.has_flag(PacketFlags::Mixed)));
+
+    // The PCMU listener gets the mix as 20 ms μ-law frames at 8 kHz.
+    let got_p = drain_udp(&p).await;
+    assert!(
+        got_p.len() >= 15,
+        "pcmu listener got {} frames",
+        got_p.len()
+    );
+    let mut p_level = 0.0f32;
+    for pkt in &got_p {
+        assert_eq!(pkt.header.ssrc, mix_ssrc);
+        assert!(pkt.header.has_flag(PacketFlags::Mixed));
+        assert!(pkt.header.has_flag(PacketFlags::Pcmu));
+        assert_eq!(pkt.payload.len(), PCMU_FRAME_SAMPLES);
+        let mut pcm8 = Vec::new();
+        g711::decode(&pkt.payload, &mut pcm8);
+        p_level = p_level.max(rms(&pcm8));
+    }
+    assert!((0.2..0.45).contains(&p_level), "pcmu mixed level {p_level}");
+
+    // C hears A and B mixed on a private mixer (a speaker must never hear itself).
+    let got_c = drain_udp(&c).await;
+    assert!(
+        got_c.len() >= 15,
+        "speaker C got {} mixed frames",
+        got_c.len()
+    );
+    assert!(got_c
+        .iter()
+        .all(|p| p.header.ssrc == mix_ssrc && p.header.has_flag(PacketFlags::Mixed)));
+    // Speakers on per-speaker downlinks still get the two source streams.
+    let got_a = drain_udp(&a).await;
+    assert!(got_a
+        .iter()
+        .all(|p| p.header.ssrc == s_b.ssrc && !p.header.has_flag(PacketFlags::Mixed)));
+    assert!(got_a.len() >= 20);
+
+    // C alone talks: the listeners hear the mix, C hears nothing back.
+    for i in 0..10 {
+        c.send_audio(addr, &channel, &tone_frame(&mut enc_a, i, 440.0, 0.3))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!drain_udp(&l).await.is_empty());
+    assert!(drain_udp(&c).await.is_empty(), "no self-audio in C's mix");
+
+    // End-to-end encrypted frames bypass the mixer: they arrive as A's own stream.
+    let seq = a.next_seq();
+    let mut e2ee = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"sealed-by-the-app"),
+    );
+    e2ee.header.flags |= PacketFlags::E2ee as u16;
+    a.sock.send_to(&e2ee.seal(&s_a.keys), addr).await.unwrap();
+    let got = drain_udp(&l).await;
+    let e2ee_frames: Vec<_> = got
+        .iter()
+        .filter(|p| p.header.has_flag(PacketFlags::E2ee))
+        .collect();
+    assert_eq!(e2ee_frames.len(), 1);
+    assert_eq!(e2ee_frames[0].header.ssrc, s_a.ssrc);
+    assert!(!e2ee_frames[0].header.has_flag(PacketFlags::Mixed));
+    assert_eq!(&e2ee_frames[0].payload[..], b"sealed-by-the-app");
+    assert!(got
+        .iter()
+        .all(|p| p.header.has_flag(PacketFlags::E2ee) || p.header.ssrc == mix_ssrc));
+
+    // Back to per-speaker streams for C: it hears A's own SSRC again; the listeners' mix is
+    // unaffected by C's choice.
+    sfu.set_downlink_mode(&s_c.session_id, DownlinkMode::Streams)
+        .unwrap();
+    drain_udp(&c).await;
+    for i in 0..5 {
+        a.send_audio(addr, &channel, &tone_frame(&mut enc_a, i, 440.0, 0.3))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got_c = drain_udp(&c).await;
+    assert_eq!(got_c.len(), 5);
+    assert!(got_c
+        .iter()
+        .all(|p| p.header.ssrc == s_a.ssrc && !p.header.has_flag(PacketFlags::Mixed)));
+    let got_l = drain_udp(&l).await;
+    assert!(!got_l.is_empty());
+    assert!(got_l.iter().all(|p| p.header.ssrc == mix_ssrc));
+
+    // Leaving the channel stops the mixed stream for that receiver only.
+    sfu.leave_channel(&s_l.session_id, &channel).unwrap();
+    for i in 0..5 {
+        a.send_audio(addr, &channel, &tone_frame(&mut enc_a, i, 440.0, 0.3))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(drain_udp(&l).await.is_empty());
+    assert!(!drain_udp(&p).await.is_empty());
+}

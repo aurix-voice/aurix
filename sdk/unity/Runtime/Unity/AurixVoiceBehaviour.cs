@@ -122,9 +122,22 @@ namespace Aurix.Unity
         /// <summary>Creates encoder/decoder instances. Must be set by your code (platform/licensing choice).</summary>
         public Func<IOpusCodec> CodecFactory;
 
+        /// <summary>
+        /// Creates 2-channel decoders for server-mixed channel streams (<see cref="PreferredDownlinkMode"/>
+        /// <see cref="DownlinkMode.Mixed"/>), e.g. <c>() => new ConcentusOpusCodec(48000, 2)</c>. Optional: without
+        /// it mixed frames are decoded by <see cref="CodecFactory"/>, which downmixes them to mono when that codec
+        /// is mono (the server's panning is lost, playback still works).
+        /// </summary>
+        public Func<IOpusCodec> StereoCodecFactory;
+
         [Tooltip("Session codec to negotiate on connect. PCMU (G.711 μ-law, 8 kHz) needs no Opus on this device; " +
                  "the server transcodes, so other participants keep Opus. Requires media.pcmu_fallback on the node.")]
         public AudioCodec PreferredCodec = AudioCodec.Opus;
+
+        [Tooltip("Mixed: one server-mixed stereo stream per channel instead of one stream per speaker — constant " +
+                 "downlink bandwidth and decode cost in large channels; mutes, volumes, focus and positional gains " +
+                 "are applied by the node. Requires media.downlink_mix on the node.")]
+        public DownlinkMode PreferredDownlinkMode = DownlinkMode.Streams;
 
         public AurixVoiceClient Client { get; private set; }
         public bool IsConnected => Client != null && Client.State == VoiceConnectionState.MediaBound;
@@ -266,7 +279,7 @@ namespace Aurix.Unity
             if (Client != null) await Disconnect();
 
             _encoder = CodecFactory();
-            _mixer = new RemoteMixer(CodecFactory);
+            _mixer = new RemoteMixer(CodecFactory, StereoCodecFactory);
             ApplyDspSettings();
 
             Client = new AurixVoiceClient(WebSocketUrl, Token);
@@ -282,6 +295,7 @@ namespace Aurix.Unity
             Client.OnDisconnected += _ => StopMic();
             Client.OnAudioCodecChanged += _ => _pcmuEncoder.Reset();
             if (PreferredCodec != AudioCodec.Opus) await Client.SetAudioCodecAsync(PreferredCodec);
+            if (PreferredDownlinkMode != DownlinkMode.Streams) await Client.SetDownlinkModeAsync(PreferredDownlinkMode);
             await Client.ConnectAsync();
 
             foreach (var id in (ChannelId ?? string.Empty).Split(','))
@@ -352,6 +366,19 @@ namespace Aurix.Unity
 
         /// <summary>Codec the session currently sends/receives (<see cref="AurixVoiceClient.AudioCodec"/>).</summary>
         public AudioCodec ActiveCodec => Client != null ? Client.AudioCodec : AudioCodec.Opus;
+
+        /// <summary>
+        /// Switch between per-speaker streams and one server-mixed stream per channel at runtime
+        /// (see <see cref="AurixVoiceClient.SetDownlinkModeAsync"/>).
+        /// </summary>
+        public Task SetDownlinkMode(DownlinkMode mode)
+        {
+            PreferredDownlinkMode = mode;
+            return Client != null ? Client.SetDownlinkModeAsync(mode) : Task.CompletedTask;
+        }
+
+        /// <summary>Downlink mode the server acknowledged (<see cref="AurixVoiceClient.DownlinkMode"/>).</summary>
+        public DownlinkMode ActiveDownlinkMode => Client != null ? Client.DownlinkMode : DownlinkMode.Streams;
 
         /// <summary>
         /// Switch the microphone (<c>null</c>/empty = system default). Restarts capture when it is
@@ -659,7 +686,7 @@ namespace Aurix.Unity
         private void PumpDownlink()
         {
             if (Client == null || _mixer == null) return;
-            while (Client.TryDequeueAudio(out var a)) _mixer.Push(a.SenderSsrc, a.Sequence, a.Volume, a.Direction, a.Codec, a.Payload);
+            while (Client.TryDequeueAudio(out var a)) _mixer.Push(in a);
         }
 
         // Runs on Unity's audio thread; the AudioSource plays silence which we fill with the mix,

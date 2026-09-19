@@ -90,6 +90,17 @@ impl ReceiverPrefs {
         self.focus
     }
 
+    /// True when this receiver hears every sender at the default gain (no local mutes,
+    /// volumes or blocks in either direction); focus is not a per-sender rule and is applied
+    /// downstream, so it does not count.
+    pub fn is_uniform(&self) -> bool {
+        self.muted_everywhere.is_empty()
+            && self.muted_in.is_empty()
+            && self.gain.is_empty()
+            && self.blocked.is_empty()
+            && self.blocked_by.is_empty()
+    }
+
     pub fn set_muted(&mut self, sender: UserId, channel: Option<ChannelId>, muted: bool) {
         match (channel, muted) {
             (None, true) => {
@@ -232,10 +243,16 @@ pub struct MediaSession {
     /// Codec of this session's own frames (`SetAudioCodec`); channels always carry Opus and
     /// the router transcodes when this is not `Opus`.
     pub codec: RwLock<AudioCodec>,
+    /// How this native session wants channel audio delivered (`SetDownlinkMode`).
+    pub downlink_mode: RwLock<DownlinkMode>,
     /// μ-law → Opus encoder state while `codec == Pcmu`.
     pub pcmu_uplink: Mutex<Option<crate::transcode::PcmuUplink>>,
     /// Cocktail-party slot table of this receiver (`ChannelConfig::ambient`).
     pub ambient: Mutex<crate::ambient::AmbientState>,
+    /// Per-speaker stream slots of this receiver (`ChannelConfig::audience.max_streams`),
+    /// keyed by stream SSRC; same sticky ranking as `ambient`, but losers are withheld
+    /// instead of attenuated.
+    pub stream_cap: Mutex<crate::ambient::AmbientState>,
     pub sequence: AtomicU32,
     /// Sequence counter for server-originated packets addressed to this session
     /// (acks, commands); keeps their encryption IVs unique under the session key.
@@ -296,8 +313,10 @@ impl MediaSession {
             prefs: RwLock::new(ReceiverPrefs::default()),
             transmission: RwLock::new(TransmissionMode::All),
             codec: RwLock::new(AudioCodec::Opus),
+            downlink_mode: RwLock::new(DownlinkMode::Streams),
             pcmu_uplink: Mutex::new(None),
             ambient: Mutex::new(crate::ambient::AmbientState::default()),
+            stream_cap: Mutex::new(crate::ambient::AmbientState::default()),
             sequence: AtomicU32::new(0),
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
@@ -456,6 +475,7 @@ impl MediaSession {
         channels.retain(|c| c != channel_id);
         drop(channels);
         self.ambient.lock().forget_channel(channel_id);
+        self.stream_cap.lock().forget_channel(channel_id);
     }
 
     /// Drops routing state that referenced `channel_id`: a `Single` transmission targeting it
@@ -485,6 +505,27 @@ impl MediaSession {
 
     pub fn codec(&self) -> AudioCodec {
         *self.codec.read()
+    }
+
+    pub fn downlink_mode(&self) -> DownlinkMode {
+        *self.downlink_mode.read()
+    }
+
+    /// Only native AURX sessions choose; browsers always get the WebRTC mix.
+    pub fn set_downlink_mode(&self, mode: DownlinkMode) -> Result<(), AurixError> {
+        if self.transport() != Transport::Aurx {
+            return Err(AurixError::Validation(
+                "only native AURX sessions can change the downlink mode".into(),
+            ));
+        }
+        *self.downlink_mode.write() = mode;
+        Ok(())
+    }
+
+    /// Whether every sender reaches this receiver at the default gain (see
+    /// [`ReceiverPrefs::is_uniform`]).
+    pub fn has_uniform_prefs(&self) -> bool {
+        self.prefs.read().is_uniform()
     }
 
     /// Switches the codec of this session's frames. Only native AURX sessions may leave Opus:

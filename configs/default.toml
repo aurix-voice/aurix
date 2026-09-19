@@ -73,6 +73,12 @@ media_tunnel = true
 # Downlink packets queued per tunneled session (≈20 ms of audio per packet per speaker heard)
 # before that session's packets are dropped; a stalled TCP connection never blocks the SFU.
 tunnel_queue_packets = 128
+# Let native AURX sessions receive one server-mixed stereo stream per channel instead of a
+# stream per speaker (`SetDownlinkMode { mode: "mixed" }`; forced on listeners of channels
+# with `audience.mix_for_listeners`). Receivers without per-receiver rules share one mixer per
+# channel (one decode per speaker + one encode per channel); receivers with local mutes /
+# volumes / positional or ambient gains get a private mixer (one encode each).
+downlink_mix = true
 
 [turn]
 enabled = false

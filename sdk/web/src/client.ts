@@ -5,6 +5,7 @@ import {
   RESUME_SUBPROTOCOL_PREFIX,
   parseServerMessage,
   SYSTEM_USER_ID,
+  type ChannelRole,
   type ChatMessageWire,
   type ClientMessage,
   type JsonValue,
@@ -181,6 +182,40 @@ export interface ChannelScope {
   rosterRadius?: number;
   /** Channel chat, typing and transcripts reach only members within this distance. */
   textRadius?: number;
+}
+
+/**
+ * What the server told us about a joined channel in `ChannelJoinAck` (audience / large-channel
+ * metadata). Older servers omit the fields; the defaults below then apply.
+ */
+export interface ChannelInfo {
+  /** Our role; `listener` means receive-only — `unmute()` / speaking has no effect there. */
+  role: ChannelRole;
+  /**
+   * Members across all nodes, including listeners hidden from the roster by
+   * `ChannelConfig.audience.hide_listeners` (so it may exceed the roster size).
+   */
+  participantCount: number;
+  /** Listeners are hidden from presence (roster and `participantJoined` / `participantLeft`). */
+  hiddenListeners: boolean;
+  /** The channel transcribes speech (same as {@link AurixClient.isChannelTranscribed}). */
+  transcription: boolean;
+  /** Speech is monitored by content safety (same as {@link AurixClient.isChannelMonitored}). */
+  safetyVoice: boolean;
+}
+
+/** `ChannelJoinAck` → {@link ChannelInfo}, filling the defaults older servers imply. */
+export function channelInfoFromJoinAck(
+  d: Extract<ServerMessage, { type: 'ChannelJoinAck' }>['data'],
+): ChannelInfo {
+  return {
+    role: d.role ?? 'speaker',
+    participantCount:
+      typeof d.participant_count === 'number' ? d.participant_count : d.participants.length,
+    hiddenListeners: d.hidden_listeners === true,
+    transcription: d.transcription === true,
+    safetyVoice: d.safety_voice === true,
+  };
 }
 
 /** A text-chat message; see {@link AurixEvents.chatMessage}. */
@@ -568,6 +603,8 @@ export class AurixClient {
   private monitoredChannels = new Set<string>();
   /** channel id → presence / text scope (from `ChannelJoinAck`). */
   private channelScopes = new Map<string, ChannelScope>();
+  /** channel id → role / participant count / audience flags (from `ChannelJoinAck`). */
+  private channelInfos = new Map<string, ChannelInfo>();
   /** channel id → its audio policy (from `ChannelJoinAck.audio` / `ChannelAudioPolicy`). */
   private channelPolicies = new Map<string, AudioPolicy>();
   /** Merge of `channelPolicies`; kept after the last channel is left. */
@@ -1199,6 +1236,7 @@ export class AurixClient {
     this.transcribedChannels.clear();
     this.monitoredChannels.clear();
     this.channelScopes.clear();
+    this.channelInfos.clear();
     this.channelPolicies.clear();
     this.transientBitrateBps = undefined;
     this.appliedSenderPrefs = undefined;
@@ -1261,6 +1299,7 @@ export class AurixClient {
     this.transcribedChannels.delete(channelId);
     this.monitoredChannels.delete(channelId);
     this.channelScopes.delete(channelId);
+    this.channelInfos.delete(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
     if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
   }
@@ -1285,6 +1324,23 @@ export class AurixClient {
    */
   channelScope(channelId: string): ChannelScope | undefined {
     return this.channelScopes.get(channelId);
+  }
+
+  /**
+   * Role, participant count and audience flags of a joined channel (see {@link ChannelInfo});
+   * `undefined` before the join is acknowledged.
+   */
+  channelInfo(channelId: string): ChannelInfo | undefined {
+    return this.channelInfos.get(channelId);
+  }
+
+  /**
+   * Whether we may transmit in `channelId`: `false` for `listener` grants (`speak: false`) and
+   * for channels we have not joined. The server drops audio from listeners regardless.
+   */
+  canSpeakIn(channelId: string): boolean {
+    const info = this.channelInfos.get(channelId);
+    return info !== undefined && info.role !== 'listener';
   }
 
   /** Whether this client currently receives `transcript` events (default `true`). */
@@ -1622,6 +1678,7 @@ export class AurixClient {
         if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
       }
       this.channelPolicies.clear();
+      this.channelInfos.clear();
       this.transientBitrateBps = undefined;
       this.replayReceiverPrefs();
     }
@@ -1833,6 +1890,7 @@ export class AurixClient {
         if (typeof d.roster_radius === 'number') scope.rosterRadius = d.roster_radius;
         if (typeof d.text_radius === 'number') scope.textRadius = d.text_radius;
         this.channelScopes.set(d.channel_id, scope);
+        this.channelInfos.set(d.channel_id, channelInfoFromJoinAck(d));
         this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
         this.refreshAudioPolicy();
         const list = Array.from(roster.values());
@@ -1929,6 +1987,8 @@ export class AurixClient {
       case 'Kick': {
         const d = (msg as Extract<ServerMessage, { type: 'Kick' }>).data;
         if (this.channels.delete(d.channel_id)) this.emit('channelLeft', d.channel_id);
+        this.channelInfos.delete(d.channel_id);
+        this.channelScopes.delete(d.channel_id);
         if (this.channelPolicies.delete(d.channel_id)) this.refreshAudioPolicy();
         this.emit('kicked', d.channel_id, d.reason);
         return;

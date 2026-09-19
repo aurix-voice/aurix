@@ -297,6 +297,11 @@ typedef enum AurixEventType {
    * `MediaBound` and on each mid-session UDP ↔ tunnel switch.
    */
   AURIX_EVENT_MEDIA_PATH_CHANGED = 33,
+  /**
+   * `downlink_mode` (`aurix_event_downlink_mode`): the server acknowledged a downlink
+   * mode; a fresh session reports `Streams` and the requested mode is re-applied.
+   */
+  AURIX_EVENT_DOWNLINK_MODE_CHANGED = 34,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -327,6 +332,22 @@ typedef enum AurixAudioCodec {
    */
   AURIX_CODEC_PCMU = 1,
 } AurixAudioCodec;
+
+/**
+ * How the node delivers other speakers to this session (see
+ * `aurix_client_set_downlink_mode`).
+ */
+typedef enum AurixDownlinkMode {
+  /**
+   * Default: one stream per audible speaker, mixed by this client.
+   */
+  AURIX_DOWNLINK_STREAMS = 0,
+  /**
+   * One server-mixed stereo stream per channel (mutes / volumes / focus / positional gains
+   * applied by the node); E2EE speakers still arrive as separate streams.
+   */
+  AURIX_DOWNLINK_MIXED = 1,
+} AurixDownlinkMode;
 
 typedef enum AurixModerationAction {
   AURIX_MODERATION_KICK = 0,
@@ -567,6 +588,11 @@ typedef struct AurixSessionInfo {
    * The node accepts media over the control WebSocket (fallback when UDP is blocked).
    */
   bool media_tunnel;
+  /**
+   * The node can deliver one server-mixed stream per channel
+   * (`aurix_client_set_downlink_mode`).
+   */
+  bool downlink_mix;
 } AurixSessionInfo;
 
 /**
@@ -668,6 +694,32 @@ typedef struct AurixChannelScope {
    */
   float text_radius;
 } AurixChannelScope;
+
+/**
+ * Membership facts of a joined channel.
+ */
+typedef struct AurixChannelInfo {
+  /**
+   * This session's role; `AurixRoleListener` cannot transmit (the server drops its frames).
+   */
+  enum AurixRole role;
+  /**
+   * Members across all nodes, including listeners hidden from the roster.
+   */
+  uint32_t participant_count;
+  /**
+   * Receive-only listeners are absent from the roster and never announced.
+   */
+  bool hidden_listeners;
+  /**
+   * Speech is transcribed and captions delivered.
+   */
+  bool transcription;
+  /**
+   * Speech is analysed by the content-safety classifier (disclose it).
+   */
+  bool safety_voice;
+} AurixChannelInfo;
 
 /**
  * Runtime DSP diagnostics.
@@ -1045,6 +1097,11 @@ enum AurixTransmissionMode aurix_event_transmission(const struct AurixEvent *eve
 enum AurixAudioCodec aurix_event_audio_codec(const struct AurixEvent *event);
 
 /**
+ * Mode of a `DownlinkModeChanged` event; `Streams` otherwise.
+ */
+enum AurixDownlinkMode aurix_event_downlink_mode(const struct AurixEvent *event);
+
+/**
  * Link of a `MediaPathChanged` event; `AurixMediaNone` for other events.
  */
 enum AurixMediaPath aurix_event_media_path(const struct AurixEvent *event);
@@ -1112,6 +1169,20 @@ bool aurix_client_channel_monitored(const struct AurixClient *client,
 bool aurix_client_channel_scope(const struct AurixClient *client,
                                 const struct AurixUuid *channel_id,
                                 struct AurixChannelScope *out);
+
+/**
+ * Role / member count / roster policy of a joined channel; `false` (and `out` untouched)
+ * until its join is acknowledged.
+ */
+bool aurix_client_channel_info(const struct AurixClient *client,
+                               const struct AurixUuid *channel_id,
+                               struct AurixChannelInfo *out);
+
+/**
+ * `ChannelJoined` only: this session's role, the member count and the roster policy
+ * (defaults for other events).
+ */
+struct AurixChannelInfo aurix_event_channel_info(const struct AurixEvent *event);
 
 /**
  * `ChannelJoined` only: the channel's presence / text range (zeros for other events).
@@ -1318,6 +1389,22 @@ enum AurixResult aurix_client_set_audio_codec(struct AurixClient *client,
  * Codec the session currently uses (server-acknowledged).
  */
 enum AurixAudioCodec aurix_client_audio_codec(const struct AurixClient *client);
+
+/**
+ * Ask the server to deliver other speakers as one mixed stereo stream per channel
+ * (`AurixDownlinkMixed`) instead of one stream per speaker: constant downlink bandwidth and
+ * decode cost in large channels. Mutes, volumes, focus, positional attenuation and panning
+ * are applied by the node; E2EE speakers still arrive as separate streams. Requires
+ * `media.downlink_mix` on the node (`AurixSessionInfo.downlink_mix`, otherwise `ServerError`
+ * `DOWNLINK_MIX_NOT_AVAILABLE`); takes effect on `AurixEventDownlinkModeChanged`.
+ */
+enum AurixResult aurix_client_set_downlink_mode(struct AurixClient *client,
+                                                enum AurixDownlinkMode mode);
+
+/**
+ * Downlink mode the server acknowledged.
+ */
+enum AurixDownlinkMode aurix_client_downlink_mode(const struct AurixClient *client);
 
 enum AurixResult aurix_client_set_transcripts(struct AurixClient *client, bool enabled);
 

@@ -9,6 +9,7 @@
 
 use aurix_common::types::{AmbientConfig, ChannelId, UserId};
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 /// A speaker without a frame for this long is no longer competing for a slot (covers DTX
@@ -24,18 +25,28 @@ struct Voice {
     focused: bool,
 }
 
-#[derive(Debug, Default)]
-pub struct AmbientState {
-    channels: HashMap<ChannelId, HashMap<UserId, Voice>>,
+/// `K` identifies a competing voice (the sender's user, for both the cocktail-party mix and
+/// the per-receiver stream cap of `ChannelConfig::audience.max_streams`).
+#[derive(Debug)]
+pub struct AmbientState<K = UserId> {
+    channels: HashMap<ChannelId, HashMap<K, Voice>>,
 }
 
-impl AmbientState {
+impl<K> Default for AmbientState<K> {
+    fn default() -> Self {
+        Self {
+            channels: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash + Ord> AmbientState<K> {
     /// Records a frame from `sender` at `volume` for `channel` and returns the multiplier to
     /// apply: `1.0` for a focused speaker, `cfg.ambient_gain` for an ambient one.
     pub fn gate(
         &mut self,
         channel: &ChannelId,
-        sender: &UserId,
+        sender: &K,
         volume: f32,
         cfg: &AmbientConfig,
         now: Instant,
@@ -57,7 +68,7 @@ impl AmbientState {
             return 1.0;
         }
         // Holders compete with a bonus so equally loud voices do not swap slots every frame.
-        let mut ranked: Vec<(f32, UserId)> = voices
+        let mut ranked: Vec<(f32, K)> = voices
             .iter()
             .map(|(uid, v)| {
                 let weight = if v.focused {
@@ -71,7 +82,7 @@ impl AmbientState {
         ranked.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1 .0.cmp(&b.1 .0))
+                .then_with(|| a.1.cmp(&b.1))
         });
         for (rank, (_, uid)) in ranked.iter().enumerate() {
             if let Some(v) = voices.get_mut(uid) {
@@ -91,7 +102,7 @@ impl AmbientState {
     }
 
     /// Drops a speaker who left (so their slot frees immediately).
-    pub fn forget_sender(&mut self, channel: &ChannelId, sender: &UserId) {
+    pub fn forget_sender(&mut self, channel: &ChannelId, sender: &K) {
         if let Some(voices) = self.channels.get_mut(channel) {
             voices.remove(sender);
         }

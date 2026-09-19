@@ -85,6 +85,27 @@ AurixAudioCodec FromCodec(EAurixAudioCodec C)
 	return C == EAurixAudioCodec::Pcmu ? AURIX_CODEC_PCMU : AURIX_CODEC_OPUS;
 }
 
+EAurixDownlinkMode ToDownlinkMode(AurixDownlinkMode M)
+{
+	return M == AURIX_DOWNLINK_MIXED ? EAurixDownlinkMode::Mixed : EAurixDownlinkMode::Streams;
+}
+
+AurixDownlinkMode FromDownlinkMode(EAurixDownlinkMode M)
+{
+	return M == EAurixDownlinkMode::Mixed ? AURIX_DOWNLINK_MIXED : AURIX_DOWNLINK_STREAMS;
+}
+
+FAurixChannelInfo ToChannelInfo(const AurixChannelInfo& I)
+{
+	FAurixChannelInfo Out;
+	Out.Role = ToRole(I.role);
+	Out.ParticipantCount = static_cast<int32>(I.participant_count);
+	Out.bHiddenListeners = I.hidden_listeners;
+	Out.bTranscription = I.transcription;
+	Out.bSafetyVoice = I.safety_voice;
+	return Out;
+}
+
 EAurixMediaPath ToMediaPath(AurixMediaPath P)
 {
 	switch (P)
@@ -162,6 +183,7 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	Out.ResumeGraceMs = static_cast<int32>(S.resume_grace_ms);
 	Out.bResumed = S.resumed;
 	Out.bMediaTunnel = S.media_tunnel;
+	Out.bDownlinkMix = S.downlink_mix;
 	return Out;
 }
 
@@ -625,6 +647,23 @@ bool UAurixVoiceSubsystem::GetChannelScope(FGuid ChannelId, FAurixChannelScope& 
 	return true;
 }
 
+bool UAurixVoiceSubsystem::GetChannelInfo(FGuid ChannelId, FAurixChannelInfo& OutInfo) const
+{
+	AurixChannelInfo Raw;
+	if (!Native || !Native->Client.channel_info(ToUuid(ChannelId), Raw))
+	{
+		OutInfo = FAurixChannelInfo();
+		return false;
+	}
+	OutInfo = ToChannelInfo(Raw);
+	return true;
+}
+
+bool UAurixVoiceSubsystem::CanSpeakIn(FGuid ChannelId) const
+{
+	return Native && Native->Client.can_speak_in(ToUuid(ChannelId));
+}
+
 bool UAurixVoiceSubsystem::GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const
 {
 	OutUserId.Invalidate();
@@ -944,6 +983,16 @@ bool UAurixVoiceSubsystem::SetAudioCodec(EAurixAudioCodec Codec)
 EAurixAudioCodec UAurixVoiceSubsystem::GetAudioCodec() const
 {
 	return Native ? ToCodec(Native->Client.audio_codec()) : EAurixAudioCodec::Opus;
+}
+
+bool UAurixVoiceSubsystem::SetDownlinkMode(EAurixDownlinkMode Mode)
+{
+	return Native && Check(Native->Client.set_downlink_mode(FromDownlinkMode(Mode)), TEXT("set_downlink_mode"));
+}
+
+EAurixDownlinkMode UAurixVoiceSubsystem::GetDownlinkMode() const
+{
+	return Native ? ToDownlinkMode(Native->Client.downlink_mode()) : EAurixDownlinkMode::Streams;
 }
 
 EAurixMediaPath UAurixVoiceSubsystem::GetMediaPath() const
@@ -1296,6 +1345,10 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_AUDIO_CODEC_CHANGED:
 		OnAudioCodecChanged.Broadcast(ToCodec(aurix_event_audio_codec(Raw)));
+		break;
+
+	case AURIX_EVENT_DOWNLINK_MODE_CHANGED:
+		OnDownlinkModeChanged.Broadcast(ToDownlinkMode(aurix_event_downlink_mode(Raw)));
 		break;
 
 	case AURIX_EVENT_MEDIA_PATH_CHANGED:

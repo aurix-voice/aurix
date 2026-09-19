@@ -22,8 +22,8 @@ use aurix_common::protocol::{
     UserPosition,
 };
 use aurix_common::types::{
-    quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, NetworkQuality, RecordingConsent,
-    SessionId, UserId,
+    quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode,
+    NetworkQuality, RecordingConsent, SessionId, UserId,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -141,6 +141,10 @@ struct Prefs {
     codec: AudioCodec,
     /// Codec the server acknowledged; what capture and playback currently use.
     active_codec: AudioCodec,
+    /// Downlink mode the app asked for; replayed on a fresh session.
+    downlink: DownlinkMode,
+    /// Downlink mode the server acknowledged.
+    active_downlink: DownlinkMode,
     /// `(user, channel or None = everywhere)` → muted.
     local_mutes: HashMap<(UserId, Option<ChannelId>), bool>,
     volumes: HashMap<UserId, f32>,
@@ -154,6 +158,9 @@ struct ChannelState {
     safety_voice: bool,
     scope: ChannelScope,
     audio: AudioPolicy,
+    role: ChannelRole,
+    participant_count: u32,
+    hidden_listeners: bool,
     participants: HashMap<UserId, Participant>,
 }
 
@@ -284,12 +291,13 @@ impl Inner {
         self.jitter
             .lock()
             .observe(audio.sender_ssrc, audio.timestamp, Instant::now());
-        let _ = self.mixer.lock().push_frame(
+        let _ = self.mixer.lock().push_wire_frame(
             audio.sender_ssrc,
             audio.sequence,
             audio.volume,
             audio.direction,
             audio.codec,
+            audio.mixed && audio.codec == AudioCodec::Opus,
             audio.payload.to_vec(),
         );
     }
@@ -919,6 +927,51 @@ impl Client {
         self.inner.prefs.lock().active_codec
     }
 
+    /// `Mixed`: the node decodes every speaker the session may hear, applies its mutes /
+    /// volumes / focus / positional gains and sends one stereo Opus stream per channel
+    /// instead of one stream per speaker — constant downlink bandwidth and decode cost in
+    /// large channels, at the price of server-side mixing (E2EE speakers still arrive as
+    /// separate streams). Requires `media.downlink_mix` on the node (otherwise `ServerError`
+    /// `DOWNLINK_MIX_NOT_AVAILABLE`); takes effect on `DownlinkModeChanged`.
+    pub fn set_downlink_mode(&self, mode: DownlinkMode) -> Result<()> {
+        self.inner.prefs.lock().downlink = mode;
+        self.send_cmd(Command::Send(ControlMessage::SetDownlinkMode { mode }))
+    }
+
+    /// Downlink mode the server acknowledged.
+    pub fn downlink_mode(&self) -> DownlinkMode {
+        self.inner.prefs.lock().active_downlink
+    }
+
+    /// This session's role in a joined channel (`None` until the join is acked).
+    pub fn channel_role(&self, channel_id: ChannelId) -> Option<ChannelRole> {
+        self.inner.channels.lock().get(&channel_id).map(|c| c.role)
+    }
+
+    /// Whether this session may transmit in `channel_id` (false for listeners and unknown
+    /// channels). Capture is still encoded; the server drops frames of receive-only roles.
+    pub fn can_speak_in(&self, channel_id: ChannelId) -> bool {
+        self.channel_role(channel_id).is_some_and(|r| r.can_speak())
+    }
+
+    /// Whether receive-only listeners of a joined channel are hidden from its roster.
+    pub fn channel_hidden_listeners(&self, channel_id: ChannelId) -> bool {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .is_some_and(|c| c.hidden_listeners)
+    }
+
+    /// Channel members across all nodes, including listeners hidden from the roster.
+    pub fn participant_count(&self, channel_id: ChannelId) -> Option<u32> {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .map(|c| c.participant_count)
+    }
+
     pub fn set_channel_focus(&self, channel_id: Option<ChannelId>) -> Result<()> {
         self.inner.prefs.lock().focus = channel_id;
         self.send_cmd(Command::Send(ControlMessage::SetChannelFocus {
@@ -1436,6 +1489,7 @@ async fn session(
         resume_grace: ack.resume_grace,
         resumed: ack.resumed,
         media_tunnel: ack.media_tunnel,
+        downlink_mix: ack.downlink_mix,
     };
     *inner.session.lock() = Some(info.clone());
     *resume = Some((ack.session_id, ack.resume_token.clone()));
@@ -1499,6 +1553,14 @@ async fn session(
         if stale_codec {
             inner.encoder.lock().set_codec(AudioCodec::Opus);
             inner.emit(Event::AudioCodecChanged(AudioCodec::Opus));
+        }
+        let stale_downlink = {
+            let mut prefs = inner.prefs.lock();
+            std::mem::replace(&mut prefs.active_downlink, DownlinkMode::Streams)
+                != DownlinkMode::Streams
+        };
+        if stale_downlink {
+            inner.emit(Event::DownlinkModeChanged(DownlinkMode::Streams));
         }
         // Global preferences first; channel-scoped ones follow each re-join ack.
         let msgs = replay_global_prefs(inner);
@@ -1870,6 +1932,11 @@ fn replay_global_prefs(inner: &Inner) -> Vec<ControlMessage> {
     if prefs.codec != AudioCodec::Opus {
         msgs.push(ControlMessage::SetAudioCodec { codec: prefs.codec });
     }
+    if prefs.downlink != DownlinkMode::Streams {
+        msgs.push(ControlMessage::SetDownlinkMode {
+            mode: prefs.downlink,
+        });
+    }
     msgs
 }
 
@@ -2179,6 +2246,9 @@ async fn handle_message(
             audio,
             roster_radius,
             text_radius,
+            role,
+            participant_count,
+            hidden_listeners,
             ..
         } => {
             let scope = ChannelScope {
@@ -2207,6 +2277,9 @@ async fn handle_message(
                         safety_voice,
                         scope,
                         audio,
+                        role,
+                        participant_count,
+                        hidden_listeners,
                         participants: roster,
                     },
                 )
@@ -2222,6 +2295,9 @@ async fn handle_message(
                     transcription,
                     safety_voice,
                     scope,
+                    role,
+                    participant_count,
+                    hidden_listeners,
                 });
             }
             if request_id == 0 && !existed {
@@ -2376,6 +2452,7 @@ async fn handle_message(
             local_mutes,
             volumes,
             codec,
+            downlink,
             ..
         } => {
             let mut prefs = inner.prefs.lock();
@@ -2383,6 +2460,8 @@ async fn handle_message(
             prefs.focus = focus_channel;
             let codec_changed = prefs.active_codec != codec;
             prefs.active_codec = codec;
+            let downlink_changed = prefs.active_downlink != downlink;
+            prefs.active_downlink = downlink;
             for m in local_mutes {
                 prefs.local_mutes.insert((m.user_id, m.channel_id), true);
             }
@@ -2393,6 +2472,9 @@ async fn handle_message(
             if codec_changed {
                 inner.encoder.lock().set_codec(codec);
                 inner.emit(Event::AudioCodecChanged(codec));
+            }
+            if downlink_changed {
+                inner.emit(Event::DownlinkModeChanged(downlink));
             }
             inner.emit(Event::TransmissionChanged(transmission));
             inner.emit(Event::ChannelFocusChanged(focus_channel));
@@ -2405,6 +2487,15 @@ async fn handle_message(
             inner.prefs.lock().active_codec = codec;
             inner.encoder.lock().set_codec(codec);
             inner.emit(Event::AudioCodecChanged(codec));
+        }
+        ControlMessage::DownlinkModeChanged { mode } => {
+            let changed = {
+                let mut prefs = inner.prefs.lock();
+                std::mem::replace(&mut prefs.active_downlink, mode) != mode
+            };
+            if changed {
+                inner.emit(Event::DownlinkModeChanged(mode));
+            }
         }
         ControlMessage::ChannelFocusChanged { channel_id } => {
             inner.prefs.lock().focus = channel_id;
@@ -2607,6 +2698,7 @@ async fn handle_message(
         | ControlMessage::SetTransmission { .. }
         | ControlMessage::SetChannelFocus { .. }
         | ControlMessage::SetAudioCodec { .. }
+        | ControlMessage::SetDownlinkMode { .. }
         | ControlMessage::OcclusionUpdate { .. }
         | ControlMessage::ReverbZoneUpdate { .. }
         | ControlMessage::QualityReport { .. }
@@ -2654,6 +2746,9 @@ mod tests {
                 safety_voice: false,
                 scope: ChannelScope::default(),
                 audio,
+                role: ChannelRole::Speaker,
+                participant_count: 1,
+                hidden_listeners: false,
                 participants: HashMap::new(),
             },
         )

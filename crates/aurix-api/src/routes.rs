@@ -73,7 +73,9 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/v1/apps/:app_id",
-            get(handlers::get_app).delete(handlers::delete_app),
+            get(handlers::get_app)
+                .patch(handlers::update_app)
+                .delete(handlers::delete_app),
         )
         .route(
             "/v1/apps/:app_id/rotate-key",

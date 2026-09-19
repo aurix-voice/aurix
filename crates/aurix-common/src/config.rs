@@ -681,6 +681,14 @@ pub struct MediaConfig {
     /// packet per speaker heard.
     #[serde(default = "default_tunnel_queue_packets")]
     pub tunnel_queue_packets: usize,
+    /// Let native AURX sessions receive one server-mixed stream per channel
+    /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
+    /// A mixed receiver whose channel has no per-receiver rules shares one mixer with every
+    /// other such receiver of the channel (one decode per speaker, one encode per channel);
+    /// receivers with local mutes / volumes / positional or ambient gains get a private
+    /// mixer (one encode each). Disable on CPU-bound nodes to force per-speaker streams.
+    #[serde(default = "default_true")]
+    pub downlink_mix: bool,
     /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
     #[serde(default)]
     pub rx_workers: usize,
@@ -761,6 +769,7 @@ impl Default for MediaConfig {
             unfocused_channel_gain: default_unfocused_channel_gain(),
             pcmu_fallback: true,
             media_tunnel: true,
+            downlink_mix: true,
             tunnel_queue_packets: default_tunnel_queue_packets(),
             rx_workers: 0,
             cascade_secret: None,

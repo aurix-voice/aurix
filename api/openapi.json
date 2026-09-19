@@ -600,6 +600,61 @@
           }
         ]
       },
+      "patch": {
+        "tags": [
+          "Applications"
+        ],
+        "summary": "Edit an application's name, description or quotas",
+        "operationId": "updateApp",
+        "description": "Fields left out are unchanged; `description: null` clears it. Raising `max_participants_per_channel` is how an existing application gets large (audience) channels — `POST /v1/channels` clamps `config.max_participants` to this quota. Lowering it affects channels created or reconfigured afterwards.",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAppRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/App"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ]
+      },
       "delete": {
         "tags": [
           "Applications"
@@ -6589,6 +6644,17 @@
             ],
             "description": "Cocktail-party mode; absent/`null` (default) delivers every audible speaker at full gain."
           },
+          "audience": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AudienceConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Large-channel / audience mode: hidden listeners, server mix for listeners, speaker admission cap, per-receiver stream cap. Absent/`null` (default): plain channel."
+          },
           "audio_profile": {
             "$ref": "#/components/schemas/AudioProfile",
             "default": "voice"
@@ -7883,6 +7949,35 @@
           }
         },
         "description": "Cocktail-party mixing, ranked per receiver by delivery gain × the sender-reported audio level (sticky slots, 400 ms hold)."
+      },
+      "AudienceConfig": {
+        "type": "object",
+        "properties": {
+          "hide_listeners": {
+            "type": "boolean",
+            "default": true,
+            "description": "Receive-only members (role `listener`) are absent from the roster and presence notifications of other members; `ChannelJoinAck.participant_count` still carries the real headcount."
+          },
+          "mix_for_listeners": {
+            "type": "boolean",
+            "default": true,
+            "description": "Native listeners receive one server-mixed stream (`DownlinkMode.mixed`) whatever their own downlink mode. Browsers are always mixed."
+          },
+          "max_speakers": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Members that may speak the channel admits at once; `0` = only `max_participants` applies. Must not exceed `max_participants`."
+          },
+          "max_streams": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "default": 0,
+            "description": "Concurrent voices a receiver hears at once (`0` = unlimited), ranked per receiver by delivery gain × sender level with sticky slots; bounds the streams a native client decodes, the tracks a browser receives and the voices a server mix decodes."
+          }
+        },
+        "description": "Audience / large-channel settings."
       },
       "QualityMetrics": {
         "type": "object",
@@ -9242,6 +9337,32 @@
             }
           }
         ]
+      },
+      "UpdateAppRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_channels": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_participants_per_channel": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Upper bound for `ChannelConfig.max_participants` of this app's channels."
+          }
+        }
       }
     }
   }

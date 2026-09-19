@@ -37,6 +37,8 @@ pub struct SessionAck {
     pub resumed: bool,
     /// The node accepts AURX media as binary frames on this WebSocket (UDP-blocked fallback).
     pub media_tunnel: bool,
+    /// The node offers server-side mixed downlink (`SetDownlinkMode`).
+    pub downlink_mix: bool,
 }
 
 /// Informational (unverified) claims of the session JWT; lets the client recognise itself in
@@ -183,6 +185,7 @@ impl ControlConnection {
                     resume_grace_ms,
                     resumed,
                     media_tunnel,
+                    downlink_mix,
                 }) => {
                     let media_key = base64::engine::general_purpose::STANDARD
                         .decode(media_key.as_bytes())
@@ -199,6 +202,7 @@ impl ControlConnection {
                         resume_grace: Duration::from_millis(resume_grace_ms),
                         resumed,
                         media_tunnel,
+                        downlink_mix,
                     });
                 }
                 Some(ControlMessage::Error { code, message, .. }) => {

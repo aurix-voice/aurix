@@ -129,6 +129,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand(BitrateCommand)` |
 | Opus controls | `OpusEncoderSettings`, `SetEncoderSettings`, `SetComplexity`, `FollowChannelPolicy`, `Encoder`, `EffectiveEncoderSettings`, `AudioPolicy`, `OnAudioPolicyChanged`, `OnEncoderSettingsChanged`; `NativeOpusCodec` / `ConcentusOpusCodec`, `IOpusEncoderControls`, `IOpusFecDecoder` |
 | PCMU (G.711) fallback | `SetAudioCodecAsync(AudioCodec)`, `AudioCodec` / `PreferredAudioCodec`, `OnAudioCodecChanged`; behaviour `PreferredCodec`, `SetAudioCodec()`, `ActiveCodec`; `PcmuCodec`, `G711`, `TransmitAudioFrame(codec, …)`, `IncomingAudio.Codec` |
+| Large channels | `GetChannelInfo(channel)` → `ChannelInfo? { Role, ParticipantCount, HiddenListeners, Transcription, SafetyVoice, CanSpeak }`, `CanSpeakIn(channel)`, `SetDownlinkModeAsync(DownlinkMode)`, `DownlinkMode` / `PreferredDownlinkMode`, `OnDownlinkModeChanged`, `SessionInfo.DownlinkMix`, `IncomingAudio.Mixed`; behaviour `PreferredDownlinkMode`, `SetDownlinkMode()`, `ActiveDownlinkMode`, `StereoCodecFactory` — [below](#large-channels-listeners-and-the-server-mix) |
 | Blocked UDP | `MediaPathPolicy` (`Auto`/`UdpOnly`/`TunnelOnly`), `UdpFallbackLostHeartbeats`, `UdpReprobeInterval`, `MediaHeartbeatInterval`, `ActiveMediaPath`, `OnMediaPathChanged(path, reason)`, `SessionInfo.MediaTunnel`, `VoiceStats.MediaPath` / `HeartbeatsLostConsecutive` / `UplinkDropped`; behaviour `MediaPath`, `UdpFallbackLostHeartbeats`, `UdpReprobeIntervalSeconds` — [below](#when-udp-is-blocked-the-websocket-tunnel) |
 | Mobile | runtime microphone permission (`PermissionState`, `OnMicrophonePermissionDenied`, `RetryMicrophonePermission()`), background/foreground handling, `ProbeConnection()`, reconnect on Wi-Fi ↔ cellular |
 
@@ -214,6 +215,45 @@ downlink streams (`IncomingAudio.Codec`) next to Opus ones — a stream that cha
 fresh decoder. `SetBitrate` is a no-op on it (G.711 is fixed-rate), and `OpusEncoderSettings` /
 channel audio policies do not apply while PCMU is active. Rejected with `CODEC_NOT_AVAILABLE`
 when the node runs `media.pcmu_fallback = false`.
+
+## Large channels: listeners and the server mix
+
+The join ack says what kind of member you are
+([large channels](../features/channels.md#large-channels-and-audiences)):
+
+```csharp
+client.OnChannelJoined += (channel, participants) =>
+{
+    var info = client.GetChannelInfo(channel).Value;
+    // participants = the visible roster; info.ParticipantCount = everyone, on every node,
+    // including listeners hidden from the roster when info.HiddenListeners is true.
+    if (!client.CanSpeakIn(channel))       // info.Role == ChannelRole.Listener
+        pushToTalk.interactable = false;   // the node drops our frames anyway
+};
+```
+
+A session may also ask for **one server-mixed stereo stream per channel** instead of one
+stream per speaker — constant downlink bandwidth and decode cost however many people talk;
+mutes, volumes, focus and positional gains are applied by the node before mixing:
+
+```csharp
+// AurixVoiceBehaviour: PreferredDownlinkMode = DownlinkMode.Mixed in the inspector, and
+voice.StereoCodecFactory = () => new ConcentusOpusCodec(48000, 2);   // or NativeOpusCodec(48000, 2)
+await voice.SetDownlinkMode(DownlinkMode.Mixed);                    // runtime switch; voice.ActiveDownlinkMode
+
+// AurixVoiceClient + your own RemoteMixer:
+var mixer = new RemoteMixer(() => new ConcentusOpusCodec(), () => new ConcentusOpusCodec(48000, 2));
+await client.SetDownlinkModeAsync(DownlinkMode.Mixed);              // OnDownlinkModeChanged confirms
+while (client.TryDequeueAudio(out var a)) mixer.Push(in a);         // a.Mixed → stereo decoder, no panning
+```
+
+Mixed frames carry `PacketFlags.Mixed` under the channel's synthetic SSRC; `RemoteMixer` decodes
+them with the stereo factory (or the mono `CodecFactory`, downmixing, when none is set) and never
+pans them, so positional channels sound the same in both modes. Speakers using E2EE still arrive
+as separate streams. `PreferredDownlinkMode` is re-applied after a fresh session (a resumed one
+keeps it); rejected with `VALIDATION_ERROR` when the node runs `media.downlink_mix = false`
+(`SessionInfo.DownlinkMix`). Channels configured with `audience.mix_for_listeners` mix for
+listeners regardless of the requested mode.
 
 ## When UDP is blocked: the WebSocket tunnel
 

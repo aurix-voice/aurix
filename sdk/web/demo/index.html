@@ -277,7 +277,12 @@ $('connect').onclick = async () => {
   client.on('remoteStream', () => { log('remote stream attached'); fillDevices().catch(() => {}); });
   client.on('devicesChanged', () => { log('audio devices changed'); fillDevices().catch(() => {}); });
   client.on('inputDeviceChanged', (id) => { log('microphone now', id ?? 'default'); fillDevices().catch(() => {}); });
-  client.on('channelJoined', (ch, ps) => { log('joined', ch, `${ps.length} participants`); renderRoster(); renderChannels(); setButtons(true, true); });
+  client.on('channelJoined', (ch, ps) => {
+    const info = client.channelInfo(ch);
+    log('joined', ch, `${ps.length} visible / ${info?.participantCount ?? ps.length} total, role ${info?.role ?? 'speaker'}` +
+      `${info?.hiddenListeners ? ', listeners hidden' : ''}${client.canSpeakIn(ch) ? '' : ' (listen-only)'}`);
+    renderRoster(); renderChannels(); setButtons(true, true);
+  });
   client.on('channelLeft', (ch) => { log('left', ch); renderRoster(); renderChannels(); setButtons(client.connectionState !== 'disconnected', client.joinedChannels().length > 0); });
   client.on('transmissionChanged', (mode) => { log('transmission', mode); renderChannels(); });
   client.on('channelFocusChanged', (ch) => { log('focus', ch ?? 'none'); renderChannels(); });

@@ -58,6 +58,7 @@ have packet-type values but the WebSocket control plane is used for them.
 | `Energy` | `0x0800` | uplink payload starts with an RFC 6464 `-dBov` level byte (`127` = silence); stripped before fan-out |
 | `Directional` | `0x1000` | downlink payload carries 2 signed bytes (azimuth in π/127, elevation in π/254 units) after the gain byte |
 | `Pcmu` | `0x2000` | the audio frame is G.711 μ-law, not Opus — only on sessions that negotiated `SetAudioCodec {codec: "pcmu"}` ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)); the server sets it on the downlink copies sent to such sessions |
+| `Mixed` | `0x4000` | downlink only: the frame is the server's stereo mix of a whole channel for this receiver (`SetDownlinkMode {mode: "mixed"}`, [server mix](../features/channels.md#server-mix-for-native-clients)), under the channel's synthetic mix SSRC with its own sequence; per-receiver gains are baked in — never combined with `E2ee` or `Directional`, combined with `Pcmu` for PCMU sessions |
 
 ## Keys and sealing
 
@@ -96,7 +97,9 @@ jitter buffers do not see phantom losses.
 5. On receive: `open(keys)` (verify tag, decrypt), check the replay window per sender SSRC, strip
    the gain byte (`VolumeAttenuated`) and direction bytes (`Directional`), apply the gain, hand the
    Opus frame to the per-sender jitter buffer, mix with panning. The sender is identified by
-   `ssrc` → `ParticipantJoined.ssrc`; the top bit marks server-synthesised streams (TTS).
+   `ssrc` → `ParticipantJoined.ssrc`; the top bit marks server-synthesised streams (TTS,
+   channel mixes). A `Mixed` frame is stereo Opus (decode with a 2-channel decoder, downmix if
+   you play mono) and must not be panned again.
 6. After a resume, re-send `SessionBind` from the current UDP socket (the address may have
    changed) and continue the sequence counter — do not restart it.
 
@@ -150,6 +153,10 @@ Metrics: `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}
   the seal are the same as for Opus). PCMU frames from a session that did not negotiate and
   `Pcmu | E2ee` frames are dropped (`aurix_packets_dropped_total`); frames of a length other
   than 80/160/320/480 bytes fail the transcode (`aurix_pcmu_frames_total{outcome="error"}`).
+* Drops uplink audio from members whose channel role is `listener`, withholds per-speaker frames
+  over a receiver's `audience.max_streams` cap, and for receivers in `mixed` downlink mode feeds
+  the frame to their channel mixer instead of forwarding it (E2EE frames are still forwarded
+  as-is) — see [large channels](../features/channels.md#large-channels-and-audiences).
 
 ## Reference implementations
 

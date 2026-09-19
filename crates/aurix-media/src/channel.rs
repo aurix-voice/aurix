@@ -91,6 +91,8 @@ pub struct MediaChannel {
     participant_roles: DashMap<UserId, ChannelRole>,
     ssrc_map: DashMap<u32, UserId>,
     participant_count: AtomicU32,
+    /// Local members whose role may speak (`audience.max_speakers` admission).
+    local_speakers: AtomicU32,
     /// Members hosted on other nodes of the cascade.
     remote: DashMap<UserId, RemoteParticipant>,
     /// Poses of local and remote members (remote ones arrive over the event bus).
@@ -111,6 +113,7 @@ impl MediaChannel {
             participant_roles: DashMap::new(),
             ssrc_map: DashMap::new(),
             participant_count: AtomicU32::new(0),
+            local_speakers: AtomicU32::new(0),
             remote: DashMap::new(),
             positions: DashMap::new(),
             visible: RwLock::new(HashSet::new()),
@@ -151,7 +154,34 @@ impl MediaChannel {
             self.remove_participant(&session.user_id);
         }
         // Reserve a slot atomically so concurrent joins cannot exceed max_participants.
-        let max = self.config.read().max_participants;
+        let (max, max_speakers) = {
+            let cfg = self.config.read();
+            (
+                cfg.max_participants,
+                cfg.audience.map(|a| a.max_speakers).unwrap_or(0),
+            )
+        };
+        // Speaker slots are reserved the same way (remote speakers count against the cap
+        // as last seen; two nodes admitting the last slot at once is bounded by the
+        // cascade's propagation delay).
+        if role.can_speak() {
+            let remote_speakers = self.remote.iter().filter(|r| r.role.can_speak()).count() as u32;
+            let reserved =
+                self.local_speakers
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                        if max_speakers > 0 && c.saturating_add(remote_speakers) >= max_speakers {
+                            None
+                        } else {
+                            Some(c + 1)
+                        }
+                    });
+            if reserved.is_err() {
+                return Err(AurixError::ChannelFull(format!(
+                    "Channel {} has no speaker slot left ({max_speakers} speakers)",
+                    self.channel_id
+                )));
+            }
+        }
         let reserved =
             self.participant_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
@@ -162,6 +192,9 @@ impl MediaChannel {
                     }
                 });
         if reserved.is_err() {
+            if role.can_speak() {
+                self.local_speakers.fetch_sub(1, Ordering::AcqRel);
+            }
             return Err(AurixError::ChannelFull(format!(
                 "Channel {} full ({}/{})",
                 self.channel_id, max, max
@@ -177,13 +210,21 @@ impl MediaChannel {
     pub fn remove_participant(&self, user_id: &UserId) -> Option<Arc<MediaSession>> {
         if let Some((_, session)) = self.participants.remove(user_id) {
             self.ssrc_map.remove(&session.ssrc);
-            self.participant_roles.remove(user_id);
+            if let Some((_, role)) = self.participant_roles.remove(user_id) {
+                if role.can_speak() {
+                    self.local_speakers.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
             self.positions.remove(user_id);
             self.forget_visibility(user_id);
             for other in self.participants.iter() {
+                let other = other.value();
                 other
-                    .value()
                     .ambient
+                    .lock()
+                    .forget_sender(&self.channel_id, user_id);
+                other
+                    .stream_cap
                     .lock()
                     .forget_sender(&self.channel_id, user_id);
             }
@@ -217,9 +258,13 @@ impl MediaChannel {
         self.positions.remove(user_id);
         self.forget_visibility(user_id);
         for other in self.participants.iter() {
+            let other = other.value();
             other
-                .value()
                 .ambient
+                .lock()
+                .forget_sender(&self.channel_id, user_id);
+            other
+                .stream_cap
                 .lock()
                 .forget_sender(&self.channel_id, user_id);
         }
@@ -228,6 +273,83 @@ impl MediaChannel {
 
     pub fn remote_count(&self) -> usize {
         self.remote.len()
+    }
+
+    /// Members (local and remote) that may speak.
+    pub fn speaker_count(&self) -> u32 {
+        let remote = self.remote.iter().filter(|r| r.role.can_speak()).count() as u32;
+        self.local_speakers.load(Ordering::Relaxed) + remote
+    }
+
+    /// Role of a local or remote member (`Listener` for strangers).
+    pub fn role_of(&self, user_id: &UserId) -> ChannelRole {
+        self.member_role(user_id).unwrap_or(ChannelRole::Listener)
+    }
+
+    /// Role of a current member, local or remote (`None`: not in the channel).
+    pub fn member_role(&self, user_id: &UserId) -> Option<ChannelRole> {
+        if let Some(r) = self.participant_roles.get(user_id) {
+            return Some(*r.value());
+        }
+        self.remote.get(user_id).map(|r| r.role)
+    }
+
+    /// `ChannelConfig::audience.hide_listeners`: receive-only members stay out of presence.
+    pub fn hides_listeners(&self) -> bool {
+        self.config.read().hides_listeners()
+    }
+
+    /// Whether `user_id` is a receive-only member that presence must not disclose.
+    pub fn is_hidden_listener(&self, user_id: &UserId) -> bool {
+        let Some(role) = self.member_role(user_id) else {
+            return false;
+        };
+        if role.can_speak() {
+            return false;
+        }
+        let cfg = self.config.read();
+        cfg.hides_listeners()
+            && !(self.channel_type == ChannelType::Command
+                && cfg
+                    .command_speakers
+                    .as_ref()
+                    .is_some_and(|s| s.contains(user_id)))
+    }
+
+    /// Whether native receivers in `DownlinkMode::Mixed` must be served (`mix_for_listeners`
+    /// makes every listener mixed).
+    pub fn wants_mix(&self, receiver: &MediaSession) -> bool {
+        receiver.downlink_mode() == DownlinkMode::Mixed
+            || (self.config.read().mixes_for_listeners()
+                && !self.role_of(&receiver.user_id).can_speak())
+    }
+
+    /// True when every member of this channel hears the same audio apart from their own
+    /// receiver preferences: no distance attenuation / direction, no ambient slot table, no
+    /// whisper target. Such channels can share one server mix between receivers.
+    pub fn supports_shared_mix(&self) -> bool {
+        matches!(self.channel_type, ChannelType::Team | ChannelType::Command)
+            && self.config.read().ambient.is_none()
+    }
+
+    /// Cheap pre-check for the router: could any member of this channel be served by a
+    /// server mix right now?
+    pub fn may_mix(&self) -> bool {
+        self.config.read().mixes_for_listeners()
+            || self
+                .participants
+                .iter()
+                .any(|p| p.value().downlink_mode() == DownlinkMode::Mixed)
+    }
+
+    /// The per-receiver stream cap (`audience.max_streams`) as a slot table configuration:
+    /// `max_streams` slots, losers silenced.
+    fn stream_cap(&self) -> Option<AmbientConfig> {
+        let max = self.config.read().audience.map(|a| a.max_streams)?;
+        (max > 0).then_some(AmbientConfig {
+            max_voices: max,
+            ambient_gain: 0.0,
+        })
     }
 
     pub fn is_remote(&self, user_id: &UserId) -> bool {
@@ -253,6 +375,9 @@ impl MediaChannel {
     /// Local participants that currently see `user_id` (`None`: no roster radius, all do).
     pub fn observers_of(&self, user_id: &UserId) -> Option<Vec<UserId>> {
         self.roster_radius()?;
+        if self.is_hidden_listener(user_id) {
+            return Some(Vec::new());
+        }
         let visible = self.visible.read();
         Some(
             self.participants
@@ -286,10 +411,17 @@ impl MediaChannel {
             .and_then(|p| p.text_radius)
     }
 
-    /// Whether `observer` currently sees `subject` in this channel: always without a roster
-    /// radius, otherwise only while the pair is within it (both poses known).
+    /// Whether `observer` currently sees `subject` in this channel: never when `subject` is a
+    /// hidden listener, always without a roster radius, otherwise only while the pair is
+    /// within it (both poses known). Everybody sees themselves.
     pub fn sees(&self, observer: &UserId, subject: &UserId) -> bool {
-        if observer == subject || self.roster_radius().is_none() {
+        if observer == subject {
+            return true;
+        }
+        if self.is_hidden_listener(subject) {
+            return false;
+        }
+        if self.roster_radius().is_none() {
             return true;
         }
         self.visible.read().contains(&pair(*observer, *subject))
@@ -421,23 +553,21 @@ impl MediaChannel {
         self.participants.contains_key(user_id)
     }
 
-    /// True if `user_id` may transmit in this channel (role/command-speaker rules).
+    /// True if `user_id` may transmit in this channel: members whose grant had `speak: false`
+    /// (`ChannelRole::Listener`) are receive-only in every channel type; Command channels
+    /// additionally admit the configured `command_speakers`.
     pub fn can_transmit(&self, user_id: &UserId) -> bool {
         if !self.participants.contains_key(user_id) {
             return false;
         }
-        match self.channel_type {
-            ChannelType::Command => {
-                self.get_role(user_id).can_speak()
-                    || self
-                        .config
-                        .read()
-                        .command_speakers
-                        .as_ref()
-                        .is_some_and(|s| s.contains(user_id))
-            }
-            _ => true,
-        }
+        self.get_role(user_id).can_speak()
+            || (self.channel_type == ChannelType::Command
+                && self
+                    .config
+                    .read()
+                    .command_speakers
+                    .as_ref()
+                    .is_some_and(|s| s.contains(user_id)))
     }
 
     /// Receivers for audio relayed from another node, filtered by their own preferences towards
@@ -514,6 +644,9 @@ impl MediaChannel {
             Some(p) => p.value().position.clone(),
             None => return Vec::new(),
         };
+        // Hidden listeners take part in the distance bookkeeping (they must see others) but
+        // never appear as a subject.
+        let mover_hidden = self.is_hidden_listener(user_id);
         let mut changes = Vec::new();
         let mut visible = self.visible.write();
         for other in self.positions.iter() {
@@ -525,6 +658,7 @@ impl MediaChannel {
             if !other_local && !self.remote.contains_key(&other_id) {
                 continue;
             }
+            let other_hidden = self.is_hidden_listener(&other_id);
             let key = pair(*user_id, other_id);
             let distance = position.distance_to(&other.value().position);
             let was = visible.contains(&key);
@@ -541,14 +675,14 @@ impl MediaChannel {
             } else {
                 visible.remove(&key);
             }
-            if other_local {
+            if other_local && !mover_hidden {
                 changes.push(RosterChange {
                     observer: other_id,
                     subject: *user_id,
                     visible: now,
                 });
             }
-            if mover_local {
+            if mover_local && !other_hidden {
                 changes.push(RosterChange {
                     observer: *user_id,
                     subject: other_id,
@@ -593,10 +727,12 @@ impl MediaChannel {
         reported_level: Option<u8>,
     ) -> Vec<(Arc<MediaSession>, Mix)> {
         let ambient = self.config.read().ambient;
-        let now = ambient.map(|_| Instant::now());
+        let cap = self.stream_cap();
+        let ranked = ambient.is_some() || cap.is_some();
+        let now = ranked.then(Instant::now);
         // Sender-reported level of the current frame (unlabeled frames rank at nominal
         // loudness).
-        let level = ambient
+        let level = now
             .and_then(|_| {
                 reported_level.or_else(|| {
                     self.participants
@@ -621,6 +757,23 @@ impl MediaChannel {
                             cfg,
                             now,
                         );
+                    }
+                }
+                // Stream cap: each receiver keeps only the `max_streams` loudest concurrent
+                // voices (by what *they* would hear: gain × sender level); the rest are
+                // dropped for them. Ranked after ambient dimming so focused voices win.
+                if let (Some(cfg), Some(now)) = (cap.as_ref(), now) {
+                    if v > 0.001
+                        && receiver.stream_cap.lock().gate(
+                            &self.channel_id,
+                            sender_uid,
+                            v * level,
+                            cfg,
+                            now,
+                        ) <= 0.0
+                    {
+                        aurix_metrics::STREAMS_CAPPED.inc();
+                        return None;
                     }
                 }
                 (v > 0.001).then_some((
@@ -768,6 +921,7 @@ impl MediaChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn session(app: AppId, ssrc: u32) -> Arc<MediaSession> {
         MediaSession::new(
@@ -1282,5 +1436,441 @@ mod tests {
         );
         let whisper = ch.get_receivers_for_relayed_audio(&remote_quiet, Some(60));
         assert!((vol_to(&whisper, &listener).unwrap() - 0.2).abs() < 1e-6);
+    }
+
+    fn audience(cfg: AudienceConfig) -> ChannelConfig {
+        ChannelConfig {
+            channel_type: ChannelType::Team,
+            audience: Some(cfg),
+            ..ChannelConfig::default()
+        }
+    }
+
+    fn hears(got: &[(Arc<MediaSession>, Mix)], who: &Arc<MediaSession>) -> Option<f32> {
+        got.iter()
+            .find(|(s, _)| s.user_id == who.user_id)
+            .map(|(_, m)| m.volume)
+    }
+
+    #[test]
+    fn stream_cap_ranks_per_receiver_and_drops_the_rest() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            audience(AudienceConfig {
+                max_streams: 2,
+                ..AudienceConfig::default()
+            }),
+        );
+        let alice = session(app, 10);
+        let bob = session(app, 11);
+        let speakers: Vec<_> = (1..=3).map(|i| session(app, i)).collect();
+        for s in [&alice, &bob] {
+            ch.add_participant(s.clone(), ChannelRole::Listener)
+                .unwrap();
+        }
+        for s in &speakers {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        // Bob barely hears speaker 1; Alice hears everyone at nominal volume.
+        bob.prefs.write().set_gain(speakers[0].user_id, 0.05);
+
+        let f1 = ch.get_receivers_for_audio(1);
+        let f2 = ch.get_receivers_for_audio(2);
+        assert_eq!(hears(&f1, &alice), Some(1.0));
+        assert_eq!(hears(&f1, &bob), Some(0.05));
+        assert_eq!(hears(&f2, &alice), Some(1.0));
+        assert_eq!(hears(&f2, &bob), Some(1.0));
+
+        // The third equally loud voice does not fit for Alice (both slots are held) but it
+        // pushes the quiet speaker 1 out for Bob: the cap is ranked per receiver.
+        let f3 = ch.get_receivers_for_audio(3);
+        assert_eq!(hears(&f3, &alice), None, "alice: capped");
+        assert_eq!(
+            hears(&f3, &bob),
+            Some(1.0),
+            "bob: speaker 3 replaces the quiet one"
+        );
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &alice), Some(1.0));
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &bob), None);
+        // Other speakers keep hearing everyone: they have slots of their own.
+        assert_eq!(hears(&f3, &speakers[0]), Some(1.0));
+        assert_eq!(hears(&f3, &speakers[1]), Some(1.0));
+
+        // A speaker Alice muted never takes one of her slots, so the third voice fits.
+        alice
+            .prefs
+            .write()
+            .set_muted(speakers[1].user_id, Some(ch.channel_id), true);
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &alice), None);
+        ch.remove_participant(&speakers[1].user_id);
+        ch.add_participant(speakers[1].clone(), ChannelRole::Speaker)
+            .unwrap();
+        assert_eq!(hears(&ch.get_receivers_for_audio(3), &alice), Some(1.0));
+
+        // Holders keep their slots against an equally loud challenger, but a holder whose
+        // frames report a much quieter level loses it (rank = delivery gain × sender level).
+        speakers[1].record_audio_level(Some(0), 0.0);
+        alice
+            .prefs
+            .write()
+            .set_muted(speakers[1].user_id, Some(ch.channel_id), false);
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &alice), None);
+        speakers[0].record_audio_level(Some(40), 0.0);
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &alice), None);
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &alice), Some(1.0));
+        assert_eq!(hears(&ch.get_receivers_for_audio(3), &alice), Some(1.0));
+    }
+
+    #[test]
+    fn stream_cap_ranks_by_what_the_receiver_would_hear() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Positional,
+                positional_config: Some(PositionalConfig {
+                    near_distance: 1.0,
+                    far_distance: 11.0,
+                    rolloff: RolloffCurve::Linear,
+                    max_radius: 100.0,
+                    ..PositionalConfig::default()
+                }),
+                audience: Some(AudienceConfig {
+                    max_streams: 1,
+                    ..AudienceConfig::default()
+                }),
+                ..ChannelConfig::default()
+            },
+        );
+        let listener = session(app, 10);
+        let near = session(app, 1);
+        let far = session(app, 2);
+        let blocked = session(app, 3);
+        for s in [&listener, &near, &far, &blocked] {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        let o = Orientation3D::default;
+        ch.update_position(&listener.user_id, Position3D::new(0.0, 0.0, 0.0), o());
+        ch.update_position(&near.user_id, Position3D::new(0.0, 0.0, 0.0), o());
+        ch.update_position(&far.user_id, Position3D::new(6.0, 0.0, 0.0), o()); // 0.5
+        ch.update_position(&blocked.user_id, Position3D::new(0.0, 0.0, 0.0), o());
+        listener.prefs.write().set_blocked(blocked.user_id, true);
+
+        // A blocked speaker is filtered before ranking: they never occupy the slot.
+        assert_eq!(hears(&ch.get_receivers_for_audio(3), &listener), None);
+        // The far speaker takes the single slot at positional 0.5 ...
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &listener), Some(0.5));
+        // ... and loses it to the near speaker, who ranks at 1.0 > 0.5 x stickiness.
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &listener), None);
+        // Slots are per receiver: the blocked speaker (audible to everyone else) holds the
+        // far speaker's slot at 0.5 x stickiness, so near (0.5 to them) is dropped for far,
+        // while near takes the slot from far at the blocked speaker.
+        let f1 = ch.get_receivers_for_audio(1);
+        assert_eq!(hears(&f1, &far), None);
+        assert_eq!(hears(&f1, &blocked), Some(1.0));
+
+        // Focus attenuation applies to the ranked volume as well.
+        std::thread::sleep(crate::ambient::VOICE_HOLD + Duration::from_millis(20));
+        ch.update_position(&far.user_id, Position3D::new(0.0, 0.0, 0.0), o());
+        listener.prefs.write().set_focus(Some(ChannelId::new()));
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &listener), Some(0.5));
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &listener), None);
+        listener.prefs.write().set_focus(Some(ch.channel_id));
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+        // Near holds the slot against an equally loud challenger (1.0 x 1.2 stickiness) ...
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &listener), None);
+        // ... until it falls silent for VOICE_HOLD: the stale voice is dropped and the slot
+        // goes to whoever speaks next.
+        std::thread::sleep(crate::ambient::VOICE_HOLD + Duration::from_millis(20));
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &listener), Some(1.0));
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &listener), None);
+    }
+
+    #[test]
+    fn listeners_never_transmit_in_any_channel_type() {
+        let app = AppId::new();
+        for channel_type in [
+            ChannelType::Team,
+            ChannelType::Positional,
+            ChannelType::Echo,
+            ChannelType::Command,
+            ChannelType::Whisper,
+        ] {
+            let ch = MediaChannel::new(
+                ChannelId::new(),
+                app,
+                ChannelConfig {
+                    channel_type,
+                    ..ChannelConfig::default()
+                },
+            );
+            let listener = session(app, 1);
+            let speaker = session(app, 2);
+            ch.add_participant(listener.clone(), ChannelRole::Listener)
+                .unwrap();
+            ch.add_participant(speaker.clone(), ChannelRole::Speaker)
+                .unwrap();
+            assert!(!ch.can_transmit(&listener.user_id), "{channel_type:?}");
+            assert!(ch.can_transmit(&speaker.user_id) || channel_type == ChannelType::Command);
+            let speaker_receivers = ch.get_receivers_for_audio(2);
+            if matches!(channel_type, ChannelType::Team | ChannelType::Whisper) {
+                assert_eq!(hears(&speaker_receivers, &listener), Some(1.0));
+            }
+        }
+        // Command channels: `command_speakers` may transmit even with a listener grant.
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Command,
+                ..ChannelConfig::default()
+            },
+        );
+        let commander = session(app, 1);
+        let listener = session(app, 2);
+        ch.add_participant(commander.clone(), ChannelRole::Listener)
+            .unwrap();
+        ch.add_participant(listener.clone(), ChannelRole::Listener)
+            .unwrap();
+        assert!(!ch.can_transmit(&commander.user_id));
+        ch.update_config(ChannelConfig {
+            channel_type: ChannelType::Command,
+            command_speakers: Some(vec![commander.user_id]),
+            ..ChannelConfig::default()
+        });
+        assert!(ch.can_transmit(&commander.user_id));
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+    }
+
+    #[test]
+    fn hidden_listeners_are_invisible_to_others_but_see_everyone() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(ChannelId::new(), app, audience(AudienceConfig::default()));
+        let speaker = session(app, 1);
+        let listener = session(app, 2);
+        let other_listener = session(app, 3);
+        ch.add_participant(speaker.clone(), ChannelRole::Speaker)
+            .unwrap();
+        ch.add_participant(listener.clone(), ChannelRole::Listener)
+            .unwrap();
+        ch.add_participant(other_listener.clone(), ChannelRole::Listener)
+            .unwrap();
+        let remote_listener = UserId::new();
+        ch.add_remote(
+            remote_listener,
+            RemoteParticipant {
+                session_id: SessionId::new(),
+                display_name: "remote".into(),
+                ssrc: 99,
+                role: ChannelRole::Listener,
+                is_muted: false,
+            },
+        );
+
+        assert!(ch.hides_listeners());
+        assert!(ch.is_hidden_listener(&listener.user_id));
+        assert!(ch.is_hidden_listener(&remote_listener));
+        assert!(!ch.is_hidden_listener(&speaker.user_id));
+        assert!(
+            !ch.is_hidden_listener(&UserId::new()),
+            "non-members are not hidden"
+        );
+
+        let names = |who: &UserId| -> Vec<String> {
+            let mut v: Vec<String> = ch
+                .roster_for(who)
+                .into_iter()
+                .map(|e| e.display_name)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&speaker.user_id), Vec::<String>::new());
+        assert_eq!(names(&listener.user_id), vec!["u1".to_string()]);
+        assert_eq!(names(&other_listener.user_id), vec!["u1".to_string()]);
+        assert!(ch.sees(&listener.user_id, &listener.user_id), "self");
+        assert!(!ch.sees(&speaker.user_id, &listener.user_id));
+        assert!(ch.sees(&listener.user_id, &speaker.user_id));
+        // Counts still include them.
+        assert_eq!(ch.participant_count(), 3);
+        assert_eq!(ch.remote_count(), 1);
+        assert_eq!(ch.speaker_count(), 1);
+
+        // Audio still reaches them (mixed by default), and they may switch to streams.
+        assert!(ch.wants_mix(&listener) && ch.may_mix());
+        assert!(!ch.wants_mix(&speaker));
+        assert!(ch.supports_shared_mix());
+        assert_eq!(hears(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+
+        // Turning `hide_listeners` off reveals them.
+        ch.update_config(audience(AudienceConfig {
+            hide_listeners: false,
+            ..AudienceConfig::default()
+        }));
+        assert_eq!(names(&speaker.user_id).len(), 3);
+    }
+
+    #[test]
+    fn hidden_listeners_stay_out_of_roster_radius_transitions() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Positional,
+                positional_config: Some(PositionalConfig {
+                    roster_radius: Some(10.0),
+                    ..PositionalConfig::default()
+                }),
+                audience: Some(AudienceConfig::default()),
+                ..ChannelConfig::default()
+            },
+        );
+        let speaker = session(app, 1);
+        let listener = session(app, 2);
+        ch.add_participant(speaker.clone(), ChannelRole::Speaker)
+            .unwrap();
+        ch.add_participant(listener.clone(), ChannelRole::Listener)
+            .unwrap();
+        let o = Orientation3D::default;
+        assert!(ch
+            .update_position(&speaker.user_id, Position3D::new(0.0, 0.0, 0.0), o())
+            .is_empty());
+        let changes = ch.update_position(&listener.user_id, Position3D::new(0.0, 0.0, 0.0), o());
+        // Only the listener learns about the speaker; the speaker is told nothing.
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].observer, listener.user_id);
+        assert_eq!(changes[0].subject, speaker.user_id);
+        assert!(changes[0].visible);
+        assert_eq!(ch.observers_of(&listener.user_id), Some(Vec::new()));
+        assert_eq!(
+            ch.observers_of(&speaker.user_id),
+            Some(vec![listener.user_id])
+        );
+    }
+
+    #[test]
+    fn speaker_admission_is_atomic_and_counts_remote_speakers() {
+        let app = AppId::new();
+        let ch = Arc::new(MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                max_participants: 1000,
+                ..audience(AudienceConfig {
+                    max_speakers: 8,
+                    ..AudienceConfig::default()
+                })
+            },
+        ));
+        ch.add_remote(
+            UserId::new(),
+            RemoteParticipant {
+                session_id: SessionId::new(),
+                display_name: "remote".into(),
+                ssrc: 5000,
+                role: ChannelRole::Speaker,
+                is_muted: false,
+            },
+        );
+        let admitted = Arc::new(AtomicU32::new(0));
+        let listeners_admitted = Arc::new(AtomicU32::new(0));
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                let ch = ch.clone();
+                let admitted = admitted.clone();
+                let listeners_admitted = listeners_admitted.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20u32 {
+                        let ssrc = 1 + t * 100 + i;
+                        let role = if i % 2 == 0 {
+                            ChannelRole::Speaker
+                        } else {
+                            ChannelRole::Listener
+                        };
+                        if ch.add_participant(session(app, ssrc), role).is_ok() {
+                            if role.can_speak() {
+                                admitted.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                listeners_admitted.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // 7 local + 1 remote = 8; listeners are never turned away by the speaker cap.
+        assert_eq!(admitted.load(Ordering::Relaxed), 7);
+        assert_eq!(listeners_admitted.load(Ordering::Relaxed), 160);
+        assert_eq!(ch.speaker_count(), 8);
+        assert_eq!(ch.participant_count(), 167);
+
+        // A leaving speaker frees exactly one slot; a re-joining speaker keeps theirs.
+        let one = ch
+            .participants
+            .iter()
+            .find(|e| ch.get_role(e.key()).can_speak())
+            .map(|e| e.value().clone())
+            .unwrap();
+        assert!(ch
+            .add_participant(one.clone(), ChannelRole::Speaker)
+            .is_ok());
+        assert_eq!(ch.speaker_count(), 8);
+        assert!(ch
+            .add_participant(session(app, 9000), ChannelRole::Speaker)
+            .is_err());
+        ch.remove_participant(&one.user_id);
+        assert_eq!(ch.speaker_count(), 7);
+        assert!(ch
+            .add_participant(session(app, 9000), ChannelRole::Speaker)
+            .is_ok());
+        assert!(ch
+            .add_participant(session(app, 9001), ChannelRole::Speaker)
+            .is_err());
+        // Moderators need a slot too; the speaker cap does not apply to listeners.
+        assert!(ch
+            .add_participant(session(app, 9002), ChannelRole::Moderator)
+            .is_err());
+        assert!(ch
+            .add_participant(session(app, 9003), ChannelRole::Listener)
+            .is_ok());
+    }
+
+    #[test]
+    fn channels_grow_past_the_old_default_and_stop_at_max_participants() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                max_participants: 2000,
+                ..ChannelConfig::default()
+            },
+        );
+        let speaker = session(app, 1);
+        ch.add_participant(speaker.clone(), ChannelRole::Speaker)
+            .unwrap();
+        for i in 2..=2000u32 {
+            ch.add_participant(session(app, i), ChannelRole::Listener)
+                .unwrap();
+        }
+        assert_eq!(ch.participant_count(), 2000);
+        assert!(matches!(
+            ch.add_participant(session(app, 2001), ChannelRole::Listener),
+            Err(AurixError::ChannelFull(_))
+        ));
+        // One speaker frame fans out to all 1999 listeners (and not back to the speaker).
+        let got = ch.get_receivers_for_audio(1);
+        assert_eq!(got.len(), 1999);
+        assert!(got
+            .iter()
+            .all(|(s, m)| s.user_id != speaker.user_id && m.volume == 1.0));
     }
 }

@@ -2685,7 +2685,7 @@ pub async fn create_app(
     }
     let max_channels = req.max_channels.unwrap_or(10_000);
     let max_participants = req.max_participants_per_channel.unwrap_or(256);
-    if max_channels <= 0 || max_participants <= 0 || max_participants > 10_000 {
+    if max_channels <= 0 || max_participants <= 0 || max_participants > 100_000 {
         return Err(AurixError::Validation("Invalid quota values".into()).into());
     }
     let app_id = Uuid::now_v7();
@@ -2757,6 +2757,73 @@ pub async fn get_app(State(state): State<AppState>, Path(app_id): Path<Uuid>) ->
         .await?;
     Ok(Json(
         serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "created_at": a.created_at, "channels": channels, "active_sessions": sessions }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAppRequest {
+    pub name: Option<String>,
+    /// `null` clears the description.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub description: Option<Option<String>>,
+    pub max_channels: Option<i32>,
+    pub max_participants_per_channel: Option<i32>,
+}
+
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// Edits an app's name, description and quotas. Raising
+/// `max_participants_per_channel` is how existing apps get large (audience) channels; a
+/// lower quota applies to channels created or reconfigured afterwards.
+pub async fn update_app(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(app_id): Path<Uuid>,
+    Json(req): Json<UpdateAppRequest>,
+) -> JsonResult {
+    let name = req.name.as_deref().map(str::trim);
+    if name.is_some_and(|n| n.is_empty() || n.len() > 128) {
+        return Err(AurixError::Validation("name must be 1..=128 characters".into()).into());
+    }
+    if req.max_channels.is_some_and(|m| m <= 0)
+        || req
+            .max_participants_per_channel
+            .is_some_and(|m| m <= 0 || m > 100_000)
+    {
+        return Err(AurixError::Validation("Invalid quota values".into()).into());
+    }
+    let a = aurix_db::queries::update_app(
+        &state.control.pool,
+        app_id,
+        name,
+        req.description.as_ref().map(|d| d.as_deref()),
+        req.max_channels,
+        req.max_participants_per_channel,
+    )
+    .await?
+    .ok_or_else(|| AurixError::NotFound("Application not found".into()))?;
+    state.control.audit.log(
+        Some(AppId(app_id)),
+        UserId(admin.admin_id),
+        AuditAction::AppUpdated,
+        "app",
+        &app_id.to_string(),
+        serde_json::json!({
+            "name": name,
+            "max_channels": req.max_channels,
+            "max_participants_per_channel": req.max_participants_per_channel,
+        }),
+        client_ip_string(ip),
+    );
+    Ok(Json(
+        serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "created_at": a.created_at, "updated_at": a.updated_at }),
     ))
 }
 

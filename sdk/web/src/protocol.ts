@@ -195,6 +195,12 @@ export type ServerMessage =
         roster_radius?: number;
         /** Channel text reaches only members within this distance; absent = whole channel. */
         text_radius?: number;
+        /** Your role; `listener` = receive-only (absent on older servers = `speaker`). */
+        role?: ChannelRole;
+        /** Members across all nodes, including listeners hidden from `participants`. */
+        participant_count?: number;
+        /** Listeners are hidden from presence in this channel (`audience.hide_listeners`). */
+        hidden_listeners?: boolean;
       };
     }
   | { type: 'ChannelAudioPolicy'; data: { channel_id: string; audio: AudioPolicyWire } }

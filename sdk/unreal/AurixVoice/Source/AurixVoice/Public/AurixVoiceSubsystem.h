@@ -27,6 +27,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLocalSpeaking, bool, bSpeaking
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTransmissionMode, Mode, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioCodecChanged, EAurixAudioCodec, Codec);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixDownlinkModeChanged, EAurixDownlinkMode, Mode);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixMediaPathChanged, EAurixMediaPath, Path, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixUserBlockChanged, FGuid, UserId, bool, bBlocked);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixRecording, FGuid, ChannelId, FGuid, RecordingId, bool, bActive, FGuid, InitiatedBy);
@@ -132,6 +133,14 @@ public:
 	/** Presence / text range of a joined positional channel (0 = whole channel); false until the join is acknowledged. */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
 	bool GetChannelScope(FGuid ChannelId, FAurixChannelScope& OutScope) const;
+
+	/** Our role, the member count and the roster policy of a joined channel; false until the join is acknowledged. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool GetChannelInfo(FGuid ChannelId, FAurixChannelInfo& OutInfo) const;
+
+	/** Whether this session may transmit in the channel (false for listeners and unknown channels). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool CanSpeakIn(FGuid ChannelId) const;
 
 	/** Owner of an SSRC (microphone or its TTS voice) across joined channels. */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
@@ -281,6 +290,19 @@ public:
 	EAurixAudioCodec GetAudioCodec() const;
 
 	/**
+	 * Receive other speakers as one server-mixed stereo stream per channel (Mixed) instead of one
+	 * stream per speaker: constant bandwidth and decode cost in large channels. Needs
+	 * FAurixSessionInfo::bDownlinkMix; applied on OnDownlinkModeChanged. E2EE speakers still
+	 * arrive as separate streams.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
+	bool SetDownlinkMode(EAurixDownlinkMode Mode);
+
+	/** Downlink mode the server acknowledged. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
+	EAurixDownlinkMode GetDownlinkMode() const;
+
+	/**
 	 * Link the media uses right now: UDP, the WebSocket tunnel (UDP blocked — expect higher
 	 * latency under packet loss) or None before the first OnMediaBound.
 	 */
@@ -370,6 +392,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTransmissionChanged OnTransmissionChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelFocusChanged OnChannelFocusChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioCodecChanged OnAudioCodecChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixDownlinkModeChanged OnDownlinkModeChanged;
 	/** Media moved between UDP and the WebSocket tunnel (also fires after every OnMediaBound). */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixMediaPathChanged OnMediaPathChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixUserBlockChanged OnUserBlockChanged;

@@ -29,8 +29,8 @@
 
 use aurix_common::protocol::{TransmissionMode, TtsDestination, TtsState, UserPosition};
 use aurix_common::types::{
-    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, OpusBandwidth,
-    OpusSignal, Orientation3D, Position3D, RecordingConsent, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
+    OpusBandwidth, OpusSignal, Orientation3D, Position3D, RecordingConsent, UserId,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -268,6 +268,36 @@ impl From<AurixAudioCodec> for AudioCodec {
         match c {
             AurixAudioCodec::AurixCodecOpus => Self::Opus,
             AurixAudioCodec::AurixCodecPcmu => Self::Pcmu,
+        }
+    }
+}
+
+/// How the node delivers other speakers to this session (see
+/// `aurix_client_set_downlink_mode`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixDownlinkMode {
+    /// Default: one stream per audible speaker, mixed by this client.
+    AurixDownlinkStreams = 0,
+    /// One server-mixed stereo stream per channel (mutes / volumes / focus / positional gains
+    /// applied by the node); E2EE speakers still arrive as separate streams.
+    AurixDownlinkMixed = 1,
+}
+
+impl From<DownlinkMode> for AurixDownlinkMode {
+    fn from(m: DownlinkMode) -> Self {
+        match m {
+            DownlinkMode::Streams => Self::AurixDownlinkStreams,
+            DownlinkMode::Mixed => Self::AurixDownlinkMixed,
+        }
+    }
+}
+
+impl From<AurixDownlinkMode> for DownlinkMode {
+    fn from(m: AurixDownlinkMode) -> Self {
+        match m {
+            AurixDownlinkMode::AurixDownlinkStreams => Self::Streams,
+            AurixDownlinkMode::AurixDownlinkMixed => Self::Mixed,
         }
     }
 }
@@ -955,6 +985,9 @@ pub struct AurixSessionInfo {
     pub user_id: AurixUuid,
     /// The node accepts media over the control WebSocket (fallback when UDP is blocked).
     pub media_tunnel: bool,
+    /// The node can deliver one server-mixed stream per channel
+    /// (`aurix_client_set_downlink_mode`).
+    pub downlink_mix: bool,
 }
 
 /// `false` when no session is open.
@@ -978,6 +1011,7 @@ pub unsafe extern "C" fn aurix_client_session(
                 resumed: s.resumed,
                 user_id: c.user_id().map(|u| u.0).unwrap_or(Uuid::nil()).into(),
                 media_tunnel: s.media_tunnel,
+                downlink_mix: s.downlink_mix,
             };
             true
         }
@@ -1069,6 +1103,9 @@ pub enum AurixEventType {
     /// `media_path` (`aurix_event_media_path`), `message` = why: emitted after every
     /// `MediaBound` and on each mid-session UDP ↔ tunnel switch.
     AurixEventMediaPathChanged = 33,
+    /// `downlink_mode` (`aurix_event_downlink_mode`): the server acknowledged a downlink
+    /// mode; a fresh session reports `Streams` and the requested mode is re-applied.
+    AurixEventDownlinkModeChanged = 34,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1279,6 +1316,7 @@ impl AurixEvent {
             Event::TransmissionChanged(_) => T::AurixEventTransmissionChanged,
             Event::ChannelFocusChanged(_) => T::AurixEventChannelFocusChanged,
             Event::AudioCodecChanged(_) => T::AurixEventAudioCodecChanged,
+            Event::DownlinkModeChanged(_) => T::AurixEventDownlinkModeChanged,
             Event::UserBlockChanged { .. } => T::AurixEventUserBlockChanged,
             Event::Recording { .. } => T::AurixEventRecording,
             Event::BitrateChanged { .. } => T::AurixEventBitrateChanged,
@@ -1576,6 +1614,15 @@ pub unsafe extern "C" fn aurix_event_audio_codec(event: *const AurixEvent) -> Au
     }
 }
 
+/// Mode of a `DownlinkModeChanged` event; `Streams` otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_downlink_mode(event: *const AurixEvent) -> AurixDownlinkMode {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::DownlinkModeChanged(mode)) => (*mode).into(),
+        _ => AurixDownlinkMode::AurixDownlinkStreams,
+    }
+}
+
 /// Link of a `MediaPathChanged` event; `AurixMediaNone` for other events.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_media_path(event: *const AurixEvent) -> AurixMediaPath {
@@ -1613,6 +1660,7 @@ pub unsafe extern "C" fn aurix_event_session(
                 resumed: s.resumed,
                 user_id: zero(),
                 media_tunnel: s.media_tunnel,
+                downlink_mix: s.downlink_mix,
             };
             true
         }
@@ -1886,6 +1934,89 @@ pub unsafe extern "C" fn aurix_client_channel_scope(
             None => false,
         },
         _ => false,
+    }
+}
+
+/// Membership facts of a joined channel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurixChannelInfo {
+    /// This session's role; `AurixRoleListener` cannot transmit (the server drops its frames).
+    pub role: AurixRole,
+    /// Members across all nodes, including listeners hidden from the roster.
+    pub participant_count: u32,
+    /// Receive-only listeners are absent from the roster and never announced.
+    pub hidden_listeners: bool,
+    /// Speech is transcribed and captions delivered.
+    pub transcription: bool,
+    /// Speech is analysed by the content-safety classifier (disclose it).
+    pub safety_voice: bool,
+}
+
+impl Default for AurixChannelInfo {
+    fn default() -> Self {
+        Self {
+            role: AurixRole::AurixRoleListener,
+            participant_count: 0,
+            hidden_listeners: false,
+            transcription: false,
+            safety_voice: false,
+        }
+    }
+}
+
+/// Role / member count / roster policy of a joined channel; `false` (and `out` untouched)
+/// until its join is acknowledged.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_channel_info(
+    client: *const AurixClient,
+    channel_id: *const AurixUuid,
+    out: *mut AurixChannelInfo,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match (self::client(client), uuid_arg(channel_id, "channel_id")) {
+        (Ok(c), Ok(id)) => {
+            let id = ChannelId(id);
+            match c.channel_role(id) {
+                Some(role) => {
+                    *out = AurixChannelInfo {
+                        role: role.into(),
+                        participant_count: c.participant_count(id).unwrap_or(0),
+                        hidden_listeners: c.channel_hidden_listeners(id),
+                        transcription: c.channel_transcribes(id),
+                        safety_voice: c.channel_monitored(id),
+                    };
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `ChannelJoined` only: this session's role, the member count and the roster policy
+/// (defaults for other events).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_channel_info(event: *const AurixEvent) -> AurixChannelInfo {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::ChannelJoined {
+            role,
+            participant_count,
+            hidden_listeners,
+            transcription,
+            safety_voice,
+            ..
+        }) => AurixChannelInfo {
+            role: (*role).into(),
+            participant_count: *participant_count,
+            hidden_listeners: *hidden_listeners,
+            transcription: *transcription,
+            safety_voice: *safety_voice,
+        },
+        _ => AurixChannelInfo::default(),
     }
 }
 
@@ -2416,6 +2547,33 @@ pub unsafe extern "C" fn aurix_client_audio_codec(client: *const AurixClient) ->
     self::client(client)
         .map(|c| c.audio_codec().into())
         .unwrap_or(AurixAudioCodec::AurixCodecOpus)
+}
+
+/// Ask the server to deliver other speakers as one mixed stereo stream per channel
+/// (`AurixDownlinkMixed`) instead of one stream per speaker: constant downlink bandwidth and
+/// decode cost in large channels. Mutes, volumes, focus, positional attenuation and panning
+/// are applied by the node; E2EE speakers still arrive as separate streams. Requires
+/// `media.downlink_mix` on the node (`AurixSessionInfo.downlink_mix`, otherwise `ServerError`
+/// `DOWNLINK_MIX_NOT_AVAILABLE`); takes effect on `AurixEventDownlinkModeChanged`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_downlink_mode(
+    client: *mut AurixClient,
+    mode: AurixDownlinkMode,
+) -> AurixResult {
+    match self::client(client) {
+        Ok(c) => ok(c.set_downlink_mode(mode.into())),
+        Err(r) => r,
+    }
+}
+
+/// Downlink mode the server acknowledged.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_downlink_mode(
+    client: *const AurixClient,
+) -> AurixDownlinkMode {
+    self::client(client)
+        .map(|c| c.downlink_mode().into())
+        .unwrap_or(AurixDownlinkMode::AurixDownlinkStreams)
 }
 
 #[no_mangle]
@@ -3840,9 +3998,17 @@ mod tests {
                 roster_radius: Some(25.0),
                 text_radius: None,
             },
+            role: ChannelRole::Listener,
+            participant_count: 1200,
+            hidden_listeners: true,
         })));
         let other = Box::into_raw(Box::new(AurixEvent::new(Event::ChannelLeft { channel_id })));
         unsafe {
+            let info = aurix_event_channel_info(scoped);
+            assert_eq!(info.role, AurixRole::AurixRoleListener);
+            assert_eq!(info.participant_count, 1200);
+            assert!(info.hidden_listeners);
+            assert_eq!(aurix_event_channel_info(other), AurixChannelInfo::default());
             let scope = aurix_event_channel_scope(scoped);
             assert_eq!(scope.roster_radius, 25.0);
             assert_eq!(scope.text_radius, 0.0, "unscoped text = whole channel");

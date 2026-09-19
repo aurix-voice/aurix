@@ -109,6 +109,8 @@ public:
     std::string message() const { return to_string(aurix_event_message(ev_)); }
     AurixTransmissionMode transmission() const { return aurix_event_transmission(ev_); }
     AurixAudioCodec audio_codec() const { return aurix_event_audio_codec(ev_); }
+    /// Mode of `AURIX_EVENT_DOWNLINK_MODE_CHANGED`; `AURIX_DOWNLINK_STREAMS` for other events.
+    AurixDownlinkMode downlink_mode() const { return aurix_event_downlink_mode(ev_); }
     /// Link of `AURIX_EVENT_MEDIA_PATH_CHANGED`; `AURIX_MEDIA_NONE` for other events.
     AurixMediaPath media_path() const { return aurix_event_media_path(ev_); }
     AurixModerationAction moderation_action() const { return aurix_event_moderation_action(ev_); }
@@ -119,6 +121,9 @@ public:
     bool tts(AurixTtsStatus& out) const { return aurix_event_tts(ev_, &out); }
     /// Payload of `AURIX_EVENT_AUDIO_POLICY_CHANGED`.
     bool audio_policy(AurixAudioPolicy& out) const { return aurix_event_audio_policy(ev_, &out); }
+    /// `AURIX_EVENT_CHANNEL_JOINED` only: this session's role, the member count (all nodes,
+    /// hidden listeners included) and the roster policy.
+    AurixChannelInfo channel_info() const { return aurix_event_channel_info(ev_); }
 
     std::vector<AurixParticipant> participants() const {
         std::vector<AurixParticipant> out(aurix_event_participant_count(ev_));
@@ -225,6 +230,16 @@ public:
     bool channel_scope(const Uuid& channel, AurixChannelScope& out) const {
         return aurix_client_channel_scope(c_, &channel.raw, &out);
     }
+    /// Role / member count / roster policy of a joined channel; `false` until the join is
+    /// acknowledged.
+    bool channel_info(const Uuid& channel, AurixChannelInfo& out) const {
+        return aurix_client_channel_info(c_, &channel.raw, &out);
+    }
+    /// Whether this session may transmit in `channel` (false for listeners and unknown channels).
+    bool can_speak_in(const Uuid& channel) const {
+        AurixChannelInfo info;
+        return aurix_client_channel_info(c_, &channel.raw, &info) && info.role != AURIX_ROLE_LISTENER;
+    }
     std::vector<AurixParticipant> participants(const Uuid& channel) const {
         std::vector<AurixParticipant> buf(32);
         std::size_t n = aurix_client_participants(c_, &channel.raw, buf.data(), buf.size());
@@ -308,6 +323,10 @@ public:
     }
     AurixResult set_audio_codec(AurixAudioCodec codec) { return aurix_client_set_audio_codec(c_, codec); }
     AurixAudioCodec audio_codec() const { return aurix_client_audio_codec(c_); }
+    /// One server-mixed stereo stream per channel instead of one stream per speaker (large
+    /// channels); needs `AurixSessionInfo.downlink_mix`. Acked by `AURIX_EVENT_DOWNLINK_MODE_CHANGED`.
+    AurixResult set_downlink_mode(AurixDownlinkMode mode) { return aurix_client_set_downlink_mode(c_, mode); }
+    AurixDownlinkMode downlink_mode() const { return aurix_client_downlink_mode(c_); }
     /// Link the media currently uses (UDP or the WebSocket tunnel); `AURIX_MEDIA_NONE` before bind.
     AurixMediaPath media_path() const { return aurix_client_media_path(c_); }
     AurixResult set_transcripts(bool enabled) { return aurix_client_set_transcripts(c_, enabled); }

@@ -235,10 +235,15 @@ async fn connect_with(
         resume_grace_ms,
         resumed,
         media_tunnel,
+        downlink_mix,
     } = msg
     else {
         panic!("{name}: expected SessionInitAck, got {t}");
     };
+    assert!(
+        downlink_mix,
+        "{name}: dev nodes run with media.downlink_mix enabled"
+    );
     let media_key = base64::engine::general_purpose::STANDARD
         .decode(media_key)
         .unwrap();
@@ -7970,4 +7975,395 @@ async fn native_media_tunnel_over_the_control_websocket() {
     for p in [&mut alice, &mut bob] {
         p.send(&ControlMessage::ChannelLeave { channel_id }).await;
     }
+}
+
+async fn issue_listener_token(
+    env: &Env,
+    http: &reqwest::Client,
+    external_id: &str,
+    name: &str,
+    ch: ChannelId,
+) -> (String, String) {
+    let r: serde_json::Value = http
+        .post(format!("{}/v1/tokens", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "external_id": external_id,
+            "display_name": name,
+            "channels": [{"channel_id": ch, "join": true, "speak": false, "receive": true, "moderate": false}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        r["token"].as_str().unwrap().to_string(),
+        r["user_id"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Joins and returns `(role, roster user ids, participant_count, hidden_listeners)`.
+async fn join_ack(
+    p: &mut Player,
+    channel_id: ChannelId,
+) -> (aurix_common::types::ChannelRole, Vec<UserId>, u32, bool) {
+    let tok = p.token.clone();
+    p.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: tok,
+    })
+    .await;
+    let ack = p
+        .expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id)
+        })
+        .await;
+    let ControlMessage::ChannelJoinAck {
+        participants,
+        role,
+        participant_count,
+        hidden_listeners,
+        ..
+    } = ack
+    else {
+        unreachable!()
+    };
+    (
+        role,
+        participants.into_iter().map(|p| p.user_id).collect(),
+        participant_count,
+        hidden_listeners,
+    )
+}
+
+/// Collects up to 400 ms of downlink audio at `to`: `(frames per SSRC, mixed-flag frames,
+/// peak stereo RMS of the mixed frames)`.
+async fn downlink_summary(to: &Player) -> (std::collections::HashMap<u32, usize>, usize, f32) {
+    let mut per_ssrc: std::collections::HashMap<u32, usize> = Default::default();
+    let mut mixed = 0;
+    let mut level = 0.0f32;
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0i16; 960 * 2];
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: sealed with another key", to.name);
+        if p.header.packet_type != PacketType::Audio {
+            continue;
+        }
+        *per_ssrc.entry(p.header.ssrc).or_default() += 1;
+        if p.header.has_flag(PacketFlags::Mixed) {
+            mixed += 1;
+            assert!(!p.header.has_flag(PacketFlags::E2ee));
+            let _ = p.take_downlink_meta();
+            let n = dec
+                .decode(&p.payload, &mut pcm, false)
+                .expect("stereo Opus mix");
+            assert_eq!(n, 960, "{}: 20 ms stereo frame", to.name);
+            let sum: f32 = pcm[..n * 2]
+                .iter()
+                .map(|&s| (s as f32 / 32768.0).powi(2))
+                .sum();
+            level = level.max((sum / (n * 2) as f32).sqrt());
+        }
+    }
+    (per_ssrc, mixed, level)
+}
+
+/// Audience channels: a grant with `speak: false` is a listener in every channel type (its
+/// frames are refused), `hide_listeners` keeps listeners out of everyone else's roster and
+/// presence (also across nodes) while they see the speakers and get the true
+/// `participant_count`; native listeners receive one stereo server mix of the channel
+/// instead of a stream per speaker, a speaker can opt into the same mix with
+/// `SetDownlinkMode`, and `max_speakers` refuses the speaker over the cap with CHANNEL_FULL
+/// while listeners keep joining.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() {
+    use aurix_common::types::{ChannelRole, DownlinkMode};
+    use aurix_media::mix::channel_mix_ssrc;
+
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let far_env = env2.as_ref().unwrap_or(&env);
+    let http = reqwest::Client::new();
+
+    // `POST /v1/channels` clamps `max_participants` to the app quota (256 for apps created
+    // with defaults); with an admin token the test raises the quota first, the way an
+    // operator enables large channels for an existing app.
+    let admin_token = std::env::var("AURIX_E2E_ADMIN_TOKEN").ok();
+    if let Some(token) = &admin_token {
+        let app_id = http
+            .get(format!("{}/v1/channels?per_page=1", env.api))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["data"][0]["app_id"]
+            .as_str()
+            .expect("at least one channel exists")
+            .to_string();
+        let bad = http
+            .patch(format!("{}/v1/apps/{app_id}", env.api))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"max_participants_per_channel": 100_001}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            bad.status(),
+            400,
+            "quota above the hard ceiling is rejected"
+        );
+        let app: serde_json::Value = http
+            .patch(format!("{}/v1/apps/{app_id}", env.api))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"max_participants_per_channel": 5000}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(app["max_participants_per_channel"], 5000);
+    }
+
+    let stage = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "channel_type": "team",
+            "max_participants": 5000,
+            "audience": {"hide_listeners": true, "mix_for_listeners": true, "max_speakers": 2}
+        }),
+    )
+    .await;
+    let cfg: serde_json::Value = http
+        .get(format!("{}/v1/channels/{stage}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    if admin_token.is_some() {
+        assert_eq!(cfg["config"]["max_participants"], 5000);
+    } else {
+        eprintln!(
+            "AURIX_E2E_ADMIN_TOKEN not set: channel clamped to app quota {}",
+            cfg["config"]["max_participants"]
+        );
+    }
+    assert_eq!(cfg["config"]["audience"]["max_speakers"], 2);
+    assert_eq!(cfg["config"]["audience"]["max_streams"], 0);
+
+    let (tok_a, uid_a) = issue_token(&env, &http, "aud:alice", "Alice", stage).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "aud:bob", "Bob", stage).await;
+    let (tok_c, _) = issue_token(&env, &http, "aud:carol", "Carol", stage).await;
+    let (tok_l, uid_l) = issue_listener_token(far_env, &http, "aud:lisa", "Lisa", stage).await;
+    let (tok_n, uid_n) = issue_listener_token(&env, &http, "aud:ned", "Ned", stage).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let uid_l = UserId::from_uuid(uid_l.parse().unwrap());
+    let uid_n = UserId::from_uuid(uid_n.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    let mut lisa = connect(far_env, "lisa", tok_l).await;
+    let mut ned = connect(&env, "ned", tok_n).await;
+    if env2.is_some() {
+        assert_ne!(alice.media_addr.port(), lisa.media_addr.port());
+    }
+    for p in [&mut alice, &mut bob, &mut carol, &mut lisa, &mut ned] {
+        bind_media(p).await;
+    }
+
+    // ── roster / presence ──
+    let (role, roster, count, hidden) = join_ack(&mut alice, stage).await;
+    assert_eq!(role, ChannelRole::Speaker);
+    assert!(roster.is_empty() && count == 1 && hidden);
+
+    let (role, roster, count, hidden) = join_ack(&mut lisa, stage).await;
+    assert_eq!(role, ChannelRole::Listener);
+    assert_eq!(roster, vec![uid_a], "the listener sees the speaker");
+    assert!(hidden);
+    // Presence of a remote member may lag the ack by one replication hop.
+    assert!((1..=2).contains(&count), "lisa count {count}");
+    assert_no_presence(
+        &mut alice,
+        stage,
+        "hidden listener must not appear to Alice",
+    )
+    .await;
+
+    let (role, roster, count, _) = join_ack(&mut bob, stage).await;
+    assert_eq!(role, ChannelRole::Speaker);
+    assert_eq!(
+        roster,
+        vec![uid_a],
+        "Bob's roster has Alice but not the hidden listener"
+    );
+    assert_eq!(count, 3, "participant_count counts the hidden listener too");
+    expect_presence(&mut alice, stage, uid_b, true).await;
+    expect_presence(&mut lisa, stage, uid_b, true).await;
+
+    let (role, roster, count, _) = join_ack(&mut ned, stage).await;
+    assert_eq!(role, ChannelRole::Listener);
+    let mut expect = vec![uid_a, uid_b];
+    expect.sort();
+    let mut got = roster.clone();
+    got.sort();
+    assert_eq!(
+        got, expect,
+        "a listener sees the speakers, not other listeners"
+    );
+    assert_eq!(count, 4);
+    assert_no_presence(&mut alice, stage, "Ned is hidden from Alice").await;
+    assert_no_presence(&mut lisa, stage, "Ned is hidden from Lisa too").await;
+
+    // ── speaker cap: a third speaker is refused, listeners are not ──
+    let tok = carol.token.clone();
+    carol
+        .send(&ControlMessage::ChannelJoin {
+            channel_id: stage,
+            token: tok,
+        })
+        .await;
+    expect_error(&mut carol, "third speaker", "CHANNEL_FULL").await;
+    assert_no_presence(&mut alice, stage, "refused speaker never joined").await;
+
+    // ── audio: listeners get the channel mix, speakers get per-speaker streams ──
+    let mix_ssrc = channel_mix_ssrc(&stage);
+    let tone = opus_tone(440.0, 600);
+    let (_, to_alice) = tokio::join!(
+        stream_frames(&alice, stage, 1, &tone, false),
+        downlink_summary(&bob)
+    );
+    assert_eq!(to_alice.1, 0, "Bob (streams) gets no mixed frames");
+    assert!(
+        to_alice.0.get(&alice.ssrc).copied().unwrap_or(0) >= 25,
+        "Bob hears Alice's own stream: {:?}",
+        to_alice.0
+    );
+    let (ned_frames, ned_mixed, ned_level) = downlink_summary(&ned).await;
+    assert!(
+        ned_mixed >= 20,
+        "Ned got {ned_mixed} mixed frames: {ned_frames:?}"
+    );
+    assert_eq!(ned_frames.len(), 1, "one stream only: {ned_frames:?}");
+    assert!(ned_frames.contains_key(&mix_ssrc));
+    assert!(
+        (0.15..0.5).contains(&ned_level),
+        "Ned's mix level {ned_level}"
+    );
+    let (lisa_frames, lisa_mixed, lisa_level) = downlink_summary(&lisa).await;
+    assert!(
+        lisa_mixed >= 20,
+        "Lisa (other node) got {lisa_mixed} mixed frames: {lisa_frames:?}"
+    );
+    assert_eq!(lisa_frames.len(), 1);
+    assert!(lisa_frames.contains_key(&mix_ssrc));
+    assert!(
+        (0.15..0.5).contains(&lisa_level),
+        "Lisa's mix level {lisa_level}"
+    );
+
+    // A listener's frames are refused at the SFU.
+    let junk = Bytes::from_static(b"listener-mic");
+    send_audio(&ned, stage, 1, &junk).await;
+    send_audio(&lisa, stage, 1, &junk).await;
+    let (frames, mixed, _) = downlink_summary(&alice).await;
+    assert_eq!(mixed, 0);
+    assert!(!frames.contains_key(&ned.ssrc) && !frames.contains_key(&lisa.ssrc));
+    let (frames, _, _) = downlink_summary(&bob).await;
+    assert!(!frames.contains_key(&ned.ssrc) && !frames.contains_key(&lisa.ssrc));
+
+    // ── a speaker opts into the mix and back ──
+    bob.send(&ControlMessage::SetDownlinkMode {
+        mode: DownlinkMode::Mixed,
+    })
+    .await;
+    let m = bob
+        .expect("DownlinkModeChanged", |m| {
+            matches!(m, ControlMessage::DownlinkModeChanged { .. })
+        })
+        .await;
+    assert!(matches!(
+        m,
+        ControlMessage::DownlinkModeChanged {
+            mode: DownlinkMode::Mixed
+        }
+    ));
+    let (_, to_bob) = tokio::join!(
+        stream_frames(&alice, stage, 100, &tone, false),
+        downlink_summary(&bob)
+    );
+    assert!(to_bob.1 >= 20, "Bob (mixed) got {} mixed frames", to_bob.1);
+    assert!(
+        !to_bob.0.contains_key(&alice.ssrc),
+        "no per-speaker stream while mixed"
+    );
+    // Bob talking must not come back to Bob through his own mix.
+    let (_, to_bob) = tokio::join!(
+        stream_frames(&bob, stage, 1, &tone, false),
+        downlink_summary(&bob)
+    );
+    assert_eq!(to_bob.1, 0, "no self-audio in Bob's mix: {:?}", to_bob.0);
+    let (frames, mixed, _) = downlink_summary(&alice).await;
+    assert_eq!(mixed, 0);
+    assert!(frames.get(&bob.ssrc).copied().unwrap_or(0) >= 25);
+
+    bob.send(&ControlMessage::SetDownlinkMode {
+        mode: DownlinkMode::Streams,
+    })
+    .await;
+    bob.expect("DownlinkModeChanged(streams)", |m| {
+        matches!(
+            m,
+            ControlMessage::DownlinkModeChanged {
+                mode: DownlinkMode::Streams
+            }
+        )
+    })
+    .await;
+    let (_, to_bob) = tokio::join!(
+        stream_frames(&alice, stage, 200, &tone, false),
+        downlink_summary(&bob)
+    );
+    assert_eq!(to_bob.1, 0);
+    assert!(to_bob.0.get(&alice.ssrc).copied().unwrap_or(0) >= 25);
+
+    // ── leaving: hidden listeners leave silently, speakers do not ──
+    ned.send(&ControlMessage::ChannelLeave { channel_id: stage })
+        .await;
+    lisa.send(&ControlMessage::ChannelLeave { channel_id: stage })
+        .await;
+    assert_no_presence(&mut alice, stage, "hidden listeners leave silently").await;
+    bob.send(&ControlMessage::ChannelLeave { channel_id: stage })
+        .await;
+    expect_presence(&mut alice, stage, uid_b, false).await;
+    assert_ne!(uid_l, uid_n);
 }

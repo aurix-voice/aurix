@@ -902,6 +902,8 @@ struct Stream {
     pcmu: PcmuDecoder,
     /// Codec of the last frame decoded; the concealment path follows it.
     codec: AudioCodec,
+    /// Server-mixed stereo stream: `frame` holds interleaved L/R and is not panned.
+    stereo: bool,
     volume: f32,
     left: f32,
     right: f32,
@@ -1011,19 +1013,50 @@ impl RemoteMixer {
         codec: AudioCodec,
         data: Vec<u8>,
     ) -> Result<(), opus::Error> {
+        self.push_wire_frame(ssrc, seq, volume, direction, codec, false, data)
+    }
+
+    /// [`Self::push_frame`] with `stereo` set for a server-mixed stream (`PacketFlags::Mixed`
+    /// with Opus): the payload is decoded as interleaved stereo and played without panning.
+    /// A stream that flips between mono and stereo restarts its decoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_wire_frame(
+        &mut self,
+        ssrc: u32,
+        seq: u32,
+        volume: f32,
+        direction: Option<Direction>,
+        codec: AudioCodec,
+        stereo: bool,
+        data: Vec<u8>,
+    ) -> Result<(), opus::Error> {
+        let channels = if stereo {
+            opus::Channels::Stereo
+        } else {
+            opus::Channels::Mono
+        };
+        if let Some(s) = self.streams.get_mut(&ssrc) {
+            if s.stereo != stereo {
+                s.decoder = opus::Decoder::new(SAMPLE_RATE, channels)?;
+                s.stereo = stereo;
+                s.pos = 0;
+                s.len = 0;
+            }
+        }
         let stream = match self.streams.get_mut(&ssrc) {
             Some(s) => s,
             None => {
-                let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)?;
+                let decoder = opus::Decoder::new(SAMPLE_RATE, channels)?;
                 self.streams.entry(ssrc).or_insert(Stream {
                     jitter: JitterBuffer::new(self.target_depth, self.max_depth),
                     decoder,
                     pcmu: PcmuDecoder::new(),
                     codec,
+                    stereo,
                     volume: 1.0,
                     left: 1.0,
                     right: 1.0,
-                    frame: vec![0.0; MAX_DECODE_SAMPLES],
+                    frame: vec![0.0; MAX_DECODE_SAMPLES * 2],
                     pos: 0,
                     len: 0,
                     last_activity: Instant::now(),
@@ -1034,8 +1067,8 @@ impl RemoteMixer {
         };
         stream.volume = volume;
         match direction {
-            Some(d) => (stream.left, stream.right) = d.stereo_gains(),
-            None => (stream.left, stream.right) = (1.0, 1.0),
+            Some(d) if !stereo => (stream.left, stream.right) = d.stereo_gains(),
+            _ => (stream.left, stream.right) = (1.0, 1.0),
         }
         let now = Instant::now();
         stream.last_activity = now;
@@ -1142,12 +1175,17 @@ impl RemoteMixer {
                         }
                         JitterSlot::Lost => match s.codec {
                             AudioCodec::Opus => {
-                                s.decoder
-                                    .decode_float(&[], &mut s.frame[..FRAME_SAMPLES], false)
+                                let width = if s.stereo { 2 } else { 1 };
+                                s.decoder.decode_float(
+                                    &[],
+                                    &mut s.frame[..FRAME_SAMPLES * width],
+                                    false,
+                                )
                             }
                             AudioCodec::Pcmu => Ok(s.pcmu.conceal(&mut s.frame)),
                         },
                     };
+                    // PCMU is always mono, even on a stream that also carried stereo Opus.
                     s.len = n.unwrap_or(0);
                     s.pos = 0;
                     if s.len == 0 {
@@ -1158,10 +1196,25 @@ impl RemoteMixer {
                 let gain = s.volume * master;
                 if gain != 0.0 {
                     contributed = true;
-                    let pan = channels >= 2;
+                    let stereo_frame = s.stereo && s.codec == AudioCodec::Opus;
+                    let pan = channels >= 2 && !stereo_frame;
                     for f in 0..take {
-                        let sample = s.frame[s.pos + f];
                         let base = (written + f) * channels;
+                        if stereo_frame {
+                            let l = s.frame[(s.pos + f) * 2];
+                            let r = s.frame[(s.pos + f) * 2 + 1];
+                            for c in 0..channels {
+                                let sample = match (channels, c) {
+                                    (1, _) => 0.5 * (l + r),
+                                    (_, 0) => l,
+                                    (_, 1) => r,
+                                    _ => 0.5 * (l + r),
+                                };
+                                output[base + c] += sample * gain;
+                            }
+                            continue;
+                        }
+                        let sample = s.frame[s.pos + f];
                         for c in 0..channels {
                             let g = if pan {
                                 match c {

@@ -64,6 +64,11 @@ participant leaves); its id is derived from the name, so every token for the sam
 the same channel and the response tells you the `channel_id` up front. `max_participants` is
 clamped to the app limit and creation counts against the app's channel quota.
 
+`speak: false` makes the member a **listener** (`ChannelRole::Listener`) in that channel: the
+node drops its audio, it does not count towards `audience.max_speakers`, and with
+`audience.hide_listeners` it stays out of other members' presence — the building block for
+[large channels](../features/channels.md#large-channels-and-audiences).
+
 ## Errors
 
 Every error is `{"error":{"code":"…","message":"…"}}`:

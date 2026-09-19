@@ -2,7 +2,8 @@ use aurix_common::protocol::{
     ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsState, UserPosition,
 };
 use aurix_common::types::{
-    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, SessionId, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
+    SessionId, UserId,
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -62,6 +63,9 @@ pub struct SessionInfo {
     pub resumed: bool,
     /// The node accepts AURX media as binary frames on the control WebSocket.
     pub media_tunnel: bool,
+    /// The node can deliver one server-mixed stream per channel instead of one stream per
+    /// speaker (`Client::set_downlink_mode`).
+    pub downlink_mix: bool,
 }
 
 /// Everything the integration observes. Poll with `Client::poll_event`.
@@ -90,6 +94,12 @@ pub enum Event {
         safety_voice: bool,
         /// Presence / text range (both `None` for a whole-channel roster).
         scope: ChannelScope,
+        /// This session's role; `Listener` cannot transmit here.
+        role: ChannelRole,
+        /// Members of the channel (all nodes), including listeners hidden from `participants`.
+        participant_count: u32,
+        /// Receive-only listeners are absent from the roster and never announced.
+        hidden_listeners: bool,
     },
     ChannelLeft {
         channel_id: ChannelId,
@@ -127,6 +137,9 @@ pub enum Event {
     ChannelFocusChanged(Option<ChannelId>),
     /// The server acknowledged a session codec change; capture and playback already follow it.
     AudioCodecChanged(AudioCodec),
+    /// The server acknowledged a downlink mode (`Client::set_downlink_mode`); a fresh
+    /// session starts in `Streams` and the requested mode is re-applied automatically.
+    DownlinkModeChanged(DownlinkMode),
     UserBlockChanged {
         user_id: UserId,
         blocked: bool,

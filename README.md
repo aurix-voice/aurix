@@ -23,7 +23,8 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
 > audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
-> PCMU fallback, a WebSocket tunnel for blocked UDP, and Web / Unity / native (C ABI) / Unreal SDKs.
+> PCMU fallback, a WebSocket tunnel for blocked UDP, large channels (listeners, per-receiver stream
+> caps, a server mix for native clients), and Web / Unity / native (C ABI) / Unreal SDKs.
 > See [Limitations](#limitations) before deploying at scale.
 
 **Documentation**: the full book lives in [`docs/`](docs/src/SUMMARY.md) (`mdbook serve docs`) —
@@ -707,6 +708,32 @@ pin a link. TCP head-of-line blocking applies: the tunnel keeps the player in th
 remains the path to be on. WebRTC clients are untouched (they have ICE/TURN). Metrics:
 `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
 
+### Large channels: listeners, stream caps and the native server mix
+
+A channel with thousands of members costs what its *speakers* cost. `ChannelConfig.audience`
+(`hide_listeners`, `mix_for_listeners`, `max_speakers`, `max_streams`) does three things. A
+member whose grant says `speak: false` joins as a **listener** (`ChannelJoinAck.role`): the node
+drops its audio, it takes no `max_speakers` slot, and with `hide_listeners` it is absent from
+rosters and presence events while still counted in `ChannelJoinAck.participant_count`
+(`hidden_listeners: true` tells the client the roster is partial). `max_speakers` refuses further
+speaking joins with `CHANNEL_FULL`. `max_streams` caps how many voices *each receiver* hears:
+the ranking is receiver-specific — its mutes, blocks, volumes, focus, positional attenuation and
+the sender-reported level — with sticky slots and stale-voice cleanup, so a cap of 4 means "the
+4 voices this player should hear", not a channel-wide list; it applies before per-speaker
+delivery and before mixing (`aurix_streams_capped_total`). Native sessions can ask for **one
+server-mixed stereo stream per channel** (`SetDownlinkMode {mode: "mixed"}` →
+`DownlinkModeChanged`; `SessionInitAck.downlink_mix`, `media.downlink_mix = true`): the node
+decodes the selected speakers once, applies the receiver's gains and directions, and sends one
+Opus stereo stream flagged `Mixed` under a stable synthetic SSRC — receivers with identical
+preferences share a mixer, others get a private one (`MAX_MIXERS` 8192, idle mixers torn down
+after 10 s). `Mixed | Pcmu` for PCMU sessions; E2EE frames cannot be mixed and keep arriving
+as separate streams; recording, live streams, STT, safety and cascade tap the sources, never the
+mix. `PATCH /v1/apps/{app_id}` raises `max_participants_per_channel` (up to 100 000). SDKs:
+Web `channelInfo` / `canSpeakIn` (browsers already receive a mix), Unity `GetChannelInfo` /
+`SetDownlinkModeAsync` / `StereoCodecFactory`, native `channel_info` / `set_downlink_mode`,
+Unreal `GetChannelInfo` / `SetDownlinkMode`. Metrics: `aurix_downlink_mixers{kind}`,
+`aurix_downlink_mix_frames_total{outcome}`.
+
 ### Network / firewall
 
 | port | proto | purpose |
@@ -873,6 +900,10 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 * The blocked-UDP fallback for native clients is the control WebSocket (TCP): head-of-line
   blocking under loss, a bounded per-session downlink queue, and it needs the WebSocket port
   itself to be reachable. No QUIC, no TURN for native media.
+* Server-side mixing for native clients bypasses E2EE frames (they stay per-speaker), costs the
+  node one Opus decode per selected speaker plus one stereo encode per mixer, and is capped at
+  `MAX_MIXERS` (8192) per node; a channel's speaker admission (`max_speakers`) is enforced at
+  join time, not by demoting active speakers.
 * The Unreal plugin has not been compiled against a real engine install yet (none is available
   in the development environment); the first build in your project is the verification step.
   The protocol is documented in `crates/aurix-common/src/protocol.rs`.

@@ -37,7 +37,7 @@ npx @openapitools/openapi-generator-cli generate -i openapi.json -g typescript-f
 | --- | --- | --- |
 | Health | `GET /health`, `GET /ready`, `GET /openapi.json` | none |
 | Admin | `POST /admin/setup`, `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log`, `POST /admin/retention/sweep` | admin JWT (`superadmin` where marked), bootstrap token for setup |
-| Applications & nodes | `GET/POST /v1/apps`, `GET/DELETE /v1/apps/{app_id}`, `POST /v1/apps/{app_id}/rotate-key`, `GET /v1/nodes` | admin JWT |
+| Applications & nodes | `GET/POST /v1/apps`, `GET/PATCH/DELETE /v1/apps/{app_id}` (`PATCH` edits name, description and the `max_channels` / `max_participants_per_channel` quotas — up to 100 000 — for [large channels](../features/channels.md#large-channels-and-audiences)), `POST /v1/apps/{app_id}/rotate-key`, `GET /v1/nodes` | admin JWT |
 | Tokens & TURN | `POST /v1/tokens`, `POST /v1/tokens/action`, `POST /v1/turn/credentials` | API key |
 | Channels | `GET/POST /v1/channels`, `GET/DELETE /v1/channels/{id}`, `PUT /v1/channels/{id}/config`, `GET /v1/channels/{id}/participants`, `POST /v1/channels/{id}/tts`, `GET /v1/tts/voices` | API key |
 | Chat | `GET/POST /v1/channels/{id}/messages`, `GET/POST /v1/users/{id}/messages` | API key |

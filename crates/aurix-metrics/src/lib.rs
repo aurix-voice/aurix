@@ -1,8 +1,8 @@
 use once_cell::sync::Lazy;
 use prometheus::{
     register_gauge, register_histogram, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge, Encoder, Gauge, Histogram, HistogramVec,
-    IntCounter, IntCounterVec, IntGauge, TextEncoder,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Encoder, Gauge,
+    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 
 // ── Connection Metrics ──
@@ -258,11 +258,44 @@ pub static TUNNEL_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `kind` is `shared` (one mix for every uniform receiver of a channel) or `private`.
+pub static DOWNLINK_MIXERS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aurix_downlink_mixers",
+        "Live server-side channel mixers serving native receivers in mixed downlink mode",
+        &["kind"]
+    )
+    .unwrap()
+});
+
+/// `outcome` is `sent` (one mixed frame delivered to one receiver), `dropped` or `failed`.
+pub static DOWNLINK_MIX_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_downlink_mix_frames_total",
+        "Server-mixed frames produced for native receivers in mixed downlink mode",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Per-speaker streams a receiver did not get because it was over its stream cap
+/// (`ChannelConfig.audience.max_streams`).
+pub static STREAMS_CAPPED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_streams_capped_total",
+        "Downlink packets withheld by the per-receiver stream cap"
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
     let _ = &*PCMU_FRAMES;
     let _ = &*PCMU_SESSIONS;
     let _ = &*TUNNEL_PACKETS;
     let _ = &*TUNNEL_SESSIONS;
+    let _ = &*DOWNLINK_MIXERS;
+    let _ = &*DOWNLINK_MIX_FRAMES;
+    let _ = &*STREAMS_CAPPED;
     // Touch all lazy statics to ensure registration
     let _ = &*ACTIVE_SESSIONS;
     let _ = &*ACTIVE_CHANNELS;
