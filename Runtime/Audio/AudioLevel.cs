@@ -10,6 +10,10 @@ namespace Aurix.Audio
     public static class AudioLevel
     {
         public const byte Silence = 127;
+        /// <summary>Largest software input gain accepted by <see cref="ApplyGain"/> (+12 dB).</summary>
+        public const float MaxInputGain = 4f;
+        /// <summary>Largest master output volume accepted by <see cref="RemoteMixer.OutputVolume"/>.</summary>
+        public const float MaxOutputVolume = 2f;
 
         /// <summary>Linear energy (RMS, 0..1) → wire level.</summary>
         public static byte Encode(float energy)
@@ -36,6 +40,30 @@ namespace Aurix.Audio
             double sum = 0;
             for (int i = 0; i < count; i++) sum += (double)pcm[i] * pcm[i];
             return (float)Math.Sqrt(sum / count);
+        }
+
+        /// <summary>Clamp a requested gain/volume into <c>0..max</c> (NaN → 1).</summary>
+        public static float ClampGain(float gain, float max)
+        {
+            if (float.IsNaN(gain)) return 1f;
+            return gain < 0f ? 0f : (gain > max ? max : gain);
+        }
+
+        /// <summary>
+        /// Scale a PCM frame in place by <paramref name="gain"/> (clamped to <c>0..MaxInputGain</c>)
+        /// with hard clipping to ±1. Unity gain is a no-op.
+        /// </summary>
+        public static void ApplyGain(float[] pcm, int count, float gain)
+        {
+            if (pcm == null || count <= 0) return;
+            float g = ClampGain(gain, MaxInputGain);
+            if (g == 1f) return;
+            count = Math.Min(count, pcm.Length);
+            for (int i = 0; i < count; i++)
+            {
+                float v = pcm[i] * g;
+                pcm[i] = v > 1f ? 1f : (v < -1f ? -1f : v);
+            }
         }
     }
 

@@ -418,5 +418,88 @@ namespace Aurix.Voice.Tests
             Assert.True(jb.Pop(out f)); Assert.Equal(13, f[0]);
             Assert.Equal(1, jb.Lost);
         }
+
+        [Fact]
+        public void InputGainScalesAndClips()
+        {
+            var pcm = new float[] { 0.25f, -0.25f, 0.6f, -0.9f };
+            AudioLevel.ApplyGain(pcm, pcm.Length, 2f);
+            Assert.Equal(new float[] { 0.5f, -0.5f, 1f, -1f }, pcm);
+
+            var same = new float[] { 0.3f, -0.3f };
+            AudioLevel.ApplyGain(same, same.Length, 1f);
+            Assert.Equal(new float[] { 0.3f, -0.3f }, same);
+
+            var silent = new float[] { 0.3f, -0.3f };
+            AudioLevel.ApplyGain(silent, silent.Length, 0f);
+            Assert.Equal(new float[] { 0f, 0f }, silent);
+
+            Assert.Equal(AudioLevel.MaxInputGain, AudioLevel.ClampGain(99f, AudioLevel.MaxInputGain));
+            Assert.Equal(0f, AudioLevel.ClampGain(-1f, AudioLevel.MaxInputGain));
+            Assert.Equal(1f, AudioLevel.ClampGain(float.NaN, AudioLevel.MaxInputGain));
+        }
+
+        /// <summary>Decoder stub: every frame decodes to a constant-level mono signal.</summary>
+        private sealed class ConstantCodec : IOpusCodec
+        {
+            public const float Level = 0.5f;
+            public int SampleRate => AudioFormat.SampleRate;
+            public int Channels => 1;
+            public int Encode(ReadOnlySpan<float> pcm, int frameSamplesPerChannel, Span<byte> output) => 0;
+            public int Decode(ReadOnlySpan<byte> opus, Span<float> pcm, int maxFrameSamplesPerChannel)
+            {
+                pcm.Slice(0, AudioFormat.FrameSamples).Fill(Level);
+                return AudioFormat.FrameSamples;
+            }
+            public int DecodeLost(Span<float> pcm, int frameSamplesPerChannel)
+            {
+                pcm.Slice(0, frameSamplesPerChannel).Fill(0f);
+                return frameSamplesPerChannel;
+            }
+            public void SetBitrate(int bitsPerSecond) { }
+            public void Dispose() { }
+        }
+
+        [Fact]
+        public void RemoteMixerAppliesMasterVolumeAndSpeakerMute()
+        {
+            var mixer = new RemoteMixer(() => new ConstantCodec());
+            for (uint seq = 0; seq < 8; seq++) mixer.Push(0xA11CE, seq, 0.8f, new byte[] { 1 });
+            var stereo = new float[AudioFormat.FrameSamples * 2];
+
+            mixer.Mix(stereo, 2);
+            Assert.Equal(ConstantCodec.Level * 0.8f, stereo[0], 4);
+            Assert.Equal(ConstantCodec.Level * 0.8f, stereo[stereo.Length - 1], 4);
+
+            mixer.OutputVolume = 2f;
+            Array.Clear(stereo, 0, stereo.Length);
+            mixer.Mix(stereo, 2);
+            Assert.Equal(ConstantCodec.Level * 0.8f * 2f, stereo[0], 4);
+
+            mixer.OutputVolume = 50f; // clamped to MaxOutputVolume
+            Assert.Equal(AudioLevel.MaxOutputVolume, mixer.OutputVolume);
+
+            mixer.OutputMuted = true;
+            Array.Clear(stereo, 0, stereo.Length);
+            mixer.Mix(stereo, 2);
+            Assert.All(stereo, v => Assert.Equal(0f, v));
+
+            // Muted frames were still consumed: unmuting plays the next frame, not a stale backlog.
+            mixer.OutputMuted = false;
+            mixer.OutputVolume = 1f;
+            Array.Clear(stereo, 0, stereo.Length);
+            mixer.Mix(stereo, 2);
+            Assert.Equal(ConstantCodec.Level * 0.8f, stereo[0], 4);
+            for (int i = 0; i < 4; i++)
+            {
+                Array.Clear(stereo, 0, stereo.Length);
+                mixer.Mix(stereo, 2);
+                Assert.Equal(ConstantCodec.Level * 0.8f, stereo[0], 4);
+            }
+            Array.Clear(stereo, 0, stereo.Length);
+            mixer.Mix(stereo, 2);
+            Assert.All(stereo, v => Assert.Equal(0f, v)); // 8 pushed, 8 mixed (incl. the muted one): drained
+            mixer.Dispose();
+        }
     }
 }
