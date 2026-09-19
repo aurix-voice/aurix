@@ -27,6 +27,8 @@ import {
   enumerateAudioDevices,
   supportsOutputSelection,
   type AudioDevices,
+  type AudioInjectionOptions,
+  type AudioInjectionSource,
 } from './devices.js';
 
 export interface AurixClientOptions {
@@ -200,6 +202,8 @@ export interface AurixEvents {
   devicesChanged: (devices: AudioDevices) => void;
   /** The microphone in use changed (`setInputDevice`, or a fallback after the device vanished). */
   inputDeviceChanged: (deviceId: string | undefined) => void;
+  /** Audio injection started (`true`) or ended (`false`: buffer finished, `stopAudioInjection`, media closed). */
+  audioInjection: (active: boolean) => void;
   positions: (channelId: string, positions: UserPosition[]) => void;
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string) => void;
   bitrate: (targetKbps: number, reason: string) => void;
@@ -549,6 +553,49 @@ export class AurixClient {
     this.inputPipeline.setGain(gain);
   }
 
+  /** `true` while {@link injectAudio} is playing into the uplink. */
+  get injectingAudio(): boolean {
+    return this.inputPipeline?.injecting ?? false;
+  }
+
+  /**
+   * Decode an encoded audio file (wav/ogg/mp3/… — whatever the browser decodes) for
+   * {@link injectAudio}. Usable before media is up.
+   */
+  async decodeAudio(data: ArrayBuffer): Promise<AudioBuffer> {
+    if (typeof AudioContext === 'undefined') throw new Error('Web Audio is unavailable');
+    const shared = this.inputPipeline?.audioContext;
+    const ctx = shared ?? new AudioContext();
+    try {
+      return await ctx.decodeAudioData(data.slice(0));
+    } finally {
+      if (!shared) void ctx.close().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Play a decoded buffer or a live `MediaStream` (e.g. `HTMLMediaElement.captureStream()`)
+   * into every channel the microphone goes to — a sound test in an `echo` channel, a bot
+   * voice, an in-game radio. Mixed over the microphone unless `mixWithMicrophone: false`;
+   * `setMuted(true)` silences both. Requires media (`connect()` first). Replaces a previous
+   * injection; fires `audioInjection(true)` now and `audioInjection(false)` when it ends.
+   */
+  injectAudio(source: AudioInjectionSource, options: AudioInjectionOptions = {}): void {
+    if (!this.localStream) throw new Error('injectAudio needs media: call connect() first');
+    this.ensureInputPipeline(this.localStream);
+    const pipeline = this.inputPipeline;
+    if (!pipeline) throw new Error('Web Audio is unavailable: audio injection is not supported here');
+    pipeline.onInjectionEnded = () => this.emit('audioInjection', false);
+    const wasInjecting = pipeline.injecting;
+    pipeline.inject(source, options);
+    if (!wasInjecting) this.emit('audioInjection', true);
+  }
+
+  /** Stop {@link injectAudio}; the microphone is audible again immediately. */
+  stopAudioInjection(): void {
+    if (this.inputPipeline?.stopInjection()) this.emit('audioInjection', false);
+  }
+
   /**
    * Let the client drive an `<audio>` element: it receives the remote stream (now and after
    * every reconnect), the output volume/mute and the selected speaker. Several elements may be
@@ -845,8 +892,10 @@ export class AurixClient {
     this.pc = undefined;
     this.releaseLocalStream(this.localStream);
     this.localStream = undefined;
+    const wasInjecting = this.inputPipeline?.injecting ?? false;
     this.inputPipeline?.close();
     this.inputPipeline = undefined;
+    if (wasInjecting) this.emit('audioInjection', false);
     this.remoteStream = undefined;
     for (const el of this.outputElements) el.srcObject = null;
     if (typeof navigator !== 'undefined') {
@@ -1016,6 +1065,10 @@ export class AurixClient {
   setMuted(muted: boolean): void {
     this.muted = muted;
     this.localStream?.getAudioTracks().forEach((t) => {
+      t.enabled = !muted;
+    });
+    // The pipeline's output carries injected audio too: mute means nothing leaves the client.
+    this.inputPipeline?.stream?.getAudioTracks().forEach((t) => {
       t.enabled = !muted;
     });
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.userId) return;
@@ -1309,6 +1362,7 @@ export class AurixClient {
     this.inputPipeline = pipeline;
     const processed = pipeline.stream;
     const track = processed?.getAudioTracks()[0];
+    if (track) track.enabled = !this.muted;
     const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'audio' || s.track === null);
     if (track && sender) {
       void sender.replaceTrack(track).catch((e: unknown) => {

@@ -53,4 +53,9 @@ export {
   enumerateAudioDevices,
   supportsOutputSelection,
 } from './devices.js';
-export type { AudioDeviceInfo, AudioDevices } from './devices.js';
+export type {
+  AudioDeviceInfo,
+  AudioDevices,
+  AudioInjectionOptions,
+  AudioInjectionSource,
+} from './devices.js';

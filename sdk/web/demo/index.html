@@ -48,6 +48,7 @@
       <label>Display name <input id="name" value="web-player"></label>
     </div>
     <button id="mkchannel">Create channel</button>
+    <button id="mkecho">Create echo (mic test) channel</button>
     <button id="mktoken">Issue token for channel(s)</button>
   </details>
 </fieldset>
@@ -70,6 +71,10 @@
   <label>Mic gain <span id="gainval">1.00</span>× <input id="gain" type="range" min="0" max="4" step="0.05" value="1"></label>
   <label>Speaker volume <span id="volval">100</span>% <input id="vol" type="range" min="0" max="1" step="0.01" value="1"></label>
   <button id="spkmute">Mute speaker</button>
+  <label>Inject audio file <input id="inject" type="file" accept="audio/*" disabled></label>
+  <label><input id="injectmix" type="checkbox" checked> mix with microphone</label>
+  <label><input id="injectloop" type="checkbox"> loop</label>
+  <button id="injectstop" disabled>Stop injection</button>
 </fieldset>
 
 <fieldset>
@@ -276,6 +281,7 @@ $('connect').onclick = async () => {
   });
   client.on('localEnergy', (s) => { $('micmeter').style.width = `${meterWidth(s.energy)}%`; });
   client.on('localSpeaking', (on) => { $('micvad').textContent = on ? '🎙️' : ''; });
+  client.on('audioInjection', (active) => { log('audio injection', active ? 'started' : 'ended'); $('injectstop').disabled = !active; });
   client.on('receiverPreferences', (prefs) => { log('receiver prefs', prefs); renderRoster(); renderChannels(); });
   client.on('userBlockChanged', (u, blocked) => { log(blocked ? 'blocked' : 'unblocked', u); renderRoster(); });
   client.on('recording', (ch, id, active, by) => {
@@ -324,6 +330,16 @@ $('gain').oninput = () => {
   try { client?.setInputGain(Number($('gain').value)); } catch (e) { log('gain failed:', e.message); }
 };
 $('vol').oninput = () => { $('volval').textContent = Math.round($('vol').value * 100); client?.setOutputVolume(Number($('vol').value)); };
+$('inject').onchange = async () => {
+  const file = $('inject').files[0];
+  if (!file || !client) return;
+  try {
+    const buffer = await client.decodeAudio(await file.arrayBuffer());
+    client.injectAudio(buffer, { loop: $('injectloop').checked, mixWithMicrophone: $('injectmix').checked });
+  } catch (e) { log('inject failed:', e.message); }
+  $('inject').value = '';
+};
+$('injectstop').onclick = () => client?.stopAudioInjection();
 $('spkmute').onclick = () => {
   const on = $('spkmute').textContent === 'Mute speaker';
   $('spkmute').textContent = on ? 'Unmute speaker' : 'Mute speaker';
@@ -335,6 +351,12 @@ const apiFetch = (path, body) => fetch($('api').value.replace(/\/$/, '') + path,
   method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + $('apikey').value.trim() }, body: JSON.stringify(body),
 }).then(async (r) => { if (!r.ok) throw new Error(`${r.status} ${await r.text()}`); return r.json(); });
 
+$('mkecho').onclick = async () => {
+  try {
+    const ch = await apiFetch('/v1/channels', { name: 'web-echo-' + Date.now(), config: { channel_type: 'echo' } });
+    $('channel').value = ch.id; log('echo channel', ch.id, '— you will hear yourself only');
+  } catch (e) { log('create echo channel failed:', e.message); }
+};
 $('mkchannel').onclick = async () => {
   try { const ch = await apiFetch('/v1/channels', { name: 'web-demo-' + Date.now() }); $('channel').value = ch.id; log('channel', ch.id); }
   catch (e) { log('create channel failed:', e.message); }

@@ -299,7 +299,7 @@ impl PacketRouter {
 
         self.tap_audio(&channel, sender, packet);
         self.fan_out(&channel, sender, packet).await;
-        if let Some(ref cascade) = self.cascade {
+        if let Some(cascade) = self.cascade.as_ref().filter(|_| channel.relays_to_peers()) {
             cascade
                 .forward_to_peers(&channel_id, &sender.user_id, packet)
                 .await;
@@ -373,7 +373,7 @@ impl PacketRouter {
                     }
                 }
             }
-            if let Some(ref cascade) = self.cascade {
+            if let Some(cascade) = self.cascade.as_ref().filter(|_| channel.relays_to_peers()) {
                 cascade
                     .forward_to_peers(&channel_id, &sender.user_id, &packet)
                     .await;

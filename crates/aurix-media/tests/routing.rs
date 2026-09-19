@@ -376,6 +376,72 @@ async fn cross_app_sessions_cannot_join_channel() {
         .is_err());
 }
 
+/// Echo channel (microphone test): each participant's frames come straight back to them,
+/// sealed like any downlink, and nobody else in the channel hears them.
+#[tokio::test]
+async fn echo_channel_loops_audio_back_to_the_sender_only() {
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let cfg = ChannelConfig {
+        channel_type: ChannelType::Echo,
+        ..ChannelConfig::default()
+    };
+    let mut clients = Vec::new();
+    for name in ["alice", "bob"] {
+        let s = sfu
+            .create_session(SessionId::new(), UserId::new(), app, name.into())
+            .unwrap();
+        sfu.join_channel(&s.session_id, channel, cfg.clone(), ChannelRole::Speaker)
+            .unwrap();
+        let mut c = Client::new(s).await;
+        c.bind(addr).await;
+        clients.push(c);
+    }
+    let (mut alice, bob) = (clients.remove(0), clients.remove(0));
+
+    alice.send_audio(addr, &channel, b"mic-test").await;
+    let back = alice.recv().await.expect("alice hears herself");
+    assert_eq!(back.header.packet_type, PacketType::Audio);
+    assert_eq!(back.header.ssrc, alice.session.ssrc);
+    assert!(
+        !back.header.has_flag(PacketFlags::VolumeAttenuated),
+        "loopback is unity gain"
+    );
+    assert_eq!(&back.payload[..], b"mic-test");
+    assert!(
+        bob.recv().await.is_none(),
+        "bob never hears alice's mic test"
+    );
+
+    // Receiver-local volume shapes the loopback like any other downlink.
+    alice
+        .session
+        .prefs
+        .write()
+        .set_gain(alice.session.user_id, 0.5);
+    alice.send_audio(addr, &channel, b"quieter").await;
+    let mut back = alice.recv().await.unwrap();
+    assert!(back.header.has_flag(PacketFlags::VolumeAttenuated));
+    let (volume, direction) = back.take_downlink_meta();
+    assert!((volume - 0.5).abs() < 0.01, "{volume}");
+    assert!(direction.is_none());
+    assert_eq!(&back.payload[..], b"quieter");
+
+    // A browser in the same echo channel is equally private: its frames go nowhere else.
+    let web = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "web".into())
+        .unwrap();
+    web.set_transport(Transport::WebRtc);
+    sfu.join_channel(&web.session_id, channel, cfg, ChannelRole::Speaker)
+        .unwrap();
+    sfu.route_webrtc_audio(&web.session_id, 960, b"web-test".to_vec(), None)
+        .await
+        .unwrap();
+    assert!(alice.recv().await.is_none());
+    assert!(bob.recv().await.is_none());
+}
+
 /// Receiver-side preferences: a local mute (per channel or everywhere), a per-participant gain
 /// and a cross-mute all shape the downlink of the receiver only; other listeners and the
 /// sender's own state are untouched.

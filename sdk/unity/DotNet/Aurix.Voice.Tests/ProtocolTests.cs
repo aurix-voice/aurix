@@ -659,5 +659,81 @@ namespace Aurix.Voice.Tests
             Assert.All(stereo, v => Assert.Equal(0f, v)); // 8 pushed, 8 mixed (incl. the muted one): drained
             mixer.Dispose();
         }
+
+        [Fact]
+        public void AudioInjectorMixesReplacesLoopsAndEnds()
+        {
+            var inj = new AudioInjector();
+            var frame = new float[AudioFormat.FrameSamples];
+            Assert.False(inj.Active);
+            Assert.False(inj.Fill(frame, frame.Length));
+
+            // 1.5 frames of a 0.25 DC clip over a 0.5 microphone: mixed, then the tail, then ended.
+            int ended = 0;
+            inj.Ended += () => ended++;
+            var clip = new float[AudioFormat.FrameSamples * 3 / 2];
+            Array.Fill(clip, 0.25f);
+            inj.Play(clip, 1, AudioFormat.SampleRate);
+            Assert.True(inj.Active);
+            Array.Fill(frame, 0.5f);
+            Assert.True(inj.Fill(frame, frame.Length));
+            Assert.All(frame, v => Assert.Equal(0.75f, v, 3));
+            Array.Fill(frame, 0.5f);
+            Assert.True(inj.Fill(frame, frame.Length));
+            Assert.Equal(0.75f, frame[0], 3);
+            Assert.Equal(0.5f, frame[frame.Length - 1], 3); // past the clip: microphone only
+            Assert.Equal(1, ended);
+            Assert.False(inj.Active);
+            Array.Fill(frame, 0.5f);
+            Assert.False(inj.Fill(frame, frame.Length));
+            Assert.All(frame, v => Assert.Equal(0.5f, v));
+
+            // Replace mode + gain + loop: microphone gone, clip repeats, hard clip at ±1.
+            inj.MixWithMicrophone = false;
+            inj.Gain = 3f;
+            inj.Play(new[] { 0.2f, 0.4f }, 1, AudioFormat.SampleRate, loop: true);
+            Array.Fill(frame, 0.9f);
+            Assert.True(inj.Fill(frame, 4));
+            Assert.Equal(new[] { 0.6f, 1f, 0.6f, 1f }, new[] { frame[0], frame[1], frame[2], frame[3] });
+            Assert.True(inj.Active);
+            Assert.True(inj.Stop());
+            Assert.Equal(2, ended);
+            Assert.False(inj.Stop());
+            Assert.Equal(2, ended);
+
+            // Stereo 24 kHz input is downmixed and resampled to 48 kHz mono.
+            var mono = AudioInjector.ToMono48k(new[] { 1f, 0f, 1f, 0f }, 2, 24000);
+            Assert.Equal(4, mono.Length);
+            Assert.All(mono, v => Assert.Equal(0.5f, v, 3));
+        }
+
+        [Fact]
+        public void AudioInjectorStreamsPushedPcmAndStarvesToSilence()
+        {
+            var inj = new AudioInjector();
+            inj.Gain = 1f;
+            inj.MixWithMicrophone = true;
+            inj.Push(new[] { 1f }, 1, AudioFormat.SampleRate); // no stream open: ignored
+            Assert.Equal(0, inj.QueuedSamples);
+            inj.OpenStream();
+            Assert.True(inj.Active);
+            inj.Push(new[] { 0.1f, 0.2f, 0.3f }, 1, AudioFormat.SampleRate);
+            Assert.Equal(3, inj.QueuedSamples);
+            var frame = new float[5];
+            Assert.True(inj.Fill(frame, frame.Length));
+            Assert.Equal(new[] { 0.1f, 0.2f, 0.3f, 0f, 0f }, frame);
+            Assert.True(inj.Active); // starved but open
+
+            // The queue grows on demand and drops the oldest audio beyond the cap.
+            var big = new float[AudioInjector.MaxQueuedSamples + 10];
+            for (int i = 0; i < big.Length; i++) big[i] = i < 10 ? 1f : 0f;
+            inj.Push(big, 1, AudioFormat.SampleRate);
+            Assert.Equal(AudioInjector.MaxQueuedSamples, inj.QueuedSamples);
+            var head = new float[10];
+            inj.Fill(head, head.Length);
+            Assert.All(head, v => Assert.Equal(0f, v)); // the leading ones were dropped
+            Assert.True(inj.Stop());
+            Assert.Equal(0, inj.QueuedSamples);
+        }
     }
 }

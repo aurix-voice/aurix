@@ -3010,3 +3010,66 @@ async fn directional_positional_audio_follows_listener_orientation() {
             .await;
     }
 }
+
+/// Echo channel over the real stack: Alice's frames come back only to Alice (her own SSRC,
+/// re-sealed with her key, no metadata), Bob in the same echo channel receives nothing — also
+/// when he sits on another node (`AURIX_E2E_WS2`), because echo channels are never relayed
+/// through the cascade.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn echo_channel_loops_audio_back_to_the_sender_only() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let bob_env = env2.as_ref().unwrap_or(&env);
+    let http = reqwest::Client::new();
+    let echo = create_channel_with(&env, &http, serde_json::json!({"channel_type": "echo"})).await;
+
+    let (tok_a, _) = issue_token(&env, &http, "echo:alice", "Alice", echo).await;
+    let (tok_b, _) = issue_token(bob_env, &http, "echo:bob", "Bob", echo).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(bob_env, "bob", tok_b).await;
+    if env2.is_some() {
+        assert_ne!(
+            alice.media_addr.port(),
+            bob.media_addr.port(),
+            "players must land on different nodes"
+        );
+    }
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    join(&mut alice, echo).await;
+    join(&mut bob, echo).await;
+    // Presence is still shared (the roster is real), only the audio is private.
+    alice
+        .expect("ParticipantJoined(Bob)", |m| {
+            matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == "Bob")
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let hello = Bytes::from_static(&[0xFC, 0xEC, 0x40, 1, 2, 3, 4, 5, 6, 7]);
+    send_audio(&alice, echo, 1, &hello).await;
+    let (gain, n) = audio_from(&alice, alice.ssrc, &hello).await;
+    assert!(n >= 8, "Alice got only {n} of her 10 frames back");
+    assert_eq!(gain, None, "echo carries no volume metadata");
+    let (_, n) = audio_from(&bob, alice.ssrc, &hello).await;
+    assert_eq!(n, 0, "Bob must not hear Alice's echo");
+
+    // Symmetric: Bob hears himself, Alice hears nothing of him.
+    let world = Bytes::from_static(&[0xFC, 0xEC, 0x40, 9, 9, 9]);
+    send_audio(&bob, echo, 100, &world).await;
+    assert!(audio_from(&bob, bob.ssrc, &world).await.1 >= 8);
+    assert_eq!(audio_from(&alice, bob.ssrc, &world).await.1, 0);
+
+    for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::ChannelLeave { channel_id: echo })
+            .await;
+    }
+}

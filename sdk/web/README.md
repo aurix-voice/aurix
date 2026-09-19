@@ -247,6 +247,32 @@ microphone disappears (track `ended`) the SDK falls back to the system default a
 applied to attached elements only (`element.volume` / `element.muted` + remote track
 `enabled`), nothing is signalled to the server.
 
+### Echo channel (mic test) & audio injection
+
+```ts
+// backend: POST /v1/channels {"name":"mic-test","config":{"channel_type":"echo"}}
+await client.joinChannel(echoChannelId);   // you hear only yourself, nobody hears you
+
+const clip = await client.decodeAudio(await (await fetch('/sfx/test.ogg')).arrayBuffer());
+client.injectAudio(clip, { loop: true, gain: 0.8 });        // mixed over the microphone
+client.injectAudio(clip, { mixWithMicrophone: false });     // replaces the microphone until it ends
+client.injectAudio(radioElement.captureStream(), { gain: 1 }); // any live MediaStream (TTS, radio)
+client.on('audioInjection', (active) => testButton.disabled = active);
+client.injectingAudio;                     // true while something plays
+client.stopAudioInjection();               // microphone is audible again immediately
+```
+
+An `echo` channel loops each participant's own frames back through the real uplink → server →
+downlink path (so a level meter on `remoteStream` is the real round trip) and never forwards
+them to anybody else or to other nodes. Injection feeds the uplink through the same Web Audio
+graph as the input gain (`AudioBufferSourceNode` / `MediaStreamAudioSourceNode` → `GainNode`
+summed into the sent track), so there is no renegotiation and it goes to every channel the
+microphone goes to (transmission mode, focus and channel limits apply unchanged); `setMuted(true)`
+silences microphone and injection together, `setInputGain` scales the microphone only. A new
+`injectAudio` replaces the current one; a one-shot buffer ends on its own (`audioInjection(false)`),
+a stream plays until `stopAudioInjection()` or `disconnect()`. `injectAudio` needs media
+(`connect()` first) and Web Audio; `decodeAudio` accepts whatever `decodeAudioData` decodes.
+
 ## How it maps to the server
 
 | SDK | server |

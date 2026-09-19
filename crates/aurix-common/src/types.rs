@@ -130,6 +130,10 @@ pub enum ChannelType {
     Team,
     Command,
     Whisper,
+    /// Microphone test: every participant hears only their own audio, routed through the
+    /// server (so it exercises the real uplink + downlink path). Never relayed to other
+    /// nodes.
+    Echo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

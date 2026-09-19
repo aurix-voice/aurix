@@ -7,7 +7,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
   **WebRTC** (for browsers / Unity WebGL), bridged by one SFU with per-participant volumes.
 * **Multi-tenant**: apps, API keys with fine-grained permissions, per-app users, channels,
   recordings, bans and audit log are strictly isolated.
-* **Positional / 3D audio, whisper & command channels, server mute, kick, ban, reports.**
+* **Positional / 3D audio, whisper, command & echo (mic test) channels, audio injection, server mute, kick, ban, reports.**
 * **Recording** (Ogg/Opus, consent-gated, optional AES-GCM at rest, S3 / local storage).
 * **Built-in TURN/STUN** with time-limited HMAC credentials issued by the API.
 * **Horizontal scale**: PostgreSQL + Redis control plane, media nodes register and heartbeat,
@@ -215,6 +215,17 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
     gains. The WebRTC downlink is mixed in stereo on the server (Opus `sprop-stereo=1`, the Web
     SDK offers `stereo=1` so browsers decode both channels; uplinks stay mono). End-to-end
     encrypted native frames are forwarded untouched (no server-side metadata).
+11. **Echo channel & audio injection**: a channel with `channel_type: echo` is a microphone
+    test — every participant hears *only their own* audio, looped back through the real uplink
+    → server → downlink path (encrypted/authenticated native frames or the WebRTC mix, with
+    the receiver's own local volume/mute applied), never anybody else's, and echo frames are
+    never relayed to other nodes. Put a player alone in one from the settings screen; sharing
+    one is harmless (rosters and speaking states are still visible, audio is not). Both SDKs
+    can also *inject* audio into the uplink — a test clip in the echo channel, a bot voice, an
+    in-game radio — mixed over the microphone or replacing it, looped or one-shot, with its own
+    gain (`injectAudio` / `AudioInjector`); the microphone mute silences injected audio too,
+    and the server sees ordinary frames (VAD, transmission mode, focus and channel limits apply
+    unchanged).
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 

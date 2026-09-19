@@ -41,19 +41,39 @@ export function supportsOutputSelection(): boolean {
 /** Largest software input gain accepted by {@link InputPipeline} / `AurixClient.setInputGain`. */
 export const MAX_INPUT_GAIN = 4;
 
+/** What to play into the uplink besides (or instead of) the microphone. */
+export type AudioInjectionSource = AudioBuffer | MediaStream;
+
+export interface AudioInjectionOptions {
+  /** Restart the buffer when it ends (buffers only; default `false`). */
+  loop?: boolean;
+  /** Linear gain of the injected signal, `0..MAX_INPUT_GAIN` (default `1`). */
+  gain?: number;
+  /**
+   * Keep the microphone audible underneath the injected audio (default `true`). `false`
+   * silences the microphone for as long as the injection plays (sound test, bot voice).
+   */
+  mixWithMicrophone?: boolean;
+}
+
 /**
- * Microphone → `GainNode` → `MediaStreamAudioDestinationNode`. The destination's track is what
- * the peer connection sends, so the device can be swapped ({@link setSource}) without
- * renegotiating and the gain changes take effect immediately. Muting keeps working on the raw
- * track (a disabled input yields silence through the graph).
+ * Microphone → `GainNode` (input gain) → `GainNode` (mic switch) → `MediaStreamAudioDestinationNode`,
+ * with an optional injected source → `GainNode` summed into the same destination. The
+ * destination's track is what the peer connection sends, so the device can be swapped
+ * ({@link setSource}) without renegotiating and gain changes take effect immediately.
  */
 export class InputPipeline {
   private ctx: AudioContext | undefined;
   private source: MediaStreamAudioSourceNode | undefined;
   private gain: GainNode | undefined;
+  private micSwitch: GainNode | undefined;
+  private injectGain: GainNode | undefined;
+  private injectNode: AudioBufferSourceNode | MediaStreamAudioSourceNode | undefined;
   private destination: MediaStreamAudioDestinationNode | undefined;
   private readonly ownsContext: boolean;
   private target = 1;
+  /** Called when an injected buffer plays to its end (not on {@link stopInjection}). */
+  onInjectionEnded: (() => void) | undefined;
 
   constructor(audioContext?: AudioContext) {
     this.ctx = audioContext;
@@ -74,6 +94,10 @@ export class InputPipeline {
     return this.target;
   }
 
+  get injecting(): boolean {
+    return this.injectNode !== undefined;
+  }
+
   /** Build the graph on `raw`. Returns `false` when Web Audio is unavailable. */
   open(raw: MediaStream, gain = 1): boolean {
     if (this.destination) {
@@ -85,8 +109,12 @@ export class InputPipeline {
     try {
       this.ctx ??= new AudioContext();
       this.gain = this.ctx.createGain();
+      this.micSwitch = this.ctx.createGain();
+      this.injectGain = this.ctx.createGain();
       this.destination = this.ctx.createMediaStreamDestination();
-      this.gain.connect(this.destination);
+      this.gain.connect(this.micSwitch);
+      this.micSwitch.connect(this.destination);
+      this.injectGain.connect(this.destination);
       this.setSource(raw);
       this.setGain(gain);
     } catch {
@@ -115,12 +143,80 @@ export class InputPipeline {
     param.setTargetAtTime(g, this.ctx.currentTime, 0.005);
   }
 
+  /**
+   * Play `source` into the uplink (replacing a previous injection). Throws when the pipeline
+   * is not open.
+   */
+  inject(source: AudioInjectionSource, options: AudioInjectionOptions = {}): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.injectGain || !this.micSwitch) throw new Error('input pipeline is not open');
+    this.stopInjection();
+    const g = Math.min(MAX_INPUT_GAIN, Math.max(0, options.gain ?? 1));
+    this.injectGain.gain.cancelScheduledValues(ctx.currentTime);
+    this.injectGain.gain.setValueAtTime(g, ctx.currentTime);
+    let node: AudioBufferSourceNode | MediaStreamAudioSourceNode;
+    if (source instanceof AudioBuffer) {
+      const buffer = ctx.createBufferSource();
+      buffer.buffer = source;
+      buffer.loop = options.loop ?? false;
+      buffer.onended = () => {
+        if (this.injectNode !== buffer) return;
+        this.teardownInjection();
+        this.onInjectionEnded?.();
+      };
+      buffer.connect(this.injectGain);
+      buffer.start();
+      node = buffer;
+    } else {
+      node = ctx.createMediaStreamSource(source);
+      node.connect(this.injectGain);
+    }
+    this.injectNode = node;
+    this.setMicSwitch((options.mixWithMicrophone ?? true) ? 1 : 0);
+    if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined);
+  }
+
+  /** Stop the current injection and restore the microphone. Returns `false` when idle. */
+  stopInjection(): boolean {
+    if (!this.injectNode) return false;
+    this.teardownInjection();
+    return true;
+  }
+
+  private teardownInjection(): void {
+    const node = this.injectNode;
+    this.injectNode = undefined;
+    if (!node) return;
+    if (node instanceof AudioBufferSourceNode) {
+      node.onended = null;
+      try {
+        node.stop();
+      } catch {
+        // already stopped
+      }
+    }
+    node.disconnect();
+    this.setMicSwitch(1);
+  }
+
+  private setMicSwitch(value: number): void {
+    if (!this.micSwitch || !this.ctx) return;
+    const param = this.micSwitch.gain;
+    param.cancelScheduledValues(this.ctx.currentTime);
+    param.setTargetAtTime(value, this.ctx.currentTime, 0.005);
+  }
+
   close(): void {
+    this.teardownInjection();
     this.source?.disconnect();
     this.gain?.disconnect();
+    this.micSwitch?.disconnect();
+    this.injectGain?.disconnect();
     this.destination?.stream.getTracks().forEach((t) => t.stop());
     this.source = undefined;
     this.gain = undefined;
+    this.micSwitch = undefined;
+    this.injectGain = undefined;
     this.destination = undefined;
     if (this.ownsContext && this.ctx) void this.ctx.close().catch(() => undefined);
     if (this.ownsContext) this.ctx = undefined;

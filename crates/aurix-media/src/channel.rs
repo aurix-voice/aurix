@@ -176,12 +176,17 @@ impl MediaChannel {
         &self,
         sender: &UserId,
     ) -> Vec<(Arc<MediaSession>, Mix)> {
-        let base = if self.channel_type == ChannelType::Positional {
-            self.positional_receivers(sender)
-        } else {
-            self.all_others_full_volume(sender)
+        let base = match self.channel_type {
+            ChannelType::Positional => self.positional_receivers(sender),
+            ChannelType::Echo => return Vec::new(),
+            _ => self.all_others_full_volume(sender),
         };
         self.apply_receiver_prefs(sender, base)
+    }
+
+    /// Echo channels are local to the sender's node: nothing to relay through the cascade.
+    pub fn relays_to_peers(&self) -> bool {
+        self.channel_type != ChannelType::Echo
     }
 
     pub fn update_position(
@@ -285,6 +290,15 @@ impl MediaChannel {
 
         if self.channel_type == ChannelType::Positional {
             return self.positional_receivers(&sender_uid);
+        }
+
+        // ── Echo channel: the sender is the only listener of their own audio ──
+        if self.channel_type == ChannelType::Echo {
+            return self
+                .participants
+                .get(&sender_uid)
+                .map(|s| vec![(s.value().clone(), Mix::UNITY)])
+                .unwrap_or_default();
         }
 
         // ── Team channel: everyone hears everyone at full volume ──
@@ -616,5 +630,39 @@ mod tests {
 
         b.prefs.write().set_blocked_by(remote, true);
         assert!(ch.get_receivers_for_relayed_audio(&remote).is_empty());
+    }
+
+    #[test]
+    fn echo_channel_returns_audio_to_its_sender_only() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Echo,
+                ..ChannelConfig::default()
+            },
+        );
+        let (a, b) = (session(app, 1), session(app, 2));
+        ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
+        ch.add_participant(b.clone(), ChannelRole::Speaker).unwrap();
+
+        let got = ch.get_receivers_for_audio(1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.ssrc, 1, "alice hears herself");
+        assert_eq!(got[0].1, Mix::UNITY);
+        assert_eq!(
+            ch.get_receivers_for_audio(2)[0].0.ssrc,
+            2,
+            "bob hears himself"
+        );
+
+        // Receiver-local volume still applies to the loopback; other nodes never get it.
+        a.prefs.write().set_gain(a.user_id, 0.5);
+        assert_eq!(ch.get_receivers_for_audio(1)[0].1.volume, 0.5);
+        assert!(!ch.relays_to_peers());
+        assert!(ch
+            .get_receivers_for_relayed_audio(&UserId::new())
+            .is_empty());
     }
 }

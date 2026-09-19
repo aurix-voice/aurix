@@ -53,6 +53,14 @@ namespace Aurix.Unity
 
         /// <summary>Local microphone meter/VAD; read <see cref="VoiceActivityDetector.Energy"/> for a level bar.</summary>
         public VoiceActivityDetector Vad { get; } = new VoiceActivityDetector();
+
+        /// <summary>
+        /// Extra audio mixed into (or replacing) the microphone before VAD and encoding — see
+        /// <see cref="InjectClip"/>. Keeps transmitting on a 20 ms clock while no microphone is
+        /// capturing, so a sound test works on a machine without one.
+        /// </summary>
+        public AudioInjector Injector { get; } = new AudioInjector();
+        public bool IsInjecting => Injector.Active;
         /// <summary>Local VAD edge (true = started speaking). Fired from the Unity main thread.</summary>
         public event Action<bool> OnLocalSpeaking;
         /// <summary>
@@ -81,6 +89,7 @@ namespace Aurix.Unity
         private RemoteMixer _mixer;
         private int _micRate;
         private int _micChannels;
+        private float _injectClock;
 
         private void Start()
         {
@@ -119,6 +128,7 @@ namespace Aurix.Unity
         public async Task Disconnect()
         {
             StopMic();
+            Injector.Stop();
             var c = Client;
             Client = null;
             if (c != null) await c.DisconnectAsync();
@@ -151,6 +161,27 @@ namespace Aurix.Unity
 
         /// <summary>Speaker mute (local only). Your own microphone keeps sending.</summary>
         public void SetOutputMuted(bool muted) => OutputMuted = muted;
+
+        /// <summary>
+        /// Play <paramref name="clip"/> into every channel the microphone goes to (an <c>echo</c>
+        /// channel for a sound test, a bot voice, an in-game radio). Mixed over the microphone
+        /// unless <paramref name="mixWithMicrophone"/> is <c>false</c>; <see cref="SetMuted"/>
+        /// silences both. Replaces a previous injection; <see cref="AudioInjector.Ended"/> fires
+        /// when a non-looping clip finishes.
+        /// </summary>
+        public void InjectClip(AudioClip clip, bool loop = false, float gain = 1f, bool mixWithMicrophone = true)
+        {
+            if (clip == null) throw new ArgumentNullException(nameof(clip));
+            var pcm = new float[clip.samples * clip.channels];
+            clip.GetData(pcm, 0);
+            Injector.Gain = gain;
+            Injector.MixWithMicrophone = mixWithMicrophone;
+            Injector.Play(pcm, clip.channels, clip.frequency, loop);
+            _injectClock = 0f;
+        }
+
+        /// <summary>Stop <see cref="InjectClip"/> (or a stream opened on <see cref="Injector"/>).</summary>
+        public void StopInjection() => Injector.Stop();
 
         private void StartMic()
         {
@@ -198,6 +229,7 @@ namespace Aurix.Unity
             }
             WatchMicrophone();
             PumpMicrophone();
+            PumpInjectionWithoutMic();
             PumpDownlink();
         }
 
@@ -235,17 +267,46 @@ namespace Aurix.Unity
                 if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
                 Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
                 AudioLevel.ApplyGain(_mono, AudioFormat.FrameSamples, InputGain);
-                Vad.Threshold = VadThreshold;
-                Vad.HangoverFrames = VadHangoverFrames;
-                if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
-                if (GateOnVad && !Vad.Speaking)
-                {
-                    Client.SkipFrame(AudioFormat.FrameSamples);
-                    continue;
-                }
-                int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
-                if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
+                Injector.Fill(_mono, AudioFormat.FrameSamples);
+                EncodeAndSend();
             }
+        }
+
+        /// <summary>Without a microphone the injector alone paces the uplink at one frame per 20 ms.</summary>
+        private void PumpInjectionWithoutMic()
+        {
+            if (_micClip != null || Client == null || !IsConnected || !Injector.Active)
+            {
+                _injectClock = 0f;
+                return;
+            }
+            _injectClock += Time.unscaledDeltaTime;
+            const float frameSeconds = AudioFormat.FrameMs / 1000f;
+            int frames = 0;
+            while (_injectClock >= frameSeconds && frames++ < 5 && Injector.Active)
+            {
+                _injectClock -= frameSeconds;
+                if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
+                Array.Clear(_mono, 0, _mono.Length);
+                Injector.Fill(_mono, AudioFormat.FrameSamples);
+                EncodeAndSend();
+            }
+            if (_injectClock > frameSeconds) _injectClock = 0f; // fell behind (hitch): don't burst
+        }
+
+        /// <summary>VAD, gating and Opus for the frame in <see cref="_mono"/>.</summary>
+        private void EncodeAndSend()
+        {
+            Vad.Threshold = VadThreshold;
+            Vad.HangoverFrames = VadHangoverFrames;
+            if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
+            if (GateOnVad && !Vad.Speaking)
+            {
+                Client.SkipFrame(AudioFormat.FrameSamples);
+                return;
+            }
+            int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
+            if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
         }
 
         /// <summary>Mono downmix plus naive linear resample to 48 kHz (only used when the mic cannot run at 48 kHz).</summary>
