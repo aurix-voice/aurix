@@ -77,6 +77,11 @@ namespace Aurix.Transport
         public Direction? Direction;
         /// <summary>Codec of <see cref="Payload"/>: Opus unless this session negotiated PCMU.</summary>
         public AudioCodec Codec;
+        /// <summary>
+        /// The frame is the server's mix of the whole channel for this receiver (<see cref="PacketFlags.Mixed"/>):
+        /// stereo Opus (mono μ-law on a PCMU session) under the channel's mix SSRC rather than one speaker's voice.
+        /// </summary>
+        public bool Mixed;
         /// <summary>The encoded frame (Opus, or μ-law when <see cref="Codec"/> is <see cref="AudioCodec.Pcmu"/>).</summary>
         public byte[] Payload;
         [Obsolete("Use Payload and check Codec; the frame is not Opus on a PCMU session.")]
@@ -441,6 +446,7 @@ namespace Aurix.Transport
                         Volume = volume,
                         Direction = direction,
                         Codec = (pkt.Header.Flags & PacketFlags.Pcmu) != 0 ? AudioCodec.Pcmu : AudioCodec.Opus,
+                        Mixed = (pkt.Header.Flags & PacketFlags.Mixed) != 0,
                         Payload = pkt.Payload,
                     });
                     break;

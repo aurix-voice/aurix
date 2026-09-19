@@ -5,6 +5,18 @@ namespace Aurix.Protocol
 {
     public enum ChannelRole { Listener, Speaker, Moderator, Administrator }
 
+    /// <summary>How the node delivers other speakers to this session (<c>SetDownlinkMode</c>).</summary>
+    public enum DownlinkMode
+    {
+        /// <summary>Default: one stream per audible speaker, mixed by this client.</summary>
+        Streams = 0,
+        /// <summary>
+        /// One server-mixed stereo stream per channel (<see cref="PacketFlags.Mixed"/>): constant downlink bandwidth
+        /// and decode cost in large channels; mutes, volumes, focus and positional gains are applied by the node.
+        /// </summary>
+        Mixed = 1,
+    }
+
     public enum RecordingConsent { Pending, Accepted, Declined }
 
     public sealed class ParticipantBrief
@@ -134,6 +146,8 @@ namespace Aurix.Protocol
         public Guid? FocusChannel;
         /// <summary>Codec this session sends and receives on the native media path (Opus unless negotiated).</summary>
         public Aurix.Audio.AudioCodec Codec = Aurix.Audio.AudioCodec.Opus;
+        /// <summary>How channel audio reaches this session (<see cref="DownlinkMode.Streams"/> unless requested).</summary>
+        public DownlinkMode Downlink = DownlinkMode.Streams;
     }
 
     /// <summary>
@@ -340,11 +354,19 @@ namespace Aurix.Protocol
             if (Data.TryGetValue("transmission", out var tv)) prefs.Transmission = TransmissionMode.FromWire(tv);
             prefs.FocusChannel = MiniJson.GetGuid(Data, "focus_channel");
             prefs.Codec = AudioCodecFromWire(MiniJson.GetString(Data, "codec"));
+            prefs.Downlink = DownlinkModeFromWire(MiniJson.GetString(Data, "downlink"));
             return prefs;
         }
 
         /// <summary>Typed view of an <c>AudioCodecChanged</c> payload.</summary>
         public Aurix.Audio.AudioCodec AudioCodec() => AudioCodecFromWire(MiniJson.GetString(Data, "codec"));
+
+        /// <summary>Typed view of a <c>DownlinkModeChanged</c> payload.</summary>
+        public DownlinkMode DownlinkMode() => DownlinkModeFromWire(MiniJson.GetString(Data, "mode"));
+
+        internal static DownlinkMode DownlinkModeFromWire(string s) => s == "mixed" ? Protocol.DownlinkMode.Mixed : Protocol.DownlinkMode.Streams;
+
+        internal static string DownlinkModeToWire(DownlinkMode mode) => mode == Protocol.DownlinkMode.Mixed ? "mixed" : "streams";
 
         internal static Aurix.Audio.AudioCodec AudioCodecFromWire(string s) =>
             s == "pcmu" ? Aurix.Audio.AudioCodec.Pcmu : Aurix.Audio.AudioCodec.Opus;
@@ -573,6 +595,9 @@ namespace Aurix.Protocol
 
         public static string SetAudioCodec(Aurix.Audio.AudioCodec codec) =>
             Serialize("SetAudioCodec", new Dictionary<string, object> { { "codec", AudioCodecToWire(codec) } });
+
+        public static string SetDownlinkMode(DownlinkMode mode) =>
+            Serialize("SetDownlinkMode", new Dictionary<string, object> { { "mode", DownlinkModeToWire(mode) } });
 
         public static string TtsSpeak(Guid? channelId, string text, string voice, TtsDestination destination, string clientRef)
         {

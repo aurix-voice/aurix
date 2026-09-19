@@ -51,6 +51,12 @@ namespace Aurix.Protocol
         Directional = 0x1000,
         /// <summary>Payload is G.711 μ-law (8 kHz) instead of Opus — only on sessions that negotiated PCMU.</summary>
         Pcmu = 0x2000,
+        /// <summary>
+        /// Downlink only: the frame is the server's mix of a whole channel for this receiver (stereo Opus under
+        /// the channel's mix SSRC, mutes / volumes / focus / positional gains already applied) — see
+        /// <c>AurixVoiceClient.SetDownlinkModeAsync</c>. Never combined with <see cref="E2ee"/> or <see cref="Directional"/>.
+        /// </summary>
+        Mixed = 0x4000,
     }
 
     /// <summary>

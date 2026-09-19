@@ -50,6 +50,34 @@ namespace Aurix
         public float? TextRadius;
     }
 
+    /// <summary>What the server told us about a joined channel and our place in it (<c>ChannelJoinAck</c>).</summary>
+    public struct ChannelInfo
+    {
+        /// <summary>
+        /// Our role; <see cref="ChannelRole.Listener"/> means receive-only (the grant had <c>speak: false</c>),
+        /// whatever the channel type — the microphone is not sent there.
+        /// </summary>
+        public ChannelRole Role;
+        /// <summary>
+        /// Members across all nodes, including listeners hidden from <see cref="AurixVoiceClient.GetParticipants"/>
+        /// (<see cref="HiddenListeners"/>). A snapshot taken at join time.
+        /// </summary>
+        public uint ParticipantCount;
+        /// <summary>
+        /// Receive-only listeners are absent from the roster and never announced by
+        /// <see cref="AurixVoiceClient.OnParticipantJoined"/> / <see cref="AurixVoiceClient.OnParticipantLeft"/>
+        /// (<c>ChannelConfig.audience.hide_listeners</c>); show <see cref="ParticipantCount"/> for the audience size.
+        /// </summary>
+        public bool HiddenListeners;
+        /// <summary>Speech in the channel is transcribed server-side (<see cref="AurixVoiceClient.OnTranscript"/>).</summary>
+        public bool Transcription;
+        /// <summary>Speech in the channel is analysed by the operator's content-safety pipeline.</summary>
+        public bool SafetyVoice;
+
+        /// <summary>Whether this session may transmit in the channel.</summary>
+        public bool CanSpeak => Role != ChannelRole.Listener;
+    }
+
     /// <summary>A queued text-to-speech request; see <see cref="AurixVoiceClient.SpeakAsync"/>.</summary>
     public sealed class SpeechRequest
     {
@@ -68,6 +96,11 @@ namespace Aurix
         public bool Resumed;
         /// <summary>The node accepts AURX media as binary frames on the control WebSocket (UDP fallback).</summary>
         public bool MediaTunnel;
+        /// <summary>
+        /// The node can deliver one server-mixed stream per channel
+        /// (<see cref="AurixVoiceClient.SetDownlinkModeAsync"/> with <see cref="DownlinkMode.Mixed"/>).
+        /// </summary>
+        public bool DownlinkMix;
     }
 
     public sealed class RecordingNotice
@@ -139,9 +172,12 @@ namespace Aurix
         private bool _wantTranscripts = true;
         private AudioCodec _preferredCodec = AudioCodec.Opus;
         private AudioCodec _activeCodec = AudioCodec.Opus;
+        private DownlinkMode _preferredDownlink = DownlinkMode.Streams;
+        private DownlinkMode _activeDownlink = DownlinkMode.Streams;
         private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
         private readonly HashSet<Guid> _monitoredChannels = new HashSet<Guid>();
         private readonly Dictionary<Guid, ChannelScope> _channelScopes = new Dictionary<Guid, ChannelScope>();
+        private readonly Dictionary<Guid, ChannelInfo> _channelInfos = new Dictionary<Guid, ChannelInfo>();
         /// <summary>Audio policy of every joined channel (from <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>).</summary>
         private readonly Dictionary<Guid, AudioPolicy> _channelPolicies = new Dictionary<Guid, AudioPolicy>();
         private AudioPolicy? _audioPolicy;
@@ -382,6 +418,12 @@ namespace Aurix
         /// </summary>
         public event Action<AudioCodec> OnAudioCodecChanged;
         /// <summary>
+        /// The server switched how channel audio reaches this session (acknowledging
+        /// <see cref="SetDownlinkModeAsync"/>, or back to <see cref="DownlinkMode.Streams"/> on a fresh session).
+        /// Frames already in flight may still be of the previous kind.
+        /// </summary>
+        public event Action<DownlinkMode> OnDownlinkModeChanged;
+        /// <summary>
         /// The media moved to another link (path, reason): on every bind, when UDP fell back to the
         /// WebSocket tunnel, and when a UDP re-probe brought it back. Purely informational — audio,
         /// sequence numbers and the session continue.
@@ -526,6 +568,7 @@ namespace Aurix
                     MediaAddr = ack.Str("media_addr"),
                     Resumed = ack.Bool("resumed"),
                     MediaTunnel = ack.Bool("media_tunnel"),
+                    DownlinkMix = ack.Bool("downlink_mix"),
                 };
                 _mediaKey = Convert.FromBase64String(ack.Str("media_key") ?? throw new InvalidOperationException("SessionInitAck without media_key"));
                 var token = ack.Str("resume_token");
@@ -814,6 +857,7 @@ namespace Aurix
                 _transcribedChannels.Remove(channelId);
                 _monitoredChannels.Remove(channelId);
                 _channelScopes.Remove(channelId);
+                _channelInfos.Remove(channelId);
                 _channelPolicies.Remove(channelId);
                 if (_channels.TryGetValue(channelId, out var map))
                 {
@@ -1024,6 +1068,25 @@ namespace Aurix
             lock (_channels) return _channelScopes.TryGetValue(channelId, out var s) ? s : (ChannelScope?)null;
         }
 
+        /// <summary>
+        /// Our role, the member count (all nodes, hidden listeners included) and the roster policy of a joined
+        /// channel (see <see cref="ChannelInfo"/>); <c>null</c> before the join is acknowledged.
+        /// </summary>
+        public ChannelInfo? GetChannelInfo(Guid channelId)
+        {
+            lock (_channels) return _channelInfos.TryGetValue(channelId, out var i) ? i : (ChannelInfo?)null;
+        }
+
+        /// <summary>
+        /// Whether this session may transmit in <paramref name="channelId"/>: false for listeners (a grant with
+        /// <c>speak: false</c>) and for channels not joined. Capture sent to a listener-only channel is dropped
+        /// by the server, so use this to hide the push-to-talk / mute controls.
+        /// </summary>
+        public bool CanSpeakIn(Guid channelId)
+        {
+            lock (_channels) return _channelInfos.TryGetValue(channelId, out var i) && i.CanSpeak;
+        }
+
         /// <summary>Whether this client receives <see cref="OnTranscript"/> (default true).</summary>
         public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
 
@@ -1067,6 +1130,34 @@ namespace Aurix
             var control = _control;
             if (control == null || !control.IsOpen || !send) return Task.CompletedTask;
             return control.SendAsync(ControlMessage.SetAudioCodec(codec), ct);
+        }
+
+        /// <summary>How channel audio currently reaches this session (server-acknowledged).</summary>
+        public DownlinkMode DownlinkMode { get { lock (_channels) return _activeDownlink; } }
+
+        /// <summary>Mode requested with <see cref="SetDownlinkModeAsync"/>; re-requested after a fresh reconnect.</summary>
+        public DownlinkMode PreferredDownlinkMode { get { lock (_channels) return _preferredDownlink; } }
+
+        /// <summary>
+        /// <see cref="DownlinkMode.Mixed"/>: the node decodes every speaker we may hear, applies our mutes,
+        /// volumes, focus and positional gains and sends one stereo Opus stream per channel
+        /// (<see cref="IncomingAudio.Mixed"/>, under the channel's mix SSRC) instead of one stream per speaker —
+        /// constant downlink bandwidth and decode cost in large channels. End-to-end encrypted speakers still
+        /// arrive as separate streams. Needs <see cref="SessionInfo.DownlinkMix"/>; otherwise the request fails
+        /// with <see cref="OnServerError"/> <c>DOWNLINK_MIX_NOT_AVAILABLE</c>. Takes effect on
+        /// <see cref="OnDownlinkModeChanged"/>. Client-held: survives reconnects.
+        /// </summary>
+        public Task SetDownlinkModeAsync(DownlinkMode mode, CancellationToken ct = default)
+        {
+            bool send;
+            lock (_channels)
+            {
+                _preferredDownlink = mode;
+                send = mode != _activeDownlink;
+            }
+            var control = _control;
+            if (control == null || !control.IsOpen || !send) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetDownlinkMode(mode), ct);
         }
 
         /// <summary>
@@ -1150,6 +1241,7 @@ namespace Aurix
                 _transcribedChannels.Clear();
                 _monitoredChannels.Clear();
                 _channelScopes.Clear();
+                _channelInfos.Clear();
             }
         }
 
@@ -1177,12 +1269,16 @@ namespace Aurix
                 await control.SendAsync(ControlMessage.SetTransmission(transmission), ct).ConfigureAwait(false);
             bool wantTranscripts;
             AudioCodec codec;
-            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; }
+            DownlinkMode downlink;
+            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; downlink = _preferredDownlink; }
             if (!wantTranscripts)
                 await control.SendAsync(ControlMessage.SetTranscripts(false), ct).ConfigureAwait(false);
             // A fresh session is Opus; the server confirms the switch with AudioCodecChanged.
             if (codec != AudioCodec.Opus)
                 await control.SendAsync(ControlMessage.SetAudioCodec(codec), ct).ConfigureAwait(false);
+            // Likewise per-speaker streams; the server confirms with DownlinkModeChanged.
+            if (downlink != DownlinkMode.Streams)
+                await control.SendAsync(ControlMessage.SetDownlinkMode(downlink), ct).ConfigureAwait(false);
         }
 
         /// <summary>Channel-scoped mutes, a <c>Single</c> target and the focus need membership, so they are (re-)sent after each successful join.</summary>
@@ -1472,7 +1568,7 @@ namespace Aurix
             _resumeToken = null;
             _joinTcs?.TrySetException(new OperationCanceledException("disconnected"));
             FailPendingChat(new OperationCanceledException("disconnected"));
-            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; }
+            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; _activeDownlink = DownlinkMode.Streams; }
         }
 
         /// <summary>Runs on the Update thread when a control channel closes or fails.</summary>
@@ -1625,6 +1721,14 @@ namespace Aurix
                             RosterRadius = m.Has("roster_radius") ? (float?)m.Num("roster_radius") : null,
                             TextRadius = m.Has("text_radius") ? (float?)m.Num("text_radius") : null,
                         };
+                        _channelInfos[channelId] = new ChannelInfo
+                        {
+                            Role = m.Has("role") ? ControlMessage.ParseRole(m.Str("role")) : ChannelRole.Speaker,
+                            ParticipantCount = m.Has("participant_count") ? m.U32("participant_count") : (uint)roster.Count,
+                            HiddenListeners = m.Bool("hidden_listeners"),
+                            Transcription = m.Bool("transcription"),
+                            SafetyVoice = m.Bool("safety_voice"),
+                        };
                         var policy = Audio.AudioPolicy.FromMessage(m);
                         if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
                     }
@@ -1737,7 +1841,7 @@ namespace Aurix
                 case "Kick":
                 {
                     var channelId = m.Id("channel_id");
-                    lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); _channelPolicies.Remove(channelId); }
+                    lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); _channelPolicies.Remove(channelId); _channelInfos.Remove(channelId); }
                     RefreshAudioPolicy();
                     OnKicked?.Invoke(channelId, m.Str("reason") ?? string.Empty);
                     break;
@@ -1774,10 +1878,15 @@ namespace Aurix
                         lock (_channels) { _transmission = prefs.Transmission; _focusChannel = prefs.FocusChannel; }
                     // The codec is authoritative either way: a fresh session reports Opus and our replay of a
                     // PCMU preference is answered by AudioCodecChanged afterwards.
-                    bool codecChanged;
-                    lock (_channels) { codecChanged = _activeCodec != prefs.Codec; _activeCodec = prefs.Codec; }
+                    bool codecChanged, downlinkChanged;
+                    lock (_channels)
+                    {
+                        codecChanged = _activeCodec != prefs.Codec; _activeCodec = prefs.Codec;
+                        downlinkChanged = _activeDownlink != prefs.Downlink; _activeDownlink = prefs.Downlink;
+                    }
                     OnReceiverPreferences?.Invoke(prefs);
                     if (codecChanged) OnAudioCodecChanged?.Invoke(prefs.Codec);
+                    if (downlinkChanged) OnDownlinkModeChanged?.Invoke(prefs.Downlink);
                     break;
                 }
                 case "AudioCodecChanged":
@@ -1785,6 +1894,13 @@ namespace Aurix
                     var codec = m.AudioCodec();
                     lock (_channels) _activeCodec = codec;
                     OnAudioCodecChanged?.Invoke(codec);
+                    break;
+                }
+                case "DownlinkModeChanged":
+                {
+                    var mode = m.DownlinkMode();
+                    lock (_channels) _activeDownlink = mode;
+                    OnDownlinkModeChanged?.Invoke(mode);
                     break;
                 }
                 case "TransmissionChanged":
