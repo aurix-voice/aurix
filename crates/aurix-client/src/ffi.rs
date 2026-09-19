@@ -43,7 +43,7 @@ use crate::audio::EncoderSettings;
 use crate::client::Client;
 use crate::config::ClientConfig;
 use crate::error::ClientError;
-use crate::events::{ConnectionState, Event};
+use crate::events::{ChannelScope, ConnectionState, Event};
 
 // ------------------------------------------------------------------------------- results
 
@@ -1596,6 +1596,60 @@ pub unsafe extern "C" fn aurix_client_channel_monitored(
     match (self::client(client), uuid_arg(channel_id, "channel_id")) {
         (Ok(c), Ok(id)) => c.channel_monitored(ChannelId(id)),
         _ => false,
+    }
+}
+
+/// How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
+/// `text_radius`). A radius `<= 0` means "the whole channel".
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AurixChannelScope {
+    /// The roster only lists members within this distance of us (once both positions are
+    /// known); `ParticipantJoined`/`ParticipantLeft` also fire when someone moves in or out
+    /// of range (leaving uses a 10 % wider radius so the edge does not flicker).
+    pub roster_radius: f32,
+    /// Channel chat, typing and transcripts reach only members within this distance.
+    pub text_radius: f32,
+}
+
+impl From<ChannelScope> for AurixChannelScope {
+    fn from(s: ChannelScope) -> Self {
+        Self {
+            roster_radius: s.roster_radius.unwrap_or(0.0),
+            text_radius: s.text_radius.unwrap_or(0.0),
+        }
+    }
+}
+
+/// Presence / text range of a joined channel; `false` (and `out` untouched) until its join
+/// is acknowledged.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_channel_scope(
+    client: *const AurixClient,
+    channel_id: *const AurixUuid,
+    out: *mut AurixChannelScope,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match (self::client(client), uuid_arg(channel_id, "channel_id")) {
+        (Ok(c), Ok(id)) => match c.channel_scope(ChannelId(id)) {
+            Some(s) => {
+                *out = s.into();
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// `ChannelJoined` only: the channel's presence / text range (zeros for other events).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_channel_scope(event: *const AurixEvent) -> AurixChannelScope {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::ChannelJoined { scope, .. }) => (*scope).into(),
+        _ => AurixChannelScope::default(),
     }
 }
 
@@ -3238,6 +3292,40 @@ mod tests {
             assert!(json.contains("\"type\":\"chat_message\""), "{json}");
             assert!(!aurix_event_transcript(ev, ptr::null_mut()));
             aurix_event_free(ev);
+        }
+    }
+
+    #[test]
+    fn channel_scope_event_maps_none_to_zero() {
+        let channel_id = ChannelId::new();
+        let scoped = Box::into_raw(Box::new(AurixEvent::new(Event::ChannelJoined {
+            request_id: 3,
+            channel_id,
+            participants: Vec::new(),
+            transcription: false,
+            safety_voice: false,
+            scope: ChannelScope {
+                roster_radius: Some(25.0),
+                text_radius: None,
+            },
+        })));
+        let other = Box::into_raw(Box::new(AurixEvent::new(Event::ChannelLeft { channel_id })));
+        unsafe {
+            let scope = aurix_event_channel_scope(scoped);
+            assert_eq!(scope.roster_radius, 25.0);
+            assert_eq!(scope.text_radius, 0.0, "unscoped text = whole channel");
+            let none = aurix_event_channel_scope(other);
+            assert_eq!((none.roster_radius, none.text_radius), (0.0, 0.0));
+            aurix_event_free(scoped);
+            aurix_event_free(other);
+            let raw = AurixUuid::from(channel_id.0);
+            let mut out = AurixChannelScope::default();
+            assert!(!aurix_client_channel_scope(ptr::null(), &raw, &mut out));
+            assert!(!aurix_client_channel_scope(
+                ptr::null(),
+                &raw,
+                ptr::null_mut()
+            ));
         }
     }
 

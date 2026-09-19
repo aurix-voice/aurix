@@ -184,11 +184,14 @@ impl CascadeRelay {
     }
 
     /// Forward a locally originated audio packet from `sender` to all peers for this channel.
+    /// `level` is the sender-reported loudness of the frame (`-dBov`), re-attached so the peer
+    /// node can rank the speaker for its ambient receivers exactly as this node does.
     pub async fn forward_to_peers(
         &self,
         channel_id: &ChannelId,
         sender: &UserId,
         packet: &AurixPacket,
+        level: Option<u8>,
     ) {
         if packet.header.has_flag(PacketFlags::Relay) {
             return;
@@ -197,6 +200,8 @@ impl CascadeRelay {
             Some(p) if !p.is_empty() => p.value().clone(),
             _ => return,
         };
+        let labelled = level.map(|l| packet.with_audio_level(l));
+        let packet = labelled.as_ref().unwrap_or(packet);
         let counter = self.relay_counter.fetch_add(1, Ordering::Relaxed);
         let data = AurixPacket::relay_envelope(packet, self.relay_ssrc, counter, sender)
             .seal(&self.keys)

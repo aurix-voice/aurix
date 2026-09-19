@@ -168,6 +168,21 @@ export interface Participant {
   energy: number;
 }
 
+/**
+ * How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
+ * `text_radius`, from `ChannelJoinAck`). `undefined` = the whole channel.
+ */
+export interface ChannelScope {
+  /**
+   * With a roster radius the roster only lists members within this distance of you (once both
+   * positions are known); `participantJoined` / `participantLeft` also fire when someone moves
+   * in or out of range (leaving uses a 10 % wider radius so the edge does not flicker).
+   */
+  rosterRadius?: number;
+  /** Channel chat, typing and transcripts reach only members within this distance. */
+  textRadius?: number;
+}
+
 /** A text-chat message; see {@link AurixEvents.chatMessage}. */
 export interface ChatMessage {
   id: string;
@@ -551,6 +566,8 @@ export class AurixClient {
   /** Channels the server transcribes (from `ChannelJoinAck`). */
   private transcribedChannels = new Set<string>();
   private monitoredChannels = new Set<string>();
+  /** channel id → presence / text scope (from `ChannelJoinAck`). */
+  private channelScopes = new Map<string, ChannelScope>();
   /** channel id → its audio policy (from `ChannelJoinAck.audio` / `ChannelAudioPolicy`). */
   private channelPolicies = new Map<string, AudioPolicy>();
   /** Merge of `channelPolicies`; kept after the last channel is left. */
@@ -1181,6 +1198,7 @@ export class AurixClient {
     this.speechDone.clear();
     this.transcribedChannels.clear();
     this.monitoredChannels.clear();
+    this.channelScopes.clear();
     this.channelPolicies.clear();
     this.transientBitrateBps = undefined;
     this.appliedSenderPrefs = undefined;
@@ -1242,6 +1260,7 @@ export class AurixClient {
     this.typingSentAt.delete(channelId);
     this.transcribedChannels.delete(channelId);
     this.monitoredChannels.delete(channelId);
+    this.channelScopes.delete(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
     if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
   }
@@ -1258,6 +1277,14 @@ export class AurixClient {
    */
   isChannelMonitored(channelId: string): boolean {
     return this.monitoredChannels.has(channelId);
+  }
+
+  /**
+   * Presence / text range of a joined positional channel (see {@link ChannelScope}); an empty
+   * object for unscoped channels, `undefined` before the join is acknowledged.
+   */
+  channelScope(channelId: string): ChannelScope | undefined {
+    return this.channelScopes.get(channelId);
   }
 
   /** Whether this client currently receives `transcript` events (default `true`). */
@@ -1802,6 +1829,10 @@ export class AurixClient {
         else this.transcribedChannels.delete(d.channel_id);
         if (d.safety_voice) this.monitoredChannels.add(d.channel_id);
         else this.monitoredChannels.delete(d.channel_id);
+        const scope: ChannelScope = {};
+        if (typeof d.roster_radius === 'number') scope.rosterRadius = d.roster_radius;
+        if (typeof d.text_radius === 'number') scope.textRadius = d.text_radius;
+        this.channelScopes.set(d.channel_id, scope);
         this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
         this.refreshAudioPolicy();
         const list = Array.from(roster.values());
@@ -1824,8 +1855,8 @@ export class AurixClient {
           userId: d.user_id,
           displayName: d.display_name,
           ssrc: d.ssrc,
-          role: 'unknown',
-          muted: false,
+          role: d.role ?? 'unknown',
+          muted: d.is_muted === true,
           serverMuted: false,
           speaking: false,
           energy: 0,

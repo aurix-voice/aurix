@@ -31,7 +31,7 @@ use crate::audio::{
 use crate::config::ClientConfig;
 use crate::control::{token_identity, ws_host, ControlConnection, SessionAck, TokenIdentity};
 use crate::error::{ClientError, Result};
-use crate::events::{ConnectionState, Event, Participant, RequestId, SessionInfo};
+use crate::events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
 use crate::media::{resolve_media_addr, IncomingAudio, MediaStats, MediaTransport};
 
 const MAX_QUEUED_EVENTS: usize = 4096;
@@ -126,6 +126,7 @@ struct ChannelState {
     hash: u32,
     transcription: bool,
     safety_voice: bool,
+    scope: ChannelScope,
     audio: AudioPolicy,
     participants: HashMap<UserId, Participant>,
 }
@@ -560,6 +561,12 @@ impl Client {
             .lock()
             .get(&channel_id)
             .is_some_and(|c| c.safety_voice)
+    }
+
+    /// Presence / text range of a joined positional channel; `None` until the join is
+    /// acknowledged, both radii `None` for unscoped channels.
+    pub fn channel_scope(&self, channel_id: ChannelId) -> Option<ChannelScope> {
+        self.inner.channels.lock().get(&channel_id).map(|c| c.scope)
     }
 
     pub fn participants(&self, channel_id: ChannelId) -> Vec<Participant> {
@@ -1863,8 +1870,14 @@ async fn handle_message(
             transcription,
             safety_voice,
             audio,
+            roster_radius,
+            text_radius,
             ..
         } => {
+            let scope = ChannelScope {
+                roster_radius,
+                text_radius,
+            };
             let roster: HashMap<UserId, Participant> = participants
                 .iter()
                 .map(|b| (b.user_id, participant_from_brief(b)))
@@ -1885,6 +1898,7 @@ async fn handle_message(
                         hash: channel_id_hash(&channel_id),
                         transcription,
                         safety_voice,
+                        scope,
                         audio,
                         participants: roster,
                     },
@@ -1900,6 +1914,7 @@ async fn handle_message(
                     participants: participants.iter().map(participant_from_brief).collect(),
                     transcription,
                     safety_voice,
+                    scope,
                 });
             }
             if request_id == 0 && !existed {
@@ -1918,13 +1933,15 @@ async fn handle_message(
             user_id,
             display_name,
             ssrc,
+            role,
+            is_muted,
         } => {
             let participant = Participant {
                 user_id,
                 display_name,
                 ssrc,
-                role: aurix_common::types::ChannelRole::Speaker,
-                muted: false,
+                role,
+                muted: is_muted,
                 server_muted: false,
                 speaking: false,
                 energy: 0.0,
@@ -2328,6 +2345,7 @@ mod tests {
                 hash,
                 transcription: false,
                 safety_voice: false,
+                scope: ChannelScope::default(),
                 audio,
                 participants: HashMap::new(),
             },

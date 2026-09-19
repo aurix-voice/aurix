@@ -17,12 +17,13 @@ use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
     decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
-    ParticipantEnergy, ParticipantVolume, TransmissionMode, TtsDestination,
+    ParticipantEnergy, ParticipantVolume, TransmissionMode, TtsDestination, UserPosition,
 };
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::{ActionTokenService, ControlPlane, ParticipantSpeak, ServerEvent};
+use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
 use aurix_media::{MediaEvent, SfuNode};
 use aurix_recording::RecordingService;
@@ -328,6 +329,226 @@ impl WsState {
         }
     }
 
+    /// `broadcast_channel_in_app` narrowed to the members that currently see `subject`
+    /// (channels with a `roster_radius`; everyone otherwise).
+    fn broadcast_visible(
+        &self,
+        app_id: AppId,
+        channel_id: &ChannelId,
+        subject: &UserId,
+        msg: &ControlMessage,
+        exclude: Option<&SessionId>,
+    ) {
+        let Ok(json) = serde_json::to_string(msg) else {
+            return;
+        };
+        let Some(members) = self.channel_members.get(channel_id) else {
+            return;
+        };
+        let channel = self.sfu.read().get_channel(channel_id);
+        let scoped = channel.as_ref().filter(|c| c.roster_radius().is_some());
+        for sid in members.iter() {
+            if Some(&*sid) == exclude {
+                continue;
+            }
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id {
+                continue;
+            }
+            if scoped.is_some_and(|c| !c.sees(&conn.user_id, subject)) {
+                continue;
+            }
+            let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    /// Sends `msg` to the channel sessions of `user_id`.
+    fn send_to_member(&self, app_id: AppId, channel_id: &ChannelId, user_id: &UserId, json: &str) {
+        let Some(members) = self.channel_members.get(channel_id) else {
+            return;
+        };
+        for sid in members.iter() {
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id || conn.user_id != *user_id {
+                continue;
+            }
+            let _ = conn.tx.try_send(json.to_string());
+        }
+    }
+
+    /// Roster-radius transitions become `ParticipantJoined` / `ParticipantLeft` for the
+    /// local observer of each pair.
+    fn emit_roster_changes(
+        &self,
+        app_id: AppId,
+        channel_id: &ChannelId,
+        channel: &MediaChannel,
+        changes: Vec<RosterChange>,
+    ) {
+        for change in changes {
+            let msg = if change.visible {
+                let Some(entry) = channel.roster_entry(&change.subject) else {
+                    continue;
+                };
+                ControlMessage::ParticipantJoined {
+                    channel_id: *channel_id,
+                    user_id: entry.user_id,
+                    display_name: entry.display_name,
+                    ssrc: entry.ssrc,
+                    role: entry.role,
+                    is_muted: entry.is_muted,
+                }
+            } else {
+                ControlMessage::ParticipantLeft {
+                    channel_id: *channel_id,
+                    user_id: change.subject,
+                }
+            };
+            let Ok(json) = serde_json::to_string(&msg) else {
+                continue;
+            };
+            self.send_to_member(app_id, channel_id, &change.observer, &json);
+        }
+    }
+
+    /// Applies poses to the SFU (audio routing, text range, roster radius), notifies roster
+    /// transitions and forwards each mover's position to the local members that see them.
+    fn apply_positions(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        positions: Vec<UserPosition>,
+        exclude: Option<&SessionId>,
+    ) {
+        let Some(channel) = self.sfu.read().get_channel(&channel_id) else {
+            return;
+        };
+        if channel.app_id != app_id {
+            return;
+        }
+        let mut changes = Vec::new();
+        for up in &positions {
+            changes.extend(channel.update_position(
+                &up.user_id,
+                up.position.clone(),
+                up.orientation.clone(),
+            ));
+        }
+        self.emit_roster_changes(app_id, &channel_id, &channel, changes);
+        let Some(members) = self.channel_members.get(&channel_id) else {
+            return;
+        };
+        let scoped = channel.roster_radius().is_some();
+        let everyone = if scoped {
+            None
+        } else {
+            serde_json::to_string(&ControlMessage::PositionUpdate {
+                channel_id,
+                positions: positions.clone(),
+            })
+            .ok()
+        };
+        for sid in members.iter() {
+            if Some(&*sid) == exclude {
+                continue;
+            }
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id {
+                continue;
+            }
+            if let Some(json) = &everyone {
+                let _ = conn.tx.try_send(json.clone());
+                continue;
+            }
+            let visible: Vec<UserPosition> = positions
+                .iter()
+                .filter(|p| channel.sees(&conn.user_id, &p.user_id))
+                .cloned()
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            if let Ok(json) = serde_json::to_string(&ControlMessage::PositionUpdate {
+                channel_id,
+                positions: visible,
+            }) {
+                let _ = conn.tx.try_send(json);
+            }
+        }
+    }
+
+    /// Publishes the poses of this node's members of `channel` so other nodes hosting the
+    /// channel can route relayed audio positionally and scope presence/text.
+    fn publish_pose_snapshot(&self, app_id: AppId, channel: &MediaChannel) {
+        let positions = channel.local_poses();
+        if positions.is_empty() {
+            return;
+        }
+        self.control
+            .events
+            .publish(ServerEvent::ParticipantPositions {
+                app_id,
+                channel_id: channel.channel_id,
+                origin: self.control.node_id,
+                positions,
+            });
+    }
+
+    /// Registers channel members hosted on other nodes (from the database) so the joining
+    /// participant's roster and later presence include them.
+    async fn sync_remote_members(&self, app_id: AppId, channel_id: ChannelId) {
+        let rows = match self
+            .control
+            .sessions
+            .get_channel_roster(app_id, channel_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("channel roster lookup failed: {e}");
+                return;
+            }
+        };
+        let Some(channel) = self.sfu.read().get_channel(&channel_id) else {
+            return;
+        };
+        let mut added_remote = false;
+        let mut changes = Vec::new();
+        for row in rows {
+            let session_id = SessionId::from_uuid(row.session_id);
+            if row.media_node_id == self.control.node_id.0
+                || self.sfu.read().get_session(&session_id).is_some()
+            {
+                continue;
+            }
+            let user_id = UserId::from_uuid(row.user_id);
+            if channel.has_participant(&user_id) || channel.is_remote(&user_id) {
+                continue;
+            }
+            added_remote = true;
+            changes.extend(channel.add_remote(
+                user_id,
+                RemoteParticipant {
+                    session_id,
+                    display_name: row.display_name,
+                    ssrc: row.ssrc as u32,
+                    role: parse_role(&row.role),
+                    is_muted: row.is_muted || row.is_server_muted,
+                },
+            ));
+        }
+        self.emit_roster_changes(app_id, &channel_id, &channel, changes);
+        if added_remote {
+            self.publish_pose_snapshot(app_id, &channel);
+        }
+    }
+
     fn index_leave(&self, channel_id: &ChannelId, session_id: &SessionId) {
         if let Some(members) = self.channel_members.get(channel_id) {
             members.remove(session_id);
@@ -355,30 +576,56 @@ impl WsState {
             };
             match event {
                 ServerEvent::ParticipantJoined {
+                    app_id,
                     channel_id,
                     user_id,
                     display_name,
                     session_id,
                     ssrc,
+                    role,
                     ..
                 } => {
-                    let ssrc = self
-                        .connections
-                        .get(&session_id)
-                        .map(|c| c.ssrc)
-                        .unwrap_or(ssrc);
-                    self.broadcast_channel(
+                    let local = self.connections.get(&session_id).map(|c| c.ssrc);
+                    let ssrc = local.unwrap_or(ssrc);
+                    let channel = self.sfu.read().get_channel(&channel_id);
+                    if let Some(channel) = &channel {
+                        if local.is_none() && !channel.has_participant(&user_id) {
+                            let changes = channel.add_remote(
+                                user_id,
+                                RemoteParticipant {
+                                    session_id,
+                                    display_name: display_name.clone(),
+                                    ssrc,
+                                    role,
+                                    is_muted: false,
+                                },
+                            );
+                            self.emit_roster_changes(app_id, &channel_id, channel, changes);
+                            self.publish_pose_snapshot(app_id, channel);
+                        }
+                        if channel.roster_radius().is_some() {
+                            // Scoped presence: the newcomer appears to others (and others to
+                            // them) once their positions put them within the roster radius.
+                            continue;
+                        }
+                    }
+                    self.broadcast_visible(
+                        app_id,
                         &channel_id,
+                        &user_id,
                         &ControlMessage::ParticipantJoined {
                             channel_id,
                             user_id,
                             display_name,
                             ssrc,
+                            role,
+                            is_muted: false,
                         },
                         Some(&session_id),
                     );
                 }
                 ServerEvent::ParticipantLeft {
+                    app_id,
                     channel_id,
                     user_id,
                     session_id,
@@ -387,8 +634,31 @@ impl WsState {
                     if let Some(rec) = &self.recording {
                         rec.live().on_participant_left(channel_id, user_id);
                     }
-                    self.broadcast_channel(
+                    let channel = self.sfu.read().get_channel(&channel_id);
+                    if let Some(channel) = &channel {
+                        if channel.is_remote(&user_id) {
+                            // Remote members leave the roster of whoever saw them; local
+                            // leavers were announced by `leave_channel_full`.
+                            if let Some(observers) = channel.remove_remote(&user_id) {
+                                let msg = ControlMessage::ParticipantLeft {
+                                    channel_id,
+                                    user_id,
+                                };
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    for observer in observers {
+                                        self.send_to_member(app_id, &channel_id, &observer, &json);
+                                    }
+                                }
+                                continue;
+                            }
+                        } else if channel.roster_radius().is_some() {
+                            continue;
+                        }
+                    }
+                    self.broadcast_visible(
+                        app_id,
                         &channel_id,
+                        &user_id,
                         &ControlMessage::ParticipantLeft {
                             channel_id,
                             user_id,
@@ -403,8 +673,13 @@ impl WsState {
                     ..
                 } => {
                     self.apply_server_mute(app_id, user_id, true);
-                    self.broadcast_channel(
+                    if let Some(channel) = self.sfu.read().get_channel(&channel_id) {
+                        channel.set_remote_muted(&user_id, true);
+                    }
+                    self.broadcast_visible(
+                        app_id,
                         &channel_id,
+                        &user_id,
                         &ControlMessage::MuteStateChanged {
                             channel_id,
                             user_id,
@@ -421,8 +696,13 @@ impl WsState {
                     ..
                 } => {
                     self.apply_server_mute(app_id, user_id, false);
-                    self.broadcast_channel(
+                    if let Some(channel) = self.sfu.read().get_channel(&channel_id) {
+                        channel.set_remote_muted(&user_id, false);
+                    }
+                    self.broadcast_visible(
+                        app_id,
                         &channel_id,
+                        &user_id,
                         &ControlMessage::MuteStateChanged {
                             channel_id,
                             user_id,
@@ -482,14 +762,16 @@ impl WsState {
                     user_id,
                     speaking,
                 } => {
-                    self.broadcast_channel_in_app(
+                    self.broadcast_visible(
                         app_id,
                         &channel_id,
+                        &user_id,
                         &ControlMessage::SpeakingStateChanged {
                             channel_id,
                             user_id,
                             speaking,
                         },
+                        None,
                     );
                 }
                 ServerEvent::ChannelEnergy {
@@ -497,11 +779,17 @@ impl WsState {
                     channel_id,
                     levels,
                 } => {
-                    self.broadcast_channel_in_app(
-                        app_id,
-                        &channel_id,
-                        &ControlMessage::ChannelEnergy { channel_id, levels },
-                    );
+                    self.deliver_energy(app_id, channel_id, levels);
+                }
+                ServerEvent::ParticipantPositions {
+                    app_id,
+                    channel_id,
+                    origin,
+                    positions,
+                } => {
+                    if origin != self.control.node_id {
+                        self.apply_positions(app_id, channel_id, positions, None);
+                    }
                 }
                 ServerEvent::Transcript { app_id, transcript } => {
                     self.deliver_transcript(app_id, transcript);
@@ -796,6 +1084,10 @@ impl WsState {
         else {
             return;
         };
+        let text_range = message
+            .channel_id
+            .and_then(|c| self.sfu.read().get_channel(&c))
+            .filter(|c| c.text_radius().is_some());
         for sid in recipients {
             let Some(conn) = self.connections.get(&sid) else {
                 continue;
@@ -808,7 +1100,10 @@ impl WsState {
             let is_sender = Some(sid) == from_session_id;
             if !is_sender
                 && conn.user_id != message.from_user_id
-                && !self.text_allowed(&sid, &message.from_user_id)
+                && (!self.text_allowed(&sid, &message.from_user_id)
+                    || text_range
+                        .as_ref()
+                        .is_some_and(|c| !c.text_reaches(&message.from_user_id, &conn.user_id)))
             {
                 continue;
             }
@@ -835,6 +1130,7 @@ impl WsState {
         let Some(members) = self.channel_members.get(&channel_id) else {
             return;
         };
+        let channel = self.sfu.read().get_channel(&channel_id);
         for sid in members.iter() {
             if *sid == session_id {
                 continue;
@@ -847,6 +1143,11 @@ impl WsState {
                 || !self.text_allowed(&sid, &user_id)
             {
                 continue;
+            }
+            if let Some(c) = &channel {
+                if !c.text_reaches(&user_id, &conn.user_id) || !c.sees(&conn.user_id, &user_id) {
+                    continue;
+                }
             }
             let _ = conn.tx.try_send(json.clone());
         }
@@ -864,6 +1165,7 @@ impl WsState {
         let Some(members) = self.channel_members.get(&channel_id) else {
             return;
         };
+        let channel = self.sfu.read().get_channel(&channel_id);
         for sid in members.iter() {
             let Some(conn) = self.connections.get(&sid) else {
                 continue;
@@ -874,7 +1176,56 @@ impl WsState {
             if conn.user_id != speaker && !self.hears(&sid, &channel_id, &speaker) {
                 continue;
             }
+            if channel
+                .as_ref()
+                .is_some_and(|c| !c.text_reaches(&speaker, &conn.user_id))
+            {
+                continue;
+            }
             let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    /// Energy levels reach the members of the same tenant; with a roster radius each member
+    /// only gets the levels of participants they currently see.
+    fn deliver_energy(&self, app_id: AppId, channel_id: ChannelId, levels: Vec<ParticipantEnergy>) {
+        let channel = self
+            .sfu
+            .read()
+            .get_channel(&channel_id)
+            .filter(|c| c.roster_radius().is_some());
+        let Some(channel) = channel else {
+            self.broadcast_channel_in_app(
+                app_id,
+                &channel_id,
+                &ControlMessage::ChannelEnergy { channel_id, levels },
+            );
+            return;
+        };
+        let Some(members) = self.channel_members.get(&channel_id) else {
+            return;
+        };
+        for sid in members.iter() {
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id {
+                continue;
+            }
+            let visible: Vec<ParticipantEnergy> = levels
+                .iter()
+                .filter(|l| channel.sees(&conn.user_id, &l.user_id))
+                .cloned()
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            if let Ok(json) = serde_json::to_string(&ControlMessage::ChannelEnergy {
+                channel_id,
+                levels: visible,
+            }) {
+                let _ = conn.tx.try_send(json);
+            }
         }
     }
 
@@ -963,17 +1314,20 @@ impl WsState {
                         .get_session(&session_id)
                         .map(|s| s.is_server_muted.load(Ordering::Relaxed))
                         .unwrap_or(false);
+                    let app_id = self.connections.get(&session_id).map(|c| c.app_id);
                     for channel_id in channels {
-                        self.broadcast_channel(
-                            &channel_id,
-                            &ControlMessage::MuteStateChanged {
-                                channel_id,
-                                user_id,
-                                muted,
-                                server_muted,
-                            },
-                            None,
-                        );
+                        let msg = ControlMessage::MuteStateChanged {
+                            channel_id,
+                            user_id,
+                            muted,
+                            server_muted,
+                        };
+                        match app_id {
+                            Some(app_id) => {
+                                self.broadcast_visible(app_id, &channel_id, &user_id, &msg, None)
+                            }
+                            None => self.broadcast_channel(&channel_id, &msg, None),
+                        }
                     }
                 }
             }
@@ -1000,6 +1354,17 @@ impl WsState {
                 .unwrap_or_default()
         };
         self.index_leave(&channel_id, &session_id);
+        if let Some(observers) = &left.roster_observers {
+            let msg = ControlMessage::ParticipantLeft {
+                channel_id,
+                user_id,
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                for observer in observers {
+                    self.send_to_member(app_id, &channel_id, observer, &json);
+                }
+            }
+        }
         if left.transmission_reset {
             send_msg(
                 &tx,
@@ -1348,20 +1713,45 @@ fn channel_snapshot(
     let Some(channel) = sfu.get_channel(channel_id) else {
         return Vec::new();
     };
+    let Some(user_id) = sfu.get_session(session_id).map(|s| s.user_id) else {
+        return Vec::new();
+    };
     channel
-        .get_all_participants()
+        .roster_for(&user_id)
         .into_iter()
-        .filter(|s| s.session_id != *session_id)
-        .map(|s| ParticipantBrief {
-            user_id: s.user_id,
-            display_name: s.display_name.clone(),
-            ssrc: s.ssrc,
-            role: channel.get_role(&s.user_id),
-            is_muted: s.is_muted.load(Ordering::Relaxed)
-                || s.is_server_muted.load(Ordering::Relaxed),
-            is_speaking: s.is_speaking.load(Ordering::Relaxed),
-        })
+        .filter(|e| e.user_id != user_id)
+        .map(brief_from_entry)
         .collect()
+}
+
+fn brief_from_entry(e: RosterEntry) -> ParticipantBrief {
+    ParticipantBrief {
+        user_id: e.user_id,
+        display_name: e.display_name,
+        ssrc: e.ssrc,
+        role: e.role,
+        is_muted: e.is_muted,
+        is_speaking: e.is_speaking,
+    }
+}
+
+fn parse_role(s: &str) -> ChannelRole {
+    match s {
+        "listener" => ChannelRole::Listener,
+        "moderator" => ChannelRole::Moderator,
+        "administrator" => ChannelRole::Administrator,
+        _ => ChannelRole::Speaker,
+    }
+}
+
+/// Radii the joining client needs to interpret presence and text scoping.
+fn channel_radii(state: &WsState, channel_id: &ChannelId) -> (Option<f32>, Option<f32>) {
+    state
+        .sfu
+        .read()
+        .get_channel(channel_id)
+        .map(|c| (c.roster_radius(), c.text_radius()))
+        .unwrap_or((None, None))
 }
 
 async fn handle_ws_connection(
@@ -1472,6 +1862,7 @@ async fn handle_ws_connection(
     }
     // A resumed client reconciles its channel state from one ChannelJoinAck per channel.
     for channel_id in attached.resumed_channels.iter().flatten() {
+        let (roster_radius, text_radius) = channel_radii(&state, channel_id);
         send_msg(
             &tx,
             &ControlMessage::ChannelJoinAck {
@@ -1480,6 +1871,8 @@ async fn handle_ws_connection(
                 transcription: channel_transcribes(&state, channel_id),
                 safety_voice: channel_safety_monitored(&state, channel_id),
                 audio: channel_audio_policy(&state, channel_id),
+                roster_radius,
+                text_radius,
             },
         )
         .await;
@@ -2069,25 +2462,10 @@ async fn handle_control_message(
                 let _ = redis.add_user_channel(token.user_id, channel_id).await;
                 let _ = redis.incr_channel_participants(channel_id).await;
             }
-            let participants: Vec<ParticipantBrief> = {
-                let sfu = state.sfu.read();
-                let channel = sfu.get_channel(&channel_id);
-                existing
-                    .iter()
-                    .map(|s| ParticipantBrief {
-                        user_id: s.user_id,
-                        display_name: s.display_name.clone(),
-                        ssrc: s.ssrc,
-                        role: channel
-                            .as_ref()
-                            .map(|c| c.get_role(&s.user_id))
-                            .unwrap_or(ChannelRole::Speaker),
-                        is_muted: s.is_muted.load(Ordering::Relaxed)
-                            || s.is_server_muted.load(Ordering::Relaxed),
-                        is_speaking: s.is_speaking.load(Ordering::Relaxed),
-                    })
-                    .collect()
-            };
+            drop(existing);
+            state.sync_remote_members(token.app_id, channel_id).await;
+            let participants = channel_snapshot(state, &session_id, &channel_id);
+            let (roster_radius, text_radius) = channel_radii(state, &channel_id);
             send_msg(
                 tx,
                 &ControlMessage::ChannelJoinAck {
@@ -2096,6 +2474,8 @@ async fn handle_control_message(
                     transcription: channel_transcribes(state, &channel_id),
                     safety_voice: channel_safety_monitored(state, &channel_id),
                     audio: channel_audio_policy(state, &channel_id),
+                    roster_radius,
+                    text_radius,
                 },
             )
             .await;
@@ -2129,6 +2509,7 @@ async fn handle_control_message(
                         .get(&session_id)
                         .map(|c| c.ssrc)
                         .unwrap_or(0),
+                    role,
                     timestamp: chrono::Utc::now(),
                 });
         }
@@ -2376,25 +2757,28 @@ async fn handle_control_message(
             if accepted.is_empty() {
                 return;
             }
-            {
-                let sfu = state.sfu.read();
-                for up in &accepted {
-                    sfu.update_position(
-                        &up.user_id,
-                        &channel_id,
-                        up.position.clone(),
-                        up.orientation.clone(),
-                    );
-                }
-            }
-            state.broadcast_channel(
-                &channel_id,
-                &ControlMessage::PositionUpdate {
-                    channel_id,
-                    positions: accepted,
-                },
+            let has_remote = state
+                .sfu
+                .read()
+                .get_channel(&channel_id)
+                .is_some_and(|c| c.remote_count() > 0);
+            state.apply_positions(
+                token.app_id,
+                channel_id,
+                accepted.clone(),
                 Some(&session_id),
             );
+            if has_remote {
+                state
+                    .control
+                    .events
+                    .publish(ServerEvent::ParticipantPositions {
+                        app_id: token.app_id,
+                        channel_id,
+                        origin: state.control.node_id,
+                        positions: accepted,
+                    });
+            }
         }
 
         ControlMessage::OcclusionUpdate {

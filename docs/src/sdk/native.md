@@ -138,6 +138,17 @@ with `push_capture_*` is decimated to 8 kHz and μ-law encoded, μ-law downlink 
 `Pcmu`) are decoded and upsampled into the same mixer as Opus streams, and after a fresh session
 the preferred codec is negotiated again. The node transcodes at the edge, so other participants
 are unaffected ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+
+## Presence and text range
+
+`Event::ChannelJoined { scope, .. }` and `client.channel_scope(channel_id)` expose the
+positional channel's `roster_radius` / `text_radius` (`ChannelScope`, `None` = the whole
+channel). In a scoped channel `Event::ParticipantJoined` / `ParticipantLeft` fire as players
+move in and out of the roster radius, not only on join/leave, and audio may arrive from an SSRC
+the client has not been introduced to (the mixer plays it; the host names it when the roster
+entry arrives). C: `AurixChannelScope` (a `0` radius means unscoped) via
+`aurix_client_channel_scope` / `aurix_event_channel_scope`, C++ `Client::channel_scope`,
+Unreal `GetChannelScope` ([radius-scoped presence](../features/channels.md#radius-scoped-presence-and-text)).
 C: `aurix_client_set_audio_codec(client, AURIX_CODEC_PCMU)`, `aurix_client_audio_codec`,
 `AURIX_EVENT_AUDIO_CODEC_CHANGED` + `aurix_event_audio_codec`; C++ `set_audio_codec` /
 `audio_codec`; Unreal `SetAudioCodec(EAurixAudioCodec::Pcmu)`, `GetAudioCodec`,

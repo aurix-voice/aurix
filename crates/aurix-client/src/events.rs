@@ -38,6 +38,18 @@ pub struct Participant {
     pub energy: f32,
 }
 
+/// How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
+/// `text_radius`, from `ChannelJoinAck`). `None` = the whole channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct ChannelScope {
+    /// The roster only lists members within this distance of us (once both positions are
+    /// known); `ParticipantJoined`/`ParticipantLeft` also fire when someone moves in or out of
+    /// range (leaving uses a 10 % wider radius so the edge does not flicker).
+    pub roster_radius: Option<f32>,
+    /// Channel chat, typing and transcripts reach only members within this distance.
+    pub text_radius: Option<f32>,
+}
+
 /// Session facts handed out by `SessionInitAck`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionInfo {
@@ -65,6 +77,8 @@ pub enum Event {
         transcription: bool,
         /// Speech is analysed by the server's content-safety classifier.
         safety_voice: bool,
+        /// Presence / text range (both `None` for a whole-channel roster).
+        scope: ChannelScope,
     },
     ChannelLeft {
         channel_id: ChannelId,

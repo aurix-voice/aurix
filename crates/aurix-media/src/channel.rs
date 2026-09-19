@@ -3,8 +3,13 @@ use aurix_common::error::AurixError;
 use aurix_common::types::*;
 use dashmap::DashMap;
 use parking_lot::{RwLock, RwLockReadGuard};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
+
+/// A sender-reported level older than this no longer describes the frame being routed.
+const AMBIENT_LEVEL_STALE_MS: i64 = 500;
 
 /// How one receiver should hear a sender's frame: gain after channel routing, positional
 /// attenuation and the receiver's own preferences, plus where the sender is relative to the
@@ -35,6 +40,47 @@ struct Pose {
     orientation: Orientation3D,
 }
 
+/// A member of this channel hosted on another node (learned from the event bus / database),
+/// so rosters, presence and relayed audio can treat them like a local participant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteParticipant {
+    pub session_id: SessionId,
+    pub display_name: String,
+    pub ssrc: u32,
+    pub role: ChannelRole,
+    pub is_muted: bool,
+}
+
+/// Presence of one channel member as seen by another (`ChannelJoinAck.participants` entry
+/// or a `ParticipantJoined`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterEntry {
+    pub user_id: UserId,
+    pub display_name: String,
+    pub ssrc: u32,
+    pub role: ChannelRole,
+    pub is_muted: bool,
+    pub is_speaking: bool,
+    pub local: bool,
+}
+
+/// A pair of members came into / went out of each other's roster radius. `observer` is a
+/// participant hosted on this node (the one to notify); `subject` may be local or remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterChange {
+    pub observer: UserId,
+    pub subject: UserId,
+    pub visible: bool,
+}
+
+fn pair(a: UserId, b: UserId) -> (UserId, UserId) {
+    if a.0 <= b.0 {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 pub struct MediaChannel {
     pub channel_id: ChannelId,
     pub app_id: AppId,
@@ -44,10 +90,14 @@ pub struct MediaChannel {
     participants: DashMap<UserId, Arc<MediaSession>>,
     participant_roles: DashMap<UserId, ChannelRole>,
     ssrc_map: DashMap<u32, UserId>,
-    /// Participants of this channel hosted on other nodes (learned from the event bus), so
-    /// receiver preferences can be applied to relayed audio too.
     participant_count: AtomicU32,
+    /// Members hosted on other nodes of the cascade.
+    remote: DashMap<UserId, RemoteParticipant>,
+    /// Poses of local and remote members (remote ones arrive over the event bus).
     positions: DashMap<UserId, Pose>,
+    /// Pairs currently within each other's `roster_radius` (unordered, smaller id first).
+    /// Only maintained when the channel has a roster radius.
+    visible: RwLock<HashSet<(UserId, UserId)>>,
 }
 
 impl MediaChannel {
@@ -61,7 +111,9 @@ impl MediaChannel {
             participant_roles: DashMap::new(),
             ssrc_map: DashMap::new(),
             participant_count: AtomicU32::new(0),
+            remote: DashMap::new(),
             positions: DashMap::new(),
+            visible: RwLock::new(HashSet::new()),
         }
     }
 
@@ -73,7 +125,11 @@ impl MediaChannel {
     /// is fixed for the channel's lifetime; a different type in `config` is ignored.
     pub fn update_config(&self, mut config: ChannelConfig) {
         config.channel_type = self.channel_type;
+        let had_radius = self.roster_radius().is_some();
         *self.config.write() = config;
+        if had_radius && self.roster_radius().is_none() {
+            self.visible.write().clear();
+        }
     }
 
     pub fn audio_policy(&self) -> AudioPolicy {
@@ -113,6 +169,7 @@ impl MediaChannel {
         }
         self.ssrc_map.insert(session.ssrc, session.user_id);
         self.participant_roles.insert(session.user_id, role);
+        self.remote.remove(&session.user_id);
         self.participants.insert(session.user_id, session);
         Ok(())
     }
@@ -122,10 +179,206 @@ impl MediaChannel {
             self.ssrc_map.remove(&session.ssrc);
             self.participant_roles.remove(user_id);
             self.positions.remove(user_id);
+            self.forget_visibility(user_id);
+            for other in self.participants.iter() {
+                other
+                    .value()
+                    .ambient
+                    .lock()
+                    .forget_sender(&self.channel_id, user_id);
+            }
             self.participant_count.fetch_sub(1, Ordering::Relaxed);
             Some(session)
         } else {
             None
+        }
+    }
+
+    /// Registers (or refreshes) a member hosted on another node. If their pose arrived
+    /// first, roster visibility is evaluated now (transitions for local observers returned).
+    pub fn add_remote(&self, user_id: UserId, participant: RemoteParticipant) -> Vec<RosterChange> {
+        if self.participants.contains_key(&user_id) {
+            return Vec::new();
+        }
+        self.remote.insert(user_id, participant);
+        if self.positions.contains_key(&user_id) {
+            self.refresh_visibility(&user_id)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Forgets a remote member; returns the local observers that had them in sight (they
+    /// need a `ParticipantLeft`), or `None` when the channel has no roster radius (everyone
+    /// saw them).
+    pub fn remove_remote(&self, user_id: &UserId) -> Option<Vec<UserId>> {
+        let observers = self.observers_of(user_id);
+        self.remote.remove(user_id);
+        self.positions.remove(user_id);
+        self.forget_visibility(user_id);
+        for other in self.participants.iter() {
+            other
+                .value()
+                .ambient
+                .lock()
+                .forget_sender(&self.channel_id, user_id);
+        }
+        observers
+    }
+
+    pub fn remote_count(&self) -> usize {
+        self.remote.len()
+    }
+
+    pub fn is_remote(&self, user_id: &UserId) -> bool {
+        self.remote.contains_key(user_id)
+    }
+
+    /// Poses of the members hosted on this node (to seed a node that just learned about
+    /// this channel).
+    pub fn local_poses(&self) -> Vec<aurix_common::protocol::UserPosition> {
+        self.participants
+            .iter()
+            .filter_map(|e| {
+                let pose = self.positions.get(e.key())?;
+                Some(aurix_common::protocol::UserPosition {
+                    user_id: *e.key(),
+                    position: pose.value().position.clone(),
+                    orientation: pose.value().orientation.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Local participants that currently see `user_id` (`None`: no roster radius, all do).
+    pub fn observers_of(&self, user_id: &UserId) -> Option<Vec<UserId>> {
+        self.roster_radius()?;
+        let visible = self.visible.read();
+        Some(
+            self.participants
+                .iter()
+                .filter(|e| e.key() != user_id && visible.contains(&pair(*e.key(), *user_id)))
+                .map(|e| *e.key())
+                .collect(),
+        )
+    }
+
+    fn forget_visibility(&self, user_id: &UserId) {
+        let mut visible = self.visible.write();
+        if !visible.is_empty() {
+            visible.retain(|(a, b)| a != user_id && b != user_id);
+        }
+    }
+
+    pub fn roster_radius(&self) -> Option<f32> {
+        self.config
+            .read()
+            .positional_config
+            .as_ref()
+            .and_then(|p| p.roster_radius)
+    }
+
+    pub fn text_radius(&self) -> Option<f32> {
+        self.config
+            .read()
+            .positional_config
+            .as_ref()
+            .and_then(|p| p.text_radius)
+    }
+
+    /// Whether `observer` currently sees `subject` in this channel: always without a roster
+    /// radius, otherwise only while the pair is within it (both poses known).
+    pub fn sees(&self, observer: &UserId, subject: &UserId) -> bool {
+        if observer == subject || self.roster_radius().is_none() {
+            return true;
+        }
+        self.visible.read().contains(&pair(*observer, *subject))
+    }
+
+    /// Whether channel text from `sender` reaches `receiver` (`text_radius`; both poses must
+    /// be known, as for audio). The sender always gets their own echo.
+    pub fn text_reaches(&self, sender: &UserId, receiver: &UserId) -> bool {
+        if sender == receiver {
+            return true;
+        }
+        let Some(radius) = self.text_radius() else {
+            return true;
+        };
+        let (Some(a), Some(b)) = (self.positions.get(sender), self.positions.get(receiver)) else {
+            return false;
+        };
+        a.value().position.distance_to(&b.value().position) <= radius
+    }
+
+    /// Everything `observer` should currently see in the roster: local and remote members
+    /// except themselves, filtered by the roster radius.
+    pub fn roster_for(&self, observer: &UserId) -> Vec<RosterEntry> {
+        let mut out = Vec::new();
+        for e in self.participants.iter() {
+            if e.key() == observer || !self.sees(observer, e.key()) {
+                continue;
+            }
+            let s = e.value();
+            out.push(RosterEntry {
+                user_id: s.user_id,
+                display_name: s.display_name.clone(),
+                ssrc: s.ssrc,
+                role: self.get_role(&s.user_id),
+                is_muted: s.is_muted.load(Ordering::Relaxed)
+                    || s.is_server_muted.load(Ordering::Relaxed),
+                is_speaking: s.is_speaking.load(Ordering::Relaxed),
+                local: true,
+            });
+        }
+        for e in self.remote.iter() {
+            if e.key() == observer || !self.sees(observer, e.key()) {
+                continue;
+            }
+            let r = e.value();
+            out.push(RosterEntry {
+                user_id: *e.key(),
+                display_name: r.display_name.clone(),
+                ssrc: r.ssrc,
+                role: r.role,
+                is_muted: r.is_muted,
+                is_speaking: false,
+                local: false,
+            });
+        }
+        out
+    }
+
+    /// Presence entry for `user_id` (local or remote), for a `ParticipantJoined` sent when
+    /// they come into range.
+    pub fn roster_entry(&self, user_id: &UserId) -> Option<RosterEntry> {
+        if let Some(s) = self.participants.get(user_id) {
+            let s = s.value();
+            return Some(RosterEntry {
+                user_id: s.user_id,
+                display_name: s.display_name.clone(),
+                ssrc: s.ssrc,
+                role: self.get_role(&s.user_id),
+                is_muted: s.is_muted.load(Ordering::Relaxed)
+                    || s.is_server_muted.load(Ordering::Relaxed),
+                is_speaking: s.is_speaking.load(Ordering::Relaxed),
+                local: true,
+            });
+        }
+        self.remote.get(user_id).map(|r| RosterEntry {
+            user_id: *user_id,
+            display_name: r.display_name.clone(),
+            ssrc: r.ssrc,
+            role: r.role,
+            is_muted: r.is_muted,
+            is_speaking: false,
+            local: false,
+        })
+    }
+
+    /// Marks a remote member's mute state (kept for rosters built later).
+    pub fn set_remote_muted(&self, user_id: &UserId, muted: bool) {
+        if let Some(mut r) = self.remote.get_mut(user_id) {
+            r.is_muted = muted;
         }
     }
 
@@ -190,16 +443,19 @@ impl MediaChannel {
     /// Receivers for audio relayed from another node, filtered by their own preferences towards
     /// the remote `sender`. Positional channels attenuate/pan by the sender's pose (learned
     /// from the event bus); other channel types deliver to every local participant.
+    /// `level` is the sender-reported loudness (`-dBov`) carried through the cascade, used
+    /// to rank the remote speaker for ambient receivers.
     pub fn get_receivers_for_relayed_audio(
         &self,
         sender: &UserId,
+        level: Option<u8>,
     ) -> Vec<(Arc<MediaSession>, Mix)> {
         let base = match self.channel_type {
             ChannelType::Positional => self.positional_receivers(sender),
             ChannelType::Echo => return Vec::new(),
             _ => self.all_others_full_volume(sender),
         };
-        self.apply_receiver_prefs(sender, base)
+        self.apply_receiver_prefs(sender, base, level)
     }
 
     /// Echo channels are local to the sender's node: nothing to relay through the cascade.
@@ -221,12 +477,14 @@ impl MediaChannel {
             .collect()
     }
 
+    /// Stores a member's pose (local or remote). With a roster radius, re-evaluates which
+    /// pairs involving `user_id` are in sight and returns the transitions for local observers.
     pub fn update_position(
         &self,
         user_id: &UserId,
         position: Position3D,
         orientation: Orientation3D,
-    ) {
+    ) -> Vec<RosterChange> {
         self.positions.insert(
             *user_id,
             Pose {
@@ -234,6 +492,71 @@ impl MediaChannel {
                 orientation,
             },
         );
+        self.refresh_visibility(user_id)
+    }
+
+    fn refresh_visibility(&self, user_id: &UserId) -> Vec<RosterChange> {
+        let (Some(enter), Some(exit)) = ({
+            let cfg = self.config.read();
+            let p = cfg.positional_config.as_ref();
+            (
+                p.and_then(|p| p.roster_radius),
+                p.and_then(|p| p.roster_exit_radius()),
+            )
+        }) else {
+            return Vec::new();
+        };
+        let mover_local = self.participants.contains_key(user_id);
+        if !mover_local && !self.remote.contains_key(user_id) {
+            return Vec::new();
+        }
+        let position = match self.positions.get(user_id) {
+            Some(p) => p.value().position.clone(),
+            None => return Vec::new(),
+        };
+        let mut changes = Vec::new();
+        let mut visible = self.visible.write();
+        for other in self.positions.iter() {
+            let other_id = *other.key();
+            if other_id == *user_id {
+                continue;
+            }
+            let other_local = self.participants.contains_key(&other_id);
+            if !other_local && !self.remote.contains_key(&other_id) {
+                continue;
+            }
+            let key = pair(*user_id, other_id);
+            let distance = position.distance_to(&other.value().position);
+            let was = visible.contains(&key);
+            let now = if was {
+                distance <= exit
+            } else {
+                distance <= enter
+            };
+            if now == was {
+                continue;
+            }
+            if now {
+                visible.insert(key);
+            } else {
+                visible.remove(&key);
+            }
+            if other_local {
+                changes.push(RosterChange {
+                    observer: other_id,
+                    subject: *user_id,
+                    visible: now,
+                });
+            }
+            if mover_local {
+                changes.push(RosterChange {
+                    observer: *user_id,
+                    subject: other_id,
+                    visible: now,
+                });
+            }
+        }
+        changes
     }
 
     pub fn get_position(&self, user_id: &UserId) -> Option<Position3D> {
@@ -258,19 +581,48 @@ impl MediaChannel {
             None => return Vec::new(),
         };
         let base = self.routed_receivers(&sender_uid);
-        self.apply_receiver_prefs(&sender_uid, base)
+        self.apply_receiver_prefs(&sender_uid, base, None)
     }
 
+    /// `reported_level` is the frame's `-dBov` level when the sender is not a local
+    /// participant (relayed audio); local senders are read from their session.
     fn apply_receiver_prefs(
         &self,
         sender_uid: &UserId,
         receivers: Vec<(Arc<MediaSession>, Mix)>,
+        reported_level: Option<u8>,
     ) -> Vec<(Arc<MediaSession>, Mix)> {
+        let ambient = self.config.read().ambient;
+        let now = ambient.map(|_| Instant::now());
+        // Sender-reported level of the current frame (unlabeled frames rank at nominal
+        // loudness).
+        let level = ambient
+            .and_then(|_| {
+                reported_level.or_else(|| {
+                    self.participants
+                        .get(sender_uid)
+                        .map(|s| s.current_audio_level(AMBIENT_LEVEL_STALE_MS))
+                })
+            })
+            .filter(|l| *l < aurix_common::protocol::AUDIO_LEVEL_SILENCE)
+            .map(aurix_common::protocol::decode_audio_level)
+            .unwrap_or(1.0);
         receivers
             .into_iter()
             .filter_map(|(receiver, mix)| {
                 let gain = receiver.gain_for(sender_uid, &self.channel_id)?;
-                let v = mix.volume * gain;
+                let mut v = mix.volume * gain;
+                if let (Some(cfg), Some(now)) = (ambient.as_ref(), now) {
+                    if v > 0.001 {
+                        v *= receiver.ambient.lock().gate(
+                            &self.channel_id,
+                            sender_uid,
+                            v * level,
+                            cfg,
+                            now,
+                        );
+                    }
+                }
                 (v > 0.001).then_some((
                     receiver,
                     Mix {
@@ -591,7 +943,7 @@ mod tests {
         // Relayed audio from a remote speaker with a known pose is spatialised the same way.
         let remote = UserId::new();
         ch.update_position(&remote, Position3D::new(-5.0, 0.0, 0.0), facing(0.0, 1.0));
-        let got = ch.get_receivers_for_relayed_audio(&remote);
+        let got = ch.get_receivers_for_relayed_audio(&remote, None);
         let (_, mix) = got
             .iter()
             .find(|(r, _)| r.user_id == facing_z.user_id)
@@ -653,17 +1005,17 @@ mod tests {
         ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
         ch.add_participant(b.clone(), ChannelRole::Speaker).unwrap();
         let remote = UserId::new();
-        assert_eq!(ch.get_receivers_for_relayed_audio(&remote).len(), 2);
+        assert_eq!(ch.get_receivers_for_relayed_audio(&remote, None).len(), 2);
 
         a.prefs.write().set_blocked(remote, true);
         b.prefs.write().set_gain(remote, 0.5);
-        let got = ch.get_receivers_for_relayed_audio(&remote);
+        let got = ch.get_receivers_for_relayed_audio(&remote, None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.ssrc, 11);
         assert_eq!(got[0].1.volume, 0.5);
 
         b.prefs.write().set_blocked_by(remote, true);
-        assert!(ch.get_receivers_for_relayed_audio(&remote).is_empty());
+        assert!(ch.get_receivers_for_relayed_audio(&remote, None).is_empty());
     }
 
     #[test]
@@ -696,7 +1048,239 @@ mod tests {
         assert_eq!(ch.get_receivers_for_audio(1)[0].1.volume, 0.5);
         assert!(!ch.relays_to_peers());
         assert!(ch
-            .get_receivers_for_relayed_audio(&UserId::new())
+            .get_receivers_for_relayed_audio(&UserId::new(), None)
             .is_empty());
+    }
+
+    fn radius_channel(app: AppId, roster: Option<f32>, text: Option<f32>) -> MediaChannel {
+        MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Positional,
+                positional_config: Some(PositionalConfig {
+                    roster_radius: roster,
+                    text_radius: text,
+                    ..PositionalConfig::default()
+                }),
+                ..ChannelConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn roster_radius_reveals_and_hides_with_hysteresis() {
+        let app = AppId::new();
+        let ch = radius_channel(app, Some(10.0), None);
+        let (a, b) = (session(app, 1), session(app, 2));
+        ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
+        ch.add_participant(b.clone(), ChannelRole::Speaker).unwrap();
+        let o = Orientation3D::default;
+
+        // Nobody is visible until both poses are known.
+        assert!(!ch.sees(&a.user_id, &b.user_id));
+        assert!(ch.roster_for(&a.user_id).is_empty());
+        assert!(ch
+            .update_position(&a.user_id, Position3D::new(0.0, 0.0, 0.0), o())
+            .is_empty());
+
+        // Bob appears 5 m away: both local observers get an "enter" transition.
+        let mut changes = ch.update_position(&b.user_id, Position3D::new(5.0, 0.0, 0.0), o());
+        changes.sort_by_key(|c| c.observer.0);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|c| c.visible));
+        assert!(changes
+            .iter()
+            .any(|c| c.observer == a.user_id && c.subject == b.user_id));
+        assert!(changes
+            .iter()
+            .any(|c| c.observer == b.user_id && c.subject == a.user_id));
+        assert!(ch.sees(&a.user_id, &b.user_id) && ch.sees(&b.user_id, &a.user_id));
+        let roster = ch.roster_for(&a.user_id);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].user_id, b.user_id);
+        assert!(roster[0].local);
+
+        // 10.5 m: beyond the entry radius but inside the 1.1x exit radius -> still visible.
+        assert!(ch
+            .update_position(&b.user_id, Position3D::new(10.5, 0.0, 0.0), o())
+            .is_empty());
+        assert!(ch.sees(&a.user_id, &b.user_id));
+        // 12 m: hidden for both.
+        let changes = ch.update_position(&b.user_id, Position3D::new(12.0, 0.0, 0.0), o());
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|c| !c.visible));
+        assert!(!ch.sees(&a.user_id, &b.user_id));
+        // 10.5 m again: not back until inside the entry radius.
+        assert!(ch
+            .update_position(&b.user_id, Position3D::new(10.5, 0.0, 0.0), o())
+            .is_empty());
+        assert!(!ch.sees(&a.user_id, &b.user_id));
+        assert_eq!(
+            ch.update_position(&b.user_id, Position3D::new(9.0, 0.0, 0.0), o())
+                .len(),
+            2
+        );
+
+        // Leaving clears the pairs and reports who saw the leaver.
+        assert_eq!(ch.observers_of(&b.user_id), Some(vec![a.user_id]));
+        ch.remove_participant(&b.user_id);
+        assert!(!ch.sees(&a.user_id, &b.user_id));
+        assert_eq!(ch.observers_of(&b.user_id), Some(Vec::new()));
+    }
+
+    #[test]
+    fn remote_members_join_the_scoped_roster_once_positioned() {
+        let app = AppId::new();
+        let ch = radius_channel(app, Some(10.0), None);
+        let a = session(app, 1);
+        ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
+        let o = Orientation3D::default;
+        ch.update_position(&a.user_id, Position3D::new(0.0, 0.0, 0.0), o());
+
+        // A pose for an unknown user is stored but produces no transition...
+        let remote = UserId::new();
+        assert!(ch
+            .update_position(&remote, Position3D::new(3.0, 0.0, 0.0), o())
+            .is_empty());
+        assert!(!ch.sees(&a.user_id, &remote));
+        // ...until the member is registered: only the local observer gets a transition.
+        let changes = ch.add_remote(
+            remote,
+            RemoteParticipant {
+                session_id: SessionId::new(),
+                display_name: "Remote".into(),
+                ssrc: 77,
+                role: ChannelRole::Moderator,
+                is_muted: true,
+            },
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            (changes[0].observer, changes[0].subject),
+            (a.user_id, remote)
+        );
+        let roster = ch.roster_for(&a.user_id);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].ssrc, 77);
+        assert_eq!(roster[0].role, ChannelRole::Moderator);
+        assert!(roster[0].is_muted && !roster[0].local);
+        assert_eq!(ch.remote_count(), 1);
+        assert_eq!(
+            ch.local_poses()
+                .iter()
+                .map(|p| p.user_id)
+                .collect::<Vec<_>>(),
+            vec![a.user_id]
+        );
+
+        assert_eq!(ch.remove_remote(&remote), Some(vec![a.user_id]));
+        assert!(ch.roster_for(&a.user_id).is_empty());
+        assert!(!ch.is_remote(&remote));
+    }
+
+    #[test]
+    fn text_radius_scopes_text_but_not_roster() {
+        let app = AppId::new();
+        let ch = radius_channel(app, None, Some(4.0));
+        let (a, b) = (session(app, 1), session(app, 2));
+        ch.add_participant(a.clone(), ChannelRole::Speaker).unwrap();
+        ch.add_participant(b.clone(), ChannelRole::Speaker).unwrap();
+        let o = Orientation3D::default;
+
+        // Without a roster radius everyone is listed; text needs both poses.
+        assert_eq!(ch.roster_for(&a.user_id).len(), 1);
+        assert!(ch.sees(&a.user_id, &b.user_id));
+        assert!(!ch.text_reaches(&a.user_id, &b.user_id));
+        assert!(ch.text_reaches(&a.user_id, &a.user_id), "own echo");
+
+        assert!(ch
+            .update_position(&a.user_id, Position3D::new(0.0, 0.0, 0.0), o())
+            .is_empty());
+        ch.update_position(&b.user_id, Position3D::new(3.0, 0.0, 0.0), o());
+        assert!(ch.text_reaches(&a.user_id, &b.user_id));
+        ch.update_position(&b.user_id, Position3D::new(4.5, 0.0, 0.0), o());
+        assert!(!ch.text_reaches(&a.user_id, &b.user_id));
+
+        // A channel without radii keeps whole-channel text.
+        let plain = radius_channel(app, None, None);
+        assert!(plain.text_reaches(&a.user_id, &b.user_id));
+        assert_eq!(
+            radius_channel(app, None, None).observers_of(&a.user_id),
+            None
+        );
+    }
+
+    #[test]
+    fn ambient_mode_keeps_the_loudest_voices_and_dims_the_rest() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                channel_type: ChannelType::Team,
+                ambient: Some(AmbientConfig {
+                    max_voices: 2,
+                    ambient_gain: 0.2,
+                }),
+                ..ChannelConfig::default()
+            },
+        );
+        let listener = session(app, 9);
+        let speakers: Vec<_> = (1..=3).map(|i| session(app, i)).collect();
+        ch.add_participant(listener.clone(), ChannelRole::Speaker)
+            .unwrap();
+        for s in &speakers {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        let vol_to = |got: &[(Arc<MediaSession>, Mix)], who: &Arc<MediaSession>| {
+            got.iter()
+                .find(|(s, _)| s.user_id == who.user_id)
+                .map(|(_, m)| m.volume)
+        };
+
+        // Speakers 1 and 2 talk first (unlabeled frames rank at nominal loudness) ...
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(2), &listener), Some(1.0));
+        // ... a third, equally loud voice becomes ambient for the listener ...
+        let third = ch.get_receivers_for_audio(3);
+        assert!((vol_to(&third, &listener).unwrap() - 0.2).abs() < 1e-6);
+        // ... but speaker 1 (who is not hearing speaker 2 at all yet) still gets it in full:
+        // slots are per receiver.
+        assert_eq!(vol_to(&third, &speakers[0]), Some(1.0));
+        // Holders keep their slots against an equally loud challenger.
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+
+        // A holder whose frames report a much quieter level loses the slot to the louder
+        // challenger (ranking = delivery gain x sender-reported level).
+        speakers[2].record_audio_level(Some(0), 0.0); // 0 dBov = full scale
+        speakers[0].record_audio_level(Some(40), 0.0); // -40 dBov
+        assert!((vol_to(&ch.get_receivers_for_audio(1), &listener).unwrap() - 0.2).abs() < 1e-6);
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(3), &listener), Some(1.0));
+
+        // Receiver-local volume still applies on top and a muted sender is not routed.
+        listener.prefs.write().set_gain(speakers[1].user_id, 0.5);
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(2), &listener), Some(0.5));
+        listener.prefs.write().set_gain(speakers[1].user_id, 0.0);
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(2), &listener), None);
+
+        // Leaving frees the slot for the listener immediately.
+        ch.remove_participant(&speakers[2].user_id);
+        assert_eq!(vol_to(&ch.get_receivers_for_audio(1), &listener), Some(1.0));
+
+        // A speaker on another node competes with the level its origin node relayed: a
+        // full-scale remote voice takes a slot from the whispering speaker 1, a -60 dBov
+        // remote voice stays ambient.
+        let remote_loud = UserId::new();
+        let remote_quiet = UserId::new();
+        assert_eq!(
+            vol_to(
+                &ch.get_receivers_for_relayed_audio(&remote_loud, Some(0)),
+                &listener
+            ),
+            Some(1.0)
+        );
+        let whisper = ch.get_receivers_for_relayed_audio(&remote_quiet, Some(60));
+        assert!((vol_to(&whisper, &listener).unwrap() - 0.2).abs() < 1e-6);
     }
 }

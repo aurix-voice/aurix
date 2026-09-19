@@ -7226,3 +7226,371 @@ async fn content_safety_incidents_evidence_and_auto_actions() {
         .await;
     }
 }
+
+async fn expect_presence(p: &mut Player, ch: ChannelId, who: UserId, joined: bool) {
+    let what = if joined {
+        "ParticipantJoined"
+    } else {
+        "ParticipantLeft"
+    };
+    expect_within(p, what, Duration::from_secs(3), |m| match m {
+        ControlMessage::ParticipantJoined {
+            channel_id,
+            user_id,
+            ..
+        } => joined && *channel_id == ch && *user_id == who,
+        ControlMessage::ParticipantLeft {
+            channel_id,
+            user_id,
+        } => !joined && *channel_id == ch && *user_id == who,
+        _ => false,
+    })
+    .await;
+}
+
+async fn assert_no_presence(p: &mut Player, ch: ChannelId, why: &str) {
+    assert_none_matching(p, Duration::from_millis(500), why, |m| {
+        matches!(
+            m,
+            ControlMessage::ParticipantJoined { channel_id, .. }
+                | ControlMessage::ParticipantLeft { channel_id, .. }
+                if *channel_id == ch
+        )
+    })
+    .await;
+}
+
+/// Interleaves 10 labelled frames (`level` in -dBov) from every speaker — all within the
+/// ambient hold window — and returns, per speaker SSRC, the last downlink gain `to` saw and
+/// the frame count.
+async fn ambient_burst(
+    speakers: &[(&Player, u32, u8)],
+    to: &Player,
+    ch: ChannelId,
+    payload: &Bytes,
+) -> std::collections::HashMap<u32, (f32, usize)> {
+    let hash = channel_id_hash(&ch);
+    for i in 0..10u32 {
+        for (from, first_seq, level) in speakers {
+            let seq = first_seq + i;
+            let pkt =
+                AurixPacket::audio_with_level(seq, seq * 960, from.ssrc, hash, *level, payload);
+            from.udp
+                .send_to(&pkt.seal(&from.keys), from.media_addr)
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut seen: std::collections::HashMap<u32, (f32, usize)> = Default::default();
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
+        if p.header.packet_type != PacketType::Audio {
+            continue;
+        }
+        let (volume, _) = p.take_downlink_meta();
+        assert_eq!(&p.payload[..], &payload[..]);
+        let e = seen.entry(p.header.ssrc).or_insert((volume, 0));
+        e.0 = volume;
+        e.1 += 1;
+    }
+    seen
+}
+
+/// Positional channels with `roster_radius` / `text_radius` (`PositionalConfig`): the roster
+/// starts empty and members appear (`ParticipantJoined`) once both poses are known and within
+/// the roster radius, disappear (`ParticipantLeft`) only beyond the 10 % exit hysteresis, and
+/// come back when they return; chat / typing follow the independent text radius (sender echo
+/// always) while the audio range stays `max_radius`; leaving the channel notifies every
+/// observer exactly once; a member on another node (`AURIX_E2E_WS2`) is scoped the same way.
+/// Then a team channel with `ambient` keeps the loudest `max_voices` speakers at full gain and
+/// dims the rest to `ambient_gain`, ranked by the level the sender reported.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn radius_visibility_text_range_and_ambient_mode() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let carol_env = env2.as_ref().unwrap_or(&env);
+    let http = reqwest::Client::new();
+    let world = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "channel_type": "positional",
+            "positional_config": {
+                "near_distance": 5.0, "far_distance": 25.0, "rolloff": "linear",
+                "max_radius": 30.0, "directional": false, "coordinate_system": "left_handed",
+                "roster_radius": 10.0, "text_radius": 5.0
+            }
+        }),
+    )
+    .await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "e2e:radius-alice", "Alice", world).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e:radius-bob", "Bob", world).await;
+    let (tok_c, uid_c) = issue_token(carol_env, &http, "e2e:radius-carol", "Carol", world).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let uid_c = UserId::from_uuid(uid_c.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(carol_env, "carol", tok_c).await;
+    if env2.is_some() {
+        assert_ne!(
+            alice.media_addr.port(),
+            carol.media_addr.port(),
+            "carol must land on the other node"
+        );
+    }
+    for p in [&mut alice, &mut bob, &mut carol] {
+        bind_media(p).await;
+    }
+
+    // Join ack: the radii are announced and nobody is listed until positions are known.
+    for p in [&mut alice, &mut bob, &mut carol] {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id: world,
+            token: tok,
+        })
+        .await;
+        let ack = p
+            .expect("ChannelJoinAck", |m| {
+                matches!(m, ControlMessage::ChannelJoinAck { channel_id, .. } if *channel_id == world)
+            })
+            .await;
+        let ControlMessage::ChannelJoinAck {
+            participants,
+            roster_radius,
+            text_radius,
+            ..
+        } = ack
+        else {
+            unreachable!()
+        };
+        assert_eq!(roster_radius, Some(10.0));
+        assert_eq!(text_radius, Some(5.0));
+        assert!(
+            participants.is_empty(),
+            "{}: nobody has a position yet: {participants:?}",
+            p.name
+        );
+    }
+    for p in [&mut alice, &mut bob, &mut carol] {
+        assert_no_presence(p, world, "no positions are known yet").await;
+    }
+
+    let pose = |user_id: UserId, x: f32| ControlMessage::PositionUpdate {
+        channel_id: world,
+        positions: vec![UserPosition {
+            user_id,
+            position: at(x, 0.0, 0.0),
+            orientation: facing(0.0, 0.0, 1.0),
+        }],
+    };
+
+    // Alice alone at the origin: still nothing to reveal (Bob and Carol have no pose).
+    let m = pose(uid_a, 0.0);
+    alice.send(&m).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        assert_no_presence(p, world, "only one position is known").await;
+    }
+
+    // Bob 3 m away: both see each other; Carol (no pose) sees nothing.
+    let m = pose(uid_b, 3.0);
+    bob.send(&m).await;
+    expect_presence(&mut alice, world, uid_b, true).await;
+    expect_presence(&mut bob, world, uid_a, true).await;
+    assert_no_presence(&mut carol, world, "carol has no position").await;
+
+    // Text within 5 m reaches Bob (and echoes to Alice); Carol is out of scope.
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: world,
+            text: "near".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    assert_eq!(expect_chat(&mut alice, "own echo").await.text, "near");
+    assert_eq!(
+        expect_chat(&mut bob, "chat within text radius").await.text,
+        "near"
+    );
+    assert_no_chat(&mut carol, "she has no position").await;
+
+    // Bob walks to 7 m: still on the roster (≤ 10 m) but out of text range (> 5 m).
+    let m = pose(uid_b, 7.0);
+    bob.send(&m).await;
+    alice
+        .expect("PositionUpdate(bob)", |m| {
+            matches!(m, ControlMessage::PositionUpdate { positions, .. }
+                if positions.iter().any(|p| p.user_id == uid_b))
+        })
+        .await;
+    assert_no_presence(&mut alice, world, "bob is still within the roster radius").await;
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: world,
+            text: "far".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    assert_eq!(expect_chat(&mut alice, "own echo").await.text, "far");
+    assert_no_chat(&mut bob, "bob is beyond the text radius").await;
+    alice
+        .send(&ControlMessage::ChatTyping {
+            channel_id: world,
+            typing: true,
+        })
+        .await;
+    assert_no_chat(&mut bob, "typing is scoped like chat").await;
+
+    // 10.5 m: inside the 10 % exit hysteresis, nobody leaves. 12 m: both lose each other —
+    // yet audio still flows because the audio range is `max_radius` (30 m).
+    let m = pose(uid_b, 10.5);
+    bob.send(&m).await;
+    assert_no_presence(&mut alice, world, "10.5 m is within the exit hysteresis").await;
+    assert_no_presence(&mut bob, world, "10.5 m is within the exit hysteresis").await;
+    let m = pose(uid_b, 12.0);
+    bob.send(&m).await;
+    expect_presence(&mut alice, world, uid_b, false).await;
+    expect_presence(&mut bob, world, uid_a, false).await;
+    let hello = Bytes::from_static(b"hello");
+    drain_udp(&bob).await;
+    send_audio(&alice, world, 1, &hello).await;
+    let (meta, n) = directional_audio_from(&bob, alice.ssrc, &hello).await;
+    assert_eq!(n, 10, "audio range is max_radius, not roster_radius");
+    let (volume, _) = meta.unwrap();
+    assert!(
+        (volume - 0.65).abs() < 0.03,
+        "linear 5..25 m at 12 m: {volume}"
+    );
+    assert_none_matching(
+        &mut bob,
+        Duration::from_millis(300),
+        "speaking events are roster-scoped",
+        |m| matches!(m, ControlMessage::SpeakingStateChanged { user_id, .. } if *user_id == uid_a),
+    )
+    .await;
+
+    // Back to 5 m: revealed again, and text reaches Bob again (exactly at the text radius).
+    let m = pose(uid_b, 5.0);
+    bob.send(&m).await;
+    expect_presence(&mut alice, world, uid_b, true).await;
+    expect_presence(&mut bob, world, uid_a, true).await;
+
+    // Carol (other node when configured) appears 4 m from Alice, 1 m from Bob: everyone sees
+    // everyone, and Alice's message reaches both.
+    let m = pose(uid_c, 4.0);
+    carol.send(&m).await;
+    expect_presence(&mut alice, world, uid_c, true).await;
+    expect_presence(&mut bob, world, uid_c, true).await;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let m = expect_within(
+            &mut carol,
+            "ParticipantJoined(alice|bob)",
+            Duration::from_secs(3),
+            |m| matches!(m, ControlMessage::ParticipantJoined { channel_id, .. } if *channel_id == world),
+        )
+        .await;
+        if let ControlMessage::ParticipantJoined { user_id, .. } = m {
+            seen.insert(user_id);
+        }
+    }
+    assert_eq!(seen, [uid_a, uid_b].into_iter().collect());
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: world,
+            text: "all".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    assert_eq!(expect_chat(&mut alice, "own echo").await.text, "all");
+    assert_eq!(expect_chat(&mut bob, "bob at 5 m").await.text, "all");
+    assert_eq!(expect_chat(&mut carol, "carol at 4 m").await.text, "all");
+
+    // Bob leaves the channel: the observers that saw him are told exactly once.
+    bob.send(&ControlMessage::ChannelLeave { channel_id: world })
+        .await;
+    expect_presence(&mut alice, world, uid_b, false).await;
+    expect_presence(&mut carol, world, uid_b, false).await;
+    assert_no_presence(&mut alice, world, "a single ParticipantLeft per observer").await;
+    assert_no_presence(&mut carol, world, "a single ParticipantLeft per observer").await;
+    for p in [&mut alice, &mut carol] {
+        p.send(&ControlMessage::ChannelLeave { channel_id: world })
+            .await;
+    }
+
+    // Ambient (cocktail-party) team channel: one full-gain voice, the rest at 0.2.
+    let party = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({"ambient": {"max_voices": 1, "ambient_gain": 0.2}}),
+    )
+    .await;
+    let (tok_a, _) = issue_token(&env, &http, "e2e:ambient-alice", "Alice", party).await;
+    let (tok_b, _) = issue_token(&env, &http, "e2e:ambient-bob", "Bob", party).await;
+    let (tok_d, _) = issue_token(carol_env, &http, "e2e:ambient-dave", "Dave", party).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut dave = connect(carol_env, "dave", tok_d).await;
+    for p in [&mut alice, &mut bob, &mut dave] {
+        bind_media(p).await;
+        join(p, party).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_udp(&dave).await;
+
+    // Alice alone at -6 dBov: full gain, no gain byte.
+    let got = ambient_burst(&[(&alice, 1, 6)], &dave, party, &hello).await;
+    assert_eq!(got[&alice.ssrc], (1.0, 10), "{got:?}");
+    // Alice (-6 dBov) and a quieter Bob (-30 dBov) together: Bob is background at 0.2.
+    let got = ambient_burst(&[(&alice, 100, 6), (&bob, 100, 30)], &dave, party, &hello).await;
+    assert_eq!(got[&alice.ssrc].1, 10, "{got:?}");
+    assert_eq!(
+        got[&alice.ssrc].0, 1.0,
+        "the loud voice holds the slot: {got:?}"
+    );
+    assert_eq!(got[&bob.ssrc].1, 10, "{got:?}");
+    assert!(
+        (got[&bob.ssrc].0 - 0.2).abs() < 0.02,
+        "the quiet voice is dimmed: {got:?}"
+    );
+    // Bob shouts (0 dBov) while Alice whispers (-40 dBov): the slot changes hands.
+    let got = ambient_burst(&[(&alice, 200, 40), (&bob, 200, 0)], &dave, party, &hello).await;
+    assert_eq!(
+        got[&bob.ssrc].0, 1.0,
+        "the louder speaker takes the slot: {got:?}"
+    );
+    assert!(
+        (got[&alice.ssrc].0 - 0.2).abs() < 0.02,
+        "the whispering holder is dimmed: {got:?}"
+    );
+    // After the hold time nobody occupies the slot: Alice alone is full gain again.
+    let got = ambient_burst(&[(&alice, 300, 6)], &dave, party, &hello).await;
+    assert_eq!(
+        got[&alice.ssrc],
+        (1.0, 10),
+        "slots expire after silence: {got:?}"
+    );
+
+    for p in [&mut alice, &mut bob, &mut dave] {
+        p.send(&ControlMessage::ChannelLeave { channel_id: party })
+            .await;
+    }
+}

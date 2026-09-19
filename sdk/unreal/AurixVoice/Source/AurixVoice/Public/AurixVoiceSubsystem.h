@@ -128,6 +128,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
 	bool IsChannelMonitored(FGuid ChannelId) const;
 
+	/** Presence / text range of a joined positional channel (0 = whole channel); false until the join is acknowledged. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool GetChannelScope(FGuid ChannelId, FAurixChannelScope& OutScope) const;
+
 	/** Owner of an SSRC (microphone or its TTS voice) across joined channels. */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
 	bool GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const;

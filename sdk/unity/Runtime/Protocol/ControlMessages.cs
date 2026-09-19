@@ -238,6 +238,8 @@ namespace Aurix.Protocol
         public double Num(string key) => MiniJson.GetNumber(Data, key);
         public uint U32(string key) => MiniJson.GetUInt32(Data, key);
         public Guid Id(string key) => MiniJson.GetGuid(Data, key) ?? Guid.Empty;
+        /// <summary>Whether <paramref name="key"/> is present with a non-null value.</summary>
+        public bool Has(string key) => Data != null && Data.TryGetValue(key, out var v) && v != null;
 
         public List<ParticipantBrief> Participants()
         {

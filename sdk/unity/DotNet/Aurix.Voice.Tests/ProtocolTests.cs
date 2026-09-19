@@ -991,5 +991,55 @@ namespace Aurix.Voice.Tests
             Assert.InRange(s.Mos, 4.3f, 4.5f);
             Assert.Null(client.LastNetworkQuality);
         }
+
+        [Fact]
+        public void ChannelScopeAndScopedPresenceTransitionsAreTracked()
+        {
+            var client = new AurixVoiceClient("ws://127.0.0.1:1", "token");
+            var plaza = Guid.NewGuid();
+            var lobby = Guid.NewGuid();
+            var bob = Guid.NewGuid();
+            var joined = new List<(Guid, Participant)>();
+            var left = new List<(Guid, Participant)>();
+            client.OnParticipantJoined += (c, p) => joined.Add((c, p));
+            client.OnParticipantLeft += (c, p) => left.Add((c, p));
+
+            Assert.Null(client.GetChannelScope(plaza));
+            client.HandleMessage(ControlMessage.Parse(
+                "{\"type\":\"ChannelJoinAck\",\"data\":{\"channel_id\":\"" + plaza +
+                "\",\"participants\":[],\"roster_radius\":25.0,\"text_radius\":10}}"));
+            client.HandleMessage(ControlMessage.Parse(
+                "{\"type\":\"ChannelJoinAck\",\"data\":{\"channel_id\":\"" + lobby + "\",\"participants\":[]}}"));
+            var scope = client.GetChannelScope(plaza);
+            Assert.NotNull(scope);
+            Assert.Equal(25f, scope.Value.RosterRadius);
+            Assert.Equal(10f, scope.Value.TextRadius);
+            var unscoped = client.GetChannelScope(lobby);
+            Assert.NotNull(unscoped);
+            Assert.Null(unscoped.Value.RosterRadius);
+            Assert.Null(unscoped.Value.TextRadius);
+
+            // Bob walks into range: the transition carries his role and mute state ...
+            client.HandleMessage(ControlMessage.Parse(
+                "{\"type\":\"ParticipantJoined\",\"data\":{\"channel_id\":\"" + plaza + "\",\"user_id\":\"" + bob +
+                "\",\"display_name\":\"Bob\",\"ssrc\":7,\"role\":\"moderator\",\"is_muted\":true}}"));
+            Assert.Single(joined);
+            Assert.Equal(ChannelRole.Moderator, joined[0].Item2.Role);
+            Assert.True(joined[0].Item2.IsMuted);
+            Assert.Single(client.GetParticipants(plaza));
+            // ... and out of range: the roster forgets him.
+            client.HandleMessage(ControlMessage.Parse(
+                "{\"type\":\"ParticipantLeft\",\"data\":{\"channel_id\":\"" + plaza + "\",\"user_id\":\"" + bob + "\"}}"));
+            Assert.Single(left);
+            Assert.Equal(bob, left[0].Item2.UserId);
+            Assert.Empty(client.GetParticipants(plaza));
+
+            // An older server without the role field still yields a speaker.
+            client.HandleMessage(ControlMessage.Parse(
+                "{\"type\":\"ParticipantJoined\",\"data\":{\"channel_id\":\"" + lobby + "\",\"user_id\":\"" + bob +
+                "\",\"display_name\":\"Bob\",\"ssrc\":8}}"));
+            Assert.Equal(ChannelRole.Speaker, joined[1].Item2.Role);
+            Assert.False(joined[1].Item2.IsMuted);
+        }
     }
 }

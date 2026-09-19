@@ -80,6 +80,18 @@ pub struct ChannelMembershipRow {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ChannelRosterRow {
+    pub user_id: Uuid,
+    pub session_id: Uuid,
+    pub media_node_id: Uuid,
+    pub display_name: String,
+    pub role: String,
+    pub is_muted: bool,
+    pub is_server_muted: bool,
+    pub ssrc: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct BanRow {
     pub id: Uuid,
     pub app_id: Uuid,

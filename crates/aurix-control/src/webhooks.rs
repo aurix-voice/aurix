@@ -1064,6 +1064,7 @@ mod tests {
             display_name: "Alice".into(),
             session_id: SessionId::new(),
             ssrc: 7,
+            role: ChannelRole::Speaker,
             timestamp: Utc::now(),
         };
         let env = PublicEvent::from_event(&ev).unwrap();

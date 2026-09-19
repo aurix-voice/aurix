@@ -233,6 +233,17 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
     gains. The WebRTC downlink is mixed in stereo on the server (Opus `sprop-stereo=1`, the Web
     SDK offers `stereo=1` so browsers decode both channels; uplinks stay mono). End-to-end
     encrypted native frames are forwarded untouched (no server-side metadata).
+    `positional_config.roster_radius` / `text_radius` additionally scope *presence* (join
+    ack roster, `ParticipantJoined`/`Left`, positions, mute/speaking/energy) and *text*
+    (channel chat, typing, transcripts) by distance, independently of the audio range: a
+    member is visible/reachable only when both poses are known and within the radius, moving
+    in and out of the roster radius is reported as `ParticipantJoined`/`ParticipantLeft` (exit
+    10 % wider, so nobody flickers), the sender always gets their own chat echo, and the radii
+    are announced in `ChannelJoinAck` (SDK `channelScope` / `GetChannelScope` /
+    `channel_scope`). `"ambient": {"max_voices": 4, "ambient_gain": 0.15}` on any channel turns
+    on cocktail-party mixing: per receiver the loudest `max_voices` speakers (delivery gain ×
+    the RFC 6464 level the sender reported, sticky slots, 400 ms hold, also for speakers
+    relayed from other nodes) arrive at full gain and the rest are dimmed to `ambient_gain`.
 11. **Echo channel & audio injection**: a channel with `channel_type: echo` is a microphone
     test — every participant hears *only their own* audio, looped back through the real uplink
     → server → downlink path (encrypted/authenticated native frames or the WebRTC mix, with

@@ -43,8 +43,11 @@ action token decides them at join time.
       "rolloff": "logarithmic",
       "max_radius": 100.0,
       "directional": true,
-      "coordinate_system": "left_handed"
-    }
+      "coordinate_system": "left_handed",
+      "roster_radius": 60.0,
+      "text_radius": 20.0
+    },
+    "ambient": { "max_voices": 4, "ambient_gain": 0.15 }
   }
 }
 ```
@@ -75,7 +78,11 @@ action token decides them at join time.
 * `positional_config`: attenuation is 1.0 up to `near_distance`, follows `rolloff`
   (`linear`, `logarithmic`, `custom_spline`) to `far_distance`, and speakers beyond
   `max_radius` are not delivered at all. `coordinate_system` (`left_handed` — Unity/Unreal —
-  or `right_handed`) tells the panner which way is left.
+  or `right_handed`) tells the panner which way is left. The optional `roster_radius` and
+  `text_radius` scope *presence* and *text* by distance — see
+  [Radius-scoped presence and text](#radius-scoped-presence-and-text).
+* `ambient` turns on [cocktail-party mixing](#ambient-cocktail-party-mode) for any channel
+  type; absent (the default) every audible speaker arrives at full gain.
 
 `PUT /v1/channels/{id}/config` updates the configuration live; participants on every node hosting
 the channel pick it up (channel type changes take effect for subsequent frames).
@@ -150,6 +157,57 @@ WebRTC receivers get a server-mixed stereo downlink (`sprop-stereo=1`). `Occlusi
 (a listener-side 0–1 factor towards one speaker, validated and echoed to the listener's own
 client) and `ReverbZoneUpdate` (broadcast to the channel) are relayed as hints for client-side
 DSP; the server does not process audio for them.
+
+## Radius-scoped presence and text
+
+A positional channel can hold a whole shard, yet a player only cares about the people around
+them. Two optional radii in `positional_config` (metres, in the game's units) scope what the
+server tells each member, independently of the audio range (`max_radius`):
+
+| Field | Scopes | Without it |
+| --- | --- | --- |
+| `roster_radius` | `ChannelJoinAck.participants`, `ParticipantJoined` / `ParticipantLeft`, `PositionUpdate`, `MuteStateChanged`, `SpeakingStateChanged`, `ChannelEnergy` | the whole channel, as for any other channel type |
+| `text_radius` | channel chat (`ChatSend`), `ParticipantTyping`, `Transcript` | the whole channel (subject to the usual blocks / mutes / opt-ins) |
+
+* **Unknown positions hide.** With a radius configured, a member appears to another only once
+  *both* positions are known — a fresh joiner gets an empty roster and is invisible until their
+  first `PositionUpdate`. Nothing about presence is ever leaked beyond the radius, so a client
+  cannot enumerate a shard by joining.
+* **Entering and leaving the radius is presence.** When two members come within
+  `roster_radius` of each other, each receives `ParticipantJoined` for the other (with
+  `role` and `is_muted`, so the roster entry is complete); when they part they receive
+  `ParticipantLeft`. Leaving uses a 10 % wider radius (`ROSTER_EXIT_FACTOR`) so two players
+  dancing on the edge do not flicker in and out. Leaving the channel or disconnecting notifies
+  only the observers who currently see the member — exactly once.
+* **Text has its own range.** `text_radius` is typically smaller than the roster radius
+  ("say" versus "who is here"); the sender always receives their own echo, so a chat UI can
+  confirm delivery even when nobody was in earshot. `ChatSendDirect` is unaffected.
+* **Audio range stays `max_radius`.** Choose `roster_radius ≥ max_radius` so every voice you
+  can hear belongs to someone on your roster; a smaller roster radius is legal (the E2E test
+  uses one) and simply delivers frames from SSRCs the client has not been introduced to —
+  SDKs keep such streams playable but unnamed.
+* Members on other nodes are scoped the same way: nodes exchange positions on the event bus
+  and each node evaluates visibility for its own sessions. The radii are announced to clients
+  in `ChannelJoinAck.roster_radius` / `text_radius` (Web `channelScope()`, Unity
+  `GetChannelScope`, native `channel_scope` / `aurix_client_channel_scope`, Unreal
+  `GetChannelScope`).
+
+## Ambient (cocktail-party) mode
+
+`"ambient": {"max_voices": 4, "ambient_gain": 0.15}` keeps a crowded channel intelligible: per
+receiver, the speakers with a frame in the last 400 ms are ranked by how loud they would arrive —
+the delivery gain after distance attenuation, per-participant volume and focus, multiplied by the
+level the sender reported for the frame (RFC 6464; unlabelled frames rank at nominal loudness) —
+the loudest `max_voices` keep their full gain and every other voice is attenuated to
+`ambient_gain` (a murmur rather than silence). Slot holders are sticky (a challenger must be
+20 % louder to take a slot) and a speaker who pauses frees the slot after the hold time, so DTX
+gaps do not reshuffle the mix. Ranking is per receiver: your own mutes, blocks and volumes
+decide who competes for *your* slots, and a speaker you muted never occupies one. Directional
+metadata, E2EE payloads and the PCMU re-encode are untouched — only the gain byte / WebRTC
+mixer gain changes. Speakers relayed from another node carry their reported level inside the
+cascade envelope, so a remote shout wins a slot exactly as a local one. Defaults when the
+object is present but partial: `max_voices` 4, `ambient_gain` 0.15; `max_voices` is clamped to
+at least 1 and `ambient_gain` must be `0.0..=1.0`.
 
 ## Ad-hoc channels
 

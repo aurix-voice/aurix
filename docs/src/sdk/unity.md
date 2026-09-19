@@ -118,6 +118,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Local mute / volume / block | `SetParticipantMutedAsync(user, muted, channel?)`, `SetParticipantVolumeAsync(user, 0..2)`, `SetUserBlockedAsync`, `OnReceiverPreferences`, `OnUserBlockChanged` |
 | Multiple channels | `SetTransmissionAsync(TransmissionMode)`, `TransmitToChannelAsync`, `SetChannelFocusAsync(Guid?)`, `OnTransmissionChanged`, `OnChannelFocusChanged`, `TransmitOpusFrame` (one frame to every allowed channel) |
 | Positional / directional | `UpdatePositionAsync(channel, selfUserId, Position3D, Orientation3D)`, `OnPositions`; `RemoteMixer` pans by the per-packet direction — keep the `AudioSource` 2D |
+| Presence / text range | `GetChannelScope(channel)` → `ChannelScope? { RosterRadius, TextRadius }`; `OnParticipantJoined` / `OnParticipantLeft` also fire as players move in and out of the roster radius (`Participant.Role` / `IsMuted` filled from the event) — see [radius-scoped presence](../features/channels.md#radius-scoped-presence-and-text) |
 | Energy / VAD | `VoiceActivityDetector` (`Speaking`, `Level`), `GateOnVad`, `OnChannelEnergy`, `participant.Energy` |
 | Devices | `InputDevices`, `SetInputDevice()`, `SetInputGain()`, `SetOutputVolume()`, `SetOutputMuted()`; `OutputResampler` for non-48 kHz mixers |
 | Echo test / injection | echo channel + `InjectClip(clip, loop, gain, mixWithMicrophone)`, `Injector` (live PCM), `StopInjection()` |

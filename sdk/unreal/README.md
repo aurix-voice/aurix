@@ -209,7 +209,10 @@ delivers every event as JSON for anything not typed (remote position updates, fu
 
 `IsChannelTranscribed` / `IsChannelMonitored` (from `ChannelJoinAck`) tell whether a joined
 channel is captioned or analysed by the server's content-safety classifier — show the latter
-to the player where your policy requires a disclosure.
+to the player where your policy requires a disclosure. `GetChannelScope` returns the presence /
+text range of a positional channel (`RosterRadius` / `TextRadius`, 0 = whole channel): with a
+roster radius, `OnParticipantJoined` / `OnParticipantLeft` also fire when someone walks into or
+out of range, so a nameplate list driven by those events shows only nearby players.
 
 All events are dispatched on the game thread from the subsystem's tick (up to 256 events per
 tick; backlog is drained across ticks, nothing is dropped).

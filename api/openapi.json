@@ -6578,6 +6578,17 @@
               }
             ]
           },
+          "ambient": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AmbientConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cocktail-party mode; absent/`null` (default) delivers every audible speaker at full gain."
+          },
           "audio_profile": {
             "$ref": "#/components/schemas/AudioProfile",
             "default": "voice"
@@ -7834,8 +7845,44 @@
           "coordinate_system": {
             "$ref": "#/components/schemas/CoordinateSystem",
             "default": "left_handed"
+          },
+          "roster_radius": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "description": "Presence scope: members appear in each other's roster (join ack, `ParticipantJoined`/`Left`, positions, mute/speaking/energy) only when both positions are known and within this distance; leaving uses a 10 % wider radius. `null`: the whole channel."
+          },
+          "text_radius": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "description": "Text scope: channel chat, typing and transcripts reach only members within this distance of the sender (both positions known); the sender always gets their own echo. `null`: the whole channel."
           }
         }
+      },
+      "AmbientConfig": {
+        "type": "object",
+        "properties": {
+          "max_voices": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255,
+            "default": 4,
+            "description": "How many of the loudest concurrent speakers each receiver hears at full gain."
+          },
+          "ambient_gain": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "default": 0.15,
+            "description": "Gain applied to every other concurrent speaker (`0` drops them)."
+          }
+        },
+        "description": "Cocktail-party mixing, ranked per receiver by delivery gain × the sender-reported audio level (sticky slots, 400 ms hold)."
       },
       "QualityMetrics": {
         "type": "object",

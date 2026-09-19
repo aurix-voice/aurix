@@ -25,12 +25,15 @@ const ENERGY_REPORT_MIN_STEP_DB: u8 = 3;
 const QUALITY_SUMMARY_EVERY: u64 = 5;
 
 /// Side effects of leaving a channel that the client must be told about.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelLeft {
     /// `TransmissionMode::Single` pointed at the left channel and fell back to `None`.
     pub transmission_reset: bool,
     /// The left channel was the focused one; focus is now cleared.
     pub focus_reset: bool,
+    /// Local members that had the leaver in their roster when the channel scopes presence
+    /// by `roster_radius` (`None`: no radius, every member saw them).
+    pub roster_observers: Option<Vec<UserId>>,
 }
 
 /// Media-plane tunables taken from `MediaConfig`.
@@ -333,7 +336,7 @@ impl SfuNode {
                 .start_receiver(Arc::new(move |sender, packet| {
                     let router = router.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = router.route_relayed_audio(&sender, &packet).await {
+                        if let Err(e) = router.route_relayed_audio(&sender, packet).await {
                             warn!("Cascade relay route error: {}", e);
                         }
                     });
@@ -490,13 +493,15 @@ impl SfuNode {
     ) -> ChannelLeft {
         session.leave_channel(channel_id);
         let (transmission_reset, focus_reset) = session.forget_channel(channel_id);
-        let left = ChannelLeft {
+        let mut left = ChannelLeft {
             transmission_reset,
             focus_reset,
+            roster_observers: None,
         };
         let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else {
             return left;
         };
+        left.roster_observers = channel.observers_of(&session.user_id);
         channel.remove_participant(&session.user_id);
         if let Some(ref router) = self.router {
             router.forget_pcmu_downlinks(Some(session.ssrc), Some(channel_id_hash(channel_id)));
@@ -632,15 +637,18 @@ impl SfuNode {
         Ok(())
     }
 
+    /// Stores a member's pose; returns roster transitions for local observers
+    /// (`roster_radius` channels only).
     pub fn update_position(
         &self,
         user_id: &UserId,
         channel_id: &ChannelId,
         position: Position3D,
         orientation: Orientation3D,
-    ) {
-        if let Some(channel) = self.channels.get(channel_id) {
-            channel.update_position(user_id, position, orientation);
+    ) -> Vec<crate::channel::RosterChange> {
+        match self.channels.get(channel_id) {
+            Some(channel) => channel.update_position(user_id, position, orientation),
+            None => Vec::new(),
         }
     }
 

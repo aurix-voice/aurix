@@ -1,6 +1,6 @@
 use aurix_common::error::{AurixError, Result};
 use aurix_common::types::*;
-use aurix_db::models::{ChannelMembershipRow, SessionRow};
+use aurix_db::models::{ChannelMembershipRow, ChannelRosterRow, SessionRow};
 use aurix_db::DbPool;
 use chrono::Utc;
 use uuid::Uuid;
@@ -187,6 +187,17 @@ impl SessionManager {
         aurix_db::queries::get_channel_members(&self.pool, app_id.0, channel_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Member list failed: {e}")))
+    }
+
+    /// Members with display name and hosting node (see `queries::get_channel_roster`).
+    pub async fn get_channel_roster(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+    ) -> Result<Vec<ChannelRosterRow>> {
+        aurix_db::queries::get_channel_roster(&self.pool, app_id.0, channel_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("Roster failed: {e}")))
     }
 
     pub async fn count_active_sessions(&self, app_id: AppId) -> Result<i64> {

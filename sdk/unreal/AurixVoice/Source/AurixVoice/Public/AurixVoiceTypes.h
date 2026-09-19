@@ -152,6 +152,28 @@ struct AURIXVOICE_API FAurixAudioPolicy
 	EAurixOpusSignal Signal = EAurixOpusSignal::Auto;
 };
 
+/**
+ * How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
+ * `text_radius`, from `ChannelJoinAck`). A radius of 0 means "the whole channel".
+ */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixChannelScope
+{
+	GENERATED_BODY()
+
+	/**
+	 * The roster only lists members within this distance of us (once both positions are known);
+	 * OnParticipantJoined / OnParticipantLeft also fire when someone moves in or out of range
+	 * (leaving uses a 10 % wider radius so the edge does not flicker).
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RosterRadius = 0.f;
+
+	/** Channel chat, typing and transcripts reach only members within this distance. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float TextRadius = 0.f;
+};
+
 UENUM(BlueprintType)
 enum class EAurixTtsDestination : uint8
 {

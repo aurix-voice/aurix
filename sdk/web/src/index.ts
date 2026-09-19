@@ -40,6 +40,7 @@ export type { ClientStats, NetworkQuality, NetworkQualityWire, RtcStatsInput, Rt
 export type {
   AurixClientOptions,
   AurixEvents,
+  ChannelScope,
   ChatMessage,
   ConnectionState,
   Participant,

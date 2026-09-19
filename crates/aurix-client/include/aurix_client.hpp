@@ -218,6 +218,11 @@ public:
     bool channel_transcribes(const Uuid& channel) const { return aurix_client_channel_transcribes(c_, &channel.raw); }
     /// Speech in `channel` is analysed by the server's content-safety classifier — disclose it.
     bool channel_monitored(const Uuid& channel) const { return aurix_client_channel_monitored(c_, &channel.raw); }
+    /// Presence / text range of a joined positional channel (radius `<= 0` = whole channel);
+    /// `false` until the join is acknowledged.
+    bool channel_scope(const Uuid& channel, AurixChannelScope& out) const {
+        return aurix_client_channel_scope(c_, &channel.raw, &out);
+    }
     std::vector<AurixParticipant> participants(const Uuid& channel) const {
         std::vector<AurixParticipant> buf(32);
         std::size_t n = aurix_client_participants(c_, &channel.raw, buf.data(), buf.size());

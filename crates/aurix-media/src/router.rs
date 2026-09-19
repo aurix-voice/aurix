@@ -374,7 +374,7 @@ impl PacketRouter {
         self.fan_out(&channel, sender, packet).await;
         if let Some(cascade) = self.cascade.as_ref().filter(|_| channel.relays_to_peers()) {
             cascade
-                .forward_to_peers(&channel_id, &sender.user_id, packet)
+                .forward_to_peers(&channel_id, &sender.user_id, packet, level)
                 .await;
         }
         Ok(())
@@ -448,7 +448,7 @@ impl PacketRouter {
             }
             if let Some(cascade) = self.cascade.as_ref().filter(|_| channel.relays_to_peers()) {
                 cascade
-                    .forward_to_peers(&channel_id, &sender.user_id, &packet)
+                    .forward_to_peers(&channel_id, &sender.user_id, &packet, level)
                     .await;
             }
             per_channel.push((channel, packet));
@@ -466,8 +466,13 @@ impl PacketRouter {
     }
 
     /// Inject a packet relayed from another node (already authenticated by the cascade layer);
-    /// `sender` is the remote participant it originates from.
-    pub async fn route_relayed_audio(&self, sender: &UserId, packet: &AurixPacket) -> Result<()> {
+    /// `sender` is the remote participant it originates from. The origin node re-attaches the
+    /// sender-reported level for ambient ranking; it is stripped again before delivery.
+    pub async fn route_relayed_audio(
+        &self,
+        sender: &UserId,
+        mut packet: AurixPacket,
+    ) -> Result<()> {
         let channel_id = match self
             .shared
             .channels_by_hash
@@ -480,11 +485,12 @@ impl PacketRouter {
             Some(c) => c.value().clone(),
             None => return Ok(()),
         };
+        let level = packet.take_audio_level();
         if !packet.header.has_flag(PacketFlags::E2ee) {
-            self.tap_sink(&channel, *sender, packet.header.ssrc, packet);
+            self.tap_sink(&channel, *sender, packet.header.ssrc, &packet);
         }
-        let receivers = channel.get_receivers_for_relayed_audio(sender);
-        self.deliver(&channel, receivers, packet).await;
+        let receivers = channel.get_receivers_for_relayed_audio(sender, level);
+        self.deliver(&channel, receivers, &packet).await;
         Ok(())
     }
 
@@ -531,7 +537,7 @@ impl PacketRouter {
             }
             if let Some(cascade) = self.cascade.as_ref().filter(|_| channel.relays_to_peers()) {
                 cascade
-                    .forward_to_peers(channel_id, &sender.user_id, &packet)
+                    .forward_to_peers(channel_id, &sender.user_id, &packet, None)
                     .await;
             }
             self.fan_out(&channel, sender, &packet).await;

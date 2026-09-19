@@ -458,6 +458,10 @@ pub struct ChannelConfig {
     pub complexity: Option<u8>,
     pub positional_config: Option<PositionalConfig>,
     pub audio_profile: AudioProfile,
+    /// Cocktail-party mixing: each receiver hears at most `max_voices` speakers at their
+    /// computed gain, every other concurrent speaker at `ambient_gain` (`0` drops them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambient: Option<AmbientConfig>,
     pub recording_enabled: bool,
     /// Transcribe participants' speech (when `[stt]` is configured on the node) and deliver
     /// `Transcript` events to the channel's participants.
@@ -485,6 +489,7 @@ impl Default for ChannelConfig {
             complexity: None,
             positional_config: None,
             audio_profile: AudioProfile::Voice,
+            ambient: None,
             recording_enabled: false,
             transcription: false,
             safety_voice: false,
@@ -530,6 +535,12 @@ impl ChannelConfig {
         }
         if self.complexity.is_some_and(|c| c > 10) {
             return Err("complexity must be within 0..=10".into());
+        }
+        if let Some(p) = &self.positional_config {
+            p.validate()?;
+        }
+        if let Some(a) = &self.ambient {
+            a.validate()?;
         }
         Ok(())
     }
@@ -658,6 +669,15 @@ pub struct PositionalConfig {
     pub directional: bool,
     /// Handedness of the game's world coordinates, needed to tell left from right.
     pub coordinate_system: CoordinateSystem,
+    /// Radius-based presence: two participants see each other (roster, join/leave, speaking,
+    /// energy, typing, mute state, positions) only while closer than this. `None`: the whole
+    /// channel is visible. A pair drops out of sight again at `roster_radius × 1.1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roster_radius: Option<f32>,
+    /// Channel text messages reach only participants within this distance of the sender.
+    /// `None`: every member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_radius: Option<f32>,
 }
 
 impl Default for PositionalConfig {
@@ -669,7 +689,78 @@ impl Default for PositionalConfig {
             max_radius: 100.0,
             directional: true,
             coordinate_system: CoordinateSystem::LeftHanded,
+            roster_radius: None,
+            text_radius: None,
         }
+    }
+}
+
+impl PositionalConfig {
+    /// Hysteresis applied when a visible pair separates: they stay in each other's roster
+    /// until `roster_radius × ROSTER_EXIT_FACTOR`.
+    pub const ROSTER_EXIT_FACTOR: f32 = 1.1;
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        fn positive(name: &str, v: f32) -> std::result::Result<(), String> {
+            if v.is_finite() && v > 0.0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "positional_config.{name} must be a positive number"
+                ))
+            }
+        }
+        positive("near_distance", self.near_distance)?;
+        positive("far_distance", self.far_distance)?;
+        positive("max_radius", self.max_radius)?;
+        if self.far_distance < self.near_distance {
+            return Err("positional_config.far_distance must be >= near_distance".into());
+        }
+        if let Some(r) = self.roster_radius {
+            positive("roster_radius", r)?;
+        }
+        if let Some(r) = self.text_radius {
+            positive("text_radius", r)?;
+        }
+        Ok(())
+    }
+
+    /// Distance at which a visible pair stops seeing each other.
+    pub fn roster_exit_radius(&self) -> Option<f32> {
+        self.roster_radius.map(|r| r * Self::ROSTER_EXIT_FACTOR)
+    }
+}
+
+/// Cocktail-party mode ([`ChannelConfig::ambient`]). Speakers are ranked per receiver by the
+/// gain they would be heard at (distance attenuation × local volume × focus); the top
+/// `max_voices` are delivered as computed, the rest multiplied by `ambient_gain`. A speaker
+/// that already holds a slot keeps it until a challenger is clearly louder, so slots do not
+/// flap between equally loud voices.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AmbientConfig {
+    pub max_voices: u8,
+    pub ambient_gain: f32,
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        Self {
+            max_voices: 4,
+            ambient_gain: 0.15,
+        }
+    }
+}
+
+impl AmbientConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.max_voices == 0 {
+            return Err("ambient.max_voices must be >= 1".into());
+        }
+        if !self.ambient_gain.is_finite() || !(0.0..=1.0).contains(&self.ambient_gain) {
+            return Err("ambient.ambient_gain must be within 0.0..=1.0".into());
+        }
+        Ok(())
     }
 }
 

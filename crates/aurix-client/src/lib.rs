@@ -40,7 +40,7 @@ pub use aurix_common::types::{
 pub use client::{Client, ClientStats, TransmitStats};
 pub use config::{ClientConfig, ReconnectPolicy};
 pub use error::{ClientError, Result};
-pub use events::{ConnectionState, Event, Participant, RequestId, SessionInfo};
+pub use events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
 pub use media::{IncomingAudio, MediaStats};
 pub use regions::{GeoLocation, ProbedRegion, Region, RegionEndpoint, RegionsResponse};
 

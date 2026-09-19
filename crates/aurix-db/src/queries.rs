@@ -939,6 +939,29 @@ pub async fn get_channel_members(
     .await
 }
 
+/// Active members of a channel with their display name and the node hosting their session
+/// (for the roster a joining participant receives, including members on other nodes).
+pub async fn get_channel_roster(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+) -> Result<Vec<ChannelRosterRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChannelRosterRow>(
+        r#"SELECT m.user_id, m.session_id, s.media_node_id, u.display_name, m.role,
+                  m.is_muted, m.is_server_muted, m.ssrc
+           FROM channel_memberships m
+           JOIN channels c ON c.id = m.channel_id
+           JOIN sessions s ON s.id = m.session_id
+           JOIN users u ON u.id = m.user_id
+           WHERE c.app_id = $1 AND m.channel_id = $2 AND m.left_at IS NULL
+             AND s.disconnected_at IS NULL"#,
+    )
+    .bind(app_id)
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn set_server_mute(
     pool: &DbPool,
     app_id: Uuid,

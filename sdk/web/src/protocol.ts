@@ -191,12 +191,23 @@ export type ServerMessage =
         transcription?: boolean;
         safety_voice?: boolean;
         audio?: AudioPolicyWire;
+        /** Presence is scoped to this distance (positional channel); absent = whole channel. */
+        roster_radius?: number;
+        /** Channel text reaches only members within this distance; absent = whole channel. */
+        text_radius?: number;
       };
     }
   | { type: 'ChannelAudioPolicy'; data: { channel_id: string; audio: AudioPolicyWire } }
   | {
       type: 'ParticipantJoined';
-      data: { channel_id: string; user_id: string; display_name: string; ssrc: number };
+      data: {
+        channel_id: string;
+        user_id: string;
+        display_name: string;
+        ssrc: number;
+        role?: ParticipantBrief['role'];
+        is_muted?: boolean;
+      };
     }
   | { type: 'ParticipantLeft'; data: { channel_id: string; user_id: string } }
   | {

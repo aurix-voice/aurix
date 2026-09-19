@@ -41,8 +41,8 @@ connection simply yields a new session and the client must re-join its channels.
 
 | Client → server | Server → client | Notes |
 | --- | --- | --- |
-| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, transcription, safety_voice, audio }` | `token` = player JWT listing the channel, or a `join` action token |
-| `ChannelLeave { channel_id }` | `ParticipantJoined { channel_id, user_id, display_name, ssrc }`, `ParticipantLeft` | roster; `ssrc` identifies the sender's AURX packets |
+| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, transcription, safety_voice, audio, roster_radius?, text_radius? }` | `token` = player JWT listing the channel, or a `join` action token; the radii are present only for [radius-scoped](../features/channels.md#radius-scoped-presence-and-text) positional channels |
+| `ChannelLeave { channel_id }` | `ParticipantJoined { channel_id, user_id, display_name, ssrc, role, is_muted }`, `ParticipantLeft` | roster; `ssrc` identifies the sender's AURX packets; in a radius-scoped channel these also report players moving in and out of `roster_radius` |
 | — | `MediaBound { session_id }` | the UDP `SessionBind` was accepted |
 | — | `SessionClose { session_id, reason }`, `Kick { channel_id, user_id, reason }` | session is gone / removed from a channel |
 | — | `MuteStateChanged { channel_id, user_id, muted, server_muted }` | sender-side and moderator mutes (never receiver-local ones) |

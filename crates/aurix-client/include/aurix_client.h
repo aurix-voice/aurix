@@ -539,6 +539,23 @@ typedef struct AurixTtsStatus {
 } AurixTtsStatus;
 
 /**
+ * How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
+ * `text_radius`). A radius `<= 0` means "the whole channel".
+ */
+typedef struct AurixChannelScope {
+  /**
+   * The roster only lists members within this distance of us (once both positions are
+   * known); `ParticipantJoined`/`ParticipantLeft` also fire when someone moves in or out
+   * of range (leaving uses a 10 % wider radius so the edge does not flicker).
+   */
+  float roster_radius;
+  /**
+   * Channel chat, typing and transcripts reach only members within this distance.
+   */
+  float text_radius;
+} AurixChannelScope;
+
+/**
  * A channel's audio policy as set by the operator (`ChannelConfig`), merged across the
  * joined channels. `complexity < 0` = no hint.
  */
@@ -905,6 +922,19 @@ bool aurix_client_channel_transcribes(const struct AurixClient *client,
  */
 bool aurix_client_channel_monitored(const struct AurixClient *client,
                                     const struct AurixUuid *channel_id);
+
+/**
+ * Presence / text range of a joined channel; `false` (and `out` untouched) until its join
+ * is acknowledged.
+ */
+bool aurix_client_channel_scope(const struct AurixClient *client,
+                                const struct AurixUuid *channel_id,
+                                struct AurixChannelScope *out);
+
+/**
+ * `ChannelJoined` only: the channel's presence / text range (zeros for other events).
+ */
+struct AurixChannelScope aurix_event_channel_scope(const struct AurixEvent *event);
 
 /**
  * Copy up to `capacity` participants of `channel_id`; returns the total count.

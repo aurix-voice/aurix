@@ -217,6 +217,8 @@ pub struct MediaSession {
     pub codec: RwLock<AudioCodec>,
     /// μ-law → Opus encoder state while `codec == Pcmu`.
     pub pcmu_uplink: Mutex<Option<crate::transcode::PcmuUplink>>,
+    /// Cocktail-party slot table of this receiver (`ChannelConfig::ambient`).
+    pub ambient: Mutex<crate::ambient::AmbientState>,
     pub sequence: AtomicU32,
     /// Sequence counter for server-originated packets addressed to this session
     /// (acks, commands); keeps their encryption IVs unique under the session key.
@@ -278,6 +280,7 @@ impl MediaSession {
             transmission: RwLock::new(TransmissionMode::All),
             codec: RwLock::new(AudioCodec::Opus),
             pcmu_uplink: Mutex::new(None),
+            ambient: Mutex::new(crate::ambient::AmbientState::default()),
             sequence: AtomicU32::new(0),
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
@@ -362,6 +365,8 @@ impl MediaSession {
     pub fn leave_channel(&self, channel_id: &ChannelId) {
         let mut channels = self.channels.write();
         channels.retain(|c| c != channel_id);
+        drop(channels);
+        self.ambient.lock().forget_channel(channel_id);
     }
 
     /// Drops routing state that referenced `channel_id`: a `Single` transmission targeting it

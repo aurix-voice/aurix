@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
 
+fn default_participant_role() -> ChannelRole {
+    ChannelRole::Speaker
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "payload")]
 pub enum ServerEvent {
@@ -15,6 +19,8 @@ pub enum ServerEvent {
         session_id: SessionId,
         #[serde(default)]
         ssrc: u32,
+        #[serde(default = "default_participant_role")]
+        role: ChannelRole,
         timestamp: DateTime<Utc>,
     },
     ParticipantLeft {
@@ -207,6 +213,15 @@ pub enum ServerEvent {
         channel_id: ChannelId,
         levels: Vec<aurix_common::protocol::ParticipantEnergy>,
     },
+    /// Poses of channel members hosted on `origin`, so every node of the cascade can apply
+    /// positional audio, roster and text radii to relayed audio and cross-node presence.
+    /// Node-scoped: never exported to webhooks/SSE.
+    ParticipantPositions {
+        app_id: AppId,
+        channel_id: ChannelId,
+        origin: MediaNodeId,
+        positions: Vec<aurix_common::protocol::UserPosition>,
+    },
     /// Speech-to-text segment produced by the media node hosting the speaker, for a channel
     /// with `transcription` enabled. Every node delivers it to its local channel members that
     /// opted in; it is not stored.
@@ -299,6 +314,7 @@ impl ServerEvent {
             | Self::ParticipantTyping { app_id, .. }
             | Self::ParticipantSpeaking { app_id, .. }
             | Self::ChannelEnergy { app_id, .. }
+            | Self::ParticipantPositions { app_id, .. }
             | Self::Transcript { app_id, .. }
             | Self::TtsAnnouncement { app_id, .. }
             | Self::TtsStatus { app_id, .. }
@@ -315,6 +331,7 @@ impl ServerEvent {
             Self::ParticipantTyping { .. }
                 | Self::ParticipantSpeaking { .. }
                 | Self::ChannelEnergy { .. }
+                | Self::ParticipantPositions { .. }
         )
     }
 
@@ -353,6 +370,7 @@ impl ServerEvent {
             Self::NodeHealthChanged { .. }
             | Self::WebhooksChanged { .. }
             | Self::RecordingConsentGiven { .. }
+            | Self::ParticipantPositions { .. }
             | Self::TtsAnnouncement { .. } => return None,
         })
     }

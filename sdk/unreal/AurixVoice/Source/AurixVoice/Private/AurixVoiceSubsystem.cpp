@@ -518,6 +518,19 @@ bool UAurixVoiceSubsystem::IsChannelMonitored(FGuid ChannelId) const
 	return Native && Native->Client.channel_monitored(ToUuid(ChannelId));
 }
 
+bool UAurixVoiceSubsystem::GetChannelScope(FGuid ChannelId, FAurixChannelScope& OutScope) const
+{
+	AurixChannelScope Raw;
+	if (!Native || !Native->Client.channel_scope(ToUuid(ChannelId), Raw))
+	{
+		OutScope = FAurixChannelScope();
+		return false;
+	}
+	OutScope.RosterRadius = Raw.roster_radius;
+	OutScope.TextRadius = Raw.text_radius;
+	return true;
+}
+
 bool UAurixVoiceSubsystem::GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const
 {
 	OutUserId.Invalidate();

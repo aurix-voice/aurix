@@ -448,6 +448,17 @@ impl AurixPacket {
         Some(level)
     }
 
+    /// Copy of this plain audio packet with the `Energy` flag and `level` byte re-attached
+    /// (the inverse of [`Self::take_audio_level`]), for hops that rank speakers by loudness.
+    pub fn with_audio_level(&self, level: u8) -> Self {
+        let mut header = self.header.clone();
+        header.flags |= PacketFlags::Energy as u16;
+        let mut payload = BytesMut::with_capacity(1 + self.payload.len());
+        payload.put_u8(level.min(AUDIO_LEVEL_SILENCE));
+        payload.put_slice(&self.payload);
+        Self::new(header, payload.freeze())
+    }
+
     /// Header and payload of the downlink copy of this audio packet for one receiver: the gain
     /// byte is prepended when `volume` is not unity, the direction bytes when `direction` is
     /// given (`VolumeAttenuated` / `Directional` flags set accordingly).
@@ -794,6 +805,15 @@ pub enum ControlMessage {
         /// Encoder settings this channel requires; merge over all joined channels.
         #[serde(default)]
         audio: AudioPolicy,
+        /// Presence is radius-scoped (`PositionalConfig.roster_radius`): `participants` and
+        /// later `ParticipantJoined`/`ParticipantLeft` reflect who is within this distance of
+        /// you, and members appear only once both of you reported a position.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roster_radius: Option<f32>,
+        /// Channel text (chat, typing, transcripts) only reaches members within this distance
+        /// of the sender (`PositionalConfig.text_radius`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_radius: Option<f32>,
     },
     /// Server→client: an operator changed the channel's audio settings while you are in it.
     ChannelAudioPolicy {
@@ -808,6 +828,10 @@ pub enum ControlMessage {
         user_id: UserId,
         display_name: String,
         ssrc: u32,
+        #[serde(default = "default_participant_role")]
+        role: ChannelRole,
+        #[serde(default)]
+        is_muted: bool,
     },
     ParticipantLeft {
         channel_id: ChannelId,
@@ -1200,6 +1224,10 @@ pub struct UserPosition {
     pub user_id: UserId,
     pub position: Position3D,
     pub orientation: Orientation3D,
+}
+
+fn default_participant_role() -> ChannelRole {
+    ChannelRole::Speaker
 }
 
 #[cfg(test)]
