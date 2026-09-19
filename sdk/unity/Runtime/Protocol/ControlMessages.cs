@@ -58,6 +58,33 @@ namespace Aurix.Protocol
     }
 
     /// <summary>
+    /// One text-chat message. Exactly one of <see cref="ChannelId"/> / <see cref="ToUserId"/> is set.
+    /// <see cref="FromUserId"/> is <see cref="SystemUserId"/> for messages injected by the game server
+    /// through the REST API. <see cref="ClientRef"/> is only present on the sender's own echo.
+    /// </summary>
+    public sealed class ChatMessage
+    {
+        /// <summary><c>from_user_id</c> of server-injected system messages (nil UUID).</summary>
+        public static readonly Guid SystemUserId = Guid.Empty;
+
+        public Guid Id;
+        public Guid? ChannelId;
+        public Guid FromUserId;
+        public string DisplayName;
+        public Guid? ToUserId;
+        public string Text;
+        /// <summary>Game payload as parsed JSON (<c>Dictionary&lt;string, object&gt;</c>, <c>List&lt;object&gt;</c>, string, double, bool) or null.</summary>
+        public object Metadata;
+        public DateTimeOffset SentAt;
+        public string ClientRef;
+
+        public bool IsSystem => FromUserId == SystemUserId;
+        public bool IsDirect => ToUserId.HasValue;
+        /// <summary>Echo of a message this client sent (the server returns <c>client_ref</c> only to the sender).</summary>
+        public bool IsOwn => ClientRef != null;
+    }
+
+    /// <summary>
     /// One WebSocket control message: <c>{"type": "&lt;Variant&gt;", "data": {...}}</c>, mirroring the
     /// Rust <c>ControlMessage</c> enum. <see cref="Data"/> is the raw parsed <c>data</c> object; typed
     /// accessors are provided for the variants the client consumes.
@@ -183,6 +210,27 @@ namespace Aurix.Protocol
             return prefs;
         }
 
+        /// <summary>Typed view of a <c>ChatMessageReceived</c> payload (<c>data.message</c>); null if absent.</summary>
+        public ChatMessage ChatMessage()
+        {
+            var o = MiniJson.AsObject(Data != null && Data.TryGetValue("message", out var v) ? v : null);
+            if (o == null) return null;
+            var sentAt = MiniJson.GetString(o, "sent_at");
+            return new ChatMessage
+            {
+                Id = MiniJson.GetGuid(o, "id") ?? Guid.Empty,
+                ChannelId = MiniJson.GetGuid(o, "channel_id"),
+                FromUserId = MiniJson.GetGuid(o, "from_user_id") ?? Guid.Empty,
+                DisplayName = MiniJson.GetString(o, "display_name") ?? string.Empty,
+                ToUserId = MiniJson.GetGuid(o, "to_user_id"),
+                Text = MiniJson.GetString(o, "text") ?? string.Empty,
+                Metadata = o.TryGetValue("metadata", out var md) ? md : null,
+                SentAt = sentAt != null && DateTimeOffset.TryParse(sentAt, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTimeOffset.MinValue,
+                ClientRef = MiniJson.GetString(o, "client_ref"),
+            };
+        }
+
         public static string ConsentToWire(RecordingConsent c)
         {
             switch (c)
@@ -256,6 +304,25 @@ namespace Aurix.Protocol
 
         public static string SetUserBlock(Guid userId, bool blocked) =>
             Serialize("SetUserBlock", new Dictionary<string, object> { { "user_id", userId }, { "blocked", blocked } });
+
+        public static string ChatSend(Guid channelId, string text, object metadata, string clientRef)
+        {
+            var d = new Dictionary<string, object> { { "channel_id", channelId }, { "text", text } };
+            if (metadata != null) d["metadata"] = metadata;
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("ChatSend", d);
+        }
+
+        public static string ChatSendDirect(Guid userId, string text, object metadata, string clientRef)
+        {
+            var d = new Dictionary<string, object> { { "user_id", userId }, { "text", text } };
+            if (metadata != null) d["metadata"] = metadata;
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("ChatSendDirect", d);
+        }
+
+        public static string ChatTyping(Guid channelId, bool typing) =>
+            Serialize("ChatTyping", new Dictionary<string, object> { { "channel_id", channelId }, { "typing", typing } });
 
         public static string PositionUpdate(Guid channelId, Guid userId, Position3D pos, Orientation3D ori) =>
             Serialize("PositionUpdate", new Dictionary<string, object>

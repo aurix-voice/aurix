@@ -88,3 +88,18 @@ requests_per_second = 100
 burst_size = 200
 channel_joins_per_minute = 30
 messages_per_second = 50
+
+# Lightweight in-game text chat over the control WebSocket (channel + directed messages,
+# typing). History is optional and off by default; the filter webhook is the moderation hook.
+[chat]
+enabled = true
+max_message_bytes = 1024
+messages_per_second = 2
+message_burst = 10
+typing_interval_ms = 1500
+server_mute_blocks_text = true
+# filter_webhook = "https://moderation.example.com/aurix/chat"
+filter_timeout_ms = 1500
+filter_fail_open = false
+persist = false
+retention_days = 30

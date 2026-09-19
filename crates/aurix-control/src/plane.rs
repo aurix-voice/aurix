@@ -2,6 +2,7 @@ use crate::action_tokens::{ActionTokenService, PendingClaim};
 use crate::analytics::AnalyticsCollector;
 use crate::block_manager::BlockManager;
 use crate::channel_manager::ChannelManager;
+use crate::chat::ChatService;
 use crate::event_bus::EventBus;
 use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
@@ -29,6 +30,7 @@ pub struct ControlPlane {
     pub sessions: Arc<SessionManager>,
     pub blocks: Arc<BlockManager>,
     pub action_tokens: Arc<ActionTokenService>,
+    pub chat: Arc<ChatService>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -158,6 +160,12 @@ impl ControlPlane {
             redis.clone(),
             &config.auth,
         ));
+        let chat = Arc::new(ChatService::new(
+            config.chat.clone(),
+            pool.clone(),
+            events.clone(),
+        ));
+        chat.start_retention_sweep();
 
         Ok(Self {
             node_id,
@@ -171,6 +179,7 @@ impl ControlPlane {
             channels,
             sessions,
             action_tokens,
+            chat,
             blocks,
             events,
             audit,

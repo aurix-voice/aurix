@@ -240,7 +240,7 @@ async fn setup_session(args: &Args, token: String, channel_id: ChannelId) -> Res
         let remaining = deadline.saturating_duration_since(Instant::now());
         match recv_control(&mut s, remaining).await? {
             ControlMessage::ChannelJoinAck { .. } => return Ok(s),
-            ControlMessage::Error { code, message } => {
+            ControlMessage::Error { code, message, .. } => {
                 return Err(anyhow!("join rejected: {code} {message}"))
             }
             _ => continue,

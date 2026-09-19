@@ -15,6 +15,13 @@
   #roster li.speaking { background: #2c82; }
   #roster li.muted { opacity: .6; }
   #log { height: 12rem; overflow: auto; font: 12px/1.35 ui-monospace, monospace; background: #0001; padding: .5rem; white-space: pre-wrap; }
+  #chat { height: 10rem; overflow: auto; background: #0001; padding: .5rem; }
+  #chat div { margin: .15rem 0; }
+  #chat .own { opacity: .75; }
+  #chat .system { font-style: italic; }
+  #chat .direct { color: #c70; }
+  #chat .failed { text-decoration: line-through; color: #c33; }
+  #typing { min-height: 1.2em; font-size: .85em; opacity: .7; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
   .status { font-weight: 600; }
   details summary { cursor: pointer; }
@@ -57,6 +64,13 @@
 <fieldset>
   <legend>Participants</legend>
   <ul id="roster"></ul>
+</fieldset>
+
+<fieldset>
+  <legend>Text chat</legend>
+  <div id="chat"></div>
+  <div id="typing"></div>
+  <label>Message (<code>/w &lt;user-id&gt; text</code> sends a directed message) <input id="msg" placeholder="say something" disabled></label>
 </fieldset>
 
 <fieldset>
@@ -117,7 +131,53 @@ function setButtons(connected, joined) {
   $('leave').disabled = !joined;
   $('mute').disabled = !connected;
   $('disconnect').disabled = !connected;
+  $('msg').disabled = !joined;
 }
+
+const typingUsers = new Map();
+function renderTyping() {
+  const names = [...typingUsers.keys()].map((u) => {
+    for (const ch of client.joinedChannels()) for (const p of client.participants(ch)) if (p.userId === u) return p.displayName;
+    return u.slice(0, 8);
+  });
+  $('typing').textContent = names.length ? `${names.join(', ')} typing…` : '';
+}
+
+function appendChat(m, cls) {
+  const div = document.createElement('div');
+  div.className = cls;
+  div.dataset.ref = m.clientRef ?? '';
+  const when = m.sentAt.toLocaleTimeString();
+  const who = m.system ? 'server' : m.displayName;
+  const dm = m.toUserId ? ` → ${m.toUserId.slice(0, 8)}` : '';
+  div.textContent = `[${when}] ${who}${dm}: ${m.text}${m.metadata ? ' ' + JSON.stringify(m.metadata) : ''}`;
+  $('chat').appendChild(div);
+  $('chat').scrollTop = 1e9;
+  return div;
+}
+
+$('msg').addEventListener('input', () => {
+  const ch = client?.joinedChannels()[0];
+  if (ch) client.setTyping(ch, $('msg').value.length > 0);
+});
+$('msg').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter' || !$('msg').value.trim()) return;
+  const text = $('msg').value.trim();
+  $('msg').value = '';
+  const ch = client.joinedChannels()[0];
+  const dm = /^\/w\s+(\S+)\s+(.+)$/s.exec(text);
+  const optimistic = appendChat({ displayName: 'me', text: dm ? dm[2] : text, sentAt: new Date(), toUserId: dm?.[1] }, 'own pending');
+  try {
+    if (dm) await client.sendDirectMessage(dm[1], dm[2]);
+    else await client.sendMessage(ch, text);
+    optimistic.remove();
+  } catch (err) {
+    optimistic.className = 'failed';
+    optimistic.title = err.message;
+    log('send failed:', err.message);
+  }
+  client.setTyping(ch, false);
+});
 
 $('connect').onclick = async () => {
   client = new AurixClient({ apiUrl: $('api').value, wsUrl: $('ws').value, token: $('token').value.trim() });
@@ -142,6 +202,13 @@ $('connect').onclick = async () => {
   client.on('recovered', (i) => log(i.resumed ? 'session resumed' : 'fresh session, channels re-joined', i.sessionId));
   client.on('failedToRecover', (e) => log('gave up reconnecting:', e.message));
   client.on('sessionClosed', (why) => log('session closed by server:', why));
+  client.on('chatMessage', (m) => appendChat(m, (m.own ? 'own ' : '') + (m.system ? 'system ' : '') + (m.toUserId ? 'direct' : '')));
+  client.on('participantTyping', (ch, u, typing) => {
+    clearTimeout(typingUsers.get(u));
+    if (typing) typingUsers.set(u, setTimeout(() => { typingUsers.delete(u); renderTyping(); }, 4000));
+    else typingUsers.delete(u);
+    renderTyping();
+  });
   client.on('serverError', (code, msg) => log('server error', code, msg));
   client.on('error', (e) => log('error', e.message));
   try {

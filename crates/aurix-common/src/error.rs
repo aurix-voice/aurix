@@ -88,6 +88,17 @@ pub enum AurixError {
 
     #[error("Not found: {0}")]
     NotFound(String),
+
+    /// Text chat is disabled on this node.
+    #[error("Chat disabled")]
+    ChatDisabled,
+
+    /// Message rejected by the content filter.
+    #[error("Message blocked: {0}")]
+    MessageBlocked(String),
+
+    #[error("User is not online")]
+    UserOffline,
 }
 
 impl AurixError {
@@ -145,6 +156,9 @@ impl AurixError {
             Self::NotFound(_) => 404,
             Self::NotImplemented(_) => 501,
             Self::MediaNodeUnavailable(_) => 503,
+            Self::ChatDisabled => 404,
+            Self::MessageBlocked(_) => 422,
+            Self::UserOffline => 404,
             _ => 500,
         }
     }
@@ -180,6 +194,9 @@ impl AurixError {
             Self::Conflict(_) => "CONFLICT",
             Self::Timeout(_) => "TIMEOUT",
             Self::NotFound(_) => "NOT_FOUND",
+            Self::ChatDisabled => "CHAT_DISABLED",
+            Self::MessageBlocked(_) => "MESSAGE_BLOCKED",
+            Self::UserOffline => "USER_OFFLINE",
         }
     }
 }

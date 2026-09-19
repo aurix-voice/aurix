@@ -4,6 +4,7 @@ use crate::state::AppState;
 use aurix_auth::ValidatedToken;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
+use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use axum::{
     extract::{Extension, State},
@@ -700,6 +701,143 @@ fn publish_block_change(
         });
 }
 
+// ── Text chat ──
+
+#[derive(Deserialize)]
+pub struct ChatHistoryQuery {
+    /// Return messages sent strictly before this timestamp (RFC 3339); newest first.
+    pub before: Option<chrono::DateTime<Utc>>,
+    pub limit: Option<i64>,
+}
+
+fn history_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
+pub async fn list_channel_messages(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<ChatHistoryQuery>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let messages = state
+        .control
+        .chat
+        .channel_history(
+            ctx.app_id,
+            channel_id,
+            query.before,
+            history_limit(query.limit),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "messages": messages })))
+}
+
+pub async fn list_user_messages(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<ChatHistoryQuery>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let messages = state
+        .control
+        .chat
+        .user_history(
+            ctx.app_id,
+            user_id,
+            query.before,
+            history_limit(query.limit),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "messages": messages })))
+}
+
+/// Server-originated message (announcements, match events, invites). The sender is the
+/// nil `SYSTEM_USER`; `display_name` defaults to "Server".
+#[derive(Deserialize)]
+pub struct SystemMessageRequest {
+    pub text: String,
+    pub display_name: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+fn system_display_name(name: Option<String>) -> Result<String, ApiError> {
+    let name = name.unwrap_or_else(|| "Server".to_string());
+    let name = name.trim().to_string();
+    if name.is_empty() || name.len() > 64 {
+        return Err(AurixError::Validation("display_name must be 1..=64 characters".into()).into());
+    }
+    Ok(name)
+}
+
+pub async fn send_channel_message(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<SystemMessageRequest>,
+) -> JsonResult {
+    ctx.require("chat:write")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let message = state
+        .control
+        .chat
+        .accept(OutgoingMessage {
+            app_id: ctx.app_id,
+            channel_id: Some(channel_id),
+            to_user_id: None,
+            from_user_id: SYSTEM_USER,
+            display_name: system_display_name(req.display_name)?,
+            text: req.text,
+            metadata: req.metadata,
+            client_ref: None,
+            from_session_id: None,
+        })
+        .await?;
+    to_json(message)
+}
+
+pub async fn send_user_message(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<SystemMessageRequest>,
+) -> JsonResult {
+    ctx.require("chat:write")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let message = state
+        .control
+        .chat
+        .accept(OutgoingMessage {
+            app_id: ctx.app_id,
+            channel_id: None,
+            to_user_id: Some(user_id),
+            from_user_id: SYSTEM_USER,
+            display_name: system_display_name(req.display_name)?,
+            text: req.text,
+            metadata: req.metadata,
+            client_ref: None,
+            from_session_id: None,
+        })
+        .await?;
+    to_json(message)
+}
+
 // ── Moderation ──
 
 #[derive(Deserialize)]
@@ -1221,6 +1359,8 @@ const KNOWN_PERMISSIONS: &[&str] = &[
     "moderation:write",
     "recordings:read",
     "recordings:write",
+    "chat:read",
+    "chat:write",
     "keys:manage",
     "analytics:read",
     "audit:read",

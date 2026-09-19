@@ -146,6 +146,39 @@ required once the server hands out a new session). `ModerateAsync` completes on
 `ModerateParticipantAck` and otherwise throws `InvalidOperationException("<CODE>: <message>")`
 with the server's error code (`TOKEN_REUSED`, `ACTION_TOKEN_REQUIRED`, `AUTH_DENIED`, …).
 
+### Text chat (lite)
+
+Party/team text, `/`-commands and map pings ride on the control WebSocket: channel messages to
+channels you are a member of, directed messages to a user who is online in the same app, and
+typing indicators. No history, no offline delivery, no read state. Persistent blocks
+(`SetUserBlockedAsync`) suppress text like voice, both ways.
+
+```csharp
+client.OnChatMessage += m =>
+{
+    // m.IsOwn — my echo (the send task completes with the same object), m.IsSystem — from the
+    // server (POST /v1/channels/:id/messages, FromUserId == ChatMessage.SystemUserId),
+    // m.IsDirect — DM; m.Metadata is the parsed JSON (Dictionary<string, object> / List<object>)
+    ui.Append(m.ChannelId, m.DisplayName, m.Text, m.SentAt);
+};
+client.OnParticipantTyping += (channelId, userId, typing) => ui.ShowTyping(userId, typing);
+
+var sent = await client.SendMessageAsync(channelId, "gg",
+    metadata: new Dictionary<string, object> { { "ping", new Dictionary<string, object> { { "x", 12.5 }, { "y", 8.0 } } } },
+    clientRef: localId);                              // optional; echoed only to you → reconcile optimistic UI
+await client.SendDirectMessageAsync(userId, "psst");  // target must be online in this app
+await client.SetTypingAsync(channelId, true);         // call on every keystroke; coalesced to one frame per 1.5 s
+await client.SetTypingAsync(channelId, false);        // always sent
+```
+
+The tasks complete with the server-stamped message (`Id`, `SentAt`) and otherwise throw
+`InvalidOperationException("<CODE>: <message>")`: `AUTH_DENIED` (not a member, or a block between
+the two users), `USER_MUTED` (server-muted while `chat.server_mute_blocks_text`),
+`VALIDATION_ERROR` (empty, too long, control characters, self-DM), `USER_OFFLINE`,
+`RATE_LIMIT_EXCEEDED` (anti-flood, per session), `MESSAGE_BLOCKED` (content filter),
+`CHAT_DISABLED`. Only the send whose `client_ref` the server echoes back fails; unrelated `Error`
+frames go to `OnServerError`. Events fire from `Update()` like everything else.
+
 ## .NET: build, test, end-to-end demo
 
 ```bash
@@ -168,6 +201,11 @@ channel), and once for good (the client must give up with `OnFailedToRecover`). 
 `--scenario prefs` checks receiver-local mute / volume / block end to end over real UDP: bob mutes alice in the
 channel and everywhere (0 packets), unmutes (audio resumes), sets volume 0.5 and 2.0 (volume byte decodes to
 0.5 / ≈1.99), blocks her (silence, persisted into a fresh session, alice never notified) and unblocks.
+
+`--scenario chat` exercises text over the real control connection: channel message with metadata (sender echo
+with `client_ref`, recipient copy without), rejections carried back to the right send (empty text, self-DM,
+offline target), a directed message, typing coalescing (3 calls → 1 frame, origin never notified) and the
+anti-flood limit (a 14-message burst: `message_burst` accepted, the rest `RATE_LIMIT_EXCEEDED`, none hanging).
 
 ## Notes
 

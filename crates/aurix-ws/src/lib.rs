@@ -15,8 +15,11 @@
 use aurix_auth::{JwtService, ValidatedToken};
 use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
-use aurix_common::protocol::{ControlMessage, LocalMute, ParticipantBrief, ParticipantVolume};
+use aurix_common::protocol::{
+    ChatMessage, ControlMessage, LocalMute, ParticipantBrief, ParticipantVolume,
+};
 use aurix_common::types::*;
+use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::{ActionTokenService, ControlPlane, ServerEvent};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
@@ -405,6 +408,22 @@ impl WsState {
                 } => {
                     self.apply_block_change(app_id, user_id, blocked_user_id, blocked);
                 }
+                ServerEvent::ChatMessage {
+                    app_id,
+                    message,
+                    from_session_id,
+                } => {
+                    self.deliver_chat(app_id, message, from_session_id);
+                }
+                ServerEvent::ParticipantTyping {
+                    app_id,
+                    channel_id,
+                    user_id,
+                    session_id,
+                    typing,
+                } => {
+                    self.deliver_typing(app_id, channel_id, user_id, session_id, typing);
+                }
                 ServerEvent::UserKicked {
                     app_id,
                     channel_id,
@@ -529,6 +548,112 @@ impl WsState {
         };
         for sid in self.sessions_of_user(app_id, user_id) {
             self.send_to_session(&sid, &ack);
+        }
+    }
+
+    /// Whether `session_id` may receive text from `sender` (no persistent block either way).
+    fn text_allowed(&self, session_id: &SessionId, sender: &UserId) -> bool {
+        let sfu = self.sfu.read();
+        match sfu.get_session(session_id) {
+            Some(s) => !s.prefs.read().is_blocked_either_way(sender),
+            None => true,
+        }
+    }
+
+    /// Local delivery of an accepted chat message: channel members (or the target user's
+    /// sessions) that have no block relationship with the sender, plus the sender's own echo
+    /// carrying `client_ref`.
+    fn deliver_chat(
+        &self,
+        app_id: AppId,
+        message: ChatMessage,
+        from_session_id: Option<SessionId>,
+    ) {
+        let mut recipients: Vec<SessionId> = match (message.channel_id, message.to_user_id) {
+            (Some(channel_id), _) => self
+                .channel_members
+                .get(&channel_id)
+                .map(|m| m.iter().map(|s| *s).collect())
+                .unwrap_or_default(),
+            (None, Some(to)) => self.sessions_of_user(app_id, to),
+            (None, None) => return,
+        };
+        // Directed messages echo to every session of the sender (multi-device), channel
+        // messages already include the sender through channel membership.
+        if message.channel_id.is_none() && message.from_user_id != SYSTEM_USER {
+            for sid in self.sessions_of_user(app_id, message.from_user_id) {
+                if !recipients.contains(&sid) {
+                    recipients.push(sid);
+                }
+            }
+        }
+        let echo = ControlMessage::ChatMessageReceived {
+            message: message.clone(),
+        };
+        let plain = ControlMessage::ChatMessageReceived {
+            message: ChatMessage {
+                client_ref: None,
+                ..message.clone()
+            },
+        };
+        let (Ok(echo_json), Ok(plain_json)) =
+            (serde_json::to_string(&echo), serde_json::to_string(&plain))
+        else {
+            return;
+        };
+        for sid in recipients {
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            // Channel membership is per node and tenant-checked at join; the app filter here
+            // guards the (theoretical) case of a channel UUID reused across tenants.
+            if conn.app_id != app_id {
+                continue;
+            }
+            let is_sender = Some(sid) == from_session_id;
+            if !is_sender
+                && conn.user_id != message.from_user_id
+                && !self.text_allowed(&sid, &message.from_user_id)
+            {
+                continue;
+            }
+            let json = if is_sender { &echo_json } else { &plain_json };
+            let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    fn deliver_typing(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        session_id: SessionId,
+        typing: bool,
+    ) {
+        let Ok(json) = serde_json::to_string(&ControlMessage::ParticipantTyping {
+            channel_id,
+            user_id,
+            typing,
+        }) else {
+            return;
+        };
+        let Some(members) = self.channel_members.get(&channel_id) else {
+            return;
+        };
+        for sid in members.iter() {
+            if *sid == session_id {
+                continue;
+            }
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id
+                || conn.user_id == user_id
+                || !self.text_allowed(&sid, &user_id)
+            {
+                continue;
+            }
+            let _ = conn.tx.try_send(json.clone());
         }
     }
 
@@ -827,7 +952,7 @@ async fn open_session(
     user_agent: Option<&str>,
     tx: &mpsc::Sender<String>,
     resume_hash: [u8; 32],
-) -> Result<Attached, ControlMessage> {
+) -> Result<Attached, AurixError> {
     // One live session per user and node (`Sfu::create_session` tears down the media side of
     // any previous one): close its control side too so channels and DB memberships follow.
     for old in state.sessions_of_user(token.app_id, token.user_id) {
@@ -849,10 +974,7 @@ async fn open_session(
             token.display_name.clone(),
         )
     };
-    let media_session = created.map_err(|e| ControlMessage::Error {
-        code: e.error_code().into(),
-        message: e.public_message(),
-    })?;
+    let media_session = created?;
     match state
         .control
         .blocks
@@ -884,10 +1006,7 @@ async fn open_session(
             let sfu = state.sfu.read();
             let _ = sfu.destroy_session(&session_id);
         }
-        return Err(ControlMessage::Error {
-            code: "INTERNAL_ERROR".into(),
-            message: "Session could not be created".into(),
-        });
+        return Err(AurixError::Internal("Session could not be created".into()));
     }
 
     state.connections.insert(
@@ -980,6 +1099,7 @@ async fn handle_ws_connection(
                 &ControlMessage::Error {
                     code: "INTERNAL_ERROR".into(),
                     message: "Session could not be created".into(),
+                    client_ref: None,
                 },
             )
             .await;
@@ -1009,8 +1129,16 @@ async fn handle_ws_connection(
         .await
         {
             Ok(a) => a,
-            Err(err) => {
-                send_direct(&mut ws_sender, &err).await;
+            Err(e) => {
+                send_direct(
+                    &mut ws_sender,
+                    &ControlMessage::Error {
+                        code: e.error_code().into(),
+                        message: e.public_message(),
+                        client_ref: None,
+                    },
+                )
+                .await;
                 let _ = ws_sender.close().await;
                 return;
             }
@@ -1203,6 +1331,7 @@ async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: Use
         q
     };
     state.connections.remove(&session_id);
+    state.control.chat.forget_session(session_id);
     let _ = state
         .control
         .sessions
@@ -1223,9 +1352,19 @@ async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: Use
 }
 
 async fn send_error(tx: &mpsc::Sender<String>, code: &str, message: &str) {
+    send_error_ref(tx, code, message, None).await;
+}
+
+async fn send_error_ref(
+    tx: &mpsc::Sender<String>,
+    code: &str,
+    message: &str,
+    client_ref: Option<String>,
+) {
     let err = ControlMessage::Error {
         code: code.into(),
         message: message.into(),
+        client_ref,
     };
     let _ = tx
         .send(serde_json::to_string(&err).unwrap_or_default())
@@ -1250,6 +1389,83 @@ fn channel_role(
         return None;
     }
     Some(channel.get_role(&session.user_id))
+}
+
+/// Authorization and flow control for a client chat message, then hand-off to `ChatService`.
+/// Channel messages need active membership; directed ones an online target in the same app
+/// (live-only: no offline delivery) with no block between the two users.
+async fn send_chat(
+    state: &WsState,
+    session_id: SessionId,
+    msg: OutgoingMessage,
+) -> Result<(), AurixError> {
+    let chat = &state.control.chat;
+    if !chat.enabled() {
+        return Err(AurixError::ChatDisabled);
+    }
+    match (msg.channel_id, msg.to_user_id) {
+        (Some(channel_id), _) => {
+            if channel_role(state, &session_id, &channel_id).is_none() {
+                return Err(AurixError::AuthorizationDenied(
+                    "Not a member of this channel".into(),
+                ));
+            }
+        }
+        (None, Some(to)) if to == msg.from_user_id => {
+            return Err(AurixError::Validation("Cannot message yourself".into()));
+        }
+        (None, Some(to)) => {
+            let blocked = {
+                let sfu = state.sfu.read();
+                sfu.get_session(&session_id)
+                    .map(|s| s.prefs.read().is_blocked_either_way(&to))
+                    .unwrap_or(false)
+            };
+            if blocked {
+                return Err(AurixError::AuthorizationDenied(
+                    "Cannot message this user".into(),
+                ));
+            }
+        }
+        (None, None) => return Err(AurixError::Validation("No recipient".into())),
+    }
+    chat_sender_allowed(state, &session_id)?;
+    chat.validate(&msg.text, msg.metadata.as_ref())?;
+    chat.check_flood(session_id)?;
+    if let Some(to) = msg.to_user_id {
+        // Sessions of every node are in the DB, so this covers targets on other nodes.
+        let online = state
+            .control
+            .sessions
+            .get_active_sessions_for_user(to)
+            .await?
+            .iter()
+            .any(|s| s.app_id == msg.app_id.0);
+        if !online {
+            return Err(AurixError::UserOffline);
+        }
+    }
+    chat.accept(msg).await.map(|_| ())
+}
+
+/// A server-muted participant may not send text when `chat.server_mute_blocks_text` is set.
+fn chat_sender_allowed(state: &WsState, session_id: &SessionId) -> Result<(), AurixError> {
+    if !state.control.config.chat.server_mute_blocks_text {
+        return Ok(());
+    }
+    let muted = {
+        let sfu = state.sfu.read();
+        sfu.get_session(session_id)
+            .map(|s| s.is_server_muted.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+    if muted {
+        Err(AurixError::UserMuted(
+            "Server-muted participants cannot send text".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn handle_control_message(
@@ -1773,6 +1989,65 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::ChatSend {
+            channel_id,
+            text,
+            metadata,
+            client_ref,
+        } => {
+            let msg = OutgoingMessage {
+                app_id: token.app_id,
+                channel_id: Some(channel_id),
+                to_user_id: None,
+                from_user_id: token.user_id,
+                display_name: token.display_name.clone(),
+                text,
+                metadata,
+                client_ref: client_ref.clone(),
+                from_session_id: Some(session_id),
+            };
+            if let Err(e) = send_chat(state, session_id, msg).await {
+                send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+            }
+        }
+
+        ControlMessage::ChatSendDirect {
+            user_id,
+            text,
+            metadata,
+            client_ref,
+        } => {
+            let msg = OutgoingMessage {
+                app_id: token.app_id,
+                channel_id: None,
+                to_user_id: Some(user_id),
+                from_user_id: token.user_id,
+                display_name: token.display_name.clone(),
+                text,
+                metadata,
+                client_ref: client_ref.clone(),
+                from_session_id: Some(session_id),
+            };
+            if let Err(e) = send_chat(state, session_id, msg).await {
+                send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+            }
+        }
+
+        ControlMessage::ChatTyping { channel_id, typing } => {
+            let chat = &state.control.chat;
+            if !chat.enabled() || channel_role(state, &session_id, &channel_id).is_none() {
+                return;
+            }
+            if chat_sender_allowed(state, &session_id).is_err() {
+                return;
+            }
+            // "Stopped typing" always passes so a throttled start cannot leave a stale indicator.
+            if typing && !chat.typing_allowed(session_id, channel_id) {
+                return;
+            }
+            chat.publish_typing(token.app_id, channel_id, token.user_id, session_id, typing);
+        }
+
         ControlMessage::WebRtcOffer { sdp } => {
             if sdp.len() > MAX_TEXT_FRAME {
                 return send_error(tx, "VALIDATION_ERROR", "SDP too large").await;
@@ -1808,6 +2083,8 @@ async fn handle_control_message(
         | ControlMessage::Error { .. }
         | ControlMessage::Kick { .. }
         | ControlMessage::ModerateParticipantAck { .. }
+        | ControlMessage::ChatMessageReceived { .. }
+        | ControlMessage::ParticipantTyping { .. }
         | ControlMessage::WebRtcAnswer { .. }
         | ControlMessage::Pong { .. } => {
             send_error(
@@ -1879,6 +2156,10 @@ async fn handle_event_stream(socket: WebSocket, state: WsState, app_id: AppId) {
             };
             // Node health is operational (not tenant) data and is only exposed to admins.
             if event.app_id() != Some(app_id) {
+                continue;
+            }
+            // Typing indicators are pure client UX noise for a backend consumer.
+            if matches!(event, ServerEvent::ParticipantTyping { .. }) {
                 continue;
             }
             let json = serde_json::to_string(&event).unwrap_or_default();

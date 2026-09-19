@@ -15,6 +15,8 @@ pub struct AurixConfig {
     pub metrics: MetricsConfig,
     pub tracing: TracingConfig,
     pub rate_limiting: RateLimitConfig,
+    #[serde(default)]
+    pub chat: ChatConfig,
 }
 
 impl AurixConfig {
@@ -56,6 +58,7 @@ impl AurixConfig {
             &mut self.media.cascade_secret,
             &mut self.auth.admin_bootstrap_token,
             &mut self.recording.encryption_key,
+            &mut self.chat.filter_webhook,
         ] {
             if opt.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false) {
                 *opt = None;
@@ -87,6 +90,19 @@ impl AurixConfig {
         }
         if self.media.max_participants_per_node == 0 {
             anyhow::bail!("max_participants_per_node must be > 0");
+        }
+        if self.chat.enabled {
+            if self.chat.max_message_bytes == 0 || self.chat.max_message_bytes > 16 * 1024 {
+                anyhow::bail!("chat.max_message_bytes must be within 1..=16384");
+            }
+            if self.chat.messages_per_second == 0 || self.chat.message_burst == 0 {
+                anyhow::bail!("chat.messages_per_second and chat.message_burst must be > 0");
+            }
+            if let Some(url) = &self.chat.filter_webhook {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    anyhow::bail!("chat.filter_webhook must be an http(s) URL");
+                }
+            }
         }
         if self.turn.min_port > self.turn.max_port {
             anyhow::bail!("turn.min_port must be <= turn.max_port");
@@ -571,6 +587,81 @@ impl Default for RateLimitConfig {
             burst_size: 200,
             channel_joins_per_minute: 30,
             messages_per_second: 10,
+        }
+    }
+}
+
+/// Lightweight in-game text chat: real-time channel and directed messages plus typing
+/// indicators over the control WebSocket. Not a messaging product — no offline delivery, no
+/// conversations, no read markers; history is optional and off by default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Upper bound on UTF-8 bytes of `text` plus serialized `metadata` per message.
+    #[serde(default = "default_chat_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Anti-flood token bucket per session: sustained rate and burst.
+    #[serde(default = "default_chat_messages_per_second")]
+    pub messages_per_second: u32,
+    #[serde(default = "default_chat_message_burst")]
+    pub message_burst: u32,
+    /// Minimum interval between typing indicators per session and channel.
+    #[serde(default = "default_chat_typing_interval_ms")]
+    pub typing_interval_ms: u64,
+    /// A server-muted participant cannot send text either (moderation mute silences fully).
+    #[serde(default = "default_true")]
+    pub server_mute_blocks_text: bool,
+    /// Optional filter hook: `POST` with `{app_id, channel_id, from_user_id, to_user_id, text}`;
+    /// the reply `{"action":"allow"|"replace"|"block","text":…,"reason":…}` decides.
+    #[serde(default)]
+    pub filter_webhook: Option<String>,
+    #[serde(default = "default_chat_filter_timeout_ms")]
+    pub filter_timeout_ms: u64,
+    /// Deliver messages when the filter is unreachable (`false` = block them).
+    #[serde(default)]
+    pub filter_fail_open: bool,
+    /// Store messages in `chat_messages` and expose `GET …/messages` history endpoints.
+    #[serde(default)]
+    pub persist: bool,
+    /// Days to keep stored messages (`0` = forever).
+    #[serde(default = "default_chat_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_chat_max_message_bytes() -> usize {
+    1024
+}
+fn default_chat_messages_per_second() -> u32 {
+    2
+}
+fn default_chat_message_burst() -> u32 {
+    10
+}
+fn default_chat_typing_interval_ms() -> u64 {
+    1500
+}
+fn default_chat_filter_timeout_ms() -> u64 {
+    1500
+}
+fn default_chat_retention_days() -> u32 {
+    30
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_message_bytes: default_chat_max_message_bytes(),
+            messages_per_second: default_chat_messages_per_second(),
+            message_burst: default_chat_message_burst(),
+            typing_interval_ms: default_chat_typing_interval_ms(),
+            server_mute_blocks_text: true,
+            filter_webhook: None,
+            filter_timeout_ms: default_chat_filter_timeout_ms(),
+            filter_fail_open: false,
+            persist: false,
+            retention_days: default_chat_retention_days(),
         }
     }
 }

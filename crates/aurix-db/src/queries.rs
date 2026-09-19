@@ -776,6 +776,75 @@ pub async fn delete_recording(pool: &DbPool, id: uuid::Uuid) -> Result<(), sqlx:
     Ok(())
 }
 
+// ── Chat Queries ──
+
+pub async fn insert_chat_message(pool: &DbPool, m: &ChatMessageRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO chat_messages (id, app_id, channel_id, from_user_id, display_name, to_user_id, text, metadata, sent_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+    )
+    .bind(m.id).bind(m.app_id).bind(m.channel_id).bind(m.from_user_id)
+    .bind(&m.display_name).bind(m.to_user_id).bind(&m.text).bind(&m.metadata)
+    .bind(m.sent_at)
+    .execute(pool).await?;
+    Ok(())
+}
+
+/// Newest-first page of a channel's messages, optionally strictly older than `before`.
+pub async fn list_channel_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+    before: Option<DateTime<Utc>>,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(
+        r#"SELECT * FROM chat_messages
+           WHERE app_id = $1 AND channel_id = $2 AND ($3::timestamptz IS NULL OR sent_at < $3)
+           ORDER BY sent_at DESC LIMIT $4"#,
+    )
+    .bind(app_id)
+    .bind(channel_id)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Newest-first page of everything a user sent or was sent directly (moderation evidence,
+/// data export).
+pub async fn list_user_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    before: Option<DateTime<Utc>>,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(
+        r#"SELECT * FROM chat_messages
+           WHERE app_id = $1 AND (from_user_id = $2 OR to_user_id = $2)
+             AND ($3::timestamptz IS NULL OR sent_at < $3)
+           ORDER BY sent_at DESC LIMIT $4"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_chat_messages_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM chat_messages WHERE sent_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
 // ── Media Node Queries ──
 
 pub async fn upsert_media_node(

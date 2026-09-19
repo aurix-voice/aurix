@@ -113,7 +113,7 @@ impl Player {
             if pred(&m) {
                 return m;
             }
-            if let ControlMessage::Error { code, message } = &m {
+            if let ControlMessage::Error { code, message, .. } = &m {
                 panic!(
                     "{}: server error while waiting for {what}: {code} {message}",
                     self.name
@@ -1408,7 +1408,10 @@ async fn expect_error(p: &mut Player, what: &str, code: &str) {
     let m = p
         .expect(what, |m| matches!(m, ControlMessage::Error { .. }))
         .await;
-    let ControlMessage::Error { code: got, message } = m else {
+    let ControlMessage::Error {
+        code: got, message, ..
+    } = m
+    else {
         unreachable!()
     };
     assert_eq!(got, code, "{}: {what}: {message}", p.name);
@@ -1970,4 +1973,459 @@ async fn strict_mode_requires_action_tokens() {
         })
         .await;
     alice.ws.close(None).await.unwrap();
+}
+
+async fn expect_chat(p: &mut Player, what: &str) -> aurix_common::protocol::ChatMessage {
+    let m = p
+        .expect(what, |m| {
+            matches!(m, ControlMessage::ChatMessageReceived { .. })
+        })
+        .await;
+    let ControlMessage::ChatMessageReceived { message } = m else {
+        unreachable!()
+    };
+    message
+}
+
+async fn assert_no_chat(p: &mut Player, why: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    while let Some(m) = p
+        .try_recv(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .await
+    {
+        assert!(
+            !matches!(
+                m,
+                ControlMessage::ChatMessageReceived { .. }
+                    | ControlMessage::ParticipantTyping { .. }
+            ),
+            "{}: must not receive chat while {why}: {m:?}",
+            p.name
+        );
+    }
+}
+
+/// Text chat lite: channel messages reach every member (sender echo carries `client_ref`),
+/// directed messages reach one online user, typing indicators are throttled, non-members,
+/// blocked pairs, server-muted and flooding senders are refused, REST can inject operator
+/// messages and (when `chat.persist` is on) read tenant-scoped history.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn text_chat_channel_direct_typing_and_history() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let other_channel = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "e2e:chat-alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e:chat-bob", "Bob", channel_id).await;
+    let (tok_c, uid_c) = issue_token(&env, &http, "e2e:chat-carol", "Carol", channel_id).await;
+    let (tok_d, _) = issue_token(&env, &http, "e2e:chat-dave", "Dave", other_channel).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let uid_c = UserId::from_uuid(uid_c.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    let mut dave = connect(&env, "dave", tok_d).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        join(p, channel_id).await;
+    }
+    join(&mut dave, other_channel).await;
+
+    // ── channel message: echo with client_ref, members without, non-member nothing ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "gg wp".into(),
+            metadata: Some(serde_json::json!({"kind": "say"})),
+            client_ref: Some("ref-1".into()),
+        })
+        .await;
+    let echo = expect_chat(&mut alice, "own echo").await;
+    assert_eq!(echo.client_ref.as_deref(), Some("ref-1"));
+    assert_eq!(echo.text, "gg wp");
+    assert_eq!(echo.from_user_id, uid_a);
+    assert_eq!(echo.display_name, "Alice");
+    assert_eq!(echo.channel_id, Some(channel_id));
+    assert_eq!(echo.metadata, Some(serde_json::json!({"kind": "say"})));
+    for p in [&mut bob, &mut carol] {
+        let m = expect_chat(p, "alice's channel message").await;
+        assert_eq!(m.id, echo.id);
+        assert_eq!(m.text, "gg wp");
+        assert!(m.client_ref.is_none(), "client_ref is for the sender only");
+    }
+    assert_no_chat(&mut dave, "not a member").await;
+
+    dave.send(&ControlMessage::ChatSend {
+        channel_id,
+        text: "let me in".into(),
+        metadata: None,
+        client_ref: Some("ref-dave".into()),
+    })
+    .await;
+    let m = dave
+        .expect("non-member ChatSend error", |m| {
+            matches!(m, ControlMessage::Error { .. })
+        })
+        .await;
+    assert!(
+        matches!(&m, ControlMessage::Error { code, client_ref, .. }
+            if code == "AUTH_DENIED" && client_ref.as_deref() == Some("ref-dave")),
+        "rejections carry the client_ref: {m:?}"
+    );
+
+    // ── validation ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "   ".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_error(&mut alice, "empty text", "VALIDATION_ERROR").await;
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "x".repeat(4000),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_error(&mut alice, "oversize text", "VALIDATION_ERROR").await;
+
+    // ── directed message: recipient + sender echo only ──
+    bob.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_a,
+        text: "/invite".into(),
+        metadata: None,
+        client_ref: Some("ref-2".into()),
+    })
+    .await;
+    let echo = expect_chat(&mut bob, "own direct echo").await;
+    assert_eq!(echo.client_ref.as_deref(), Some("ref-2"));
+    assert_eq!(echo.to_user_id, Some(uid_a));
+    assert!(echo.channel_id.is_none());
+    let m = expect_chat(&mut alice, "bob's directed message").await;
+    assert_eq!(m.id, echo.id);
+    assert_eq!(m.from_user_id, uid_b);
+    assert!(m.client_ref.is_none());
+    assert_no_chat(&mut carol, "not the target").await;
+
+    bob.send(&ControlMessage::ChatSendDirect {
+        user_id: UserId::new(),
+        text: "hello?".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    expect_error(&mut bob, "direct to unknown user", "USER_OFFLINE").await;
+    bob.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_b,
+        text: "me".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    expect_error(&mut bob, "direct to self", "VALIDATION_ERROR").await;
+
+    // ── typing: fan-out to other members, throttled per channel, stop always passes ──
+    alice
+        .send(&ControlMessage::ChatTyping {
+            channel_id,
+            typing: true,
+        })
+        .await;
+    for p in [&mut bob, &mut carol] {
+        let m = p
+            .expect("ParticipantTyping", |m| {
+                matches!(m, ControlMessage::ParticipantTyping { .. })
+            })
+            .await;
+        assert!(matches!(
+            m,
+            ControlMessage::ParticipantTyping { channel_id: c, user_id, typing: true }
+                if c == channel_id && user_id == uid_a
+        ));
+    }
+    alice
+        .send(&ControlMessage::ChatTyping {
+            channel_id,
+            typing: true,
+        })
+        .await;
+    assert_no_chat(&mut bob, "typing is throttled").await;
+    assert_no_chat(&mut alice, "own typing is never echoed").await;
+    alice
+        .send(&ControlMessage::ChatTyping {
+            channel_id,
+            typing: false,
+        })
+        .await;
+    let m = bob
+        .expect("ParticipantTyping(false)", |m| {
+            matches!(m, ControlMessage::ParticipantTyping { .. })
+        })
+        .await;
+    assert!(matches!(
+        m,
+        ControlMessage::ParticipantTyping { typing: false, .. }
+    ));
+    dave.send(&ControlMessage::ChatTyping {
+        channel_id,
+        typing: true,
+    })
+    .await;
+    assert_no_chat(&mut bob, "non-member typing is dropped").await;
+
+    // ── persistent block: no text either way, same as media ──
+    alice
+        .send(&ControlMessage::SetUserBlock {
+            user_id: uid_c,
+            blocked: true,
+        })
+        .await;
+    alice
+        .expect("UserBlockChanged", |m| {
+            matches!(m, ControlMessage::UserBlockChanged { blocked: true, .. })
+        })
+        .await;
+    carol
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "can you hear me".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_chat(&mut carol, "own echo").await;
+    expect_chat(&mut bob, "carol's message").await;
+    assert_no_chat(&mut alice, "alice blocked carol").await;
+    carol
+        .send(&ControlMessage::ChatSendDirect {
+            user_id: uid_a,
+            text: "psst".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_error(&mut carol, "direct to a user who blocked me", "AUTH_DENIED").await;
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "still here".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_chat(&mut alice, "own echo").await;
+    expect_chat(&mut bob, "alice's message").await;
+    assert_no_chat(&mut carol, "blocked by alice").await;
+    alice
+        .send(&ControlMessage::SetUserBlock {
+            user_id: uid_c,
+            blocked: false,
+        })
+        .await;
+    alice
+        .expect("UserBlockChanged", |m| {
+            matches!(m, ControlMessage::UserBlockChanged { blocked: false, .. })
+        })
+        .await;
+
+    // ── server mute (moderation) also silences text ──
+    http.post(format!("{}/v1/moderation/mute", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"user_id": uid_c, "channel_id": channel_id, "muted": true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    carol
+        .expect("MuteStateChanged", |m| {
+            matches!(m, ControlMessage::MuteStateChanged { muted: true, .. })
+        })
+        .await;
+    carol
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "mmmph".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_error(&mut carol, "muted ChatSend", "USER_MUTED").await;
+    http.post(format!("{}/v1/moderation/mute", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"user_id": uid_c, "channel_id": channel_id, "muted": false}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // ── anti-flood: default bucket is 10 burst / 2 per second ──
+    for i in 0..20 {
+        bob.send(&ControlMessage::ChatSend {
+            channel_id,
+            text: format!("spam {i}"),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    }
+    let (mut echoes, mut limited) = (0, 0);
+    while let Some(m) = bob.try_recv(Duration::from_millis(500)).await {
+        match m {
+            ControlMessage::ChatMessageReceived { .. } => echoes += 1,
+            ControlMessage::Error { code, .. } if code == "RATE_LIMIT_EXCEEDED" => limited += 1,
+            ControlMessage::MuteStateChanged { .. } => {}
+            other => panic!("bob: unexpected {other:?}"),
+        }
+    }
+    assert!(
+        (10..=12).contains(&echoes) && echoes + limited == 20,
+        "flood control: {echoes} delivered, {limited} limited"
+    );
+    // Drain what the others received.
+    for p in [&mut alice, &mut carol] {
+        while p.try_recv(Duration::from_millis(300)).await.is_some() {}
+    }
+
+    // ── operator messages via REST ──
+    let sys: serde_json::Value = http
+        .post(format!("{}/v1/channels/{}/messages", env.api, channel_id))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "Match starts in 10s", "metadata": {"kind": "announce"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sys["display_name"], "Server");
+    for p in [&mut alice, &mut bob, &mut carol] {
+        let m = expect_chat(p, "system channel message").await;
+        assert_eq!(m.id.to_string(), sys["id"].as_str().unwrap());
+        assert!(m.from_user_id.0.is_nil());
+        assert_eq!(m.text, "Match starts in 10s");
+    }
+    assert_no_chat(&mut dave, "system message to another channel").await;
+    http.post(format!("{}/v1/users/{}/messages", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "You have been invited", "display_name": "Matchmaker"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let m = expect_chat(&mut alice, "system direct message").await;
+    assert_eq!(m.display_name, "Matchmaker");
+    assert_eq!(m.to_user_id, Some(uid_a));
+    assert_no_chat(&mut bob, "directed system message to alice").await;
+    let r = http
+        .post(format!("{}/v1/users/{}/messages", env.api, UserId::new()))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // ── history (only when the server runs with chat.persist = true) ──
+    let r = http
+        .get(format!(
+            "{}/v1/channels/{}/messages?limit=100",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    if r.status() == 404 {
+        eprintln!("chat.persist is off on this server; skipping history checks");
+    } else {
+        let body: serde_json::Value = r.error_for_status().unwrap().json().await.unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        let texts: Vec<&str> = msgs.iter().map(|m| m["text"].as_str().unwrap()).collect();
+        assert_eq!(texts[0], "Match starts in 10s", "newest first: {texts:?}");
+        assert!(texts.contains(&"gg wp") && texts.contains(&"still here"));
+        assert!(
+            !texts.contains(&"/invite") && !texts.contains(&"You have been invited"),
+            "directed messages are not channel history"
+        );
+        assert!(msgs.iter().all(|m| m.get("client_ref").is_none()));
+        assert!(
+            texts.iter().filter(|t| t.starts_with("spam ")).count() <= 12,
+            "rate-limited messages must not be stored"
+        );
+
+        let body: serde_json::Value = http
+            .get(format!("{}/v1/users/{}/messages", env.api, uid_a))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let texts: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["text"].as_str().unwrap())
+            .collect();
+        assert!(texts.contains(&"/invite") && texts.contains(&"You have been invited"));
+        assert!(texts.contains(&"gg wp"), "own channel messages: {texts:?}");
+        assert!(
+            !texts.contains(&"spam 0"),
+            "other people's channel messages are not included"
+        );
+
+        if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+            for url in [
+                format!("{}/v1/channels/{}/messages", env.api, channel_id),
+                format!("{}/v1/users/{}/messages", env.api, uid_a),
+            ] {
+                let r = http
+                    .get(&url)
+                    .header("x-api-key", &api_key2)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    r.status(),
+                    404,
+                    "foreign tenant must not read history: {url}"
+                );
+                let r = http
+                    .post(&url)
+                    .header("x-api-key", &api_key2)
+                    .json(&serde_json::json!({"text": "hi"}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    r.status(),
+                    404,
+                    "foreign tenant must not inject messages: {url}"
+                );
+            }
+        } else {
+            eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+        }
+    }
+
+    for p in [&mut alice, &mut bob, &mut carol, &mut dave] {
+        p.ws.close(None).await.unwrap();
+    }
 }

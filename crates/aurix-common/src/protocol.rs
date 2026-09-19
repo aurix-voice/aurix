@@ -720,9 +720,13 @@ pub enum ControlMessage {
         recording_id: uuid::Uuid,
         consent: crate::types::RecordingConsent,
     },
+    /// `client_ref` is set when the error answers a `ChatSend`/`ChatSendDirect` that carried
+    /// one, so the client can mark that message as failed.
     Error {
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
     },
     Kick {
         channel_id: ChannelId,
@@ -743,6 +747,40 @@ pub enum ControlMessage {
         channel_id: ChannelId,
         user_id: UserId,
         action: ActionKind,
+    },
+    /// Text chat: send to every participant of a joined channel. `client_ref` is echoed back
+    /// in the sender's own `ChatMessageReceived` so the client can correlate the ack.
+    ChatSend {
+        channel_id: ChannelId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Text chat: directed message to one online user of the same app (party invite, whisper,
+    /// ping). Not stored for offline users.
+    ChatSendDirect {
+        user_id: UserId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    ChatMessageReceived {
+        message: ChatMessage,
+    },
+    /// Client → server: this session is (no longer) composing a message in `channel_id`.
+    ChatTyping {
+        channel_id: ChannelId,
+        typing: bool,
+    },
+    /// Server → other channel members.
+    ParticipantTyping {
+        channel_id: ChannelId,
+        user_id: UserId,
+        typing: bool,
     },
     /// Browser clients: SDP offer for this session; the server replies with `WebRtcAnswer`.
     WebRtcOffer {
@@ -765,6 +803,25 @@ pub struct LocalMute {
     /// `None` = muted in every channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<ChannelId>,
+}
+
+/// A delivered text message. `channel_id` is `None` for directed messages; `from_user_id` is
+/// the nil UUID for server/system messages posted via the REST API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatMessage {
+    pub id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<ChannelId>,
+    pub from_user_id: UserId,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_user_id: Option<UserId>,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    pub sent_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -955,5 +1012,58 @@ mod tests {
         assert!(!w.check_and_update(100));
         assert!(w.check_and_update(150));
         assert!(!w.check_and_update(150));
+    }
+
+    #[test]
+    fn chat_messages_serialize_with_optional_fields_omitted() {
+        let send: ControlMessage = serde_json::from_str(
+            r#"{"type":"ChatSend","data":{"channel_id":"11111111-1111-1111-1111-111111111111","text":"gg"}}"#,
+        )
+        .unwrap();
+        match send {
+            ControlMessage::ChatSend {
+                text,
+                metadata,
+                client_ref,
+                ..
+            } => {
+                assert_eq!(text, "gg");
+                assert!(metadata.is_none() && client_ref.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let msg = ChatMessage {
+            id: uuid::Uuid::nil(),
+            channel_id: None,
+            from_user_id: UserId(uuid::Uuid::nil()),
+            display_name: "p".into(),
+            to_user_id: Some(UserId(uuid::Uuid::nil())),
+            text: "ping".into(),
+            metadata: None,
+            sent_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            client_ref: None,
+        };
+        let json = serde_json::to_value(ControlMessage::ChatMessageReceived {
+            message: msg.clone(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "ChatMessageReceived");
+        let m = &json["data"]["message"];
+        assert!(m.get("channel_id").is_none() && m.get("metadata").is_none());
+        assert!(m.get("client_ref").is_none());
+        assert_eq!(m["to_user_id"], "00000000-0000-0000-0000-000000000000");
+        let back: ControlMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ControlMessage::ChatMessageReceived { message } => assert_eq!(message, msg),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let typing = serde_json::to_string(&ControlMessage::ChatTyping {
+            channel_id: ChannelId(uuid::Uuid::nil()),
+            typing: true,
+        })
+        .unwrap();
+        assert!(typing.contains(r#""type":"ChatTyping""#));
     }
 }

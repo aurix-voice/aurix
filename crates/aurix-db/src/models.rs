@@ -132,6 +132,19 @@ pub struct RecordingRow {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ChatMessageRow {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub channel_id: Option<Uuid>,
+    pub from_user_id: Uuid,
+    pub display_name: String,
+    pub to_user_id: Option<Uuid>,
+    pub text: String,
+    pub metadata: Option<serde_json::Value>,
+    pub sent_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MediaNodeRow {
     pub id: Uuid,
     pub region: String,

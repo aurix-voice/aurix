@@ -161,6 +161,19 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
    broadcast, unlike the sender-side `SetMute` and the moderator mute. A fresh session starts
    with `ReceiverPreferences { blocked_users, local_mutes, volumes }` (blocks come from the
    database; mutes/volumes are replayed by the SDKs), the blocker gets `UserBlockChanged` acks.
+7. **Text chat (lite)**: `ChatSend { channel_id, text, metadata?, client_ref? }` to a channel you
+   are a member of, `ChatSendDirect { user_id, … }` to a user online in the same application
+   (live-only: no offline delivery, no history), `ChatTyping { channel_id, typing }`. Everyone
+   entitled to see the message — including the sender — receives one
+   `ChatMessageReceived { message }` with a server-assigned `id`/`sent_at`; the sender's copy
+   also carries the `client_ref`, nobody else's does. A rejected send comes back as
+   `Error { code, message, client_ref }` so the client can fail exactly that optimistic message
+   (`AUTH_DENIED`, `USER_MUTED`, `VALIDATION_ERROR`, `USER_OFFLINE`, `RATE_LIMIT_EXCEEDED`,
+   `MESSAGE_BLOCKED`, `CHAT_DISABLED`). Typing is throttled per session+channel and never echoed
+   to its origin. Persistent blocks, tenant boundaries and (by default) the moderator mute apply
+   to text exactly as to voice; delivery crosses nodes through the same Redis event bus as
+   presence events. Metadata is arbitrary JSON (`/`-commands, map pings, …) and counts toward
+   `chat.max_message_bytes`.
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 
@@ -180,13 +193,15 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
 | API key | `GET|POST /v1/users/:id/blocks`, `DELETE /v1/users/:id/blocks/:blocked_id` | persistent cross-mute (applied to live sessions on every node) |
+| API key | `POST /v1/channels/:id/messages`, `POST /v1/users/:id/messages` | server/system text message into a channel or to one user's live sessions (`chat:write`; sender is the nil user id, bypasses the content filter; fire-and-forget — dropped if nobody is online unless persisted) |
+| API key | `GET /v1/channels/:id/messages`, `GET /v1/users/:id/messages` | history, newest first, `?before=<rfc3339>&limit=1..200` — only when `chat.persist = true`, otherwise `404 NOT_FOUND` (`chat:read`) |
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | player JWT | `GET /v1/me/turn-credentials`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users |
 
 API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
-`moderation:read|write`, `recordings:read|write`, `keys:manage`. A key can only mint keys with a
+`moderation:read|write`, `recordings:read|write`, `chat:read|write`, `keys:manage`. A key can only mint keys with a
 subset of its own permissions. Errors are `{"error":{"code":"…","message":"…"}}`.
 
 ---
@@ -228,6 +243,23 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__SERVER__TLS_CERT_PATH`, `AURIX__SERVER__TLS_KEY_PATH` | native TLS for API + WebSocket (PEM). Otherwise terminate TLS on your proxy |
 | `AURIX__RECORDING__*` | `ENABLED`, `STORAGE_PATH`, `RETENTION_DAYS`, `REQUIRE_CONSENT`, `ENCRYPTION_ENABLED` + `ENCRYPTION_KEY` (≥ 32 chars), S3 settings |
 | `AURIX__RATE_LIMITING__*` | per-IP / per-key limits (Redis-backed when available) |
+| `AURIX__CHAT__*` | `ENABLED` (default `true`), `MAX_MESSAGE_BYTES` (1024, text + metadata, ≤ 16384), `MESSAGES_PER_SECOND`/`MESSAGE_BURST` (2 / 10 per session), `TYPING_INTERVAL_MS` (1500), `SERVER_MUTE_BLOCKS_TEXT` (`true`), `FILTER_WEBHOOK` + `FILTER_TIMEOUT_MS` (1500) + `FILTER_FAIL_OPEN` (`false`), `PERSIST` (`false`) + `RETENTION_DAYS` (30) |
+
+#### Chat content filter webhook
+
+When `chat.filter_webhook` is set, every player message (not system messages) is `POST`ed there
+as JSON before delivery:
+
+```json
+{"app_id":"…","channel_id":"…"|null,"from_user_id":"…","to_user_id":null|"…",
+ "display_name":"alice","text":"…","metadata":{…}|null}
+```
+
+Reply `200` with `{"action":"allow"}`, `{"action":"replace","text":"…"}` (deliver the substitute)
+or `{"action":"block","reason":"…"}` (sender gets `MESSAGE_BLOCKED` with that reason). A non-2xx
+status, invalid body or timeout blocks the message unless `chat.filter_fail_open = true`. Storage
+is off by default; with `chat.persist = true` messages land in `chat_messages` (post-filter text,
+per application) and are swept hourly after `chat.retention_days`.
 
 ### Network / firewall
 
@@ -361,7 +393,9 @@ Both SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys st
 ## Limitations
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
-* No SIP/PSTN gateway, no text chat, no server-side noise suppression (clients do that).
+* No SIP/PSTN gateway, no server-side noise suppression (clients do that).
+* Text chat is deliberately "lite": live channel/directed messages and typing only — no offline
+  delivery, conversations, read markers or attachments; history is an opt-in per deployment.
 * STT/content moderation is a pluggable pipeline; no provider is bundled.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
   it assumes nodes can reach each other directly on `media.port + 1`/UDP.

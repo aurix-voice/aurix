@@ -3,6 +3,7 @@ pub mod analytics;
 pub mod block_manager;
 pub mod cascade_topology;
 pub mod channel_manager;
+pub mod chat;
 pub mod event_bus;
 pub mod moderation_actions;
 pub mod node_manager;
@@ -12,6 +13,7 @@ pub mod session_manager;
 
 pub use action_tokens::{ActionTokenService, PendingClaim};
 pub use block_manager::{BlockManager, MAX_BLOCKS_PER_USER};
+pub use chat::{ChatService, OutgoingMessage};
 pub use event_bus::{EventBus, ServerEvent};
 pub use plane::ControlPlane;
 pub use redis_store::RedisStore;

@@ -50,6 +50,7 @@ namespace Aurix.Demo
             var channelId = Guid.Parse(channel);
             if (Get(opt, "scenario", "audio") == "reconnect") return await ReconnectScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
+            if (Get(opt, "scenario", "audio") == "chat") return await ChatScenario(ws, channelId, tokenA, tokenB);
 
             var log = new List<string>();
             var alice = new AurixVoiceClient(ws, tokenA);
@@ -220,6 +221,90 @@ namespace Aurix.Demo
             await pump; await pump2;
             await alice.DisconnectAsync();
             await bob2.DisconnectAsync();
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Text chat: alice and bob share a channel. Channel messages (with metadata) and their sender echo,
+        /// typing indicators, a directed message, rejections carrying the client_ref (self-DM, empty text)
+        /// and the server's anti-flood limit are exercised over the real control connection.
+        /// </summary>
+        private static async Task<int> ChatScenario(string ws, Guid channelId, string tokenA, string tokenB)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA);
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            var bobChat = new List<ChatMessage>();
+            var aliceChat = new List<ChatMessage>();
+            var bobTyping = new List<(Guid user, bool typing)>();
+            var aliceTyping = new List<(Guid user, bool typing)>();
+            bob.OnChatMessage += m => { lock (bobChat) bobChat.Add(m); };
+            alice.OnChatMessage += m => { lock (aliceChat) aliceChat.Add(m); };
+            bob.OnParticipantTyping += (_, u, t) => { lock (bobTyping) bobTyping.Add((u, t)); };
+            alice.OnParticipantTyping += (_, u, t) => { lock (aliceTyping) aliceTyping.Add((u, t)); };
+
+            var a = await alice.ConnectAsync();
+            var b = await bob.ConnectAsync();
+            await alice.JoinChannelAsync(channelId);
+            var rosterB = await bob.JoinChannelAsync(channelId);
+            var aliceId = rosterB.First(p => p.Ssrc == a.Ssrc).UserId;
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            await Task.Delay(300);
+            var bobId = alice.GetParticipants(channelId).First(p => p.Ssrc == b.Ssrc).UserId;
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+            async Task<Exception> Fails(Func<Task> f) { try { await f(); return null; } catch (Exception e) { return e; } }
+
+            var echo = await alice.SendMessageAsync(channelId, "gg", new Dictionary<string, object> { { "ping", new Dictionary<string, object> { { "x", 1.0 }, { "y", 2.0 } } } }, "ref-1");
+            Check(echo.IsOwn && echo.ClientRef == "ref-1" && echo.ChannelId == channelId && echo.FromUserId == aliceId && echo.Text == "gg" && !echo.IsSystem,
+                "sender echo completes the send with id/timestamp/client_ref");
+            Check(echo.SentAt > DateTimeOffset.UtcNow.AddMinutes(-5), $"sent_at parsed ({echo.SentAt:O})");
+            await Task.Delay(300);
+            ChatMessage received; lock (bobChat) received = bobChat.FirstOrDefault(m => m.Id == echo.Id);
+            Check(received != null && !received.IsOwn && received.ClientRef == null && received.DisplayName == "alice"
+                  && MiniJson.GetNumber(MiniJson.AsObject(MiniJson.AsObject(received.Metadata)["ping"]), "y") == 2.0,
+                "bob receives the message with metadata and without client_ref");
+            lock (aliceChat) Check(aliceChat.Count == 1 && aliceChat[0].Id == echo.Id, "echo also raised through OnChatMessage");
+
+            var e1 = await Fails(() => alice.SendMessageAsync(channelId, "   "));
+            Check(e1 != null && e1.Message.StartsWith("VALIDATION_ERROR:"), $"empty text rejected: {e1?.Message}");
+            var e2 = await Fails(() => alice.SendDirectMessageAsync(aliceId, "me"));
+            Check(e2 != null && e2.Message.StartsWith("VALIDATION_ERROR:"), $"self DM rejected: {e2?.Message}");
+            var e3 = await Fails(() => alice.SendDirectMessageAsync(Guid.NewGuid(), "hi"));
+            Check(e3 != null && e3.Message.StartsWith("USER_OFFLINE:"), $"offline DM rejected: {e3?.Message}");
+
+            var dm = await alice.SendDirectMessageAsync(bobId, "psst");
+            await Task.Delay(300);
+            ChatMessage gotDm; lock (bobChat) gotDm = bobChat.FirstOrDefault(m => m.Id == dm.Id);
+            Check(dm.IsDirect && dm.ToUserId == bobId && dm.ChannelId == null && gotDm != null && gotDm.Text == "psst" && !gotDm.IsOwn,
+                "directed message delivered to the online target");
+
+            await alice.SetTypingAsync(channelId, true);
+            await alice.SetTypingAsync(channelId, true);
+            await alice.SetTypingAsync(channelId, true);
+            await Task.Delay(300);
+            await alice.SetTypingAsync(channelId, false);
+            await Task.Delay(300);
+            lock (bobTyping) Check(bobTyping.Count == 2 && bobTyping[0] == (aliceId, true) && bobTyping[1] == (aliceId, false),
+                $"typing coalesced client-side and delivered to bob ({bobTyping.Count} events)");
+            lock (aliceTyping) Check(aliceTyping.Count == 0, "alice never receives her own typing");
+
+            var burst = new List<Task<ChatMessage>>();
+            for (int i = 0; i < 14; i++) burst.Add(bob.SendMessageAsync(channelId, $"spam {i}"));
+            try { await Task.WhenAll(burst); } catch { /* individual results inspected below */ }
+            int limited = burst.Count(t => t.IsFaulted && t.Exception.InnerException.Message.StartsWith("RATE_LIMIT_EXCEEDED:"));
+            int accepted = burst.Count(t => t.IsCompletedSuccessfully);
+            Check(limited >= 1 && accepted >= 1 && limited + accepted == burst.Count, $"anti-flood: {accepted} accepted, {limited} rate-limited, none hanging");
+
+            cts.Cancel();
+            await pump;
+            await alice.DisconnectAsync();
+            await bob.DisconnectAsync();
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }

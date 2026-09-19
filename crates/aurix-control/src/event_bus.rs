@@ -116,6 +116,23 @@ pub enum ServerEvent {
         blocked: bool,
         timestamp: DateTime<Utc>,
     },
+    /// Text chat message accepted by the origin node (already filtered and, if enabled,
+    /// stored). Every node delivers it to its local recipients: channel members for channel
+    /// messages, the target user's sessions for directed ones, plus the sender's own session.
+    ChatMessage {
+        app_id: AppId,
+        message: aurix_common::protocol::ChatMessage,
+        /// Session that sent it (`None` for REST/system messages); receives the echo with
+        /// `client_ref` and is excluded from nothing else.
+        from_session_id: Option<SessionId>,
+    },
+    ParticipantTyping {
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        session_id: SessionId,
+        typing: bool,
+    },
 }
 
 impl ServerEvent {
@@ -135,7 +152,9 @@ impl ServerEvent {
             | Self::RecordingStarted { app_id, .. }
             | Self::RecordingStopped { app_id, .. }
             | Self::RecordingConsentRequired { app_id, .. }
-            | Self::UserBlockChanged { app_id, .. } => Some(*app_id),
+            | Self::UserBlockChanged { app_id, .. }
+            | Self::ChatMessage { app_id, .. }
+            | Self::ParticipantTyping { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } => None,
         }
     }

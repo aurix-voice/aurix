@@ -2,15 +2,19 @@ export { AurixClient } from './client.js';
 export type {
   AurixClientOptions,
   AurixEvents,
+  ChatMessage,
   ConnectionState,
   Participant,
   ReceiverPreferences,
   ReconnectPolicy,
+  SendMessageOptions,
   SessionInfo,
 } from './client.js';
 export type {
   ChannelRole,
+  ChatMessageWire,
   ClientMessage,
+  JsonValue,
   LocalMute,
   ModerationAction,
   Orientation3D,
@@ -28,5 +32,6 @@ export {
   BEARER_SUBPROTOCOL_PREFIX,
   MAX_PARTICIPANT_VOLUME,
   RESUME_SUBPROTOCOL_PREFIX,
+  SYSTEM_USER_ID,
   parseServerMessage,
 } from './protocol.js';

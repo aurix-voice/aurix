@@ -109,6 +109,14 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/users/:user_id/blocks/:blocked_user_id",
             delete(handlers::remove_user_block),
         )
+        .route(
+            "/v1/channels/:channel_id/messages",
+            get(handlers::list_channel_messages).post(handlers::send_channel_message),
+        )
+        .route(
+            "/v1/users/:user_id/messages",
+            get(handlers::list_user_messages).post(handlers::send_user_message),
+        )
         .route("/v1/moderation/ban", post(handlers::ban_user))
         .route("/v1/moderation/bans", get(handlers::list_bans))
         .route("/v1/moderation/bans/:ban_id/revoke", post(handlers::unban))

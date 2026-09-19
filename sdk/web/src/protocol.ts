@@ -58,6 +58,29 @@ export const MAX_PARTICIPANT_VOLUME = 2.0;
 /** Moderation performed by a player with a one-time action token (`POST /v1/tokens/action`). */
 export type ModerationAction = 'kick' | 'mute' | 'unmute';
 
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/**
+ * One text-chat message as delivered by the server. Exactly one of `channel_id` /
+ * `to_user_id` is set. `from_user_id` is the nil UUID for server-injected system messages.
+ * `client_ref` is only present on the sender's own echo.
+ */
+export interface ChatMessageWire {
+  id: string;
+  channel_id?: string | null;
+  from_user_id: string;
+  display_name: string;
+  to_user_id?: string | null;
+  text: string;
+  metadata?: JsonValue | null;
+  /** RFC 3339 timestamp. */
+  sent_at: string;
+  client_ref?: string | null;
+}
+
+/** `from_user_id` of messages injected through the REST API (`POST .../messages`). */
+export const SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000';
+
 /** Messages the client may send. */
 export type ClientMessage =
   | { type: 'ChannelJoin'; data: { channel_id: string; token: string } }
@@ -82,6 +105,15 @@ export type ClientMessage =
     }
   | { type: 'SetParticipantVolume'; data: { user_id: string; volume: number } }
   | { type: 'SetUserBlock'; data: { user_id: string; blocked: boolean } }
+  | {
+      type: 'ChatSend';
+      data: { channel_id: string; text: string; metadata?: JsonValue; client_ref?: string };
+    }
+  | {
+      type: 'ChatSendDirect';
+      data: { user_id: string; text: string; metadata?: JsonValue; client_ref?: string };
+    }
+  | { type: 'ChatTyping'; data: { channel_id: string; typing: boolean } }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number } }
   | { type: 'RecordingConsentResponse'; data: { recording_id: string; consent: RecordingConsent } }
@@ -122,6 +154,8 @@ export type ServerMessage =
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'BitrateCommand'; data: { target_bitrate_kbps: number; reason: string } }
   | { type: 'UserBlockChanged'; data: { user_id: string; blocked: boolean } }
+  | { type: 'ChatMessageReceived'; data: { message: ChatMessageWire } }
+  | { type: 'ParticipantTyping'; data: { channel_id: string; user_id: string; typing: boolean } }
   | {
       type: 'ReceiverPreferences';
       data: { blocked_users: string[]; local_mutes: LocalMute[]; volumes: ParticipantVolume[] };
@@ -130,7 +164,7 @@ export type ServerMessage =
       type: 'RecordingNotification';
       data: { channel_id: string; recording_id: string; active: boolean; initiated_by: string };
     }
-  | { type: 'Error'; data: { code: string; message: string } }
+  | { type: 'Error'; data: { code: string; message: string; client_ref?: string } }
   | { type: 'Kick'; data: { channel_id: string; user_id: string; reason: string } }
   | {
       type: 'ModerateParticipantAck';

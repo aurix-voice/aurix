@@ -25,3 +25,8 @@ flume = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }

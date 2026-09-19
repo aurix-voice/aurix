@@ -108,6 +108,39 @@ has to be opened (the client calls it before every reconnect attempt, so keep it
 tokens. A `login` token also authenticates `GET /v1/me/*` (TURN credentials) while it is within
 its TTL, which is exactly when the SDK fetches them.
 
+### Text chat (lite)
+
+Real-time text rides on the same control WebSocket: channel messages to the channels you are a
+member of, directed messages to a user who is online in the same app, and typing indicators.
+There is no history, no offline delivery and no read state — it is party/team chat, `/`-commands
+and map pings, not a messenger. Persistent blocks (`setUserBlocked`) suppress text exactly like
+voice, in both directions.
+
+```ts
+client.on('chatMessage', (m) => {
+  // m.own — my echo (the send promise resolves with the same object); m.system — from the server
+  // (`POST /v1/channels/:id/messages`, fromUserId === SYSTEM_USER_ID); m.toUserId set for DMs
+  render(m.channelId ?? 'dm', m.displayName, m.text, m.metadata);
+});
+client.on('participantTyping', (channelId, userId, typing) => showTyping(userId, typing));
+
+const sent = await client.sendMessage(channelId, 'gg', {
+  metadata: { ping: { x: 12.5, y: 8 } },   // any JSON, counts toward chat.max_message_bytes
+  clientRef: localId,                       // optional; echoed only to you → reconcile optimistic UI
+});
+await client.sendDirectMessage(userId, '/w psst');   // target must be online in this app
+client.setTyping(channelId, true);                   // call on every keystroke; coalesced to one frame per 1.5 s
+client.setTyping(channelId, false);                  // always sent
+```
+
+`sendMessage`/`sendDirectMessage` resolve with the server-stamped message (`id`, `sentAt`) and
+reject with `Error('<CODE>: <message>')`: `AUTH_DENIED` (not a member, or a block between the
+two users), `USER_MUTED` (server-muted while `chat.server_mute_blocks_text`), `VALIDATION_ERROR`
+(empty, too long, control characters, self-DM), `USER_OFFLINE`, `RATE_LIMIT_EXCEEDED` (anti-flood,
+per session), `MESSAGE_BLOCKED` (content filter), `CHAT_DISABLED`. The server correlates a rejection with the send through the
+`client_ref`, so only that promise fails — an unrelated `Error` frame is emitted as `serverError`.
+Messages from the same sender arrive in order; you are not told about your own typing.
+
 ## How it maps to the server
 
 | SDK | server |

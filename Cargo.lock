@@ -381,6 +381,7 @@ name = "aurix-control"
 version = "1.0.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "aurix-auth",
  "aurix-common",
  "aurix-db",
@@ -391,8 +392,10 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "redis",
+ "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

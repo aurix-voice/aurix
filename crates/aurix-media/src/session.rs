@@ -109,6 +109,12 @@ impl ReceiverPrefs {
         self.blocked.contains(user)
     }
 
+    /// True when a persistent block exists in either direction; such pairs exchange neither
+    /// audio nor text.
+    pub fn is_blocked_either_way(&self, user: &UserId) -> bool {
+        self.blocked.contains(user) || self.blocked_by.contains(user)
+    }
+
     /// Muted-for-me senders, `(user, channel)` with `None` meaning every channel.
     pub fn local_mutes(&self) -> Vec<(UserId, Option<ChannelId>)> {
         self.muted_everywhere

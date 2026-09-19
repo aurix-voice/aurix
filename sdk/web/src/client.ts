@@ -4,7 +4,10 @@ import {
   MAX_PARTICIPANT_VOLUME,
   RESUME_SUBPROTOCOL_PREFIX,
   parseServerMessage,
+  SYSTEM_USER_ID,
+  type ChatMessageWire,
   type ClientMessage,
+  type JsonValue,
   type LocalMute,
   type ModerationAction,
   type ParticipantBrief,
@@ -104,6 +107,37 @@ export interface Participant {
   speaking: boolean;
 }
 
+/** A text-chat message; see {@link AurixEvents.chatMessage}. */
+export interface ChatMessage {
+  id: string;
+  /** Set for channel messages. */
+  channelId?: string;
+  fromUserId: string;
+  displayName: string;
+  /** Set for directed messages (the target is either this user or, on the echo, the peer). */
+  toUserId?: string;
+  text: string;
+  /** Game payload (`/command` args, ping coordinates, item links, ...). */
+  metadata?: JsonValue;
+  sentAt: Date;
+  /** `true` when this is the echo of a message this client sent. */
+  own: boolean;
+  /** Injected by the game server through the REST API rather than sent by a player. */
+  system: boolean;
+  /** The `clientRef` passed to `sendMessage`/`sendDirectMessage`; only on `own` echoes. */
+  clientRef?: string;
+}
+
+export interface SendMessageOptions {
+  /** Structured game payload delivered verbatim; counts toward the server size limit. */
+  metadata?: JsonValue;
+  /**
+   * Correlation id the server echoes back on the accepted message or the rejection so the
+   * UI can reconcile an optimistically rendered message. Generated when omitted.
+   */
+  clientRef?: string;
+}
+
 export type ConnectionState =
   | 'disconnected'
   | 'connecting'
@@ -147,6 +181,13 @@ export interface AurixEvents {
   failedToRecover: (error: Error) => void;
   /** The server ended the session (kick from the platform, ban, shutdown). No reconnect. */
   sessionClosed: (reason: string) => void;
+  /**
+   * A text message for this client: channel message of a joined channel, directed message
+   * addressed to this user, or the echo (`own: true`) of a message this client sent.
+   */
+  chatMessage: (message: ChatMessage) => void;
+  /** Another member of `channelId` started/stopped typing (never this client's own state). */
+  participantTyping: (channelId: string, userId: string, typing: boolean) => void;
   serverError: (code: string, message: string) => void;
   error: (error: Error) => void;
   message: (message: ServerMessage | UnknownMessage) => void;
@@ -211,6 +252,11 @@ export class AurixClient {
   private listeners = new Map<keyof AurixEvents, Set<AnyListener>>();
   private pendingJoins = new Map<string, Pending<Participant[]>>();
   private pendingModerations = new Map<string, Pending<void>>();
+  /** client_ref → pending `sendMessage`/`sendDirectMessage`. */
+  private pendingChat = new Map<string, Pending<ChatMessage>>();
+  private chatRefCounter = 0;
+  /** channel id → last `ChatTyping { typing: true }` sent (ms, `performance.now()` clock). */
+  private typingSentAt = new Map<string, number>();
   private pendingAnswer: Pending<string> | undefined;
   private pendingInit: Pending<SessionInfo> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
@@ -495,6 +541,12 @@ export class AurixClient {
       p.reject(new Error(reason));
     }
     this.pendingModerations.clear();
+    for (const p of this.pendingChat.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.pendingChat.clear();
+    this.typingSentAt.clear();
     this.rejectPending(this.pendingAnswer, reason);
     this.pendingAnswer = undefined;
     this.rejectPending(this.pendingInit, reason);
@@ -550,7 +602,74 @@ export class AurixClient {
   leaveChannel(channelId: string): void {
     this.requireOpen();
     this.send({ type: 'ChannelLeave', data: { channel_id: channelId } });
+    this.typingSentAt.delete(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
+  }
+
+  /**
+   * Send a text message to every member of a joined channel. Resolves with the server's copy
+   * (id, timestamp) once accepted, which is also emitted as `chatMessage` with `own: true`.
+   * Rejects with `<CODE>: <message>` on refusal (`AUTH_DENIED` not a member, `USER_MUTED`,
+   * `RATE_LIMIT_EXCEEDED`, `MESSAGE_BLOCKED` by the content filter, `VALIDATION_ERROR`).
+   */
+  sendMessage(channelId: string, text: string, options: SendMessageOptions = {}): Promise<ChatMessage> {
+    return this.sendChat((clientRef) => ({
+      type: 'ChatSend',
+      data: {
+        channel_id: channelId,
+        text,
+        ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
+        client_ref: clientRef,
+      },
+    }), options.clientRef);
+  }
+
+  /**
+   * Send a text message to one user of the same app. Live-only: the target must currently
+   * have a session (`USER_OFFLINE` otherwise) and neither side may have blocked the other.
+   */
+  sendDirectMessage(userId: string, text: string, options: SendMessageOptions = {}): Promise<ChatMessage> {
+    return this.sendChat((clientRef) => ({
+      type: 'ChatSendDirect',
+      data: {
+        user_id: userId,
+        text,
+        ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
+        client_ref: clientRef,
+      },
+    }), options.clientRef);
+  }
+
+  /**
+   * Announce that this user is (not) typing in `channelId`. Best-effort: `typing: true` is
+   * coalesced client-side to at most one message per `intervalMs`, so it can be called on
+   * every keystroke; `typing: false` is always sent (and clears the throttle).
+   */
+  setTyping(channelId: string, typing: boolean, intervalMs = 1500): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    if (typing) {
+      const last = this.typingSentAt.get(channelId);
+      if (last !== undefined && now - last < intervalMs) return;
+      this.typingSentAt.set(channelId, now);
+    } else {
+      this.typingSentAt.delete(channelId);
+    }
+    this.send({ type: 'ChatTyping', data: { channel_id: channelId, typing } });
+  }
+
+  private sendChat(build: (clientRef: string) => ClientMessage, ref?: string): Promise<ChatMessage> {
+    this.requireOpen();
+    const clientRef = ref ?? `m${++this.chatRefCounter}-${Date.now().toString(36)}`;
+    if (this.pendingChat.has(clientRef)) return Promise.reject(new Error(`clientRef ${clientRef} already pending`));
+    return new Promise<ChatMessage>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingChat.delete(clientRef);
+        reject(new Error('message send timed out'));
+      }, this.opts.requestTimeoutMs);
+      this.pendingChat.set(clientRef, { resolve, reject, timer });
+      this.send(build(clientRef));
+    });
   }
 
   /** Mute/unmute the microphone locally and announce the state to channel members. */
@@ -930,6 +1049,16 @@ export class AurixClient {
       }
       case 'Error': {
         const d = (msg as Extract<ServerMessage, { type: 'Error' }>).data;
+        if (d.client_ref !== undefined) {
+          const pending = this.pendingChat.get(d.client_ref);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingChat.delete(d.client_ref);
+            pending.reject(new Error(`${d.code}: ${d.message}`));
+          }
+          this.emit('serverError', d.code, d.message);
+          return;
+        }
         // A failed join/moderation/offer is reported as a generic Error; fail the oldest
         // pending request.
         const join = this.pendingJoins.entries().next();
@@ -951,6 +1080,25 @@ export class AurixClient {
           pending.reject(new Error(`${d.code}: ${d.message}`));
         }
         this.emit('serverError', d.code, d.message);
+        return;
+      }
+      case 'ChatMessageReceived': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatMessageReceived' }>).data;
+        const message = this.toChatMessage(d.message);
+        if (message.own && message.clientRef !== undefined) {
+          const pending = this.pendingChat.get(message.clientRef);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingChat.delete(message.clientRef);
+            pending.resolve(message);
+          }
+        }
+        this.emit('chatMessage', message);
+        return;
+      }
+      case 'ParticipantTyping': {
+        const d = (msg as Extract<ServerMessage, { type: 'ParticipantTyping' }>).data;
+        this.emit('participantTyping', d.channel_id, d.user_id, d.typing);
         return;
       }
       case 'ModerateParticipantAck': {
@@ -1151,6 +1299,29 @@ export class AurixClient {
 
   private requireOpen(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('not connected');
+  }
+
+  private toChatMessage(w: ChatMessageWire): ChatMessage {
+    // `client_ref` is only echoed to the sender, so its presence (or a pending ref) marks
+    // our own messages even before the user id is known from a channel join.
+    const clientRef = w.client_ref ?? undefined;
+    const own =
+      (this.userId !== undefined && w.from_user_id === this.userId) ||
+      (clientRef !== undefined && this.pendingChat.has(clientRef));
+    const m: ChatMessage = {
+      id: w.id,
+      fromUserId: w.from_user_id,
+      displayName: w.display_name,
+      text: w.text,
+      sentAt: new Date(w.sent_at),
+      own,
+      system: w.from_user_id === SYSTEM_USER_ID,
+    };
+    if (w.channel_id != null) m.channelId = w.channel_id;
+    if (w.to_user_id != null) m.toUserId = w.to_user_id;
+    if (w.metadata != null) m.metadata = w.metadata;
+    if (clientRef !== undefined) m.clientRef = clientRef;
+    return m;
   }
 
   private send(msg: ClientMessage): void {
