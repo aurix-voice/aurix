@@ -193,9 +193,15 @@ namespace Aurix.Audio
         /// existing contents. Mono streams with a direction are panned between the first two output
         /// channels (left, right); further channels get the centred signal.
         /// </summary>
-        public void Mix(float[] output, int outputChannels)
+        public void Mix(float[] output, int outputChannels) => Mix(output, 0, output.Length / outputChannels, outputChannels);
+
+        /// <summary>
+        /// Mix <paramref name="frames"/> frames into <paramref name="output"/> starting at sample index
+        /// <paramref name="offset"/> (see <see cref="Mix(float[], int)"/>).
+        /// </summary>
+        public void Mix(float[] output, int offset, int frames, int outputChannels)
         {
-            int framesNeeded = output.Length / outputChannels;
+            int framesNeeded = frames;
             float master = _outputMuted ? 0f : _outputVolume;
             lock (_streams)
             {
@@ -235,7 +241,7 @@ namespace Aurix.Audio
                                     int srcC = dch == 1 ? 0 : Math.Min(c, dch - 1);
                                     float g = gain;
                                     if (pan) g *= c == 0 ? s.LeftGain : c == 1 ? s.RightGain : 1f;
-                                    output[(written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * g;
+                                    output[offset + (written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * g;
                                 }
                             }
                         }
@@ -246,7 +252,8 @@ namespace Aurix.Audio
                 foreach (var k in _stale) { _streams[k].Decoder.Dispose(); _streams.Remove(k); }
             }
             // Soft clip to avoid wrap-around distortion when several loud talkers overlap.
-            for (int i = 0; i < output.Length; i++)
+            int end = offset + frames * outputChannels;
+            for (int i = offset; i < end; i++)
             {
                 float v = output[i];
                 if (v > 1f) output[i] = 1f; else if (v < -1f) output[i] = -1f;

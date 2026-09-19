@@ -87,6 +87,8 @@ namespace Aurix
         private CancellationTokenSource _cts;
         private DateTime _lastPing = DateTime.MinValue;
         private DateTime _lastPong = DateTime.MinValue;
+        private DateTime _probeDeadline = DateTime.MaxValue;
+        private ulong _probeNonce;
         private uint _rtpTimestamp;
         private bool _muted;
         private Guid? _pendingChannelJoin;
@@ -241,6 +243,42 @@ namespace Aurix
         /// </summary>
         public void ReconnectNow() => _skipBackoff?.Cancel();
 
+        /// <summary>
+        /// Drop the current connection and reconnect right away (resume + UDP rebind), as if it had been
+        /// lost. Use it when the network path is known to have changed — Wi-Fi ↔ cellular, VPN up/down:
+        /// the TCP socket may take a minute to notice and the media session is bound to the old source
+        /// address, so nothing is heard until the rebind. While already reconnecting it skips the current
+        /// backoff delay; disconnected clients are left alone. Call from the <see cref="Update"/> thread.
+        /// </summary>
+        public void ForceReconnect(string reason = "network changed")
+        {
+            if (_closedByUser) return;
+            if (State == VoiceConnectionState.Reconnecting) { ReconnectNow(); return; }
+            var control = _control;
+            if (control == null || State == VoiceConnectionState.Disconnected || State == VoiceConnectionState.Failed) return;
+            control.Dispose();
+            HandleClosed(control, reason);
+        }
+
+        /// <summary>
+        /// Check whether the control connection is still alive after the app was suspended (mobile
+        /// background, laptop sleep): sends a ping now and, unless a pong arrives within
+        /// <paramref name="timeout"/> (default 2 s), treats the connection as lost so the reconnect
+        /// starts immediately instead of after the regular ping timeout (3 × <see cref="PingInterval"/>).
+        /// A live connection is left untouched.
+        /// </summary>
+        public void ProbeConnection(TimeSpan? timeout = null)
+        {
+            var control = _control;
+            if (control == null || !control.IsOpen) return;
+            var now = DateTime.UtcNow;
+            _lastPing = now;
+            _probeDeadline = now + (timeout ?? TimeSpan.FromSeconds(2));
+            var nonce = (ulong)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() & 0x1F_FFFF_FFFF_FFFF);
+            _probeNonce = nonce; // only a pong to this ping (or a later one) counts, not one already in flight
+            _ = control.SendAsync(ControlMessage.Ping(nonce));
+        }
+
         /// <summary>Open a control channel (optionally resuming) and wait for <c>SessionInitAck</c>.</summary>
         private async Task<SessionInfo> OpenSessionAsync(string resume, CancellationToken ct)
         {
@@ -276,6 +314,7 @@ namespace Aurix
                 _control = control;
                 _lastPing = DateTime.UtcNow;
                 _lastPong = _lastPing;
+                _probeDeadline = DateTime.MaxValue;
                 SetState(VoiceConnectionState.Connected);
                 return info;
             }
@@ -850,11 +889,14 @@ namespace Aurix
                     var nonce = (ulong)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() & 0x1F_FFFF_FFFF_FFFF);
                     _ = control.SendAsync(ControlMessage.Ping(nonce));
                 }
-                // Two unanswered pings: the socket is half-open, treat it as lost so a reconnect can start.
-                if (_lastPong < _lastPing && now - _lastPong > PingInterval + PingInterval + PingInterval)
+                bool probeExpired = _probeDeadline != DateTime.MaxValue && now > _probeDeadline;
+                // Two unanswered pings (or an unanswered probe): the socket is half-open, treat it as lost
+                // so a reconnect can start.
+                if (probeExpired || (_lastPong < _lastPing && now - _lastPong > PingInterval + PingInterval + PingInterval))
                 {
+                    _probeDeadline = DateTime.MaxValue;
                     control.Dispose();
-                    HandleClosed(control, "ping timeout");
+                    HandleClosed(control, probeExpired ? "probe timeout" : "ping timeout");
                 }
             }
         }
@@ -1220,6 +1262,7 @@ namespace Aurix
                     var sent = (long)m.Num("nonce");
                     ControlRttMs = Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - sent);
                     _lastPong = DateTime.UtcNow;
+                    if ((ulong)sent >= _probeNonce) _probeDeadline = DateTime.MaxValue;
                     break;
                 }
                 default:

@@ -727,6 +727,40 @@ namespace Aurix.Demo
             Console.WriteLine($"reconnecting={reconnecting} back={back} sameSession={sameSession} audioAfterResume={audioAfterResume} " +
                               $"(bob {bobBefore}→{bob.Media.PacketsReceived}, alice seq {sentBefore}→{alice.Media.CurrentSequence}) bobSawLeave={bobSawLeave}");
 
+            // 1b. Mobile: the app knows the network path changed (Wi-Fi → cellular) → ForceReconnect on a
+            // healthy connection resumes the same session and rebinds media without waiting for a timeout.
+            Console.WriteLine("ForceReconnect (network change) on a healthy connection");
+            long bobBeforeForce = bob.Media.PacketsReceived;
+            var forcedAt = DateTime.UtcNow;
+            alice.ForceReconnect("wifi -> cellular");
+            bool forcedReconnecting = await WaitState(alice, VoiceConnectionState.Reconnecting, TimeSpan.FromSeconds(2));
+            bool forcedBack = await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(10));
+            var forcedTook = DateTime.UtcNow - forcedAt;
+            alice.PingInterval = TimeSpan.FromSeconds(30); // regular ping timeout would be 90 s
+            bool forcedSame = alice.Session.SessionId == a.SessionId && alice.Session.Resumed;
+            await Task.Delay(200);
+            await Stream(25);
+            await Task.Delay(300);
+            bool audioAfterForce = bob.Media.PacketsReceived > bobBeforeForce;
+            Console.WriteLine($"forced: reconnecting={forcedReconnecting} back={forcedBack} in {forcedTook.TotalMilliseconds:F0} ms sameSession={forcedSame} audio={audioAfterForce}");
+
+            // 1c. Mobile: back from background over a half-open socket (bytes vanish, no RST) →
+            // ProbeConnection detects it within its own timeout instead of 3 × PingInterval.
+            Console.WriteLine("stalling the connection, then ProbeConnection(700 ms)");
+            proxy.Stall(true);
+            var probedAt = DateTime.UtcNow;
+            alice.ProbeConnection(TimeSpan.FromMilliseconds(700));
+            bool probeReconnecting = await WaitState(alice, VoiceConnectionState.Reconnecting, TimeSpan.FromSeconds(5));
+            var probeTook = DateTime.UtcNow - probedAt;
+            proxy.Stall(false);
+            proxy.Cut(); // the stalled sockets are dead on the client side already; drop the proxy halves too
+            bool probeBack = await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(10));
+            bool probeSame = alice.Session.SessionId == a.SessionId && alice.Session.Resumed;
+            alice.PingInterval = TimeSpan.FromSeconds(1);
+            bool probeFast = probeReconnecting && probeTook < TimeSpan.FromSeconds(3);
+            string probeReason; lock (log) probeReason = log.FindLast(l => l.StartsWith("alice: recovering #1 in") && l.Contains("probe timeout")) ?? "(no probe-timeout recovery logged)";
+            Console.WriteLine($"probe: reconnecting={probeReconnecting} after {probeTook.TotalMilliseconds:F0} ms back={probeBack} sameSession={probeSame} — {probeReason}");
+
             // 2. Cut for longer than grace → fresh session, channel re-joined.
             bool freshOk = true, rejoined = true, bobSawRejoin = true;
             if (alice.ResumeGrace <= TimeSpan.FromSeconds(10))
@@ -758,7 +792,10 @@ namespace Aurix.Demo
             await bob.DisconnectAsync();
             Console.WriteLine("events:");
             lock (log) foreach (var l in log) Console.WriteLine("  " + l);
-            bool ok = reconnecting && sameSession && audioAfterResume && !bobSawLeave && freshOk && rejoined && bobSawRejoin && failed && failedEvent;
+            bool ok = reconnecting && sameSession && audioAfterResume && !bobSawLeave
+                      && forcedReconnecting && forcedBack && forcedSame && audioAfterForce
+                      && probeFast && probeBack && probeSame && probeReason.Contains("probe timeout")
+                      && freshOk && rejoined && bobSawRejoin && failed && failedEvent;
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }
@@ -769,6 +806,7 @@ namespace Aurix.Demo
             private readonly System.Net.Sockets.TcpListener _listener;
             private readonly List<System.Net.Sockets.TcpClient> _sockets = new List<System.Net.Sockets.TcpClient>();
             private volatile bool _blocked;
+            private volatile bool _stalled;
             public int Port { get; }
 
             public CutProxy(string host, int port)
@@ -791,14 +829,18 @@ namespace Aurix.Demo
                 });
             }
 
-            private static async Task Pipe(System.Net.Sockets.TcpClient from, System.Net.Sockets.TcpClient to)
+            private async Task Pipe(System.Net.Sockets.TcpClient from, System.Net.Sockets.TcpClient to)
             {
                 var buf = new byte[16 * 1024];
                 try
                 {
                     var src = from.GetStream(); var dst = to.GetStream();
                     int n;
-                    while ((n = await src.ReadAsync(buf, 0, buf.Length)) > 0) await dst.WriteAsync(buf, 0, n);
+                    while ((n = await src.ReadAsync(buf, 0, buf.Length)) > 0)
+                    {
+                        if (_stalled) continue; // black hole: the connection looks alive but nothing gets through
+                        await dst.WriteAsync(buf, 0, n);
+                    }
                 }
                 catch { }
                 finally { from.Dispose(); to.Dispose(); }
@@ -806,6 +848,9 @@ namespace Aurix.Demo
 
             /// <summary>Reject new connections (simulates the server being unreachable).</summary>
             public void Block(bool blocked) => _blocked = blocked;
+
+            /// <summary>Keep connections open but drop every byte (simulates a half-open socket after a network change).</summary>
+            public void Stall(bool stalled) => _stalled = stalled;
 
             /// <summary>Destroy every relayed connection abruptly.</summary>
             public void Cut()
