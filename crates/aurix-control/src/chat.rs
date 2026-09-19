@@ -248,11 +248,7 @@ impl ChatService {
         self.validate(&msg.text, msg.metadata.as_ref())?;
 
         // Operator messages come from the REST API and bypass the player-content filter.
-        let filter = self
-            .filter
-            .as_ref()
-            .filter(|_| msg.from_user_id != SYSTEM_USER);
-        if let Some(filter) = filter {
+        if msg.from_user_id != SYSTEM_USER {
             let req = FilterRequest {
                 app_id: msg.app_id,
                 channel_id: msg.channel_id,
@@ -262,26 +258,8 @@ impl ChatService {
                 text: &msg.text,
                 metadata: msg.metadata.as_ref(),
             };
-            match filter.check(req).await {
-                Ok(Verdict::Allow) => {}
-                Ok(Verdict::Replace(text)) => {
-                    if text.len() > self.cfg.max_message_bytes {
-                        return Err(AurixError::MessageBlocked(
-                            "Filter replacement exceeds the size limit".into(),
-                        ));
-                    }
-                    msg.text = text;
-                }
-                Ok(Verdict::Block(reason)) => return Err(AurixError::MessageBlocked(reason)),
-                Err(e) if self.cfg.filter_fail_open => {
-                    warn!("chat filter unavailable, delivering unfiltered: {e}");
-                }
-                Err(e) => {
-                    warn!("chat filter unavailable, blocking message: {e}");
-                    return Err(AurixError::MessageBlocked(
-                        "Content filter is unavailable".into(),
-                    ));
-                }
+            if let Some(text) = self.filter_text(req, self.cfg.max_message_bytes).await? {
+                msg.text = text;
             }
         }
 
@@ -322,6 +300,46 @@ impl ChatService {
             from_session_id: msg.from_session_id,
         });
         Ok(message)
+    }
+
+    /// Runs the configured content filter (if any) over player-authored text. Returns the
+    /// replacement text when the filter rewrote it, `Ok(None)` when it passes unchanged, and
+    /// `MessageBlocked` when it must not be delivered (including a failed filter call unless
+    /// `filter_fail_open`). Voice-related text (TTS) shares this hook with chat.
+    pub async fn filter_text(
+        &self,
+        req: FilterRequest<'_>,
+        max_replacement_bytes: usize,
+    ) -> Result<Option<String>> {
+        let Some(filter) = self.filter.as_ref() else {
+            return Ok(None);
+        };
+        match filter.check(req).await {
+            Ok(Verdict::Allow) => Ok(None),
+            Ok(Verdict::Replace(text)) => {
+                if text.len() > max_replacement_bytes {
+                    return Err(AurixError::MessageBlocked(
+                        "Filter replacement exceeds the size limit".into(),
+                    ));
+                }
+                Ok(Some(text))
+            }
+            Ok(Verdict::Block(reason)) => Err(AurixError::MessageBlocked(reason)),
+            Err(e) if self.cfg.filter_fail_open => {
+                warn!("content filter unavailable, delivering unfiltered: {e}");
+                Ok(None)
+            }
+            Err(e) => {
+                warn!("content filter unavailable, blocking message: {e}");
+                Err(AurixError::MessageBlocked(
+                    "Content filter is unavailable".into(),
+                ))
+            }
+        }
+    }
+
+    pub fn has_filter(&self) -> bool {
+        self.filter.is_some()
     }
 
     pub fn publish_typing(

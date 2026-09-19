@@ -105,17 +105,61 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    // STT / content analysis pipeline (only when a provider endpoint is configured).
-    if let Some(endpoint) = config.moderation.content_analysis_webhook.as_ref() {
+    // Speech-to-text: channels with `transcription` enabled are segmented per speaker and sent
+    // to the provider; results fan out as `channel.transcript` events (never stored here).
+    if let (true, Some(endpoint)) = (config.stt.enabled, config.stt.endpoint.as_ref()) {
         let stt: Arc<dyn aurix_common::tts_stt::SttProvider> =
-            Arc::new(aurix_common::tts_stt::WhisperSttProvider::new(endpoint));
-        let pipeline = aurix_media::audio_pipeline::AudioAnalysisPipeline::new(
+            Arc::new(aurix_common::tts_stt::WhisperSttProvider::with_options(
+                endpoint,
+                aurix_common::tts_stt::HttpProviderOptions {
+                    api_key: config.stt.api_key.clone(),
+                    model: config.stt.model.clone(),
+                    timeout: Some(std::time::Duration::from_millis(config.stt.timeout_ms)),
+                },
+                config.stt.language.clone(),
+            ));
+        let mut options = aurix_media::audio_pipeline::PipelineOptions::new(
             config.media.default_sample_rate,
-            2.0,
-            Some(stt),
-            Vec::new(),
+            config.stt.segment_secs,
         );
+        options.silence_flush = (config.stt.silence_flush_ms > 0)
+            .then(|| std::time::Duration::from_millis(config.stt.silence_flush_ms));
+        options.min_segment = std::time::Duration::from_millis(config.stt.min_segment_ms);
+        options.max_concurrent_stt = config.stt.max_concurrent_requests as usize;
+        let mut pipeline =
+            aurix_media::audio_pipeline::AudioAnalysisPipeline::new(options, Some(stt), Vec::new());
+        let events = control.events.clone();
+        let include_words = config.stt.include_words;
+        pipeline.set_stt_callback(move |seg| {
+            let words = if include_words {
+                seg.result
+                    .words
+                    .into_iter()
+                    .map(|w| aurix_common::protocol::TranscriptWordTiming {
+                        word: w.word,
+                        start_ms: w.start_ms,
+                        end_ms: w.end_ms,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            events.publish(aurix_control::ServerEvent::Transcript {
+                app_id: seg.app_id,
+                transcript: aurix_common::protocol::Transcript {
+                    id: uuid::Uuid::new_v4(),
+                    channel_id: seg.channel_id,
+                    user_id: seg.user_id,
+                    text: seg.result.text,
+                    language: Some(seg.result.language).filter(|l| !l.is_empty()),
+                    started_at: seg.started_at,
+                    duration_ms: seg.audio_ms,
+                    words,
+                },
+            });
+        });
         sfu.set_audio_pipeline(Arc::new(pipeline));
+        info!("Speech-to-text enabled");
     }
 
     let recording = if config.recording.enabled {
@@ -133,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     let media_bind = format!("{}:{}", config.media.host, config.media.port);
     sfu.start(&media_bind).await?;
     info!("SFU node started on {}", media_bind);
+    control.speech.start(&sfu);
     let sfu = Arc::new(RwLock::new(sfu));
 
     let node_address = config

@@ -33,6 +33,15 @@ namespace Aurix
         public float Energy;
     }
 
+    /// <summary>A queued text-to-speech request; see <see cref="AurixVoiceClient.SpeakAsync"/>.</summary>
+    public sealed class SpeechRequest
+    {
+        public Guid RequestId;
+        public string ClientRef;
+        /// <summary>Completes with the terminal status (finished, cancelled or failed).</summary>
+        public Task<TtsStatus> Done;
+    }
+
     public sealed class SessionInfo
     {
         public Guid SessionId;
@@ -89,6 +98,13 @@ namespace Aurix
         private int _chatRefCounter;
         /// <summary>channel → time of the last <c>ChatTyping {typing: true}</c> sent.</summary>
         private readonly Dictionary<Guid, DateTime> _typingSentAt = new Dictionary<Guid, DateTime>();
+        /// <summary>client_ref → pending <see cref="SpeakAsync"/> (settled by the <c>queued</c> status or an <c>Error</c>).</summary>
+        private readonly Dictionary<string, TaskCompletionSource<SpeechRequest>> _pendingSpeak = new Dictionary<string, TaskCompletionSource<SpeechRequest>>();
+        /// <summary>client_ref → completion of <see cref="SpeechRequest.Done"/> for requests still in flight.</summary>
+        private readonly Dictionary<string, TaskCompletionSource<TtsStatus>> _speechDone = new Dictionary<string, TaskCompletionSource<TtsStatus>>();
+        private int _speakRefCounter;
+        private bool _wantTranscripts = true;
+        private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
         private byte[] _mediaKey;
         private string _resumeToken;
         private uint _lastMediaSequence;
@@ -155,6 +171,14 @@ namespace Aurix
         public event Action<ChatMessage> OnChatMessage;
         /// <summary>Another member of the channel started/stopped typing (channel, user, typing).</summary>
         public event Action<Guid, Guid, bool> OnParticipantTyping;
+        /// <summary>
+        /// Speech-to-text of a member (or this user) in a channel the server transcribes. Ephemeral: nothing is
+        /// stored server-side. Suppressed after <see cref="SetTranscriptsAsync"/>(false); participants this client
+        /// blocked or locally muted are not transcribed for it either.
+        /// </summary>
+        public event Action<Transcript> OnTranscript;
+        /// <summary>Progress of a <see cref="SpeakAsync"/> request (queued → playing → finished/cancelled/failed).</summary>
+        public event Action<TtsStatus> OnTtsStatus;
         /// <summary>
         /// Periodic audio levels of channel members whose energy changed (channel, levels). Participants'
         /// <see cref="Participant.Energy"/> is updated before the event fires. Level meters should decay
@@ -225,6 +249,7 @@ namespace Aurix
             control.Received += CompletePendingJoin;
             control.Received += CompletePendingModeration;
             control.Received += CompletePendingChat;
+            control.Received += CompletePendingSpeak;
             try
             {
                 await control.ConnectAsync(new Uri(_wsUrl), _token, ct, resume).ConfigureAwait(false);
@@ -361,6 +386,7 @@ namespace Aurix
             lock (_channels)
             {
                 _joinedChannels.Remove(channelId);
+                _transcribedChannels.Remove(channelId);
                 if (_channels.TryGetValue(channelId, out var map))
                 {
                     foreach (var p in map.Values) _bySsrc.Remove(p.Ssrc);
@@ -544,6 +570,67 @@ namespace Aurix
             return control.SendAsync(ControlMessage.ChatTyping(channelId, typing), ct);
         }
 
+        /// <summary>Whether the server transcribes <paramref name="channelId"/> (per its <c>ChannelJoinAck</c>).</summary>
+        public bool IsChannelTranscribed(Guid channelId)
+        {
+            lock (_channels) return _transcribedChannels.Contains(channelId);
+        }
+
+        /// <summary>Whether this client receives <see cref="OnTranscript"/> (default true).</summary>
+        public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
+
+        /// <summary>
+        /// Opt out of (or back into) transcript delivery. Client-held: survives reconnects. Does not change
+        /// whether the channel is transcribed for others.
+        /// </summary>
+        public Task SetTranscriptsAsync(bool enabled, CancellationToken ct = default)
+        {
+            lock (_channels) _wantTranscripts = enabled;
+            var control = _control;
+            if (control == null || !control.IsOpen) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetTranscripts(enabled), ct);
+        }
+
+        /// <summary>
+        /// Have the server synthesize <paramref name="text"/> and play it as this user's voice. Completes once
+        /// the request is queued; <see cref="SpeechRequest.Done"/> and <see cref="OnTtsStatus"/> follow playback.
+        /// <paramref name="channelId"/> may be null when the session transmits to exactly one channel. Faults with
+        /// <c>CODE: message</c> on refusal (<c>FEATURE_DISABLED</c>, <c>AUTH_DENIED</c> not a member, <c>USER_MUTED</c>
+        /// when server-muted, <c>VALIDATION_ERROR</c> text too long / unknown voice, <c>RATE_LIMIT_EXCEEDED</c>,
+        /// <c>MESSAGE_BLOCKED</c> by the content filter).
+        /// </summary>
+        public async Task<SpeechRequest> SpeakAsync(string text, Guid? channelId = null, TtsDestination destination = TtsDestination.Channel,
+            string voice = null, string clientRef = null, CancellationToken ct = default)
+        {
+            EnsureConnected();
+            if (channelId == Guid.Empty) channelId = null;
+            var reference = clientRef ?? $"t{Interlocked.Increment(ref _speakRefCounter)}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
+            var tcs = new TaskCompletionSource<SpeechRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pendingSpeak)
+            {
+                if (_pendingSpeak.ContainsKey(reference) || _speechDone.ContainsKey(reference))
+                    throw new InvalidOperationException($"clientRef {reference} already pending");
+                _pendingSpeak[reference] = tcs;
+            }
+            try
+            {
+                await _control.SendAsync(ControlMessage.TtsSpeak(channelId, text, voice, destination, reference), ct).ConfigureAwait(false);
+                using (var timeout = new CancellationTokenSource(RequestTimeout))
+                using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("speak request timeout"))))
+                using (ct.Register(() => tcs.TrySetCanceled()))
+                    return await tcs.Task.ConfigureAwait(false);
+            }
+            finally { lock (_pendingSpeak) _pendingSpeak.Remove(reference); }
+        }
+
+        /// <summary>Cancel every queued or playing <see cref="SpeakAsync"/> request of this session.</summary>
+        public Task CancelSpeechAsync(CancellationToken ct = default)
+        {
+            var control = _control;
+            if (control == null || !control.IsOpen) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.TtsCancel(), ct);
+        }
+
         private async Task<ChatMessage> SendChatAsync(Func<string, string> build, string clientRef, CancellationToken ct)
         {
             EnsureConnected();
@@ -571,6 +658,16 @@ namespace Aurix
             lock (_pendingChat) { pending = new List<TaskCompletionSource<ChatMessage>>(_pendingChat.Values); _pendingChat.Clear(); }
             foreach (var tcs in pending) tcs.TrySetException(e);
             lock (_typingSentAt) _typingSentAt.Clear();
+            List<TaskCompletionSource<SpeechRequest>> speak;
+            List<TaskCompletionSource<TtsStatus>> done;
+            lock (_pendingSpeak)
+            {
+                speak = new List<TaskCompletionSource<SpeechRequest>>(_pendingSpeak.Values); _pendingSpeak.Clear();
+                done = new List<TaskCompletionSource<TtsStatus>>(_speechDone.Values); _speechDone.Clear();
+            }
+            foreach (var tcs in speak) tcs.TrySetException(e);
+            foreach (var tcs in done) tcs.TrySetException(e);
+            lock (_channels) _transcribedChannels.Clear();
         }
 
         /// <summary>A fresh (non-resumed) session forgot our local mutes/volumes/transmission: send them again.</summary>
@@ -595,6 +692,10 @@ namespace Aurix
             // `All` is the server default; `Single`/focus need the channel and follow its ChannelJoinAck.
             if (transmission.Kind == TransmissionKind.None)
                 await control.SendAsync(ControlMessage.SetTransmission(transmission), ct).ConfigureAwait(false);
+            bool wantTranscripts;
+            lock (_channels) wantTranscripts = _wantTranscripts;
+            if (!wantTranscripts)
+                await control.SendAsync(ControlMessage.SetTranscripts(false), ct).ConfigureAwait(false);
         }
 
         /// <summary>Channel-scoped mutes, a <c>Single</c> target and the focus need membership, so they are (re-)sent after each successful join.</summary>
@@ -704,8 +805,16 @@ namespace Aurix
 
         public Participant FindBySsrc(uint ssrc)
         {
-            lock (_channels) return _bySsrc.TryGetValue(ssrc, out var p) ? p : null;
+            lock (_channels)
+            {
+                if (_bySsrc.TryGetValue(ssrc, out var p)) return p;
+                // A participant's synthesized (TTS) voice shares its SSRC with the flag bit set.
+                return (ssrc & AurxPacket.SynthSsrcFlag) != 0 && _bySsrc.TryGetValue(ssrc & ~AurxPacket.SynthSsrcFlag, out p) ? p : null;
+            }
         }
+
+        /// <summary>True for SSRCs of server-synthesized speech (a participant's TTS voice or a channel announcement).</summary>
+        public static bool IsSynthesizedSsrc(uint ssrc) => (ssrc & AurxPacket.SynthSsrcFlag) != 0;
 
         /// <summary>Non-event alternative to <see cref="OnAudio"/> for audio-thread consumers.</summary>
         public bool TryDequeueAudio(out IncomingAudio audio)
@@ -941,6 +1050,7 @@ namespace Aurix
                         }
                         _channels[channelId] = map;
                         _joinedChannels.Add(channelId);
+                        if (m.Bool("transcription")) _transcribedChannels.Add(channelId); else _transcribedChannels.Remove(channelId);
                     }
                     OnChannelJoined?.Invoke(channelId, roster);
                     break;
@@ -1081,6 +1191,18 @@ namespace Aurix
                 case "ParticipantTyping":
                     OnParticipantTyping?.Invoke(m.Id("channel_id"), m.Id("user_id"), m.Bool("typing"));
                     break;
+                case "Transcript":
+                {
+                    var t = m.Transcript();
+                    if (t != null) OnTranscript?.Invoke(t);
+                    break;
+                }
+                case "TtsStatus":
+                {
+                    var s = m.TtsStatus();
+                    if (s != null) OnTtsStatus?.Invoke(s);
+                    break;
+                }
                 case "ChannelEnergy":
                 {
                     var channelId = m.Id("channel_id");
@@ -1163,6 +1285,44 @@ namespace Aurix
             lock (_pendingChat) if (!_pendingChat.TryGetValue(reference, out tcs)) return;
             if (m.Type == "Error") tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
             else tcs.TrySetResult(m.ChatMessage());
+        }
+
+        /// <summary>
+        /// Runs on the network thread: the <c>queued</c> status settles the matching <see cref="SpeakAsync"/>,
+        /// a terminal status completes its <see cref="SpeechRequest.Done"/>, an <c>Error</c> with the same
+        /// <c>client_ref</c> faults the send.
+        /// </summary>
+        private void CompletePendingSpeak(ControlMessage m)
+        {
+            if (m.Type == "Error")
+            {
+                var reference = m.Str("client_ref");
+                if (reference == null) return;
+                TaskCompletionSource<SpeechRequest> pending;
+                lock (_pendingSpeak) if (!_pendingSpeak.TryGetValue(reference, out pending)) return;
+                pending.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
+                return;
+            }
+            if (m.Type != "TtsStatus") return;
+            var status = m.TtsStatus();
+            if (status?.ClientRef == null) return;
+            TaskCompletionSource<SpeechRequest> speak;
+            TaskCompletionSource<TtsStatus> done = null;
+            lock (_pendingSpeak)
+            {
+                if (_pendingSpeak.TryGetValue(status.ClientRef, out speak) && !_speechDone.ContainsKey(status.ClientRef))
+                {
+                    done = new TaskCompletionSource<TtsStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _speechDone[status.ClientRef] = done;
+                }
+                else speak = null;
+                if (status.IsTerminal && _speechDone.TryGetValue(status.ClientRef, out var finished))
+                {
+                    _speechDone.Remove(status.ClientRef);
+                    finished.TrySetResult(status);
+                }
+            }
+            speak?.TrySetResult(new SpeechRequest { RequestId = status.RequestId, ClientRef = status.ClientRef, Done = done.Task });
         }
 
         private Participant Lookup(Guid channelId, Guid userId)

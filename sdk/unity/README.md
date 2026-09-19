@@ -311,6 +311,37 @@ the transmission mode and focus treat injected audio exactly like speech; with n
 attached) the behaviour still pumps injection-only 20 ms frames. `Play`/`OpenStream` replace whatever is playing;
 drive the injector from the thread that produces the microphone frames (it is not thread-safe).
 
+### Transcripts & text-to-speech
+
+```csharp
+// backend: channel config {"transcription": true} + [stt] configured on the server
+voice.Client.OnTranscript += t => captions.Show(t.UserId, t.Text, t.StartedAt, t.DurationMs, t.Words);
+voice.Client.IsChannelTranscribed(channelId);        // from ChannelJoinAck.transcription
+await voice.Client.SetTranscriptsAsync(false);       // stop receiving captions (replayed after reconnect)
+voice.Client.TranscriptsEnabled;                     // true by default
+
+// [tts] configured on the server (GET /v1/tts/voices lists voices and limits)
+var req = await voice.Client.SpeakAsync("Enemy spotted at B", channelId, TtsDestination.Channel, voice: "nova");
+voice.Client.OnTtsStatus += s => Debug.Log($"{s.ClientRef} {s.State} {s.DurationMs} {s.Message}");
+var final = await req.Done;                          // Finished | Cancelled | Failed
+await voice.Client.SpeakAsync("Reading your message…", channelId, TtsDestination.Local); // only you hear it
+await voice.Client.CancelSpeechAsync();              // drops everything still queued or playing
+
+AurixVoiceClient.IsSynthesizedSsrc(frame.Ssrc);      // TTS voice vs. microphone; FindBySsrc resolves both
+```
+
+Transcripts arrive only for channels the operator marked `transcription: true`, only from participants you
+would hear (local mute, block and zero gain suppress their captions), never for end-to-end-encrypted audio, and
+are not stored by the server — the event is your only copy. `SpeakAsync` completes once the server queued the
+request and faults with `CODE: message` on refusal (`FEATURE_DISABLED`, `AUTH_DENIED` not a member, `USER_MUTED`,
+`VALIDATION_ERROR` too long / unknown voice / control characters / ambiguous channel, `RATE_LIMIT_EXCEEDED`
+queue or per-minute budget, `MESSAGE_BLOCKED` by the content filter); `channelId` may be null when the session
+transmits to exactly one channel. Synthesized speech is routed exactly like your microphone (transmission mode,
+mutes, blocks, focus, other nodes) and arrives on the participant's SSRC with the top bit set (`SynthSsrcFlag`),
+so the `RemoteMixer` gives it its own jitter buffer and `FindBySsrc` still returns the speaker; channel
+announcements (`POST /v1/channels/:id/tts`) use a per-channel synthetic SSRC with no participant behind it.
+Statuses go to the requesting session only; disconnecting cancels pending requests.
+
 ## .NET: build, test, end-to-end demo
 
 ```bash

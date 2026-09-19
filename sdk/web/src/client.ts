@@ -16,6 +16,9 @@ import {
   type RecordingConsent,
   type ServerMessage,
   type TransmissionModeWire,
+  type TranscriptWire,
+  type TtsDestinationWire,
+  type TtsStateWire,
   type TurnCredentials,
   type UnknownMessage,
   type UserPosition,
@@ -164,6 +167,70 @@ export interface SendMessageOptions {
   clientRef?: string;
 }
 
+/** A server-side speech-to-text result for a channel with transcription enabled. */
+export interface Transcript {
+  id: string;
+  channelId: string;
+  userId: string;
+  text: string;
+  /** BCP-47 / ISO language the provider detected, when known. */
+  language?: string;
+  /** When the transcribed audio started. */
+  startedAt: Date;
+  /** Length of the transcribed audio (ms). */
+  durationMs: number;
+  /** Word timings relative to `startedAt`; empty unless the server enables them. */
+  words: TranscriptWord[];
+}
+
+export interface TranscriptWord {
+  word: string;
+  startMs: number;
+  endMs: number;
+}
+
+/**
+ * Who hears a synthesized utterance: `channel` = the other members (the classic
+ * "text-to-speech into voice chat"), `local` = only this client, `both` = everyone including
+ * this client.
+ */
+export type TtsDestination = TtsDestinationWire;
+
+export type TtsState = TtsStateWire;
+
+export interface SpeakOptions {
+  /**
+   * Channel to speak into. Optional when this session transmits to exactly one channel
+   * (single joined channel or `single` transmission mode).
+   */
+  channelId?: string;
+  /** Provider voice; must be on the server's allowlist (`GET /v1/tts/voices`). */
+  voice?: string;
+  /** Defaults to `channel`. */
+  destination?: TtsDestination;
+  /** Correlation id echoed on every `ttsStatus` for this request. Generated when omitted. */
+  clientRef?: string;
+}
+
+/** A queued TTS request; see {@link AurixClient.speak}. */
+export interface SpeechRequest {
+  requestId: string;
+  clientRef: string;
+  /** Resolves with the terminal status (`finished`, `cancelled` or `failed`). */
+  done: Promise<TtsStatus>;
+}
+
+/** Lifecycle update of a TTS request; see {@link AurixEvents.ttsStatus}. */
+export interface TtsStatus {
+  requestId: string;
+  clientRef?: string;
+  state: TtsState;
+  /** Audio length (ms), set once synthesis succeeded. */
+  durationMs?: number;
+  /** Sanitized failure reason for `failed`. */
+  message?: string;
+}
+
 export type ConnectionState =
   | 'disconnected'
   | 'connecting'
@@ -243,6 +310,15 @@ export interface AurixEvents {
   chatMessage: (message: ChatMessage) => void;
   /** Another member of `channelId` started/stopped typing (never this client's own state). */
   participantTyping: (channelId: string, userId: string, typing: boolean) => void;
+  /**
+   * Speech-to-text of a channel member (or this user) in a channel with transcription
+   * enabled. Ephemeral: the server does not store transcripts. Suppressed with
+   * `setTranscripts(false)`; participants this client blocked/locally muted are not
+   * transcribed for it either.
+   */
+  transcript: (transcript: Transcript) => void;
+  /** Progress of a `speak()` request (queued → playing → finished/cancelled/failed). */
+  ttsStatus: (status: TtsStatus) => void;
   serverError: (code: string, message: string) => void;
   error: (error: Error) => void;
   message: (message: ServerMessage | UnknownMessage) => void;
@@ -299,7 +375,20 @@ const ALL_CHANNELS = '*';
 interface Pending<T> {
   resolve: (value: T) => void;
   reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: ReturnType<typeof setTimeout> | undefined;
+}
+
+function transcriptFromWire(t: TranscriptWire): Transcript {
+  return {
+    id: t.id,
+    channelId: t.channel_id,
+    userId: t.user_id,
+    text: t.text,
+    ...(t.language !== undefined && t.language !== null ? { language: t.language } : {}),
+    startedAt: new Date(t.started_at),
+    durationMs: t.duration_ms,
+    words: (t.words ?? []).map((w) => ({ word: w.word, startMs: w.start_ms, endMs: w.end_ms })),
+  };
 }
 
 function checkInputGain(gain: number): number {
@@ -403,6 +492,14 @@ export class AurixClient {
   private chatRefCounter = 0;
   /** channel id → last `ChatTyping { typing: true }` sent (ms, `performance.now()` clock). */
   private typingSentAt = new Map<string, number>();
+  /** client_ref → pending `speak()` (resolved by the `queued` status). */
+  private pendingSpeak = new Map<string, Pending<SpeechRequest>>();
+  /** client_ref → resolver of `SpeechRequest.done` for requests still in flight. */
+  private speechDone = new Map<string, Pending<TtsStatus>>();
+  private speakRefCounter = 0;
+  private wantTranscripts = true;
+  /** Channels the server transcribes (from `ChannelJoinAck`). */
+  private transcribedChannels = new Set<string>();
   private pendingAnswer: Pending<string> | undefined;
   private pendingInit: Pending<SessionInfo> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
@@ -810,6 +907,9 @@ export class AurixClient {
     if (this.transmission.type === 'none') {
       this.trySend({ type: 'SetTransmission', data: { mode: { mode: 'none' } } });
     }
+    if (!this.wantTranscripts) {
+      this.trySend({ type: 'SetTranscripts', data: { enabled: false } });
+    }
   }
 
   /**
@@ -936,6 +1036,17 @@ export class AurixClient {
     }
     this.pendingChat.clear();
     this.typingSentAt.clear();
+    for (const p of this.pendingSpeak.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.pendingSpeak.clear();
+    for (const p of this.speechDone.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.speechDone.clear();
+    this.transcribedChannels.clear();
     this.rejectPending(this.pendingAnswer, reason);
     this.pendingAnswer = undefined;
     this.rejectPending(this.pendingInit, reason);
@@ -992,7 +1103,64 @@ export class AurixClient {
     this.requireOpen();
     this.send({ type: 'ChannelLeave', data: { channel_id: channelId } });
     this.typingSentAt.delete(channelId);
+    this.transcribedChannels.delete(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
+  }
+
+  /** Whether the server transcribes `channelId` (speech-to-text is enabled for it). */
+  isChannelTranscribed(channelId: string): boolean {
+    return this.transcribedChannels.has(channelId);
+  }
+
+  /** Whether this client currently receives `transcript` events (default `true`). */
+  get transcriptsEnabled(): boolean {
+    return this.wantTranscripts;
+  }
+
+  /**
+   * Opt this client out of (or back into) transcript delivery. Client-held: survives
+   * reconnects. Does not affect whether the channel is transcribed for others.
+   */
+  setTranscripts(enabled: boolean): void {
+    this.wantTranscripts = enabled;
+    this.trySend({ type: 'SetTranscripts', data: { enabled } });
+  }
+
+  /**
+   * Have the server synthesize `text` and play it as this user's voice. Resolves once the
+   * request is queued; `done` (and `ttsStatus` events) track playback. Rejects with
+   * `<CODE>: <message>` on refusal (`FEATURE_DISABLED`, `AUTH_DENIED` not a member,
+   * `USER_MUTED` when server-muted, `VALIDATION_ERROR` text too long / unknown voice,
+   * `RATE_LIMIT_EXCEEDED`, `MESSAGE_BLOCKED` by the content filter).
+   */
+  speak(text: string, options: SpeakOptions = {}): Promise<SpeechRequest> {
+    this.requireOpen();
+    const clientRef = options.clientRef ?? `t${++this.speakRefCounter}-${Date.now().toString(36)}`;
+    if (this.pendingSpeak.has(clientRef) || this.speechDone.has(clientRef)) {
+      return Promise.reject(new Error(`clientRef ${clientRef} already pending`));
+    }
+    return new Promise<SpeechRequest>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingSpeak.delete(clientRef);
+        reject(new Error('speak request timed out'));
+      }, this.opts.requestTimeoutMs);
+      this.pendingSpeak.set(clientRef, { resolve, reject, timer });
+      this.send({
+        type: 'TtsSpeak',
+        data: {
+          ...(options.channelId !== undefined ? { channel_id: options.channelId } : {}),
+          text,
+          ...(options.voice !== undefined ? { voice: options.voice } : {}),
+          destination: options.destination ?? 'channel',
+          client_ref: clientRef,
+        },
+      });
+    });
+  }
+
+  /** Cancel every queued or playing `speak()` request of this session. */
+  cancelSpeech(): void {
+    this.trySend({ type: 'TtsCancel' });
   }
 
   /**
@@ -1433,6 +1601,8 @@ export class AurixClient {
           if (me) this.userId = me.user_id;
         }
         this.channels.set(d.channel_id, roster);
+        if (d.transcription) this.transcribedChannels.add(d.channel_id);
+        else this.transcribedChannels.delete(d.channel_id);
         const list = Array.from(roster.values());
         const pending = this.pendingJoins.get(d.channel_id);
         if (pending) {
@@ -1599,6 +1769,12 @@ export class AurixClient {
             this.pendingChat.delete(d.client_ref);
             pending.reject(new Error(`${d.code}: ${d.message}`));
           }
+          const speak = this.pendingSpeak.get(d.client_ref);
+          if (speak) {
+            clearTimeout(speak.timer);
+            this.pendingSpeak.delete(d.client_ref);
+            speak.reject(new Error(`${d.code}: ${d.message}`));
+          }
           this.emit('serverError', d.code, d.message);
           return;
         }
@@ -1642,6 +1818,44 @@ export class AurixClient {
       case 'ParticipantTyping': {
         const d = (msg as Extract<ServerMessage, { type: 'ParticipantTyping' }>).data;
         this.emit('participantTyping', d.channel_id, d.user_id, d.typing);
+        return;
+      }
+      case 'Transcript': {
+        const d = (msg as Extract<ServerMessage, { type: 'Transcript' }>).data;
+        this.emit('transcript', transcriptFromWire(d.transcript));
+        return;
+      }
+      case 'TtsStatus': {
+        const d = (msg as Extract<ServerMessage, { type: 'TtsStatus' }>).data;
+        const status: TtsStatus = {
+          requestId: d.request_id,
+          ...(d.client_ref !== undefined ? { clientRef: d.client_ref } : {}),
+          state: d.state,
+          ...(d.duration_ms !== undefined ? { durationMs: d.duration_ms } : {}),
+          ...(d.message !== undefined ? { message: d.message } : {}),
+        };
+        if (d.client_ref !== undefined) {
+          const pending = this.pendingSpeak.get(d.client_ref);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingSpeak.delete(d.client_ref);
+            const clientRef = d.client_ref;
+            const done = new Promise<TtsStatus>((resolve, reject) => {
+              this.speechDone.set(clientRef, { resolve, reject, timer: undefined });
+            });
+            // Nobody is obliged to await `done`.
+            done.catch(() => undefined);
+            pending.resolve({ requestId: d.request_id, clientRef, done });
+          }
+          if (d.state === 'finished' || d.state === 'cancelled' || d.state === 'failed') {
+            const done = this.speechDone.get(d.client_ref);
+            if (done) {
+              this.speechDone.delete(d.client_ref);
+              done.resolve(status);
+            }
+          }
+        }
+        this.emit('ttsStatus', status);
         return;
       }
       case 'ModerateParticipantAck': {

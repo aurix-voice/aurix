@@ -502,6 +502,59 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void SpeechMessagesMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b821-4856-71ab-9f6c-8907f61da4c2");
+            var alice = Guid.Parse("01a0b821-4862-73cd-81a3-dbe148edea9b");
+
+            Assert.Equal("{\"type\":\"SetTranscripts\",\"data\":{\"enabled\":false}}", ControlMessage.SetTranscripts(false));
+            Assert.Equal(
+                "{\"type\":\"TtsSpeak\",\"data\":{\"text\":\"gg\",\"destination\":\"channel\"}}",
+                ControlMessage.TtsSpeak(null, "gg", null, TtsDestination.Channel, null));
+            Assert.Equal(
+                "{\"type\":\"TtsSpeak\",\"data\":{\"text\":\"gg\",\"destination\":\"both\",\"channel_id\":\"" + team + "\",\"voice\":\"nova\",\"client_ref\":\"t1\"}}",
+                ControlMessage.TtsSpeak(team, "gg", "nova", TtsDestination.Both, "t1"));
+            Assert.Equal("{\"type\":\"TtsCancel\"}", ControlMessage.TtsCancel());
+
+            // Transcript as the server emits it (words only with stt.include_words, language optional).
+            var t = ControlMessage.Parse("{\"type\":\"Transcript\",\"data\":{\"transcript\":{\"id\":\"5855c240-f790-4303-8101-20f036ea25b1\"," +
+                "\"channel_id\":\"" + team + "\",\"user_id\":\"" + alice + "\",\"text\":\"tone 440hz\",\"language\":\"en\"," +
+                "\"started_at\":\"2026-09-19T05:26:24.581762672Z\",\"duration_ms\":1500," +
+                "\"words\":[{\"word\":\"tone\",\"start_ms\":0,\"end_ms\":750},{\"word\":\"440hz\",\"start_ms\":750,\"end_ms\":1500}]}}}").Transcript();
+            Assert.Equal(team, t.ChannelId);
+            Assert.Equal(alice, t.UserId);
+            Assert.Equal("tone 440hz", t.Text);
+            Assert.Equal("en", t.Language);
+            Assert.Equal(new DateTimeOffset(2026, 9, 19, 5, 26, 24, TimeSpan.Zero).AddTicks(5817627), t.StartedAt);
+            Assert.Equal(1500UL, t.DurationMs);
+            Assert.Equal(2, t.Words.Count);
+            Assert.Equal("440hz", t.Words[1].Word);
+            Assert.Equal(750UL, t.Words[1].StartMs);
+            var bare = ControlMessage.Parse("{\"type\":\"Transcript\",\"data\":{\"transcript\":{\"id\":\"5855c240-f790-4303-8101-20f036ea25b2\"," +
+                "\"channel_id\":\"" + team + "\",\"user_id\":\"" + alice + "\",\"text\":\"hi\",\"started_at\":\"2026-09-19T05:26:24Z\",\"duration_ms\":400}}}").Transcript();
+            Assert.Null(bare.Language);
+            Assert.Empty(bare.Words);
+
+            // TtsStatus lifecycle: optional fields omitted rather than null.
+            var queued = ControlMessage.Parse("{\"type\":\"TtsStatus\",\"data\":{\"request_id\":\"11111111-2222-3333-4444-555555555555\",\"client_ref\":\"t1\",\"state\":\"queued\"}}").TtsStatus();
+            Assert.Equal(TtsState.Queued, queued.State);
+            Assert.Equal("t1", queued.ClientRef);
+            Assert.Null(queued.DurationMs);
+            Assert.False(queued.IsTerminal);
+            var failed = ControlMessage.Parse("{\"type\":\"TtsStatus\",\"data\":{\"request_id\":\"11111111-2222-3333-4444-555555555555\",\"client_ref\":\"t1\",\"state\":\"failed\",\"message\":\"Text-to-speech failed\"}}").TtsStatus();
+            Assert.Equal(TtsState.Failed, failed.State);
+            Assert.True(failed.IsTerminal);
+            Assert.Equal("Text-to-speech failed", failed.Message);
+            var playing = ControlMessage.Parse("{\"type\":\"TtsStatus\",\"data\":{\"request_id\":\"11111111-2222-3333-4444-555555555555\",\"state\":\"playing\",\"duration_ms\":1200}}").TtsStatus();
+            Assert.Equal(1200UL, playing.DurationMs);
+            Assert.Null(playing.ClientRef);
+
+            // Synthesized voices ride on the participant SSRC with the top bit set; announcements have no owner.
+            Assert.True(AurixVoiceClient.IsSynthesizedSsrc(0x12345678u | AurxPacket.SynthSsrcFlag));
+            Assert.False(AurixVoiceClient.IsSynthesizedSsrc(0x12345678u));
+        }
+
+        [Fact]
         public void ChannelEnergyMessageParses()
         {
             var team = Guid.Parse("aaaaaaaa-0000-0000-0000-000000000001");

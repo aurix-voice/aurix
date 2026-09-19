@@ -27,6 +27,26 @@ use crate::channel::{MediaChannel, Mix};
 use crate::session::{MediaSession, Transport};
 use crate::webrtc::{ForwardMedia, WebRtcManager};
 
+/// One synthesized Opus frame handed to the router for injection.
+pub struct InjectedFrame {
+    pub ssrc: u32,
+    pub sequence: u32,
+    pub timestamp: u32,
+    pub payload: Bytes,
+}
+
+impl InjectedFrame {
+    fn into_packet(self, channel_id: &ChannelId) -> AurixPacket {
+        AurixPacket::audio(
+            self.sequence,
+            self.timestamp,
+            self.ssrc,
+            channel_id_hash(channel_id),
+            self.payload,
+        )
+    }
+}
+
 /// Notifications from the media plane to the control plane (WebSocket layer).
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
@@ -412,6 +432,106 @@ impl PacketRouter {
         Ok(())
     }
 
+    /// Inject a synthesized Opus frame spoken *by* `sender` into `channel_id`. It is routed like
+    /// the participant's own uplink — channel type rules, receiver preferences (local mute,
+    /// gain, blocks), cascade — but carries `ssrc` (a synthesized-stream SSRC, see
+    /// [`crate::tts`]) so receivers keep it apart from the microphone stream. Synthesized audio
+    /// is neither recorded nor transcribed. `to_channel` sends it to the other participants,
+    /// `to_self` echoes it back to the sender.
+    pub async fn inject_participant_audio(
+        &self,
+        sender: &Arc<MediaSession>,
+        channel_id: &ChannelId,
+        frame: InjectedFrame,
+        to_channel: bool,
+        to_self: bool,
+    ) -> Result<()> {
+        if !sender.is_active() {
+            return Err(AurixError::SessionNotFound(sender.session_id.to_string()));
+        }
+        let channel = self.channel_for_sender(channel_id, sender)?;
+        let packet = frame.into_packet(channel_id);
+        if to_channel {
+            if sender
+                .is_server_muted
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(AurixError::AuthorizationDenied(
+                    "Participant is muted by the server".into(),
+                ));
+            }
+            if !channel.can_transmit(&sender.user_id) {
+                return Err(AurixError::AuthorizationDenied(
+                    "Sender may not transmit in this channel".into(),
+                ));
+            }
+            if sender.mark_audio_activity() {
+                let _ = self.events.send(MediaEvent::SpeakingChanged {
+                    session_id: sender.session_id,
+                    user_id: sender.user_id,
+                    channels: vec![*channel_id],
+                    speaking: true,
+                });
+            }
+            if let Some(cascade) = self.cascade.as_ref().filter(|_| channel.relays_to_peers()) {
+                cascade
+                    .forward_to_peers(channel_id, &sender.user_id, &packet)
+                    .await;
+            }
+            self.fan_out(&channel, sender, &packet).await;
+        }
+        if to_self {
+            self.deliver(&channel, vec![(sender.clone(), Mix::UNITY)], &packet)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Inject a synthesized Opus frame from the server itself (announcement) into `channel_id`:
+    /// every local participant hears it at their channel-focus gain; nothing else filters it and
+    /// it is not relayed to other nodes (each node announces to its own participants).
+    pub async fn inject_system_audio(
+        &self,
+        app_id: &AppId,
+        channel_id: &ChannelId,
+        frame: InjectedFrame,
+    ) -> Result<()> {
+        let channel = self
+            .shared
+            .channels
+            .get(channel_id)
+            .map(|c| c.value().clone())
+            .ok_or_else(|| AurixError::ChannelNotFound(channel_id.to_string()))?;
+        if channel.app_id != *app_id {
+            return Err(AurixError::AuthorizationDenied(
+                "Channel belongs to a different application".into(),
+            ));
+        }
+        let packet = frame.into_packet(channel_id);
+        let receivers = channel.get_receivers_for_announcement();
+        self.deliver(&channel, receivers, &packet).await;
+        Ok(())
+    }
+
+    fn channel_for_sender(
+        &self,
+        channel_id: &ChannelId,
+        sender: &Arc<MediaSession>,
+    ) -> Result<Arc<MediaChannel>> {
+        let channel = self
+            .shared
+            .channels
+            .get(channel_id)
+            .map(|c| c.value().clone())
+            .ok_or_else(|| AurixError::ChannelNotFound(channel_id.to_string()))?;
+        if channel.app_id != sender.app_id || !channel.has_participant(&sender.user_id) {
+            return Err(AurixError::AuthorizationDenied(
+                "Sender is not a participant of this channel".into(),
+            ));
+        }
+        Ok(channel)
+    }
+
     fn tap_audio(
         &self,
         channel: &Arc<MediaChannel>,
@@ -433,9 +553,7 @@ impl PacketRouter {
             }
         }
         if let Some(ref pipeline) = self.audio_pipeline {
-            if pipeline.is_enabled() {
-                pipeline.process_opus_packet(sender.user_id, channel.channel_id, &packet.payload);
-            }
+            pipeline.process_opus_packet(channel, sender.user_id, &packet.payload);
         }
     }
 

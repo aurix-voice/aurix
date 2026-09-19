@@ -21,6 +21,10 @@ pub struct AurixConfig {
     pub webhooks: WebhooksConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub stt: SttConfig,
+    #[serde(default)]
+    pub tts: TtsConfig,
 }
 
 impl AurixConfig {
@@ -38,7 +42,8 @@ impl AurixConfig {
                 .with_list_parse_key("server.cors_origins")
                 .with_list_parse_key("server.trusted_proxies")
                 .with_list_parse_key("media.cascade_peers")
-                .with_list_parse_key("webhooks.retry_delays_secs"),
+                .with_list_parse_key("webhooks.retry_delays_secs")
+                .with_list_parse_key("tts.voices"),
         );
         let cfg = builder.build()?;
         let mut config: AurixConfig = cfg.try_deserialize()?;
@@ -64,11 +69,19 @@ impl AurixConfig {
             &mut self.auth.admin_bootstrap_token,
             &mut self.recording.encryption_key,
             &mut self.chat.filter_webhook,
+            &mut self.stt.endpoint,
+            &mut self.stt.api_key,
+            &mut self.stt.model,
+            &mut self.stt.language,
+            &mut self.tts.endpoint,
+            &mut self.tts.api_key,
+            &mut self.tts.model,
         ] {
             if opt.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false) {
                 *opt = None;
             }
         }
+        clean(&mut self.tts.voices);
     }
 
     pub fn is_production(&self) -> bool {
@@ -166,6 +179,58 @@ impl AurixConfig {
                 "server.session_resume_grace_secs must be <= media.session_timeout_secs, otherwise \
                  the media session is reaped before the client can resume"
             );
+        }
+        if self.stt.enabled {
+            match &self.stt.endpoint {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {}
+                Some(_) => anyhow::bail!("stt.endpoint must be an http(s) URL"),
+                None => anyhow::bail!("stt.enabled requires stt.endpoint"),
+            }
+            if self.stt.segment_secs < 0.5 || self.stt.segment_secs > 60.0 {
+                anyhow::bail!("stt.segment_secs must be within 0.5..=60");
+            }
+            if self.stt.silence_flush_ms != 0 && self.stt.silence_flush_ms < 100 {
+                anyhow::bail!("stt.silence_flush_ms must be 0 (off) or >= 100");
+            }
+            if self.stt.timeout_ms < 500 || self.stt.timeout_ms > 120_000 {
+                anyhow::bail!("stt.timeout_ms must be within 500..=120000");
+            }
+            if self.stt.max_concurrent_requests == 0 {
+                anyhow::bail!("stt.max_concurrent_requests must be > 0");
+            }
+        }
+        if self.tts.enabled {
+            match &self.tts.endpoint {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {}
+                Some(_) => anyhow::bail!("tts.endpoint must be an http(s) URL"),
+                None => anyhow::bail!("tts.enabled requires tts.endpoint"),
+            }
+            if self.tts.max_text_chars == 0 || self.tts.max_text_chars > 10_000 {
+                anyhow::bail!("tts.max_text_chars must be within 1..=10000");
+            }
+            if self.tts.max_audio_secs == 0 || self.tts.max_audio_secs > 600 {
+                anyhow::bail!("tts.max_audio_secs must be within 1..=600");
+            }
+            if self.tts.timeout_ms < 500 || self.tts.timeout_ms > 120_000 {
+                anyhow::bail!("tts.timeout_ms must be within 500..=120000");
+            }
+            if self.tts.max_concurrent_requests == 0 {
+                anyhow::bail!("tts.max_concurrent_requests must be > 0");
+            }
+            if self.tts.max_queued_per_session == 0 || self.tts.max_queued_per_channel == 0 {
+                anyhow::bail!(
+                    "tts.max_queued_per_session and tts.max_queued_per_channel must be > 0"
+                );
+            }
+            if self.tts.requests_per_minute_per_session == 0 {
+                anyhow::bail!("tts.requests_per_minute_per_session must be > 0");
+            }
+            if self.tts.voices.is_empty() {
+                anyhow::bail!("tts.voices must list at least one voice");
+            }
+            if !self.tts.voices.contains(&self.tts.default_voice) {
+                anyhow::bail!("tts.default_voice must be one of tts.voices");
+            }
         }
         for cidr in &self.server.trusted_proxies {
             cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
@@ -929,6 +994,106 @@ impl Default for RetentionConfig {
             tombstones_days: default_retention_tombstones_days(),
             batch_size: default_retention_batch_size(),
             interval_secs: default_retention_interval_secs(),
+        }
+    }
+}
+
+/// Speech-to-text: server-side transcription of channel audio through an OpenAI-compatible
+/// `/v1/audio/transcriptions` endpoint (whisper.cpp server, faster-whisper, vLLM, …).
+/// Transcripts are delivered live to the participants of channels created with
+/// `transcription: true`; nothing is stored.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SttConfig {
+    pub enabled: bool,
+    /// Base URL of the transcription server, e.g. `http://whisper:8000`.
+    pub endpoint: Option<String>,
+    /// Optional bearer token sent as `Authorization: Bearer …`.
+    pub api_key: Option<String>,
+    /// `model` form field (provider specific; omitted when unset).
+    pub model: Option<String>,
+    /// ISO-639-1 hint (`language` form field); auto-detect when unset.
+    pub language: Option<String>,
+    /// Audio per participant accumulated before a transcription request is issued.
+    pub segment_secs: f32,
+    /// Flush a shorter segment once the participant has been silent for this long
+    /// (`0` = only flush on `segment_secs`).
+    pub silence_flush_ms: u64,
+    /// Segments shorter than this are dropped instead of transcribed.
+    pub min_segment_ms: u64,
+    pub timeout_ms: u64,
+    /// Requests in flight to the STT server per node; further segments are dropped.
+    pub max_concurrent_requests: u32,
+    /// Include word timings (when the provider returns them) in the client event.
+    pub include_words: bool,
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            api_key: None,
+            model: None,
+            language: None,
+            segment_secs: 3.0,
+            silence_flush_ms: 700,
+            min_segment_ms: 400,
+            timeout_ms: 15_000,
+            max_concurrent_requests: 8,
+            include_words: false,
+        }
+    }
+}
+
+/// Text-to-speech through an OpenAI-compatible `/v1/audio/speech` endpoint returning WAV
+/// (Piper/OpenedAI-Speech, Kokoro-FastAPI, …). The server resamples and Opus-encodes the
+/// result and plays it into the channel as ordinary media.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TtsConfig {
+    pub enabled: bool,
+    /// Base URL of the speech server, e.g. `http://piper:8000`.
+    pub endpoint: Option<String>,
+    pub api_key: Option<String>,
+    /// `model` JSON field (provider specific; omitted when unset).
+    pub model: Option<String>,
+    /// Voices clients/operators may request. The first entry is used when none is given
+    /// unless `default_voice` says otherwise.
+    pub voices: Vec<String>,
+    pub default_voice: String,
+    /// Allow players to trigger TTS from the client (`TtsSpeak`). REST announcements by the
+    /// game server are always allowed when TTS is enabled.
+    pub allow_client_requests: bool,
+    pub max_text_chars: usize,
+    /// Synthesized audio longer than this is truncated.
+    pub max_audio_secs: u32,
+    pub timeout_ms: u64,
+    /// Synthesis requests in flight per node; further requests are rejected.
+    pub max_concurrent_requests: u32,
+    /// Pending utterances per player session / per channel announcement queue.
+    pub max_queued_per_session: u32,
+    pub max_queued_per_channel: u32,
+    pub requests_per_minute_per_session: u32,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            api_key: None,
+            model: None,
+            voices: vec!["alloy".to_string()],
+            default_voice: "alloy".to_string(),
+            allow_client_requests: true,
+            max_text_chars: 500,
+            max_audio_secs: 30,
+            timeout_ms: 15_000,
+            max_concurrent_requests: 4,
+            max_queued_per_session: 3,
+            max_queued_per_channel: 8,
+            requests_per_minute_per_session: 10,
         }
     }
 }

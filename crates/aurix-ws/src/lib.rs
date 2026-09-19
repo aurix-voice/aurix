@@ -17,12 +17,12 @@ use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
     decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
-    ParticipantEnergy, ParticipantVolume, TransmissionMode,
+    ParticipantEnergy, ParticipantVolume, TransmissionMode, TtsDestination,
 };
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
-use aurix_control::{ActionTokenService, ControlPlane, ServerEvent};
+use aurix_control::{ActionTokenService, ControlPlane, ParticipantSpeak, ServerEvent};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
 use aurix_media::{MediaEvent, SfuNode};
 use aurix_recording::RecordingService;
@@ -82,6 +82,8 @@ pub struct ConnectionInfo {
     generation: u64,
     /// Server-initiated close (ban, shutdown); such sessions are never resumable.
     closing: Option<String>,
+    /// Delivers `Transcript` events for the session's channels (`SetTranscripts`).
+    transcripts: bool,
 }
 
 impl ConnectionInfo {
@@ -476,6 +478,50 @@ impl WsState {
                         &ControlMessage::ChannelEnergy { channel_id, levels },
                     );
                 }
+                ServerEvent::Transcript { app_id, transcript } => {
+                    self.deliver_transcript(app_id, transcript);
+                }
+                ServerEvent::TtsAnnouncement {
+                    app_id,
+                    channel_id,
+                    request_id,
+                    text,
+                    voice,
+                } => {
+                    self.control
+                        .speech
+                        .play_announcement(&self.sfu, app_id, channel_id, request_id, text, voice);
+                }
+                ServerEvent::TtsStatus {
+                    app_id,
+                    request_id,
+                    session_id: Some(session_id),
+                    client_ref,
+                    state,
+                    duration_ms,
+                    message,
+                    ..
+                } => {
+                    let same_app = self
+                        .connections
+                        .get(&session_id)
+                        .is_some_and(|c| c.app_id == app_id);
+                    if same_app {
+                        self.send_to_session(
+                            &session_id,
+                            &ControlMessage::TtsStatus {
+                                request_id,
+                                client_ref,
+                                state,
+                                duration_ms,
+                                message,
+                            },
+                        );
+                    }
+                }
+                ServerEvent::TtsStatus {
+                    session_id: None, ..
+                } => {}
                 ServerEvent::UserKicked {
                     app_id,
                     channel_id,
@@ -619,6 +665,15 @@ impl WsState {
         }
     }
 
+    /// Whether `session_id` would hear `speaker` in `channel_id` (no block, not locally muted).
+    fn hears(&self, session_id: &SessionId, channel_id: &ChannelId, speaker: &UserId) -> bool {
+        let sfu = self.sfu.read();
+        match sfu.get_session(session_id) {
+            Some(s) => s.gain_for(speaker, channel_id).is_some(),
+            None => false,
+        }
+    }
+
     /// Local delivery of an accepted chat message: channel members (or the target user's
     /// sessions) that have no block relationship with the sender, plus the sender's own echo
     /// carrying `client_ref`.
@@ -710,6 +765,32 @@ impl WsState {
                 || conn.user_id == user_id
                 || !self.text_allowed(&sid, &user_id)
             {
+                continue;
+            }
+            let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    /// A transcript goes to the channel's local members of the same tenant that did not opt
+    /// out; the speaker gets their own (captions), a receiver who blocked or locally muted the
+    /// speaker does not (they would not hear them either).
+    fn deliver_transcript(&self, app_id: AppId, transcript: aurix_common::protocol::Transcript) {
+        let channel_id = transcript.channel_id;
+        let speaker = transcript.user_id;
+        let Ok(json) = serde_json::to_string(&ControlMessage::Transcript { transcript }) else {
+            return;
+        };
+        let Some(members) = self.channel_members.get(&channel_id) else {
+            return;
+        };
+        for sid in members.iter() {
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id || !conn.transcripts {
+                continue;
+            }
+            if conn.user_id != speaker && !self.hears(&sid, &channel_id, &speaker) {
                 continue;
             }
             let _ = conn.tx.try_send(json.clone());
@@ -1122,6 +1203,7 @@ async fn open_session(
             detached_since: None,
             generation: 0,
             closing: None,
+            transcripts: true,
         },
     );
     Ok(Attached {
@@ -1294,6 +1376,7 @@ async fn handle_ws_connection(
             &ControlMessage::ChannelJoinAck {
                 channel_id: *channel_id,
                 participants: channel_snapshot(&state, &session_id, channel_id),
+                transcription: channel_transcribes(&state, channel_id),
             },
         )
         .await;
@@ -1435,6 +1518,7 @@ async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: Use
     };
     state.connections.remove(&session_id);
     state.control.chat.forget_session(session_id);
+    state.control.speech.cancel_for_session(session_id, None);
     let _ = state
         .control
         .sessions
@@ -1478,6 +1562,16 @@ async fn send_msg(tx: &mpsc::Sender<String>, msg: &ControlMessage) {
     if let Ok(json) = serde_json::to_string(msg) {
         let _ = tx.send(json).await;
     }
+}
+
+/// Whether speech in `channel_id` is transcribed on this node (channel opt-in and STT configured).
+fn channel_transcribes(state: &WsState, channel_id: &ChannelId) -> bool {
+    state.control.config.stt.enabled
+        && state
+            .sfu
+            .read()
+            .get_channel(channel_id)
+            .is_some_and(|c| c.config.transcription)
 }
 
 fn channel_role(
@@ -1556,6 +1650,18 @@ fn chat_sender_allowed(state: &WsState, session_id: &SessionId) -> Result<(), Au
     if !state.control.config.chat.server_mute_blocks_text {
         return Ok(());
     }
+    sender_not_server_muted(
+        state,
+        session_id,
+        "Server-muted participants cannot send text",
+    )
+}
+
+fn sender_not_server_muted(
+    state: &WsState,
+    session_id: &SessionId,
+    message: &str,
+) -> Result<(), AurixError> {
     let muted = {
         let sfu = state.sfu.read();
         sfu.get_session(session_id)
@@ -1563,12 +1669,86 @@ fn chat_sender_allowed(state: &WsState, session_id: &SessionId) -> Result<(), Au
             .unwrap_or(false)
     };
     if muted {
-        Err(AurixError::UserMuted(
-            "Server-muted participants cannot send text".into(),
-        ))
+        Err(AurixError::UserMuted(message.into()))
     } else {
         Ok(())
     }
+}
+
+struct SpeakArgs {
+    channel_id: Option<ChannelId>,
+    text: String,
+    voice: Option<String>,
+    destination: TtsDestination,
+    client_ref: Option<String>,
+}
+
+/// A player's `TtsSpeak`: resolve the target channel (explicit, or the single channel the
+/// session transmits to), check membership and server mute, then hand over to
+/// `SpeechService` for policy and synthesis.
+async fn speak(
+    state: &WsState,
+    session_id: SessionId,
+    token: &ValidatedToken,
+    args: SpeakArgs,
+) -> Result<uuid::Uuid, AurixError> {
+    let speech = &state.control.speech;
+    if !speech.enabled() {
+        return Err(AurixError::TtsDisabled);
+    }
+    let session = {
+        let sfu = state.sfu.read();
+        sfu.get_session(&session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?
+    };
+    let channel_id = match args.channel_id {
+        Some(id) => id,
+        None => {
+            let mut targets = session
+                .get_channels()
+                .into_iter()
+                .filter(|c| session.transmits_to(c));
+            let first = targets
+                .next()
+                .ok_or_else(|| AurixError::Validation("Session transmits to no channel".into()))?;
+            if targets.next().is_some() {
+                return Err(AurixError::Validation(
+                    "Session transmits to several channels; specify channel_id".into(),
+                ));
+            }
+            first
+        }
+    };
+    if channel_role(state, &session_id, &channel_id).is_none() {
+        return Err(AurixError::AuthorizationDenied(
+            "Not a member of this channel".into(),
+        ));
+    }
+    let (to_channel, to_self) = match args.destination {
+        TtsDestination::Channel => (true, false),
+        TtsDestination::Local => (false, true),
+        TtsDestination::Both => (true, true),
+    };
+    if to_channel {
+        sender_not_server_muted(
+            state,
+            &session_id,
+            "Server-muted participants cannot speak in the channel",
+        )?;
+    }
+    speech
+        .speak_as_participant(ParticipantSpeak {
+            app_id: token.app_id,
+            channel_id,
+            session,
+            display_name: token.display_name.clone(),
+            text: args.text,
+            voice: args.voice,
+            to_channel,
+            to_self,
+            client_ref: args.client_ref,
+        })
+        .await
 }
 
 async fn handle_control_message(
@@ -1763,6 +1943,7 @@ async fn handle_control_message(
                 &ControlMessage::ChannelJoinAck {
                     channel_id,
                     participants,
+                    transcription: channel_transcribes(state, &channel_id),
                 },
             )
             .await;
@@ -2240,6 +2421,35 @@ async fn handle_control_message(
             chat.publish_typing(token.app_id, channel_id, token.user_id, session_id, typing);
         }
 
+        ControlMessage::SetTranscripts { enabled } => {
+            if let Some(mut conn) = state.connections.get_mut(&session_id) {
+                conn.transcripts = enabled;
+            }
+        }
+
+        ControlMessage::TtsSpeak {
+            channel_id,
+            text,
+            voice,
+            destination,
+            client_ref,
+        } => {
+            let req = SpeakArgs {
+                channel_id,
+                text,
+                voice,
+                destination,
+                client_ref: client_ref.clone(),
+            };
+            if let Err(e) = speak(state, session_id, token, req).await {
+                send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+            }
+        }
+
+        ControlMessage::TtsCancel => {
+            state.control.speech.cancel_for_session(session_id, None);
+        }
+
         ControlMessage::WebRtcOffer { sdp } => {
             if sdp.len() > MAX_TEXT_FRAME {
                 return send_error(tx, "VALIDATION_ERROR", "SDP too large").await;
@@ -2280,6 +2490,8 @@ async fn handle_control_message(
         | ControlMessage::ChatMessageReceived { .. }
         | ControlMessage::ParticipantTyping { .. }
         | ControlMessage::ChannelEnergy { .. }
+        | ControlMessage::Transcript { .. }
+        | ControlMessage::TtsStatus { .. }
         | ControlMessage::WebRtcAnswer { .. }
         | ControlMessage::Pong { .. } => {
             send_error(
@@ -2404,6 +2616,7 @@ mod tests {
             detached_since: Some(Instant::now()),
             generation: 1,
             closing: None,
+            transcripts: true,
         }
     }
 

@@ -399,6 +399,11 @@ impl MediaSession {
         self.prefs.read().focus()
     }
 
+    /// Gain this session applies to `channel` from its focus alone (no sender involved).
+    pub fn focus_gain(&self, channel: &ChannelId) -> f32 {
+        self.prefs.read().focus_gain(channel)
+    }
+
     pub fn is_in_channel(&self, channel_id: &ChannelId) -> bool {
         self.channels.read().contains(channel_id)
     }

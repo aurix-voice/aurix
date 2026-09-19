@@ -143,6 +143,11 @@ impl SfuNode {
         self.cascade.as_ref()
     }
 
+    /// The packet router; `None` until `start`.
+    pub fn router(&self) -> Option<&Arc<PacketRouter>> {
+        self.router.as_ref()
+    }
+
     /// Subscribe to media-plane notifications (speaking/mute changes, session binds).
     pub fn subscribe_events(&self) -> broadcast::Receiver<MediaEvent> {
         self.events.subscribe()
@@ -363,6 +368,9 @@ impl SfuNode {
         self.start_session_cleanup();
         self.start_speaking_timeout();
         self.start_energy_reports();
+        if let Some(ref pipeline) = self.audio_pipeline {
+            pipeline.spawn_idle_flusher(self.channels.clone());
+        }
         self.local_addr = Some(local_addr);
         self.router = Some(router);
         self.started = true;
@@ -484,6 +492,9 @@ impl SfuNode {
         channel.remove_participant(&session.user_id);
         if let Some(ref sink) = self.audio_sink {
             sink.on_participant_left(*channel_id, session.user_id);
+        }
+        if let Some(ref pipeline) = self.audio_pipeline {
+            pipeline.participant_left(&channel, session.user_id);
         }
         if channel.is_empty() {
             self.channels.remove(channel_id);

@@ -133,3 +133,36 @@ inactive_users_days = 0     # 0 = never auto-erase idle users
 tombstones_days = 30
 batch_size = 5000
 interval_secs = 3600
+[stt]
+# Speech-to-text of channels created with `transcription = true` (OpenAI-compatible
+# `/v1/audio/transcriptions`, e.g. faster-whisper-server). Transcripts are pushed to the
+# channel members as `Transcript` and to webhooks/SSE as `channel.transcript`; nothing is stored.
+enabled = false
+# endpoint = "http://whisper:8000"
+# api_key = "…"            # AURIX__STT__API_KEY
+# model = "Systran/faster-whisper-small"
+# language = "en"           # omit for auto-detect
+segment_secs = 3.0
+silence_flush_ms = 700
+min_segment_ms = 400
+timeout_ms = 15000
+max_concurrent_requests = 8
+include_words = false
+[tts]
+# Text-to-speech through an OpenAI-compatible `/v1/audio/speech` endpoint returning WAV
+# (Piper/OpenedAI-Speech, Kokoro-FastAPI, …); the server Opus-encodes the result and plays it
+# into the channel as the requester's voice (`TtsSpeak`) or as an announcement (REST).
+enabled = false
+# endpoint = "http://tts:8000"
+# api_key = "…"            # AURIX__TTS__API_KEY
+# model = "tts-1"
+voices = ["alloy"]
+default_voice = "alloy"
+allow_client_requests = true
+max_text_chars = 500
+max_audio_secs = 30
+timeout_ms = 15000
+max_concurrent_requests = 4
+max_queued_per_session = 3
+max_queued_per_channel = 8
+requests_per_minute_per_session = 10

@@ -1108,3 +1108,243 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
     );
     while b.recv().await.is_some() {}
 }
+
+struct ToneTts;
+
+#[async_trait::async_trait]
+impl aurix_common::tts_stt::TtsProvider for ToneTts {
+    async fn synthesize(
+        &self,
+        text: &str,
+        _voice: &str,
+    ) -> aurix_common::error::Result<aurix_common::tts_stt::PcmAudio> {
+        // 24 kHz stereo, length scales with text so truncation can be exercised.
+        let frames = 24_000 * text.len() / 10;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = ((i as f32 / 24_000.0 * 440.0 * std::f32::consts::TAU).sin() * 9000.0) as i16;
+            samples.push(v);
+            samples.push(v);
+        }
+        Ok(aurix_common::tts_stt::PcmAudio {
+            sample_rate: 24_000,
+            channels: 2,
+            samples,
+        })
+    }
+    fn provider_name(&self) -> &str {
+        "tone"
+    }
+}
+
+/// Synthesized speech is injected through the normal delivery path: it carries the speaker's
+/// synthesized SSRC, is sealed per receiver, honours receiver preferences and the requester's
+/// destination, and announcements reach everybody regardless of blocks.
+#[tokio::test]
+async fn tts_injection_follows_channel_routing() {
+    use aurix_common::protocol::TtsState;
+    use aurix_media::tts::*;
+
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let cfg = ChannelConfig::default();
+    let mut clients = Vec::new();
+    for name in ["alice", "bob", "carol"] {
+        let s = sfu
+            .create_session(SessionId::new(), UserId::new(), app, name.into())
+            .unwrap();
+        sfu.join_channel(&s.session_id, channel, cfg.clone(), ChannelRole::Speaker)
+            .unwrap();
+        let mut c = Client::new(s).await;
+        c.bind(addr).await;
+        clients.push(c);
+    }
+    let (alice, bob, carol) = (clients.remove(0), clients.remove(0), clients.remove(0));
+    // Carol has muted Alice locally: she must not hear Alice's synthesized voice either.
+    carol
+        .session
+        .prefs
+        .write()
+        .set_muted(alice.session.user_id, None, true);
+
+    let engine = std::sync::Arc::new(TtsEngine::new(
+        std::sync::Arc::new(ToneTts),
+        TtsEngineOptions {
+            max_audio: Duration::from_millis(200),
+            max_queued_per_session: 1,
+            ..TtsEngineOptions::default()
+        },
+    ));
+    engine.attach_router(sfu.router().unwrap().clone());
+    let mut status = engine.subscribe();
+
+    let id = engine
+        .submit(TtsRequest {
+            app_id: app,
+            channel_id: channel,
+            text: "hello".into(), // 500 ms of audio → truncated to 200 ms = 10 frames
+            voice: "alloy".into(),
+            source: TtsSource::Participant {
+                session: alice.session.clone(),
+                to_channel: true,
+                to_self: true,
+            },
+            client_ref: Some("r1".into()),
+            request_id: None,
+        })
+        .unwrap();
+    // Per-session queue limit.
+    let err = engine
+        .submit(TtsRequest {
+            app_id: app,
+            channel_id: channel,
+            text: "again".into(),
+            voice: "alloy".into(),
+            source: TtsSource::Participant {
+                session: alice.session.clone(),
+                to_channel: true,
+                to_self: false,
+            },
+            client_ref: None,
+            request_id: None,
+        })
+        .unwrap_err();
+    assert_eq!(err.error_code(), "RATE_LIMIT_EXCEEDED");
+
+    let mut states = Vec::new();
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(2), status.recv()).await {
+        assert_eq!(ev.request_id, id);
+        assert_eq!(ev.client_ref.as_deref(), Some("r1"));
+        states.push(ev.state);
+        if matches!(ev.state, TtsState::Finished | TtsState::Failed) {
+            assert_eq!(ev.duration_ms, Some(200));
+            break;
+        }
+    }
+    assert_eq!(
+        states,
+        vec![TtsState::Queued, TtsState::Playing, TtsState::Finished]
+    );
+
+    let synth_ssrc = participant_voice_ssrc(alice.session.ssrc);
+    let mut bob_frames = Vec::new();
+    while let Some(p) = bob.recv().await {
+        assert_eq!(p.header.packet_type, PacketType::Audio);
+        assert_eq!(p.header.ssrc, synth_ssrc);
+        assert_eq!(p.header.channel_id_hash, channel_id_hash(&channel));
+        bob_frames.push(p);
+    }
+    assert_eq!(bob_frames.len(), 10, "10 × 20 ms after truncation");
+    let seqs: Vec<u32> = bob_frames.iter().map(|p| p.header.sequence).collect();
+    assert_eq!(seqs, (0..10).collect::<Vec<_>>());
+    assert_eq!(bob_frames[1].header.timestamp, 960);
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut pcm = vec![0i16; 5760];
+    let mut rms = 0.0;
+    for p in &bob_frames {
+        let n = dec.decode(&p.payload, &mut pcm, false).unwrap();
+        assert_eq!(n, 960);
+        rms = (pcm[..n].iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / n as f64).sqrt();
+    }
+    assert!(rms > 5000.0, "tone survives resample+opus: rms {rms}");
+
+    let mut alice_frames = 0;
+    while let Some(p) = alice.recv().await {
+        assert_eq!(p.header.ssrc, synth_ssrc);
+        alice_frames += 1;
+    }
+    assert_eq!(alice_frames, 10, "destination=both echoes to the requester");
+    assert!(carol.recv().await.is_none(), "local mute applies to TTS");
+    assert_eq!(engine.pending(), 0);
+
+    // Announcement: nobody's voice, everybody hears it (Carol's mute of Alice is irrelevant),
+    // stable per-channel SSRC, continuing sequence across requests.
+    for _ in 0..2 {
+        let id = engine
+            .submit(TtsRequest {
+                app_id: app,
+                channel_id: channel,
+                text: "x".into(), // 100 ms → 5 frames
+                voice: "alloy".into(),
+                source: TtsSource::System,
+                client_ref: None,
+                request_id: None,
+            })
+            .unwrap();
+        loop {
+            let ev = status.recv().await.unwrap();
+            if ev.request_id == id && ev.state == TtsState::Finished {
+                assert_eq!(ev.session_id, None);
+                break;
+            }
+        }
+    }
+    let sys = system_voice_ssrc(&channel);
+    assert_ne!(sys & SYNTH_SSRC_FLAG, 0);
+    for c in [&alice, &bob, &carol] {
+        let mut seqs = Vec::new();
+        while let Some(p) = c.recv().await {
+            assert_eq!(p.header.ssrc, sys);
+            seqs.push(p.header.sequence);
+        }
+        assert_eq!(seqs, (0..10).collect::<Vec<_>>(), "{}", c.session.user_id);
+    }
+
+    // Another tenant cannot announce into this channel.
+    let id = engine
+        .submit(TtsRequest {
+            app_id: AppId::new(),
+            channel_id: channel,
+            text: "x".into(),
+            voice: "alloy".into(),
+            source: TtsSource::System,
+            client_ref: None,
+            request_id: None,
+        })
+        .unwrap();
+    loop {
+        let ev = status.recv().await.unwrap();
+        if ev.request_id == id && ev.state != TtsState::Queued && ev.state != TtsState::Playing {
+            assert_eq!(ev.state, TtsState::Failed);
+            break;
+        }
+    }
+
+    // Cancellation mid-playout stops the stream; only the owner may cancel.
+    let id = engine
+        .submit(TtsRequest {
+            app_id: app,
+            channel_id: channel,
+            text: "long text that plays for a while".into(),
+            voice: "alloy".into(),
+            source: TtsSource::Participant {
+                session: bob.session.clone(),
+                to_channel: true,
+                to_self: false,
+            },
+            client_ref: None,
+            request_id: None,
+        })
+        .unwrap();
+    loop {
+        let ev = status.recv().await.unwrap();
+        if ev.request_id == id && ev.state == TtsState::Playing {
+            break;
+        }
+    }
+    assert!(!engine.cancel(&id, Some(alice.session.session_id)));
+    assert!(engine.cancel(&id, Some(bob.session.session_id)));
+    loop {
+        let ev = status.recv().await.unwrap();
+        if ev.request_id == id && ev.state != TtsState::Playing {
+            assert_eq!(ev.state, TtsState::Cancelled);
+            break;
+        }
+    }
+    let mut got = 0;
+    while alice.recv().await.is_some() {
+        got += 1;
+    }
+    assert!(got < 10, "cancelled after {got} frames");
+}

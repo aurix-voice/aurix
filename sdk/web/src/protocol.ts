@@ -131,6 +131,18 @@ export type ClientMessage =
       data: { user_id: string; text: string; metadata?: JsonValue; client_ref?: string };
     }
   | { type: 'ChatTyping'; data: { channel_id: string; typing: boolean } }
+  | { type: 'SetTranscripts'; data: { enabled: boolean } }
+  | {
+      type: 'TtsSpeak';
+      data: {
+        channel_id?: string;
+        text: string;
+        voice?: string;
+        destination?: TtsDestinationWire;
+        client_ref?: string;
+      };
+    }
+  | { type: 'TtsCancel'; data?: undefined }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number } }
   | { type: 'RecordingConsentResponse'; data: { recording_id: string; consent: RecordingConsent } }
@@ -157,7 +169,10 @@ export type ServerMessage =
     }
   | { type: 'MediaBound'; data: { session_id: string } }
   | { type: 'SessionClose'; data: { session_id: string; reason: string } }
-  | { type: 'ChannelJoinAck'; data: { channel_id: string; participants: ParticipantBrief[] } }
+  | {
+      type: 'ChannelJoinAck';
+      data: { channel_id: string; participants: ParticipantBrief[]; transcription?: boolean };
+    }
   | {
       type: 'ParticipantJoined';
       data: { channel_id: string; user_id: string; display_name: string; ssrc: number };
@@ -176,6 +191,17 @@ export type ServerMessage =
   | { type: 'ChatMessageReceived'; data: { message: ChatMessageWire } }
   | { type: 'ParticipantTyping'; data: { channel_id: string; user_id: string; typing: boolean } }
   | { type: 'ChannelEnergy'; data: { channel_id: string; levels: ParticipantEnergy[] } }
+  | { type: 'Transcript'; data: { transcript: TranscriptWire } }
+  | {
+      type: 'TtsStatus';
+      data: {
+        request_id: string;
+        client_ref?: string;
+        state: TtsStateWire;
+        duration_ms?: number;
+        message?: string;
+      };
+    }
   | {
       type: 'ReceiverPreferences';
       data: {
@@ -204,6 +230,32 @@ export interface UnknownMessage {
   type: string;
   data: unknown;
 }
+
+export type TtsDestinationWire = 'channel' | 'local' | 'both';
+export type TtsStateWire = 'queued' | 'playing' | 'finished' | 'cancelled' | 'failed';
+
+export interface TranscriptWordWire {
+  word: string;
+  start_ms: number;
+  end_ms: number;
+}
+
+export interface TranscriptWire {
+  id: string;
+  channel_id: string;
+  user_id: string;
+  text: string;
+  language?: string;
+  started_at: string;
+  duration_ms: number;
+  words?: TranscriptWordWire[];
+}
+
+/**
+ * Synthesized-voice streams (server TTS) carry SSRCs with the top bit set; a participant's
+ * synthesized voice is `ssrc | SYNTH_SSRC_FLAG`, announcements use a per-channel SSRC.
+ */
+export const SYNTH_SSRC_FLAG = 0x80000000;
 
 export interface TurnCredentials {
   username: string;

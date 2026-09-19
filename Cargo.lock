@@ -453,6 +453,7 @@ name = "aurix-media"
 version = "1.0.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "aurix-common",
  "aurix-metrics",
  "base64 0.22.1",
@@ -472,6 +473,7 @@ dependencies = [
  "str0m",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -560,10 +562,12 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "opus",
  "parking_lot",
  "rand 0.8.8",
  "reqwest",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

@@ -445,6 +445,9 @@ pub struct ChannelConfig {
     pub positional_config: Option<PositionalConfig>,
     pub audio_profile: AudioProfile,
     pub recording_enabled: bool,
+    /// Transcribe participants' speech (when `[stt]` is configured on the node) and deliver
+    /// `Transcript` events to the channel's participants.
+    pub transcription: bool,
     pub whisper_target: Option<UserId>,
     pub command_speakers: Option<Vec<UserId>>,
 }
@@ -462,6 +465,7 @@ impl Default for ChannelConfig {
             positional_config: None,
             audio_profile: AudioProfile::Voice,
             recording_enabled: false,
+            transcription: false,
             whisper_target: None,
             command_speakers: None,
         }

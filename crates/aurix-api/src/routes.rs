@@ -127,6 +127,11 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/users/:user_id/messages",
             get(handlers::list_user_messages).post(handlers::send_user_message),
         )
+        .route(
+            "/v1/channels/:channel_id/tts",
+            post(handlers::announce_in_channel),
+        )
+        .route("/v1/tts/voices", get(handlers::tts_voices))
         .route("/v1/moderation/ban", post(handlers::ban_user))
         .route("/v1/moderation/bans", get(handlers::list_bans))
         .route("/v1/moderation/bans/:ban_id/revoke", post(handlers::unban))

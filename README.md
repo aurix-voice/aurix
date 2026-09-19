@@ -264,6 +264,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `GET /v1/channels/:id/messages`, `GET /v1/users/:id/messages` | history, newest first, `?before=<rfc3339>&limit=1..200` — only when `chat.persist = true`, otherwise `404 NOT_FOUND` (`chat:read`) |
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
 | API key | `POST /v1/moderation/{mute-all,kick-all}` | channel-wide server mute / kick of everyone currently present minus `except: [user ids]`; response lists `affected`, `skipped`, `failed`; every target still gets its own `user.muted`/`user.kicked` event and audit entry plus one `channel_mute_all`/`channel_kick_all` summary |
+| API key | `POST /v1/channels/:id/tts`, `GET /v1/tts/voices` | speak a server announcement into a channel with the configured TTS provider (`tts:write`; `{"text":…,"voice":…}` → `request_id`, progress as `tts.status` events) / list voices and limits (see [Transcripts and text-to-speech](#transcripts-and-text-to-speech)) |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
@@ -272,7 +273,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 
 API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
 `moderation:read|write`, `recordings:read|write`, `chat:read|write`, `webhooks:read|write`, `events:read`,
-`users:erase|export`, `keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
+`users:erase|export`, `tts:write`, `keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
 `{"error":{"code":"…","message":"…"}}`.
 
 ### Webhooks and the event stream
@@ -364,6 +365,8 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__CHAT__*` | `ENABLED` (default `true`), `MAX_MESSAGE_BYTES` (1024, text + metadata, ≤ 16384), `MESSAGES_PER_SECOND`/`MESSAGE_BURST` (2 / 10 per session), `TYPING_INTERVAL_MS` (1500), `SERVER_MUTE_BLOCKS_TEXT` (`true`), `FILTER_WEBHOOK` + `FILTER_TIMEOUT_MS` (1500) + `FILTER_FAIL_OPEN` (`false`), `PERSIST` (`false`) + `RETENTION_DAYS` (30) |
 | `AURIX__RETENTION__*` | `ENABLED` (`true`), `SESSIONS_DAYS` (90), `MODERATION_EVENTS_DAYS` (365, resolved cases only), `AUDIT_LOG_DAYS` (0 = keep), `ANALYTICS_DAYS` (400), `TOMBSTONES_DAYS` (30, must cover the longest token lifetime), `INACTIVE_USERS_DAYS` (0 = never auto-erase), `BATCH_SIZE` (5000), `INTERVAL_SECS` (3600, ≥ 60) — see [User erasure, export and retention](#user-erasure-export-and-retention) |
 | `AURIX__WEBHOOKS__*` | `ENABLED` (`true`), `TIMEOUT_MS` (5000), `RETRY_DELAYS_SECS` (`5,30,120,600,1800,3600,7200`), `CONCURRENCY` (16), `BATCH_SIZE` (100), `MAX_PENDING_PER_SUBSCRIPTION` (10000 — older events are dropped for a dead endpoint), `RETENTION_HOURS` (72, delivery log), `MAX_SUBSCRIPTIONS_PER_APP` (20), `REQUIRE_HTTPS` / `ALLOW_PRIVATE_URLS` (default: strict in production), `SSE_KEEPALIVE_SECS` (15) |
+| `AURIX__STT__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/transcriptions`), `API_KEY`, `MODEL`, `LANGUAGE` (unset = auto-detect), `SEGMENT_SECS` (3.0), `SILENCE_FLUSH_MS` (700), `MIN_SEGMENT_MS` (400), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (8), `INCLUDE_WORDS` (`false`) — see [Transcripts and text-to-speech](#transcripts-and-text-to-speech) |
+| `AURIX__TTS__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/speech`, WAV), `API_KEY`, `MODEL`, `VOICES` (`alloy`), `DEFAULT_VOICE`, `ALLOW_CLIENT_REQUESTS` (`true`), `MAX_TEXT_CHARS` (500), `MAX_AUDIO_SECS` (30), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (4), `MAX_QUEUED_PER_SESSION` (3), `MAX_QUEUED_PER_CHANNEL` (8), `REQUESTS_PER_MINUTE_PER_SESSION` (10) |
 
 #### Chat content filter webhook
 
@@ -436,6 +439,47 @@ returns the per-rule counts. Sweeps that removed anything are audited as `retent
 before the request still contains the data — set your backup retention accordingly. Webhook
 deliveries already queued that mention the user are delivered as-is (the events happened), and
 nothing is recalled from game servers that consumed the event stream.
+
+### Transcripts and text-to-speech
+
+Both features are off by default and point at **HTTP providers you run yourself** (no cloud
+account is baked in): speech-to-text expects an OpenAI-compatible `POST /v1/audio/transcriptions`
+(faster-whisper-server, whisper.cpp server, …) and text-to-speech an OpenAI-compatible
+`POST /v1/audio/speech` returning WAV (OpenedAI-Speech/Piper, Kokoro-FastAPI, …). Provider keys
+stay on the node: they never appear in events, REST responses or logs.
+`cargo run -p aurix-server --example mock_speech` starts a stand-in for both during development.
+
+**Transcripts.** A channel opts in with `"transcription": true` in its config; nothing else is
+ever sent to STT, and neither are end-to-end-encrypted frames (the node cannot read them). The
+SFU decodes each speaker's Opus, cuts segments of `stt.segment_secs` (earlier after
+`silence_flush_ms` of silence, dropping anything shorter than `min_segment_ms`) and pushes the
+result as `Transcript {id, channel_id, user_id, text, language, started_at, duration_ms, words}`
+to the speaker and to the members of that channel who would hear them (local mutes, blocks and
+zero gain suppress captions too), on every node. Clients opt out/in with
+`SetTranscripts {enabled}` (Web `setTranscripts()`, Unity `SetTranscriptsAsync()`); the
+`ChannelJoinAck.transcription` flag tells them whether a channel is captioned. Game servers get the
+same segments as `channel.transcript` (webhooks / SSE, only when asked for). Transcripts are
+**ephemeral** — the server stores nothing; keep them yourself if your policy requires it.
+
+**Text-to-speech.** A participant sends `TtsSpeak {channel_id?, text, voice?, destination,
+client_ref?}` (Web `speak()`, Unity `SpeakAsync()`); `destination` is `channel` (everyone their
+microphone would reach — same routing, mutes, blocks, focus and cascade as their voice),
+`local` (only themselves, e.g. accessibility read-out) or `both`. The node synthesizes, Opus-encodes
+and paces the audio in real time on a **synthetic SSRC** — the participant's SSRC with the top bit
+set — so native receivers attribute it to the right user while telling it apart from the microphone
+(`participant_voice_ssrc` / Unity `IsSynthesizedSsrc`); browsers get it inside their mixed
+WebRTC downlink like any other voice. The requester alone receives `TtsStatus` (`queued → playing → finished | cancelled |
+failed`, correlated by `client_ref`) and can `TtsCancel` everything still pending; a closed
+connection cancels too. Text runs through the chat content filter when it is destined for the
+channel, server-muted participants cannot speak into a channel, and `tts.max_text_chars`,
+`max_audio_secs` (longer audio is truncated), per-session/per-channel queue depth and
+`requests_per_minute_per_session` bound the cost. Provider failures reach the client as a
+sanitized `failed` status.
+
+Operators announce with `POST /v1/channels/:id/tts` (`tts:write`): every node hosting the
+channel plays the announcement to its participants on a per-channel system SSRC (no
+participant attached), and progress is published as `tts.status` events. `GET /v1/tts/voices`
+lists the configured voices and limits.
 
 ### Network / firewall
 
@@ -573,7 +617,8 @@ Both SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys st
 * No SIP/PSTN gateway, no server-side noise suppression (clients do that).
 * Text chat is deliberately "lite": live channel/directed messages and typing only — no offline
   delivery, conversations, read markers or attachments; history is an opt-in per deployment.
-* STT/content moderation is a pluggable pipeline; no provider is bundled.
+* STT/TTS talk to OpenAI-compatible HTTP servers you host; no speech model ships with Aurix, and
+  transcripts are not stored server-side.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
   it assumes nodes can reach each other directly on `media.port + 1`/UDP.
 * No Unreal SDK yet; the protocol is documented in `crates/aurix-common/src/protocol.rs`, and the

@@ -10,6 +10,7 @@ pub mod node_manager;
 pub mod plane;
 pub mod redis_store;
 pub mod session_manager;
+pub mod speech;
 pub mod user_lifecycle;
 pub mod webhooks;
 
@@ -19,5 +20,6 @@ pub use chat::{ChatService, OutgoingMessage};
 pub use event_bus::{EventBus, ServerEvent};
 pub use plane::ControlPlane;
 pub use redis_store::RedisStore;
+pub use speech::{ParticipantSpeak, SpeechService};
 pub use user_lifecycle::{DeleteUserRequest, RetentionService, UserLifecycle};
 pub use webhooks::{PublicEvent, WebhookService};

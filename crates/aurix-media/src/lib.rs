@@ -7,6 +7,7 @@ pub mod router;
 pub mod session;
 pub mod sfu;
 pub mod transport;
+pub mod tts;
 pub mod webrtc;
 
 pub use channel::MediaChannel;

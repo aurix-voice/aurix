@@ -17,7 +17,7 @@
   .meter { display: inline-block; width: 6rem; height: .6rem; vertical-align: middle; margin-left: .5rem; background: #8883; border-radius: 3px; overflow: hidden; }
   .meter i { display: block; height: 100%; background: #2c8; transition: width .1s linear; }
   #log { height: 12rem; overflow: auto; font: 12px/1.35 ui-monospace, monospace; background: #0001; padding: .5rem; white-space: pre-wrap; }
-  #chat { height: 10rem; overflow: auto; background: #0001; padding: .5rem; }
+  #chat, #transcript { height: 10rem; overflow: auto; background: #0001; padding: .5rem; }
   #chat div { margin: .15rem 0; }
   #chat .own { opacity: .75; }
   #chat .system { font-style: italic; }
@@ -94,6 +94,15 @@
   <div id="chat"></div>
   <div id="typing"></div>
   <label>Message (<code>/w &lt;user-id&gt; text</code> sends a directed message) <input id="msg" placeholder="say something" disabled></label>
+</fieldset>
+
+<fieldset>
+  <legend>Speech (transcripts &amp; text-to-speech)</legend>
+  <label><input type="checkbox" id="transcripts" checked> receive transcripts</label>
+  <div id="transcript"></div>
+  <label>Speak <input id="tts" placeholder="text to synthesize into the channel" disabled></label>
+  <select id="ttsdest"><option value="channel">to channel</option><option value="local">only me</option><option value="both">channel + me</option></select>
+  <button id="ttscancel" disabled>Cancel speech</button>
 </fieldset>
 
 <fieldset>
@@ -302,6 +311,14 @@ $('connect').onclick = async () => {
     else typingUsers.delete(u);
     renderTyping();
   });
+  client.on('transcript', (t) => {
+    const div = document.createElement('div');
+    div.textContent = `[${t.startedAt.toLocaleTimeString()}] ${t.userId.slice(0, 8)}${t.language ? ` (${t.language})` : ''}: ${t.text}`;
+    $('transcript').appendChild(div);
+    $('transcript').scrollTop = 1e9;
+  });
+  client.on('ttsStatus', (s) => log('tts', s.clientRef ?? s.requestId.slice(0, 8), s.state, s.durationMs ? `${s.durationMs} ms` : '', s.message ?? ''));
+  client.on('channelJoined', (ch) => { $('tts').disabled = false; $('ttscancel').disabled = false; if (client.isChannelTranscribed(ch)) log('channel', ch, 'is transcribed'); });
   client.on('serverError', (code, msg) => log('server error', code, msg));
   client.on('error', (e) => log('error', e.message));
   try {
@@ -322,6 +339,17 @@ $('tx').onchange = () => {
   client?.setTransmission(v.startsWith('single:') ? { type: 'single', channelId: v.slice(7) } : { type: v });
 };
 $('mute').onclick = () => { muted = !muted; client.setMuted(muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
+$('transcripts').onchange = () => client?.setTranscripts($('transcripts').checked);
+$('tts').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter' || !$('tts').value.trim()) return;
+  const text = $('tts').value.trim();
+  $('tts').value = '';
+  try {
+    const req = await client.speak(text, { channelId: client.joinedChannels()[0], destination: $('ttsdest').value });
+    log('tts queued', req.clientRef);
+  } catch (err) { log('tts refused:', err.message); }
+});
+$('ttscancel').onclick = () => client?.cancelSpeech();
 $('disconnect').onclick = () => client.disconnect();
 $('mic').onchange = () => client?.setInputDevice($('mic').value || undefined).catch((e) => log('mic select failed:', e.message));
 $('spk').onchange = () => client?.setOutputDevice($('spk').value || undefined).catch((e) => log('speaker select failed:', e.message));

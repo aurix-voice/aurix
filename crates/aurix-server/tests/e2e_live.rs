@@ -820,6 +820,7 @@ async fn session_resume_after_ws_drop() {
     let ControlMessage::ChannelJoinAck {
         channel_id: c,
         participants,
+        ..
     } = ack
     else {
         unreachable!()
@@ -4617,4 +4618,671 @@ async fn user_erasure_export_and_stale_token_rejection() {
         let _ = p.ws.close(None).await;
     }
     let _ = alice.ws.close(None).await;
+}
+
+/// 20 ms Opus frames of a mono sine at 48 kHz — real audio the server-side STT can decode.
+fn opus_tone(hz: f32, ms: u32) -> Vec<Bytes> {
+    let mut enc = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+        .expect("opus encoder");
+    let frames = ms / 20;
+    let mut out = Vec::with_capacity(frames as usize);
+    let mut pcm = vec![0i16; 960];
+    let mut buf = vec![0u8; 1500];
+    for f in 0..frames {
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = (f as f32 * 960.0 + i as f32) / 48_000.0;
+            *s = ((t * hz * std::f32::consts::TAU).sin() * 0.35 * 32767.0) as i16;
+        }
+        let n = enc.encode(&pcm, &mut buf).unwrap();
+        out.push(Bytes::copy_from_slice(&buf[..n]));
+    }
+    out
+}
+
+/// Streams `frames` as this player's microphone into `channel_id`, paced at 20 ms.
+async fn stream_frames(
+    from: &Player,
+    channel_id: ChannelId,
+    first_seq: u32,
+    frames: &[Bytes],
+    e2ee: bool,
+) {
+    let hash = channel_id_hash(&channel_id);
+    for (i, payload) in frames.iter().enumerate() {
+        let seq = first_seq + i as u32;
+        let mut pkt = AurixPacket::audio(seq, seq * 960, from.ssrc, hash, payload.clone());
+        if e2ee {
+            pkt.header.set_flag(PacketFlags::E2ee);
+        }
+        from.udp
+            .send_to(&pkt.seal(&from.keys), from.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits up to `wait` for a message matching `pred`, skipping everything else.
+async fn expect_within<F: Fn(&ControlMessage) -> bool>(
+    p: &mut Player,
+    what: &str,
+    wait: Duration,
+    pred: F,
+) -> ControlMessage {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            panic!("{}: never received {what}", p.name);
+        }
+        match p.try_recv(left).await {
+            Some(m) if pred(&m) => return m,
+            Some(ControlMessage::Error { code, message, .. }) => {
+                panic!(
+                    "{}: server error while waiting for {what}: {code} {message}",
+                    p.name
+                )
+            }
+            Some(_) => continue,
+            None => panic!("{}: never received {what}", p.name),
+        }
+    }
+}
+
+/// Asserts no message matching `pred` reaches `p` within `wait` (other traffic is ignored).
+async fn assert_none_matching<F: Fn(&ControlMessage) -> bool>(
+    p: &mut Player,
+    wait: Duration,
+    why: &str,
+    pred: F,
+) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match p.try_recv(left).await {
+            Some(m) if pred(&m) => panic!("{}: unexpected message ({why}): {m:?}", p.name),
+            Some(_) => continue,
+            None => return,
+        }
+    }
+}
+
+async fn assert_no_transcript(p: &mut Player, wait: Duration, why: &str) {
+    assert_none_matching(p, wait, why, |m| {
+        matches!(m, ControlMessage::Transcript { .. })
+    })
+    .await;
+}
+
+/// Parses the frequency out of the mock provider's `tone <N>hz ...` transcript text.
+fn tone_hz(text: &str) -> Option<f32> {
+    text.strip_prefix("tone ")?
+        .split_once("hz")?
+        .0
+        .parse::<f32>()
+        .ok()
+}
+
+/// Discards whatever is pending on the control connection.
+async fn drain_ws(p: &mut Player) {
+    while p.try_recv(Duration::from_millis(300)).await.is_some() {}
+}
+
+async fn expect_transcript(
+    p: &mut Player,
+    channel_id: ChannelId,
+    speaker: UserId,
+) -> aurix_common::protocol::Transcript {
+    let m = expect_within(p, "Transcript", Duration::from_secs(12), |m| {
+        matches!(m, ControlMessage::Transcript { transcript }
+            if transcript.channel_id == channel_id && transcript.user_id == speaker)
+    })
+    .await;
+    match m {
+        ControlMessage::Transcript { transcript } => transcript,
+        _ => unreachable!(),
+    }
+}
+
+async fn expect_tts_status(
+    p: &mut Player,
+    client_ref: &str,
+    state: aurix_common::protocol::TtsState,
+) -> (uuid::Uuid, Option<u64>, Option<String>) {
+    let m = expect_within(
+        p,
+        &format!("TtsStatus {state:?} for {client_ref}"),
+        Duration::from_secs(10),
+        |m| {
+            matches!(m, ControlMessage::TtsStatus { client_ref: Some(r), state: s, .. }
+                if r == client_ref && *s == state)
+        },
+    )
+    .await;
+    match m {
+        ControlMessage::TtsStatus {
+            request_id,
+            duration_ms,
+            message,
+            ..
+        } => (request_id, duration_ms, message),
+        _ => unreachable!(),
+    }
+}
+
+/// Counts audio packets from `ssrc` arriving within `wait`; returns the count and whether
+/// every payload was a decodable Opus frame.
+async fn synth_audio_from(to: &Player, ssrc: u32, wait: Duration) -> (usize, bool) {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut pcm = vec![0i16; 5760];
+    let mut got = 0;
+    let mut decodable = true;
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Ok(Ok((n, _))) = tokio::time::timeout(left, to.udp.recv_from(&mut buf)).await else {
+            break;
+        };
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: downlink not sealed for us", to.name);
+        if p.header.packet_type == PacketType::Audio && p.header.ssrc == ssrc {
+            got += 1;
+            decodable &= dec.decode(&p.payload, &mut pcm, false).is_ok();
+        }
+    }
+    (got, decodable)
+}
+
+async fn drain_udp(p: &Player) {
+    let mut buf = vec![0u8; 2048];
+    while tokio::time::timeout(Duration::from_millis(300), p.udp.recv_from(&mut buf))
+        .await
+        .is_ok()
+    {}
+}
+
+/// Speech features against the mock provider (`examples/mock_speech.rs`): transcripts are
+/// produced only for channels with `transcription: true` and never for E2EE frames, reach the
+/// speaker and same-tenant listeners on every node but not sessions that opted out; TTS plays
+/// as the participant's synthetic SSRC to the chosen destination, reports its lifecycle to the
+/// requester only, enforces voice/text/queue/rate limits, hides provider errors, and can be
+/// cancelled; operator announcements come from a per-channel system SSRC and are tenant-scoped.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with STT/TTS pointed at examples/mock_speech.rs"]
+async fn speech_transcripts_and_text_to_speech() {
+    use aurix_common::protocol::{TtsDestination, TtsState};
+    use aurix_media::tts::{participant_voice_ssrc, system_voice_ssrc};
+
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let voices: serde_json::Value = http
+        .get(format!("{}/v1/tts/voices", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    if voices["enabled"] != true {
+        eprintln!("TTS not enabled on the node; skipping (start examples/mock_speech.rs)");
+        return;
+    }
+    assert_eq!(voices["client_requests"], true);
+    assert_eq!(
+        voices["voices"][0], "alloy",
+        "default voice first: {voices}"
+    );
+    assert!(
+        voices.get("api_key").is_none() && voices.get("endpoint").is_none(),
+        "provider settings must not leak: {voices}"
+    );
+    let max_text = voices["max_text_chars"].as_u64().unwrap() as usize;
+    let env2 = match std::env::var("AURIX_E2E_WS2") {
+        Ok(ws) => Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+            ws,
+            api_key: env.api_key.clone(),
+        },
+        Err(_) => {
+            eprintln!("AURIX_E2E_WS2 not set; running the listener on the same node");
+            env.clone()
+        }
+    };
+
+    let spoken = create_channel_with(&env, &http, serde_json::json!({"transcription": true})).await;
+    let quiet = create_channel(&env, &http).await;
+    let (tok_a, uid_a) =
+        issue_token_for(&env, &http, "speech:alice", "Alice", &[spoken, quiet]).await;
+    let (tok_b, _) = issue_token_for(&env, &http, "speech:bob", "Bob", &[spoken, quiet]).await;
+    let (tok_c, _) = issue_token(&env2, &http, "speech:carol", "Carol", spoken).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(&env2, "carol", tok_c).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        bind_media(p).await;
+    }
+
+    // The join ack tells the client whether the channel is transcribed.
+    async fn join_expecting(p: &mut Player, ch: ChannelId, transcribed: bool) {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id: ch,
+            token: tok,
+        })
+        .await;
+        let ack = p
+            .expect("ChannelJoinAck", |m| {
+                matches!(m, ControlMessage::ChannelJoinAck { channel_id, .. } if *channel_id == ch)
+            })
+            .await;
+        let ControlMessage::ChannelJoinAck { transcription, .. } = ack else {
+            unreachable!()
+        };
+        assert_eq!(transcription, transcribed, "{}: join ack for {ch}", p.name);
+    }
+    join_expecting(&mut alice, spoken, true).await;
+    join_expecting(&mut alice, quiet, false).await;
+    join_expecting(&mut bob, spoken, true).await;
+    join_expecting(&mut carol, spoken, true).await;
+    // Alice transmits to both channels; the TTS request below must then name its channel.
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::All,
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged", |m| {
+            matches!(m, ControlMessage::TransmissionChanged { .. })
+        })
+        .await;
+
+    // ── STT: speaker + same-tenant listeners (cross-node), not the opted-out session ──
+    bob.send(&ControlMessage::SetTranscripts { enabled: false })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tone = opus_tone(440.0, 1_600);
+    stream_frames(&alice, spoken, 1, &tone, false).await;
+    let t = expect_transcript(&mut alice, spoken, uid_a).await;
+    assert!(
+        tone_hz(&t.text).is_some_and(|hz| (hz - 440.0).abs() < 10.0) && t.text.contains("dur="),
+        "speaker gets their own captions: {t:?}"
+    );
+    assert_eq!(t.language.as_deref(), Some("en"));
+    assert!(t.duration_ms >= 1_000, "segment length: {t:?}");
+    assert_eq!(t.words.len(), 2, "stt.include_words on the node: {t:?}");
+    assert!(t.words[1].start_ms > 0 && t.words[1].end_ms >= t.words[1].start_ms);
+    let tc = expect_transcript(&mut carol, spoken, uid_a).await;
+    assert_eq!(tc.id, t.id, "the listener sees the same segment");
+    assert_eq!(tc.text, t.text);
+    // Let the tail of the stream (below `min_segment_ms`) be discarded before asserting silence.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_no_transcript(&mut bob, Duration::from_millis(500), "opted out").await;
+
+    bob.send(&ControlMessage::SetTranscripts { enabled: true })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stream_frames(&alice, spoken, 1_000, &opus_tone(880.0, 1_600), false).await;
+    let tb = expect_transcript(&mut bob, spoken, uid_a).await;
+    assert!(
+        tone_hz(&tb.text).is_some_and(|hz| (hz - 880.0).abs() < 15.0),
+        "opted back in: {tb:?}"
+    );
+    for p in [&mut alice, &mut carol] {
+        expect_transcript(p, spoken, uid_a).await;
+    }
+    for p in [&mut alice, &mut bob, &mut carol] {
+        drain_ws(p).await;
+    }
+
+    // A channel without `transcription` is never sent to STT; neither are E2EE frames.
+    stream_frames(&alice, quiet, 2_000, &opus_tone(660.0, 1_600), false).await;
+    stream_frames(&alice, spoken, 3_000, &opus_tone(660.0, 1_600), true).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        assert_no_transcript(p, Duration::from_millis(400), "quiet channel / e2ee").await;
+    }
+    for p in [&alice, &bob, &carol] {
+        drain_udp(p).await;
+    }
+
+    // ── TTS as a participant: channel destination ──
+    let alice_voice = participant_voice_ssrc(alice.ssrc);
+    alice
+        .send(&ControlMessage::TtsSpeak {
+            channel_id: Some(spoken),
+            text: "incoming [dur=600]".into(),
+            voice: Some("nova".into()),
+            destination: TtsDestination::Channel,
+            client_ref: Some("r1".into()),
+        })
+        .await;
+    let (rid, _, _) = expect_tts_status(&mut alice, "r1", TtsState::Queued).await;
+    let (rid2, dur, _) = expect_tts_status(&mut alice, "r1", TtsState::Playing).await;
+    assert_eq!(rid, rid2);
+    assert_eq!(dur, Some(600), "duration of the synthesized clip");
+    let ((got_b, ok_b), (got_c, ok_c)) = tokio::join!(
+        synth_audio_from(&bob, alice_voice, Duration::from_millis(1_500)),
+        synth_audio_from(&carol, alice_voice, Duration::from_millis(1_500)),
+    );
+    assert!(
+        (25..=31).contains(&got_b) && ok_b,
+        "bob hears the synthetic voice as 20 ms Opus frames: {got_b} ok={ok_b}"
+    );
+    assert!(
+        (25..=31).contains(&got_c) && ok_c,
+        "carol (other node) hears it through the cascade: {got_c} ok={ok_c}"
+    );
+    let (rid3, dur3, _) = expect_tts_status(&mut alice, "r1", TtsState::Finished).await;
+    assert_eq!((rid3, dur3), (rid, Some(600)));
+    assert_eq!(
+        synth_audio_from(&alice, alice_voice, Duration::from_millis(300))
+            .await
+            .0,
+        0,
+        "destination=channel does not echo to the requester"
+    );
+    // Nobody but the requester sees the lifecycle.
+    for p in [&mut bob, &mut carol] {
+        assert_none_matching(p, Duration::from_millis(300), "TtsStatus leaked", |m| {
+            matches!(m, ControlMessage::TtsStatus { .. })
+        })
+        .await;
+    }
+
+    // ── local destination: only the requester hears it ──
+    alice
+        .send(&ControlMessage::TtsSpeak {
+            channel_id: Some(spoken),
+            text: "preview [dur=400]".into(),
+            voice: None,
+            destination: TtsDestination::Local,
+            client_ref: Some("r2".into()),
+        })
+        .await;
+    expect_tts_status(&mut alice, "r2", TtsState::Playing).await;
+    let ((got_a, ok_a), (got_b, _)) = tokio::join!(
+        synth_audio_from(&alice, alice_voice, Duration::from_millis(1_200)),
+        synth_audio_from(&bob, alice_voice, Duration::from_millis(1_200)),
+    );
+    assert!(
+        (16..=21).contains(&got_a) && ok_a,
+        "local playback: {got_a}"
+    );
+    assert_eq!(got_b, 0, "local playback must not reach the channel");
+    expect_tts_status(&mut alice, "r2", TtsState::Finished).await;
+
+    // ── validation and authorization, each rejected with the caller's client_ref ──
+    struct Rejected(
+        Option<ChannelId>,
+        String,
+        Option<&'static str>,
+        &'static str,
+        &'static str,
+    );
+    let cases = [
+        Rejected(
+            Some(spoken),
+            "x".into(),
+            Some("hal9000"),
+            "VALIDATION_ERROR",
+            "unknown voice",
+        ),
+        Rejected(
+            Some(spoken),
+            "y".repeat(max_text + 1),
+            None,
+            "VALIDATION_ERROR",
+            "too long",
+        ),
+        Rejected(
+            Some(spoken),
+            "tab\u{7}bell".into(),
+            None,
+            "VALIDATION_ERROR",
+            "control chars",
+        ),
+        Rejected(
+            None,
+            "which channel?".into(),
+            None,
+            "VALIDATION_ERROR",
+            "ambiguous channel",
+        ),
+    ];
+    for (i, Rejected(channel_id, text, voice, code, why)) in cases.into_iter().enumerate() {
+        let r = format!("bad{i}");
+        alice
+            .send(&ControlMessage::TtsSpeak {
+                channel_id,
+                text,
+                voice: voice.map(str::to_string),
+                destination: TtsDestination::Channel,
+                client_ref: Some(r.clone()),
+            })
+            .await;
+        let m = expect_within(
+            &mut alice,
+            why,
+            Duration::from_secs(5),
+            |m| matches!(m, ControlMessage::Error { client_ref: Some(c), .. } if *c == r),
+        )
+        .await;
+        assert!(
+            matches!(&m, ControlMessage::Error { code: c, .. } if c == code),
+            "{why}: {m:?}"
+        );
+    }
+    // Carol is not a member of `quiet`.
+    carol
+        .send(&ControlMessage::TtsSpeak {
+            channel_id: Some(quiet),
+            text: "sneak".into(),
+            voice: None,
+            destination: TtsDestination::Channel,
+            client_ref: Some("nm".into()),
+        })
+        .await;
+    let m = expect_within(
+        &mut carol,
+        "non-member rejection",
+        Duration::from_secs(5),
+        |m| matches!(m, ControlMessage::Error { client_ref: Some(c), .. } if c == "nm"),
+    )
+    .await;
+    assert!(
+        matches!(&m, ControlMessage::Error { code, .. } if code == "AUTH_DENIED"),
+        "non-member: {m:?}"
+    );
+
+    // ── provider failure is reported as a sanitized Failed status ──
+    alice
+        .send(&ControlMessage::TtsSpeak {
+            channel_id: Some(spoken),
+            text: "boom [fail]".into(),
+            voice: None,
+            destination: TtsDestination::Channel,
+            client_ref: Some("r3".into()),
+        })
+        .await;
+    expect_tts_status(&mut alice, "r3", TtsState::Queued).await;
+    let (_, _, msg) = expect_tts_status(&mut alice, "r3", TtsState::Failed).await;
+    let msg = msg.unwrap_or_default();
+    assert!(
+        !msg.contains("synthetic") && !msg.contains("500") && !msg.is_empty(),
+        "provider details must not leak: {msg:?}"
+    );
+
+    // ── cancellation: a slow synthesis and everything queued behind it ──
+    for r in ["c1", "c2"] {
+        alice
+            .send(&ControlMessage::TtsSpeak {
+                channel_id: Some(spoken),
+                text: format!("{r} [slow]"),
+                voice: None,
+                destination: TtsDestination::Channel,
+                client_ref: Some(r.into()),
+            })
+            .await;
+        expect_tts_status(&mut alice, r, TtsState::Queued).await;
+    }
+    // max_queued_per_session on the node is 2: the third is refused before it costs anything.
+    alice
+        .send(&ControlMessage::TtsSpeak {
+            channel_id: Some(spoken),
+            text: "c3 [slow]".into(),
+            voice: None,
+            destination: TtsDestination::Channel,
+            client_ref: Some("c3".into()),
+        })
+        .await;
+    let m = expect_within(
+        &mut alice,
+        "queue limit",
+        Duration::from_secs(5),
+        |m| matches!(m, ControlMessage::Error { client_ref: Some(c), .. } if c == "c3"),
+    )
+    .await;
+    assert!(matches!(&m, ControlMessage::Error { code, .. } if code == "RATE_LIMIT_EXCEEDED"));
+    alice.send(&ControlMessage::TtsCancel).await;
+    // Both land as `Cancelled`, in whichever order the jobs observe the token.
+    let mut cancelled = std::collections::BTreeSet::new();
+    while cancelled.len() < 2 {
+        let m = expect_within(
+            &mut alice,
+            "TtsStatus Cancelled",
+            Duration::from_secs(10),
+            |m| matches!(m, ControlMessage::TtsStatus { .. }),
+        )
+        .await;
+        let ControlMessage::TtsStatus {
+            client_ref, state, ..
+        } = m
+        else {
+            unreachable!()
+        };
+        assert_eq!(state, TtsState::Cancelled, "{client_ref:?}");
+        cancelled.insert(client_ref.expect("client_ref echoed"));
+    }
+    assert_eq!(cancelled.into_iter().collect::<Vec<_>>(), ["c1", "c2"]);
+    drain_udp(&bob).await;
+    assert_eq!(
+        synth_audio_from(&bob, alice_voice, Duration::from_secs(4))
+            .await
+            .0,
+        0,
+        "cancelled utterances never play"
+    );
+
+    // ── per-session request rate (6/min on the node): Bob burns his budget ──
+    let mut refused = None;
+    for i in 0..8 {
+        let r = format!("rate{i}");
+        bob.send(&ControlMessage::TtsSpeak {
+            channel_id: Some(spoken),
+            text: "quick [dur=100]".into(),
+            voice: None,
+            destination: TtsDestination::Local,
+            client_ref: Some(r.clone()),
+        })
+        .await;
+        let m = expect_within(&mut bob, "queued or refused", Duration::from_secs(5), |m| {
+            matches!(m, ControlMessage::TtsStatus { client_ref: Some(c), state: TtsState::Queued, .. } if *c == r)
+                || matches!(m, ControlMessage::Error { client_ref: Some(c), .. } if *c == r)
+        })
+        .await;
+        if let ControlMessage::Error { code, .. } = m {
+            assert_eq!(code, "RATE_LIMIT_EXCEEDED");
+            refused = Some(i);
+            break;
+        }
+        // Keep the queue (limit 2) from being the reason for a refusal.
+        expect_tts_status(&mut bob, &r, TtsState::Finished).await;
+    }
+    assert_eq!(
+        refused,
+        Some(6),
+        "seventh request within a minute is refused"
+    );
+
+    // ── operator announcement: system SSRC, every node, tenant-scoped ──
+    for p in [&alice, &bob, &carol] {
+        drain_udp(p).await;
+    }
+    let r = http
+        .post(format!("{}/v1/channels/{}/tts", env.api, spoken))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "server maintenance in five minutes [dur=500]"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["state"], "queued");
+    uuid::Uuid::parse_str(body["request_id"].as_str().unwrap()).unwrap();
+    let system = system_voice_ssrc(&spoken);
+    let ((ga, oa), (gb, ob), (gc, oc)) = tokio::join!(
+        synth_audio_from(&alice, system, Duration::from_millis(1_500)),
+        synth_audio_from(&bob, system, Duration::from_millis(1_500)),
+        synth_audio_from(&carol, system, Duration::from_millis(1_500)),
+    );
+    for (name, got, ok) in [("alice", ga, oa), ("bob", gb, ob), ("carol", gc, oc)] {
+        assert!(
+            (20..=26).contains(&got) && ok,
+            "{name}: announcement frames {got} ok={ok}"
+        );
+    }
+    let r = http
+        .post(format!("{}/v1/channels/{}/tts", env.api, spoken))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "nope", "voice": "hal9000"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = http
+        .post(format!(
+            "{}/v1/channels/{}/tts",
+            env.api,
+            uuid::Uuid::now_v7()
+        ))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let r = http
+            .post(format!("{}/v1/channels/{}/tts", env.api, spoken))
+            .header("x-api-key", &api_key2)
+            .json(&serde_json::json!({"text": "other tenant"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            404,
+            "another tenant cannot announce into our channel"
+        );
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation check");
+    }
+
+    for p in [&mut alice, &mut bob, &mut carol] {
+        let _ = p.ws.close(None).await;
+    }
 }

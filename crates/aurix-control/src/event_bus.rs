@@ -171,6 +171,35 @@ pub enum ServerEvent {
         channel_id: ChannelId,
         levels: Vec<aurix_common::protocol::ParticipantEnergy>,
     },
+    /// Speech-to-text segment produced by the media node hosting the speaker, for a channel
+    /// with `transcription` enabled. Every node delivers it to its local channel members that
+    /// opted in; it is not stored.
+    Transcript {
+        app_id: AppId,
+        transcript: aurix_common::protocol::Transcript,
+    },
+    /// Operator announcement accepted by the REST API; every node with local participants of
+    /// the channel synthesizes and plays it to them.
+    TtsAnnouncement {
+        app_id: AppId,
+        channel_id: ChannelId,
+        request_id: uuid::Uuid,
+        text: String,
+        voice: String,
+    },
+    /// Progress of a text-to-speech request on the node playing it (`session_id` is the
+    /// requesting player, `None` for announcements).
+    TtsStatus {
+        app_id: AppId,
+        channel_id: ChannelId,
+        request_id: uuid::Uuid,
+        session_id: Option<SessionId>,
+        user_id: Option<UserId>,
+        client_ref: Option<String>,
+        state: aurix_common::protocol::TtsState,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+    },
 }
 
 impl ServerEvent {
@@ -197,7 +226,10 @@ impl ServerEvent {
             | Self::ChatMessage { app_id, .. }
             | Self::ParticipantTyping { app_id, .. }
             | Self::ParticipantSpeaking { app_id, .. }
-            | Self::ChannelEnergy { app_id, .. } => Some(*app_id),
+            | Self::ChannelEnergy { app_id, .. }
+            | Self::Transcript { app_id, .. }
+            | Self::TtsAnnouncement { app_id, .. }
+            | Self::TtsStatus { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => None,
         }
     }
@@ -237,7 +269,11 @@ impl ServerEvent {
             Self::ParticipantTyping { .. } => "participant.typing",
             Self::ParticipantSpeaking { .. } => "participant.speaking",
             Self::ChannelEnergy { .. } => "channel.energy",
-            Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => return None,
+            Self::Transcript { .. } => "channel.transcript",
+            Self::TtsStatus { .. } => "tts.status",
+            Self::NodeHealthChanged { .. }
+            | Self::WebhooksChanged { .. }
+            | Self::TtsAnnouncement { .. } => return None,
         })
     }
 
@@ -264,6 +300,8 @@ impl ServerEvent {
         "participant.typing",
         "participant.speaking",
         "channel.energy",
+        "channel.transcript",
+        "tts.status",
     ];
 
     /// Types a subscription may name (the real-time noise is SSE-only).

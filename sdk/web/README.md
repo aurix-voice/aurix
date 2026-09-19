@@ -273,6 +273,34 @@ silences microphone and injection together, `setInputGain` scales the microphone
 a stream plays until `stopAudioInjection()` or `disconnect()`. `injectAudio` needs media
 (`connect()` first) and Web Audio; `decodeAudio` accepts whatever `decodeAudioData` decodes.
 
+### Transcripts & text-to-speech
+
+```ts
+// backend: channel config {"transcription": true} + [stt] configured on the server
+client.on('transcript', (t) => captions.append(t.userId, t.text, t.startedAt, t.words));
+client.isChannelTranscribed(channelId);      // from ChannelJoinAck.transcription
+client.setTranscripts(false);                // stop receiving captions (survives reconnect)
+client.transcriptsEnabled;                   // true by default
+
+// [tts] configured on the server (GET /v1/tts/voices lists voices and limits)
+const req = await client.speak('Enemy spotted at B', { destination: 'channel', voice: 'nova' });
+client.on('ttsStatus', (s) => console.log(s.clientRef, s.state, s.durationMs, s.message));
+const final = await req.done;                // finished | cancelled | failed
+await client.speak('Reading your message…', { destination: 'local' }); // only you hear it
+client.cancelSpeech();                       // drops everything still queued or playing
+```
+
+Transcripts arrive only for channels the operator marked `transcription: true`, only from
+participants you would hear (local mute, block and zero gain suppress their captions), never
+for end-to-end-encrypted audio, and are not stored by the server — the event is your only copy.
+`speak()` resolves once the server queued the request (rejects with `<CODE>: <message>` for
+`FEATURE_DISABLED`, `AUTH_DENIED` not a member, `USER_MUTED`, `VALIDATION_ERROR` too long /
+unknown voice / control characters / ambiguous channel, `RATE_LIMIT_EXCEEDED` queue or per-minute
+budget, `MESSAGE_BLOCKED` by the content filter); `channelId` may be omitted when the session
+transmits to exactly one channel. Synthesized speech is routed exactly like your microphone
+(transmission mode, mutes, blocks, focus, other nodes) and reaches browsers inside the mixed
+downlink; statuses go to the requesting session only. Disconnecting cancels pending requests.
+
 ## How it maps to the server
 
 | SDK | server |

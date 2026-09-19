@@ -990,6 +990,60 @@ pub async fn send_user_message(
     to_json(message)
 }
 
+// ── Text-to-speech ──
+
+#[derive(Deserialize)]
+pub struct AnnounceRequest {
+    pub text: String,
+    #[serde(default)]
+    pub voice: Option<String>,
+}
+
+/// Server announcement spoken into a channel with the configured TTS provider. Every node
+/// hosting participants of the channel plays it to them; progress is published as
+/// `tts.status` events (SSE/webhooks) under the returned `request_id`.
+pub async fn announce_in_channel(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<AnnounceRequest>,
+) -> JsonResult {
+    ctx.require("tts:write")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let request_id =
+        state
+            .control
+            .speech
+            .announce(ctx.app_id, channel_id, &req.text, req.voice.as_deref())?;
+    Ok(Json(serde_json::json!({
+        "request_id": request_id,
+        "channel_id": channel_id,
+        "state": aurix_common::protocol::TtsState::Queued,
+    })))
+}
+
+/// Voices offered by the TTS configuration (first is the default); `enabled: false` when TTS
+/// is not configured on this node.
+pub async fn tts_voices(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+) -> JsonResult {
+    ctx.require("channels:read")?;
+    let speech = &state.control.speech;
+    Ok(Json(serde_json::json!({
+        "enabled": speech.enabled(),
+        "client_requests": speech.enabled() && speech.config().allow_client_requests,
+        "voices": if speech.enabled() { speech.voices() } else { Vec::new() },
+        "max_text_chars": speech.config().max_text_chars,
+        "max_audio_secs": speech.config().max_audio_secs,
+    })))
+}
+
 // ── Moderation ──
 
 #[derive(Deserialize)]

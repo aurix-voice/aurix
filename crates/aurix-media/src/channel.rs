@@ -189,6 +189,20 @@ impl MediaChannel {
         self.channel_type != ChannelType::Echo
     }
 
+    /// Receivers of a server announcement: every participant, at their channel-focus gain
+    /// only (announcements come from no participant, so mutes/blocks/positions do not apply).
+    pub fn get_receivers_for_announcement(&self) -> Vec<(Arc<MediaSession>, Mix)> {
+        self.participants
+            .iter()
+            .map(|e| {
+                let session = e.value().clone();
+                let volume = session.focus_gain(&self.channel_id);
+                (session, Mix::volume(volume))
+            })
+            .filter(|(_, mix)| mix.volume > 0.001)
+            .collect()
+    }
+
     pub fn update_position(
         &self,
         user_id: &UserId,

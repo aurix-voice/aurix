@@ -765,6 +765,9 @@ pub enum ControlMessage {
     ChannelJoinAck {
         channel_id: ChannelId,
         participants: Vec<ParticipantBrief>,
+        /// The channel transcribes speech and delivers `Transcript` events.
+        #[serde(default)]
+        transcription: bool,
     },
     ChannelLeave {
         channel_id: ChannelId,
@@ -948,6 +951,44 @@ pub enum ControlMessage {
         user_id: UserId,
         typing: bool,
     },
+    /// Server → channel members: a speech-to-text segment of `user_id` in a channel with
+    /// `transcription: true`. Ephemeral; not stored server-side.
+    Transcript {
+        transcript: Transcript,
+    },
+    /// Client → server: opt out of (or back into) receiving `Transcript` events on this
+    /// session. Receiving is on by default; the speaker side is governed by the channel.
+    SetTranscripts {
+        enabled: bool,
+    },
+    /// Client → server: synthesize `text` server-side and play it as this participant's
+    /// voice. `channel_id` = `None` plays into every channel the session transmits to;
+    /// `destination` selects who hears it. `client_ref` is echoed in `TtsStatus`.
+    TtsSpeak {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+        #[serde(default)]
+        destination: TtsDestination,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Client → server: drop this session's pending utterances and stop the current one.
+    TtsCancel,
+    /// Server → requesting client: lifecycle of a `TtsSpeak` request.
+    TtsStatus {
+        request_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+        state: TtsState,
+        /// Length of the synthesized audio (set from `Playing` onwards).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// Browser clients: SDP offer for this session; the server replies with `WebRtcAnswer`.
     WebRtcOffer {
         sdp: String,
@@ -969,6 +1010,63 @@ pub struct LocalMute {
     /// `None` = muted in every channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<ChannelId>,
+}
+
+/// One transcribed speech segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Transcript {
+    pub id: uuid::Uuid,
+    pub channel_id: ChannelId,
+    pub user_id: UserId,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Start of the segment, server clock.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub duration_ms: u64,
+    /// Word timings relative to `started_at` (only when the node has `stt.include_words`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<TranscriptWordTiming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptWordTiming {
+    pub word: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Who hears a TTS utterance requested by a participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsDestination {
+    /// Everyone the participant's microphone would reach (their own voice).
+    #[default]
+    Channel,
+    /// Only the requesting session (preview / accessibility read-out).
+    Local,
+    /// Both of the above.
+    Both,
+}
+
+impl TtsDestination {
+    pub fn to_channel(self) -> bool {
+        matches!(self, Self::Channel | Self::Both)
+    }
+
+    pub fn to_self(self) -> bool {
+        matches!(self, Self::Local | Self::Both)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsState {
+    Queued,
+    Playing,
+    Finished,
+    Cancelled,
+    Failed,
 }
 
 /// Where a session's microphone goes when it is a member of several channels.
@@ -1427,5 +1525,77 @@ mod tests {
         let focus =
             serde_json::to_string(&ControlMessage::SetChannelFocus { channel_id: None }).unwrap();
         assert_eq!(focus, r#"{"type":"SetChannelFocus","data":{}}"#);
+    }
+
+    #[test]
+    fn transcript_and_tts_messages_json_shape() {
+        let ch = ChannelId::new();
+        // Speak with defaults: destination falls back to `channel`.
+        let speak: ControlMessage = serde_json::from_str(&format!(
+            r#"{{"type":"TtsSpeak","data":{{"channel_id":"{}","text":"go go go"}}}}"#,
+            ch.0
+        ))
+        .unwrap();
+        match speak {
+            ControlMessage::TtsSpeak {
+                channel_id,
+                text,
+                voice,
+                destination,
+                client_ref,
+            } => {
+                assert_eq!(channel_id, Some(ch));
+                assert_eq!(text, "go go go");
+                assert!(voice.is_none() && client_ref.is_none());
+                assert_eq!(destination, TtsDestination::Channel);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Unit variant carries no `data`.
+        let cancel = serde_json::to_string(&ControlMessage::TtsCancel).unwrap();
+        assert_eq!(cancel, r#"{"type":"TtsCancel"}"#);
+        let parsed: ControlMessage = serde_json::from_str(r#"{"type":"TtsCancel"}"#).unwrap();
+        assert!(matches!(parsed, ControlMessage::TtsCancel));
+
+        let status = serde_json::to_string(&ControlMessage::TtsStatus {
+            request_id: uuid::Uuid::nil(),
+            client_ref: None,
+            state: TtsState::Playing,
+            duration_ms: Some(1200),
+            message: None,
+        })
+        .unwrap();
+        assert!(status.contains(r#""state":"playing""#));
+        assert!(!status.contains("client_ref"));
+
+        // Old join acks without `transcription` still parse.
+        let ack: ControlMessage = serde_json::from_str(&format!(
+            r#"{{"type":"ChannelJoinAck","data":{{"channel_id":"{}","participants":[]}}}}"#,
+            ch.0
+        ))
+        .unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::ChannelJoinAck {
+                transcription: false,
+                ..
+            }
+        ));
+
+        let transcript = ControlMessage::Transcript {
+            transcript: Transcript {
+                id: uuid::Uuid::nil(),
+                channel_id: ch,
+                user_id: UserId::new(),
+                text: "hello".into(),
+                language: Some("en".into()),
+                started_at: chrono::Utc::now(),
+                duration_ms: 900,
+                words: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&transcript).unwrap();
+        assert!(!json.contains("\"words\""));
+        assert!(json.contains(r#""type":"Transcript""#));
     }
 }
