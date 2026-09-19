@@ -100,12 +100,32 @@ namespace Aurix.Audio
     }
 
     /// <summary>
+    /// Lifetime downlink playout counters of a <see cref="RemoteMixer"/>, including streams that
+    /// have since been removed.
+    /// </summary>
+    public struct MixerTotals
+    {
+        /// <summary>Frames declared lost by the jitter buffers (concealed with PLC).</summary>
+        public long Lost;
+        /// <summary>Frames that arrived after their playout slot and were dropped.</summary>
+        public long Late;
+        /// <summary>
+        /// Times a stream ran dry mid-spurt: the buffer starved and the next frame arrived within
+        /// <see cref="RemoteMixer.UnderrunResumeWindow"/>. The natural end of a talk spurt is not counted.
+        /// </summary>
+        public long Underruns;
+    }
+
+    /// <summary>
     /// Decodes and mixes all remote senders into one interleaved float buffer (called from the
     /// audio thread, e.g. <c>OnAudioFilterRead</c>). Each sender gets its own decoder instance
     /// because Opus decoder state is per-stream.
     /// </summary>
     public sealed class RemoteMixer : IDisposable
     {
+        /// <summary>A stream that starves and resumes within this window counts as an underrun.</summary>
+        public static readonly TimeSpan UnderrunResumeWindow = TimeSpan.FromMilliseconds(250);
+
         private sealed class Stream
         {
             public JitterBuffer Jitter = new JitterBuffer();
@@ -117,6 +137,8 @@ namespace Aurix.Audio
             public int FramePos;
             public int FrameLen;
             public long LastActivityTicks;
+            public bool Starved;
+            public long StarvedAtTicks;
         }
 
         private readonly Func<IOpusCodec> _decoderFactory;
@@ -124,6 +146,7 @@ namespace Aurix.Audio
         private readonly List<uint> _stale = new List<uint>();
         private float _outputVolume = 1f;
         private volatile bool _outputMuted;
+        private long _retiredLost, _retiredLate, _underruns;
 
         public RemoteMixer(Func<IOpusCodec> decoderFactory)
         {
@@ -171,7 +194,15 @@ namespace Aurix.Audio
                 s.Volume = volume;
                 if (direction.HasValue) (s.LeftGain, s.RightGain) = direction.Value.StereoGains();
                 else { s.LeftGain = 1f; s.RightGain = 1f; }
-                s.LastActivityTicks = DateTime.UtcNow.Ticks;
+                long now = DateTime.UtcNow.Ticks;
+                s.LastActivityTicks = now;
+                if (s.Starved)
+                {
+                    // A talk spurt after silence: refill the target depth before playing again.
+                    s.Jitter.Reset();
+                    s.Starved = false;
+                    if (now - s.StarvedAtTicks < UnderrunResumeWindow.Ticks) _underruns++;
+                }
             }
             s.Jitter.Push(seq, opus);
         }
@@ -182,10 +213,34 @@ namespace Aurix.Audio
             {
                 if (_streams.TryGetValue(ssrc, out var s))
                 {
-                    s.Decoder.Dispose();
+                    Retire(s);
                     _streams.Remove(ssrc);
                 }
             }
+        }
+
+        /// <summary>Lifetime lost/late/underrun counters across all streams, past and present.</summary>
+        public MixerTotals Totals
+        {
+            get
+            {
+                lock (_streams)
+                {
+                    var t = new MixerTotals { Lost = _retiredLost, Late = _retiredLate, Underruns = _underruns };
+                    foreach (var s in _streams.Values) { t.Lost += s.Jitter.Lost; t.Late += s.Jitter.Late; }
+                    return t;
+                }
+            }
+        }
+
+        /// <summary>Streams currently held (heard within the last 30 s).</summary>
+        public int ActiveStreams { get { lock (_streams) return _streams.Count; } }
+
+        private void Retire(Stream s)
+        {
+            _retiredLost += s.Jitter.Lost;
+            _retiredLate += s.Jitter.Late;
+            s.Decoder.Dispose();
         }
 
         /// <summary>
@@ -216,7 +271,11 @@ namespace Aurix.Audio
                     {
                         if (s.FramePos >= s.FrameLen)
                         {
-                            if (!s.Jitter.Pop(out var opus)) break;
+                            if (!s.Jitter.Pop(out var opus))
+                            {
+                                if (s.Jitter.Count == 0 && !s.Starved) { s.Starved = true; s.StarvedAtTicks = now; }
+                                break;
+                            }
                             int dc = s.Decoder.Channels;
                             int cap = AudioFormat.FrameSamples * 3 * dc; // up to 60 ms frames
                             if (s.Frame == null || s.Frame.Length < cap) s.Frame = new float[cap];
@@ -249,7 +308,7 @@ namespace Aurix.Audio
                         written += take;
                     }
                 }
-                foreach (var k in _stale) { _streams[k].Decoder.Dispose(); _streams.Remove(k); }
+                foreach (var k in _stale) { Retire(_streams[k]); _streams.Remove(k); }
             }
             // Soft clip to avoid wrap-around distortion when several loud talkers overlap.
             int end = offset + frames * outputChannels;
@@ -264,7 +323,7 @@ namespace Aurix.Audio
         {
             lock (_streams)
             {
-                foreach (var s in _streams.Values) s.Decoder.Dispose();
+                foreach (var s in _streams.Values) Retire(s);
                 _streams.Clear();
             }
         }

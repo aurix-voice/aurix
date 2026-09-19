@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Aurix.Audio;
 using Aurix.Protocol;
 using Aurix.Transport;
 
@@ -115,14 +116,30 @@ namespace Aurix
         private bool _closedByUser;
         private CancellationTokenSource _skipBackoff;
         private int _reconnectLoopActive;
+        private readonly LossWindow _lossWindow = new LossWindow();
+        private DateTime _lastQualityReport = DateTime.MinValue;
+        private NetworkQuality? _serverQuality;
 
         public VoiceConnectionState State { get; private set; } = VoiceConnectionState.Disconnected;
         public SessionInfo Session { get; private set; }
         public bool IsMuted => _muted;
         public MediaTransport Media => _media;
+        /// <summary>
+        /// The playout mixer whose jitter-buffer counters feed <see cref="GetStats"/> and the periodic
+        /// quality report (set by <c>AurixVoiceBehaviour</c>; assign it yourself when driving the mixer manually).
+        /// </summary>
+        public RemoteMixer Mixer { get; set; }
         /// <summary>Wall-clock RTT of the last WebSocket ping, in ms.</summary>
         public float ControlRttMs { get; private set; }
         public TimeSpan PingInterval { get; set; } = TimeSpan.FromSeconds(15);
+        /// <summary>
+        /// How often <see cref="Update"/> samples statistics (raising <see cref="OnStats"/>) and sends a
+        /// <c>QualityReport</c> that drives the server's adaptive bitrate and <see cref="LastNetworkQuality"/>.
+        /// Default 5 s; <see cref="TimeSpan.Zero"/> disables (call <see cref="ReportQualityAsync()"/> yourself).
+        /// </summary>
+        public TimeSpan QualityReportInterval { get; set; } = TimeSpan.FromSeconds(5);
+        /// <summary>Last server-side quality report (both directions, <c>Bars</c> 1–5), or null until one arrived.</summary>
+        public NetworkQuality? LastNetworkQuality => _serverQuality;
         public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(10);
         /// <summary>
         /// Reconnect automatically after an unexpected connection loss, resuming the same session when
@@ -159,6 +176,13 @@ namespace Aurix
         public event Action<Guid, IReadOnlyList<UserPosition>> OnPositions;
         public event Action<RecordingNotice> OnRecording;
         public event Action<uint, string> OnBitrateCommand;
+        /// <summary>
+        /// Server-side view of this connection (downlink from our reports + uplink as measured by the SFU),
+        /// sent when the 1–5 bars change and periodically as a summary.
+        /// </summary>
+        public event Action<NetworkQuality> OnNetworkQuality;
+        /// <summary>Statistics snapshot taken before each periodic quality report (see <see cref="QualityReportInterval"/>).</summary>
+        public event Action<VoiceStats> OnStats;
         public event Action<Guid, string> OnKicked;
         /// <summary>Snapshot of persistent cross-mutes (and, on a resumed session, local mutes/volumes) from the server.</summary>
         public event Action<ReceiverPreferences> OnReceiverPreferences;
@@ -350,6 +374,7 @@ namespace Aurix
                 throw;
             }
             _media = media;
+            _lossWindow.Reset();
             if (_muted) media.SendMuteState(true);
             SetState(VoiceConnectionState.MediaBound);
         }
@@ -838,6 +863,55 @@ namespace Aurix
             return _control.SendAsync(ControlMessage.QualityReport(rttMs, jitterMs, lossPercent), ct);
         }
 
+        /// <summary>Sample <see cref="GetStats"/>, raise <see cref="OnStats"/> and report the measured RTT/jitter/loss to the server.</summary>
+        public Task ReportQualityAsync(CancellationToken ct = default)
+        {
+            var s = GetStats();
+            OnStats?.Invoke(s);
+            return ReportQualityAsync(s.RttMs > 0f ? s.RttMs : s.ControlRttMs, s.JitterMs, s.LossPercent, ct);
+        }
+
+        /// <summary>
+        /// Current statistics: transport counters, RTT min/avg/max, downlink jitter, jitter-buffer
+        /// lost/late/underruns from <see cref="Mixer"/>, and the derived R-factor / MOS / 1–5 bars.
+        /// Advances the loss period, so call it at a steady cadence (the periodic report does).
+        /// </summary>
+        public VoiceStats GetStats()
+        {
+            var media = _media;
+            var mixer = Mixer;
+            var s = new VoiceStats { State = State, ControlRttMs = ControlRttMs, Server = _serverQuality };
+            if (media != null)
+            {
+                var rtt = media.Rtt;
+                s.PacketsSent = media.PacketsSent;
+                s.BytesSent = media.BytesSent;
+                s.PacketsReceived = media.PacketsReceived;
+                s.BytesReceived = media.BytesReceived;
+                s.BadAuth = media.PacketsBadAuth;
+                s.Replayed = media.PacketsReplayed;
+                s.HeartbeatsLost = media.HeartbeatsLost;
+                s.RttMs = rtt.LastMs;
+                s.RttMinMs = rtt.MinMs;
+                s.RttAvgMs = rtt.AvgMs;
+                s.RttMaxMs = rtt.MaxMs;
+                s.JitterMs = media.DownlinkJitterMs;
+            }
+            if (mixer != null)
+            {
+                var t = mixer.Totals;
+                s.FramesLost = t.Lost;
+                s.FramesLate = t.Late;
+                s.Underruns = t.Underruns;
+                s.ActiveStreams = mixer.ActiveStreams;
+            }
+            s.LossPercent = _lossWindow.Advance(s.FramesLost, s.PacketsReceived);
+            s.RFactor = QualityModel.RFactor(s.RttMs > 0f ? s.RttMs : s.ControlRttMs, s.JitterMs, s.LossPercent);
+            s.Mos = QualityModel.MosFromR(s.RFactor);
+            s.Bars = QualityModel.BarsFromR(s.RFactor);
+            return s;
+        }
+
         public IReadOnlyList<Participant> GetParticipants(Guid channelId)
         {
             lock (_channels)
@@ -879,6 +953,13 @@ namespace Aurix
             if (drainAudioToEvent && _media != null)
             {
                 while (_media.TryDequeueAudio(out var a)) OnAudio?.Invoke(FindBySsrc(a.SenderSsrc), a);
+            }
+
+            if (_media != null && _control != null && _control.IsOpen && State == VoiceConnectionState.MediaBound
+                && QualityReportInterval > TimeSpan.Zero && DateTime.UtcNow - _lastQualityReport > QualityReportInterval)
+            {
+                _lastQualityReport = DateTime.UtcNow;
+                try { _ = ReportQualityAsync(); } catch (InvalidOperationException) { }
             }
 
             var control = _control;
@@ -944,6 +1025,7 @@ namespace Aurix
             _skipBackoff?.Cancel();
             _media?.Dispose();
             _media = null;
+            _serverQuality = null;
             _control?.Dispose();
             _control = null;
             _resumeToken = null;
@@ -1163,6 +1245,16 @@ namespace Aurix
                 case "BitrateCommand":
                     OnBitrateCommand?.Invoke(m.U32("target_bitrate_kbps"), m.Str("reason") ?? string.Empty);
                     break;
+                case "NetworkQuality":
+                {
+                    var q = NetworkQuality.FromMessage(m);
+                    if (q.HasValue)
+                    {
+                        _serverQuality = q;
+                        OnNetworkQuality?.Invoke(q.Value);
+                    }
+                    break;
+                }
                 case "Kick":
                 {
                     var channelId = m.Id("channel_id");

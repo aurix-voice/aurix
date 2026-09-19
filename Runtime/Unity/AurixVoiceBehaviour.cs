@@ -164,6 +164,7 @@ namespace Aurix.Unity
             _mixer = new RemoteMixer(CodecFactory);
 
             Client = new AurixVoiceClient(WebSocketUrl, Token);
+            Client.Mixer = _mixer;
             Client.OnBitrateCommand += (kbps, _) => _encoder?.SetBitrate((int)kbps * 1000);
             Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();

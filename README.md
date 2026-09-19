@@ -71,6 +71,36 @@ void OnAudioFilterRead(float[] data, int ch) => mixer.Mix(data, ch);
 `UpdatePositionAsync` sends the player's pose for server-side positional audio (see below),
 `RespondToRecordingAsync` answers consent prompts, `ReportQualityAsync` feeds the server's bitrate adaptation.
 
+### Statistics and network quality bars
+
+`client.GetStats()` returns a `VoiceStats` snapshot; `AurixVoiceBehaviour` wires its `RemoteMixer` into
+`client.Mixer` so jitter-buffer counters are included (do the same when you drive the mixer yourself):
+
+```csharp
+var s = client.GetStats();
+s.Bars;                              // 1 (unusable) … 5 (excellent), from R-factor
+s.RFactor; s.Mos;                    // simplified E-model rating 0..100, MOS 1..4.5
+s.RttMs; s.RttMinMs; s.RttAvgMs; s.RttMaxMs; // heartbeat RTT on the media path; s.ControlRttMs for the WebSocket
+s.JitterMs;                          // RFC 3550 inter-arrival jitter of downlink audio
+s.LossPercent;                       // downlink loss over the last period, 0..100
+s.PacketsSent; s.BytesSent; s.PacketsReceived; s.BytesReceived;
+s.BadAuth; s.Replayed; s.HeartbeatsLost;
+s.FramesLost; s.FramesLate; s.Underruns; s.ActiveStreams;  // mixer / jitter buffers, lifetime
+s.Server;                            // NetworkQuality? — the server's merged view (see below)
+
+client.OnStats          += s => hud.SetBars(s.Bars);
+client.OnNetworkQuality += q => hud.SetServerBars(q.Bars, q.UplinkLossPercent);
+```
+
+Every `QualityReportInterval` (5 s; `TimeSpan.Zero` disables) `Update()` samples the stats, raises `OnStats`
+and sends a `QualityReport` (RTT, jitter, loss **percent**) that drives the server's adaptive bitrate.
+The server merges that downlink report with what the SFU measures on your uplink (sequence gaps, jitter,
+bitrate) into a `NetworkQuality` message whose `Bars` is the worse of the two directions; it arrives when
+the bar count changes and periodically as a summary (`client.LastNetworkQuality`). Bars use the same
+thresholds everywhere (server, native, Web, Unity): R ≥ 80 → 5, ≥ 70 → 4, ≥ 60 → 3, ≥ 50 → 2, else 1.
+Packet/byte/frame counters are cumulative for the current media transport; `LossPercent`, `RFactor`,
+`Mos` and `Bars` describe the last period.
+
 ### Positional / directional audio
 
 In a `positional` channel the server places every speaker for every listener from the poses the clients publish.

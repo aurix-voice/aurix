@@ -128,6 +128,10 @@ namespace Aurix.Demo
             var mixer = new RemoteMixer(() => new ConcentusOpusCodec());
             var outBuf = new float[AudioFormat.FrameSamples];
             double energy = 0; long samples = 0; int framesWithSignal = 0;
+            bob.Mixer = mixer;
+            bob.QualityReportInterval = TimeSpan.FromSeconds(1);
+            NetworkQuality? bobServerQuality = null; int serverQualityReports = 0;
+            bob.OnNetworkQuality += q => { bobServerQuality = q; serverQualityReports++; };
             var vad = new VoiceActivityDetector();
             float bobSeesAliceEnergy = 0f; int energyReports = 0;
             bob.OnChannelEnergy += (ch, levels) =>
@@ -173,6 +177,13 @@ namespace Aurix.Demo
             Console.WriteLine($"alice sent {alice.Media.PacketsSent} pkts; bob received {bob.Media.PacketsReceived} verified, {bob.Media.PacketsBadAuth} bad auth, {bob.Media.PacketsReplayed} replayed");
             Console.WriteLine($"bob decoded RMS while alice talked: {rms:F3} (expect ≈0.35 for a 0.5-amplitude sine); frames with signal: {framesWithSignal}/{frames}");
             Console.WriteLine($"heartbeat acks {alice.Media.HeartbeatAcks} (every 5 s), RTT {alice.Media.LastRttMs} ms, alive={alice.Media.IsAlive}, control RTT {alice.ControlRttMs} ms");
+            var stats = bob.GetStats();
+            Console.WriteLine($"bob stats: {stats.Bars}/5 bars (R {stats.RFactor:F1}, MOS {stats.Mos:F2}), rtt {stats.RttMs}/{stats.RttMinMs}/{stats.RttAvgMs:F1}/{stats.RttMaxMs} ms (last/min/avg/max), " +
+                              $"jitter {stats.JitterMs:F2} ms, loss {stats.LossPercent:F1}%, frames lost {stats.FramesLost} late {stats.FramesLate} underruns {stats.Underruns}, " +
+                              $"{stats.BytesReceived} B in / {stats.BytesSent} B out, heartbeats lost {stats.HeartbeatsLost}");
+            Console.WriteLine(bobServerQuality.HasValue
+                ? $"server quality for bob: {bobServerQuality.Value.Bars}/5 (R {bobServerQuality.Value.RFactor:F1}, uplink loss {bobServerQuality.Value.UplinkLossPercent:F1}%, {bobServerQuality.Value.UplinkBitrateKbps} kbps) after {serverQualityReports} report(s)"
+                : "server quality for bob: none received");
             Console.WriteLine($"alice local VAD: level {vad.Level} (-dBov), speaking={vad.Speaking}; bob got {energyReports} energy report(s) for alice, peak {bobSeesAliceEnergy:F3} (expect ≈0.35)");
             Console.WriteLine($"bob speaker-muted for {spkMuteTo - spkMuteFrom} frames while alice talked: {mutedFramesSilent} silent (expect all), packets kept flowing");
             long received = bob.Media.PacketsReceived, badAuth = bob.Media.PacketsBadAuth;
