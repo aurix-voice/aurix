@@ -283,6 +283,34 @@ hard-clips at ±1, so the transmitted level and the local VAD see the same signa
 downlink — a muted mixer still consumes and decodes frames, so the jitter buffers stay in sync and unmuting is
 instant. None of this is signalled to the server; use `SetMuted` for a microphone mute other players see.
 
+### Echo channel (mic test) & audio injection
+
+```csharp
+// backend: POST /v1/channels {"name":"mic-test","config":{"channel_type":"echo"}}
+voice.ChannelId = echoChannelId; await voice.Connect();      // you hear only yourself, nobody hears you
+
+voice.InjectClip(testClip, loop: true, gain: 0.8f);           // mixed over the microphone
+voice.InjectClip(botLine, mixWithMicrophone: false);          // replaces the microphone until it ends
+voice.Injector.Ended += () => testButton.interactable = true; // clip finished or StopInjection()
+voice.IsInjecting;  voice.StopInjection();                    // microphone is audible again immediately
+
+// live PCM (TTS, in-game radio) with your own pipeline:
+var inj = new AudioInjector { Gain = 1f, MixWithMicrophone = true };
+inj.OpenStream();                                             // stays active (silence when starved) until Stop()
+inj.Push(pcm, channels, sampleRate);                          // any layout/rate, converted to mono 48 kHz
+inj.Fill(micFrame, 960);                                      // after ApplyGain, before the VAD and Opus
+```
+
+An `echo` channel loops each participant's own frames back through the real uplink → server → downlink path
+(encrypted, authenticated, with the receiver's own local volume/mute applied) and never forwards them to anybody
+else or to other nodes. `AudioInjector` is plain C# (no Unity API): `Play` takes a decoded clip, `OpenStream` /
+`Push` a live feed (queue capped at `MaxQueuedSamples`, oldest samples dropped), `Fill` sums the injected signal
+into a 48 kHz mono microphone frame — or clears the frame first when `MixWithMicrophone` is `false` — and
+hard-clips at ±1. The behaviour calls it after the input gain and before the VAD, so `GateOnVad`, `SetMuted`,
+the transmission mode and focus treat injected audio exactly like speech; with no microphone (denied, none
+attached) the behaviour still pumps injection-only 20 ms frames. `Play`/`OpenStream` replace whatever is playing;
+drive the injector from the thread that produces the microphone frames (it is not thread-safe).
+
 ## .NET: build, test, end-to-end demo
 
 ```bash
@@ -324,6 +352,10 @@ over real UDP: no frames before both poses are known; alice 2 m to bob's right �
 stereo mix lands entirely in the right channel; bob turns to face her → azimuth `0`, both channels equal;
 alice behind-left at 12 m with bob's local volume 0.5 → azimuth `-3π/4`, volume byte 0.25 and a left-heavy mix;
 beyond `max_radius` → nothing.
+
+`--scenario echo` (needs the API key: it creates an echo channel) checks loopback over real UDP: alice and bob
+join the same echo channel, alice injects a stereo 24 kHz sine through `AudioInjector` → Opus → AURX and hears
+only her own SSRC back (RMS ≈ 0.35, `Ended` fired once), nothing after `SetMuted(true)`, bob receives 0 frames.
 
 ## Notes
 

@@ -83,6 +83,20 @@ namespace Aurix.Demo
                 var (arenaB, userB) = await IssueTokenWithUser(http, new[] { arena }, "bob");
                 return await PositionalScenario(ws, Guid.Parse(arena), arenaA, Guid.Parse(userA), arenaB, Guid.Parse(userB));
             }
+            if (Get(opt, "scenario", "audio") == "echo")
+            {
+                if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the echo scenario needs --api-key (creates an echo channel)"); return 2; }
+                using var http = new HttpClient { BaseAddress = new Uri(api) };
+                http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                var echo = MiniJson.GetString(MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/channels", new Dictionary<string, object>
+                {
+                    { "name", "csharp-demo-echo" },
+                    { "config", new Dictionary<string, object> { { "channel_type", "echo" } } },
+                }))), "id");
+                var echoA = await IssueToken(http, new[] { echo }, "alice");
+                var echoB = await IssueToken(http, new[] { echo }, "bob");
+                return await EchoScenario(ws, Guid.Parse(echo), echoA, echoB);
+            }
 
             var log = new List<string>();
             var alice = new AurixVoiceClient(ws, tokenA);
@@ -388,6 +402,89 @@ namespace Aurix.Demo
             Console.WriteLine("events:");
             foreach (var l in log) Console.WriteLine("  " + l);
             Console.WriteLine(ok ? "positional scenario: OK" : "positional scenario: FAILED");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Sound test over real UDP: alice has no microphone signal (silent frames) and injects a
+        /// 440 Hz clip through <see cref="AudioInjector"/>; the echo channel loops her own audio
+        /// back to her — and only to her — while bob, in the same channel, hears nothing.
+        /// </summary>
+        private static async Task<int> EchoScenario(string ws, Guid echo, string tokenA, string tokenB)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA);
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            var a = await alice.ConnectAsync();
+            await bob.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            await alice.JoinChannelAsync(echo);
+            await bob.JoinChannelAsync(echo);
+            var hash = AurixVoiceClient.ChannelHash(echo);
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+
+            // A 0.6 s clip: 0.5-amplitude sine at 440 Hz, stereo 24 kHz to exercise the converter.
+            var clip = new float[24000 * 8 / 10 * 2];
+            for (int i = 0; i < clip.Length / 2; i++) { float v = (float)(0.5 * Math.Sin(2 * Math.PI * 440 * i / 24000.0)); clip[2 * i] = v; clip[2 * i + 1] = v; }
+            var injector = new AudioInjector();
+            int ended = 0; injector.Ended += () => ended++;
+            injector.Play(clip, 2, 24000);
+
+            using var enc = new ConcentusOpusCodec();
+            var pcm = new float[AudioFormat.FrameSamples];
+            var opus = new byte[1275];
+            var mixer = new RemoteMixer(() => new ConcentusOpusCodec());
+            var outBuf = new float[AudioFormat.FrameSamples];
+            var vad = new VoiceActivityDetector();
+            double energy = 0; long samples = 0; int aliceFrames = 0, bobFrames = 0, wrongSsrc = 0, afterMute = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < 60; i++)
+            {
+                Array.Clear(pcm, 0, pcm.Length);              // "microphone": silence
+                injector.Fill(pcm, AudioFormat.FrameSamples);  // + injected clip (ends after 40 frames)
+                vad.Process(pcm, AudioFormat.FrameSamples);
+                int len = enc.Encode(pcm, AudioFormat.FrameSamples, opus);
+                alice.SendOpusFrame(hash, opus, len, AudioFormat.FrameSamples, vad.Level);
+                if (i == 30) alice.SetMuted(true); // muting the uplink silences the sound test too
+                while (alice.TryDequeueAudio(out var inc))
+                {
+                    aliceFrames++;
+                    if (i >= 36) afterMute++;
+                    if (inc.SenderSsrc != a.Ssrc) wrongSsrc++;
+                    mixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Opus);
+                }
+                while (bob.TryDequeueAudio(out _)) bobFrames++;
+                Array.Clear(outBuf, 0, outBuf.Length);
+                mixer.Mix(outBuf, 1);
+                if (i >= 5 && i < 30) { foreach (var v in outBuf) energy += v * v; samples += outBuf.Length; }
+                var wait = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs) - sw.Elapsed;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait);
+            }
+            await Task.Delay(200);
+            while (alice.TryDequeueAudio(out _)) { aliceFrames++; afterMute++; }
+            while (bob.TryDequeueAudio(out _)) bobFrames++;
+
+            double rms = Math.Sqrt(energy / Math.Max(1, samples));
+            Check(aliceFrames >= 25 && aliceFrames <= 36 && wrongSsrc == 0, $"alice hears herself: {aliceFrames} frames (expect ≈30, until she muted), all with her own SSRC ({wrongSsrc} foreign)");
+            Check(rms > 0.25, $"loopback RMS {rms:F3} (expect ≈0.35 for the injected 0.5-amplitude sine)");
+            Check(ended == 1 && !injector.Active, $"clip ended once: {ended}, injector active={injector.Active}");
+            Check(afterMute == 0, $"nothing loops back after SetMuted(true): {afterMute} frames");
+            Check(bobFrames == 0, $"bob (same echo channel) got {bobFrames} frames (expect 0)");
+            Check(alice.Media.PacketsBadAuth == 0 && bob.Media.PacketsBadAuth == 0, "no auth failures");
+
+            cts.Cancel();
+            await pump;
+            await alice.DisconnectAsync();
+            await bob.DisconnectAsync();
+            mixer.Dispose();
+            Console.WriteLine("events:");
+            foreach (var l in log) Console.WriteLine("  " + l);
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }
 
