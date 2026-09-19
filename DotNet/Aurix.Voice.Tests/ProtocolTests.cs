@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using Aurix.Audio;
 using Aurix.Protocol;
@@ -255,6 +256,65 @@ namespace Aurix.Voice.Tests
             Assert.Equal(bob, ack.Id("user_id"));
             Assert.Equal(ModerationAction.Mute, ControlMessage.ParseModerationAction(ack.Str("action")));
             Assert.Null(ControlMessage.ParseModerationAction("ban"));
+        }
+
+        [Fact]
+        public void ChatMessagesMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b6d1-131f-7160-afd2-056622380dd3");
+            var bob = Guid.Parse("01a0b6d1-132a-7385-8e7a-9ac1eceaeb0c");
+
+            // Outbound: optional fields are omitted entirely (serde `default`), not sent as null.
+            Assert.Equal(
+                "{\"type\":\"ChatSend\",\"data\":{\"channel_id\":\"" + team + "\",\"text\":\"gg\"}}",
+                ControlMessage.ChatSend(team, "gg", null, null));
+            Assert.Equal(
+                "{\"type\":\"ChatSend\",\"data\":{\"channel_id\":\"" + team + "\",\"text\":\"/ping\",\"metadata\":{\"x\":1.5,\"tags\":[\"a\"]},\"client_ref\":\"m1\"}}",
+                ControlMessage.ChatSend(team, "/ping", new Dictionary<string, object> { { "x", 1.5 }, { "tags", new List<object> { "a" } } }, "m1"));
+            Assert.Equal(
+                "{\"type\":\"ChatSendDirect\",\"data\":{\"user_id\":\"" + bob + "\",\"text\":\"psst\",\"client_ref\":\"m2\"}}",
+                ControlMessage.ChatSendDirect(bob, "psst", null, "m2"));
+            Assert.Equal(
+                "{\"type\":\"ChatTyping\",\"data\":{\"channel_id\":\"" + team + "\",\"typing\":true}}",
+                ControlMessage.ChatTyping(team, true));
+
+            // Inbound channel message as the sender sees it (client_ref echoed) — server omits null fields.
+            var own = ControlMessage.Parse("{\"type\":\"ChatMessageReceived\",\"data\":{\"message\":{\"id\":\"11111111-2222-3333-4444-555555555555\"," +
+                "\"channel_id\":\"" + team + "\",\"from_user_id\":\"" + bob + "\",\"display_name\":\"Bob\",\"text\":\"gg\"," +
+                "\"metadata\":{\"ping\":{\"x\":1}},\"sent_at\":\"2026-09-18T21:24:05.123456Z\",\"client_ref\":\"m1\"}}}").ChatMessage();
+            Assert.Equal(Guid.Parse("11111111-2222-3333-4444-555555555555"), own.Id);
+            Assert.Equal(team, own.ChannelId);
+            Assert.Null(own.ToUserId);
+            Assert.Equal(bob, own.FromUserId);
+            Assert.Equal("Bob", own.DisplayName);
+            Assert.Equal("gg", own.Text);
+            Assert.Equal(1.0, MiniJson.GetNumber(MiniJson.AsObject(MiniJson.AsObject(own.Metadata)["ping"]), "x"));
+            Assert.Equal(new DateTimeOffset(2026, 9, 18, 21, 24, 5, TimeSpan.Zero).AddTicks(1234560), own.SentAt);
+            Assert.Equal("m1", own.ClientRef);
+            Assert.True(own.IsOwn);
+            Assert.False(own.IsDirect);
+            Assert.False(own.IsSystem);
+
+            // Directed system message as a recipient sees it: nil sender, no client_ref, no metadata.
+            var sys = ControlMessage.Parse("{\"type\":\"ChatMessageReceived\",\"data\":{\"message\":{\"id\":\"11111111-2222-3333-4444-555555555556\"," +
+                "\"from_user_id\":\"00000000-0000-0000-0000-000000000000\",\"display_name\":\"Server\",\"to_user_id\":\"" + bob + "\"," +
+                "\"text\":\"Match starts\",\"sent_at\":\"2026-09-18T21:24:06Z\"}}}").ChatMessage();
+            Assert.Null(sys.ChannelId);
+            Assert.Equal(bob, sys.ToUserId);
+            Assert.Null(sys.Metadata);
+            Assert.Null(sys.ClientRef);
+            Assert.True(sys.IsSystem);
+            Assert.True(sys.IsDirect);
+            Assert.False(sys.IsOwn);
+
+            var typing = ControlMessage.Parse("{\"type\":\"ParticipantTyping\",\"data\":{\"channel_id\":\"" + team + "\",\"user_id\":\"" + bob + "\",\"typing\":false}}");
+            Assert.Equal(team, typing.Id("channel_id"));
+            Assert.Equal(bob, typing.Id("user_id"));
+            Assert.False(typing.Bool("typing"));
+
+            var err = ControlMessage.Parse("{\"type\":\"Error\",\"data\":{\"code\":\"RATE_LIMIT_EXCEEDED\",\"message\":\"slow down\",\"client_ref\":\"m1\"}}");
+            Assert.Equal("m1", err.Str("client_ref"));
+            Assert.Null(ControlMessage.Parse("{\"type\":\"Error\",\"data\":{\"code\":\"X\",\"message\":\"y\"}}").Str("client_ref"));
         }
 
         [Fact]

@@ -80,6 +80,11 @@ namespace Aurix
         private TaskCompletionSource<List<Participant>> _joinTcs;
         private string _pendingModeration;
         private TaskCompletionSource<bool> _moderationTcs;
+        /// <summary>client_ref → pending <see cref="SendMessageAsync"/>/<see cref="SendDirectMessageAsync"/>.</summary>
+        private readonly Dictionary<string, TaskCompletionSource<ChatMessage>> _pendingChat = new Dictionary<string, TaskCompletionSource<ChatMessage>>();
+        private int _chatRefCounter;
+        /// <summary>channel → time of the last <c>ChatTyping {typing: true}</c> sent.</summary>
+        private readonly Dictionary<Guid, DateTime> _typingSentAt = new Dictionary<Guid, DateTime>();
         private byte[] _mediaKey;
         private string _resumeToken;
         private uint _lastMediaSequence;
@@ -135,6 +140,13 @@ namespace Aurix
         public event Action<ReceiverPreferences> OnReceiverPreferences;
         /// <summary>A cross-mute placed or lifted by this user, from this or any other device / the REST API.</summary>
         public event Action<Guid, bool> OnUserBlockChanged;
+        /// <summary>
+        /// A text message for this client: channel message of a joined channel, directed message addressed to
+        /// this user, or the echo of a message this client sent (<see cref="ChatMessage.IsOwn"/>).
+        /// </summary>
+        public event Action<ChatMessage> OnChatMessage;
+        /// <summary>Another member of the channel started/stopped typing (channel, user, typing).</summary>
+        public event Action<Guid, Guid, bool> OnParticipantTyping;
         public event Action<string, string> OnServerError;
         /// <summary>Connection closed for good: after <see cref="DisconnectAsync"/>, a server <c>SessionClose</c>, or when reconnecting gave up.</summary>
         public event Action<string> OnDisconnected;
@@ -198,6 +210,7 @@ namespace Aurix
             control.Closed += reason => Post(() => HandleClosed(control, reason));
             control.Received += CompletePendingJoin;
             control.Received += CompletePendingModeration;
+            control.Received += CompletePendingChat;
             try
             {
                 await control.ConnectAsync(new Uri(_wsUrl), _token, ct, resume).ConfigureAwait(false);
@@ -421,6 +434,75 @@ namespace Aurix
 
         public IReadOnlyCollection<Guid> BlockedUsers { get { lock (_blockedUsers) return new List<Guid>(_blockedUsers); } }
 
+        /// <summary>
+        /// Send a text message to every member of a joined channel. Completes with the server's copy (id,
+        /// timestamp) once accepted — also raised through <see cref="OnChatMessage"/> — or faults with
+        /// <c>CODE: message</c> (<c>AUTH_DENIED</c> not a member, <c>USER_MUTED</c>, <c>RATE_LIMIT_EXCEEDED</c>,
+        /// <c>MESSAGE_BLOCKED</c> by the content filter, <c>VALIDATION_ERROR</c>).
+        /// <paramref name="metadata"/> is an optional game payload (dictionary/list/string/number/bool) sent verbatim.
+        /// </summary>
+        public Task<ChatMessage> SendMessageAsync(Guid channelId, string text, object metadata = null, string clientRef = null, CancellationToken ct = default) =>
+            SendChatAsync(r => ControlMessage.ChatSend(channelId, text, metadata, r), clientRef, ct);
+
+        /// <summary>
+        /// Send a text message to one user of the same app. Live-only: the target must currently have a
+        /// session (<c>USER_OFFLINE</c> otherwise) and neither side may have blocked the other.
+        /// </summary>
+        public Task<ChatMessage> SendDirectMessageAsync(Guid userId, string text, object metadata = null, string clientRef = null, CancellationToken ct = default) =>
+            SendChatAsync(r => ControlMessage.ChatSendDirect(userId, text, metadata, r), clientRef, ct);
+
+        /// <summary>
+        /// Announce that this user is (not) typing in a channel. Best-effort: <c>typing = true</c> is coalesced
+        /// to at most one message per <paramref name="interval"/> (default 1.5 s) so it can be called on every
+        /// keystroke; <c>typing = false</c> is always sent and clears the throttle.
+        /// </summary>
+        public Task SetTypingAsync(Guid channelId, bool typing, TimeSpan? interval = null, CancellationToken ct = default)
+        {
+            var control = _control;
+            if (control == null || !control.IsOpen) return Task.CompletedTask;
+            var now = DateTime.UtcNow;
+            lock (_typingSentAt)
+            {
+                if (typing)
+                {
+                    if (_typingSentAt.TryGetValue(channelId, out var last) && now - last < (interval ?? TimeSpan.FromMilliseconds(1500)))
+                        return Task.CompletedTask;
+                    _typingSentAt[channelId] = now;
+                }
+                else _typingSentAt.Remove(channelId);
+            }
+            return control.SendAsync(ControlMessage.ChatTyping(channelId, typing), ct);
+        }
+
+        private async Task<ChatMessage> SendChatAsync(Func<string, string> build, string clientRef, CancellationToken ct)
+        {
+            EnsureConnected();
+            var reference = clientRef ?? $"m{Interlocked.Increment(ref _chatRefCounter)}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
+            var tcs = new TaskCompletionSource<ChatMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pendingChat)
+            {
+                if (_pendingChat.ContainsKey(reference)) throw new InvalidOperationException($"clientRef {reference} already pending");
+                _pendingChat[reference] = tcs;
+            }
+            try
+            {
+                await _control.SendAsync(build(reference), ct).ConfigureAwait(false);
+                using (var timeout = new CancellationTokenSource(RequestTimeout))
+                using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("message send timeout"))))
+                using (ct.Register(() => tcs.TrySetCanceled()))
+                    return await tcs.Task.ConfigureAwait(false);
+            }
+            finally { lock (_pendingChat) _pendingChat.Remove(reference); }
+        }
+
+        private void FailPendingChat(Exception e)
+        {
+            List<TaskCompletionSource<ChatMessage>> pending;
+            lock (_pendingChat) { pending = new List<TaskCompletionSource<ChatMessage>>(_pendingChat.Values); _pendingChat.Clear(); }
+            foreach (var tcs in pending) tcs.TrySetException(e);
+            lock (_typingSentAt) _typingSentAt.Clear();
+        }
+
         /// <summary>A fresh (non-resumed) session forgot our local mutes/volumes: send them again.</summary>
         private async Task ReplayReceiverPrefsAsync(CancellationToken ct)
         {
@@ -586,6 +668,7 @@ namespace Aurix
             _control = null;
             _resumeToken = null;
             _joinTcs?.TrySetException(new OperationCanceledException("disconnected"));
+            FailPendingChat(new OperationCanceledException("disconnected"));
             lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); }
         }
 
@@ -596,6 +679,7 @@ namespace Aurix
             _control = null;
             control.Dispose();
             _joinTcs?.TrySetException(new System.IO.IOException("connection lost"));
+            FailPendingChat(new System.IO.IOException("connection lost"));
             if (_closedByUser || State == VoiceConnectionState.Disconnected) return;
             if (!AutoReconnect || Session == null || _cts == null || _cts.IsCancellationRequested)
             {
@@ -842,6 +926,15 @@ namespace Aurix
                 case "Error":
                     OnServerError?.Invoke(m.Str("code") ?? "error", m.Str("message") ?? string.Empty);
                     break;
+                case "ChatMessageReceived":
+                {
+                    var chat = m.ChatMessage();
+                    if (chat != null) OnChatMessage?.Invoke(chat);
+                    break;
+                }
+                case "ParticipantTyping":
+                    OnParticipantTyping?.Invoke(m.Id("channel_id"), m.Id("user_id"), m.Bool("typing"));
+                    break;
                 case "Pong":
                 {
                     var sent = (long)m.Num("nonce");
@@ -874,7 +967,7 @@ namespace Aurix
                     });
                 tcs.TrySetResult(roster);
             }
-            else if (m.Type == "Error")
+            else if (m.Type == "Error" && m.Str("client_ref") == null)
             {
                 tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
             }
@@ -891,10 +984,27 @@ namespace Aurix
                 if (action.HasValue && ModerationKey(m.Id("channel_id"), m.Id("user_id"), action.Value) == pending)
                     tcs.TrySetResult(true);
             }
-            else if (m.Type == "Error" && _joinTcs == null)
+            else if (m.Type == "Error" && _joinTcs == null && m.Str("client_ref") == null)
             {
                 tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
             }
+        }
+
+        /// <summary>
+        /// Runs on the network thread: the sender's echo (which alone carries <c>client_ref</c>) or an
+        /// <c>Error</c> tagged with the same <c>client_ref</c> settles the matching send.
+        /// </summary>
+        private void CompletePendingChat(ControlMessage m)
+        {
+            string reference;
+            if (m.Type == "ChatMessageReceived") reference = m.ChatMessage()?.ClientRef;
+            else if (m.Type == "Error") reference = m.Str("client_ref");
+            else return;
+            if (reference == null) return;
+            TaskCompletionSource<ChatMessage> tcs;
+            lock (_pendingChat) if (!_pendingChat.TryGetValue(reference, out tcs)) return;
+            if (m.Type == "Error") tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
+            else tcs.TrySetResult(m.ChatMessage());
         }
 
         private Participant Lookup(Guid channelId, Guid userId)
