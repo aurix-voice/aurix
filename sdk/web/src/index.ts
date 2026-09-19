@@ -45,3 +45,10 @@ export {
   SYSTEM_USER_ID,
   parseServerMessage,
 } from './protocol.js';
+export {
+  InputPipeline,
+  MAX_INPUT_GAIN,
+  enumerateAudioDevices,
+  supportsOutputSelection,
+} from './devices.js';
+export type { AudioDeviceInfo, AudioDevices } from './devices.js';

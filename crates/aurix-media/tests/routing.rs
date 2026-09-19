@@ -602,4 +602,32 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
     let evs = drain(&mut events, 150).await;
     assert_eq!(speaking_of(&evs, s_a.user_id), vec![true]);
     assert!(energy_of(&evs, channel, s_a.user_id).is_empty());
+
+    // A steady level is reported once — and once more when a new member joins the channel so
+    // late joiners get a baseline for everyone already talking.
+    for _ in 0..4 {
+        a.send_audio_with_level(addr, &channel, 6, b"steady").await;
+    }
+    let evs = drain(&mut events, 120).await;
+    assert_eq!(energy_of(&evs, channel, s_a.user_id), vec![6]);
+    for _ in 0..4 {
+        a.send_audio_with_level(addr, &channel, 6, b"steady").await;
+    }
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    sfu.join_channel(
+        &s_c.session_id,
+        channel,
+        ChannelConfig::default(),
+        ChannelRole::Listener,
+    )
+    .unwrap();
+    let evs = drain(&mut events, 120).await;
+    assert_eq!(
+        energy_of(&evs, channel, s_a.user_id),
+        vec![6],
+        "unchanged level is re-reported for the late joiner"
+    );
+    while b.recv().await.is_some() {}
 }

@@ -368,6 +368,13 @@ impl MediaSession {
         Some(current)
     }
 
+    /// Forget the last reported level so the next report carries the current one even if it
+    /// did not change (used when a new member joins and has no baseline yet).
+    pub fn reset_energy_report(&self) {
+        self.energy_reported
+            .store(AUDIO_LEVEL_SILENCE, Ordering::Relaxed);
+    }
+
     /// Clear speaking if no audio arrived within `timeout_ms`. Returns `true` if it flipped to false.
     pub fn expire_speaking(&self, timeout_ms: i64) -> bool {
         if !self.is_speaking.load(Ordering::Relaxed) {
@@ -474,6 +481,16 @@ mod tests {
         assert_eq!(s.take_energy_report(1000, 3), Some(20));
         s.audio_level_at_ms.fetch_sub(5000, Ordering::Relaxed);
         assert_eq!(s.take_energy_report(1000, 3), Some(AUDIO_LEVEL_SILENCE));
+        // A reset re-reports an unchanged, still-fresh level exactly once.
+        s.record_audio_level(Some(20), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), Some(20));
+        s.reset_energy_report();
+        assert_eq!(s.take_energy_report(1000, 3), Some(20));
+        assert_eq!(s.take_energy_report(1000, 3), None);
+        s.record_audio_level(Some(AUDIO_LEVEL_SILENCE), 0.0);
+        assert_eq!(s.take_energy_report(1000, 3), Some(AUDIO_LEVEL_SILENCE));
+        s.reset_energy_report();
+        assert_eq!(s.take_energy_report(1000, 3), None);
     }
 
     #[test]

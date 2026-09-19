@@ -22,7 +22,15 @@ namespace Aurix.Unity
         public string ChannelId;
 
         [Header("Audio")]
+        [Tooltip("Microphone name from Microphone.devices (see InputDevices); empty = system default. " +
+                 "Change at runtime with SetInputDevice.")]
         public string MicrophoneDevice = null;
+        [Tooltip("Software microphone gain before VAD and encoding (1 = unity, 2 ≈ +6 dB).")]
+        [Range(0f, 4f)] public float InputGain = 1f;
+        [Tooltip("Master volume of all remote voices (1 = unity), on top of per-participant volumes.")]
+        [Range(0f, 2f)] public float OutputVolume = 1f;
+        [Tooltip("Speaker mute: hear nobody, without telling the server or affecting your microphone.")]
+        public bool OutputMuted = false;
         [Range(6000, 128000)] public int BitrateBps = 32000;
         public bool AutoConnectOnStart = false;
 
@@ -45,8 +53,23 @@ namespace Aurix.Unity
         public VoiceActivityDetector Vad { get; } = new VoiceActivityDetector();
         /// <summary>Local VAD edge (true = started speaking). Fired from the Unity main thread.</summary>
         public event Action<bool> OnLocalSpeaking;
+        /// <summary>
+        /// The capture device changed: a <see cref="SetInputDevice"/> call, or the active microphone
+        /// disappeared and capture fell back to the system default (<c>null</c>).
+        /// </summary>
+        public event Action<string> OnInputDeviceChanged;
+
+        /// <summary>Microphones currently known to Unity (names usable with <see cref="SetInputDevice"/>).</summary>
+        public static string[] InputDevices => Microphone.devices;
+
+        /// <summary>Device actually being captured (<c>null</c> = system default); differs from
+        /// <see cref="MicrophoneDevice"/> after a fallback.</summary>
+        public string ActiveInputDevice => _activeDevice;
+        public bool IsCapturing => _micClip != null;
 
         private AudioClip _micClip;
+        private string _activeDevice;
+        private float _micRetryAt;
         private int _micReadPos;
         private float[] _micScratch;
         private float[] _frame;
@@ -102,21 +125,61 @@ namespace Aurix.Unity
 
         public void SetMuted(bool muted) => Client?.SetMuted(muted);
 
+        /// <summary>
+        /// Switch the microphone (<c>null</c>/empty = system default). Restarts capture when it is
+        /// running; returns <c>false</c> (and keeps the current device) when the name is unknown.
+        /// </summary>
+        public bool SetInputDevice(string device)
+        {
+            if (string.IsNullOrEmpty(device)) device = null;
+            if (device != null && Array.IndexOf(Microphone.devices, device) < 0) return false;
+            MicrophoneDevice = device;
+            if (_micClip == null) return true;
+            StopMic();
+            StartMic();
+            return true;
+        }
+
+        /// <summary>Software microphone gain, clamped to <c>0..4</c>.</summary>
+        public void SetInputGain(float gain) => InputGain = AudioLevel.ClampGain(gain, AudioLevel.MaxInputGain);
+
+        /// <summary>Master volume of remote voices, clamped to <c>0..2</c>.</summary>
+        public void SetOutputVolume(float volume) => OutputVolume = AudioLevel.ClampGain(volume, AudioLevel.MaxOutputVolume);
+
+        /// <summary>Speaker mute (local only). Your own microphone keeps sending.</summary>
+        public void SetOutputMuted(bool muted) => OutputMuted = muted;
+
         private void StartMic()
         {
+            string device = string.IsNullOrEmpty(MicrophoneDevice) ? null : MicrophoneDevice;
+            if (device != null && Array.IndexOf(Microphone.devices, device) < 0)
+            {
+                Debug.LogWarning($"Aurix: microphone '{device}' not found, using the system default");
+                device = null;
+            }
             _micRate = AudioFormat.SampleRate;
-            Microphone.GetDeviceCaps(MicrophoneDevice, out var minFreq, out var maxFreq);
+            Microphone.GetDeviceCaps(device, out var minFreq, out var maxFreq);
             if (maxFreq != 0 && (_micRate < minFreq || _micRate > maxFreq)) _micRate = maxFreq;
-            _micClip = Microphone.Start(MicrophoneDevice, true, 1, _micRate);
+            _micClip = Microphone.Start(device, true, 1, _micRate);
+            if (_micClip == null)
+            {
+                Debug.LogWarning("Aurix: Microphone.Start failed; will retry");
+                _micRetryAt = Time.unscaledTime + 1f;
+                return;
+            }
+            bool changed = _activeDevice != device;
+            _activeDevice = device;
             _micChannels = _micClip.channels;
             _micReadPos = 0;
+            Vad.Reset();
+            if (changed) OnInputDeviceChanged?.Invoke(device);
         }
 
         private void StopMic()
         {
             if (_micClip != null)
             {
-                Microphone.End(MicrophoneDevice);
+                Microphone.End(_activeDevice);
                 _micClip = null;
             }
         }
@@ -124,14 +187,38 @@ namespace Aurix.Unity
         private void Update()
         {
             Client?.Update();
+            var mixer = _mixer;
+            if (mixer != null)
+            {
+                mixer.OutputVolume = OutputVolume;
+                mixer.OutputMuted = OutputMuted;
+            }
+            WatchMicrophone();
             PumpMicrophone();
             PumpDownlink();
+        }
+
+        /// <summary>Recover from an unplugged/failed microphone: fall back to the default device.</summary>
+        private void WatchMicrophone()
+        {
+            if (Client == null || !IsConnected) return;
+            if (_micClip != null)
+            {
+                if (Microphone.IsRecording(_activeDevice)) return;
+                Debug.LogWarning($"Aurix: microphone '{_activeDevice ?? "default"}' stopped; switching to the system default");
+                StopMic();
+                if (_activeDevice != null) MicrophoneDevice = null;
+                _micRetryAt = Time.unscaledTime + 1f;
+                return;
+            }
+            if (Time.unscaledTime < _micRetryAt) return;
+            StartMic();
         }
 
         private void PumpMicrophone()
         {
             if (_micClip == null || Client == null || !IsConnected) return;
-            int writePos = Microphone.GetPosition(MicrophoneDevice);
+            int writePos = Microphone.GetPosition(_activeDevice);
             int frameAtMicRate = _micRate * AudioFormat.FrameMs / 1000;
             int available = (writePos - _micReadPos + _micClip.samples) % _micClip.samples;
             while (available >= frameAtMicRate)
@@ -144,6 +231,7 @@ namespace Aurix.Unity
 
                 if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
                 Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
+                AudioLevel.ApplyGain(_mono, AudioFormat.FrameSamples, InputGain);
                 Vad.Threshold = VadThreshold;
                 Vad.HangoverFrames = VadHangoverFrames;
                 if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);

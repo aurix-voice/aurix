@@ -163,6 +163,34 @@ client.localEnergy; client.localSpeaking;                          // current va
 server, and `VoiceActivityDetector` / `AudioLevelMeter` are exported for custom pipelines. The
 meter is skipped silently where `AudioContext` is unavailable.
 
+### Devices, input gain, speaker mute
+
+```ts
+const { inputs, outputs } = await AurixClient.enumerateAudioDevices(); // labels need a granted mic permission
+client.on('devicesChanged', ({ inputs, outputs }) => refillSelects(inputs, outputs));
+
+const client = new AurixClient({ …, inputDeviceId: micSelect.value, inputGain: 1.5 });
+await client.setInputDevice(deviceId);   // hot-swaps the microphone (RTCRtpSender.replaceTrack, no renegotiation)
+await client.setInputDevice(undefined);  // back to the system default
+client.on('inputDeviceChanged', (id) => micSelect.value = id ?? '');
+client.setInputGain(2);                  // 0..4 software gain (1 = unity) before encoding; independent of setMuted()
+
+client.attachAudioOutput(audioElement);  // remote mix plays through the <audio>; several elements may be attached
+if (AurixClient.supportsOutputSelection) await client.setOutputDevice(speakerSelect.value); // HTMLMediaElement.setSinkId
+client.setOutputVolume(0.5);             // 0..1 master volume
+client.setOutputMuted(true);             // speaker mute: you keep sending, remote audio is silenced locally
+```
+
+`setInputDevice` keeps the mute state, gain and local meter; if the requested device cannot be
+opened the promise rejects and the current microphone keeps working. When the active
+microphone disappears (track `ended`) the SDK falls back to the system default and emits
+`inputDeviceChanged`. The first non-unity gain routes the microphone through a Web Audio
+`GainNode` and sends the processed track (the raw track is sent until then). `setOutputDevice` rejects with
+`NotFoundError` for unknown ids and throws where `setSinkId` is missing (Safari, Firefox without
+`media.setsinkid.enabled`) — check `supportsOutputSelection` first. Output volume/mute are
+applied to attached elements only (`element.volume` / `element.muted` + remote track
+`enabled`), nothing is signalled to the server.
+
 ## How it maps to the server
 
 | SDK | server |

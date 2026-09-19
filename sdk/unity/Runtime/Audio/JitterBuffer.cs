@@ -120,10 +120,32 @@ namespace Aurix.Audio
         private readonly Func<IOpusCodec> _decoderFactory;
         private readonly Dictionary<uint, Stream> _streams = new Dictionary<uint, Stream>();
         private readonly List<uint> _stale = new List<uint>();
+        private float _outputVolume = 1f;
+        private volatile bool _outputMuted;
 
         public RemoteMixer(Func<IOpusCodec> decoderFactory)
         {
             _decoderFactory = decoderFactory ?? throw new ArgumentNullException(nameof(decoderFactory));
+        }
+
+        /// <summary>
+        /// Master volume applied on top of per-participant volumes, <c>0..2</c> (1 = unity).
+        /// Safe to set from any thread.
+        /// </summary>
+        public float OutputVolume
+        {
+            get => _outputVolume;
+            set => _outputVolume = AudioLevel.ClampGain(value, AudioLevel.MaxOutputVolume);
+        }
+
+        /// <summary>
+        /// Speaker mute: streams keep being decoded (jitter buffers stay in sync, unmute is
+        /// instant) but nothing is written to the output.
+        /// </summary>
+        public bool OutputMuted
+        {
+            get => _outputMuted;
+            set => _outputMuted = value;
         }
 
         /// <summary>Queue a verified frame from the transport (any thread).</summary>
@@ -159,6 +181,7 @@ namespace Aurix.Audio
         public void Mix(float[] output, int outputChannels)
         {
             int framesNeeded = output.Length / outputChannels;
+            float master = _outputMuted ? 0f : _outputVolume;
             lock (_streams)
             {
                 long now = DateTime.UtcNow.Ticks;
@@ -186,12 +209,16 @@ namespace Aurix.Audio
                         int dch = s.Decoder.Channels;
                         int availFrames = (s.FrameLen - s.FramePos) / dch;
                         int take = Math.Min(availFrames, framesNeeded - written);
-                        for (int f = 0; f < take; f++)
+                        float gain = s.Volume * master;
+                        if (gain != 0f)
                         {
-                            for (int c = 0; c < outputChannels; c++)
+                            for (int f = 0; f < take; f++)
                             {
-                                int srcC = dch == 1 ? 0 : Math.Min(c, dch - 1);
-                                output[(written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * s.Volume;
+                                for (int c = 0; c < outputChannels; c++)
+                                {
+                                    int srcC = dch == 1 ? 0 : Math.Min(c, dch - 1);
+                                    output[(written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * gain;
+                                }
                             }
                         }
                         s.FramePos += take * dch;

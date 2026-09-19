@@ -530,6 +530,9 @@ impl SfuNode {
             aurix_metrics::ACTIVE_CHANNELS.inc();
         }
         let existing = channel.get_other_participants(&session.user_id);
+        for peer in &existing {
+            peer.reset_energy_report();
+        }
         info!(
             "User {} joined channel {} as {:?} (now {} participants)",
             session.user_id,

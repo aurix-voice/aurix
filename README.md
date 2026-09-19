@@ -183,10 +183,19 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
    reaches `media.speaking_energy_threshold` (unlabelled frames keep counting as speech by
    arrival) and every `media.energy_interval_ms` broadcasts `ChannelEnergy { channel_id, levels:
    [{ user_id, energy }] }` to the channel with the *changed* levels (≥ 3 dB step or a transition
-   to/from silence; `energy` is linear `0..1`, a stale level decays to `0`). Both events travel
+   to/from silence; `energy` is linear `0..1`, a stale level decays to `0`; when a member joins,
+   the current levels of everyone already talking on that node are re-sent once so the newcomer
+   gets a baseline). Both events travel
    across nodes with the other presence events and are never persisted. The SDKs expose a local
    VAD (`localSpeaking`/`localEnergy` in the Web SDK, `VoiceActivityDetector` + optional
    `GateOnVad` transmit gating in Unity) and the remote `energy` / `OnChannelEnergy` events.
+9. **Devices, input gain, speaker mute** are client-side only (nothing on the wire): the Web SDK
+   enumerates/selects microphones and speakers (`enumerateAudioDevices`, `setInputDevice` via
+   `replaceTrack`, `setOutputDevice` via `setSinkId` where supported), applies `0..4` software
+   input gain through Web Audio and mutes/attenuates the remote mix on attached `<audio>`
+   elements; the Unity SDK does the same with `Microphone.devices` (hot-swap with fallback to the
+   default device), `AudioLevel.ApplyGain` before VAD/Opus and `RemoteMixer.OutputVolume` /
+   `OutputMuted` (decoding continues while muted so jitter buffers stay in sync).
 
 The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessage`).
 

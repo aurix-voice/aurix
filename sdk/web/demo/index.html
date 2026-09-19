@@ -65,6 +65,15 @@
 </fieldset>
 
 <fieldset>
+  <legend>Devices</legend>
+  <label>Microphone <select id="mic"><option value="">System default</option></select></label>
+  <label>Speaker <select id="spk"><option value="">System default</option></select></label>
+  <label>Mic gain <span id="gainval">1.00</span>× <input id="gain" type="range" min="0" max="4" step="0.05" value="1"></label>
+  <label>Speaker volume <span id="volval">100</span>% <input id="vol" type="range" min="0" max="1" step="0.01" value="1"></label>
+  <button id="spkmute">Mute speaker</button>
+</fieldset>
+
+<fieldset>
   <legend>Participants</legend>
   <ul id="roster"></ul>
 </fieldset>
@@ -191,11 +200,34 @@ $('msg').addEventListener('keydown', async (e) => {
   client.setTyping(ch, false);
 });
 
+const fillDevices = async () => {
+  const d = await AurixClient.enumerateAudioDevices();
+  const fill = (sel, list, current) => {
+    sel.replaceChildren(new Option('System default', ''));
+    for (const dev of list) sel.add(new Option(dev.label || dev.deviceId.slice(0, 8), dev.deviceId));
+    sel.value = list.some((x) => x.deviceId === current) ? current : '';
+  };
+  fill($('mic'), d.inputs, client?.inputDeviceId ?? $('mic').value);
+  fill($('spk'), d.outputs, client?.outputDeviceId ?? $('spk').value);
+  $('spk').disabled = !AurixClient.supportsOutputSelection;
+};
+fillDevices().catch(() => {});
+
 $('connect').onclick = async () => {
-  client = new AurixClient({ apiUrl: $('api').value, wsUrl: $('ws').value, token: $('token').value.trim() });
+  client = new AurixClient({
+    apiUrl: $('api').value, wsUrl: $('ws').value, token: $('token').value.trim(),
+    ...($('mic').value ? { inputDeviceId: $('mic').value } : {}),
+    inputGain: Number($('gain').value),
+  });
+  client.attachAudioOutput($('remote'));
+  client.setOutputVolume(Number($('vol').value));
+  client.setOutputMuted($('spkmute').textContent === 'Unmute speaker');
+  if ($('spk').value) client.setOutputDevice($('spk').value).catch((e) => log('speaker select failed:', e.message));
   client.on('connectionState', (s) => { $('state').textContent = s; setButtons(s !== 'disconnected' && s !== 'failed', client.joinedChannels().length > 0); });
   client.on('sessionReady', (i) => log('session', i));
-  client.on('remoteStream', (s) => { $('remote').srcObject = s; log('remote stream attached'); });
+  client.on('remoteStream', () => { log('remote stream attached'); fillDevices().catch(() => {}); });
+  client.on('devicesChanged', () => { log('audio devices changed'); fillDevices().catch(() => {}); });
+  client.on('inputDeviceChanged', (id) => { log('microphone now', id ?? 'default'); fillDevices().catch(() => {}); });
   client.on('channelJoined', (ch, ps) => { log('joined', ch, `${ps.length} participants`); renderRoster(); setButtons(true, true); });
   client.on('channelLeft', (ch) => { log('left', ch); renderRoster(); setButtons(client.connectionState !== 'disconnected', false); });
   client.on('participantJoined', (ch, p) => { log('+', p.displayName); renderRoster(); });
@@ -242,6 +274,18 @@ $('join').onclick = async () => {
 $('leave').onclick = () => client.leaveChannel($('channel').value.trim());
 $('mute').onclick = () => { muted = !muted; client.setMuted(muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
 $('disconnect').onclick = () => client.disconnect();
+$('mic').onchange = () => client?.setInputDevice($('mic').value || undefined).catch((e) => log('mic select failed:', e.message));
+$('spk').onchange = () => client?.setOutputDevice($('spk').value || undefined).catch((e) => log('speaker select failed:', e.message));
+$('gain').oninput = () => {
+  $('gainval').textContent = Number($('gain').value).toFixed(2);
+  try { client?.setInputGain(Number($('gain').value)); } catch (e) { log('gain failed:', e.message); }
+};
+$('vol').oninput = () => { $('volval').textContent = Math.round($('vol').value * 100); client?.setOutputVolume(Number($('vol').value)); };
+$('spkmute').onclick = () => {
+  const on = $('spkmute').textContent === 'Mute speaker';
+  $('spkmute').textContent = on ? 'Unmute speaker' : 'Mute speaker';
+  client?.setOutputMuted(on);
+};
 
 // ── dev helpers (server-to-server calls; only for local experiments) ──
 const apiFetch = (path, body) => fetch($('api').value.replace(/\/$/, '') + path, {

@@ -203,6 +203,26 @@ client.OnChannelEnergy += (channel, levels) => { foreach (var l in levels) SetBa
 level (`SendOpusFrame(hash, opus, len)`) still work — the server then treats every arriving frame as
 speech, as before.
 
+### Devices, input gain, speaker mute
+
+```csharp
+foreach (var d in AurixVoiceBehaviour.InputDevices) micDropdown.Add(d);   // Microphone.devices
+voice.SetInputDevice(micDropdown.Selected);   // hot-swap; null/"" = system default; false for an unknown name
+voice.OnInputDeviceChanged += name => micDropdown.Selected = name;   // also fired on fallback
+voice.ActiveInputDevice;                      // what is actually being captured
+voice.SetInputGain(1.5f);                     // 0..AudioLevel.MaxInputGain (4); 1 = unity, applied before VAD + Opus
+voice.SetOutputVolume(0.8f);                  // 0..AudioLevel.MaxOutputVolume (2) master volume of the remote mix
+voice.SetOutputMuted(true);                   // speaker mute: keep sending, hear nothing
+```
+
+`InputGain`, `OutputVolume`, `OutputMuted` are also inspector fields. Switching the microphone keeps the
+encoder, VAD and mute state; if `Microphone.Start` fails or the device stops recording (unplugged), capture
+falls back to the system default and `OnInputDeviceChanged` reports it. Gain scales the mono PCM and
+hard-clips at ±1, so the transmitted level and the local VAD see the same signal. With your own pipeline:
+`AudioLevel.ApplyGain(pcm, count, gain)` on the uplink, `RemoteMixer.OutputVolume` / `OutputMuted` on the
+downlink — a muted mixer still consumes and decodes frames, so the jitter buffers stay in sync and unmuting is
+instant. None of this is signalled to the server; use `SetMuted` for a microphone mute other players see.
+
 ## .NET: build, test, end-to-end demo
 
 ```bash
@@ -214,8 +234,9 @@ AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1
 
 The demo creates a channel, issues two tokens, connects "alice" and "bob" over real UDP, streams an Opus-encoded
 440 Hz tone for half the run and mutes for the other half, and asserts: all packets verified (0 bad auth / replays),
-decoded RMS ≈ 0.35, speaking / mute / leave events observed by the peer, the local VAD reports speech and the peer
-receives a matching `ChannelEnergy` level (≈ 0.35). It prints `RESULT: PASS` and exits 0.
+decoded RMS ≈ 0.35, speaking / mute / leave events observed by the peer, the local VAD reports speech, the peer
+receives a matching `ChannelEnergy` level (≈ 0.35), and a speaker-muted mixer outputs silence while packets keep
+flowing and decoding. It prints `RESULT: PASS` and exits 0.
 
 `--scenario reconnect` runs the reconnect check instead: alice's control connection goes through a local
 TCP proxy that is cut abruptly — once within the grace window (same session and SSRC must resume, audio

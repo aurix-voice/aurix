@@ -94,6 +94,8 @@ namespace Aurix.Demo
             };
 
             int frames = seconds * 50;
+            int spkMuteFrom = frames / 8, spkMuteTo = spkMuteFrom + 25; // bob mutes his speaker for 0.5 s mid-talk
+            int mutedFramesSilent = 0;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             for (int i = 0; i < frames; i++)
             {
@@ -103,11 +105,14 @@ namespace Aurix.Demo
                 alice.SendOpusFrame(hash, opus, len, AudioFormat.FrameSamples, vad.Level);
                 if (i == frames / 2) alice.SetMuted(true);       // second half: muted → bob should hear silence
 
+                bool spkMuted = i >= spkMuteFrom && i < spkMuteTo;
+                mixer.OutputMuted = spkMuted;
                 while (bob.TryDequeueAudio(out var incoming)) mixer.Push(incoming.SenderSsrc, incoming.Sequence, incoming.Volume, incoming.Opus);
                 Array.Clear(outBuf, 0, outBuf.Length);
                 mixer.Mix(outBuf, 1);
                 double e = 0; foreach (var v in outBuf) e += v * v;
-                if (i < frames / 2) { energy += e; samples += outBuf.Length; }
+                if (spkMuted) { if (e == 0) mutedFramesSilent++; }
+                else if (i < frames / 2) { energy += e; samples += outBuf.Length; }
                 if (e / outBuf.Length > 0.01) framesWithSignal++;
 
                 var target = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs);
@@ -123,6 +128,7 @@ namespace Aurix.Demo
             Console.WriteLine($"bob decoded RMS while alice talked: {rms:F3} (expect ≈0.35 for a 0.5-amplitude sine); frames with signal: {framesWithSignal}/{frames}");
             Console.WriteLine($"heartbeat acks {alice.Media.HeartbeatAcks} (every 5 s), RTT {alice.Media.LastRttMs} ms, alive={alice.Media.IsAlive}, control RTT {alice.ControlRttMs} ms");
             Console.WriteLine($"alice local VAD: level {vad.Level} (-dBov), speaking={vad.Speaking}; bob got {energyReports} energy report(s) for alice, peak {bobSeesAliceEnergy:F3} (expect ≈0.35)");
+            Console.WriteLine($"bob speaker-muted for {spkMuteTo - spkMuteFrom} frames while alice talked: {mutedFramesSilent} silent (expect all), packets kept flowing");
             long received = bob.Media.PacketsReceived, badAuth = bob.Media.PacketsBadAuth;
             await alice.LeaveChannelAsync(channelId);
             await Task.Delay(200);
@@ -132,7 +138,7 @@ namespace Aurix.Demo
             Console.WriteLine("events:");
             foreach (var l in log) Console.WriteLine("  " + l);
 
-            bool ok = received > frames / 4 && rms > 0.2 && badAuth == 0
+            bool ok = received > frames / 4 && rms > 0.2 && badAuth == 0 && mutedFramesSilent == spkMuteTo - spkMuteFrom
                       && log.Contains("bob: speaking alice true") && log.Contains("bob: mute alice muted=True")
                       && vad.Speaking && bobSeesAliceEnergy > 0.2f;
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");

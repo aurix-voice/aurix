@@ -20,6 +20,13 @@ import {
   type UserPosition,
 } from './protocol.js';
 import { AudioLevelMeter, type AudioLevelMeterOptions, type AudioLevelSample } from './audio.js';
+import {
+  InputPipeline,
+  MAX_INPUT_GAIN,
+  enumerateAudioDevices,
+  supportsOutputSelection,
+  type AudioDevices,
+} from './devices.js';
 
 export interface AurixClientOptions {
   /** REST base URL, e.g. `https://voice.example.com` (used for TURN credentials). */
@@ -55,6 +62,13 @@ export interface AurixClientOptions {
   audioConstraints?: MediaTrackConstraints;
   /** Use this stream instead of calling `getUserMedia` (device management done by the app). */
   localStream?: MediaStream;
+  /**
+   * Microphone to open (`deviceId` from `enumerateAudioDevices()`); default device when unset.
+   * Ignored when `localStream` is given. Change at runtime with `setInputDevice`.
+   */
+  inputDeviceId?: string;
+  /** Software microphone gain `0..4` (`1` = unity, default). Needs Web Audio; see `setInputGain`. */
+  inputGain?: number;
   /**
    * Meter the local microphone with Web Audio and emit `localEnergy` / `localSpeaking`
    * (default `true`). Pass an object to tune the VAD, `false` to disable.
@@ -178,6 +192,13 @@ export interface AurixEvents {
   localEnergy: (sample: AudioLevelSample) => void;
   /** Local VAD edge: the user started (`true`) / stopped (`false`) speaking. */
   localSpeaking: (speaking: boolean) => void;
+  /**
+   * The set of audio devices changed (plugged/unplugged) while media is up; `devices` is the
+   * fresh list. A removed microphone is replaced by the default one automatically.
+   */
+  devicesChanged: (devices: AudioDevices) => void;
+  /** The microphone in use changed (`setInputDevice`, or a fallback after the device vanished). */
+  inputDeviceChanged: (deviceId: string | undefined) => void;
   positions: (channelId: string, positions: UserPosition[]) => void;
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string) => void;
   bitrate: (targetKbps: number, reason: string) => void;
@@ -231,6 +252,13 @@ interface Pending<T> {
   timer: ReturnType<typeof setTimeout>;
 }
 
+function checkInputGain(gain: number): number {
+  if (!(gain >= 0 && gain <= MAX_INPUT_GAIN)) {
+    throw new RangeError(`input gain must be within 0..${MAX_INPUT_GAIN}`);
+  }
+  return gain;
+}
+
 function decodeJwtSubject(token: string): string | undefined {
   const parts = token.split('.');
   if (parts.length < 2 || parts[1] === undefined) return undefined;
@@ -269,6 +297,17 @@ export class AurixClient {
   private pc: RTCPeerConnection | undefined;
   private localStream: MediaStream | undefined;
   private localMeter: AudioLevelMeter | undefined;
+  private inputPipeline: InputPipeline | undefined;
+  private inputGainValue = 1;
+  private inputDeviceIdValue: string | undefined;
+  private remoteStream: MediaStream | undefined;
+  private readonly outputElements = new Set<HTMLMediaElement>();
+  private outputVolumeValue = 1;
+  private outputMutedValue = false;
+  private outputDeviceIdValue: string | undefined;
+  private readonly onDeviceChange = (): void => {
+    void enumerateAudioDevices().then((d) => this.emit('devicesChanged', d));
+  };
   private listeners = new Map<keyof AurixEvents, Set<AnyListener>>();
   private pendingJoins = new Map<string, Pending<Participant[]>>();
   private pendingModerations = new Map<string, Pending<void>>();
@@ -311,6 +350,8 @@ export class AurixClient {
     };
     this.reconnectPolicy = { ...DEFAULT_RECONNECT, ...(options.reconnect ?? {}) };
     this.userId = decodeJwtSubject(options.token);
+    if (options.inputGain !== undefined) this.inputGainValue = checkInputGain(options.inputGain);
+    this.inputDeviceIdValue = options.inputDeviceId;
   }
 
   // ── Events ──
@@ -375,6 +416,123 @@ export class AurixClient {
 
   get localMediaStream(): MediaStream | undefined {
     return this.localStream;
+  }
+
+  // ── Devices, input gain, speaker ──
+
+  /** Microphones and speakers; labels appear once microphone permission was granted. */
+  static enumerateAudioDevices(): Promise<AudioDevices> {
+    return enumerateAudioDevices();
+  }
+
+  /** `deviceId` of the microphone currently captured (`undefined` before media is up). */
+  get inputDeviceId(): string | undefined {
+    const track = this.localStream?.getAudioTracks()[0];
+    return track?.getSettings().deviceId ?? this.inputDeviceIdValue;
+  }
+
+  /**
+   * Switch the microphone (`undefined` = system default). Takes effect immediately when
+   * media is up (`replaceTrack`, no renegotiation, mute/gain/meter preserved), otherwise on
+   * the next `connect()`. Rejects when the device cannot be opened; the old one keeps going.
+   */
+  async setInputDevice(deviceId: string | undefined): Promise<void> {
+    this.inputDeviceIdValue = deviceId;
+    if (!this.localStream || !this.pc) return;
+    const stream = await this.openMicrophone();
+    await this.adoptLocalStream(stream);
+  }
+
+  /** Current software microphone gain (`1` = unity). */
+  get inputGain(): number {
+    return this.inputGainValue;
+  }
+
+  /**
+   * Software gain on the outgoing microphone signal, `0..4` (`1` = unity, `2` ≈ +6 dB). The
+   * first non-unity value routes the microphone through Web Audio; throws when that is not
+   * available. Independent of `setMuted` and of the browser's own AGC.
+   */
+  setInputGain(gain: number): void {
+    this.inputGainValue = checkInputGain(gain);
+    if (!this.localStream) return;
+    if (!this.inputPipeline) {
+      if (gain === 1) return;
+      this.ensureInputPipeline(this.localStream);
+      return;
+    }
+    this.inputPipeline.setGain(gain);
+  }
+
+  /**
+   * Let the client drive an `<audio>` element: it receives the remote stream (now and after
+   * every reconnect), the output volume/mute and the selected speaker. Several elements may be
+   * attached; `detachAudioOutput` releases one.
+   */
+  attachAudioOutput(element: HTMLMediaElement): void {
+    this.outputElements.add(element);
+    this.applyOutput(element);
+    if (this.remoteStream && element.paused) void element.play().catch(() => undefined);
+  }
+
+  detachAudioOutput(element: HTMLMediaElement): void {
+    if (!this.outputElements.delete(element)) return;
+    element.srcObject = null;
+  }
+
+  /** `true` when this browser lets `setOutputDevice` pick the speaker. */
+  static get supportsOutputSelection(): boolean {
+    return supportsOutputSelection();
+  }
+
+  get outputDeviceId(): string | undefined {
+    return this.outputDeviceIdValue;
+  }
+
+  /**
+   * Play remote audio on a specific speaker (`deviceId` of an `audiooutput`, `undefined` =
+   * system default). Applies to attached elements; rejects on browsers without `setSinkId`.
+   */
+  async setOutputDevice(deviceId: string | undefined): Promise<void> {
+    if (!supportsOutputSelection()) {
+      throw new Error('output device selection is not supported by this browser');
+    }
+    const previous = this.outputDeviceIdValue;
+    this.outputDeviceIdValue = deviceId;
+    try {
+      await Promise.all(Array.from(this.outputElements, (el) => el.setSinkId(deviceId ?? '')));
+    } catch (e) {
+      this.outputDeviceIdValue = previous;
+      throw e;
+    }
+  }
+
+  get outputVolume(): number {
+    return this.outputVolumeValue;
+  }
+
+  /** Master volume of everything you hear, `0..1` (attached elements). */
+  setOutputVolume(volume: number): void {
+    if (!(volume >= 0 && volume <= 1)) throw new RangeError('output volume must be within 0..1');
+    this.outputVolumeValue = volume;
+    for (const el of this.outputElements) el.volume = volume;
+  }
+
+  get isOutputMuted(): boolean {
+    return this.outputMutedValue;
+  }
+
+  /**
+   * Speaker mute: silence all remote audio locally (the remote track is disabled, so it also
+   * works for apps that play the stream themselves). Nobody else is told; your microphone is
+   * unaffected.
+   */
+  setOutputMuted(muted: boolean): void {
+    this.outputMutedValue = muted;
+    this.remoteStream?.getAudioTracks().forEach((t) => {
+      t.enabled = !muted;
+    });
+    for (const el of this.outputElements) el.muted = muted;
   }
 
   /** Smoothed local microphone energy 0..1 (0 when metering is off or media is down). */
@@ -539,10 +697,15 @@ export class AurixClient {
     this.stopLocalMeter();
     this.pc?.close();
     this.pc = undefined;
-    if (this.localStream && this.localStream !== this.opts.localStream) {
-      this.localStream.getTracks().forEach((t) => t.stop());
-    }
+    this.releaseLocalStream(this.localStream);
     this.localStream = undefined;
+    this.inputPipeline?.close();
+    this.inputPipeline = undefined;
+    this.remoteStream = undefined;
+    for (const el of this.outputElements) el.srcObject = null;
+    if (typeof navigator !== 'undefined') {
+      navigator.mediaDevices?.removeEventListener?.('devicechange', this.onDeviceChange);
+    }
     for (const channelId of this.channels.keys()) this.emit('channelLeft', channelId);
     this.channels.clear();
     this.session = undefined;
@@ -933,6 +1096,97 @@ export class AurixClient {
     if (wasSpeaking) this.emit('localSpeaking', false);
   }
 
+  /** Stream the peer connection sends: the gain pipeline's output or the raw microphone. */
+  private sentStream(): MediaStream | undefined {
+    return this.inputPipeline?.stream ?? this.localStream;
+  }
+
+  private async openMicrophone(): Promise<MediaStream> {
+    const base: MediaTrackConstraints = this.opts.audioConstraints ?? {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    const deviceId = this.inputDeviceIdValue;
+    const audio: MediaTrackConstraints = deviceId ? { ...base, deviceId: { exact: deviceId } } : base;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio, video: false });
+    return stream;
+  }
+
+  /** Stop tracks of a stream this client opened itself (never one supplied by the app). */
+  private releaseLocalStream(stream: MediaStream | undefined): void {
+    if (!stream || stream === this.opts.localStream) return;
+    stream.getTracks().forEach((t) => t.stop());
+  }
+
+  private watchInputTrack(stream: MediaStream): void {
+    const track = stream.getAudioTracks()[0];
+    if (!track) return;
+    track.addEventListener('ended', () => {
+      // Device unplugged / revoked: fall back to the default microphone while media is up.
+      if (this.localStream !== stream || !this.pc || stream === this.opts.localStream) return;
+      this.inputDeviceIdValue = undefined;
+      void this.openMicrophone()
+        .then((s) => this.adoptLocalStream(s))
+        .catch((e: unknown) => this.emit('error', e instanceof Error ? e : new Error(String(e))));
+    });
+  }
+
+  /** Make `stream` the microphone: mute state, gain pipeline, uplink track and meter follow. */
+  private async adoptLocalStream(stream: MediaStream): Promise<void> {
+    const previous = this.localStream;
+    this.localStream = stream;
+    stream.getAudioTracks().forEach((t) => {
+      t.enabled = !this.muted;
+    });
+    this.watchInputTrack(stream);
+    if (this.inputPipeline) {
+      this.inputPipeline.setSource(stream);
+    } else {
+      const track = stream.getAudioTracks()[0];
+      const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'audio' || s.track === null);
+      if (track && sender) await sender.replaceTrack(track);
+      this.stopLocalMeter();
+      this.startLocalMeter(stream);
+    }
+    if (previous && previous !== stream) this.releaseLocalStream(previous);
+    this.emit('inputDeviceChanged', this.inputDeviceId);
+  }
+
+  /** Route `raw` through the gain pipeline and send its output instead of the raw track. */
+  private ensureInputPipeline(raw: MediaStream): void {
+    if (this.inputPipeline) return;
+    const pipeline = new InputPipeline();
+    if (!pipeline.open(raw, this.inputGainValue)) {
+      throw new Error('Web Audio is unavailable: input gain is not supported here');
+    }
+    this.inputPipeline = pipeline;
+    const processed = pipeline.stream;
+    const track = processed?.getAudioTracks()[0];
+    const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'audio' || s.track === null);
+    if (track && sender) {
+      void sender.replaceTrack(track).catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      });
+    }
+    if (processed) {
+      this.stopLocalMeter();
+      this.startLocalMeter(processed);
+    }
+  }
+
+  private applyOutput(element: HTMLMediaElement): void {
+    element.autoplay = true;
+    element.volume = this.outputVolumeValue;
+    element.muted = this.outputMutedValue;
+    if (element.srcObject !== (this.remoteStream ?? null)) element.srcObject = this.remoteStream ?? null;
+    if (this.outputDeviceIdValue !== undefined && supportsOutputSelection()) {
+      void element.setSinkId(this.outputDeviceIdValue).catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      });
+    }
+  }
+
   private cancelReconnect(): void {
     if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -1203,30 +1457,41 @@ export class AurixClient {
       }
     }
 
-    this.localStream ??=
-      this.opts.localStream ??
-      (await navigator.mediaDevices.getUserMedia({
-        audio: this.opts.audioConstraints ?? {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      }));
+    if (!this.localStream) {
+      this.localStream = this.opts.localStream ?? (await this.openMicrophone());
+      this.watchInputTrack(this.localStream);
+    }
     this.localStream.getAudioTracks().forEach((t) => {
       t.enabled = !this.muted;
     });
-    this.startLocalMeter(this.localStream);
+    if (this.inputGainValue !== 1 && !this.inputPipeline) {
+      const pipeline = new InputPipeline();
+      if (pipeline.open(this.localStream, this.inputGainValue)) this.inputPipeline = pipeline;
+      else this.emit('error', new Error('Web Audio is unavailable: input gain ignored'));
+    }
+    const sent = this.sentStream() ?? this.localStream;
+    this.startLocalMeter(sent);
+    if (typeof navigator !== 'undefined') {
+      navigator.mediaDevices?.addEventListener?.('devicechange', this.onDeviceChange);
+    }
 
     const pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' });
     this.pc = pc;
     // One sendrecv audio transceiver: uplink microphone, downlink server-side mix.
-    const track = this.localStream.getAudioTracks()[0];
+    const track = sent.getAudioTracks()[0];
     if (!track) throw new Error('no audio track');
-    pc.addTransceiver(track, { direction: 'sendrecv', streams: [this.localStream] });
+    pc.addTransceiver(track, { direction: 'sendrecv', streams: [sent] });
 
     pc.ontrack = (ev) => {
       const stream = ev.streams[0] ?? new MediaStream([ev.track]);
+      this.remoteStream = stream;
+      stream.getAudioTracks().forEach((t) => {
+        t.enabled = !this.outputMutedValue;
+      });
+      for (const el of this.outputElements) {
+        this.applyOutput(el);
+        if (el.paused) void el.play().catch(() => undefined);
+      }
       this.emit('remoteStream', stream);
     };
     pc.onconnectionstatechange = () => {
