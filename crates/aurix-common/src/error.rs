@@ -26,6 +26,10 @@ pub enum AurixError {
     #[error("Channel full: {0}")]
     ChannelFull(String),
 
+    /// The session is already joined to as many channels as the node allows.
+    #[error("Channel limit exceeded: {0}")]
+    ChannelLimitExceeded(String),
+
     #[error("User not found: {0}")]
     UserNotFound(String),
 
@@ -146,6 +150,7 @@ impl AurixError {
             Self::UserNotFound(_) => 404,
             Self::SessionNotFound(_) => 404,
             Self::ChannelFull(_) => 409,
+            Self::ChannelLimitExceeded(_) => 409,
             Self::UserBanned(_) => 403,
             Self::UserMuted(_) => 403,
             Self::RateLimitExceeded(_) => 429,
@@ -173,6 +178,7 @@ impl AurixError {
             Self::ActionTokenRequired(_) => "ACTION_TOKEN_REQUIRED",
             Self::ChannelNotFound(_) => "CHANNEL_NOT_FOUND",
             Self::ChannelFull(_) => "CHANNEL_FULL",
+            Self::ChannelLimitExceeded(_) => "CHANNEL_LIMIT_EXCEEDED",
             Self::UserNotFound(_) => "USER_NOT_FOUND",
             Self::UserBanned(_) => "USER_BANNED",
             Self::UserMuted(_) => "USER_MUTED",

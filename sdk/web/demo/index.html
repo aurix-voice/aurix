@@ -40,7 +40,7 @@
     <label>WebSocket URL <input id="ws" value="ws://127.0.0.1:8081/ws"></label>
   </div>
   <label>Player token (JWT from <code>POST /v1/tokens</code>) <input id="token" placeholder="eyJ..."></label>
-  <label>Channel ID <input id="channel" placeholder="uuid"></label>
+  <label>Channel ID(s), comma-separated <input id="channel" placeholder="uuid[, uuid…]"></label>
   <details>
     <summary>Development helper: issue a token with an API key (never ship an API key to browsers)</summary>
     <div class="row">
@@ -48,15 +48,14 @@
       <label>Display name <input id="name" value="web-player"></label>
     </div>
     <button id="mkchannel">Create channel</button>
-    <button id="mktoken">Issue token for channel</button>
+    <button id="mktoken">Issue token for channel(s)</button>
   </details>
 </fieldset>
 
 <fieldset>
   <legend>Session <span id="state" class="status">disconnected</span></legend>
   <button id="connect">Connect</button>
-  <button id="join" disabled>Join channel</button>
-  <button id="leave" disabled>Leave</button>
+  <button id="join" disabled>Join channel(s)</button>
   <button id="mute" disabled>Mute</button>
   <button id="disconnect" disabled>Disconnect</button>
   <span id="rtt"></span>
@@ -71,6 +70,13 @@
   <label>Mic gain <span id="gainval">1.00</span>× <input id="gain" type="range" min="0" max="4" step="0.05" value="1"></label>
   <label>Speaker volume <span id="volval">100</span>% <input id="vol" type="range" min="0" max="1" step="0.01" value="1"></label>
   <button id="spkmute">Mute speaker</button>
+</fieldset>
+
+<fieldset>
+  <legend>Channels</legend>
+  <label>Transmit to <select id="tx"><option value="all">all joined channels</option><option value="none">nowhere (listen only)</option></select></label>
+  <span id="txstate"></span>
+  <ul id="channels"></ul>
 </fieldset>
 
 <fieldset>
@@ -146,10 +152,38 @@ function renderRoster() {
   }
 }
 
+function renderChannels() {
+  const ul = $('channels');
+  ul.innerHTML = '';
+  if (!client) return;
+  const tx = client.getTransmission();
+  const sel = $('tx');
+  for (const o of [...sel.options]) if (o.value !== 'all' && o.value !== 'none') o.remove();
+  for (const ch of client.joinedChannels()) {
+    const o = document.createElement('option');
+    o.value = 'single:' + ch; o.textContent = 'only ' + ch.slice(0, 8);
+    sel.appendChild(o);
+  }
+  sel.value = tx.type === 'single' ? 'single:' + tx.channelId : tx.type;
+  $('txstate').textContent = tx.type === 'single' ? `→ ${tx.channelId.slice(0, 8)}` : tx.type === 'none' ? '(not transmitting)' : '';
+  const focus = client.getChannelFocus();
+  for (const ch of client.joinedChannels()) {
+    const li = document.createElement('li');
+    li.textContent = `${ch} ${client.transmitsTo(ch) ? '🎙️' : ''}${focus === ch ? ' [focused]' : focus ? ' [attenuated]' : ''} `;
+    const f = document.createElement('button');
+    f.textContent = focus === ch ? 'unfocus' : 'focus';
+    f.onclick = () => client.setChannelFocus(focus === ch ? undefined : ch);
+    const leave = document.createElement('button');
+    leave.textContent = 'leave';
+    leave.onclick = () => client.leaveChannel(ch);
+    li.append(f, ' ', leave);
+    ul.appendChild(li);
+  }
+}
+
 function setButtons(connected, joined) {
   $('connect').disabled = connected;
-  $('join').disabled = !connected || joined;
-  $('leave').disabled = !joined;
+  $('join').disabled = !connected;
   $('mute').disabled = !connected;
   $('disconnect').disabled = !connected;
   $('msg').disabled = !joined;
@@ -228,8 +262,10 @@ $('connect').onclick = async () => {
   client.on('remoteStream', () => { log('remote stream attached'); fillDevices().catch(() => {}); });
   client.on('devicesChanged', () => { log('audio devices changed'); fillDevices().catch(() => {}); });
   client.on('inputDeviceChanged', (id) => { log('microphone now', id ?? 'default'); fillDevices().catch(() => {}); });
-  client.on('channelJoined', (ch, ps) => { log('joined', ch, `${ps.length} participants`); renderRoster(); setButtons(true, true); });
-  client.on('channelLeft', (ch) => { log('left', ch); renderRoster(); setButtons(client.connectionState !== 'disconnected', false); });
+  client.on('channelJoined', (ch, ps) => { log('joined', ch, `${ps.length} participants`); renderRoster(); renderChannels(); setButtons(true, true); });
+  client.on('channelLeft', (ch) => { log('left', ch); renderRoster(); renderChannels(); setButtons(client.connectionState !== 'disconnected', client.joinedChannels().length > 0); });
+  client.on('transmissionChanged', (mode) => { log('transmission', mode); renderChannels(); });
+  client.on('channelFocusChanged', (ch) => { log('focus', ch ?? 'none'); renderChannels(); });
   client.on('participantJoined', (ch, p) => { log('+', p.displayName); renderRoster(); });
   client.on('participantLeft', (ch, u) => { log('-', u); renderRoster(); });
   client.on('participantUpdated', renderRoster);
@@ -240,7 +276,7 @@ $('connect').onclick = async () => {
   });
   client.on('localEnergy', (s) => { $('micmeter').style.width = `${meterWidth(s.energy)}%`; });
   client.on('localSpeaking', (on) => { $('micvad').textContent = on ? '🎙️' : ''; });
-  client.on('receiverPreferences', (prefs) => { log('receiver prefs', prefs); renderRoster(); });
+  client.on('receiverPreferences', (prefs) => { log('receiver prefs', prefs); renderRoster(); renderChannels(); });
   client.on('userBlockChanged', (u, blocked) => { log(blocked ? 'blocked' : 'unblocked', u); renderRoster(); });
   client.on('recording', (ch, id, active, by) => {
     log(`recording ${active ? 'started' : 'stopped'} by ${by}`);
@@ -268,10 +304,17 @@ $('connect').onclick = async () => {
   } catch (e) { log('connect failed:', e.message); }
 };
 
+const channelIds = () => $('channel').value.split(',').map((s) => s.trim()).filter(Boolean);
 $('join').onclick = async () => {
-  try { await client.joinChannel($('channel').value.trim()); } catch (e) { log('join failed:', e.message); }
+  for (const ch of channelIds()) {
+    if (client.joinedChannels().includes(ch)) continue;
+    try { await client.joinChannel(ch); } catch (e) { log('join failed:', ch, e.message); }
+  }
 };
-$('leave').onclick = () => client.leaveChannel($('channel').value.trim());
+$('tx').onchange = () => {
+  const v = $('tx').value;
+  client?.setTransmission(v.startsWith('single:') ? { type: 'single', channelId: v.slice(7) } : { type: v });
+};
 $('mute').onclick = () => { muted = !muted; client.setMuted(muted); $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
 $('disconnect').onclick = () => client.disconnect();
 $('mic').onchange = () => client?.setInputDevice($('mic').value || undefined).catch((e) => log('mic select failed:', e.message));
@@ -300,7 +343,7 @@ $('mktoken').onclick = async () => {
   try {
     const t = await apiFetch('/v1/tokens', {
       external_id: 'web-' + Math.random().toString(36).slice(2, 8), display_name: $('name').value,
-      channels: [{ channel_id: $('channel').value.trim(), join: true, speak: true, receive: true }],
+      channels: channelIds().map((channel_id) => ({ channel_id, join: true, speak: true, receive: true })),
     });
     $('token').value = t.token; log('token for user', t.user_id);
   } catch (e) { log('issue token failed:', e.message); }

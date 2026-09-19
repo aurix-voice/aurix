@@ -2,7 +2,7 @@ use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::MediaChannel;
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
-use crate::session::{MediaSession, Transport};
+use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
 use aurix_common::crypto::CryptoProvider;
 use aurix_common::error::{AurixError, Result};
@@ -22,6 +22,15 @@ use tracing::{error, info, warn};
 /// Level change (dB) below which a participant is left out of the next `ChannelEnergy` report.
 const ENERGY_REPORT_MIN_STEP_DB: u8 = 3;
 
+/// Side effects of leaving a channel that the client must be told about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelLeft {
+    /// `TransmissionMode::Single` pointed at the left channel and fell back to `None`.
+    pub transmission_reset: bool,
+    /// The left channel was the focused one; focus is now cleared.
+    pub focus_reset: bool,
+}
+
 /// Media-plane tunables taken from `MediaConfig`.
 #[derive(Debug, Clone)]
 pub struct SfuOptions {
@@ -33,6 +42,12 @@ pub struct SfuOptions {
     pub speaking_energy_threshold: f32,
     /// Period of `MediaEvent::ChannelEnergy` reports (0 = disabled).
     pub energy_interval_ms: u64,
+    /// Channels a single session may be joined to at once.
+    pub max_channels_per_session: u32,
+    /// Positional channels a single session may be joined to at once (0 = unlimited).
+    pub max_positional_channels_per_session: u32,
+    /// Gain for channels other than the one a session focused (see `ReceiverPrefs`).
+    pub unfocused_channel_gain: f32,
     pub session_timeout_secs: u64,
     pub cascade_secret: Option<String>,
     pub cascade_peers: Vec<String>,
@@ -52,6 +67,9 @@ impl Default for SfuOptions {
             speaking_timeout_ms: 400,
             speaking_energy_threshold: 0.01,
             energy_interval_ms: 200,
+            max_channels_per_session: 10,
+            max_positional_channels_per_session: 1,
+            unfocused_channel_gain: DEFAULT_UNFOCUSED_GAIN,
             session_timeout_secs: 60,
             cascade_secret: None,
             cascade_peers: Vec::new(),
@@ -74,6 +92,7 @@ pub struct SfuNode {
     crypto: Arc<CryptoProvider>,
     active_participant_count: Arc<AtomicU32>,
     webrtc_manager: Option<Arc<WebRtcManager>>,
+    router: Option<Arc<PacketRouter>>,
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
@@ -97,6 +116,7 @@ impl SfuNode {
             crypto: Arc::new(CryptoProvider::new()),
             active_participant_count: Arc::new(AtomicU32::new(0)),
             webrtc_manager: None,
+            router: None,
             cascade: None,
             audio_pipeline: None,
             audio_sink: None,
@@ -344,6 +364,7 @@ impl SfuNode {
         self.start_speaking_timeout();
         self.start_energy_reports();
         self.local_addr = Some(local_addr);
+        self.router = Some(router);
         self.started = true;
         info!(
             "SFU node {} started in region {:?}, listening on {} (advertised {})",
@@ -389,6 +410,8 @@ impl SfuNode {
             }
         }
         let session = MediaSession::new(session_id, user_id, app_id, display_name, ssrc, media_key);
+        *session.prefs.write() =
+            ReceiverPrefs::with_unfocused_gain(self.options.unfocused_channel_gain);
         self.sessions_by_id.insert(session_id, session.clone());
         self.sessions_by_user.insert(user_id, session.clone());
         aurix_metrics::SESSIONS_TOTAL.inc();
@@ -444,10 +467,19 @@ impl SfuNode {
         aurix_metrics::SESSION_DURATION.observe(elapsed as f64);
     }
 
-    fn remove_from_channel(&self, channel_id: &ChannelId, session: &Arc<MediaSession>) {
+    fn remove_from_channel(
+        &self,
+        channel_id: &ChannelId,
+        session: &Arc<MediaSession>,
+    ) -> ChannelLeft {
         session.leave_channel(channel_id);
+        let (transmission_reset, focus_reset) = session.forget_channel(channel_id);
+        let left = ChannelLeft {
+            transmission_reset,
+            focus_reset,
+        };
         let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else {
-            return;
+            return left;
         };
         channel.remove_participant(&session.user_id);
         if let Some(ref sink) = self.audio_sink {
@@ -461,6 +493,7 @@ impl SfuNode {
             }
             aurix_metrics::ACTIVE_CHANNELS.dec();
         }
+        left
     }
 
     pub fn destroy_session(&self, session_id: &SessionId) -> Result<()> {
@@ -490,6 +523,9 @@ impl SfuNode {
         let session = self
             .get_session(session_id)
             .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        if !session.is_in_channel(&channel_id) {
+            self.check_session_channel_limits(&session, config.channel_type)?;
+        }
         if !self.channels.contains_key(&channel_id)
             && self.channels.len() as u32 >= self.options.max_channels
         {
@@ -543,18 +579,52 @@ impl SfuNode {
         Ok(existing)
     }
 
+    fn check_session_channel_limits(
+        &self,
+        session: &MediaSession,
+        joining: ChannelType,
+    ) -> Result<()> {
+        let joined = session.get_channels();
+        if joined.len() as u32 >= self.options.max_channels_per_session {
+            return Err(AurixError::ChannelLimitExceeded(format!(
+                "session may join at most {} channels",
+                self.options.max_channels_per_session
+            )));
+        }
+        let max_positional = self.options.max_positional_channels_per_session;
+        if joining == ChannelType::Positional && max_positional != 0 {
+            let positional = joined
+                .iter()
+                .filter(|c| {
+                    self.channels
+                        .get(c)
+                        .is_some_and(|ch| ch.channel_type == ChannelType::Positional)
+                })
+                .count() as u32;
+            if positional >= max_positional {
+                return Err(AurixError::ChannelLimitExceeded(format!(
+                    "session may join at most {max_positional} positional channel(s)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn update_position(&self, user_id: &UserId, channel_id: &ChannelId, position: Position3D) {
         if let Some(channel) = self.channels.get(channel_id) {
             channel.update_position(user_id, position);
         }
     }
 
-    pub fn leave_channel(&self, session_id: &SessionId, channel_id: &ChannelId) -> Result<()> {
+    pub fn leave_channel(
+        &self,
+        session_id: &SessionId,
+        channel_id: &ChannelId,
+    ) -> Result<ChannelLeft> {
         let session = self
             .get_session(session_id)
             .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
-        self.remove_from_channel(channel_id, &session);
-        Ok(())
+        Ok(self.remove_from_channel(channel_id, &session))
     }
 
     pub fn server_mute_user(&self, user_id: &UserId, muted: bool) -> Result<()> {
@@ -591,6 +661,26 @@ impl SfuNode {
         self.sessions_by_user
             .get(user_id)
             .map(|s| s.value().clone())
+    }
+    /// Route one Opus frame on behalf of `session_id` as if it had arrived over its WebRTC
+    /// uplink (one frame fans out to every channel the transmission mode allows).
+    pub async fn route_webrtc_audio(
+        &self,
+        session_id: &SessionId,
+        rtp_time: u32,
+        payload: Vec<u8>,
+        level: Option<u8>,
+    ) -> Result<()> {
+        let router = self
+            .router
+            .as_ref()
+            .ok_or_else(|| AurixError::Internal("SFU not started".into()))?;
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        router
+            .route_webrtc_audio(&session, rtp_time, payload, level)
+            .await
     }
     /// Every live session of a user on this node (a user may hold a session per device).
     pub fn sessions_for_user(&self, user_id: &UserId) -> Vec<Arc<MediaSession>> {

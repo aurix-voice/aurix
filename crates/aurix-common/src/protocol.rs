@@ -735,11 +735,36 @@ pub enum ControlMessage {
         blocked: bool,
     },
     /// Server→client, after `SessionInitAck`: everything this session is currently not hearing
-    /// or hearing at a non-default gain. Local mutes and volumes survive a resume only.
+    /// or hearing at a non-default gain, plus its transmission mode and focused channel. Local
+    /// mutes, volumes, transmission and focus survive a resume only.
     ReceiverPreferences {
         blocked_users: Vec<UserId>,
         local_mutes: Vec<LocalMute>,
         volumes: Vec<ParticipantVolume>,
+        #[serde(default)]
+        transmission: TransmissionMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus_channel: Option<ChannelId>,
+    },
+    /// Client→server: which of the joined channels receive this session's microphone.
+    /// `single` must name a joined channel; leaving that channel switches to `none`.
+    SetTransmission {
+        mode: TransmissionMode,
+    },
+    /// Server→client: ack of `SetTransmission`, or an automatic change (target channel left).
+    TransmissionChanged {
+        mode: TransmissionMode,
+    },
+    /// Client→server: hear `channel_id` at full volume and every other joined channel
+    /// attenuated by `media.unfocused_channel_gain`; `None` restores equal volume.
+    SetChannelFocus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+    },
+    /// Server→client: ack of `SetChannelFocus`, or an automatic reset (focused channel left).
+    ChannelFocusChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
     },
     SpeakingStateChanged {
         channel_id: ChannelId,
@@ -868,6 +893,29 @@ pub struct LocalMute {
     /// `None` = muted in every channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<ChannelId>,
+}
+
+/// Where a session's microphone goes when it is a member of several channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TransmissionMode {
+    /// Audio is accepted by the server but forwarded nowhere.
+    None,
+    /// Only `channel_id` receives audio; frames addressed elsewhere are dropped.
+    Single { channel_id: ChannelId },
+    /// Every joined channel (default).
+    #[default]
+    All,
+}
+
+impl TransmissionMode {
+    pub fn allows(&self, channel: &ChannelId) -> bool {
+        match self {
+            Self::None => false,
+            Self::Single { channel_id } => channel_id == channel,
+            Self::All => true,
+        }
+    }
 }
 
 /// A delivered text message. `channel_id` is `None` for directed messages; `from_user_id` is
@@ -1177,5 +1225,52 @@ mod tests {
         })
         .unwrap();
         assert!(typing.contains(r#""type":"ChatTyping""#));
+    }
+
+    /// Wire shape shared with the Web/Unity SDKs: `{"mode":"single","channel_id":…}`.
+    #[test]
+    fn transmission_mode_wire_shape() {
+        let ch = ChannelId(uuid::Uuid::nil());
+        let single = serde_json::to_string(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::Single { channel_id: ch },
+        })
+        .unwrap();
+        assert_eq!(
+            single,
+            r#"{"type":"SetTransmission","data":{"mode":{"mode":"single","channel_id":"00000000-0000-0000-0000-000000000000"}}}"#
+        );
+        let none: ControlMessage =
+            serde_json::from_str(r#"{"type":"SetTransmission","data":{"mode":{"mode":"none"}}}"#)
+                .unwrap();
+        assert!(matches!(
+            none,
+            ControlMessage::SetTransmission {
+                mode: TransmissionMode::None
+            }
+        ));
+        assert!(TransmissionMode::All.allows(&ch));
+        assert!(!TransmissionMode::None.allows(&ch));
+        assert!(TransmissionMode::Single { channel_id: ch }.allows(&ch));
+        assert!(!TransmissionMode::Single { channel_id: ch }.allows(&ChannelId::new()));
+
+        // Older servers/clients omit the new fields; they default to `all` / no focus.
+        let prefs: ControlMessage = serde_json::from_str(
+            r#"{"type":"ReceiverPreferences","data":{"blocked_users":[],"local_mutes":[],"volumes":[]}}"#,
+        )
+        .unwrap();
+        match prefs {
+            ControlMessage::ReceiverPreferences {
+                transmission,
+                focus_channel,
+                ..
+            } => {
+                assert_eq!(transmission, TransmissionMode::All);
+                assert!(focus_channel.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let focus =
+            serde_json::to_string(&ControlMessage::SetChannelFocus { channel_id: None }).unwrap();
+        assert_eq!(focus, r#"{"type":"SetChannelFocus","data":{}}"#);
     }
 }

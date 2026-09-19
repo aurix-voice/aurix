@@ -97,6 +97,12 @@ impl AurixConfig {
         if self.media.energy_interval_ms != 0 && self.media.energy_interval_ms < 50 {
             anyhow::bail!("media.energy_interval_ms must be 0 (off) or >= 50");
         }
+        if !(0.0..=1.0).contains(&self.media.unfocused_channel_gain) {
+            anyhow::bail!("media.unfocused_channel_gain must be within 0.0..=1.0");
+        }
+        if self.media.max_channels_per_session == 0 {
+            anyhow::bail!("media.max_channels_per_session must be > 0");
+        }
         if self.chat.enabled {
             if self.chat.max_message_bytes == 0 || self.chat.max_message_bytes > 16 * 1024 {
                 anyhow::bail!("chat.max_message_bytes must be within 1..=16384");
@@ -384,6 +390,16 @@ pub struct MediaConfig {
     /// How often (ms) `ChannelEnergy` level reports are sent to channel members (0 = never).
     #[serde(default = "default_energy_interval_ms")]
     pub energy_interval_ms: u64,
+    /// Channels one session may be joined to at the same time.
+    #[serde(default = "default_max_channels_per_session")]
+    pub max_channels_per_session: u32,
+    /// Positional channels one session may be joined to at the same time (0 = unlimited).
+    #[serde(default = "default_max_positional_channels_per_session")]
+    pub max_positional_channels_per_session: u32,
+    /// Gain applied to audio from channels other than the one a session focused
+    /// (`SetChannelFocus`); `1.0` makes focus a no-op.
+    #[serde(default = "default_unfocused_channel_gain")]
+    pub unfocused_channel_gain: f32,
     /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
     #[serde(default)]
     pub rx_workers: usize,
@@ -418,6 +434,15 @@ fn default_speaking_energy_threshold() -> f32 {
 fn default_energy_interval_ms() -> u64 {
     200
 }
+fn default_max_channels_per_session() -> u32 {
+    10
+}
+fn default_max_positional_channels_per_session() -> u32 {
+    1
+}
+fn default_unfocused_channel_gain() -> f32 {
+    0.5
+}
 
 impl Default for MediaConfig {
     fn default() -> Self {
@@ -442,6 +467,9 @@ impl Default for MediaConfig {
             speaking_timeout_ms: default_speaking_timeout_ms(),
             speaking_energy_threshold: default_speaking_energy_threshold(),
             energy_interval_ms: default_energy_interval_ms(),
+            max_channels_per_session: default_max_channels_per_session(),
+            max_positional_channels_per_session: default_max_positional_channels_per_session(),
+            unfocused_channel_gain: default_unfocused_channel_gain(),
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

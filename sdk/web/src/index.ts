@@ -1,4 +1,4 @@
-export { AurixClient } from './client.js';
+export { AurixClient, transmissionFromWire, transmissionToWire } from './client.js';
 export {
   AUDIO_LEVEL_SILENCE,
   AudioLevelMeter,
@@ -18,6 +18,7 @@ export type {
   ReconnectPolicy,
   SendMessageOptions,
   SessionInfo,
+  TransmissionMode,
 } from './client.js';
 export type {
   ChannelRole,
@@ -33,6 +34,7 @@ export type {
   Position3D,
   RecordingConsent,
   ServerMessage,
+  TransmissionModeWire,
   TurnCredentials,
   UnknownMessage,
   UserPosition,

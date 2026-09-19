@@ -15,6 +15,7 @@
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{
     channel_id_hash, encode_volume_byte, AurixPacket, ControlMessage, PacketFlags, PacketType,
+    TransmissionMode,
 };
 use aurix_common::types::{ChannelId, RecordingConsent, SessionId, UserId};
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
@@ -152,13 +153,29 @@ async fn issue_token(
     name: &str,
     ch: ChannelId,
 ) -> (String, String) {
+    issue_token_for(env, http, external_id, name, &[ch]).await
+}
+
+async fn issue_token_for(
+    env: &Env,
+    http: &reqwest::Client,
+    external_id: &str,
+    name: &str,
+    channels: &[ChannelId],
+) -> (String, String) {
+    let grants: Vec<serde_json::Value> = channels
+        .iter()
+        .map(|ch| {
+            serde_json::json!({"channel_id": ch, "join": true, "speak": true, "receive": true, "moderate": false})
+        })
+        .collect();
     let r: serde_json::Value = http
         .post(format!("{}/v1/tokens", env.api))
         .header("x-api-key", &env.api_key)
         .json(&serde_json::json!({
             "external_id": external_id,
             "display_name": name,
-            "channels": [{"channel_id": ch, "join": true, "speak": true, "receive": true, "moderate": false}]
+            "channels": grants,
         }))
         .send()
         .await
@@ -1161,6 +1178,7 @@ async fn local_mute_volume_and_persistent_cross_mute() {
             blocked_users,
             local_mutes,
             volumes,
+            ..
         } = prefs
         {
             assert!(blocked_users.is_empty() && local_mutes.is_empty() && volumes.is_empty());
@@ -2485,4 +2503,259 @@ async fn text_chat_channel_direct_typing_and_history() {
     for p in [&mut alice, &mut bob, &mut carol, &mut dave] {
         p.ws.close(None).await.unwrap();
     }
+}
+
+/// Transmission policy and channel focus over the control plane: a `Single` policy drops the
+/// sender's audio in every other joined channel and `None` everywhere, focus attenuates the
+/// listener's other channels by the configured gain, both reset when their channel is left,
+/// survive a session resume via `ReceiverPreferences`, and the per-session channel limit is
+/// enforced at join with `CHANNEL_LIMIT_EXCEEDED`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn transmission_mode_channel_focus_and_channel_limit() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let team = create_channel(&env, &http).await;
+    let party = create_channel(&env, &http).await;
+    let mut spare = Vec::new();
+    for _ in 0..12 {
+        spare.push(create_channel(&env, &http).await);
+    }
+    let mut all = vec![team, party];
+    all.extend(spare.iter().copied());
+    let (tok_a, _) = issue_token_for(&env, &http, "e2e:tx-alice", "Alice", &all).await;
+    let (tok_b, _) = issue_token_for(&env, &http, "e2e:tx-bob", "Bob", &all).await;
+
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env, "bob", tok_b.clone()).await;
+    for p in [&mut alice, &mut bob] {
+        let prefs = p
+            .expect("ReceiverPreferences", |m| {
+                matches!(m, ControlMessage::ReceiverPreferences { .. })
+            })
+            .await;
+        if let ControlMessage::ReceiverPreferences {
+            transmission,
+            focus_channel,
+            ..
+        } = prefs
+        {
+            assert_eq!(transmission, TransmissionMode::All);
+            assert_eq!(focus_channel, None);
+        }
+        bind_media(p).await;
+        join(p, team).await;
+        join(p, party).await;
+    }
+    let hello = Bytes::from_static(b"hello");
+
+    // Baseline: `All` — both channels reach Bob at full gain.
+    send_audio(&alice, team, 1, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await, (None, 10));
+    send_audio(&alice, party, 100, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await, (None, 10));
+
+    // `Single(team)`: party audio is dropped at the server, team still flows.
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::Single { channel_id: team },
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged", |m| {
+            matches!(
+                m,
+                ControlMessage::TransmissionChanged {
+                    mode: TransmissionMode::Single { channel_id }
+                } if *channel_id == team
+            )
+        })
+        .await;
+    send_audio(&alice, party, 200, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+    send_audio(&alice, team, 300, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 10);
+
+    // Targets must be joined channels.
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::Single {
+                channel_id: ChannelId::new(),
+            },
+        })
+        .await;
+    expect_error(&mut alice, "SetTransmission(unknown)", "NOT_IN_CHANNEL").await;
+    bob.send(&ControlMessage::SetChannelFocus {
+        channel_id: Some(ChannelId::new()),
+    })
+    .await;
+    expect_error(&mut bob, "SetChannelFocus(unknown)", "NOT_IN_CHANNEL").await;
+
+    // `None`: nothing leaves the session.
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::None,
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged(None)", |m| {
+            matches!(
+                m,
+                ControlMessage::TransmissionChanged {
+                    mode: TransmissionMode::None
+                }
+            )
+        })
+        .await;
+    send_audio(&alice, team, 400, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await.1, 0);
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::All,
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged(All)", |m| {
+            matches!(
+                m,
+                ControlMessage::TransmissionChanged {
+                    mode: TransmissionMode::All
+                }
+            )
+        })
+        .await;
+
+    // Bob focuses team: party arrives attenuated (default unfocused gain 0.5), team at full.
+    bob.send(&ControlMessage::SetChannelFocus {
+        channel_id: Some(team),
+    })
+    .await;
+    bob.expect(
+        "ChannelFocusChanged",
+        |m| matches!(m, ControlMessage::ChannelFocusChanged { channel_id: Some(c) } if *c == team),
+    )
+    .await;
+    send_audio(&alice, party, 500, &hello).await;
+    let (gain, n) = audio_from(&bob, alice.ssrc, &hello).await;
+    assert_eq!(n, 10);
+    assert!(
+        gain.is_some() && gain != Some(encode_volume_byte(1.0)),
+        "unfocused channel must be attenuated, got {gain:?}"
+    );
+    send_audio(&alice, team, 600, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await, (None, 10));
+
+    // Focus and a `Single` target survive a session resume through ReceiverPreferences.
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::Single { channel_id: team },
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged", |m| {
+            matches!(m, ControlMessage::TransmissionChanged { .. })
+        })
+        .await;
+    let sid_a = alice.session_id;
+    let Player {
+        resume_token: tok_resume,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut alice = connect_with(&env, "alice", tok_a.clone(), Some((sid_a, &tok_resume))).await;
+    assert!(alice.resumed);
+    let prefs = alice
+        .expect("ReceiverPreferences (resumed)", |m| {
+            matches!(m, ControlMessage::ReceiverPreferences { .. })
+        })
+        .await;
+    let ControlMessage::ReceiverPreferences { transmission, .. } = prefs else {
+        unreachable!()
+    };
+    assert_eq!(transmission, TransmissionMode::Single { channel_id: team });
+    bind_media(&mut alice).await;
+
+    // Leaving the targeted / focused channel resets the state and tells the client.
+    alice
+        .send(&ControlMessage::ChannelLeave { channel_id: team })
+        .await;
+    alice
+        .expect("TransmissionChanged(None) after leave", |m| {
+            matches!(
+                m,
+                ControlMessage::TransmissionChanged {
+                    mode: TransmissionMode::None
+                }
+            )
+        })
+        .await;
+    bob.send(&ControlMessage::ChannelLeave { channel_id: team })
+        .await;
+    bob.expect("ChannelFocusChanged(None) after leave", |m| {
+        matches!(m, ControlMessage::ChannelFocusChanged { channel_id: None })
+    })
+    .await;
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::All,
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged(All)", |m| {
+            matches!(
+                m,
+                ControlMessage::TransmissionChanged {
+                    mode: TransmissionMode::All
+                }
+            )
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&alice, party, 700, &hello).await;
+    assert_eq!(audio_from(&bob, alice.ssrc, &hello).await, (None, 10));
+
+    // Per-session channel limit (media.max_channels_per_session): the server is expected to
+    // run with a limit small enough to hit here (CI sets 4).
+    match std::env::var("AURIX_E2E_MAX_CHANNELS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(limit) => {
+            // Alice is in `party` only; fill up to the limit, then one more must be refused.
+            let mut joined = 1;
+            let mut it = spare.iter();
+            while joined < limit {
+                join(&mut alice, *it.next().expect("not enough spare channels")).await;
+                joined += 1;
+            }
+            let extra = *it.next().expect("not enough spare channels");
+            alice
+                .send(&ControlMessage::ChannelJoin {
+                    channel_id: extra,
+                    token: tok_a.clone(),
+                })
+                .await;
+            expect_error(
+                &mut alice,
+                "ChannelJoin over limit",
+                "CHANNEL_LIMIT_EXCEEDED",
+            )
+            .await;
+            // Leaving frees the slot again.
+            alice
+                .send(&ControlMessage::ChannelLeave { channel_id: party })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            join(&mut alice, extra).await;
+        }
+        None => eprintln!("AURIX_E2E_MAX_CHANNELS not set; skipping channel-limit checks"),
+    }
+
+    let _ = alice.ws.close(None).await;
+    let _ = bob.ws.close(None).await;
 }

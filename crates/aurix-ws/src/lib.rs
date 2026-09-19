@@ -17,7 +17,7 @@ use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
     decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
-    ParticipantEnergy, ParticipantVolume,
+    ParticipantEnergy, ParticipantVolume, TransmissionMode,
 };
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
@@ -794,10 +794,10 @@ impl WsState {
 
     /// Leaves a channel everywhere: SFU, WS index, DB membership, Redis, events.
     async fn leave_channel_full(&self, session_id: SessionId, channel_id: ChannelId, reason: &str) {
-        let Some((user_id, app_id)) = self
+        let Some((user_id, app_id, tx)) = self
             .connections
             .get(&session_id)
-            .map(|c| (c.user_id, c.app_id))
+            .map(|c| (c.user_id, c.app_id, c.tx.clone()))
         else {
             return;
         };
@@ -806,11 +806,28 @@ impl WsState {
             .get(&channel_id)
             .map(|m| m.contains(&session_id))
             .unwrap_or(false);
-        {
+        let left = {
             let sfu = self.sfu.read();
-            let _ = sfu.leave_channel(&session_id, &channel_id);
-        }
+            sfu.leave_channel(&session_id, &channel_id)
+                .unwrap_or_default()
+        };
         self.index_leave(&channel_id, &session_id);
+        if left.transmission_reset {
+            send_msg(
+                &tx,
+                &ControlMessage::TransmissionChanged {
+                    mode: TransmissionMode::None,
+                },
+            )
+            .await;
+        }
+        if left.focus_reset {
+            send_msg(
+                &tx,
+                &ControlMessage::ChannelFocusChanged { channel_id: None },
+            )
+            .await;
+        }
         if !was_member {
             return;
         }
@@ -1107,6 +1124,7 @@ async fn open_session(
 
 fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<ControlMessage> {
     let session = state.sfu.read().get_session(session_id)?;
+    let transmission = session.transmission();
     let prefs = session.prefs.read();
     Some(ControlMessage::ReceiverPreferences {
         blocked_users: prefs.blocked_users(),
@@ -1123,6 +1141,8 @@ fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<Contr
             .into_iter()
             .map(|(user_id, volume)| ParticipantVolume { user_id, volume })
             .collect(),
+        transmission,
+        focus_channel: prefs.focus(),
     })
 }
 
@@ -1844,6 +1864,40 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetTransmission { mode } => {
+            let result = {
+                let sfu = state.sfu.read();
+                match sfu.get_session(&session_id) {
+                    Some(s) => s.set_transmission(mode),
+                    None => Err(AurixError::SessionNotFound(session_id.to_string())),
+                }
+            };
+            match result {
+                Ok(()) => send_msg(tx, &ControlMessage::TransmissionChanged { mode }).await,
+                Err(AurixError::ChannelNotFound(_)) => {
+                    return send_error(tx, "NOT_IN_CHANNEL", "Not a member of this channel").await
+                }
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+            }
+        }
+
+        ControlMessage::SetChannelFocus { channel_id } => {
+            let result = {
+                let sfu = state.sfu.read();
+                match sfu.get_session(&session_id) {
+                    Some(s) => s.set_focus(channel_id),
+                    None => Err(AurixError::SessionNotFound(session_id.to_string())),
+                }
+            };
+            match result {
+                Ok(()) => send_msg(tx, &ControlMessage::ChannelFocusChanged { channel_id }).await,
+                Err(AurixError::ChannelNotFound(_)) => {
+                    return send_error(tx, "NOT_IN_CHANNEL", "Not a member of this channel").await
+                }
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+            }
+        }
+
         ControlMessage::SetUserBlock { user_id, blocked } => {
             if user_id == token.user_id {
                 return send_error(tx, "VALIDATION_ERROR", "Cannot block yourself").await;
@@ -2151,6 +2205,8 @@ async fn handle_control_message(
         | ControlMessage::SpeakingStateChanged { .. }
         | ControlMessage::UserBlockChanged { .. }
         | ControlMessage::ReceiverPreferences { .. }
+        | ControlMessage::TransmissionChanged { .. }
+        | ControlMessage::ChannelFocusChanged { .. }
         | ControlMessage::BitrateCommand { .. }
         | ControlMessage::RecordingNotification { .. }
         | ControlMessage::Error { .. }

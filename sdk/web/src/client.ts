@@ -15,6 +15,7 @@ import {
   type ParticipantVolume,
   type RecordingConsent,
   type ServerMessage,
+  type TransmissionModeWire,
   type TurnCredentials,
   type UnknownMessage,
   type UserPosition,
@@ -210,6 +211,16 @@ export interface AurixEvents {
   receiverPreferences: (prefs: ReceiverPreferences) => void;
   /** A cross-mute placed or lifted by this user (from this or any other device/REST). */
   userBlockChanged: (userId: string, blocked: boolean) => void;
+  /**
+   * The server acknowledged a new transmission policy — after `setTransmission`, or reset to
+   * `none` because the single target channel was left.
+   */
+  transmissionChanged: (mode: TransmissionMode) => void;
+  /**
+   * The server acknowledged a new focus — after `setChannelFocus`, or cleared because the
+   * focused channel was left.
+   */
+  channelFocusChanged: (channelId: string | undefined) => void;
   /** Connection lost unexpectedly; attempt `attempt` (1-based) is scheduled in `delayMs`. */
   recovering: (attempt: number, delayMs: number, cause: string) => void;
   /**
@@ -241,6 +252,41 @@ export interface ReceiverPreferences {
   blockedUsers: string[];
   localMutes: LocalMute[];
   volumes: ParticipantVolume[];
+  transmission: TransmissionMode;
+  focusChannel: string | undefined;
+}
+
+/**
+ * Where this session's audio is sent. `none` mutes the uplink at the server without touching
+ * the microphone, `single` limits it to one joined channel (e.g. talk to the party while
+ * still hearing the team), `all` (default) fans out to every joined channel.
+ */
+export type TransmissionMode =
+  | { type: 'none' }
+  | { type: 'single'; channelId: string }
+  | { type: 'all' };
+
+export function transmissionToWire(mode: TransmissionMode): TransmissionModeWire {
+  switch (mode.type) {
+    case 'none':
+      return { mode: 'none' };
+    case 'single':
+      return { mode: 'single', channel_id: mode.channelId };
+    case 'all':
+      return { mode: 'all' };
+  }
+}
+
+export function transmissionFromWire(mode: TransmissionModeWire | undefined): TransmissionMode {
+  if (!mode) return { type: 'all' };
+  switch (mode.mode) {
+    case 'none':
+      return { type: 'none' };
+    case 'single':
+      return { type: 'single', channelId: mode.channel_id };
+    default:
+      return { type: 'all' };
+  }
 }
 
 /** Marker for "in every channel" in the local-mute table. */
@@ -332,6 +378,8 @@ export class AurixClient {
   /** user_id → receiver-local gain (unity entries are not stored). */
   private volumes = new Map<string, number>();
   private blockedUsers = new Set<string>();
+  private transmission: TransmissionMode = { type: 'all' };
+  private focusChannel: string | undefined;
   private closedByUser = false;
   private readonly reconnectPolicy: ReconnectPolicy;
   private resumeToken: string | undefined;
@@ -616,6 +664,52 @@ export class AurixClient {
     return Array.from(this.blockedUsers);
   }
 
+  /**
+   * Choose where the microphone goes: `{ type: 'all' }` (default), `{ type: 'single',
+   * channelId }` for exactly one joined channel or `{ type: 'none' }` to send nowhere while
+   * still receiving. Applied by the server; confirmed via `transmissionChanged`. A `single`
+   * target must be a joined channel — when it is left, the server resets the policy to `none`.
+   */
+  setTransmission(mode: TransmissionMode): void {
+    if (mode.type === 'single' && !mode.channelId) {
+      throw new RangeError('single transmission requires a channelId');
+    }
+    this.transmission = mode;
+    if (mode.type === 'single' && !this.channels.has(mode.channelId)) return; // sent on join
+    this.trySend({ type: 'SetTransmission', data: { mode: transmissionToWire(mode) } });
+  }
+
+  /** Shorthand for `setTransmission({ type: 'single', channelId })`. */
+  transmitToChannel(channelId: string): void {
+    this.setTransmission({ type: 'single', channelId });
+  }
+
+  getTransmission(): TransmissionMode {
+    return this.transmission;
+  }
+
+  /** `true` when audio sent now would be delivered to `channelId`. */
+  transmitsTo(channelId: string): boolean {
+    const t = this.transmission;
+    return t.type === 'all' || (t.type === 'single' && t.channelId === channelId);
+  }
+
+  /**
+   * Receiver-local focus: audio from `channelId` stays at full volume while every other
+   * joined channel is attenuated by the server's `media.unfocused_channel_gain` (0.5 by
+   * default). `undefined` clears the focus. Confirmed via `channelFocusChanged`; cleared by
+   * the server when the focused channel is left.
+   */
+  setChannelFocus(channelId: string | undefined): void {
+    this.focusChannel = channelId;
+    if (channelId !== undefined && !this.channels.has(channelId)) return; // sent on join
+    this.trySend({ type: 'SetChannelFocus', data: { channel_id: channelId ?? null } });
+  }
+
+  getChannelFocus(): string | undefined {
+    return this.focusChannel;
+  }
+
   /** Re-send the client-held local mutes/volumes after a fresh (non-resumed) session. */
   private replayReceiverPrefs(): void {
     for (const [userId, scopes] of this.localMutes) {
@@ -629,9 +723,15 @@ export class AurixClient {
     for (const [userId, volume] of this.volumes) {
       this.trySend({ type: 'SetParticipantVolume', data: { user_id: userId, volume } });
     }
+    if (this.transmission.type === 'none') {
+      this.trySend({ type: 'SetTransmission', data: { mode: { mode: 'none' } } });
+    }
   }
 
-  /** Channel-scoped mutes need membership, so they are re-sent per `ChannelJoinAck`. */
+  /**
+   * Channel-scoped mutes, a `single` transmission target and the focus need membership, so
+   * they are re-sent per `ChannelJoinAck`.
+   */
   private replayChannelMutes(channelId: string): void {
     for (const [userId, scopes] of this.localMutes) {
       if (scopes.has(channelId) && !scopes.has(ALL_CHANNELS)) {
@@ -640,6 +740,15 @@ export class AurixClient {
           data: { user_id: userId, channel_id: channelId, muted: true },
         });
       }
+    }
+    if (this.transmission.type === 'single' && this.transmission.channelId === channelId) {
+      this.trySend({
+        type: 'SetTransmission',
+        data: { mode: transmissionToWire(this.transmission) },
+      });
+    }
+    if (this.focusChannel === channelId) {
+      this.trySend({ type: 'SetChannelFocus', data: { channel_id: channelId } });
     }
   }
 
@@ -1329,6 +1438,18 @@ export class AurixClient {
         this.emit('userBlockChanged', d.user_id, d.blocked);
         return;
       }
+      case 'TransmissionChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'TransmissionChanged' }>).data;
+        this.transmission = transmissionFromWire(d.mode);
+        this.emit('transmissionChanged', this.transmission);
+        return;
+      }
+      case 'ChannelFocusChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChannelFocusChanged' }>).data;
+        this.focusChannel = d.channel_id ?? undefined;
+        this.emit('channelFocusChanged', this.focusChannel);
+        return;
+      }
       case 'ReceiverPreferences': {
         const d = (msg as Extract<ServerMessage, { type: 'ReceiverPreferences' }>).data;
         this.blockedUsers = new Set(d.blocked_users);
@@ -1343,10 +1464,20 @@ export class AurixClient {
           if (v.volume === 1) this.volumes.delete(v.user_id);
           else this.volumes.set(v.user_id, v.volume);
         }
+        // A resumed session reports the policy it still holds; a fresh one reports the
+        // defaults, which `replayReceiverPrefs`/`replayChannelMutes` then override.
+        const transmission = transmissionFromWire(d.transmission);
+        const focusChannel = d.focus_channel ?? undefined;
+        if (this.session?.resumed) {
+          this.transmission = transmission;
+          this.focusChannel = focusChannel;
+        }
         this.emit('receiverPreferences', {
           blockedUsers: d.blocked_users,
           localMutes: d.local_mutes,
           volumes: d.volumes,
+          transmission,
+          focusChannel,
         });
         return;
       }

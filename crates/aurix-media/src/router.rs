@@ -14,6 +14,7 @@ use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -281,6 +282,11 @@ impl PacketRouter {
                 "Sender may not transmit in this channel".into(),
             ));
         }
+        // Frames for a channel outside the transmission mode are dropped silently: the client
+        // may legitimately still be sending while the mode change is in flight.
+        if !sender.transmits_to(&channel_id) {
+            return Ok(());
+        }
 
         if sender.record_audio_level(level, self.speaking_energy_threshold) {
             let _ = self.events.send(MediaEvent::SpeakingChanged {
@@ -317,7 +323,11 @@ impl PacketRouter {
         if !sender.is_transmitting_allowed() {
             return Ok(());
         }
-        let channels = sender.get_channels();
+        let channels: Vec<ChannelId> = sender
+            .get_channels()
+            .into_iter()
+            .filter(|c| sender.transmits_to(c))
+            .collect();
         if channels.is_empty() {
             return Ok(());
         }
@@ -332,6 +342,11 @@ impl PacketRouter {
         let seq = sender
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A browser sends one frame for all its channels, so a receiver sharing several of them
+        // with the sender must get it exactly once — through the channel where it hears the
+        // sender loudest (focus / positional attenuation) — or the mixers would double the audio.
+        let mut per_channel: Vec<(Arc<MediaChannel>, AurixPacket)> = Vec::new();
+        let mut best: HashMap<SessionId, (usize, Arc<MediaSession>, f32)> = HashMap::new();
         for channel_id in channels {
             let channel = match self.shared.channels.get(&channel_id) {
                 Some(c) => c.value().clone(),
@@ -348,11 +363,30 @@ impl PacketRouter {
                 Bytes::from(payload.clone()),
             );
             self.tap_audio(&channel, sender, &packet);
-            self.fan_out(&channel, sender, &packet).await;
+            let idx = per_channel.len();
+            for (receiver, volume) in channel.get_receivers_for_audio(sender.ssrc) {
+                match best.get_mut(&receiver.session_id) {
+                    Some(slot) if slot.2 >= volume => {}
+                    Some(slot) => *slot = (idx, receiver, volume),
+                    None => {
+                        best.insert(receiver.session_id, (idx, receiver, volume));
+                    }
+                }
+            }
             if let Some(ref cascade) = self.cascade {
                 cascade
                     .forward_to_peers(&channel_id, &sender.user_id, &packet)
                     .await;
+            }
+            per_channel.push((channel, packet));
+        }
+        let mut receivers: Vec<Vec<(Arc<MediaSession>, f32)>> = vec![Vec::new(); per_channel.len()];
+        for (idx, receiver, volume) in best.into_values() {
+            receivers[idx].push((receiver, volume));
+        }
+        for ((channel, packet), receivers) in per_channel.iter().zip(receivers) {
+            if !receivers.is_empty() {
+                self.deliver(channel, receivers, packet).await;
             }
         }
         Ok(())

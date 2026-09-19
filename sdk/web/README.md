@@ -53,6 +53,38 @@ Mutes and volumes live for the session and are replayed automatically after a no
 reconnect (channel-scoped mutes once the channel is re-joined); blocks are stored per application
 in the server database and also manageable from your backend via `/v1/users/:id/blocks`.
 
+### Multiple channels: transmission policy, focus, channel limit
+
+A session may sit in several channels at once (team + party + proximity…). Two independent
+controls decide where the microphone goes and how the channels are heard:
+
+```ts
+await client.joinChannel(teamId);
+await client.joinChannel(partyId);
+
+client.transmitToChannel(partyId);                     // speak to the party only, keep hearing the team
+client.setTransmission({ type: 'all' });               // default: every joined channel
+client.setTransmission({ type: 'none' });              // listen only (mic stays live locally)
+client.transmitsTo(teamId);                            // would audio sent now reach `teamId`?
+client.on('transmissionChanged', (mode) => updatePttIndicator(mode));
+
+client.setChannelFocus(teamId);                        // team at full volume, the rest attenuated
+client.setChannelFocus(undefined);                     // everything at full volume again
+client.on('channelFocusChanged', (channelId) => highlight(channelId));
+```
+
+`setTransmission` is enforced on the server: frames for channels outside the policy are dropped
+before fan-out, so `none` is a server-side push-to-talk release. `single` and the focus must
+point at a joined channel; calling them before the join is fine (they are sent on the
+`ChannelJoinAck`), and the server resets them (`TransmissionChanged {none}` /
+`ChannelFocusChanged {}`) when that channel is left. Focus is receiver-local — other channels
+are scaled by `media.unfocused_channel_gain` (0.5 by default), multiplied with per-participant
+volume; local mutes and blocks still win. Both settings are replayed after a reconnect.
+
+The server caps memberships per session (`media.max_channels_per_session`, default 10, and
+`media.max_positional_channels_per_session`, default 1); `joinChannel` rejects with
+`CHANNEL_LIMIT_EXCEEDED: …` when the cap is reached.
+
 ### Reconnect / session resume
 
 Enabled by default (`autoReconnect: true`). When the control connection drops the client keeps
@@ -200,6 +232,8 @@ applied to attached elements only (`element.volume` / `element.muted` + remote t
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's own relay candidates |
 | `joinChannel()` → `ChannelJoin{channel_id, token}` | membership check against the token's channel claims |
 | `setMuted()` → track `enabled` + `MuteStateChanged` | broadcast to channel members |
+| `setTransmission()` → `SetTransmission{mode}` | `MediaSession::set_transmission`; routers drop frames outside the policy |
+| `setChannelFocus()` → `SetChannelFocus{channel_id}` | `ReceiverPrefs::set_focus`; unfocused channels scaled in the per-receiver gain |
 | `reportQuality()` → `QualityReport` | adaptive `BitrateCommand`, applied via `RTCRtpSender.setParameters` |
 | `Ping`/`Pong` | keepalive + `roundTripMs` |
 | reconnect with `['aurix', 'bearer.<jwt>', 'resume.<session_id>.<resume_token>']` | `SessionInitAck{resumed: true}` + replayed `ChannelJoinAck`s within `server.session_resume_grace_secs` |

@@ -3,6 +3,7 @@
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::*;
 use aurix_common::types::*;
+use aurix_media::session::Transport;
 use aurix_media::{MediaEvent, SfuNode, SfuOptions};
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -486,6 +487,255 @@ async fn receiver_preferences_filter_and_scale_downlink() {
     assert_eq!(&hears(&c, &a).await.unwrap().payload[..], b"p4");
 }
 
+/// Multi-channel sessions: the transmission mode decides which joined channels receive the
+/// uplink, focus attenuates every other channel on the receiver side, and the node caps how
+/// many (positional) channels one session may join.
+#[tokio::test]
+async fn transmission_mode_focus_and_session_channel_limits() {
+    let mut sfu = SfuNode::new(
+        MediaNodeId::new(),
+        Region::EuWest,
+        SfuOptions {
+            max_participants: 3,
+            max_channels_per_session: 3,
+            max_positional_channels_per_session: 1,
+            unfocused_channel_gain: 0.25,
+            ..SfuOptions::default()
+        },
+    );
+    sfu.start("127.0.0.1:0").await.unwrap();
+    let addr = sfu.local_addr().unwrap();
+    let app = AppId::new();
+    let team = ChannelId::new();
+    let party = ChannelId::new();
+
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    for s in [&s_a, &s_b] {
+        for ch in [team, party] {
+            sfu.join_channel(
+                &s.session_id,
+                ch,
+                ChannelConfig::default(),
+                ChannelRole::Speaker,
+            )
+            .unwrap();
+        }
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+
+    // Default `All`: both channels are forwarded.
+    a.send_audio(addr, &team, b"t1").await;
+    assert_eq!(&b.recv().await.unwrap().payload[..], b"t1");
+    a.send_audio(addr, &party, b"p1").await;
+    assert_eq!(&b.recv().await.unwrap().payload[..], b"p1");
+
+    // `Single(team)`: party frames are dropped, team frames still go through.
+    s_a.set_transmission(TransmissionMode::Single { channel_id: team })
+        .unwrap();
+    a.send_audio(addr, &party, b"p2").await;
+    assert!(b.recv().await.is_none(), "single mode drops other channels");
+    a.send_audio(addr, &team, b"t2").await;
+    assert_eq!(&b.recv().await.unwrap().payload[..], b"t2");
+
+    // `None`: nothing is forwarded.
+    s_a.set_transmission(TransmissionMode::None).unwrap();
+    a.send_audio(addr, &team, b"t3").await;
+    assert!(b.recv().await.is_none());
+    s_a.set_transmission(TransmissionMode::All).unwrap();
+
+    // Focus on `team` at the receiver: party audio arrives attenuated, team at unity.
+    s_b.set_focus(Some(team)).unwrap();
+    a.send_audio(addr, &party, b"p3").await;
+    let got = b.recv().await.unwrap();
+    assert!(got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(got.payload[0], encode_volume_byte(0.25));
+    assert_eq!(&got.payload[1..], b"p3");
+    a.send_audio(addr, &team, b"t4").await;
+    let got = b.recv().await.unwrap();
+    assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(&got.payload[..], b"t4");
+    // Focus stacks with per-sender gain.
+    s_b.prefs.write().set_gain(s_a.user_id, 2.0);
+    a.send_audio(addr, &party, b"p4").await;
+    assert_eq!(b.recv().await.unwrap().payload[0], encode_volume_byte(0.5));
+    s_b.prefs.write().set_gain(s_a.user_id, 1.0);
+
+    // Leaving the focused / single-target channel resets both, reported to the caller.
+    s_a.set_transmission(TransmissionMode::Single { channel_id: team })
+        .unwrap();
+    let left = sfu.leave_channel(&s_a.session_id, &team).unwrap();
+    assert!(left.transmission_reset && !left.focus_reset);
+    assert_eq!(s_a.transmission(), TransmissionMode::None);
+    let left = sfu.leave_channel(&s_b.session_id, &team).unwrap();
+    assert!(!left.transmission_reset && left.focus_reset);
+    assert!(s_b.focus().is_none());
+    a.send_audio(addr, &party, b"p5").await;
+    assert!(b.recv().await.is_none(), "transmission fell back to none");
+    s_a.set_transmission(TransmissionMode::All).unwrap();
+    a.send_audio(addr, &party, b"p6").await;
+    let got = b.recv().await.unwrap();
+    assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(&got.payload[..], b"p6");
+
+    // Per-session limits: 3 channels total, 1 positional. A is in `party` only now.
+    let positional = ChannelConfig {
+        channel_type: ChannelType::Positional,
+        ..ChannelConfig::default()
+    };
+    sfu.join_channel(
+        &s_a.session_id,
+        ChannelId::new(),
+        positional.clone(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+    let err = sfu
+        .join_channel(
+            &s_a.session_id,
+            ChannelId::new(),
+            positional,
+            ChannelRole::Speaker,
+        )
+        .unwrap_err();
+    assert_eq!(err.error_code(), "CHANNEL_LIMIT_EXCEEDED");
+    sfu.join_channel(
+        &s_a.session_id,
+        ChannelId::new(),
+        ChannelConfig::default(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+    assert_eq!(s_a.get_channels().len(), 3);
+    let err = sfu
+        .join_channel(
+            &s_a.session_id,
+            ChannelId::new(),
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap_err();
+    assert_eq!(err.error_code(), "CHANNEL_LIMIT_EXCEEDED");
+    // Re-joining an already joined channel is idempotent and not counted twice.
+    sfu.join_channel(
+        &s_a.session_id,
+        party,
+        ChannelConfig::default(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+    assert_eq!(s_a.get_channels().len(), 3);
+}
+
+/// A WebRTC uplink carries one frame for every channel the browser transmits to. A receiver
+/// sharing several of those channels with the sender must hear it exactly once — via the
+/// channel where it is loudest for that receiver — and the transmission mode decides which
+/// channels (and therefore which receivers) are reached at all.
+#[tokio::test]
+async fn webrtc_frame_reaches_shared_receiver_once_via_loudest_channel() {
+    let mut sfu = SfuNode::new(
+        MediaNodeId::new(),
+        Region::EuWest,
+        SfuOptions {
+            max_participants: 3,
+            unfocused_channel_gain: 0.25,
+            ..SfuOptions::default()
+        },
+    );
+    sfu.start("127.0.0.1:0").await.unwrap();
+    let addr = sfu.local_addr().unwrap();
+    let app = AppId::new();
+    let team = ChannelId::new();
+    let party = ChannelId::new();
+
+    let s_w = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "web".into())
+        .unwrap();
+    s_w.set_transport(Transport::WebRtc);
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    for (s, chans) in [
+        (&s_w, vec![team, party]),
+        (&s_b, vec![team, party]),
+        (&s_c, vec![party]),
+    ] {
+        for ch in chans {
+            sfu.join_channel(
+                &s.session_id,
+                ch,
+                ChannelConfig::default(),
+                ChannelRole::Speaker,
+            )
+            .unwrap();
+        }
+    }
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    b.bind(addr).await;
+    c.bind(addr).await;
+
+    // `All`, no focus: B (in both channels) gets a single copy, C (party only) gets one too.
+    sfu.route_webrtc_audio(&s_w.session_id, 960, b"w1".to_vec(), None)
+        .await
+        .unwrap();
+    let got = b.recv().await.unwrap();
+    assert_eq!(&got.payload[..], b"w1");
+    assert!(
+        b.recv().await.is_none(),
+        "shared receiver must not get a duplicate"
+    );
+    assert_eq!(&c.recv().await.unwrap().payload[..], b"w1");
+    assert!(c.recv().await.is_none());
+
+    // B focuses `party`: the one copy comes through `party` at unity, not through `team` at 0.25.
+    s_b.set_focus(Some(party)).unwrap();
+    sfu.route_webrtc_audio(&s_w.session_id, 1920, b"w2".to_vec(), None)
+        .await
+        .unwrap();
+    let got = b.recv().await.unwrap();
+    assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(got.header.channel_id_hash, channel_id_hash(&party));
+    assert_eq!(&got.payload[..], b"w2");
+    assert!(b.recv().await.is_none());
+    c.recv().await.unwrap();
+
+    // Sender restricts to `team`: B now hears it through `team`, attenuated; C hears nothing.
+    s_w.set_transmission(TransmissionMode::Single { channel_id: team })
+        .unwrap();
+    sfu.route_webrtc_audio(&s_w.session_id, 2880, b"w3".to_vec(), None)
+        .await
+        .unwrap();
+    let got = b.recv().await.unwrap();
+    assert!(got.header.has_flag(PacketFlags::VolumeAttenuated));
+    assert_eq!(got.header.channel_id_hash, channel_id_hash(&team));
+    assert_eq!(got.payload[0], encode_volume_byte(0.25));
+    assert_eq!(&got.payload[1..], b"w3");
+    assert!(b.recv().await.is_none());
+    assert!(
+        c.recv().await.is_none(),
+        "party is outside the sender's mode"
+    );
+
+    // `None`: nobody hears the browser.
+    s_w.set_transmission(TransmissionMode::None).unwrap();
+    sfu.route_webrtc_audio(&s_w.session_id, 3840, b"w4".to_vec(), None)
+        .await
+        .unwrap();
+    assert!(b.recv().await.is_none());
+    assert!(c.recv().await.is_none());
+}
+
 /// Client-measured audio levels: the level byte never reaches other participants, quiet frames
 /// keep the sender out of the speaking state, loud ones put it in, and the node periodically
 /// reports changed levels per channel (including the drop back to silence).
@@ -563,6 +813,11 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
     }
     drain(&mut events, 100).await; // SessionBound etc.
 
+    // Levels go stale after 2 × interval (100 ms) and decay to a single silence report; each
+    // phase below either waits that decay out or stops well before it can fire.
+    const AFTER_DECAY_MS: u64 = 300;
+    const BEFORE_DECAY_MS: u64 = 80;
+
     // Quiet frames (-60 dBov): forwarded as audio, level byte stripped, but not "speaking".
     for _ in 0..5 {
         a.send_audio_with_level(addr, &channel, 60, b"quiet-opus")
@@ -571,14 +826,14 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
     let got = b.recv().await.expect("b hears quiet audio");
     assert!(!got.header.has_flag(PacketFlags::Energy));
     assert_eq!(&got.payload[..], b"quiet-opus");
-    let evs = drain(&mut events, 150).await;
+    let evs = drain(&mut events, AFTER_DECAY_MS).await;
     assert!(
         speaking_of(&evs, s_a.user_id).is_empty(),
         "quiet labelled frames must not flip speaking: {evs:?}"
     );
     let quiet = energy_of(&evs, channel, s_a.user_id);
     assert!(
-        quiet.first() == Some(&60) && quiet.iter().skip(1).all(|l| *l == 127),
+        quiet.len() == 2 && quiet[0] == 60 && quiet[1] == 127,
         "level of quiet frames is still reported: {quiet:?}"
     );
     assert!(
@@ -604,11 +859,12 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
     assert!(energy_of(&evs, channel, s_a.user_id).is_empty());
 
     // A steady level is reported once — and once more when a new member joins the channel so
-    // late joiners get a baseline for everyone already talking.
+    // late joiners get a baseline for everyone already talking. Frames are refreshed before the
+    // level can go stale so nothing but the join causes a report.
     for _ in 0..4 {
         a.send_audio_with_level(addr, &channel, 6, b"steady").await;
     }
-    let evs = drain(&mut events, 120).await;
+    let evs = drain(&mut events, BEFORE_DECAY_MS).await;
     assert_eq!(energy_of(&evs, channel, s_a.user_id), vec![6]);
     for _ in 0..4 {
         a.send_audio_with_level(addr, &channel, 6, b"steady").await;
@@ -623,7 +879,7 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
         ChannelRole::Listener,
     )
     .unwrap();
-    let evs = drain(&mut events, 120).await;
+    let evs = drain(&mut events, BEFORE_DECAY_MS).await;
     assert_eq!(
         energy_of(&evs, channel, s_a.user_id),
         vec![6],

@@ -61,6 +61,15 @@ export interface ParticipantEnergy {
 /** Upper bound the server accepts for `SetParticipantVolume`. */
 export const MAX_PARTICIPANT_VOLUME = 2.0;
 
+/**
+ * Where this session's outgoing audio goes: nowhere, exactly one joined channel or every
+ * joined channel (the default). Enforced by the server before fan-out.
+ */
+export type TransmissionModeWire =
+  | { mode: 'none' }
+  | { mode: 'single'; channel_id: string }
+  | { mode: 'all' };
+
 /** Moderation performed by a player with a one-time action token (`POST /v1/tokens/action`). */
 export type ModerationAction = 'kick' | 'mute' | 'unmute';
 
@@ -111,6 +120,8 @@ export type ClientMessage =
     }
   | { type: 'SetParticipantVolume'; data: { user_id: string; volume: number } }
   | { type: 'SetUserBlock'; data: { user_id: string; blocked: boolean } }
+  | { type: 'SetTransmission'; data: { mode: TransmissionModeWire } }
+  | { type: 'SetChannelFocus'; data: { channel_id?: string | null } }
   | {
       type: 'ChatSend';
       data: { channel_id: string; text: string; metadata?: JsonValue; client_ref?: string };
@@ -160,12 +171,21 @@ export type ServerMessage =
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'BitrateCommand'; data: { target_bitrate_kbps: number; reason: string } }
   | { type: 'UserBlockChanged'; data: { user_id: string; blocked: boolean } }
+  | { type: 'TransmissionChanged'; data: { mode: TransmissionModeWire } }
+  | { type: 'ChannelFocusChanged'; data: { channel_id?: string | null } }
   | { type: 'ChatMessageReceived'; data: { message: ChatMessageWire } }
   | { type: 'ParticipantTyping'; data: { channel_id: string; user_id: string; typing: boolean } }
   | { type: 'ChannelEnergy'; data: { channel_id: string; levels: ParticipantEnergy[] } }
   | {
       type: 'ReceiverPreferences';
-      data: { blocked_users: string[]; local_mutes: LocalMute[]; volumes: ParticipantVolume[] };
+      data: {
+        blocked_users: string[];
+        local_mutes: LocalMute[];
+        volumes: ParticipantVolume[];
+        /** Absent on servers predating transmission policies (= `all`). */
+        transmission?: TransmissionModeWire;
+        focus_channel?: string | null;
+      };
     }
   | {
       type: 'RecordingNotification';

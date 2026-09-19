@@ -1,5 +1,8 @@
 use aurix_common::crypto::MediaKeys;
-use aurix_common::protocol::{decode_audio_level, ReplayWindow, AUDIO_LEVEL_SILENCE};
+use aurix_common::error::AurixError;
+use aurix_common::protocol::{
+    decode_audio_level, ReplayWindow, TransmissionMode, AUDIO_LEVEL_SILENCE,
+};
 use aurix_common::types::*;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -11,10 +14,15 @@ use std::sync::Arc;
 /// Upper bound for a per-participant gain (1.0 = as sent, 2.0 = +6 dB).
 pub const MAX_PARTICIPANT_GAIN: f32 = 2.0;
 
+/// Gain for channels other than the focused one when the node does not configure
+/// `media.unfocused_channel_gain`.
+pub const DEFAULT_UNFOCUSED_GAIN: f32 = 0.5;
+
 /// What this participant wants to hear: local ("for me") mutes, per-sender gain and the
-/// persistent cross-mute list. Evaluated per packet on the receiver side of the fan-out, so a
-/// muted or blocked sender's audio never leaves the server towards this session.
-#[derive(Debug, Default)]
+/// persistent cross-mute list, plus the focused channel (every other channel is attenuated by
+/// `unfocused_gain`). Evaluated per packet on the receiver side of the fan-out, so a muted or
+/// blocked sender's audio never leaves the server towards this session.
+#[derive(Debug)]
 pub struct ReceiverPrefs {
     muted_everywhere: HashSet<UserId>,
     muted_in: HashSet<(ChannelId, UserId)>,
@@ -23,9 +31,32 @@ pub struct ReceiverPrefs {
     blocked: HashSet<UserId>,
     /// Users who blocked this participant; cross-mute is mutual so they are silenced too.
     blocked_by: HashSet<UserId>,
+    focus: Option<ChannelId>,
+    unfocused_gain: f32,
+}
+
+impl Default for ReceiverPrefs {
+    fn default() -> Self {
+        Self {
+            muted_everywhere: HashSet::new(),
+            muted_in: HashSet::new(),
+            gain: HashMap::new(),
+            blocked: HashSet::new(),
+            blocked_by: HashSet::new(),
+            focus: None,
+            unfocused_gain: DEFAULT_UNFOCUSED_GAIN,
+        }
+    }
 }
 
 impl ReceiverPrefs {
+    pub fn with_unfocused_gain(unfocused_gain: f32) -> Self {
+        Self {
+            unfocused_gain: clamp_unit_gain(unfocused_gain, DEFAULT_UNFOCUSED_GAIN),
+            ..Self::default()
+        }
+    }
+
     /// Gain multiplier applied to audio from `sender` in `channel`, or `None` when it must be
     /// dropped for this receiver.
     pub fn gain_for(&self, sender: &UserId, channel: &ChannelId) -> Option<f32> {
@@ -36,7 +67,24 @@ impl ReceiverPrefs {
         {
             return None;
         }
-        Some(self.gain.get(sender).copied().unwrap_or(1.0))
+        let sender_gain = self.gain.get(sender).copied().unwrap_or(1.0);
+        Some(sender_gain * self.focus_gain(channel))
+    }
+
+    /// `1.0` for the focused channel (or when nothing is focused), `unfocused_gain` otherwise.
+    pub fn focus_gain(&self, channel: &ChannelId) -> f32 {
+        match self.focus {
+            Some(focused) if focused != *channel => self.unfocused_gain,
+            _ => 1.0,
+        }
+    }
+
+    pub fn set_focus(&mut self, channel: Option<ChannelId>) {
+        self.focus = channel;
+    }
+
+    pub fn focus(&self) -> Option<ChannelId> {
+        self.focus
     }
 
     pub fn set_muted(&mut self, sender: UserId, channel: Option<ChannelId>, muted: bool) {
@@ -125,6 +173,14 @@ impl ReceiverPrefs {
     }
 }
 
+fn clamp_unit_gain(gain: f32, fallback: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
 /// How a participant's media reaches the SFU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -152,6 +208,8 @@ pub struct MediaSession {
     pub is_server_muted: AtomicBool,
     pub is_speaking: AtomicBool,
     pub prefs: RwLock<ReceiverPrefs>,
+    /// Which joined channels receive this session's uplink (`All` by default).
+    pub transmission: RwLock<TransmissionMode>,
     pub sequence: AtomicU32,
     /// Sequence counter for server-originated packets addressed to this session
     /// (acks, commands); keeps their encryption IVs unique under the session key.
@@ -203,6 +261,7 @@ impl MediaSession {
             is_server_muted: AtomicBool::new(false),
             is_speaking: AtomicBool::new(false),
             prefs: RwLock::new(ReceiverPrefs::default()),
+            transmission: RwLock::new(TransmissionMode::All),
             sequence: AtomicU32::new(0),
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
@@ -278,6 +337,66 @@ impl MediaSession {
     pub fn leave_channel(&self, channel_id: &ChannelId) {
         let mut channels = self.channels.write();
         channels.retain(|c| c != channel_id);
+    }
+
+    /// Drops routing state that referenced `channel_id`: a `Single` transmission targeting it
+    /// falls back to `None` (nothing is sent to a channel the client did not choose) and focus
+    /// on it is cleared. Returns `(transmission_changed, focus_changed)`.
+    pub fn forget_channel(&self, channel_id: &ChannelId) -> (bool, bool) {
+        let mut transmission = self.transmission.write();
+        let transmission_changed = matches!(
+            *transmission,
+            TransmissionMode::Single { channel_id: target } if target == *channel_id
+        );
+        if transmission_changed {
+            *transmission = TransmissionMode::None;
+        }
+        drop(transmission);
+        let mut prefs = self.prefs.write();
+        let focus_changed = prefs.focus() == Some(*channel_id);
+        if focus_changed {
+            prefs.set_focus(None);
+        }
+        (transmission_changed, focus_changed)
+    }
+
+    pub fn transmission(&self) -> TransmissionMode {
+        *self.transmission.read()
+    }
+
+    /// Sets the transmission mode; `Single` must name a channel this session is joined to.
+    pub fn set_transmission(&self, mode: TransmissionMode) -> Result<(), AurixError> {
+        if let TransmissionMode::Single { channel_id } = &mode {
+            if !self.is_in_channel(channel_id) {
+                return Err(AurixError::ChannelNotFound(
+                    "transmission target is not a joined channel".into(),
+                ));
+            }
+        }
+        *self.transmission.write() = mode;
+        Ok(())
+    }
+
+    /// True when this session's uplink may be forwarded into `channel_id`.
+    pub fn transmits_to(&self, channel_id: &ChannelId) -> bool {
+        self.transmission.read().allows(channel_id)
+    }
+
+    /// Focuses a joined channel (others are attenuated) or clears focus with `None`.
+    pub fn set_focus(&self, channel_id: Option<ChannelId>) -> Result<(), AurixError> {
+        if let Some(channel_id) = &channel_id {
+            if !self.is_in_channel(channel_id) {
+                return Err(AurixError::ChannelNotFound(
+                    "focus target is not a joined channel".into(),
+                ));
+            }
+        }
+        self.prefs.write().set_focus(channel_id);
+        Ok(())
+    }
+
+    pub fn focus(&self) -> Option<ChannelId> {
+        self.prefs.read().focus()
     }
 
     pub fn is_in_channel(&self, channel_id: &ChannelId) -> bool {
@@ -546,5 +665,75 @@ mod tests {
         assert_eq!(p.gain_for(&alice, &team), Some(0.5));
         assert_eq!(p.gain_for(&bob, &team), None);
         assert_eq!(p.blocked_users(), vec![bob]);
+    }
+
+    #[test]
+    fn focus_attenuates_other_channels_and_stacks_with_sender_gain() {
+        let mut p = ReceiverPrefs::with_unfocused_gain(0.25);
+        let alice = UserId::new();
+        let (team, party) = (ChannelId::new(), ChannelId::new());
+        assert_eq!(p.gain_for(&alice, &team), Some(1.0));
+
+        p.set_focus(Some(team));
+        assert_eq!(p.gain_for(&alice, &team), Some(1.0));
+        assert_eq!(p.gain_for(&alice, &party), Some(0.25));
+        p.set_gain(alice, 2.0);
+        assert_eq!(p.gain_for(&alice, &party), Some(0.5));
+        // Mutes and blocks still win over focus.
+        p.set_muted(alice, Some(team), true);
+        assert_eq!(p.gain_for(&alice, &team), None);
+
+        p.set_focus(None);
+        assert_eq!(p.gain_for(&alice, &party), Some(2.0));
+
+        // Out-of-range or NaN gains fall back to safe values.
+        assert_eq!(
+            ReceiverPrefs::with_unfocused_gain(f32::NAN).focus_gain(&team),
+            1.0
+        );
+        let mut clamped = ReceiverPrefs::with_unfocused_gain(7.0);
+        clamped.set_focus(Some(team));
+        assert_eq!(clamped.focus_gain(&party), 1.0);
+        let mut zero = ReceiverPrefs::with_unfocused_gain(-3.0);
+        zero.set_focus(Some(team));
+        assert_eq!(zero.focus_gain(&party), 0.0);
+    }
+
+    #[test]
+    fn transmission_and_focus_require_membership_and_reset_on_leave() {
+        let s = session();
+        let (team, party) = (ChannelId::new(), ChannelId::new());
+        assert_eq!(s.transmission(), TransmissionMode::All);
+        assert!(s.transmits_to(&team));
+
+        assert!(s
+            .set_transmission(TransmissionMode::Single { channel_id: team })
+            .is_err());
+        assert!(s.set_focus(Some(team)).is_err());
+
+        s.join_channel(team);
+        s.join_channel(party);
+        s.set_transmission(TransmissionMode::Single { channel_id: team })
+            .unwrap();
+        assert!(s.transmits_to(&team) && !s.transmits_to(&party));
+        s.set_focus(Some(team)).unwrap();
+        assert_eq!(s.focus(), Some(team));
+
+        // Leaving an unrelated channel changes nothing.
+        s.leave_channel(&party);
+        assert_eq!(s.forget_channel(&party), (false, false));
+        assert_eq!(
+            s.transmission(),
+            TransmissionMode::Single { channel_id: team }
+        );
+
+        s.leave_channel(&team);
+        assert_eq!(s.forget_channel(&team), (true, true));
+        assert_eq!(s.transmission(), TransmissionMode::None);
+        assert!(s.focus().is_none());
+        assert!(!s.transmits_to(&party));
+
+        s.set_transmission(TransmissionMode::All).unwrap();
+        assert!(s.transmits_to(&party));
     }
 }

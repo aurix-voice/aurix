@@ -51,6 +51,16 @@ namespace Aurix.Demo
             if (Get(opt, "scenario", "audio") == "reconnect") return await ReconnectScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "chat") return await ChatScenario(ws, channelId, tokenA, tokenB);
+            if (Get(opt, "scenario", "audio") == "transmission")
+            {
+                if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the transmission scenario needs --api-key (second channel + multi-channel tokens)"); return 2; }
+                using var http = new HttpClient { BaseAddress = new Uri(api) };
+                http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                var party = MiniJson.GetString(MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/channels", new Dictionary<string, object> { { "name", "csharp-demo-party" } }))), "id");
+                var multiA = await IssueToken(http, new[] { channel, party }, "alice");
+                var multiB = await IssueToken(http, new[] { channel, party }, "bob");
+                return await TransmissionScenario(ws, channelId, Guid.Parse(party), multiA, multiB);
+            }
 
             var log = new List<string>();
             var alice = new AurixVoiceClient(ws, tokenA);
@@ -240,6 +250,112 @@ namespace Aurix.Demo
             await pump; await pump2;
             await alice.DisconnectAsync();
             await bob2.DisconnectAsync();
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Multi-channel: alice and bob are in `team` and `party`. Alice's <c>TransmitOpusFrame</c> reaches
+        /// both, only `team` under <c>Single(team)</c> and nobody under <c>None</c> (the server drops frames the
+        /// client still sends by hash). Bob's focus attenuates the other channel; leaving the focused / target
+        /// channel resets both, and the state survives a fresh join order (deferred until the channel is joined).
+        /// </summary>
+        private static async Task<int> TransmissionScenario(string ws, Guid team, Guid party, string tokenA, string tokenB)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA);
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            var txEvents = new List<TransmissionMode>();
+            var focusEvents = new List<Guid?>();
+            alice.OnTransmissionChanged += m => { lock (txEvents) txEvents.Add(m); };
+            bob.OnChannelFocusChanged += c => { lock (focusEvents) focusEvents.Add(c); };
+
+            // Set before connecting: `Single(party)` must wait for the party join, `All`-default is untouched.
+            await alice.TransmitToChannelAsync(party);
+            await alice.ConnectAsync();
+            await bob.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            await alice.JoinChannelAsync(team);
+            await bob.JoinChannelAsync(team);
+            await bob.JoinChannelAsync(party);
+            var teamHash = AurixVoiceClient.ChannelHash(team);
+            var partyHash = AurixVoiceClient.ChannelHash(party);
+            var opus = new byte[] { 0xf8, 0xff, 0xfe };
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+
+            // Streams 25 frames via TransmitOpusFrame and counts what bob got per channel (+ the party gain byte).
+            async Task<(int team, int party, float partyVolume, int sentTo)> Probe()
+            {
+                await Task.Delay(250);
+                while (bob.TryDequeueAudio(out _)) { }
+                int sent = 0;
+                for (int i = 0; i < 25; i++) { sent = alice.TransmitOpusFrame(opus); await Task.Delay(20); }
+                await Task.Delay(300);
+                int t = 0, p = 0; float vol = 1f;
+                while (bob.TryDequeueAudio(out var inc))
+                {
+                    if (inc.ChannelHash == teamHash) t++;
+                    else if (inc.ChannelHash == partyHash) { p++; vol = inc.Volume; }
+                }
+                return (t, p, vol, sent);
+            }
+
+            // Alice is in `team` only, mode `Single(party)` is pending (party not joined): nothing goes out.
+            var pending = await Probe();
+            Check(alice.Transmission == TransmissionMode.Single(party) && pending.sentTo == 0 && pending.team == 0,
+                $"single(party) before joining party: no frames sent ({pending.sentTo} targets, team {pending.team})");
+            lock (txEvents) Check(txEvents.Count == 0, "no server round-trip yet for a target that is not joined");
+
+            await alice.JoinChannelAsync(party);
+            await Task.Delay(300);
+            lock (txEvents) Check(txEvents.Count == 1 && txEvents[0] == TransmissionMode.Single(party), "single(party) sent with the party join and acked");
+            var single = await Probe();
+            Check(single.sentTo == 1 && single.team == 0 && single.party >= 20, $"single(party): team {single.team}, party {single.party} pkts");
+
+            await alice.SetTransmissionAsync(TransmissionMode.All);
+            var all = await Probe();
+            Check(all.sentTo == 2 && all.team >= 20 && all.party >= 20 && Math.Abs(all.partyVolume - 1f) < 1e-3,
+                $"all: team {all.team}, party {all.party} pkts, party gain {all.partyVolume}");
+
+            await alice.SetTransmissionAsync(TransmissionMode.None);
+            var none = await Probe();
+            Check(none.sentTo == 0 && none.team == 0 && none.party == 0, $"none: team {none.team}, party {none.party} pkts");
+            // Frames addressed by hash while `None` are dropped locally too.
+            alice.SendOpusFrame(teamHash, opus);
+            await Task.Delay(300);
+            Check(!bob.TryDequeueAudio(out _), "SendOpusFrame honours the mode locally");
+            await alice.SetTransmissionAsync(TransmissionMode.All);
+
+            // Receiver focus at bob: team at unity, party attenuated (server default gain 0.5).
+            await bob.SetChannelFocusAsync(team);
+            await Task.Delay(300);
+            lock (focusEvents) Check(focusEvents.Count == 1 && focusEvents[0] == team, "focus(team) acked");
+            var focused = await Probe();
+            Check(focused.team >= 20 && focused.party >= 20 && focused.partyVolume < 0.99f,
+                $"focus(team): party gain byte decodes to {focused.partyVolume}");
+            Check(alice.FocusChannel == null, "focus is receiver-local: alice's own focus untouched");
+
+            // Leaving resets: alice's `Single(team)` -> None, bob's focus(team) -> null, both via server events.
+            await alice.TransmitToChannelAsync(team);
+            await Task.Delay(300);
+            await alice.LeaveChannelAsync(team);
+            await bob.LeaveChannelAsync(team);
+            await Task.Delay(400);
+            Check(alice.Transmission == TransmissionMode.None, $"leaving the single target resets transmission to {alice.Transmission}");
+            Check(bob.FocusChannel == null, "leaving the focused channel clears the focus");
+            lock (focusEvents) Check(focusEvents.Count == 2 && focusEvents[1] == null, "focus reset delivered as ChannelFocusChanged{null}");
+            var afterLeave = await Probe();
+            Check(afterLeave.sentTo == 0 && afterLeave.party == 0, $"after the reset nothing is transmitted ({afterLeave.party} party pkts)");
+
+            cts.Cancel();
+            await pump;
+            await alice.DisconnectAsync();
+            await bob.DisconnectAsync();
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }
@@ -486,12 +602,17 @@ namespace Aurix.Demo
 
         private static void Add(List<string> log, string s) { lock (log) log.Add(s); }
 
-        private static async Task<string> IssueToken(HttpClient http, string channel, string name)
+        private static Task<string> IssueToken(HttpClient http, string channel, string name) => IssueToken(http, new[] { channel }, name);
+
+        private static async Task<string> IssueToken(HttpClient http, string[] channels, string name)
         {
+            var grants = new List<object>();
+            foreach (var channel in channels)
+                grants.Add(new Dictionary<string, object> { { "channel_id", channel }, { "join", true }, { "speak", true }, { "receive", true } });
             var body = new Dictionary<string, object>
             {
                 { "external_id", "csharp-" + name }, { "display_name", name },
-                { "channels", new List<object> { new Dictionary<string, object> { { "channel_id", channel }, { "join", true }, { "speak", true }, { "receive", true } } } },
+                { "channels", grants },
             };
             return MiniJson.GetString(MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/tokens", body))), "token");
         }
