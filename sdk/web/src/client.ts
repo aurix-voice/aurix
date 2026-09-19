@@ -42,6 +42,18 @@ import {
   type NetworkQuality,
   type RtcStatsInput,
 } from './quality.js';
+import {
+  applyOpusSenderPreferences,
+  audioPoliciesEqual,
+  mergeAllAudioPolicies,
+  negotiatedOpusPreferences,
+  parseAudioPolicy,
+  resolveOpusSenderPreferences,
+  senderPreferencesEqual,
+  type AudioPolicy,
+  type OpusBrowserOptions,
+  type OpusSenderPreferences,
+} from './opus.js';
 
 export interface AurixClientOptions {
   /** REST base URL, e.g. `https://voice.example.com` (used for TURN credentials). */
@@ -84,6 +96,12 @@ export interface AurixClientOptions {
   inputDeviceId?: string;
   /** Software microphone gain `0..4` (`1` = unity, default). Needs Web Audio; see `setInputGain`. */
   inputGain?: number;
+  /**
+   * Opus preferences for the uplink. Browsers expose only bitrate (live), FEC, DTX, bandwidth
+   * and CBR (at negotiation); complexity/signal/VBR are the browser's own. By default the
+   * server's channel audio policy drives all of them — see `opus.ts` for the mapping.
+   */
+  opus?: OpusBrowserOptions;
   /**
    * Meter the local microphone with Web Audio and emit `localEnergy` / `localSpeaking`
    * (default `true`). Pass an object to tune the VAD, `false` to disable.
@@ -288,7 +306,17 @@ export interface AurixEvents {
   positions: (channelId: string, positions: UserPosition[]) => void;
   /** `live` — a real-time stream to an operator service rather than a stored file; same consent flow. */
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string, live: boolean) => void;
-  bitrate: (targetKbps: number, reason: string) => void;
+  /**
+   * Adaptive-bitrate command from the server (applied by the SDK as the sender's `maxBitrate`,
+   * bounded by the channel policy). `expectedLossPercent` is the loss estimate that triggered it.
+   */
+  bitrate: (targetKbps: number, reason: string, expectedLossPercent: number) => void;
+  /**
+   * Merged audio policy of the joined channels changed (join, leave, operator edit). The
+   * bitrate part is applied live; FEC/DTX/bandwidth apply at the next media negotiation —
+   * compare `negotiatedOpus` with `opusPreferences` and call `renegotiateMedia()` if it matters.
+   */
+  audioPolicy: (policy: AudioPolicy) => void;
   /**
    * Server-side view of this connection (downlink from our reports + uplink as measured by
    * the SFU): sent when the 1–5 `bars` change and periodically as a summary.
@@ -522,6 +550,14 @@ export class AurixClient {
   private wantTranscripts = true;
   /** Channels the server transcribes (from `ChannelJoinAck`). */
   private transcribedChannels = new Set<string>();
+  /** channel id → its audio policy (from `ChannelJoinAck.audio` / `ChannelAudioPolicy`). */
+  private channelPolicies = new Map<string, AudioPolicy>();
+  /** Merge of `channelPolicies`; kept after the last channel is left. */
+  private audioPolicyValue: AudioPolicy | undefined;
+  /** Last server `BitrateCommand` (bit/s); cleared when the policy or options change. */
+  private transientBitrateBps: number | undefined;
+  /** Sender preferences last pushed through `setParameters`. */
+  private appliedSenderPrefs: OpusSenderPreferences | undefined;
   private pendingAnswer: Pending<string> | undefined;
   private pendingInit: Pending<SessionInfo> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
@@ -630,6 +666,57 @@ export class AurixClient {
   /** Last snapshot taken by `getStats()` (also refreshed by the periodic quality report). */
   get lastStats(): ClientStats | undefined {
     return this.statsSnapshot;
+  }
+
+  /**
+   * Merged audio policy of the channels this session is in (widest bitrate/bandwidth, FEC if
+   * any wants it, DTX only if all allow it), or `undefined` before the first `ChannelJoinAck`.
+   */
+  get audioPolicy(): AudioPolicy | undefined {
+    return this.audioPolicyValue;
+  }
+
+  /** Policy of one joined channel, as sent by the server. */
+  channelAudioPolicy(channelId: string): AudioPolicy | undefined {
+    return this.channelPolicies.get(channelId);
+  }
+
+  /**
+   * What the SDK currently wants from the browser's Opus encoder: `opus` options over the
+   * merged channel policy, bitrate further capped by the last server `BitrateCommand`.
+   */
+  get opusPreferences(): OpusSenderPreferences {
+    return resolveOpusSenderPreferences(this.opts.opus, this.audioPolicyValue, this.transientBitrateBps);
+  }
+
+  /**
+   * Opus `fmtp` parameters of the current remote description — what the browser's encoder was
+   * actually told at the last negotiation (`{}` without media).
+   */
+  get negotiatedOpus(): OpusSenderPreferences {
+    return negotiatedOpusPreferences(this.pc?.remoteDescription?.sdp);
+  }
+
+  /**
+   * Change the local Opus preferences at runtime. The bitrate ceiling is applied immediately;
+   * FEC/DTX/bandwidth/CBR need `renegotiateMedia()` (or the next reconnect).
+   */
+  setOpusOptions(opus: OpusBrowserOptions | undefined): void {
+    if (opus) this.opts.opus = opus;
+    else delete this.opts.opus;
+    this.transientBitrateBps = undefined;
+    void this.applySenderPreferences();
+  }
+
+  /**
+   * Negotiate a fresh media transport for the same session so that Opus `fmtp` preferences
+   * (FEC/DTX/bandwidth/CBR) take effect. Audio is interrupted for roughly one ICE round trip;
+   * channels, mutes and preferences are untouched.
+   */
+  async renegotiateMedia(): Promise<void> {
+    this.requireOpen();
+    if (!this.session) throw new Error('no session');
+    await this.restoreMedia(false);
   }
 
   participants(channelId: string): Participant[] {
@@ -1092,6 +1179,9 @@ export class AurixClient {
     }
     this.speechDone.clear();
     this.transcribedChannels.clear();
+    this.channelPolicies.clear();
+    this.transientBitrateBps = undefined;
+    this.appliedSenderPrefs = undefined;
     this.rejectPending(this.pendingAnswer, reason);
     this.pendingAnswer = undefined;
     this.rejectPending(this.pendingInit, reason);
@@ -1150,6 +1240,7 @@ export class AurixClient {
     this.typingSentAt.delete(channelId);
     this.transcribedChannels.delete(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
+    if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
   }
 
   /** Whether the server transcribes `channelId` (speech-to-text is enabled for it). */
@@ -1491,6 +1582,8 @@ export class AurixClient {
       for (const channelId of wanted) {
         if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
       }
+      this.channelPolicies.clear();
+      this.transientBitrateBps = undefined;
       this.replayReceiverPrefs();
     }
     this.setState('connected');
@@ -1695,6 +1788,8 @@ export class AurixClient {
         this.channels.set(d.channel_id, roster);
         if (d.transcription) this.transcribedChannels.add(d.channel_id);
         else this.transcribedChannels.delete(d.channel_id);
+        this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
+        this.refreshAudioPolicy();
         const list = Array.from(roster.values());
         const pending = this.pendingJoins.get(d.channel_id);
         if (pending) {
@@ -1774,13 +1869,22 @@ export class AurixClient {
       }
       case 'BitrateCommand': {
         const d = (msg as Extract<ServerMessage, { type: 'BitrateCommand' }>).data;
-        void this.applyBitrate(d.target_bitrate_kbps);
-        this.emit('bitrate', d.target_bitrate_kbps, d.reason);
+        this.transientBitrateBps = d.target_bitrate_kbps * 1000;
+        void this.applySenderPreferences();
+        this.emit('bitrate', d.target_bitrate_kbps, d.reason, d.expected_loss_percent ?? 0);
+        return;
+      }
+      case 'ChannelAudioPolicy': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChannelAudioPolicy' }>).data;
+        if (!this.channels.has(d.channel_id)) return;
+        this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
+        this.refreshAudioPolicy();
         return;
       }
       case 'Kick': {
         const d = (msg as Extract<ServerMessage, { type: 'Kick' }>).data;
         if (this.channels.delete(d.channel_id)) this.emit('channelLeft', d.channel_id);
+        if (this.channelPolicies.delete(d.channel_id)) this.refreshAudioPolicy();
         this.emit('kicked', d.channel_id, d.reason);
         return;
       }
@@ -2069,7 +2173,13 @@ export class AurixClient {
     if (!localSdp) throw new Error('missing local description');
 
     const answerSdp = await this.requestAnswer(localSdp);
-    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    // RFC 7587: the fmtp of the description we *receive* states what the browser should send.
+    await pc.setRemoteDescription({
+      type: 'answer',
+      sdp: applyOpusSenderPreferences(answerSdp, this.opusPreferences),
+    });
+    this.appliedSenderPrefs = undefined;
+    await this.applySenderPreferences(pc);
   }
 
   private requestAnswer(sdp: string): Promise<string> {
@@ -2100,15 +2210,36 @@ export class AurixClient {
     });
   }
 
-  private async applyBitrate(kbps: number): Promise<void> {
-    const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'audio');
+  /** Recompute the merged policy after a join/leave/policy update; apply and announce on change. */
+  private refreshAudioPolicy(): void {
+    if (this.channelPolicies.size === 0) return;
+    const merged = mergeAllAudioPolicies(this.channelPolicies.values());
+    if (audioPoliciesEqual(this.audioPolicyValue, merged)) return;
+    this.audioPolicyValue = merged;
+    this.transientBitrateBps = undefined;
+    void this.applySenderPreferences();
+    this.emit('audioPolicy', merged);
+  }
+
+  /**
+   * Push the live part of the preferences (the bitrate ceiling) through `setParameters`. The
+   * browser's congestion control still adapts underneath it.
+   */
+  private async applySenderPreferences(pc: RTCPeerConnection | undefined = this.pc): Promise<void> {
+    const prefs = this.opusPreferences;
+    if (this.appliedSenderPrefs && senderPreferencesEqual(this.appliedSenderPrefs, prefs)) return;
+    const sender = pc?.getSenders().find((s) => s.track?.kind === 'audio');
     if (!sender) return;
     const params = sender.getParameters();
     if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
     const first = params.encodings[0];
-    if (first) first.maxBitrate = kbps * 1000;
+    if (first) {
+      if (prefs.maxBitrateBps !== undefined) first.maxBitrate = prefs.maxBitrateBps;
+      else delete first.maxBitrate;
+    }
     try {
       await sender.setParameters(params);
+      this.appliedSenderPrefs = prefs;
     } catch (e) {
       this.emit('error', e instanceof Error ? e : new Error(String(e)));
     }

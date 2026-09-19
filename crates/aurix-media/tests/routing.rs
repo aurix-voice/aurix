@@ -376,6 +376,96 @@ async fn cross_app_sessions_cannot_join_channel() {
         .is_err());
 }
 
+/// Operator edits to a live channel reach the sessions in it, are tenant-scoped, cannot
+/// change the channel type, and the per-sender policy is the merge over joined channels.
+#[tokio::test]
+async fn channel_config_updates_apply_live_and_merge_per_sender() {
+    let (sfu, _addr) = start_sfu().await;
+    let app = AppId::new();
+    let voice = ChannelId::new();
+    let music = ChannelId::new();
+    let s1 = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s2 = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let voice_cfg = ChannelConfig {
+        bitrate: 24_000,
+        min_bitrate: 8_000,
+        max_bandwidth: OpusBandwidth::Wideband,
+        complexity: Some(5),
+        ..ChannelConfig::default()
+    };
+    for s in [&s1, &s2] {
+        sfu.join_channel(
+            &s.session_id,
+            voice,
+            voice_cfg.clone(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let music_cfg = ChannelConfig {
+        bitrate: 96_000,
+        min_bitrate: 32_000,
+        enable_dtx: false,
+        audio_profile: AudioProfile::Music,
+        channel_type: ChannelType::Echo,
+        ..ChannelConfig::default()
+    };
+    sfu.join_channel(
+        &s1.session_id,
+        music,
+        music_cfg.clone(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+
+    let p1 = sfu.session_audio_policy(&s1);
+    assert_eq!(p1, voice_cfg.audio_policy().merge(music_cfg.audio_policy()));
+    assert_eq!((p1.bitrate_bps, p1.signal), (96_000, OpusSignal::Music));
+    assert_eq!(sfu.session_audio_policy(&s2), voice_cfg.audio_policy());
+
+    // Operator lowers the voice channel and tries to flip its type: sessions in the channel
+    // are returned for notification, the type stays.
+    let mut edited = voice_cfg.clone();
+    edited.bitrate = 16_000;
+    edited.min_bitrate = 6_000;
+    edited.channel_type = ChannelType::Positional;
+    let affected = sfu
+        .update_channel_config(&voice, &app, edited.clone())
+        .expect("channel is live on this node");
+    let ids: std::collections::HashSet<_> = affected.iter().map(|s| s.session_id).collect();
+    assert_eq!(ids, [s1.session_id, s2.session_id].into_iter().collect());
+    let live = sfu.get_channel(&voice).unwrap();
+    assert_eq!(live.config().bitrate, 16_000);
+    assert_eq!(live.config().channel_type, ChannelType::Team);
+    assert_eq!(live.channel_type, ChannelType::Team);
+    assert_eq!(sfu.session_audio_policy(&s2).bitrate_bps, 16_000);
+    assert_eq!(
+        sfu.session_audio_policy(&s1).bitrate_bps,
+        96_000,
+        "music channel still dominates s1's uplink"
+    );
+
+    // Another tenant cannot touch it; an unknown channel is not live.
+    assert!(sfu
+        .update_channel_config(&voice, &AppId::new(), edited.clone())
+        .is_none());
+    assert_eq!(sfu.get_channel(&voice).unwrap().config().bitrate, 16_000);
+    assert!(sfu
+        .update_channel_config(&ChannelId::new(), &app, edited)
+        .is_none());
+
+    // Leaving the music channel drops s1 back to the (edited) voice policy.
+    sfu.leave_channel(&s1.session_id, &music).unwrap();
+    assert_eq!(
+        sfu.session_audio_policy(&s1),
+        sfu.get_channel(&voice).unwrap().audio_policy()
+    );
+}
+
 /// Echo channel (microphone test): each participant's frames come straight back to them,
 /// sealed like any downlink, and nobody else in the channel hears them.
 #[tokio::test]

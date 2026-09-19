@@ -1,3 +1,4 @@
+use crate::audio::EncoderSettings;
 use std::time::Duration;
 
 /// Exponential backoff for automatic reconnects.
@@ -48,8 +49,13 @@ pub struct ClientConfig {
     pub ping_interval: Duration,
     /// Media heartbeat (NAT keepalive + RTT probe).
     pub heartbeat_interval: Duration,
-    /// Uplink Opus bitrate.
-    pub bitrate_bps: u32,
+    /// Uplink Opus encoder before any channel policy applies (bitrate, complexity, bandwidth,
+    /// VBR/FEC/DTX).
+    pub encoder: EncoderSettings,
+    /// Adopt each joined channel's `AudioPolicy` (bitrate, FEC/DTX, bandwidth, signal and the
+    /// complexity hint unless pinned with `Client::set_complexity`). Off: the policy is only
+    /// reported through `Event::AudioPolicyChanged`; server bitrate commands still apply.
+    pub follow_channel_policy: bool,
     /// Frames buffered before a sender's playout starts (2 ≈ 40 ms).
     pub jitter_target_frames: usize,
     /// Hard cap of buffered frames per sender.
@@ -71,7 +77,8 @@ impl ClientConfig {
             request_timeout: Duration::from_secs(10),
             ping_interval: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(5),
-            bitrate_bps: 32_000,
+            encoder: EncoderSettings::default(),
+            follow_channel_policy: true,
             jitter_target_frames: 2,
             jitter_max_frames: 12,
             vad_gate: false,

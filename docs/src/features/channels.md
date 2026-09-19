@@ -27,9 +27,12 @@ action token decides them at join time.
     "max_participants": 256,
     "codec": "opus",
     "bitrate": 48000,
+    "min_bitrate": 12000,
     "sample_rate": 48000,
     "enable_dtx": true,
     "enable_fec": true,
+    "max_bandwidth": "fullband",
+    "complexity": null,
     "audio_profile": "voice",
     "recording_enabled": false,
     "transcription": false,
@@ -45,13 +48,25 @@ action token decides them at join time.
 }
 ```
 
-* `bitrate` is the encoder target the SDKs start from; when a client's `QualityReport` shows
-  more than 10 % loss or 50 ms jitter the server sends `BitrateCommand` (32 kbps, or 16 kbps
-  above 20 % loss) and the client's encoder follows (see [quality](quality.md)).
-* `enable_dtx` / `enable_fec` and `audio_profile` (`voice`, `music`, `broadcast`,
-  `low_bandwidth`) are encoder hints stored with the channel for your backend and tooling
-  (`GET /v1/channels/{id}`); the server forwards native frames without transcoding, so the
-  client's encoder settings are what actually go on the wire.
+* The Opus fields form the channel's **audio policy** — what everyone sending into the channel
+  encodes with. `bitrate` is the uplink target and the ceiling server-driven adaptation returns
+  to, `min_bitrate` its floor (`6000 ≤ min_bitrate ≤ bitrate ≤ media.max_bitrate`), `enable_fec`
+  requires in-band FEC, `enable_dtx` allows silence suppression, `max_bandwidth`
+  (`narrowband` 4 kHz … `fullband` 20 kHz) caps the encoded band, `complexity` (`0..=10`,
+  `null` = client default) is a CPU/quality hint and `audio_profile` (`voice`, `music`,
+  `broadcast`, `low_bandwidth`) selects the encoder's signal mode (`music` → `OPUS_SIGNAL_MUSIC`,
+  `broadcast` → auto, otherwise voice). Invalid combinations are rejected with `400`.
+* The policy is delivered to participants as `ChannelJoinAck.audio` and, when an operator edits
+  the channel, as `ChannelAudioPolicy` to everyone in it on every node (`channel.config_updated`
+  event for your backend). A session in several channels applies the **merge**: the highest
+  target/floor bitrate and widest bandwidth, FEC if any channel wants it, DTX only if all allow
+  it, the highest complexity hint, `music` over `voice` over auto. The server forwards native
+  frames without transcoding, so the client's encoder is what actually goes on the wire;
+  native/Unity/Unreal clients apply the policy to libopus (or Concentus) directly and browsers
+  apply the WebRTC-controllable part (see [quality](quality.md) and the SDK chapters).
+* When a client's `QualityReport` shows more than 10 % loss or 50 ms jitter the server sends
+  `BitrateCommand` (32 kbit/s, 16 kbit/s above 20 % loss, clamped to
+  `min_bitrate..=bitrate` of the merged policy) and lifts it again when the link recovers.
 * `recording_enabled` allows `POST /v1/recordings/start` for the channel; `transcription`
   turns on STT (when the node has an `[stt]` provider).
 * `positional_config`: attenuation is 1.0 up to `near_distance`, follows `rolloff`

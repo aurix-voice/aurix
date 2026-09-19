@@ -226,6 +226,9 @@ pub struct MediaSession {
     pub energy_reported: AtomicU8,
     pub last_heartbeat: RwLock<DateTime<Utc>>,
     pub quality: RwLock<QualityMetrics>,
+    /// Uplink bitrate (kbit/s) the server last asked this client to use via `BitrateCommand`;
+    /// `0` while the client is at the channel policy's target.
+    pub commanded_bitrate_kbps: AtomicU32,
     /// Server-measured uplink (fed by the router) and the latest merged report sent to the
     /// client / shown to operators.
     pub uplink: Mutex<UplinkEstimator>,
@@ -283,6 +286,7 @@ impl MediaSession {
                 bitrate_kbps: 0,
                 mos_score: 4.5,
             }),
+            commanded_bitrate_kbps: AtomicU32::new(0),
             uplink: Mutex::new(UplinkEstimator::default()),
             network_quality: RwLock::new(None),
             created_at: Utc::now(),

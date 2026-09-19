@@ -18,7 +18,8 @@ use aurix_common::protocol::{
     TransmissionMode, UserPosition,
 };
 use aurix_common::types::{
-    ChannelId, Direction, Orientation3D, Position3D, RecordingConsent, SessionId, UserId,
+    AudioPolicy, ChannelId, Direction, OpusBandwidth, OpusSignal, Orientation3D, Position3D,
+    RecordingConsent, SessionId, UserId,
 };
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use base64::Engine;
@@ -6106,6 +6107,233 @@ async fn network_quality_bars_bitrate_adaptation_and_session_stats() {
     }
 
     for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::ChannelLeave { channel_id }).await;
+    }
+}
+
+// ── Channel audio policy ──
+
+fn expect_bitrate(m: ControlMessage) -> (u32, u8) {
+    match m {
+        ControlMessage::BitrateCommand {
+            target_bitrate_kbps,
+            expected_loss_percent,
+            ..
+        } => (target_bitrate_kbps, expected_loss_percent),
+        other => panic!("expected BitrateCommand, got {other:?}"),
+    }
+}
+
+async fn expect_audio_policy(p: &mut Player, channel_id: ChannelId) -> AudioPolicy {
+    let m = expect_within(p, "ChannelAudioPolicy", Duration::from_secs(5), |m| {
+        matches!(m, ControlMessage::ChannelAudioPolicy { channel_id: c, .. } if *c == channel_id)
+    })
+    .await;
+    match m {
+        ControlMessage::ChannelAudioPolicy { audio, .. } => audio,
+        _ => unreachable!(),
+    }
+}
+
+/// The channel's Opus settings (bitrate, floor, FEC/DTX, bandwidth, complexity, signal) travel to
+/// clients as `ChannelJoinAck.audio`; a `PUT /v1/channels/:id` is validated against the node's
+/// media limits, then fans out live as `ChannelAudioPolicy` to every joined session on every
+/// node. Adaptive `BitrateCommand`s never go below the policy floor nor above its target, carry
+/// the reported loss, and recovery returns to the (possibly updated) target.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let http = reqwest::Client::new();
+
+    let channel_id = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "bitrate": 40000, "min_bitrate": 24000,
+            "enable_fec": false, "enable_dtx": false,
+            "max_bandwidth": "wideband", "complexity": 6,
+            "audio_profile": "music"
+        }),
+    )
+    .await;
+    let initial = AudioPolicy {
+        bitrate_bps: 40_000,
+        min_bitrate_bps: 24_000,
+        fec: false,
+        dtx: false,
+        max_bandwidth: OpusBandwidth::Wideband,
+        complexity: Some(6),
+        signal: OpusSignal::Music,
+    };
+
+    let (tok_a, _) = issue_token(&env, &http, "opus:alice", "Alice", channel_id).await;
+    let bob_env = env2.as_ref().unwrap_or(&env);
+    let (tok_b, _) = issue_token(bob_env, &http, "opus:bob", "Bob", channel_id).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(bob_env, "bob", tok_b).await;
+    if env2.is_some() {
+        assert_ne!(
+            alice.media_addr.port(),
+            bob.media_addr.port(),
+            "players must land on different nodes"
+        );
+    }
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+
+    for p in [&mut alice, &mut bob] {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: tok,
+        })
+        .await;
+        let ack = p
+            .expect("ChannelJoinAck", |m| {
+                matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id)
+            })
+            .await;
+        let ControlMessage::ChannelJoinAck { audio, .. } = ack else {
+            unreachable!()
+        };
+        assert_eq!(
+            audio, initial,
+            "{}: join ack carries the channel policy",
+            p.name
+        );
+    }
+
+    // 25 % loss would normally ask for 16 kbps; the channel floor of 24 kbps wins.
+    bob.send(&ControlMessage::QualityReport {
+        rtt_ms: 30.0,
+        jitter_ms: 5.0,
+        packet_loss: 25.0,
+    })
+    .await;
+    let cmd = expect_within(&mut bob, "BitrateCommand", Duration::from_secs(5), |m| {
+        matches!(m, ControlMessage::BitrateCommand { .. })
+    })
+    .await;
+    assert_eq!(expect_bitrate(cmd), (24, 25));
+
+    // Out-of-range settings are rejected before anything is stored or broadcast.
+    for bad in [
+        serde_json::json!({"bitrate": 48000, "complexity": 11}),
+        serde_json::json!({"bitrate": 48000, "min_bitrate": 64000}),
+        serde_json::json!({"bitrate": 48000, "sample_rate": 44100}),
+        serde_json::json!({"bitrate": 1000}),
+    ] {
+        let status = http
+            .put(format!("{}/v1/channels/{channel_id}/config", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&bad)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 400, "{bad} must be rejected");
+    }
+    assert_none_matching(
+        &mut alice,
+        Duration::from_millis(500),
+        "rejected updates must not broadcast a policy",
+        |m| matches!(m, ControlMessage::ChannelAudioPolicy { .. }),
+    )
+    .await;
+
+    // A valid update reaches both nodes' sessions as ChannelAudioPolicy.
+    let updated: serde_json::Value = http
+        .put(format!("{}/v1/channels/{channel_id}/config", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "bitrate": 64000, "min_bitrate": 16000,
+            "enable_fec": true, "enable_dtx": true,
+            "max_bandwidth": "fullband",
+            "audio_profile": "voice"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["config"]["min_bitrate"], 16000, "{updated}");
+    assert_eq!(updated["config"]["max_bandwidth"], "fullband", "{updated}");
+    let expected = AudioPolicy {
+        bitrate_bps: 64_000,
+        min_bitrate_bps: 16_000,
+        fec: true,
+        dtx: true,
+        max_bandwidth: OpusBandwidth::Fullband,
+        complexity: None,
+        signal: OpusSignal::Voice,
+    };
+    assert_eq!(expect_audio_policy(&mut alice, channel_id).await, expected);
+    assert_eq!(expect_audio_policy(&mut bob, channel_id).await, expected);
+
+    // The new floor lets the same loss report go down to 16 kbps; a clean report recovers to the
+    // new 64 kbps target rather than the original 40.
+    bob.send(&ControlMessage::QualityReport {
+        rtt_ms: 30.0,
+        jitter_ms: 5.0,
+        packet_loss: 25.0,
+    })
+    .await;
+    let cmd = expect_within(
+        &mut bob,
+        "BitrateCommand(16)",
+        Duration::from_secs(5),
+        |m| matches!(m, ControlMessage::BitrateCommand { .. }),
+    )
+    .await;
+    assert_eq!(expect_bitrate(cmd), (16, 25));
+    bob.send(&ControlMessage::QualityReport {
+        rtt_ms: 30.0,
+        jitter_ms: 5.0,
+        packet_loss: 0.0,
+    })
+    .await;
+    let cmd = expect_within(
+        &mut bob,
+        "BitrateCommand(64)",
+        Duration::from_secs(5),
+        |m| matches!(m, ControlMessage::BitrateCommand { .. }),
+    )
+    .await;
+    assert_eq!(expect_bitrate(cmd), (64, 0));
+
+    // A late joiner sees the updated policy in its ack.
+    let (tok_c, _) = issue_token(&env, &http, "opus:carol", "Carol", channel_id).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    let tok = carol.token.clone();
+    carol
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: tok,
+        })
+        .await;
+    let ack = carol
+        .expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    let ControlMessage::ChannelJoinAck { audio, .. } = ack else {
+        unreachable!()
+    };
+    assert_eq!(audio, expected);
+
+    for p in [&mut alice, &mut bob, &mut carol] {
         p.send(&ControlMessage::ChannelLeave { channel_id }).await;
     }
 }

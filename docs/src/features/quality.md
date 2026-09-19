@@ -31,10 +31,15 @@ on resume); loss, R-factor, MOS and bars describe the latest period.
 
 1. Clients send `QualityReport {rtt_ms, jitter_ms, packet_loss}` (loss in percent) every report
    interval; `0` disables it.
-2. The node uses the report for the **adaptive downlink bitrate** — `BitrateCommand
-   {target_bitrate_kbps, reason}` (also a native `BitrateCommand` packet): loss > 10 % or
-   jitter > 50 ms drops the target to 32 kbit/s, loss > 20 % to 16 kbit/s and also raises a
-   `quality.alert` event with `metric: "packet_loss"`.
+2. The node uses the report for the **adaptive uplink bitrate** — `BitrateCommand
+   {target_bitrate_kbps, reason, expected_loss_percent}` (also a native `BitrateCommand`
+   packet): loss > 10 % or jitter > 50 ms drops the target to 32 kbit/s, loss > 20 % to
+   16 kbit/s (and raises a `quality.alert` event with `metric: "packet_loss"`); loss ≤ 2 % with
+   jitter ≤ 20 ms returns to the channel target. Targets are clamped to the merged channel
+   policy's `min_bitrate..=bitrate` ([channels](channels.md)), a command is only sent when the
+   value changes, and `expected_loss_percent` lets libopus-based clients tune in-band FEC
+   (`OPUS_SET_PACKET_LOSS_PERC`). The command changes the running encoder, not the client's
+   configured baseline: a new policy (join/leave/edit) recomputes from the baseline.
 3. Every `media.quality_interval_ms` (2000; `0` disables, minimum 500) the node merges the
    client report with what the SFU measures on that session's **uplink** — sequence gaps (loss),
    RFC 3550 inter-arrival jitter and bitrate. The worse direction decides the rating. Sessions

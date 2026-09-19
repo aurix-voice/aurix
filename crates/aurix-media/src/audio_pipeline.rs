@@ -123,7 +123,7 @@ impl AudioAnalysisPipeline {
     /// True when packets in `channel` are worth decoding at all.
     pub fn wants_channel(&self, channel: &MediaChannel) -> bool {
         !self.content_analyzers.is_empty()
-            || (self.stt_provider.is_some() && channel.config.transcription)
+            || (self.stt_provider.is_some() && channel.config().transcription)
     }
 
     /// Feed a raw Opus packet from the router. Decodes to PCM with a stateful per-speaker
@@ -237,7 +237,7 @@ impl AudioAnalysisPipeline {
         if let Some(stt) = self
             .stt_provider
             .as_ref()
-            .filter(|_| channel.config.transcription)
+            .filter(|_| channel.config().transcription)
         {
             match Arc::clone(&self.stt_permits).try_acquire_owned() {
                 Ok(permit) => {

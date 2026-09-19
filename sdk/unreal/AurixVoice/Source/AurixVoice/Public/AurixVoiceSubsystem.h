@@ -30,6 +30,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixUserBlockChanged, FGuid, User
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixRecording, FGuid, ChannelId, FGuid, RecordingId, bool, bActive, FGuid, InitiatedBy);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixBitrateChanged, int32, BitrateBps, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixNetworkQualityChanged, const FAurixNetworkQuality&, Quality);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioPolicyChanged, const FAurixAudioPolicy&, Policy);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixKicked, FGuid, ChannelId, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixModerationApplied, int64, RequestId, FGuid, ChannelId, FGuid, UserId, EAurixModerationAction, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatMessageReceived, const FAurixChatMessage&, Message);
@@ -168,6 +169,25 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	bool SetBitrate(int32 BitrateBps);
 
+	/**
+	 * Replace the baseline Opus settings (bitrate, complexity, bandwidth, VBR/FEC/DTX). The channel
+	 * policy is laid over them while bFollowChannelPolicy is set. Takes effect from the next frame.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	bool SetEncoderSettings(const FAurixEncoderSettings& Settings);
+
+	/** Settings the encoder is running with right now (after policy and server bitrate commands). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool GetEncoderSettings(FAurixEncoderSettings& OutSettings) const;
+
+	/** Pin Opus complexity 0..10 regardless of channel hints (e.g. lower on a weak CPU); -1 unpins. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	bool SetComplexity(int32 Complexity);
+
+	/** Merged audio policy of the joined channels; false before the first join. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool GetAudioPolicy(FAurixAudioPolicy& OutPolicy) const;
+
 	// ---- playback --------------------------------------------------------------------------
 
 	/** Start the 2D playback component (automatic when bAutoStartPlayback is set). */
@@ -300,6 +320,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRecording OnRecording;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixBitrateChanged OnBitrateChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixNetworkQualityChanged OnNetworkQuality;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioPolicyChanged OnAudioPolicyChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixKicked OnKicked;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixModerationApplied OnModerationApplied;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatMessageReceived OnChatMessage;

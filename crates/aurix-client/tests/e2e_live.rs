@@ -12,8 +12,8 @@
 
 use aurix_client::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use aurix_client::events::{ConnectionState, Event};
-use aurix_client::{Client, ClientConfig};
-use aurix_common::types::{ChannelId, UserId};
+use aurix_client::{Client, ClientConfig, EncoderSettings};
+use aurix_common::types::{AudioPolicy, ChannelId, OpusBandwidth, OpusSignal, UserId};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,10 +37,21 @@ fn env() -> Option<Env> {
 }
 
 async fn create_channel(env: &Env, http: &reqwest::Client) -> ChannelId {
+    create_channel_with(env, http, serde_json::json!({})).await
+}
+
+async fn create_channel_with(
+    env: &Env,
+    http: &reqwest::Client,
+    config: serde_json::Value,
+) -> ChannelId {
     let ch: serde_json::Value = http
         .post(format!("{}/v1/channels", env.api))
         .header("x-api-key", &env.api_key)
-        .json(&serde_json::json!({"name": format!("native-e2e-{}", uuid::Uuid::now_v7())}))
+        .json(&serde_json::json!({
+            "name": format!("native-e2e-{}", uuid::Uuid::now_v7()),
+            "config": config,
+        }))
         .send()
         .await
         .unwrap()
@@ -447,4 +458,227 @@ async fn native_clients_talk_chat_resume_and_leave() {
     assert!(saw_disconnect, "no Disconnected event after disconnect()");
     bob.disconnect();
     assert_eq!(bob.state(), ConnectionState::Disconnected);
+}
+
+/// The channel's Opus policy drives the native encoder: the join ack configures libopus
+/// (bitrate/FEC/DTX/bandwidth/signal/complexity), a local complexity pin survives policy
+/// changes, a live `PUT /v1/channels/:id/config` re-applies the encoder without interrupting
+/// audio, and `follow_channel_policy = false` keeps the app's own settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_client_follows_channel_audio_policy() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "bitrate": 40000, "min_bitrate": 24000,
+            "enable_fec": false, "enable_dtx": false,
+            "max_bandwidth": "wideband", "complexity": 6,
+            "audio_profile": "music"
+        }),
+    )
+    .await;
+    let initial = AudioPolicy {
+        bitrate_bps: 40_000,
+        min_bitrate_bps: 24_000,
+        fec: false,
+        dtx: false,
+        max_bandwidth: OpusBandwidth::Wideband,
+        complexity: Some(6),
+        signal: OpusSignal::Music,
+    };
+    let (alice_token, _) = issue_token(&env, &http, "native-opus-alice", "Alice", channel).await;
+    let (bob_token, _) = issue_token(&env, &http, "native-opus-bob", "Bob", channel).await;
+
+    let alice = Client::new(ClientConfig::new(ws_with_path(&env.ws), alice_token)).unwrap();
+    let mut bob_cfg = ClientConfig::new(ws_with_path(&env.ws), bob_token);
+    bob_cfg.follow_channel_policy = false;
+    bob_cfg.encoder = EncoderSettings {
+        bitrate_bps: 20_000,
+        complexity: 4,
+        ..EncoderSettings::default()
+    };
+    let bob = Client::new(bob_cfg).unwrap();
+    let baseline = alice.encoder_settings();
+    assert_eq!(baseline, EncoderSettings::default());
+    assert_eq!(alice.audio_policy(), None);
+
+    alice.connect().unwrap();
+    bob.connect().unwrap();
+    for (c, who) in [(&alice, "alice"), (&bob, "bob")] {
+        wait_for(c, &format!("{who} media"), Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaBound)
+        })
+        .await;
+    }
+
+    // --- join applies the channel policy to Alice's encoder; Bob (opted out) keeps his own.
+    alice.join_channel(channel, None).unwrap();
+    let ev = wait_for(&alice, "alice policy", Duration::from_secs(10), |e| {
+        matches!(e, Event::AudioPolicyChanged(_))
+    })
+    .await;
+    let Event::AudioPolicyChanged(p) = ev else {
+        unreachable!()
+    };
+    assert_eq!(p, initial);
+    assert_eq!(alice.audio_policy(), Some(initial));
+    wait_for(
+        &alice,
+        "alice join",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ChannelJoined { channel_id, .. } if *channel_id == channel),
+    )
+    .await;
+    let applied = alice.encoder_settings();
+    assert_eq!(
+        (
+            applied.bitrate_bps,
+            applied.fec,
+            applied.dtx,
+            applied.max_bandwidth,
+            applied.signal,
+            applied.complexity,
+        ),
+        (
+            40_000,
+            false,
+            false,
+            OpusBandwidth::Wideband,
+            OpusSignal::Music,
+            6
+        ),
+        "{applied:?}"
+    );
+    assert_eq!(
+        (applied.vbr, applied.constrained_vbr),
+        (baseline.vbr, baseline.constrained_vbr)
+    );
+    bob.join_channel(channel, None).unwrap();
+    wait_for(
+        &bob,
+        "bob join",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ChannelJoined { channel_id, .. } if *channel_id == channel),
+    )
+    .await;
+    wait_for(&alice, "bob joined", Duration::from_secs(10), |e| {
+        matches!(e, Event::ParticipantJoined { .. })
+    })
+    .await;
+    assert_eq!(
+        bob.audio_policy(),
+        Some(initial),
+        "policy is tracked even when not followed"
+    );
+    let bob_enc = bob.encoder_settings();
+    assert_eq!(
+        (bob_enc.bitrate_bps, bob_enc.complexity),
+        (20_000, 4),
+        "{bob_enc:?}"
+    );
+    assert_eq!(bob_enc.max_bandwidth, OpusBandwidth::Fullband);
+
+    // --- a local complexity pin overrides the channel hint.
+    alice.set_complexity(Some(3)).unwrap();
+    assert_eq!(alice.encoder_settings().complexity, 3);
+
+    // --- audio flows under the wideband/music policy.
+    let (rms, active) = stream_tone(&alice, &bob, 1.0).await;
+    assert!(active >= 30 && rms > 0.1, "rms {rms} over {active} frames");
+
+    // --- live policy update: the pin stays, everything else follows the new channel config.
+    http.put(format!("{}/v1/channels/{channel}/config", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "bitrate": 64000, "min_bitrate": 16000,
+            "enable_fec": true, "enable_dtx": true,
+            "max_bandwidth": "fullband",
+            "audio_profile": "voice"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let updated = AudioPolicy {
+        bitrate_bps: 64_000,
+        min_bitrate_bps: 16_000,
+        fec: true,
+        dtx: true,
+        max_bandwidth: OpusBandwidth::Fullband,
+        complexity: None,
+        signal: OpusSignal::Voice,
+    };
+    let ev = wait_for(
+        &alice,
+        "alice policy update",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::AudioPolicyChanged(_)),
+    )
+    .await;
+    let Event::AudioPolicyChanged(p) = ev else {
+        unreachable!()
+    };
+    assert_eq!(p, updated);
+    let ev = wait_for(&bob, "bob policy update", Duration::from_secs(10), |e| {
+        matches!(e, Event::AudioPolicyChanged(_))
+    })
+    .await;
+    let Event::AudioPolicyChanged(p) = ev else {
+        unreachable!()
+    };
+    assert_eq!(p, updated);
+    let applied = alice.encoder_settings();
+    assert_eq!(
+        (
+            applied.bitrate_bps,
+            applied.fec,
+            applied.dtx,
+            applied.max_bandwidth,
+            applied.signal,
+            applied.complexity,
+        ),
+        (
+            64_000,
+            true,
+            true,
+            OpusBandwidth::Fullband,
+            OpusSignal::Voice,
+            3
+        ),
+        "{applied:?}"
+    );
+    assert_eq!(
+        bob.encoder_settings(),
+        bob_enc,
+        "opted-out client is untouched"
+    );
+
+    // --- unpin: policy has no complexity hint, so the app baseline (9) returns.
+    alice.set_complexity(None).unwrap();
+    assert_eq!(alice.encoder_settings().complexity, baseline.complexity);
+    let (rms, active) = stream_tone(&alice, &bob, 1.0).await;
+    assert!(
+        active >= 30 && rms > 0.1,
+        "rms {rms} over {active} frames after update"
+    );
+
+    // --- leaving the last channel keeps the last policy (no flip-flop between channels).
+    alice.leave_channel(channel).unwrap();
+    wait_for(
+        &alice,
+        "alice left",
+        Duration::from_secs(5),
+        |e| matches!(e, Event::ChannelLeft { channel_id } if *channel_id == channel),
+    )
+    .await;
+    assert_eq!(alice.audio_policy(), Some(updated));
+    assert_eq!(alice.encoder_settings().bitrate_bps, 64_000);
+    alice.disconnect();
+    bob.disconnect();
 }

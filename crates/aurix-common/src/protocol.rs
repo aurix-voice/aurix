@@ -1,8 +1,8 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
-    ActionKind, ChannelId, ChannelRole, Direction, Orientation3D, Position3D, ReverbDescriptor,
-    SessionId, UserId,
+    ActionKind, AudioPolicy, ChannelId, ChannelRole, Direction, Orientation3D, Position3D,
+    ReverbDescriptor, SessionId, UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -768,6 +768,14 @@ pub enum ControlMessage {
         /// The channel transcribes speech and delivers `Transcript` events.
         #[serde(default)]
         transcription: bool,
+        /// Encoder settings this channel requires; merge over all joined channels.
+        #[serde(default)]
+        audio: AudioPolicy,
+    },
+    /// Server→client: an operator changed the channel's audio settings while you are in it.
+    ChannelAudioPolicy {
+        channel_id: ChannelId,
+        audio: AudioPolicy,
     },
     ChannelLeave {
         channel_id: ChannelId,
@@ -877,9 +885,14 @@ pub enum ControlMessage {
         jitter_ms: f32,
         packet_loss: f32,
     },
+    /// Server→client: bitrate adaptation for the whole uplink, bounded by the merged channel
+    /// policy (`min_bitrate_bps..=bitrate_bps`). `expected_loss_percent` is the loss the server
+    /// currently sees, for the encoder's FEC tuning (`OPUS_SET_PACKET_LOSS_PERC`).
     BitrateCommand {
         target_bitrate_kbps: u32,
         reason: String,
+        #[serde(default)]
+        expected_loss_percent: u8,
     },
     /// Server→client, periodic (`media.quality_interval_ms`): the server's view of this
     /// session's link — client-reported downlink merged with the uplink it measures itself.
@@ -1609,5 +1622,40 @@ mod tests {
         let json = serde_json::to_string(&transcript).unwrap();
         assert!(!json.contains("\"words\""));
         assert!(json.contains(r#""type":"Transcript""#));
+    }
+
+    /// Wire shape of the audio policy shared with the Web/Unity SDKs: snake_case enums, `complexity`
+    /// null when the operator left no hint, and every key optional on the way in.
+    #[test]
+    fn audio_policy_wire_shape() {
+        use crate::types::{AudioPolicy, OpusBandwidth, OpusSignal};
+        let ch = ChannelId(uuid::Uuid::nil());
+        let msg = ControlMessage::ChannelAudioPolicy {
+            channel_id: ch,
+            audio: AudioPolicy {
+                bitrate_bps: 24_000,
+                min_bitrate_bps: 8_000,
+                fec: true,
+                dtx: false,
+                max_bandwidth: OpusBandwidth::Wideband,
+                complexity: Some(5),
+                signal: OpusSignal::Voice,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice"}}}"#
+        );
+        let no_hint = serde_json::to_string(&AudioPolicy::default()).unwrap();
+        assert_eq!(
+            no_hint,
+            r#"{"bitrate_bps":48000,"min_bitrate_bps":12000,"fec":true,"dtx":true,"max_bandwidth":"fullband","complexity":null,"signal":"voice"}"#
+        );
+        let partial: AudioPolicy =
+            serde_json::from_str(r#"{"bitrate_bps":16000,"signal":"music"}"#).unwrap();
+        assert_eq!(partial.bitrate_bps, 16_000);
+        assert_eq!(partial.signal, OpusSignal::Music);
+        assert_eq!(partial.max_bandwidth, OpusBandwidth::Fullband);
+        assert!(partial.dtx);
     }
 }

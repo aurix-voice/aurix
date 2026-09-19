@@ -590,6 +590,32 @@ with `GET /v1/sessions/:id/stats` (node-local; the session's node is listed in
 `GET /v1/users/:id`). Client counters are cumulative for the current transport; loss, R-factor,
 MOS and bars describe the latest period.
 
+### Opus controls and channel audio policy
+
+Every channel carries an **audio policy** derived from its `ChannelConfig` — `bitrate`
+(target), `min_bitrate` (floor for the adaptive bitrate), `enable_fec`, `enable_dtx`,
+`max_bandwidth` (`narrowband` … `fullband`), an optional `complexity` hint (0–10) and the signal
+mode from `audio_profile` (`voice`/`low_bandwidth` → voice, `music` → music, `broadcast` → auto).
+Configs are validated against the node (`6000..=media.max_bitrate`, `min_bitrate ≤ bitrate`,
+sample rate ∈ {8, 12, 16, 24, 48} kHz). The policy is delivered in `ChannelJoinAck.audio` and,
+when a channel is edited over REST, pushed live as `ChannelAudioPolicy` to everyone in it
+(`channel.config_updated` on webhooks/SSE). A client in several channels merges them: highest
+bitrate and floor, widest bandwidth, FEC if any channel wants it, DTX only if all allow it,
+music > voice > auto, highest complexity hint.
+
+The native core, Unity and Unreal SDKs expose every libopus encoder control (bitrate 6–300 kbit/s,
+complexity, max bandwidth, signal, VBR / constrained VBR, FEC, expected loss, DTX) as a
+**baseline**, apply the merged policy on top unless `follow_channel_policy` is off (complexity
+can always be pinned locally — the CPU budget is the game's decision), and finally the server's
+transient `BitrateCommand {target_bitrate_kbps, reason, expected_loss_percent}`, which the node
+clamps to the policy's `min_bitrate..=bitrate` and which also raises the FEC loss tuning.
+Browsers own their encoder, so the Web SDK sets only what WebRTC allows: bitrate ceiling
+(`RTCRtpSender.setParameters` + `maxaveragebitrate`), `useinbandfec`, `usedtx`,
+`maxplaybackrate` and `cbr` on the answer's Opus `fmtp`. Unity gets libopus through
+`NativeOpusCodec` (P/Invoke into `libaurix_client`, non-variadic entry points, FEC recovery) as
+an alternative to the pure-C# Concentus sample; the C ABI exposes the same encoder/decoder
+standalone (`aurix_opus_*`).
+
 ### Network / firewall
 
 | port | proto | purpose |
@@ -747,6 +773,9 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
   buffer them across a consumer outage beyond `recording.live.queue_frames`.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
   it assumes nodes can reach each other directly on `media.port + 1`/UDP.
+* Browsers cannot set Opus complexity, signal mode, VBR mode or expected loss — only the
+  bitrate ceiling, FEC, DTX, max bandwidth and CBR that WebRTC exposes; the native, Unity and
+  Unreal SDKs have the full set.
 * The Unreal plugin has not been compiled against a real engine install yet (none is available
   in the development environment); the first build in your project is the verification step.
   The protocol is documented in `crates/aurix-common/src/protocol.rs`.

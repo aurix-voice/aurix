@@ -355,6 +355,42 @@ jitter, bitrate) and picks the worse direction: `R ≥ 80` → 5 bars, `≥ 70` 
 counters are cumulative for the peer connection. The same helpers (`rFactor`, `mosFromR`,
 `barsFromR`, `assembleClientStats`) are exported for HUDs that read raw stats themselves.
 
+### Opus controls (what a browser lets you set)
+
+```ts
+const client = new AurixClient({
+  // ...
+  opus: {
+    maxBitrateBps: 32_000,   // ceiling: RTCRtpSender maxBitrate + fmtp maxaveragebitrate
+    fec: true,               // fmtp useinbandfec
+    dtx: false,              // fmtp usedtx
+    maxBandwidth: 'wideband',// fmtp maxplaybackrate=16000
+    cbr: false,              // fmtp cbr (local only; default VBR)
+    followChannelPolicy: true, // unset fields come from the server's channel policy (default)
+  },
+});
+
+client.on('audioPolicy', (p) => {
+  // merged policy of all joined channels: bitrateBps, minBitrateBps, fec, dtx, maxBandwidth,
+  // complexity?, signal — as configured by the operator (ChannelJoinAck.audio / ChannelAudioPolicy)
+  console.log(p, client.opusPreferences, client.negotiatedOpus);
+});
+client.on('bitrate', (kbps, reason, expectedLossPercent) => { /* server adaptation */ });
+
+client.setOpusOptions({ maxBandwidth: 'superwideband' }); // bitrate part applies live …
+await client.renegotiateMedia();                          // … fmtp part at the next negotiation
+```
+
+Everything goes through WebRTC, so only these controls exist: the bitrate ceiling (live, via
+`setParameters`, and `maxaveragebitrate` at negotiation), in-band FEC, DTX, maximum bandwidth
+and CBR — all `fmtp` parameters of the Opus payload in the server's answer (RFC 7587: the
+receiver states what the sender should do). **Complexity, signal mode, VBR mode and expected
+loss are owned by the browser** and cannot be set; the policy still exposes them for parity with
+the native SDKs. The server's `BitrateCommand` moves the ceiling within the policy's
+`minBitrateBps..=bitrateBps`; the browser's congestion control keeps running underneath. Helpers
+(`parseAudioPolicy`, `mergeAudioPolicies`, `resolveOpusSenderPreferences`,
+`applyOpusSenderPreferences`, `negotiatedOpusPreferences`) are exported for custom pipelines.
+
 ## How it maps to the server
 
 | SDK | server |
@@ -367,7 +403,8 @@ counters are cumulative for the peer connection. The same helpers (`rFactor`, `m
 | `setMuted()` → track `enabled` + `MuteStateChanged` | broadcast to channel members |
 | `setTransmission()` → `SetTransmission{mode}` | `MediaSession::set_transmission`; routers drop frames outside the policy |
 | `setChannelFocus()` → `SetChannelFocus{channel_id}` | `ReceiverPrefs::set_focus`; unfocused channels scaled in the per-receiver gain |
-| `getStats()` / `reportQuality()` → `QualityReport` (loss in %) | adaptive `BitrateCommand` (applied via `RTCRtpSender.setParameters`) + `NetworkQuality` merged with the SFU's uplink measurements |
+| `getStats()` / `reportQuality()` → `QualityReport` (loss in %) | adaptive `BitrateCommand` (applied via `RTCRtpSender.setParameters`, clamped to the channel policy) + `NetworkQuality` merged with the SFU's uplink measurements |
+| Opus `fmtp` rewrite of the answer (`useinbandfec`, `usedtx`, `maxplaybackrate`, `maxaveragebitrate`, `cbr`) | `ChannelJoinAck.audio` / `ChannelAudioPolicy` derived from `ChannelConfig` |
 | `Ping`/`Pong` | keepalive + `roundTripMs` |
 | reconnect with `['aurix', 'bearer.<jwt>', 'resume.<session_id>.<resume_token>']` | `SessionInitAck{resumed: true}` + replayed `ChannelJoinAck`s within `server.session_resume_grace_secs` |
 

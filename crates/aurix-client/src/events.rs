@@ -1,7 +1,9 @@
 use aurix_common::protocol::{
     ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsState, UserPosition,
 };
-use aurix_common::types::{ActionKind, ChannelId, ChannelRole, NetworkQuality, SessionId, UserId};
+use aurix_common::types::{
+    ActionKind, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, SessionId, UserId,
+};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -112,6 +114,10 @@ pub enum Event {
         bitrate_bps: u32,
         reason: String,
     },
+    /// The merged audio policy of the joined channels changed (join/leave or an operator
+    /// edited a channel). Already applied to the encoder when
+    /// `ClientConfig::follow_channel_policy` is on.
+    AudioPolicyChanged(AudioPolicy),
     /// Periodic server-side view of both directions (bars 1–5, R-factor, MOS, RTT,
     /// jitter/loss per direction). Also available any time via `Client::stats().server`.
     NetworkQuality(NetworkQuality),

@@ -17,9 +17,14 @@ Unreal plugin, mobile wrappers and any other native integration build on top of 
 
 ## What it does
 
-* **Audio** (`audio`): 48 kHz / 20 ms Opus encoder with input gain, VAD and RFC 6464 level
-  metadata, resampling from any device rate, per-sender jitter buffers with PLC, stereo mixer
-  with per-participant gain and directional panning, output volume/mute.
+* **Audio** (`audio`): 48 kHz / 20 ms Opus encoder with every libopus control
+  (`EncoderSettings`: bitrate, complexity, max bandwidth, signal, VBR/CVBR, FEC, expected loss,
+  DTX), input gain, VAD and RFC 6464 level metadata, resampling from any device rate, per-sender
+  jitter buffers with PLC, stereo mixer with per-participant gain and directional panning, output
+  volume/mute. The encoder follows the merged channel audio policy (`ChannelJoinAck.audio`,
+  `ChannelAudioPolicy`) and the server's transient `BitrateCommand`; complexity can be pinned.
+  `OpusEncoder` / `OpusDecoder` are also exported standalone (C: `aurix_opus_*`) for hosts that
+  only want libopus — the Unity SDK's `NativeOpusCodec` uses them.
 * **Media** (`media`): AURX v2 over UDP — signed `SessionBind`, AES-256-CTR + HMAC on every
   packet, per-sender replay windows, heartbeats with RTT, quality reports, mute state.
 * **Control** (`control`): WebSocket with `Authorization: Bearer`, one-time resume tokens,

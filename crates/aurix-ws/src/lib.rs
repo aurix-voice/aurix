@@ -441,6 +441,25 @@ impl WsState {
                 } => {
                     self.apply_block_change(app_id, user_id, blocked_user_id, blocked);
                 }
+                ServerEvent::ChannelConfigUpdated {
+                    app_id,
+                    channel_id,
+                    config,
+                    ..
+                } => {
+                    let audio = config.audio_policy();
+                    let updated =
+                        self.sfu
+                            .read()
+                            .update_channel_config(&channel_id, &app_id, config);
+                    if updated.is_some() {
+                        self.broadcast_channel_in_app(
+                            app_id,
+                            &channel_id,
+                            &ControlMessage::ChannelAudioPolicy { channel_id, audio },
+                        );
+                    }
+                }
                 ServerEvent::ChatMessage {
                     app_id,
                     message,
@@ -1458,6 +1477,7 @@ async fn handle_ws_connection(
                 channel_id: *channel_id,
                 participants: channel_snapshot(&state, &session_id, channel_id),
                 transcription: channel_transcribes(&state, channel_id),
+                audio: channel_audio_policy(&state, channel_id),
             },
         )
         .await;
@@ -1653,7 +1673,44 @@ fn channel_transcribes(state: &WsState, channel_id: &ChannelId) -> bool {
             .sfu
             .read()
             .get_channel(channel_id)
-            .is_some_and(|c| c.config.transcription)
+            .is_some_and(|c| c.config().transcription)
+}
+
+fn channel_audio_policy(state: &WsState, channel_id: &ChannelId) -> AudioPolicy {
+    state
+        .sfu
+        .read()
+        .get_channel(channel_id)
+        .map(|c| c.audio_policy())
+        .unwrap_or_default()
+}
+
+/// Uplink bitrate the client should use for the reported link, within the merged channel
+/// policy. `None` when the current command still stands.
+fn adapt_bitrate(
+    policy: &AudioPolicy,
+    packet_loss: f32,
+    jitter_ms: f32,
+    commanded_kbps: u32,
+) -> Option<u32> {
+    let target_kbps = policy.bitrate_bps.div_ceil(1000);
+    let floor_kbps = policy.min_bitrate_bps.div_ceil(1000).min(target_kbps);
+    let wanted = if packet_loss > 20.0 {
+        16
+    } else if packet_loss > 10.0 || jitter_ms > 50.0 {
+        32
+    } else if packet_loss <= 2.0 && jitter_ms <= 20.0 {
+        target_kbps
+    } else {
+        return None;
+    };
+    let wanted = wanted.clamp(floor_kbps, target_kbps);
+    let current = if commanded_kbps == 0 {
+        target_kbps
+    } else {
+        commanded_kbps
+    };
+    (wanted != current).then_some(wanted)
 }
 
 fn channel_role(
@@ -2026,6 +2083,7 @@ async fn handle_control_message(
                     channel_id,
                     participants,
                     transcription: channel_transcribes(state, &channel_id),
+                    audio: channel_audio_policy(state, &channel_id),
                 },
             )
             .await;
@@ -2438,27 +2496,45 @@ async fn handle_control_message(
                     q.mos_score = q.calculate_mos();
                 }
             }
-            if packet_loss > 10.0 || jitter_ms > 50.0 {
-                let target = if packet_loss > 20.0 { 16 } else { 32 };
+            let adaptation = {
+                let sfu = state.sfu.read();
+                sfu.get_session(&session_id).and_then(|s| {
+                    let policy = sfu.session_audio_policy(&s);
+                    let commanded = s.commanded_bitrate_kbps.load(Ordering::Relaxed);
+                    adapt_bitrate(&policy, packet_loss, jitter_ms, commanded).map(|target| {
+                        let at_target = target == policy.bitrate_bps.div_ceil(1000);
+                        s.commanded_bitrate_kbps
+                            .store(if at_target { 0 } else { target }, Ordering::Relaxed);
+                        (target, at_target)
+                    })
+                })
+            };
+            if let Some((target, at_target)) = adaptation {
+                let reason = if at_target {
+                    format!("recovered loss={packet_loss:.1}% jitter={jitter_ms:.1}ms")
+                } else {
+                    format!("loss={packet_loss:.1}% jitter={jitter_ms:.1}ms")
+                };
                 send_msg(
                     tx,
                     &ControlMessage::BitrateCommand {
                         target_bitrate_kbps: target,
-                        reason: format!("loss={packet_loss:.1}% jitter={jitter_ms:.1}ms"),
+                        reason,
+                        expected_loss_percent: packet_loss.round().clamp(0.0, 100.0) as u8,
                     },
                 )
                 .await;
-                if packet_loss > 20.0 {
-                    state.control.events.publish(ServerEvent::QualityAlert {
-                        app_id: token.app_id,
-                        session_id,
-                        user_id: token.user_id,
-                        metric: "packet_loss".into(),
-                        value: packet_loss as f64,
-                        threshold: 20.0,
-                        timestamp: chrono::Utc::now(),
-                    });
-                }
+            }
+            if packet_loss > 20.0 {
+                state.control.events.publish(ServerEvent::QualityAlert {
+                    app_id: token.app_id,
+                    session_id,
+                    user_id: token.user_id,
+                    metric: "packet_loss".into(),
+                    value: packet_loss as f64,
+                    threshold: 20.0,
+                    timestamp: chrono::Utc::now(),
+                });
             }
         }
 
@@ -2575,6 +2651,7 @@ async fn handle_control_message(
         | ControlMessage::SessionInitAck { .. }
         | ControlMessage::MediaBound { .. }
         | ControlMessage::ChannelJoinAck { .. }
+        | ControlMessage::ChannelAudioPolicy { .. }
         | ControlMessage::ParticipantJoined { .. }
         | ControlMessage::ParticipantLeft { .. }
         | ControlMessage::SpeakingStateChanged { .. }
@@ -2691,6 +2768,44 @@ async fn handle_event_stream(socket: WebSocket, state: WsState, app_id: AppId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_bitrate_stays_inside_the_channel_policy() {
+        let policy = AudioPolicy {
+            bitrate_bps: 48_000,
+            min_bitrate_bps: 24_000,
+            ..AudioPolicy::default()
+        };
+        // Nothing commanded, link is fine: already at target, no command.
+        assert_eq!(adapt_bitrate(&policy, 0.0, 5.0, 0), None);
+        // Moderate loss steps down to 32 kbit/s (inside the floor).
+        assert_eq!(adapt_bitrate(&policy, 12.0, 5.0, 0), Some(32));
+        assert_eq!(
+            adapt_bitrate(&policy, 12.0, 5.0, 32),
+            None,
+            "same command twice"
+        );
+        // Severe loss wants 16 kbit/s but the channel floor is 24.
+        assert_eq!(adapt_bitrate(&policy, 30.0, 5.0, 32), Some(24));
+        // In-between conditions leave the current command alone.
+        assert_eq!(adapt_bitrate(&policy, 5.0, 30.0, 24), None);
+        // Recovery goes back up to the policy target, never above it.
+        assert_eq!(adapt_bitrate(&policy, 1.0, 10.0, 24), Some(48));
+
+        // A low-bitrate channel: "step down to 32" must not raise the bitrate.
+        let narrow = AudioPolicy {
+            bitrate_bps: 16_000,
+            min_bitrate_bps: 8_000,
+            ..AudioPolicy::default()
+        };
+        assert_eq!(adapt_bitrate(&narrow, 12.0, 5.0, 0), None);
+        assert_eq!(
+            adapt_bitrate(&narrow, 30.0, 5.0, 0),
+            None,
+            "16 is already the target"
+        );
+        assert_eq!(adapt_bitrate(&narrow, 30.0, 5.0, 12), Some(16));
+    }
 
     fn jwt(user_id: UserId, app_id: AppId) -> ValidatedToken {
         ValidatedToken {

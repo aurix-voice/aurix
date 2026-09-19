@@ -41,7 +41,7 @@ connection simply yields a new session and the client must re-join its channels.
 
 | Client → server | Server → client | Notes |
 | --- | --- | --- |
-| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, transcription }` | `token` = player JWT listing the channel, or a `join` action token |
+| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, transcription, audio }` | `token` = player JWT listing the channel, or a `join` action token |
 | `ChannelLeave { channel_id }` | `ParticipantJoined { channel_id, user_id, display_name, ssrc }`, `ParticipantLeft` | roster; `ssrc` identifies the sender's AURX packets |
 | — | `MediaBound { session_id }` | the UDP `SessionBind` was accepted |
 | — | `SessionClose { session_id, reason }`, `Kick { channel_id, user_id, reason }` | session is gone / removed from a channel |
@@ -50,7 +50,8 @@ connection simply yields a new session and the client must re-join its channels.
 | `SetTransmission { mode }`, `SetChannelFocus { channel_id? }` | `TransmissionChanged`, `ChannelFocusChanged` | `mode` = `none` / `single { channel_id }` / `all`; server resets both when the target channel is left |
 | — | `SpeakingStateChanged { channel_id, user_id, speaking }`, `ChannelEnergy { channel_id, levels }` | voice activity, see [Channels](../features/channels.md#speaking-energy-and-roster) |
 | `PositionUpdate { channel_id, positions }`, `OcclusionUpdate`, `ReverbZoneUpdate` | — | positional channels; players may only move themselves unless they hold a moderator role |
-| `QualityReport { rtt_ms, jitter_ms, packet_loss }` | `NetworkQuality { quality }`, `BitrateCommand { target_bitrate_kbps, reason }` | see [Network quality](../features/quality.md) |
+| `QualityReport { rtt_ms, jitter_ms, packet_loss }` | `NetworkQuality { quality }`, `BitrateCommand { target_bitrate_kbps, reason, expected_loss_percent }` | see [Network quality](../features/quality.md) |
+| — | `ChannelAudioPolicy { channel_id, audio }` | an operator edited the channel's Opus settings; `audio` has the same shape as `ChannelJoinAck.audio` ([channels](../features/channels.md#configuration)) |
 | `RecordingConsentResponse { recording_id, consent }` | `RecordingNotification { channel_id, recording_id, active, initiated_by, live }` | consent gating for recordings and live streams |
 | `ModerateParticipant { channel_id, user_id, action, token, reason? }` | `ModerateParticipantAck` | in-game kick/mute/unmute with a one-time action token |
 | `ChatSend { channel_id, text, metadata?, client_ref? }`, `ChatSendDirect { user_id, … }`, `ChatTyping { channel_id, typing }` | `ChatMessageReceived { message }`, `ParticipantTyping` | see [Text chat](../features/chat.md) |

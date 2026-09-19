@@ -15,7 +15,8 @@ use aurix_common::protocol::{
     UserPosition,
 };
 use aurix_common::types::{
-    quality, ActionKind, ChannelId, NetworkQuality, RecordingConsent, SessionId, UserId,
+    quality, ActionKind, AudioPolicy, ChannelId, NetworkQuality, RecordingConsent, SessionId,
+    UserId,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,7 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::audio::{CaptureEncoder, MixerTotals, RemoteMixer, StreamStats, FRAME_SAMPLES};
+use crate::audio::{
+    CaptureEncoder, EncoderSettings, MixerTotals, RemoteMixer, StreamStats, FRAME_SAMPLES,
+};
 use crate::config::ClientConfig;
 use crate::control::{token_identity, ws_host, ControlConnection, SessionAck, TokenIdentity};
 use crate::error::{ClientError, Result};
@@ -118,6 +121,7 @@ struct Prefs {
 struct ChannelState {
     hash: u32,
     transcription: bool,
+    audio: AudioPolicy,
     participants: HashMap<UserId, Participant>,
 }
 
@@ -153,6 +157,10 @@ struct Inner {
     media: RwLock<Option<Arc<MediaTransport>>>,
     mixer: Mutex<RemoteMixer>,
     encoder: Mutex<CaptureEncoder>,
+    /// Merge of the joined channels' policies; kept after the last channel is left.
+    audio_policy: Mutex<Option<AudioPolicy>>,
+    /// App-pinned complexity, taking precedence over the channel hint.
+    complexity_pin: Mutex<Option<u8>>,
     muted: AtomicBool,
     local_speaking: AtomicBool,
     channels: Mutex<HashMap<ChannelId, ChannelState>>,
@@ -338,7 +346,7 @@ impl Client {
         if cfg.ws_url.is_empty() {
             return Err(ClientError::InvalidArgument("ws_url is empty".into()));
         }
-        let encoder = CaptureEncoder::new(cfg.bitrate_bps)?;
+        let encoder = CaptureEncoder::new(cfg.encoder)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(cfg.worker_threads.max(1))
             .thread_name("aurix-client")
@@ -352,6 +360,8 @@ impl Client {
                 cfg.jitter_max_frames,
             )),
             encoder: Mutex::new(encoder),
+            audio_policy: Mutex::new(None),
+            complexity_pin: Mutex::new(None),
             cfg: RwLock::new(cfg),
             state: AtomicU8::new(0),
             events: Mutex::new(VecDeque::new()),
@@ -695,10 +705,36 @@ impl Client {
         self.inner.cfg.write().vad_gate = enabled;
     }
 
+    /// Local bitrate override, applied immediately. A later channel policy or server
+    /// `BitrateCommand` replaces it.
     pub fn set_bitrate(&self, bitrate_bps: u32) -> Result<()> {
         self.inner.encoder.lock().set_bitrate(bitrate_bps)?;
-        self.inner.cfg.write().bitrate_bps = bitrate_bps;
+        self.inner.cfg.write().encoder.bitrate_bps = bitrate_bps;
         Ok(())
+    }
+
+    /// Replace the app's baseline encoder settings (`ClientConfig::encoder`) and re-apply them,
+    /// under the current channel policy when `follow_channel_policy` is on.
+    pub fn set_encoder_settings(&self, settings: EncoderSettings) -> Result<()> {
+        self.inner.cfg.write().encoder = settings.clamped();
+        reapply_encoder(&self.inner)
+    }
+
+    /// Settings the encoder is running with right now.
+    pub fn encoder_settings(&self) -> EncoderSettings {
+        self.inner.encoder.lock().settings()
+    }
+
+    /// Pin the Opus complexity (`0..=10`) regardless of channel hints — e.g. lower it on a
+    /// weak mobile CPU. `None` returns to the channel hint / `ClientConfig::encoder`.
+    pub fn set_complexity(&self, complexity: Option<u8>) -> Result<()> {
+        *self.inner.complexity_pin.lock() = complexity.map(|c| c.min(10));
+        reapply_encoder(&self.inner)
+    }
+
+    /// Merged policy of the channels joined so far (`None` before the first join).
+    pub fn audio_policy(&self) -> Option<AudioPolicy> {
+        *self.inner.audio_policy.lock()
     }
 
     /// Master playback volume `0..=2`.
@@ -1704,7 +1740,52 @@ fn forget_channel(inner: &Inner, channel_id: ChannelId) {
         }
         drop(mixer);
         inner.emit(Event::ChannelLeft { channel_id });
+        refresh_audio_policy(inner);
     }
+}
+
+/// Settings for the encoder given the baseline, the pinned complexity and the channel policy.
+fn effective_encoder_settings(inner: &Inner) -> EncoderSettings {
+    let cfg = inner.cfg.read();
+    let pin = *inner.complexity_pin.lock();
+    let policy = *inner.audio_policy.lock();
+    match policy {
+        Some(p) if cfg.follow_channel_policy => cfg.encoder.with_policy(&p, pin),
+        _ => {
+            let mut s = cfg.encoder;
+            if let Some(c) = pin {
+                s.complexity = c;
+            }
+            s.clamped()
+        }
+    }
+}
+
+fn reapply_encoder(inner: &Inner) -> Result<()> {
+    let settings = effective_encoder_settings(inner);
+    inner.encoder.lock().apply(settings)?;
+    Ok(())
+}
+
+/// Recompute the merged policy over the joined channels; on change, retune the encoder and
+/// tell the app. Leaving the last channel keeps the previous policy.
+fn refresh_audio_policy(inner: &Inner) {
+    let merged = {
+        let channels = inner.channels.lock();
+        if channels.is_empty() {
+            return;
+        }
+        AudioPolicy::merge_all(channels.values().map(|c| c.audio))
+    };
+    if inner.audio_policy.lock().replace(merged) == Some(merged) {
+        return;
+    }
+    if inner.cfg.read().follow_channel_policy {
+        if let Err(e) = reapply_encoder(inner) {
+            tracing::warn!("applying channel audio policy failed: {e}");
+        }
+    }
+    inner.emit(Event::AudioPolicyChanged(merged));
 }
 
 async fn handle_message(
@@ -1738,6 +1819,7 @@ async fn handle_message(
             channel_id,
             participants,
             transcription,
+            audio,
         } => {
             let roster: HashMap<UserId, Participant> = participants
                 .iter()
@@ -1758,11 +1840,13 @@ async fn handle_message(
                     ChannelState {
                         hash: channel_id_hash(&channel_id),
                         transcription,
+                        audio,
                         participants: roster,
                     },
                 )
                 .is_some();
             pending.desired.insert(channel_id);
+            refresh_audio_policy(inner);
             // A resume replays acks for channels we already track: refresh silently.
             if !(existed && request_id == 0) {
                 inner.emit(Event::ChannelJoined {
@@ -1944,12 +2028,28 @@ async fn handle_message(
             inner.prefs.lock().focus = channel_id;
             inner.emit(Event::ChannelFocusChanged(channel_id));
         }
+        ControlMessage::ChannelAudioPolicy { channel_id, audio } => {
+            if let Some(ch) = inner.channels.lock().get_mut(&channel_id) {
+                ch.audio = audio;
+            }
+            refresh_audio_policy(inner);
+        }
         ControlMessage::BitrateCommand {
             target_bitrate_kbps,
             reason,
+            expected_loss_percent,
         } => {
             let bps = target_bitrate_kbps.saturating_mul(1000);
-            let _ = inner.encoder.lock().set_bitrate(bps);
+            {
+                let mut enc = inner.encoder.lock();
+                let current = enc.settings();
+                let _ = enc.apply(EncoderSettings {
+                    bitrate_bps: bps,
+                    expected_loss_percent: expected_loss_percent
+                        .max(EncoderSettings::default().expected_loss_percent),
+                    ..current
+                });
+            }
             inner.emit(Event::BitrateChanged {
                 bitrate_bps: bps,
                 reason,
@@ -2144,6 +2244,8 @@ async fn handle_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aurix_common::types::{OpusBandwidth, OpusSignal};
+    use uuid::Uuid;
 
     #[test]
     fn loss_window_reports_the_last_period_only() {
@@ -2158,5 +2260,132 @@ mod tests {
         assert_eq!(w.advance(50, 50), 50.0);
         let r = quality::r_factor(0.0, 0.0, w.loss_percent);
         assert_eq!(quality::bars_from_r(r), 1);
+    }
+
+    fn channel(hash: u32, audio: AudioPolicy) -> (ChannelId, ChannelState) {
+        (
+            ChannelId(Uuid::new_v4()),
+            ChannelState {
+                hash,
+                transcription: false,
+                audio,
+                participants: HashMap::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn channel_policies_merge_into_the_encoder_and_local_pin_wins() {
+        let mut cfg = ClientConfig::new("ws://localhost:1/ws", "t");
+        cfg.encoder.bitrate_bps = 20_000;
+        cfg.encoder.complexity = 6;
+        let client = Client::new(cfg).unwrap();
+        let inner = &client.inner;
+        assert!(client.audio_policy().is_none());
+
+        let voice = AudioPolicy {
+            bitrate_bps: 32_000,
+            min_bitrate_bps: 12_000,
+            fec: true,
+            dtx: true,
+            max_bandwidth: OpusBandwidth::Wideband,
+            complexity: Some(4),
+            signal: OpusSignal::Voice,
+        };
+        let (id_a, a) = channel(1, voice);
+        inner.channels.lock().insert(id_a, a);
+        refresh_audio_policy(inner);
+        assert_eq!(client.audio_policy(), Some(voice));
+        let s = client.encoder_settings();
+        assert_eq!(
+            (s.bitrate_bps, s.complexity, s.max_bandwidth, s.dtx, s.fec),
+            (32_000, 4, OpusBandwidth::Wideband, true, true)
+        );
+        assert!(matches!(client.poll_event(), Some(Event::AudioPolicyChanged(p)) if p == voice));
+
+        // A music channel joined alongside widens everything; DTX needs both to allow it.
+        let music = AudioPolicy {
+            bitrate_bps: 96_000,
+            min_bitrate_bps: 32_000,
+            fec: false,
+            dtx: false,
+            max_bandwidth: OpusBandwidth::Fullband,
+            complexity: None,
+            signal: OpusSignal::Music,
+        };
+        let (id_b, b) = channel(2, music);
+        inner.channels.lock().insert(id_b, b);
+        refresh_audio_policy(inner);
+        let s = client.encoder_settings();
+        assert_eq!(
+            (
+                s.bitrate_bps,
+                s.complexity,
+                s.max_bandwidth,
+                s.dtx,
+                s.fec,
+                s.signal
+            ),
+            (
+                96_000,
+                4,
+                OpusBandwidth::Fullband,
+                false,
+                true,
+                OpusSignal::Music
+            )
+        );
+        assert!(matches!(
+            client.poll_event(),
+            Some(Event::AudioPolicyChanged(_))
+        ));
+        // Same merged policy again: no event, no retune.
+        refresh_audio_policy(inner);
+        assert!(client.poll_event().is_none());
+
+        // The app pins a lower complexity for a weak CPU; the policy hint no longer applies.
+        client.set_complexity(Some(2)).unwrap();
+        assert_eq!(client.encoder_settings().complexity, 2);
+
+        // Leaving the music channel falls back to the voice policy (pin kept).
+        forget_channel(inner, id_b);
+        let s = client.encoder_settings();
+        assert_eq!(
+            (s.bitrate_bps, s.complexity, s.signal),
+            (32_000, 2, OpusSignal::Voice)
+        );
+        assert!(
+            matches!(client.poll_event(), Some(Event::ChannelLeft { channel_id }) if channel_id == id_b)
+        );
+        assert!(matches!(client.poll_event(), Some(Event::AudioPolicyChanged(p)) if p == voice));
+
+        // Leaving the last channel keeps the last policy rather than snapping back to config.
+        forget_channel(inner, id_a);
+        assert_eq!(client.audio_policy(), Some(voice));
+        assert_eq!(client.encoder_settings().bitrate_bps, 32_000);
+
+        client.set_complexity(None).unwrap();
+        assert_eq!(
+            client.encoder_settings().complexity,
+            4,
+            "hint applies again"
+        );
+    }
+
+    #[test]
+    fn policy_is_only_reported_when_not_followed() {
+        let mut cfg = ClientConfig::new("ws://localhost:1/ws", "t");
+        cfg.follow_channel_policy = false;
+        cfg.encoder.bitrate_bps = 20_000;
+        let client = Client::new(cfg).unwrap();
+        let policy = AudioPolicy {
+            bitrate_bps: 64_000,
+            ..AudioPolicy::default()
+        };
+        let (id, ch) = channel(1, policy);
+        client.inner.channels.lock().insert(id, ch);
+        refresh_audio_policy(&client.inner);
+        assert_eq!(client.encoder_settings().bitrate_bps, 20_000);
+        assert!(matches!(client.poll_event(), Some(Event::AudioPolicyChanged(p)) if p == policy));
     }
 }

@@ -604,6 +604,9 @@ pub async fn create_channel(
     if config.max_participants > app.max_participants_per_channel as u32 {
         config.max_participants = app.max_participants_per_channel as u32;
     }
+    config
+        .validate(state.control.config.media.max_bitrate)
+        .map_err(AurixError::Validation)?;
     let channel = state
         .control
         .channels
@@ -691,15 +694,24 @@ pub async fn update_channel(
     Json(config): Json<ChannelConfig>,
 ) -> JsonResult {
     ctx.require("channels:write")?;
-    if config.max_participants == 0 {
-        return Err(AurixError::Validation("max_participants must be > 0".into()).into());
-    }
+    config
+        .validate(state.control.config.media.max_bitrate)
+        .map_err(AurixError::Validation)?;
     let channel_id = ChannelId::from_uuid(channel_id);
     state
         .control
         .channels
         .update_channel_config(ctx.app_id, channel_id, &config)
         .await?;
+    state
+        .control
+        .events
+        .publish(aurix_control::ServerEvent::ChannelConfigUpdated {
+            app_id: ctx.app_id,
+            channel_id,
+            config: config.clone(),
+            timestamp: Utc::now(),
+        });
     let channel = state
         .control
         .channels

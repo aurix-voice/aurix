@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <vector>
 
 #include "aurix_client.hpp"
 
@@ -50,6 +51,15 @@ bool handle_event(const aurix::Event& ev) {
         AurixChatMessage m;
         if (ev.chat(m)) {
             std::printf("chat <%s> %s\n", m.sender_name, m.text);
+        }
+        return false;
+    }
+    case AURIX_EVENT_AUDIO_POLICY_CHANGED: {
+        AurixAudioPolicy p;
+        if (ev.audio_policy(p)) {
+            std::printf("audio policy -> %u..%u bps fec=%d dtx=%d bandwidth=%d complexity=%d\n", p.min_bitrate_bps,
+                        p.bitrate_bps, static_cast<int>(p.fec), static_cast<int>(p.dtx),
+                        static_cast<int>(p.max_bandwidth), static_cast<int>(p.complexity));
         }
         return false;
     }
@@ -93,6 +103,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    {
+        // Bare codec self-test (what a host with its own audio pipeline would use).
+        AurixClientConfig defaults;
+        aurix_client_config_default(&defaults);
+        AurixEncoderSettings s = defaults.encoder;
+        s.bitrate_bps = 24000;
+        s.max_bandwidth = AURIX_BANDWIDTH_WIDEBAND;
+        aurix::OpusEncoder enc(48000, 1, &s);
+        aurix::OpusDecoder dec(48000, 1);
+        if (!enc.valid() || !dec.valid()) {
+            std::fprintf(stderr, "bare codec init failed: %s\n", aurix::last_error().c_str());
+            return 2;
+        }
+        std::vector<float> tone(960);
+        for (std::size_t i = 0; i < tone.size(); ++i) {
+            tone[i] = 0.5f * std::sin(static_cast<float>(i) * 440.0f * 6.2831853f / 48000.0f);
+        }
+        std::uint8_t packet[1275];
+        std::vector<float> pcm(960);
+        const int len = enc.encode(tone.data(), tone.size(), packet, sizeof packet);
+        const int n = len > 0 ? dec.decode(packet, static_cast<std::size_t>(len), pcm.data(), pcm.size()) : -1;
+        if (len <= 0 || n != 960) {
+            std::fprintf(stderr, "bare codec round trip failed (%d/%d): %s\n", len, n, aurix::last_error().c_str());
+            return 2;
+        }
+        std::printf("bare codec: 20 ms frame -> %d bytes\n", len);
+    }
+
     aurix::Uuid channel;
     if (!aurix::Uuid::parse(argv[3], channel)) {
         std::fprintf(stderr, "bad channel id: %s\n", aurix::last_error().c_str());
@@ -101,6 +139,7 @@ int main(int argc, char** argv) {
 
     aurix::Config cfg(argv[1], argv[2]);
     cfg.raw.vad_gate = false;  // always send our test tone
+    cfg.raw.encoder.complexity = 5;
     aurix::Client client = aurix::Client::create(cfg);
     if (!client) {
         std::fprintf(stderr, "create failed: %s\n", aurix::last_error().c_str());

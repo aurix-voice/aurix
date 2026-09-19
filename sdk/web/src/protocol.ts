@@ -12,6 +12,17 @@ export type ChannelRole = 'listener' | 'speaker' | 'moderator' | 'administrator'
 
 export type RecordingConsent = 'pending' | 'accepted' | 'declined';
 
+/** `AudioPolicy` as serialised by the server (snake_case; `complexity` is `null` without a hint). */
+export interface AudioPolicyWire {
+  bitrate_bps?: number;
+  min_bitrate_bps?: number;
+  fec?: boolean;
+  dtx?: boolean;
+  max_bandwidth?: string;
+  complexity?: number | null;
+  signal?: string;
+}
+
 export interface ParticipantBrief {
   user_id: string;
   display_name: string;
@@ -174,8 +185,14 @@ export type ServerMessage =
   | { type: 'SessionClose'; data: { session_id: string; reason: string } }
   | {
       type: 'ChannelJoinAck';
-      data: { channel_id: string; participants: ParticipantBrief[]; transcription?: boolean };
+      data: {
+        channel_id: string;
+        participants: ParticipantBrief[];
+        transcription?: boolean;
+        audio?: AudioPolicyWire;
+      };
     }
+  | { type: 'ChannelAudioPolicy'; data: { channel_id: string; audio: AudioPolicyWire } }
   | {
       type: 'ParticipantJoined';
       data: { channel_id: string; user_id: string; display_name: string; ssrc: number };
@@ -187,7 +204,10 @@ export type ServerMessage =
     }
   | { type: 'SpeakingStateChanged'; data: { channel_id: string; user_id: string; speaking: boolean } }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
-  | { type: 'BitrateCommand'; data: { target_bitrate_kbps: number; reason: string } }
+  | {
+      type: 'BitrateCommand';
+      data: { target_bitrate_kbps: number; reason: string; expected_loss_percent?: number };
+    }
   | { type: 'NetworkQuality'; data: { quality: NetworkQualityWire } }
   | { type: 'UserBlockChanged'; data: { user_id: string; blocked: boolean } }
   | { type: 'TransmissionChanged'; data: { mode: TransmissionModeWire } }

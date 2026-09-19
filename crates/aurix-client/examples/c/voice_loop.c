@@ -87,6 +87,15 @@ static int handle_event(struct AurixClient *client, struct AurixEvent *ev) {
         printf("bitrate -> %llu bps (%s)\n", (unsigned long long)aurix_event_number(ev),
                aurix_event_message(ev));
         break;
+    case AURIX_EVENT_AUDIO_POLICY_CHANGED: {
+        struct AurixAudioPolicy p;
+        if (aurix_event_audio_policy(ev, &p)) {
+            printf("audio policy -> %u..%u bps fec=%d dtx=%d bandwidth=%d complexity=%d\n",
+                   p.min_bitrate_bps, p.bitrate_bps, (int)p.fec, (int)p.dtx, (int)p.max_bandwidth,
+                   (int)p.complexity);
+        }
+        break;
+    }
     case AURIX_EVENT_REQUEST_FAILED:
     case AURIX_EVENT_SERVER_ERROR:
     case AURIX_EVENT_REJOIN_FAILED:
@@ -134,6 +143,9 @@ int main(int argc, char **argv) {
     cfg.ws_url = argv[1];
     cfg.token = argv[2];
     cfg.vad_gate = false; /* always send our test tone */
+    cfg.encoder.bitrate_bps = 24000;                   /* until the channel policy arrives */
+    cfg.encoder.complexity = 5;                        /* cheap enough for a handheld */
+    cfg.encoder.max_bandwidth = AURIX_BANDWIDTH_WIDEBAND;
 
     struct AurixClient *client = aurix_client_create(&cfg);
     if (!client) {

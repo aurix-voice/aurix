@@ -47,6 +47,102 @@ enum class EAurixModerationAction : uint8
 	Unmute,
 };
 
+/** Widest audio band the Opus encoder may code (OPUS_SET_MAX_BANDWIDTH). */
+UENUM(BlueprintType)
+enum class EAurixOpusBandwidth : uint8
+{
+	/** 4 kHz. */
+	Narrowband,
+	/** 6 kHz. */
+	Mediumband,
+	/** 8 kHz. */
+	Wideband,
+	/** 12 kHz. */
+	Superwideband,
+	/** 20 kHz. */
+	Fullband,
+};
+
+/** Opus content hint (OPUS_SET_SIGNAL). */
+UENUM(BlueprintType)
+enum class EAurixOpusSignal : uint8
+{
+	Auto,
+	Voice,
+	Music,
+};
+
+/** Uplink Opus encoder settings; values outside libopus' ranges are clamped by the core. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixEncoderSettings
+{
+	GENERATED_BODY()
+
+	/** 6000..300000 bit/s. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	int32 BitrateBps = 32000;
+
+	/** 0..10; 10 = best quality at the most CPU (libopus default 9). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	int32 Complexity = 9;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	EAurixOpusBandwidth MaxBandwidth = EAurixOpusBandwidth::Fullband;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	EAurixOpusSignal Signal = EAurixOpusSignal::Voice;
+
+	/** Variable bitrate; off = hard CBR at BitrateBps. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bVbr = true;
+
+	/** Constrained VBR keeps every frame within the bitrate's byte budget. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bConstrainedVbr = true;
+
+	/** In-band forward error correction. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bFec = true;
+
+	/** Packet loss the FEC is tuned for, 0..100 %. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	int32 ExpectedLossPercent = 5;
+
+	/** Discontinuous transmission during silence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bDtx = false;
+};
+
+/** A channel's audio policy (operator-set ChannelConfig), merged over the joined channels. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixAudioPolicy
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 BitrateBps = 0;
+
+	/** Floor the server's adaptive bitrate never goes below. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 MinBitrateBps = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bFec = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bDtx = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	EAurixOpusBandwidth MaxBandwidth = EAurixOpusBandwidth::Fullband;
+
+	/** -1 = the channel gives no complexity hint. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 Complexity = -1;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	EAurixOpusSignal Signal = EAurixOpusSignal::Auto;
+};
+
 UENUM(BlueprintType)
 enum class EAurixTtsDestination : uint8
 {
@@ -99,9 +195,16 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
 	int32 RequestTimeoutMs = 10000;
 
-	/** Opus target bitrate, 6000..128000. */
+	/** Uplink Opus encoder before any channel policy applies. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
-	int32 BitrateBps = 32000;
+	FAurixEncoderSettings Encoder;
+
+	/**
+	 * Adopt each joined channel's audio policy (bitrate, FEC/DTX, bandwidth, signal and the
+	 * complexity hint unless pinned with SetComplexity). Server bitrate commands apply either way.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	bool bFollowChannelPolicy = true;
 
 	/** Jitter buffer depth before playout starts, in 20 ms frames. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")

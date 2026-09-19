@@ -11,6 +11,18 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#define EncoderSettings_MIN_BITRATE 6000
+
+/**
+ * libopus clamps a mono stream's bitrate to 300 kbit/s internally.
+ */
+#define EncoderSettings_MAX_BITRATE 300000
+
+/**
+ * libopus' own default.
+ */
+#define EncoderSettings_DEFAULT_COMPLEXITY 9
+
 /**
  * Bytes needed for `aurix_uuid_format` (36 characters + NUL).
  */
@@ -62,6 +74,41 @@ typedef enum AurixResult {
   AURIX_CODEC = 9,
   AURIX_PROTOCOL = 10,
 } AurixResult;
+
+/**
+ * Opus coding bandwidth (`OPUS_SET_MAX_BANDWIDTH`), widest band the encoder may use.
+ */
+typedef enum AurixOpusBandwidth {
+  /**
+   * 4 kHz audio band.
+   */
+  AURIX_BANDWIDTH_NARROWBAND = 0,
+  /**
+   * 6 kHz.
+   */
+  AURIX_BANDWIDTH_MEDIUMBAND = 1,
+  /**
+   * 8 kHz.
+   */
+  AURIX_BANDWIDTH_WIDEBAND = 2,
+  /**
+   * 12 kHz.
+   */
+  AURIX_BANDWIDTH_SUPERWIDEBAND = 3,
+  /**
+   * 20 kHz.
+   */
+  AURIX_BANDWIDTH_FULLBAND = 4,
+} AurixOpusBandwidth;
+
+/**
+ * Opus content hint (`OPUS_SET_SIGNAL`).
+ */
+typedef enum AurixOpusSignal {
+  AURIX_SIGNAL_AUTO = 0,
+  AURIX_SIGNAL_VOICE = 1,
+  AURIX_SIGNAL_MUSIC = 2,
+} AurixOpusSignal;
 
 typedef enum AurixConnectionState {
   AURIX_STATE_DISCONNECTED = 0,
@@ -195,6 +242,10 @@ typedef enum AurixEventType {
    * `network_quality`.
    */
   AURIX_EVENT_NETWORK_QUALITY = 30,
+  /**
+   * `audio_policy`: merged policy of the joined channels changed.
+   */
+  AURIX_EVENT_AUDIO_POLICY_CHANGED = 31,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -258,6 +309,16 @@ typedef struct AurixClient AurixClient;
 typedef struct AurixEvent AurixEvent;
 
 /**
+ * Opaque bare Opus decoder (see `aurix_opus_decoder_create`).
+ */
+typedef struct AurixOpusDecoder AurixOpusDecoder;
+
+/**
+ * Opaque bare Opus encoder (see `aurix_opus_encoder_create`).
+ */
+typedef struct AurixOpusEncoder AurixOpusEncoder;
+
+/**
  * Opaque, mutable list of regions; release with `aurix_regions_free`.
  */
 typedef struct AurixRegionList AurixRegionList;
@@ -268,6 +329,42 @@ typedef struct AurixRegionList AurixRegionList;
 typedef struct AurixUuid {
   uint8_t bytes[16];
 } AurixUuid;
+
+/**
+ * Uplink Opus encoder settings. Out-of-range values are clamped, never rejected.
+ */
+typedef struct AurixEncoderSettings {
+  /**
+   * 6000..=300000 (libopus' mono ceiling).
+   */
+  uint32_t bitrate_bps;
+  /**
+   * 0..=10 (10 = best quality, most CPU).
+   */
+  uint8_t complexity;
+  enum AurixOpusBandwidth max_bandwidth;
+  enum AurixOpusSignal signal;
+  /**
+   * Variable bitrate; `false` = hard CBR.
+   */
+  bool vbr;
+  /**
+   * Constrained VBR (frames stay within the bitrate's byte budget).
+   */
+  bool constrained_vbr;
+  /**
+   * In-band forward error correction.
+   */
+  bool fec;
+  /**
+   * Loss the FEC is tuned for, 0..=100 %.
+   */
+  uint8_t expected_loss_percent;
+  /**
+   * Discontinuous transmission during silence.
+   */
+  bool dtx;
+} AurixEncoderSettings;
 
 /**
  * Connection parameters. Fill with `aurix_client_config_default`, then set `ws_url`/`token`.
@@ -292,9 +389,15 @@ typedef struct AurixClientConfig {
   uint32_t ping_interval_ms;
   uint32_t heartbeat_interval_ms;
   /**
-   * Opus target bitrate, 6000..=128000.
+   * Uplink Opus encoder before any channel policy applies.
    */
-  uint32_t bitrate_bps;
+  struct AurixEncoderSettings encoder;
+  /**
+   * Adopt joined channels' audio policy (bitrate/FEC/DTX/bandwidth/signal and the complexity
+   * hint unless pinned with `aurix_client_set_complexity`). Server bitrate commands apply
+   * either way.
+   */
+  bool follow_channel_policy;
   /**
    * Jitter buffer depth before playout starts (20 ms frames).
    */
@@ -415,6 +518,26 @@ typedef struct AurixTtsStatus {
    */
   const char *message;
 } AurixTtsStatus;
+
+/**
+ * A channel's audio policy as set by the operator (`ChannelConfig`), merged across the
+ * joined channels. `complexity < 0` = no hint.
+ */
+typedef struct AurixAudioPolicy {
+  /**
+   * Target uplink bitrate.
+   */
+  uint32_t bitrate_bps;
+  /**
+   * Floor the server's adaptive bitrate never goes below.
+   */
+  uint32_t min_bitrate_bps;
+  bool fec;
+  bool dtx;
+  enum AurixOpusBandwidth max_bandwidth;
+  int8_t complexity;
+  enum AurixOpusSignal signal;
+} AurixAudioPolicy;
 
 /**
  * Pose of one user for positional channels (engine coordinates; the channel config decides
@@ -829,6 +952,35 @@ void aurix_client_set_vad_gate(struct AurixClient *client, bool enabled);
 enum AurixResult aurix_client_set_bitrate(struct AurixClient *client, uint32_t bitrate_bps);
 
 /**
+ * Replace the app's baseline encoder settings and re-apply them (under the current channel
+ * policy when `follow_channel_policy` is on). Takes effect from the next frame.
+ */
+enum AurixResult aurix_client_set_encoder_settings(struct AurixClient *client,
+                                                   const struct AurixEncoderSettings *settings);
+
+/**
+ * Settings the encoder is running with right now (after policy and server bitrate commands).
+ */
+bool aurix_client_encoder_settings(const struct AurixClient *client,
+                                   struct AurixEncoderSettings *out);
+
+/**
+ * Pin Opus complexity `0..=10` regardless of channel hints (e.g. lower it on a weak CPU);
+ * a negative value unpins and returns to the channel hint / config value.
+ */
+enum AurixResult aurix_client_set_complexity(struct AurixClient *client, int8_t complexity);
+
+/**
+ * Merged audio policy of the joined channels; `false` before the first join.
+ */
+bool aurix_client_audio_policy(const struct AurixClient *client, struct AurixAudioPolicy *out);
+
+/**
+ * Payload of `AurixEventAudioPolicyChanged`.
+ */
+bool aurix_event_audio_policy(const struct AurixEvent *event, struct AurixAudioPolicy *out);
+
+/**
  * Master playback volume `0..=2`.
  */
 void aurix_client_set_output_volume(struct AurixClient *client, float volume);
@@ -1003,6 +1155,80 @@ enum AurixResult aurix_regions_set_rtt(struct AurixRegionList *regions,
 enum AurixResult aurix_regions_rank(struct AurixRegionList *regions,
                                     const char *preferred_region,
                                     double rtt_tolerance_ms);
+
+/**
+ * Create an Opus encoder for `sample_rate_hz` (8000/12000/16000/24000/48000) and 1 or 2
+ * channels with `settings` (NULL = defaults). Returns NULL on error (see `aurix_last_error`).
+ */
+struct AurixOpusEncoder *aurix_opus_encoder_create(uint32_t sample_rate_hz,
+                                                   uint8_t channels,
+                                                   const struct AurixEncoderSettings *settings);
+
+void aurix_opus_encoder_destroy(struct AurixOpusEncoder *encoder);
+
+/**
+ * Push new settings into the encoder; takes effect from the next frame. Out-of-range values
+ * are clamped (read them back with `aurix_opus_encoder_settings`).
+ */
+enum AurixResult aurix_opus_encoder_apply(struct AurixOpusEncoder *encoder,
+                                          const struct AurixEncoderSettings *settings);
+
+/**
+ * The settings the encoder is running with (as clamped).
+ */
+bool aurix_opus_encoder_settings(const struct AurixOpusEncoder *encoder,
+                                 struct AurixEncoderSettings *out);
+
+/**
+ * Encode one interleaved f32 frame of `frame_samples_per_channel` samples per channel (a
+ * valid Opus frame size: 2.5/5/10/20/40/60 ms). Returns the packet length written to `out`,
+ * or a negative `AurixResult` code.
+ */
+int32_t aurix_opus_encoder_encode_f32(struct AurixOpusEncoder *encoder,
+                                      const float *pcm,
+                                      size_t frame_samples_per_channel,
+                                      uint8_t *out,
+                                      size_t out_len);
+
+/**
+ * `aurix_opus_encoder_encode_f32` for interleaved i16 PCM.
+ */
+int32_t aurix_opus_encoder_encode_i16(struct AurixOpusEncoder *encoder,
+                                      const int16_t *pcm,
+                                      size_t frame_samples_per_channel,
+                                      uint8_t *out,
+                                      size_t out_len);
+
+/**
+ * Create an Opus decoder for `sample_rate_hz` and 1 or 2 channels. NULL on error.
+ */
+struct AurixOpusDecoder *aurix_opus_decoder_create(uint32_t sample_rate_hz, uint8_t channels);
+
+void aurix_opus_decoder_destroy(struct AurixOpusDecoder *decoder);
+
+/**
+ * Decode one packet into interleaved f32 PCM with room for `max_frame_samples_per_channel`
+ * samples per channel. `packet == NULL` or `packet_len == 0` runs packet-loss concealment
+ * for exactly `max_frame_samples_per_channel` samples. `fec` decodes the in-band FEC data
+ * carried by `packet` for the *previous* (lost) frame instead of the packet's own audio.
+ * Returns samples per channel written, or a negative `AurixResult` code.
+ */
+int32_t aurix_opus_decoder_decode_f32(struct AurixOpusDecoder *decoder,
+                                      const uint8_t *packet,
+                                      size_t packet_len,
+                                      float *pcm,
+                                      size_t max_frame_samples_per_channel,
+                                      bool fec);
+
+/**
+ * `aurix_opus_decoder_decode_f32` for interleaved i16 PCM.
+ */
+int32_t aurix_opus_decoder_decode_i16(struct AurixOpusDecoder *decoder,
+                                      const uint8_t *packet,
+                                      size_t packet_len,
+                                      int16_t *pcm,
+                                      size_t max_frame_samples_per_channel,
+                                      bool fec);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -438,10 +438,18 @@ pub struct ChannelConfig {
     pub channel_type: ChannelType,
     pub max_participants: u32,
     pub codec: AudioCodec,
+    /// Target uplink bitrate participants encode at (bit/s); also the ceiling the server's
+    /// bitrate adaptation returns to.
     pub bitrate: u32,
+    /// Floor for server-driven bitrate adaptation (bit/s).
+    pub min_bitrate: u32,
     pub sample_rate: u32,
     pub enable_dtx: bool,
     pub enable_fec: bool,
+    /// Widest audio bandwidth participants may encode.
+    pub max_bandwidth: OpusBandwidth,
+    /// Encoder complexity hint `0..=10` (`None`: the client's default).
+    pub complexity: Option<u8>,
     pub positional_config: Option<PositionalConfig>,
     pub audio_profile: AudioProfile,
     pub recording_enabled: bool,
@@ -459,9 +467,12 @@ impl Default for ChannelConfig {
             max_participants: 256,
             codec: AudioCodec::Opus,
             bitrate: 48000,
+            min_bitrate: 12000,
             sample_rate: 48000,
             enable_dtx: true,
             enable_fec: true,
+            max_bandwidth: OpusBandwidth::Fullband,
+            complexity: None,
             positional_config: None,
             audio_profile: AudioProfile::Voice,
             recording_enabled: false,
@@ -469,6 +480,152 @@ impl Default for ChannelConfig {
             whisper_target: None,
             command_speakers: None,
         }
+    }
+}
+
+impl ChannelConfig {
+    /// Opus bitrate range (RFC 6716).
+    pub const MIN_OPUS_BITRATE: u32 = 6_000;
+    pub const MAX_OPUS_BITRATE: u32 = 510_000;
+
+    /// Rejects values a client could not honour. `bitrate_cap` is the node's
+    /// `media.max_bitrate`.
+    pub fn validate(&self, bitrate_cap: u32) -> std::result::Result<(), String> {
+        if self.max_participants == 0 {
+            return Err("max_participants must be > 0".into());
+        }
+        let cap = bitrate_cap.clamp(Self::MIN_OPUS_BITRATE, Self::MAX_OPUS_BITRATE);
+        if !(Self::MIN_OPUS_BITRATE..=cap).contains(&self.bitrate) {
+            return Err(format!(
+                "bitrate must be within {}..={} bit/s",
+                Self::MIN_OPUS_BITRATE,
+                cap
+            ));
+        }
+        if !(Self::MIN_OPUS_BITRATE..=self.bitrate).contains(&self.min_bitrate) {
+            return Err(format!(
+                "min_bitrate must be within {}..=bitrate ({})",
+                Self::MIN_OPUS_BITRATE,
+                self.bitrate
+            ));
+        }
+        if !matches!(self.sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) {
+            return Err("sample_rate must be one of 8000, 12000, 16000, 24000, 48000".into());
+        }
+        if self.complexity.is_some_and(|c| c > 10) {
+            return Err("complexity must be within 0..=10".into());
+        }
+        Ok(())
+    }
+
+    /// The encoder policy this channel imposes on its participants.
+    pub fn audio_policy(&self) -> AudioPolicy {
+        AudioPolicy {
+            bitrate_bps: self.bitrate,
+            min_bitrate_bps: self.min_bitrate.min(self.bitrate),
+            fec: self.enable_fec,
+            dtx: self.enable_dtx,
+            max_bandwidth: self.max_bandwidth,
+            complexity: self.complexity,
+            signal: match self.audio_profile {
+                AudioProfile::Voice | AudioProfile::LowBandwidth => OpusSignal::Voice,
+                AudioProfile::Music => OpusSignal::Music,
+                AudioProfile::Broadcast => OpusSignal::Auto,
+            },
+        }
+    }
+}
+
+/// Audio bandwidth an Opus encoder is allowed to use (`OPUS_SET_MAX_BANDWIDTH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpusBandwidth {
+    /// 4 kHz — telephone quality, ~6–10 kbit/s.
+    Narrowband,
+    /// 6 kHz.
+    Mediumband,
+    /// 8 kHz — the classic "wideband" voice codec range.
+    Wideband,
+    /// 12 kHz.
+    Superwideband,
+    /// 20 kHz — everything the 48 kHz stream carries.
+    #[default]
+    Fullband,
+}
+
+impl OpusBandwidth {
+    /// `maxplaybackrate` value for SDP (RFC 7587): the sample rate that covers this bandwidth.
+    pub fn max_playback_rate_hz(self) -> u32 {
+        match self {
+            Self::Narrowband => 8_000,
+            Self::Mediumband => 12_000,
+            Self::Wideband => 16_000,
+            Self::Superwideband => 24_000,
+            Self::Fullband => 48_000,
+        }
+    }
+}
+
+/// Content hint for the encoder (`OPUS_SET_SIGNAL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpusSignal {
+    #[default]
+    Auto,
+    Voice,
+    Music,
+}
+
+/// Encoder settings a channel requires of everyone sending into it. Delivered in
+/// `ChannelJoinAck.audio` and, when an operator edits the channel, in `ChannelAudioPolicy`.
+/// A client in several channels applies [`AudioPolicy::merge`] over all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioPolicy {
+    pub bitrate_bps: u32,
+    pub min_bitrate_bps: u32,
+    pub fec: bool,
+    pub dtx: bool,
+    pub max_bandwidth: OpusBandwidth,
+    pub complexity: Option<u8>,
+    pub signal: OpusSignal,
+}
+
+impl Default for AudioPolicy {
+    fn default() -> Self {
+        ChannelConfig::default().audio_policy()
+    }
+}
+
+impl AudioPolicy {
+    /// Combined policy for a sender whose one encoder feeds several channels: the widest
+    /// bitrate and bandwidth so no channel is starved, FEC if any channel wants it, DTX only if
+    /// every channel allows it, the highest complexity hint, and `Music` if any channel is music.
+    pub fn merge(self, other: AudioPolicy) -> AudioPolicy {
+        AudioPolicy {
+            bitrate_bps: self.bitrate_bps.max(other.bitrate_bps),
+            min_bitrate_bps: self.min_bitrate_bps.max(other.min_bitrate_bps),
+            fec: self.fec || other.fec,
+            dtx: self.dtx && other.dtx,
+            max_bandwidth: self.max_bandwidth.max(other.max_bandwidth),
+            complexity: match (self.complexity, other.complexity) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
+            signal: match (self.signal, other.signal) {
+                (OpusSignal::Music, _) | (_, OpusSignal::Music) => OpusSignal::Music,
+                (OpusSignal::Voice, _) | (_, OpusSignal::Voice) => OpusSignal::Voice,
+                _ => OpusSignal::Auto,
+            },
+        }
+    }
+
+    /// Merge of all policies, or the default policy when the iterator is empty.
+    pub fn merge_all(policies: impl IntoIterator<Item = AudioPolicy>) -> AudioPolicy {
+        policies
+            .into_iter()
+            .reduce(AudioPolicy::merge)
+            .unwrap_or_default()
     }
 }
 
@@ -1237,5 +1394,69 @@ mod tests {
         }
         .stereo_gains();
         assert!(r > l);
+    }
+
+    #[test]
+    fn channel_config_validation_bounds_opus_settings() {
+        let mut cfg = ChannelConfig::default();
+        assert!(cfg.validate(510_000).is_ok());
+        cfg.bitrate = 5_000;
+        assert!(cfg.validate(510_000).is_err());
+        cfg.bitrate = 64_000;
+        assert!(cfg.validate(32_000).is_err(), "node cap applies");
+        assert!(cfg.validate(64_000).is_ok());
+        cfg.min_bitrate = 96_000;
+        assert!(cfg.validate(510_000).is_err(), "floor above target");
+        cfg.min_bitrate = 8_000;
+        cfg.complexity = Some(11);
+        assert!(cfg.validate(510_000).is_err());
+        cfg.complexity = Some(10);
+        cfg.sample_rate = 44_100;
+        assert!(cfg.validate(510_000).is_err());
+        cfg.sample_rate = 16_000;
+        assert!(cfg.validate(510_000).is_ok());
+        cfg.max_participants = 0;
+        assert!(cfg.validate(510_000).is_err());
+    }
+
+    #[test]
+    fn audio_policy_merge_is_the_most_permissive_encoder() {
+        let voice = ChannelConfig {
+            bitrate: 24_000,
+            min_bitrate: 8_000,
+            enable_dtx: true,
+            enable_fec: false,
+            max_bandwidth: OpusBandwidth::Wideband,
+            complexity: Some(5),
+            ..ChannelConfig::default()
+        }
+        .audio_policy();
+        let music = ChannelConfig {
+            bitrate: 96_000,
+            min_bitrate: 32_000,
+            enable_dtx: false,
+            enable_fec: true,
+            max_bandwidth: OpusBandwidth::Fullband,
+            complexity: None,
+            audio_profile: AudioProfile::Music,
+            ..ChannelConfig::default()
+        }
+        .audio_policy();
+        assert_eq!(voice.signal, OpusSignal::Voice);
+        assert_eq!(music.signal, OpusSignal::Music);
+        let merged = voice.merge(music);
+        assert_eq!(merged.bitrate_bps, 96_000);
+        assert_eq!(merged.min_bitrate_bps, 32_000);
+        assert!(merged.fec && !merged.dtx);
+        assert_eq!(merged.max_bandwidth, OpusBandwidth::Fullband);
+        assert_eq!(merged.complexity, Some(5));
+        assert_eq!(merged.signal, OpusSignal::Music);
+        assert_eq!(music.merge(voice), merged, "commutative");
+        assert_eq!(AudioPolicy::merge_all([]), AudioPolicy::default());
+        assert_eq!(AudioPolicy::merge_all([voice]), voice);
+        assert_eq!(
+            AudioPolicy::default().max_bandwidth.max_playback_rate_hz(),
+            48_000
+        );
     }
 }

@@ -36,6 +36,14 @@ pub enum ServerEvent {
         channel_id: ChannelId,
         timestamp: DateTime<Utc>,
     },
+    /// An operator edited the channel; live channels on every node pick up `config` and
+    /// participants receive the new `AudioPolicy`.
+    ChannelConfigUpdated {
+        app_id: AppId,
+        channel_id: ChannelId,
+        config: ChannelConfig,
+        timestamp: DateTime<Utc>,
+    },
     /// First participant joined an otherwise empty channel.
     ChannelActivated {
         app_id: AppId,
@@ -238,6 +246,7 @@ impl ServerEvent {
             | Self::ParticipantLeft { app_id, .. }
             | Self::ChannelCreated { app_id, .. }
             | Self::ChannelDestroyed { app_id, .. }
+            | Self::ChannelConfigUpdated { app_id, .. }
             | Self::ChannelActivated { app_id, .. }
             | Self::ChannelDeactivated { app_id, .. }
             | Self::UserMuted { app_id, .. }
@@ -283,6 +292,7 @@ impl ServerEvent {
             Self::ParticipantLeft { .. } => "participant.left",
             Self::ChannelCreated { .. } => "channel.created",
             Self::ChannelDestroyed { .. } => "channel.destroyed",
+            Self::ChannelConfigUpdated { .. } => "channel.config_updated",
             Self::ChannelActivated { .. } => "channel.activated",
             Self::ChannelDeactivated { .. } => "channel.deactivated",
             Self::UserMuted { .. } => "participant.muted",
@@ -315,6 +325,7 @@ impl ServerEvent {
     pub const PUBLIC_TYPES: &'static [&'static str] = &[
         "channel.created",
         "channel.destroyed",
+        "channel.config_updated",
         "channel.activated",
         "channel.deactivated",
         "participant.joined",

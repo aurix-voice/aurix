@@ -10,7 +10,7 @@ emit:
 
 | Family | Events |
 | --- | --- |
-| channels | `channel.created`, `channel.destroyed`, `channel.activated`, `channel.deactivated`, `channel.energy`, `channel.transcript` |
+| channels | `channel.created`, `channel.destroyed`, `channel.config_updated`, `channel.activated`, `channel.deactivated`, `channel.energy`, `channel.transcript` |
 | participants | `participant.joined`, `participant.left`, `participant.muted`, `participant.unmuted`, `participant.kicked`, `participant.speaking`, `participant.typing` |
 | users / moderation | `user.banned`, `user.deleted`, `user.block_changed`, `moderation.event` |
 | recordings / streams | `recording.started`, `recording.stopped`, `recording.consent_required`, `audio_stream.started`, `audio_stream.stopped` |
@@ -20,7 +20,8 @@ emit:
 
 `channel.activated` / `channel.deactivated` fire when a channel gets its first participant /
 loses its last one — including channels left behind by a crashed node once its sessions
-expire. The high-frequency types `participant.typing`, `participant.speaking` and
+expire. `channel.config_updated` carries the full new `config` after `PUT /v1/channels/{id}/config`
+(it is also how the other nodes learn about the edit). The high-frequency types `participant.typing`, `participant.speaking` and
 `channel.energy` are delivered only when a subscription or SSE filter names them explicitly;
 `"*"` does not include them.
 

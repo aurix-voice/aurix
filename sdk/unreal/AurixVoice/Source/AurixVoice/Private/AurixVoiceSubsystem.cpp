@@ -174,6 +174,93 @@ FAurixNetworkQuality ToNetworkQuality(const AurixNetworkQuality& Q)
 	return Out;
 }
 
+AurixOpusBandwidth ToNativeBandwidth(EAurixOpusBandwidth B)
+{
+	switch (B)
+	{
+	case EAurixOpusBandwidth::Narrowband: return AURIX_BANDWIDTH_NARROWBAND;
+	case EAurixOpusBandwidth::Mediumband: return AURIX_BANDWIDTH_MEDIUMBAND;
+	case EAurixOpusBandwidth::Wideband: return AURIX_BANDWIDTH_WIDEBAND;
+	case EAurixOpusBandwidth::Superwideband: return AURIX_BANDWIDTH_SUPERWIDEBAND;
+	default: return AURIX_BANDWIDTH_FULLBAND;
+	}
+}
+
+EAurixOpusBandwidth FromNativeBandwidth(AurixOpusBandwidth B)
+{
+	switch (B)
+	{
+	case AURIX_BANDWIDTH_NARROWBAND: return EAurixOpusBandwidth::Narrowband;
+	case AURIX_BANDWIDTH_MEDIUMBAND: return EAurixOpusBandwidth::Mediumband;
+	case AURIX_BANDWIDTH_WIDEBAND: return EAurixOpusBandwidth::Wideband;
+	case AURIX_BANDWIDTH_SUPERWIDEBAND: return EAurixOpusBandwidth::Superwideband;
+	default: return EAurixOpusBandwidth::Fullband;
+	}
+}
+
+AurixOpusSignal ToNativeSignal(EAurixOpusSignal S)
+{
+	switch (S)
+	{
+	case EAurixOpusSignal::Voice: return AURIX_SIGNAL_VOICE;
+	case EAurixOpusSignal::Music: return AURIX_SIGNAL_MUSIC;
+	default: return AURIX_SIGNAL_AUTO;
+	}
+}
+
+EAurixOpusSignal FromNativeSignal(AurixOpusSignal S)
+{
+	switch (S)
+	{
+	case AURIX_SIGNAL_VOICE: return EAurixOpusSignal::Voice;
+	case AURIX_SIGNAL_MUSIC: return EAurixOpusSignal::Music;
+	default: return EAurixOpusSignal::Auto;
+	}
+}
+
+AurixEncoderSettings ToNativeEncoderSettings(const FAurixEncoderSettings& S)
+{
+	AurixEncoderSettings Out;
+	Out.bitrate_bps = static_cast<uint32_t>(FMath::Max(1, S.BitrateBps));
+	Out.complexity = static_cast<uint8_t>(FMath::Clamp(S.Complexity, 0, 10));
+	Out.max_bandwidth = ToNativeBandwidth(S.MaxBandwidth);
+	Out.signal = ToNativeSignal(S.Signal);
+	Out.vbr = S.bVbr;
+	Out.constrained_vbr = S.bConstrainedVbr;
+	Out.fec = S.bFec;
+	Out.expected_loss_percent = static_cast<uint8_t>(FMath::Clamp(S.ExpectedLossPercent, 0, 100));
+	Out.dtx = S.bDtx;
+	return Out;
+}
+
+FAurixEncoderSettings FromNativeEncoderSettings(const AurixEncoderSettings& S)
+{
+	FAurixEncoderSettings Out;
+	Out.BitrateBps = static_cast<int32>(S.bitrate_bps);
+	Out.Complexity = static_cast<int32>(S.complexity);
+	Out.MaxBandwidth = FromNativeBandwidth(S.max_bandwidth);
+	Out.Signal = FromNativeSignal(S.signal);
+	Out.bVbr = S.vbr;
+	Out.bConstrainedVbr = S.constrained_vbr;
+	Out.bFec = S.fec;
+	Out.ExpectedLossPercent = static_cast<int32>(S.expected_loss_percent);
+	Out.bDtx = S.dtx;
+	return Out;
+}
+
+FAurixAudioPolicy ToAudioPolicy(const AurixAudioPolicy& P)
+{
+	FAurixAudioPolicy Out;
+	Out.BitrateBps = static_cast<int32>(P.bitrate_bps);
+	Out.MinBitrateBps = static_cast<int32>(P.min_bitrate_bps);
+	Out.bFec = P.fec;
+	Out.bDtx = P.dtx;
+	Out.MaxBandwidth = FromNativeBandwidth(P.max_bandwidth);
+	Out.Complexity = static_cast<int32>(P.complexity);
+	Out.Signal = FromNativeSignal(P.signal);
+	return Out;
+}
+
 FAurixStats ToStats(const AurixStats& S)
 {
 	FAurixStats Out;
@@ -276,7 +363,8 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.reconnect_initial_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectInitialDelayMs));
 	Cfg.raw.reconnect_max_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectMaxDelayMs));
 	Cfg.raw.request_timeout_ms = static_cast<uint32_t>(FMath::Max(1, Settings.RequestTimeoutMs));
-	Cfg.raw.bitrate_bps = static_cast<uint32_t>(FMath::Max(1, Settings.BitrateBps));
+	Cfg.raw.encoder = ToNativeEncoderSettings(Settings.Encoder);
+	Cfg.raw.follow_channel_policy = Settings.bFollowChannelPolicy;
 	Cfg.raw.jitter_target_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterTargetFrames));
 	Cfg.raw.jitter_max_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterMaxFrames));
 	Cfg.raw.vad_gate = Settings.bVadGate;
@@ -515,6 +603,41 @@ void UAurixVoiceSubsystem::SetVadGate(bool bEnabled)
 bool UAurixVoiceSubsystem::SetBitrate(int32 BitrateBps)
 {
 	return Native && BitrateBps > 0 && Check(Native->Client.set_bitrate(static_cast<uint32_t>(BitrateBps)), TEXT("set_bitrate"));
+}
+
+bool UAurixVoiceSubsystem::SetEncoderSettings(const FAurixEncoderSettings& Settings)
+{
+	return Native && Check(Native->Client.set_encoder_settings(ToNativeEncoderSettings(Settings)), TEXT("set_encoder_settings"));
+}
+
+bool UAurixVoiceSubsystem::GetEncoderSettings(FAurixEncoderSettings& OutSettings) const
+{
+	AurixEncoderSettings Raw;
+	if (!Native || !Native->Client.encoder_settings(Raw))
+	{
+		OutSettings = FAurixEncoderSettings();
+		return false;
+	}
+	OutSettings = FromNativeEncoderSettings(Raw);
+	return true;
+}
+
+bool UAurixVoiceSubsystem::SetComplexity(int32 Complexity)
+{
+	const int8_t Pinned = Complexity < 0 ? int8_t(-1) : static_cast<int8_t>(FMath::Min(Complexity, 10));
+	return Native && Check(Native->Client.set_complexity(Pinned), TEXT("set_complexity"));
+}
+
+bool UAurixVoiceSubsystem::GetAudioPolicy(FAurixAudioPolicy& OutPolicy) const
+{
+	AurixAudioPolicy Raw;
+	if (!Native || !Native->Client.audio_policy(Raw))
+	{
+		OutPolicy = FAurixAudioPolicy();
+		return false;
+	}
+	OutPolicy = ToAudioPolicy(Raw);
+	return true;
 }
 
 // ---- playback ------------------------------------------------------------------------------
@@ -1107,6 +1230,16 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		if (aurix_event_network_quality(Raw, &Q))
 		{
 			OnNetworkQuality.Broadcast(ToNetworkQuality(Q));
+		}
+		break;
+	}
+
+	case AURIX_EVENT_AUDIO_POLICY_CHANGED:
+	{
+		AurixAudioPolicy P;
+		if (aurix_event_audio_policy(Raw, &P))
+		{
+			OnAudioPolicyChanged.Broadcast(ToAudioPolicy(P));
 		}
 		break;
 	}

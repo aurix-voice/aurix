@@ -2,6 +2,7 @@ use crate::session::MediaSession;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
 use dashmap::DashMap;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -38,7 +39,8 @@ pub struct MediaChannel {
     pub channel_id: ChannelId,
     pub app_id: AppId,
     pub channel_type: ChannelType,
-    pub config: ChannelConfig,
+    /// Current configuration; operator edits are applied live via [`MediaChannel::update_config`].
+    config: RwLock<ChannelConfig>,
     participants: DashMap<UserId, Arc<MediaSession>>,
     participant_roles: DashMap<UserId, ChannelRole>,
     ssrc_map: DashMap<u32, UserId>,
@@ -54,13 +56,28 @@ impl MediaChannel {
             channel_id,
             app_id,
             channel_type: config.channel_type,
-            config,
+            config: RwLock::new(config),
             participants: DashMap::new(),
             participant_roles: DashMap::new(),
             ssrc_map: DashMap::new(),
             participant_count: AtomicU32::new(0),
             positions: DashMap::new(),
         }
+    }
+
+    pub fn config(&self) -> RwLockReadGuard<'_, ChannelConfig> {
+        self.config.read()
+    }
+
+    /// Replaces the configuration for participants already in the channel. The channel type
+    /// is fixed for the channel's lifetime; a different type in `config` is ignored.
+    pub fn update_config(&self, mut config: ChannelConfig) {
+        config.channel_type = self.channel_type;
+        *self.config.write() = config;
+    }
+
+    pub fn audio_policy(&self) -> AudioPolicy {
+        self.config.read().audio_policy()
     }
 
     pub fn add_participant(
@@ -78,7 +95,7 @@ impl MediaChannel {
             self.remove_participant(&session.user_id);
         }
         // Reserve a slot atomically so concurrent joins cannot exceed max_participants.
-        let max = self.config.max_participants;
+        let max = self.config.read().max_participants;
         let reserved =
             self.participant_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
@@ -161,6 +178,7 @@ impl MediaChannel {
                 self.get_role(user_id).can_speak()
                     || self
                         .config
+                        .read()
                         .command_speakers
                         .as_ref()
                         .is_some_and(|s| s.contains(user_id))
@@ -272,6 +290,7 @@ impl MediaChannel {
             let allowed = sender_role.can_speak()
                 || self
                     .config
+                    .read()
                     .command_speakers
                     .as_ref()
                     .is_some_and(|speakers| speakers.contains(&sender_uid));
@@ -284,7 +303,8 @@ impl MediaChannel {
 
         // ── Whisper channel: only send to the designated target ──
         if self.channel_type == ChannelType::Whisper {
-            if let Some(ref target) = self.config.whisper_target {
+            let target = self.config.read().whisper_target;
+            if let Some(ref target) = target {
                 return self
                     .participants
                     .get(target)
@@ -327,7 +347,7 @@ impl MediaChannel {
             Some(p) => p.value().position.clone(),
             None => return Vec::new(), // No position known for sender
         };
-        let pos_cfg = match &self.config.positional_config {
+        let pos_cfg = match self.config.read().positional_config.clone() {
             Some(c) => c,
             None => return self.all_others_full_volume(sender_uid),
         };

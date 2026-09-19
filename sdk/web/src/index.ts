@@ -9,6 +9,24 @@ export {
 } from './audio.js';
 export type { AudioLevelMeterOptions, AudioLevelSample } from './audio.js';
 export {
+  DEFAULT_AUDIO_POLICY,
+  applyOpusSenderPreferences,
+  audioPoliciesEqual,
+  mergeAllAudioPolicies,
+  mergeAudioPolicies,
+  negotiatedOpusPreferences,
+  opusPlaybackRateHz,
+  parseAudioPolicy,
+  resolveOpusSenderPreferences,
+} from './opus.js';
+export type {
+  AudioPolicy,
+  OpusBandwidth,
+  OpusBrowserOptions,
+  OpusSenderPreferences,
+  OpusSignal,
+} from './opus.js';
+export {
   LossWindow,
   RttTracker,
   assembleClientStats,
@@ -39,6 +57,7 @@ export type {
   TtsStatus,
 } from './client.js';
 export type {
+  AudioPolicyWire,
   ChannelRole,
   ChatMessageWire,
   ClientMessage,

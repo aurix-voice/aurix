@@ -87,6 +87,48 @@ Statistics: `aurix_client_stats` (`AurixStats`: media counters, `bad_auth`, `rep
 `aurix_client_network_quality` and the `NETWORK_QUALITY` event — see
 [Network quality](../features/quality.md).
 
+## Opus encoder controls
+
+The core owns a libopus encoder (statically linked) and exposes every control of it:
+
+```rust
+use aurix_client::{EncoderSettings, OpusBandwidth, OpusSignal};
+
+let mut cfg = ClientConfig::new(ws_url, jwt);
+cfg.encoder = EncoderSettings {
+    bitrate_bps: 32_000,                 // 6_000..=300_000 (mono libopus ceiling)
+    complexity: 9,                       // 0..=10
+    max_bandwidth: OpusBandwidth::Fullband,
+    signal: OpusSignal::Voice,           // Auto | Voice | Music → application + signal hint
+    vbr: true, constrained_vbr: true,
+    fec: true, expected_loss_percent: 5,
+    dtx: false,
+};
+cfg.follow_channel_policy = true;        // default
+
+client.set_encoder_settings(settings)?;  // replace the baseline at runtime
+client.set_complexity(Some(5))?;         // pin the CPU budget regardless of policy hints
+client.audio_policy();                   // merged policy of the joined channels
+// Event::AudioPolicyChanged(policy) / Event::BitrateChanged { .. }
+```
+
+C: `AurixEncoderSettings`, `aurix_client_set_encoder_settings` / `aurix_client_encoder_settings`,
+`aurix_client_set_complexity` (−1 un-pins), `aurix_client_audio_policy` (`AurixAudioPolicy`),
+`AURIX_EVENT_AUDIO_POLICY_CHANGED` + `aurix_event_audio_policy`. Three layers are applied in
+order: the baseline, the merged **channel audio policy** (`ChannelJoinAck.audio`, live
+`ChannelAudioPolicy`; max bitrate, widest bandwidth, FEC if any channel wants it, DTX only if
+all allow it, Music > Voice > Auto, complexity hint unless pinned) and the server's transient
+`BitrateCommand` (clamped to the policy's floor/target; its `expected_loss_percent` also raises
+the FEC tuning). Same semantics in Unity and — where WebRTC permits — the Web SDK
+([Channels](../features/channels.md#configuration), [Network quality](../features/quality.md)).
+
+The codec is also available **standalone**, for hosts that run their own transport or want
+libopus without the client: `aurix_opus_encoder_create/apply/settings/encode_f32/encode_i16`,
+`aurix_opus_decoder_create/decode_f32/decode_i16` (`packet == NULL` = PLC, `fec = true` =
+recover the previous lost frame from this packet's FEC data). None of these is variadic, so they
+are safe P/Invoke targets — this is how the Unity SDK's `NativeOpusCodec` gets libopus. C++:
+`aurix::OpusEncoder` / `aurix::OpusDecoder` in `aurix_client.hpp`.
+
 ## Region selection
 
 The core has no HTTP client, so region discovery is split: the host performs the HTTP requests,
@@ -159,6 +201,12 @@ Audio options: default engine capture + 2D `UAudioComponent` (`PlaybackSoundClas
 through your mixer/ducking); or `PushCaptureAudio` from your own capture path and
 `MixOutputAudio` from your own procedural sound/submix — both audio-thread safe until
 `Disconnect()`.
+
+Opus: `FAurixVoiceSettings.Encoder` (`FAurixEncoderSettings`: bitrate, complexity, max
+bandwidth, signal, VBR/constrained VBR, FEC, expected loss, DTX) and `bFollowChannelPolicy`;
+at runtime `SetEncoderSettings`, `GetEncoderSettings`, `SetComplexity` (pin, `-1` un-pins),
+`GetAudioPolicy` (`FAurixAudioPolicy`) and the `OnAudioPolicyChanged` / `OnBitrateChanged`
+delegates — the same layering as the Rust API above.
 
 `GetStats(FAurixStats&)`, `GetNetworkQuality(FAurixNetworkQuality&)` and `OnNetworkQuality`
 expose the shared quality model; `OnRawEvent` delivers every event as JSON for anything without

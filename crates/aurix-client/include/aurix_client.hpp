@@ -114,6 +114,8 @@ public:
     bool chat(AurixChatMessage& out) const { return aurix_event_chat(ev_, &out); }
     bool transcript(AurixTranscript& out) const { return aurix_event_transcript(ev_, &out); }
     bool tts(AurixTtsStatus& out) const { return aurix_event_tts(ev_, &out); }
+    /// Payload of `AURIX_EVENT_AUDIO_POLICY_CHANGED`.
+    bool audio_policy(AurixAudioPolicy& out) const { return aurix_event_audio_policy(ev_, &out); }
 
     std::vector<AurixParticipant> participants() const {
         std::vector<AurixParticipant> out(aurix_event_participant_count(ev_));
@@ -250,6 +252,17 @@ public:
     void set_vad(float threshold, std::uint32_t hangover_frames) { aurix_client_set_vad(c_, threshold, hangover_frames); }
     void set_vad_gate(bool enabled) { aurix_client_set_vad_gate(c_, enabled); }
     AurixResult set_bitrate(std::uint32_t bps) { return aurix_client_set_bitrate(c_, bps); }
+    /// Replace the baseline Opus settings (bitrate, complexity, bandwidth, VBR/FEC/DTX);
+    /// the channel policy is laid over them when `follow_channel_policy` is on.
+    AurixResult set_encoder_settings(const AurixEncoderSettings& settings) {
+        return aurix_client_set_encoder_settings(c_, &settings);
+    }
+    /// What the encoder runs with right now.
+    bool encoder_settings(AurixEncoderSettings& out) const { return aurix_client_encoder_settings(c_, &out); }
+    /// Pin complexity 0..=10 over channel hints; a negative value unpins.
+    AurixResult set_complexity(std::int8_t complexity) { return aurix_client_set_complexity(c_, complexity); }
+    /// Merged policy of the joined channels; `false` before the first join.
+    bool audio_policy(AurixAudioPolicy& out) const { return aurix_client_audio_policy(c_, &out); }
     void set_output_volume(float volume) { aurix_client_set_output_volume(c_, volume); }
     void set_output_muted(bool muted) { aurix_client_set_output_muted(c_, muted); }
     void reset_capture() { aurix_client_reset_capture(c_); }
@@ -374,6 +387,88 @@ private:
         }
     }
     AurixRegionList* r_;
+};
+
+/// Bare Opus encoder for hosts with their own capture pipeline (the `Client` already encodes
+/// what it captures). Move-only.
+class OpusEncoder {
+public:
+    OpusEncoder() : e_(nullptr) {}
+    /// `settings == nullptr` selects the defaults. `valid()` is false on error (see `last_error()`).
+    OpusEncoder(std::uint32_t sample_rate_hz, std::uint8_t channels, const AurixEncoderSettings* settings = nullptr)
+        : e_(aurix_opus_encoder_create(sample_rate_hz, channels, settings)) {}
+    OpusEncoder(OpusEncoder&& o) noexcept : e_(o.e_) { o.e_ = nullptr; }
+    OpusEncoder& operator=(OpusEncoder&& o) noexcept {
+        if (this != &o) {
+            reset();
+            e_ = o.e_;
+            o.e_ = nullptr;
+        }
+        return *this;
+    }
+    ~OpusEncoder() { reset(); }
+    OpusEncoder(const OpusEncoder&) = delete;
+    OpusEncoder& operator=(const OpusEncoder&) = delete;
+
+    bool valid() const { return e_ != nullptr; }
+    AurixResult apply(const AurixEncoderSettings& settings) { return aurix_opus_encoder_apply(e_, &settings); }
+    bool settings(AurixEncoderSettings& out) const { return aurix_opus_encoder_settings(e_, &out); }
+    /// Packet length, or a negative `AurixResult`.
+    int encode(const float* pcm, std::size_t frame_samples_per_channel, std::uint8_t* out, std::size_t out_len) {
+        return aurix_opus_encoder_encode_f32(e_, pcm, frame_samples_per_channel, out, out_len);
+    }
+    int encode(const std::int16_t* pcm, std::size_t frame_samples_per_channel, std::uint8_t* out,
+               std::size_t out_len) {
+        return aurix_opus_encoder_encode_i16(e_, pcm, frame_samples_per_channel, out, out_len);
+    }
+
+private:
+    void reset() {
+        if (e_) {
+            aurix_opus_encoder_destroy(e_);
+            e_ = nullptr;
+        }
+    }
+    AurixOpusEncoder* e_;
+};
+
+/// Bare Opus decoder with PLC/FEC. Move-only.
+class OpusDecoder {
+public:
+    OpusDecoder() : d_(nullptr) {}
+    OpusDecoder(std::uint32_t sample_rate_hz, std::uint8_t channels) : d_(aurix_opus_decoder_create(sample_rate_hz, channels)) {}
+    OpusDecoder(OpusDecoder&& o) noexcept : d_(o.d_) { o.d_ = nullptr; }
+    OpusDecoder& operator=(OpusDecoder&& o) noexcept {
+        if (this != &o) {
+            reset();
+            d_ = o.d_;
+            o.d_ = nullptr;
+        }
+        return *this;
+    }
+    ~OpusDecoder() { reset(); }
+    OpusDecoder(const OpusDecoder&) = delete;
+    OpusDecoder& operator=(const OpusDecoder&) = delete;
+
+    bool valid() const { return d_ != nullptr; }
+    /// Samples per channel, or a negative `AurixResult`. `packet == nullptr` runs PLC.
+    int decode(const std::uint8_t* packet, std::size_t packet_len, float* pcm, std::size_t max_frame_samples_per_channel,
+               bool fec = false) {
+        return aurix_opus_decoder_decode_f32(d_, packet, packet_len, pcm, max_frame_samples_per_channel, fec);
+    }
+    int decode(const std::uint8_t* packet, std::size_t packet_len, std::int16_t* pcm,
+               std::size_t max_frame_samples_per_channel, bool fec = false) {
+        return aurix_opus_decoder_decode_i16(d_, packet, packet_len, pcm, max_frame_samples_per_channel, fec);
+    }
+
+private:
+    void reset() {
+        if (d_) {
+            aurix_opus_decoder_destroy(d_);
+            d_ = nullptr;
+        }
+    }
+    AurixOpusDecoder* d_;
 };
 
 }  // namespace aurix

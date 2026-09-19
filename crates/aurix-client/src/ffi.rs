@@ -29,8 +29,8 @@
 
 use aurix_common::protocol::{TransmissionMode, TtsDestination, TtsState, UserPosition};
 use aurix_common::types::{
-    ActionKind, ChannelId, ChannelRole, NetworkQuality, Orientation3D, Position3D,
-    RecordingConsent, UserId,
+    ActionKind, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, OpusBandwidth, OpusSignal,
+    Orientation3D, Position3D, RecordingConsent, UserId,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::audio::EncoderSettings;
 use crate::client::Client;
 use crate::config::ClientConfig;
 use crate::error::ClientError;
@@ -335,6 +336,160 @@ pub enum AurixRecordingConsent {
 
 // -------------------------------------------------------------------------------- config
 
+/// Opus coding bandwidth (`OPUS_SET_MAX_BANDWIDTH`), widest band the encoder may use.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixOpusBandwidth {
+    /// 4 kHz audio band.
+    AurixBandwidthNarrowband = 0,
+    /// 6 kHz.
+    AurixBandwidthMediumband = 1,
+    /// 8 kHz.
+    AurixBandwidthWideband = 2,
+    /// 12 kHz.
+    AurixBandwidthSuperwideband = 3,
+    /// 20 kHz.
+    AurixBandwidthFullband = 4,
+}
+
+impl From<OpusBandwidth> for AurixOpusBandwidth {
+    fn from(b: OpusBandwidth) -> Self {
+        match b {
+            OpusBandwidth::Narrowband => Self::AurixBandwidthNarrowband,
+            OpusBandwidth::Mediumband => Self::AurixBandwidthMediumband,
+            OpusBandwidth::Wideband => Self::AurixBandwidthWideband,
+            OpusBandwidth::Superwideband => Self::AurixBandwidthSuperwideband,
+            OpusBandwidth::Fullband => Self::AurixBandwidthFullband,
+        }
+    }
+}
+
+impl From<AurixOpusBandwidth> for OpusBandwidth {
+    fn from(b: AurixOpusBandwidth) -> Self {
+        match b {
+            AurixOpusBandwidth::AurixBandwidthNarrowband => Self::Narrowband,
+            AurixOpusBandwidth::AurixBandwidthMediumband => Self::Mediumband,
+            AurixOpusBandwidth::AurixBandwidthWideband => Self::Wideband,
+            AurixOpusBandwidth::AurixBandwidthSuperwideband => Self::Superwideband,
+            AurixOpusBandwidth::AurixBandwidthFullband => Self::Fullband,
+        }
+    }
+}
+
+/// Opus content hint (`OPUS_SET_SIGNAL`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixOpusSignal {
+    AurixSignalAuto = 0,
+    AurixSignalVoice = 1,
+    AurixSignalMusic = 2,
+}
+
+impl From<OpusSignal> for AurixOpusSignal {
+    fn from(s: OpusSignal) -> Self {
+        match s {
+            OpusSignal::Auto => Self::AurixSignalAuto,
+            OpusSignal::Voice => Self::AurixSignalVoice,
+            OpusSignal::Music => Self::AurixSignalMusic,
+        }
+    }
+}
+
+impl From<AurixOpusSignal> for OpusSignal {
+    fn from(s: AurixOpusSignal) -> Self {
+        match s {
+            AurixOpusSignal::AurixSignalAuto => Self::Auto,
+            AurixOpusSignal::AurixSignalVoice => Self::Voice,
+            AurixOpusSignal::AurixSignalMusic => Self::Music,
+        }
+    }
+}
+
+/// Uplink Opus encoder settings. Out-of-range values are clamped, never rejected.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurixEncoderSettings {
+    /// 6000..=300000 (libopus' mono ceiling).
+    pub bitrate_bps: u32,
+    /// 0..=10 (10 = best quality, most CPU).
+    pub complexity: u8,
+    pub max_bandwidth: AurixOpusBandwidth,
+    pub signal: AurixOpusSignal,
+    /// Variable bitrate; `false` = hard CBR.
+    pub vbr: bool,
+    /// Constrained VBR (frames stay within the bitrate's byte budget).
+    pub constrained_vbr: bool,
+    /// In-band forward error correction.
+    pub fec: bool,
+    /// Loss the FEC is tuned for, 0..=100 %.
+    pub expected_loss_percent: u8,
+    /// Discontinuous transmission during silence.
+    pub dtx: bool,
+}
+
+impl From<EncoderSettings> for AurixEncoderSettings {
+    fn from(s: EncoderSettings) -> Self {
+        Self {
+            bitrate_bps: s.bitrate_bps,
+            complexity: s.complexity,
+            max_bandwidth: s.max_bandwidth.into(),
+            signal: s.signal.into(),
+            vbr: s.vbr,
+            constrained_vbr: s.constrained_vbr,
+            fec: s.fec,
+            expected_loss_percent: s.expected_loss_percent,
+            dtx: s.dtx,
+        }
+    }
+}
+
+impl From<AurixEncoderSettings> for EncoderSettings {
+    fn from(s: AurixEncoderSettings) -> Self {
+        EncoderSettings {
+            bitrate_bps: s.bitrate_bps,
+            complexity: s.complexity,
+            max_bandwidth: s.max_bandwidth.into(),
+            signal: s.signal.into(),
+            vbr: s.vbr,
+            constrained_vbr: s.constrained_vbr,
+            fec: s.fec,
+            expected_loss_percent: s.expected_loss_percent,
+            dtx: s.dtx,
+        }
+        .clamped()
+    }
+}
+
+/// A channel's audio policy as set by the operator (`ChannelConfig`), merged across the
+/// joined channels. `complexity < 0` = no hint.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurixAudioPolicy {
+    /// Target uplink bitrate.
+    pub bitrate_bps: u32,
+    /// Floor the server's adaptive bitrate never goes below.
+    pub min_bitrate_bps: u32,
+    pub fec: bool,
+    pub dtx: bool,
+    pub max_bandwidth: AurixOpusBandwidth,
+    pub complexity: i8,
+    pub signal: AurixOpusSignal,
+}
+
+impl From<AudioPolicy> for AurixAudioPolicy {
+    fn from(p: AudioPolicy) -> Self {
+        Self {
+            bitrate_bps: p.bitrate_bps,
+            min_bitrate_bps: p.min_bitrate_bps,
+            fec: p.fec,
+            dtx: p.dtx,
+            max_bandwidth: p.max_bandwidth.into(),
+            complexity: p.complexity.map_or(-1, |c| c.min(10) as i8),
+            signal: p.signal.into(),
+        }
+    }
+}
+
 /// Connection parameters. Fill with `aurix_client_config_default`, then set `ws_url`/`token`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -351,8 +506,12 @@ pub struct AurixClientConfig {
     pub request_timeout_ms: u32,
     pub ping_interval_ms: u32,
     pub heartbeat_interval_ms: u32,
-    /// Opus target bitrate, 6000..=128000.
-    pub bitrate_bps: u32,
+    /// Uplink Opus encoder before any channel policy applies.
+    pub encoder: AurixEncoderSettings,
+    /// Adopt joined channels' audio policy (bitrate/FEC/DTX/bandwidth/signal and the complexity
+    /// hint unless pinned with `aurix_client_set_complexity`). Server bitrate commands apply
+    /// either way.
+    pub follow_channel_policy: bool,
     /// Jitter buffer depth before playout starts (20 ms frames).
     pub jitter_target_frames: u32,
     pub jitter_max_frames: u32,
@@ -378,7 +537,8 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         request_timeout_ms: d.request_timeout.as_millis() as u32,
         ping_interval_ms: d.ping_interval.as_millis() as u32,
         heartbeat_interval_ms: d.heartbeat_interval.as_millis() as u32,
-        bitrate_bps: d.bitrate_bps,
+        encoder: d.encoder.into(),
+        follow_channel_policy: d.follow_channel_policy,
         jitter_target_frames: d.jitter_target_frames as u32,
         jitter_max_frames: d.jitter_max_frames as u32,
         vad_gate: d.vad_gate,
@@ -438,7 +598,8 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.request_timeout = Duration::from_millis(c.request_timeout_ms.max(500) as u64);
     cfg.ping_interval = Duration::from_millis(c.ping_interval_ms.max(1000) as u64);
     cfg.heartbeat_interval = Duration::from_millis(c.heartbeat_interval_ms.max(500) as u64);
-    cfg.bitrate_bps = c.bitrate_bps.clamp(6_000, 128_000);
+    cfg.encoder = c.encoder.into();
+    cfg.follow_channel_policy = c.follow_channel_policy;
     cfg.jitter_target_frames = c.jitter_target_frames.clamp(1, 50) as usize;
     cfg.jitter_max_frames = c
         .jitter_max_frames
@@ -642,6 +803,8 @@ pub enum AurixEventType {
     AurixEventDisconnected = 29,
     /// `network_quality`.
     AurixEventNetworkQuality = 30,
+    /// `audio_policy`: merged policy of the joined channels changed.
+    AurixEventAudioPolicyChanged = 31,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -867,6 +1030,7 @@ impl AurixEvent {
             Event::FailedToRecover { .. } => T::AurixEventFailedToRecover,
             Event::Disconnected { .. } => T::AurixEventDisconnected,
             Event::NetworkQuality(_) => T::AurixEventNetworkQuality,
+            Event::AudioPolicyChanged(_) => T::AurixEventAudioPolicyChanged,
         }
     }
 }
@@ -1577,6 +1741,90 @@ pub unsafe extern "C" fn aurix_client_set_bitrate(
     match self::client(client) {
         Ok(c) => ok(c.set_bitrate(bitrate_bps)),
         Err(r) => r,
+    }
+}
+
+/// Replace the app's baseline encoder settings and re-apply them (under the current channel
+/// policy when `follow_channel_policy` is on). Takes effect from the next frame.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_encoder_settings(
+    client: *mut AurixClient,
+    settings: *const AurixEncoderSettings,
+) -> AurixResult {
+    if settings.is_null() {
+        return null_ptr("settings");
+    }
+    match self::client(client) {
+        Ok(c) => ok(c.set_encoder_settings((*settings).into())),
+        Err(r) => r,
+    }
+}
+
+/// Settings the encoder is running with right now (after policy and server bitrate commands).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_encoder_settings(
+    client: *const AurixClient,
+    out: *mut AurixEncoderSettings,
+) -> bool {
+    let Ok(c) = self::client(client) else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    *out = c.encoder_settings().into();
+    true
+}
+
+/// Pin Opus complexity `0..=10` regardless of channel hints (e.g. lower it on a weak CPU);
+/// a negative value unpins and returns to the channel hint / config value.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_complexity(
+    client: *mut AurixClient,
+    complexity: i8,
+) -> AurixResult {
+    match self::client(client) {
+        Ok(c) => ok(c.set_complexity(u8::try_from(complexity).ok().map(|v| v.min(10)))),
+        Err(r) => r,
+    }
+}
+
+/// Merged audio policy of the joined channels; `false` before the first join.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_audio_policy(
+    client: *const AurixClient,
+    out: *mut AurixAudioPolicy,
+) -> bool {
+    let Ok(c) = self::client(client) else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    match c.audio_policy() {
+        Some(p) => {
+            *out = p.into();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Payload of `AurixEventAudioPolicyChanged`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_audio_policy(
+    event: *const AurixEvent,
+    out: *mut AurixAudioPolicy,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::AudioPolicyChanged(p)) => {
+            *out = (*p).into();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2390,6 +2638,226 @@ pub unsafe extern "C" fn aurix_regions_rank(
     AurixResult::AurixOk
 }
 
+// -------------------------------------------------------------------------------- bare codec
+//
+// A standalone Opus encoder/decoder pair for hosts that run their own capture/playback
+// pipeline (the Unity SDK's `NativeOpusCodec`). libopus is linked statically into this
+// library, and every control is a plain non-variadic function, so P/Invoke works on every
+// platform including Apple arm64 (where calling `opus_encoder_ctl` through a fixed-arity
+// P/Invoke signature is undefined).
+
+/// Opaque bare Opus encoder (see `aurix_opus_encoder_create`).
+pub struct AurixOpusEncoder {
+    inner: crate::audio::OpusEncoder,
+}
+
+/// Opaque bare Opus decoder (see `aurix_opus_decoder_create`).
+pub struct AurixOpusDecoder {
+    inner: crate::audio::OpusDecoder,
+}
+
+fn codec_fail(e: crate::audio::CodecError) -> AurixResult {
+    set_error(&e.to_string());
+    match e {
+        crate::audio::CodecError::BadChannels(_) | crate::audio::CodecError::BadFrame => {
+            AurixResult::AurixInvalidArgument
+        }
+        crate::audio::CodecError::Opus(_) => AurixResult::AurixCodec,
+    }
+}
+
+/// Encoder-side error code for the `encode`/`decode` calls: negative `AurixResult`.
+fn codec_err_i32(e: crate::audio::CodecError) -> i32 {
+    -(codec_fail(e) as i32)
+}
+
+/// Create an Opus encoder for `sample_rate_hz` (8000/12000/16000/24000/48000) and 1 or 2
+/// channels with `settings` (NULL = defaults). Returns NULL on error (see `aurix_last_error`).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_encoder_create(
+    sample_rate_hz: u32,
+    channels: u8,
+    settings: *const AurixEncoderSettings,
+) -> *mut AurixOpusEncoder {
+    let settings = if settings.is_null() {
+        EncoderSettings::default()
+    } else {
+        (*settings).into()
+    };
+    match crate::audio::OpusEncoder::new(sample_rate_hz, channels, settings) {
+        Ok(inner) => Box::into_raw(Box::new(AurixOpusEncoder { inner })),
+        Err(e) => {
+            codec_fail(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_encoder_destroy(encoder: *mut AurixOpusEncoder) {
+    if !encoder.is_null() {
+        drop(Box::from_raw(encoder));
+    }
+}
+
+/// Push new settings into the encoder; takes effect from the next frame. Out-of-range values
+/// are clamped (read them back with `aurix_opus_encoder_settings`).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_encoder_apply(
+    encoder: *mut AurixOpusEncoder,
+    settings: *const AurixEncoderSettings,
+) -> AurixResult {
+    if encoder.is_null() {
+        return null_ptr("encoder");
+    }
+    if settings.is_null() {
+        return null_ptr("settings");
+    }
+    match (*encoder).inner.apply((*settings).into()) {
+        Ok(()) => AurixResult::AurixOk,
+        Err(e) => codec_fail(e.into()),
+    }
+}
+
+/// The settings the encoder is running with (as clamped).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_encoder_settings(
+    encoder: *const AurixOpusEncoder,
+    out: *mut AurixEncoderSettings,
+) -> bool {
+    if encoder.is_null() || out.is_null() {
+        return false;
+    }
+    *out = (*encoder).inner.settings().into();
+    true
+}
+
+/// Encode one interleaved f32 frame of `frame_samples_per_channel` samples per channel (a
+/// valid Opus frame size: 2.5/5/10/20/40/60 ms). Returns the packet length written to `out`,
+/// or a negative `AurixResult` code.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_encoder_encode_f32(
+    encoder: *mut AurixOpusEncoder,
+    pcm: *const f32,
+    frame_samples_per_channel: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if encoder.is_null() || pcm.is_null() || out.is_null() {
+        return -(null_ptr("encoder/pcm/out") as i32);
+    }
+    let enc = &mut (*encoder).inner;
+    let n = frame_samples_per_channel.saturating_mul(enc.channels());
+    let pcm = std::slice::from_raw_parts(pcm, n);
+    let out = std::slice::from_raw_parts_mut(out, out_len);
+    match enc.encode_f32(pcm, out) {
+        Ok(len) => len as i32,
+        Err(e) => codec_err_i32(e),
+    }
+}
+
+/// `aurix_opus_encoder_encode_f32` for interleaved i16 PCM.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_encoder_encode_i16(
+    encoder: *mut AurixOpusEncoder,
+    pcm: *const i16,
+    frame_samples_per_channel: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if encoder.is_null() || pcm.is_null() || out.is_null() {
+        return -(null_ptr("encoder/pcm/out") as i32);
+    }
+    let enc = &mut (*encoder).inner;
+    let n = frame_samples_per_channel.saturating_mul(enc.channels());
+    let pcm = std::slice::from_raw_parts(pcm, n);
+    let out = std::slice::from_raw_parts_mut(out, out_len);
+    match enc.encode_i16(pcm, out) {
+        Ok(len) => len as i32,
+        Err(e) => codec_err_i32(e),
+    }
+}
+
+/// Create an Opus decoder for `sample_rate_hz` and 1 or 2 channels. NULL on error.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_create(
+    sample_rate_hz: u32,
+    channels: u8,
+) -> *mut AurixOpusDecoder {
+    match crate::audio::OpusDecoder::new(sample_rate_hz, channels) {
+        Ok(inner) => Box::into_raw(Box::new(AurixOpusDecoder { inner })),
+        Err(e) => {
+            codec_fail(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_destroy(decoder: *mut AurixOpusDecoder) {
+    if !decoder.is_null() {
+        drop(Box::from_raw(decoder));
+    }
+}
+
+/// Decode one packet into interleaved f32 PCM with room for `max_frame_samples_per_channel`
+/// samples per channel. `packet == NULL` or `packet_len == 0` runs packet-loss concealment
+/// for exactly `max_frame_samples_per_channel` samples. `fec` decodes the in-band FEC data
+/// carried by `packet` for the *previous* (lost) frame instead of the packet's own audio.
+/// Returns samples per channel written, or a negative `AurixResult` code.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_decode_f32(
+    decoder: *mut AurixOpusDecoder,
+    packet: *const u8,
+    packet_len: usize,
+    pcm: *mut f32,
+    max_frame_samples_per_channel: usize,
+    fec: bool,
+) -> i32 {
+    if decoder.is_null() || pcm.is_null() {
+        return -(null_ptr("decoder/pcm") as i32);
+    }
+    let dec = &mut (*decoder).inner;
+    let packet: &[u8] = if packet.is_null() || packet_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(packet, packet_len)
+    };
+    let n = max_frame_samples_per_channel.saturating_mul(dec.channels());
+    let pcm = std::slice::from_raw_parts_mut(pcm, n);
+    match dec.decode_f32(packet, pcm, fec) {
+        Ok(len) => len as i32,
+        Err(e) => codec_err_i32(e),
+    }
+}
+
+/// `aurix_opus_decoder_decode_f32` for interleaved i16 PCM.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_decode_i16(
+    decoder: *mut AurixOpusDecoder,
+    packet: *const u8,
+    packet_len: usize,
+    pcm: *mut i16,
+    max_frame_samples_per_channel: usize,
+    fec: bool,
+) -> i32 {
+    if decoder.is_null() || pcm.is_null() {
+        return -(null_ptr("decoder/pcm") as i32);
+    }
+    let dec = &mut (*decoder).inner;
+    let packet: &[u8] = if packet.is_null() || packet_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(packet, packet_len)
+    };
+    let n = max_frame_samples_per_channel.saturating_mul(dec.channels());
+    let pcm = std::slice::from_raw_parts_mut(pcm, n);
+    match dec.decode_i16(packet, pcm, fec) {
+        Ok(len) => len as i32,
+        Err(e) => codec_err_i32(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2448,6 +2916,170 @@ mod tests {
                 0
             );
             aurix_client_destroy(client);
+        }
+    }
+
+    #[test]
+    fn encoder_settings_round_trip_through_the_abi() {
+        unsafe {
+            let mut cfg = std::mem::MaybeUninit::<AurixClientConfig>::uninit();
+            aurix_client_config_default(cfg.as_mut_ptr());
+            let mut cfg = cfg.assume_init();
+            assert_eq!(
+                cfg.encoder,
+                AurixEncoderSettings::from(EncoderSettings::default())
+            );
+            assert!(cfg.follow_channel_policy);
+            let url = CString::new("ws://localhost:1/ws").unwrap();
+            let token = CString::new("t").unwrap();
+            cfg.ws_url = url.as_ptr();
+            cfg.token = token.as_ptr();
+            cfg.encoder.bitrate_bps = 20_000;
+            cfg.encoder.complexity = 99; // clamped to 10
+            cfg.encoder.max_bandwidth = AurixOpusBandwidth::AurixBandwidthWideband;
+            cfg.encoder.signal = AurixOpusSignal::AurixSignalMusic;
+            cfg.encoder.vbr = false;
+            cfg.encoder.dtx = true;
+            let client = aurix_client_create(&cfg);
+            assert!(!client.is_null());
+
+            let mut got = cfg.encoder;
+            assert!(aurix_client_encoder_settings(client, &mut got));
+            assert_eq!(
+                (
+                    got.bitrate_bps,
+                    got.complexity,
+                    got.max_bandwidth,
+                    got.signal,
+                    got.vbr,
+                    got.dtx
+                ),
+                (
+                    20_000,
+                    10,
+                    AurixOpusBandwidth::AurixBandwidthWideband,
+                    AurixOpusSignal::AurixSignalMusic,
+                    false,
+                    true
+                )
+            );
+
+            assert_eq!(aurix_client_set_complexity(client, 3), AurixResult::AurixOk);
+            assert!(aurix_client_encoder_settings(client, &mut got));
+            assert_eq!(got.complexity, 3);
+            // Pinned complexity survives a baseline replacement; unpinning restores it.
+            let mut next = got;
+            next.complexity = 7;
+            next.bitrate_bps = 1; // clamped to the floor
+            assert_eq!(
+                aurix_client_set_encoder_settings(client, &next),
+                AurixResult::AurixOk
+            );
+            assert!(aurix_client_encoder_settings(client, &mut got));
+            assert_eq!(
+                (got.complexity, got.bitrate_bps),
+                (3, EncoderSettings::MIN_BITRATE)
+            );
+            assert_eq!(
+                aurix_client_set_complexity(client, -1),
+                AurixResult::AurixOk
+            );
+            assert!(aurix_client_encoder_settings(client, &mut got));
+            assert_eq!(got.complexity, 7);
+
+            let mut policy = AurixAudioPolicy::from(AudioPolicy::default());
+            assert!(
+                !aurix_client_audio_policy(client, &mut policy),
+                "no channel joined"
+            );
+            assert_eq!(
+                aurix_client_set_encoder_settings(client, ptr::null()),
+                AurixResult::AurixNullPointer
+            );
+            aurix_client_destroy(client);
+        }
+    }
+
+    #[test]
+    fn bare_codec_encodes_decodes_and_clamps() {
+        unsafe {
+            assert!(aurix_opus_encoder_create(48_000, 3, ptr::null()).is_null());
+            assert!(aurix_opus_decoder_create(44_100, 1).is_null());
+            let mut settings = AurixEncoderSettings::from(EncoderSettings::default());
+            settings.bitrate_bps = 24_000;
+            settings.complexity = 4;
+            settings.max_bandwidth = AurixOpusBandwidth::AurixBandwidthWideband;
+            let enc = aurix_opus_encoder_create(48_000, 2, &settings);
+            assert!(!enc.is_null());
+            let mut got = settings;
+            assert!(aurix_opus_encoder_settings(enc, &mut got));
+            assert_eq!((got.bitrate_bps, got.complexity), (24_000, 4));
+
+            // 20 ms stereo frame of a 440 Hz tone.
+            let frame = 960usize;
+            let pcm: Vec<f32> = (0..frame)
+                .flat_map(|i| {
+                    let v = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5;
+                    [v, v]
+                })
+                .collect();
+            let mut packet = vec![0u8; 1275];
+            let len = aurix_opus_encoder_encode_f32(
+                enc,
+                pcm.as_ptr(),
+                frame,
+                packet.as_mut_ptr(),
+                packet.len(),
+            );
+            assert!(len > 0, "encode failed: {len}");
+            // Not a valid Opus frame size -> invalid argument, negative.
+            let bad = aurix_opus_encoder_encode_f32(
+                enc,
+                pcm.as_ptr(),
+                1000,
+                packet.as_mut_ptr(),
+                packet.len(),
+            );
+            assert_eq!(bad, -(AurixResult::AurixCodec as i32));
+
+            let dec = aurix_opus_decoder_create(48_000, 2);
+            assert!(!dec.is_null());
+            let mut out = vec![0f32; frame * 2];
+            let n = aurix_opus_decoder_decode_f32(
+                dec,
+                packet.as_ptr(),
+                len as usize,
+                out.as_mut_ptr(),
+                frame,
+                false,
+            );
+            assert_eq!(n as usize, frame);
+            // PLC frame: same length, finite audio.
+            let n =
+                aurix_opus_decoder_decode_f32(dec, ptr::null(), 0, out.as_mut_ptr(), frame, false);
+            assert_eq!(n as usize, frame);
+            assert!(out.iter().all(|v| v.is_finite()));
+
+            settings.bitrate_bps = 999_999;
+            settings.complexity = 42;
+            assert_eq!(
+                aurix_opus_encoder_apply(enc, &settings),
+                AurixResult::AurixOk
+            );
+            assert!(aurix_opus_encoder_settings(enc, &mut got));
+            assert_eq!(
+                (got.bitrate_bps, got.complexity),
+                (EncoderSettings::MAX_BITRATE, 10)
+            );
+            assert_eq!(
+                aurix_opus_encoder_apply(enc, ptr::null()),
+                AurixResult::AurixNullPointer
+            );
+
+            aurix_opus_encoder_destroy(enc);
+            aurix_opus_decoder_destroy(dec);
+            aurix_opus_encoder_destroy(ptr::null_mut());
+            aurix_opus_decoder_destroy(ptr::null_mut());
         }
     }
 

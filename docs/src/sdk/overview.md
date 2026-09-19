@@ -9,7 +9,7 @@ where they differ.
 |---|---|---|---|---|
 | Language | TypeScript (ES2020, no deps) | C# (netstandard2.1) | Rust + C ABI (`aurix_client.h`, C++11 RAII header) | C++ / Blueprint over the C ABI |
 | Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP | AURX v2 over UDP | AURX v2 over UDP |
-| Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or your libopus binding | bundled libopus (static) | bundled libopus (static) |
+| Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) |
 | Platforms | Chromium, Firefox, Safari | Unity 2021.3+ (all but WebGL), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac |
 | Downlink | server-mixed stereo track | per-participant streams, client mixer | per-participant streams, client mixer | client mixer → procedural `USoundWave` |
 | Reconnect / resume | yes | yes | yes | yes |
@@ -22,6 +22,8 @@ where they differ.
 | Stats / quality bars | `getStats()` | `GetStats()` | `aurix_client_stats` | `GetStats` |
 | Devices / input gain / speaker mute | yes | yes | host-provided capture | engine `AudioCapture` |
 | Action tokens (`refreshToken`/`joinToken`) | yes | yes | yes | yes |
+| Opus controls (bitrate, bandwidth, complexity, signal, VBR/CVBR, FEC, loss %, DTX) | bitrate, bandwidth, FEC, DTX, CBR via WebRTC `fmtp`/`setParameters` | all (`OpusEncoderSettings`) | all (`EncoderSettings` / `AurixEncoderSettings`) | all (`FAurixEncoderSettings`) |
+| Channel audio policy (`ChannelJoinAck.audio`, `ChannelAudioPolicy`) | merged, applied where WebRTC allows | merged, applied | merged, applied | merged, applied |
 
 Where a browser is not involved the native path is preferred: it avoids ICE/DTLS, costs ~30
 bytes of header per 20 ms frame and lets the client mix and pan per participant. Browsers cannot
@@ -47,9 +49,12 @@ chapter maps its methods and events onto those messages.
 ## Choosing the codec in Unity
 
 The Unity SDK does not bundle Opus. The **Concentus Opus codec** sample (`Samples~/Concentus`)
-is a pure-C# implementation that works everywhere Unity runs and is what the quick-start scene
-uses; for lower CPU on mobile implement `IOpusCodec` around a native libopus/UnityOpus binding —
-the interface is a handful of methods (`Encode`, `Decode`, `SetBitrate`).
+is a pure-C# implementation that works everywhere Unity runs; **`NativeOpusCodec`** binds
+libopus from the native core (`aurix_client`) through P/Invoke for a fraction of the CPU — drop
+the binary into `Plugins/` and the quick-start scene picks it automatically
+(`NativeOpusCodec.IsAvailable`). Both implement every encoder control and FEC recovery; a custom
+`IOpusCodec` needs only `Encode`, `Decode`, `DecodeLost`, `SetBitrate`
+([Unity SDK](unity.md#opus-codec-and-controls)).
 
 ## Versioning
 

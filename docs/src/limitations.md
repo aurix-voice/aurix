@@ -30,6 +30,11 @@ the chapter that explains the boundary.
   session; per-participant tracks, insertable-stream encryption and native AURX over UDP are not
   available in browsers ([Web SDK](sdk/web.md)).
 * **Opus only.** No PCMU/PCMA fallback, no video.
+* **Browsers own their encoder.** The Web SDK can set the bitrate ceiling, FEC, DTX, maximum
+  bandwidth and CBR through WebRTC (`fmtp` / `setParameters`); complexity, signal mode, VBR mode
+  and expected loss are only controllable in the native, Unity and Unreal SDKs
+  ([Web SDK](sdk/web.md#opus-in-the-browser)). Native mono encoders are capped at 300 kbit/s
+  (libopus), channel configs at `media.max_bitrate`.
 * **Cascade is a one-hop mesh** between the nodes that host a channel — no relay trees; nodes
   must reach each other directly on `media.port + 1`/UDP ([Scaling](operations/scaling.md)).
 * **Positional audio is server-side attenuation and panning** from client-reported positions;
@@ -70,12 +75,15 @@ the chapter that explains the boundary.
 * **Unity Editor and devices.** The Unity SDK and the sample scene are compiled against a
   UnityEngine stub and exercised through the .NET demo; permission dialogs, audio-route changes
   and background/foreground transitions on real iOS/Android hardware are not exercised in CI
-  ([Unity SDK](sdk/unity.md)).
+  ([Unity SDK](sdk/unity.md)). `NativeOpusCodec` is tested against the Linux build of the native
+  core; loading from `Plugins/` on other platforms follows Unity's P/Invoke rules and is not run here.
+* **Browser Opus negotiation.** The Web SDK's `fmtp` rewrite and `setParameters` path are unit-
+  tested on SDP text and applied in the E2E browser runs; whether a given browser honours
+  `useinbandfec`/`usedtx`/`maxplaybackrate` is up to that browser's WebRTC stack.
 * **Windows/macOS native builds** of `aurix-client` are scripted (`build_native.ps1`) but only
   the Linux build runs in CI.
 
 ## Planned
 
-Opus complexity/bandwidth controls with an optional native libopus binding, safety adapters
-(STT → toxicity, evidence export), PCMU fallback, and ambient/radius visibility. The operator web
-panel is tracked separately.
+Safety adapters (STT → toxicity, evidence export), PCMU fallback, and ambient/radius
+visibility. The operator web panel is tracked separately.

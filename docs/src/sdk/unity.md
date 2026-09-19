@@ -25,7 +25,8 @@ sdk/unity/
    URL pointing at that folder).
 2. On the package page import the **Concentus Opus codec** sample and put the
    [Concentus](https://www.nuget.org/packages/Concentus) 2.x `netstandard2.0` assembly into
-   `Assets/Plugins/`. Any other `IOpusCodec` (libopus/UnityOpus binding) works too.
+   `Assets/Plugins/` — or ship the native core and use `NativeOpusCodec` (libopus); see
+   [Opus codec and controls](#opus-codec-and-controls). Any other `IOpusCodec` works too.
 3. *Project Settings ▸ Audio ▸ System Sample Rate* = **48000** (other rates work through the
    built-in resampler, 48 kHz avoids it).
 
@@ -123,8 +124,40 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Chat lite | `SendMessageAsync`, `SendDirectMessageAsync`, `SetTypingAsync`, `OnChatMessage`, `OnParticipantTyping` |
 | Transcripts / TTS | `OnTranscript`, `SetTranscriptsAsync`, `SpeakAsync(text, channel?, TtsDestination, voice, clientRef)` → `SpeechRequest`, `OnTtsStatus`, `CancelSpeechAsync`, `IsSynthesizedSsrc` |
 | Recording consent | `OnRecording(RecordingNotice)`, `RespondToRecordingAsync(id, RecordingConsent)` |
-| Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand` |
+| Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand(BitrateCommand)` |
+| Opus controls | `OpusEncoderSettings`, `SetEncoderSettings`, `SetComplexity`, `FollowChannelPolicy`, `Encoder`, `EffectiveEncoderSettings`, `AudioPolicy`, `OnAudioPolicyChanged`, `OnEncoderSettingsChanged`; `NativeOpusCodec` / `ConcentusOpusCodec`, `IOpusEncoderControls`, `IOpusFecDecoder` |
 | Mobile | runtime microphone permission (`PermissionState`, `OnMicrophonePermissionDenied`, `RetryMicrophonePermission()`), background/foreground handling, `ProbeConnection()`, reconnect on Wi-Fi ↔ cellular |
+
+## Opus codec and controls
+
+The SDK does not bundle Opus; two codecs are provided and the client is codec-agnostic:
+
+* **`ConcentusOpusCodec`** (sample) — pure C# Concentus 2.x, no native binaries, runs everywhere
+  Unity runs C#; roughly 5–10× the CPU of libopus, keep complexity ≤ 5 on mobile.
+* **`NativeOpusCodec`** — libopus statically linked into the Aurix native core (`aurix_client`,
+  the same library the Unreal plugin uses; `cargo build -p aurix-client --release` or
+  `sdk/unreal/AurixVoice/build_native.*`). Put the binary where P/Invoke finds it
+  (`Assets/Plugins/x86_64/aurix_client.dll`, `Assets/Plugins/Linux/x86_64/libaurix_client.so`,
+  `Assets/Plugins/macOS/libaurix_client.dylib`, `Assets/Plugins/Android/<abi>/libaurix_client.so`;
+  iOS links the static `libaurix_client.a` and resolves through `__Internal`). Nothing loads the
+  library unless you construct the codec; `NativeOpusCodec.IsAvailable` probes once so a project
+  can fall back to Concentus — the quick-start scene does exactly that.
+
+Both expose every libopus encoder control through `OpusEncoderSettings` (`BitrateBps`
+6 000..300 000, `Complexity` 0..10, `MaxBandwidth`, `Signal` Auto/Voice/Music, `Vbr`,
+`ConstrainedVbr`, `Fec`, `ExpectedLossPercent`, `Dtx`) and recover lost frames from the next
+packet's FEC data (`IOpusFecDecoder`; `RemoteMixer` uses it before falling back to PLC,
+`VoiceStats.FramesFecRecovered`).
+
+The encoder the client drives (`client.Encoder = codec`) runs the **baseline** you set
+(`SetEncoderSettings`, the *Opus encoder* inspector block of `AurixVoiceBehaviour`) with the
+**channel audio policy** layered on top (`ChannelJoinAck.audio`, live `ChannelAudioPolicy`;
+merged across joined channels, `OnAudioPolicyChanged`, opt out with
+`FollowChannelPolicy = false`, pin the CPU budget with `SetComplexity`), and the server's
+transient **`BitrateCommand`** (clamped to the policy's floor/target, also raises
+`ExpectedLossPercent`) on top of that — `EffectiveEncoderSettings` shows the result. Semantics
+are identical in the native and Web SDKs; see [Channels](../features/channels.md#configuration)
+and [Network quality](../features/quality.md).
 
 ## .NET: build, test, demo
 

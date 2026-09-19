@@ -299,7 +299,8 @@ $('connect').onclick = async () => {
     if (active && confirm('This channel is being recorded. Accept?')) client.respondToRecording(id, 'accepted');
     else if (active) client.respondToRecording(id, 'declined');
   });
-  client.on('bitrate', (kbps, why) => log('bitrate', kbps, why));
+  client.on('bitrate', (kbps, why, loss) => log(`bitrate command ${kbps} kbps (${why}, loss ${loss}%) → sender ${JSON.stringify(client.opusPreferences)}`));
+  client.on('audioPolicy', (p) => log(`audio policy: ${p.bitrateBps / 1000} kbps ${p.maxBandwidth} fec=${p.fec} dtx=${p.dtx} ${p.signal}; negotiated ${JSON.stringify(client.negotiatedOpus)}`));
   client.on('networkQuality', (q) => { renderQuality(); log(`network quality ${q.bars}/5 (R ${q.rFactor.toFixed(0)}, uplink loss ${q.uplinkLossPercent.toFixed(1)}%, ${q.uplinkBitrateKbps} kbps)`); });
   client.on('stats', renderQuality);
   client.on('kicked', (ch, why) => log('kicked from', ch, why));

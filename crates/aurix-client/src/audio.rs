@@ -4,7 +4,7 @@
 //! constant-power panning). Mirrors `sdk/unity/Runtime/Audio` so all clients sound the same.
 
 use aurix_common::protocol::{decode_audio_level, encode_audio_level, AUDIO_LEVEL_SILENCE};
-use aurix_common::types::Direction;
+use aurix_common::types::{AudioPolicy, Direction, OpusBandwidth, OpusSignal};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -175,6 +175,292 @@ pub struct EncodedFrame {
     pub speech: bool,
 }
 
+/// Everything the uplink Opus encoder can be tuned with. Values outside libopus' ranges are
+/// clamped by [`EncoderSettings::clamped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSettings {
+    /// `6_000..=300_000` bit/s (libopus' ceiling for a mono stream).
+    pub bitrate_bps: u32,
+    /// `0..=10`; lower is cheaper on the CPU, higher sounds better at the same bitrate.
+    pub complexity: u8,
+    /// Widest audio band the encoder may code (`OPUS_SET_MAX_BANDWIDTH`).
+    pub max_bandwidth: OpusBandwidth,
+    /// Content hint (`OPUS_SET_SIGNAL`).
+    pub signal: OpusSignal,
+    /// Variable bitrate; off is hard CBR at `bitrate_bps`.
+    pub vbr: bool,
+    /// Constrained VBR keeps every frame within the bitrate's byte budget.
+    pub constrained_vbr: bool,
+    /// In-band forward error correction (costs bitrate, recovers single lost frames).
+    pub fec: bool,
+    /// Loss the FEC is tuned for, `0..=100` %.
+    pub expected_loss_percent: u8,
+    /// Discontinuous transmission: near-empty frames during silence.
+    pub dtx: bool,
+}
+
+impl EncoderSettings {
+    pub const MIN_BITRATE: u32 = 6_000;
+    /// libopus clamps a mono stream's bitrate to 300 kbit/s internally.
+    pub const MAX_BITRATE: u32 = 300_000;
+    /// libopus' own default.
+    pub const DEFAULT_COMPLEXITY: u8 = 9;
+
+    pub fn clamped(mut self) -> Self {
+        self.bitrate_bps = self.bitrate_bps.clamp(Self::MIN_BITRATE, Self::MAX_BITRATE);
+        self.complexity = self.complexity.min(10);
+        self.expected_loss_percent = self.expected_loss_percent.min(100);
+        self
+    }
+
+    /// The channel's policy laid over these settings. `complexity` is the app's own choice
+    /// (`None`: follow the policy's hint, or keep the current value if it has none); VBR mode
+    /// stays local.
+    pub fn with_policy(mut self, policy: &AudioPolicy, local_complexity: Option<u8>) -> Self {
+        self.bitrate_bps = policy.bitrate_bps;
+        self.fec = policy.fec;
+        self.dtx = policy.dtx;
+        self.max_bandwidth = policy.max_bandwidth;
+        self.signal = policy.signal;
+        if let Some(c) = local_complexity.or(policy.complexity) {
+            self.complexity = c;
+        }
+        self.clamped()
+    }
+}
+
+impl Default for EncoderSettings {
+    fn default() -> Self {
+        Self {
+            bitrate_bps: 32_000,
+            complexity: Self::DEFAULT_COMPLEXITY,
+            max_bandwidth: OpusBandwidth::Fullband,
+            signal: OpusSignal::Voice,
+            vbr: true,
+            constrained_vbr: true,
+            fec: true,
+            expected_loss_percent: 5,
+            dtx: false,
+        }
+    }
+}
+
+fn opus_bandwidth(bw: OpusBandwidth) -> opus::Bandwidth {
+    match bw {
+        OpusBandwidth::Narrowband => opus::Bandwidth::Narrowband,
+        OpusBandwidth::Mediumband => opus::Bandwidth::Mediumband,
+        OpusBandwidth::Wideband => opus::Bandwidth::Wideband,
+        OpusBandwidth::Superwideband => opus::Bandwidth::Superwideband,
+        OpusBandwidth::Fullband => opus::Bandwidth::Fullband,
+    }
+}
+
+fn opus_signal(signal: OpusSignal) -> opus::Signal {
+    match signal {
+        OpusSignal::Auto => opus::Signal::Auto,
+        OpusSignal::Voice => opus::Signal::Voice,
+        OpusSignal::Music => opus::Signal::Music,
+    }
+}
+
+/// Pushes every setting into a libopus encoder; takes effect from the next frame. Returns
+/// the clamped settings that were applied. On error the encoder keeps whatever libopus
+/// accepted so far.
+pub fn apply_encoder_settings(
+    e: &mut opus::Encoder,
+    settings: EncoderSettings,
+) -> Result<EncoderSettings, opus::Error> {
+    let s = settings.clamped();
+    e.set_signal(opus_signal(s.signal))?;
+    e.set_max_bandwidth(opus_bandwidth(s.max_bandwidth))?;
+    e.set_complexity(i32::from(s.complexity))?;
+    e.set_vbr(s.vbr)?;
+    e.set_vbr_constraint(s.constrained_vbr)?;
+    e.set_inband_fec(s.fec)?;
+    e.set_packet_loss_perc(i32::from(s.expected_loss_percent))?;
+    e.set_dtx(s.dtx)?;
+    e.set_bitrate(opus::Bitrate::Bits(s.bitrate_bps as i32))?;
+    Ok(s)
+}
+
+/// What libopus reports back, for tests and diagnostics.
+pub fn probe_encoder_settings(e: &mut opus::Encoder) -> Result<EncoderSettings, opus::Error> {
+    let bitrate_bps = match e.get_bitrate()? {
+        opus::Bitrate::Bits(b) => b.max(0) as u32,
+        _ => 0,
+    };
+    let max_bandwidth = match e.get_max_bandwidth()? {
+        opus::Bandwidth::Narrowband => OpusBandwidth::Narrowband,
+        opus::Bandwidth::Mediumband => OpusBandwidth::Mediumband,
+        opus::Bandwidth::Wideband => OpusBandwidth::Wideband,
+        opus::Bandwidth::Superwideband => OpusBandwidth::Superwideband,
+        opus::Bandwidth::Fullband | opus::Bandwidth::Auto => OpusBandwidth::Fullband,
+    };
+    let signal = match e.get_signal()? {
+        opus::Signal::Voice => OpusSignal::Voice,
+        opus::Signal::Music => OpusSignal::Music,
+        opus::Signal::Auto => OpusSignal::Auto,
+    };
+    Ok(EncoderSettings {
+        bitrate_bps,
+        complexity: e.get_complexity()?.clamp(0, 10) as u8,
+        max_bandwidth,
+        signal,
+        vbr: e.get_vbr()?,
+        constrained_vbr: e.get_vbr_constraint()?,
+        fec: e.get_inband_fec()?,
+        expected_loss_percent: e.get_packet_loss_perc()?.clamp(0, 100) as u8,
+        dtx: e.get_dtx()?,
+    })
+}
+
+/// Errors from the bare [`OpusEncoder`] / [`OpusDecoder`] wrappers.
+#[derive(Debug)]
+pub enum CodecError {
+    /// Only mono and stereo streams are supported.
+    BadChannels(u8),
+    /// The PCM slice is not a whole number of interleaved frames.
+    BadFrame,
+    Opus(opus::Error),
+}
+
+impl std::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadChannels(c) => write!(f, "unsupported channel count {c} (1 or 2)"),
+            Self::BadFrame => f.write_str("pcm length is not a multiple of the channel count"),
+            Self::Opus(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CodecError {}
+
+impl From<opus::Error> for CodecError {
+    fn from(e: opus::Error) -> Self {
+        Self::Opus(e)
+    }
+}
+
+fn opus_channels(channels: u8) -> Result<opus::Channels, CodecError> {
+    match channels {
+        1 => Ok(opus::Channels::Mono),
+        2 => Ok(opus::Channels::Stereo),
+        other => Err(CodecError::BadChannels(other)),
+    }
+}
+
+/// A bare Opus encoder (any supported rate, mono or stereo) with the same settings model as
+/// the capture path; backs the C ABI `aurix_opus_encoder_*` family used by the Unity SDK's
+/// native codec.
+pub struct OpusEncoder {
+    encoder: opus::Encoder,
+    channels: usize,
+    settings: EncoderSettings,
+}
+
+impl OpusEncoder {
+    pub fn new(
+        sample_rate_hz: u32,
+        channels: u8,
+        settings: EncoderSettings,
+    ) -> Result<Self, CodecError> {
+        let ch = opus_channels(channels)?;
+        let application = match settings.signal {
+            OpusSignal::Music => opus::Application::Audio,
+            _ => opus::Application::Voip,
+        };
+        let mut encoder = opus::Encoder::new(sample_rate_hz, ch, application)?;
+        let settings = apply_encoder_settings(&mut encoder, settings)?;
+        Ok(Self {
+            encoder,
+            channels: usize::from(channels),
+            settings,
+        })
+    }
+
+    pub fn settings(&self) -> EncoderSettings {
+        self.settings
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn apply(&mut self, settings: EncoderSettings) -> Result<(), opus::Error> {
+        self.settings = apply_encoder_settings(&mut self.encoder, settings)?;
+        Ok(())
+    }
+
+    pub fn probe(&mut self) -> Result<EncoderSettings, opus::Error> {
+        probe_encoder_settings(&mut self.encoder)
+    }
+
+    /// Encodes one interleaved frame (a valid Opus frame size for the encoder's rate:
+    /// 2.5/5/10/20/40/60 ms). Returns the packet length.
+    pub fn encode_f32(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize, CodecError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(self.channels) {
+            return Err(CodecError::BadFrame);
+        }
+        Ok(self.encoder.encode_float(pcm, out)?)
+    }
+
+    pub fn encode_i16(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(self.channels) {
+            return Err(CodecError::BadFrame);
+        }
+        Ok(self.encoder.encode(pcm, out)?)
+    }
+}
+
+/// A bare Opus decoder with packet-loss concealment and FEC recovery; backs the C ABI
+/// `aurix_opus_decoder_*` family.
+pub struct OpusDecoder {
+    decoder: opus::Decoder,
+    channels: usize,
+}
+
+impl OpusDecoder {
+    pub fn new(sample_rate_hz: u32, channels: u8) -> Result<Self, CodecError> {
+        let ch = opus_channels(channels)?;
+        Ok(Self {
+            decoder: opus::Decoder::new(sample_rate_hz, ch)?,
+            channels: usize::from(channels),
+        })
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Decodes `packet` into interleaved f32 PCM; an empty packet runs PLC for one frame of
+    /// `pcm.len() / channels` samples. `fec` asks for the in-band FEC of the *next* packet
+    /// (pass the following packet to recover the lost one). Returns samples per channel.
+    pub fn decode_f32(
+        &mut self,
+        packet: &[u8],
+        pcm: &mut [f32],
+        fec: bool,
+    ) -> Result<usize, CodecError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(self.channels) {
+            return Err(CodecError::BadFrame);
+        }
+        Ok(self.decoder.decode_float(packet, pcm, fec)?)
+    }
+
+    pub fn decode_i16(
+        &mut self,
+        packet: &[u8],
+        pcm: &mut [i16],
+        fec: bool,
+    ) -> Result<usize, CodecError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(self.channels) {
+            return Err(CodecError::BadFrame);
+        }
+        Ok(self.decoder.decode(packet, pcm, fec)?)
+    }
+}
+
 /// Turns arbitrary captured PCM (any rate, 1..=8 interleaved channels, i16 or f32) into
 /// 20 ms mono 48 kHz Opus frames with input gain and VAD metering applied.
 pub struct CaptureEncoder {
@@ -184,40 +470,53 @@ pub struct CaptureEncoder {
     pending: Vec<f32>,
     gain: f32,
     pub vad: VoiceActivityDetector,
-    bitrate_bps: u32,
+    settings: EncoderSettings,
     out: [u8; 1275],
 }
 
 impl CaptureEncoder {
-    pub fn new(bitrate_bps: u32) -> Result<Self, opus::Error> {
-        let mut encoder =
+    pub fn new(settings: EncoderSettings) -> Result<Self, opus::Error> {
+        let encoder =
             opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)?;
-        let bitrate = bitrate_bps.clamp(6_000, 128_000);
-        encoder.set_bitrate(opus::Bitrate::Bits(bitrate as i32))?;
-        encoder.set_inband_fec(true)?;
-        encoder.set_packet_loss_perc(5)?;
-        Ok(Self {
+        let mut this = Self {
             encoder,
             resampler: None,
             mono: Vec::with_capacity(FRAME_SAMPLES * 4),
             pending: Vec::with_capacity(FRAME_SAMPLES * 4),
             gain: 1.0,
             vad: VoiceActivityDetector::default(),
-            bitrate_bps: bitrate,
+            settings: settings.clamped(),
             out: [0u8; 1275],
-        })
+        };
+        this.apply(this.settings)?;
+        Ok(this)
     }
 
     pub fn bitrate(&self) -> u32 {
-        self.bitrate_bps
+        self.settings.bitrate_bps
     }
 
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), opus::Error> {
-        let bitrate = bitrate_bps.clamp(6_000, 128_000);
-        self.encoder
-            .set_bitrate(opus::Bitrate::Bits(bitrate as i32))?;
-        self.bitrate_bps = bitrate;
+        self.apply(EncoderSettings {
+            bitrate_bps,
+            ..self.settings
+        })
+    }
+
+    pub fn settings(&self) -> EncoderSettings {
+        self.settings
+    }
+
+    /// Pushes every setting into libopus; takes effect from the next frame. On error the
+    /// encoder keeps whatever libopus accepted so far and `settings()` is unchanged.
+    pub fn apply(&mut self, settings: EncoderSettings) -> Result<(), opus::Error> {
+        self.settings = apply_encoder_settings(&mut self.encoder, settings)?;
         Ok(())
+    }
+
+    /// What libopus reports back, for tests and diagnostics.
+    pub fn probe(&mut self) -> Result<EncoderSettings, opus::Error> {
+        probe_encoder_settings(&mut self.encoder)
     }
 
     /// Software input gain, clamped to `0..=MAX_INPUT_GAIN`.
@@ -715,7 +1014,7 @@ mod tests {
 
     #[test]
     fn capture_encoder_frames_and_mixer_reproduces_tone() {
-        let mut enc = CaptureEncoder::new(32_000).unwrap();
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
         let pcm = sine(44_100, 44_100, 440.0, 0.5);
         // Stereo, 44.1 kHz, chunked like a typical device callback.
         let stereo: Vec<f32> = pcm.iter().flat_map(|&s| [s, s]).collect();
@@ -763,8 +1062,123 @@ mod tests {
     }
 
     #[test]
+    fn encoder_settings_reach_libopus() {
+        let wanted = EncoderSettings {
+            bitrate_bps: 24_000,
+            complexity: 3,
+            max_bandwidth: OpusBandwidth::Wideband,
+            signal: OpusSignal::Music,
+            vbr: false,
+            constrained_vbr: false,
+            fec: false,
+            expected_loss_percent: 20,
+            dtx: true,
+        };
+        let mut enc = CaptureEncoder::new(wanted).unwrap();
+        assert_eq!(enc.settings(), wanted);
+        assert_eq!(enc.probe().unwrap(), wanted);
+
+        // Out-of-range values are clamped rather than rejected.
+        enc.apply(EncoderSettings {
+            bitrate_bps: 1_000_000,
+            complexity: 99,
+            expected_loss_percent: 255,
+            ..wanted
+        })
+        .unwrap();
+        let s = enc.settings();
+        assert_eq!(
+            (s.bitrate_bps, s.complexity, s.expected_loss_percent),
+            (EncoderSettings::MAX_BITRATE, 10, 100)
+        );
+        assert_eq!(enc.probe().unwrap(), s);
+        enc.set_bitrate(1).unwrap();
+        assert_eq!(enc.bitrate(), EncoderSettings::MIN_BITRATE);
+        assert_eq!(enc.probe().unwrap().complexity, 10, "other settings kept");
+    }
+
+    #[test]
+    fn bandwidth_cap_bounds_the_frame_size() {
+        // A narrowband, low-complexity, CBR encoder produces smaller packets than a fullband
+        // VBR one for the same wideband-rich input.
+        fn bytes_for(settings: EncoderSettings) -> usize {
+            let mut enc = CaptureEncoder::new(settings).unwrap();
+            let mut pcm = sine(SAMPLE_RATE as usize, SAMPLE_RATE, 440.0, 0.3);
+            let hi = sine(SAMPLE_RATE as usize, SAMPLE_RATE, 9_000.0, 0.3);
+            for (a, b) in pcm.iter_mut().zip(hi) {
+                *a += b;
+            }
+            let mut total = 0;
+            enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| total += f.opus.len());
+            total
+        }
+        let full = bytes_for(EncoderSettings {
+            bitrate_bps: 64_000,
+            ..EncoderSettings::default()
+        });
+        let narrow = bytes_for(EncoderSettings {
+            bitrate_bps: 64_000,
+            max_bandwidth: OpusBandwidth::Narrowband,
+            complexity: 0,
+            ..EncoderSettings::default()
+        });
+        assert!(narrow < full, "narrow={narrow} full={full}");
+        let cbr = bytes_for(EncoderSettings {
+            bitrate_bps: 16_000,
+            vbr: false,
+            ..EncoderSettings::default()
+        });
+        // 50 frames × 20 ms at 16 kbit/s = 40 bytes each, CBR is exact.
+        assert!((1_900..=2_100).contains(&cbr), "{cbr}");
+    }
+
+    #[test]
+    fn channel_policy_overrides_wire_settings_but_not_local_complexity() {
+        let policy = AudioPolicy {
+            bitrate_bps: 96_000,
+            min_bitrate_bps: 32_000,
+            fec: false,
+            dtx: true,
+            max_bandwidth: OpusBandwidth::Superwideband,
+            complexity: Some(4),
+            signal: OpusSignal::Music,
+        };
+        let base = EncoderSettings {
+            vbr: false,
+            ..EncoderSettings::default()
+        };
+        let s = base.with_policy(&policy, None);
+        assert_eq!(
+            (
+                s.bitrate_bps,
+                s.fec,
+                s.dtx,
+                s.max_bandwidth,
+                s.signal,
+                s.complexity,
+                s.vbr
+            ),
+            (
+                96_000,
+                false,
+                true,
+                OpusBandwidth::Superwideband,
+                OpusSignal::Music,
+                4,
+                false
+            )
+        );
+        assert_eq!(base.with_policy(&policy, Some(8)).complexity, 8);
+        let no_hint = AudioPolicy {
+            complexity: None,
+            ..policy
+        };
+        assert_eq!(base.with_policy(&no_hint, None).complexity, base.complexity);
+    }
+
+    #[test]
     fn mixer_pans_directional_streams() {
-        let mut enc = CaptureEncoder::new(32_000).unwrap();
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
         let pcm = sine(FRAME_SAMPLES * 10, 48_000, 440.0, 0.5);
         let mut frames = Vec::new();
         enc.push_f32(&pcm, 48_000, 1, |f| frames.push(f));
@@ -799,7 +1213,7 @@ mod tests {
 
     #[test]
     fn mixer_totals_count_loss_late_underruns_and_survive_stream_removal() {
-        let mut enc = CaptureEncoder::new(32_000).unwrap();
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
         let pcm = sine(FRAME_SAMPLES * 12, 48_000, 440.0, 0.5);
         let mut frames = Vec::new();
         enc.push_f32(&pcm, 48_000, 1, |f| frames.push(f));

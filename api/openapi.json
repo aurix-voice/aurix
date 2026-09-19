@@ -6259,19 +6259,49 @@
           "bitrate": {
             "type": "integer",
             "default": 48000,
-            "description": "Target Opus bitrate in bit/s."
+            "minimum": 6000,
+            "maximum": 510000,
+            "description": "Target uplink Opus bitrate in bit/s (also the ceiling server-driven adaptation returns to). Capped by the node's `media.max_bitrate`."
+          },
+          "min_bitrate": {
+            "type": "integer",
+            "default": 12000,
+            "minimum": 6000,
+            "description": "Floor for server-driven bitrate adaptation (bit/s); must not exceed `bitrate`."
           },
           "sample_rate": {
             "type": "integer",
-            "default": 48000
+            "default": 48000,
+            "enum": [
+              8000,
+              12000,
+              16000,
+              24000,
+              48000
+            ]
           },
           "enable_dtx": {
             "type": "boolean",
-            "default": true
+            "default": true,
+            "description": "Allow discontinuous transmission (silence frames are not sent)."
           },
           "enable_fec": {
             "type": "boolean",
-            "default": true
+            "default": true,
+            "description": "Require in-band forward error correction on the uplink."
+          },
+          "max_bandwidth": {
+            "$ref": "#/components/schemas/OpusBandwidth",
+            "default": "fullband"
+          },
+          "complexity": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Encoder complexity hint 0..=10 (`null`: the client's default). Browsers ignore it."
           },
           "positional_config": {
             "oneOf": [
@@ -6314,7 +6344,18 @@
             }
           }
         },
-        "description": "All fields are optional; omitted ones take the defaults shown."
+        "description": "All fields are optional; omitted ones take the defaults shown. The Opus fields become the `AudioPolicy` delivered to participants in `ChannelJoinAck.audio` (and `ChannelAudioPolicy` on live edits)."
+      },
+      "OpusBandwidth": {
+        "type": "string",
+        "enum": [
+          "narrowband",
+          "mediumband",
+          "wideband",
+          "superwideband",
+          "fullband"
+        ],
+        "description": "Widest audio bandwidth participants may encode (4/6/8/12/20 kHz)."
       },
       "ChannelGrant": {
         "type": "object",

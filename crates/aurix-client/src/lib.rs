@@ -27,12 +27,14 @@ pub mod ffi;
 pub mod media;
 pub mod regions;
 
+pub use audio::EncoderSettings;
 pub use aurix_common::protocol::{
     ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsDestination, TtsState,
     UserPosition,
 };
 pub use aurix_common::types::{
-    ActionKind, ChannelId, ChannelRole, Direction, Orientation3D, Position3D, SessionId, UserId,
+    ActionKind, AudioPolicy, ChannelId, ChannelRole, Direction, OpusBandwidth, OpusSignal,
+    Orientation3D, Position3D, SessionId, UserId,
 };
 
 pub use client::{Client, ClientStats, TransmitStats};

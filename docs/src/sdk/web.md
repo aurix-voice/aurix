@@ -83,8 +83,34 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | Echo test / injection | echo channel + `injectAudio(AudioBuffer \| MediaStream, {loop, gain, mixWithMicrophone})`, `stopAudioInjection()`, `decodeAudio()`, `audioInjection` | same Web Audio graph as the input gain |
 | Chat lite | `sendMessage()`, `sendDirectMessage()`, `setTyping()`, `chatMessage`, `participantTyping` | see [Text chat](../features/chat.md) |
 | Transcripts / TTS | `transcript`, `setTranscripts(bool)`, `isChannelTranscribed()`, `speak(text, {destination, voice, clientRef})` → `{ done }`, `ttsStatus`, `cancelSpeech()` | see [Transcripts and TTS](../features/speech.md) |
-| Stats / quality | `getStats()` → `ClientStats`, `stats`, `networkQuality`, `client.networkQuality`, `qualityReportIntervalMs` | see [Network quality](../features/quality.md) |
+| Stats / quality | `getStats()` → `ClientStats`, `stats`, `networkQuality`, `client.networkQuality`, `qualityReportIntervalMs`, `bitrate` | see [Network quality](../features/quality.md) |
+| Opus controls | `opus: {maxBitrateBps, fec, dtx, maxBandwidth, cbr, followChannelPolicy}`, `setOpusOptions()`, `audioPolicy` / `channelAudioPolicy(id)`, `opusPreferences`, `negotiatedOpus`, `renegotiateMedia()`, `audioPolicy` event | see [Opus in the browser](#opus-in-the-browser) |
 | Errors | rejected promises carry `Error('<CODE>: <message>')`; unsolicited server errors arrive as `serverError` | codes listed in [Errors](../concepts/auth.md#errors) |
+
+## Opus in the browser
+
+A browser never exposes its Opus encoder; everything goes through WebRTC, so the SDK applies the
+server's channel audio policy ([channels](../features/channels.md#configuration)) only where
+WebRTC has a knob for it:
+
+| Control | Mechanism | Takes effect |
+|---|---|---|
+| bitrate target / ceiling | `RTCRtpSender.setParameters({encodings: [{maxBitrate}]})` and `maxaveragebitrate` in the Opus `fmtp` | live / negotiation |
+| in-band FEC | `useinbandfec` in the Opus `fmtp` (RFC 7587) | negotiation |
+| DTX | `usedtx` in the Opus `fmtp` | negotiation |
+| max bandwidth | `maxplaybackrate` in the Opus `fmtp` (`wideband` → 16000 …) | negotiation |
+| constant bitrate | `cbr` in the Opus `fmtp` (`opus.cbr`, local only) | negotiation |
+| complexity, signal mode, VBR mode, expected loss | **not controllable** — the browser decides | — |
+
+RFC 7587 makes the `fmtp` parameters the *receiver's* wishes, so the SDK rewrites the Opus
+`fmtp` line of the server's answer before `setRemoteDescription`. The policy of every joined
+channel is merged exactly like in the native SDKs (`mergeAudioPolicies` in `opus.ts`) and
+`audioPolicy` fires on change; the bitrate ceiling is re-applied immediately, while FEC/DTX/
+bandwidth changes wait for the next negotiation — compare `client.negotiatedOpus` with
+`client.opusPreferences` and call `renegotiateMedia()` (a short audio gap) when it matters.
+`BitrateCommand` lowers the ceiling within the policy floor and the SDK never disables the
+browser's own congestion control underneath `maxBitrate`. Set `opus.followChannelPolicy: false`
+to keep only your explicit options.
 
 ## How it maps to the server
 
@@ -95,7 +121,8 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's relay candidates |
 | `joinChannel()` → `ChannelJoin {channel_id, token}` | membership check against the token's channel claims / ad-hoc grant |
 | `setMuted()` → track `enabled` + `MuteStateChanged` | broadcast to channel members |
-| `getStats()` → `QualityReport` (loss in %) | `BitrateCommand` (applied through `RTCRtpSender.setParameters`) + merged `NetworkQuality` |
+| `getStats()` → `QualityReport` (loss in %) | `BitrateCommand` (applied through `RTCRtpSender.setParameters`, within the channel policy) + merged `NetworkQuality` |
+| answer `fmtp` rewrite (`useinbandfec`, `usedtx`, `maxplaybackrate`, `maxaveragebitrate`) | `ChannelJoinAck.audio` / `ChannelAudioPolicy` from the channel config |
 | `Ping` / `Pong` | keepalive + `roundTripMs`; two missed pongs close the socket |
 | reconnect with `['aurix', 'bearer.<jwt>', 'resume.<session_id>.<resume_token>']` | `SessionInitAck {resumed: true}` + replayed `ChannelJoinAck`s within `server.session_resume_grace_secs` |
 

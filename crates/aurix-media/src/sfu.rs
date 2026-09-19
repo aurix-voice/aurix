@@ -677,6 +677,31 @@ impl SfuNode {
     pub fn get_channel(&self, channel_id: &ChannelId) -> Option<Arc<MediaChannel>> {
         self.channels.get(channel_id).map(|c| c.value().clone())
     }
+    /// Applies an operator edit to a live channel. Returns the sessions on this node that
+    /// are in the channel (they need the new `AudioPolicy`), or `None` if the channel is not
+    /// live here.
+    pub fn update_channel_config(
+        &self,
+        channel_id: &ChannelId,
+        app_id: &AppId,
+        config: ChannelConfig,
+    ) -> Option<Vec<Arc<MediaSession>>> {
+        let channel = self
+            .get_channel(channel_id)
+            .filter(|c| c.app_id == *app_id)?;
+        channel.update_config(config);
+        Some(channel.get_all_participants())
+    }
+    /// Encoder policy for one sender: the merge over every channel the session is in.
+    pub fn session_audio_policy(&self, session: &MediaSession) -> AudioPolicy {
+        AudioPolicy::merge_all(
+            session
+                .get_channels()
+                .iter()
+                .filter_map(|id| self.get_channel(id))
+                .map(|c| c.audio_policy()),
+        )
+    }
     pub fn get_session(&self, session_id: &SessionId) -> Option<Arc<MediaSession>> {
         self.sessions_by_id
             .get(session_id)
