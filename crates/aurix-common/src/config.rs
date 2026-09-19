@@ -663,6 +663,11 @@ pub struct MediaConfig {
     /// (`SetChannelFocus`); `1.0` makes focus a no-op.
     #[serde(default = "default_unfocused_channel_gain")]
     pub unfocused_channel_gain: f32,
+    /// Let native AURX sessions negotiate G.711 μ-law (`SetAudioCodec { codec: "pcmu" }`).
+    /// Each PCMU session costs one Opus encoder plus one decoder per sender it hears on the
+    /// node; disable on CPU-bound nodes.
+    #[serde(default = "default_true")]
+    pub pcmu_fallback: bool,
     /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
     #[serde(default)]
     pub rx_workers: usize,
@@ -737,6 +742,7 @@ impl Default for MediaConfig {
             max_channels_per_session: default_max_channels_per_session(),
             max_positional_channels_per_session: default_max_positional_channels_per_session(),
             unfocused_channel_gain: default_unfocused_channel_gain(),
+            pcmu_fallback: true,
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

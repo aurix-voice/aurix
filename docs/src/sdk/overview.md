@@ -10,6 +10,7 @@ where they differ.
 | Language | TypeScript (ES2020, no deps) | C# (netstandard2.1) | Rust + C ABI (`aurix_client.h`, C++11 RAII header) | C++ / Blueprint over the C ABI |
 | Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP | AURX v2 over UDP | AURX v2 over UDP |
 | Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) |
+| PCMU (G.711) fallback | — (WebRTC negotiates Opus) | `SetAudioCodecAsync` / `PreferredCodec`, `PcmuCodec` | `set_audio_codec` / `aurix_client_set_audio_codec` | `SetAudioCodec` |
 | Platforms | Chromium, Firefox, Safari | Unity 2021.3+ (all but WebGL), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac |
 | Downlink | server-mixed stereo track | per-participant streams, client mixer | per-participant streams, client mixer | client mixer → procedural `USoundWave` |
 | Reconnect / resume | yes | yes | yes | yes |

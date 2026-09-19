@@ -108,6 +108,7 @@ public:
     std::string code() const { return to_string(aurix_event_code(ev_)); }
     std::string message() const { return to_string(aurix_event_message(ev_)); }
     AurixTransmissionMode transmission() const { return aurix_event_transmission(ev_); }
+    AurixAudioCodec audio_codec() const { return aurix_event_audio_codec(ev_); }
     AurixModerationAction moderation_action() const { return aurix_event_moderation_action(ev_); }
 
     bool session(AurixSessionInfo& out) const { return aurix_event_session(ev_, &out); }
@@ -286,6 +287,8 @@ public:
     AurixResult set_channel_focus(const Uuid* channel) {
         return aurix_client_set_channel_focus(c_, channel ? &channel->raw : nullptr);
     }
+    AurixResult set_audio_codec(AurixAudioCodec codec) { return aurix_client_set_audio_codec(c_, codec); }
+    AurixAudioCodec audio_codec() const { return aurix_client_audio_codec(c_); }
     AurixResult set_transcripts(bool enabled) { return aurix_client_set_transcripts(c_, enabled); }
     AurixResult update_positions(const Uuid& channel, const AurixPosition* positions, std::size_t count) {
         return aurix_client_update_positions(c_, &channel.raw, positions, count);

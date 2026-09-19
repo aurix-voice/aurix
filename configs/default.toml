@@ -62,6 +62,10 @@ energy_interval_ms = 200
 # uplink loss/jitter/bitrate the SFU measures, sent as NetworkQuality (1–5 bars) when the bars
 # change and every fifth period (0 disables).
 quality_interval_ms = 2000
+# Let native AURX sessions negotiate the G.711 μ-law (PCMU) fallback with SetAudioCodec. The
+# node transcodes at the edge (channels stay Opus); each PCMU session costs one Opus encoder
+# plus one decoder per speaker it hears. Disable on CPU-bound nodes.
+pcmu_fallback = true
 
 [turn]
 enabled = false

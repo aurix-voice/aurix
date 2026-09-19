@@ -144,6 +144,7 @@ namespace Aurix.Audio
             public JitterBuffer Jitter = new JitterBuffer();
             public IOpusCodec Decoder;
             public IOpusFecDecoder Fec;
+            public AudioCodec Codec;
             public long FecRecovered;
             public float Volume = 1f;
             public float LeftGain = 1f;
@@ -189,23 +190,39 @@ namespace Aurix.Audio
         }
 
         /// <summary>Queue a verified frame from the transport (any thread).</summary>
-        public void Push(uint ssrc, uint seq, float volume, byte[] opus) => Push(ssrc, seq, volume, null, opus);
+        public void Push(uint ssrc, uint seq, float volume, byte[] opus) => Push(ssrc, seq, volume, null, AudioCodec.Opus, opus);
 
         /// <summary>
         /// Queue a verified frame with the speaker's direction relative to this listener. A mono
         /// stream is panned across a stereo output by constant-power law (see
         /// <see cref="Protocol.Direction.StereoGains"/>); <c>null</c> keeps it centred.
         /// </summary>
-        public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, byte[] opus)
+        public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, byte[] opus) =>
+            Push(ssrc, seq, volume, direction, AudioCodec.Opus, opus);
+
+        /// <summary>
+        /// Queue a verified frame of either codec (<see cref="Transport.IncomingAudio.Codec"/>). After
+        /// this session negotiates PCMU every downlink frame arrives as μ-law and is decoded by a
+        /// <see cref="PcmuCodec"/>; a codec change on a stream swaps its decoder and refills the jitter buffer.
+        /// </summary>
+        public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, AudioCodec codec, byte[] payload)
         {
             Stream s;
             lock (_streams)
             {
                 if (!_streams.TryGetValue(ssrc, out s))
                 {
-                    var decoder = _decoderFactory();
-                    s = new Stream { Decoder = decoder, Fec = decoder as IOpusFecDecoder };
+                    s = new Stream();
+                    Attach(s, codec);
                     _streams[ssrc] = s;
+                }
+                else if (s.Codec != codec)
+                {
+                    Retire(s);
+                    s.Jitter = new JitterBuffer();
+                    s.FecRecovered = 0;
+                    s.FramePos = s.FrameLen = 0;
+                    Attach(s, codec);
                 }
                 s.Volume = volume;
                 if (direction.HasValue) (s.LeftGain, s.RightGain) = direction.Value.StereoGains();
@@ -220,7 +237,15 @@ namespace Aurix.Audio
                     if (now - s.StarvedAtTicks < UnderrunResumeWindow.Ticks) _underruns++;
                 }
             }
-            s.Jitter.Push(seq, opus);
+            s.Jitter.Push(seq, payload);
+        }
+
+        private void Attach(Stream s, AudioCodec codec)
+        {
+            var decoder = codec == AudioCodec.Pcmu ? new PcmuCodec() : _decoderFactory();
+            s.Decoder = decoder;
+            s.Fec = decoder as IOpusFecDecoder;
+            s.Codec = codec;
         }
 
         public void Remove(uint ssrc)

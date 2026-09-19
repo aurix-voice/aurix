@@ -49,6 +49,8 @@ namespace Aurix.Protocol
         Energy = 0x0800,
         /// <summary>Downlink frame carries a 2-byte <see cref="Direction"/> (after the volume byte, if any).</summary>
         Directional = 0x1000,
+        /// <summary>Payload is G.711 μ-law (8 kHz) instead of Opus — only on sessions that negotiated PCMU.</summary>
+        Pcmu = 0x2000,
     }
 
     /// <summary>

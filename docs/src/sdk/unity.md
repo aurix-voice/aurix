@@ -126,6 +126,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Recording consent | `OnRecording(RecordingNotice)`, `RespondToRecordingAsync(id, RecordingConsent)` |
 | Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand(BitrateCommand)` |
 | Opus controls | `OpusEncoderSettings`, `SetEncoderSettings`, `SetComplexity`, `FollowChannelPolicy`, `Encoder`, `EffectiveEncoderSettings`, `AudioPolicy`, `OnAudioPolicyChanged`, `OnEncoderSettingsChanged`; `NativeOpusCodec` / `ConcentusOpusCodec`, `IOpusEncoderControls`, `IOpusFecDecoder` |
+| PCMU (G.711) fallback | `SetAudioCodecAsync(AudioCodec)`, `AudioCodec` / `PreferredAudioCodec`, `OnAudioCodecChanged`; behaviour `PreferredCodec`, `SetAudioCodec()`, `ActiveCodec`; `PcmuCodec`, `G711`, `TransmitAudioFrame(codec, …)`, `IncomingAudio.Codec` |
 | Mobile | runtime microphone permission (`PermissionState`, `OnMicrophonePermissionDenied`, `RetryMicrophonePermission()`), background/foreground handling, `ProbeConnection()`, reconnect on Wi-Fi ↔ cellular |
 
 ## Opus codec and controls
@@ -159,6 +160,34 @@ transient **`BitrateCommand`** (clamped to the policy's floor/target, also raise
 are identical in the native and Web SDKs; see [Channels](../features/channels.md#configuration)
 and [Network quality](../features/quality.md).
 
+## PCMU (G.711) fallback
+
+For devices where even Concentus at low complexity is too expensive, a session can run on
+**G.711 μ-law** instead of Opus (8 kHz, 64 kbit/s, telephone quality; a lookup table, no
+encoder state). It is negotiated per session with the server, which transcodes at the edge —
+everyone else in the channel keeps Opus ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+
+```csharp
+// AurixVoiceBehaviour: set PreferredCodec = AudioCodec.Pcmu in the inspector (or before Connect),
+// or switch at runtime:
+await voice.SetAudioCodec(AudioCodec.Pcmu);   // await voice.SetAudioCodec(AudioCodec.Opus) to go back
+voice.ActiveCodec;                            // what the server acknowledged
+
+// AurixVoiceClient with your own capture pipeline:
+client.OnAudioCodecChanged += codec => encoder = codec == AudioCodec.Pcmu ? pcmu : opus;
+await client.SetAudioCodecAsync(AudioCodec.Pcmu);
+int n = pcmu.Encode(pcm48k, AudioFormat.FrameSamples, ulaw);   // PcmuCodec: 960 → 160 bytes
+client.TransmitAudioFrame(client.AudioCodec, ulaw, n, AudioFormat.FrameSamples, vad.Level);
+```
+
+The behaviour switches its encoder when `OnAudioCodecChanged` fires, so frames always match the
+codec the server expects; `PreferredCodec` is re-negotiated automatically after a fresh session
+(a resumed session keeps it). `PcmuCodec` implements `IOpusCodec`, so `RemoteMixer` decodes PCMU
+downlink streams (`IncomingAudio.Codec`) next to Opus ones — a stream that changes codec gets a
+fresh decoder. `SetBitrate` is a no-op on it (G.711 is fixed-rate), and `OpusEncoderSettings` /
+channel audio policies do not apply while PCMU is active. Rejected with `CODEC_NOT_AVAILABLE`
+when the node runs `media.pcmu_fallback = false`.
+
 ## .NET: build, test, demo
 
 ```bash
@@ -169,7 +198,7 @@ AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1
 ```
 
 The demo connects two headless clients over real UDP and asserts audio, events and counters;
-`--scenario reconnect | prefs | chat | transmission | positional | echo` cover the other
+`--scenario reconnect | prefs | chat | transmission | positional | echo | pcmu` cover the other
 features against a live server (see the README for what each checks).
 
 ## iOS / Android notes

@@ -219,7 +219,28 @@ pub static SAFETY_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `direction` is `uplink` (μ-law → Opus) or `downlink` (Opus → μ-law); `outcome` is `ok` or
+/// `error`.
+pub static PCMU_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_pcmu_frames_total",
+        "Audio frames transcoded for sessions that negotiated the PCMU fallback codec",
+        &["direction", "outcome"]
+    )
+    .unwrap()
+});
+
+pub static PCMU_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_pcmu_sessions",
+        "Sessions currently using the PCMU fallback codec"
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
+    let _ = &*PCMU_FRAMES;
+    let _ = &*PCMU_SESSIONS;
     // Touch all lazy statics to ensure registration
     let _ = &*ACTIVE_SESSIONS;
     let _ = &*ACTIVE_CHANNELS;

@@ -4,6 +4,7 @@ pub mod audit;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod g711;
 #[cfg(feature = "server")]
 pub mod jitter_buffer;
 #[cfg(feature = "server")]

@@ -1,17 +1,22 @@
 //! Audio building blocks shared by every native integration: level metering + VAD, capture
-//! framing (any PCM format → 20 ms mono 48 kHz Opus frames) and the receive side (per-sender
-//! jitter buffer + Opus decoder, mixed into one interleaved output with per-participant gain and
-//! constant-power panning). Mirrors `sdk/unity/Runtime/Audio` so all clients sound the same.
+//! framing (any PCM format → 20 ms mono 48 kHz Opus frames, or 8 kHz G.711 μ-law when the
+//! session negotiated the PCMU fallback) and the receive side (per-sender jitter buffer +
+//! decoder, mixed into one interleaved output with per-participant gain and constant-power
+//! panning). Mirrors `sdk/unity/Runtime/Audio` so all clients sound the same.
 
+use aurix_common::g711::{self, PCMU_FRAME_SAMPLES, PCMU_FRAME_SIZES, PCMU_SAMPLE_RATE};
 use aurix_common::protocol::{decode_audio_level, encode_audio_level, AUDIO_LEVEL_SILENCE};
-use aurix_common::types::{AudioPolicy, Direction, OpusBandwidth, OpusSignal};
+use aurix_common::types::{AudioCodec, AudioPolicy, Direction, OpusBandwidth, OpusSignal};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
-/// Everything on the wire is Opus at 48 kHz.
+/// Opus on the wire runs at 48 kHz; the mixer and the capture path work at this rate and
+/// PCMU frames are resampled to/from it at the edge.
 pub const SAMPLE_RATE: u32 = 48_000;
 /// One packet carries 20 ms of audio.
 pub const FRAME_SAMPLES: usize = 960;
+/// 48 kHz → 8 kHz decimation factor of the PCMU path.
+const PCMU_DECIMATION: usize = (SAMPLE_RATE / PCMU_SAMPLE_RATE) as usize;
 /// Largest software input gain (+12 dB).
 pub const MAX_INPUT_GAIN: f32 = 4.0;
 /// Largest master output volume (+6 dB).
@@ -163,10 +168,160 @@ impl Resampler {
     }
 }
 
+/// Low-pass FIR (windowed sinc) run at 48 kHz on both sides of the PCMU path: before decimating
+/// captured audio to 8 kHz (anti-aliasing) and after zero-stuffing decoded μ-law back to 48 kHz
+/// (anti-imaging). Cut-off is the telephone band, so it costs nothing audible on μ-law.
+#[derive(Debug, Clone)]
+struct NarrowbandFir {
+    taps: Vec<f32>,
+    history: Vec<f32>,
+    pos: usize,
+}
+
+impl NarrowbandFir {
+    const TAPS: usize = 63;
+    const CUTOFF_HZ: f32 = 3_600.0;
+
+    fn new(gain: f32) -> Self {
+        let fc = Self::CUTOFF_HZ / SAMPLE_RATE as f32;
+        let m = (Self::TAPS - 1) as f32;
+        let mut taps: Vec<f32> = (0..Self::TAPS)
+            .map(|n| {
+                let x = n as f32 - m / 2.0;
+                let sinc = if x == 0.0 {
+                    2.0 * fc
+                } else {
+                    (2.0 * std::f32::consts::PI * fc * x).sin() / (std::f32::consts::PI * x)
+                };
+                let hamming = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * n as f32 / m).cos();
+                sinc * hamming
+            })
+            .collect();
+        let sum: f32 = taps.iter().sum();
+        for t in taps.iter_mut() {
+            *t *= gain / sum;
+        }
+        Self {
+            taps,
+            history: vec![0.0; Self::TAPS],
+            pos: 0,
+        }
+    }
+
+    fn process(&mut self, sample: f32) -> f32 {
+        self.history[self.pos] = sample;
+        let mut acc = 0.0;
+        let mut idx = self.pos;
+        for &t in &self.taps {
+            acc += t * self.history[idx];
+            idx = if idx == 0 { Self::TAPS - 1 } else { idx - 1 };
+        }
+        self.pos = (self.pos + 1) % Self::TAPS;
+        acc
+    }
+
+    fn reset(&mut self) {
+        self.history.iter_mut().for_each(|h| *h = 0.0);
+        self.pos = 0;
+    }
+}
+
+/// 48 kHz mono → G.711 μ-law at 8 kHz, one 20 ms frame at a time.
+#[derive(Debug, Clone)]
+pub struct PcmuEncoder {
+    fir: NarrowbandFir,
+}
+
+impl Default for PcmuEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PcmuEncoder {
+    pub fn new() -> Self {
+        Self {
+            fir: NarrowbandFir::new(1.0),
+        }
+    }
+
+    /// `pcm` is 48 kHz mono; every 6th low-passed sample becomes one μ-law byte in `out`.
+    pub fn encode(&mut self, pcm: &[f32], out: &mut Vec<u8>) {
+        for (i, &s) in pcm.iter().enumerate() {
+            let y = self.fir.process(s);
+            if i % PCMU_DECIMATION == PCMU_DECIMATION - 1 {
+                out.push(g711::ulaw_encode((y.clamp(-1.0, 1.0) * 32767.0) as i16));
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.fir.reset();
+    }
+}
+
+/// G.711 μ-law at 8 kHz → 48 kHz mono, with hold-last-sample concealment for lost frames.
+#[derive(Debug, Clone)]
+pub struct PcmuDecoder {
+    fir: NarrowbandFir,
+    last: f32,
+}
+
+impl Default for PcmuDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PcmuDecoder {
+    pub fn new() -> Self {
+        Self {
+            fir: NarrowbandFir::new(PCMU_DECIMATION as f32),
+            last: 0.0,
+        }
+    }
+
+    /// Decodes one μ-law frame (10/20/40/60 ms) into `out` at 48 kHz. Returns the number of
+    /// samples written, or `None` for a frame of unsupported size.
+    pub fn decode(&mut self, ulaw: &[u8], out: &mut [f32]) -> Option<usize> {
+        if !PCMU_FRAME_SIZES.contains(&ulaw.len()) || out.len() < ulaw.len() * PCMU_DECIMATION {
+            return None;
+        }
+        let mut n = 0;
+        for &b in ulaw {
+            let s = g711::ulaw_decode(b) as f32 / 32768.0;
+            self.last = s;
+            for k in 0..PCMU_DECIMATION {
+                out[n] = self.fir.process(if k == 0 { s } else { 0.0 });
+                n += 1;
+            }
+        }
+        Some(n)
+    }
+
+    /// Fills one 20 ms frame for a lost packet: a fast fade from the last sample to silence.
+    pub fn conceal(&mut self, out: &mut [f32]) -> usize {
+        let n = FRAME_SAMPLES.min(out.len());
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            let fade = 1.0 - i as f32 / n as f32;
+            *o = self.last * fade;
+        }
+        self.last = 0.0;
+        n
+    }
+
+    pub fn reset(&mut self) {
+        self.fir.reset();
+        self.last = 0.0;
+    }
+}
+
 /// One encoded uplink frame.
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
-    pub opus: Vec<u8>,
+    /// Encoded audio: Opus, or 160 bytes of μ-law when `codec` is [`AudioCodec::Pcmu`].
+    pub payload: Vec<u8>,
+    pub codec: AudioCodec,
     /// Wire audio level of the frame before encoding.
     pub level: u8,
     /// RMS of the frame, `0..=1`.
@@ -462,9 +617,12 @@ impl OpusDecoder {
 }
 
 /// Turns arbitrary captured PCM (any rate, 1..=8 interleaved channels, i16 or f32) into
-/// 20 ms mono 48 kHz Opus frames with input gain and VAD metering applied.
+/// 20 ms mono frames — 48 kHz Opus, or 8 kHz μ-law when the session codec is PCMU — with
+/// input gain and VAD metering applied.
 pub struct CaptureEncoder {
     encoder: opus::Encoder,
+    pcmu: PcmuEncoder,
+    codec: AudioCodec,
     resampler: Option<Resampler>,
     mono: Vec<f32>,
     pending: Vec<f32>,
@@ -472,6 +630,7 @@ pub struct CaptureEncoder {
     pub vad: VoiceActivityDetector,
     settings: EncoderSettings,
     out: [u8; 1275],
+    ulaw: Vec<u8>,
 }
 
 impl CaptureEncoder {
@@ -480,6 +639,8 @@ impl CaptureEncoder {
             opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)?;
         let mut this = Self {
             encoder,
+            pcmu: PcmuEncoder::new(),
+            codec: AudioCodec::Opus,
             resampler: None,
             mono: Vec::with_capacity(FRAME_SAMPLES * 4),
             pending: Vec::with_capacity(FRAME_SAMPLES * 4),
@@ -487,9 +648,24 @@ impl CaptureEncoder {
             vad: VoiceActivityDetector::default(),
             settings: settings.clamped(),
             out: [0u8; 1275],
+            ulaw: Vec::with_capacity(PCMU_FRAME_SAMPLES),
         };
         this.apply(this.settings)?;
         Ok(this)
+    }
+
+    /// Which codec the produced frames use. Switching resets both codecs' state so the first
+    /// frame after the switch does not carry the previous one's history.
+    pub fn set_codec(&mut self, codec: AudioCodec) {
+        if self.codec != codec {
+            self.codec = codec;
+            self.pcmu.reset();
+            let _ = self.encoder.reset_state();
+        }
+    }
+
+    pub fn codec(&self) -> AudioCodec {
+        self.codec
     }
 
     pub fn bitrate(&self) -> u32 {
@@ -564,14 +740,28 @@ impl CaptureEncoder {
             }
             self.vad.process(frame);
             let energy = rms(frame);
-            match self.encoder.encode_float(frame, &mut self.out) {
-                Ok(n) if n > 0 => sink(EncodedFrame {
-                    opus: self.out[..n].to_vec(),
-                    level: self.vad.level(),
-                    energy,
-                    speech: self.vad.speaking(),
-                }),
-                _ => {}
+            match self.codec {
+                AudioCodec::Opus => match self.encoder.encode_float(frame, &mut self.out) {
+                    Ok(n) if n > 0 => sink(EncodedFrame {
+                        payload: self.out[..n].to_vec(),
+                        codec: AudioCodec::Opus,
+                        level: self.vad.level(),
+                        energy,
+                        speech: self.vad.speaking(),
+                    }),
+                    _ => {}
+                },
+                AudioCodec::Pcmu => {
+                    self.ulaw.clear();
+                    self.pcmu.encode(frame, &mut self.ulaw);
+                    sink(EncodedFrame {
+                        payload: self.ulaw.clone(),
+                        codec: AudioCodec::Pcmu,
+                        level: self.vad.level(),
+                        energy,
+                        speech: self.vad.speaking(),
+                    });
+                }
             }
             offset += FRAME_SAMPLES;
         }
@@ -596,14 +786,15 @@ impl CaptureEncoder {
         self.resampler = None;
         self.vad.reset();
         let _ = self.encoder.reset_state();
+        self.pcmu.reset();
     }
 }
 
 /// Per-sender jitter buffer: reorders by sequence, absorbs jitter with a small target depth and
 /// hands frames (or loss markers for PLC) to the decoder at a steady 20 ms cadence.
 #[derive(Debug)]
-pub struct JitterBuffer {
-    frames: BTreeMap<u32, Vec<u8>>,
+pub struct JitterBuffer<F = Vec<u8>> {
+    frames: BTreeMap<u32, F>,
     target_depth: usize,
     max_depth: usize,
     next_seq: u32,
@@ -613,15 +804,15 @@ pub struct JitterBuffer {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum JitterSlot {
+pub enum JitterSlot<F = Vec<u8>> {
     /// Nothing to play yet (still filling or starved).
     Wait,
-    Frame(Vec<u8>),
+    Frame(F),
     /// The packet for this slot is missing; run PLC.
     Lost,
 }
 
-impl JitterBuffer {
+impl<F> JitterBuffer<F> {
     pub fn new(target_depth: usize, max_depth: usize) -> Self {
         let target_depth = target_depth.max(1);
         Self {
@@ -647,12 +838,12 @@ impl JitterBuffer {
         (a.wrapping_sub(b) as i32) < 0
     }
 
-    pub fn push(&mut self, seq: u32, opus: Vec<u8>) {
+    pub fn push(&mut self, seq: u32, frame: F) {
         if self.started && Self::seq_before(seq, self.next_seq) {
             self.late += 1;
             return;
         }
-        self.frames.insert(seq, opus);
+        self.frames.insert(seq, frame);
         if self.frames.len() > self.max_depth {
             while self.frames.len() > self.target_depth {
                 self.frames.pop_first();
@@ -663,7 +854,7 @@ impl JitterBuffer {
         }
     }
 
-    pub fn pop(&mut self) -> JitterSlot {
+    pub fn pop(&mut self) -> JitterSlot<F> {
         let Some(&first) = self.frames.keys().next() else {
             return JitterSlot::Wait;
         };
@@ -692,9 +883,19 @@ impl JitterBuffer {
     }
 }
 
+/// One downlink frame waiting in a jitter buffer.
+#[derive(Debug, PartialEq)]
+struct WireFrame {
+    codec: AudioCodec,
+    data: Vec<u8>,
+}
+
 struct Stream {
-    jitter: JitterBuffer,
+    jitter: JitterBuffer<WireFrame>,
     decoder: opus::Decoder,
+    pcmu: PcmuDecoder,
+    /// Codec of the last frame decoded; the concealment path follows it.
+    codec: AudioCodec,
     volume: f32,
     left: f32,
     right: f32,
@@ -732,8 +933,10 @@ pub struct MixerTotals {
 pub const UNDERRUN_RESUME_WINDOW: Duration = Duration::from_millis(250);
 
 /// Decodes and mixes every remote sender into one interleaved float buffer. Each sender has
-/// its own decoder because Opus decoder state is per-stream. Safe to drive from the audio
-/// thread: pushes only touch a `BTreeMap` behind the caller's lock.
+/// its own decoders because decoder state is per-stream; Opus and PCMU frames of the same
+/// sender (around a codec switch) are decoded by whichever codec each frame is flagged with.
+/// Safe to drive from the audio thread: pushes only touch a `BTreeMap` behind the caller's
+/// lock.
 pub struct RemoteMixer {
     streams: HashMap<u32, Stream>,
     output_volume: f32,
@@ -779,7 +982,7 @@ impl RemoteMixer {
         self.output_muted
     }
 
-    /// Queue one verified downlink frame. `volume` is the server-applied gain byte and
+    /// Queue one verified downlink Opus frame. `volume` is the server-applied gain byte and
     /// `direction` the speaker's bearing relative to this listener (`None` = centred).
     pub fn push(
         &mut self,
@@ -789,6 +992,19 @@ impl RemoteMixer {
         direction: Option<Direction>,
         opus: Vec<u8>,
     ) -> Result<(), opus::Error> {
+        self.push_frame(ssrc, seq, volume, direction, AudioCodec::Opus, opus)
+    }
+
+    /// [`Self::push`] for a frame in either codec.
+    pub fn push_frame(
+        &mut self,
+        ssrc: u32,
+        seq: u32,
+        volume: f32,
+        direction: Option<Direction>,
+        codec: AudioCodec,
+        data: Vec<u8>,
+    ) -> Result<(), opus::Error> {
         let stream = match self.streams.get_mut(&ssrc) {
             Some(s) => s,
             None => {
@@ -796,6 +1012,8 @@ impl RemoteMixer {
                 self.streams.entry(ssrc).or_insert(Stream {
                     jitter: JitterBuffer::new(self.target_depth, self.max_depth),
                     decoder,
+                    pcmu: PcmuDecoder::new(),
+                    codec,
                     volume: 1.0,
                     left: 1.0,
                     right: 1.0,
@@ -823,7 +1041,7 @@ impl RemoteMixer {
                 self.underruns += 1;
             }
         }
-        stream.jitter.push(seq, opus);
+        stream.jitter.push(seq, WireFrame { codec, data });
         Ok(())
     }
 
@@ -905,13 +1123,24 @@ impl RemoteMixer {
                             }
                             break;
                         }
-                        JitterSlot::Frame(opus) => {
-                            s.decoder.decode_float(&opus, &mut s.frame, false)
+                        JitterSlot::Frame(WireFrame { codec, data }) => {
+                            s.codec = codec;
+                            match codec {
+                                AudioCodec::Opus => {
+                                    s.decoder.decode_float(&data, &mut s.frame, false)
+                                }
+                                AudioCodec::Pcmu => {
+                                    Ok(s.pcmu.decode(&data, &mut s.frame).unwrap_or(0))
+                                }
+                            }
                         }
-                        JitterSlot::Lost => {
-                            s.decoder
-                                .decode_float(&[], &mut s.frame[..FRAME_SAMPLES], false)
-                        }
+                        JitterSlot::Lost => match s.codec {
+                            AudioCodec::Opus => {
+                                s.decoder
+                                    .decode_float(&[], &mut s.frame[..FRAME_SAMPLES], false)
+                            }
+                            AudioCodec::Pcmu => Ok(s.pcmu.conceal(&mut s.frame)),
+                        },
                     };
                     s.len = n.unwrap_or(0);
                     s.pos = 0;
@@ -1030,7 +1259,9 @@ mod tests {
         let mut out = vec![0i16; FRAME_SAMPLES * 2 * frames.len()];
         let mut active = 0;
         for (i, f) in frames.iter().enumerate() {
-            mixer.push(7, i as u32, 1.0, None, f.opus.clone()).unwrap();
+            mixer
+                .push(7, i as u32, 1.0, None, f.payload.clone())
+                .unwrap();
             let slice = &mut out[i * FRAME_SAMPLES * 2..(i + 1) * FRAME_SAMPLES * 2];
             active += mixer.mix_i16(slice, 2);
         }
@@ -1042,6 +1273,97 @@ mod tests {
             .collect();
         let e = rms(&tail);
         assert!((e - 0.3535).abs() < 0.05, "{e}");
+    }
+
+    #[test]
+    fn pcmu_encoder_decimates_and_decoder_restores_tone() {
+        let mut enc = PcmuEncoder::new();
+        let mut dec = PcmuDecoder::new();
+        let pcm = sine(FRAME_SAMPLES * 20, 48_000, 440.0, 0.5);
+        let mut ulaw = Vec::new();
+        let mut out = Vec::new();
+        let mut frame = vec![0f32; FRAME_SAMPLES];
+        for chunk in pcm.chunks(FRAME_SAMPLES) {
+            ulaw.clear();
+            enc.encode(chunk, &mut ulaw);
+            assert_eq!(ulaw.len(), PCMU_FRAME_SAMPLES);
+            assert_eq!(dec.decode(&ulaw, &mut frame), Some(FRAME_SAMPLES));
+            out.extend_from_slice(&frame);
+        }
+        assert_eq!(out.len(), pcm.len());
+        // Skip the FIR group delay of both filters, then the tone must come back at level.
+        let e = rms(&out[FRAME_SAMPLES * 2..]);
+        assert!((e - 0.3535).abs() < 0.03, "{e}");
+        // Unsupported frame sizes are refused rather than misinterpreted.
+        assert_eq!(dec.decode(&[0xff; 100], &mut frame), None);
+        assert_eq!(
+            dec.decode(&[0xff; 80], &mut frame),
+            Some(80 * PCMU_DECIMATION)
+        );
+        // Concealment fades to silence and never exceeds one frame.
+        assert_eq!(dec.conceal(&mut frame), FRAME_SAMPLES);
+        assert!(frame[FRAME_SAMPLES - 1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn capture_encoder_switches_codec_and_mixer_plays_mixed_streams() {
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        assert_eq!(enc.codec(), AudioCodec::Opus);
+        let pcm = sine(FRAME_SAMPLES * 12, 48_000, 440.0, 0.5);
+        let mut opus_frames = Vec::new();
+        enc.push_f32(&pcm, 48_000, 1, |f| opus_frames.push(f));
+        assert!(opus_frames.iter().all(|f| f.codec == AudioCodec::Opus));
+
+        enc.set_codec(AudioCodec::Pcmu);
+        assert_eq!(enc.codec(), AudioCodec::Pcmu);
+        let mut pcmu_frames = Vec::new();
+        enc.push_f32(&pcm, 48_000, 1, |f| pcmu_frames.push(f));
+        assert_eq!(pcmu_frames.len(), 12);
+        assert!(pcmu_frames
+            .iter()
+            .all(|f| f.codec == AudioCodec::Pcmu && f.payload.len() == PCMU_FRAME_SAMPLES));
+        // Level/VAD metadata is computed before encoding, so it is codec independent.
+        assert!(pcmu_frames.iter().all(|f| f.speech && f.level < 20));
+
+        enc.set_codec(AudioCodec::Opus);
+        let mut back = Vec::new();
+        enc.push_f32(&pcm[..FRAME_SAMPLES], 48_000, 1, |f| back.push(f));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].codec, AudioCodec::Opus);
+
+        // One Opus and one PCMU participant on the same mixer, each at -6 dB volume.
+        let mut mixer = RemoteMixer::new(1, 12);
+        for (i, (o, p)) in opus_frames.iter().zip(&pcmu_frames).enumerate() {
+            mixer
+                .push_frame(1, i as u32, 0.5, None, AudioCodec::Opus, o.payload.clone())
+                .unwrap();
+            mixer
+                .push_frame(2, i as u32, 0.5, None, AudioCodec::Pcmu, p.payload.clone())
+                .unwrap();
+        }
+        let mut out = vec![0f32; FRAME_SAMPLES * 12];
+        mixer.mix(&mut out, 1);
+        // Both streams are audible: one alone would sit at 0.177 (half volume), two tones
+        // with different codec delays sum somewhere between incoherent and coherent.
+        let e = rms(&out[FRAME_SAMPLES * 3..]);
+        assert!(e > 0.21 && e < 0.38, "{e}");
+
+        // A stream that flips codec mid-way keeps decoding (server re-negotiation).
+        let mut mixer = RemoteMixer::new(1, 12);
+        for (i, o) in opus_frames.iter().enumerate().take(6) {
+            mixer
+                .push_frame(3, i as u32, 1.0, None, AudioCodec::Opus, o.payload.clone())
+                .unwrap();
+        }
+        for (i, p) in pcmu_frames.iter().enumerate().skip(6) {
+            mixer
+                .push_frame(3, i as u32, 1.0, None, AudioCodec::Pcmu, p.payload.clone())
+                .unwrap();
+        }
+        let mut out = vec![0f32; FRAME_SAMPLES * 12];
+        mixer.mix(&mut out, 1);
+        let e = rms(&out[FRAME_SAMPLES * 8..]);
+        assert!((e - 0.3535).abs() < 0.08, "{e}");
     }
 
     #[test]
@@ -1109,7 +1431,7 @@ mod tests {
                 *a += b;
             }
             let mut total = 0;
-            enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| total += f.opus.len());
+            enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| total += f.payload.len());
             total
         }
         let full = bytes_for(EncoderSettings {
@@ -1189,7 +1511,7 @@ mod tests {
         };
         for (i, f) in frames.iter().enumerate() {
             mixer
-                .push(1, i as u32, 0.5, Some(right), f.opus.clone())
+                .push(1, i as u32, 0.5, Some(right), f.payload.clone())
                 .unwrap();
         }
         let mut out = vec![0f32; FRAME_SAMPLES * 2 * 10];
@@ -1223,13 +1545,15 @@ mod tests {
         // Frames 0,1,3 (2 lost), then an ancient frame that is discarded as late.
         for seq in [0u32, 1, 3] {
             mixer
-                .push(9, seq, 1.0, None, frames[seq as usize].opus.clone())
+                .push(9, seq, 1.0, None, frames[seq as usize].payload.clone())
                 .unwrap();
         }
         for _ in 0..4 {
             mixer.mix(&mut out, 1);
         }
-        mixer.push(9, 0, 1.0, None, frames[0].opus.clone()).unwrap();
+        mixer
+            .push(9, 0, 1.0, None, frames[0].payload.clone())
+            .unwrap();
         let t = mixer.totals();
         assert_eq!((t.lost, t.late), (1, 1), "{t:?}");
 
@@ -1237,7 +1561,9 @@ mod tests {
         for _ in 0..3 {
             mixer.mix(&mut out, 1);
         }
-        mixer.push(9, 4, 1.0, None, frames[4].opus.clone()).unwrap();
+        mixer
+            .push(9, 4, 1.0, None, frames[4].payload.clone())
+            .unwrap();
         assert_eq!(mixer.totals().underruns, 1);
         // Starving again without a follow-up frame is a natural pause, not an underrun.
         for _ in 0..3 {

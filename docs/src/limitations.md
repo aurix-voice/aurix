@@ -29,7 +29,9 @@ the chapter that explains the boundary.
 * **Browsers get a server-side mix.** The Web SDK receives one mixed (stereo) downlink per
   session; per-participant tracks, insertable-stream encryption and native AURX over UDP are not
   available in browsers ([Web SDK](sdk/web.md)).
-* **Opus only.** No PCMU/PCMA fallback, no video.
+* **Opus inside; PCMU only as a per-session fallback** for native AURX clients (the node
+  transcodes at the edge). No PCMA, no PCMU over WebRTC, no PCMU for `E2ee` frames, no video
+  ([codecs](features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 * **Browsers own their encoder.** The Web SDK can set the bitrate ceiling, FEC, DTX, maximum
   bandwidth and CBR through WebRTC (`fmtp` / `setParameters`); complexity, signal mode, VBR mode
   and expected loss are only controllable in the native, Unity and Unreal SDKs
@@ -85,4 +87,4 @@ the chapter that explains the boundary.
 
 ## Planned
 
-PCMU fallback and ambient/radius visibility. The operator web panel is tracked separately.
+Ambient/radius visibility. The operator web panel is tracked separately.

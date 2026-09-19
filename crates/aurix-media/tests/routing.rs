@@ -1438,3 +1438,186 @@ async fn tts_injection_follows_channel_routing() {
     }
     assert!(got < 10, "cancelled after {got} frames");
 }
+
+/// A session that negotiated PCMU sends and receives μ-law while the channel stays Opus:
+/// its uplink is transcoded before recording/fan-out, Opus participants never see μ-law,
+/// and only PCMU receivers get frames re-encoded (with the usual downlink metadata).
+#[tokio::test]
+async fn pcmu_sessions_are_transcoded_at_the_edge() {
+    use aurix_common::g711::{self, PCMU_FRAME_SAMPLES, PCMU_SAMPLE_RATE};
+
+    fn ulaw_tone(frame: usize, amp: f32) -> Vec<u8> {
+        let pcm: Vec<i16> = (0..PCMU_FRAME_SAMPLES)
+            .map(|i| {
+                let t = (frame * PCMU_FRAME_SAMPLES + i) as f32 / PCMU_SAMPLE_RATE as f32;
+                ((t * 440.0 * std::f32::consts::TAU).sin() * amp * 32767.0) as i16
+            })
+            .collect();
+        let mut out = Vec::new();
+        g711::encode(&pcm, &mut out);
+        out
+    }
+    fn rms_i16(pcm: &[i16]) -> f32 {
+        (pcm.iter()
+            .map(|&s| (s as f32 / 32768.0).powi(2))
+            .sum::<f32>()
+            / pcm.len() as f32)
+            .sqrt()
+    }
+
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let team = ChannelId::new();
+
+    // Negotiation is native-only: a browser session stays on Opus.
+    let web = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "web".into())
+        .unwrap();
+    web.set_transport(Transport::WebRtc);
+    assert!(web.set_codec(AudioCodec::Pcmu).is_err());
+    assert_eq!(web.codec(), AudioCodec::Opus);
+    sfu.destroy_session(&web.session_id).unwrap();
+
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    for s in [&s_a, &s_b, &s_c] {
+        sfu.join_channel(
+            &s.session_id,
+            team,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+    c.bind(addr).await;
+
+    // Negotiation is per session.
+    assert_eq!(s_a.codec(), AudioCodec::Opus);
+    s_a.set_codec(AudioCodec::Pcmu).unwrap();
+    s_c.set_codec(AudioCodec::Pcmu).unwrap();
+
+    // Before negotiating, a μ-law frame is refused: B still sends Opus-flagged frames only.
+    let seq = b.next_seq();
+    let mut bad = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_b.ssrc,
+        channel_id_hash(&team),
+        Bytes::from(ulaw_tone(0, 0.5)),
+    );
+    bad.header.flags |= PacketFlags::Pcmu as u16;
+    b.sock.send_to(&bad.seal(&s_b.keys), addr).await.unwrap();
+    assert!(
+        a.recv().await.is_none(),
+        "unnegotiated PCMU must be dropped"
+    );
+
+    // A (PCMU) speaks: B (Opus) hears Opus, C (PCMU) hears μ-law, both at 440 Hz.
+    let mut opus_dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut pcm48 = vec![0i16; 960];
+    let mut b_level = 0.0;
+    let mut c_level = 0.0;
+    for i in 0..10 {
+        let seq = a.next_seq();
+        let mut pkt = AurixPacket::audio_with_level(
+            seq,
+            seq * 960,
+            s_a.ssrc,
+            channel_id_hash(&team),
+            12,
+            &ulaw_tone(i, 0.5),
+        );
+        pkt.header.flags |= PacketFlags::Pcmu as u16;
+        a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+
+        let got = b.recv().await.expect("B hears A");
+        assert_eq!(got.header.ssrc, s_a.ssrc);
+        assert!(!got.header.has_flag(PacketFlags::Pcmu), "Opus receiver");
+        assert!(!got.header.has_flag(PacketFlags::Energy), "level stripped");
+        let n = opus_dec.decode(&got.payload, &mut pcm48, false).unwrap();
+        assert_eq!(n, 960, "20 ms Opus frame");
+        b_level = rms_i16(&pcm48[..n]);
+
+        let got = c.recv().await.expect("C hears A");
+        assert_eq!(got.header.ssrc, s_a.ssrc);
+        assert!(got.header.has_flag(PacketFlags::Pcmu), "PCMU receiver");
+        assert_eq!(got.payload.len(), PCMU_FRAME_SAMPLES);
+        let mut pcm8 = Vec::new();
+        g711::decode(&got.payload, &mut pcm8);
+        c_level = rms_i16(&pcm8);
+    }
+    assert!((b_level - 0.3535).abs() < 0.06, "B level {b_level}");
+    assert!((c_level - 0.3535).abs() < 0.03, "C level {c_level}");
+    assert!(a.recv().await.is_none(), "no echo to the sender");
+
+    // B (Opus) speaks: A gets μ-law with its per-participant gain in the volume byte.
+    s_a.prefs.write().set_gain(s_b.user_id, 0.5);
+    let mut enc =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let mut a_level = 0.0;
+    for i in 0..10 {
+        let pcm: Vec<i16> = (0..960)
+            .map(|k| {
+                let t = (i * 960 + k) as f32 / 48_000.0;
+                ((t * 440.0 * std::f32::consts::TAU).sin() * 0.5 * 32767.0) as i16
+            })
+            .collect();
+        let frame = enc.encode_vec(&pcm, 1275).unwrap();
+        b.send_audio(addr, &team, &frame).await;
+
+        let got = a.recv().await.expect("A hears B");
+        assert!(got.header.has_flag(PacketFlags::Pcmu));
+        assert!(got.header.has_flag(PacketFlags::VolumeAttenuated));
+        assert_eq!(got.payload[0], encode_volume_byte(0.5));
+        assert_eq!(got.payload.len(), 1 + PCMU_FRAME_SAMPLES);
+        let mut pcm8 = Vec::new();
+        g711::decode(&got.payload[1..], &mut pcm8);
+        a_level = rms_i16(&pcm8);
+
+        let got = c.recv().await.expect("C hears B");
+        assert!(got.header.has_flag(PacketFlags::Pcmu));
+        assert!(!got.header.has_flag(PacketFlags::VolumeAttenuated));
+        assert_eq!(got.payload.len(), PCMU_FRAME_SAMPLES);
+    }
+    // Gain is applied by the receiver from the volume byte, the payload itself is at level.
+    assert!((a_level - 0.3535).abs() < 0.06, "A level {a_level}");
+
+    // Malformed μ-law (not a 10/20/40/60 ms frame) and E2EE μ-law never reach anyone.
+    for (payload, e2ee) in [(vec![0xffu8; 100], false), (ulaw_tone(0, 0.5), true)] {
+        let seq = a.next_seq();
+        let mut pkt = AurixPacket::audio(
+            seq,
+            seq * 960,
+            s_a.ssrc,
+            channel_id_hash(&team),
+            Bytes::from(payload),
+        );
+        pkt.header.flags |= PacketFlags::Pcmu as u16;
+        if e2ee {
+            pkt.header.flags |= PacketFlags::E2ee as u16;
+        }
+        a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+        assert!(b.recv().await.is_none(), "e2ee={e2ee}");
+        assert!(c.recv().await.is_none(), "e2ee={e2ee}");
+    }
+
+    // Back to Opus: A now receives plain Opus again and its μ-law uplink is refused.
+    s_a.set_codec(AudioCodec::Opus).unwrap();
+    let frame = enc.encode_vec(&vec![0i16; 960], 1275).unwrap();
+    b.send_audio(addr, &team, &frame).await;
+    let got = a.recv().await.expect("A hears B as Opus");
+    assert!(!got.header.has_flag(PacketFlags::Pcmu));
+    assert_eq!(&got.payload[1..], &frame[..]);
+}

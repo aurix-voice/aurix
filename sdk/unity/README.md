@@ -122,6 +122,38 @@ Set `client.Encoder = codec` and the client pushes every change through `IOpusEn
 `RemoteMixer` uses `IOpusFecDecoder` when a packet is missing and its successor has already arrived
 (`VoiceStats.FramesFecRecovered`), and falls back to PLC otherwise.
 
+### PCMU (G.711) fallback for weak devices
+
+A session can run on **G.711 μ-law** instead of Opus — 8 kHz, 64 kbit/s, a lookup table with no encoder
+state, for hardware where even Concentus at complexity 0 does not fit. The codec is negotiated per
+session; the server transcodes at the edge, so every other participant keeps Opus and notices nothing
+(the PCMU listener hears narrowband audio).
+
+```csharp
+// AurixVoiceBehaviour: PreferredCodec = AudioCodec.Pcmu in the inspector, or at runtime:
+await voice.SetAudioCodec(AudioCodec.Pcmu);      // ActiveCodec flips when the server acks
+
+// AurixVoiceClient with your own capture:
+var pcmu = new PcmuCodec();                      // IOpusCodec: 48 kHz float in/out, μ-law on the wire
+client.OnAudioCodecChanged += codec => Debug.Log($"codec now {codec}");
+await client.SetAudioCodecAsync(AudioCodec.Pcmu);
+int n = pcmu.Encode(mono48k, AudioFormat.FrameSamples, ulaw);          // 960 samples → 160 bytes
+client.TransmitAudioFrame(client.AudioCodec, ulaw, n, AudioFormat.FrameSamples, vad.Level);
+await client.SetAudioCodecAsync(AudioCodec.Opus);                       // back to Opus
+```
+
+* `client.AudioCodec` is what the server acknowledged (`AudioCodecChanged`), `PreferredAudioCodec` what
+  you asked for; the behaviour picks its encoder from `AudioCodec` on every frame, so no frame is sent in
+  the wrong codec around a switch. A resumed session keeps the codec; after a fresh session the client
+  re-sends `SetAudioCodec` for a non-Opus preference.
+* Downlink frames arrive flagged `PacketFlags.Pcmu`; `IncomingAudio.Codec`/`Payload` tell you which
+  (the old `Opus` field is kept but obsolete), and `RemoteMixer` decodes PCMU and Opus streams side by
+  side, replacing a stream's decoder when its codec changes. `SendOpusFrame`/`TransmitOpusFrame` still
+  work and simply mean `AudioCodec.Opus`.
+* `PcmuCodec.SetBitrate` is a no-op and `OpusEncoderSettings` / channel audio policies are not applied
+  while PCMU is active. Not available on WebRTC sessions or for E2EE frames; the node may refuse with
+  `CODEC_NOT_AVAILABLE` (`media.pcmu_fallback = false`).
+
 ### Choosing a region
 
 Session resume is node-local, so a player should connect to the *nearest node with capacity* and keep its
@@ -540,6 +572,12 @@ beyond `max_radius` → nothing.
 `--scenario echo` (needs the API key: it creates an echo channel) checks loopback over real UDP: alice and bob
 join the same echo channel, alice injects a stereo 24 kHz sine through `AudioInjector` → Opus → AURX and hears
 only her own SSRC back (RMS ≈ 0.35, `Ended` fired once), nothing after `SetMuted(true)`, bob receives 0 frames.
+
+`--scenario pcmu` negotiates alice onto PCMU while bob stays on Opus: alice's μ-law tone reaches bob as Opus
+(RMS ≈ 0.35 for a 0.5 tone), bob's Opus reaches alice flagged `Pcmu` and decodes to RMS ≈ 0.21 for a 0.3
+tone, alice switches back to Opus and the frames follow, `OnAudioCodecChanged` fires `Pcmu, Opus`, 0 auth
+failures. `--scenario reconnect` also negotiates PCMU first and checks the codec survives a resume and is
+re-negotiated after a fresh session.
 
 ## Notes
 

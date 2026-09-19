@@ -50,6 +50,8 @@ carries a stable `code` — the table at the end maps codes to causes.
 | positional channel silent | both listener and speaker must have sent a `PositionUpdate`; check `positional_config` (`near_distance`, `far_distance`, `max_radius`) and that the channel is `positional` |
 | a participant is silent for one player only | receiver-local mute, volume 0, block, `TransmissionMode` / focus — `ReceiverPreferences` events show the state |
 | speaking indicator never lights | frames below `media.speaking_energy_threshold` (0.01); VAD gate on the client too strict |
+| one participant sounds narrowband / telephone-like to everyone | that participant negotiated the PCMU fallback (`aurix_pcmu_sessions` > 0); expected — the node upsamples 8 kHz μ-law into the Opus stream ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)) |
+| PCMU client hears nothing while Opus clients do | frames sent before `AudioCodecChanged` arrived, or `Pcmu` frames with a length other than 80/160/320/480 bytes (`aurix_pcmu_frames_total{outcome="error"}`); a `Pcmu | E2ee` frame is always dropped |
 
 ## Features returning errors
 
@@ -62,6 +64,7 @@ carries a stable `code` — the table at the end maps codes to causes.
 | `USER_BANNED`, `USER_MUTED`, `USER_OFFLINE` | moderation state; direct chat to a user without a live session |
 | `CHAT_DISABLED`, `MESSAGE_BLOCKED`, `VALIDATION_ERROR` | chat off, filter webhook blocked the text (fail-closed by default), size/field validation |
 | `RATE_LIMIT_EXCEEDED` | per-IP / per-key / per-session limits (`[rate_limiting]`, `[chat]`, `[tts]`) |
+| `CODEC_NOT_AVAILABLE` | `SetAudioCodec` for a codec the node does not allow: `media.pcmu_fallback = false`, or the session is WebRTC (browsers negotiate Opus in SDP) |
 | `INVALID_CONFIG` | feature disabled on the node (recording, live streams, STT/TTS) or misconfigured request against it |
 | `CONFLICT` | retention sweep already running, live stream on another node, duplicate resource |
 | `MEDIA_NODE_UNAVAILABLE`, `TIMEOUT`, `STT_ERROR`, `TTS_ERROR`, `TTS_DISABLED` | node capacity, provider timeouts or failures (details are sanitised; see the node log) |

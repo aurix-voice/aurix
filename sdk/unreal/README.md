@@ -151,6 +151,12 @@ void AMyPlayerController::Tick(float DeltaSeconds)
 Both native entry points are audio-thread safe and stay valid until `Disconnect()`, which
 stops capture, unbinds the sound wave and only then destroys the client.
 
+* **PCMU fallback:** `SetAudioCodec(EAurixAudioCodec::Pcmu)` negotiates G.711 μ-law for this
+  session (8 kHz, no Opus CPU; the node transcodes at the edge, other participants keep Opus).
+  `OnAudioCodecChanged` / `GetAudioCodec()` report what the server acknowledged; capture and
+  playback switch codec inside the native core, nothing changes in the bridge. Refused with
+  `CODEC_NOT_AVAILABLE` when the node runs `media.pcmu_fallback = false`.
+
 ### Statistics and network quality bars
 
 `GetStats(FAurixStats&)` returns the native snapshot (packets/bytes both ways, `BadAuth`,

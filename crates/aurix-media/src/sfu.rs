@@ -498,6 +498,9 @@ impl SfuNode {
             return left;
         };
         channel.remove_participant(&session.user_id);
+        if let Some(ref router) = self.router {
+            router.forget_pcmu_downlinks(Some(session.ssrc), Some(channel_id_hash(channel_id)));
+        }
         if let Some(ref sink) = self.audio_sink {
             sink.on_participant_left(*channel_id, session.user_id);
         }

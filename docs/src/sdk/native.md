@@ -129,6 +129,21 @@ recover the previous lost frame from this packet's FEC data). None of these is v
 are safe P/Invoke targets — this is how the Unity SDK's `NativeOpusCodec` gets libopus. C++:
 `aurix::OpusEncoder` / `aurix::OpusDecoder` in `aurix_client.hpp`.
 
+## PCMU (G.711) fallback
+
+`client.set_audio_codec(AudioCodec::Pcmu)` asks the server to run the session on G.711 μ-law
+(8 kHz, 64 kbit/s, no Opus CPU); `Event::AudioCodecChanged(codec)` confirms it and
+`client.audio_codec()` reports the acknowledged codec. The core does the rest: capture pushed
+with `push_capture_*` is decimated to 8 kHz and μ-law encoded, μ-law downlink frames (flagged
+`Pcmu`) are decoded and upsampled into the same mixer as Opus streams, and after a fresh session
+the preferred codec is negotiated again. The node transcodes at the edge, so other participants
+are unaffected ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+C: `aurix_client_set_audio_codec(client, AURIX_CODEC_PCMU)`, `aurix_client_audio_codec`,
+`AURIX_EVENT_AUDIO_CODEC_CHANGED` + `aurix_event_audio_codec`; C++ `set_audio_codec` /
+`audio_codec`; Unreal `SetAudioCodec(EAurixAudioCodec::Pcmu)`, `GetAudioCodec`,
+`OnAudioCodecChanged`. Fails with `CODEC_NOT_AVAILABLE` when the node sets
+`media.pcmu_fallback = false`.
+
 ## Region selection
 
 The core has no HTTP client, so region discovery is split: the host performs the HTTP requests,

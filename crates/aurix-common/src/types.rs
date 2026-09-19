@@ -194,10 +194,16 @@ pub enum ConnectionState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Audio codec of a media stream. Channels always carry Opus; a native AURX session may
+/// negotiate PCMU for its own uplink/downlink with `SetAudioCodec`, in which case the server
+/// transcodes between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioCodec {
+    #[default]
     Opus,
+    /// ITU-T G.711 μ-law, 8 kHz mono, 64 kbit/s (see `aurix_common::g711`).
+    Pcmu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,6 +504,11 @@ impl ChannelConfig {
     pub fn validate(&self, bitrate_cap: u32) -> std::result::Result<(), String> {
         if self.max_participants == 0 {
             return Err("max_participants must be > 0".into());
+        }
+        if self.codec != AudioCodec::Opus {
+            return Err(
+                "codec must be opus; PCMU is negotiated per session with SetAudioCodec".into(),
+            );
         }
         let cap = bitrate_cap.clamp(Self::MIN_OPUS_BITRATE, Self::MAX_OPUS_BITRATE);
         if !(Self::MIN_OPUS_BITRATE..=cap).contains(&self.bitrate) {

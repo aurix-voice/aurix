@@ -31,6 +31,15 @@ enum class EAurixTransmissionMode : uint8
 };
 
 UENUM(BlueprintType)
+enum class EAurixAudioCodec : uint8
+{
+	/** Default: 48 kHz Opus. */
+	Opus,
+	/** G.711 mu-law fallback: 8 kHz, 64 kbit/s, no Opus CPU cost, telephone quality. */
+	Pcmu,
+};
+
+UENUM(BlueprintType)
 enum class EAurixRole : uint8
 {
 	Listener,

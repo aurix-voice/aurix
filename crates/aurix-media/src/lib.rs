@@ -6,6 +6,7 @@ pub mod quality;
 pub mod router;
 pub mod session;
 pub mod sfu;
+pub mod transcode;
 pub mod transport;
 pub mod tts;
 pub mod webrtc;

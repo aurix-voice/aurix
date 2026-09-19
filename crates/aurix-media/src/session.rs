@@ -212,6 +212,11 @@ pub struct MediaSession {
     pub prefs: RwLock<ReceiverPrefs>,
     /// Which joined channels receive this session's uplink (`All` by default).
     pub transmission: RwLock<TransmissionMode>,
+    /// Codec of this session's own frames (`SetAudioCodec`); channels always carry Opus and
+    /// the router transcodes when this is not `Opus`.
+    pub codec: RwLock<AudioCodec>,
+    /// μ-law → Opus encoder state while `codec == Pcmu`.
+    pub pcmu_uplink: Mutex<Option<crate::transcode::PcmuUplink>>,
     pub sequence: AtomicU32,
     /// Sequence counter for server-originated packets addressed to this session
     /// (acks, commands); keeps their encryption IVs unique under the session key.
@@ -271,6 +276,8 @@ impl MediaSession {
             is_speaking: AtomicBool::new(false),
             prefs: RwLock::new(ReceiverPrefs::default()),
             transmission: RwLock::new(TransmissionMode::All),
+            codec: RwLock::new(AudioCodec::Opus),
+            pcmu_uplink: Mutex::new(None),
             sequence: AtomicU32::new(0),
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
@@ -310,7 +317,9 @@ impl MediaSession {
     }
 
     pub fn deactivate(&self) {
-        self.active.store(false, Ordering::Relaxed);
+        if self.active.swap(false, Ordering::Relaxed) && self.codec() == AudioCodec::Pcmu {
+            aurix_metrics::PCMU_SESSIONS.dec();
+        }
     }
 
     pub fn transport(&self) -> Transport {
@@ -319,6 +328,10 @@ impl MediaSession {
 
     pub fn set_transport(&self, t: Transport) {
         *self.transport.write() = t;
+        if t != Transport::Aurx {
+            // Browser media is Opus by SDP; a PCMU negotiation from before the offer is void.
+            let _ = self.set_codec(AudioCodec::Opus);
+        }
     }
 
     /// True once the UDP source address has been authenticated via `SessionBind`
@@ -374,6 +387,31 @@ impl MediaSession {
 
     pub fn transmission(&self) -> TransmissionMode {
         *self.transmission.read()
+    }
+
+    pub fn codec(&self) -> AudioCodec {
+        *self.codec.read()
+    }
+
+    /// Switches the codec of this session's frames. Only native AURX sessions may leave Opus:
+    /// a browser's codec is fixed by its SDP.
+    pub fn set_codec(&self, codec: AudioCodec) -> Result<(), AurixError> {
+        if codec != AudioCodec::Opus && self.transport() != Transport::Aurx {
+            return Err(AurixError::Validation(
+                "only native AURX sessions can change codec".into(),
+            ));
+        }
+        let previous = std::mem::replace(&mut *self.codec.write(), codec);
+        if self.is_active() && previous != codec {
+            match codec {
+                AudioCodec::Pcmu => aurix_metrics::PCMU_SESSIONS.inc(),
+                AudioCodec::Opus => aurix_metrics::PCMU_SESSIONS.dec(),
+            }
+        }
+        if codec == AudioCodec::Opus {
+            *self.pcmu_uplink.lock() = None;
+        }
+        Ok(())
     }
 
     /// Sets the transmission mode; `Single` must name a channel this session is joined to.

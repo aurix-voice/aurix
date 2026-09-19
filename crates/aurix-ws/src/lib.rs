@@ -1335,6 +1335,7 @@ fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<Contr
             .collect(),
         transmission,
         focus_channel: prefs.focus(),
+        codec: session.codec(),
     })
 }
 
@@ -2291,6 +2292,28 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetAudioCodec { codec } => {
+            if codec == AudioCodec::Pcmu && !state.control.config.media.pcmu_fallback {
+                return send_error(
+                    tx,
+                    "CODEC_NOT_AVAILABLE",
+                    "The PCMU fallback codec is disabled on this node",
+                )
+                .await;
+            }
+            let result = {
+                let sfu = state.sfu.read();
+                match sfu.get_session(&session_id) {
+                    Some(s) => s.set_codec(codec),
+                    None => Err(AurixError::SessionNotFound(session_id.to_string())),
+                }
+            };
+            match result {
+                Ok(()) => send_msg(tx, &ControlMessage::AudioCodecChanged { codec }).await,
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+            }
+        }
+
         ControlMessage::SetUserBlock { user_id, blocked } => {
             if user_id == token.user_id {
                 return send_error(tx, "VALIDATION_ERROR", "Cannot block yourself").await;
@@ -2670,6 +2693,7 @@ async fn handle_control_message(
         | ControlMessage::ReceiverPreferences { .. }
         | ControlMessage::TransmissionChanged { .. }
         | ControlMessage::ChannelFocusChanged { .. }
+        | ControlMessage::AudioCodecChanged { .. }
         | ControlMessage::BitrateCommand { .. }
         | ControlMessage::NetworkQuality { .. }
         | ControlMessage::RecordingNotification { .. }

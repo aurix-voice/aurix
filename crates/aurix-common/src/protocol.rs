@@ -1,8 +1,8 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
-    ActionKind, AudioPolicy, ChannelId, ChannelRole, Direction, Orientation3D, Position3D,
-    ReverbDescriptor, SessionId, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, Orientation3D,
+    Position3D, ReverbDescriptor, SessionId, UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -239,6 +239,10 @@ pub enum PacketFlags {
     /// speaker relative to this receiver, after the `VolumeAttenuated` gain byte when present
     /// and before the Opus frame.
     Directional = 0x1000,
+    /// The audio frame is G.711 μ-law (`g711`) instead of Opus. Set by a client that negotiated
+    /// `AudioCodec::Pcmu` with `SetAudioCodec`; the server transcodes so everybody else still
+    /// receives Opus, and sets it on the downlink copies sent to PCMU sessions.
+    Pcmu = 0x2000,
 }
 
 #[derive(Debug, Clone)]
@@ -452,12 +456,26 @@ impl AurixPacket {
         volume: f32,
         direction: Option<&Direction>,
     ) -> (PacketHeader, Bytes) {
+        self.downlink_parts_with(&self.payload, volume, direction)
+    }
+
+    /// [`Self::downlink_parts`] with the audio frame replaced by `frame` (server-side
+    /// transcoding); the header flags are copied from this packet, so callers set
+    /// `PacketFlags::Pcmu` on the result themselves.
+    pub fn downlink_parts_with(
+        &self,
+        frame: &Bytes,
+        volume: f32,
+        direction: Option<&Direction>,
+    ) -> (PacketHeader, Bytes) {
         let attenuated = (volume - 1.0).abs() > 0.01;
         if !attenuated && direction.is_none() {
-            return (self.header.clone(), self.payload.clone());
+            let mut header = self.header.clone();
+            header.payload_length = frame.len() as u16;
+            return (header, frame.clone());
         }
         let mut header = self.header.clone();
-        let mut body = BytesMut::with_capacity(1 + DIRECTION_SIZE + self.payload.len());
+        let mut body = BytesMut::with_capacity(1 + DIRECTION_SIZE + frame.len());
         if attenuated {
             header.flags |= PacketFlags::VolumeAttenuated as u16;
             body.put_u8(encode_volume_byte(volume));
@@ -466,7 +484,8 @@ impl AurixPacket {
             header.flags |= PacketFlags::Directional as u16;
             body.put_slice(&encode_direction(direction));
         }
-        body.put_slice(&self.payload);
+        body.put_slice(frame);
+        header.payload_length = body.len() as u16;
         (header, body.freeze())
     }
 
@@ -836,6 +855,20 @@ pub enum ControlMessage {
         transmission: TransmissionMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         focus_channel: Option<ChannelId>,
+        /// Uplink/downlink codec of this session (`opus` unless negotiated otherwise).
+        #[serde(default)]
+        codec: AudioCodec,
+    },
+    /// Client→server (native AURX only): switch this session's own audio frames to `codec`.
+    /// With `pcmu` the client sends G.711 μ-law frames flagged `PacketFlags::Pcmu` and receives
+    /// its downlink as PCMU; the server transcodes to/from the Opus the rest of the channel
+    /// uses. Rejected when the node disables `media.pcmu_fallback` or the session is WebRTC.
+    SetAudioCodec {
+        codec: AudioCodec,
+    },
+    /// Server→client: ack of `SetAudioCodec`; frames sent from now on must use `codec`.
+    AudioCodecChanged {
+        codec: AudioCodec,
     },
     /// Client→server: which of the joined channels receive this session's microphone.
     /// `single` must name a joined channel; leaving that channel switches to `none`.

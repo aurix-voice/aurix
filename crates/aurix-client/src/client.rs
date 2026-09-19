@@ -15,8 +15,8 @@ use aurix_common::protocol::{
     UserPosition,
 };
 use aurix_common::types::{
-    quality, ActionKind, AudioPolicy, ChannelId, NetworkQuality, RecordingConsent, SessionId,
-    UserId,
+    quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, NetworkQuality, RecordingConsent,
+    SessionId, UserId,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -111,6 +111,10 @@ impl LossWindow {
 struct Prefs {
     transmission: TransmissionMode,
     focus: Option<ChannelId>,
+    /// Codec the app asked for; replayed on a fresh session.
+    codec: AudioCodec,
+    /// Codec the server acknowledged; what capture and playback currently use.
+    active_codec: AudioCodec,
     /// `(user, channel or None = everywhere)` → muted.
     local_mutes: HashMap<(UserId, Option<ChannelId>), bool>,
     volumes: HashMap<UserId, f32>,
@@ -248,12 +252,13 @@ impl Inner {
         self.jitter
             .lock()
             .observe(audio.sender_ssrc, audio.timestamp, Instant::now());
-        let _ = self.mixer.lock().push(
+        let _ = self.mixer.lock().push_frame(
             audio.sender_ssrc,
             audio.sequence,
             audio.volume,
             audio.direction,
-            audio.opus.to_vec(),
+            audio.codec,
+            audio.payload.to_vec(),
         );
     }
 }
@@ -606,7 +611,7 @@ impl Client {
             }
             if let Some(m) = &media {
                 for hash in &targets {
-                    m.send_audio(*hash, ts, Some(frame.level), &frame.opus);
+                    m.send_audio_frame(*hash, ts, Some(frame.level), frame.codec, &frame.payload);
                     stats.frames_sent += 1;
                 }
             } else {
@@ -814,6 +819,20 @@ impl Client {
 
     pub fn transmission(&self) -> TransmissionMode {
         self.inner.prefs.lock().transmission
+    }
+
+    /// Ask the server to switch this session's uplink and downlink to `codec`. Opus is the
+    /// default; `Pcmu` (G.711 μ-law, 8 kHz, 64 kbit/s, no Opus CPU cost) is a fallback for
+    /// very weak devices and is only available on native AURX sessions of nodes with
+    /// `media.pcmu_fallback` enabled. Frames switch once `AudioCodecChanged` arrives.
+    pub fn set_audio_codec(&self, codec: AudioCodec) -> Result<()> {
+        self.inner.prefs.lock().codec = codec;
+        self.send_cmd(Command::Send(ControlMessage::SetAudioCodec { codec }))
+    }
+
+    /// Codec the session currently sends and receives (server-acknowledged).
+    pub fn audio_codec(&self) -> AudioCodec {
+        self.inner.prefs.lock().active_codec
     }
 
     pub fn set_channel_focus(&self, channel_id: Option<ChannelId>) -> Result<()> {
@@ -1396,6 +1415,15 @@ async fn session(
         });
     }
     if !ack.resumed {
+        // A fresh session starts as Opus on the server; stop sending PCMU until it re-acks.
+        let stale_codec = {
+            let mut prefs = inner.prefs.lock();
+            std::mem::replace(&mut prefs.active_codec, AudioCodec::Opus) != AudioCodec::Opus
+        };
+        if stale_codec {
+            inner.encoder.lock().set_codec(AudioCodec::Opus);
+            inner.emit(Event::AudioCodecChanged(AudioCodec::Opus));
+        }
         // Global preferences first; channel-scoped ones follow each re-join ack.
         let msgs = replay_global_prefs(inner);
         for m in msgs {
@@ -1524,6 +1552,9 @@ fn replay_global_prefs(inner: &Inner) -> Vec<ControlMessage> {
         msgs.push(ControlMessage::SetTransmission {
             mode: prefs.transmission,
         });
+    }
+    if prefs.codec != AudioCodec::Opus {
+        msgs.push(ControlMessage::SetAudioCodec { codec: prefs.codec });
     }
     msgs
 }
@@ -2020,11 +2051,14 @@ async fn handle_message(
             focus_channel,
             local_mutes,
             volumes,
+            codec,
             ..
         } => {
             let mut prefs = inner.prefs.lock();
             prefs.transmission = transmission;
             prefs.focus = focus_channel;
+            let codec_changed = prefs.active_codec != codec;
+            prefs.active_codec = codec;
             for m in local_mutes {
                 prefs.local_mutes.insert((m.user_id, m.channel_id), true);
             }
@@ -2032,12 +2066,21 @@ async fn handle_message(
                 prefs.volumes.insert(v.user_id, v.volume);
             }
             drop(prefs);
+            if codec_changed {
+                inner.encoder.lock().set_codec(codec);
+                inner.emit(Event::AudioCodecChanged(codec));
+            }
             inner.emit(Event::TransmissionChanged(transmission));
             inner.emit(Event::ChannelFocusChanged(focus_channel));
         }
         ControlMessage::TransmissionChanged { mode } => {
             inner.prefs.lock().transmission = mode;
             inner.emit(Event::TransmissionChanged(mode));
+        }
+        ControlMessage::AudioCodecChanged { codec } => {
+            inner.prefs.lock().active_codec = codec;
+            inner.encoder.lock().set_codec(codec);
+            inner.emit(Event::AudioCodecChanged(codec));
         }
         ControlMessage::ChannelFocusChanged { channel_id } => {
             inner.prefs.lock().focus = channel_id;
@@ -2239,6 +2282,7 @@ async fn handle_message(
         | ControlMessage::SetUserBlock { .. }
         | ControlMessage::SetTransmission { .. }
         | ControlMessage::SetChannelFocus { .. }
+        | ControlMessage::SetAudioCodec { .. }
         | ControlMessage::OcclusionUpdate { .. }
         | ControlMessage::ReverbZoneUpdate { .. }
         | ControlMessage::QualityReport { .. }

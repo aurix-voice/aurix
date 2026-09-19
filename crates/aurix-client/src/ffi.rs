@@ -29,8 +29,8 @@
 
 use aurix_common::protocol::{TransmissionMode, TtsDestination, TtsState, UserPosition};
 use aurix_common::types::{
-    ActionKind, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, OpusBandwidth, OpusSignal,
-    Orientation3D, Position3D, RecordingConsent, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, OpusBandwidth,
+    OpusSignal, Orientation3D, Position3D, RecordingConsent, UserId,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -236,6 +236,34 @@ pub enum AurixTransmissionMode {
     AurixTransmitSingle = 1,
     /// Microphone reaches every joined channel.
     AurixTransmitAll = 2,
+}
+
+/// Session audio codec (see `aurix_client_set_audio_codec`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixAudioCodec {
+    /// Default: 48 kHz Opus.
+    AurixCodecOpus = 0,
+    /// G.711 μ-law fallback: 8 kHz, 64 kbit/s, no Opus CPU cost, telephone quality.
+    AurixCodecPcmu = 1,
+}
+
+impl From<AudioCodec> for AurixAudioCodec {
+    fn from(c: AudioCodec) -> Self {
+        match c {
+            AudioCodec::Opus => Self::AurixCodecOpus,
+            AudioCodec::Pcmu => Self::AurixCodecPcmu,
+        }
+    }
+}
+
+impl From<AurixAudioCodec> for AudioCodec {
+    fn from(c: AurixAudioCodec) -> Self {
+        match c {
+            AurixAudioCodec::AurixCodecOpus => Self::Opus,
+            AurixAudioCodec::AurixCodecPcmu => Self::Pcmu,
+        }
+    }
 }
 
 #[repr(C)]
@@ -806,6 +834,8 @@ pub enum AurixEventType {
     AurixEventNetworkQuality = 30,
     /// `audio_policy`: merged policy of the joined channels changed.
     AurixEventAudioPolicyChanged = 31,
+    /// `audio_codec`: the server switched this session's codec (`aurix_event_audio_codec`).
+    AurixEventAudioCodecChanged = 32,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1013,6 +1043,7 @@ impl AurixEvent {
             Event::LocalSpeaking(_) => T::AurixEventLocalSpeaking,
             Event::TransmissionChanged(_) => T::AurixEventTransmissionChanged,
             Event::ChannelFocusChanged(_) => T::AurixEventChannelFocusChanged,
+            Event::AudioCodecChanged(_) => T::AurixEventAudioCodecChanged,
             Event::UserBlockChanged { .. } => T::AurixEventUserBlockChanged,
             Event::Recording { .. } => T::AurixEventRecording,
             Event::BitrateChanged { .. } => T::AurixEventBitrateChanged,
@@ -1298,6 +1329,15 @@ pub unsafe extern "C" fn aurix_event_transmission(
             AurixTransmissionMode::AurixTransmitSingle
         }
         _ => AurixTransmissionMode::AurixTransmitAll,
+    }
+}
+
+/// Codec of an `AudioCodecChanged` event; Opus otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_audio_codec(event: *const AurixEvent) -> AurixAudioCodec {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::AudioCodecChanged(codec)) => (*codec).into(),
+        _ => AurixAudioCodec::AurixCodecOpus,
     }
 }
 
@@ -1968,6 +2008,29 @@ pub unsafe extern "C" fn aurix_client_set_channel_focus(
         Ok(c) => ok(c.set_channel_focus(opt_uuid_arg(channel_id).map(ChannelId))),
         Err(r) => r,
     }
+}
+
+/// Ask the server to run this session on `codec`. PCMU (G.711 μ-law) is a low-CPU fallback
+/// for weak devices: the node transcodes, so Opus participants of the same channel are
+/// unaffected. Requires `media.pcmu_fallback` on the node (otherwise `ServerError`
+/// `CODEC_NOT_AVAILABLE`); the switch takes effect on `AurixEventAudioCodecChanged`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_audio_codec(
+    client: *mut AurixClient,
+    codec: AurixAudioCodec,
+) -> AurixResult {
+    match self::client(client) {
+        Ok(c) => ok(c.set_audio_codec(codec.into())),
+        Err(r) => r,
+    }
+}
+
+/// Codec the session currently uses (server-acknowledged).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_audio_codec(client: *const AurixClient) -> AurixAudioCodec {
+    self::client(client)
+        .map(|c| c.audio_codec().into())
+        .unwrap_or(AurixAudioCodec::AurixCodecOpus)
 }
 
 #[no_mangle]

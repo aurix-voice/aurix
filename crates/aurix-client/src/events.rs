@@ -2,7 +2,7 @@ use aurix_common::protocol::{
     ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsState, UserPosition,
 };
 use aurix_common::types::{
-    ActionKind, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, SessionId, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, NetworkQuality, SessionId, UserId,
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -100,6 +100,8 @@ pub enum Event {
     LocalSpeaking(bool),
     TransmissionChanged(TransmissionMode),
     ChannelFocusChanged(Option<ChannelId>),
+    /// The server acknowledged a session codec change; capture and playback already follow it.
+    AudioCodecChanged(AudioCodec),
     UserBlockChanged {
         user_id: UserId,
         blocked: bool,

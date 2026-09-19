@@ -75,6 +75,16 @@ AurixTransmissionMode FromTransmission(EAurixTransmissionMode M)
 	}
 }
 
+EAurixAudioCodec ToCodec(AurixAudioCodec C)
+{
+	return C == AURIX_CODEC_PCMU ? EAurixAudioCodec::Pcmu : EAurixAudioCodec::Opus;
+}
+
+AurixAudioCodec FromCodec(EAurixAudioCodec C)
+{
+	return C == EAurixAudioCodec::Pcmu ? AURIX_CODEC_PCMU : AURIX_CODEC_OPUS;
+}
+
 EAurixModerationAction ToModeration(AurixModerationAction A)
 {
 	switch (A)
@@ -781,6 +791,16 @@ bool UAurixVoiceSubsystem::SetChannelFocus(FGuid ChannelId)
 	return Check(Native->Client.set_channel_focus(ChannelId.IsValid() ? &Channel : nullptr), TEXT("set_channel_focus"));
 }
 
+bool UAurixVoiceSubsystem::SetAudioCodec(EAurixAudioCodec Codec)
+{
+	return Native && Check(Native->Client.set_audio_codec(FromCodec(Codec)), TEXT("set_audio_codec"));
+}
+
+EAurixAudioCodec UAurixVoiceSubsystem::GetAudioCodec() const
+{
+	return Native ? ToCodec(Native->Client.audio_codec()) : EAurixAudioCodec::Opus;
+}
+
 bool UAurixVoiceSubsystem::SetTranscripts(bool bEnabled)
 {
 	return Native && Check(Native->Client.set_transcripts(bEnabled), TEXT("set_transcripts"));
@@ -1122,6 +1142,10 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_CHANNEL_FOCUS_CHANGED:
 		OnChannelFocusChanged.Broadcast(ChannelId);
+		break;
+
+	case AURIX_EVENT_AUDIO_CODEC_CHANGED:
+		OnAudioCodecChanged.Broadcast(ToCodec(aurix_event_audio_codec(Raw)));
 		break;
 
 	case AURIX_EVENT_USER_BLOCK_CHANGED:

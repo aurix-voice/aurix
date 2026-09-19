@@ -4,9 +4,9 @@
 
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{
-    AurixPacket, PacketHeader, PacketType, ReplayWindow, MAX_PACKET_SIZE,
+    AurixPacket, PacketFlags, PacketHeader, PacketType, ReplayWindow, MAX_PACKET_SIZE,
 };
-use aurix_common::types::{Direction, SessionId};
+use aurix_common::types::{AudioCodec, Direction, SessionId};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -29,7 +29,9 @@ pub struct IncomingAudio {
     pub volume: f32,
     /// Speaker bearing relative to this listener in directional channels.
     pub direction: Option<Direction>,
-    pub opus: Bytes,
+    /// Codec of `payload`: Opus, or PCMU when the packet carries `PacketFlags::Pcmu`.
+    pub codec: AudioCodec,
+    pub payload: Bytes,
 }
 
 /// Counters of the media path since bind.
@@ -284,6 +286,11 @@ impl MediaTransport {
                     }
                     let (volume, direction) = packet.take_downlink_meta();
                     self.stats.lock().audio_frames_received += 1;
+                    let codec = if packet.header.has_flag(PacketFlags::Pcmu) {
+                        AudioCodec::Pcmu
+                    } else {
+                        AudioCodec::Opus
+                    };
                     sink(IncomingAudio {
                         sender_ssrc: sender,
                         sequence: seq,
@@ -291,7 +298,8 @@ impl MediaTransport {
                         channel_hash: packet.header.channel_id_hash,
                         volume,
                         direction,
-                        opus: packet.payload,
+                        codec,
+                        payload: packet.payload,
                     });
                 }
                 PacketType::HeartbeatAck => {
@@ -325,22 +333,38 @@ impl MediaTransport {
 
     /// Send one Opus frame to `channel_hash`. `level` is the frame's measured wire level.
     pub fn send_audio(&self, channel_hash: u32, timestamp: u32, level: Option<u8>, opus: &[u8]) {
-        if opus.is_empty() || opus.len() > MAX_PACKET_SIZE - 64 {
+        self.send_audio_frame(channel_hash, timestamp, level, AudioCodec::Opus, opus);
+    }
+
+    /// [`Self::send_audio`] for a frame in either codec; PCMU frames are flagged
+    /// `PacketFlags::Pcmu` so the server transcodes them.
+    pub fn send_audio_frame(
+        &self,
+        channel_hash: u32,
+        timestamp: u32,
+        level: Option<u8>,
+        codec: AudioCodec,
+        data: &[u8],
+    ) {
+        if data.is_empty() || data.len() > MAX_PACKET_SIZE - 64 {
             return;
         }
         let seq = self.next_seq();
-        let packet = match level {
+        let mut packet = match level {
             Some(level) => {
-                AurixPacket::audio_with_level(seq, timestamp, self.ssrc, channel_hash, level, opus)
+                AurixPacket::audio_with_level(seq, timestamp, self.ssrc, channel_hash, level, data)
             }
             None => AurixPacket::audio(
                 seq,
                 timestamp,
                 self.ssrc,
                 channel_hash,
-                Bytes::copy_from_slice(opus),
+                Bytes::copy_from_slice(data),
             ),
         };
+        if codec == AudioCodec::Pcmu {
+            packet.header.flags |= PacketFlags::Pcmu as u16;
+        }
         self.send_sealed(&packet);
     }
 
@@ -531,7 +555,7 @@ mod tests {
         assert!(got.iter().all(|a| a.sender_ssrc == 0x1234
             && a.channel_hash == ch
             && (a.volume - 0.5).abs() < 0.02
-            && a.opus.as_ref() == [1, 2, 3, 4]));
+            && a.payload.as_ref() == [1, 2, 3, 4]));
         let stats = transport.stats();
         assert_eq!(stats.replayed, 5);
         assert_eq!(stats.bad_auth, 0);

@@ -92,6 +92,10 @@ namespace Aurix.Unity
         /// <summary>Creates encoder/decoder instances. Must be set by your code (platform/licensing choice).</summary>
         public Func<IOpusCodec> CodecFactory;
 
+        [Tooltip("Session codec to negotiate on connect. PCMU (G.711 μ-law, 8 kHz) needs no Opus on this device; " +
+                 "the server transcodes, so other participants keep Opus. Requires media.pcmu_fallback on the node.")]
+        public AudioCodec PreferredCodec = AudioCodec.Opus;
+
         public AurixVoiceClient Client { get; private set; }
         public bool IsConnected => Client != null && Client.State == VoiceConnectionState.MediaBound;
 
@@ -139,6 +143,8 @@ namespace Aurix.Unity
         private float[] _mono;
         private byte[] _opusOut = new byte[1275];
         private IOpusCodec _encoder;
+        private readonly PcmuCodec _pcmuEncoder = new PcmuCodec();
+        private readonly byte[] _pcmuOut = new byte[AudioFormat.FrameSamples / PcmuCodec.Decimation];
         private RemoteMixer _mixer;
         private int _micRate;
         private int _micChannels;
@@ -195,6 +201,8 @@ namespace Aurix.Unity
             Client.Encoder = _encoder;
             Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();
+            Client.OnAudioCodecChanged += _ => _pcmuEncoder.Reset();
+            if (PreferredCodec != AudioCodec.Opus) await Client.SetAudioCodecAsync(PreferredCodec);
             await Client.ConnectAsync();
 
             foreach (var id in (ChannelId ?? string.Empty).Split(','))
@@ -249,6 +257,19 @@ namespace Aurix.Unity
         }
 
         public void SetMuted(bool muted) => Client?.SetMuted(muted);
+
+        /// <summary>
+        /// Negotiate the session codec at runtime (see <see cref="AurixVoiceClient.SetAudioCodecAsync"/>).
+        /// Capture keeps encoding with the current codec until the server confirms the switch.
+        /// </summary>
+        public Task SetAudioCodec(AudioCodec codec)
+        {
+            PreferredCodec = codec;
+            return Client != null ? Client.SetAudioCodecAsync(codec) : Task.CompletedTask;
+        }
+
+        /// <summary>Codec the session currently sends/receives (<see cref="AurixVoiceClient.AudioCodec"/>).</summary>
+        public AudioCodec ActiveCodec => Client != null ? Client.AudioCodec : AudioCodec.Opus;
 
         /// <summary>
         /// Switch the microphone (<c>null</c>/empty = system default). Restarts capture when it is
@@ -514,7 +535,7 @@ namespace Aurix.Unity
             if (_injectClock > frameSeconds) _injectClock = 0f; // fell behind (hitch): don't burst
         }
 
-        /// <summary>VAD, gating and Opus for the frame in <see cref="_mono"/>.</summary>
+        /// <summary>VAD, gating and encoding (with the negotiated codec) of the frame in <see cref="_mono"/>.</summary>
         private void EncodeAndSend()
         {
             Vad.Threshold = VadThreshold;
@@ -525,8 +546,16 @@ namespace Aurix.Unity
                 Client.SkipFrame(AudioFormat.FrameSamples);
                 return;
             }
-            int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
-            if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
+            if (Client.AudioCodec == AudioCodec.Pcmu)
+            {
+                int n = _pcmuEncoder.Encode(_mono, AudioFormat.FrameSamples, _pcmuOut);
+                if (n > 0) Client.TransmitAudioFrame(AudioCodec.Pcmu, _pcmuOut, n, AudioFormat.FrameSamples, Vad.Level);
+            }
+            else
+            {
+                int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
+                if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
+            }
         }
 
         /// <summary>Mono downmix plus naive linear resample to 48 kHz (only used when the mic cannot run at 48 kHz).</summary>
@@ -547,7 +576,7 @@ namespace Aurix.Unity
         private void PumpDownlink()
         {
             if (Client == null || _mixer == null) return;
-            while (Client.TryDequeueAudio(out var a)) _mixer.Push(a.SenderSsrc, a.Sequence, a.Volume, a.Direction, a.Opus);
+            while (Client.TryDequeueAudio(out var a)) _mixer.Push(a.SenderSsrc, a.Sequence, a.Volume, a.Direction, a.Codec, a.Payload);
         }
 
         // Runs on Unity's audio thread; the AudioSource plays silence which we fill with the mix,

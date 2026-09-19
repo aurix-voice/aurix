@@ -247,6 +247,10 @@ typedef enum AurixEventType {
    * `audio_policy`: merged policy of the joined channels changed.
    */
   AURIX_EVENT_AUDIO_POLICY_CHANGED = 31,
+  /**
+   * `audio_codec`: the server switched this session's codec (`aurix_event_audio_codec`).
+   */
+  AURIX_EVENT_AUDIO_CODEC_CHANGED = 32,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -263,6 +267,20 @@ typedef enum AurixTransmissionMode {
    */
   AURIX_TRANSMIT_ALL = 2,
 } AurixTransmissionMode;
+
+/**
+ * Session audio codec (see `aurix_client_set_audio_codec`).
+ */
+typedef enum AurixAudioCodec {
+  /**
+   * Default: 48 kHz Opus.
+   */
+  AURIX_CODEC_OPUS = 0,
+  /**
+   * G.711 μ-law fallback: 8 kHz, 64 kbit/s, no Opus CPU cost, telephone quality.
+   */
+  AURIX_CODEC_PCMU = 1,
+} AurixAudioCodec;
 
 typedef enum AurixModerationAction {
   AURIX_MODERATION_KICK = 0,
@@ -827,6 +845,11 @@ const char *aurix_event_message(const struct AurixEvent *event);
 
 enum AurixTransmissionMode aurix_event_transmission(const struct AurixEvent *event);
 
+/**
+ * Codec of an `AudioCodecChanged` event; Opus otherwise.
+ */
+enum AurixAudioCodec aurix_event_audio_codec(const struct AurixEvent *event);
+
 enum AurixModerationAction aurix_event_moderation_action(const struct AurixEvent *event);
 
 /**
@@ -1041,6 +1064,20 @@ enum AurixResult aurix_client_set_transmission(struct AurixClient *client,
  */
 enum AurixResult aurix_client_set_channel_focus(struct AurixClient *client,
                                                 const struct AurixUuid *channel_id);
+
+/**
+ * Ask the server to run this session on `codec`. PCMU (G.711 μ-law) is a low-CPU fallback
+ * for weak devices: the node transcodes, so Opus participants of the same channel are
+ * unaffected. Requires `media.pcmu_fallback` on the node (otherwise `ServerError`
+ * `CODEC_NOT_AVAILABLE`); the switch takes effect on `AurixEventAudioCodecChanged`.
+ */
+enum AurixResult aurix_client_set_audio_codec(struct AurixClient *client,
+                                              enum AurixAudioCodec codec);
+
+/**
+ * Codec the session currently uses (server-acknowledged).
+ */
+enum AurixAudioCodec aurix_client_audio_codec(const struct AurixClient *client);
 
 enum AurixResult aurix_client_set_transcripts(struct AurixClient *client, bool enabled);
 

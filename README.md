@@ -643,6 +643,27 @@ Browsers own their encoder, so the Web SDK sets only what WebRTC allows: bitrate
 an alternative to the pure-C# Concentus sample; the C ABI exposes the same encoder/decoder
 standalone (`aurix_opus_*`).
 
+### PCMU (G.711) fallback for weak devices
+
+Channels are Opus internally, but a native AURX session can ask to run on **G.711 μ-law** —
+8 kHz, 64 kbit/s, no Opus CPU on the device (old phones, embedded/handheld hardware, very cheap
+SoCs). It is a **per-session** negotiation, never a channel setting: `SetAudioCodec {codec:
+"pcmu"}` over the control connection → `AudioCodecChanged {codec}` ack, after which the client
+sends 8 kHz μ-law frames (80/160/320/480 bytes = 10/20/40/60 ms) flagged `Pcmu` (`0x2000`) and
+receives its downlink as PCMU. The node transcodes at the edge: PCMU uplink is decoded and
+encoded to narrowband Opus **before** recording, transcription, safety, live streams, cascade
+and fan-out (so every other participant, browsers included, keeps receiving Opus), and internal
+Opus is decoded/encoded to μ-law only for PCMU receivers, after mutes, blocks, volume, focus,
+positional attenuation and direction have been applied (the gain/direction bytes and the
+per-receiver seal are identical to Opus downlinks). `ReceiverPreferences.codec` replays the
+session's codec after a resume; a fresh session starts on Opus and the SDKs re-negotiate the
+preferred codec. Not available to WebRTC sessions (browsers negotiate Opus in SDP), never for
+`E2ee` frames (the server cannot transcode what it cannot read — such frames are dropped), and
+switched off node-wide with `media.pcmu_fallback = false`
+(`CODEC_NOT_AVAILABLE`). Metrics: `aurix_pcmu_sessions`,
+`aurix_pcmu_frames_total{direction="uplink"|"downlink",outcome="ok"|"error"}`. SDKs: Unity `SetAudioCodecAsync` / behaviour
+`PreferredCodec`, native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec`.
+
 ### Network / firewall
 
 | port | proto | purpose |
@@ -803,6 +824,9 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 * Browsers cannot set Opus complexity, signal mode, VBR mode or expected loss — only the
   bitrate ceiling, FEC, DTX, max bandwidth and CBR that WebRTC exposes; the native, Unity and
   Unreal SDKs have the full set.
+* PCMU is a per-session fallback for native AURX clients only (no PCMA, no WebRTC PCMU, no
+  PCMU for `E2ee` frames); each PCMU session costs the node one Opus encoder plus one Opus
+  decoder per speaker it hears.
 * The Unreal plugin has not been compiled against a real engine install yet (none is available
   in the development environment); the first build in your project is the verification step.
   The protocol is documented in `crates/aurix-common/src/protocol.rs`.

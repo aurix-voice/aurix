@@ -46,7 +46,8 @@ connection simply yields a new session and the client must re-join its channels.
 | — | `MediaBound { session_id }` | the UDP `SessionBind` was accepted |
 | — | `SessionClose { session_id, reason }`, `Kick { channel_id, user_id, reason }` | session is gone / removed from a channel |
 | — | `MuteStateChanged { channel_id, user_id, muted, server_muted }` | sender-side and moderator mutes (never receiver-local ones) |
-| `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |
+| `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…, codec}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |
+| `SetAudioCodec { codec }` | `AudioCodecChanged { codec }` | native AURX only; `codec` = `opus` (default) / `pcmu` — G.711 fallback transcoded by the node, see [codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback); `CODEC_NOT_AVAILABLE` when `media.pcmu_fallback` is off or the session is WebRTC |
 | `SetTransmission { mode }`, `SetChannelFocus { channel_id? }` | `TransmissionChanged`, `ChannelFocusChanged` | `mode` = `none` / `single { channel_id }` / `all`; server resets both when the target channel is left |
 | — | `SpeakingStateChanged { channel_id, user_id, speaking }`, `ChannelEnergy { channel_id, levels }` | voice activity, see [Channels](../features/channels.md#speaking-energy-and-roster) |
 | `PositionUpdate { channel_id, positions }`, `OcclusionUpdate`, `ReverbZoneUpdate` | — | positional channels; players may only move themselves unless they hold a moderator role |

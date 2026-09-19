@@ -80,6 +80,34 @@ action token decides them at join time.
 `PUT /v1/channels/{id}/config` updates the configuration live; participants on every node hosting
 the channel pick it up (channel type changes take effect for subsequent frames).
 
+## Codecs: Opus and the PCMU fallback
+
+Every channel is Opus internally — `ChannelConfig.codec` only accepts `opus`, and that is what
+recording, transcription, live streams, cascade and every WebRTC participant see. A **native
+AURX session** may nevertheless run on **G.711 μ-law (PCMU)**: 8 kHz, 64 kbit/s, a lookup table
+instead of an Opus encoder/decoder — for devices where Opus does not fit the CPU budget.
+
+* The client sends `SetAudioCodec { codec: "pcmu" }` over the control connection and waits
+  for `AudioCodecChanged { codec }`; from then on its uplink frames are μ-law of 80/160/320/480
+  bytes (10/20/40/60 ms) flagged `Pcmu` and its downlink arrives as μ-law with the same flag.
+  `SetAudioCodec { codec: "opus" }` switches back; the ack decides which codec the next frames
+  use. The negotiated codec is replayed in `ReceiverPreferences.codec` after a resume; a fresh
+  session starts on Opus and the SDKs send `SetAudioCodec` again.
+* The node transcodes **at the edge**: a PCMU uplink is decoded and encoded to narrowband Opus
+  before it enters the channel, and the Opus a PCMU receiver would get is converted to μ-law
+  after mutes, blocks, per-participant volume, focus, positional attenuation and direction have
+  been applied — the gain/direction bytes and the per-receiver seal are exactly as for Opus.
+  Opus participants in the same channel notice nothing; a PCMU listener hears narrowband audio.
+* Not available to WebRTC sessions (`CODEC_NOT_AVAILABLE`; browsers negotiate Opus in SDP) and
+  never for `E2ee` frames — the node cannot transcode what it cannot decrypt, so `Pcmu | E2ee`
+  frames are dropped. PCMU frames from a session that did not negotiate are dropped too.
+* `media.pcmu_fallback = false` refuses the negotiation node-wide. Cost per PCMU session: one
+  Opus encoder plus one Opus decoder per speaker it hears, on the node. Metrics:
+  `aurix_pcmu_sessions`, `aurix_pcmu_frames_total{direction,outcome}`.
+
+SDKs: Unity `client.SetAudioCodecAsync(AudioCodec.Pcmu)` / `AurixVoiceBehaviour.PreferredCodec`,
+native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec` ([overview](../sdk/overview.md)).
+
 ## Multiple channels per session
 
 A session can be a member of up to `media.max_channels_per_session` (10) channels, at most

@@ -57,6 +57,7 @@ have packet-type values but the WebSocket control plane is used for them.
 | `Authenticated` | `0x0400` | 16-byte HMAC tag follows the payload |
 | `Energy` | `0x0800` | uplink payload starts with an RFC 6464 `-dBov` level byte (`127` = silence); stripped before fan-out |
 | `Directional` | `0x1000` | downlink payload carries 2 signed bytes (azimuth in π/127, elevation in π/254 units) after the gain byte |
+| `Pcmu` | `0x2000` | the audio frame is G.711 μ-law, not Opus — only on sessions that negotiated `SetAudioCodec {codec: "pcmu"}` ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)); the server sets it on the downlink copies sent to such sessions |
 
 ## Keys and sealing
 
@@ -109,6 +110,12 @@ jitter buffers do not see phantom losses.
 * Feeds the decoded frame to recording, live streams and transcription **only** when the
   channel/consent rules allow and the frame is not `E2ee`.
 * Estimates uplink quality from sequence gaps/jitter for [network quality](../features/quality.md).
+* On a session that negotiated PCMU: decodes the μ-law uplink and re-encodes it as narrowband
+  Opus before any of the above, so the rest of the channel is unaffected; encodes the Opus it
+  would have sent to that session as μ-law after the per-receiver step (gain/direction bytes and
+  the seal are the same as for Opus). PCMU frames from a session that did not negotiate and
+  `Pcmu | E2ee` frames are dropped (`aurix_packets_dropped_total`); frames of a length other
+  than 80/160/320/480 bytes fail the transcode (`aurix_pcmu_frames_total{outcome="error"}`).
 
 ## Reference implementations
 

@@ -26,6 +26,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChannelEnergy, FGuid, Channel
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLocalSpeaking, bool, bSpeaking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTransmissionMode, Mode, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioCodecChanged, EAurixAudioCodec, Codec);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixUserBlockChanged, FGuid, UserId, bool, bBlocked);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixRecording, FGuid, ChannelId, FGuid, RecordingId, bool, bActive, FGuid, InitiatedBy);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixBitrateChanged, int32, BitrateBps, const FString&, Reason);
@@ -242,6 +243,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetChannelFocus(FGuid ChannelId);
 
+	/**
+	 * Ask the server to run this session on Codec. Pcmu (G.711) is a low-CPU fallback for weak
+	 * devices; the node transcodes, so Opus participants are unaffected. Needs
+	 * `media.pcmu_fallback` on the node; applied on OnAudioCodecChanged.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
+	bool SetAudioCodec(EAurixAudioCodec Codec);
+
+	/** Codec the session currently uses (server-acknowledged). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
+	EAurixAudioCodec GetAudioCodec() const;
+
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetTranscripts(bool bEnabled);
 
@@ -324,6 +337,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixLocalSpeaking OnLocalSpeaking;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTransmissionChanged OnTransmissionChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelFocusChanged OnChannelFocusChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioCodecChanged OnAudioCodecChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixUserBlockChanged OnUserBlockChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRecording OnRecording;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixBitrateChanged OnBitrateChanged;
