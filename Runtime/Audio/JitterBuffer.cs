@@ -111,6 +111,8 @@ namespace Aurix.Audio
             public JitterBuffer Jitter = new JitterBuffer();
             public IOpusCodec Decoder;
             public float Volume = 1f;
+            public float LeftGain = 1f;
+            public float RightGain = 1f;
             public float[] Frame;
             public int FramePos;
             public int FrameLen;
@@ -149,7 +151,14 @@ namespace Aurix.Audio
         }
 
         /// <summary>Queue a verified frame from the transport (any thread).</summary>
-        public void Push(uint ssrc, uint seq, float volume, byte[] opus)
+        public void Push(uint ssrc, uint seq, float volume, byte[] opus) => Push(ssrc, seq, volume, null, opus);
+
+        /// <summary>
+        /// Queue a verified frame with the speaker's direction relative to this listener. A mono
+        /// stream is panned across a stereo output by constant-power law (see
+        /// <see cref="Protocol.Direction.StereoGains"/>); <c>null</c> keeps it centred.
+        /// </summary>
+        public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, byte[] opus)
         {
             Stream s;
             lock (_streams)
@@ -160,6 +169,8 @@ namespace Aurix.Audio
                     _streams[ssrc] = s;
                 }
                 s.Volume = volume;
+                if (direction.HasValue) (s.LeftGain, s.RightGain) = direction.Value.StereoGains();
+                else { s.LeftGain = 1f; s.RightGain = 1f; }
                 s.LastActivityTicks = DateTime.UtcNow.Ticks;
             }
             s.Jitter.Push(seq, opus);
@@ -177,7 +188,11 @@ namespace Aurix.Audio
             }
         }
 
-        /// <summary>Mix into <paramref name="output"/> (interleaved, <c>outputChannels</c> wide). Adds to existing contents.</summary>
+        /// <summary>
+        /// Mix into <paramref name="output"/> (interleaved, <c>outputChannels</c> wide). Adds to
+        /// existing contents. Mono streams with a direction are panned between the first two output
+        /// channels (left, right); further channels get the centred signal.
+        /// </summary>
         public void Mix(float[] output, int outputChannels)
         {
             int framesNeeded = output.Length / outputChannels;
@@ -212,12 +227,15 @@ namespace Aurix.Audio
                         float gain = s.Volume * master;
                         if (gain != 0f)
                         {
+                            bool pan = dch == 1 && outputChannels >= 2;
                             for (int f = 0; f < take; f++)
                             {
                                 for (int c = 0; c < outputChannels; c++)
                                 {
                                     int srcC = dch == 1 ? 0 : Math.Min(c, dch - 1);
-                                    output[(written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * gain;
+                                    float g = gain;
+                                    if (pan) g *= c == 0 ? s.LeftGain : c == 1 ? s.RightGain : 1f;
+                                    output[(written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * g;
                                 }
                             }
                         }

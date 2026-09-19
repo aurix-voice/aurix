@@ -61,6 +61,28 @@ namespace Aurix.Demo
                 var multiB = await IssueToken(http, new[] { channel, party }, "bob");
                 return await TransmissionScenario(ws, channelId, Guid.Parse(party), multiA, multiB);
             }
+            if (Get(opt, "scenario", "audio") == "positional")
+            {
+                if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the positional scenario needs --api-key (creates a directional positional channel)"); return 2; }
+                using var http = new HttpClient { BaseAddress = new Uri(api) };
+                http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                var arena = MiniJson.GetString(MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/channels", new Dictionary<string, object>
+                {
+                    { "name", "csharp-demo-arena" },
+                    { "config", new Dictionary<string, object>
+                        {
+                            { "channel_type", "positional" },
+                            { "positional_config", new Dictionary<string, object>
+                                {
+                                    { "near_distance", 2.0 }, { "far_distance", 22.0 }, { "rolloff", "linear" },
+                                    { "max_radius", 30.0 }, { "directional", true }, { "coordinate_system", "left_handed" },
+                                } },
+                        } },
+                }))), "id");
+                var (arenaA, userA) = await IssueTokenWithUser(http, new[] { arena }, "alice");
+                var (arenaB, userB) = await IssueTokenWithUser(http, new[] { arena }, "bob");
+                return await PositionalScenario(ws, Guid.Parse(arena), arenaA, Guid.Parse(userA), arenaB, Guid.Parse(userB));
+            }
 
             var log = new List<string>();
             var alice = new AurixVoiceClient(ws, tokenA);
@@ -260,6 +282,115 @@ namespace Aurix.Demo
         /// client still sends by hash). Bob's focus attenuates the other channel; leaving the focused / target
         /// channel resets both, and the state survives a fresh join order (deferred until the channel is joined).
         /// </summary>
+        /// <summary>
+        /// Directional positional channel: alice plays a tone while bob (and the server) move her around
+        /// him; bob's stereo mix must follow — right ear, then straight ahead after bob turns, then
+        /// behind-left and quieter with distance and a receiver-local volume.
+        /// </summary>
+        private static async Task<int> PositionalScenario(string ws, Guid arena, string tokenA, Guid userA, string tokenB, Guid userB)
+        {
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(ws, tokenA);
+            var bob = new AurixVoiceClient(ws, tokenB);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            await alice.ConnectAsync();
+            await bob.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            await alice.JoinChannelAsync(arena);
+            await bob.JoinChannelAsync(arena);
+            var hash = AurixVoiceClient.ChannelHash(arena);
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what}"); ok &= cond; }
+            static Position3D At(float x, float y, float z) => new Position3D { X = x, Y = y, Z = z };
+            static Orientation3D Facing(float x, float y, float z) => new Orientation3D { ForwardX = x, ForwardY = y, ForwardZ = z, UpX = 0, UpY = 1, UpZ = 0 };
+
+            using var enc = new ConcentusOpusCodec();
+            var pcm = new float[AudioFormat.FrameSamples];
+            var opus = new byte[1275];
+            double phase = 0;
+            var mixer = new RemoteMixer(() => new ConcentusOpusCodec());
+            var stereo = new float[AudioFormat.FrameSamples * 2];
+
+            // Streams 50 frames (1 s) of a 0.5-amplitude sine and measures bob's stereo mix over the
+            // second half (after the jitter buffer settled). Returns (leftRms, rightRms, volume, azimuth).
+            async Task<(double left, double right, float volume, float? azimuth, int frames)> Probe()
+            {
+                await Task.Delay(250);
+                while (bob.TryDequeueAudio(out _)) { }
+                double le = 0, re = 0; long n = 0; float vol = 1f; float? az = null; int got = 0;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < 50; i++)
+                {
+                    for (int k = 0; k < pcm.Length; k++) { pcm[k] = (float)(0.5 * Math.Sin(phase)); phase += 2 * Math.PI * 440 / AudioFormat.SampleRate; }
+                    int len = enc.Encode(pcm, AudioFormat.FrameSamples, opus);
+                    alice.SendOpusFrame(hash, opus, len);
+                    while (bob.TryDequeueAudio(out var inc))
+                    {
+                        got++; vol = inc.Volume; az = inc.Direction?.Azimuth;
+                        mixer.Push(inc.SenderSsrc, inc.Sequence, inc.Volume, inc.Direction, inc.Opus);
+                    }
+                    Array.Clear(stereo, 0, stereo.Length);
+                    mixer.Mix(stereo, 2);
+                    if (i >= 25)
+                    {
+                        for (int k = 0; k < stereo.Length; k += 2) { le += stereo[k] * stereo[k]; re += stereo[k + 1] * stereo[k + 1]; }
+                        n += stereo.Length / 2;
+                    }
+                    var wait = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs) - sw.Elapsed;
+                    if (wait > TimeSpan.Zero) await Task.Delay(wait);
+                }
+                return (Math.Sqrt(le / Math.Max(1, n)), Math.Sqrt(re / Math.Max(1, n)), vol, az, got);
+            }
+
+            // Nothing is placed yet → nothing is forwarded.
+            var blind = await Probe();
+            Check(blind.frames == 0, $"no poses yet: bob got {blind.frames} frames");
+
+            // Bob at the origin facing +Z, alice 1 m to his right.
+            await bob.UpdatePositionAsync(arena, userB, At(0, 0, 0), Facing(0, 0, 1));
+            await alice.UpdatePositionAsync(arena, userA, At(1, 0, 0), Facing(0, 0, 1));
+            var right = await Probe();
+            Check(right.frames >= 40 && right.azimuth is float a1 && Math.Abs(a1 - MathF.PI / 2) < 0.05 && right.volume == 1f,
+                $"alice to the right: azimuth {right.azimuth:F2} (expect +1.57), gain {right.volume}, {right.frames} frames");
+            Check(right.left < 0.05 && right.right > 0.40,
+                $"stereo mix: left RMS {right.left:F3} ≈ 0, right RMS {right.right:F3} ≈ 0.5 (0.35 × √2)");
+
+            // Bob turns to face +X: alice is straight ahead, equal in both ears.
+            await bob.UpdatePositionAsync(arena, userB, At(0, 0, 0), Facing(1, 0, 0));
+            var ahead = await Probe();
+            Check(ahead.azimuth is float a2 && Math.Abs(a2) < 0.05, $"bob turned: azimuth {ahead.azimuth:F2} (expect 0)");
+            Check(Math.Abs(ahead.left - ahead.right) < 0.03 && ahead.left > 0.30,
+                $"stereo mix: left {ahead.left:F3} ≈ right {ahead.right:F3} ≈ 0.35");
+
+            // Bob faces +Z again, alice walks 12 m behind-left; bob also turns her down to 0.5×.
+            await bob.UpdatePositionAsync(arena, userB, At(0, 0, 0), Facing(0, 0, 1));
+            float d = 12f / MathF.Sqrt(2f);
+            await alice.UpdatePositionAsync(arena, userA, At(-d, 0, -d), Facing(0, 0, 1));
+            await bob.SetParticipantVolumeAsync(userA, 0.5f);
+            var far = await Probe();
+            Check(far.azimuth is float a3 && Math.Abs(a3 + 3 * MathF.PI / 4) < 0.05 && Math.Abs(far.volume - 0.25f) < 0.02f,
+                $"behind-left, 12 m, local 0.5×: azimuth {far.azimuth:F2} (expect -2.36), gain {far.volume:F2} (expect 0.25)");
+            Check(far.left > 3 * far.right && far.left < 0.20 && far.left > 0.08,
+                $"stereo mix: left {far.left:F3} (≈0.35 × 0.25 × 1.38), right {far.right:F3} (≈0.35 × 0.25 × 0.32)");
+
+            // Out of range: silence again.
+            await alice.UpdatePositionAsync(arena, userA, At(0, 0, 40), Facing(0, 0, 1));
+            var gone = await Probe();
+            Check(gone.frames == 0, $"beyond max_radius: bob got {gone.frames} frames");
+
+            cts.Cancel();
+            await pump;
+            await alice.DisconnectAsync();
+            await bob.DisconnectAsync();
+            Console.WriteLine("events:");
+            foreach (var l in log) Console.WriteLine("  " + l);
+            Console.WriteLine(ok ? "positional scenario: OK" : "positional scenario: FAILED");
+            return ok ? 0 : 1;
+        }
+
         private static async Task<int> TransmissionScenario(string ws, Guid team, Guid party, string tokenA, string tokenB)
         {
             var log = new List<string>();
@@ -604,7 +735,9 @@ namespace Aurix.Demo
 
         private static Task<string> IssueToken(HttpClient http, string channel, string name) => IssueToken(http, new[] { channel }, name);
 
-        private static async Task<string> IssueToken(HttpClient http, string[] channels, string name)
+        private static async Task<string> IssueToken(HttpClient http, string[] channels, string name) => (await IssueTokenWithUser(http, channels, name)).token;
+
+        private static async Task<(string token, string userId)> IssueTokenWithUser(HttpClient http, string[] channels, string name)
         {
             var grants = new List<object>();
             foreach (var channel in channels)
@@ -614,7 +747,8 @@ namespace Aurix.Demo
                 { "external_id", "csharp-" + name }, { "display_name", name },
                 { "channels", grants },
             };
-            return MiniJson.GetString(MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/tokens", body))), "token");
+            var res = MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/tokens", body)));
+            return (MiniJson.GetString(res, "token"), MiniJson.GetString(res, "user_id"));
         }
 
         private static async Task<string> PostJson(HttpClient http, string path, Dictionary<string, object> body)

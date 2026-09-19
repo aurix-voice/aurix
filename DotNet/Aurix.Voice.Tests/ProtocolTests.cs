@@ -157,6 +157,74 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void DirectionWireFormatMatchesServer()
+        {
+            // Same fixed vectors as the Rust `direction_wire_format_is_fixed` test.
+            var buf = new byte[2];
+            new Direction(MathF.PI / 2f, 0f).Encode(buf);
+            Assert.Equal(new byte[] { 64, 0 }, buf);
+            new Direction(-MathF.PI / 2f, MathF.PI / 4f).Encode(buf);
+            Assert.Equal(new byte[] { 0xC0, 64 }, buf);
+            new Direction(-4f, 9f).Encode(buf);
+            Assert.Equal(new byte[] { 0x81, 127 }, buf);
+            var d = Direction.Decode(64, 0xC0);
+            Assert.InRange(d.Azimuth, MathF.PI / 2f - 0.02f, MathF.PI / 2f + 0.02f);
+            Assert.InRange(d.Elevation, -MathF.PI / 4f - 0.02f, -MathF.PI / 4f + 0.02f);
+
+            var (l, r) = Direction.Ahead.StereoGains();
+            Assert.Equal(1f, l, 4); Assert.Equal(1f, r, 4);
+            (l, r) = new Direction(MathF.PI / 2f, 0f).StereoGains();
+            Assert.Equal(0f, l, 4); Assert.Equal(1.41421f, r, 4);
+            (l, r) = new Direction(-MathF.PI / 2f, 0f).StereoGains();
+            Assert.Equal(1.41421f, l, 4); Assert.Equal(0f, r, 4);
+            (l, r) = new Direction(0.4f, 0f).StereoGains();
+            Assert.Equal(2f, l * l + r * r, 4);
+        }
+
+        [Fact]
+        public void DownlinkMetaIsParsedInServerOrder()
+        {
+            var h = PacketHeader.Create(PacketType.Audio, 3, 1920, 7);
+            h.Flags |= PacketFlags.Directional;
+            var pkt = new AurxPacket(h, new byte[] { 64, 0, (byte)'o', (byte)'p' });
+            Assert.Equal(1f, pkt.Volume);
+            Assert.InRange(pkt.Direction.Value.Azimuth, 1.55f, 1.59f);
+            Assert.Equal(new byte[] { (byte)'o', (byte)'p' }, pkt.AudioPayload.ToArray());
+
+            h.Flags |= PacketFlags.VolumeAttenuated;
+            var both = new AurxPacket(h, new byte[] { 64, 64, 0, (byte)'o', (byte)'p' });
+            Assert.Equal(0.5f, both.Volume);
+            Assert.InRange(both.Direction.Value.Azimuth, 1.55f, 1.59f);
+            Assert.Equal(0f, both.Direction.Value.Elevation);
+            Assert.Equal(new byte[] { (byte)'o', (byte)'p' }, both.AudioPayload.ToArray());
+
+            // Round-trip through the sealed wire format, then strip the metadata in place.
+            var keys = MediaKeys.Derive(System.Text.Encoding.UTF8.GetBytes("directional"));
+            var wire = both.Seal(keys);
+            Assert.True(AurxPacket.TryDecode(wire, out var got, out _));
+            Assert.True(got.Open(keys));
+            var (volume, direction) = got.TakeDownlinkMeta();
+            Assert.Equal(0.5f, volume);
+            Assert.InRange(direction.Value.Azimuth, 1.55f, 1.59f);
+            Assert.Equal(new byte[] { (byte)'o', (byte)'p' }, got.Payload);
+            Assert.Equal(2, got.Header.PayloadLength);
+            Assert.Equal(PacketFlags.None, got.Header.Flags & (PacketFlags.Directional | PacketFlags.VolumeAttenuated));
+            Assert.Equal((1f, (Direction?)null), got.TakeDownlinkMeta());
+
+            // Truncated directional payloads are treated as having no direction.
+            var trunc = new AurxPacket(h, new byte[] { 64, 64 });
+            Assert.Null(trunc.Direction);
+            Assert.Equal(new byte[] { 64 }, trunc.AudioPayload.ToArray());
+
+            // Direction metadata sits in front of the Energy level byte, as the server strips
+            // Energy before forwarding and only ever prepends its own metadata.
+            var plain = new AurxPacket(PacketHeader.Create(PacketType.Audio, 1, 0, 5), new byte[] { 9 });
+            Assert.Null(plain.Direction);
+            Assert.Equal((1f, (Direction?)null), plain.TakeDownlinkMeta());
+            Assert.Equal(new byte[] { 9 }, plain.Payload);
+        }
+
+        [Fact]
         public void SessionBindPayloadLayout()
         {
             var sid = Guid.Parse("00000000-0000-0000-0000-000000000001");
@@ -507,6 +575,49 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void RemoteMixerPansDirectionalStreams()
+        {
+            const float L = ConstantCodec.Level;
+            const float Sqrt2 = 1.41421f;
+            var mixer = new RemoteMixer(() => new ConstantCodec());
+            var stereo = new float[AudioFormat.FrameSamples * 2];
+            var right = new Direction(MathF.PI / 2f, 0f);
+            for (uint seq = 0; seq < 12; seq++) mixer.Push(0xA11CE, seq, 0.4f, new byte[] { 1 });
+            for (uint seq = 0; seq < 4; seq++) mixer.Push(0xB0B, seq, 1f, right, new byte[] { 1 });
+
+            // Centred stream in both ears, hard-right stream only in the right one (+3 dB).
+            mixer.Mix(stereo, 2);
+            Assert.Equal(L * 0.4f, stereo[0], 4);
+            Assert.Equal(L * 0.4f + L * Sqrt2, stereo[1], 3);
+            Assert.Equal(stereo[0], stereo[stereo.Length - 2], 4);
+            Assert.Equal(stereo[1], stereo[stereo.Length - 1], 4);
+
+            // Direction follows the latest frame; null recentres.
+            for (uint seq = 4; seq < 8; seq++) mixer.Push(0xB0B, seq, 1f, null, new byte[] { 1 });
+            for (int i = 0; i < 4; i++) { Array.Clear(stereo, 0, stereo.Length); mixer.Mix(stereo, 2); }
+            Assert.Equal(stereo[0], stereo[1], 4);
+            Assert.Equal(L * 1.4f, stereo[0], 4);
+
+            // Mono outputs ignore panning; per-participant volume still applies to a panned stream.
+            for (uint seq = 8; seq < 12; seq++) mixer.Push(0xB0B, seq, 0.5f, right, new byte[] { 1 });
+            var mono = new float[AudioFormat.FrameSamples];
+            mixer.Mix(mono, 1);
+            Assert.Equal(L * 0.4f + L * 0.5f, mono[0], 4);
+            Array.Clear(stereo, 0, stereo.Length);
+            mixer.Mix(stereo, 2);
+            Assert.Equal(L * 0.4f, stereo[0], 4);
+            Assert.Equal(L * 0.4f + L * 0.5f * Sqrt2, stereo[1], 3);
+
+            // Surround: channels beyond the first two get the centred signal.
+            var quad = new float[AudioFormat.FrameSamples * 4];
+            mixer.Mix(quad, 4);
+            Assert.Equal(L * 0.4f, quad[0], 4);
+            Assert.Equal(L * 0.4f + L * 0.5f * Sqrt2, quad[1], 3);
+            Assert.Equal(L * 0.4f + L * 0.5f, quad[2], 4);
+            Assert.Equal(L * 0.4f + L * 0.5f, quad[3], 4);
+        }
+
+        [Fact]
         public void RemoteMixerAppliesMasterVolumeAndSpeakerMute()
         {
             var mixer = new RemoteMixer(() => new ConstantCodec());
@@ -516,6 +627,7 @@ namespace Aurix.Voice.Tests
             mixer.Mix(stereo, 2);
             Assert.Equal(ConstantCodec.Level * 0.8f, stereo[0], 4);
             Assert.Equal(ConstantCodec.Level * 0.8f, stereo[stereo.Length - 1], 4);
+
 
             mixer.OutputVolume = 2f;
             Array.Clear(stereo, 0, stereo.Length);
