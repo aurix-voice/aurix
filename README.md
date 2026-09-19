@@ -467,6 +467,43 @@ hard-clips at ±1, so the transmitted level and the local VAD see the same signa
 downlink — a muted mixer still consumes and decodes frames, so the jitter buffers stay in sync and unmuting is
 instant. None of this is signalled to the server; use `SetMuted` for a microphone mute other players see.
 
+### Capture processing: echo cancellation, noise suppression, AGC
+
+The microphone is cleaned right after downmix/resampling and before `InputGain`, the injector, VAD and the
+encoder. Two implementations sit behind one interface (`ICaptureProcessor`):
+
+| Mode | Implementation | High-pass | AEC | Noise suppression | AGC |
+|---|---|---|---|---|---|
+| `Native` | `NativeCaptureDsp` — the Aurix native core (`aurix_client` in `Plugins/`, same binary as `NativeOpusCodec`) | 80 Hz | frequency-domain, 40–500 ms tail, delay estimation | RNNoise-derived neural NS | speech-gated, soft limiter |
+| `Managed` | `ManagedCaptureDsp` — pure C#, no native dependency, works everywhere incl. IL2CPP | 80 Hz | — | — | speech-gated, soft limiter |
+
+`DspMode = Auto` (default) picks the native core when its library loads and the managed chain otherwise;
+`Off` disables the stage. Settings are inspector fields (`HighPass`, `EchoCancellation`, `EchoTailMs`,
+`NoiseSuppression`, `Agc`, `AgcTargetDbfs`, `AgcMaxGainDb`) and can be changed live:
+
+```csharp
+voice.NoiseSuppression = NoiseSuppression.Moderate;
+voice.EchoTailMs = 300;                       // open speakers in a big room
+voice.ApplyDspSettings();                     // re-read the fields; switching DspMode swaps the processor
+
+var dsp = voice.Dsp;                          // null when Off / not connected
+bool realAec = dsp != null && dsp.SupportsEchoCancellation;   // false on the managed chain
+var s = dsp.Stats;                            // ErleDb, EchoDelayMs, EchoConverged, FarEndActive,
+                                              // SpeechProbability, AgcGainDb, FarEndUnderruns
+```
+
+The echo canceller's reference is the remote mix this behaviour plays through its `AudioSource`
+(`OnAudioFilterRead` feeds it automatically, at 48 kHz before the output resampler). If you play voice through
+your own audio graph — or want game music/SFX cancelled too — call `voice.Dsp.PushRender(pcm, offset, count,
+channels)` from that graph's filter callback with the 48 kHz interleaved speaker signal in playout order; the
+delay estimator absorbs up to 500 ms of buffering. Unity's own `Microphone` has no AEC, so on desktop the
+native chain is what stops players hearing themselves through open speakers.
+
+The managed chain never pretends: `ManagedCaptureDsp.Settings` reports `EchoCancellation = false` and
+`NoiseSuppression = Off` whatever you asked for, so a UI can grey those toggles out. Own pipeline:
+`CaptureDsp.Create(mode, DspSettings)` → `Process(mono48k, frames)` (whole 480-sample blocks; a 20 ms frame is
+two) plus `PushRender` from the speaker side. Values outside the native ranges are clamped (`DspSettings.Clamped()`).
+
 ### Echo channel (mic test) & audio injection
 
 ```csharp
@@ -584,4 +621,6 @@ re-negotiated after a fresh session.
 * Threading: network I/O runs on thread-pool tasks; all events fire from `Update()` on the caller's thread.
   `JoinChannelAsync` completes even if `Update()` is not being pumped yet.
 * Audio format: 48 kHz, 20 ms frames (`AudioFormat`). Mono uplink; the mixer outputs to any channel count.
+* Capture DSP with echo cancellation and neural noise suppression needs the native core in `Plugins/`; without
+  it the managed chain (high-pass + AGC) is used and `Dsp.SupportsEchoCancellation` is `false`.
 * Not supported: WebGL (no UDP) — use the browser SDK; IL2CPP works (no reflection, no dynamic code).
