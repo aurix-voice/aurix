@@ -1,9 +1,13 @@
 #if UNITY_5_3_OR_NEWER
 using System;
+using System.Collections;
 using System.Threading.Tasks;
 using Aurix.Audio;
 using Aurix.Protocol;
 using UnityEngine;
+#if UNITY_ANDROID
+using UnityEngine.Android;
+#endif
 
 namespace Aurix.Unity
 {
@@ -46,6 +50,20 @@ namespace Aurix.Unity
                  "Off: every frame is sent, tagged with its level, and the server decides who is speaking.")]
         public bool GateOnVad = false;
 
+        [Header("Mobile")]
+        [Tooltip("Ask for the microphone permission (Android RECORD_AUDIO / iOS NSMicrophoneUsageDescription) before " +
+                 "capturing. Off: connect as a listener when the permission is missing and let your UI request it.")]
+        public bool RequestMicrophonePermission = true;
+        [Tooltip("Stop the microphone while the app is in the background and restart it on return " +
+                 "(iOS suspends audio anyway; on Android this avoids recording behind the user's back).")]
+        public bool StopMicrophoneInBackground = true;
+        [Tooltip("After being suspended longer than this many seconds, ping the server and reconnect at once if " +
+                 "it does not answer within 2 s (instead of waiting for the regular 3 × PingInterval timeout). 0 = off.")]
+        public float ProbeAfterBackgroundSeconds = 2f;
+        [Tooltip("Reconnect (resume + UDP rebind) when Application.internetReachability changes, e.g. Wi-Fi ↔ cellular: " +
+                 "the media session is bound to the old source address, so nothing is heard until the rebind.")]
+        public bool ReconnectOnNetworkChange = true;
+
         /// <summary>Creates encoder/decoder instances. Must be set by your code (platform/licensing choice).</summary>
         public Func<IOpusCodec> CodecFactory;
 
@@ -69,6 +87,16 @@ namespace Aurix.Unity
         /// disappeared and capture fell back to the system default (<c>null</c>).
         /// </summary>
         public event Action<string> OnInputDeviceChanged;
+        /// <summary>
+        /// The user denied the microphone permission: the client stays connected as a listener. Call
+        /// <see cref="RetryMicrophonePermission"/> after explaining why the game needs it (Android may
+        /// require the user to grant it from the system settings after a second refusal).
+        /// </summary>
+        public event Action OnMicrophonePermissionDenied;
+
+        public enum MicrophonePermission { Unknown, Requesting, Granted, Denied }
+        /// <summary>Current microphone permission state (always <see cref="MicrophonePermission.Granted"/> on desktop).</summary>
+        public MicrophonePermission PermissionState { get; private set; } = MicrophonePermission.Unknown;
 
         /// <summary>Microphones currently known to Unity (names usable with <see cref="SetInputDevice"/>).</summary>
         public static string[] InputDevices => Microphone.devices;
@@ -83,7 +111,6 @@ namespace Aurix.Unity
         private float _micRetryAt;
         private int _micReadPos;
         private float[] _micScratch;
-        private float[] _frame;
         private float[] _mono;
         private byte[] _opusOut = new byte[1275];
         private IOpusCodec _encoder;
@@ -91,9 +118,39 @@ namespace Aurix.Unity
         private int _micRate;
         private int _micChannels;
         private float _injectClock;
+        private readonly OutputResampler _outputResampler = new OutputResampler();
+        private OutputResampler.FillSource _fillFromMixer;
+        private volatile int _outputRate = AudioFormat.SampleRate;
+        private float _pausedAt = -1f;
+        private NetworkReachability _reachability;
+        private float _nextReachabilityCheck;
+
+        private void Awake()
+        {
+            _fillFromMixer = (buf, off, frames, ch) => _mixer?.Mix(buf, off, frames, ch);
+            _outputRate = AudioSettings.outputSampleRate;
+        }
+
+        private void OnEnable() => AudioSettings.OnAudioConfigurationChanged += OnAudioConfigurationChanged;
+
+        private void OnDisable() => AudioSettings.OnAudioConfigurationChanged -= OnAudioConfigurationChanged;
+
+        /// <summary>
+        /// Headphones/Bluetooth route changes on mobile restart the audio engine, possibly at another sample
+        /// rate and with every AudioSource stopped: pick up the new rate and resume the playback source.
+        /// </summary>
+        private void OnAudioConfigurationChanged(bool deviceWasChanged)
+        {
+            _outputRate = AudioSettings.outputSampleRate;
+            _outputResampler.Reset();
+            if (Client == null) return;
+            var src = GetComponent<AudioSource>();
+            if (src != null && !src.isPlaying) src.Play();
+        }
 
         private void Start()
         {
+            _reachability = Application.internetReachability;
             if (AutoConnectOnStart) _ = Connect();
         }
 
@@ -163,6 +220,14 @@ namespace Aurix.Unity
         /// <summary>Speaker mute (local only). Your own microphone keeps sending.</summary>
         public void SetOutputMuted(bool muted) => OutputMuted = muted;
 
+        /// <summary>Ask for the microphone permission again after <see cref="OnMicrophonePermissionDenied"/>.</summary>
+        public void RetryMicrophonePermission()
+        {
+            if (PermissionState == MicrophonePermission.Requesting) return;
+            PermissionState = MicrophonePermission.Unknown;
+            _micRetryAt = 0f;
+        }
+
         /// <summary>
         /// Play <paramref name="clip"/> into every channel the microphone goes to (an <c>echo</c>
         /// channel for a sound test, a bot voice, an in-game radio). Mixed over the microphone
@@ -186,6 +251,7 @@ namespace Aurix.Unity
 
         private void StartMic()
         {
+            if (!EnsureMicrophonePermission()) return;
             string device = string.IsNullOrEmpty(MicrophoneDevice) ? null : MicrophoneDevice;
             if (device != null && Array.IndexOf(Microphone.devices, device) < 0)
             {
@@ -210,6 +276,71 @@ namespace Aurix.Unity
             if (changed) OnInputDeviceChanged?.Invoke(device);
         }
 
+        /// <summary>
+        /// True when capture may start now. Otherwise the permission request is in flight (or was denied)
+        /// and <see cref="WatchMicrophone"/> will call <see cref="StartMic"/> again when it resolves.
+        /// </summary>
+        private bool EnsureMicrophonePermission()
+        {
+            switch (PermissionState)
+            {
+                case MicrophonePermission.Granted: return true;
+                case MicrophonePermission.Requesting: return false;
+                case MicrophonePermission.Denied: _micRetryAt = float.PositiveInfinity; return false;
+            }
+            if (HasMicrophonePermission())
+            {
+                PermissionState = MicrophonePermission.Granted;
+                return true;
+            }
+            if (!RequestMicrophonePermission)
+            {
+                PermissionDenied();
+                return false;
+            }
+            PermissionState = MicrophonePermission.Requesting;
+#if UNITY_ANDROID && !UNITY_EDITOR
+            var callbacks = new PermissionCallbacks();
+            callbacks.PermissionGranted += _ => PermissionGranted();
+            callbacks.PermissionDenied += _ => PermissionDenied();
+            callbacks.PermissionDeniedAndDontAskAgain += _ => PermissionDenied();
+            Permission.RequestUserPermission(Permission.Microphone, callbacks);
+#else
+            StartCoroutine(RequestPermissionCoroutine());
+#endif
+            return false;
+        }
+
+        private static bool HasMicrophonePermission()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            return Permission.HasUserAuthorizedPermission(Permission.Microphone);
+#else
+            return Application.HasUserAuthorization(UserAuthorization.Microphone);
+#endif
+        }
+
+        private IEnumerator RequestPermissionCoroutine()
+        {
+            yield return Application.RequestUserAuthorization(UserAuthorization.Microphone);
+            if (Application.HasUserAuthorization(UserAuthorization.Microphone)) PermissionGranted();
+            else PermissionDenied();
+        }
+
+        private void PermissionGranted()
+        {
+            PermissionState = MicrophonePermission.Granted;
+            _micRetryAt = 0f;
+        }
+
+        private void PermissionDenied()
+        {
+            PermissionState = MicrophonePermission.Denied;
+            _micRetryAt = float.PositiveInfinity;
+            Debug.LogWarning("Aurix: microphone permission denied; staying connected as a listener");
+            OnMicrophonePermissionDenied?.Invoke();
+        }
+
         private void StopMic()
         {
             if (_micClip != null)
@@ -222,6 +353,7 @@ namespace Aurix.Unity
         private void Update()
         {
             Client?.Update();
+            _outputRate = AudioSettings.outputSampleRate;
             var mixer = _mixer;
             if (mixer != null)
             {
@@ -232,12 +364,45 @@ namespace Aurix.Unity
             PumpMicrophone();
             PumpInjectionWithoutMic();
             PumpDownlink();
+            WatchNetwork();
+        }
+
+        /// <summary>
+        /// Background/foreground: drop the microphone while suspended and, on return, probe the control
+        /// connection so a socket the OS silently killed is replaced now rather than after the ping timeout.
+        /// </summary>
+        private void OnApplicationPause(bool paused)
+        {
+            if (paused)
+            {
+                _pausedAt = Time.realtimeSinceStartup;
+                if (StopMicrophoneInBackground) StopMic();
+                return;
+            }
+            if (_pausedAt < 0f) return;
+            float away = Time.realtimeSinceStartup - _pausedAt;
+            _pausedAt = -1f;
+            _micRetryAt = 0f;
+            if (ProbeAfterBackgroundSeconds > 0f && away >= ProbeAfterBackgroundSeconds) Client?.ProbeConnection();
+        }
+
+        private void WatchNetwork()
+        {
+            if (!ReconnectOnNetworkChange || Time.unscaledTime < _nextReachabilityCheck) return;
+            _nextReachabilityCheck = Time.unscaledTime + 1f;
+            var now = Application.internetReachability;
+            if (now == _reachability) return;
+            var before = _reachability;
+            _reachability = now;
+            if (Client == null || now == NetworkReachability.NotReachable) return;
+            Client.ForceReconnect($"network changed ({before} -> {now})");
         }
 
         /// <summary>Recover from an unplugged/failed microphone: fall back to the default device.</summary>
         private void WatchMicrophone()
         {
             if (Client == null || !IsConnected) return;
+            if (_pausedAt >= 0f && StopMicrophoneInBackground) return; // suspended: Update may still run with "Run In Background"
             if (_micClip != null)
             {
                 if (Microphone.IsRecording(_activeDevice)) return;
@@ -331,13 +496,13 @@ namespace Aurix.Unity
             while (Client.TryDequeueAudio(out var a)) _mixer.Push(a.SenderSsrc, a.Sequence, a.Volume, a.Direction, a.Opus);
         }
 
-        // Runs on Unity's audio thread; the AudioSource plays silence which we fill with the mix.
+        // Runs on Unity's audio thread; the AudioSource plays silence which we fill with the mix,
+        // resampled from 48 kHz when the device runs at another rate (common on mobile).
         private void OnAudioFilterRead(float[] data, int channels)
         {
             var mixer = _mixer;
-            if (mixer == null) return;
-            if (AudioSettings.outputSampleRate != AudioFormat.SampleRate) return; // set Project Settings > Audio > 48000 Hz
-            mixer.Mix(data, channels);
+            if (mixer == null || _fillFromMixer == null) return;
+            _outputResampler.Process(data, channels, _outputRate, _fillFromMixer);
         }
 
         private void OnDestroy()

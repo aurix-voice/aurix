@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using Aurix.Audio;
 using Aurix.Protocol;
@@ -787,6 +788,82 @@ namespace Aurix.Voice.Tests
             Assert.All(head, v => Assert.Equal(0f, v)); // the leading ones were dropped
             Assert.True(inj.Stop());
             Assert.Equal(0, inj.QueuedSamples);
+        }
+
+        [Theory]
+        [InlineData(44100, 512)]
+        [InlineData(24000, 480)]
+        [InlineData(96000, 1024)]
+        [InlineData(44100, 333)]
+        public void OutputResamplerKeepsToneContinuousAcrossBlocks(int outputRate, int blockFrames)
+        {
+            const double freq = 1000.0, amp = 0.5;
+            long sourcePos = 0;
+            OutputResampler.FillSource tone = (buf, off, frames, ch) =>
+            {
+                for (int i = 0; i < frames; i++, sourcePos++)
+                {
+                    float v = (float)(amp * Math.Sin(2 * Math.PI * freq * sourcePos / AudioFormat.SampleRate));
+                    for (int c = 0; c < ch; c++) buf[off + i * ch + c] = v;
+                }
+            };
+            var rs = new OutputResampler();
+            var outBlock = new float[blockFrames * 2];
+            var collected = new List<float>();
+            for (int b = 0; b < 200; b++)
+            {
+                Array.Clear(outBlock, 0, outBlock.Length);
+                rs.Process(outBlock, 2, outputRate, tone);
+                for (int i = 0; i < blockFrames; i++)
+                {
+                    Assert.Equal(outBlock[i * 2], outBlock[i * 2 + 1]);
+                    collected.Add(outBlock[i * 2]);
+                }
+            }
+
+            // Source consumption tracks the rate ratio (no drift, no bursts).
+            double expectedSource = 200.0 * blockFrames * AudioFormat.SampleRate / outputRate;
+            Assert.InRange(rs.SourceFramesPulled, expectedSource - 2, expectedSource + 3);
+
+            // Amplitude preserved (RMS of a sine = amp / √2) and no seams: the largest sample-to-sample
+            // step of the tone at the output rate is amp·2π·f/rate; a discontinuity would exceed it.
+            var skip = collected.Skip(blockFrames).ToArray(); // first block ramps in from the zeroed history frame
+            double rms = Math.Sqrt(skip.Select(v => (double)v * v).Average());
+            Assert.InRange(rms, amp / Math.Sqrt(2) * 0.98, amp / Math.Sqrt(2) * 1.02);
+            double maxStep = amp * 2 * Math.PI * freq / outputRate;
+            for (int i = 1; i < skip.Length; i++)
+                Assert.True(Math.Abs(skip[i] - skip[i - 1]) <= maxStep * 1.05, $"seam at {i}: {skip[i - 1]} -> {skip[i]}");
+
+            // Frequency preserved: count zero crossings.
+            int crossings = 0;
+            for (int i = 1; i < skip.Length; i++) if ((skip[i - 1] < 0) != (skip[i] < 0)) crossings++;
+            double seconds = (double)skip.Length / outputRate;
+            Assert.InRange(crossings / seconds / 2, freq * 0.995, freq * 1.005);
+        }
+
+        [Fact]
+        public void OutputResamplerPassesThroughAtNativeRateAndAdds()
+        {
+            var rs = new OutputResampler();
+            var buf = new float[8];
+            for (int i = 0; i < buf.Length; i++) buf[i] = 0.25f;
+            int calls = 0;
+            rs.Process(buf, 2, AudioFormat.SampleRate, (b, off, frames, ch) =>
+            {
+                calls++;
+                Assert.Same(buf, b);
+                Assert.Equal(0, off);
+                Assert.Equal(4, frames);
+                for (int i = 0; i < frames * ch; i++) b[off + i] += 0.5f;
+            });
+            Assert.Equal(1, calls);
+            Assert.All(buf, v => Assert.Equal(0.75f, v, 5));
+
+            // Resampled output also adds to what is already in the buffer.
+            var half = new float[4];
+            half[0] = half[1] = half[2] = half[3] = 0.1f;
+            rs.Process(half, 2, 24000, (b, off, frames, ch) => { for (int i = 0; i < frames * ch; i++) b[off + i] = 0.2f; });
+            Assert.All(half.Skip(2), v => Assert.Equal(0.3f, v, 4));
         }
     }
 }

@@ -174,9 +174,57 @@ client.OnSessionClosed   += reason => { /* kicked/banned/shutdown: no reconnect 
 * The UDP media path is re-bound from a new local port either way (`SessionBind` with the kept key), and the
   uplink sequence continues where it left off so the server's replay window keeps accepting packets.
 * `SendOpusFrame` is a silent no-op while `State == Reconnecting`; keep the microphone running.
-* Two unanswered pings (`PingInterval`) close a half-open socket and start the reconnect.
+* Three unanswered pings (`PingInterval`) close a half-open socket and start the reconnect.
   `ReconnectNow()` skips the current backoff delay (e.g. when the OS reports connectivity is back).
+* `ForceReconnect(reason)` drops a *healthy* control connection on purpose and resumes right away — use
+  it when the app learns the network path changed (Wi-Fi ↔ cellular) so media is re-bound from the new
+  address instead of waiting for the old socket to time out (~320 ms in the demo).
+* `ProbeConnection(timeout = 2 s)` sends an out-of-band ping; with no pong before the deadline the socket
+  is treated as dead and the reconnect starts. Meant for the return from background, where the OS often
+  kills the TCP socket silently (bytes vanish, no RST) and the regular timeout would take 3 × `PingInterval`.
+  A pong for a ping sent *before* the probe does not satisfy it (nonces are compared).
 * `DisconnectAsync()` and a server-side `SessionClose` never trigger a reconnect.
+
+### Mobile (iOS / Android)
+
+`AurixVoiceBehaviour` handles the platform quirks; the protocol/media code is the same on every platform.
+
+| Inspector field | Default | Effect |
+|---|---|---|
+| `RequestMicrophonePermission` | on | Ask for the microphone at runtime before `Microphone.Start` (Android `RECORD_AUDIO` via `UnityEngine.Android.Permission`, iOS via `Application.RequestUserAuthorization`). Off = never prompt, capture only if already granted. |
+| `StopMicrophoneInBackground` | on | Release the microphone in `OnApplicationPause(true)`, restart it on return (otherwise the OS shows a "recording" indicator or suspends the app anyway). |
+| `ProbeAfterBackgroundSeconds` | 2 | After at least this long in the background, `ProbeConnection()` on resume. 0 = off. |
+| `ReconnectOnNetworkChange` | on | Poll `Application.internetReachability` once a second; a change between two *reachable* states calls `ForceReconnect`. Going offline waits (the ping timeout or the OS closing the socket takes over). |
+
+* **Permission denied is not a failure.** The client stays connected as a listener, `PermissionState`
+  becomes `Denied`, `OnMicrophonePermissionDenied` fires (show your own explanation UI), and
+  `RetryMicrophonePermission()` asks again — Android's "don't ask again" then needs the system settings.
+  On desktop the state goes straight to `Granted`.
+* **iOS project settings:** fill *Player Settings → Microphone Usage Description* (becomes
+  `NSMicrophoneUsageDescription`; the app is killed on first `Microphone.Start` without it). Enable
+  *Prepare iOS for Recording* to avoid the first-capture stall and *Force iOS Speakers when Recording* unless
+  you want earpiece routing. To keep talking in the background set `StopMicrophoneInBackground = false` and
+  enable the *Audio, AirPlay and Picture in Picture* background mode — Apple review expects a visible reason.
+* **Android:** Unity adds `RECORD_AUDIO` to the manifest automatically because the `Microphone` class is
+  referenced. By default Unity asks for every dangerous permission at startup; add
+  `<meta-data android:name="unityplayer.SkipPermissionsDialog" android:value="true" />` to your manifest
+  to defer the prompt until `AurixVoiceBehaviour` needs the microphone. Bluetooth
+  headsets switch the output rate (44.1 → 16/48 kHz) — see below. `INTERNET` is required (always added).
+* **Output sample rate.** Mobile mixers commonly run at 44.1 kHz or 24 kHz, not the 48 kHz Aurix decodes
+  at. `OnAudioFilterRead` goes through `OutputResampler` (linear, fractional phase carried across
+  callbacks, additive so the AudioSource mix is preserved); at 48 kHz the mixer writes straight through.
+  `AudioSettings.OnAudioConfigurationChanged` (headphones/Bluetooth route change) picks up the new rate and
+  re-`Play()`s the AudioSource Unity stopped.
+* **Microphone sample rate.** Devices that cannot capture at 48 kHz are opened at their maximum
+  (`Microphone.GetDeviceCaps`) and downmixed/resampled to 48 kHz mono before VAD/Opus, as on desktop.
+* **Battery:** the client is a single UDP socket plus one WebSocket; VAD gating (`GateOnVad`) is the
+  biggest saving because silent frames are not encoded or sent.
+
+What was verified here: the Unity-only code compiles under `UNITY_5_3_OR_NEWER` (and `UNITY_ANDROID`)
+against a stub of the referenced `UnityEngine` API, the resampler is unit-tested at 44.1/24/96 kHz with
+odd block sizes, and `--scenario reconnect` exercises `ForceReconnect` and `ProbeConnection` through a
+TCP proxy that stalls the connection. It was **not** run on a phone: permission dialogs, background
+suspension and route changes need a device test in your project.
 
 ### One-time action tokens
 
