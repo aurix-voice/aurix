@@ -176,14 +176,111 @@ pub async fn count_users(pool: &DbPool, app_id: Uuid) -> Result<i64, sqlx::Error
 
 pub async fn create_channel(pool: &DbPool, ch: &ChannelRow) -> Result<ChannelRow, sqlx::Error> {
     sqlx::query_as::<_, ChannelRow>(
-        r#"INSERT INTO channels (id, app_id, name, channel_type, config, max_participants, is_persistent, active_participants, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        r#"INSERT INTO channels (id, app_id, name, channel_type, config, max_participants, is_persistent, ad_hoc, active_participants, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING *"#
     )
     .bind(ch.id).bind(ch.app_id).bind(&ch.name).bind(&ch.channel_type)
-    .bind(&ch.config).bind(ch.max_participants).bind(ch.is_persistent)
+    .bind(&ch.config).bind(ch.max_participants).bind(ch.is_persistent).bind(ch.ad_hoc)
     .bind(ch.active_participants).bind(ch.created_at).bind(ch.updated_at)
     .fetch_one(pool).await
+}
+
+/// Creates an ad-hoc channel or revives a soft-deleted one with the same derived id. Returns
+/// `(row, created)`; `created` is false when a live row already existed (concurrent joiners).
+/// A live non-ad-hoc row with that id is left untouched and reported as not created.
+pub async fn ensure_ad_hoc_channel(
+    pool: &DbPool,
+    ch: &ChannelRow,
+) -> Result<(ChannelRow, bool), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query_as::<_, ChannelRow>(
+        "SELECT * FROM channels WHERE id = $1 AND app_id = $2 FOR UPDATE",
+    )
+    .bind(ch.id)
+    .bind(ch.app_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (row, created) = match existing {
+        Some(row) if row.deleted_at.is_none() => (row, false),
+        Some(_) => {
+            let row = sqlx::query_as::<_, ChannelRow>(
+                r#"UPDATE channels
+                   SET name = $3, channel_type = $4, config = $5, max_participants = $6,
+                       ad_hoc = true, deleted_at = NULL, updated_at = NOW(),
+                       active_participants = (SELECT COUNT(*) FROM channel_memberships m
+                                              WHERE m.channel_id = channels.id AND m.left_at IS NULL)
+                   WHERE id = $1 AND app_id = $2
+                   RETURNING *"#,
+            )
+            .bind(ch.id)
+            .bind(ch.app_id)
+            .bind(&ch.name)
+            .bind(&ch.channel_type)
+            .bind(&ch.config)
+            .bind(ch.max_participants)
+            .fetch_one(&mut *tx)
+            .await?;
+            (row, true)
+        }
+        None => {
+            let row = sqlx::query_as::<_, ChannelRow>(
+                r#"INSERT INTO channels (id, app_id, name, channel_type, config, max_participants, is_persistent, ad_hoc, active_participants, created_at, updated_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, false, true, 0, NOW(), NOW())
+                   RETURNING *"#,
+            )
+            .bind(ch.id)
+            .bind(ch.app_id)
+            .bind(&ch.name)
+            .bind(&ch.channel_type)
+            .bind(&ch.config)
+            .bind(ch.max_participants)
+            .fetch_one(&mut *tx)
+            .await?;
+            (row, true)
+        }
+    };
+    tx.commit().await?;
+    Ok((row, created))
+}
+
+/// Soft-deletes an ad-hoc channel that has no active participants. Returns true when the row
+/// was deleted by this call (so exactly one node announces `channel.destroyed`).
+pub async fn delete_empty_ad_hoc_channel(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE channels SET deleted_at = NOW(), updated_at = NOW()
+           WHERE app_id = $1 AND id = $2 AND ad_hoc AND deleted_at IS NULL
+             AND active_participants <= 0
+             AND NOT EXISTS (SELECT 1 FROM channel_memberships m WHERE m.channel_id = channels.id AND m.left_at IS NULL)"#,
+    )
+    .bind(app_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Undoes a soft delete of an ad-hoc channel that a participant entered concurrently (the
+/// release saw an empty channel just before the join was persisted). Returns true when the row
+/// was revived by this call.
+pub async fn revive_ad_hoc_channel(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE channels SET deleted_at = NULL, updated_at = NOW()
+           WHERE app_id = $1 AND id = $2 AND ad_hoc AND deleted_at IS NOT NULL"#,
+    )
+    .bind(app_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
 }
 
 pub async fn get_channel(

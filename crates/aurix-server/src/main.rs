@@ -185,13 +185,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // Channels emptied by the crash cleanup above: tell subscribers now that the queue is live.
     for (app_id, channel_id) in deactivated_on_recovery {
-        control
-            .events
-            .publish(aurix_control::ServerEvent::ChannelDeactivated {
-                app_id,
-                channel_id,
-                timestamp: chrono::Utc::now(),
-            });
+        control.channel_emptied(app_id, channel_id).await;
     }
 
     if config.turn.enabled {

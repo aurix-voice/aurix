@@ -123,7 +123,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/moderation/bans", get(handlers::list_bans))
         .route("/v1/moderation/bans/:ban_id/revoke", post(handlers::unban))
         .route("/v1/moderation/mute", post(handlers::server_mute))
+        .route("/v1/moderation/mute-all", post(handlers::mute_all))
         .route("/v1/moderation/kick", post(handlers::kick_user))
+        .route("/v1/moderation/kick-all", post(handlers::kick_all))
         .route("/v1/moderation/report", post(handlers::report_user))
         .route(
             "/v1/moderation/events",

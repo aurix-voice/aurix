@@ -152,6 +152,7 @@ mod tests {
             speak: true,
             receive: true,
             moderate: false,
+            ad_hoc: None,
             metadata: None,
             ttl_secs: 90,
         }

@@ -3183,9 +3183,26 @@ struct HookRx {
 }
 
 impl HookRx {
-    /// `true` when nothing (buffered or fresh) arrives within `wait`.
-    async fn silent(&mut self, wait: Duration) -> bool {
-        self.pending.is_empty() && tokio::time::timeout(wait, self.rx.recv()).await.is_err()
+    /// `true` when nothing about `channel_id` arrives within `wait`. Other tests share the
+    /// tenant and may produce unrelated deliveries; those are buffered, not counted.
+    async fn silent_for_channel(&mut self, channel_id: ChannelId, wait: Duration) -> bool {
+        let about = |h: &Hook| {
+            serde_json::from_slice::<serde_json::Value>(&h.body)
+                .map(|b| b["data"]["channel_id"] == channel_id.to_string())
+                .unwrap_or(false)
+        };
+        if self.pending.iter().any(about) {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        while let Ok(Some(h)) = tokio::time::timeout_at(deadline, self.rx.recv()).await {
+            if about(&h) {
+                self.pending.push(h);
+                return false;
+            }
+            self.pending.push(h);
+        }
+        true
     }
 }
 
@@ -3503,9 +3520,10 @@ async fn webhooks_and_sse_deliver_signed_tenant_scoped_events() {
         .await;
     assert_eq!(sse_join["data"]["user_id"], uid_a);
 
-    // Webhook 2 is filtered: nothing yet.
+    // Webhook 2 is filtered: nothing about this channel yet.
     assert!(
-        rx2.silent(Duration::from_secs(2)).await,
+        rx2.silent_for_channel(channel_id, Duration::from_secs(2))
+            .await,
         "participant.left-only webhook must not get join events"
     );
 
@@ -3547,9 +3565,12 @@ async fn webhooks_and_sse_deliver_signed_tenant_scoped_events() {
         "explicit filter passes only its types"
     );
 
-    // Delivery log: the retried delivery shows 2 attempts and `delivered`.
+    // Delivery log: the retried delivery is listed (filter by status, since the tenant is shared
+    // with concurrently running tests) and shows 2 attempts and `delivered`.
     let deliveries: serde_json::Value = http
-        .get(api(&format!("/v1/webhooks/{hook1}/deliveries")))
+        .get(api(&format!(
+            "/v1/webhooks/{hook1}/deliveries?status=delivered&limit=200"
+        )))
         .header("x-api-key", &env.api_key)
         .send()
         .await
@@ -3807,4 +3828,494 @@ async fn webhooks_and_sse_deliver_signed_tenant_scoped_events() {
         .await
         .unwrap();
     assert_eq!(r.status(), 404);
+}
+
+async fn channel_status(env: &Env, http: &reqwest::Client, channel_id: ChannelId) -> u16 {
+    http.get(format!("{}/v1/channels/{}", env.api, channel_id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+async fn moderation_call(
+    env: &Env,
+    http: &reqwest::Client,
+    api_key: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let r = http
+        .post(format!("{}/v1/moderation/{path}", env.api))
+        .header("x-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body = r.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+fn id_list(v: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = v
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Ad-hoc channels: a token grant with an `ad_hoc` template creates the channel on first join
+/// (id derived from the name, so the game server knows it up front), the channel disappears
+/// when the last participant leaves and comes back on the next join. `mute-all` / `kick-all`
+/// apply the single-user moderation semantics to everyone present minus an exclusion list.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn ad_hoc_channels_and_channel_wide_moderation() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let name = format!("e2e-match-{}", uuid::Uuid::now_v7().simple());
+
+    // Bad grants are refused when the token is issued, not when the player joins.
+    for (body, why) in [
+        (
+            serde_json::json!({"ad_hoc": {"name": name, "channel_type": "team"}, "channel_id": ChannelId::new()}),
+            "channel_id that does not match the derived one",
+        ),
+        (
+            serde_json::json!({"ad_hoc": {"name": "", "channel_type": "team"}}),
+            "empty ad-hoc name",
+        ),
+        (
+            serde_json::json!({"ad_hoc": {"name": "x", "channel_type": "team", "max_participants": 0}}),
+            "zero max_participants",
+        ),
+        (
+            serde_json::json!({"join": true}),
+            "grant without channel_id or ad_hoc",
+        ),
+    ] {
+        let r = http
+            .post(format!("{}/v1/tokens", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&serde_json::json!({
+                "external_id": "e2e-adhoc-bad",
+                "display_name": "Bad",
+                "channels": [body],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "{why} must be rejected");
+    }
+
+    // Alice: session JWT with an ad-hoc grant. The response resolves the channel id.
+    let r: serde_json::Value = http
+        .post(format!("{}/v1/tokens", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "external_id": "e2e-adhoc-alice",
+            "display_name": "Alice",
+            "channels": [{
+                "ad_hoc": {"name": name, "channel_type": "team", "max_participants": 100000},
+                "moderate": true,
+            }],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_token = r["token"].as_str().unwrap().to_string();
+    let uid_a = r["user_id"].as_str().unwrap().to_string();
+    let channel_id: ChannelId =
+        serde_json::from_value(r["channels"][0]["channel_id"].clone()).unwrap();
+    assert_eq!(r["channels"][0]["ad_hoc"]["name"], name);
+    assert!(
+        r["channels"][0]["ad_hoc"]["max_participants"]
+            .as_u64()
+            .unwrap()
+            < 100000,
+        "max_participants is clamped to the app limit: {r}"
+    );
+    assert_eq!(
+        channel_status(&env, &http, channel_id).await,
+        404,
+        "ad-hoc channel must not exist before the first join"
+    );
+
+    // Bob: one-time join action token with the same template and no channel_id.
+    let r = action_token(
+        &env,
+        &http,
+        serde_json::json!({
+            "action": "join",
+            "external_id": "e2e-adhoc-bob",
+            "display_name": "Bob",
+            "ad_hoc": {"name": name, "channel_type": "team"},
+        }),
+    )
+    .await
+    .expect("join action token with ad_hoc");
+    let bob_join_tok = r["token"].as_str().unwrap().to_string();
+    let uid_b = r["user_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        serde_json::from_value::<ChannelId>(r["channel_id"].clone()).unwrap(),
+        channel_id,
+        "action token derives the same id from the same name"
+    );
+    assert_eq!(
+        action_token(
+            &env,
+            &http,
+            serde_json::json!({
+                "action": "kick",
+                "external_id": "e2e-adhoc-bob",
+                "display_name": "Bob",
+                "target_user_id": uid_a,
+                "ad_hoc": {"name": name},
+            }),
+        )
+        .await
+        .err(),
+        Some(400),
+        "ad_hoc is only meaningful for join"
+    );
+    // Carol: session token for the same channel id but WITHOUT the template - she can join
+    // only once the channel exists.
+    let (carol_token, uid_c) =
+        issue_token(&env, &http, "e2e-adhoc-carol", "Carol", channel_id).await;
+    let mut carol = connect(&env, "carol", carol_token).await;
+    carol
+        .send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: carol.token.clone(),
+        })
+        .await;
+    expect_error(
+        &mut carol,
+        "join of a not-yet-created ad-hoc channel",
+        "CHANNEL_NOT_FOUND",
+    )
+    .await;
+
+    // First join creates the channel.
+    let mut alice = connect(&env, "alice", alice_token).await;
+    join(&mut alice, channel_id).await;
+    assert_eq!(channel_status(&env, &http, channel_id).await, 200);
+    let ch: serde_json::Value = http
+        .get(format!("{}/v1/channels/{}", env.api, channel_id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ch["ad_hoc"], true, "{ch}");
+    assert_eq!(ch["name"], name, "{ch}");
+    assert_eq!(ch["channel_type"], "team", "{ch}");
+
+    // Bob's session is opened with an ordinary token (no channel grants); the ad-hoc join
+    // token alone authorizes the channel entry.
+    let (bob_session, _) = issue_token_for(&env, &http, "e2e-adhoc-bob", "Bob", &[]).await;
+    let mut bob = connect(&env, "bob", bob_session).await;
+    bob.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: bob_join_tok,
+    })
+    .await;
+    bob.expect(
+        "ChannelJoinAck",
+        |m| matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id),
+    )
+    .await;
+    alice
+        .expect(
+            "ParticipantJoined(bob)",
+            |m| matches!(m, ControlMessage::ParticipantJoined { user_id, .. } if user_id.to_string() == uid_b),
+        )
+        .await;
+    join(&mut carol, channel_id).await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 3);
+
+    // mute-all except Alice: Bob and Carol are server-muted, Alice untouched.
+    let (status, body) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "mute-all",
+        serde_json::json!({"channel_id": channel_id, "muted": true, "except": [uid_a]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let mut expected = vec![uid_b.clone(), uid_c.clone()];
+    expected.sort();
+    assert_eq!(id_list(&body["affected"]), expected, "{body}");
+    assert_eq!(id_list(&body["skipped"]), vec![uid_a.clone()], "{body}");
+    assert_eq!(
+        body["failed"].as_array().map(|a| a.len()),
+        Some(0),
+        "{body}"
+    );
+    for target in [&uid_b, &uid_c] {
+        alice
+            .expect("MuteStateChanged(server mute)", |m| {
+                matches!(m, ControlMessage::MuteStateChanged { user_id, muted: true, server_muted: true, .. } if user_id.to_string() == *target)
+            })
+            .await;
+    }
+    let parts: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{}/participants",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let muted: Vec<(String, bool)> = parts["memberships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["user_id"].as_str().unwrap().to_string(),
+                m["is_server_muted"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    for (uid, is_muted) in &muted {
+        assert_eq!(*is_muted, *uid != uid_a, "{uid}: {parts}");
+    }
+
+    // Unmute everyone (no exclusions).
+    let (status, body) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "mute-all",
+        serde_json::json!({"channel_id": channel_id, "muted": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["affected"].as_array().map(|a| a.len()),
+        Some(3),
+        "{body}"
+    );
+
+    // Tenant isolation and validation.
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let (status, _) = moderation_call(
+            &env,
+            &http,
+            &api_key2,
+            "kick-all",
+            serde_json::json!({"channel_id": channel_id, "reason": "nope"}),
+        )
+        .await;
+        assert_eq!(status, 404, "another tenant cannot moderate this channel");
+    }
+    let (status, _) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "kick-all",
+        serde_json::json!({"channel_id": channel_id, "reason": ""}),
+    )
+    .await;
+    assert_eq!(status, 400, "empty reason");
+    let (status, _) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "kick-all",
+        serde_json::json!({"channel_id": channel_id, "reason": "x", "except": ["not-a-uuid"]}),
+    )
+    .await;
+    assert_eq!(status, 400, "malformed except entry");
+
+    // kick-all except Alice: Bob and Carol receive Kick, the channel survives (Alice stays).
+    let (status, body) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "kick-all",
+        serde_json::json!({"channel_id": channel_id, "reason": "round over", "except": [uid_a]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kicked"], 2, "{body}");
+    assert_eq!(id_list(&body["affected"]), expected, "{body}");
+    bob.expect("Kick", |m| {
+        matches!(m, ControlMessage::Kick { user_id, reason, .. } if user_id.to_string() == uid_b && reason == "round over")
+    })
+    .await;
+    carol
+        .expect(
+            "Kick",
+            |m| matches!(m, ControlMessage::Kick { user_id, .. } if user_id.to_string() == uid_c),
+        )
+        .await;
+    for _ in 0..2 {
+        alice
+            .expect("ParticipantLeft", |m| {
+                matches!(m, ControlMessage::ParticipantLeft { .. })
+            })
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+    assert_eq!(
+        channel_status(&env, &http, channel_id).await,
+        200,
+        "channel stays while a participant remains"
+    );
+
+    // Last participant leaves: the ad-hoc channel is destroyed...
+    alice
+        .send(&ControlMessage::ChannelLeave { channel_id })
+        .await;
+    let mut gone = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if channel_status(&env, &http, channel_id).await == 404 {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "ad-hoc channel must be destroyed when it empties");
+    let (status, _) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "mute-all",
+        serde_json::json!({"channel_id": channel_id, "muted": true}),
+    )
+    .await;
+    assert_eq!(status, 404, "destroyed channel is gone for moderation too");
+
+    // ...and re-created by the next join with the same name and id.
+    join(&mut alice, channel_id).await;
+    assert_eq!(channel_status(&env, &http, channel_id).await, 200);
+    assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+    alice.ws.close(None).await.unwrap();
+    bob.ws.close(None).await.unwrap();
+    carol.ws.close(None).await.unwrap();
+    let mut gone = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if channel_status(&env, &http, channel_id).await == 404 {
+            gone = true;
+            break;
+        }
+    }
+    assert!(
+        gone,
+        "disconnect of the last participant destroys the channel"
+    );
+
+    // Cross-node: the channel is created from node 1, Bob joins it on node 2 with his own
+    // ad-hoc grant, and channel-wide moderation issued via node 1 reaches him.
+    let Ok(ws2) = std::env::var("AURIX_E2E_WS2") else {
+        eprintln!("AURIX_E2E_WS2 not set; skipping cross-node ad-hoc checks");
+        return;
+    };
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: ws2,
+        api_key: env.api_key.clone(),
+    };
+    let mut alice = connect(&env, "alice", alice.token.clone()).await;
+    join(&mut alice, channel_id).await;
+    let r: serde_json::Value = http
+        .post(format!("{}/v1/tokens", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "external_id": "e2e-adhoc-bob",
+            "display_name": "Bob",
+            "channels": [{"ad_hoc": {"name": name, "channel_type": "team"}}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut bob = connect(&env2, "bob@node2", r["token"].as_str().unwrap().to_string()).await;
+    join(&mut bob, channel_id).await;
+    alice
+        .expect(
+            "ParticipantJoined(bob)",
+            |m| matches!(m, ControlMessage::ParticipantJoined { user_id, .. } if user_id.to_string() == uid_b),
+        )
+        .await;
+    assert_eq!(channel_status(&env2, &http, channel_id).await, 200);
+    let (status, body) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "mute-all",
+        serde_json::json!({"channel_id": channel_id, "muted": true, "except": [uid_a]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(id_list(&body["affected"]), vec![uid_b.clone()], "{body}");
+    bob.expect("MuteStateChanged on node 2", |m| {
+        matches!(m, ControlMessage::MuteStateChanged { user_id, muted: true, server_muted: true, .. } if user_id.to_string() == uid_b)
+    })
+    .await;
+    let (status, body) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "kick-all",
+        serde_json::json!({"channel_id": channel_id, "reason": "server restart"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kicked"], 2, "{body}");
+    bob.expect("Kick on node 2", |m| {
+        matches!(m, ControlMessage::Kick { user_id, reason, .. } if user_id.to_string() == uid_b && reason == "server restart")
+    })
+    .await;
+    alice
+        .expect(
+            "Kick",
+            |m| matches!(m, ControlMessage::Kick { user_id, .. } if user_id.to_string() == uid_a),
+        )
+        .await;
+    let mut gone = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if channel_status(&env, &http, channel_id).await == 404
+            && channel_status(&env2, &http, channel_id).await == 404
+        {
+            gone = true;
+            break;
+        }
+    }
+    assert!(
+        gone,
+        "kick-all of everyone destroys the ad-hoc channel on both nodes"
+    );
+    alice.ws.close(None).await.unwrap();
+    bob.ws.close(None).await.unwrap();
 }

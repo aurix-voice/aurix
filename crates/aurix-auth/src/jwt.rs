@@ -28,6 +28,8 @@ pub struct ChannelPermClaim {
     pub speak: bool,
     pub receive: bool,
     pub moderate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ad_hoc: Option<AdHocChannel>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +62,8 @@ pub struct ActionClaims {
     #[serde(default)]
     pub moderate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ad_hoc: Option<AdHocChannel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     pub exp: i64,
     pub iat: i64,
@@ -80,6 +84,7 @@ pub struct ActionTokenSpec {
     pub speak: bool,
     pub receive: bool,
     pub moderate: bool,
+    pub ad_hoc: Option<AdHocChannel>,
     pub metadata: Option<serde_json::Value>,
     pub ttl_secs: i64,
 }
@@ -95,6 +100,7 @@ pub struct ValidatedActionToken {
     pub speak: bool,
     pub receive: bool,
     pub moderate: bool,
+    pub ad_hoc: Option<AdHocChannel>,
     pub metadata: Option<serde_json::Value>,
     pub jti: String,
     pub exp: i64,
@@ -112,6 +118,7 @@ impl ValidatedActionToken {
             speak: self.speak,
             receive: self.receive,
             moderate: self.moderate,
+            ad_hoc: self.ad_hoc.clone(),
         })
     }
 
@@ -250,6 +257,7 @@ impl JwtService {
                     speak: c.speak,
                     receive: c.receive,
                     moderate: c.moderate,
+                    ad_hoc: c.ad_hoc.clone(),
                 })
                 .collect(),
             exp: now + self.token_ttl,
@@ -289,6 +297,7 @@ impl JwtService {
                         speak: c.speak,
                         receive: c.receive,
                         moderate: c.moderate,
+                        ad_hoc: c.ad_hoc.clone(),
                     })
             })
             .collect();
@@ -359,6 +368,7 @@ impl JwtService {
             speak: spec.speak,
             receive: spec.receive,
             moderate: spec.moderate,
+            ad_hoc: spec.ad_hoc.clone(),
             metadata: spec.metadata.clone(),
             exp,
             iat: now,
@@ -413,6 +423,7 @@ impl JwtService {
             speak: claims.speak,
             receive: claims.receive,
             moderate: claims.moderate,
+            ad_hoc: claims.ad_hoc,
             metadata: claims.metadata,
             jti: claims.jti,
             exp: claims.exp,
@@ -466,6 +477,7 @@ mod tests {
             speak: true,
             receive: true,
             moderate: false,
+            ad_hoc: None,
             metadata: None,
             ttl_secs: 90,
         }
@@ -501,6 +513,45 @@ mod tests {
         ));
         assert!(matches!(s.validate_any(&session), Ok(AnyToken::Session(_))));
         assert!(matches!(s.validate_any(&token), Ok(AnyToken::Action(_))));
+    }
+
+    #[test]
+    fn ad_hoc_templates_round_trip_in_session_and_action_tokens() {
+        let s = svc();
+        let app_id = AppId::new();
+        let template = AdHocChannel {
+            name: "match-42".into(),
+            channel_type: ChannelType::Positional,
+            max_participants: Some(16),
+        };
+        let channel_id = template.channel_id(app_id);
+        let perm = ChannelPermission {
+            channel_id,
+            join: true,
+            speak: true,
+            receive: true,
+            moderate: false,
+            ad_hoc: Some(template.clone()),
+        };
+        let token = s
+            .generate_token(UserId::new(), app_id, "Alice", vec![perm], None)
+            .unwrap();
+        let v = s.validate_token(&token).unwrap();
+        assert_eq!(v.channels.len(), 1);
+        assert_eq!(v.channels[0].channel_id, channel_id);
+        assert_eq!(v.channels[0].ad_hoc.as_ref(), Some(&template));
+
+        let mut spec = spec(ActionKind::Join);
+        spec.app_id = app_id;
+        spec.channel_id = Some(channel_id);
+        spec.ad_hoc = Some(template.clone());
+        let (token, _, _) = s.generate_action_token(&spec).unwrap();
+        let v = s.validate_action_token(&token).unwrap();
+        assert_eq!(v.ad_hoc.as_ref(), Some(&template));
+        assert_eq!(
+            v.channel_permission().unwrap().ad_hoc.as_ref(),
+            Some(&template)
+        );
     }
 
     #[test]

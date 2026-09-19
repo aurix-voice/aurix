@@ -3,7 +3,7 @@ use crate::analytics::AnalyticsCollector;
 use crate::block_manager::BlockManager;
 use crate::channel_manager::ChannelManager;
 use crate::chat::ChatService;
-use crate::event_bus::EventBus;
+use crate::event_bus::{EventBus, ServerEvent};
 use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
 use crate::session_manager::SessionManager;
@@ -308,5 +308,39 @@ impl ControlPlane {
     /// Consumes the `jti` of a `login` action token; `Err(TokenReused)` on replay.
     pub async fn consume_login(&self, claim: &PendingClaim) -> Result<()> {
         self.action_tokens.consume(claim).await
+    }
+
+    /// The last participant left `channel_id`: announce `channel.deactivated` and, for ad-hoc
+    /// channels, soft-delete the row and announce `channel.destroyed`. Safe to call from every
+    /// node; only the node whose delete wins announces destruction.
+    pub async fn channel_emptied(&self, app_id: AppId, channel_id: ChannelId) {
+        let now = chrono::Utc::now();
+        self.events.publish(ServerEvent::ChannelDeactivated {
+            app_id,
+            channel_id,
+            timestamp: now,
+        });
+        match self.channels.release_if_ad_hoc(app_id, channel_id).await {
+            Ok(true) => self.events.publish(ServerEvent::ChannelDestroyed {
+                app_id,
+                channel_id,
+                timestamp: now,
+            }),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("ad-hoc channel release failed for {channel_id}: {e}"),
+        }
+    }
+
+    /// Undoes an ad-hoc creation whose join did not complete (nobody ever entered).
+    pub async fn release_ad_hoc(&self, app_id: AppId, channel_id: ChannelId) {
+        match self.channels.release_if_ad_hoc(app_id, channel_id).await {
+            Ok(true) => self.events.publish(ServerEvent::ChannelDestroyed {
+                app_id,
+                channel_id,
+                timestamp: chrono::Utc::now(),
+            }),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("ad-hoc channel release failed for {channel_id}: {e}"),
+        }
     }
 }

@@ -119,6 +119,20 @@ curl -X POST localhost:8080/v1/tokens/action -H "x-api-key: $KEY" -H 'content-ty
   -d '{"action":"join","external_id":"steam:7656119","channel_id":"<channel uuid>","speak":true}'
 # kick/mute/unmute additionally need moderation:write, a target and the acting user:
 #   {"action":"kick","user_id":"<moderator uuid>","channel_id":"<channel>","target_user_id":"<player>"}
+
+# ad-hoc channel: no POST /v1/channels needed - the grant names the channel and it is created
+# on the first join (and removed when the last participant leaves). The id is derived from the
+# name, so the response tells you the channel_id up front and every token for the same name
+# lands in the same channel. Works in both /v1/tokens and /v1/tokens/action (join).
+curl -X POST localhost:8080/v1/tokens -H "x-api-key: $KEY" -H 'content-type: application/json' \
+  -d '{"external_id":"steam:7656119","display_name":"Alice",
+       "channels":[{"ad_hoc":{"name":"match-8f3a","channel_type":"team","max_participants":10}}]}'
+
+# channel-wide moderation: everyone currently present except the listed users
+curl -X POST localhost:8080/v1/moderation/mute-all -H "x-api-key: $KEY" -H 'content-type: application/json' \
+  -d '{"channel_id":"<channel uuid>","muted":true,"except":["<game master uuid>"]}'
+curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'content-type: application/json' \
+  -d '{"channel_id":"<channel uuid>","reason":"round over"}'
 ```
 
 ### Client flow
@@ -239,8 +253,8 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | bootstrap | `POST /admin/setup` | first admin (see above) |
 | admin JWT | `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log` | operators |
 | admin JWT | `POST|GET /v1/apps`, `GET|DELETE /v1/apps/:id`, `POST /v1/apps/:id/rotate-key`, `GET /v1/nodes` | tenants & fleet |
-| API key | `POST /v1/tokens` | issue player JWT |
-| API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`) |
+| API key | `POST /v1/tokens` | issue player JWT; a channel grant is `{"channel_id":…}` or `{"ad_hoc":{"name":…,"channel_type":…,"max_participants":…}}` (created on first join, dropped when empty; `max_participants` is clamped to the app limit, creation counts against the app's channel quota) |
+| API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`; `join` accepts `ad_hoc` too) |
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
@@ -248,6 +262,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/channels/:id/messages`, `POST /v1/users/:id/messages` | server/system text message into a channel or to one user's live sessions (`chat:write`; sender is the nil user id, bypasses the content filter; fire-and-forget — dropped if nobody is online unless persisted) |
 | API key | `GET /v1/channels/:id/messages`, `GET /v1/users/:id/messages` | history, newest first, `?before=<rfc3339>&limit=1..200` — only when `chat.persist = true`, otherwise `404 NOT_FOUND` (`chat:read`) |
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
+| API key | `POST /v1/moderation/{mute-all,kick-all}` | channel-wide server mute / kick of everyone currently present minus `except: [user ids]`; response lists `affected`, `skipped`, `failed`; every target still gets its own `user.muted`/`user.kicked` event and audit entry plus one `channel_mute_all`/`channel_kick_all` summary |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |

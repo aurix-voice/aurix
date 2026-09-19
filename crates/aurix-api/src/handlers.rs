@@ -99,8 +99,70 @@ pub struct GenerateTokenRequest {
     pub external_id: String,
     pub display_name: String,
     #[serde(default)]
-    pub channels: Vec<ChannelPermission>,
+    pub channels: Vec<ChannelGrant>,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// One channel entry of a token request. Either an existing `channel_id` or an `ad_hoc`
+/// template (whose id is derived from the name); both may be given if they agree.
+#[derive(Deserialize)]
+pub struct ChannelGrant {
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
+    #[serde(default = "default_true")]
+    pub join: bool,
+    #[serde(default = "default_true")]
+    pub speak: bool,
+    #[serde(default = "default_true")]
+    pub receive: bool,
+    #[serde(default)]
+    pub moderate: bool,
+    #[serde(default)]
+    pub ad_hoc: Option<AdHocChannel>,
+}
+
+/// Turns a grant into the permission carried by the token. Ad-hoc templates are validated
+/// and clamped to the app's per-channel limit here so a bad grant fails at the game server.
+fn resolve_ad_hoc(
+    app_id: AppId,
+    channel_id: Option<ChannelId>,
+    ad_hoc: Option<AdHocChannel>,
+    app: &aurix_db::models::AppRow,
+) -> Result<(ChannelId, Option<AdHocChannel>), ApiError> {
+    match ad_hoc {
+        Some(mut template) => {
+            template.name = template.name.trim().to_string();
+            let config = aurix_control::channel_manager::ChannelManager::validate_ad_hoc(
+                &template,
+                app.max_participants_per_channel as u32,
+            )?;
+            template.max_participants = Some(config.max_participants);
+            let derived = template.channel_id(app_id);
+            if let Some(given) = channel_id {
+                if given != derived {
+                    return Err(AurixError::Validation(format!(
+                        "channel_id {given} does not match ad_hoc channel '{}' ({derived})",
+                        template.name
+                    ))
+                    .into());
+                }
+            }
+            Ok((derived, Some(template)))
+        }
+        None => match channel_id {
+            Some(id) => Ok((id, None)),
+            None => Err(AurixError::Validation(
+                "Each channel grant needs channel_id or ad_hoc".into(),
+            )
+            .into()),
+        },
+    }
+}
+
+async fn load_app(state: &AppState, app_id: AppId) -> Result<aurix_db::models::AppRow, ApiError> {
+    Ok(aurix_db::queries::get_app(&state.control.pool, app_id.0)
+        .await?
+        .ok_or_else(|| AurixError::AuthorizationDenied("Application is inactive".into()))?)
 }
 
 #[derive(Serialize)]
@@ -108,6 +170,9 @@ pub struct TokenResponse {
     pub token: String,
     pub user_id: UserId,
     pub expires_at: String,
+    /// Resolved grants; ad-hoc entries carry the derived `channel_id` the game server can
+    /// use for moderation calls before anyone has joined.
+    pub channels: Vec<ChannelPermission>,
 }
 
 /// Issues an end-user JWT bound to the API key's app. The user row is upserted so bans, sessions
@@ -153,11 +218,27 @@ pub async fn generate_token(
         return Err(AurixError::UserBanned("User is banned".into()).into());
     }
     let user_id = UserId(user.id);
+    let mut channels = Vec::with_capacity(req.channels.len());
+    if !req.channels.is_empty() {
+        let app = load_app(&state, app_id).await?;
+        for grant in req.channels {
+            let (channel_id, ad_hoc) =
+                resolve_ad_hoc(app_id, grant.channel_id, grant.ad_hoc, &app)?;
+            channels.push(ChannelPermission {
+                channel_id,
+                join: grant.join,
+                speak: grant.speak,
+                receive: grant.receive,
+                moderate: grant.moderate,
+                ad_hoc,
+            });
+        }
+    }
     let token = state.control.jwt.generate_token(
         user_id,
         app_id,
         display_name,
-        req.channels,
+        channels.clone(),
         req.metadata,
     )?;
     let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs);
@@ -165,6 +246,7 @@ pub async fn generate_token(
         token,
         user_id,
         expires_at: expires_at.to_rfc3339(),
+        channels,
     }))
 }
 
@@ -189,6 +271,9 @@ pub struct ActionTokenRequest {
     pub receive: bool,
     #[serde(default)]
     pub moderate: bool,
+    /// `join` only: create the channel on first join instead of requiring it to exist.
+    #[serde(default)]
+    pub ad_hoc: Option<AdHocChannel>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
@@ -206,6 +291,8 @@ pub struct ActionTokenResponse {
     pub action: ActionKind,
     pub user_id: UserId,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<ChannelId>,
 }
 
 async fn ensure_not_banned(
@@ -297,20 +384,33 @@ pub async fn generate_action_token(
         .unwrap_or(&user.display_name)
         .to_string();
 
-    let channel_id = match &req.channel_id {
-        Some(raw) => {
-            let id = ChannelId::from_uuid(parse_uuid(raw, "channel_id")?);
-            state.control.channels.require_channel(app_id, id).await?;
-            Some(id)
+    let requested_channel = match &req.channel_id {
+        Some(raw) => Some(ChannelId::from_uuid(parse_uuid(raw, "channel_id")?)),
+        None => None,
+    };
+    let (channel_id, ad_hoc) = match (requested_channel, req.ad_hoc) {
+        (_, Some(_)) if req.action != ActionKind::Join => {
+            return Err(
+                AurixError::Validation("ad_hoc is only valid for action 'join'".into()).into(),
+            );
         }
-        None if req.action.needs_channel() => {
+        (given, Some(template)) => {
+            let app = load_app(&state, app_id).await?;
+            let (id, template) = resolve_ad_hoc(app_id, given, Some(template), &app)?;
+            (Some(id), template)
+        }
+        (Some(id), None) => {
+            state.control.channels.require_channel(app_id, id).await?;
+            (Some(id), None)
+        }
+        (None, None) if req.action.needs_channel() => {
             return Err(AurixError::Validation(format!(
                 "channel_id is required for action '{}'",
                 req.action
             ))
             .into());
         }
-        None => None,
+        (None, None) => (None, None),
     };
     let target_user_id = match &req.target_user_id {
         Some(raw) => {
@@ -343,6 +443,7 @@ pub async fn generate_action_token(
         speak: req.speak,
         receive: req.receive,
         moderate: req.moderate,
+        ad_hoc,
         metadata: req.metadata,
         ttl_secs,
     };
@@ -356,6 +457,7 @@ pub async fn generate_action_token(
         action: req.action,
         user_id,
         expires_at,
+        channel_id,
     }))
 }
 
@@ -1092,6 +1194,120 @@ pub async fn kick_user(
     Ok(Json(
         serde_json::json!({"kicked": true, "memberships_closed": removed}),
     ))
+}
+
+const MAX_BULK_EXCEPT: usize = 256;
+
+#[derive(Deserialize)]
+pub struct MuteAllRequest {
+    pub channel_id: String,
+    pub muted: bool,
+    #[serde(default)]
+    pub except: Vec<String>,
+    pub moderator_user_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct KickAllRequest {
+    pub channel_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub except: Vec<String>,
+    pub moderator_user_id: Option<String>,
+}
+
+fn parse_except(raw: &[String]) -> Result<Vec<UserId>, ApiError> {
+    if raw.len() > MAX_BULK_EXCEPT {
+        return Err(AurixError::Validation(format!(
+            "except may list at most {MAX_BULK_EXCEPT} users"
+        ))
+        .into());
+    }
+    raw.iter()
+        .map(|r| Ok(UserId::from_uuid(parse_uuid(r, "except")?)))
+        .collect()
+}
+
+/// Server-mutes/unmutes everyone currently in the channel except the listed users. Only the
+/// present participants are affected; later joiners come in unmuted.
+pub async fn mute_all(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Json(req): Json<MuteAllRequest>,
+) -> JsonResult {
+    ctx.require("moderation:write")?;
+    let app_id = ctx.app_id;
+    let channel_id = ChannelId::from_uuid(parse_uuid(&req.channel_id, "channel_id")?);
+    state
+        .control
+        .channels
+        .require_channel(app_id, channel_id)
+        .await?;
+    let except = parse_except(&req.except)?;
+    let actor = resolve_actor(&state, &ctx, req.moderator_user_id.as_deref()).await?;
+    let outcome = moderation_actions::set_server_mute_all(
+        &state.control,
+        &state.sfu,
+        moderation_actions::BulkTarget {
+            app_id,
+            channel_id,
+            actor,
+            ip: client_ip_string(ip),
+            except,
+        },
+        req.muted,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({
+        "muted": req.muted,
+        "affected": outcome.affected,
+        "skipped": outcome.skipped,
+        "failed": outcome.failed,
+    })))
+}
+
+/// Removes everyone currently in the channel except the listed users. Unlike deleting the
+/// channel, the channel itself (and its configuration) stays.
+pub async fn kick_all(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Json(req): Json<KickAllRequest>,
+) -> JsonResult {
+    ctx.require("moderation:write")?;
+    let app_id = ctx.app_id;
+    let channel_id = ChannelId::from_uuid(parse_uuid(&req.channel_id, "channel_id")?);
+    state
+        .control
+        .channels
+        .require_channel(app_id, channel_id)
+        .await?;
+    let reason = req.reason.trim();
+    if reason.is_empty() || reason.len() > 512 {
+        return Err(AurixError::Validation("reason must be 1..=512 characters".into()).into());
+    }
+    let except = parse_except(&req.except)?;
+    let actor = resolve_actor(&state, &ctx, req.moderator_user_id.as_deref()).await?;
+    let outcome = moderation_actions::kick_all(
+        &state.control,
+        &state.sfu,
+        moderation_actions::BulkTarget {
+            app_id,
+            channel_id,
+            actor,
+            ip: client_ip_string(ip),
+            except,
+        },
+        reason.to_string(),
+    )
+    .await?;
+    Ok(Json(serde_json::json!({
+        "kicked": outcome.affected.len(),
+        "affected": outcome.affected,
+        "skipped": outcome.skipped,
+        "failed": outcome.failed,
+    })))
 }
 
 #[derive(Deserialize)]

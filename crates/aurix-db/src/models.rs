@@ -44,6 +44,7 @@ pub struct ChannelRow {
     pub config: serde_json::Value,
     pub max_participants: i32,
     pub is_persistent: bool,
+    pub ad_hoc: bool,
     pub active_participants: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

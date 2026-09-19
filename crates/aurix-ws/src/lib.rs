@@ -860,13 +860,7 @@ impl WsState {
             timestamp: chrono::Utc::now(),
         });
         if let Ok(0) = count {
-            self.control
-                .events
-                .publish(ServerEvent::ChannelDeactivated {
-                    app_id,
-                    channel_id,
-                    timestamp: chrono::Utc::now(),
-                });
+            self.control.channel_emptied(app_id, channel_id).await;
         }
     }
 }
@@ -1632,22 +1626,40 @@ async fn handle_control_message(
             if let Err(e) = state.control.rbac.check_channel_join(&channel_id, &perms) {
                 return send_error(tx, e.error_code(), &e.public_message()).await;
             }
-            // Tenant check + persisted configuration (limits, spatial settings, codec).
-            let config = match state
+            // Tenant check + persisted configuration (limits, spatial settings, codec). An
+            // ad-hoc grant creates the channel on first join.
+            let ad_hoc = perms
+                .iter()
+                .find(|p| p.channel_id == channel_id)
+                .and_then(|p| p.ad_hoc.as_ref());
+            let resolved = match state
                 .control
                 .channels
-                .load_channel_config(token.app_id, channel_id)
+                .resolve_join(token.app_id, channel_id, ad_hoc)
                 .await
             {
                 Ok(c) => c,
                 Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
             };
+            let config = resolved.config;
+            let channel_type = config.channel_type;
+            if resolved.created {
+                state.control.events.publish(ServerEvent::ChannelCreated {
+                    app_id: token.app_id,
+                    channel_id,
+                    channel_type,
+                    timestamp: chrono::Utc::now(),
+                });
+            }
             let role = state
                 .control
                 .rbac
                 .role_from_permissions(&channel_id, &perms);
             if let Some(claim) = claim {
                 if let Err(e) = state.control.action_tokens.consume(&claim).await {
+                    if resolved.created {
+                        state.control.release_ad_hoc(token.app_id, channel_id).await;
+                    }
                     return send_error(tx, e.error_code(), &e.public_message()).await;
                 }
             }
@@ -1657,7 +1669,12 @@ async fn handle_control_message(
             };
             let existing = match join_result {
                 Ok(existing) => existing,
-                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+                Err(e) => {
+                    if resolved.created {
+                        state.control.release_ad_hoc(token.app_id, channel_id).await;
+                    }
+                    return send_error(tx, e.error_code(), &e.public_message()).await;
+                }
             };
             let ssrc = state
                 .connections
@@ -1675,6 +1692,9 @@ async fn handle_control_message(
                     let sfu = state.sfu.read();
                     let _ = sfu.leave_channel(&session_id, &channel_id);
                 }
+                if resolved.created {
+                    state.control.release_ad_hoc(token.app_id, channel_id).await;
+                }
                 return send_error(tx, "INTERNAL_ERROR", "Channel join could not be persisted")
                     .await;
             }
@@ -1690,6 +1710,23 @@ async fn handle_control_message(
                     channel_id,
                     timestamp: chrono::Utc::now(),
                 });
+            }
+            if resolved.ad_hoc && !resolved.created {
+                match state
+                    .control
+                    .channels
+                    .revive_if_released(token.app_id, channel_id)
+                    .await
+                {
+                    Ok(true) => state.control.events.publish(ServerEvent::ChannelCreated {
+                        app_id: token.app_id,
+                        channel_id,
+                        channel_type,
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("ad-hoc channel revive check failed: {e}"),
+                }
             }
             if let Some(ref redis) = state.control.redis {
                 let _ = redis.add_user_channel(token.user_id, channel_id).await;

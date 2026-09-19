@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UserId(pub Uuid);
 
 impl UserId {
@@ -42,6 +42,22 @@ impl ChannelId {
     }
     pub fn from_uuid(u: Uuid) -> Self {
         Self(u)
+    }
+
+    /// Deterministic id of an ad-hoc channel: the same `(app, name)` pair always maps to the
+    /// same channel, so game servers can address it (mute-all, kick-all, participants) without
+    /// a lookup and concurrent first joiners agree on one row.
+    pub fn ad_hoc(app_id: AppId, name: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"aurix.ad_hoc_channel.v1\0");
+        h.update(app_id.0.as_bytes());
+        h.update(b"\0");
+        h.update(name.as_bytes());
+        let digest = h.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self(uuid::Builder::from_custom_bytes(bytes).into_uuid())
     }
 }
 
@@ -649,6 +665,48 @@ pub struct ChannelPermission {
     pub receive: bool,
     #[serde(default)]
     pub moderate: bool,
+    /// When set, joining a channel that does not exist yet creates it with this template
+    /// instead of failing with `CHANNEL_NOT_FOUND`. `channel_id` must equal
+    /// `ChannelId::ad_hoc(app_id, template.name)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ad_hoc: Option<AdHocChannel>,
+}
+
+/// Template for a channel created on first join. Kept deliberately small: the game server
+/// picks a type and a size, the channel inherits the app defaults for everything else and is
+/// destroyed automatically once the last participant leaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdHocChannel {
+    /// Stable per-app name, e.g. `match:1234` or `party:abcd`.
+    pub name: String,
+    #[serde(default = "default_ad_hoc_type")]
+    pub channel_type: ChannelType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_participants: Option<u32>,
+}
+
+fn default_ad_hoc_type() -> ChannelType {
+    ChannelType::Team
+}
+
+impl AdHocChannel {
+    pub fn channel_id(&self, app_id: AppId) -> ChannelId {
+        ChannelId::ad_hoc(app_id, &self.name)
+    }
+
+    pub fn channel_config(&self) -> ChannelConfig {
+        let mut config = ChannelConfig {
+            channel_type: self.channel_type,
+            ..ChannelConfig::default()
+        };
+        if let Some(max) = self.max_participants {
+            config.max_participants = max;
+        }
+        if self.channel_type == ChannelType::Positional {
+            config.positional_config = Some(PositionalConfig::default());
+        }
+        config
+    }
 }
 
 /// Operation a one-time action token (`POST /v1/tokens/action`) authorises.
@@ -743,6 +801,8 @@ pub enum AuditAction {
     WebhookUpdated,
     WebhookDeleted,
     WebhookSecretRotated,
+    ChannelMuteAll,
+    ChannelKickAll,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,6 +895,56 @@ pub struct AdminContext {
 mod tests {
     use super::*;
     use std::f32::consts::{FRAC_PI_2, PI};
+
+    #[test]
+    fn ad_hoc_channel_ids_are_stable_per_app_and_name() {
+        let app = AppId::new();
+        let other = AppId::new();
+        assert_eq!(
+            ChannelId::ad_hoc(app, "match-1"),
+            ChannelId::ad_hoc(app, "match-1")
+        );
+        assert_ne!(
+            ChannelId::ad_hoc(app, "match-1"),
+            ChannelId::ad_hoc(app, "match-2")
+        );
+        assert_ne!(
+            ChannelId::ad_hoc(app, "match-1"),
+            ChannelId::ad_hoc(other, "match-1")
+        );
+        let template = AdHocChannel {
+            name: "match-1".into(),
+            channel_type: ChannelType::Team,
+            max_participants: None,
+        };
+        assert_eq!(template.channel_id(app), ChannelId::ad_hoc(app, "match-1"));
+        let parsed: AdHocChannel = serde_json::from_str(r#"{"name":"match-1"}"#).unwrap();
+        assert_eq!(parsed, template);
+    }
+
+    #[test]
+    fn ad_hoc_template_builds_a_channel_config() {
+        let team = AdHocChannel {
+            name: "t".into(),
+            channel_type: ChannelType::Team,
+            max_participants: Some(8),
+        }
+        .channel_config();
+        assert_eq!(team.channel_type, ChannelType::Team);
+        assert_eq!(team.max_participants, 8);
+        assert!(team.positional_config.is_none());
+        let positional = AdHocChannel {
+            name: "p".into(),
+            channel_type: ChannelType::Positional,
+            max_participants: None,
+        }
+        .channel_config();
+        assert_eq!(
+            positional.max_participants,
+            ChannelConfig::default().max_participants
+        );
+        assert!(positional.positional_config.is_some());
+    }
 
     fn dir(listener: (f32, f32, f32), source: (f32, f32, f32), o: Orientation3D) -> Direction {
         Direction::from_listener(
