@@ -14,7 +14,8 @@ sdk/unity/
 │   ├── Audio/                   IOpusCodec abstraction, JitterBuffer, RemoteMixer
 │   └── Unity/AurixVoiceBehaviour.cs  MonoBehaviour: microphone capture + AudioSource playback
 ├── Samples~/Concentus/          IOpusCodec implementation on top of Concentus (pure C# Opus)
-└── DotNet/                      .NET solution: library build, xunit tests, headless two-client E2E demo
+├── Samples~/VoiceQuickstart/    sample scene: connect, roster, mute/PTT, quality bars, stats, reconnect, chat
+└── DotNet/                      .NET solution: library build, xunit tests, Unity compile check, headless two-client E2E demo
 ```
 
 ## Security model (mirrors the server)
@@ -31,6 +32,9 @@ sdk/unity/
    expose rejected traffic). Replays are dropped with a 64-packet window per remote SSRC, identical to the server.
 
 ## Unity quick start
+
+Fastest path: import the **Voice quick start** sample (see `Samples~/VoiceQuickstart/README.md`) and press Play —
+it is a complete, IMGUI-driven client you can copy from. The manual route:
 
 1. Add the package (`Window ▸ Package Manager ▸ + ▸ Add package from disk… ▸ sdk/unity/package.json`).
 2. Provide an Opus codec: import the **Concentus** sample from the package and drop the `Concentus` 2.x DLL
@@ -424,7 +428,7 @@ Statuses go to the requesting session only; disconnecting cancels pending reques
 
 ```bash
 cd sdk/unity/DotNet
-dotnet build                     # library (netstandard2.1) + tests + demo, warnings as errors
+dotnet build                     # library (netstandard2.1) + tests + demo + Unity compile check (Runtime/Unity + Samples~ against UnityEngine stubs), warnings as errors
 dotnet test                      # packet layout, CRC32/UUID vectors, seal/open + tamper detection, server wire vectors, replay window, JSON, jitter buffer
 AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081/ws
 ```

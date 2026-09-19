@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Compile check for the Unity-only code paths (Runtime/Unity/*.cs and the samples), which the plain
+       Aurix.Voice library never sees because they sit behind UNITY_5_3_OR_NEWER. UnityStubs.cs declares
+       just enough of the UnityEngine surface to type-check them; nothing here is shipped. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>Aurix.Voice.UnityCheck</AssemblyName>
+    <RootNamespace>Aurix</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DefineConstants>$(DefineConstants);UNITY_5_3_OR_NEWER;$(UnityExtraDefines)</DefineConstants>
+    <NoWarn>CS0067;CS0649</NoWarn>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="UnityStubs.cs" />
+    <Compile Include="../../Runtime/**/*.cs" />
+    <Compile Include="../../Samples~/**/*.cs" />
+    <PackageReference Include="Concentus" Version="2.2.2" />
+  </ItemGroup>
+</Project>
