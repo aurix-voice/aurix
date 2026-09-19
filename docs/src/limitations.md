@@ -88,4 +88,6 @@ the chapter that explains the boundary.
 
 ## Planned
 
-Ambient/radius visibility. The operator web panel is tracked separately.
+The operator web panel is tracked separately. Client-side noise suppression / echo cancellation
+in the native core, a TCP fallback for native AURX media, and per-receiver stream caps for very
+large channels are the next backlog items.
