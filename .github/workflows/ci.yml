@@ -99,6 +99,12 @@ jobs:
           AURIX_E2E_API_KEY2: ${{ steps.bootstrap.outputs.key2 }}
           AURIX_E2E_MAX_CHANNELS: "4"
         run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture
+      - name: E2E (native client core)
+        env:
+          AURIX_E2E_API: http://127.0.0.1:8080
+          AURIX_E2E_WS: ws://127.0.0.1:8081
+          AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
+        run: cargo test --locked -p aurix-client --test e2e_live -- --nocapture
       - name: E2E (strict action tokens)
         env:
           AURIX__TURN__ENABLED: "false"

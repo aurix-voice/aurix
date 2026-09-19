@@ -1,0 +1,34 @@
+[package]
+name = "aurix-client"
+description = "Aurix native voice client core: AURX v2 media over UDP, WebSocket control plane, Opus, jitter buffer and a stable C ABI for engine integrations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aurix_client"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+aurix-common = { path = "../aurix-common", default-features = false }
+tokio = { version = "1.36", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+opus = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+cbindgen = { version = "0.29", default-features = false }
+reqwest = { workspace = true }
+anyhow = { workspace = true }

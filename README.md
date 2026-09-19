@@ -608,8 +608,9 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 |-----|------|-----------|-------------|
 | Web (TypeScript) | [`sdk/web`](sdk/web) | WebRTC/Opus via the SFU, WS control plane, demo page | two-browser smoke test (ICE/DTLS, RTP both ways, decoded audio) |
 | Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
+| Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
 
-Both SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
+All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
 
 ## Limitations
 
@@ -621,8 +622,8 @@ Both SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys st
   transcripts are not stored server-side.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
   it assumes nodes can reach each other directly on `media.port + 1`/UDP.
-* No Unreal SDK yet; the protocol is documented in `crates/aurix-common/src/protocol.rs`, and the
-  C# `MediaTransport`/`AurxPacket` sources are a compact reference implementation.
+* No Unreal plugin yet; `crates/aurix-client` ships the C ABI it will wrap, and the protocol is
+  documented in `crates/aurix-common/src/protocol.rs`.
 
 ## License
 

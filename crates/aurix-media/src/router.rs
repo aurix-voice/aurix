@@ -131,6 +131,10 @@ impl PacketRouter {
         match packet.header.packet_type {
             PacketType::Audio | PacketType::AudioFec => {
                 let level = packet.take_audio_level();
+                // The uplink sequence is shared with heartbeats and reports (one anti-replay
+                // window per session); receivers' jitter buffers need a gapless audio-only
+                // sequence, so the forwarded stream is renumbered per sender.
+                packet.header.sequence = session.next_sequence();
                 self.route_audio_packet(&packet, &session, level).await
             }
             PacketType::Heartbeat => self.handle_heartbeat(&packet, &session, src_addr).await,

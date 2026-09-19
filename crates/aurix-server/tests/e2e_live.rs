@@ -405,7 +405,9 @@ async fn full_stack_two_players_udp_audio_and_turn() {
     }
     let mut labelled = 0;
     while let Some(p) = bob.recv_udp().await {
-        if p.header.packet_type == PacketType::Audio && p.header.sequence >= 20 {
+        // The downlink carries the server's per-sender audio sequence (0-based), so the
+        // labelled batch is frames 10..20 regardless of the uplink numbering.
+        if p.header.packet_type == PacketType::Audio && p.header.sequence >= 10 {
             assert!(
                 !p.header.has_flag(PacketFlags::Energy),
                 "level metadata must not be forwarded to listeners"

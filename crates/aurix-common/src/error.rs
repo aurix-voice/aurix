@@ -231,6 +231,7 @@ impl AurixError {
 
 pub type Result<T> = std::result::Result<T, AurixError>;
 
+#[cfg(feature = "server")]
 impl From<sqlx::Error> for AurixError {
     fn from(e: sqlx::Error) -> Self {
         AurixError::Database(e.to_string())

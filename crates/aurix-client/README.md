@@ -1,0 +1,109 @@
+# aurix-client — native voice client core and C ABI
+
+`aurix-client` is the reusable client foundation for engines and native applications: the same
+AURX v2 media path and WebSocket control plane the Unity SDK implements in C#, written once in
+Rust and exposed both as a Rust crate and as a stable C ABI (`include/aurix_client.h`). The
+Unreal plugin, mobile wrappers and any other native integration build on top of it.
+
+```
+ your engine / app              aurix-client
+ ┌──────────────────┐   PCM     ┌──────────┐  Opus + level  ┌───────┐  AURX v2 (AES-CTR+HMAC)
+ │ mic callback     ├──────────►│ capture  ├───────────────►│ media ├────────────────────────► UDP
+ │ speaker callback │◄──────────┤ mixer    │◄───────────────┤ (udp) │◄──────────────────────── UDP
+ │ game thread      │ poll      ├──────────┤                └───────┘
+ │  (events, joins) │◄─────────►│ client   ├─── typed ControlMessage ─── WebSocket (wss, bearer)
+ └──────────────────┘           └──────────┘
+```
+
+## What it does
+
+* **Audio** (`audio`): 48 kHz / 20 ms Opus encoder with input gain, VAD and RFC 6464 level
+  metadata, resampling from any device rate, per-sender jitter buffers with PLC, stereo mixer
+  with per-participant gain and directional panning, output volume/mute.
+* **Media** (`media`): AURX v2 over UDP — signed `SessionBind`, AES-256-CTR + HMAC on every
+  packet, per-sender replay windows, heartbeats with RTT, quality reports, mute state.
+* **Control** (`control`): WebSocket with `Authorization: Bearer`, one-time resume tokens,
+  typed `ControlMessage` send/receive, `SessionInitAck` → media key.
+* **Client** (`client`): one voice session on its own small Tokio runtime; automatic reconnect
+  with exponential backoff and session resume (same session id / SSRC / media key / channels),
+  re-join of channels after a fresh session, receiver preferences (mute, volume, block, focus,
+  transmission mode) that survive resume, chat/typing, moderation with action tokens,
+  transcripts, TTS, recording consent, 3D positions, statistics — all behind a synchronous,
+  thread-safe API with a poll-based event queue.
+* **FFI** (`ffi`): 70+ `extern "C"` functions, `#[repr(C)]` structs/enums, opaque handles,
+  explicit ownership, thread-local error strings, JSON escape hatch for every event.
+
+## Rust usage
+
+```rust
+use aurix_client::{Client, ClientConfig, Event};
+use std::time::Duration;
+
+let client = Client::new(ClientConfig::new("wss://voice.example.com/ws", session_jwt))?;
+client.connect()?;
+loop {
+    match client.wait_event(Duration::from_millis(100)) {
+        Some(Event::SessionReady(_)) => { client.join_channel(channel_id, None)?; }
+        Some(Event::ChannelJoined { participants, .. }) => println!("{} others", participants.len()),
+        Some(Event::Disconnected { reason, .. }) => break,
+        _ => {}
+    }
+    // audio thread: client.push_capture_f32(mic_pcm, device_rate, channels);
+    //               client.mix_output_f32(speaker_pcm, 2);
+}
+```
+
+`push_capture_*` and `mix_output_*` are lock-light and meant for the audio callback; everything
+else can be called from the game thread. `poll_event`/`wait_event` return owned events; the
+optional wake hook (`set_wake_hook`) lets an engine signal its main loop instead of polling.
+
+## C ABI
+
+The header is generated with cbindgen and committed; `tests/c_abi.rs` fails if it drifts:
+
+```bash
+cargo run -p aurix-client --example gen_header     # regenerate include/aurix_client.h
+cargo build -p aurix-client --release              # libaurix_client.{so,dylib,dll,a}
+cc -std=c99 -Icrates/aurix-client/include crates/aurix-client/examples/c/voice_loop.c \
+   -Ltarget/release -laurix_client -lm -o voice_loop
+```
+
+`examples/c/voice_loop.c` is a complete integration: create → connect → wait for
+`AURIX_EVENT_SESSION_READY` → join → push a tone / mix output → print statistics → disconnect.
+
+### Ownership and threading rules
+
+* `aurix_client_create` returns a handle owned by the caller; `aurix_client_destroy` disconnects
+  and frees it. Never destroy from inside the wake callback.
+* `aurix_client_poll_event` / `aurix_client_wait_event` return events owned by the caller;
+  release each with `aurix_event_free`. Pointers returned by `aurix_event_*` accessors stay valid
+  until that free.
+* Input strings and arrays are borrowed for the duration of the call and copied when retained
+  (`token`, `ws_url`, join tokens, chat text).
+* `aurix_last_error` is thread-local and valid until the next failing call on the same thread.
+* The wake callback runs on an internal thread; do nothing but signal there. Events themselves
+  are consumed from your own thread.
+* Audio functions are safe to call from a real-time audio thread concurrently with control calls
+  from the game thread.
+* `aurix_client_disconnect` blocks for up to ~3 s to let the server acknowledge; `connect` is
+  asynchronous and reports through `AURIX_EVENT_STATE_CHANGED` / `SESSION_READY` / `DISCONNECTED`.
+* Reconnect: with `auto_reconnect` the client emits `RECOVERING` (per attempt), then either
+  `RECOVERED` (with `resumed` = same session) or `FAILED_TO_RECOVER`; when the server issued a
+  fresh session, channels are re-joined automatically and `REJOIN_FAILED` names the ones that
+  did not come back.
+
+Rust enums never cross the ABI as-is; every event, mode and role has a `#[repr(C)]` mirror, and
+`aurix_event_json` exposes the full serialised event for fields that have no dedicated accessor.
+
+## Tests
+
+```bash
+cargo test -p aurix-client                 # unit tests (audio, media with a fake server, ABI)
+cargo test -p aurix-client --test c_abi    # header is up to date, C sample compiles/links/runs
+AURIX_E2E_API_KEY=aurx_... cargo test -p aurix-client --test e2e_live -- --nocapture
+```
+
+The live test drives two native clients against a running node: session + media bind, roster,
+encrypted Opus tone Alice→Bob (RMS and gapless sequence asserted), speaking/energy events, chat
+with request correlation, WebSocket drop through a TCP proxy → resume with the same session,
+audio continues, leave and disconnect.
