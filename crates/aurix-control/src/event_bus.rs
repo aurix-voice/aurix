@@ -36,6 +36,18 @@ pub enum ServerEvent {
         channel_id: ChannelId,
         timestamp: DateTime<Utc>,
     },
+    /// First participant joined an otherwise empty channel.
+    ChannelActivated {
+        app_id: AppId,
+        channel_id: ChannelId,
+        timestamp: DateTime<Utc>,
+    },
+    /// Last participant left the channel.
+    ChannelDeactivated {
+        app_id: AppId,
+        channel_id: ChannelId,
+        timestamp: DateTime<Utc>,
+    },
     UserMuted {
         app_id: AppId,
         channel_id: ChannelId,
@@ -80,6 +92,9 @@ pub enum ServerEvent {
         healthy: bool,
         timestamp: DateTime<Utc>,
     },
+    /// A tenant's webhook subscriptions changed; every node drops its cached copy. Internal,
+    /// never exported.
+    WebhooksChanged { app_id: AppId },
     ModerationEvent {
         app_id: AppId,
         event_type: String,
@@ -157,6 +172,8 @@ impl ServerEvent {
             | Self::ParticipantLeft { app_id, .. }
             | Self::ChannelCreated { app_id, .. }
             | Self::ChannelDestroyed { app_id, .. }
+            | Self::ChannelActivated { app_id, .. }
+            | Self::ChannelDeactivated { app_id, .. }
             | Self::UserMuted { app_id, .. }
             | Self::UserUnmuted { app_id, .. }
             | Self::UserBanned { app_id, .. }
@@ -171,7 +188,7 @@ impl ServerEvent {
             | Self::ParticipantTyping { app_id, .. }
             | Self::ParticipantSpeaking { app_id, .. }
             | Self::ChannelEnergy { app_id, .. } => Some(*app_id),
-            Self::NodeHealthChanged { .. } => None,
+            Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => None,
         }
     }
 
@@ -183,6 +200,83 @@ impl ServerEvent {
                 | Self::ParticipantSpeaking { .. }
                 | Self::ChannelEnergy { .. }
         )
+    }
+
+    /// Public dotted name used by webhooks and the SSE stream (`participant.joined`, …).
+    /// Node-scoped events have no public name and are never exported.
+    pub fn public_type(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::ParticipantJoined { .. } => "participant.joined",
+            Self::ParticipantLeft { .. } => "participant.left",
+            Self::ChannelCreated { .. } => "channel.created",
+            Self::ChannelDestroyed { .. } => "channel.destroyed",
+            Self::ChannelActivated { .. } => "channel.activated",
+            Self::ChannelDeactivated { .. } => "channel.deactivated",
+            Self::UserMuted { .. } => "participant.muted",
+            Self::UserUnmuted { .. } => "participant.unmuted",
+            Self::UserBanned { .. } => "user.banned",
+            Self::UserKicked { .. } => "participant.kicked",
+            Self::QualityAlert { .. } => "quality.alert",
+            Self::ModerationEvent { .. } => "moderation.event",
+            Self::RecordingStarted { .. } => "recording.started",
+            Self::RecordingStopped { .. } => "recording.stopped",
+            Self::RecordingConsentRequired { .. } => "recording.consent_required",
+            Self::UserBlockChanged { .. } => "user.block_changed",
+            Self::ChatMessage { .. } => "chat.message",
+            Self::ParticipantTyping { .. } => "participant.typing",
+            Self::ParticipantSpeaking { .. } => "participant.speaking",
+            Self::ChannelEnergy { .. } => "channel.energy",
+            Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => return None,
+        })
+    }
+
+    /// Every exportable event type, in the order shown by `GET /v1/webhooks/events`.
+    pub const PUBLIC_TYPES: &'static [&'static str] = &[
+        "channel.created",
+        "channel.destroyed",
+        "channel.activated",
+        "channel.deactivated",
+        "participant.joined",
+        "participant.left",
+        "participant.muted",
+        "participant.unmuted",
+        "participant.kicked",
+        "user.banned",
+        "user.block_changed",
+        "moderation.event",
+        "recording.started",
+        "recording.stopped",
+        "recording.consent_required",
+        "quality.alert",
+        "chat.message",
+        "participant.typing",
+        "participant.speaking",
+        "channel.energy",
+    ];
+
+    /// Types a subscription may name (the real-time noise is SSE-only).
+    pub fn webhook_type_allowed(ty: &str) -> bool {
+        ty == "*"
+            || Self::PUBLIC_TYPES.contains(&ty)
+                && !matches!(
+                    ty,
+                    "participant.typing" | "participant.speaking" | "channel.energy"
+                )
+    }
+
+    /// Tenant-facing JSON body (`payload` of the tagged representation, without `app_id`
+    /// which travels in the envelope).
+    pub fn public_data(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        match v.get_mut("payload").map(serde_json::Value::take) {
+            Some(mut payload) => {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.remove("app_id");
+                }
+                payload
+            }
+            None => serde_json::Value::Null,
+        }
     }
 }
 

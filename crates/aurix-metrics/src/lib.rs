@@ -167,6 +167,35 @@ pub static RATE_LIMIT_HITS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_rate_limit_hits_total", "Total rate limit hits").unwrap()
 });
 
+// ── Webhook / event stream Metrics ──
+
+/// `result` is `delivered`, `retry` (attempt failed, rescheduled), `failed` (gave up),
+/// `dropped` (queue full or bus lag).
+pub static WEBHOOK_DELIVERIES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_webhook_deliveries_total",
+        "Webhook delivery attempts by outcome",
+        &["result"]
+    )
+    .unwrap()
+});
+
+pub static WEBHOOK_PENDING: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_webhook_deliveries_leased",
+        "Webhook deliveries currently in flight on this node"
+    )
+    .unwrap()
+});
+
+pub static SSE_CLIENTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_event_stream_clients",
+        "Open GET /v1/events server-sent-event streams"
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
     // Touch all lazy statics to ensure registration
     let _ = &*ACTIVE_SESSIONS;
@@ -179,6 +208,9 @@ pub fn gather_metrics() -> String {
     let _ = &*BYTES_SENT;
     let _ = &*NODE_CPU_USAGE;
     let _ = &*NODE_MEMORY_USAGE;
+    let _ = &*WEBHOOK_DELIVERIES;
+    let _ = &*WEBHOOK_PENDING;
+    let _ = &*SSE_CLIENTS;
 
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();

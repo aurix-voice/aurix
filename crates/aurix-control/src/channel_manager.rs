@@ -148,7 +148,8 @@ impl ChannelManager {
         Ok(())
     }
 
-    pub async fn update_participant_count(&self, channel_id: ChannelId, delta: i32) -> Result<()> {
+    /// Returns the channel's participant count after the change.
+    pub async fn update_participant_count(&self, channel_id: ChannelId, delta: i32) -> Result<i32> {
         aurix_db::queries::update_channel_participant_count(&self.pool, channel_id.0, delta)
             .await
             .map_err(|e| AurixError::Database(format!("Failed to update count: {e}")))

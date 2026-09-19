@@ -17,6 +17,8 @@ pub struct AurixConfig {
     pub rate_limiting: RateLimitConfig,
     #[serde(default)]
     pub chat: ChatConfig,
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
 }
 
 impl AurixConfig {
@@ -33,7 +35,8 @@ impl AurixConfig {
                 .list_separator(",")
                 .with_list_parse_key("server.cors_origins")
                 .with_list_parse_key("server.trusted_proxies")
-                .with_list_parse_key("media.cascade_peers"),
+                .with_list_parse_key("media.cascade_peers")
+                .with_list_parse_key("webhooks.retry_delays_secs"),
         );
         let cfg = builder.build()?;
         let mut config: AurixConfig = cfg.try_deserialize()?;
@@ -114,6 +117,23 @@ impl AurixConfig {
                 if !url.starts_with("http://") && !url.starts_with("https://") {
                     anyhow::bail!("chat.filter_webhook must be an http(s) URL");
                 }
+            }
+        }
+        if self.webhooks.enabled {
+            if self.webhooks.timeout_ms < 100 || self.webhooks.timeout_ms > 60_000 {
+                anyhow::bail!("webhooks.timeout_ms must be within 100..=60000");
+            }
+            if self.webhooks.retry_delays_secs.len() > 32 {
+                anyhow::bail!("webhooks.retry_delays_secs may list at most 32 delays");
+            }
+            if self.webhooks.poll_interval_ms < 100 {
+                anyhow::bail!("webhooks.poll_interval_ms must be >= 100");
+            }
+            if self.webhooks.batch_size == 0 || self.webhooks.concurrency == 0 {
+                anyhow::bail!("webhooks.batch_size and webhooks.concurrency must be > 0");
+            }
+            if self.webhooks.max_subscriptions_per_app == 0 {
+                anyhow::bail!("webhooks.max_subscriptions_per_app must be > 0");
             }
         }
         if self.turn.min_port > self.turn.max_port {
@@ -713,6 +733,109 @@ impl Default for ChatConfig {
             persist: false,
             retention_days: default_chat_retention_days(),
         }
+    }
+}
+
+/// Tenant webhooks (`/v1/webhooks`) and the game-server event stream (`GET /v1/events`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebhooksConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-request timeout for one delivery attempt (connect + response headers).
+    #[serde(default = "default_webhook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Backoff between attempts; an empty list means a single attempt. The first delivery is
+    /// immediate, then `retry_delays_secs[n-1]` seconds before attempt `n+1`.
+    #[serde(default = "default_webhook_retry_delays")]
+    pub retry_delays_secs: Vec<u64>,
+    /// How often each node polls the queue for due deliveries.
+    #[serde(default = "default_webhook_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Deliveries leased per poll and delivered concurrently per node.
+    #[serde(default = "default_webhook_batch_size")]
+    pub batch_size: u32,
+    #[serde(default = "default_webhook_concurrency")]
+    pub concurrency: usize,
+    /// Queue depth per subscription; when exceeded new events are dropped (the endpoint is
+    /// considered dead) and a `webhook.resync` is the way to catch up.
+    #[serde(default = "default_webhook_max_pending")]
+    pub max_pending_per_subscription: u32,
+    /// Hours to keep delivered/failed rows for `GET /v1/webhooks/:id/deliveries` (`0` = forever).
+    #[serde(default = "default_webhook_retention_hours")]
+    pub retention_hours: u32,
+    #[serde(default = "default_webhook_max_subscriptions")]
+    pub max_subscriptions_per_app: u32,
+    /// Permit endpoints on loopback/private/link-local addresses. Defaults to `true` outside
+    /// production and `false` in production (SSRF guard).
+    #[serde(default)]
+    pub allow_private_urls: Option<bool>,
+    /// Require `https://` endpoints. Defaults to the production flag as well.
+    #[serde(default)]
+    pub require_https: Option<bool>,
+    /// Interval of SSE keep-alive comments on `GET /v1/events`.
+    #[serde(default = "default_webhook_sse_keepalive_secs")]
+    pub sse_keepalive_secs: u64,
+}
+
+fn default_webhook_timeout_ms() -> u64 {
+    5000
+}
+fn default_webhook_retry_delays() -> Vec<u64> {
+    vec![5, 30, 120, 600, 1800, 3600, 7200]
+}
+fn default_webhook_poll_interval_ms() -> u64 {
+    1000
+}
+fn default_webhook_batch_size() -> u32 {
+    100
+}
+fn default_webhook_concurrency() -> usize {
+    16
+}
+fn default_webhook_max_pending() -> u32 {
+    10_000
+}
+fn default_webhook_retention_hours() -> u32 {
+    72
+}
+fn default_webhook_max_subscriptions() -> u32 {
+    20
+}
+fn default_webhook_sse_keepalive_secs() -> u64 {
+    15
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_ms: default_webhook_timeout_ms(),
+            retry_delays_secs: default_webhook_retry_delays(),
+            poll_interval_ms: default_webhook_poll_interval_ms(),
+            batch_size: default_webhook_batch_size(),
+            concurrency: default_webhook_concurrency(),
+            max_pending_per_subscription: default_webhook_max_pending(),
+            retention_hours: default_webhook_retention_hours(),
+            max_subscriptions_per_app: default_webhook_max_subscriptions(),
+            allow_private_urls: None,
+            require_https: None,
+            sse_keepalive_secs: default_webhook_sse_keepalive_secs(),
+        }
+    }
+}
+
+impl WebhooksConfig {
+    /// Total attempts per delivery: the immediate one plus one per configured delay.
+    pub fn max_attempts(&self) -> u32 {
+        self.retry_delays_secs.len() as u32 + 1
+    }
+
+    pub fn private_urls_allowed(&self, production: bool) -> bool {
+        self.allow_private_urls.unwrap_or(!production)
+    }
+
+    pub fn https_required(&self, production: bool) -> bool {
+        self.require_https.unwrap_or(production)
     }
 }
 

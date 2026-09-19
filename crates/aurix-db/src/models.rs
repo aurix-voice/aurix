@@ -145,6 +145,65 @@ pub struct ChatMessageRow {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WebhookSubscriptionRow {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub url: String,
+    /// HMAC-SHA256 signing key; never serialized into API responses (see `WebhookView`).
+    #[serde(skip_serializing)]
+    pub secret: String,
+    pub events: Vec<String>,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub consecutive_failures: i32,
+    pub last_delivery_at: Option<DateTime<Utc>>,
+    pub last_status: Option<i16>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WebhookSubscriptionRow {
+    /// `true` when the subscription wants `event_type` (`"*"` matches everything).
+    pub fn wants(&self, event_type: &str) -> bool {
+        self.events.iter().any(|e| e == "*" || e == event_type)
+    }
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WebhookDeliveryRow {
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub app_id: Uuid,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempts: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub leased_until: Option<DateTime<Utc>>,
+    pub last_status: Option<i16>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// One open channel membership joined with its channel type and the member's display name.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ActiveMemberRow {
+    pub channel_id: Uuid,
+    pub channel_type: String,
+    pub user_id: Uuid,
+    pub display_name: String,
+    pub session_id: Uuid,
+    pub role: String,
+    pub is_muted: bool,
+    pub is_server_muted: bool,
+    pub ssrc: i64,
+    pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MediaNodeRow {
     pub id: Uuid,
     pub region: String,

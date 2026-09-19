@@ -3073,3 +3073,738 @@ async fn echo_channel_loops_audio_back_to_the_sender_only() {
             .await;
     }
 }
+
+// ── Webhooks + SSE ──
+
+struct Hook {
+    delivery_id: String,
+    event: String,
+    webhook_id: String,
+    attempt: u32,
+    signature: String,
+    body: Vec<u8>,
+}
+
+/// Minimal webhook receiver: records every POST and answers 500 to the first delivery of
+/// `fail_once` (an event type), 200 to everything else.
+async fn start_receiver(fail_once: Option<&'static str>) -> (String, HookRx) {
+    use axum::extract::State as AxState;
+    use axum::http::{HeaderMap, StatusCode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Hook>();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(
+            move |AxState((tx, hits)): AxState<(
+                tokio::sync::mpsc::UnboundedSender<Hook>,
+                Arc<AtomicUsize>,
+            )>,
+                  headers: HeaderMap,
+                  body: axum::body::Bytes| async move {
+                let h = |n: &str| {
+                    headers
+                        .get(n)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let event = h("x-aurix-event");
+                let fail = fail_once == Some(event.as_str())
+                    && hits
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok();
+                let _ = tx.send(Hook {
+                    delivery_id: h("x-aurix-delivery-id"),
+                    event,
+                    webhook_id: h("x-aurix-webhook-id"),
+                    attempt: h("x-aurix-attempt").parse().unwrap_or(0),
+                    signature: h("x-aurix-signature"),
+                    body: body.to_vec(),
+                });
+                if fail {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app.with_state((tx, hits)))
+            .await
+            .unwrap();
+    });
+    (
+        url,
+        HookRx {
+            rx,
+            pending: Vec::new(),
+        },
+    )
+}
+
+fn verify(secret: &str, h: &Hook) -> bool {
+    aurix_control::webhooks::verify_signature(
+        secret,
+        &h.signature,
+        &h.body,
+        chrono::Utc::now(),
+        Duration::from_secs(300),
+    )
+}
+
+/// Next `event` hook; other events that arrive meanwhile are kept in `rx.pending` so a
+/// concurrent delivery order does not lose them.
+async fn next_hook(rx: &mut HookRx, event: &str, wait: Duration) -> Hook {
+    if let Some(i) = rx.pending.iter().position(|h| h.event == event) {
+        return rx.pending.remove(i);
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let h = tokio::time::timeout_at(deadline, rx.rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no `{event}` webhook within {wait:?}"))
+            .expect("receiver closed");
+        if h.event == event {
+            return h;
+        }
+        rx.pending.push(h);
+    }
+}
+
+struct HookRx {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Hook>,
+    pending: Vec<Hook>,
+}
+
+impl HookRx {
+    /// `true` when nothing (buffered or fresh) arrives within `wait`.
+    async fn silent(&mut self, wait: Duration) -> bool {
+        self.pending.is_empty() && tokio::time::timeout(wait, self.rx.recv()).await.is_err()
+    }
+}
+
+/// Reads SSE frames (`event:` + `data:` lines) from a streaming response until `pred` matches
+/// an event name/JSON payload or `wait` elapses.
+struct SseClient {
+    resp: reqwest::Response,
+    buf: String,
+}
+
+impl SseClient {
+    async fn open(env: &Env, api_key: &str, types: Option<&str>) -> reqwest::Result<Self> {
+        let mut url = format!("{}/v1/events", env.api);
+        if let Some(t) = types {
+            url.push_str(&format!("?types={t}"));
+        }
+        let resp = reqwest::Client::new()
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("accept", "text/event-stream")
+            .send()
+            .await?;
+        Ok(Self {
+            resp,
+            buf: String::new(),
+        })
+    }
+
+    /// Next `(event, data)` frame; comments (keepalives) are skipped.
+    async fn next(&mut self, wait: Duration) -> Option<(String, serde_json::Value)> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(pos) = self.buf.find("\n\n") {
+                let frame = self.buf[..pos].to_string();
+                self.buf.drain(..pos + 2);
+                let mut event = String::new();
+                let mut data = String::new();
+                for line in frame.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        event = v.trim().to_string();
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim());
+                    }
+                }
+                if event.is_empty() {
+                    continue; // comment-only frame (keepalive)
+                }
+                let json = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+                return Some((event, json));
+            }
+            let chunk = tokio::time::timeout_at(deadline, self.resp.chunk())
+                .await
+                .ok()?
+                .ok()??;
+            self.buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    async fn expect(&mut self, event: &str, wait: Duration) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (ev, data) = self
+                .next(remaining)
+                .await
+                .unwrap_or_else(|| panic!("no `{event}` SSE frame within {wait:?}"));
+            if ev == event {
+                return data;
+            }
+        }
+    }
+}
+
+/// Webhook subscriptions get signed, retried, tenant-scoped deliveries for channel/participant
+/// lifecycle events (also when the player sits on another node), `webhook.test` / `webhook.resync`
+/// on demand, and the same events flow over the `GET /v1/events` SSE stream.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn webhooks_and_sse_deliver_signed_tenant_scoped_events() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let api = |path: &str| format!("{}{path}", env.api);
+
+    // Leftovers of an aborted run would eat the per-app subscription quota.
+    let existing: serde_json::Value = http
+        .get(api("/v1/webhooks"))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for w in existing["webhooks"].as_array().unwrap() {
+        if w["description"] == "e2e" {
+            http.delete(api(&format!("/v1/webhooks/{}", w["id"].as_str().unwrap())))
+                .header("x-api-key", &env.api_key)
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+
+    // Event catalogue: public names only, noise flagged.
+    let catalogue: serde_json::Value = http
+        .get(api("/v1/webhooks/events"))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = catalogue["webhook"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    let stream: Vec<&str> = catalogue["stream"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    for n in [
+        "participant.joined",
+        "participant.left",
+        "channel.activated",
+        "channel.deactivated",
+        "recording.started",
+        "moderation.event",
+    ] {
+        assert!(names.contains(&n), "catalogue lacks {n}: {names:?}");
+    }
+    assert!(
+        !names.contains(&"participant.speaking"),
+        "noise is not webhook-able"
+    );
+    assert!(
+        stream.contains(&"participant.speaking"),
+        "but it can be streamed on request"
+    );
+    assert!(!stream.iter().any(|n| n.starts_with("node.")));
+
+    // Validation: bad URL, unknown event, noisy event.
+    for (body, why) in [
+        (
+            serde_json::json!({"url": "ftp://example.com/x", "events": ["*"]}),
+            "scheme",
+        ),
+        (
+            serde_json::json!({"url": "http://127.0.0.1:9/x", "events": ["nope.nope"]}),
+            "unknown event",
+        ),
+        (
+            serde_json::json!({"url": "http://127.0.0.1:9/x", "events": ["participant.speaking"]}),
+            "noisy event",
+        ),
+        (
+            serde_json::json!({"url": "http://127.0.0.1:9/x", "events": []}),
+            "empty events",
+        ),
+    ] {
+        let r = http
+            .post(api("/v1/webhooks"))
+            .header("x-api-key", &env.api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{why} must be rejected");
+    }
+
+    // Subscription 1: everything; the first `channel.activated` delivery fails once -> retry.
+    let (url1, mut rx1) = start_receiver(Some("channel.activated")).await;
+    let created: serde_json::Value = http
+        .post(api("/v1/webhooks"))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"url": url1, "events": ["*"], "description": "e2e"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hook1 = created["id"].as_str().unwrap().to_string();
+    let secret1 = created["secret"].as_str().unwrap().to_string();
+    assert!(secret1.starts_with("whsec_"), "secret shown once on create");
+
+    // The secret is never returned again.
+    let fetched: serde_json::Value = http
+        .get(api(&format!("/v1/webhooks/{hook1}")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        fetched.get("secret").is_none(),
+        "GET must not leak the secret: {fetched}"
+    );
+    assert_eq!(fetched["events"], serde_json::json!(["*"]));
+
+    // Subscription 2: only participant.left.
+    let (url2, mut rx2) = start_receiver(None).await;
+    let created2: serde_json::Value = http
+        .post(api("/v1/webhooks"))
+        .header("x-api-key", &env.api_key)
+        .json(
+            &serde_json::json!({"url": url2, "events": ["participant.left"], "description": "e2e"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hook2 = created2["id"].as_str().unwrap().to_string();
+    let secret2 = created2["secret"].as_str().unwrap().to_string();
+
+    // SSE consumers: default filter (no noise) and an explicit one.
+    let mut sse = SseClient::open(&env, &env.api_key, None).await.unwrap();
+    assert_eq!(sse.resp.status(), 200);
+    assert!(sse.resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let hello = sse.expect("stream.open", Duration::from_secs(5)).await;
+    assert_eq!(hello["filter"], serde_json::Value::Null);
+    let mut sse_left = SseClient::open(&env, &env.api_key, Some("participant.left"))
+        .await
+        .unwrap();
+    sse_left.expect("stream.open", Duration::from_secs(5)).await;
+    let bad = SseClient::open(&env, &env.api_key, Some("nope.nope"))
+        .await
+        .unwrap();
+    assert_eq!(bad.resp.status(), 400, "unknown SSE filter type");
+
+    // A player joins (on node 2 when available: events must cross the cluster).
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let player_env = env2.as_ref().unwrap_or(&env);
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "wh:alice", "Alice", channel_id).await;
+    let mut alice = connect(player_env, "alice", tok_a).await;
+    join(&mut alice, channel_id).await;
+
+    // Webhook 1 fails the first delivery and receives the retry with attempt=2 and the same
+    // delivery id; the signature verifies against the secret shown at creation.
+    let first = next_hook(&mut rx1, "channel.activated", Duration::from_secs(10)).await;
+    assert_eq!(first.attempt, 1);
+    assert_eq!(first.webhook_id, hook1);
+    assert!(
+        verify(&secret1, &first),
+        "signature must verify: {}",
+        first.signature
+    );
+    assert!(!verify(&secret2, &first), "another secret must not verify");
+    let body: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(body["type"], "channel.activated");
+    assert_eq!(body["data"]["channel_id"], channel_id.to_string());
+    assert!(
+        body["data"].get("app_id").is_none(),
+        "tenant id lives in the envelope only"
+    );
+    assert!(body["app_id"].is_string());
+    let event_id = body["id"].as_str().unwrap().to_string();
+
+    let retry = next_hook(&mut rx1, "channel.activated", Duration::from_secs(15)).await;
+    assert_eq!(
+        retry.delivery_id, first.delivery_id,
+        "retry keeps the delivery id"
+    );
+    assert_eq!(retry.attempt, 2);
+    let retry_body: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
+    assert_eq!(
+        retry_body["id"], event_id,
+        "event id is stable across attempts"
+    );
+
+    let joined = next_hook(&mut rx1, "participant.joined", Duration::from_secs(15)).await;
+    let joined_body: serde_json::Value = serde_json::from_slice(&joined.body).unwrap();
+    assert_eq!(joined_body["data"]["user_id"], uid_a);
+    assert_eq!(joined_body["data"]["channel_id"], channel_id.to_string());
+
+    // SSE saw the same events (same ids) live.
+    let sse_act = sse
+        .expect("channel.activated", Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        sse_act["id"], event_id,
+        "SSE and webhook share the event id"
+    );
+    let sse_join = sse
+        .expect("participant.joined", Duration::from_secs(5))
+        .await;
+    assert_eq!(sse_join["data"]["user_id"], uid_a);
+
+    // Webhook 2 is filtered: nothing yet.
+    assert!(
+        rx2.silent(Duration::from_secs(2)).await,
+        "participant.left-only webhook must not get join events"
+    );
+
+    // Snapshot lists the live channel with Alice.
+    let snap: serde_json::Value = http
+        .get(api("/v1/events/snapshot"))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ch = snap["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["channel_id"] == channel_id.to_string())
+        .unwrap_or_else(|| panic!("snapshot lacks the channel: {snap}"));
+    assert_eq!(ch["participants"][0]["user_id"], uid_a);
+
+    // Leave: participant.left everywhere, channel.deactivated, and webhook 2 finally fires.
+    alice
+        .send(&ControlMessage::ChannelLeave { channel_id })
+        .await;
+    let left2 = next_hook(&mut rx2, "participant.left", Duration::from_secs(10)).await;
+    assert_eq!(left2.webhook_id, hook2);
+    assert!(verify(&secret2, &left2));
+    next_hook(&mut rx1, "participant.left", Duration::from_secs(10)).await;
+    next_hook(&mut rx1, "channel.deactivated", Duration::from_secs(10)).await;
+    sse.expect("participant.left", Duration::from_secs(5)).await;
+    sse.expect("channel.deactivated", Duration::from_secs(5))
+        .await;
+    let (ev, _) = sse_left.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        ev, "participant.left",
+        "explicit filter passes only its types"
+    );
+
+    // Delivery log: the retried delivery shows 2 attempts and `delivered`.
+    let deliveries: serde_json::Value = http
+        .get(api(&format!("/v1/webhooks/{hook1}/deliveries")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let d = deliveries["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == first.delivery_id)
+        .unwrap_or_else(|| panic!("delivery log lacks {}: {deliveries}", first.delivery_id));
+    assert_eq!(d["status"], "delivered");
+    assert_eq!(d["attempts"], 2);
+    assert_eq!(d["last_status"], 200);
+    let sub: serde_json::Value = http
+        .get(api(&format!("/v1/webhooks/{hook1}")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub["consecutive_failures"], 0);
+    assert_eq!(sub["last_status"], 200);
+
+    // Manual redelivery re-sends the finished delivery with a fresh attempt counter.
+    http.post(api(&format!(
+        "/v1/webhooks/{hook1}/deliveries/{}/retry",
+        first.delivery_id
+    )))
+    .header("x-api-key", &env.api_key)
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let again = next_hook(&mut rx1, "channel.activated", Duration::from_secs(10)).await;
+    assert_eq!(again.delivery_id, first.delivery_id);
+    assert_eq!(again.attempt, 1);
+
+    // Test + resync on demand.
+    http.post(api(&format!("/v1/webhooks/{hook2}/test")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let t = next_hook(&mut rx2, "webhook.test", Duration::from_secs(10)).await;
+    let t_body: serde_json::Value = serde_json::from_slice(&t.body).unwrap();
+    assert_eq!(t_body["data"]["webhook_id"], hook2);
+    http.post(api(&format!("/v1/webhooks/{hook2}/resync")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let r = next_hook(&mut rx2, "webhook.resync", Duration::from_secs(10)).await;
+    let r_body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert!(r_body["data"]["channels"].is_array());
+
+    // Rotate: old secret stops verifying, the new one is shown once.
+    let rotated: serde_json::Value = http
+        .post(api(&format!("/v1/webhooks/{hook2}/rotate-secret")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let secret2b = rotated["secret"].as_str().unwrap().to_string();
+    assert_ne!(secret2b, secret2);
+    http.post(api(&format!("/v1/webhooks/{hook2}/test")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let t2 = next_hook(&mut rx2, "webhook.test", Duration::from_secs(10)).await;
+    assert!(verify(&secret2b, &t2));
+    assert!(!verify(&secret2, &t2));
+
+    // Disable: lifecycle events stop, PATCH is honoured.
+    let patched: serde_json::Value = http
+        .patch(api(&format!("/v1/webhooks/{hook2}")))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(patched["enabled"], false);
+
+    // Tenant isolation: another app cannot see or touch these webhooks, and its SSE stream
+    // never carries this app's events.
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let list2: serde_json::Value = http
+            .get(api("/v1/webhooks"))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !list2["webhooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["id"] == hook1 || w["id"] == hook2),
+            "foreign tenant lists our webhooks: {list2}"
+        );
+        for (method, path) in [
+            (reqwest::Method::GET, format!("/v1/webhooks/{hook1}")),
+            (reqwest::Method::DELETE, format!("/v1/webhooks/{hook1}")),
+            (reqwest::Method::POST, format!("/v1/webhooks/{hook1}/test")),
+            (
+                reqwest::Method::POST,
+                format!("/v1/webhooks/{hook1}/rotate-secret"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/v1/webhooks/{hook1}/deliveries"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/v1/webhooks/{hook1}/deliveries/{}", first.delivery_id),
+            ),
+        ] {
+            let r = http
+                .request(method.clone(), api(&path))
+                .header("x-api-key", &api_key2)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                404,
+                "{method} {path} must be hidden from another tenant"
+            );
+        }
+        let mut sse2 = SseClient::open(&env, &api_key2, None).await.unwrap();
+        sse2.expect("stream.open", Duration::from_secs(5)).await;
+        let (tok_b, _) = issue_token(&env, &http, "wh:bob", "Bob", channel_id).await;
+        let mut bob = connect(&env, "bob", tok_b).await;
+        join(&mut bob, channel_id).await;
+        sse.expect("participant.joined", Duration::from_secs(5))
+            .await;
+        assert!(
+            sse2.next(Duration::from_secs(2)).await.is_none(),
+            "foreign tenant's SSE stream must stay silent"
+        );
+        bob.send(&ControlMessage::ChannelLeave { channel_id }).await;
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    // No key / wrong permission: nothing about webhooks or the stream is reachable.
+    for path in [
+        "/v1/webhooks",
+        "/v1/webhooks/events",
+        "/v1/events",
+        "/v1/events/snapshot",
+    ] {
+        let r = http.get(api(path)).send().await.unwrap();
+        assert_eq!(r.status(), 401, "{path} without a key");
+        let r = http
+            .get(api(path))
+            .header("x-api-key", "ak_not_a_real_key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "{path} with a bogus key");
+    }
+
+    // Closing an SSE client is noticed by the server (gauge drops back, keepalives stop).
+    if let Ok(metrics) = std::env::var("AURIX_E2E_METRICS") {
+        let gauge = |body: &str| -> i64 {
+            body.lines()
+                .find(|l| l.starts_with("aurix_event_stream_clients "))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v as i64)
+                .unwrap_or_else(|| panic!("gauge missing in {body}"))
+        };
+        let open = gauge(
+            &http
+                .get(&metrics)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        );
+        assert!(open >= 2, "our streams are counted: {open}");
+        drop(sse);
+        drop(sse_left);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let now = gauge(
+                &http
+                    .get(&metrics)
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap(),
+            );
+            if now <= open - 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SSE gauge stuck at {now} (was {open}) after clients disconnected"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    } else {
+        eprintln!("AURIX_E2E_METRICS not set; skipping SSE disconnect gauge check");
+    }
+
+    // Cleanup; deleting a webhook drops its delivery log.
+    for id in [&hook1, &hook2] {
+        let r = http
+            .delete(api(&format!("/v1/webhooks/{id}")))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+    }
+    let r = http
+        .get(api(&format!("/v1/webhooks/{hook1}/deliveries")))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}

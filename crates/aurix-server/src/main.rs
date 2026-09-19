@@ -63,12 +63,17 @@ async fn main() -> anyhow::Result<()> {
     let control = Arc::new(ControlPlane::new(config.clone(), pool.clone(), node_id).await?);
     info!("Control plane initialized");
 
+    let mut deactivated_on_recovery = Vec::new();
     match control.sessions.recover_node_state(node_id).await {
-        Ok((s, m)) if s + m > 0 => info!(
-            "Recovered {} stale sessions and {} memberships from a previous run",
-            s, m
-        ),
-        Ok(_) => {}
+        Ok(r) => {
+            if r.sessions + r.memberships > 0 {
+                info!(
+                    "Recovered {} stale sessions and {} memberships from a previous run",
+                    r.sessions, r.memberships
+                );
+            }
+            deactivated_on_recovery = r.deactivated_channels;
+        }
         Err(e) => error!("Stale session recovery failed: {e}"),
     }
 
@@ -166,6 +171,28 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     let mut tasks = tokio::task::JoinSet::new();
+
+    for handle in control.webhooks.start(shutdown.clone()) {
+        tasks.spawn(async move {
+            let _ = handle.await;
+        });
+    }
+    if control.webhooks.enabled() {
+        info!(
+            "Webhooks enabled (retry schedule {:?}s, {} workers)",
+            config.webhooks.retry_delays_secs, config.webhooks.concurrency
+        );
+    }
+    // Channels emptied by the crash cleanup above: tell subscribers now that the queue is live.
+    for (app_id, channel_id) in deactivated_on_recovery {
+        control
+            .events
+            .publish(aurix_control::ServerEvent::ChannelDeactivated {
+                app_id,
+                channel_id,
+                timestamp: chrono::Utc::now(),
+            });
+    }
 
     if config.turn.enabled {
         let turn_server = Arc::new(TurnServer::new(&config.turn));

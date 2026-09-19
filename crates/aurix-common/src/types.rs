@@ -739,6 +739,10 @@ pub enum AuditAction {
     AdminCreated,
     AppCreated,
     AppDeleted,
+    WebhookCreated,
+    WebhookUpdated,
+    WebhookDeleted,
+    WebhookSecretRotated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

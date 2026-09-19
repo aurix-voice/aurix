@@ -839,7 +839,7 @@ impl WsState {
         {
             warn!("membership close failed: {e}");
         }
-        let _ = self
+        let count = self
             .control
             .channels
             .update_participant_count(channel_id, -1)
@@ -859,6 +859,15 @@ impl WsState {
             reason: reason.into(),
             timestamp: chrono::Utc::now(),
         });
+        if let Ok(0) = count {
+            self.control
+                .events
+                .publish(ServerEvent::ChannelDeactivated {
+                    app_id,
+                    channel_id,
+                    timestamp: chrono::Utc::now(),
+                });
+        }
     }
 }
 
@@ -1670,11 +1679,18 @@ async fn handle_control_message(
                     .await;
             }
             state.index_join(channel_id, session_id);
-            let _ = state
+            let count = state
                 .control
                 .channels
                 .update_participant_count(channel_id, 1)
                 .await;
+            if let Ok(1) = count {
+                state.control.events.publish(ServerEvent::ChannelActivated {
+                    app_id: token.app_id,
+                    channel_id,
+                    timestamp: chrono::Utc::now(),
+                });
+            }
             if let Some(ref redis) = state.control.redis {
                 let _ = redis.add_user_channel(token.user_id, channel_id).await;
                 let _ = redis.incr_channel_participants(channel_id).await;

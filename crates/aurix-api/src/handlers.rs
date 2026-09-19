@@ -1364,6 +1364,9 @@ const KNOWN_PERMISSIONS: &[&str] = &[
     "keys:manage",
     "analytics:read",
     "audit:read",
+    "webhooks:read",
+    "webhooks:write",
+    "events:read",
 ];
 
 fn validate_permissions(value: &serde_json::Value) -> Result<(), ApiError> {

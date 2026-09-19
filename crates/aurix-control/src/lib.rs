@@ -10,6 +10,7 @@ pub mod node_manager;
 pub mod plane;
 pub mod redis_store;
 pub mod session_manager;
+pub mod webhooks;
 
 pub use action_tokens::{ActionTokenService, PendingClaim};
 pub use block_manager::{BlockManager, MAX_BLOCKS_PER_USER};
@@ -17,3 +18,4 @@ pub use chat::{ChatService, OutgoingMessage};
 pub use event_bus::{EventBus, ServerEvent};
 pub use plane::ControlPlane;
 pub use redis_store::RedisStore;
+pub use webhooks::{PublicEvent, WebhookService};

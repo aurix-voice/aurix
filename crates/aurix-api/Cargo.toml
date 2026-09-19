@@ -33,3 +33,4 @@ parking_lot = { workspace = true }
 sqlx = { workspace = true }
 ipnetwork = { workspace = true }
 rand = { workspace = true }
+futures-util = { workspace = true }

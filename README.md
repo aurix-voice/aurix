@@ -250,11 +250,60 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
 | API key | `POST|GET /v1/api-keys`, `DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
+| API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
+| API key | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | live server event stream for game servers (`events:read`) |
 | player JWT | `GET /v1/me/turn-credentials`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users |
 
 API-key permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read|write`, `users:read|write`,
-`moderation:read|write`, `recordings:read|write`, `chat:read|write`, `keys:manage`. A key can only mint keys with a
-subset of its own permissions. Errors are `{"error":{"code":"…","message":"…"}}`.
+`moderation:read|write`, `recordings:read|write`, `chat:read|write`, `webhooks:read|write`, `events:read`,
+`keys:manage`. A key can only mint keys with a subset of its own permissions. Errors are
+`{"error":{"code":"…","message":"…"}}`.
+
+### Webhooks and the event stream
+
+Game servers learn what happens in voice either by **push** (signed HTTP webhooks) or by
+**streaming** (`GET /v1/events`, server-sent events). Both carry the same envelope and the same
+event ids, so a consumer can mix them and de-duplicate:
+
+```json
+{"id":"<uuid, stable per event>","type":"participant.joined","app_id":"…",
+ "created_at":"2026-…Z","data":{"channel_id":"…","user_id":"…","display_name":"…","session_id":"…"}}
+```
+
+Event types (`GET /v1/webhooks/events` lists them): `channel.created|destroyed|activated|deactivated`
+(activated = first participant in, deactivated = last one out — also emitted for channels a
+crashed node left behind), `participant.joined|left|muted|unmuted|kicked`, `user.banned`,
+`user.block_changed`, `moderation.event`, `recording.started|stopped|consent_required`,
+`quality.alert`, `chat.message`. `participant.typing`, `participant.speaking` and `channel.energy`
+are high-frequency UX signals: SSE delivers them only when named in `?types=`, webhooks refuse them.
+
+**Webhooks.** `POST /v1/webhooks {"url","events":["*"]|[…],"description"}` returns the signing
+secret once (`whsec_…`; `POST …/rotate-secret` issues a new one). Every delivery is a JSON `POST`
+with headers `X-Aurix-Event`, `X-Aurix-Delivery-Id`, `X-Aurix-Webhook-Id`,
+`X-Aurix-Attempt` and
+
+```
+X-Aurix-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+```
+
+Verify by recomputing the HMAC over the *raw* body and rejecting `t` older than a few minutes
+(reference implementation: `aurix_control::webhooks::verify_signature`).
+Answer any 2xx within `webhooks.timeout_ms` (5 s). Deliveries are queued in PostgreSQL (so they
+survive restarts and are shared by every node), retried on `webhooks.retry_delays_secs`
+(`5, 30, 120, 600, 1800, 3600, 7200`) with the same delivery id and event id, then marked `failed`;
+`GET …/deliveries` shows the log, `POST …/deliveries/:id/retry` re-sends one, `POST …/test` sends a
+`webhook.test`, `POST …/resync` sends a `webhook.resync` with every live channel and its members
+(use it after downtime instead of replaying history). A subscription's `consecutive_failures`,
+`last_status` and `last_error` are visible on `GET /v1/webhooks/:id`. URLs must be `https://` in
+production and may not point at private, loopback or link-local addresses (DNS is resolved and
+pinned per delivery; redirects are not followed) — `webhooks.require_https` /
+`webhooks.allow_private_urls` relax this for development.
+
+**SSE.** `GET /v1/events[?types=a.b,c.d]` with an API key streams `event:`/`id:`/`data:` frames,
+opening with `stream.open` and sending a keep-alive comment every `webhooks.sse_keepalive_secs`.
+A `lagged` frame (`{"dropped": n}`) means the consumer fell behind the broadcast buffer — fetch
+`GET /v1/events/snapshot` (live channels + members of your app) to resynchronise. Both endpoints
+only ever carry the caller's tenant.
 
 ---
 
@@ -297,6 +346,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__RECORDING__*` | `ENABLED`, `STORAGE_PATH`, `RETENTION_DAYS`, `REQUIRE_CONSENT`, `ENCRYPTION_ENABLED` + `ENCRYPTION_KEY` (≥ 32 chars), S3 settings |
 | `AURIX__RATE_LIMITING__*` | per-IP / per-key limits (Redis-backed when available) |
 | `AURIX__CHAT__*` | `ENABLED` (default `true`), `MAX_MESSAGE_BYTES` (1024, text + metadata, ≤ 16384), `MESSAGES_PER_SECOND`/`MESSAGE_BURST` (2 / 10 per session), `TYPING_INTERVAL_MS` (1500), `SERVER_MUTE_BLOCKS_TEXT` (`true`), `FILTER_WEBHOOK` + `FILTER_TIMEOUT_MS` (1500) + `FILTER_FAIL_OPEN` (`false`), `PERSIST` (`false`) + `RETENTION_DAYS` (30) |
+| `AURIX__WEBHOOKS__*` | `ENABLED` (`true`), `TIMEOUT_MS` (5000), `RETRY_DELAYS_SECS` (`5,30,120,600,1800,3600,7200`), `CONCURRENCY` (16), `BATCH_SIZE` (100), `MAX_PENDING_PER_SUBSCRIPTION` (10000 — older events are dropped for a dead endpoint), `RETENTION_HOURS` (72, delivery log), `MAX_SUBSCRIPTIONS_PER_APP` (20), `REQUIRE_HTTPS` / `ALLOW_PRIVATE_URLS` (default: strict in production), `SSE_KEEPALIVE_SECS` (15) |
 
 #### Chat content filter webhook
 

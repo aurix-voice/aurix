@@ -1,6 +1,7 @@
 use crate::handlers;
 use crate::middleware;
 use crate::state::AppState;
+use crate::webhooks;
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue, Method},
@@ -27,6 +28,7 @@ fn cors_layer(state: &AppState) -> CorsLayer {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
@@ -156,6 +158,43 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/recordings/:recording_id/stop",
             post(handlers::stop_recording),
         )
+        .route(
+            "/v1/webhooks",
+            post(webhooks::create_webhook).get(webhooks::list_webhooks),
+        )
+        .route("/v1/webhooks/events", get(webhooks::list_event_types))
+        .route(
+            "/v1/webhooks/:webhook_id",
+            get(webhooks::get_webhook)
+                .patch(webhooks::update_webhook)
+                .delete(webhooks::delete_webhook),
+        )
+        .route(
+            "/v1/webhooks/:webhook_id/rotate-secret",
+            post(webhooks::rotate_webhook_secret),
+        )
+        .route(
+            "/v1/webhooks/:webhook_id/test",
+            post(webhooks::test_webhook),
+        )
+        .route(
+            "/v1/webhooks/:webhook_id/resync",
+            post(webhooks::resync_webhook),
+        )
+        .route(
+            "/v1/webhooks/:webhook_id/deliveries",
+            get(webhooks::list_deliveries),
+        )
+        .route(
+            "/v1/webhooks/:webhook_id/deliveries/:delivery_id",
+            get(webhooks::get_delivery),
+        )
+        .route(
+            "/v1/webhooks/:webhook_id/deliveries/:delivery_id/retry",
+            post(webhooks::retry_delivery),
+        )
+        .route("/v1/events", get(webhooks::event_stream))
+        .route("/v1/events/snapshot", get(webhooks::event_snapshot))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::api_key_middleware,

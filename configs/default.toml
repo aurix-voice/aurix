@@ -109,3 +109,17 @@ filter_timeout_ms = 1500
 filter_fail_open = false
 persist = false
 retention_days = 30
+[webhooks]
+enabled = true
+timeout_ms = 5000
+retry_delays_secs = [5, 30, 120, 600, 1800, 3600, 7200]
+poll_interval_ms = 1000
+batch_size = 100
+concurrency = 16
+max_pending_per_subscription = 10000
+retention_hours = 72
+max_subscriptions_per_app = 20
+# Both default to the production flag: strict in production, relaxed in development.
+# require_https = true
+# allow_private_urls = false
+sse_keepalive_secs = 15

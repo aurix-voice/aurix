@@ -238,15 +238,47 @@ pub async fn list_active_channels(
     .fetch_all(pool).await
 }
 
+/// Adjusts the live counter and returns the new value, so callers can detect the
+/// `0 → 1` (activated) and `1 → 0` (deactivated) edges exactly once under the row lock.
 pub async fn update_channel_participant_count(
     pool: &DbPool,
     channel_id: Uuid,
     delta: i32,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE channels SET active_participants = GREATEST(0, active_participants + $2), updated_at = NOW() WHERE id = $1")
+) -> Result<i32, sqlx::Error> {
+    let count: Option<i32> = sqlx::query_scalar(
+        "UPDATE channels SET active_participants = GREATEST(0, active_participants + $2), updated_at = NOW() WHERE id = $1 RETURNING active_participants",
+    )
         .bind(channel_id).bind(delta)
-        .execute(pool).await?;
-    Ok(())
+        .fetch_optional(pool).await?;
+    Ok(count.unwrap_or(0))
+}
+
+/// Re-derives `active_participants` from open memberships for the given channels; run after
+/// stale memberships of a crashed node were closed so the counter does not drift.
+/// Recomputes `active_participants` for `channel_ids` and returns `(app_id, channel_id)` of
+/// the channels that ended up empty.
+pub async fn recount_channel_participants(
+    pool: &DbPool,
+    channel_ids: &[Uuid],
+) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+    if channel_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, i32)>(
+        r#"UPDATE channels c SET active_participants = (
+               SELECT COUNT(*) FROM channel_memberships m WHERE m.channel_id = c.id AND m.left_at IS NULL
+           ), updated_at = NOW()
+           WHERE c.id = ANY($1)
+           RETURNING c.app_id, c.id, c.active_participants"#,
+    )
+    .bind(channel_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, n)| *n == 0)
+        .map(|(app, id, _)| (app, id))
+        .collect())
 }
 
 pub async fn delete_channel(
@@ -334,14 +366,15 @@ pub async fn close_stale_sessions_for_node(
     Ok(r.rows_affected())
 }
 
+/// Closes memberships left open by a previous crash of this node; returns the channel of every
+/// closed membership so the participant counters can be recomputed.
 pub async fn close_stale_memberships_for_node(
     pool: &DbPool,
     media_node_id: Uuid,
-) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE channel_memberships SET left_at = NOW() WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1)"
-    ).bind(media_node_id).execute(pool).await?;
-    Ok(r.rows_affected())
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE channel_memberships SET left_at = NOW() WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1) RETURNING channel_id"
+    ).bind(media_node_id).fetch_all(pool).await
 }
 
 pub async fn get_active_sessions_for_user(
@@ -843,6 +876,322 @@ pub async fn delete_chat_messages_before(
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
+}
+
+// ── Webhook Queries ──
+
+pub async fn insert_webhook(
+    pool: &DbPool,
+    w: &WebhookSubscriptionRow,
+) -> Result<WebhookSubscriptionRow, sqlx::Error> {
+    sqlx::query_as::<_, WebhookSubscriptionRow>(
+        r#"INSERT INTO webhook_subscriptions (id, app_id, url, secret, events, description, enabled, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) RETURNING *"#,
+    )
+    .bind(w.id).bind(w.app_id).bind(&w.url).bind(&w.secret).bind(&w.events)
+    .bind(&w.description).bind(w.enabled).bind(w.created_at)
+    .fetch_one(pool).await
+}
+
+pub async fn get_webhook(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+) -> Result<Option<WebhookSubscriptionRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookSubscriptionRow>(
+        "SELECT * FROM webhook_subscriptions WHERE app_id = $1 AND id = $2",
+    )
+    .bind(app_id)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_webhooks(
+    pool: &DbPool,
+    app_id: Uuid,
+) -> Result<Vec<WebhookSubscriptionRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookSubscriptionRow>(
+        "SELECT * FROM webhook_subscriptions WHERE app_id = $1 ORDER BY created_at",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_enabled_webhooks(
+    pool: &DbPool,
+    app_id: Uuid,
+) -> Result<Vec<WebhookSubscriptionRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookSubscriptionRow>(
+        "SELECT * FROM webhook_subscriptions WHERE app_id = $1 AND enabled ORDER BY created_at",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_webhooks(pool: &DbPool, app_id: Uuid) -> Result<i64, sqlx::Error> {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webhook_subscriptions WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
+}
+
+/// Partial update; `None` keeps the current value. Re-enabling resets the failure counter.
+pub async fn update_webhook(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+    url: Option<&str>,
+    events: Option<&[String]>,
+    description: Option<Option<&str>>,
+    enabled: Option<bool>,
+) -> Result<Option<WebhookSubscriptionRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookSubscriptionRow>(
+        r#"UPDATE webhook_subscriptions SET
+               url = COALESCE($3, url),
+               events = COALESCE($4, events),
+               description = CASE WHEN $5 THEN $6 ELSE description END,
+               enabled = COALESCE($7, enabled),
+               consecutive_failures = CASE WHEN $7 THEN 0 ELSE consecutive_failures END,
+               updated_at = NOW()
+           WHERE app_id = $1 AND id = $2 RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(id)
+    .bind(url)
+    .bind(events)
+    .bind(description.is_some())
+    .bind(description.flatten())
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn rotate_webhook_secret(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+    secret: &str,
+) -> Result<Option<WebhookSubscriptionRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookSubscriptionRow>(
+        "UPDATE webhook_subscriptions SET secret = $3, updated_at = NOW() WHERE app_id = $1 AND id = $2 RETURNING *",
+    )
+    .bind(app_id)
+    .bind(id)
+    .bind(secret)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_webhook(pool: &DbPool, app_id: Uuid, id: Uuid) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM webhook_subscriptions WHERE app_id = $1 AND id = $2")
+        .bind(app_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Enqueues a delivery unless the subscription already has `max_pending` undelivered rows
+/// (dead endpoint). Returns `false` when dropped.
+pub async fn enqueue_webhook_delivery(
+    pool: &DbPool,
+    d: &WebhookDeliveryRow,
+    max_pending: i64,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"INSERT INTO webhook_deliveries (id, subscription_id, app_id, event_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+           SELECT $1, $2, $3, $4, $5, $6, 'pending', 0, $7, $7
+           WHERE (SELECT COUNT(*) FROM webhook_deliveries WHERE subscription_id = $2 AND status = 'pending') < $8"#,
+    )
+    .bind(d.id).bind(d.subscription_id).bind(d.app_id).bind(d.event_id).bind(&d.event_type)
+    .bind(&d.payload).bind(d.created_at).bind(max_pending)
+    .execute(pool).await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Leases up to `limit` due deliveries for `lease` seconds (skipping rows another node holds)
+/// and counts the attempt. Rows whose lease expired are picked up again, so a node crash
+/// mid-delivery costs at most one duplicate.
+pub async fn lease_due_webhook_deliveries(
+    pool: &DbPool,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<WebhookDeliveryRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookDeliveryRow>(
+        r#"UPDATE webhook_deliveries d
+           SET leased_until = NOW() + make_interval(secs => $2), attempts = d.attempts + 1
+           FROM (
+               SELECT id FROM webhook_deliveries
+               WHERE status = 'pending' AND next_attempt_at <= NOW()
+                 AND (leased_until IS NULL OR leased_until < NOW())
+               ORDER BY next_attempt_at
+               LIMIT $1
+               FOR UPDATE SKIP LOCKED
+           ) due
+           WHERE d.id = due.id
+           RETURNING d.*"#,
+    )
+    .bind(limit)
+    .bind(lease_secs as f64)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn mark_webhook_delivered(
+    pool: &DbPool,
+    id: Uuid,
+    status: i16,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE webhook_deliveries SET status = 'delivered', delivered_at = NOW(), leased_until = NULL,
+               last_status = $2, last_error = NULL WHERE id = $1"#,
+    )
+    .bind(id)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Records a failed attempt: schedules the retry at `next_attempt_at`, or gives up (`failed`)
+/// when `None`.
+pub async fn mark_webhook_attempt_failed(
+    pool: &DbPool,
+    id: Uuid,
+    status: Option<i16>,
+    error: &str,
+    next_attempt_at: Option<DateTime<Utc>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE webhook_deliveries SET
+               status = CASE WHEN $4::timestamptz IS NULL THEN 'failed' ELSE 'pending' END,
+               next_attempt_at = COALESCE($4, next_attempt_at),
+               leased_until = NULL, last_status = $2, last_error = $3
+           WHERE id = $1"#,
+    )
+    .bind(id)
+    .bind(status)
+    .bind(error)
+    .bind(next_attempt_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn record_webhook_result(
+    pool: &DbPool,
+    subscription_id: Uuid,
+    ok: bool,
+    status: Option<i16>,
+    error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE webhook_subscriptions SET
+               last_delivery_at = NOW(), last_status = $3, last_error = $4,
+               consecutive_failures = CASE WHEN $2 THEN 0 ELSE consecutive_failures + 1 END
+           WHERE id = $1"#,
+    )
+    .bind(subscription_id)
+    .bind(ok)
+    .bind(status)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_webhook_deliveries(
+    pool: &DbPool,
+    app_id: Uuid,
+    subscription_id: Uuid,
+    status: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<WebhookDeliveryRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookDeliveryRow>(
+        r#"SELECT * FROM webhook_deliveries
+           WHERE app_id = $1 AND subscription_id = $2 AND ($3::text IS NULL OR status = $3)
+           ORDER BY created_at DESC LIMIT $4 OFFSET $5"#,
+    )
+    .bind(app_id)
+    .bind(subscription_id)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_webhook_delivery(
+    pool: &DbPool,
+    app_id: Uuid,
+    subscription_id: Uuid,
+    id: Uuid,
+) -> Result<Option<WebhookDeliveryRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookDeliveryRow>(
+        "SELECT * FROM webhook_deliveries WHERE app_id = $1 AND subscription_id = $2 AND id = $3",
+    )
+    .bind(app_id)
+    .bind(subscription_id)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Puts a delivered/failed row back in the queue for an immediate attempt.
+pub async fn requeue_webhook_delivery(
+    pool: &DbPool,
+    app_id: Uuid,
+    subscription_id: Uuid,
+    id: Uuid,
+) -> Result<Option<WebhookDeliveryRow>, sqlx::Error> {
+    sqlx::query_as::<_, WebhookDeliveryRow>(
+        r#"UPDATE webhook_deliveries SET status = 'pending', attempts = 0, next_attempt_at = NOW(),
+               leased_until = NULL, delivered_at = NULL
+           WHERE app_id = $1 AND subscription_id = $2 AND id = $3 RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(subscription_id)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_finished_webhook_deliveries_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let r =
+        sqlx::query("DELETE FROM webhook_deliveries WHERE status <> 'pending' AND created_at < $1")
+            .bind(cutoff)
+            .execute(pool)
+            .await?;
+    Ok(r.rows_affected())
+}
+
+/// Open memberships of every live channel in the app (with the member's display name and the
+/// channel type), for `webhook.resync` snapshots.
+pub async fn list_active_channel_members(
+    pool: &DbPool,
+    app_id: Uuid,
+) -> Result<Vec<ActiveMemberRow>, sqlx::Error> {
+    sqlx::query_as::<_, ActiveMemberRow>(
+        r#"SELECT m.channel_id, c.channel_type, m.user_id, u.display_name, m.session_id,
+                  m.role, m.is_muted, m.is_server_muted, m.ssrc, m.joined_at
+           FROM channel_memberships m
+           JOIN channels c ON c.id = m.channel_id
+           JOIN users u ON u.id = m.user_id
+           WHERE c.app_id = $1 AND c.deleted_at IS NULL AND m.left_at IS NULL
+           ORDER BY m.channel_id, m.joined_at"#,
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
 }
 
 // ── Media Node Queries ──

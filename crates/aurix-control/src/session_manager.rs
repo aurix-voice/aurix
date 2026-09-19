@@ -9,6 +9,15 @@ pub struct SessionManager {
     pool: DbPool,
 }
 
+/// Outcome of [`SessionManager::recover_node_state`].
+pub struct RecoveredState {
+    pub sessions: u64,
+    pub memberships: u64,
+    /// Channels that lost their last participant to the cleanup; the caller publishes
+    /// `ChannelDeactivated` for them once its event consumers are running.
+    pub deactivated_channels: Vec<(AppId, ChannelId)>,
+}
+
 impl SessionManager {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
@@ -134,18 +143,34 @@ impl SessionManager {
     }
 
     /// Close sessions/memberships left open by a previous crash of this node.
-    pub async fn recover_node_state(&self, media_node_id: MediaNodeId) -> Result<(u64, u64)> {
-        let m = aurix_db::queries::close_stale_memberships_for_node(&self.pool, media_node_id.0)
+    pub async fn recover_node_state(&self, media_node_id: MediaNodeId) -> Result<RecoveredState> {
+        let mut channels =
+            aurix_db::queries::close_stale_memberships_for_node(&self.pool, media_node_id.0)
+                .await
+                .map_err(|e| {
+                    AurixError::Database(format!("Stale membership cleanup failed: {e}"))
+                })?;
+        let memberships = channels.len() as u64;
+        channels.sort_unstable();
+        channels.dedup();
+        let emptied = aurix_db::queries::recount_channel_participants(&self.pool, &channels)
             .await
-            .map_err(|e| AurixError::Database(format!("Stale membership cleanup failed: {e}")))?;
-        let s = aurix_db::queries::close_stale_sessions_for_node(
+            .map_err(|e| AurixError::Database(format!("Participant recount failed: {e}")))?;
+        let sessions = aurix_db::queries::close_stale_sessions_for_node(
             &self.pool,
             media_node_id.0,
             "node_restart",
         )
         .await
         .map_err(|e| AurixError::Database(format!("Stale session cleanup failed: {e}")))?;
-        Ok((s, m))
+        Ok(RecoveredState {
+            sessions,
+            memberships,
+            deactivated_channels: emptied
+                .into_iter()
+                .map(|(app, ch)| (AppId::from_uuid(app), ChannelId::from_uuid(ch)))
+                .collect(),
+        })
     }
 
     pub async fn get_active_sessions_for_user(&self, user_id: UserId) -> Result<Vec<SessionRow>> {

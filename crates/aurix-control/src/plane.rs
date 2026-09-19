@@ -7,6 +7,7 @@ use crate::event_bus::EventBus;
 use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
 use crate::session_manager::SessionManager;
+use crate::webhooks::WebhookService;
 use aurix_auth::admin::AdminAuthService;
 use aurix_auth::{AnyToken, ApiKeyService, JwtService, RbacService, ValidatedToken};
 use aurix_common::audit::AuditLogger;
@@ -31,6 +32,7 @@ pub struct ControlPlane {
     pub blocks: Arc<BlockManager>,
     pub action_tokens: Arc<ActionTokenService>,
     pub chat: Arc<ChatService>,
+    pub webhooks: Arc<WebhookService>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -166,6 +168,12 @@ impl ControlPlane {
             events.clone(),
         ));
         chat.start_retention_sweep();
+        let webhooks = Arc::new(WebhookService::new(
+            config.webhooks.clone(),
+            config.is_production(),
+            pool.clone(),
+            events.clone(),
+        )?);
 
         Ok(Self {
             node_id,
@@ -180,6 +188,7 @@ impl ControlPlane {
             sessions,
             action_tokens,
             chat,
+            webhooks,
             blocks,
             events,
             audit,
