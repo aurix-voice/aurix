@@ -10,27 +10,53 @@ using Aurix.Protocol;
 namespace Aurix.Transport
 {
     /// <summary>
+    /// A reliable, ordered byte-frame link that can carry sealed AURX packets when UDP cannot:
+    /// one packet per frame, in both directions. <see cref="ControlChannel"/> implements it over
+    /// the control WebSocket (binary frames); tests can plug in a fake.
+    /// </summary>
+    public interface IMediaTunnel
+    {
+        /// <summary>
+        /// Queue one sealed packet for sending without blocking. Returns false when the link is
+        /// closed or its bounded queue is full (the packet is dropped, like a lost datagram).
+        /// </summary>
+        bool TrySendMedia(byte[] wire);
+        /// <summary>Raised on the link's read thread for every inbound media frame.</summary>
+        event Action<byte[]> MediaReceived;
+    }
+
+    /// <summary>
     /// WebSocket control channel. Authentication uses the <c>bearer.&lt;jwt&gt;</c> subprotocol (the
     /// same mechanism as the Web SDK) so it works on every .NET/Unity backend, including those
     /// that do not let callers set the Authorization header on the upgrade request.
     /// Received messages are queued and delivered by <see cref="Drain"/> on the caller's thread.
+    /// Binary frames are AURX media for a tunnelled <see cref="MediaTransport"/> (see
+    /// <see cref="IMediaTunnel"/>); they never enter the control inbox.
     /// </summary>
-    public sealed class ControlChannel : IDisposable
+    public sealed class ControlChannel : IDisposable, IMediaTunnel
     {
         public const string AurixSubprotocol = "aurix";
         public const string BearerSubprotocolPrefix = "bearer.";
         public const string ResumeSubprotocolPrefix = "resume.";
+        /// <summary>Outbound media frames waiting for the socket; beyond this they are dropped.</summary>
+        public const int MediaQueueLength = 64;
 
         private readonly ConcurrentQueue<ControlMessage> _inbox = new ConcurrentQueue<ControlMessage>();
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
+        private readonly ConcurrentQueue<byte[]> _mediaOutbox = new ConcurrentQueue<byte[]>();
+        private readonly SemaphoreSlim _mediaSignal = new SemaphoreSlim(0);
+        private int _mediaQueued;
         private ClientWebSocket _ws;
         private CancellationTokenSource _cts;
         private Task _readLoop;
+        private Task _mediaPump;
 
         /// <summary>Raised from the read loop thread when the socket closes or fails.</summary>
         public event Action<string> Closed;
         /// <summary>Raised on the read loop thread for every message, before it is queued for <see cref="Drain"/>.</summary>
         public event Action<ControlMessage> Received;
+        /// <summary>Raised on the read loop thread for every binary (media) frame.</summary>
+        public event Action<byte[]> MediaReceived;
 
         public bool IsOpen => _ws != null && _ws.State == WebSocketState.Open;
 
@@ -50,6 +76,7 @@ namespace Aurix.Transport
             _ws = ws;
             _cts = new CancellationTokenSource();
             _readLoop = Task.Run(() => ReadLoop(_cts.Token));
+            _mediaPump = Task.Run(() => MediaPump(_cts.Token));
         }
 
         public async Task SendAsync(string json, CancellationToken ct = default)
@@ -66,6 +93,49 @@ namespace Aurix.Transport
             {
                 _sendLock.Release();
             }
+        }
+
+        /// <inheritdoc/>
+        public bool TrySendMedia(byte[] wire)
+        {
+            if (wire == null) throw new ArgumentNullException(nameof(wire));
+            var ws = _ws;
+            if (ws == null || ws.State != WebSocketState.Open) return false;
+            if (Interlocked.Increment(ref _mediaQueued) > MediaQueueLength)
+            {
+                Interlocked.Decrement(ref _mediaQueued);
+                return false;
+            }
+            _mediaOutbox.Enqueue(wire);
+            _mediaSignal.Release();
+            return true;
+        }
+
+        private async Task MediaPump(CancellationToken ct)
+        {
+            var ws = _ws;
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await _mediaSignal.WaitAsync(ct).ConfigureAwait(false);
+                    if (!_mediaOutbox.TryDequeue(out var wire)) continue;
+                    Interlocked.Decrement(ref _mediaQueued);
+                    if (ws.State != WebSocketState.Open) return;
+                    await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        await ws.SendAsync(new ArraySegment<byte>(wire), WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _sendLock.Release();
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
+            catch (WebSocketException) { /* the read loop reports the closure */ }
         }
 
         /// <summary>Dequeue every message received since the last call.</summary>
@@ -116,6 +186,16 @@ namespace Aurix.Transport
                         ms.Write(buffer, 0, r.Count);
                     } while (!r.EndOfMessage);
 
+                    if (r.MessageType == WebSocketMessageType.Binary)
+                    {
+                        var media = MediaReceived;
+                        if (media != null && ms.Length > 0 && ms.Length <= AurxPacket.MaxPacketSize)
+                        {
+                            // A misbehaving media consumer must not take the control plane down with it.
+                            try { media(ms.ToArray()); } catch (Exception) { }
+                        }
+                        continue;
+                    }
                     if (r.MessageType != WebSocketMessageType.Text) continue;
                     var text = Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
                     try

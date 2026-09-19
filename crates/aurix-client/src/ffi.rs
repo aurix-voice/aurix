@@ -45,6 +45,7 @@ use crate::config::ClientConfig;
 use crate::dsp::{DspConfig, DspStats, NoiseSuppression};
 use crate::error::ClientError;
 use crate::events::{ChannelScope, ConnectionState, Event};
+use crate::media::{MediaPath, MediaPathPolicy};
 
 // ------------------------------------------------------------------------------- results
 
@@ -556,6 +557,15 @@ pub struct AurixClientConfig {
     /// and encoder; `aurix_dsp_config_default` = everything on, `aurix_dsp_config_bypass` for
     /// hosts with their own processing. Changeable later with `aurix_client_set_dsp`.
     pub dsp: AurixDspConfig,
+    /// Which link carries media: UDP with the WebSocket tunnel as fallback (default), UDP
+    /// only, or tunnel only.
+    pub media_path: AurixMediaPathPolicy,
+    /// `Auto`: unanswered UDP heartbeats in a row before media moves to the tunnel (0 = never
+    /// fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
+    pub udp_fallback_lost_heartbeats: u32,
+    /// `Auto`: how often a tunnelled session re-probes UDP and moves back when it answers
+    /// (0 = never; stays tunnelled until the next connect).
+    pub udp_reprobe_interval_ms: u32,
 }
 
 #[no_mangle]
@@ -581,7 +591,64 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         vad_gate: d.vad_gate,
         worker_threads: d.worker_threads as u32,
         dsp: d.dsp.into(),
+        media_path: d.media_path.into(),
+        udp_fallback_lost_heartbeats: d.udp_fallback_lost_heartbeats,
+        udp_reprobe_interval_ms: d.udp_reprobe_interval.as_millis() as u32,
     };
+}
+
+/// Media link selection policy (`AurixClientConfig::media_path`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixMediaPathPolicy {
+    /// UDP first; WebSocket tunnel when UDP is blocked; back to UDP when it answers again.
+    AurixMediaPathAuto = 0,
+    AurixMediaPathUdpOnly = 1,
+    AurixMediaPathTunnelOnly = 2,
+}
+
+impl From<MediaPathPolicy> for AurixMediaPathPolicy {
+    fn from(p: MediaPathPolicy) -> Self {
+        match p {
+            MediaPathPolicy::Auto => Self::AurixMediaPathAuto,
+            MediaPathPolicy::UdpOnly => Self::AurixMediaPathUdpOnly,
+            MediaPathPolicy::TunnelOnly => Self::AurixMediaPathTunnelOnly,
+        }
+    }
+}
+
+impl From<AurixMediaPathPolicy> for MediaPathPolicy {
+    fn from(p: AurixMediaPathPolicy) -> Self {
+        match p {
+            AurixMediaPathPolicy::AurixMediaPathAuto => Self::Auto,
+            AurixMediaPathPolicy::AurixMediaPathUdpOnly => Self::UdpOnly,
+            AurixMediaPathPolicy::AurixMediaPathTunnelOnly => Self::TunnelOnly,
+        }
+    }
+}
+
+/// Link the media currently travels over.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AurixMediaPath {
+    /// No media link yet (before `AurixEventMediaBound`).
+    #[default]
+    AurixMediaNone = 0,
+    /// Native AURX over UDP.
+    AurixMediaUdp = 1,
+    /// AURX packets as binary frames on the control WebSocket (TCP; higher latency under
+    /// loss).
+    AurixMediaTunnel = 2,
+}
+
+impl From<Option<MediaPath>> for AurixMediaPath {
+    fn from(p: Option<MediaPath>) -> Self {
+        match p {
+            None => Self::AurixMediaNone,
+            Some(MediaPath::Udp) => Self::AurixMediaUdp,
+            Some(MediaPath::Tunnel) => Self::AurixMediaTunnel,
+        }
+    }
 }
 
 /// Noise suppression strength (dry/wet blend of the RNNoise output).
@@ -782,6 +849,9 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.vad_gate = c.vad_gate;
     cfg.worker_threads = c.worker_threads.clamp(1, 8) as usize;
     cfg.dsp = c.dsp.into();
+    cfg.media_path = c.media_path.into();
+    cfg.udp_fallback_lost_heartbeats = c.udp_fallback_lost_heartbeats;
+    cfg.udp_reprobe_interval = Duration::from_millis(c.udp_reprobe_interval_ms as u64);
     Ok(cfg)
 }
 
@@ -883,6 +953,8 @@ pub struct AurixSessionInfo {
     pub resumed: bool,
     /// Zero UUID when the token carries no `sub`.
     pub user_id: AurixUuid,
+    /// The node accepts media over the control WebSocket (fallback when UDP is blocked).
+    pub media_tunnel: bool,
 }
 
 /// `false` when no session is open.
@@ -905,10 +977,20 @@ pub unsafe extern "C" fn aurix_client_session(
                 resume_grace_ms: s.resume_grace.as_millis().min(u32::MAX as u128) as u32,
                 resumed: s.resumed,
                 user_id: c.user_id().map(|u| u.0).unwrap_or(Uuid::nil()).into(),
+                media_tunnel: s.media_tunnel,
             };
             true
         }
         None => false,
+    }
+}
+
+/// Link the media currently uses; `AurixMediaNone` before the first bind.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_media_path(client: *const AurixClient) -> AurixMediaPath {
+    match self::client(client) {
+        Ok(c) => c.media_path().into(),
+        Err(_) => AurixMediaPath::AurixMediaNone,
     }
 }
 
@@ -984,6 +1066,9 @@ pub enum AurixEventType {
     AurixEventAudioPolicyChanged = 31,
     /// `audio_codec`: the server switched this session's codec (`aurix_event_audio_codec`).
     AurixEventAudioCodecChanged = 32,
+    /// `media_path` (`aurix_event_media_path`), `message` = why: emitted after every
+    /// `MediaBound` and on each mid-session UDP ↔ tunnel switch.
+    AurixEventMediaPathChanged = 33,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1123,6 +1208,7 @@ impl AurixEvent {
                     .collect();
             }
             Event::BitrateChanged { reason, .. } => message = reason.clone(),
+            Event::MediaPathChanged { reason, .. } => message = reason.clone(),
             Event::Kicked { reason, .. }
             | Event::FailedToRecover { reason }
             | Event::Disconnected { reason } => message = reason.clone(),
@@ -1181,6 +1267,7 @@ impl AurixEvent {
             Event::StateChanged(_) => T::AurixEventStateChanged,
             Event::SessionReady(_) => T::AurixEventSessionReady,
             Event::MediaBound => T::AurixEventMediaBound,
+            Event::MediaPathChanged { .. } => T::AurixEventMediaPathChanged,
             Event::ChannelJoined { .. } => T::AurixEventChannelJoined,
             Event::ChannelLeft { .. } => T::AurixEventChannelLeft,
             Event::ParticipantJoined { .. } => T::AurixEventParticipantJoined,
@@ -1489,6 +1576,15 @@ pub unsafe extern "C" fn aurix_event_audio_codec(event: *const AurixEvent) -> Au
     }
 }
 
+/// Link of a `MediaPathChanged` event; `AurixMediaNone` for other events.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_media_path(event: *const AurixEvent) -> AurixMediaPath {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::MediaPathChanged { path, .. }) => Some(*path).into(),
+        _ => AurixMediaPath::AurixMediaNone,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_moderation_action(
     event: *const AurixEvent,
@@ -1516,6 +1612,7 @@ pub unsafe extern "C" fn aurix_event_session(
                 resume_grace_ms: s.resume_grace.as_millis().min(u32::MAX as u128) as u32,
                 resumed: s.resumed,
                 user_id: zero(),
+                media_tunnel: s.media_tunnel,
             };
             true
         }
@@ -2696,6 +2793,12 @@ pub struct AurixStats {
     pub server: AurixNetworkQuality,
     /// Remote streams currently decoding.
     pub active_streams: u32,
+    /// Link the media currently uses.
+    pub media_path: AurixMediaPath,
+    /// Tunnel only: uplink packets dropped because the WebSocket could not keep up.
+    pub uplink_dropped: u64,
+    /// Heartbeats unanswered in a row on the current link (0 = healthy).
+    pub heartbeats_lost_consecutive: u32,
 }
 
 #[no_mangle]
@@ -2738,6 +2841,9 @@ pub unsafe extern "C" fn aurix_client_stats(
         has_server: s.server.is_some(),
         server: s.server.map(Into::into).unwrap_or_default(),
         active_streams: s.streams.len() as u32,
+        media_path: s.media_path.into(),
+        uplink_dropped: s.media.uplink_dropped,
+        heartbeats_lost_consecutive: s.media.heartbeats_lost_consecutive,
     };
     AurixResult::AurixOk
 }

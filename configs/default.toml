@@ -66,6 +66,13 @@ quality_interval_ms = 2000
 # node transcodes at the edge (channels stay Opus); each PCMU session costs one Opus encoder
 # plus one decoder per speaker it hears. Disable on CPU-bound nodes.
 pcmu_fallback = true
+# Let native AURX sessions fall back to carrying media over their control WebSocket (TCP) when
+# UDP is blocked. Same per-packet AEAD/replay protection as UDP, but TCP head-of-line blocking
+# adds latency for those sessions; UDP is always tried first by the SDKs.
+media_tunnel = true
+# Downlink packets queued per tunneled session (≈20 ms of audio per packet per speaker heard)
+# before that session's packets are dropped; a stalled TCP connection never blocks the SFU.
+tunnel_queue_packets = 128
 
 [turn]
 enabled = false

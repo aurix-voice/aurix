@@ -7,13 +7,15 @@ use aurix_common::types::{
 use serde::Serialize;
 use std::time::Duration;
 
+use crate::media::MediaPath;
+
 /// Lifecycle of the control connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
     Disconnected,
     Connecting,
-    /// WebSocket up, session opened, UDP not yet authenticated.
+    /// WebSocket up, session opened, media link not yet authenticated.
     Connected,
     /// `SessionBind` acknowledged: audio flows.
     MediaBound,
@@ -58,6 +60,8 @@ pub struct SessionInfo {
     pub media_addr: String,
     pub resume_grace: Duration,
     pub resumed: bool,
+    /// The node accepts AURX media as binary frames on the control WebSocket.
+    pub media_tunnel: bool,
 }
 
 /// Everything the integration observes. Poll with `Client::poll_event`.
@@ -67,8 +71,15 @@ pub enum Event {
     StateChanged(ConnectionState),
     /// The session is open (fresh or resumed); media binding follows.
     SessionReady(SessionInfo),
-    /// UDP authenticated; audio may be sent and received.
+    /// The media link is authenticated; audio may be sent and received. Followed by
+    /// `MediaPathChanged` naming the link.
     MediaBound,
+    /// Media now travels over `path`: on every bind and on each mid-session switch (UDP
+    /// heartbeats stopped → tunnel; a UDP re-probe succeeded → back to UDP).
+    MediaPathChanged {
+        path: MediaPath,
+        reason: String,
+    },
     ChannelJoined {
         request_id: RequestId,
         channel_id: ChannelId,

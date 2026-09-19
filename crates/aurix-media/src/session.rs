@@ -6,6 +6,7 @@ use aurix_common::protocol::{
 use aurix_common::types::*;
 
 use crate::quality::{UplinkEstimator, UplinkSample};
+use crate::tunnel::MediaTunnel;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -186,10 +187,26 @@ fn clamp_unit_gain(gain: f32, fallback: f32) -> f32 {
 /// How a participant's media reaches the SFU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// Native AURX/UDP client (authenticated with the per-session media key).
+    /// Native AURX client (authenticated with the per-session media key), over UDP or, when
+    /// UDP is blocked, tunneled through its control WebSocket (see [`MediaEndpoint`]).
     Aurx,
     /// Browser/WebRTC client (media arrives via str0m, downlink is a mixed track).
     WebRtc,
+}
+
+/// Where a bound session's downlink goes.
+#[derive(Debug, Clone)]
+pub enum MediaEndpoint {
+    /// UDP source authenticated by `SessionBind` (or the WebRTC ICE remote).
+    Udp(SocketAddr),
+    /// AURX-over-WebSocket tunnel of the session's control connection.
+    Tunnel(Arc<MediaTunnel>),
+}
+
+impl MediaEndpoint {
+    pub fn is_tunnel(&self) -> bool {
+        matches!(self, MediaEndpoint::Tunnel(_))
+    }
 }
 
 #[derive(Debug)]
@@ -204,7 +221,7 @@ pub struct MediaSession {
     /// Authentication/encryption keys derived from `media_key` (see `MediaKeys`).
     pub keys: MediaKeys,
     pub transport: RwLock<Transport>,
-    pub remote_addr: RwLock<Option<SocketAddr>>,
+    endpoint: RwLock<Option<MediaEndpoint>>,
     pub channels: RwLock<Vec<ChannelId>>,
     pub is_muted: AtomicBool,
     pub is_server_muted: AtomicBool,
@@ -271,7 +288,7 @@ impl MediaSession {
             media_key,
             keys: MediaKeys::derive(&media_key),
             transport: RwLock::new(Transport::Aurx),
-            remote_addr: RwLock::new(None),
+            endpoint: RwLock::new(None),
             channels: RwLock::new(Vec::new()),
             is_muted: AtomicBool::new(false),
             is_server_muted: AtomicBool::new(false),
@@ -337,22 +354,94 @@ impl MediaSession {
         }
     }
 
-    /// True once the UDP source address has been authenticated via `SessionBind`
-    /// (or the WebRTC ICE session connected).
+    /// True once a media path exists: a UDP source authenticated via `SessionBind`, a
+    /// WebSocket tunnel bound the same way, or a connected WebRTC ICE session.
     pub fn is_bound(&self) -> bool {
-        self.remote_addr.read().is_some()
+        self.endpoint.read().is_some()
     }
 
+    pub fn endpoint(&self) -> Option<MediaEndpoint> {
+        self.endpoint.read().clone()
+    }
+
+    /// True while the downlink goes through the WebSocket tunnel.
+    pub fn is_tunneled(&self) -> bool {
+        self.endpoint.read().as_ref().is_some_and(|e| e.is_tunnel())
+    }
+
+    /// Wire-level transport as reported to clients and operators.
+    pub fn transport_kind(&self) -> MediaTransportKind {
+        match self.transport() {
+            Transport::WebRtc => MediaTransportKind::WebRtc,
+            Transport::Aurx if self.is_tunneled() => MediaTransportKind::Tunnel,
+            Transport::Aurx => MediaTransportKind::Udp,
+        }
+    }
+
+    fn replace_endpoint(&self, next: Option<MediaEndpoint>) -> Option<MediaEndpoint> {
+        let mut slot = self.endpoint.write();
+        let was_tunnel = slot.as_ref().is_some_and(|e| e.is_tunnel());
+        let is_tunnel = next.as_ref().is_some_and(|e| e.is_tunnel());
+        if was_tunnel != is_tunnel {
+            if is_tunnel {
+                aurix_metrics::TUNNEL_SESSIONS.inc();
+            } else {
+                aurix_metrics::TUNNEL_SESSIONS.dec();
+            }
+        }
+        std::mem::replace(&mut *slot, next)
+    }
+
+    /// Binds the downlink to a UDP source (replacing a tunnel, if the session was on one).
     pub fn set_remote_addr(&self, addr: SocketAddr) {
-        *self.remote_addr.write() = Some(addr);
+        self.replace_endpoint(Some(MediaEndpoint::Udp(addr)));
     }
 
-    pub fn clear_remote_addr(&self) -> Option<SocketAddr> {
-        self.remote_addr.write().take()
+    /// Binds the downlink to a WebSocket tunnel; returns the UDP address it replaces (to be
+    /// unregistered from the by-address index), if any.
+    pub fn set_tunnel(&self, tunnel: Arc<MediaTunnel>) -> Option<SocketAddr> {
+        match self.replace_endpoint(Some(MediaEndpoint::Tunnel(tunnel))) {
+            Some(MediaEndpoint::Udp(addr)) => Some(addr),
+            _ => None,
+        }
     }
 
+    /// Drops the media path (UDP or tunnel); returns the UDP address to unregister, if any.
+    pub fn clear_endpoint(&self) -> Option<SocketAddr> {
+        match self.replace_endpoint(None) {
+            Some(MediaEndpoint::Udp(addr)) => Some(addr),
+            _ => None,
+        }
+    }
+
+    /// Drops the tunnel `tunnel` if it is still this session's media path (a later bind may
+    /// already have moved the session elsewhere). Returns whether anything changed.
+    pub fn clear_tunnel(&self, tunnel: &MediaTunnel) -> bool {
+        let mut slot = self.endpoint.write();
+        match slot.as_ref() {
+            Some(MediaEndpoint::Tunnel(current)) if **current == *tunnel => {
+                *slot = None;
+                aurix_metrics::TUNNEL_SESSIONS.dec();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// UDP source address of the media path (`None` when unbound or tunneled).
     pub fn get_remote_addr(&self) -> Option<SocketAddr> {
-        *self.remote_addr.read()
+        match self.endpoint.read().as_ref() {
+            Some(MediaEndpoint::Udp(addr)) => Some(*addr),
+            _ => None,
+        }
+    }
+
+    /// Tunnel of the media path (`None` when unbound or on UDP).
+    pub fn tunnel(&self) -> Option<Arc<MediaTunnel>> {
+        match self.endpoint.read().as_ref() {
+            Some(MediaEndpoint::Tunnel(t)) => Some(t.clone()),
+            _ => None,
+        }
     }
 
     pub fn join_channel(&self, channel_id: ChannelId) {

@@ -1,5 +1,6 @@
 use crate::audio::EncoderSettings;
 use crate::dsp::DspConfig;
+use crate::media::MediaPathPolicy;
 use std::time::Duration;
 
 /// Exponential backoff for automatic reconnects.
@@ -50,6 +51,15 @@ pub struct ClientConfig {
     pub ping_interval: Duration,
     /// Media heartbeat (NAT keepalive + RTT probe).
     pub heartbeat_interval: Duration,
+    /// Which link carries media: UDP first with the WebSocket tunnel as fallback (default),
+    /// UDP only, or tunnel only.
+    pub media_path: MediaPathPolicy,
+    /// `Auto` only: unanswered heartbeats in a row on UDP before media moves to the tunnel
+    /// (with the default 5 s heartbeat, 3 ≈ 15 s of silence).
+    pub udp_fallback_lost_heartbeats: u32,
+    /// `Auto` only: how often a tunnelled session re-probes UDP and moves back when it
+    /// answers; zero disables re-probing (the session stays tunnelled until it reconnects).
+    pub udp_reprobe_interval: Duration,
     /// Uplink Opus encoder before any channel policy applies (bitrate, complexity, bandwidth,
     /// VBR/FEC/DTX).
     pub encoder: EncoderSettings,
@@ -82,6 +92,9 @@ impl ClientConfig {
             request_timeout: Duration::from_secs(10),
             ping_interval: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(5),
+            media_path: MediaPathPolicy::Auto,
+            udp_fallback_lost_heartbeats: 3,
+            udp_reprobe_interval: Duration::from_secs(30),
             encoder: EncoderSettings::default(),
             dsp: DspConfig::default(),
             follow_channel_policy: true,

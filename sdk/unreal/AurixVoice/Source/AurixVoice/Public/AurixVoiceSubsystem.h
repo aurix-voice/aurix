@@ -27,6 +27,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLocalSpeaking, bool, bSpeaking
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTransmissionMode, Mode, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioCodecChanged, EAurixAudioCodec, Codec);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixMediaPathChanged, EAurixMediaPath, Path, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixUserBlockChanged, FGuid, UserId, bool, bBlocked);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixRecording, FGuid, ChannelId, FGuid, RecordingId, bool, bActive, FGuid, InitiatedBy);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixBitrateChanged, int32, BitrateBps, const FString&, Reason);
@@ -279,6 +280,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
 	EAurixAudioCodec GetAudioCodec() const;
 
+	/**
+	 * Link the media uses right now: UDP, the WebSocket tunnel (UDP blocked — expect higher
+	 * latency under packet loss) or None before the first OnMediaBound.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
+	EAurixMediaPath GetMediaPath() const;
+
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetTranscripts(bool bEnabled);
 
@@ -362,6 +370,8 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTransmissionChanged OnTransmissionChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelFocusChanged OnChannelFocusChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioCodecChanged OnAudioCodecChanged;
+	/** Media moved between UDP and the WebSocket tunnel (also fires after every OnMediaBound). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixMediaPathChanged OnMediaPathChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixUserBlockChanged OnUserBlockChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRecording OnRecording;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixBitrateChanged OnBitrateChanged;

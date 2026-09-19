@@ -206,6 +206,19 @@ pub enum AudioCodec {
     Pcmu,
 }
 
+/// How a session's media reaches the node (`MediaBound.transport`, session stats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTransportKind {
+    /// Native AURX over UDP.
+    #[default]
+    Udp,
+    /// Native AURX tunneled through the control WebSocket (UDP-blocked fallback).
+    Tunnel,
+    /// Browser WebRTC (str0m).
+    WebRtc,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BanScope {

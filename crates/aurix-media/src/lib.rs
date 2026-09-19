@@ -10,6 +10,7 @@ pub mod sfu;
 pub mod transcode;
 pub mod transport;
 pub mod tts;
+pub mod tunnel;
 pub mod webrtc;
 
 pub use channel::MediaChannel;

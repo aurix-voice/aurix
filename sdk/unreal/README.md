@@ -169,6 +169,15 @@ stops capture, unbinds the sound wave and only then destroys the client.
   playback switch codec inside the native core, nothing changes in the bridge. Refused with
   `CODEC_NOT_AVAILABLE` when the node runs `media.pcmu_fallback = false`.
 
+* **Blocked UDP:** `FAurixVoiceSettings.MediaPath` (`EAurixMediaPathPolicy::Auto` by default)
+  binds media over UDP and falls back to the authenticated control WebSocket when the bind gets
+  no answer or `UdpFallbackLostHeartbeats` heartbeats vanish mid-call; while tunnelled UDP is
+  re-probed every `UdpReprobeIntervalMs` and taken back when it answers. `UdpOnly` /
+  `TunnelOnly` pin a link. `GetMediaPath()`, `OnMediaPathChanged(Path, Reason)`,
+  `FAurixSessionInfo.bMediaTunnel` (node advertises the tunnel) and `FAurixStats.MediaPath` /
+  `HeartbeatsLostConsecutive` / `UplinkDropped`. The tunnel is TCP — expect latency bursts under
+  loss; it keeps the player in the call, UDP remains the path to be on.
+
 ### Statistics and network quality bars
 
 `GetStats(FAurixStats&)` returns the native snapshot (packets/bytes both ways, `BadAuth`,

@@ -8197,7 +8197,17 @@
             "format": "uuid"
           },
           "transport": {
-            "type": "string"
+            "type": "string",
+            "description": "Session transport family: `Aurx` (native) or `WebRtc`."
+          },
+          "media_path": {
+            "type": "string",
+            "enum": [
+              "udp",
+              "tunnel",
+              "web_rtc"
+            ],
+            "description": "Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), or WebRTC."
           },
           "channels": {
             "type": "array",

@@ -134,6 +134,9 @@ impl AurixConfig {
         if self.media.quality_interval_ms != 0 && self.media.quality_interval_ms < 500 {
             anyhow::bail!("media.quality_interval_ms must be 0 (off) or >= 500");
         }
+        if !(8..=4096).contains(&self.media.tunnel_queue_packets) {
+            anyhow::bail!("media.tunnel_queue_packets must be within 8..=4096");
+        }
         if !(0.0..=1.0).contains(&self.media.unfocused_channel_gain) {
             anyhow::bail!("media.unfocused_channel_gain must be within 0.0..=1.0");
         }
@@ -668,6 +671,16 @@ pub struct MediaConfig {
     /// node; disable on CPU-bound nodes.
     #[serde(default = "default_true")]
     pub pcmu_fallback: bool,
+    /// Let native AURX sessions carry media over their control WebSocket when UDP is
+    /// blocked (one sealed AURX packet per binary frame). Costs TCP head-of-line blocking
+    /// for those sessions only; disable to force UDP.
+    #[serde(default = "default_true")]
+    pub media_tunnel: bool,
+    /// Downlink packets queued per tunneled session before the node starts dropping that
+    /// session's audio (a stalled TCP connection never blocks the SFU). ~20 ms of audio per
+    /// packet per speaker heard.
+    #[serde(default = "default_tunnel_queue_packets")]
+    pub tunnel_queue_packets: usize,
     /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
     #[serde(default)]
     pub rx_workers: usize,
@@ -715,6 +728,10 @@ fn default_unfocused_channel_gain() -> f32 {
     0.5
 }
 
+fn default_tunnel_queue_packets() -> usize {
+    128
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
@@ -743,6 +760,8 @@ impl Default for MediaConfig {
             max_positional_channels_per_session: default_max_positional_channels_per_session(),
             unfocused_channel_gain: default_unfocused_channel_gain(),
             pcmu_fallback: true,
+            media_tunnel: true,
+            tunnel_queue_packets: default_tunnel_queue_packets(),
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

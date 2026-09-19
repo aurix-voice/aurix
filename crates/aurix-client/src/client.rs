@@ -1,7 +1,8 @@
-//! `Client`: one voice session. Owns a small tokio runtime for the control plane, the UDP media
-//! transport, the capture encoder and the remote mixer, and exposes a synchronous, thread-safe
-//! API plus a poll-based event queue — the shape engines want (audio callbacks push/pull PCM,
-//! the game thread pumps events once per tick).
+//! `Client`: one voice session. Owns a small tokio runtime for the control plane, the media
+//! transport (UDP, or tunnelled through the control WebSocket when UDP is blocked), the
+//! capture encoder and the remote mixer, and exposes a synchronous, thread-safe API plus a
+//! poll-based event queue — the shape engines want (audio callbacks push/pull PCM, the game
+//! thread pumps events once per tick).
 //!
 //! Reconnect policy: a dropped control socket (or a stalled one: no message for three ping
 //! intervals) triggers exponential-backoff reconnects that first try to *resume* the session
@@ -9,6 +10,12 @@
 //! session instead, previously joined channels are re-joined with the session token and
 //! receiver preferences (local mutes, volumes, transmission, focus) are replayed. A
 //! `SessionClose` from the server (kick, ban, erasure, shutdown) is terminal.
+//!
+//! Media path policy (`ClientConfig::media_path`, default `Auto`): UDP is bound first; when
+//! the bind gets no ack, or UDP heartbeats stop being acknowledged mid-session, media moves to
+//! the WebSocket tunnel (same session, SSRC, key and sequence counter, so peers notice
+//! nothing but latency). A tunnelled session re-probes UDP periodically and moves back when it
+//! answers.
 
 use aurix_common::protocol::{
     channel_id_hash, ControlMessage, ParticipantBrief, TransmissionMode, TtsDestination, TtsState,
@@ -29,16 +36,32 @@ use crate::audio::{
     CaptureEncoder, EncoderSettings, MixerTotals, RemoteMixer, StreamStats, FRAME_SAMPLES,
 };
 use crate::config::ClientConfig;
-use crate::control::{token_identity, ws_host, ControlConnection, SessionAck, TokenIdentity};
+use crate::control::{
+    token_identity, ws_host, ControlConnection, Inbound, SessionAck, TokenIdentity,
+};
 use crate::dsp::{DspConfig, DspStats, FarEndHandle};
 use crate::error::{ClientError, Result};
 use crate::events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
-use crate::media::{resolve_media_addr, IncomingAudio, MediaStats, MediaTransport};
+use crate::media::{
+    resolve_media_addr, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
+    MediaTransport, SequenceCounter, TUNNEL_UPLINK_QUEUE,
+};
 
 const MAX_QUEUED_EVENTS: usize = 4096;
 const REQUEST_TICK: Duration = Duration::from_millis(200);
 const BIND_ATTEMPTS: u32 = 3;
 const BIND_TIMEOUT: Duration = Duration::from_secs(2);
+/// UDP bind budget when the tunnel is there to fall back to (2 × 1 s, then tunnel).
+const FALLBACK_BIND_ATTEMPTS: u32 = 2;
+const FALLBACK_BIND_TIMEOUT: Duration = Duration::from_secs(1);
+/// One UDP re-probe while tunnelled.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Tunnel `SessionBind` → `SessionBindAck` handshake over the WebSocket.
+const TUNNEL_BIND_ATTEMPTS: u32 = 2;
+const TUNNEL_BIND_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a failed UDP bind keeps `Auto` reconnects going straight to the tunnel when
+/// re-probing is disabled.
+const UDP_BLOCK_MEMORY: Duration = Duration::from_secs(60);
 /// Client refs of chat/TTS requests are kept this long after the last status so late
 /// `TtsStatus` updates still map to the request id.
 const REF_RETENTION: Duration = Duration::from_secs(600);
@@ -61,6 +84,8 @@ pub struct TransmitStats {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientStats {
     pub state: Option<ConnectionState>,
+    /// Link the media currently uses (`None` before the first bind).
+    pub media_path: Option<MediaPath>,
     pub media: MediaStats,
     pub transmit: TransmitStats,
     /// Inter-arrival jitter of downlink audio, RFC 3550 style, in milliseconds.
@@ -184,6 +209,9 @@ struct Inner {
     next_request: AtomicU64,
     closing: AtomicBool,
     resume_seq: Mutex<Option<u32>>,
+    /// A UDP bind failed or UDP heartbeats died at least until this instant: `Auto` sessions
+    /// opened before it go straight to the tunnel and let the re-probe find UDP again.
+    udp_blocked_until: Mutex<Option<Instant>>,
 }
 
 impl Inner {
@@ -398,6 +426,7 @@ impl Client {
             next_request: AtomicU64::new(1),
             closing: AtomicBool::new(false),
             resume_seq: Mutex::new(None),
+            udp_blocked_until: Mutex::new(None),
         });
         Ok(Self {
             inner,
@@ -472,6 +501,11 @@ impl Client {
 
     pub fn state(&self) -> ConnectionState {
         self.inner.state()
+    }
+
+    /// Link the media currently travels over; `None` until the first `MediaBound`.
+    pub fn media_path(&self) -> Option<MediaPath> {
+        self.inner.media.read().as_ref().map(|m| m.path())
     }
 
     pub fn session(&self) -> Option<SessionInfo> {
@@ -1093,6 +1127,7 @@ impl Client {
         let r = quality::r_factor(media.rtt_ms, jitter_ms, loss_percent);
         ClientStats {
             state: Some(self.inner.state()),
+            media_path: self.media_path(),
             media,
             transmit: *self.inner.tx_stats.lock(),
             jitter_ms,
@@ -1400,6 +1435,7 @@ async fn session(
         media_addr: ack.media_addr.clone(),
         resume_grace: ack.resume_grace,
         resumed: ack.resumed,
+        media_tunnel: ack.media_tunnel,
     };
     *inner.session.lock() = Some(info.clone());
     *resume = Some((ack.session_id, ack.resume_token.clone()));
@@ -1415,49 +1451,39 @@ async fn session(
         }
     }
 
-    // UDP bind off the async threads (blocking socket I/O with retries).
-    let media_res = {
-        let host = ws_host(&cfg.ws_url).unwrap_or_else(|| "127.0.0.1".into());
-        let addr = resolve_media_addr(&ack.media_addr, &host);
-        let initial_sequence = take_pending_sequence(inner);
-        let key = ack.media_key.clone();
-        let (sid, ssrc) = (ack.session_id, ack.ssrc);
-        match addr {
-            Ok(addr) => tokio::task::spawn_blocking(move || {
-                MediaTransport::bind(
-                    addr,
-                    sid,
-                    ssrc,
-                    &key,
-                    initial_sequence,
-                    BIND_ATTEMPTS,
-                    BIND_TIMEOUT,
-                )
-            })
-            .await
-            .map_err(|e| ClientError::Transport(format!("bind task: {e}")))
-            .and_then(|r| r),
-            Err(e) => Err(e),
-        }
+    let links = MediaLinks {
+        sid: ack.session_id,
+        ssrc: ack.ssrc,
+        key: ack.media_key.clone(),
+        seq: Arc::new(AtomicU32::new(take_pending_sequence(inner))),
+        udp_addr: resolve_media_addr(
+            &ack.media_addr,
+            &ws_host(&cfg.ws_url).unwrap_or_else(|| "127.0.0.1".into()),
+        ),
+        tunnel_offered: ack.media_tunnel,
     };
-    let media = match media_res {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            let reason = format!("media bind failed: {e}");
-            conn.abort();
-            return Exit::Dropped(reason);
-        }
-    };
-    {
-        let sink_inner = Arc::clone(inner);
-        media.start(Arc::new(move |audio| sink_inner.on_incoming_audio(audio)));
-        if inner.muted.load(Ordering::Relaxed) {
-            media.send_mute_state(true);
-        }
-        *inner.media.write() = Some(Arc::clone(&media));
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Vec<u8>>(TUNNEL_UPLINK_QUEUE);
+    // Control messages the server sent while a tunnel handshake was waiting for its ack.
+    let mut deferred: Vec<ControlMessage> = Vec::new();
+    let (mut media, first_path) =
+        match bind_initial_media(inner, cfg, &mut conn, &links, &tunnel_tx, &mut deferred).await {
+            Ok(m) => m,
+            Err(e) => {
+                let reason = format!("media bind failed: {e}");
+                conn.abort();
+                return Exit::Dropped(reason);
+            }
+        };
+    install_media(inner, &media, None);
+    if inner.muted.load(Ordering::Relaxed) {
+        media.send_mute_state(true);
     }
     inner.set_state(ConnectionState::MediaBound);
     inner.emit(Event::MediaBound);
+    inner.emit(Event::MediaPathChanged {
+        path: media.path(),
+        reason: first_path,
+    });
 
     if !first {
         inner.emit(Event::Recovered {
@@ -1505,7 +1531,24 @@ async fn session(
     let mut requests = tokio::time::interval(REQUEST_TICK);
     let mut last_rx = Instant::now();
     let mut ping_nonce: u64 = rand::random();
+    let reprobe_enabled = cfg.media_path == MediaPathPolicy::Auto
+        && links.tunnel_offered
+        && !cfg.udp_reprobe_interval.is_zero()
+        && links.udp_addr.is_ok();
+    let mut reprobe = tokio::time::interval(if reprobe_enabled {
+        cfg.udp_reprobe_interval
+    } else {
+        Duration::from_secs(3600)
+    });
+    reprobe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    reprobe.reset();
+    let mut probe: Option<tokio::task::JoinHandle<Result<MediaTransport>>> = None;
 
+    for m in std::mem::take(&mut deferred) {
+        if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
+            return exit;
+        }
+    }
     if let Err(exit) = pump_joins(inner, cfg, &mut conn, pending).await {
         return exit;
     }
@@ -1515,9 +1558,14 @@ async fn session(
             msg = conn.recv() => {
                 last_rx = Instant::now();
                 match msg {
-                    Ok(Some(m)) => {
+                    Ok(Some(Inbound::Control(m))) => {
                         if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
                             return exit;
+                        }
+                    }
+                    Ok(Some(Inbound::Media(data))) => {
+                        if media.path() == MediaPath::Tunnel {
+                            media.handle_frame(&data);
                         }
                     }
                     Ok(None) => return Exit::Dropped("server closed the socket".into()),
@@ -1525,6 +1573,11 @@ async fn session(
                         tracing::warn!("ignoring malformed control message: {p}");
                     }
                     Err(e) => return Exit::Dropped(e.to_string()),
+                }
+            }
+            Some(packet) = tunnel_rx.recv() => {
+                if conn.send_media(packet).await.is_err() {
+                    return Exit::Dropped("media tunnel send failed".into());
                 }
             }
             cmd = cmd_rx.recv() => {
@@ -1557,6 +1610,66 @@ async fn session(
                 media.send_heartbeat();
                 let stats = inner_stats(inner, &media);
                 media.send_quality_report(stats.0, stats.1, stats.2);
+                let udp_dead = media.path() == MediaPath::Udp
+                    && cfg.media_path == MediaPathPolicy::Auto
+                    && links.tunnel_offered
+                    && cfg.udp_fallback_lost_heartbeats > 0
+                    && media.consecutive_heartbeats_lost() >= cfg.udp_fallback_lost_heartbeats;
+                if udp_dead {
+                    let lost = media.consecutive_heartbeats_lost();
+                    mark_udp_blocked(inner, cfg);
+                    let tunnel = Arc::new(links.tunnel(&tunnel_tx));
+                    match bind_tunnel(&mut conn, &tunnel, &mut deferred).await {
+                        Ok(()) => {
+                            let reason = format!("{lost} UDP heartbeats unanswered");
+                            install_media(inner, &tunnel, Some(&media));
+                            media = tunnel;
+                            inner.emit(Event::MediaPathChanged { path: MediaPath::Tunnel, reason });
+                            reprobe.reset();
+                        }
+                        Err(ClientError::Transport(e)) => {
+                            return Exit::Dropped(format!("media tunnel bind failed: {e}"));
+                        }
+                        Err(e) => tracing::warn!("UDP is silent and the tunnel bind failed: {e}"),
+                    }
+                    for m in std::mem::take(&mut deferred) {
+                        if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
+                            return exit;
+                        }
+                    }
+                }
+            }
+            _ = reprobe.tick(), if reprobe_enabled && probe.is_none() && media.path() == MediaPath::Tunnel => {
+                probe = links.udp_addr.as_ref().ok().map(|&addr| {
+                    let (sid, ssrc, key, seq) = (links.sid, links.ssrc, links.key.clone(), Arc::clone(&links.seq));
+                    tokio::task::spawn_blocking(move || {
+                        MediaTransport::bind_udp(addr, sid, ssrc, &key, seq, 1, PROBE_TIMEOUT)
+                    })
+                });
+            }
+            probed = async { probe.as_mut().expect("guarded by the branch condition").await }, if probe.is_some() => {
+                probe = None;
+                match probed {
+                    Ok(Ok(udp)) => {
+                        let udp = Arc::new(udp);
+                        install_media(inner, &udp, Some(&media));
+                        media = udp;
+                        *inner.udp_blocked_until.lock() = None;
+                        inner.emit(Event::MediaPathChanged {
+                            path: MediaPath::Udp,
+                            reason: "UDP re-probe answered".into(),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("UDP re-probe failed, staying tunnelled: {e}");
+                        // The probe's SessionBind may have reached the node even though its ack
+                        // did not come back; reclaim the endpoint for the tunnel.
+                        if media.path() == MediaPath::Tunnel {
+                            media.send_bind();
+                        }
+                    }
+                    Err(e) => tracing::warn!("UDP re-probe task failed: {e}"),
+                }
             }
             _ = requests.tick() => {
                 expire_requests(inner, pending);
@@ -1576,6 +1689,157 @@ fn inner_stats(inner: &Inner, media: &MediaTransport) -> (f32, f32, f32) {
         .lock()
         .advance(totals.lost, m.audio_frames_received);
     (m.rtt_ms, inner.jitter.lock().jitter_ms, loss)
+}
+
+/// Everything needed to open either media link for one session.
+struct MediaLinks {
+    sid: SessionId,
+    ssrc: u32,
+    key: Vec<u8>,
+    /// Shared by every link of the session so the server's replay window keeps accepting
+    /// packets across UDP ↔ tunnel switches.
+    seq: SequenceCounter,
+    udp_addr: Result<std::net::SocketAddr>,
+    tunnel_offered: bool,
+}
+
+impl MediaLinks {
+    fn tunnel(&self, uplink: &mpsc::Sender<Vec<u8>>) -> MediaTransport {
+        MediaTransport::tunnel(
+            self.sid,
+            self.ssrc,
+            &self.key,
+            Arc::clone(&self.seq),
+            uplink.clone(),
+        )
+    }
+
+    /// UDP bind off the async threads (blocking socket I/O with retries).
+    async fn bind_udp(&self, attempts: u32, timeout: Duration) -> Result<MediaTransport> {
+        let addr = self.udp_addr.clone()?;
+        let (sid, ssrc, key, seq) = (self.sid, self.ssrc, self.key.clone(), Arc::clone(&self.seq));
+        tokio::task::spawn_blocking(move || {
+            MediaTransport::bind_udp(addr, sid, ssrc, &key, seq, attempts, timeout)
+        })
+        .await
+        .map_err(|e| ClientError::Transport(format!("bind task: {e}")))?
+    }
+}
+
+/// Picks the first media link per `ClientConfig::media_path`. Returns the transport and a
+/// human-readable reason for the `MediaPathChanged` event.
+async fn bind_initial_media(
+    inner: &Inner,
+    cfg: &ClientConfig,
+    conn: &mut ControlConnection,
+    links: &MediaLinks,
+    tunnel_tx: &mpsc::Sender<Vec<u8>>,
+    deferred: &mut Vec<ControlMessage>,
+) -> Result<(Arc<MediaTransport>, String)> {
+    let tunnel = |reason: String| async move {
+        let t = Arc::new(links.tunnel(tunnel_tx));
+        bind_tunnel(conn, &t, deferred).await?;
+        Ok((t, reason))
+    };
+    match cfg.media_path {
+        MediaPathPolicy::UdpOnly => {
+            let udp = links.bind_udp(BIND_ATTEMPTS, BIND_TIMEOUT).await?;
+            Ok((Arc::new(udp), "UDP bound".into()))
+        }
+        MediaPathPolicy::TunnelOnly => {
+            if !links.tunnel_offered {
+                return Err(ClientError::Transport(
+                    "media path is tunnel-only but the node offers no media tunnel".into(),
+                ));
+            }
+            tunnel("tunnel-only policy".into()).await
+        }
+        MediaPathPolicy::Auto if !links.tunnel_offered => {
+            let udp = links.bind_udp(BIND_ATTEMPTS, BIND_TIMEOUT).await?;
+            Ok((Arc::new(udp), "UDP bound".into()))
+        }
+        MediaPathPolicy::Auto => {
+            let udp_blocked = inner
+                .udp_blocked_until
+                .lock()
+                .is_some_and(|until| until > Instant::now());
+            if udp_blocked {
+                return tunnel("UDP was blocked before this session".into()).await;
+            }
+            match links
+                .bind_udp(FALLBACK_BIND_ATTEMPTS, FALLBACK_BIND_TIMEOUT)
+                .await
+            {
+                Ok(udp) => Ok((Arc::new(udp), "UDP bound".into())),
+                Err(e) => {
+                    tracing::info!("UDP bind failed ({e}); falling back to the media tunnel");
+                    mark_udp_blocked(inner, cfg);
+                    tunnel(format!("UDP bind failed: {e}")).await
+                }
+            }
+        }
+    }
+}
+
+fn mark_udp_blocked(inner: &Inner, cfg: &ClientConfig) {
+    let memory = if cfg.udp_reprobe_interval.is_zero() {
+        UDP_BLOCK_MEMORY
+    } else {
+        cfg.udp_reprobe_interval
+    };
+    *inner.udp_blocked_until.lock() = Some(Instant::now() + memory);
+}
+
+/// Tunnel handshake: signed `SessionBind` out as a binary frame, sealed `SessionBindAck` back.
+/// Text frames that arrive meanwhile are queued in `deferred`. `Err(Transport)` means the
+/// socket is gone; other errors mean the node refused or never acked the bind.
+async fn bind_tunnel(
+    conn: &mut ControlConnection,
+    tunnel: &MediaTransport,
+    deferred: &mut Vec<ControlMessage>,
+) -> Result<()> {
+    for _ in 0..TUNNEL_BIND_ATTEMPTS {
+        conn.send_media(tunnel.bind_packet()).await?;
+        let deadline = tokio::time::Instant::now() + TUNNEL_BIND_TIMEOUT;
+        loop {
+            let next = match tokio::time::timeout_at(deadline, conn.recv()).await {
+                Err(_) => break,
+                Ok(Ok(Some(next))) => next,
+                Ok(Ok(None)) => {
+                    return Err(ClientError::Transport(
+                        "server closed the socket during the tunnel bind".into(),
+                    ))
+                }
+                Ok(Err(ClientError::Protocol(p))) => {
+                    tracing::warn!("ignoring malformed control message: {p}");
+                    continue;
+                }
+                Ok(Err(e)) => return Err(e),
+            };
+            match next {
+                Inbound::Control(m) => deferred.push(m),
+                Inbound::Media(data) => {
+                    if tunnel.handle_frame(&data) == FrameKind::BindAck {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    Err(ClientError::Protocol(format!(
+        "no SessionBindAck over the tunnel after {TUNNEL_BIND_ATTEMPTS} attempts"
+    )))
+}
+
+/// Makes `new` the session's media link: starts its receive side, points the capture path at
+/// it and stops `old` (uplink sequence continues; the server moved on its bind ack).
+fn install_media(inner: &Arc<Inner>, new: &Arc<MediaTransport>, old: Option<&Arc<MediaTransport>>) {
+    let sink_inner = Arc::clone(inner);
+    new.start(Arc::new(move |audio| sink_inner.on_incoming_audio(audio)));
+    *inner.media.write() = Some(Arc::clone(new));
+    if let Some(old) = old {
+        old.stop();
+    }
 }
 
 fn replay_global_prefs(inner: &Inner) -> Vec<ControlMessage> {

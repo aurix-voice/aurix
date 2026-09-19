@@ -129,6 +129,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand(BitrateCommand)` |
 | Opus controls | `OpusEncoderSettings`, `SetEncoderSettings`, `SetComplexity`, `FollowChannelPolicy`, `Encoder`, `EffectiveEncoderSettings`, `AudioPolicy`, `OnAudioPolicyChanged`, `OnEncoderSettingsChanged`; `NativeOpusCodec` / `ConcentusOpusCodec`, `IOpusEncoderControls`, `IOpusFecDecoder` |
 | PCMU (G.711) fallback | `SetAudioCodecAsync(AudioCodec)`, `AudioCodec` / `PreferredAudioCodec`, `OnAudioCodecChanged`; behaviour `PreferredCodec`, `SetAudioCodec()`, `ActiveCodec`; `PcmuCodec`, `G711`, `TransmitAudioFrame(codec, …)`, `IncomingAudio.Codec` |
+| Blocked UDP | `MediaPathPolicy` (`Auto`/`UdpOnly`/`TunnelOnly`), `UdpFallbackLostHeartbeats`, `UdpReprobeInterval`, `MediaHeartbeatInterval`, `ActiveMediaPath`, `OnMediaPathChanged(path, reason)`, `SessionInfo.MediaTunnel`, `VoiceStats.MediaPath` / `HeartbeatsLostConsecutive` / `UplinkDropped`; behaviour `MediaPath`, `UdpFallbackLostHeartbeats`, `UdpReprobeIntervalSeconds` — [below](#when-udp-is-blocked-the-websocket-tunnel) |
 | Mobile | runtime microphone permission (`PermissionState`, `OnMicrophonePermissionDenied`, `RetryMicrophonePermission()`), background/foreground handling, `ProbeConnection()`, reconnect on Wi-Fi ↔ cellular |
 
 ## Capture processing: echo cancellation, noise suppression, AGC
@@ -214,6 +215,37 @@ fresh decoder. `SetBitrate` is a no-op on it (G.711 is fixed-rate), and `OpusEnc
 channel audio policies do not apply while PCMU is active. Rejected with `CODEC_NOT_AVAILABLE`
 when the node runs `media.pcmu_fallback = false`.
 
+## When UDP is blocked: the WebSocket tunnel
+
+Some networks drop UDP altogether. In `MediaPathPolicy.Auto` (default) the client binds media
+over UDP first and, if the node never answers, carries the very same sealed AURX packets as
+binary frames over the control WebSocket it already holds — no second connection, no new
+credentials ([protocol](../api/aurx.md#tunnel-aurx-over-the-control-websocket)). Later, while
+on UDP, `UdpFallbackLostHeartbeats` (3) unanswered heartbeats in a row switch to the tunnel
+mid-call; while tunnelled, every `UdpReprobeInterval` (30 s, `TimeSpan.Zero` = never) a fresh
+UDP bind is tried and the media moves back the moment it answers. `MediaHeartbeatInterval`
+(5 s) sets how quickly a dead UDP path is noticed. `UdpOnly` restores the old behaviour (a dead
+path is a reconnect), `TunnelOnly` never opens a UDP socket. `Auto` needs the node to advertise
+the tunnel (`SessionInfo.MediaTunnel`, `media.media_tunnel = true`).
+
+```csharp
+client.MediaPathPolicy = MediaPathPolicy.Auto;
+client.UdpFallbackLostHeartbeats = 3;
+client.UdpReprobeInterval = TimeSpan.FromSeconds(30);
+client.OnMediaPathChanged += (path, why) => Debug.Log($"media over {path}: {why}");
+// "Tunnel: UDP bind failed: …", "Tunnel: 3 UDP heartbeats unanswered", "Udp: UDP re-probe answered"
+var stats = client.GetStats();   // stats.MediaPath, stats.HeartbeatsLostConsecutive, stats.UplinkDropped
+```
+
+Both links share one uplink sequence counter, so a switch is invisible to the server's replay
+window and to other players' jitter buffers; codecs, mute, quality reports, reconnect and resume
+behave the same on either link. `UplinkDropped` counts frames the tunnel's bounded send queue
+(`ControlChannel.MediaQueueLength`, 64 frames) refused because the TCP connection was stalled —
+audio never blocks the game thread. Expect higher and burstier latency on the tunnel (TCP
+retransmits stall everything behind a lost segment): it keeps the player in the call, UDP
+remains the path to be on. `MediaTransport.OverTunnel(IMediaTunnel, …)` exposes the link for
+custom pipelines; `ControlChannel` implements `IMediaTunnel`.
+
 ## .NET: build, test, demo
 
 ```bash
@@ -224,8 +256,10 @@ AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1
 ```
 
 The demo connects two headless clients over real UDP and asserts audio, events and counters;
-`--scenario reconnect | prefs | chat | transmission | positional | echo | pcmu` cover the other
-features against a live server (see the README for what each checks).
+`--scenario reconnect | prefs | chat | transmission | positional | echo | pcmu | tunnel` cover
+the other features against a live server (see the README for what each checks). `tunnel` adds
+`--udp-block 1` to black-hole UDP with `sudo iptables` on the fly and watch an `Auto` client fall
+back at bind, return on the re-probe and fall back again on heartbeat loss.
 
 ## iOS / Android notes
 

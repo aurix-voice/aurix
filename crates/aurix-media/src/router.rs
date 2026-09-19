@@ -1,4 +1,4 @@
-//! AURX/UDP packet router.
+//! AURX packet router (UDP and the WebSocket tunnel fallback).
 //!
 //! Security model:
 //! * A UDP source address is only associated with a session after an authenticated
@@ -6,6 +6,9 @@
 //! * Every subsequent packet must come from the bound address; when
 //!   `require_packet_auth` is on it must also carry a valid HMAC tag and a fresh
 //!   sequence number (64-packet anti-replay window shared by audio and control packets).
+//! * Packets arriving through a WebSocket tunnel are attributed to the session that
+//!   connection authenticated as (never to the session named in the packet), then pass the
+//!   same tag/replay checks as UDP packets; the bind/ack handshake is identical.
 //! * The SSRC in the header is never used to look up a sender.
 
 use aurix_common::error::{AurixError, Result};
@@ -26,8 +29,9 @@ use tracing::{debug, warn};
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::{MediaChannel, Mix};
-use crate::session::{MediaSession, Transport};
+use crate::session::{MediaEndpoint, MediaSession, Transport};
 use crate::transcode::{PcmuDownlink, PcmuUplink};
+use crate::tunnel::MediaTunnel;
 use crate::webrtc::{ForwardMedia, WebRtcManager};
 
 /// Sweep idle PCMU downlink decoders when the table grows past this.
@@ -58,10 +62,10 @@ impl InjectedFrame {
 /// Notifications from the media plane to the control plane (WebSocket layer).
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
-    /// UDP address authenticated for the session.
+    /// A media path was authenticated for the session.
     SessionBound {
         session_id: SessionId,
-        addr: SocketAddr,
+        transport: MediaTransportKind,
     },
     SpeakingChanged {
         session_id: SessionId,
@@ -89,6 +93,22 @@ pub enum MediaEvent {
         user_id: UserId,
         quality: NetworkQuality,
     },
+}
+
+/// Where an uplink packet came from.
+#[derive(Clone, Copy)]
+enum PacketSource<'a> {
+    Udp(SocketAddr),
+    Tunnel(&'a Arc<MediaTunnel>),
+}
+
+impl std::fmt::Display for PacketSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketSource::Udp(addr) => write!(f, "{addr}"),
+            PacketSource::Tunnel(t) => write!(f, "tunnel#{}", t.id()),
+        }
+    }
 }
 
 pub struct RouterShared {
@@ -140,12 +160,26 @@ impl PacketRouter {
     }
 
     pub async fn route_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
+        self.route_from(data, PacketSource::Udp(src_addr)).await
+    }
+
+    /// Routes one AURX packet that arrived as a binary frame on the WebSocket connection
+    /// owning `tunnel`.
+    pub async fn route_tunnel_packet(&self, data: &[u8], tunnel: &Arc<MediaTunnel>) -> Result<()> {
+        let res = self.route_from(data, PacketSource::Tunnel(tunnel)).await;
+        aurix_metrics::TUNNEL_PACKETS
+            .with_label_values(&["uplink", if res.is_ok() { "received" } else { "rejected" }])
+            .inc();
+        res
+    }
+
+    async fn route_from(&self, data: &[u8], source: PacketSource<'_>) -> Result<()> {
         let mut packet = AurixPacket::decode(data)?;
         if packet.header.packet_type == PacketType::SessionBind {
-            return self.handle_session_bind(&packet, src_addr).await;
+            return self.handle_session_bind(&packet, source).await;
         }
 
-        let session = self.authenticate(&mut packet, src_addr)?;
+        let session = self.authenticate(&mut packet, source)?;
         let is_audio = matches!(
             packet.header.packet_type,
             PacketType::Audio | PacketType::AudioFec
@@ -164,7 +198,7 @@ impl PacketRouter {
                 packet.header.sequence = session.next_sequence();
                 self.route_audio_packet(&packet, &session, level).await
             }
-            PacketType::Heartbeat => self.handle_heartbeat(&packet, &session, src_addr).await,
+            PacketType::Heartbeat => self.handle_heartbeat(&packet, &session, source).await,
             PacketType::QualityReport => {
                 self.handle_quality_report(&packet, &session);
                 Ok(())
@@ -184,19 +218,37 @@ impl PacketRouter {
         }
     }
 
-    /// Resolve the sender by *bound address*, verify the tag, decrypt the payload in place and
-    /// check the anti-replay window.
+    /// Resolve the sender by *bound address* (UDP) or by the *authenticated connection* (tunnel),
+    /// verify the tag, decrypt the payload in place and check the anti-replay window.
     fn authenticate(
         &self,
         packet: &mut AurixPacket,
-        src_addr: SocketAddr,
+        source: PacketSource<'_>,
     ) -> Result<Arc<MediaSession>> {
-        let session = self
-            .shared
-            .sessions_by_addr
-            .get(&src_addr)
-            .map(|s| s.value().clone())
-            .ok_or_else(|| AurixError::AuthenticationFailed("Unbound media source".into()))?;
+        let session = match source {
+            PacketSource::Udp(src_addr) => self
+                .shared
+                .sessions_by_addr
+                .get(&src_addr)
+                .map(|s| s.value().clone())
+                .ok_or_else(|| AurixError::AuthenticationFailed("Unbound media source".into()))?,
+            PacketSource::Tunnel(tunnel) => {
+                let session = self
+                    .shared
+                    .sessions_by_id
+                    .get(&tunnel.session_id())
+                    .map(|s| s.value().clone())
+                    .ok_or_else(|| AurixError::SessionNotFound("Tunnel session is gone".into()))?;
+                // Same rule as UDP ("from the bound address"): media is accepted only through
+                // the tunnel the session bound, never while it is on UDP or on an older tunnel.
+                if !session.tunnel().is_some_and(|t| *t == **tunnel) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "Unbound media tunnel".into(),
+                    ));
+                }
+                session
+            }
+        };
         if !session.is_active() {
             return Err(AurixError::SessionNotFound("Session inactive".into()));
         }
@@ -231,13 +283,26 @@ impl PacketRouter {
         Ok(session)
     }
 
-    async fn handle_session_bind(&self, packet: &AurixPacket, src_addr: SocketAddr) -> Result<()> {
+    async fn handle_session_bind(
+        &self,
+        packet: &AurixPacket,
+        source: PacketSource<'_>,
+    ) -> Result<()> {
         if packet.header.has_flag(PacketFlags::Encrypted) {
             return Err(AurixError::AuthenticationFailed(
                 "SessionBind must be signed, not encrypted".into(),
             ));
         }
         let (session_id, unix_ms, _nonce) = packet.parse_session_bind()?;
+        if let PacketSource::Tunnel(tunnel) = source {
+            // The connection already proved who it is; a bind for anyone else is an attack.
+            if tunnel.session_id() != session_id {
+                aurix_metrics::PACKETS_DROPPED.inc();
+                return Err(AurixError::AuthenticationFailed(
+                    "SessionBind for a session the connection does not own".into(),
+                ));
+            }
+        }
         let session = self
             .shared
             .sessions_by_id
@@ -277,28 +342,51 @@ impl PacketRouter {
             .last_bind_ms
             .store(unix_ms, std::sync::atomic::Ordering::Release);
 
-        if let Some(old) = session.get_remote_addr() {
-            if old != src_addr {
-                self.shared.sessions_by_addr.remove(&old);
-            }
-        }
         session.set_transport(Transport::Aurx);
-        session.set_remote_addr(src_addr);
+        let transport = match source {
+            PacketSource::Udp(src_addr) => {
+                if let Some(old) = session.get_remote_addr() {
+                    if old != src_addr {
+                        self.shared.sessions_by_addr.remove(&old);
+                    }
+                }
+                session.set_remote_addr(src_addr);
+                self.shared
+                    .sessions_by_addr
+                    .insert(src_addr, session.clone());
+                MediaTransportKind::Udp
+            }
+            PacketSource::Tunnel(tunnel) => {
+                if let Some(old) = session.set_tunnel(tunnel.clone()) {
+                    self.shared.sessions_by_addr.remove(&old);
+                }
+                MediaTransportKind::Tunnel
+            }
+        };
         session.update_heartbeat();
-        self.shared
-            .sessions_by_addr
-            .insert(src_addr, session.clone());
 
         let ack =
             AurixPacket::session_bind_ack(session.ssrc, session.next_downlink_sequence(), now)
                 .seal(&session.keys);
-        let _ = self.socket.send_to(&ack, src_addr).await;
+        self.reply(source, &ack).await;
         let _ = self.events.send(MediaEvent::SessionBound {
             session_id,
-            addr: src_addr,
+            transport,
         });
-        debug!("Session {} bound to {}", session_id, src_addr);
+        debug!("Session {} bound to {}", session_id, source);
         Ok(())
+    }
+
+    /// Sends a server-originated packet back to where an uplink packet came from.
+    async fn reply(&self, source: PacketSource<'_>, bytes: &[u8]) {
+        match source {
+            PacketSource::Udp(addr) => {
+                let _ = self.socket.send_to(bytes, addr).await;
+            }
+            PacketSource::Tunnel(tunnel) => {
+                tunnel.send(bytes.to_vec());
+            }
+        }
     }
 
     async fn route_audio_packet(
@@ -767,7 +855,7 @@ impl PacketRouter {
                     }
                 }
                 Transport::Aurx => {
-                    let Some(addr) = receiver.get_remote_addr() else {
+                    let Some(endpoint) = receiver.endpoint() else {
                         continue;
                     };
                     let out = if e2ee {
@@ -789,18 +877,30 @@ impl PacketRouter {
                             packet.downlink_parts(mix.volume, mix.direction.as_ref());
                         AurixPacket::seal_parts(&header, &body, &receiver.keys)
                     };
-                    match self.send_udp(&out, addr).await {
-                        Ok(n) => {
-                            receiver.record_packet_sent(n as u64);
-                            aurix_metrics::PACKETS_SENT.inc();
-                            aurix_metrics::BYTES_SENT.inc_by(n as u64);
-                        }
-                        Err(e) => {
-                            aurix_metrics::PACKETS_DROPPED.inc();
-                            warn!(
-                                "Failed to send audio to {} in {}: {}",
-                                receiver.user_id, channel.channel_id, e
-                            );
+                    match endpoint {
+                        MediaEndpoint::Udp(addr) => match self.send_udp(&out, addr).await {
+                            Ok(n) => {
+                                receiver.record_packet_sent(n as u64);
+                                aurix_metrics::PACKETS_SENT.inc();
+                                aurix_metrics::BYTES_SENT.inc_by(n as u64);
+                            }
+                            Err(e) => {
+                                aurix_metrics::PACKETS_DROPPED.inc();
+                                warn!(
+                                    "Failed to send audio to {} in {}: {}",
+                                    receiver.user_id, channel.channel_id, e
+                                );
+                            }
+                        },
+                        MediaEndpoint::Tunnel(tunnel) => {
+                            let n = out.len() as u64;
+                            if tunnel.send(out.to_vec()) {
+                                receiver.record_packet_sent(n);
+                                aurix_metrics::PACKETS_SENT.inc();
+                                aurix_metrics::BYTES_SENT.inc_by(n);
+                            } else {
+                                aurix_metrics::PACKETS_DROPPED.inc();
+                            }
                         }
                     }
                 }
@@ -812,7 +912,7 @@ impl PacketRouter {
         &self,
         packet: &AurixPacket,
         session: &Arc<MediaSession>,
-        src_addr: SocketAddr,
+        source: PacketSource<'_>,
     ) -> Result<()> {
         session.update_heartbeat();
         let ack = AurixPacket::new(
@@ -829,7 +929,7 @@ impl PacketRouter {
         } else {
             ack.encode()
         };
-        let _ = self.socket.send_to(&bytes, src_addr).await;
+        self.reply(source, &bytes).await;
         Ok(())
     }
 

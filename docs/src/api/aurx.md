@@ -100,6 +100,40 @@ jitter buffers do not see phantom losses.
 6. After a resume, re-send `SessionBind` from the current UDP socket (the address may have
    changed) and continue the sequence counter — do not restart it.
 
+## Tunnel: AURX over the control WebSocket
+
+When UDP is blocked (corporate NAT, hotel Wi-Fi, some carriers) a native session can carry the
+same packets over its authenticated control WebSocket instead. Nothing about the packets
+changes: **one sealed AURX packet per binary WebSocket frame**, both directions; text frames
+remain the JSON control plane. The node advertises support with `SessionInitAck.media_tunnel`
+(`media.media_tunnel`, on by default) and reports the active link in `MediaBound.transport`
+(`udp` | `tunnel`) and in `GET /v1/sessions/{id}/stats`.
+
+* **Bind.** Send the signed `SessionBind` as a binary frame; the ack comes back as a binary
+  frame (and `MediaBound` over text). The session id inside the bind must be the one this
+  WebSocket authenticated — a tunnel is owned by exactly one connection and one session, so the
+  "source address" the server attributes uplink packets to is the connection itself. A bind with
+  a timestamp newer than the current UDP binding moves the session onto the tunnel; a later UDP
+  `SessionBind` moves it back (the SDKs use this to return to UDP once it answers again).
+* **Same checks.** Tag, SSRC, protocol version, replay window and sequence continuity are
+  verified exactly as for UDP, so keep the **same sequence counter** across path changes; a
+  frame larger than `MAX_PACKET_SIZE` is rejected before decoding.
+* **Downlink.** Packets for a tunnelled receiver are sealed per receiver as usual and queued
+  behind that session's WebSocket (`media.tunnel_queue_packets`, default 128 ≈ 2.5 s of one
+  speaker); when the queue is full *that* receiver's packets are dropped
+  (`aurix_tunnel_packets_total{direction="downlink",outcome="dropped"}`) — a stalled TCP
+  connection never blocks the SFU or other participants.
+* **Lifecycle.** A reconnected/resumed WebSocket must bind again (the old tunnel dies with the
+  socket); a second bind on the same socket replaces the first; the tunnel is released when the
+  session ends. Heartbeats work over the tunnel too, and their RTT includes TCP.
+* **Cost.** TCP retransmission means head-of-line blocking under loss: the jitter buffer sees
+  bursts instead of gaps, latency rises. Treat the tunnel as a fallback — every SDK tries UDP
+  first, falls back after a failed bind or `udp_fallback_lost_heartbeats` unanswered heartbeats,
+  and re-probes UDP every `udp_reprobe_interval` while tunnelled. WebRTC clients are unaffected
+  (they have ICE/TURN for the same problem).
+
+Metrics: `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
+
 ## What the server does with your packets
 
 * Drops anything from an unbound address, with a bad tag, wrong SSRC, protocol version ≠ 2,

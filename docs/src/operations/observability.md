@@ -33,6 +33,7 @@ docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < auri
 | `aurix_packets_dropped_total` | packets rejected before routing: bad authentication tag, replay, unknown session, malformed |
 | `aurix_packet_loss_rate`, `aurix_jitter_milliseconds`, `aurix_rtt_milliseconds` | quality aggregates |
 | `aurix_pcmu_sessions`, `aurix_pcmu_frames_total{direction,outcome}` | sessions on the G.711 fallback and the frames transcoded for them (`uplink`/`downlink`, `ok`/`error`) — CPU the node spends on their behalf |
+| `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}` | native sessions whose media rides the control WebSocket because UDP is blocked, and their packets (`uplink` `received`/`rejected`, `downlink` `sent`/`dropped`) — many `dropped` means a client's TCP connection is stalling behind loss |
 | `aurix_api_requests_total{method,path,status}`, `aurix_api_request_duration_seconds` | REST (path templated, ids collapsed) |
 | `aurix_ws_connections`, `aurix_ws_sessions_detached`, `aurix_ws_sessions_resumed_total` | control plane and reconnects |
 | `aurix_rate_limit_hits_total`, `aurix_moderation_events_total` | abuse signals |

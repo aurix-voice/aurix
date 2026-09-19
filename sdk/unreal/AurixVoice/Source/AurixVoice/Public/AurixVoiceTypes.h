@@ -48,6 +48,28 @@ enum class EAurixRole : uint8
 	Administrator,
 };
 
+/** Which link carries media (FAurixVoiceSettings::MediaPath). */
+UENUM(BlueprintType)
+enum class EAurixMediaPathPolicy : uint8
+{
+	/** UDP first; the WebSocket tunnel when UDP is blocked; back to UDP once it answers again. */
+	Auto,
+	UdpOnly,
+	TunnelOnly,
+};
+
+/** Link the media currently travels over. */
+UENUM(BlueprintType)
+enum class EAurixMediaPath : uint8
+{
+	/** No media link yet (before OnMediaBound). */
+	None,
+	/** Native AURX over UDP. */
+	Udp,
+	/** AURX packets as binary frames on the control WebSocket (TCP: higher latency under loss). */
+	Tunnel,
+};
+
 UENUM(BlueprintType)
 enum class EAurixModerationAction : uint8
 {
@@ -340,6 +362,21 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	bool bVadGate = true;
 
+	/**
+	 * Media link: UDP with the WebSocket tunnel as fallback (default), UDP only, or tunnel only.
+	 * The tunnel keeps the same session, SSRC, key and encryption; only latency under loss differs.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
+	EAurixMediaPathPolicy MediaPath = EAurixMediaPathPolicy::Auto;
+
+	/** Auto: unanswered UDP heartbeats in a row before media moves to the tunnel (0 = never mid-session). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
+	int32 UdpFallbackLostHeartbeats = 3;
+
+	/** Auto: how often a tunnelled session re-probes UDP and moves back when it answers (0 = never). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
+	int32 UdpReprobeIntervalMs = 30000;
+
 	/** Open the microphone (AudioCapture) as soon as the session is ready. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	bool bAutoStartCapture = true;
@@ -380,6 +417,10 @@ struct AURIXVOICE_API FAurixSessionInfo
 	/** The latest (re)connect resumed the previous session. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bResumed = false;
+
+	/** The node accepts media tunnelled over the control WebSocket (fallback when UDP is blocked). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bMediaTunnel = false;
 };
 
 /** Channel member snapshot. For OnChannelEnergy only UserId and Energy are meaningful. */
@@ -594,6 +635,18 @@ struct AURIXVOICE_API FAurixStats
 
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int64 HeartbeatsLost = 0;
+
+	/** Unanswered heartbeats in a row on the current link (resets on every reply). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 HeartbeatsLostConsecutive = 0;
+
+	/** Link the media uses right now. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	EAurixMediaPath MediaPath = EAurixMediaPath::None;
+
+	/** Uplink packets dropped because the tunnel send queue was full (0 on UDP). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 UplinkDropped = 0;
 
 	/** Downlink frames concealed (PLC), discarded as late, and jitter-buffer underruns. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")

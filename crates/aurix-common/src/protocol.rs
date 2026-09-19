@@ -1,8 +1,8 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
-    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, Orientation3D,
-    Position3D, ReverbDescriptor, SessionId, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, MediaTransportKind,
+    Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -767,6 +767,10 @@ pub enum ControlMessage {
     /// within `resume_grace_ms` presenting `session_id` + `resume_token` (see `aurix-ws`) and
     /// gets the same session, SSRC, media key and channel memberships back (`resumed: true`,
     /// followed by one `ChannelJoinAck` per channel still joined). Every ack rotates the token.
+    ///
+    /// `media_tunnel: true` means this very WebSocket also accepts AURX media as binary frames
+    /// (one sealed packet per frame, same `SessionBind` handshake and per-packet
+    /// authentication as UDP) — the fallback native clients use when UDP is blocked.
     SessionInitAck {
         session_id: SessionId,
         ssrc: u32,
@@ -778,10 +782,15 @@ pub enum ControlMessage {
         resume_grace_ms: u64,
         #[serde(default)]
         resumed: bool,
+        #[serde(default)]
+        media_tunnel: bool,
     },
-    /// Sent by the server once the UDP source address has been authenticated via `SessionBind`.
+    /// Sent by the server once a media path has been authenticated via `SessionBind`:
+    /// `transport` is `udp`, `tunnel` (AURX over this WebSocket) or `webrtc`.
     MediaBound {
         session_id: SessionId,
+        #[serde(default)]
+        transport: MediaTransportKind,
     },
     SessionClose {
         session_id: SessionId,

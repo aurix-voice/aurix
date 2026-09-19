@@ -3,6 +3,7 @@ use crate::cascade::CascadeRelay;
 use crate::channel::MediaChannel;
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
+use crate::tunnel::MediaTunnel;
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
 use aurix_common::crypto::CryptoProvider;
 use aurix_common::error::{AurixError, Result};
@@ -63,6 +64,10 @@ pub struct SfuOptions {
     pub downlink_bitrate: u32,
     /// Number of concurrent UDP receive workers (0 = derive from available CPUs).
     pub rx_workers: usize,
+    /// Accept AURX media over the control WebSocket (see `MediaConfig::media_tunnel`).
+    pub media_tunnel: bool,
+    /// Downlink queue depth per tunneled session (see `MediaConfig::tunnel_queue_packets`).
+    pub tunnel_queue_packets: usize,
 }
 
 impl Default for SfuOptions {
@@ -84,6 +89,8 @@ impl Default for SfuOptions {
             advertised_addr: None,
             downlink_bitrate: 32_000,
             rx_workers: 0,
+            media_tunnel: true,
+            tunnel_queue_packets: 128,
         }
     }
 }
@@ -309,7 +316,7 @@ impl SfuNode {
                                 sessions_by_addr.insert(remote, session.clone());
                                 let _ = events.send(MediaEvent::SessionBound {
                                     session_id,
-                                    addr: remote,
+                                    transport: MediaTransportKind::WebRtc,
                                 });
                             }
                             info!("WebRTC session {} connected from {}", session_id, remote);
@@ -318,7 +325,7 @@ impl SfuNode {
                             if let Some(session) =
                                 sessions_by_id.get(&session_id).map(|s| s.value().clone())
                             {
-                                if let Some(addr) = session.clear_remote_addr() {
+                                if let Some(addr) = session.clear_endpoint() {
                                     sessions_by_addr.remove(&addr);
                                 }
                             }
@@ -454,7 +461,7 @@ impl SfuNode {
         if manager.has_session(session_id) {
             manager.remove_session(session_id);
         }
-        if let Some(addr) = session.clear_remote_addr() {
+        if let Some(addr) = session.clear_endpoint() {
             self.sessions_by_addr.remove(&addr);
         }
         let answer = manager.create_session(offer_sdp, *session_id, session.user_id)?;
@@ -466,7 +473,7 @@ impl SfuNode {
     fn teardown_session(&self, session: &Arc<MediaSession>) {
         session.deactivate();
         self.sessions_by_id.remove(&session.session_id);
-        if let Some(addr) = session.clear_remote_addr() {
+        if let Some(addr) = session.clear_endpoint() {
             self.sessions_by_addr.remove(&addr);
         }
         for ch in session.get_channels() {
@@ -538,6 +545,49 @@ impl SfuNode {
             session_id, session.user_id
         );
         Ok(())
+    }
+
+    /// Opens a WebSocket media tunnel for `session_id`. The receiver yields sealed downlink
+    /// packets to be written as binary frames on the connection that authenticated as that
+    /// session. The tunnel becomes the session's media path only once the client sends an
+    /// authenticated `SessionBind` through it (`PacketRouter::route_tunnel_packet`).
+    pub fn open_tunnel(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(Arc<MediaTunnel>, mpsc::Receiver<Vec<u8>>)> {
+        if !self.options.media_tunnel {
+            return Err(AurixError::AuthorizationDenied(
+                "WebSocket media tunnel is disabled on this node".into(),
+            ));
+        }
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        if session.transport() == Transport::WebRtc {
+            return Err(AurixError::AuthorizationDenied(
+                "WebRTC sessions cannot use the AURX tunnel".into(),
+            ));
+        }
+        Ok(MediaTunnel::new(
+            *session_id,
+            self.options.tunnel_queue_packets,
+        ))
+    }
+
+    /// The packet router, for feeding tunneled AURX frames without holding the SFU lock across
+    /// the (async) routing.
+    pub fn packet_router(&self) -> Result<Arc<PacketRouter>> {
+        self.router
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AurixError::Internal("SFU not started".into()))
+    }
+
+    /// The connection owning `tunnel` closed: unbind the session if it was still on this
+    /// tunnel (a later UDP bind or a newer tunnel is left alone). Returns whether it was.
+    pub fn close_tunnel(&self, tunnel: &MediaTunnel) -> bool {
+        self.get_session(&tunnel.session_id())
+            .is_some_and(|s| s.clear_tunnel(tunnel))
     }
 
     pub fn join_channel(
@@ -815,7 +865,7 @@ impl SfuNode {
                     };
                     session.deactivate();
                     sessions_by_user.remove_if(&session.user_id, |_, s| s.session_id == sid);
-                    if let Some(addr) = session.clear_remote_addr() {
+                    if let Some(addr) = session.clear_endpoint() {
                         sessions_by_addr.remove(&addr);
                     }
                     for ch_id in session.get_channels() {

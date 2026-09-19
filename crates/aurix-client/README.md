@@ -31,7 +31,9 @@ Unreal plugin, mobile wrappers and any other native integration build on top of 
   RNNoise-derived neural noise suppression (`nnnoiseless`) and a speech-gated AGC with a soft
   limiter. `DspConfig` / `DspStats`; also exported standalone (C: `aurix_dsp_*`).
 * **Media** (`media`): AURX v2 over UDP — signed `SessionBind`, AES-256-CTR + HMAC on every
-  packet, per-sender replay windows, heartbeats with RTT, quality reports, mute state.
+  packet, per-sender replay windows, heartbeats with RTT, quality reports, mute state — and the
+  same packets as binary frames over the control WebSocket when UDP is blocked (`MediaPath`,
+  one shared sequence counter across both links).
 * **Control** (`control`): WebSocket with `Authorization: Bearer`, one-time resume tokens,
   typed `ControlMessage` send/receive, `SessionInitAck` → media key.
 * **Client** (`client`): one voice session on its own small Tokio runtime; automatic reconnect
@@ -112,6 +114,19 @@ uplink loss/jitter the SFU measures). The client sends a quality report over the
 transport on every heartbeat (`ClientConfig::heartbeat_interval`, 5 s), which also drives the
 server's adaptive downlink bitrate. In C: `aurix_client_stats`,
 `aurix_client_network_quality`, `aurix_event_network_quality`.
+
+### When UDP is blocked
+
+`ClientConfig::media_path`: `MediaPathPolicy::Auto` (default) binds over UDP, falls back to the
+control WebSocket when the bind gets no answer or `udp_fallback_lost_heartbeats` (3) heartbeats
+in a row vanish, and re-probes UDP every `udp_reprobe_interval` (30 s) while tunnelled, moving
+back as soon as it answers; `UdpOnly` / `TunnelOnly` pin a link. Requires the node to
+advertise `SessionInfo::media_tunnel`. `Event::MediaPathChanged { path, reason }`,
+`client.media_path()`, `ClientStats::media.{media_path, heartbeats_lost_consecutive,
+uplink_dropped}`. C: `AurixClientConfig.media_path` (`AURIX_MEDIA_PATH_*`),
+`udp_fallback_lost_heartbeats`, `udp_reprobe_interval_ms`, `aurix_client_media_path`,
+`aurix_event_media_path`. The tunnel is TCP: head-of-line blocking under loss, so it is a way
+to stay in the call, not a replacement for UDP.
 
 ### Region discovery
 

@@ -27,7 +27,8 @@ Full reference: `crates/aurix-client/README.md` and `sdk/unreal/README.md`.
   cancellation, RNNoise-derived neural noise suppression, speech-gated AGC — between resampling
   and the input gain / VAD / encoder ([below](#capture-dsp-echo-cancellation-noise-suppression-agc)).
 * **Media:** signed `SessionBind`, AES-256-CTR + HMAC on every packet, replay windows,
-  heartbeats with RTT, quality reports.
+  heartbeats with RTT, quality reports; UDP first, the same packets over the control WebSocket
+  when UDP is blocked ([below](#when-udp-is-blocked-the-websocket-tunnel)).
 * **Control:** `Authorization: Bearer` WebSocket, one-time resume tokens, typed
   `ControlMessage`s.
 * **Client:** one voice session on a small private Tokio runtime; reconnect with backoff and
@@ -183,6 +184,32 @@ with `push_capture_*` is decimated to 8 kHz and μ-law encoded, μ-law downlink 
 the preferred codec is negotiated again. The node transcodes at the edge, so other participants
 are unaffected ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 
+## When UDP is blocked: the WebSocket tunnel
+
+`ClientConfig::media_path` picks the link ([protocol](../api/aurx.md#tunnel-aurx-over-the-control-websocket)):
+
+* `MediaPathPolicy::Auto` (default) — bind over UDP; if the bind gets no answer, carry the
+  media over the already-authenticated control WebSocket instead. While on UDP,
+  `udp_fallback_lost_heartbeats` (3) unanswered heartbeats in a row move the session onto the
+  tunnel mid-call; while tunnelled, every `udp_reprobe_interval` (30 s, `0` = never) the core
+  binds UDP again and moves back as soon as it answers. The node must advertise the tunnel
+  (`SessionInfo::media_tunnel`); otherwise `Auto` behaves like `UdpOnly`.
+* `MediaPathPolicy::UdpOnly` — never tunnel (a dead UDP path is a reconnect, as before).
+* `MediaPathPolicy::TunnelOnly` — never open a UDP socket (tests, environments that forbid it).
+
+The uplink sequence counter is shared by both links, so the server's replay window and the
+receivers' jitter buffers see one continuous stream across a switch; a resume re-binds on the
+link the policy selects. `Event::MediaPathChanged { path, reason }` fires after every bind and
+switch (`"UDP bind failed: …"`, `"3 UDP heartbeats unanswered"`, `"UDP re-probe answered"`),
+`client.media_path()` returns the current link and `ClientStats` adds `media_path`,
+`heartbeats_lost_consecutive` and `uplink_dropped` (frames the tunnel's bounded send queue
+refused — always 0 on UDP). C: `AurixClientConfig.media_path` (`AURIX_MEDIA_PATH_*`),
+`udp_fallback_lost_heartbeats`, `udp_reprobe_interval_ms`, `aurix_client_media_path`,
+`aurix_event_media_path`, `AurixSessionInfo.media_tunnel`.
+
+Expect more latency on the tunnel (TCP retransmits stall everything behind a lost segment);
+it is a way to stay in the call, not a replacement for UDP.
+
 ## Presence and text range
 
 `Event::ChannelJoined { scope, .. }` and `client.channel_scope(channel_id)` expose the
@@ -289,6 +316,12 @@ delegates — the same layering as the Rust API above.
 expose the shared quality model; `OnRawEvent` delivers every event as JSON for anything without
 a typed delegate. Events are dispatched from the subsystem tick, up to 256 per tick, nothing
 dropped.
+
+Blocked UDP: `FAurixVoiceSettings.MediaPath` (`EAurixMediaPathPolicy` Auto / UdpOnly /
+TunnelOnly), `UdpFallbackLostHeartbeats`, `UdpReprobeIntervalMs`; `GetMediaPath()`
+(`EAurixMediaPath`), `OnMediaPathChanged(Path, Reason)`, `FAurixSessionInfo.bMediaTunnel` and
+`FAurixStats.MediaPath` — the core's [tunnel behaviour](#when-udp-is-blocked-the-websocket-tunnel)
+unchanged.
 
 **Regions.** `DiscoverRegions(FAurixRegionDiscoveryRequest, OnComplete)` runs the whole flow
 above with the engine's `HTTP` module (bearer `GET /v1/me/regions`, optional probes with

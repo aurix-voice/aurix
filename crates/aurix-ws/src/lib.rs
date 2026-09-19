@@ -25,6 +25,7 @@ use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::{ActionTokenService, ControlPlane, ParticipantSpeak, ServerEvent};
 use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
+use aurix_media::tunnel::MediaTunnel;
 use aurix_media::{MediaEvent, SfuNode};
 use aurix_recording::RecordingService;
 use axum::extract::ws::{Message, WebSocket};
@@ -50,6 +51,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const UPLINK_LOSS_ALERT_PERCENT: f32 = 20.0;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_TEXT_FRAME: usize = 64 * 1024;
+/// Largest binary (tunneled AURX) frame accepted on the control socket.
+const MAX_MEDIA_FRAME: usize = aurix_common::protocol::MAX_PACKET_SIZE;
 const MAX_POSITIONS_PER_UPDATE: usize = 64;
 /// Sub-protocol prefix browsers use to pass the JWT (`Sec-WebSocket-Protocol: aurix, bearer.<jwt>`).
 const BEARER_SUBPROTOCOL_PREFIX: &str = "bearer.";
@@ -1241,8 +1244,17 @@ impl WsState {
                 Err(_) => return,
             };
             match event {
-                MediaEvent::SessionBound { session_id, .. } => {
-                    self.send_to_session(&session_id, &ControlMessage::MediaBound { session_id });
+                MediaEvent::SessionBound {
+                    session_id,
+                    transport,
+                } => {
+                    self.send_to_session(
+                        &session_id,
+                        &ControlMessage::MediaBound {
+                            session_id,
+                            transport,
+                        },
+                    );
                 }
                 MediaEvent::SpeakingChanged {
                     session_id,
@@ -1829,6 +1841,15 @@ async fn handle_ws_connection(
             .await;
     }
 
+    // UDP-blocked fallback: this connection may carry AURX packets as binary frames. The
+    // tunnel is owned by the connection and only becomes the session's media path after an
+    // authenticated SessionBind arrives through it.
+    let (tunnel, mut tunnel_rx): (Option<Arc<MediaTunnel>>, mpsc::Receiver<Vec<u8>>) =
+        match state.sfu.read().open_tunnel(&session_id) {
+            Ok((t, rx)) => (Some(t), rx),
+            Err(_) => (None, mpsc::channel(1).1),
+        };
+
     let media_addr = format!(
         "{}:{}",
         state
@@ -1848,6 +1869,7 @@ async fn handle_ws_connection(
         resume_token: resume_token.token,
         resume_grace_ms: grace.as_millis() as u64,
         resumed,
+        media_tunnel: tunnel.is_some(),
     };
     if tx
         .send(serde_json::to_string(&init_ack).unwrap_or_default())
@@ -1901,17 +1923,24 @@ async fn handle_ws_connection(
         ip
     );
 
+    let mut tunnel_open = tunnel.is_some();
     let send_task = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
         loop {
             tokio::select! {
+                // Control messages first: they are rare and must not starve behind media.
+                biased;
                 msg = rx.recv() => match msg {
                     Some(m) if m == CLOSE_SENTINEL => { let _ = ws_sender.close().await; break; }
                     Some(m) => { if ws_sender.send(Message::Text(m)).await.is_err() { break; } }
                     None => { let _ = ws_sender.close().await; break; }
                 },
                 _ = ping.tick() => { if ws_sender.send(Message::Ping(Vec::new())).await.is_err() { break; } }
+                pkt = tunnel_rx.recv(), if tunnel_open => match pkt {
+                    Some(p) => { if ws_sender.send(Message::Binary(p)).await.is_err() { break; } }
+                    None => tunnel_open = false,
+                },
             }
         }
     });
@@ -1920,6 +1949,7 @@ async fn handle_ws_connection(
     let recv_token = token.clone();
     let recv_tx = tx.clone();
     let recv_ip = ip;
+    let recv_tunnel = tunnel.clone();
     let recv_task = tokio::spawn(async move {
         loop {
             let frame = tokio::time::timeout(IDLE_TIMEOUT, ws_receiver.next()).await;
@@ -1949,6 +1979,29 @@ async fn handle_ws_connection(
                         send_error(&recv_tx, "VALIDATION_ERROR", "Malformed control message").await
                     }
                 },
+                Message::Binary(data) => {
+                    let Some(tunnel) = recv_tunnel.as_ref() else {
+                        send_error(
+                            &recv_tx,
+                            "VALIDATION_ERROR",
+                            "Media tunnel is not available",
+                        )
+                        .await;
+                        continue;
+                    };
+                    if data.len() > MAX_MEDIA_FRAME {
+                        aurix_metrics::TUNNEL_PACKETS
+                            .with_label_values(&["uplink", "rejected"])
+                            .inc();
+                        continue;
+                    }
+                    let router = recv_state.sfu.read().packet_router();
+                    if let Ok(router) = router {
+                        if let Err(e) = router.route_tunnel_packet(&data, tunnel).await {
+                            debug!("tunnel packet from session {session_id} rejected: {e}");
+                        }
+                    }
+                }
                 Message::Close(_) => return Disconnect::ClientClose,
                 _ => {}
             }
@@ -1978,6 +2031,10 @@ async fn handle_ws_connection(
     };
     redis_task.abort();
     aurix_metrics::WS_CONNECTIONS.dec();
+    if let Some(tunnel) = tunnel.as_ref() {
+        // The session may survive (resume grace); its media path does not.
+        state.sfu.read().close_tunnel(tunnel);
+    }
 
     let closing = state
         .connections

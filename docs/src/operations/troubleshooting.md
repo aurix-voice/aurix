@@ -52,6 +52,8 @@ carries a stable `code` — the table at the end maps codes to causes.
 | speaking indicator never lights | frames below `media.speaking_energy_threshold` (0.01); VAD gate on the client too strict |
 | one participant sounds narrowband / telephone-like to everyone | that participant negotiated the PCMU fallback (`aurix_pcmu_sessions` > 0); expected — the node upsamples 8 kHz μ-law into the Opus stream ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)) |
 | PCMU client hears nothing while Opus clients do | frames sent before `AudioCodecChanged` arrived, or `Pcmu` frames with a length other than 80/160/320/480 bytes (`aurix_pcmu_frames_total{outcome="error"}`); a `Pcmu | E2ee` frame is always dropped |
+| native/Unity/Unreal player connects but never gets `MediaBound`; browsers work | UDP is blocked on their network. With `media.media_tunnel = true` (default) an `Auto` client falls back to the WebSocket tunnel by itself (`MediaBound.transport = "tunnel"`, `OnMediaPathChanged`); if the SDK is pinned to `UdpOnly` or the node runs `media_tunnel = false`, open `media.port`/UDP or enable the tunnel ([tunnel](../api/aurx.md#tunnel-aurx-over-the-control-websocket)) |
+| tunnelled player hears bursts / stutter, `aurix_tunnel_packets_total{direction="downlink",outcome="dropped"}` grows | TCP head-of-line blocking on that player's connection; the node drops only that receiver's queue (`media.tunnel_queue_packets`). Nothing to fix server-side — check why UDP is blocked for them, the SDK re-probes it every `udp_reprobe_interval` |
 
 ## Features returning errors
 

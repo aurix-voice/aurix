@@ -120,6 +120,18 @@ typedef enum AurixNoiseSuppression {
   AURIX_NOISE_SUPPRESSION_HIGH = 3,
 } AurixNoiseSuppression;
 
+/**
+ * Media link selection policy (`AurixClientConfig::media_path`).
+ */
+typedef enum AurixMediaPathPolicy {
+  /**
+   * UDP first; WebSocket tunnel when UDP is blocked; back to UDP when it answers again.
+   */
+  AURIX_MEDIA_PATH_AUTO = 0,
+  AURIX_MEDIA_PATH_UDP_ONLY = 1,
+  AURIX_MEDIA_PATH_TUNNEL_ONLY = 2,
+} AurixMediaPathPolicy;
+
 typedef enum AurixConnectionState {
   AURIX_STATE_DISCONNECTED = 0,
   AURIX_STATE_CONNECTING = 1,
@@ -128,6 +140,25 @@ typedef enum AurixConnectionState {
   AURIX_STATE_RECONNECTING = 4,
   AURIX_STATE_FAILED = 5,
 } AurixConnectionState;
+
+/**
+ * Link the media currently travels over.
+ */
+typedef enum AurixMediaPath {
+  /**
+   * No media link yet (before `AurixEventMediaBound`).
+   */
+  AURIX_MEDIA_NONE = 0,
+  /**
+   * Native AURX over UDP.
+   */
+  AURIX_MEDIA_UDP = 1,
+  /**
+   * AURX packets as binary frames on the control WebSocket (TCP; higher latency under
+   * loss).
+   */
+  AURIX_MEDIA_TUNNEL = 2,
+} AurixMediaPath;
 
 typedef enum AurixEventType {
   /**
@@ -261,6 +292,11 @@ typedef enum AurixEventType {
    * `audio_codec`: the server switched this session's codec (`aurix_event_audio_codec`).
    */
   AURIX_EVENT_AUDIO_CODEC_CHANGED = 32,
+  /**
+   * `media_path` (`aurix_event_media_path`), `message` = why: emitted after every
+   * `MediaBound` and on each mid-session UDP ↔ tunnel switch.
+   */
+  AURIX_EVENT_MEDIA_PATH_CHANGED = 33,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -489,6 +525,21 @@ typedef struct AurixClientConfig {
    * hosts with their own processing. Changeable later with `aurix_client_set_dsp`.
    */
   struct AurixDspConfig dsp;
+  /**
+   * Which link carries media: UDP with the WebSocket tunnel as fallback (default), UDP
+   * only, or tunnel only.
+   */
+  enum AurixMediaPathPolicy media_path;
+  /**
+   * `Auto`: unanswered UDP heartbeats in a row before media moves to the tunnel (0 = never
+   * fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
+   */
+  uint32_t udp_fallback_lost_heartbeats;
+  /**
+   * `Auto`: how often a tunnelled session re-probes UDP and moves back when it answers
+   * (0 = never; stays tunnelled until the next connect).
+   */
+  uint32_t udp_reprobe_interval_ms;
 } AurixClientConfig;
 
 /**
@@ -512,6 +563,10 @@ typedef struct AurixSessionInfo {
    * Zero UUID when the token carries no `sub`.
    */
   struct AurixUuid user_id;
+  /**
+   * The node accepts media over the control WebSocket (fallback when UDP is blocked).
+   */
+  bool media_tunnel;
 } AurixSessionInfo;
 
 /**
@@ -755,6 +810,18 @@ typedef struct AurixStats {
    * Remote streams currently decoding.
    */
   uint32_t active_streams;
+  /**
+   * Link the media currently uses.
+   */
+  enum AurixMediaPath media_path;
+  /**
+   * Tunnel only: uplink packets dropped because the WebSocket could not keep up.
+   */
+  uint64_t uplink_dropped;
+  /**
+   * Heartbeats unanswered in a row on the current link (0 = healthy).
+   */
+  uint32_t heartbeats_lost_consecutive;
 } AurixStats;
 
 /**
@@ -879,6 +946,11 @@ enum AurixConnectionState aurix_client_state(const struct AurixClient *client);
 bool aurix_client_session(const struct AurixClient *client, struct AurixSessionInfo *out);
 
 /**
+ * Link the media currently uses; `AurixMediaNone` before the first bind.
+ */
+enum AurixMediaPath aurix_client_media_path(const struct AurixClient *client);
+
+/**
  * Next queued event or `NULL`. Caller owns the result (`aurix_event_free`).
  */
 struct AurixEvent *aurix_client_poll_event(struct AurixClient *client);
@@ -971,6 +1043,11 @@ enum AurixTransmissionMode aurix_event_transmission(const struct AurixEvent *eve
  * Codec of an `AudioCodecChanged` event; Opus otherwise.
  */
 enum AurixAudioCodec aurix_event_audio_codec(const struct AurixEvent *event);
+
+/**
+ * Link of a `MediaPathChanged` event; `AurixMediaNone` for other events.
+ */
+enum AurixMediaPath aurix_event_media_path(const struct AurixEvent *event);
 
 enum AurixModerationAction aurix_event_moderation_action(const struct AurixEvent *event);
 

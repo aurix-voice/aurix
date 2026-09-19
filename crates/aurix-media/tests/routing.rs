@@ -114,17 +114,301 @@ impl Client {
 }
 
 async fn start_sfu() -> (SfuNode, SocketAddr) {
+    start_sfu_with(SfuOptions::default()).await
+}
+
+async fn start_sfu_with(options: SfuOptions) -> (SfuNode, SocketAddr) {
     let mut sfu = SfuNode::new(
         MediaNodeId::new(),
         Region::EuWest,
         SfuOptions {
             max_participants: 3,
-            ..SfuOptions::default()
+            ..options
         },
     );
     sfu.start("127.0.0.1:0").await.unwrap();
     let addr = sfu.local_addr().unwrap();
     (sfu, addr)
+}
+
+/// A client whose media path is the WebSocket tunnel: packets go in through the router as
+/// binary frames would, and downlinks come out of the tunnel's queue.
+struct TunnelClient {
+    tunnel: std::sync::Arc<aurix_media::tunnel::MediaTunnel>,
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    session: std::sync::Arc<aurix_media::MediaSession>,
+    seq: u32,
+}
+
+impl TunnelClient {
+    fn open(sfu: &SfuNode, session: std::sync::Arc<aurix_media::MediaSession>) -> Self {
+        let (tunnel, rx) = sfu.open_tunnel(&session.session_id).unwrap();
+        Self {
+            tunnel,
+            rx,
+            session,
+            seq: 1,
+        }
+    }
+
+    fn next_seq(&mut self) -> u32 {
+        let s = self.seq;
+        self.seq += 1;
+        s
+    }
+
+    async fn push(&self, sfu: &SfuNode, wire: &[u8]) -> aurix_common::Result<()> {
+        sfu.packet_router()
+            .unwrap()
+            .route_tunnel_packet(wire, &self.tunnel)
+            .await
+    }
+
+    async fn bind(&mut self, sfu: &SfuNode) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let pkt = AurixPacket::session_bind(&self.session.session_id, self.session.ssrc, now, 7);
+        self.push(sfu, &pkt.encode_authenticated(&self.session.keys))
+            .await
+            .expect("tunnel bind accepted");
+        let mut ack = self.recv().await.expect("bind ack over the tunnel");
+        assert_eq!(ack.header.packet_type, PacketType::SessionBindAck);
+        assert!(ack.header.has_flag(PacketFlags::Encrypted));
+        assert!(ack.open(&self.session.keys));
+    }
+
+    async fn send_audio(&mut self, sfu: &SfuNode, channel: &ChannelId, payload: &[u8]) {
+        let seq = self.next_seq();
+        let pkt = AurixPacket::audio(
+            seq,
+            seq * 960,
+            self.session.ssrc,
+            channel_id_hash(channel),
+            Bytes::copy_from_slice(payload),
+        );
+        let _ = self.push(sfu, &pkt.seal(&self.session.keys)).await;
+    }
+
+    /// Next sealed downlink frame, still closed (as it would be written to the socket).
+    async fn recv(&mut self) -> Option<AurixPacket> {
+        let wire = tokio::time::timeout(Duration::from_millis(300), self.rx.recv())
+            .await
+            .ok()??;
+        Some(AurixPacket::decode(&wire).unwrap())
+    }
+
+    async fn recv_open(&mut self) -> Option<AurixPacket> {
+        let mut pkt = self.recv().await?;
+        assert!(pkt.header.has_flag(PacketFlags::Encrypted));
+        assert!(
+            pkt.open(&self.session.keys),
+            "tunnel downlink must be sealed for this session"
+        );
+        Some(pkt)
+    }
+}
+
+#[tokio::test]
+async fn tunnel_carries_authenticated_media_and_binds_only_its_own_session() {
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    for s in [&s_a, &s_b] {
+        sfu.join_channel(
+            &s.session_id,
+            channel,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut events = sfu.subscribe_events();
+    let mut a = TunnelClient::open(&sfu, s_a.clone());
+    let mut b = Client::new(s_b.clone()).await;
+
+    // Media through an unbound tunnel is rejected (same rule as an unbound UDP source).
+    a.send_audio(&sfu, &channel, b"early").await;
+    assert!(b.recv().await.is_none());
+    assert!(!s_a.is_tunneled());
+
+    // A bind naming another session, even signed with that session's key, is refused: the
+    // connection authenticated as A and can only ever bind A.
+    let now = chrono::Utc::now().timestamp_millis();
+    let foreign = AurixPacket::session_bind(&s_b.session_id, s_b.ssrc, now, 1)
+        .encode_authenticated(&s_b.keys);
+    assert!(a.push(&sfu, &foreign).await.is_err());
+    assert!(s_b.endpoint().is_none());
+
+    a.bind(&sfu).await;
+    assert!(s_a.is_tunneled());
+    assert_eq!(s_a.transport_kind(), MediaTransportKind::Tunnel);
+    let bound = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        bound,
+        MediaEvent::SessionBound {
+            transport: MediaTransportKind::Tunnel,
+            ..
+        }
+    ));
+    b.bind(addr).await;
+    assert_eq!(s_b.transport_kind(), MediaTransportKind::Udp);
+
+    // Tunnel → UDP and UDP → tunnel, each downlink sealed for its receiver.
+    a.send_audio(&sfu, &channel, b"from-tunnel").await;
+    let got = b
+        .recv()
+        .await
+        .expect("udp receiver hears the tunneled sender");
+    assert_eq!(got.header.ssrc, s_a.ssrc);
+    assert_eq!(&got.payload[..], b"from-tunnel");
+    b.send_audio(addr, &channel, b"from-udp").await;
+    let got = a.recv_open().await.expect("tunneled receiver hears udp");
+    assert_eq!(got.header.ssrc, s_b.ssrc);
+    assert_eq!(&got.payload[..], b"from-udp");
+    assert!(a.recv().await.is_none(), "sender must not hear itself");
+
+    // Replay through the tunnel is dropped like on UDP (seq 2 carried "from-tunnel").
+    let replay = AurixPacket::audio(
+        2,
+        1920,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"replay"),
+    );
+    assert!(a.push(&sfu, &replay.seal(&s_a.keys)).await.is_err());
+    assert!(b.recv().await.is_none());
+
+    // Wrong SSRC / wrong key / unencrypted frames are rejected on the tunnel too.
+    let seq = a.next_seq();
+    let imposter = AurixPacket::audio(
+        seq,
+        0,
+        s_b.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"imposter"),
+    );
+    assert!(a.push(&sfu, &imposter.seal(&s_b.keys)).await.is_err());
+    let seq = a.next_seq();
+    let plain = AurixPacket::audio(
+        seq,
+        0,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"plain"),
+    );
+    assert!(a.push(&sfu, &plain.encode()).await.is_err());
+    assert!(a
+        .push(&sfu, &plain.encode_authenticated(&s_a.keys))
+        .await
+        .is_err());
+    assert!(b.recv().await.is_none());
+
+    // Heartbeat over the tunnel is answered over the tunnel.
+    let mut hb = AurixPacket::heartbeat(s_a.ssrc, 4242);
+    hb.header.sequence = a.next_seq();
+    a.push(&sfu, &hb.seal(&s_a.keys)).await.unwrap();
+    let ack = a.recv_open().await.expect("heartbeat ack over the tunnel");
+    assert_eq!(ack.header.packet_type, PacketType::HeartbeatAck);
+
+    // A UDP bind moves the session off the tunnel; the old tunnel no longer carries media.
+    let mut a_udp = Client::new(s_a.clone()).await;
+    a_udp.bind(addr).await;
+    assert!(!s_a.is_tunneled());
+    assert_eq!(s_a.transport_kind(), MediaTransportKind::Udp);
+    a.send_audio(&sfu, &channel, b"stale-tunnel").await;
+    assert!(b.recv().await.is_none());
+    a_udp.send_audio(addr, &channel, b"via-udp").await;
+    assert_eq!(&b.recv().await.unwrap().payload[..], b"via-udp");
+    b.send_audio(addr, &channel, b"to-udp-now").await;
+    assert!(a_udp.recv().await.is_some());
+    assert!(a.recv().await.is_none(), "stale tunnel gets no downlink");
+
+    // Closing a tunnel that is no longer the path is a no-op; closing the live one unbinds.
+    assert!(!sfu.close_tunnel(&a.tunnel));
+    assert_eq!(
+        s_a.get_remote_addr(),
+        Some(a_udp.sock.local_addr().unwrap())
+    );
+    let mut a2 = TunnelClient::open(&sfu, s_a.clone());
+    a2.bind(&sfu).await;
+    assert!(s_a.is_tunneled());
+    assert!(
+        s_a.get_remote_addr().is_none(),
+        "tunnel bind replaces the UDP path"
+    );
+    a_udp.send_audio(addr, &channel, b"udp-after-tunnel").await;
+    assert!(
+        b.recv().await.is_none(),
+        "the replaced UDP address is unbound"
+    );
+    assert!(sfu.close_tunnel(&a2.tunnel));
+    assert!(s_a.endpoint().is_none());
+    b.send_audio(addr, &channel, b"nobody-home").await;
+    assert!(a2.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn tunnel_queue_drops_only_the_stalled_receiver() {
+    let (sfu, addr) = start_sfu_with(SfuOptions {
+        tunnel_queue_packets: 8,
+        ..SfuOptions::default()
+    })
+    .await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    for s in [&s_a, &s_b, &s_c] {
+        sfu.join_channel(
+            &s.session_id,
+            channel,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = TunnelClient::open(&sfu, s_b.clone());
+    let mut c = Client::new(s_c.clone()).await;
+    a.bind(addr).await;
+    b.bind(&sfu).await;
+    c.bind(addr).await;
+
+    // B's connection stalls (nobody drains its queue) while A keeps talking.
+    for i in 0..20u8 {
+        a.send_audio(addr, &channel, &[i; 40]).await;
+    }
+    let mut heard_c = 0;
+    while c.recv().await.is_some() {
+        heard_c += 1;
+    }
+    assert_eq!(heard_c, 20, "the healthy UDP receiver gets everything");
+    let mut heard_b = 0;
+    while b.recv_open().await.is_some() {
+        heard_b += 1;
+    }
+    assert_eq!(heard_b, 8, "the stalled tunnel keeps only its queue depth");
+    assert!(b.tunnel.packets_dropped() >= 12);
+    assert_eq!(b.tunnel.packets_sent(), 9, "8 audio frames + the bind ack");
+
+    // Once drained, delivery resumes.
+    a.send_audio(addr, &channel, b"again").await;
+    assert_eq!(&b.recv_open().await.unwrap().payload[..], b"again");
 }
 
 #[tokio::test]

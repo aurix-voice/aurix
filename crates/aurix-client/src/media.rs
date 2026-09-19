@@ -1,6 +1,15 @@
-//! Native AURX v2 media transport: one UDP socket per session, signed `SessionBind`, AES-CTR +
-//! HMAC on every packet, per-sender replay windows, heartbeats with RTT measurement. The receive
-//! loop runs on a dedicated OS thread (no runtime hop between the socket and the mixer).
+//! Native AURX v2 media transport: signed `SessionBind`, AES-CTR + HMAC on every packet,
+//! per-sender replay windows, heartbeats with RTT measurement — over one of two links:
+//!
+//! * **UDP** (default): one socket per session; the receive loop runs on a dedicated OS thread
+//!   (no runtime hop between the socket and the mixer).
+//! * **Tunnel**: the same sealed packets as binary frames on the control WebSocket, for
+//!   networks that block UDP. Uplink packets are queued to the control task (bounded, drop on
+//!   overflow), downlink frames are handed in by the control task through
+//!   [`MediaTransport::handle_frame`]. TCP head-of-line blocking applies.
+//!
+//! Both links share the uplink sequence counter so a mid-session switch keeps the server's
+//! replay window happy.
 
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{
@@ -9,6 +18,7 @@ use aurix_common::protocol::{
 use aurix_common::types::{AudioCodec, Direction, SessionId};
 use bytes::Bytes;
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,6 +27,44 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::error::ClientError;
+
+/// Which link carries the session's media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaPath {
+    /// Native AURX over its own UDP socket.
+    Udp,
+    /// Native AURX as binary frames on the control WebSocket (UDP blocked).
+    Tunnel,
+}
+
+/// Link selection policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaPathPolicy {
+    /// UDP first; fall back to the tunnel when the UDP bind fails or heartbeats stop being
+    /// acknowledged, and re-probe UDP periodically while tunnelled.
+    #[default]
+    Auto,
+    /// UDP only; a blocked UDP path fails the connection as before.
+    UdpOnly,
+    /// Tunnel only (testing, or hosts known to block UDP).
+    TunnelOnly,
+}
+
+/// Shared uplink sequence counter: one per session, handed to every link the session uses.
+pub type SequenceCounter = Arc<AtomicU32>;
+
+/// Downlink frames the control task hands to a tunnelled transport are classified so the
+/// bind handshake can wait for its ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    BindAck,
+    Audio,
+    HeartbeatAck,
+    Other,
+    Rejected,
+}
 
 /// One verified downlink audio frame.
 #[derive(Debug, Clone)]
@@ -46,6 +94,8 @@ pub struct MediaStats {
     pub bad_auth: u64,
     /// Packets rejected by a replay window.
     pub replayed: u64,
+    /// Uplink packets dropped because the tunnel queue to the control task was full (0 on UDP).
+    pub uplink_dropped: u64,
     /// Last heartbeat round-trip in milliseconds (0 until the first ack).
     pub rtt_ms: f32,
     /// Round-trip extremes and running average over the whole session (0 until the first ack).
@@ -55,6 +105,8 @@ pub struct MediaStats {
     pub rtt_samples: u64,
     /// Heartbeats sent without an ack arriving before the next one.
     pub heartbeats_lost: u64,
+    /// Heartbeats lost in a row; reset by every ack.
+    pub heartbeats_lost_consecutive: u32,
 }
 
 impl MediaStats {
@@ -104,12 +156,29 @@ fn split_host_port(s: &str) -> Option<(&str, u16)> {
     Some((host, port))
 }
 
+/// How many uplink packets may wait for the control task before the tunnel drops them
+/// (~1.3 s of audio at 20 ms frames).
+pub const TUNNEL_UPLINK_QUEUE: usize = 64;
+
+enum Link {
+    Udp {
+        socket: UdpSocket,
+        server: SocketAddr,
+    },
+    Tunnel {
+        uplink: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+}
+
+type Sink = Arc<dyn Fn(IncomingAudio) + Send + Sync>;
+
 pub struct MediaTransport {
-    socket: UdpSocket,
-    server: SocketAddr,
+    link: Link,
+    session_id: SessionId,
     ssrc: u32,
     keys: MediaKeys,
-    sequence: AtomicU32,
+    sequence: SequenceCounter,
+    bound: AtomicBool,
     stop: AtomicBool,
     stats: Mutex<MediaStats>,
     replay: Mutex<HashMap<u32, ReplayWindow>>,
@@ -118,18 +187,20 @@ pub struct MediaTransport {
     /// Header timestamp and send instant of the heartbeat awaiting its ack.
     heartbeat_pending: Mutex<Option<(u32, Instant)>>,
     started: Instant,
+    sink: Mutex<Option<Sink>>,
     recv_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl MediaTransport {
-    /// Open a socket and authenticate it with the server (`SessionBind` → `SessionBindAck`),
-    /// retrying `attempts` times with `timeout` each. Blocking; run it off the game thread.
-    pub fn bind(
+    /// Open a UDP socket and authenticate it with the server (`SessionBind` →
+    /// `SessionBindAck`), retrying `attempts` times with `timeout` each. Blocking; run it off
+    /// the game thread.
+    pub fn bind_udp(
         server: SocketAddr,
         session_id: SessionId,
         ssrc: u32,
         media_key: &[u8],
-        initial_sequence: u32,
+        sequence: SequenceCounter,
         attempts: u32,
         timeout: Duration,
     ) -> Result<Self, ClientError> {
@@ -192,12 +263,50 @@ impl MediaTransport {
         socket
             .set_read_timeout(Some(Duration::from_millis(250)))
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        Ok(Self {
-            socket,
-            server,
+        let me = Self::new(
+            Link::Udp { socket, server },
+            session_id,
             ssrc,
             keys,
-            sequence: AtomicU32::new(initial_sequence),
+            sequence,
+        );
+        me.bound.store(true, Ordering::Relaxed);
+        Ok(me)
+    }
+
+    /// A transport whose packets travel as binary frames on the control WebSocket. Unbound
+    /// until the control task has sent [`Self::bind_packet`] and fed the `SessionBindAck`
+    /// back through [`Self::handle_frame`].
+    pub fn tunnel(
+        session_id: SessionId,
+        ssrc: u32,
+        media_key: &[u8],
+        sequence: SequenceCounter,
+        uplink: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Self {
+        Self::new(
+            Link::Tunnel { uplink },
+            session_id,
+            ssrc,
+            MediaKeys::derive(media_key),
+            sequence,
+        )
+    }
+
+    fn new(
+        link: Link,
+        session_id: SessionId,
+        ssrc: u32,
+        keys: MediaKeys,
+        sequence: SequenceCounter,
+    ) -> Self {
+        Self {
+            link,
+            session_id,
+            ssrc,
+            keys,
+            sequence,
+            bound: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             stats: Mutex::new(MediaStats::default()),
             replay: Mutex::new(HashMap::new()),
@@ -205,12 +314,41 @@ impl MediaTransport {
             heartbeat_acked: AtomicBool::new(true),
             heartbeat_pending: Mutex::new(None),
             started: Instant::now(),
+            sink: Mutex::new(None),
             recv_thread: Mutex::new(None),
-        })
+        }
     }
 
-    pub fn server(&self) -> SocketAddr {
-        self.server
+    pub fn path(&self) -> MediaPath {
+        match self.link {
+            Link::Udp { .. } => MediaPath::Udp,
+            Link::Tunnel { .. } => MediaPath::Tunnel,
+        }
+    }
+
+    /// `SessionBind` acknowledged (immediately true for a UDP transport).
+    pub fn is_bound(&self) -> bool {
+        self.bound.load(Ordering::Relaxed)
+    }
+
+    /// Signed `SessionBind` for the tunnel handshake (a fresh nonce per call).
+    pub fn bind_packet(&self) -> Vec<u8> {
+        AurixPacket::session_bind(
+            &self.session_id,
+            self.ssrc,
+            chrono::Utc::now().timestamp_millis(),
+            rand::random(),
+        )
+        .encode_authenticated(&self.keys)
+        .to_vec()
+    }
+
+    /// Server address of the UDP link.
+    pub fn server(&self) -> Option<SocketAddr> {
+        match &self.link {
+            Link::Udp { server, .. } => Some(*server),
+            Link::Tunnel { .. } => None,
+        }
     }
 
     pub fn ssrc(&self) -> u32 {
@@ -218,7 +356,10 @@ impl MediaTransport {
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.socket.local_addr().ok()
+        match &self.link {
+            Link::Udp { socket, .. } => socket.local_addr().ok(),
+            Link::Tunnel { .. } => None,
+        }
     }
 
     /// Sequence the next uplink packet will use; carried over a resume so the server's replay
@@ -227,12 +368,22 @@ impl MediaTransport {
         self.sequence.load(Ordering::Relaxed)
     }
 
+    /// The counter shared with the other link of this session.
+    pub fn sequence_counter(&self) -> SequenceCounter {
+        Arc::clone(&self.sequence)
+    }
+
     pub fn stats(&self) -> MediaStats {
         *self.stats.lock()
     }
 
-    /// Start the receive thread; every authenticated audio frame is handed to `sink`.
-    pub fn start(self: &Arc<Self>, sink: Arc<dyn Fn(IncomingAudio) + Send + Sync>) {
+    /// Start delivering authenticated audio frames to `sink`: spawns the receive thread on
+    /// UDP; on a tunnel the control task feeds frames through [`Self::handle_frame`].
+    pub fn start(self: &Arc<Self>, sink: Sink) {
+        *self.sink.lock() = Some(Arc::clone(&sink));
+        if !matches!(self.link, Link::Udp { .. }) {
+            return;
+        }
         let me = Arc::clone(self);
         let handle = std::thread::Builder::new()
             .name("aurix-media-rx".into())
@@ -241,10 +392,13 @@ impl MediaTransport {
         *self.recv_thread.lock() = Some(handle);
     }
 
-    fn recv_loop(&self, sink: Arc<dyn Fn(IncomingAudio) + Send + Sync>) {
+    fn recv_loop(&self, sink: Sink) {
+        let Link::Udp { socket, .. } = &self.link else {
+            return;
+        };
         let mut buf = vec![0u8; MAX_PACKET_SIZE * 2];
         while !self.stop.load(Ordering::Relaxed) {
-            let n = match self.socket.recv(&mut buf) {
+            let n = match socket.recv(&mut buf) {
                 Ok(n) => n,
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -257,40 +411,55 @@ impl MediaTransport {
                     continue;
                 }
             };
-            {
-                let mut s = self.stats.lock();
-                s.packets_received += 1;
-                s.bytes_received += n as u64;
-            }
-            let Ok(mut packet) = AurixPacket::decode(&buf[..n]) else {
-                self.stats.lock().bad_auth += 1;
-                continue;
-            };
-            if !packet.open(&self.keys) {
-                self.stats.lock().bad_auth += 1;
-                continue;
-            }
-            match packet.header.packet_type {
-                PacketType::Audio | PacketType::AudioFec => {
-                    let sender = packet.header.ssrc;
-                    let seq = packet.header.sequence;
-                    if !self
-                        .replay
-                        .lock()
-                        .entry(sender)
-                        .or_default()
-                        .check_and_update(seq)
-                    {
-                        self.stats.lock().replayed += 1;
-                        continue;
-                    }
-                    let (volume, direction) = packet.take_downlink_meta();
-                    self.stats.lock().audio_frames_received += 1;
-                    let codec = if packet.header.has_flag(PacketFlags::Pcmu) {
-                        AudioCodec::Pcmu
-                    } else {
-                        AudioCodec::Opus
-                    };
+            self.process(&buf[..n], Some(&sink));
+        }
+    }
+
+    /// Feed one binary WebSocket frame to a tunnelled transport. Ignored after [`Self::stop`].
+    pub fn handle_frame(&self, data: &[u8]) -> FrameKind {
+        if self.stop.load(Ordering::Relaxed) {
+            return FrameKind::Rejected;
+        }
+        let sink = self.sink.lock().clone();
+        self.process(data, sink.as_ref())
+    }
+
+    fn process(&self, data: &[u8], sink: Option<&Sink>) -> FrameKind {
+        {
+            let mut s = self.stats.lock();
+            s.packets_received += 1;
+            s.bytes_received += data.len() as u64;
+        }
+        let Ok(mut packet) = AurixPacket::decode(data) else {
+            self.stats.lock().bad_auth += 1;
+            return FrameKind::Rejected;
+        };
+        if !packet.open(&self.keys) {
+            self.stats.lock().bad_auth += 1;
+            return FrameKind::Rejected;
+        }
+        match packet.header.packet_type {
+            PacketType::Audio | PacketType::AudioFec => {
+                let sender = packet.header.ssrc;
+                let seq = packet.header.sequence;
+                if !self
+                    .replay
+                    .lock()
+                    .entry(sender)
+                    .or_default()
+                    .check_and_update(seq)
+                {
+                    self.stats.lock().replayed += 1;
+                    return FrameKind::Rejected;
+                }
+                let (volume, direction) = packet.take_downlink_meta();
+                self.stats.lock().audio_frames_received += 1;
+                let codec = if packet.header.has_flag(PacketFlags::Pcmu) {
+                    AudioCodec::Pcmu
+                } else {
+                    AudioCodec::Opus
+                };
+                if let Some(sink) = sink {
                     sink(IncomingAudio {
                         sender_ssrc: sender,
                         sequence: seq,
@@ -302,28 +471,64 @@ impl MediaTransport {
                         payload: packet.payload,
                     });
                 }
-                PacketType::HeartbeatAck => {
-                    let pending = *self.heartbeat_pending.lock();
-                    if let Some((ts, sent_at)) = pending {
-                        if ts == packet.header.timestamp {
-                            self.stats
-                                .lock()
-                                .record_rtt(sent_at.elapsed().as_secs_f32() * 1000.0);
-                        }
-                    }
-                    self.heartbeat_acked.store(true, Ordering::Relaxed);
-                }
-                _ => {}
+                FrameKind::Audio
             }
+            PacketType::HeartbeatAck => {
+                let pending = *self.heartbeat_pending.lock();
+                if let Some((ts, sent_at)) = pending {
+                    if ts == packet.header.timestamp {
+                        let mut s = self.stats.lock();
+                        s.record_rtt(sent_at.elapsed().as_secs_f32() * 1000.0);
+                        s.heartbeats_lost_consecutive = 0;
+                    }
+                }
+                self.heartbeat_acked.store(true, Ordering::Relaxed);
+                FrameKind::HeartbeatAck
+            }
+            PacketType::SessionBindAck => {
+                if packet.header.ssrc == self.ssrc {
+                    self.bound.store(true, Ordering::Relaxed);
+                    FrameKind::BindAck
+                } else {
+                    FrameKind::Rejected
+                }
+            }
+            _ => FrameKind::Other,
         }
     }
 
     fn send_sealed(&self, packet: &AurixPacket) {
-        let wire = packet.seal(&self.keys);
-        if self.socket.send(&wire).is_ok() {
+        self.send_wire(packet.seal(&self.keys).to_vec());
+    }
+
+    /// Re-send the signed `SessionBind` on the current link (re-claims the server endpoint
+    /// after a probe on the other link may have moved it). The ack is observed via
+    /// [`Self::handle_frame`] / the receive thread.
+    pub fn send_bind(&self) {
+        self.send_wire(self.bind_packet());
+    }
+
+    fn send_wire(&self, wire: Vec<u8>) {
+        let len = wire.len() as u64;
+        let sent = match &self.link {
+            Link::Udp { socket, .. } => socket.send(&wire).is_ok(),
+            Link::Tunnel { uplink } => {
+                if self.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match uplink.try_send(wire) {
+                    Ok(()) => true,
+                    Err(_) => {
+                        self.stats.lock().uplink_dropped += 1;
+                        false
+                    }
+                }
+            }
+        };
+        if sent {
             let mut s = self.stats.lock();
             s.packets_sent += 1;
-            s.bytes_sent += wire.len() as u64;
+            s.bytes_sent += len;
         }
     }
 
@@ -393,7 +598,9 @@ impl MediaTransport {
         if !self.heartbeat_acked.swap(false, Ordering::Relaxed)
             && self.heartbeat_sent.load(Ordering::Relaxed) > 0
         {
-            self.stats.lock().heartbeats_lost += 1;
+            let mut s = self.stats.lock();
+            s.heartbeats_lost += 1;
+            s.heartbeats_lost_consecutive += 1;
         }
         self.heartbeat_sent.fetch_add(1, Ordering::Relaxed);
         let ts = self.started.elapsed().as_millis() as u32;
@@ -403,13 +610,21 @@ impl MediaTransport {
         self.send_sealed(&packet);
     }
 
+    /// Heartbeats unanswered in a row (the UDP-path health signal behind the tunnel fallback).
+    pub fn consecutive_heartbeats_lost(&self) -> u32 {
+        self.stats.lock().heartbeats_lost_consecutive
+    }
+
     /// Drop replay state for a sender that left (its SSRC may be reused later).
     pub fn forget_sender(&self, ssrc: u32) {
         self.replay.lock().remove(&ssrc);
     }
 
+    /// Stop receiving: joins the UDP thread; a tunnelled transport ignores further frames and
+    /// stops queueing uplink packets.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.bound.store(false, Ordering::Relaxed);
         if let Some(h) = self.recv_thread.lock().take() {
             if std::thread::current().id() != h.thread().id() {
                 let _ = h.join();
@@ -518,17 +733,19 @@ mod tests {
         let ssrc = 0x0badcafe;
         let (addr, server) = fake_server(key, ssrc);
         let transport = Arc::new(
-            MediaTransport::bind(
+            MediaTransport::bind_udp(
                 addr,
                 SessionId::new(),
                 ssrc,
                 &key,
-                10,
+                Arc::new(AtomicU32::new(10)),
                 3,
                 Duration::from_millis(500),
             )
             .unwrap(),
         );
+        assert_eq!(transport.path(), MediaPath::Udp);
+        assert!(transport.is_bound());
         let received = Arc::new(Mutex::new(Vec::<IncomingAudio>::new()));
         let sink = {
             let received = received.clone();
@@ -574,18 +791,88 @@ mod tests {
     fn bind_fails_without_ack() {
         let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = dead.local_addr().unwrap();
-        let err = MediaTransport::bind(
+        let err = MediaTransport::bind_udp(
             addr,
             SessionId::new(),
             1,
             &[0u8; 32],
-            0,
+            Arc::new(AtomicU32::new(0)),
             2,
             Duration::from_millis(100),
         )
         .err()
         .unwrap();
         assert!(err.to_string().contains("SessionBindAck"));
+    }
+
+    #[test]
+    fn tunnel_shares_sequence_binds_via_frames_and_drops_on_full_queue() {
+        let key = [9u8; 32];
+        let ssrc = 0x5151;
+        let keys = MediaKeys::derive(&key);
+        let seq = Arc::new(AtomicU32::new(40));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let transport = Arc::new(MediaTransport::tunnel(
+            SessionId::new(),
+            ssrc,
+            &key,
+            Arc::clone(&seq),
+            tx,
+        ));
+        assert_eq!(transport.path(), MediaPath::Tunnel);
+        assert!(!transport.is_bound());
+        assert!(transport.server().is_none());
+
+        // Bind handshake: signed SessionBind out, sealed SessionBindAck in.
+        let bind = AurixPacket::decode(&transport.bind_packet()).unwrap();
+        assert_eq!(bind.header.packet_type, PacketType::SessionBind);
+        assert!(bind.verify_auth(&keys));
+        let foreign = AurixPacket::session_bind_ack(ssrc + 1, 0, 0).seal(&keys);
+        assert_eq!(transport.handle_frame(&foreign), FrameKind::Rejected);
+        assert!(!transport.is_bound());
+        let ack = AurixPacket::session_bind_ack(ssrc, 0, 0).seal(&keys);
+        assert_eq!(transport.handle_frame(&ack), FrameKind::BindAck);
+        assert!(transport.is_bound());
+
+        // Downlink audio reaches the sink once; the replayed copy does not.
+        let received = Arc::new(Mutex::new(Vec::<IncomingAudio>::new()));
+        let sink = {
+            let received = received.clone();
+            Arc::new(move |a: IncomingAudio| received.lock().push(a))
+        };
+        transport.start(sink);
+        let audio = AurixPacket::audio(7, 960, 0x1234, 77, Bytes::from_static(&[1, 2, 3]));
+        let (h, body) = audio.downlink_parts(0.25, None);
+        let wire = AurixPacket::seal_parts(&h, &body, &keys);
+        assert_eq!(transport.handle_frame(&wire), FrameKind::Audio);
+        assert_eq!(transport.handle_frame(&wire), FrameKind::Rejected);
+        assert_eq!(transport.handle_frame(b"garbage"), FrameKind::Rejected);
+        assert_eq!(received.lock().len(), 1);
+        assert!((received.lock()[0].volume - 0.25).abs() < 0.02);
+
+        // Uplink: packets are queued for the control task, sequence continues from 40.
+        transport.send_audio(77, 0, Some(10), &[4, 5]);
+        transport.send_heartbeat();
+        let first = AurixPacket::decode(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first.header.sequence, 40);
+        assert_eq!(seq.load(Ordering::Relaxed), 42);
+        assert_eq!(transport.next_sequence(), 42);
+        // Queue capacity 4: one heartbeat is still queued, three more fit, the rest drop.
+        for i in 0..6u32 {
+            transport.send_audio(77, i * 960, None, &[1]);
+        }
+        let s = transport.stats();
+        assert_eq!(s.uplink_dropped, 3);
+        assert_eq!(s.packets_sent, 5);
+        assert_eq!(s.replayed, 1);
+        assert_eq!(s.bad_auth, 1);
+
+        transport.stop();
+        assert!(!transport.is_bound());
+        assert_eq!(transport.handle_frame(&wire), FrameKind::Rejected);
+        while rx.try_recv().is_ok() {}
+        transport.send_audio(77, 0, None, &[1]);
+        assert!(rx.try_recv().is_err(), "stopped transports queue nothing");
     }
 
     #[test]

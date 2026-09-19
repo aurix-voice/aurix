@@ -1,6 +1,7 @@
 //! WebSocket control plane: authenticated upgrade (`Authorization: Bearer`, optional
 //! `X-Aurix-Resume`), first-message `SessionInitAck` handshake and typed
-//! [`ControlMessage`] send/receive. Connection policy (reconnects, re-joins) lives in
+//! [`ControlMessage`] send/receive. Binary frames carry sealed AURX media when the session is
+//! tunnelled (see [`crate::media`]). Connection policy (reconnects, re-joins) lives in
 //! [`crate::client`].
 
 use aurix_common::protocol::ControlMessage;
@@ -34,6 +35,8 @@ pub struct SessionAck {
     pub resume_token: String,
     pub resume_grace: Duration,
     pub resumed: bool,
+    /// The node accepts AURX media as binary frames on this WebSocket (UDP-blocked fallback).
+    pub media_tunnel: bool,
 }
 
 /// Informational (unverified) claims of the session JWT; lets the client recognise itself in
@@ -116,6 +119,13 @@ pub struct ControlConnection {
     stream: SplitStream<WsStream>,
 }
 
+/// One frame from the server: JSON control (text) or a sealed AURX packet (binary).
+#[derive(Debug)]
+pub enum Inbound {
+    Control(ControlMessage),
+    Media(Vec<u8>),
+}
+
 impl ControlConnection {
     /// Open the WebSocket, authenticate and wait for `SessionInitAck`.
     ///
@@ -163,7 +173,7 @@ impl ControlConnection {
 
     async fn wait_for_ack(&mut self) -> Result<SessionAck> {
         loop {
-            match self.recv().await? {
+            match self.recv_control().await? {
                 Some(ControlMessage::SessionInitAck {
                     session_id,
                     ssrc,
@@ -172,6 +182,7 @@ impl ControlConnection {
                     resume_token,
                     resume_grace_ms,
                     resumed,
+                    media_tunnel,
                 }) => {
                     let media_key = base64::engine::general_purpose::STANDARD
                         .decode(media_key.as_bytes())
@@ -187,6 +198,7 @@ impl ControlConnection {
                         resume_token,
                         resume_grace: Duration::from_millis(resume_grace_ms),
                         resumed,
+                        media_tunnel,
                     });
                 }
                 Some(ControlMessage::Error { code, message, .. }) => {
@@ -215,9 +227,17 @@ impl ControlConnection {
             .map_err(map_ws_error)
     }
 
-    /// Next control message; `Ok(None)` once the peer closed the socket. Transport-level pings
-    /// are answered by the WebSocket layer; binary frames are ignored.
-    pub async fn recv(&mut self) -> Result<Option<ControlMessage>> {
+    /// Send one sealed AURX packet as a binary frame (media tunnel uplink).
+    pub async fn send_media(&mut self, packet: Vec<u8>) -> Result<()> {
+        self.sink
+            .send(Message::Binary(packet))
+            .await
+            .map_err(map_ws_error)
+    }
+
+    /// Next frame; `Ok(None)` once the peer closed the socket. Transport-level pings are
+    /// answered by the WebSocket layer.
+    pub async fn recv(&mut self) -> Result<Option<Inbound>> {
         loop {
             match self.stream.next().await {
                 None => return Ok(None),
@@ -227,11 +247,23 @@ impl ControlConnection {
                 Some(Err(e)) => return Err(map_ws_error(e)),
                 Some(Ok(Message::Text(text))) => {
                     return serde_json::from_str::<ControlMessage>(&text)
-                        .map(Some)
+                        .map(|m| Some(Inbound::Control(m)))
                         .map_err(Into::into);
                 }
+                Some(Ok(Message::Binary(data))) => return Ok(Some(Inbound::Media(data))),
                 Some(Ok(Message::Close(_))) => return Ok(None),
                 Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    /// [`Self::recv`] skipping binary frames (handshake, before any media path exists).
+    pub async fn recv_control(&mut self) -> Result<Option<ControlMessage>> {
+        loop {
+            match self.recv().await? {
+                Some(Inbound::Control(m)) => return Ok(Some(m)),
+                Some(Inbound::Media(_)) => {}
+                None => return Ok(None),
             }
         }
     }

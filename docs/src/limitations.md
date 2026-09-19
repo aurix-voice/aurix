@@ -35,6 +35,12 @@ the chapter that explains the boundary.
 * **Opus inside; PCMU only as a per-session fallback** for native AURX clients (the node
   transcodes at the edge). No PCMA, no PCMU over WebRTC, no PCMU for `E2ee` frames, no video
   ([codecs](features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+* **The TCP fallback for native media is the control WebSocket, not a second transport.** When
+  UDP is blocked the SDKs carry AURX packets over the authenticated WebSocket
+  ([tunnel](api/aurx.md#tunnel-aurx-over-the-control-websocket)); that inherits TCP head-of-line
+  blocking (latency bursts under loss) and the node's per-session downlink queue drops when the
+  client's connection stalls. There is no QUIC/HTTP/3 path, no TURN for native clients, and the
+  tunnel needs the WebSocket itself to be reachable (`wss://` on 443 is the usual answer).
 * **Browsers own their encoder.** The Web SDK can set the bitrate ceiling, FEC, DTX, maximum
   bandwidth and CBR through WebRTC (`fmtp` / `setParameters`); complexity, signal mode, VBR mode
   and expected loss are only controllable in the native, Unity and Unreal SDKs
@@ -91,6 +97,5 @@ the chapter that explains the boundary.
 
 ## Planned
 
-The operator web panel is tracked separately. A TCP fallback for native AURX media,
-per-receiver stream caps / audience mode for very large channels and cross-node session
-failover are the next backlog items.
+The operator web panel is tracked separately. Per-receiver stream caps / audience mode for very
+large channels and cross-node session failover are the next backlog items.

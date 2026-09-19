@@ -23,7 +23,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
 > audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
-> PCMU fallback, and Web / Unity / native (C ABI) / Unreal SDKs.
+> PCMU fallback, a WebSocket tunnel for blocked UDP, and Web / Unity / native (C ABI) / Unreal SDKs.
 > See [Limitations](#limitations) before deploying at scale.
 
 **Documentation**: the full book lives in [`docs/`](docs/src/SUMMARY.md) (`mdbook serve docs`) —
@@ -683,6 +683,30 @@ switched off node-wide with `media.pcmu_fallback = false`
 `aurix_pcmu_frames_total{direction="uplink"|"downlink",outcome="ok"|"error"}`. SDKs: Unity `SetAudioCodecAsync` / behaviour
 `PreferredCodec`, native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec`.
 
+### When UDP is blocked: AURX over the control WebSocket
+
+Corporate NATs, hotel Wi-Fi and some carriers drop UDP entirely. A native AURX session can then
+carry **the same sealed packets** — one per binary WebSocket frame, both directions — over the
+control WebSocket it already authenticated with; text frames stay the JSON control plane. The
+node advertises it in `SessionInitAck.media_tunnel` (`media.media_tunnel = true`, default) and
+reports the live link in `MediaBound.transport` (`udp` / `tunnel`) and
+`GET /v1/sessions/{id}/stats`. A tunnel belongs to exactly one connection and therefore one
+session: the binary `SessionBind` must name that session, the SSRC/HMAC/AEAD/replay checks are
+the ones UDP uses, and the packet then walks the same router — mutes, blocks, volume, focus,
+positional/ambient, PCMU transcoding, recording, cascade and the WebRTC fan-out do not know which
+link it came from. Downlink to a tunnelled receiver is sealed per receiver and queued behind its
+socket (`media.tunnel_queue_packets`, 128); a stalled TCP connection drops *its own* packets
+(`aurix_tunnel_packets_total{direction="downlink",outcome="dropped"}`), never anyone else's. The
+newest signed bind wins, so a client moves between UDP and the tunnel by simply binding again on
+the other link, keeping one sequence counter. SDKs (`Auto` by default): UDP first, tunnel when
+the UDP bind gets no answer or `udp_fallback_lost_heartbeats` heartbeats vanish mid-call, UDP
+re-probed every `udp_reprobe_interval` and taken back as soon as it answers — native
+`Event::MediaPathChanged` / `aurix_client_media_path`, Unity `OnMediaPathChanged` /
+`ActiveMediaPath`, Unreal `OnMediaPathChanged` / `GetMediaPath`; `UdpOnly` and `TunnelOnly`
+pin a link. TCP head-of-line blocking applies: the tunnel keeps the player in the call, UDP
+remains the path to be on. WebRTC clients are untouched (they have ICE/TURN). Metrics:
+`aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
+
 ### Network / firewall
 
 | port | proto | purpose |
@@ -846,6 +870,9 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 * PCMU is a per-session fallback for native AURX clients only (no PCMA, no WebRTC PCMU, no
   PCMU for `E2ee` frames); each PCMU session costs the node one Opus encoder plus one Opus
   decoder per speaker it hears.
+* The blocked-UDP fallback for native clients is the control WebSocket (TCP): head-of-line
+  blocking under loss, a bounded per-session downlink queue, and it needs the WebSocket port
+  itself to be reachable. No QUIC, no TURN for native media.
 * The Unreal plugin has not been compiled against a real engine install yet (none is available
   in the development environment); the first build in your project is the verification step.
   The protocol is documented in `crates/aurix-common/src/protocol.rs`.

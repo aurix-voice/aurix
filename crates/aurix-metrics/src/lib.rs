@@ -238,9 +238,31 @@ pub static PCMU_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `direction` is `uplink` (client → node over the WebSocket) or `downlink`; `outcome` is
+/// `sent`/`received`, `dropped` (downlink queue full or connection gone) or `rejected`
+/// (uplink frame that failed decoding or authentication).
+pub static TUNNEL_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_tunnel_packets_total",
+        "AURX packets carried over the WebSocket media tunnel (UDP fallback)",
+        &["direction", "outcome"]
+    )
+    .unwrap()
+});
+
+pub static TUNNEL_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_tunnel_sessions",
+        "Native sessions whose media is currently bound through the WebSocket tunnel"
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
     let _ = &*PCMU_FRAMES;
     let _ = &*PCMU_SESSIONS;
+    let _ = &*TUNNEL_PACKETS;
+    let _ = &*TUNNEL_SESSIONS;
     // Touch all lazy statics to ensure registration
     let _ = &*ACTIVE_SESSIONS;
     let _ = &*ACTIVE_CHANNELS;

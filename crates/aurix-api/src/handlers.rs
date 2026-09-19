@@ -829,6 +829,7 @@ pub async fn get_session_stats(
         "session_id": session.session_id,
         "user_id": session.user_id,
         "transport": format!("{:?}", *session.transport.read()),
+        "media_path": session.transport_kind(),
         "channels": session.get_channels(),
         "packets_sent": stats.packets_sent,
         "bytes_sent": stats.bytes_sent,

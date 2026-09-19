@@ -15,7 +15,7 @@ no_includes = true
 [export]
 prefix = ""
 include = ["AurixClient", "AurixEvent"]
-exclude = ["SYNTH_SSRC_FLAG", "SAMPLE_RATE", "FRAME_SAMPLES", "MAX_INPUT_GAIN", "MAX_OUTPUT_VOLUME", "VERSION", "BLOCK", "MAX_ECHO_TAIL_MS", "MIN_ECHO_TAIL_MS", "MAX_STREAM_DELAY_MS", "DspConfig", "DspStats", "NoiseSuppression"]
+exclude = ["SYNTH_SSRC_FLAG", "TUNNEL_UPLINK_QUEUE", "SAMPLE_RATE", "FRAME_SAMPLES", "MAX_INPUT_GAIN", "MAX_OUTPUT_VOLUME", "VERSION", "BLOCK", "MAX_ECHO_TAIL_MS", "MIN_ECHO_TAIL_MS", "MAX_STREAM_DELAY_MS", "DspConfig", "DspStats", "NoiseSuppression"]
 
 [export.rename]
 "AurixClient" = "AurixClient"

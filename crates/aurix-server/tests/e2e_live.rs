@@ -18,8 +18,8 @@ use aurix_common::protocol::{
     TransmissionMode, UserPosition,
 };
 use aurix_common::types::{
-    AudioCodec, AudioPolicy, ChannelId, Direction, OpusBandwidth, OpusSignal, Orientation3D,
-    Position3D, RecordingConsent, SessionId, UserId,
+    AudioCodec, AudioPolicy, ChannelId, Direction, MediaTransportKind, OpusBandwidth, OpusSignal,
+    Orientation3D, Position3D, RecordingConsent, SessionId, UserId,
 };
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use base64::Engine;
@@ -62,6 +62,7 @@ struct Player {
     resume_token: String,
     resume_grace: Duration,
     resumed: bool,
+    media_tunnel: bool,
 }
 
 impl Player {
@@ -233,6 +234,7 @@ async fn connect_with(
         resume_token,
         resume_grace_ms,
         resumed,
+        media_tunnel,
     } = msg
     else {
         panic!("{name}: expected SessionInitAck, got {t}");
@@ -259,6 +261,7 @@ async fn connect_with(
         resume_token,
         resume_grace: Duration::from_millis(resume_grace_ms),
         resumed,
+        media_tunnel,
     }
 }
 
@@ -280,7 +283,9 @@ async fn bind_media(p: &mut Player) {
             matches!(m, ControlMessage::MediaBound { .. })
         })
         .await;
-    assert!(matches!(m, ControlMessage::MediaBound { session_id } if session_id == p.session_id));
+    assert!(
+        matches!(m, ControlMessage::MediaBound { session_id, .. } if session_id == p.session_id)
+    );
 }
 
 #[tokio::test]
@@ -7592,5 +7597,377 @@ async fn radius_visibility_text_range_and_ambient_mode() {
     for p in [&mut alice, &mut bob, &mut dave] {
         p.send(&ControlMessage::ChannelLeave { channel_id: party })
             .await;
+    }
+}
+
+/// One frame of any kind from the control socket, or `None` when it stays silent.
+async fn next_frame(p: &mut Player, wait: Duration) -> Option<Message> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, p.ws.next()).await {
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(m))) => return Some(m),
+            _ => return None,
+        }
+    }
+}
+
+/// Next sealed AURX packet delivered as a binary frame, skipping control messages.
+async fn recv_tunnel(p: &mut Player, wait: Duration) -> Option<AurixPacket> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match next_frame(p, left).await? {
+            Message::Binary(b) => {
+                let mut pkt = AurixPacket::decode(&b).expect("bad AURX frame on the tunnel");
+                assert!(
+                    pkt.header.has_flag(PacketFlags::Encrypted),
+                    "{}: tunnel downlink must be encrypted",
+                    p.name
+                );
+                assert!(
+                    pkt.open(&p.keys),
+                    "{}: tunnel downlink must be sealed with this session's key",
+                    p.name
+                );
+                return Some(pkt);
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// True when nothing bind-related (a binary ack or `MediaBound`) shows up within `wait`;
+/// unrelated control messages (e.g. `ReceiverPreferences` on session start) are skipped.
+async fn no_bind_reply(p: &mut Player, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match next_frame(p, left).await {
+            None => return true,
+            Some(Message::Binary(_)) => return false,
+            Some(Message::Text(t)) => {
+                if matches!(
+                    serde_json::from_str::<ControlMessage>(&t),
+                    Ok(ControlMessage::MediaBound { .. })
+                ) {
+                    return false;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Binds the session's media through its own control WebSocket: signed `SessionBind` as a
+/// binary frame → sealed `SessionBindAck` back on the socket and `MediaBound { tunnel }`.
+async fn bind_tunnel(p: &mut Player) {
+    let pkt = AurixPacket::session_bind(&p.session_id, p.ssrc, now_ms(), rand::random());
+    p.ws.send(Message::Binary(pkt.encode_authenticated(&p.keys).to_vec()))
+        .await
+        .unwrap();
+    let (mut acked, mut bound) = (false, false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !(acked && bound) {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match next_frame(p, left).await {
+            Some(Message::Binary(b)) => {
+                let mut ack = AurixPacket::decode(&b).unwrap();
+                assert!(ack.open(&p.keys));
+                assert_eq!(ack.header.packet_type, PacketType::SessionBindAck);
+                assert_eq!(ack.payload.len(), 8);
+                acked = true;
+            }
+            Some(Message::Text(t)) => {
+                let m: ControlMessage = serde_json::from_str(&t).unwrap();
+                if let ControlMessage::MediaBound {
+                    session_id,
+                    transport,
+                } = m
+                {
+                    assert_eq!(session_id, p.session_id);
+                    assert_eq!(transport, MediaTransportKind::Tunnel, "{}", p.name);
+                    bound = true;
+                }
+            }
+            _ => panic!("{}: tunnel bind got no ack/MediaBound", p.name),
+        }
+    }
+}
+
+async fn session_media_path(env: &Env, http: &reqwest::Client, sid: SessionId) -> String {
+    let stats: serde_json::Value = http
+        .get(format!("{}/v1/sessions/{sid}/stats", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    stats["media_path"].as_str().unwrap_or("").to_string()
+}
+
+/// AURX over the control WebSocket ("UDP is blocked"): the same sealed packets as binary
+/// frames, attributed to the connection's own session, routed exactly like UDP, with the
+/// newest signed bind deciding which link a session is on.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn native_media_tunnel_over_the_control_websocket() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let hash = channel_id_hash(&channel_id);
+    let (tok_a, _) = issue_token(&env, &http, "e2e:tun-alice", "Alice", channel_id).await;
+    let (tok_b, _) = issue_token(&env, &http, "e2e:tun-bob", "Bob", channel_id).await;
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    assert!(
+        alice.media_tunnel && bob.media_tunnel,
+        "node must advertise the tunnel in SessionInitAck"
+    );
+
+    // A bind for a session this connection does not own is dropped even though it is validly
+    // signed by that session's key (Bob's) — no ack, no MediaBound for anyone.
+    let foreign = AurixPacket::session_bind(&bob.session_id, bob.ssrc, now_ms(), rand::random());
+    alice
+        .ws
+        .send(Message::Binary(
+            foreign.encode_authenticated(&bob.keys).to_vec(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        no_bind_reply(&mut alice, Duration::from_millis(700)).await,
+        "foreign SessionBind must be ignored"
+    );
+    assert!(no_bind_reply(&mut bob, Duration::from_millis(300)).await);
+
+    // Media that arrives before the tunnel is bound is dropped like unbound UDP.
+    let early = AurixPacket::audio(1, 960, alice.ssrc, hash, Bytes::from_static(&[0xFC, 9]));
+    alice
+        .ws
+        .send(Message::Binary(early.seal(&alice.keys).to_vec()))
+        .await
+        .unwrap();
+
+    bind_tunnel(&mut alice).await;
+    bind_media(&mut bob).await;
+    assert_eq!(
+        session_media_path(&env, &http, alice.session_id).await,
+        "tunnel"
+    );
+    assert_eq!(session_media_path(&env, &http, bob.session_id).await, "udp");
+
+    // A replayed bind (timestamp not newer than the accepted one) is refused on the tunnel too.
+    let stale = AurixPacket::session_bind(&alice.session_id, alice.ssrc, now_ms() - 60_000, 7);
+    alice
+        .ws
+        .send(Message::Binary(
+            stale.encode_authenticated(&alice.keys).to_vec(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        no_bind_reply(&mut alice, Duration::from_millis(500)).await,
+        "stale SessionBind must be ignored"
+    );
+
+    for p in [&mut alice, &mut bob] {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: tok,
+        })
+        .await;
+        p.expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    }
+    alice
+        .expect("ParticipantJoined", |m| {
+            matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == "Bob")
+        })
+        .await;
+
+    // Alice (tunnel) → Bob (UDP): binary frames come out as ordinary UDP downlink.
+    let payload = Bytes::from_static(&[0xFC, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    let mut seq = 10u32;
+    for _ in 0..10 {
+        seq += 1;
+        let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
+        alice
+            .ws
+            .send(Message::Binary(pkt.seal(&alice.keys).to_vec()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut got = 0;
+    while let Some(p) = bob.recv_udp().await {
+        if p.header.packet_type == PacketType::Audio {
+            assert_eq!(p.header.ssrc, alice.ssrc);
+            assert_eq!(&p.payload[..], &payload[..]);
+            got += 1;
+            if got >= 8 {
+                break;
+            }
+        }
+    }
+    assert!(
+        got >= 8,
+        "Bob received only {got} tunnelled packets from Alice"
+    );
+
+    // Bob (UDP) → Alice (tunnel): downlink sealed with Alice's key, one packet per frame.
+    for i in 1..=10u32 {
+        let pkt = AurixPacket::audio(i, i * 960, bob.ssrc, hash, payload.clone());
+        bob.udp
+            .send_to(&pkt.seal(&bob.keys), bob.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut got = 0;
+    while let Some(p) = recv_tunnel(&mut alice, Duration::from_secs(3)).await {
+        if p.header.packet_type == PacketType::Audio {
+            assert_eq!(p.header.ssrc, bob.ssrc);
+            assert_eq!(&p.payload[..], &payload[..]);
+            got += 1;
+            if got >= 8 {
+                break;
+            }
+        }
+    }
+    assert!(
+        got >= 8,
+        "Alice received only {got} packets over the tunnel"
+    );
+    assert!(
+        alice.udp.try_recv_from(&mut [0u8; 64]).is_err(),
+        "nothing may reach Alice's (unbound) UDP socket"
+    );
+
+    // Heartbeats are answered on the tunnel and share the uplink sequence with audio.
+    seq += 1;
+    let mut hb = AurixPacket::heartbeat(alice.ssrc, seq * 960);
+    hb.header.sequence = seq;
+    alice
+        .ws
+        .send(Message::Binary(hb.seal(&alice.keys).to_vec()))
+        .await
+        .unwrap();
+    let mut acked = false;
+    while let Some(p) = recv_tunnel(&mut alice, Duration::from_secs(2)).await {
+        if p.header.packet_type == PacketType::HeartbeatAck {
+            acked = true;
+            break;
+        }
+    }
+    assert!(acked, "tunnel heartbeat not acked");
+    while recv_tunnel(&mut alice, Duration::from_millis(300))
+        .await
+        .is_some()
+    {}
+
+    // Replay on the tunnel: an already-accepted sequence is dropped, Bob hears nothing new.
+    while bob.recv_udp().await.is_some() {}
+    let replay = AurixPacket::audio(11, 11 * 960, alice.ssrc, hash, payload.clone());
+    alice
+        .ws
+        .send(Message::Binary(replay.seal(&alice.keys).to_vec()))
+        .await
+        .unwrap();
+    assert!(
+        bob.recv_udp().await.is_none(),
+        "replayed tunnel packet must not be forwarded"
+    );
+
+    // "UDP works again": a newer signed bind from a UDP socket moves Alice off the tunnel;
+    // Bob's audio now lands on the socket, the WebSocket carries only control frames …
+    bind_media(&mut alice).await;
+    assert_eq!(
+        session_media_path(&env, &http, alice.session_id).await,
+        "udp"
+    );
+    for i in 11..=15u32 {
+        let pkt = AurixPacket::audio(i, i * 960, bob.ssrc, hash, payload.clone());
+        bob.udp
+            .send_to(&pkt.seal(&bob.keys), bob.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut on_udp = 0;
+    while let Some(p) = alice.recv_udp().await {
+        if p.header.packet_type == PacketType::Audio && p.header.ssrc == bob.ssrc {
+            on_udp += 1;
+            if on_udp >= 4 {
+                break;
+            }
+        }
+    }
+    assert!(
+        on_udp >= 4,
+        "Alice got {on_udp} packets on UDP after moving back"
+    );
+    assert!(
+        recv_tunnel(&mut alice, Duration::from_millis(400))
+            .await
+            .is_none(),
+        "no media may be pushed down the released tunnel"
+    );
+    // … and media sent over the (no longer bound) tunnel is refused like a stale UDP source.
+    seq += 1;
+    let orphan = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
+    alice
+        .ws
+        .send(Message::Binary(orphan.seal(&alice.keys).to_vec()))
+        .await
+        .unwrap();
+    assert!(
+        bob.recv_udp().await.is_none(),
+        "media over an unbound tunnel must be dropped"
+    );
+
+    // … and back onto the tunnel with the sequence still counting (a mid-call fallback).
+    bind_tunnel(&mut alice).await;
+    assert_eq!(
+        session_media_path(&env, &http, alice.session_id).await,
+        "tunnel"
+    );
+    for _ in 0..5 {
+        seq += 1;
+        let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
+        alice
+            .ws
+            .send(Message::Binary(pkt.seal(&alice.keys).to_vec()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut got = 0;
+    while let Some(p) = bob.recv_udp().await {
+        if p.header.packet_type == PacketType::Audio && p.header.ssrc == alice.ssrc {
+            got += 1;
+            if got >= 4 {
+                break;
+            }
+        }
+    }
+    assert!(
+        got >= 4,
+        "Bob got {got} packets after Alice fell back to the tunnel"
+    );
+
+    for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::ChannelLeave { channel_id }).await;
     }
 }

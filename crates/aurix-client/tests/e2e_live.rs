@@ -12,7 +12,7 @@
 
 use aurix_client::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use aurix_client::events::{ConnectionState, Event};
-use aurix_client::{Client, ClientConfig, DspConfig, EncoderSettings};
+use aurix_client::{Client, ClientConfig, DspConfig, EncoderSettings, MediaPath, MediaPathPolicy};
 use aurix_common::types::{AudioPolicy, ChannelId, OpusBandwidth, OpusSignal, UserId};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,81 @@ fn env() -> Option<Env> {
         ws: std::env::var("AURIX_E2E_WS").unwrap_or_else(|_| "ws://127.0.0.1:8081".into()),
         api_key,
     })
+}
+
+/// Silently drops every UDP datagram one server media port sends back to this host
+/// (`sudo iptables`), so a client of that node sees a UDP black hole — its packets leave, the
+/// server even processes them, nothing returns — while other nodes stay reachable. Removes
+/// the rule again on drop (also when the test panics).
+struct UdpBlock {
+    port: u16,
+    active: bool,
+}
+
+impl UdpBlock {
+    fn rule(port: u16) -> [String; 7] {
+        [
+            "INPUT".into(),
+            "-p".into(),
+            "udp".into(),
+            "--sport".into(),
+            port.to_string(),
+            "-j".into(),
+            "DROP".into(),
+        ]
+    }
+
+    fn iptables(action: &str, port: u16) -> bool {
+        std::process::Command::new("sudo")
+            .args(["-n", "iptables", action])
+            .args(Self::rule(port))
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn new(port: u16) -> Self {
+        Self {
+            port,
+            active: false,
+        }
+    }
+
+    fn block(&mut self) {
+        if !self.active {
+            assert!(Self::iptables("-A", self.port), "iptables -A failed");
+            self.active = true;
+        }
+    }
+
+    fn unblock(&mut self) {
+        if self.active {
+            assert!(Self::iptables("-D", self.port), "iptables -D failed");
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for UdpBlock {
+    fn drop(&mut self) {
+        if self.active {
+            Self::iptables("-D", self.port);
+        }
+    }
+}
+
+async fn session_media_path(env: &Env, http: &reqwest::Client, session: &str) -> String {
+    let stats: serde_json::Value = http
+        .get(format!("{}/v1/sessions/{}/stats", env.api, session))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    stats["media_path"].as_str().unwrap_or("").to_string()
 }
 
 async fn create_channel(env: &Env, http: &reqwest::Client) -> ChannelId {
@@ -699,6 +774,299 @@ async fn native_client_follows_channel_audio_policy() {
     .await;
     assert_eq!(alice.audio_policy(), Some(updated));
     assert_eq!(alice.encoder_settings().bitrate_bps, 64_000);
+    alice.disconnect();
+    bob.disconnect();
+}
+
+/// Media over the control WebSocket when UDP is unusable. Alice sits on the second node
+/// (`AURIX_E2E_WS2`, default `ws://127.0.0.1:8091`, media UDP `AURIX_E2E_UDP2`, default 10002),
+/// Bob on the first one over plain UDP, so the tunnelled uplink also crosses the cascade.
+///
+/// 1. `TunnelOnly`: bind, both directions of audio, heartbeats, REST `media_path = tunnel`.
+/// 2. With `AURIX_E2E_SUDO_IPTABLES=1` the host drops UDP to Alice's node: `Auto` falls back
+///    to the tunnel at bind time, moves back to UDP when the block lifts and the re-probe
+///    answers, falls back again mid-session after unanswered heartbeats, and a control-plane
+///    drop while tunnelled resumes the same session over the tunnel — audio flows throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_client_tunnels_media_when_udp_is_blocked() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: std::env::var("AURIX_E2E_WS2").unwrap_or_else(|_| "ws://127.0.0.1:8091".into()),
+        api_key: env.api_key.clone(),
+    };
+    let udp2: u16 = std::env::var("AURIX_E2E_UDP2")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(10002);
+    let http = reqwest::Client::new();
+    let channel = create_channel(&env, &http).await;
+    let (alice_token, alice_id) = issue_token(&env, &http, "tunnel-alice", "Alice", channel).await;
+    let (bob_token, bob_id) = issue_token(&env, &http, "tunnel-bob", "Bob", channel).await;
+
+    let mut bob_cfg = ClientConfig::new(ws_with_path(&env.ws), bob_token);
+    bob_cfg.heartbeat_interval = Duration::from_millis(500);
+    bob_cfg.dsp = DspConfig::BYPASS;
+    let bob = Client::new(bob_cfg).unwrap();
+    bob.connect().unwrap();
+    wait_for(&bob, "bob media", Duration::from_secs(10), |e| {
+        matches!(e, Event::MediaBound)
+    })
+    .await;
+    assert_eq!(bob.media_path(), Some(MediaPath::Udp));
+    bob.join_channel(channel, None).unwrap();
+    wait_for(&bob, "bob join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await;
+
+    async fn join_and_check_audio(
+        alice: &Client,
+        bob: &Client,
+        channel: ChannelId,
+        alice_id: UserId,
+        bob_id: UserId,
+        join: bool,
+        label: &str,
+    ) {
+        if join {
+            alice.join_channel(channel, None).unwrap();
+            wait_for(alice, "alice join", Duration::from_secs(10), |e| {
+                matches!(e, Event::ChannelJoined { participants, .. }
+                    if participants.iter().any(|p| p.user_id == bob_id))
+            })
+            .await;
+            wait_for(
+                bob,
+                "alice joined",
+                Duration::from_secs(10),
+                |e| matches!(e, Event::ParticipantJoined { participant, .. } if participant.user_id == alice_id),
+            )
+            .await;
+        }
+        let (rms, active) = stream_tone(alice, bob, 1.2).await;
+        eprintln!("[{label}] bob heard rms={rms:.3} over {active} frames");
+        assert!(
+            active >= 30 && (0.15..0.35).contains(&rms),
+            "[{label}] alice → bob: rms={rms} active={active}"
+        );
+        let (rms, active) = stream_tone(bob, alice, 1.2).await;
+        eprintln!("[{label}] alice heard rms={rms:.3} over {active} frames");
+        assert!(
+            active >= 30 && (0.15..0.35).contains(&rms),
+            "[{label}] bob → alice: rms={rms} active={active}"
+        );
+    }
+
+    // --- 1. forced tunnel.
+    let mut alice_cfg = ClientConfig::new(ws_with_path(&env2.ws), alice_token.clone());
+    alice_cfg.media_path = MediaPathPolicy::TunnelOnly;
+    alice_cfg.heartbeat_interval = Duration::from_millis(500);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    let alice = Client::new(alice_cfg).unwrap();
+    alice.connect().unwrap();
+    let Event::SessionReady(session) =
+        wait_for(&alice, "alice session", Duration::from_secs(10), |e| {
+            matches!(e, Event::SessionReady(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        session.media_tunnel,
+        "node does not offer the media tunnel: {session:?}"
+    );
+    wait_for(&alice, "alice tunnel", Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            Event::MediaPathChanged {
+                path: MediaPath::Tunnel,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(alice.state(), ConnectionState::MediaBound);
+    assert_eq!(alice.media_path(), Some(MediaPath::Tunnel));
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tunnel"
+    );
+    join_and_check_audio(&alice, &bob, channel, alice_id, bob_id, true, "tunnel-only").await;
+    let stats = alice.stats();
+    assert_eq!(stats.media_path, Some(MediaPath::Tunnel), "{stats:?}");
+    assert!(stats.media.rtt_samples > 0, "{stats:?}");
+    assert_eq!(stats.media.heartbeats_lost_consecutive, 0, "{stats:?}");
+    assert_eq!(stats.media.uplink_dropped, 0, "{stats:?}");
+    assert!(
+        stats.media.bad_auth == 0 && stats.media.replayed == 0,
+        "{stats:?}"
+    );
+    assert!(stats.media.rtt_ms > 0.0, "{stats:?}");
+    alice.disconnect();
+    wait_for(
+        &bob,
+        "alice gone",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ParticipantLeft { user_id, .. } if *user_id == alice_id),
+    )
+    .await;
+
+    if std::env::var("AURIX_E2E_SUDO_IPTABLES").is_err() {
+        eprintln!("AURIX_E2E_SUDO_IPTABLES not set; skipping the blocked-UDP part");
+        bob.disconnect();
+        return;
+    }
+
+    // --- 2. Auto with UDP to Alice's node dropped by the host firewall.
+    let mut block = UdpBlock::new(udp2);
+    block.block();
+    let proxy = Proxy::start(ws_upstream(&env2.ws)).await;
+    let mut alice_cfg = ClientConfig::new(ws_url_via(&proxy, &ws_with_path(&env2.ws)), alice_token);
+    alice_cfg.heartbeat_interval = Duration::from_millis(500);
+    alice_cfg.udp_fallback_lost_heartbeats = 3;
+    alice_cfg.udp_reprobe_interval = Duration::from_secs(3);
+    alice_cfg.reconnect.initial_delay = Duration::from_millis(200);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    let alice = Client::new(alice_cfg).unwrap();
+    let t0 = Instant::now();
+    alice.connect().unwrap();
+    let Event::MediaPathChanged { reason, .. } =
+        wait_for(&alice, "fallback at bind", Duration::from_secs(20), |e| {
+            matches!(
+                e,
+                Event::MediaPathChanged {
+                    path: MediaPath::Tunnel,
+                    ..
+                }
+            )
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("fell back to the tunnel after {:?}: {reason}", t0.elapsed());
+    assert!(reason.contains("UDP bind failed"), "{reason}");
+    let session = alice.session().unwrap();
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tunnel"
+    );
+    join_and_check_audio(&alice, &bob, channel, alice_id, bob_id, true, "auto→tunnel").await;
+
+    // UDP comes back: the periodic re-probe moves the media off the tunnel.
+    block.unblock();
+    let t0 = Instant::now();
+    wait_for(&alice, "back to UDP", Duration::from_secs(20), |e| {
+        matches!(
+            e,
+            Event::MediaPathChanged {
+                path: MediaPath::Udp,
+                ..
+            }
+        )
+    })
+    .await;
+    eprintln!("moved back to UDP after {:?}", t0.elapsed());
+    assert_eq!(alice.media_path(), Some(MediaPath::Udp));
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "udp"
+    );
+    join_and_check_audio(
+        &alice,
+        &bob,
+        channel,
+        alice_id,
+        bob_id,
+        false,
+        "reprobed-udp",
+    )
+    .await;
+
+    // UDP dies mid-session: unanswered heartbeats push the media onto the tunnel.
+    block.block();
+    let t0 = Instant::now();
+    let Event::MediaPathChanged { reason, .. } =
+        wait_for(&alice, "heartbeat fallback", Duration::from_secs(20), |e| {
+            matches!(
+                e,
+                Event::MediaPathChanged {
+                    path: MediaPath::Tunnel,
+                    ..
+                }
+            )
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("heartbeat fallback after {:?}: {reason}", t0.elapsed());
+    assert!(reason.contains("heartbeats unanswered"), "{reason}");
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tunnel"
+    );
+    assert_eq!(alice.session().unwrap().session_id, session.session_id);
+    join_and_check_audio(
+        &alice,
+        &bob,
+        channel,
+        alice_id,
+        bob_id,
+        false,
+        "heartbeat→tunnel",
+    )
+    .await;
+
+    // Control-plane drop while tunnelled: resume brings the same session back over the tunnel
+    // without waiting for UDP first (the block is remembered).
+    proxy.kill();
+    wait_for(&alice, "recovering", Duration::from_secs(15), |e| {
+        matches!(e, Event::Recovering { .. })
+    })
+    .await;
+    let t0 = Instant::now();
+    let recovered = wait_for(&alice, "recovered", Duration::from_secs(15), |e| {
+        matches!(e, Event::Recovered { .. })
+    })
+    .await;
+    assert!(
+        matches!(recovered, Event::Recovered { resumed: true }),
+        "{recovered:?}"
+    );
+    eprintln!("resumed over the tunnel in {:?}", t0.elapsed());
+    let after = alice.session().unwrap();
+    assert_eq!(after.session_id, session.session_id);
+    assert_eq!(after.ssrc, session.ssrc);
+    assert_eq!(alice.media_path(), Some(MediaPath::Tunnel));
+    assert_eq!(alice.joined_channels(), vec![channel]);
+    while let Some(ev) = bob.poll_event() {
+        assert!(
+            !matches!(ev, Event::ParticipantLeft { user_id, .. } if user_id == alice_id),
+            "bob saw alice leave during resume"
+        );
+    }
+    join_and_check_audio(
+        &alice,
+        &bob,
+        channel,
+        alice_id,
+        bob_id,
+        false,
+        "resumed-tunnel",
+    )
+    .await;
+    let stats = alice.stats();
+    assert_eq!(stats.media.bad_auth, 0, "{stats:?}");
+    assert_eq!(stats.media.replayed, 0, "{stats:?}");
+    eprintln!("final stats: {stats:?}");
+
+    block.unblock();
     alice.disconnect();
     bob.disconnect();
 }

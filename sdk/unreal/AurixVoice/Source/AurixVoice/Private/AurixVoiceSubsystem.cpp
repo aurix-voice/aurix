@@ -85,6 +85,28 @@ AurixAudioCodec FromCodec(EAurixAudioCodec C)
 	return C == EAurixAudioCodec::Pcmu ? AURIX_CODEC_PCMU : AURIX_CODEC_OPUS;
 }
 
+EAurixMediaPath ToMediaPath(AurixMediaPath P)
+{
+	switch (P)
+	{
+	case AURIX_MEDIA_UDP: return EAurixMediaPath::Udp;
+	case AURIX_MEDIA_TUNNEL: return EAurixMediaPath::Tunnel;
+	case AURIX_MEDIA_NONE:
+	default: return EAurixMediaPath::None;
+	}
+}
+
+AurixMediaPathPolicy FromMediaPathPolicy(EAurixMediaPathPolicy P)
+{
+	switch (P)
+	{
+	case EAurixMediaPathPolicy::UdpOnly: return AURIX_MEDIA_PATH_UDP_ONLY;
+	case EAurixMediaPathPolicy::TunnelOnly: return AURIX_MEDIA_PATH_TUNNEL_ONLY;
+	case EAurixMediaPathPolicy::Auto:
+	default: return AURIX_MEDIA_PATH_AUTO;
+	}
+}
+
 EAurixModerationAction ToModeration(AurixModerationAction A)
 {
 	switch (A)
@@ -139,6 +161,7 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	Out.Ssrc = static_cast<int64>(S.ssrc);
 	Out.ResumeGraceMs = static_cast<int32>(S.resume_grace_ms);
 	Out.bResumed = S.resumed;
+	Out.bMediaTunnel = S.media_tunnel;
 	return Out;
 }
 
@@ -346,6 +369,9 @@ FAurixStats ToStats(const AurixStats& S)
 	Out.BadAuth = static_cast<int64>(S.bad_auth);
 	Out.Replayed = static_cast<int64>(S.replayed);
 	Out.HeartbeatsLost = static_cast<int64>(S.heartbeats_lost);
+	Out.HeartbeatsLostConsecutive = static_cast<int32>(S.heartbeats_lost_consecutive);
+	Out.MediaPath = ToMediaPath(S.media_path);
+	Out.UplinkDropped = static_cast<int64>(S.uplink_dropped);
 	Out.FramesLost = static_cast<int64>(S.frames_lost);
 	Out.FramesLate = static_cast<int64>(S.frames_late);
 	Out.Underruns = static_cast<int64>(S.underruns);
@@ -443,6 +469,9 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.jitter_target_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterTargetFrames));
 	Cfg.raw.jitter_max_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterMaxFrames));
 	Cfg.raw.vad_gate = Settings.bVadGate;
+	Cfg.raw.media_path = FromMediaPathPolicy(Settings.MediaPath);
+	Cfg.raw.udp_fallback_lost_heartbeats = static_cast<uint32_t>(FMath::Max(0, Settings.UdpFallbackLostHeartbeats));
+	Cfg.raw.udp_reprobe_interval_ms = static_cast<uint32_t>(FMath::Max(0, Settings.UdpReprobeIntervalMs));
 
 	TUniquePtr<FAurixNativeClient> Created = MakeUnique<FAurixNativeClient>();
 	Created->Client = aurix::Client::create(Cfg);
@@ -917,6 +946,11 @@ EAurixAudioCodec UAurixVoiceSubsystem::GetAudioCodec() const
 	return Native ? ToCodec(Native->Client.audio_codec()) : EAurixAudioCodec::Opus;
 }
 
+EAurixMediaPath UAurixVoiceSubsystem::GetMediaPath() const
+{
+	return Native ? ToMediaPath(Native->Client.media_path()) : EAurixMediaPath::None;
+}
+
 bool UAurixVoiceSubsystem::SetTranscripts(bool bEnabled)
 {
 	return Native && Check(Native->Client.set_transcripts(bEnabled), TEXT("set_transcripts"));
@@ -1262,6 +1296,10 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_AUDIO_CODEC_CHANGED:
 		OnAudioCodecChanged.Broadcast(ToCodec(aurix_event_audio_codec(Raw)));
+		break;
+
+	case AURIX_EVENT_MEDIA_PATH_CHANGED:
+		OnMediaPathChanged.Broadcast(ToMediaPath(aurix_event_media_path(Raw)), FromUtf8(aurix_event_message(Raw)));
 		break;
 
 	case AURIX_EVENT_USER_BLOCK_CHANGED:

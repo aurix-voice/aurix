@@ -66,6 +66,8 @@ namespace Aurix
         public string MediaAddr;
         /// <summary>True when this is the same session as before a connection loss (same SSRC, channels kept).</summary>
         public bool Resumed;
+        /// <summary>The node accepts AURX media as binary frames on the control WebSocket (UDP fallback).</summary>
+        public bool MediaTunnel;
     }
 
     public sealed class RecordingNotice
@@ -152,6 +154,10 @@ namespace Aurix
         private byte[] _mediaKey;
         private string _resumeToken;
         private uint _lastMediaSequence;
+        /// <summary>UDP failed to bind or its heartbeats died at least until here: Auto sessions opened before go straight to the tunnel.</summary>
+        private DateTime? _udpBlockedUntil;
+        private DateTime _nextUdpProbe = DateTime.MaxValue;
+        private int _pathSwitchActive;
         private bool _closedByUser;
         private CancellationTokenSource _skipBackoff;
         private int _reconnectLoopActive;
@@ -163,6 +169,23 @@ namespace Aurix
         public SessionInfo Session { get; private set; }
         public bool IsMuted => _muted;
         public MediaTransport Media => _media;
+        /// <summary>
+        /// How the native media reaches the node: <see cref="MediaPathPolicy.Auto"/> (default) uses UDP and
+        /// falls back to the same sealed packets as binary frames on the control WebSocket when UDP does not
+        /// bind (2 × 1 s) or <see cref="UdpFallbackLostHeartbeats"/> heartbeats go unanswered, re-probing UDP
+        /// every <see cref="UdpReprobeInterval"/> while tunnelled. The tunnel is TCP: expect more latency under
+        /// loss (head-of-line blocking), but voice keeps working where only 443 gets through. Applies to the
+        /// next bind (connect / reconnect / fallback).
+        /// </summary>
+        public MediaPathPolicy MediaPathPolicy { get; set; } = MediaPathPolicy.Auto;
+        /// <summary>Consecutive unanswered UDP heartbeats (every <see cref="MediaHeartbeatInterval"/>) before Auto moves to the tunnel; 0 disables.</summary>
+        public int UdpFallbackLostHeartbeats { get; set; } = 3;
+        /// <summary>How often a tunnelled Auto session tries UDP again (and moves back when it answers); zero disables.</summary>
+        public TimeSpan UdpReprobeInterval { get; set; } = TimeSpan.FromSeconds(30);
+        /// <summary>Media heartbeat cadence (RTT samples, liveness, fallback detection). Applies to the next bind.</summary>
+        public TimeSpan MediaHeartbeatInterval { get; set; } = TimeSpan.FromSeconds(5);
+        /// <summary>Link the media currently uses (<see cref="MediaPath.None"/> before the first bind).</summary>
+        public MediaPath ActiveMediaPath => _media?.Path ?? MediaPath.None;
         /// <summary>
         /// The playout mixer whose jitter-buffer counters feed <see cref="GetStats"/> and the periodic
         /// quality report (set by <c>AurixVoiceBehaviour</c>; assign it yourself when driving the mixer manually).
@@ -359,6 +382,12 @@ namespace Aurix
         /// </summary>
         public event Action<AudioCodec> OnAudioCodecChanged;
         /// <summary>
+        /// The media moved to another link (path, reason): on every bind, when UDP fell back to the
+        /// WebSocket tunnel, and when a UDP re-probe brought it back. Purely informational — audio,
+        /// sequence numbers and the session continue.
+        /// </summary>
+        public event Action<MediaPath, string> OnMediaPathChanged;
+        /// <summary>
         /// A text message for this client: channel message of a joined channel, directed message addressed to
         /// this user, or the echo of a message this client sent (<see cref="ChatMessage.IsOwn"/>).
         /// </summary>
@@ -496,6 +525,7 @@ namespace Aurix
                     Ssrc = ack.U32("ssrc"),
                     MediaAddr = ack.Str("media_addr"),
                     Resumed = ack.Bool("resumed"),
+                    MediaTunnel = ack.Bool("media_tunnel"),
                 };
                 _mediaKey = Convert.FromBase64String(ack.Str("media_key") ?? throw new InvalidOperationException("SessionInitAck without media_key"));
                 var token = ack.Str("resume_token");
@@ -517,7 +547,7 @@ namespace Aurix
             }
         }
 
-        /// <summary>Bind (or rebind, from a fresh UDP port) the native media path for the current session.</summary>
+        /// <summary>Bind (or rebind, from a fresh UDP port / the new control socket) the native media path for the current session.</summary>
         private async Task BindMediaAsync(SessionInfo info, CancellationToken ct)
         {
             var old = _media;
@@ -527,22 +557,185 @@ namespace Aurix
                 _lastMediaSequence = old.CurrentSequence;
                 old.Dispose();
             }
-            uint firstSeq = info.Resumed ? _lastMediaSequence : 0;
+            var seq = new SequenceCounter(info.Resumed ? _lastMediaSequence : 0);
+            var control = _control;
+            MediaTransport media;
+            string reason;
+            switch (MediaPathPolicy)
+            {
+                case MediaPathPolicy.UdpOnly:
+                    media = await BindUdpAsync(info, seq, 5, 500, ct).ConfigureAwait(false);
+                    reason = "UDP bound";
+                    break;
+                case MediaPathPolicy.TunnelOnly:
+                    if (!info.MediaTunnel) throw new InvalidOperationException("media path is tunnel-only but the node offers no media tunnel");
+                    media = await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
+                    reason = "tunnel-only policy";
+                    break;
+                default:
+                    if (!info.MediaTunnel)
+                    {
+                        media = await BindUdpAsync(info, seq, 5, 500, ct).ConfigureAwait(false);
+                        reason = "UDP bound";
+                    }
+                    else if (_udpBlockedUntil.HasValue && _udpBlockedUntil.Value > DateTime.UtcNow)
+                    {
+                        media = await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
+                        reason = "UDP was blocked before this session";
+                    }
+                    else
+                    {
+                        try
+                        {
+                            media = await BindUdpAsync(info, seq, 2, 1000, ct).ConfigureAwait(false);
+                            reason = "UDP bound";
+                        }
+                        catch (Exception e) when (!(e is OperationCanceledException))
+                        {
+                            MarkUdpBlocked();
+                            media = await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
+                            reason = $"UDP bind failed: {e.Message}";
+                        }
+                    }
+                    break;
+            }
+            _media = media;
+            _lossWindow.Reset();
+            if (_muted) media.SendMuteState(true);
+            if (media.Path == MediaPath.Tunnel) _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
+            SetState(VoiceConnectionState.MediaBound);
+            var path = media.Path;
+            Post(() => OnMediaPathChanged?.Invoke(path, reason));
+        }
+
+        private async Task<MediaTransport> BindUdpAsync(SessionInfo info, SequenceCounter seq, int attempts, int timeoutMs, CancellationToken ct)
+        {
             var endpoint = await MediaTransport.ResolveAsync(info.MediaAddr).ConfigureAwait(false);
-            var media = new MediaTransport(endpoint, info.SessionId, info.Ssrc, _mediaKey, firstSeq);
+            var media = new MediaTransport(endpoint, info.SessionId, info.Ssrc, _mediaKey, seq) { HeartbeatInterval = MediaHeartbeatInterval };
             try
             {
-                await media.BindAsync(ct).ConfigureAwait(false);
+                await media.BindAsync(ct, attempts, timeoutMs).ConfigureAwait(false);
+                return media;
             }
             catch
             {
                 media.Dispose();
                 throw;
             }
-            _media = media;
-            _lossWindow.Reset();
-            if (_muted) media.SendMuteState(true);
-            SetState(VoiceConnectionState.MediaBound);
+        }
+
+        private async Task<MediaTransport> BindTunnelAsync(ControlChannel control, SessionInfo info, SequenceCounter seq, CancellationToken ct)
+        {
+            if (control == null) throw new InvalidOperationException("not connected");
+            var media = MediaTransport.OverTunnel(control, info.SessionId, info.Ssrc, _mediaKey, seq);
+            media.HeartbeatInterval = MediaHeartbeatInterval;
+            try
+            {
+                await media.BindAsync(ct, 2, 3000).ConfigureAwait(false);
+                return media;
+            }
+            catch
+            {
+                media.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>Remember that UDP is unusable for as long as a re-probe cycle (or a minute when re-probing is off).</summary>
+        private void MarkUdpBlocked()
+        {
+            var memory = UdpReprobeInterval > TimeSpan.Zero ? UdpReprobeInterval : TimeSpan.FromSeconds(60);
+            _udpBlockedUntil = DateTime.UtcNow + memory;
+        }
+
+        /// <summary>
+        /// Called from <see cref="Update"/>: move a UDP session whose heartbeats died onto the tunnel, or
+        /// try UDP again from a tunnelled one. At most one switch runs at a time.
+        /// </summary>
+        private void DriveMediaPath(MediaTransport media, ControlChannel control)
+        {
+            var session = Session;
+            if (session == null || !session.MediaTunnel || MediaPathPolicy != MediaPathPolicy.Auto || _pathSwitchActive != 0) return;
+            var ct = _cts;
+            if (ct == null || ct.IsCancellationRequested) return;
+            if (media.Path == MediaPath.Udp)
+            {
+                int lost = media.HeartbeatsLostConsecutive;
+                if (UdpFallbackLostHeartbeats <= 0 || lost < UdpFallbackLostHeartbeats) return;
+                if (Interlocked.CompareExchange(ref _pathSwitchActive, 1, 0) != 0) return;
+                _ = FallBackToTunnelAsync(media, control, session, $"{lost} UDP heartbeats unanswered", ct.Token);
+            }
+            else if (UdpReprobeInterval > TimeSpan.Zero && DateTime.UtcNow >= _nextUdpProbe)
+            {
+                if (Interlocked.CompareExchange(ref _pathSwitchActive, 1, 0) != 0) return;
+                _ = ReprobeUdpAsync(media, session, ct.Token);
+            }
+        }
+
+        private async Task FallBackToTunnelAsync(MediaTransport udp, ControlChannel control, SessionInfo session, string reason, CancellationToken ct)
+        {
+            MediaTransport tunnel = null;
+            try
+            {
+                tunnel = await BindTunnelAsync(control, session, udp.Sequence, ct).ConfigureAwait(false);
+                var bound = tunnel;
+                Post(() =>
+                {
+                    if (!ReferenceEquals(_media, udp) || !ReferenceEquals(_control, control)) { bound.Dispose(); return; }
+                    _media = bound;
+                    udp.Dispose();
+                    MarkUdpBlocked();
+                    _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
+                    OnMediaPathChanged?.Invoke(MediaPath.Tunnel, reason);
+                });
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            catch (Exception e)
+            {
+                // Neither link works: treat the connection as lost so the regular reconnect takes over.
+                Post(() => { if (ReferenceEquals(_media, udp)) ForceReconnect($"{reason}; tunnel bind failed: {e.Message}"); });
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _pathSwitchActive, 0);
+            }
+        }
+
+        private async Task ReprobeUdpAsync(MediaTransport tunnel, SessionInfo session, CancellationToken ct)
+        {
+            try
+            {
+                MediaTransport udp;
+                try
+                {
+                    udp = await BindUdpAsync(session, tunnel.Sequence, 1, 1500, ct).ConfigureAwait(false);
+                }
+                catch (Exception e) when (!(e is OperationCanceledException))
+                {
+                    _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
+                    // The probe may have reached the server (only its ack got lost), in which case the
+                    // session's media now points at a dead socket: make the tunnel the endpoint again.
+                    try { await tunnel.ReclaimAsync(ct).ConfigureAwait(false); }
+                    catch (Exception r) when (!(r is OperationCanceledException))
+                    {
+                        Post(() => { if (ReferenceEquals(_media, tunnel)) ForceReconnect($"media tunnel lost after a UDP probe: {r.Message}"); });
+                    }
+                    return;
+                }
+                Post(() =>
+                {
+                    if (!ReferenceEquals(_media, tunnel)) { udp.Dispose(); return; }
+                    _media = udp;
+                    tunnel.Dispose();
+                    _udpBlockedUntil = null;
+                    OnMediaPathChanged?.Invoke(MediaPath.Udp, "UDP re-probe answered");
+                });
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                Interlocked.Exchange(ref _pathSwitchActive, 0);
+            }
         }
 
         /// <summary>
@@ -1125,6 +1318,7 @@ namespace Aurix
             if (media != null)
             {
                 var rtt = media.Rtt;
+                s.MediaPath = media.Path;
                 s.PacketsSent = media.PacketsSent;
                 s.BytesSent = media.BytesSent;
                 s.PacketsReceived = media.PacketsReceived;
@@ -1132,6 +1326,8 @@ namespace Aurix
                 s.BadAuth = media.PacketsBadAuth;
                 s.Replayed = media.PacketsReplayed;
                 s.HeartbeatsLost = media.HeartbeatsLost;
+                s.HeartbeatsLostConsecutive = media.HeartbeatsLostConsecutive;
+                s.UplinkDropped = media.UplinkDropped;
                 s.RttMs = rtt.LastMs;
                 s.RttMinMs = rtt.MinMs;
                 s.RttAvgMs = rtt.AvgMs;
@@ -1196,6 +1392,9 @@ namespace Aurix
             {
                 while (_media.TryDequeueAudio(out var a)) OnAudio?.Invoke(FindBySsrc(a.SenderSsrc), a);
             }
+
+            if (_media != null && _control != null && _control.IsOpen && State == VoiceConnectionState.MediaBound)
+                DriveMediaPath(_media, _control);
 
             if (_media != null && _control != null && _control.IsOpen && State == VoiceConnectionState.MediaBound
                 && QualityReportInterval > TimeSpan.Zero && DateTime.UtcNow - _lastQualityReport > QualityReportInterval)

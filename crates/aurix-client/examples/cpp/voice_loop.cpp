@@ -63,6 +63,10 @@ bool handle_event(const aurix::Event& ev) {
         }
         return false;
     }
+    case AURIX_EVENT_MEDIA_PATH_CHANGED:
+        std::printf("media path -> %s (%s)\n", ev.media_path() == AURIX_MEDIA_TUNNEL ? "ws-tunnel" : "udp",
+                    ev.message().c_str());
+        return false;
     case AURIX_EVENT_REQUEST_FAILED:
     case AURIX_EVENT_SERVER_ERROR:
     case AURIX_EVENT_REJOIN_FAILED:

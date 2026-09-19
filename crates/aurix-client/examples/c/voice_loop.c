@@ -87,6 +87,11 @@ static int handle_event(struct AurixClient *client, struct AurixEvent *ev) {
         printf("bitrate -> %llu bps (%s)\n", (unsigned long long)aurix_event_number(ev),
                aurix_event_message(ev));
         break;
+    case AURIX_EVENT_MEDIA_PATH_CHANGED:
+        printf("media path -> %s (%s)\n",
+               aurix_event_media_path(ev) == AURIX_MEDIA_TUNNEL ? "ws-tunnel" : "udp",
+               aurix_event_message(ev));
+        break;
     case AURIX_EVENT_AUDIO_POLICY_CHANGED: {
         struct AurixAudioPolicy p;
         if (aurix_event_audio_policy(ev, &p)) {

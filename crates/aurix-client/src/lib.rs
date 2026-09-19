@@ -5,8 +5,9 @@
 //!   stereo mixer (`RemoteMixer`), pure CPU code with no I/O;
 //! * [`dsp`] — capture DSP: high-pass, acoustic echo cancellation, RNNoise-based noise
 //!   suppression and AGC, pure Rust;
-//! * [`media`] — AURX v2 over UDP: authenticated `SessionBind`, AES-256-CTR + HMAC per packet,
-//!   replay windows, heartbeats, quality reports;
+//! * [`media`] — AURX v2 over UDP or tunnelled through the control WebSocket when UDP is
+//!   blocked: authenticated `SessionBind`, AES-256-CTR + HMAC per packet, replay windows,
+//!   heartbeats, quality reports;
 //! * [`control`] — the WebSocket control plane (session open/resume, channels, chat,
 //!   moderation, transcripts, TTS) as typed `ControlMessage`s;
 //! * [`client`] — `Client`: one voice session that ties the layers together, reconnects with
@@ -45,7 +46,7 @@ pub use config::{ClientConfig, ReconnectPolicy};
 pub use dsp::{DspConfig, DspStats, NoiseSuppression};
 pub use error::{ClientError, Result};
 pub use events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
-pub use media::{IncomingAudio, MediaStats};
+pub use media::{IncomingAudio, MediaPath, MediaPathPolicy, MediaStats};
 pub use regions::{GeoLocation, ProbedRegion, Region, RegionEndpoint, RegionsResponse};
 
 /// Top bit of a synthesized (TTS / announcement) stream SSRC; session SSRCs never have it.

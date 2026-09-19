@@ -103,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
             advertised_addr,
             downlink_bitrate: config.media.default_bitrate,
             rx_workers: config.media.rx_workers,
+            media_tunnel: config.media.media_tunnel,
+            tunnel_queue_packets: config.media.tunnel_queue_packets,
         },
     );
 
