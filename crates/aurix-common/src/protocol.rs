@@ -870,6 +870,8 @@ pub enum ControlMessage {
         channel_id: ChannelId,
         reverb: ReverbDescriptor,
     },
+    /// Client→server, periodic: what the client sees on its downlink. `packet_loss` is a
+    /// percentage (`0..=100`).
     QualityReport {
         rtt_ms: f32,
         jitter_ms: f32,
@@ -878,6 +880,12 @@ pub enum ControlMessage {
     BitrateCommand {
         target_bitrate_kbps: u32,
         reason: String,
+    },
+    /// Server→client, periodic (`media.quality_interval_ms`): the server's view of this
+    /// session's link — client-reported downlink merged with the uplink it measures itself.
+    /// Sent when the bar count changes and at least every fifth interval.
+    NetworkQuality {
+        quality: crate::types::NetworkQuality,
     },
     /// `live` marks a real-time stream to an operator service (as opposed to a stored file);
     /// `initiated_by` is the nil user id when an operator started it via the REST API.

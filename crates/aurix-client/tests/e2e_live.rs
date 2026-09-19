@@ -341,6 +341,36 @@ async fn native_clients_talk_chat_resume_and_leave() {
     let alice_stats = alice.stats();
     assert!(alice_stats.transmit.frames_sent >= 50, "{alice_stats:?}");
 
+    // --- quality: a clean local link scores 5 bars locally and in the server's merged view.
+    let bob_stats = bob.stats();
+    assert_eq!(bob_stats.bars, 5, "{bob_stats:?}");
+    assert!(
+        bob_stats.r_factor >= 80.0 && bob_stats.mos >= 4.0,
+        "{bob_stats:?}"
+    );
+    assert!(
+        bob_stats.media.rtt_min_ms <= bob_stats.media.rtt_avg_ms,
+        "{bob_stats:?}"
+    );
+    assert!(
+        bob_stats.media.rtt_avg_ms <= bob_stats.media.rtt_max_ms,
+        "{bob_stats:?}"
+    );
+    assert_eq!(bob_stats.loss_percent, 0.0, "{bob_stats:?}");
+    let Event::NetworkQuality(server_view) = wait_for(
+        &alice,
+        "server quality",
+        Duration::from_secs(12),
+        |e| matches!(e, Event::NetworkQuality(q) if q.uplink_packets_received > 0),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(server_view.bars, 5, "{server_view:?}");
+    assert_eq!(server_view.uplink_packets_lost, 0, "{server_view:?}");
+    assert_eq!(alice.network_quality().map(|q| q.bars), Some(5));
+
     // --- chat: channel message with a client reference, echoed to Alice with her request id.
     let req = alice
         .send_chat(channel, "gg wp", Some(serde_json::json!({"kind": "ping"})))

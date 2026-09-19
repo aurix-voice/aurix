@@ -44,6 +44,9 @@ use tracing::{debug, info, warn};
 
 const OUTBOUND_QUEUE: usize = 256;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Uplink loss (server-measured, per quality period) above which a `quality.alert` is raised;
+/// mirrors the client-reported downlink threshold.
+const UPLINK_LOSS_ALERT_PERCENT: f32 = 20.0;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_TEXT_FRAME: usize = 64 * 1024;
 const MAX_POSITIONS_PER_UPDATE: usize = 64;
@@ -909,6 +912,25 @@ impl WsState {
                             })
                             .collect(),
                     });
+                }
+                MediaEvent::NetworkQuality {
+                    session_id,
+                    app_id,
+                    user_id,
+                    quality,
+                } => {
+                    self.send_to_session(&session_id, &ControlMessage::NetworkQuality { quality });
+                    if quality.uplink_loss_percent > UPLINK_LOSS_ALERT_PERCENT {
+                        self.control.events.publish(ServerEvent::QualityAlert {
+                            app_id,
+                            session_id,
+                            user_id,
+                            metric: "uplink_packet_loss".into(),
+                            value: quality.uplink_loss_percent as f64,
+                            threshold: UPLINK_LOSS_ALERT_PERCENT as f64,
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
                 }
                 MediaEvent::MuteChanged {
                     session_id,
@@ -2400,9 +2422,12 @@ async fn handle_control_message(
             if !(rtt_ms.is_finite() && jitter_ms.is_finite() && packet_loss.is_finite()) {
                 return;
             }
-            aurix_metrics::RTT_MS.observe(rtt_ms.clamp(0.0, 10_000.0) as f64);
-            aurix_metrics::JITTER_MS.observe(jitter_ms.clamp(0.0, 10_000.0) as f64);
-            aurix_metrics::PACKET_LOSS_RATE.set(packet_loss.clamp(0.0, 100.0) as f64);
+            let rtt_ms = rtt_ms.clamp(0.0, 10_000.0);
+            let jitter_ms = jitter_ms.clamp(0.0, 10_000.0);
+            let packet_loss = packet_loss.clamp(0.0, 100.0);
+            aurix_metrics::RTT_MS.observe(rtt_ms as f64);
+            aurix_metrics::JITTER_MS.observe(jitter_ms as f64);
+            aurix_metrics::PACKET_LOSS_RATE.set(packet_loss as f64);
             {
                 let sfu = state.sfu.read();
                 if let Some(s) = sfu.get_session(&session_id) {
@@ -2558,6 +2583,7 @@ async fn handle_control_message(
         | ControlMessage::TransmissionChanged { .. }
         | ControlMessage::ChannelFocusChanged { .. }
         | ControlMessage::BitrateCommand { .. }
+        | ControlMessage::NetworkQuality { .. }
         | ControlMessage::RecordingNotification { .. }
         | ControlMessage::Error { .. }
         | ControlMessage::Kick { .. }

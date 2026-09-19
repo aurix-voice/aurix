@@ -57,6 +57,20 @@ loop {
 else can be called from the game thread. `poll_event`/`wait_event` return owned events; the
 optional wake hook (`set_wake_hook`) lets an engine signal its main loop instead of polling.
 
+### Statistics and network quality
+
+`client.stats()` returns one `ClientStats` snapshot: transport counters (`media`: packets/bytes
+both ways, audio frames, `bad_auth`, `replayed`, `heartbeats_lost`, RTT last/min/avg/max),
+`transmit` (frames encoded / sent / gated by VAD), mixer totals (`frames_lost`, `frames_late`,
+`underruns`), downlink `jitter_ms`, `loss_percent` over the last period (`0..=100`), the
+rating (`r_factor` `0..=100`, `mos`, `bars` 1–5, same formula as the server), per-stream
+`streams` and the last server-side `NetworkQuality` (`server`, also delivered as
+`Event::NetworkQuality` whenever the bars change — it merges your downlink report with the
+uplink loss/jitter the SFU measures). The client sends a quality report over the media
+transport on every heartbeat (`ClientConfig::heartbeat_interval`, 5 s), which also drives the
+server's adaptive downlink bitrate. In C: `aurix_client_stats`,
+`aurix_client_network_quality`, `aurix_event_network_quality`.
+
 ## C ABI
 
 The header is generated with cbindgen and committed; `tests/c_abi.rs` fails if it drifts:

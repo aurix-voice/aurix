@@ -181,6 +181,10 @@ typedef enum AurixEventType {
    * `message` = reason.
    */
   AURIX_EVENT_DISCONNECTED = 29,
+  /**
+   * `network_quality`.
+   */
+  AURIX_EVENT_NETWORK_QUALITY = 30,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -415,7 +419,26 @@ typedef struct AurixPosition {
 } AurixPosition;
 
 /**
- * Transport and codec counters for a network-quality indicator.
+ * Server-side view of the connection in both directions. `bars` is `1..=5`
+ * (R ≥ 80/70/60/50 → 5/4/3/2, else 1); loss values are percentages.
+ */
+typedef struct AurixNetworkQuality {
+  uint8_t bars;
+  float r_factor;
+  float mos;
+  float rtt_ms;
+  float downlink_jitter_ms;
+  float downlink_loss_percent;
+  float uplink_jitter_ms;
+  float uplink_loss_percent;
+  uint32_t uplink_bitrate_kbps;
+  uint64_t uplink_packets_received;
+  uint64_t uplink_packets_lost;
+} AurixNetworkQuality;
+
+/**
+ * Transport and codec counters for a network-quality indicator. Counters are lifetime
+ * totals; `loss_percent`, `r_factor`, `mos` and `bars` describe the last quality period.
  */
 typedef struct AurixStats {
   uint64_t packets_sent;
@@ -429,15 +452,38 @@ typedef struct AurixStats {
   uint64_t bad_auth;
   uint64_t replayed;
   uint64_t heartbeats_lost;
-  float rtt_ms;
-  float jitter_ms;
   /**
-   * Downlink loss as a percentage.
+   * Downlink frames concealed (PLC), discarded as late, and jitter-buffer underruns.
    */
-  float loss_percent;
+  uint64_t frames_lost;
+  uint64_t frames_late;
+  uint64_t underruns;
   uint64_t frames_encoded;
   uint64_t frames_sent;
   uint64_t frames_gated;
+  /**
+   * Last heartbeat RTT plus min/avg/max over the session (0 until the first ack).
+   */
+  float rtt_ms;
+  float rtt_min_ms;
+  float rtt_avg_ms;
+  float rtt_max_ms;
+  float jitter_ms;
+  /**
+   * Downlink loss over the last quality period, as a percentage (`0..=100`).
+   */
+  float loss_percent;
+  /**
+   * Client-measured downlink quality; `bars` is `1..=5`.
+   */
+  float r_factor;
+  float mos;
+  uint8_t bars;
+  /**
+   * `true` when `server` holds the latest server-reported quality.
+   */
+  bool has_server;
+  struct AurixNetworkQuality server;
   /**
    * Remote streams currently decoding.
    */
@@ -835,6 +881,18 @@ enum AurixResult aurix_client_speak(struct AurixClient *client,
 enum AurixResult aurix_client_cancel_speech(struct AurixClient *client);
 
 enum AurixResult aurix_client_stats(const struct AurixClient *client, struct AurixStats *out);
+
+/**
+ * Latest server-reported quality. Returns `false` (and leaves `out` untouched) until the
+ * server has sent its first report.
+ */
+bool aurix_client_network_quality(const struct AurixClient *client,
+                                  struct AurixNetworkQuality *out);
+
+/**
+ * Payload of `AurixEventNetworkQuality`.
+ */
+bool aurix_event_network_quality(const struct AurixEvent *event, struct AurixNetworkQuality *out);
 
 #ifdef __cplusplus
 }  // extern "C"

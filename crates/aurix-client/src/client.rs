@@ -14,7 +14,9 @@ use aurix_common::protocol::{
     channel_id_hash, ControlMessage, ParticipantBrief, TransmissionMode, TtsDestination, TtsState,
     UserPosition,
 };
-use aurix_common::types::{ActionKind, ChannelId, RecordingConsent, SessionId, UserId};
+use aurix_common::types::{
+    quality, ActionKind, ChannelId, NetworkQuality, RecordingConsent, SessionId, UserId,
+};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -22,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::audio::{CaptureEncoder, RemoteMixer, StreamStats, FRAME_SAMPLES};
+use crate::audio::{CaptureEncoder, MixerTotals, RemoteMixer, StreamStats, FRAME_SAMPLES};
 use crate::config::ClientConfig;
 use crate::control::{token_identity, ws_host, ControlConnection, SessionAck, TokenIdentity};
 use crate::error::{ClientError, Result};
@@ -49,7 +51,9 @@ pub struct TransmitStats {
     pub frames_gated: u64,
 }
 
-/// Everything the network-quality UI needs, in one snapshot.
+/// Everything the network-quality UI needs, in one snapshot. Counters are lifetime totals of
+/// the session (they survive resume); `loss_percent`, `r_factor`, `mos` and `bars` describe the
+/// last quality period (one heartbeat interval, 5 s by default).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientStats {
     pub state: Option<ConnectionState>,
@@ -57,9 +61,47 @@ pub struct ClientStats {
     pub transmit: TransmitStats,
     /// Inter-arrival jitter of downlink audio, RFC 3550 style, in milliseconds.
     pub jitter_ms: f32,
-    /// Downlink frames the jitter buffers declared lost, as a percentage of frames expected.
+    /// Downlink frames declared lost in the last quality period, as a percentage of frames
+    /// expected (`0..=100`).
     pub loss_percent: f32,
+    /// Lifetime downlink frames concealed with PLC, discarded as late, and buffer underruns.
+    pub frames_lost: u64,
+    pub frames_late: u64,
+    pub underruns: u64,
+    /// Local downlink quality (client-measured RTT/jitter/loss), simplified E-model.
+    pub r_factor: f32,
+    pub mos: f32,
+    /// 1 (unusable) … 5 (excellent). Prefer `server.bars` when present: it also covers the
+    /// uplink as the server sees it.
+    pub bars: u8,
+    /// Last `NetworkQuality` pushed by the server (both directions), if any.
+    pub server: Option<NetworkQuality>,
     pub streams: Vec<StreamStats>,
+}
+
+/// Downlink loss over the last quality period, updated on every heartbeat tick.
+#[derive(Debug, Default)]
+struct LossWindow {
+    prev_lost: u64,
+    prev_received: u64,
+    loss_percent: f32,
+}
+
+impl LossWindow {
+    /// Advance the window with the current lifetime counters and return the period loss.
+    fn advance(&mut self, lost: u64, received: u64) -> f32 {
+        let d_lost = lost.saturating_sub(self.prev_lost);
+        let d_recv = received.saturating_sub(self.prev_received);
+        self.prev_lost = lost;
+        self.prev_received = received;
+        let expected = d_lost + d_recv;
+        self.loss_percent = if expected == 0 {
+            0.0
+        } else {
+            (d_lost as f32 * 100.0 / expected as f32).clamp(0.0, 100.0)
+        };
+        self.loss_percent
+    }
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +162,8 @@ struct Inner {
     rtp_ts: AtomicU32,
     tx_stats: Mutex<TransmitStats>,
     jitter: Mutex<JitterEstimator>,
+    loss_window: Mutex<LossWindow>,
+    server_quality: Mutex<Option<NetworkQuality>>,
     next_request: AtomicU64,
     closing: AtomicBool,
     resume_seq: Mutex<Option<u32>>,
@@ -326,6 +370,8 @@ impl Client {
             rtp_ts: AtomicU32::new(rand::random()),
             tx_stats: Mutex::new(TransmitStats::default()),
             jitter: Mutex::new(JitterEstimator::default()),
+            loss_window: Mutex::new(LossWindow::default()),
+            server_quality: Mutex::new(None),
             next_request: AtomicU64::new(1),
             closing: AtomicBool::new(false),
             resume_seq: Mutex::new(None),
@@ -385,6 +431,7 @@ impl Client {
         self.inner.mixer.lock().clear();
         self.inner.channels.lock().clear();
         *self.inner.session.lock() = None;
+        *self.inner.server_quality.lock() = None;
         if self.inner.state() != ConnectionState::Failed {
             self.inner.set_state(ConnectionState::Disconnected);
         }
@@ -921,21 +968,33 @@ impl Client {
             .as_ref()
             .map(|m| m.stats())
             .unwrap_or_default();
-        let streams = self.inner.mixer.lock().stream_stats();
-        let lost: u64 = streams.iter().map(|s| s.lost).sum();
-        let expected = media.audio_frames_received + lost;
+        let (streams, totals) = {
+            let mixer = self.inner.mixer.lock();
+            (mixer.stream_stats(), mixer.totals())
+        };
+        let jitter_ms = self.inner.jitter.lock().jitter_ms;
+        let loss_percent = self.inner.loss_window.lock().loss_percent;
+        let r = quality::r_factor(media.rtt_ms, jitter_ms, loss_percent);
         ClientStats {
             state: Some(self.inner.state()),
             media,
             transmit: *self.inner.tx_stats.lock(),
-            jitter_ms: self.inner.jitter.lock().jitter_ms,
-            loss_percent: if expected == 0 {
-                0.0
-            } else {
-                lost as f32 * 100.0 / expected as f32
-            },
+            jitter_ms,
+            loss_percent,
+            frames_lost: totals.lost,
+            frames_late: totals.late,
+            underruns: totals.underruns,
+            r_factor: r,
+            mos: quality::mos_from_r(r),
+            bars: quality::bars_from_r(r),
+            server: *self.inner.server_quality.lock(),
             streams,
         }
+    }
+
+    /// Last server-side `NetworkQuality` (`None` until the first report, ~2 s after binding).
+    pub fn network_quality(&self) -> Option<NetworkQuality> {
+        *self.inner.server_quality.lock()
     }
 }
 
@@ -1156,6 +1215,7 @@ fn finish(inner: &Inner, pending: &mut Pending, reason: &str, state: ConnectionS
     }
     inner.mixer.lock().clear();
     *inner.session.lock() = None;
+    *inner.server_quality.lock() = None;
     if inner.local_speaking.swap(false, Ordering::AcqRel) {
         inner.emit(Event::LocalSpeaking(false));
     }
@@ -1385,14 +1445,11 @@ async fn session(
 
 fn inner_stats(inner: &Inner, media: &MediaTransport) -> (f32, f32, f32) {
     let m = media.stats();
-    let streams = inner.mixer.lock().stream_stats();
-    let lost: u64 = streams.iter().map(|s| s.lost).sum();
-    let expected = m.audio_frames_received + lost;
-    let loss = if expected == 0 {
-        0.0
-    } else {
-        lost as f32 * 100.0 / expected as f32
-    };
+    let totals: MixerTotals = inner.mixer.lock().totals();
+    let loss = inner
+        .loss_window
+        .lock()
+        .advance(totals.lost, m.audio_frames_received);
     (m.rtt_ms, inner.jitter.lock().jitter_ms, loss)
 }
 
@@ -1898,6 +1955,10 @@ async fn handle_message(
                 reason,
             });
         }
+        ControlMessage::NetworkQuality { quality } => {
+            *inner.server_quality.lock() = Some(quality);
+            inner.emit(Event::NetworkQuality(quality));
+        }
         ControlMessage::RecordingNotification {
             channel_id,
             recording_id,
@@ -2078,4 +2139,24 @@ async fn handle_message(
         | ControlMessage::WebRtcAnswer { .. } => {}
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loss_window_reports_the_last_period_only() {
+        let mut w = LossWindow::default();
+        assert_eq!(w.advance(0, 0), 0.0);
+        // 10 lost of 100 expected in the first period.
+        assert_eq!(w.advance(10, 90), 10.0);
+        // Nothing lost in the second period: lifetime loss stays 5 %, period loss is 0.
+        assert_eq!(w.advance(10, 190), 0.0);
+        // Counters reset (fresh session): never negative.
+        assert_eq!(w.advance(0, 0), 0.0);
+        assert_eq!(w.advance(50, 50), 50.0);
+        let r = quality::r_factor(0.0, 0.0, w.loss_percent);
+        assert_eq!(quality::bars_from_r(r), 1);
+    }
 }

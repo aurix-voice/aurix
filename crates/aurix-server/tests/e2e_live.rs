@@ -5938,3 +5938,174 @@ async fn live_audio_stream_follows_cascaded_participants() {
     pull.close(None).await.ok();
     bob.send(&ControlMessage::ChannelLeave { channel_id }).await;
 }
+
+// ── Network quality ──
+
+/// The server merges each client's `QualityReport` (downlink, loss in percent) with the uplink
+/// loss/jitter/bitrate the SFU measures from sequence gaps into `NetworkQuality` (1–5 bars,
+/// worse direction wins). A lossy report still triggers the `BitrateCommand` adaptation and a
+/// `quality.alert`; heavy uplink loss raises an `uplink_packet_loss` alert on its own.
+/// `GET /v1/sessions/:id/stats` exposes the same numbers to the session's tenant only.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn network_quality_bars_bitrate_adaptation_and_session_stats() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "quality:alice", "Alice", channel_id).await;
+    let (tok_b, _) = issue_token(&env, &http, "quality:bob", "Bob", channel_id).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    join(&mut alice, channel_id).await;
+    join(&mut bob, channel_id).await;
+    let mut sse = SseClient::open(&env, &env.api_key, Some("quality.alert"))
+        .await
+        .expect("open SSE");
+
+    // A clean link: the first evaluation after joining yields 5 bars and no uplink loss.
+    let clean = expect_within(&mut alice, "NetworkQuality", Duration::from_secs(12), |m| {
+        matches!(m, ControlMessage::NetworkQuality { .. })
+    })
+    .await;
+    let ControlMessage::NetworkQuality { quality } = clean else {
+        unreachable!()
+    };
+    assert_eq!(quality.bars, 5, "{quality:?}");
+    assert_eq!(quality.uplink_packets_lost, 0, "{quality:?}");
+    assert!(
+        quality.r_factor >= 80.0 && quality.mos >= 4.0,
+        "{quality:?}"
+    );
+
+    // Bob's downlink report: 25 % loss (a percentage, not a fraction) → 16 kbps command and a
+    // quality.alert with the reported value; the merged quality drops to 1 bar.
+    bob.send(&ControlMessage::QualityReport {
+        rtt_ms: 40.0,
+        jitter_ms: 5.0,
+        packet_loss: 25.0,
+    })
+    .await;
+    let cmd = expect_within(&mut bob, "BitrateCommand", Duration::from_secs(5), |m| {
+        matches!(m, ControlMessage::BitrateCommand { .. })
+    })
+    .await;
+    assert!(
+        matches!(
+            cmd,
+            ControlMessage::BitrateCommand {
+                target_bitrate_kbps: 16,
+                ..
+            }
+        ),
+        "{cmd:?}"
+    );
+    let alert = sse.expect("quality.alert", Duration::from_secs(10)).await;
+    assert_eq!(alert["data"]["metric"], "packet_loss", "{alert}");
+    assert_eq!(
+        alert["data"]["session_id"].as_str(),
+        Some(bob.session_id.to_string().as_str()),
+        "{alert}"
+    );
+    assert_eq!(alert["data"]["value"].as_f64(), Some(25.0), "{alert}");
+    let degraded = expect_within(
+        &mut bob,
+        "NetworkQuality(1 bar)",
+        Duration::from_secs(12),
+        |m| matches!(m, ControlMessage::NetworkQuality { quality } if quality.bars == 1),
+    )
+    .await;
+    let ControlMessage::NetworkQuality { quality } = degraded else {
+        unreachable!()
+    };
+    assert_eq!(quality.downlink_loss_percent, 25.0, "{quality:?}");
+    assert_eq!(quality.rtt_ms, 40.0, "{quality:?}");
+    assert!(quality.r_factor < 50.0, "{quality:?}");
+
+    // Alice's uplink with every second batch of frames missing: the SFU sees the sequence gaps.
+    let tone = Bytes::from_static(&[0xFC, 0xEC, 0x40, 7, 7, 7, 7]);
+    for first in [1u32, 21, 41, 61, 81, 101] {
+        send_audio(&alice, channel_id, first, &tone).await;
+    }
+    let lossy = expect_within(&mut alice, "NetworkQuality(uplink loss)", Duration::from_secs(12), |m| {
+        matches!(m, ControlMessage::NetworkQuality { quality } if quality.uplink_loss_percent > 20.0)
+    })
+    .await;
+    let ControlMessage::NetworkQuality { quality } = lossy else {
+        unreachable!()
+    };
+    assert!(quality.uplink_packets_lost >= 10, "{quality:?}");
+    assert!(quality.uplink_packets_received >= 10, "{quality:?}");
+    assert!(quality.uplink_bitrate_kbps > 0, "{quality:?}");
+    assert!(quality.bars <= 2, "{quality:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let alert = sse.expect("quality.alert", left).await;
+        if alert["data"]["metric"] == "uplink_packet_loss"
+            && alert["data"]["session_id"].as_str() == Some(alice.session_id.to_string().as_str())
+        {
+            assert!(alert["data"]["value"].as_f64().unwrap() > 20.0, "{alert}");
+            assert_eq!(
+                alert["data"]["user_id"].as_str(),
+                Some(uid_a.as_str()),
+                "{alert}"
+            );
+            break;
+        }
+    }
+
+    // REST view of the same session, scoped to its tenant.
+    let path = format!("/v1/sessions/{}/stats", bob.session_id);
+    let stats: serde_json::Value = http
+        .get(format!("{}{path}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["client_report"]["packet_loss_percent"], 25.0,
+        "{stats}"
+    );
+    assert_eq!(stats["quality"]["bars"], 1, "{stats}");
+    assert_eq!(
+        stats["channels"].as_array().map(|c| c.len()),
+        Some(1),
+        "{stats}"
+    );
+    assert!(stats["packets_sent"].as_u64().unwrap() >= 50, "{stats}");
+    assert_eq!(
+        status_of(
+            &env,
+            &http,
+            &format!("/v1/sessions/{}/stats", uuid::Uuid::new_v4())
+        )
+        .await,
+        404
+    );
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let status = http
+            .get(format!("{}{path}", env.api))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 404, "another tenant must not read session stats");
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation check");
+    }
+
+    for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::ChannelLeave { channel_id }).await;
+    }
+}

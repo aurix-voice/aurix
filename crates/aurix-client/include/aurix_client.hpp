@@ -300,6 +300,10 @@ public:
     AurixResult cancel_speech() { return aurix_client_cancel_speech(c_); }
 
     bool stats(AurixStats& out) const { return aurix_client_stats(c_, &out) == AURIX_OK; }
+    /// Latest server-reported quality; `false` until the server has sent one.
+    bool network_quality(AurixNetworkQuality& out) const {
+        return aurix_client_network_quality(c_, &out);
+    }
 
 private:
     AurixClient* c_;

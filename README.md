@@ -257,6 +257,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`; `join` accepts `ad_hoc` too) |
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
 | API key | `POST|GET /v1/channels`, `GET|DELETE /v1/channels/:id`, `PUT …/config`, `GET …/participants` | channels |
+| API key | `GET /v1/sessions/:id/stats` | media-plane statistics of one live session on this node: packet/byte counters, the client's last `QualityReport` and the merged `quality` (1–5 bars; see [Network quality and client statistics](#network-quality-and-client-statistics)) (`channels:read`) |
 | API key | `GET /v1/users`, `GET /v1/users/:id`, `POST /v1/users/:id/unban` | users |
 | API key | `DELETE /v1/users/:id[?purge_moderation=true]`, `GET /v1/users/:id/export` | erase a user and everything they own / export it as JSON (`users:erase`, `users:export`; see [User erasure, export and retention](#user-erasure-export-and-retention)) |
 | API key | `GET|POST /v1/users/:id/blocks`, `DELETE /v1/users/:id/blocks/:blocked_id` | persistent cross-mute (applied to live sessions on every node) |
@@ -550,6 +551,39 @@ Semantics worth knowing:
   players like a recording (`RecordingNotification` with `live: true`). Streams end with the
   channel and on node shutdown (`end` frame); erasing a user drops their per-stream state
   (consent, decoder) while the stream itself keeps running.
+
+### Network quality and client statistics
+
+Every SDK exposes one statistics snapshot (native `Client::stats()` / `aurix_client_stats`,
+Web `getStats()`, Unity `GetStats()`, Unreal `GetStats()`/`GetNetworkQuality()`) with the same
+vocabulary: packets/bytes in both directions, RTT last/min/avg/max, downlink jitter, loss over
+the last period (**percent**, `0..=100`), frames lost / late (out of time) / discarded and
+jitter-buffer underruns, authentication and replay failures, heartbeat loss, active remote
+streams, and the derived rating — a simplified E-model **R-factor** (`0..=100`), the **MOS**
+it maps to and **1–5 bars** (`R ≥ 80 → 5`, `≥ 70 → 4`, `≥ 60 → 3`, `≥ 50 → 2`, else `1`). The
+same formula (`aurix_common::types::quality`) runs on the server, so a HUD can show either side's
+number without recalibrating.
+
+Clients send a `QualityReport {rtt_ms, jitter_ms, packet_loss}` (loss in percent) every
+`qualityReportIntervalMs` / `QualityReportInterval` (5 s; `0` disables). The node uses it for the
+adaptive downlink bitrate (`BitrateCommand`: > 10 % loss or > 50 ms jitter lowers the target,
+> 20 % loss also raises a `quality.alert` with `metric: "packet_loss"`) and merges it every
+`media.quality_interval_ms` (2 s) with what the SFU measures on that session's **uplink** —
+sequence gaps (loss), RFC 3550 inter-arrival jitter and bitrate. The worse direction decides the
+rating, which goes back to the client as `NetworkQuality` whenever the bars change and every fifth
+period as a summary:
+
+```json
+{"type":"NetworkQuality","data":{"quality":{"bars":4,"r_factor":76.2,"mos":3.9,"rtt_ms":48.0,
+ "downlink_jitter_ms":6.5,"downlink_loss_percent":1.2,"uplink_jitter_ms":3.1,
+ "uplink_loss_percent":4.0,"uplink_bitrate_kbps":31,"uplink_packets_received":4120,"uplink_packets_lost":170}}}
+```
+
+Uplink loss above 20 % over a period raises `quality.alert` with `metric: "uplink_packet_loss"`
+(webhooks/SSE) even if the client reports nothing. Operators read the same view per session
+with `GET /v1/sessions/:id/stats` (node-local; the session's node is listed in
+`GET /v1/users/:id`). Client counters are cumulative for the current transport; loss, R-factor,
+MOS and bars describe the latest period.
 
 ### Network / firewall
 

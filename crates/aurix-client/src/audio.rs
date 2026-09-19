@@ -404,6 +404,7 @@ struct Stream {
     len: usize,
     last_activity: Instant,
     starved: bool,
+    starved_at: Instant,
 }
 
 /// Statistics of one decoded sender stream.
@@ -415,6 +416,22 @@ pub struct StreamStats {
     pub late: u64,
 }
 
+/// Downlink counters accumulated over every stream the mixer has ever seen.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MixerTotals {
+    /// Frames the jitter buffers declared lost and concealed with PLC.
+    pub lost: u64,
+    /// Frames that arrived after their play-out time and were discarded.
+    pub late: u64,
+    /// Times a stream ran dry mid-talk-spurt (a packet followed within
+    /// [`UNDERRUN_RESUME_WINDOW`]); the natural end of a spurt is not counted.
+    pub underruns: u64,
+}
+
+/// A stream that starves and receives its next frame within this window ran dry because
+/// of the network, not because the speaker paused (VAD hangover is longer than this).
+pub const UNDERRUN_RESUME_WINDOW: Duration = Duration::from_millis(250);
+
 /// Decodes and mixes every remote sender into one interleaved float buffer. Each sender has
 /// its own decoder because Opus decoder state is per-stream. Safe to drive from the audio
 /// thread: pushes only touch a `BTreeMap` behind the caller's lock.
@@ -425,6 +442,9 @@ pub struct RemoteMixer {
     target_depth: usize,
     max_depth: usize,
     scratch: Vec<f32>,
+    /// Lost/late of streams already dropped, so totals never go backwards.
+    retired: MixerTotals,
+    underruns: u64,
 }
 
 impl RemoteMixer {
@@ -436,6 +456,8 @@ impl RemoteMixer {
             target_depth,
             max_depth,
             scratch: Vec::new(),
+            retired: MixerTotals::default(),
+            underruns: 0,
         }
     }
 
@@ -483,6 +505,7 @@ impl RemoteMixer {
                     len: 0,
                     last_activity: Instant::now(),
                     starved: false,
+                    starved_at: Instant::now(),
                 })
             }
         };
@@ -491,22 +514,36 @@ impl RemoteMixer {
             Some(d) => (stream.left, stream.right) = d.stereo_gains(),
             None => (stream.left, stream.right) = (1.0, 1.0),
         }
-        stream.last_activity = Instant::now();
+        let now = Instant::now();
+        stream.last_activity = now;
         if stream.starved {
             // A talk spurt after silence: refill the target depth before playing again.
             stream.jitter.reset();
             stream.starved = false;
+            if now.duration_since(stream.starved_at) < UNDERRUN_RESUME_WINDOW {
+                self.underruns += 1;
+            }
         }
         stream.jitter.push(seq, opus);
         Ok(())
     }
 
     pub fn remove(&mut self, ssrc: u32) {
-        self.streams.remove(&ssrc);
+        if let Some(s) = self.streams.remove(&ssrc) {
+            self.retire(&s);
+        }
     }
 
     pub fn clear(&mut self) {
-        self.streams.clear();
+        for (_, s) in self.streams.drain() {
+            self.retired.lost += s.jitter.lost;
+            self.retired.late += s.jitter.late;
+        }
+    }
+
+    fn retire(&mut self, s: &Stream) {
+        self.retired.lost += s.jitter.lost;
+        self.retired.late += s.jitter.late;
     }
 
     pub fn stream_stats(&self) -> Vec<StreamStats> {
@@ -519,6 +556,17 @@ impl RemoteMixer {
                 late: s.jitter.late,
             })
             .collect()
+    }
+
+    /// Lifetime downlink totals: live streams plus everything already retired.
+    pub fn totals(&self) -> MixerTotals {
+        let mut t = self.retired;
+        for s in self.streams.values() {
+            t.lost += s.jitter.lost;
+            t.late += s.jitter.late;
+        }
+        t.underruns = self.underruns;
+        t
     }
 
     /// Mix into `output` (interleaved, `channels` wide; **adds** to its contents). Mono
@@ -534,8 +582,16 @@ impl RemoteMixer {
         };
         let now = Instant::now();
         let mut active = 0;
-        self.streams
-            .retain(|_, s| now.duration_since(s.last_activity) < STREAM_IDLE_TIMEOUT);
+        let mut retired = self.retired;
+        self.streams.retain(|_, s| {
+            let keep = now.duration_since(s.last_activity) < STREAM_IDLE_TIMEOUT;
+            if !keep {
+                retired.lost += s.jitter.lost;
+                retired.late += s.jitter.late;
+            }
+            keep
+        });
+        self.retired = retired;
         for s in self.streams.values_mut() {
             let mut written = 0;
             let mut contributed = false;
@@ -544,8 +600,9 @@ impl RemoteMixer {
                     let slot = s.jitter.pop();
                     let n = match slot {
                         JitterSlot::Wait => {
-                            if s.jitter.is_empty() {
+                            if s.jitter.is_empty() && !s.starved {
                                 s.starved = true;
+                                s.starved_at = now;
                             }
                             break;
                         }
@@ -738,5 +795,48 @@ mod tests {
             .collect();
         assert!(rms(&l) < 0.01, "{}", rms(&l));
         assert!((rms(&r) - 0.25).abs() < 0.05, "{}", rms(&r));
+    }
+
+    #[test]
+    fn mixer_totals_count_loss_late_underruns_and_survive_stream_removal() {
+        let mut enc = CaptureEncoder::new(32_000).unwrap();
+        let pcm = sine(FRAME_SAMPLES * 12, 48_000, 440.0, 0.5);
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, 48_000, 1, |f| frames.push(f));
+        let mut mixer = RemoteMixer::new(1, 12);
+        let mut out = vec![0f32; FRAME_SAMPLES];
+
+        // Frames 0,1,3 (2 lost), then an ancient frame that is discarded as late.
+        for seq in [0u32, 1, 3] {
+            mixer
+                .push(9, seq, 1.0, None, frames[seq as usize].opus.clone())
+                .unwrap();
+        }
+        for _ in 0..4 {
+            mixer.mix(&mut out, 1);
+        }
+        mixer.push(9, 0, 1.0, None, frames[0].opus.clone()).unwrap();
+        let t = mixer.totals();
+        assert_eq!((t.lost, t.late), (1, 1), "{t:?}");
+
+        // Buffer runs dry, next frame arrives within the window → one underrun.
+        for _ in 0..3 {
+            mixer.mix(&mut out, 1);
+        }
+        mixer.push(9, 4, 1.0, None, frames[4].opus.clone()).unwrap();
+        assert_eq!(mixer.totals().underruns, 1);
+        // Starving again without a follow-up frame is a natural pause, not an underrun.
+        for _ in 0..3 {
+            mixer.mix(&mut out, 1);
+        }
+        assert_eq!(mixer.totals().underruns, 1);
+
+        // Removing the stream keeps its counters in the totals.
+        mixer.remove(9);
+        assert!(mixer.stream_stats().is_empty());
+        let t = mixer.totals();
+        assert_eq!((t.lost, t.late, t.underruns), (1, 1, 1), "{t:?}");
+        mixer.clear();
+        assert_eq!(mixer.totals(), t);
     }
 }

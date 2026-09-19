@@ -51,6 +51,10 @@ speaking_timeout_ms = 400
 speaking_energy_threshold = 0.01
 # Period of ChannelEnergy level reports to channel members (0 disables them).
 energy_interval_ms = 200
+# Period of per-session network-quality evaluation: the client's QualityReport merged with the
+# uplink loss/jitter/bitrate the SFU measures, sent as NetworkQuality (1–5 bars) when the bars
+# change and every fifth period (0 disables).
+quality_interval_ms = 2000
 
 [turn]
 enabled = false

@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
             speaking_timeout_ms: config.media.speaking_timeout_ms,
             speaking_energy_threshold: config.media.speaking_energy_threshold,
             energy_interval_ms: config.media.energy_interval_ms,
+            quality_interval_ms: config.media.quality_interval_ms,
             max_channels_per_session: config.media.max_channels_per_session,
             max_positional_channels_per_session: config.media.max_positional_channels_per_session,
             unfocused_channel_gain: config.media.unfocused_channel_gain,

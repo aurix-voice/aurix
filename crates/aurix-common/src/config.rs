@@ -115,6 +115,9 @@ impl AurixConfig {
         if self.media.energy_interval_ms != 0 && self.media.energy_interval_ms < 50 {
             anyhow::bail!("media.energy_interval_ms must be 0 (off) or >= 50");
         }
+        if self.media.quality_interval_ms != 0 && self.media.quality_interval_ms < 500 {
+            anyhow::bail!("media.quality_interval_ms must be 0 (off) or >= 500");
+        }
         if !(0.0..=1.0).contains(&self.media.unfocused_channel_gain) {
             anyhow::bail!("media.unfocused_channel_gain must be within 0.0..=1.0");
         }
@@ -508,6 +511,10 @@ pub struct MediaConfig {
     /// How often (ms) `ChannelEnergy` level reports are sent to channel members (0 = never).
     #[serde(default = "default_energy_interval_ms")]
     pub energy_interval_ms: u64,
+    /// How often (ms) the server evaluates each session's link and sends `NetworkQuality`
+    /// (0 = never). Reports go out when the bar count changes and at least every fifth period.
+    #[serde(default = "default_quality_interval_ms")]
+    pub quality_interval_ms: u64,
     /// Channels one session may be joined to at the same time.
     #[serde(default = "default_max_channels_per_session")]
     pub max_channels_per_session: u32,
@@ -552,6 +559,9 @@ fn default_speaking_energy_threshold() -> f32 {
 fn default_energy_interval_ms() -> u64 {
     200
 }
+fn default_quality_interval_ms() -> u64 {
+    2000
+}
 fn default_max_channels_per_session() -> u32 {
     10
 }
@@ -585,6 +595,7 @@ impl Default for MediaConfig {
             speaking_timeout_ms: default_speaking_timeout_ms(),
             speaking_energy_threshold: default_speaking_energy_threshold(),
             energy_interval_ms: default_energy_interval_ms(),
+            quality_interval_ms: default_quality_interval_ms(),
             max_channels_per_session: default_max_channels_per_session(),
             max_positional_channels_per_session: default_max_positional_channels_per_session(),
             unfocused_channel_gain: default_unfocused_channel_gain(),

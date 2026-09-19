@@ -60,6 +60,7 @@
   <button id="mute" disabled>Mute</button>
   <button id="disconnect" disabled>Disconnect</button>
   <span id="rtt"></span>
+  <span id="quality" title="network quality: client / server"></span>
   <span title="local microphone level">mic <span class="meter"><i id="micmeter" style="width:0"></i></span> <span id="micvad"></span></span>
   <audio id="remote" autoplay></audio>
 </fieldset>
@@ -299,6 +300,8 @@ $('connect').onclick = async () => {
     else if (active) client.respondToRecording(id, 'declined');
   });
   client.on('bitrate', (kbps, why) => log('bitrate', kbps, why));
+  client.on('networkQuality', (q) => { renderQuality(); log(`network quality ${q.bars}/5 (R ${q.rFactor.toFixed(0)}, uplink loss ${q.uplinkLossPercent.toFixed(1)}%, ${q.uplinkBitrateKbps} kbps)`); });
+  client.on('stats', renderQuality);
   client.on('kicked', (ch, why) => log('kicked from', ch, why));
   client.on('recovering', (attempt, delay, cause) => log(`connection lost (${cause}); reconnect #${attempt} in ${delay} ms`));
   client.on('recovered', (i) => log(i.resumed ? 'session resumed' : 'fresh session, channels re-joined', i.sessionId));
@@ -323,9 +326,17 @@ $('connect').onclick = async () => {
   client.on('error', (e) => log('error', e.message));
   try {
     await client.connect();
-    setInterval(() => { if (client?.connectionState !== 'disconnected') { $('rtt').textContent = `rtt ${client.roundTripMs.toFixed(0)} ms`; client.reportQuality().catch(() => {}); } }, 5000);
+    setInterval(() => { if (client?.connectionState !== 'disconnected') $('rtt').textContent = `rtt ${client.roundTripMs.toFixed(0)} ms`; }, 5000);
   } catch (e) { log('connect failed:', e.message); }
 };
+
+const bars = (n) => '▮'.repeat(n) + '▯'.repeat(5 - n);
+function renderQuality() {
+  const s = client?.lastStats;
+  const q = client?.networkQuality;
+  if (!s) { $('quality').textContent = ''; return; }
+  $('quality').textContent = `${bars(s.bars)} loss ${s.lossPercent.toFixed(1)}% jitter ${s.jitterMs.toFixed(1)} ms` + (q ? ` | server ${bars(q.bars)} up-loss ${q.uplinkLossPercent.toFixed(1)}%` : '');
+}
 
 const channelIds = () => $('channel').value.split(',').map((s) => s.trim()).filter(Boolean);
 $('join').onclick = async () => {

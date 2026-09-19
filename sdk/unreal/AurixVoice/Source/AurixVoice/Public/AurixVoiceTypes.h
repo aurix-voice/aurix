@@ -291,7 +291,54 @@ struct AURIXVOICE_API FAurixPosition
 	FVector Up = FVector::UpVector;
 };
 
-/** Transport and codec counters for a network-quality indicator. */
+/**
+ * Server-side view of the connection in both directions. Bars are 1..5
+ * (R >= 80/70/60/50 -> 5/4/3/2, else 1); loss values are percentages.
+ */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixNetworkQuality
+{
+	GENERATED_BODY()
+
+	/** 1 (unusable) .. 5 (excellent); 0 until the server has reported. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 Bars = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RFactor = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float Mos = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RttMs = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float DownlinkJitterMs = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float DownlinkLossPercent = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float UplinkJitterMs = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float UplinkLossPercent = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 UplinkBitrateKbps = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 UplinkPacketsReceived = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 UplinkPacketsLost = 0;
+};
+
+/**
+ * Transport and codec counters for a network-quality indicator. Counters are lifetime
+ * totals; LossPercent / RFactor / Mos / Bars describe the last quality period.
+ */
 USTRUCT(BlueprintType)
 struct AURIXVOICE_API FAurixStats
 {
@@ -322,15 +369,51 @@ struct AURIXVOICE_API FAurixStats
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int64 HeartbeatsLost = 0;
 
+	/** Downlink frames concealed (PLC), discarded as late, and jitter-buffer underruns. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 FramesLost = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 FramesLate = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 Underruns = 0;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float RttMs = 0.f;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RttMinMs = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RttAvgMs = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RttMaxMs = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float JitterMs = 0.f;
 
-	/** Downlink loss as a percentage. */
+	/** Downlink loss over the last quality period, as a percentage (0..100). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float LossPercent = 0.f;
+
+	/** Client-measured downlink quality; Bars is 1..5. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float RFactor = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float Mos = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 Bars = 0;
+
+	/** True when Server holds the latest server-reported quality. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bHasServer = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FAurixNetworkQuality Server;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int64 FramesEncoded = 0;

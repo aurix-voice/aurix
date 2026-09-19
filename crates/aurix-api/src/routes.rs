@@ -105,6 +105,10 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/channels/:channel_id/participants",
             get(handlers::get_channel_participants),
         )
+        .route(
+            "/v1/sessions/:session_id/stats",
+            get(handlers::get_session_stats),
+        )
         .route("/v1/users", get(handlers::search_users))
         .route(
             "/v1/users/:user_id",

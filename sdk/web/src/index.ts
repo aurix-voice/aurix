@@ -8,6 +8,17 @@ export {
   rms,
 } from './audio.js';
 export type { AudioLevelMeterOptions, AudioLevelSample } from './audio.js';
+export {
+  LossWindow,
+  RttTracker,
+  assembleClientStats,
+  barsFromR,
+  lossPercent,
+  mosFromR,
+  networkQualityFromWire,
+  rFactor,
+} from './quality.js';
+export type { ClientStats, NetworkQuality, NetworkQualityWire, RtcStatsInput, RttSnapshot } from './quality.js';
 export type {
   AurixClientOptions,
   AurixEvents,

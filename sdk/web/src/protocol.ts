@@ -6,6 +6,8 @@
  * sends or receives are modelled; unknown variants are surfaced as `UnknownMessage`.
  */
 
+import type { NetworkQualityWire } from './quality.js';
+
 export type ChannelRole = 'listener' | 'speaker' | 'moderator' | 'administrator';
 
 export type RecordingConsent = 'pending' | 'accepted' | 'declined';
@@ -144,6 +146,7 @@ export type ClientMessage =
     }
   | { type: 'TtsCancel'; data?: undefined }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
+  /** `packet_loss` is a percentage (`0..=100`) of the last report period. */
   | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number } }
   | { type: 'RecordingConsentResponse'; data: { recording_id: string; consent: RecordingConsent } }
   | { type: 'WebRtcOffer'; data: { sdp: string } }
@@ -185,6 +188,7 @@ export type ServerMessage =
   | { type: 'SpeakingStateChanged'; data: { channel_id: string; user_id: string; speaking: boolean } }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | { type: 'BitrateCommand'; data: { target_bitrate_kbps: number; reason: string } }
+  | { type: 'NetworkQuality'; data: { quality: NetworkQualityWire } }
   | { type: 'UserBlockChanged'; data: { user_id: string; blocked: boolean } }
   | { type: 'TransmissionChanged'; data: { mode: TransmissionModeWire } }
   | { type: 'ChannelFocusChanged'; data: { channel_id?: string | null } }

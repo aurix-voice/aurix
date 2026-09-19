@@ -7,6 +7,7 @@ No runtime dependencies; ES2020 module with type declarations.
 ```bash
 npm install && npm run build      # -> dist/
 npm run demo                      # http://localhost:5173/  (demo/index.html)
+npm test                          # unit tests (node --test) for the quality model
 ```
 
 ## Usage
@@ -301,6 +302,34 @@ transmits to exactly one channel. Synthesized speech is routed exactly like your
 (transmission mode, mutes, blocks, focus, other nodes) and reaches browsers inside the mixed
 downlink; statuses go to the requesting session only. Disconnecting cancels pending requests.
 
+### Statistics & network quality
+
+```ts
+const s = await client.getStats();      // RTCPeerConnection.getStats(), normalized
+s.bars;                                 // 1 (unusable) … 5 (excellent), from s.rFactor
+s.rFactor; s.mos;                       // simplified E-model rating (0..100) and MOS (1..4.5)
+s.rttMs; s.rttMinMs; s.rttAvgMs; s.rttMaxMs; // application RTT (Ping/Pong), session min/avg/max
+s.iceRttMs;                             // ICE candidate-pair RTT
+s.jitterMs; s.lossPercent;              // downlink: RFC 3550 jitter, loss of the last period (0..100)
+s.packetsReceived; s.packetsLost; s.bytesReceived; s.packetsDiscarded; s.concealedSamples;
+s.jitterBufferDelayMs;                  // average jitter-buffer delay
+s.packetsSent; s.bytesSent; s.remoteLossPercent; s.remoteJitterMs; // uplink, from the SFU's RTCP
+s.server;                               // last server-side NetworkQuality (both directions), if any
+
+client.on('stats', (s) => hud.setBars(s.bars));          // before each periodic QualityReport
+client.on('networkQuality', (q) => hud.setServerBars(q.bars, q.uplinkLossPercent));
+client.networkQuality;                                   // last server report
+```
+
+Every `qualityReportIntervalMs` (5 s; `0` disables) the client samples the peer connection,
+fires `stats` and sends a `QualityReport` (`rtt_ms`, `jitter_ms`, `packet_loss` **in percent**),
+which drives the server's adaptive bitrate and its own `NetworkQuality` message. The server
+merges that downlink view with what the SFU measures on your uplink (sequence gaps, RFC 3550
+jitter, bitrate) and picks the worse direction: `R ≥ 80` → 5 bars, `≥ 70` → 4, `≥ 60` → 3,
+`≥ 50` → 2, else 1. `bars`/`rFactor`/`mos`/`lossPercent` describe the last period; packet/byte
+counters are cumulative for the peer connection. The same helpers (`rFactor`, `mosFromR`,
+`barsFromR`, `assembleClientStats`) are exported for HUDs that read raw stats themselves.
+
 ## How it maps to the server
 
 | SDK | server |
@@ -312,7 +341,7 @@ downlink; statuses go to the requesting session only. Disconnecting cancels pend
 | `setMuted()` → track `enabled` + `MuteStateChanged` | broadcast to channel members |
 | `setTransmission()` → `SetTransmission{mode}` | `MediaSession::set_transmission`; routers drop frames outside the policy |
 | `setChannelFocus()` → `SetChannelFocus{channel_id}` | `ReceiverPrefs::set_focus`; unfocused channels scaled in the per-receiver gain |
-| `reportQuality()` → `QualityReport` | adaptive `BitrateCommand`, applied via `RTCRtpSender.setParameters` |
+| `getStats()` / `reportQuality()` → `QualityReport` (loss in %) | adaptive `BitrateCommand` (applied via `RTCRtpSender.setParameters`) + `NetworkQuality` merged with the SFU's uplink measurements |
 | `Ping`/`Pong` | keepalive + `roundTripMs` |
 | reconnect with `['aurix', 'bearer.<jwt>', 'resume.<session_id>.<resume_token>']` | `SessionInitAck{resumed: true}` + replayed `ChannelJoinAck`s within `server.session_resume_grace_secs` |
 

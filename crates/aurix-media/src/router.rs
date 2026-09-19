@@ -74,6 +74,13 @@ pub enum MediaEvent {
         channel_id: ChannelId,
         levels: Vec<(UserId, u8)>,
     },
+    /// Periodic per-session link report (see `SfuOptions::quality_interval_ms`).
+    NetworkQuality {
+        session_id: SessionId,
+        app_id: AppId,
+        user_id: UserId,
+        quality: NetworkQuality,
+    },
 }
 
 pub struct RouterShared {
@@ -128,6 +135,15 @@ impl PacketRouter {
         }
 
         let session = self.authenticate(&mut packet, src_addr)?;
+        let is_audio = matches!(
+            packet.header.packet_type,
+            PacketType::Audio | PacketType::AudioFec
+        );
+        session.record_uplink(
+            packet.header.sequence as u64,
+            is_audio.then_some(packet.header.timestamp),
+            data.len(),
+        );
         match packet.header.packet_type {
             PacketType::Audio | PacketType::AudioFec => {
                 let level = packet.take_audio_level();

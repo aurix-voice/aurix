@@ -188,6 +188,23 @@ TArray<FAurixParticipant> ToParticipants(const std::vector<AurixParticipant>& In
 	return Out;
 }
 
+FAurixNetworkQuality ToNetworkQuality(const AurixNetworkQuality& Q)
+{
+	FAurixNetworkQuality Out;
+	Out.Bars = static_cast<int32>(Q.bars);
+	Out.RFactor = Q.r_factor;
+	Out.Mos = Q.mos;
+	Out.RttMs = Q.rtt_ms;
+	Out.DownlinkJitterMs = Q.downlink_jitter_ms;
+	Out.DownlinkLossPercent = Q.downlink_loss_percent;
+	Out.UplinkJitterMs = Q.uplink_jitter_ms;
+	Out.UplinkLossPercent = Q.uplink_loss_percent;
+	Out.UplinkBitrateKbps = static_cast<int32>(Q.uplink_bitrate_kbps);
+	Out.UplinkPacketsReceived = static_cast<int64>(Q.uplink_packets_received);
+	Out.UplinkPacketsLost = static_cast<int64>(Q.uplink_packets_lost);
+	return Out;
+}
+
 FAurixStats ToStats(const AurixStats& S)
 {
 	FAurixStats Out;
@@ -199,9 +216,20 @@ FAurixStats ToStats(const AurixStats& S)
 	Out.BadAuth = static_cast<int64>(S.bad_auth);
 	Out.Replayed = static_cast<int64>(S.replayed);
 	Out.HeartbeatsLost = static_cast<int64>(S.heartbeats_lost);
+	Out.FramesLost = static_cast<int64>(S.frames_lost);
+	Out.FramesLate = static_cast<int64>(S.frames_late);
+	Out.Underruns = static_cast<int64>(S.underruns);
 	Out.RttMs = S.rtt_ms;
+	Out.RttMinMs = S.rtt_min_ms;
+	Out.RttAvgMs = S.rtt_avg_ms;
+	Out.RttMaxMs = S.rtt_max_ms;
 	Out.JitterMs = S.jitter_ms;
 	Out.LossPercent = S.loss_percent;
+	Out.RFactor = S.r_factor;
+	Out.Mos = S.mos;
+	Out.Bars = static_cast<int32>(S.bars);
+	Out.bHasServer = S.has_server;
+	Out.Server = ToNetworkQuality(S.server);
 	Out.FramesEncoded = static_cast<int64>(S.frames_encoded);
 	Out.FramesSent = static_cast<int64>(S.frames_sent);
 	Out.FramesGated = static_cast<int64>(S.frames_gated);
@@ -795,6 +823,18 @@ bool UAurixVoiceSubsystem::GetStats(FAurixStats& OutStats) const
 	return true;
 }
 
+bool UAurixVoiceSubsystem::GetNetworkQuality(FAurixNetworkQuality& OutQuality) const
+{
+	AurixNetworkQuality Raw;
+	if (!Native || !Native->Client.network_quality(Raw))
+	{
+		OutQuality = FAurixNetworkQuality();
+		return false;
+	}
+	OutQuality = ToNetworkQuality(Raw);
+	return true;
+}
+
 // ---- conversions ---------------------------------------------------------------------------
 
 bool UAurixVoiceSubsystem::ParseUuid(const FString& Text, FGuid& OutGuid)
@@ -1053,6 +1093,16 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		StopCapture();
 		OnDisconnected.Broadcast(FromUtf8(aurix_event_message(Raw)));
 		break;
+
+	case AURIX_EVENT_NETWORK_QUALITY:
+	{
+		AurixNetworkQuality Q;
+		if (aurix_event_network_quality(Raw, &Q))
+		{
+			OnNetworkQuality.Broadcast(ToNetworkQuality(Q));
+		}
+		break;
+	}
 
 	default:
 		UE_LOG(LogAurixVoice, Verbose, TEXT("unhandled native event %d"), static_cast<int32>(Type));

@@ -51,6 +51,8 @@ pub enum WebRtcMediaEvent {
     AudioReceived {
         session_id: SessionId,
         user_id: UserId,
+        /// RTP sequence number (extended, monotonic per SSRC).
+        seq: u64,
         rtp_time: u32,
         payload: Vec<u8>,
         /// RFC 6464 audio level (`-dBov`, 0..=127) from the RTP header extension.
@@ -480,6 +482,7 @@ async fn poll_outputs(
                         .send(WebRtcMediaEvent::AudioReceived {
                             session_id: ctx.session_id,
                             user_id: ctx.user_id,
+                            seq: **data.seq_range.start(),
                             rtp_time: data.time.numer() as u32,
                             payload: data.data.to_vec(),
                             level: data

@@ -671,6 +671,7 @@ pub async fn get_channel_participants(
                     "is_muted": s.is_muted.load(std::sync::atomic::Ordering::Relaxed),
                     "is_server_muted": s.is_server_muted.load(std::sync::atomic::Ordering::Relaxed),
                     "is_speaking": s.is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+                    "quality": s.get_network_quality(),
                 })
             })
             .collect()
@@ -678,6 +679,36 @@ pub async fn get_channel_participants(
     Ok(Json(
         serde_json::json!({ "channel_id": channel_id, "memberships": members, "live_on_this_node": live }),
     ))
+}
+
+/// Media-plane statistics of one live session. Only sessions hosted on this node are
+/// visible (the row in `/v1/users/:id` tells which node holds a session).
+pub async fn get_session_stats(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(session_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("channels:read")?;
+    let session_id = SessionId::from_uuid(session_id);
+    let session = {
+        let sfu = state.sfu.read();
+        sfu.get_session(&session_id)
+            .filter(|s| s.app_id == ctx.app_id && s.is_active())
+    }
+    .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+    let stats = session.stats();
+    Ok(Json(serde_json::json!({
+        "session_id": session.session_id,
+        "user_id": session.user_id,
+        "transport": format!("{:?}", *session.transport.read()),
+        "channels": session.get_channels(),
+        "packets_sent": stats.packets_sent,
+        "bytes_sent": stats.bytes_sent,
+        "packets_received": stats.packets_received,
+        "bytes_received": stats.bytes_received,
+        "client_report": stats.quality,
+        "quality": session.get_network_quality(),
+    })))
 }
 
 // ── Users ──

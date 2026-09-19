@@ -21,6 +21,8 @@ use tracing::{error, info, warn};
 
 /// Level change (dB) below which a participant is left out of the next `ChannelEnergy` report.
 const ENERGY_REPORT_MIN_STEP_DB: u8 = 3;
+/// `NetworkQuality` is sent unconditionally every this many quality periods.
+const QUALITY_SUMMARY_EVERY: u64 = 5;
 
 /// Side effects of leaving a channel that the client must be told about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,6 +44,8 @@ pub struct SfuOptions {
     pub speaking_energy_threshold: f32,
     /// Period of `MediaEvent::ChannelEnergy` reports (0 = disabled).
     pub energy_interval_ms: u64,
+    /// Period of per-session `MediaEvent::NetworkQuality` evaluation (0 = disabled).
+    pub quality_interval_ms: u64,
     /// Channels a single session may be joined to at once.
     pub max_channels_per_session: u32,
     /// Positional channels a single session may be joined to at once (0 = unlimited).
@@ -67,6 +71,7 @@ impl Default for SfuOptions {
             speaking_timeout_ms: 400,
             speaking_energy_threshold: 0.01,
             energy_interval_ms: 200,
+            quality_interval_ms: 2000,
             max_channels_per_session: 10,
             max_positional_channels_per_session: 1,
             unfocused_channel_gain: DEFAULT_UNFOCUSED_GAIN,
@@ -271,6 +276,7 @@ impl SfuNode {
                         WebRtcMediaEvent::AudioReceived {
                             session_id,
                             user_id,
+                            seq,
                             rtp_time,
                             payload,
                             level,
@@ -283,6 +289,7 @@ impl SfuNode {
                             {
                                 continue;
                             }
+                            session.record_uplink(seq, Some(rtp_time), payload.len());
                             if let Err(e) = router
                                 .route_webrtc_audio(&session, rtp_time, payload, level)
                                 .await
@@ -368,6 +375,7 @@ impl SfuNode {
         self.start_session_cleanup();
         self.start_speaking_timeout();
         self.start_energy_reports();
+        self.start_quality_reports();
         if let Some(ref pipeline) = self.audio_pipeline {
             pipeline.spawn_idle_flusher(self.channels.clone());
         }
@@ -872,6 +880,44 @@ impl SfuNode {
                         channel_id,
                         levels,
                     });
+                }
+            }
+        });
+    }
+
+    /// Every `quality_interval_ms`, close each bound session's uplink interval, merge it with
+    /// the client's report and emit `NetworkQuality` when the bar count moved (and at least
+    /// every fifth period so a client that missed one still converges). Sessions without a
+    /// media path yet are not rated.
+    fn start_quality_reports(&self) {
+        let interval_ms = self.options.quality_interval_ms;
+        if interval_ms == 0 {
+            return;
+        }
+        let sessions = self.sessions_by_id.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick: u64 = 0;
+            loop {
+                interval.tick().await;
+                tick = tick.wrapping_add(1);
+                let summary = tick.is_multiple_of(QUALITY_SUMMARY_EVERY);
+                for entry in sessions.iter() {
+                    let s = entry.value();
+                    if !s.is_active() || !s.is_bound() {
+                        continue;
+                    }
+                    let (quality, changed) = s.refresh_network_quality();
+                    if changed || summary {
+                        let _ = events.send(MediaEvent::NetworkQuality {
+                            session_id: s.session_id,
+                            app_id: s.app_id,
+                            user_id: s.user_id,
+                            quality,
+                        });
+                    }
                 }
             }
         });

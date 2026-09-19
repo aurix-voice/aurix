@@ -865,5 +865,131 @@ namespace Aurix.Voice.Tests
             rs.Process(half, 2, 24000, (b, off, frames, ch) => { for (int i = 0; i < frames * ch; i++) b[off + i] = 0.2f; });
             Assert.All(half.Skip(2), v => Assert.Equal(0.3f, v, 4));
         }
+
+        [Fact]
+        public void QualityModelMatchesSharedThresholds()
+        {
+            // Same fixtures as aurix_common::types::quality and the Web SDK.
+            Assert.Equal(5, QualityModel.BarsFromR(QualityModel.RFactor(20f, 2f, 0f)));
+            Assert.Equal(5, QualityModel.BarsFromR(QualityModel.RFactor(150f, 20f, 1f)));
+            Assert.Equal(4, QualityModel.BarsFromR(QualityModel.RFactor(150f, 20f, 3f)));
+            Assert.Equal(3, QualityModel.BarsFromR(QualityModel.RFactor(300f, 30f, 3f)));
+            Assert.Equal(1, QualityModel.BarsFromR(QualityModel.RFactor(20f, 2f, 20f)));
+            Assert.Equal(1, QualityModel.BarsFromR(QualityModel.RFactor(20f, 2f, 100f)));
+
+            float perfect = QualityModel.RFactor(0f, 0f, 0f);
+            Assert.InRange(perfect, 92f, 93.2f);
+            Assert.InRange(QualityModel.MosFromR(perfect), 4.3f, 4.5f);
+            Assert.Equal(1f, QualityModel.MosFromR(0f), 4);
+            // Worse input never yields a better rating; loss is clamped to 0..100.
+            Assert.True(QualityModel.RFactor(50f, 5f, 2f) < QualityModel.RFactor(50f, 5f, 1f));
+            Assert.True(QualityModel.RFactor(50f, 20f, 2f) < QualityModel.RFactor(50f, 5f, 2f));
+            Assert.Equal(QualityModel.RFactor(10f, 1f, 100f), QualityModel.RFactor(10f, 1f, 250f));
+            // Unknown (non-finite) delay counts as 0, unknown loss as total loss.
+            Assert.Equal(QualityModel.RFactor(0f, 0f, 1f), QualityModel.RFactor(float.NaN, float.PositiveInfinity, 1f));
+            Assert.Equal(0f, QualityModel.RFactor(10f, 1f, float.NaN));
+
+            Assert.Equal(0f, QualityModel.LossPercent(0, 0));
+            Assert.Equal(25f, QualityModel.LossPercent(1, 3));
+            Assert.Equal(100f, QualityModel.LossPercent(5, 0));
+
+            var w = new LossWindow();
+            Assert.Equal(0f, w.Advance(0, 100));
+            Assert.Equal(10f, w.Advance(10, 190)); // +10 lost, +90 received
+            Assert.Equal(0f, w.Advance(10, 290));
+            w.Reset();
+            Assert.Equal(50f, w.Advance(1, 1));
+        }
+
+        [Fact]
+        public void NetworkQualityParsesServerMessage()
+        {
+            var m = ControlMessage.Parse("{\"type\":\"NetworkQuality\",\"data\":{\"quality\":{\"bars\":3,\"r_factor\":64.5," +
+                "\"mos\":3.3,\"rtt_ms\":120,\"downlink_jitter_ms\":8.5,\"downlink_loss_percent\":1.5,\"uplink_jitter_ms\":12," +
+                "\"uplink_loss_percent\":6.25,\"uplink_bitrate_kbps\":28,\"uplink_packets_received\":1500,\"uplink_packets_lost\":100}}}");
+            var q = NetworkQuality.FromMessage(m);
+            Assert.True(q.HasValue);
+            Assert.Equal(3, q.Value.Bars);
+            Assert.Equal(64.5f, q.Value.RFactor, 3);
+            Assert.Equal(3.3f, q.Value.Mos, 3);
+            Assert.Equal(120f, q.Value.RttMs, 3);
+            Assert.Equal(8.5f, q.Value.DownlinkJitterMs, 3);
+            Assert.Equal(1.5f, q.Value.DownlinkLossPercent, 3);
+            Assert.Equal(12f, q.Value.UplinkJitterMs, 3);
+            Assert.Equal(6.25f, q.Value.UplinkLossPercent, 3);
+            Assert.Equal(28u, q.Value.UplinkBitrateKbps);
+            Assert.Equal(1500L, q.Value.UplinkPacketsReceived);
+            Assert.Equal(100L, q.Value.UplinkPacketsLost);
+
+            Assert.Null(NetworkQuality.FromMessage(ControlMessage.Parse("{\"type\":\"NetworkQuality\",\"data\":{}}")));
+        }
+
+        [Fact]
+        public void RemoteMixerTotalsCountLossLateUnderrunsAndSurviveStreamRemoval()
+        {
+            var mixer = new RemoteMixer(() => new ConstantCodec());
+            var mono = new float[AudioFormat.FrameSamples];
+
+            // Frames 0,1,3 (2 lost), then an ancient frame that is discarded as late.
+            foreach (uint seq in new uint[] { 0, 1, 3 }) mixer.Push(9, seq, 1f, new byte[] { 1 });
+            for (int i = 0; i < 4; i++) mixer.Mix(mono, 1);
+            mixer.Push(9, 0, 1f, new byte[] { 1 });
+            var t = mixer.Totals;
+            Assert.Equal(1, t.Lost);
+            Assert.Equal(1, t.Late);
+            Assert.Equal(0, t.Underruns);
+            Assert.Equal(1, mixer.ActiveStreams);
+
+            // Buffer runs dry, the next frame arrives right away → one underrun, and playout refills first.
+            for (int i = 0; i < 3; i++) mixer.Mix(mono, 1);
+            mixer.Push(9, 4, 1f, new byte[] { 1 });
+            Assert.Equal(1, mixer.Totals.Underruns);
+            Array.Clear(mono, 0, mono.Length);
+            mixer.Mix(mono, 1);
+            Assert.Equal(0f, mono[0]); // one frame < target depth: still filling
+            mixer.Push(9, 5, 1f, new byte[] { 1 });
+            mixer.Mix(mono, 1);
+            Assert.Equal(ConstantCodec.Level, mono[0], 4);
+            // Starving again without a follow-up frame is a natural pause, not an underrun.
+            for (int i = 0; i < 4; i++) mixer.Mix(mono, 1);
+            Assert.Equal(1, mixer.Totals.Underruns);
+
+            // Removing the stream keeps its counters in the totals.
+            mixer.Remove(9);
+            Assert.Equal(0, mixer.ActiveStreams);
+            t = mixer.Totals;
+            Assert.Equal(1, t.Lost);
+            Assert.Equal(1, t.Late);
+            Assert.Equal(1, t.Underruns);
+            mixer.Dispose();
+            Assert.Equal(t, mixer.Totals);
+        }
+
+        [Fact]
+        public void VoiceClientStatsWithoutMediaUseControlRttAndMixer()
+        {
+            var client = new AurixVoiceClient("ws://127.0.0.1:1", "token");
+            var mixer = new RemoteMixer(() => new ConstantCodec());
+            client.Mixer = mixer;
+            foreach (uint seq in new uint[] { 0, 1, 3 }) mixer.Push(7, seq, 1f, new byte[] { 1 });
+            var mono = new float[AudioFormat.FrameSamples];
+            for (int i = 0; i < 4; i++) mixer.Mix(mono, 1);
+
+            var s = client.GetStats();
+            Assert.Equal(VoiceConnectionState.Disconnected, s.State);
+            Assert.Equal(0L, s.PacketsReceived);
+            Assert.Equal(1L, s.FramesLost);
+            Assert.Equal(1, s.ActiveStreams);
+            // No transport: nothing received, so the lost frame alone reads as total loss for the period …
+            Assert.Equal(100f, s.LossPercent);
+            Assert.Equal(1, s.Bars);
+            Assert.Null(s.Server);
+            // … and a quiet second period is back to a clean link.
+            s = client.GetStats();
+            Assert.Equal(0f, s.LossPercent);
+            Assert.Equal(5, s.Bars);
+            Assert.InRange(s.Mos, 4.3f, 4.5f);
+            Assert.Null(client.LastNetworkQuality);
+        }
     }
 }

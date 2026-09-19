@@ -46,8 +46,29 @@ pub struct MediaStats {
     pub replayed: u64,
     /// Last heartbeat round-trip in milliseconds (0 until the first ack).
     pub rtt_ms: f32,
+    /// Round-trip extremes and running average over the whole session (0 until the first ack).
+    pub rtt_min_ms: f32,
+    pub rtt_max_ms: f32,
+    pub rtt_avg_ms: f32,
+    pub rtt_samples: u64,
     /// Heartbeats sent without an ack arriving before the next one.
     pub heartbeats_lost: u64,
+}
+
+impl MediaStats {
+    pub fn record_rtt(&mut self, rtt_ms: f32) {
+        self.rtt_ms = rtt_ms;
+        if self.rtt_samples == 0 {
+            self.rtt_min_ms = rtt_ms;
+            self.rtt_max_ms = rtt_ms;
+            self.rtt_avg_ms = rtt_ms;
+        } else {
+            self.rtt_min_ms = self.rtt_min_ms.min(rtt_ms);
+            self.rtt_max_ms = self.rtt_max_ms.max(rtt_ms);
+            self.rtt_avg_ms += (rtt_ms - self.rtt_avg_ms) / (self.rtt_samples + 1) as f32;
+        }
+        self.rtt_samples += 1;
+    }
 }
 
 /// Resolve `host:port` from `SessionInitAck.media_addr`; an unspecified host (`0.0.0.0`,
@@ -277,7 +298,9 @@ impl MediaTransport {
                     let pending = *self.heartbeat_pending.lock();
                     if let Some((ts, sent_at)) = pending {
                         if ts == packet.header.timestamp {
-                            self.stats.lock().rtt_ms = sent_at.elapsed().as_secs_f32() * 1000.0;
+                            self.stats
+                                .lock()
+                                .record_rtt(sent_at.elapsed().as_secs_f32() * 1000.0);
                         }
                     }
                     self.heartbeat_acked.store(true, Ordering::Relaxed);
@@ -382,6 +405,23 @@ mod tests {
     use super::*;
     use aurix_common::protocol::channel_id_hash;
     use aurix_common::types::ChannelId;
+
+    #[test]
+    fn rtt_min_avg_max_follow_samples() {
+        let mut s = MediaStats::default();
+        s.record_rtt(40.0);
+        assert_eq!(
+            (s.rtt_min_ms, s.rtt_avg_ms, s.rtt_max_ms),
+            (40.0, 40.0, 40.0)
+        );
+        s.record_rtt(20.0);
+        s.record_rtt(60.0);
+        assert_eq!(s.rtt_ms, 60.0);
+        assert_eq!(s.rtt_min_ms, 20.0);
+        assert_eq!(s.rtt_max_ms, 60.0);
+        assert!((s.rtt_avg_ms - 40.0).abs() < 1e-4, "{}", s.rtt_avg_ms);
+        assert_eq!(s.rtt_samples, 3);
+    }
 
     /// Minimal fake server: answers `SessionBind`, echoes audio back sealed for the client,
     /// answers heartbeats.

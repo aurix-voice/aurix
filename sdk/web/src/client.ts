@@ -33,6 +33,15 @@ import {
   type AudioInjectionOptions,
   type AudioInjectionSource,
 } from './devices.js';
+import {
+  LossWindow,
+  RttTracker,
+  assembleClientStats,
+  networkQualityFromWire,
+  type ClientStats,
+  type NetworkQuality,
+  type RtcStatsInput,
+} from './quality.js';
 
 export interface AurixClientOptions {
   /** REST base URL, e.g. `https://voice.example.com` (used for TURN credentials). */
@@ -82,6 +91,11 @@ export interface AurixClientOptions {
   localVoiceActivity?: boolean | AudioLevelMeterOptions;
   /** Application-level keepalive interval in ms (`Ping`/`Pong`). Default 15000, 0 disables. */
   pingIntervalMs?: number;
+  /**
+   * How often to sample WebRTC statistics and send a `QualityReport` to the server (which
+   * feeds adaptive bitrate and the server-side `networkQuality`). Default 5000, 0 disables.
+   */
+  qualityReportIntervalMs?: number;
   /** Timeout for request/response exchanges (join, offer) in ms. Default 10000. */
   requestTimeoutMs?: number;
   /**
@@ -275,6 +289,13 @@ export interface AurixEvents {
   /** `live` — a real-time stream to an operator service rather than a stored file; same consent flow. */
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string, live: boolean) => void;
   bitrate: (targetKbps: number, reason: string) => void;
+  /**
+   * Server-side view of this connection (downlink from our reports + uplink as measured by
+   * the SFU): sent when the 1–5 `bars` change and periodically as a summary.
+   */
+  networkQuality: (quality: NetworkQuality) => void;
+  /** Statistics snapshot taken before each periodic `QualityReport` (`qualityReportIntervalMs`). */
+  stats: (stats: ClientStats) => void;
   kicked: (channelId: string, reason: string) => void;
   /**
    * Server-side snapshot of this user's receiver preferences, sent right after the session
@@ -467,7 +488,7 @@ function preferStereoOpus(sdp: string): string {
  */
 export class AurixClient {
   private readonly opts: Required<
-    Pick<AurixClientOptions, 'useTurn' | 'pingIntervalMs' | 'requestTimeoutMs'>
+    Pick<AurixClientOptions, 'useTurn' | 'pingIntervalMs' | 'requestTimeoutMs' | 'qualityReportIntervalMs'>
   > &
     AurixClientOptions;
   private ws: WebSocket | undefined;
@@ -506,7 +527,11 @@ export class AurixClient {
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pingNonce = 1;
   private lastPingSentAt = 0;
-  private rttMs = 0;
+  private rtt = new RttTracker();
+  private qualityTimer: ReturnType<typeof setInterval> | undefined;
+  private lossWindow = new LossWindow();
+  private statsSnapshot: ClientStats | undefined;
+  private serverQuality: NetworkQuality | undefined;
   private state: ConnectionState = 'disconnected';
   private session: SessionInfo | undefined;
   private userId: string | undefined;
@@ -532,6 +557,7 @@ export class AurixClient {
       useTurn: true,
       pingIntervalMs: 15_000,
       requestTimeoutMs: 10_000,
+      qualityReportIntervalMs: 5_000,
       autoReconnect: true,
       ...options,
     };
@@ -590,7 +616,20 @@ export class AurixClient {
 
   /** Last measured application-level round-trip time (ms), from `Ping`/`Pong`. */
   get roundTripMs(): number {
-    return this.rttMs;
+    return this.rtt.last;
+  }
+
+  /**
+   * Last server-side quality report (both directions; `bars` 1–5), or `undefined` until the
+   * server has sent one (~2 s after media connects).
+   */
+  get networkQuality(): NetworkQuality | undefined {
+    return this.serverQuality;
+  }
+
+  /** Last snapshot taken by `getStats()` (also refreshed by the periodic quality report). */
+  get lastStats(): ClientStats | undefined {
+    return this.statsSnapshot;
   }
 
   participants(channelId: string): Participant[] {
@@ -949,6 +988,9 @@ export class AurixClient {
     this.closedByUser = false;
     this.resumeToken = undefined;
     this.session = undefined;
+    this.rtt.reset();
+    this.serverQuality = undefined;
+    this.statsSnapshot = undefined;
     this.setState('connecting');
 
     const info = await this.openControlChannel();
@@ -1006,6 +1048,8 @@ export class AurixClient {
     this.channels.clear();
     this.session = undefined;
     this.resumeToken = undefined;
+    this.stopQualityTimer();
+    this.serverQuality = undefined;
     this.setState(finalState);
   }
 
@@ -1264,26 +1308,73 @@ export class AurixClient {
     this.send({ type: 'RecordingConsentResponse', data: { recording_id: recordingId, consent } });
   }
 
-  /** Send WebRTC receiver statistics to the server so it can adapt the downlink bitrate. */
+  /**
+   * Sample the peer connection (`RTCPeerConnection.getStats()`) and return a normalized
+   * snapshot: cumulative packet/byte counters, jitter, RTT min/avg/max, concealment and
+   * discards, downlink loss over the period since the previous call, and the derived
+   * R-factor / MOS / 1–5 bars. Without media the snapshot carries only RTT and the last
+   * server-side quality.
+   */
+  async getStats(): Promise<ClientStats> {
+    const snapshot = await this.sampleStats();
+    this.statsSnapshot = snapshot;
+    return snapshot;
+  }
+
+  /**
+   * Send the current receiver statistics to the server as a `QualityReport` so it can adapt
+   * the downlink bitrate and compute `networkQuality`. Runs automatically every
+   * `qualityReportIntervalMs`; call it directly for an out-of-band report.
+   */
   async reportQuality(): Promise<void> {
     if (!this.pc || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const stats = await this.pc.getStats();
-    let jitter = 0;
-    let lost = 0;
-    let received = 0;
-    stats.forEach((report) => {
-      if (report.type === 'inbound-rtp') {
-        const r = report as RTCInboundRtpStreamStats;
-        jitter = (r.jitter ?? 0) * 1000;
-        lost = r.packetsLost ?? 0;
-        received = r.packetsReceived ?? 0;
-      }
-    });
-    const total = lost + received;
+    const stats = await this.getStats();
+    this.emit('stats', stats);
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.send({
       type: 'QualityReport',
-      data: { rtt_ms: this.rttMs, jitter_ms: jitter, packet_loss: total > 0 ? lost / total : 0 },
+      data: { rtt_ms: stats.rttMs, jitter_ms: stats.jitterMs, packet_loss: stats.lossPercent },
     });
+  }
+
+  private async sampleStats(): Promise<ClientStats> {
+    const input: RtcStatsInput = {};
+    const pc = this.pc;
+    if (pc) {
+      let report: RTCStatsReport | undefined;
+      try {
+        report = await pc.getStats();
+      } catch {
+        report = undefined;
+      }
+      let nominatedRtt: number | undefined;
+      let succeededRtt: number | undefined;
+      report?.forEach((s) => {
+        const entry = s as RTCStats & { kind?: string };
+        if (entry.kind !== undefined && entry.kind !== 'audio') return;
+        switch (entry.type) {
+          case 'inbound-rtp':
+            input.inbound = s as NonNullable<RtcStatsInput['inbound']>;
+            break;
+          case 'outbound-rtp':
+            input.outbound = s as NonNullable<RtcStatsInput['outbound']>;
+            break;
+          case 'remote-inbound-rtp':
+            input.remoteInbound = s as NonNullable<RtcStatsInput['remoteInbound']>;
+            break;
+          case 'candidate-pair': {
+            const pair = s as RTCIceCandidatePairStats & { nominated?: boolean };
+            if (pair.state !== 'succeeded' || pair.currentRoundTripTime === undefined) break;
+            if (pair.nominated) nominatedRtt = pair.currentRoundTripTime;
+            else succeededRtt ??= pair.currentRoundTripTime;
+            break;
+          }
+        }
+      });
+      const iceRtt = nominatedRtt ?? succeededRtt;
+      if (iceRtt !== undefined) input.iceRttSeconds = iceRtt;
+    }
+    return assembleClientStats(this.rtt, input, this.lossWindow, this.serverQuality);
   }
 
   // ── Internals: control channel ──
@@ -1757,8 +1848,15 @@ export class AurixClient {
         const d = (msg as Extract<ServerMessage, { type: 'Pong' }>).data;
         this.lastPongAt = performance.now();
         if (d.nonce === this.pingNonce - 1 && this.lastPingSentAt > 0) {
-          this.rttMs = this.lastPongAt - this.lastPingSentAt;
+          this.rtt.record(this.lastPongAt - this.lastPingSentAt);
         }
+        return;
+      }
+      case 'NetworkQuality': {
+        const d = (msg as Extract<ServerMessage, { type: 'NetworkQuality' }>).data;
+        const quality = networkQualityFromWire(d.quality);
+        this.serverQuality = quality;
+        this.emit('networkQuality', quality);
         return;
       }
       case 'Error': {
@@ -1914,6 +2012,8 @@ export class AurixClient {
 
     const pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' });
     this.pc = pc;
+    this.lossWindow.reset();
+    this.startQualityTimer();
     // One sendrecv audio transceiver: uplink microphone, downlink server-side mix.
     const track = sent.getAudioTracks()[0];
     if (!track) throw new Error('no audio track');
@@ -2059,6 +2159,21 @@ export class AurixClient {
   private stopPing(): void {
     if (this.pingTimer !== undefined) clearInterval(this.pingTimer);
     this.pingTimer = undefined;
+  }
+
+  private startQualityTimer(): void {
+    this.stopQualityTimer();
+    if (this.opts.qualityReportIntervalMs <= 0) return;
+    this.qualityTimer = setInterval(() => {
+      this.reportQuality().catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      });
+    }, this.opts.qualityReportIntervalMs);
+  }
+
+  private stopQualityTimer(): void {
+    if (this.qualityTimer !== undefined) clearInterval(this.qualityTimer);
+    this.qualityTimer = undefined;
   }
 
   private setState(state: ConnectionState): void {

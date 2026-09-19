@@ -589,15 +589,133 @@ pub struct QualityMetrics {
 
 impl QualityMetrics {
     pub fn calculate_mos(&self) -> f32 {
-        let effective_latency = self.rtt_ms + self.jitter_ms * 2.0 + 10.0;
+        quality::mos_from_r(self.r_factor())
+    }
+
+    pub fn r_factor(&self) -> f32 {
+        quality::r_factor(self.rtt_ms, self.jitter_ms, self.packet_loss_percent)
+    }
+
+    /// Network-quality indicator, `1` (unusable) to `5` (excellent).
+    pub fn bars(&self) -> u8 {
+        quality::bars_from_r(self.r_factor())
+    }
+}
+
+/// Simplified E-model (ITU-T G.107) used by every Aurix component for a consistent
+/// quality indicator: clients compute it from their own measurements, the server from the
+/// client report plus what it observes on the uplink.
+pub mod quality {
+    /// Transmission rating `R` in `0..=100` from one-way network conditions. Jitter counts
+    /// double because the jitter buffer turns it into delay; each percent of loss costs 2.5.
+    pub fn r_factor(rtt_ms: f32, jitter_ms: f32, loss_percent: f32) -> f32 {
+        let rtt = if rtt_ms.is_finite() {
+            rtt_ms.max(0.0)
+        } else {
+            0.0
+        };
+        let jitter = if jitter_ms.is_finite() {
+            jitter_ms.max(0.0)
+        } else {
+            0.0
+        };
+        let loss = if loss_percent.is_finite() {
+            loss_percent.clamp(0.0, 100.0)
+        } else {
+            100.0
+        };
+        let effective_latency = rtt + jitter * 2.0 + 10.0;
         let r = if effective_latency < 160.0 {
             93.2 - (effective_latency / 40.0)
         } else {
             93.2 - ((effective_latency - 120.0) / 10.0)
         };
-        let r = r - (self.packet_loss_percent * 2.5);
+        (r - loss * 2.5).clamp(0.0, 100.0)
+    }
+
+    /// Mean opinion score `1.0..=4.5` for a rating `R`.
+    pub fn mos_from_r(r: f32) -> f32 {
         let r = r.clamp(0.0, 100.0);
         1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6
+    }
+
+    /// `R ≥ 80` → 5 bars, `≥ 70` → 4, `≥ 60` → 3, `≥ 50` → 2, else 1 (the G.107 user
+    /// satisfaction bands).
+    pub fn bars_from_r(r: f32) -> u8 {
+        match r {
+            r if r >= 80.0 => 5,
+            r if r >= 70.0 => 4,
+            r if r >= 60.0 => 3,
+            r if r >= 50.0 => 2,
+            _ => 1,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bands_follow_network_conditions() {
+            assert_eq!(bars_from_r(r_factor(20.0, 2.0, 0.0)), 5);
+            assert_eq!(bars_from_r(r_factor(150.0, 20.0, 3.0)), 4);
+            assert_eq!(bars_from_r(r_factor(250.0, 30.0, 3.0)), 3);
+            assert_eq!(bars_from_r(r_factor(300.0, 40.0, 6.0)), 2);
+            assert_eq!(bars_from_r(r_factor(500.0, 80.0, 20.0)), 1);
+            assert_eq!(bars_from_r(r_factor(f32::NAN, f32::INFINITY, f32::NAN)), 1);
+            assert!(mos_from_r(93.0) > 4.3 && mos_from_r(0.0) == 1.0);
+        }
+    }
+}
+
+/// Link quality as seen by the server for one session: the client's view of its downlink
+/// (from `QualityReport`) merged with what the SFU measures on the uplink. Sent to the
+/// client as `NetworkQuality` and shown to operators in the participants/session stats API.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NetworkQuality {
+    /// `1..=5`, the worse of the two directions.
+    pub bars: u8,
+    pub r_factor: f32,
+    pub mos: f32,
+    /// Round trip as measured by the client (0 until it reported).
+    pub rtt_ms: f32,
+    pub downlink_jitter_ms: f32,
+    pub downlink_loss_percent: f32,
+    /// Inter-arrival jitter of the client's audio at the server (RFC 3550).
+    pub uplink_jitter_ms: f32,
+    /// Sequence gaps in the client's packets over the last report interval.
+    pub uplink_loss_percent: f32,
+    pub uplink_bitrate_kbps: u32,
+    /// Totals since the session started.
+    pub uplink_packets_received: u64,
+    pub uplink_packets_lost: u64,
+}
+
+impl NetworkQuality {
+    pub fn compose(
+        client: &QualityMetrics,
+        uplink_jitter_ms: f32,
+        uplink_loss_percent: f32,
+        uplink_bitrate_kbps: u32,
+        uplink_packets_received: u64,
+        uplink_packets_lost: u64,
+    ) -> Self {
+        let down = client.r_factor();
+        let up = quality::r_factor(client.rtt_ms, uplink_jitter_ms, uplink_loss_percent);
+        let r = down.min(up);
+        Self {
+            bars: quality::bars_from_r(r),
+            r_factor: r,
+            mos: quality::mos_from_r(r),
+            rtt_ms: client.rtt_ms,
+            downlink_jitter_ms: client.jitter_ms,
+            downlink_loss_percent: client.packet_loss_percent,
+            uplink_jitter_ms,
+            uplink_loss_percent,
+            uplink_bitrate_kbps,
+            uplink_packets_received,
+            uplink_packets_lost,
+        }
     }
 }
 

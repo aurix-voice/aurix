@@ -29,7 +29,8 @@
 
 use aurix_common::protocol::{TransmissionMode, TtsDestination, TtsState, UserPosition};
 use aurix_common::types::{
-    ActionKind, ChannelId, ChannelRole, Orientation3D, Position3D, RecordingConsent, UserId,
+    ActionKind, ChannelId, ChannelRole, NetworkQuality, Orientation3D, Position3D,
+    RecordingConsent, UserId,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -639,6 +640,8 @@ pub enum AurixEventType {
     AurixEventFailedToRecover = 28,
     /// `message` = reason.
     AurixEventDisconnected = 29,
+    /// `network_quality`.
+    AurixEventNetworkQuality = 30,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -863,6 +866,7 @@ impl AurixEvent {
             Event::Recovered { .. } => T::AurixEventRecovered,
             Event::FailedToRecover { .. } => T::AurixEventFailedToRecover,
             Event::Disconnected { .. } => T::AurixEventDisconnected,
+            Event::NetworkQuality(_) => T::AurixEventNetworkQuality,
         }
     }
 }
@@ -1991,7 +1995,44 @@ pub unsafe extern "C" fn aurix_client_cancel_speech(client: *mut AurixClient) ->
 
 // --------------------------------------------------------------------------------- stats
 
-/// Transport and codec counters for a network-quality indicator.
+/// Server-side view of the connection in both directions. `bars` is `1..=5`
+/// (R ≥ 80/70/60/50 → 5/4/3/2, else 1); loss values are percentages.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AurixNetworkQuality {
+    pub bars: u8,
+    pub r_factor: f32,
+    pub mos: f32,
+    pub rtt_ms: f32,
+    pub downlink_jitter_ms: f32,
+    pub downlink_loss_percent: f32,
+    pub uplink_jitter_ms: f32,
+    pub uplink_loss_percent: f32,
+    pub uplink_bitrate_kbps: u32,
+    pub uplink_packets_received: u64,
+    pub uplink_packets_lost: u64,
+}
+
+impl From<NetworkQuality> for AurixNetworkQuality {
+    fn from(q: NetworkQuality) -> Self {
+        Self {
+            bars: q.bars,
+            r_factor: q.r_factor,
+            mos: q.mos,
+            rtt_ms: q.rtt_ms,
+            downlink_jitter_ms: q.downlink_jitter_ms,
+            downlink_loss_percent: q.downlink_loss_percent,
+            uplink_jitter_ms: q.uplink_jitter_ms,
+            uplink_loss_percent: q.uplink_loss_percent,
+            uplink_bitrate_kbps: q.uplink_bitrate_kbps,
+            uplink_packets_received: q.uplink_packets_received,
+            uplink_packets_lost: q.uplink_packets_lost,
+        }
+    }
+}
+
+/// Transport and codec counters for a network-quality indicator. Counters are lifetime
+/// totals; `loss_percent`, `r_factor`, `mos` and `bars` describe the last quality period.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AurixStats {
@@ -2004,13 +2045,28 @@ pub struct AurixStats {
     pub bad_auth: u64,
     pub replayed: u64,
     pub heartbeats_lost: u64,
-    pub rtt_ms: f32,
-    pub jitter_ms: f32,
-    /// Downlink loss as a percentage.
-    pub loss_percent: f32,
+    /// Downlink frames concealed (PLC), discarded as late, and jitter-buffer underruns.
+    pub frames_lost: u64,
+    pub frames_late: u64,
+    pub underruns: u64,
     pub frames_encoded: u64,
     pub frames_sent: u64,
     pub frames_gated: u64,
+    /// Last heartbeat RTT plus min/avg/max over the session (0 until the first ack).
+    pub rtt_ms: f32,
+    pub rtt_min_ms: f32,
+    pub rtt_avg_ms: f32,
+    pub rtt_max_ms: f32,
+    pub jitter_ms: f32,
+    /// Downlink loss over the last quality period, as a percentage (`0..=100`).
+    pub loss_percent: f32,
+    /// Client-measured downlink quality; `bars` is `1..=5`.
+    pub r_factor: f32,
+    pub mos: f32,
+    pub bars: u8,
+    /// `true` when `server` holds the latest server-reported quality.
+    pub has_server: bool,
+    pub server: AurixNetworkQuality,
     /// Remote streams currently decoding.
     pub active_streams: u32,
 }
@@ -2037,15 +2093,66 @@ pub unsafe extern "C" fn aurix_client_stats(
         bad_auth: s.media.bad_auth,
         replayed: s.media.replayed,
         heartbeats_lost: s.media.heartbeats_lost,
-        rtt_ms: s.media.rtt_ms,
-        jitter_ms: s.jitter_ms,
-        loss_percent: s.loss_percent,
+        frames_lost: s.frames_lost,
+        frames_late: s.frames_late,
+        underruns: s.underruns,
         frames_encoded: s.transmit.frames_encoded,
         frames_sent: s.transmit.frames_sent,
         frames_gated: s.transmit.frames_gated,
+        rtt_ms: s.media.rtt_ms,
+        rtt_min_ms: s.media.rtt_min_ms,
+        rtt_avg_ms: s.media.rtt_avg_ms,
+        rtt_max_ms: s.media.rtt_max_ms,
+        jitter_ms: s.jitter_ms,
+        loss_percent: s.loss_percent,
+        r_factor: s.r_factor,
+        mos: s.mos,
+        bars: s.bars,
+        has_server: s.server.is_some(),
+        server: s.server.map(Into::into).unwrap_or_default(),
         active_streams: s.streams.len() as u32,
     };
     AurixResult::AurixOk
+}
+
+/// Latest server-reported quality. Returns `false` (and leaves `out` untouched) until the
+/// server has sent its first report.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_network_quality(
+    client: *const AurixClient,
+    out: *mut AurixNetworkQuality,
+) -> bool {
+    let Ok(c) = self::client(client) else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    match c.network_quality() {
+        Some(q) => {
+            *out = q.into();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Payload of `AurixEventNetworkQuality`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_network_quality(
+    event: *const AurixEvent,
+    out: *mut AurixNetworkQuality,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::NetworkQuality(q)) => {
+            *out = (*q).into();
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

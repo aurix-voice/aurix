@@ -148,6 +148,15 @@ void AMyPlayerController::Tick(float DeltaSeconds)
 Both native entry points are audio-thread safe and stay valid until `Disconnect()`, which
 stops capture, unbinds the sound wave and only then destroys the client.
 
+### Statistics and network quality bars
+
+`GetStats(FAurixStats&)` returns the native snapshot (packets/bytes both ways, `BadAuth`,
+`Replayed`, `HeartbeatsLost`, `FramesLost`/`FramesLate`/`Underruns`, RTT last/min/avg/max,
+`JitterMs`, `LossPercent` over the last period, `RFactor`, `Mos`, `Bars` 1–5) and
+`GetNetworkQuality(FAurixNetworkQuality&)` the last server-side rating (same fields plus the
+uplink loss/jitter/bitrate the SFU measured); `OnNetworkQuality` fires when the server's bars
+change. Bars use the same thresholds on every SDK and the server, so a HUD can show either.
+
 ### Events
 
 Typed delegates cover connection state, session, media binding, channel/participant roster,

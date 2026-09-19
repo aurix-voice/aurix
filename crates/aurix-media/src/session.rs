@@ -4,6 +4,8 @@ use aurix_common::protocol::{
     decode_audio_level, ReplayWindow, TransmissionMode, AUDIO_LEVEL_SILENCE,
 };
 use aurix_common::types::*;
+
+use crate::quality::{UplinkEstimator, UplinkSample};
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -224,6 +226,10 @@ pub struct MediaSession {
     pub energy_reported: AtomicU8,
     pub last_heartbeat: RwLock<DateTime<Utc>>,
     pub quality: RwLock<QualityMetrics>,
+    /// Server-measured uplink (fed by the router) and the latest merged report sent to the
+    /// client / shown to operators.
+    pub uplink: Mutex<UplinkEstimator>,
+    pub network_quality: RwLock<Option<NetworkQuality>>,
     pub created_at: DateTime<Utc>,
     pub replay: Mutex<ReplayWindow>,
     /// Highest `SessionBind` timestamp accepted so far (rejects replayed binds).
@@ -277,6 +283,8 @@ impl MediaSession {
                 bitrate_kbps: 0,
                 mos_score: 4.5,
             }),
+            uplink: Mutex::new(UplinkEstimator::default()),
+            network_quality: RwLock::new(None),
             created_at: Utc::now(),
             replay: Mutex::new(ReplayWindow::default()),
             last_bind_ms: AtomicI64::new(i64::MIN),
@@ -529,6 +537,36 @@ impl MediaSession {
 
     pub fn get_quality(&self) -> QualityMetrics {
         self.quality.read().clone()
+    }
+
+    /// Account for an authenticated uplink packet (see `UplinkEstimator::record`).
+    pub fn record_uplink(&self, seq: u64, rtp_ts: Option<u32>, bytes: usize) {
+        self.uplink
+            .lock()
+            .record(seq, rtp_ts, bytes, std::time::Instant::now());
+    }
+
+    /// Close the current uplink interval and merge it with the client's last `QualityReport`.
+    /// Returns the new report and whether its bar count differs from the previous one.
+    pub fn refresh_network_quality(&self) -> (NetworkQuality, bool) {
+        let sample: UplinkSample = self.uplink.lock().sample(std::time::Instant::now());
+        let client = self.get_quality();
+        let quality = NetworkQuality::compose(
+            &client,
+            sample.jitter_ms,
+            sample.loss_percent,
+            sample.bitrate_kbps,
+            sample.packets_received,
+            sample.packets_lost,
+        );
+        let mut slot = self.network_quality.write();
+        let changed = slot.map(|q| q.bars) != Some(quality.bars);
+        *slot = Some(quality);
+        (quality, changed)
+    }
+
+    pub fn get_network_quality(&self) -> Option<NetworkQuality> {
+        *self.network_quality.read()
     }
 
     pub fn next_sequence(&self) -> u32 {

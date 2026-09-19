@@ -1,7 +1,7 @@
 use aurix_common::protocol::{
     ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsState, UserPosition,
 };
-use aurix_common::types::{ActionKind, ChannelId, ChannelRole, SessionId, UserId};
+use aurix_common::types::{ActionKind, ChannelId, ChannelRole, NetworkQuality, SessionId, UserId};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -112,6 +112,9 @@ pub enum Event {
         bitrate_bps: u32,
         reason: String,
     },
+    /// Periodic server-side view of both directions (bars 1–5, R-factor, MOS, RTT,
+    /// jitter/loss per direction). Also available any time via `Client::stats().server`.
+    NetworkQuality(NetworkQuality),
     Kicked {
         channel_id: ChannelId,
         reason: String,
