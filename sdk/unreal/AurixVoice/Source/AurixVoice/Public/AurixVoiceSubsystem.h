@@ -119,6 +119,14 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
 	TArray<FAurixParticipant> GetParticipants(FGuid ChannelId) const;
 
+	/** Speech in the channel is transcribed server-side (captions arrive as OnTranscript). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool IsChannelTranscribed(FGuid ChannelId) const;
+
+	/** Speech in the channel is analysed by the server's content-safety classifier — disclose it to the player. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool IsChannelMonitored(FGuid ChannelId) const;
+
 	/** Owner of an SSRC (microphone or its TTS voice) across joined channels. */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
 	bool GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const;

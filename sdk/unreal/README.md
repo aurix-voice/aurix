@@ -201,6 +201,10 @@ speaking/energy, transmission/focus, blocks, recording notices (`OnRecording` â†
 transcripts, TTS status, request/server errors and the reconnect lifecycle. `OnRawEvent`
 delivers every event as JSON for anything not typed (remote position updates, future fields).
 
+`IsChannelTranscribed` / `IsChannelMonitored` (from `ChannelJoinAck`) tell whether a joined
+channel is captioned or analysed by the server's content-safety classifier â€” show the latter
+to the player where your policy requires a disclosure.
+
 All events are dispatched on the game thread from the subsystem's tick (up to 256 events per
 tick; backlog is drained across ticks, nothing is dropped).
 

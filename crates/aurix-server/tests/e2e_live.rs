@@ -6337,3 +6337,616 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
         p.send(&ControlMessage::ChannelLeave { channel_id }).await;
     }
 }
+
+/// Content safety against the mock classifier (`examples/mock_speech.rs`, `/v1/moderations`).
+/// Opt in with `AURIX_E2E_SAFETY=1` against a node configured like the CI "speech + content
+/// safety" step: `[stt]` + `safety.enabled`, `configs/lexicon.example.toml`,
+/// `text.auto_mute = "elevated"`, `voice.auto_kick = "high"`, recording storage on (evidence),
+/// default thresholds (incident 0.7, elevated 1.0, high 2.5).
+///
+/// Chat runs lexicon → classifier → delivery: clean text passes, `shit` is masked, `kys` is
+/// blocked with a self-harm incident, `rude` is delivered but recorded, the second incident
+/// lifts the user to `elevated` and the pipeline server-mutes them through the moderation
+/// primitives (attributed to the system actor); a failing classifier fails open. Voice runs
+/// only for channels with `safety_voice` (disclosed in the join ack, no `Transcript`s are
+/// delivered for safety-only channels), skips E2EE frames, stores an encrypted Ogg/Opus
+/// evidence clip and, at `high`, kicks. Incidents are listed/exported over REST with the
+/// clip inline for `recordings:read`, are tenant-scoped, and reach SSE from every node.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with [safety] pointed at examples/mock_speech.rs"]
+async fn content_safety_incidents_evidence_and_auto_actions() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    if std::env::var("AURIX_E2E_SAFETY").is_err() {
+        eprintln!("AURIX_E2E_SAFETY not set; skipping (node must run with [safety] enabled)");
+        return;
+    }
+    let http = reqwest::Client::new();
+    let env2 = match std::env::var("AURIX_E2E_WS2") {
+        Ok(ws) => Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+            ws,
+            api_key: env.api_key.clone(),
+        },
+        Err(_) => {
+            eprintln!("AURIX_E2E_WS2 not set; running Carol on the same node");
+            env.clone()
+        }
+    };
+
+    let monitored =
+        create_channel_with(&env, &http, serde_json::json!({"safety_voice": true})).await;
+    let plain = create_channel(&env, &http).await;
+    // Risk is per user and persisted; fresh users keep reruns independent.
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let (tok_a, uid_a) = issue_token_for(
+        &env,
+        &http,
+        &format!("safety:{run}:alice"),
+        "Alice",
+        &[monitored, plain],
+    )
+    .await;
+    let (tok_b, _) = issue_token_for(
+        &env,
+        &http,
+        &format!("safety:{run}:bob"),
+        "Bob",
+        &[monitored, plain],
+    )
+    .await;
+    let (tok_c, uid_c) = issue_token(
+        &env2,
+        &http,
+        &format!("safety:{run}:carol"),
+        "Carol",
+        monitored,
+    )
+    .await;
+    let alice_id = UserId::from_uuid(uid_a.parse().unwrap());
+    let carol_id = UserId::from_uuid(uid_c.parse().unwrap());
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(&env2, "carol", tok_c).await;
+    for p in [&mut alice, &mut bob] {
+        bind_media(p).await;
+    }
+
+    // The join ack discloses safety monitoring; a safety-only channel is not "transcribed".
+    async fn join_expecting(p: &mut Player, ch: ChannelId, monitored: bool) {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id: ch,
+            token: tok,
+        })
+        .await;
+        let ack = p
+            .expect("ChannelJoinAck", |m| {
+                matches!(m, ControlMessage::ChannelJoinAck { channel_id, .. } if *channel_id == ch)
+            })
+            .await;
+        let ControlMessage::ChannelJoinAck {
+            transcription,
+            safety_voice,
+            ..
+        } = ack
+        else {
+            unreachable!()
+        };
+        assert_eq!(safety_voice, monitored, "{}: join ack for {ch}", p.name);
+        assert!(
+            !transcription,
+            "{}: safety-only channels deliver no transcripts",
+            p.name
+        );
+    }
+    join_expecting(&mut alice, monitored, true).await;
+    join_expecting(&mut alice, plain, false).await;
+    join_expecting(&mut bob, monitored, true).await;
+    join_expecting(&mut bob, plain, false).await;
+    join_expecting(&mut carol, monitored, true).await;
+    alice
+        .send(&ControlMessage::SetTransmission {
+            mode: TransmissionMode::All,
+        })
+        .await;
+    alice
+        .expect("TransmissionChanged", |m| {
+            matches!(m, ControlMessage::TransmissionChanged { .. })
+        })
+        .await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        drain_ws(p).await;
+    }
+
+    let mut sse = SseClient::open(
+        &env,
+        &env.api_key,
+        Some("safety.incident,safety.risk_changed,participant.muted"),
+    )
+    .await
+    .unwrap();
+    // Events about other tests' users may interleave; wait for the one about `user`.
+    async fn expect_sse_for(
+        sse: &mut SseClient,
+        event: &str,
+        user: &str,
+        what: &str,
+    ) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (ev, data) = sse
+                .next(left)
+                .await
+                .unwrap_or_else(|| panic!("no `{event}` SSE frame for {what}"));
+            if ev == event && data["data"]["user_id"].as_str() == Some(user) {
+                return data["data"].clone();
+            }
+        }
+    }
+    async fn expect_incident(sse: &mut SseClient, user: &str, what: &str) -> serde_json::Value {
+        expect_sse_for(sse, "safety.incident", user, what).await
+    }
+    async fn expect_risk_change(sse: &mut SseClient, user: &str, to: &str) -> serde_json::Value {
+        let data = expect_sse_for(sse, "safety.risk_changed", user, to).await;
+        assert_eq!(data["risk_level"], to, "{data}");
+        data
+    }
+    let risk = |user: &str| {
+        let http = http.clone();
+        let env = env.clone();
+        let user = user.to_string();
+        async move {
+            let r: serde_json::Value = http
+                .get(format!("{}/v1/safety/users/{user}/risk", env.api))
+                .header("x-api-key", &env.api_key)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            r
+        }
+    };
+    let r0 = risk(&uid_a).await;
+    assert_eq!(r0["risk_level"], "none", "{r0}");
+    assert_eq!(r0["incidents"], 0);
+
+    // ── chat: clean → delivered untouched; profanity → masked ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: monitored,
+            text: "gg wp".into(),
+            metadata: None,
+            client_ref: Some("s-1".into()),
+        })
+        .await;
+    assert_eq!(expect_chat(&mut alice, "clean echo").await.text, "gg wp");
+    assert_eq!(expect_chat(&mut bob, "clean").await.text, "gg wp");
+    assert_eq!(
+        expect_chat(&mut carol, "clean cross-node").await.text,
+        "gg wp"
+    );
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: monitored,
+            text: "oh Sh1t that hurt".into(),
+            metadata: None,
+            client_ref: Some("s-2".into()),
+        })
+        .await;
+    let masked = expect_chat(&mut alice, "masked echo").await;
+    assert_eq!(
+        masked.text, "oh **** that hurt",
+        "lexicon mask through obfuscation"
+    );
+    assert_eq!(masked.client_ref.as_deref(), Some("s-2"));
+    assert_eq!(
+        expect_chat(&mut bob, "masked").await.text,
+        "oh **** that hurt"
+    );
+    assert_eq!(
+        expect_chat(&mut carol, "masked").await.text,
+        "oh **** that hurt"
+    );
+    let r1 = risk(&uid_a).await;
+    assert_eq!(
+        r1["incidents"], 0,
+        "a mask below the threshold is no incident: {r1}"
+    );
+
+    // ── chat: lexicon block → MESSAGE_BLOCKED, nobody receives it, incident recorded ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: monitored,
+            text: "just kys already".into(),
+            metadata: None,
+            client_ref: Some("s-3".into()),
+        })
+        .await;
+    let m = alice
+        .expect("blocked ChatSend error", |m| {
+            matches!(m, ControlMessage::Error { .. })
+        })
+        .await;
+    assert!(
+        matches!(&m, ControlMessage::Error { code, client_ref, .. }
+            if code == "MESSAGE_BLOCKED" && client_ref.as_deref() == Some("s-3")),
+        "{m:?}"
+    );
+    assert_no_chat(&mut bob, "the message was blocked").await;
+    let inc1 = expect_incident(&mut sse, &uid_a, "kys").await;
+    assert_eq!(inc1["source"], "text", "{inc1}");
+    assert_eq!(inc1["channel_id"], monitored.to_string());
+    assert_eq!(inc1["text"], "just kys already");
+    assert_eq!(
+        inc1["classifier"], "lexicon",
+        "a lexicon block needs no classifier: {inc1}"
+    );
+    assert!(inc1["score"].as_f64().unwrap() >= 0.89, "{inc1}");
+    assert!(
+        inc1["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "self-harm"),
+        "{inc1}"
+    );
+    assert_eq!(
+        inc1["risk_level"], "low",
+        "0.9 is below `risk_elevated`: {inc1}"
+    );
+    assert_eq!(inc1["actions"], serde_json::json!([]));
+    assert!(inc1["evidence_recording_id"].is_null());
+    let rc = expect_risk_change(&mut sse, &uid_a, "low").await;
+    assert_eq!(rc["previous_level"], "none", "{rc}");
+
+    // ── chat: classifier score 0.75 → delivered (below block threshold) but recorded; second
+    //    incident → elevated → text.auto_mute fires through the moderation primitives ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: monitored,
+            text: "you are so rude".into(),
+            metadata: None,
+            client_ref: Some("s-4".into()),
+        })
+        .await;
+    assert_eq!(
+        expect_chat(&mut bob, "recorded but delivered").await.text,
+        "you are so rude"
+    );
+    assert_eq!(
+        expect_chat(&mut carol, "recorded but delivered").await.text,
+        "you are so rude"
+    );
+    let inc2 = expect_incident(&mut sse, &uid_a, "rude").await;
+    assert_eq!(inc2["classifier"], "openai_moderation", "{inc2}");
+    assert!(
+        (inc2["score"].as_f64().unwrap() - 0.75).abs() < 0.01,
+        "{inc2}"
+    );
+    assert_eq!(inc2["risk_level"], "elevated", "0.9 + 0.75 ≥ 1.0: {inc2}");
+    assert_eq!(inc2["actions"], serde_json::json!(["mute"]), "{inc2}");
+    expect_risk_change(&mut sse, &uid_a, "elevated").await;
+    for p in [&mut alice, &mut bob] {
+        expect_within(p, "automatic server mute", Duration::from_secs(5), |m| {
+            matches!(m, ControlMessage::MuteStateChanged { channel_id, user_id, server_muted: true, .. }
+                if *channel_id == monitored && *user_id == alice_id)
+        })
+        .await;
+    }
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id: monitored,
+            text: "hello?".into(),
+            metadata: None,
+            client_ref: Some("s-5".into()),
+        })
+        .await;
+    expect_error(&mut alice, "server-muted sender", "USER_MUTED").await;
+    // The mute is a regular moderation action attributed to the system actor.
+    let muted = expect_sse_for(&mut sse, "participant.muted", &uid_a, "auto mute").await;
+    assert_eq!(muted["server_mute"], true, "{muted}");
+    assert_eq!(
+        muted["muted_by"],
+        aurix_control::SYSTEM_USER.to_string(),
+        "{muted}"
+    );
+    assert_eq!(muted["channel_id"], monitored.to_string());
+
+    // Incident detail + context messages; the incident list filters by source and user.
+    let detail: serde_json::Value = http
+        .get(format!(
+            "{}/v1/safety/incidents/{}",
+            env.api,
+            inc2["incident_id"].as_str().unwrap()
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["source"], "text");
+    assert_eq!(detail["text"], "you are so rude");
+    assert_eq!(detail["incident"]["event_type"], "safety.text");
+    assert_eq!(detail["incident"]["status"], "pending");
+    assert!(detail["audio"].is_null());
+    let ctx_texts: Vec<&str> = detail["context"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        ctx_texts.contains(&"gg wp") && ctx_texts.contains(&"oh **** that hurt"),
+        "delivered messages before the incident are attached as context: {ctx_texts:?}"
+    );
+    assert!(
+        !ctx_texts.contains(&"just kys already"),
+        "blocked messages are not context: {ctx_texts:?}"
+    );
+    let listed: serde_json::Value = http
+        .get(format!(
+            "{}/v1/safety/incidents?source=text&user_id={uid_a}",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
+
+    // A failing classifier fails open (text.fail_open = true by default).
+    bob.send(&ControlMessage::ChatSend {
+        channel_id: monitored,
+        text: "[classifier-fail] anyone there?".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    assert_eq!(
+        expect_chat(&mut carol, "fail-open delivery").await.text,
+        "[classifier-fail] anyone there?"
+    );
+    drain_ws(&mut bob).await;
+
+    // Carol's incident on the other node reaches this node's SSE; her risk is shared via the DB.
+    carol
+        .send(&ControlMessage::ChatSend {
+            channel_id: monitored,
+            text: "i hate all of you".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    let inc_c = expect_incident(&mut sse, &uid_c, "carol's hate").await;
+    assert_eq!(inc_c["user_id"], carol_id.to_string());
+    assert_eq!(inc_c["risk_level"], "low");
+    let rc = risk(&uid_c).await;
+    assert_eq!(rc["incidents"], 1, "{rc}");
+    drain_ws(&mut bob).await;
+    drain_ws(&mut carol).await;
+    drain_ws(&mut alice).await;
+
+    // ── voice: lift the mute, then speak ──
+    http.post(format!("{}/v1/moderation/mute", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"user_id": uid_a, "channel_id": monitored, "muted": false}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    expect_within(&mut alice, "unmuted", Duration::from_secs(5), |m| {
+        matches!(m, ControlMessage::MuteStateChanged { server_muted: false, user_id, .. } if *user_id == alice_id)
+    })
+    .await;
+    drain_ws(&mut bob).await;
+
+    // A clean tone, a tone in the unmonitored channel and an E2EE tone: no incidents, and a
+    // safety-only channel never delivers transcripts.
+    stream_frames(&alice, monitored, 1, &opus_tone(440.0, 1_600), false).await;
+    stream_frames(&alice, plain, 1_000, &opus_tone(880.0, 1_600), false).await;
+    stream_frames(&alice, monitored, 2_000, &opus_tone(880.0, 1_600), true).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        assert_no_transcript(p, Duration::from_millis(400), "safety-only channel").await;
+    }
+    let r2 = risk(&uid_a).await;
+    assert_eq!(r2["incidents"], 2, "clean / unmonitored / e2ee audio: {r2}");
+    for p in [&alice, &bob] {
+        drain_udp(p).await;
+    }
+
+    // Flagged speech → voice incident with an evidence clip; 0.9 + 0.75 + 0.95 ≥ 2.5 → high →
+    // voice.auto_kick removes Alice from the channel.
+    stream_frames(&alice, monitored, 3_000, &opus_tone(880.0, 1_600), false).await;
+    let inc3 = expect_incident(&mut sse, &uid_a, "880hz").await;
+    assert_eq!(inc3["source"], "voice", "{inc3}");
+    assert!(
+        tone_hz(inc3["text"].as_str().unwrap()).is_some_and(|hz| (hz - 880.0).abs() < 15.0),
+        "the transcript is attached: {inc3}"
+    );
+    assert_eq!(inc3["classifier"], "openai_moderation");
+    assert_eq!(inc3["risk_level"], "high", "{inc3}");
+    assert_eq!(inc3["actions"], serde_json::json!(["kick"]), "{inc3}");
+    let recording_id = inc3["evidence_recording_id"]
+        .as_str()
+        .expect("evidence clip stored")
+        .to_string();
+    expect_risk_change(&mut sse, &uid_a, "high").await;
+    alice
+        .expect("automatic kick", |m| {
+            matches!(m, ControlMessage::Kick { channel_id, user_id, .. }
+                if *channel_id == monitored && *user_id == alice_id)
+        })
+        .await;
+    bob.expect("Alice removed", |m| {
+        matches!(m, ControlMessage::ParticipantLeft { channel_id, user_id, .. }
+            if *channel_id == monitored && *user_id == alice_id)
+    })
+    .await;
+
+    // Evidence: a `kind = evidence` recording, exported inline as decrypted Ogg/Opus for a key
+    // with `recordings:read`, downloadable through the recordings API.
+    let export: serde_json::Value = http
+        .get(format!(
+            "{}/v1/safety/incidents/{}/export",
+            env.api,
+            inc3["incident_id"].as_str().unwrap()
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(export["source"], "voice");
+    assert_eq!(export["incident"]["recording_id"], recording_id);
+    assert_eq!(
+        export["incident"]["evidence"]["audio"]["recording_id"],
+        recording_id
+    );
+    assert!(
+        export["incident"]["evidence"]["audio"]["clip_ms"]
+            .as_u64()
+            .unwrap()
+            >= 1_000,
+        "{}",
+        export["incident"]["evidence"]["audio"]
+    );
+    let audio = &export["audio"];
+    assert_eq!(audio["recording_id"], recording_id);
+    assert_eq!(audio["format"], "ogg_opus");
+    assert_eq!(audio["expired"], false);
+    assert_eq!(
+        audio["download_path"],
+        format!("/v1/recordings/{recording_id}/download")
+    );
+    assert!(audio["duration_secs"].as_f64().unwrap() >= 1.0, "{audio}");
+    use base64::Engine as _;
+    let clip = base64::engine::general_purpose::STANDARD
+        .decode(audio["content_base64"].as_str().expect("inline clip"))
+        .unwrap();
+    assert_eq!(&clip[..4], b"OggS", "decrypted Ogg container");
+    assert_eq!(clip.len() as i64, audio["size_bytes"].as_i64().unwrap());
+    let download = http
+        .get(format!(
+            "{}{}",
+            env.api,
+            audio["download_path"].as_str().unwrap()
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        &download[..],
+        &clip[..],
+        "download path serves the same clip"
+    );
+    let rec: serde_json::Value = http
+        .get(format!("{}/v1/recordings/{recording_id}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rec["recording"]["kind"], "evidence", "{rec}");
+    assert_eq!(rec["recording"]["channel_id"], monitored.to_string());
+
+    let r3 = risk(&uid_a).await;
+    assert_eq!(r3["risk_level"], "high", "{r3}");
+    assert_eq!(r3["incidents"], 3);
+    let all: serde_json::Value = http
+        .get(format!("{}/v1/safety/incidents?user_id={uid_a}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 3, "{all}");
+    let bad = http
+        .get(format!("{}/v1/safety/incidents?source=email", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // ── tenant isolation ──
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        for path in [
+            format!(
+                "/v1/safety/incidents/{}",
+                inc3["incident_id"].as_str().unwrap()
+            ),
+            format!(
+                "/v1/safety/incidents/{}/export",
+                inc3["incident_id"].as_str().unwrap()
+            ),
+            format!("/v1/safety/users/{uid_a}/risk"),
+            format!("/v1/recordings/{recording_id}"),
+        ] {
+            let r = http
+                .get(format!("{}{path}", env.api))
+                .header("x-api-key", &api_key2)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 404, "{path} must not exist for another tenant");
+        }
+        let other: serde_json::Value = http
+            .get(format!("{}/v1/safety/incidents?user_id={uid_a}", env.api))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(other.as_array().unwrap().len(), 0, "{other}");
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    for p in [&mut bob, &mut carol] {
+        p.send(&ControlMessage::ChannelLeave {
+            channel_id: monitored,
+        })
+        .await;
+    }
+}

@@ -370,6 +370,7 @@ name = "aurix-common"
 version = "1.0.0"
 dependencies = [
  "aes",
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -398,6 +399,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "unicode-normalization",
  "url",
  "uuid",
 ]

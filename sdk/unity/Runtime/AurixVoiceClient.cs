@@ -120,6 +120,7 @@ namespace Aurix
         private int _speakRefCounter;
         private bool _wantTranscripts = true;
         private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
+        private readonly HashSet<Guid> _monitoredChannels = new HashSet<Guid>();
         /// <summary>Audio policy of every joined channel (from <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>).</summary>
         private readonly Dictionary<Guid, AudioPolicy> _channelPolicies = new Dictionary<Guid, AudioPolicy>();
         private AudioPolicy? _audioPolicy;
@@ -593,6 +594,7 @@ namespace Aurix
             {
                 _joinedChannels.Remove(channelId);
                 _transcribedChannels.Remove(channelId);
+                _monitoredChannels.Remove(channelId);
                 _channelPolicies.Remove(channelId);
                 if (_channels.TryGetValue(channelId, out var map))
                 {
@@ -784,6 +786,16 @@ namespace Aurix
             lock (_channels) return _transcribedChannels.Contains(channelId);
         }
 
+        /// <summary>
+        /// Whether speech in <paramref name="channelId"/> is monitored by the operator's content-safety
+        /// pipeline (transcribed and classified server-side, <c>ChannelConfig.safety_voice</c>). Disclose
+        /// this to players, e.g. with a "voice chat is moderated" badge.
+        /// </summary>
+        public bool IsChannelMonitored(Guid channelId)
+        {
+            lock (_channels) return _monitoredChannels.Contains(channelId);
+        }
+
         /// <summary>Whether this client receives <see cref="OnTranscript"/> (default true).</summary>
         public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
 
@@ -875,7 +887,11 @@ namespace Aurix
             }
             foreach (var tcs in speak) tcs.TrySetException(e);
             foreach (var tcs in done) tcs.TrySetException(e);
-            lock (_channels) _transcribedChannels.Clear();
+            lock (_channels)
+            {
+                _transcribedChannels.Clear();
+                _monitoredChannels.Clear();
+            }
         }
 
         /// <summary>A fresh (non-resumed) session forgot our local mutes/volumes/transmission: send them again.</summary>
@@ -1321,6 +1337,7 @@ namespace Aurix
                         _channels[channelId] = map;
                         _joinedChannels.Add(channelId);
                         if (m.Bool("transcription")) _transcribedChannels.Add(channelId); else _transcribedChannels.Remove(channelId);
+                        if (m.Bool("safety_voice")) _monitoredChannels.Add(channelId); else _monitoredChannels.Remove(channelId);
                         var policy = Audio.AudioPolicy.FromMessage(m);
                         if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
                     }

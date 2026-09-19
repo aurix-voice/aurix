@@ -6,12 +6,14 @@ use aurix_common::error::AurixError;
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
+use aurix_control::safety::{event_type_for_source, is_safety_event, IncidentExport};
 use aurix_control::SelectionHint;
 use axum::{
     extract::{Extension, State},
     http::HeaderMap,
     response::IntoResponse,
 };
+use base64::Engine;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1642,6 +1644,150 @@ pub async fn resolve_moderation_event(
     Ok(Json(
         serde_json::json!({"resolved": true, "event_id": event_id}),
     ))
+}
+
+// ── Content safety ──
+
+#[derive(Deserialize)]
+pub struct SafetyIncidentsQuery {
+    pub user_id: Option<String>,
+    /// `voice` or `text`.
+    pub source: Option<String>,
+    pub status: Option<String>,
+    #[serde(default = "default_page")]
+    pub page: u32,
+    #[serde(default = "default_per_page")]
+    pub per_page: u32,
+}
+
+/// Incidents produced by the safety pipeline (a filtered view of the moderation events).
+pub async fn list_safety_incidents(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Query(query): Query<SafetyIncidentsQuery>,
+) -> JsonResult {
+    ctx.require("moderation:read")?;
+    let user_id = query
+        .user_id
+        .as_deref()
+        .map(|u| parse_uuid(u, "user_id"))
+        .transpose()?;
+    let event_type = match query.source.as_deref() {
+        None => None,
+        Some(s) => Some(
+            event_type_for_source(s)
+                .ok_or_else(|| AurixError::Validation("source must be 'voice' or 'text'".into()))?,
+        ),
+    };
+    let (limit, offset) = paging(query.page, query.per_page);
+    let rows = aurix_db::queries::list_safety_incidents(
+        &state.control.pool,
+        ctx.app_id.0,
+        user_id,
+        event_type,
+        query.status.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|e| AurixError::Database(format!("Safety incident list failed: {e}")))?;
+    to_json(rows)
+}
+
+async fn load_safety_incident(
+    state: &AppState,
+    app_id: AppId,
+    incident_id: Uuid,
+) -> Result<aurix_db::models::ModerationEventRow, ApiError> {
+    let row = aurix_db::queries::get_moderation_event(&state.control.pool, app_id.0, incident_id)
+        .await
+        .map_err(|e| AurixError::Database(format!("Safety incident lookup failed: {e}")))?
+        .filter(is_safety_event)
+        .ok_or_else(|| AurixError::NotFound("Safety incident not found".into()))?;
+    Ok(row)
+}
+
+/// The incident with its context and evidence-clip metadata (the clip itself is fetched
+/// through `GET /v1/recordings/{id}/download` or included by `/export`).
+pub async fn get_safety_incident(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(incident_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("moderation:read")?;
+    let row = load_safety_incident(&state, ctx.app_id, incident_id).await?;
+    let recording = match (row.recording_id, state.recording.as_deref()) {
+        (Some(rid), Some(svc)) => svc.get_recording(ctx.app_id, rid).await?,
+        _ => None,
+    };
+    to_json(IncidentExport::from_row(row, recording, Utc::now()))
+}
+
+/// Self-contained evidence bundle for hand-off to a trust & safety team: the incident, the
+/// surrounding messages and — when one exists and the key may read recordings — the decrypted
+/// audio clip inline (`audio.content_base64`, Ogg/Opus). Access to the clip is audited like a
+/// recording download.
+pub async fn export_safety_incident(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(incident_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("moderation:read")?;
+    let row = load_safety_incident(&state, ctx.app_id, incident_id).await?;
+    let mut clip: Option<Vec<u8>> = None;
+    let recording = match (row.recording_id, state.recording.as_deref()) {
+        (Some(rid), Some(svc)) => {
+            let rec = svc.get_recording(ctx.app_id, rid).await?;
+            if rec.is_some() && ctx.has("recordings:read") {
+                match svc.read_recording(ctx.app_id, rid).await {
+                    Ok((_, bytes)) => {
+                        state.control.audit.log(
+                            Some(ctx.app_id),
+                            ctx.actor(),
+                            AuditAction::RecordingAccessed,
+                            "recording",
+                            &rid.to_string(),
+                            serde_json::json!({"bytes": bytes.len(), "incident_id": incident_id}),
+                            client_ip_string(ip),
+                        );
+                        clip = Some(bytes);
+                    }
+                    Err(AurixError::NotFound(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            rec
+        }
+        _ => None,
+    };
+    let export = IncidentExport::from_row(row, recording, Utc::now());
+    let mut body = serde_json::to_value(&export)
+        .map_err(|e| AurixError::Internal(format!("export serialization: {e}")))?;
+    if let (Some(bytes), Some(audio)) = (clip, body.get_mut("audio")) {
+        audio["content_base64"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    Ok(Json(body))
+}
+
+/// Current decayed risk of a user in this app.
+pub async fn get_safety_user_risk(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("moderation:read")?;
+    let user = aurix_db::queries::get_user(&state.control.pool, ctx.app_id.0, user_id)
+        .await
+        .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
+        .ok_or_else(|| AurixError::NotFound("User not found".into()))?;
+    let snapshot = state
+        .control
+        .safety
+        .user_risk(ctx.app_id, UserId(user.id))
+        .await?;
+    to_json(snapshot)
 }
 
 #[derive(Deserialize)]

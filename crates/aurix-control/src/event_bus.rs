@@ -236,6 +236,38 @@ pub enum ServerEvent {
         duration_ms: Option<u64>,
         message: Option<String>,
     },
+    /// The safety pipeline flagged speech or a chat message above the incident threshold. The
+    /// incident is stored as a `moderation_events` row (`incident_id`); `text` is the flagged
+    /// transcript/message and `evidence_recording_id` the audio clip, when kept.
+    SafetyIncident {
+        app_id: AppId,
+        incident_id: uuid::Uuid,
+        channel_id: Option<ChannelId>,
+        session_id: Option<SessionId>,
+        user_id: UserId,
+        source: aurix_common::safety::SafetySource,
+        score: f32,
+        categories: Vec<String>,
+        text: Option<String>,
+        classifier: String,
+        evidence_recording_id: Option<uuid::Uuid>,
+        /// Cumulative decayed risk of the user after this incident and the level it maps to.
+        risk_score: f32,
+        risk_level: aurix_common::safety::RiskLevel,
+        /// Automatic actions the node took (`mute`, `kick`).
+        actions: Vec<String>,
+        timestamp: DateTime<Utc>,
+    },
+    /// A user's decayed risk crossed a level boundary (either direction).
+    SafetyRiskChanged {
+        app_id: AppId,
+        user_id: UserId,
+        session_id: Option<SessionId>,
+        risk_score: f32,
+        risk_level: aurix_common::safety::RiskLevel,
+        previous_level: aurix_common::safety::RiskLevel,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl ServerEvent {
@@ -269,7 +301,9 @@ impl ServerEvent {
             | Self::ChannelEnergy { app_id, .. }
             | Self::Transcript { app_id, .. }
             | Self::TtsAnnouncement { app_id, .. }
-            | Self::TtsStatus { app_id, .. } => Some(*app_id),
+            | Self::TtsStatus { app_id, .. }
+            | Self::SafetyIncident { app_id, .. }
+            | Self::SafetyRiskChanged { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => None,
         }
     }
@@ -314,6 +348,8 @@ impl ServerEvent {
             Self::ChannelEnergy { .. } => "channel.energy",
             Self::Transcript { .. } => "channel.transcript",
             Self::TtsStatus { .. } => "tts.status",
+            Self::SafetyIncident { .. } => "safety.incident",
+            Self::SafetyRiskChanged { .. } => "safety.risk_changed",
             Self::NodeHealthChanged { .. }
             | Self::WebhooksChanged { .. }
             | Self::RecordingConsentGiven { .. }
@@ -349,6 +385,8 @@ impl ServerEvent {
         "channel.energy",
         "channel.transcript",
         "tts.status",
+        "safety.incident",
+        "safety.risk_changed",
     ];
 
     /// Types a subscription may name (the real-time noise is SSE-only).

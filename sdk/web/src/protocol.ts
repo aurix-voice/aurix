@@ -189,6 +189,7 @@ export type ServerMessage =
         channel_id: string;
         participants: ParticipantBrief[];
         transcription?: boolean;
+        safety_voice?: boolean;
         audio?: AudioPolicyWire;
       };
     }

@@ -212,6 +212,7 @@ impl SpeechService {
                 channel_id: Some(req.channel_id),
                 from_user_id: req.session.user_id,
                 to_user_id: None,
+                session_id: Some(req.session.session_id),
                 display_name: &req.display_name,
                 text: &text,
                 metadata: None,

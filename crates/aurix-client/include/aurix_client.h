@@ -130,7 +130,8 @@ typedef enum AurixEventType {
   AURIX_EVENT_SESSION_READY = 1,
   AURIX_EVENT_MEDIA_BOUND = 2,
   /**
-   * `request_id`, `channel_id`, `participants`, `flag` = transcription enabled.
+   * `request_id`, `channel_id`, `participants`, `flag` = transcription enabled, `flag2` =
+   * content-safety monitoring (disclose it to the player).
    */
   AURIX_EVENT_CHANNEL_JOINED = 3,
   /**
@@ -797,7 +798,8 @@ struct AurixUuid aurix_event_object_id(const struct AurixEvent *event);
 bool aurix_event_flag(const struct AurixEvent *event);
 
 /**
- * Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`.
+ * Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`,
+ * `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`.
  */
 bool aurix_event_flag2(const struct AurixEvent *event);
 
@@ -867,6 +869,19 @@ enum AurixResult aurix_client_leave_channel(struct AurixClient *client,
 size_t aurix_client_joined_channels(const struct AurixClient *client,
                                     struct AurixUuid *out,
                                     size_t capacity);
+
+/**
+ * Whether speech in a joined channel is transcribed server-side (`Transcript` events).
+ */
+bool aurix_client_channel_transcribes(const struct AurixClient *client,
+                                      const struct AurixUuid *channel_id);
+
+/**
+ * Whether speech in a joined channel is analysed by the server's content-safety classifier
+ * (`ChannelJoinAck.safety_voice`); games should disclose it to the player.
+ */
+bool aurix_client_channel_monitored(const struct AurixClient *client,
+                                    const struct AurixUuid *channel_id);
 
 /**
  * Copy up to `capacity` participants of `channel_id`; returns the total count.

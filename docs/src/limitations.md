@@ -85,5 +85,4 @@ the chapter that explains the boundary.
 
 ## Planned
 
-Safety adapters (STT → toxicity, evidence export), PCMU fallback, and ambient/radius
-visibility. The operator web panel is tracked separately.
+PCMU fallback and ambient/radius visibility. The operator web panel is tracked separately.

@@ -63,6 +63,10 @@
       "description": "Bans, mutes, kicks, reports and their lifecycle."
     },
     {
+      "name": "Safety",
+      "description": "Content-safety incidents (voice transcripts and chat), evidence export and user risk."
+    },
+    {
       "name": "Analytics",
       "description": "Usage counters and historical snapshots of the application."
     },
@@ -3098,6 +3102,267 @@
         ],
         "x-aurix-permissions": [
           "moderation:write"
+        ]
+      }
+    },
+    "/v1/safety/incidents": {
+      "get": {
+        "tags": [
+          "Safety"
+        ],
+        "summary": "List content-safety incidents",
+        "description": "Incidents raised by the `[safety]` pipeline. They are moderation events with `event_type` `safety.voice` or `safety.text` (so `POST /v1/moderation/events/{event_id}/resolve` closes them); `evidence` holds the score, categories, flagged text, classifier and lexicon verdicts, context messages and the evidence-clip metadata. Newest first.",
+        "operationId": "listSafetyIncidents",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Only incidents of this user."
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "voice",
+                "text"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "`pending`, `resolved`, …"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModerationEvent"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "moderation:read"
+        ]
+      }
+    },
+    "/v1/safety/incidents/{incident_id}": {
+      "get": {
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Get a content-safety incident",
+        "description": "The incident with its context messages and, for voice incidents with a stored clip, the recording metadata and the path that streams it (`recordings:read`).",
+        "operationId": "getSafetyIncident",
+        "parameters": [
+          {
+            "name": "incident_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SafetyIncident"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "moderation:read"
+        ]
+      }
+    },
+    "/v1/safety/incidents/{incident_id}/export": {
+      "get": {
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Export an incident with its evidence",
+        "description": "Self-contained JSON bundle for hand-off to a trust & safety team: the incident, the surrounding chat messages and — when a clip exists **and the key also holds `recordings:read`** — the decrypted Ogg/Opus audio inline as `audio.content_base64`. Reading the clip is written to the audit log as `recording.accessed`. Without `recordings:read` the bundle is returned without the audio bytes.",
+        "operationId": "exportSafetyIncident",
+        "parameters": [
+          {
+            "name": "incident_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SafetyIncidentExport"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "moderation:read"
+        ]
+      }
+    },
+    "/v1/safety/users/{user_id}/risk": {
+      "get": {
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Current risk of a user",
+        "description": "Decayed sum of the user's recent incident scores (`[safety].risk_half_life_secs`), the same value that drives automatic mute/kick triggers and `safety.risk_changed` events. Computed from stored incidents, identical on every node.",
+        "operationId": "getSafetyUserRisk",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SafetyRisk"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "moderation:read"
         ]
       }
     },
@@ -6326,6 +6591,11 @@
             "default": false,
             "description": "Transcribe speech (when `[stt]` is configured on the node) and deliver `Transcript` events."
           },
+          "safety_voice": {
+            "type": "boolean",
+            "default": false,
+            "description": "Send the speakers' transcripts to the `[safety]` classifier (requires `[stt]`); disclosed to clients as `ChannelJoinAck.safety_voice`. Independent of `transcription`."
+          },
           "whisper_target": {
             "type": [
               "string",
@@ -8708,6 +8978,212 @@
         "required": [
           "regions",
           "recommended"
+        ]
+      },
+      "SafetySource": {
+        "type": "string",
+        "enum": [
+          "voice",
+          "text"
+        ]
+      },
+      "RiskLevel": {
+        "type": "string",
+        "enum": [
+          "none",
+          "low",
+          "elevated",
+          "high"
+        ],
+        "description": "`elevated` / `high` are the configurable thresholds `[safety].risk_elevated` / `risk_high`; `low` is anything above zero."
+      },
+      "SafetyRisk": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "risk_score": {
+            "type": "number",
+            "format": "float",
+            "minimum": 0
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          },
+          "incidents": {
+            "type": "integer",
+            "description": "Incidents inside the scoring window (10 half-lives)."
+          },
+          "half_life_secs": {
+            "type": "integer"
+          },
+          "computed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "user_id",
+          "risk_score",
+          "risk_level",
+          "incidents",
+          "half_life_secs",
+          "computed_at"
+        ]
+      },
+      "SafetyIncidentAudio": {
+        "type": "object",
+        "description": "Evidence clip stored as a recording of kind `evidence` (same encryption, object storage and retention sweep as recordings).",
+        "properties": {
+          "recording_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "format": {
+            "type": "string",
+            "example": "ogg_opus"
+          },
+          "duration_secs": {
+            "type": "number"
+          },
+          "size_bytes": {
+            "type": "integer"
+          },
+          "encrypted": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "download_path": {
+            "type": "string",
+            "example": "/v1/recordings/0190…/download",
+            "description": "Streams the decrypted clip; requires `recordings:read`."
+          },
+          "expired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recording_id",
+          "format",
+          "duration_secs",
+          "size_bytes",
+          "encrypted",
+          "expires_at",
+          "download_path",
+          "expired"
+        ]
+      },
+      "SafetyIncident": {
+        "type": "object",
+        "properties": {
+          "incident": {
+            "$ref": "#/components/schemas/ModerationEvent"
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SafetySource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The flagged transcript or message (original, unmasked)."
+          },
+          "context": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "message_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "from_user_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "sent_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            },
+            "description": "Messages delivered in the same channel / conversation before the flagged one (text incidents, `[safety.text].context_messages`)."
+          },
+          "audio": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SafetyIncidentAudio"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "exported_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "incident",
+          "context",
+          "exported_at"
+        ]
+      },
+      "SafetyIncidentExport": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SafetyIncident"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "audio": {
+                "oneOf": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/SafetyIncidentAudio"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "content_base64": {
+                            "type": "string",
+                            "contentEncoding": "base64",
+                            "contentMediaType": "audio/ogg",
+                            "description": "Present when the key holds `recordings:read` and the clip has not expired."
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
         ]
       }
     }

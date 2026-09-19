@@ -550,6 +550,7 @@ export class AurixClient {
   private wantTranscripts = true;
   /** Channels the server transcribes (from `ChannelJoinAck`). */
   private transcribedChannels = new Set<string>();
+  private monitoredChannels = new Set<string>();
   /** channel id → its audio policy (from `ChannelJoinAck.audio` / `ChannelAudioPolicy`). */
   private channelPolicies = new Map<string, AudioPolicy>();
   /** Merge of `channelPolicies`; kept after the last channel is left. */
@@ -1179,6 +1180,7 @@ export class AurixClient {
     }
     this.speechDone.clear();
     this.transcribedChannels.clear();
+    this.monitoredChannels.clear();
     this.channelPolicies.clear();
     this.transientBitrateBps = undefined;
     this.appliedSenderPrefs = undefined;
@@ -1239,6 +1241,7 @@ export class AurixClient {
     this.send({ type: 'ChannelLeave', data: { channel_id: channelId } });
     this.typingSentAt.delete(channelId);
     this.transcribedChannels.delete(channelId);
+    this.monitoredChannels.delete(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
     if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
   }
@@ -1246,6 +1249,15 @@ export class AurixClient {
   /** Whether the server transcribes `channelId` (speech-to-text is enabled for it). */
   isChannelTranscribed(channelId: string): boolean {
     return this.transcribedChannels.has(channelId);
+  }
+
+  /**
+   * Whether speech in `channelId` is monitored by the operator's content-safety pipeline
+   * (transcribed and classified server-side; `ChannelConfig.safety_voice`). Disclose this to
+   * players — e.g. a "voice chat is moderated" badge.
+   */
+  isChannelMonitored(channelId: string): boolean {
+    return this.monitoredChannels.has(channelId);
   }
 
   /** Whether this client currently receives `transcript` events (default `true`). */
@@ -1788,6 +1800,8 @@ export class AurixClient {
         this.channels.set(d.channel_id, roster);
         if (d.transcription) this.transcribedChannels.add(d.channel_id);
         else this.transcribedChannels.delete(d.channel_id);
+        if (d.safety_voice) this.monitoredChannels.add(d.channel_id);
+        else this.monitoredChannels.delete(d.channel_id);
         this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
         this.refreshAudioPolicy();
         const list = Array.from(roster.values());

@@ -193,3 +193,61 @@ max_concurrent_requests = 4
 max_queued_per_session = 3
 max_queued_per_channel = 8
 requests_per_minute_per_session = 10
+
+[safety]
+# Content safety: chat messages (and TTS text) and — for channels created with
+# `safety_voice = true` — speech transcripts go through a normalized lexicon and/or an HTTP
+# toxicity classifier. Hits become `safety.voice` / `safety.text` moderation events with a
+# `safety.incident` webhook/SSE event; a decayed per-user risk score can trigger an automatic
+# server mute or kick. Off by default; needs a classifier endpoint and/or a lexicon.
+enabled = false
+# Score at which a transcript/message becomes an incident (classifier score or lexicon severity).
+incident_threshold = 0.7
+# Restrict scoring to these classifier categories (empty = all).
+categories = []
+# Risk = sum of incident scores decaying with this half-life; `elevated` / `high` thresholds.
+risk_half_life_secs = 900
+risk_elevated = 1.0
+risk_high = 2.5
+
+[safety.classifier]
+# endpoint = "http://moderation:8000/v1/moderations"
+# format = "openai_moderation"   # or "aurix" ({"text","source","language","context"} → {"score","categories"})
+# api_key = "…"                  # AURIX__SAFETY__CLASSIFIER__API_KEY
+# model = "omni-moderation-latest"
+timeout_ms = 5000
+max_concurrent_requests = 8
+
+[safety.voice]
+# Requires `[stt]`; E2EE channels are never transcribed. Transcripts of `safety_voice` channels
+# are analyzed only, not delivered (that is `transcription = true`).
+enabled = true
+# Store the flagged segment (plus `evidence_pre_segments` before it) as an encrypted Ogg/Opus
+# recording of kind `evidence`, under the recording consent/storage policy (`[recording]`).
+evidence = true
+evidence_pre_segments = 2
+evidence_retention_days = 30
+# "never" | "incident" | "elevated" | "high"
+auto_mute = "never"
+auto_kick = "never"
+
+[safety.text]
+enabled = true
+# lexicon_path = "configs/lexicon.example.toml"
+# Inline rules instead of / in addition to the file:
+# [[safety.text.lexicon]]
+# pattern = "kys"
+# action = "block"       # "mask" (default) | "block" | "flag"
+# severity = 0.9
+# category = "self-harm"
+mask_char = "*"
+# Also run the classifier on chat (with the previous `context_messages` of the conversation).
+classify = true
+# Messages scoring at or above this are rejected (422); below it they are delivered
+# (masked by the lexicon if it matched) and recorded as an incident when over `incident_threshold`.
+block_threshold = 0.9
+context_messages = 5
+# Deliver (lexicon-only) when the classifier is unreachable; `false` rejects the message.
+fail_open = true
+auto_mute = "never"
+auto_kick = "never"

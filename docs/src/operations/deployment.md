@@ -74,7 +74,7 @@ Validation runs at start-up and refuses to boot on an invalid combination; with
 * the development database credentials.
 
 Secrets (`AURIX__AUTH__JWT_SECRET`, `AURIX__TURN__AUTH_SECRET`, `AURIX__MEDIA__CASCADE_SECRET`,
-`AURIX__RECORDING__ENCRYPTION_KEY`, `AURIX__STT__API_KEY`, `AURIX__TTS__API_KEY`, S3 credentials)
+`AURIX__RECORDING__ENCRYPTION_KEY`, `AURIX__STT__API_KEY`, `AURIX__TTS__API_KEY`, `AURIX__SAFETY__CLASSIFIER__API_KEY`, S3 credentials)
 are never echoed back by the API or logs.
 
 ### Key settings

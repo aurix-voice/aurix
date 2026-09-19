@@ -456,6 +456,10 @@ pub struct ChannelConfig {
     /// Transcribe participants' speech (when `[stt]` is configured on the node) and deliver
     /// `Transcript` events to the channel's participants.
     pub transcription: bool,
+    /// Run participants' speech through the node's `[safety]` pipeline (transcribe →
+    /// classify → incidents). Independent of `transcription`: transcripts are not delivered to
+    /// participants unless that is set too. Never applies to end-to-end encrypted media.
+    pub safety_voice: bool,
     pub whisper_target: Option<UserId>,
     pub command_speakers: Option<Vec<UserId>>,
 }
@@ -477,6 +481,7 @@ impl Default for ChannelConfig {
             audio_profile: AudioProfile::Voice,
             recording_enabled: false,
             transcription: false,
+            safety_voice: false,
             whisper_target: None,
             command_speakers: None,
         }

@@ -1477,6 +1477,7 @@ async fn handle_ws_connection(
                 channel_id: *channel_id,
                 participants: channel_snapshot(&state, &session_id, channel_id),
                 transcription: channel_transcribes(&state, channel_id),
+                safety_voice: channel_safety_monitored(&state, channel_id),
                 audio: channel_audio_policy(&state, channel_id),
             },
         )
@@ -1674,6 +1675,15 @@ fn channel_transcribes(state: &WsState, channel_id: &ChannelId) -> bool {
             .read()
             .get_channel(channel_id)
             .is_some_and(|c| c.config().transcription)
+}
+
+fn channel_safety_monitored(state: &WsState, channel_id: &ChannelId) -> bool {
+    state.control.safety.voice_enabled()
+        && state
+            .sfu
+            .read()
+            .get_channel(channel_id)
+            .is_some_and(|c| c.config().safety_voice)
 }
 
 fn channel_audio_policy(state: &WsState, channel_id: &ChannelId) -> AudioPolicy {
@@ -2083,6 +2093,7 @@ async fn handle_control_message(
                     channel_id,
                     participants,
                     transcription: channel_transcribes(state, &channel_id),
+                    safety_voice: channel_safety_monitored(state, &channel_id),
                     audio: channel_audio_policy(state, &channel_id),
                 },
             )

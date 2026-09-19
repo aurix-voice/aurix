@@ -1,10 +1,12 @@
-//! Stand-in for an OpenAI-compatible speech server, used by the live E2E test and handy for
-//! local development when no Whisper/Piper is around:
+//! Stand-in for an OpenAI-compatible speech and moderation server, used by the live E2E test
+//! and handy for local development when no Whisper/Piper/classifier is around:
 //!
 //! ```text
 //! cargo run -p aurix-server --example mock_speech -- 127.0.0.1:18790
 //! AURIX__STT__ENABLED=true AURIX__STT__ENDPOINT=http://127.0.0.1:18790 \
-//! AURIX__TTS__ENABLED=true AURIX__TTS__ENDPOINT=http://127.0.0.1:18790 cargo run --bin aurix-server
+//! AURIX__TTS__ENABLED=true AURIX__TTS__ENDPOINT=http://127.0.0.1:18790 \
+//! AURIX__SAFETY__ENABLED=true AURIX__SAFETY__CLASSIFIER__ENDPOINT=http://127.0.0.1:18790/v1/moderations \
+//! cargo run --bin aurix-server
 //! ```
 //!
 //! * `POST /v1/audio/transcriptions` (multipart WAV) answers `verbose_json` whose `text`
@@ -12,6 +14,10 @@
 //! * `POST /v1/audio/speech` returns a 24 kHz mono WAV sine. The `input` text may carry
 //!   directives: `[fail]` → HTTP 500, `[slow]` → 3 s delay before answering, `[dur=NNNN]` →
 //!   duration in ms (default 1000), `[hz=NNN]` → frequency (default 440).
+//! * `POST /v1/moderations` (OpenAI moderation shape) scores the `input` by content: text with
+//!   `hate` or a `880hz` tone → `harassment` 0.95 (flagged); `rude` or a `660hz` tone →
+//!   `harassment` 0.75 (flagged); `[classifier-fail]` → HTTP 500; anything else 0.01. The
+//!   E2E test drives voice incidents with tones and chat incidents with those words.
 //!
 //! An `Authorization` header, when the server is started with a bearer token as the second
 //! argument, must match or the request is refused with 401.
@@ -39,6 +45,7 @@ async fn main() {
     let app = Router::new()
         .route("/v1/audio/transcriptions", post(transcribe))
         .route("/v1/audio/speech", post(speak))
+        .route("/v1/moderations", post(moderate))
         .with_state(Shared { bearer });
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("mock speech server on http://{bind}");
@@ -124,6 +131,15 @@ fn dominant_hz(samples: &[i16], channels: u16, sample_rate: u32) -> u32 {
     (crossings / 2.0 / seconds).round() as u32
 }
 
+/// Frequency of a `tone NNNhz` transcript produced by [`transcribe`].
+fn tone_hz(text: &str) -> Option<u32> {
+    let end = text.find("hz")?;
+    let digits = text[..end]
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .len();
+    text[digits..end].parse().ok()
+}
+
 #[derive(serde::Deserialize)]
 struct SpeechRequest {
     input: String,
@@ -175,4 +191,54 @@ async fn speak(
         .collect();
     let wav = pcm_to_wav(&samples, sample_rate, 1);
     ([(axum::http::header::CONTENT_TYPE, "audio/wav")], wav).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ModerationRequest {
+    input: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn moderate(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    Json(req): Json<ModerationRequest>,
+) -> axum::response::Response {
+    if !authorized(&shared, &headers) {
+        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+    }
+    let text = req.input.to_lowercase();
+    if text.contains("[classifier-fail]") {
+        eprintln!("moderation: {:?} -> 500", req.input);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": "synthetic classifier failure"}})),
+        )
+            .into_response();
+    }
+    let tone = tone_hz(&text);
+    let near = |hz: u32| tone.is_some_and(|t| t.abs_diff(hz) <= 15);
+    let harassment = if text.contains("hate") || near(880) {
+        0.95
+    } else if text.contains("rude") || near(660) {
+        0.75
+    } else {
+        0.01
+    };
+    let flagged = harassment >= 0.5;
+    eprintln!(
+        "moderation: {:?} model={:?} -> harassment={harassment} flagged={flagged}",
+        req.input, req.model
+    );
+    Json(serde_json::json!({
+        "id": "modr-mock",
+        "model": req.model.unwrap_or_else(|| "mock-moderation".into()),
+        "results": [{
+            "flagged": flagged,
+            "categories": {"harassment": flagged, "hate": false, "self-harm": false},
+            "category_scores": {"harassment": harassment, "hate": 0.01, "self-harm": 0.0}
+        }]
+    }))
+    .into_response()
 }

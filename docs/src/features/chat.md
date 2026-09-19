@@ -46,7 +46,9 @@ received when persistence is on.
 
 ## Content filter
 
-When `chat.filter_webhook` is set, every player message (not system messages) is `POST`ed there
+With `[safety]` enabled, messages first pass the lexicon and the classifier described in
+[Content safety](safety.md) (masking, blocking, incidents, automatic mute/kick); the webhook
+below runs last and sees the masked text. When `chat.filter_webhook` is set, every player message (not system messages) is `POST`ed there
 as JSON before delivery:
 
 ```json

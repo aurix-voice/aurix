@@ -65,7 +65,9 @@ Reports, bans, kicks and mutes all become **moderation events** —
 …); `recording_id` links a recording that exists in the same application.
 
 Resolved events are subject to the retention sweep (`retention.moderation_events_days`, 365
-by default); open ones are kept until resolved.
+by default); open ones are kept until resolved. Incidents raised by the
+[content-safety pipeline](safety.md) are moderation events too (`safety.voice` / `safety.text`),
+listed and exported with their evidence under `/v1/safety/…`.
 
 ## Action tokens
 

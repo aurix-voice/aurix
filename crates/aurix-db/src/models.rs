@@ -130,6 +130,8 @@ pub struct RecordingRow {
     pub ended_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// `recording` for operator-started captures, `evidence` for safety clips.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

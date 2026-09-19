@@ -305,6 +305,7 @@ a stream plays until `stopAudioInjection()` or `disconnect()`. `injectAudio` nee
 // backend: channel config {"transcription": true} + [stt] configured on the server
 client.on('transcript', (t) => captions.append(t.userId, t.text, t.startedAt, t.words));
 client.isChannelTranscribed(channelId);      // from ChannelJoinAck.transcription
+client.isChannelMonitored(channelId);        // ChannelJoinAck.safety_voice: speech is analysed by the [safety] classifier — disclose it
 client.setTranscripts(false);                // stop receiving captions (survives reconnect)
 client.transcriptsEnabled;                   // true by default
 

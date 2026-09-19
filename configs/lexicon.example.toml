@@ -1,0 +1,46 @@
+# Lexicon for `[safety.text].lexicon_path`. Patterns are matched after normalization
+# (case, accents, zero-width characters, common leetspeak, Latin-looking Cyrillic, repeated
+# letters, spaced/punctuated letters) on word boundaries unless `substring = true`.
+#
+#   action   = "mask" (default; replace with `mask_char`, deliver) | "block" (reject) | "flag" (deliver, record only)
+#   severity = incident score contributed by a match, 0..1 (0 = filter only, never an incident)
+#   category = reported in incidents/events
+
+[[entries]]
+pattern = "kys"
+action = "block"
+severity = 0.9
+category = "self-harm"
+
+[[entries]]
+pattern = "kill yourself"
+action = "block"
+severity = 0.9
+category = "self-harm"
+
+[[entries]]
+pattern = "shit"
+action = "mask"
+severity = 0.2
+category = "profanity"
+
+[[entries]]
+pattern = "fuck"
+action = "mask"
+severity = 0.3
+category = "profanity"
+substring = true
+
+[[entries]]
+pattern = "retard"
+action = "mask"
+severity = 0.6
+category = "harassment"
+substring = true
+
+[[entries]]
+pattern = "discord.gg"
+action = "flag"
+severity = 0.0
+category = "advertising"
+substring = true

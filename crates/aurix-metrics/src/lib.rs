@@ -196,6 +196,29 @@ pub static SSE_CLIENTS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+// ── Content safety Metrics ──
+
+/// `source` is `voice` or `text`; `outcome` is `clean`, `incident`, `blocked` (text rejected)
+/// or `error` (classifier unavailable).
+pub static SAFETY_CHECKS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_safety_checks_total",
+        "Transcripts and chat messages run through the safety pipeline, by outcome",
+        &["source", "outcome"]
+    )
+    .unwrap()
+});
+
+/// `action` is `mute` or `kick`.
+pub static SAFETY_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_safety_actions_total",
+        "Automatic moderation actions taken by the safety pipeline",
+        &["action"]
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
     // Touch all lazy statics to ensure registration
     let _ = &*ACTIVE_SESSIONS;
@@ -211,6 +234,8 @@ pub fn gather_metrics() -> String {
     let _ = &*WEBHOOK_DELIVERIES;
     let _ = &*WEBHOOK_PENDING;
     let _ = &*SSE_CLIENTS;
+    let _ = &*SAFETY_CHECKS;
+    let _ = &*SAFETY_ACTIONS;
 
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();

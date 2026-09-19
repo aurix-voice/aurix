@@ -50,7 +50,8 @@ silence, dropping anything shorter than `min_segment_ms`) and pushes the result 
 ```
 
 `words` is present only when the node runs with `stt.include_words = true` and the provider
-returns timings.
+returns timings. Channels with `"safety_voice": true` are transcribed for the
+[content-safety](safety.md) classifier only, whether or not they are captioned.
 
 to the speaker and to the members of that channel who would hear them — local mutes, blocks
 and zero gain suppress captions too — on every node. Clients opt out/in with

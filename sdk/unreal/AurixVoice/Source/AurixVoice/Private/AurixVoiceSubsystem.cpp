@@ -498,6 +498,16 @@ TArray<FAurixParticipant> UAurixVoiceSubsystem::GetParticipants(FGuid ChannelId)
 	return Native ? ToParticipants(Native->Client.participants(ToUuid(ChannelId))) : TArray<FAurixParticipant>();
 }
 
+bool UAurixVoiceSubsystem::IsChannelTranscribed(FGuid ChannelId) const
+{
+	return Native && Native->Client.channel_transcribes(ToUuid(ChannelId));
+}
+
+bool UAurixVoiceSubsystem::IsChannelMonitored(FGuid ChannelId) const
+{
+	return Native && Native->Client.channel_monitored(ToUuid(ChannelId));
+}
+
 bool UAurixVoiceSubsystem::GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const
 {
 	OutUserId.Invalidate();

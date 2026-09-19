@@ -121,6 +121,7 @@ struct Prefs {
 struct ChannelState {
     hash: u32,
     transcription: bool,
+    safety_voice: bool,
     audio: AudioPolicy,
     participants: HashMap<UserId, Participant>,
 }
@@ -544,6 +545,16 @@ impl Client {
             .lock()
             .get(&channel_id)
             .is_some_and(|c| c.transcription)
+    }
+
+    /// Whether speech in a joined channel is analysed by the server's content-safety
+    /// classifier (`ChannelJoinAck.safety_voice`) — disclose it to the player.
+    pub fn channel_monitored(&self, channel_id: ChannelId) -> bool {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .is_some_and(|c| c.safety_voice)
     }
 
     pub fn participants(&self, channel_id: ChannelId) -> Vec<Participant> {
@@ -1819,7 +1830,9 @@ async fn handle_message(
             channel_id,
             participants,
             transcription,
+            safety_voice,
             audio,
+            ..
         } => {
             let roster: HashMap<UserId, Participant> = participants
                 .iter()
@@ -1840,6 +1853,7 @@ async fn handle_message(
                     ChannelState {
                         hash: channel_id_hash(&channel_id),
                         transcription,
+                        safety_voice,
                         audio,
                         participants: roster,
                     },
@@ -1854,6 +1868,7 @@ async fn handle_message(
                     channel_id,
                     participants: participants.iter().map(participant_from_brief).collect(),
                     transcription,
+                    safety_voice,
                 });
             }
             if request_id == 0 && !existed {
@@ -2268,6 +2283,7 @@ mod tests {
             ChannelState {
                 hash,
                 transcription: false,
+                safety_voice: false,
                 audio,
                 participants: HashMap::new(),
             },

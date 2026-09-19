@@ -14,6 +14,8 @@ pub mod rate_limit;
 #[cfg(feature = "server")]
 pub mod redis_pool;
 #[cfg(feature = "server")]
+pub mod safety;
+#[cfg(feature = "server")]
 pub mod sink;
 #[cfg(feature = "server")]
 pub mod tts_stt;

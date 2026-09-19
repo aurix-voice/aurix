@@ -159,6 +159,19 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/moderation/events/:event_id/resolve",
             post(handlers::resolve_moderation_event),
         )
+        .route("/v1/safety/incidents", get(handlers::list_safety_incidents))
+        .route(
+            "/v1/safety/incidents/:incident_id",
+            get(handlers::get_safety_incident),
+        )
+        .route(
+            "/v1/safety/incidents/:incident_id/export",
+            get(handlers::export_safety_incident),
+        )
+        .route(
+            "/v1/safety/users/:user_id/risk",
+            get(handlers::get_safety_user_risk),
+        )
         .route("/v1/analytics", get(handlers::get_analytics))
         .route(
             "/v1/api-keys",

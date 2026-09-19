@@ -25,6 +25,8 @@ pub struct AurixConfig {
     pub stt: SttConfig,
     #[serde(default)]
     pub tts: TtsConfig,
+    #[serde(default)]
+    pub safety: SafetyConfig,
 }
 
 impl AurixConfig {
@@ -43,7 +45,8 @@ impl AurixConfig {
                 .with_list_parse_key("server.trusted_proxies")
                 .with_list_parse_key("media.cascade_peers")
                 .with_list_parse_key("webhooks.retry_delays_secs")
-                .with_list_parse_key("tts.voices"),
+                .with_list_parse_key("tts.voices")
+                .with_list_parse_key("safety.categories"),
         );
         let cfg = builder.build()?;
         let mut config: AurixConfig = cfg.try_deserialize()?;
@@ -77,12 +80,24 @@ impl AurixConfig {
             &mut self.tts.endpoint,
             &mut self.tts.api_key,
             &mut self.tts.model,
+            &mut self.safety.classifier.endpoint,
+            &mut self.safety.classifier.api_key,
+            &mut self.safety.classifier.model,
+            &mut self.safety.text.lexicon_path,
         ] {
             if opt.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false) {
                 *opt = None;
             }
         }
         clean(&mut self.tts.voices);
+        clean(&mut self.safety.categories);
+        for entry in &mut self.safety.text.lexicon {
+            entry.pattern = entry.pattern.trim().to_string();
+        }
+        self.safety
+            .text
+            .lexicon
+            .retain(|entry| !entry.pattern.is_empty());
     }
 
     pub fn is_production(&self) -> bool {
@@ -234,6 +249,59 @@ impl AurixConfig {
             }
             if !self.tts.voices.contains(&self.tts.default_voice) {
                 anyhow::bail!("tts.default_voice must be one of tts.voices");
+            }
+        }
+        if self.safety.enabled {
+            let s = &self.safety;
+            match &s.classifier.endpoint {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {}
+                Some(_) => anyhow::bail!("safety.classifier.endpoint must be an http(s) URL"),
+                None => {}
+            }
+            if s.classifier.timeout_ms < 200 || s.classifier.timeout_ms > 60_000 {
+                anyhow::bail!("safety.classifier.timeout_ms must be within 200..=60000");
+            }
+            if s.classifier.max_concurrent_requests == 0 {
+                anyhow::bail!("safety.classifier.max_concurrent_requests must be > 0");
+            }
+            if !(0.0..=1.0).contains(&s.incident_threshold) {
+                anyhow::bail!("safety.incident_threshold must be within 0..=1");
+            }
+            if s.risk_half_life_secs < 10 {
+                anyhow::bail!("safety.risk_half_life_secs must be >= 10");
+            }
+            if !(s.risk_elevated > 0.0 && s.risk_high >= s.risk_elevated) {
+                anyhow::bail!("safety.risk_elevated must be > 0 and <= safety.risk_high");
+            }
+            let has_lexicon = s.text.lexicon_path.is_some() || !s.text.lexicon.is_empty();
+            if s.classifier.endpoint.is_none() && !has_lexicon {
+                anyhow::bail!(
+                    "safety.enabled requires safety.classifier.endpoint and/or a lexicon (safety.text.lexicon_path / safety.text.lexicon)"
+                );
+            }
+            if s.voice.enabled && !self.stt.enabled {
+                anyhow::bail!(
+                    "safety.voice.enabled requires stt.enabled (transcripts are classified)"
+                );
+            }
+            if s.voice.evidence_retention_days == 0 || s.voice.evidence_retention_days > 3650 {
+                anyhow::bail!("safety.voice.evidence_retention_days must be within 1..=3650");
+            }
+            if s.voice.evidence_pre_segments > 20 {
+                anyhow::bail!("safety.voice.evidence_pre_segments must be <= 20");
+            }
+            if s.text.mask_char.chars().count() != 1 {
+                anyhow::bail!("safety.text.mask_char must be exactly one character");
+            }
+            if !(0.0..=1.0).contains(&s.text.block_threshold)
+                || s.text.block_threshold < s.incident_threshold
+            {
+                anyhow::bail!(
+                    "safety.text.block_threshold must be within safety.incident_threshold..=1"
+                );
+            }
+            if s.text.context_messages > 50 {
+                anyhow::bail!("safety.text.context_messages must be <= 50");
             }
         }
         for cidr in &self.server.trusted_proxies {
@@ -1277,6 +1345,210 @@ impl Default for TtsConfig {
             requests_per_minute_per_session: 10,
         }
     }
+}
+
+/// Content safety: toxicity classification of transcripts and chat, lexicon filtering,
+/// per-user risk scoring, incident records with evidence, and optional automatic moderation.
+///
+/// The classifier is any HTTP service speaking the OpenAI `/v1/moderations` request/response
+/// shape (`format = "openai_moderation"`) or Aurix's minimal `{text} → {score, categories}`
+/// contract (`format = "aurix"`), so self-hosted open models (Detoxify, Perspective-like
+/// wrappers, llama-guard behind a small shim) and hosted APIs plug in the same way.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SafetyConfig {
+    pub enabled: bool,
+    pub classifier: SafetyClassifierConfig,
+    /// Classifier score (`0..=1`) at which a transcript or message becomes an incident.
+    pub incident_threshold: f32,
+    /// Only these classifier categories count (empty = every category the classifier returns).
+    pub categories: Vec<String>,
+    /// Half-life of a user's risk score. Each incident adds its severity; the sum decays by
+    /// half every interval, so a burst of incidents raises the level, a quiet user recovers.
+    pub risk_half_life_secs: u64,
+    /// Risk score at which a user is `elevated`.
+    pub risk_elevated: f32,
+    /// Risk score at which a user is `high`.
+    pub risk_high: f32,
+    pub voice: VoiceSafetyConfig,
+    pub text: TextSafetyConfig,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            classifier: SafetyClassifierConfig::default(),
+            incident_threshold: 0.7,
+            categories: Vec::new(),
+            risk_half_life_secs: 900,
+            risk_elevated: 1.0,
+            risk_high: 2.5,
+            voice: VoiceSafetyConfig::default(),
+            text: TextSafetyConfig::default(),
+        }
+    }
+}
+
+/// Request/response contract of the toxicity classifier endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyClassifierFormat {
+    /// `POST {endpoint}` with `{"input": text, "model"?}`; reply per OpenAI moderations
+    /// (`results[0].category_scores`, `results[0].flagged`).
+    OpenaiModeration,
+    /// `POST {endpoint}` with `{"text", "language"?, "context"?}`; reply
+    /// `{"score": 0..1, "categories": {"name": 0..1}, "labels"?: [..]}`.
+    Aurix,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SafetyClassifierConfig {
+    /// `http(s)` URL of the classifier. Without it only the lexicon runs.
+    pub endpoint: Option<String>,
+    pub format: SafetyClassifierFormat,
+    /// Sent as `Authorization: Bearer …`; never leaves the node otherwise.
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub timeout_ms: u64,
+    pub max_concurrent_requests: u32,
+}
+
+impl Default for SafetyClassifierConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            format: SafetyClassifierFormat::OpenaiModeration,
+            api_key: None,
+            model: None,
+            timeout_ms: 5_000,
+            max_concurrent_requests: 8,
+        }
+    }
+}
+
+/// Risk level at which an automatic action fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyTrigger {
+    /// Never act automatically; incidents are recorded and published only.
+    Never,
+    /// On every incident.
+    Incident,
+    /// When the user's risk score reaches `risk_elevated`.
+    Elevated,
+    /// When the user's risk score reaches `risk_high`.
+    High,
+}
+
+/// Speech: transcripts of channels with `safety_voice: true` are classified (requires `[stt]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VoiceSafetyConfig {
+    pub enabled: bool,
+    /// Store the offending audio segment plus `evidence_pre_segments` preceding segments as an
+    /// Ogg/Opus evidence clip (needs `recording.enabled`; stored like recordings — encrypted at
+    /// rest and mirrored to object storage when configured).
+    pub evidence: bool,
+    pub evidence_pre_segments: u32,
+    pub evidence_retention_days: u32,
+    pub auto_mute: SafetyTrigger,
+    pub auto_kick: SafetyTrigger,
+}
+
+impl Default for VoiceSafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            evidence: true,
+            evidence_pre_segments: 2,
+            evidence_retention_days: 30,
+            auto_mute: SafetyTrigger::Never,
+            auto_kick: SafetyTrigger::Never,
+        }
+    }
+}
+
+/// Text chat: lexicon (dictionary) filter with obfuscation-resistant normalization, then the
+/// classifier, then the legacy `chat.filter_webhook` — the first stage that replaces or blocks
+/// decides.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TextSafetyConfig {
+    pub enabled: bool,
+    /// TOML file with `[[entries]]` (`pattern`, `action = "mask"|"block"|"flag"`, `severity`,
+    /// `category`); see `configs/lexicon.example.toml`.
+    pub lexicon_path: Option<String>,
+    /// Inline entries, merged with the file.
+    pub lexicon: Vec<LexiconEntryConfig>,
+    /// Character masked words are replaced with.
+    pub mask_char: String,
+    /// Run the classifier on chat (in addition to the lexicon).
+    pub classify: bool,
+    /// Classifier score at which a message is blocked (above `incident_threshold` it is
+    /// delivered but recorded as an incident).
+    pub block_threshold: f32,
+    /// Preceding messages from the same channel (or between the same pair) attached to a text
+    /// incident as context.
+    pub context_messages: u32,
+    /// Deliver messages when the classifier is unreachable (`false` = block).
+    pub fail_open: bool,
+    pub auto_mute: SafetyTrigger,
+    pub auto_kick: SafetyTrigger,
+}
+
+impl Default for TextSafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lexicon_path: None,
+            lexicon: Vec::new(),
+            mask_char: "*".to_string(),
+            classify: true,
+            block_threshold: 0.9,
+            context_messages: 5,
+            fail_open: true,
+            auto_mute: SafetyTrigger::Never,
+            auto_kick: SafetyTrigger::Never,
+        }
+    }
+}
+
+/// One lexicon rule. `pattern` is matched against the normalized text (case-folded, accents
+/// and zero-width characters stripped, leet-speak and repeated letters collapsed), on word
+/// boundaries unless `substring = true`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct LexiconEntryConfig {
+    pub pattern: String,
+    #[serde(default)]
+    pub action: LexiconAction,
+    /// Incident severity contributed by a match (`0` = filter only, no incident).
+    #[serde(default = "default_lexicon_severity")]
+    pub severity: f32,
+    #[serde(default = "default_lexicon_category")]
+    pub category: String,
+    #[serde(default)]
+    pub substring: bool,
+}
+
+fn default_lexicon_severity() -> f32 {
+    0.5
+}
+fn default_lexicon_category() -> String {
+    "profanity".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexiconAction {
+    /// Replace the matched word with `mask_char`s and deliver.
+    #[default]
+    Mask,
+    /// Reject the message.
+    Block,
+    /// Deliver unchanged; only record/score.
+    Flag,
 }
 
 #[cfg(test)]

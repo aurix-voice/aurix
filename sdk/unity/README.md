@@ -469,6 +469,7 @@ drive the injector from the thread that produces the microphone frames (it is no
 // backend: channel config {"transcription": true} + [stt] configured on the server
 voice.Client.OnTranscript += t => captions.Show(t.UserId, t.Text, t.StartedAt, t.DurationMs, t.Words);
 voice.Client.IsChannelTranscribed(channelId);        // from ChannelJoinAck.transcription
+voice.Client.IsChannelMonitored(channelId);          // ChannelJoinAck.safety_voice: speech is analysed by the [safety] classifier — disclose it
 await voice.Client.SetTranscriptsAsync(false);       // stop receiving captions (replayed after reconnect)
 voice.Client.TranscriptsEnabled;                     // true by default
 

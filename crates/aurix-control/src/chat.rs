@@ -44,6 +44,8 @@ pub struct FilterRequest<'a> {
     pub channel_id: Option<ChannelId>,
     pub from_user_id: UserId,
     pub to_user_id: Option<UserId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub display_name: &'a str,
     pub text: &'a str,
     pub metadata: Option<&'a serde_json::Value>,
@@ -129,20 +131,32 @@ pub struct ChatService {
     cfg: ChatConfig,
     pool: DbPool,
     events: Arc<EventBus>,
-    filter: Option<Arc<dyn TextFilter>>,
+    /// Run in order; a `Replace` feeds the next stage, the first `Block` wins.
+    filters: Vec<Arc<dyn TextFilter>>,
     flood: RateLimiter,
     typing: DashMap<(SessionId, ChannelId), Instant>,
 }
 
 impl ChatService {
-    pub fn new(cfg: ChatConfig, pool: DbPool, events: Arc<EventBus>) -> Self {
-        let filter: Option<Arc<dyn TextFilter>> = cfg.filter_webhook.clone().map(|url| {
+    /// `pre_filter` (the safety lexicon/classifier stage) runs before `chat.filter_webhook`.
+    pub fn new(
+        cfg: ChatConfig,
+        pool: DbPool,
+        events: Arc<EventBus>,
+        pre_filter: Option<Arc<dyn TextFilter>>,
+    ) -> Self {
+        let webhook: Option<Arc<dyn TextFilter>> = cfg.filter_webhook.clone().map(|url| {
             Arc::new(WebhookFilter::new(
                 url,
                 Duration::from_millis(cfg.filter_timeout_ms.max(100)),
             )) as Arc<dyn TextFilter>
         });
-        Self::with_filter(cfg, pool, events, filter)
+        Self::with_filters(
+            cfg,
+            pool,
+            events,
+            pre_filter.into_iter().chain(webhook).collect(),
+        )
     }
 
     pub fn with_filter(
@@ -151,12 +165,21 @@ impl ChatService {
         events: Arc<EventBus>,
         filter: Option<Arc<dyn TextFilter>>,
     ) -> Self {
+        Self::with_filters(cfg, pool, events, filter.into_iter().collect())
+    }
+
+    pub fn with_filters(
+        cfg: ChatConfig,
+        pool: DbPool,
+        events: Arc<EventBus>,
+        filters: Vec<Arc<dyn TextFilter>>,
+    ) -> Self {
         let flood = RateLimiter::new(cfg.messages_per_second, cfg.message_burst);
         Self {
             cfg,
             pool,
             events,
-            filter,
+            filters,
             flood,
             typing: DashMap::new(),
         }
@@ -254,6 +277,7 @@ impl ChatService {
                 channel_id: msg.channel_id,
                 from_user_id: msg.from_user_id,
                 to_user_id: msg.to_user_id,
+                session_id: msg.from_session_id,
                 display_name: &msg.display_name,
                 text: &msg.text,
                 metadata: msg.metadata.as_ref(),
@@ -302,44 +326,51 @@ impl ChatService {
         Ok(message)
     }
 
-    /// Runs the configured content filter (if any) over player-authored text. Returns the
-    /// replacement text when the filter rewrote it, `Ok(None)` when it passes unchanged, and
-    /// `MessageBlocked` when it must not be delivered (including a failed filter call unless
-    /// `filter_fail_open`). Voice-related text (TTS) shares this hook with chat.
+    /// Runs the configured content filters (safety stage, then webhook) over player-authored
+    /// text. Returns the replacement text when a filter rewrote it, `Ok(None)` when it passes
+    /// unchanged, and `MessageBlocked` when it must not be delivered (including a failed
+    /// filter call unless `filter_fail_open`). Voice-related text (TTS) shares this hook.
     pub async fn filter_text(
         &self,
         req: FilterRequest<'_>,
         max_replacement_bytes: usize,
     ) -> Result<Option<String>> {
-        let Some(filter) = self.filter.as_ref() else {
+        if self.filters.is_empty() {
             return Ok(None);
-        };
-        match filter.check(req).await {
-            Ok(Verdict::Allow) => Ok(None),
-            Ok(Verdict::Replace(text)) => {
-                if text.len() > max_replacement_bytes {
+        }
+        let mut replacement: Option<String> = None;
+        for filter in &self.filters {
+            let stage = FilterRequest {
+                text: replacement.as_deref().unwrap_or(req.text),
+                ..req
+            };
+            match filter.check(stage).await {
+                Ok(Verdict::Allow) => {}
+                Ok(Verdict::Replace(text)) => {
+                    if text.len() > max_replacement_bytes {
+                        return Err(AurixError::MessageBlocked(
+                            "Filter replacement exceeds the size limit".into(),
+                        ));
+                    }
+                    replacement = Some(text);
+                }
+                Ok(Verdict::Block(reason)) => return Err(AurixError::MessageBlocked(reason)),
+                Err(e) if self.cfg.filter_fail_open => {
+                    warn!("content filter unavailable, delivering unfiltered: {e}");
+                }
+                Err(e) => {
+                    warn!("content filter unavailable, blocking message: {e}");
                     return Err(AurixError::MessageBlocked(
-                        "Filter replacement exceeds the size limit".into(),
+                        "Content filter is unavailable".into(),
                     ));
                 }
-                Ok(Some(text))
-            }
-            Ok(Verdict::Block(reason)) => Err(AurixError::MessageBlocked(reason)),
-            Err(e) if self.cfg.filter_fail_open => {
-                warn!("content filter unavailable, delivering unfiltered: {e}");
-                Ok(None)
-            }
-            Err(e) => {
-                warn!("content filter unavailable, blocking message: {e}");
-                Err(AurixError::MessageBlocked(
-                    "Content filter is unavailable".into(),
-                ))
             }
         }
+        Ok(replacement)
     }
 
     pub fn has_filter(&self) -> bool {
-        self.filter.is_some()
+        !self.filters.is_empty()
     }
 
     pub fn publish_typing(
@@ -668,6 +699,7 @@ mod tests {
             },
             pool,
             Arc::new(EventBus::new(16)),
+            None,
         )
     }
 

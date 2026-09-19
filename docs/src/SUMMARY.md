@@ -27,6 +27,7 @@
 - [Moderation, action tokens and user lifecycle](features/moderation.md)
 - [Recordings and live audio streams](features/recordings.md)
 - [Transcripts and text-to-speech](features/speech.md)
+- [Content safety](features/safety.md)
 - [Network quality and statistics](features/quality.md)
 
 # Client SDKs

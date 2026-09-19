@@ -746,7 +746,8 @@ pub enum AurixEventType {
     /// `session`.
     AurixEventSessionReady = 1,
     AurixEventMediaBound = 2,
-    /// `request_id`, `channel_id`, `participants`, `flag` = transcription enabled.
+    /// `request_id`, `channel_id`, `participants`, `flag` = transcription enabled, `flag2` =
+    /// content-safety monitoring (disclose it to the player).
     AurixEventChannelJoined = 3,
     /// `channel_id`.
     AurixEventChannelLeft = 4,
@@ -1236,10 +1237,12 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
     }
 }
 
-/// Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`.
+/// Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`,
+/// `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_flag2(event: *const AurixEvent) -> bool {
     match self::event(event).map(|e| &e.event) {
+        Some(Event::ChannelJoined { safety_voice, .. }) => *safety_voice,
         Some(Event::ParticipantMuteChanged { server_muted, .. }) => *server_muted,
         Some(Event::Recording { live, .. }) => *live,
         _ => false,
@@ -1529,6 +1532,31 @@ pub unsafe extern "C" fn aurix_client_joined_channels(
         }
     }
     ids.len()
+}
+
+/// Whether speech in a joined channel is transcribed server-side (`Transcript` events).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_channel_transcribes(
+    client: *const AurixClient,
+    channel_id: *const AurixUuid,
+) -> bool {
+    match (self::client(client), uuid_arg(channel_id, "channel_id")) {
+        (Ok(c), Ok(id)) => c.channel_transcribes(ChannelId(id)),
+        _ => false,
+    }
+}
+
+/// Whether speech in a joined channel is analysed by the server's content-safety classifier
+/// (`ChannelJoinAck.safety_voice`); games should disclose it to the player.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_channel_monitored(
+    client: *const AurixClient,
+    channel_id: *const AurixUuid,
+) -> bool {
+    match (self::client(client), uuid_arg(channel_id, "channel_id")) {
+        (Ok(c), Ok(id)) => c.channel_monitored(ChannelId(id)),
+        _ => false,
+    }
 }
 
 /// Copy up to `capacity` participants of `channel_id`; returns the total count.

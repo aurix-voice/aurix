@@ -63,11 +63,18 @@ pub struct TranscriptSegment {
     /// Length of the audio that was sent to the provider.
     pub audio_ms: u64,
     pub result: TranscriptResult,
+    /// The decoded mono audio the transcript was produced from, at `sample_rate`.
+    pub pcm: Arc<Vec<i16>>,
+    pub sample_rate: u32,
+    /// Channel has `transcription: true` — deliver the transcript to participants.
+    pub deliver: bool,
+    /// Channel has `safety_voice: true` — hand the transcript to the safety pipeline.
+    pub safety: bool,
 }
 
 /// Pipeline that intercepts Opus packets from the SFU router, decodes them to PCM, accumulates
 /// a window per speaker and dispatches to the STT provider (channels with
-/// `transcription: true`) and content analyzers (every channel).
+/// `transcription: true` or `safety_voice: true`) and content analyzers (every channel).
 pub struct AudioAnalysisPipeline {
     buffers: Mutex<HashMap<(UserId, ChannelId), UserAudioBuffer>>,
     decoders: Mutex<HashMap<(UserId, ChannelId), opus::Decoder>>,
@@ -79,6 +86,8 @@ pub struct AudioAnalysisPipeline {
     stt_permits: Arc<Semaphore>,
     stt_callback: Option<TranscriptCallback>,
     violation_callback: Option<ViolationCallback>,
+    /// Without a safety consumer, `safety_voice` alone does not trigger transcription.
+    safety_enabled: bool,
 }
 
 pub type TranscriptCallback = Arc<dyn Fn(TranscriptSegment) + Send + Sync>;
@@ -103,7 +112,20 @@ impl AudioAnalysisPipeline {
             min_samples,
             stt_callback: None,
             violation_callback: None,
+            safety_enabled: false,
         }
+    }
+
+    /// Transcribe channels with `safety_voice: true` too (the transcript callback receives
+    /// segments with `safety = true`).
+    pub fn set_safety_enabled(&mut self, enabled: bool) {
+        self.safety_enabled = enabled;
+    }
+
+    fn transcribes(&self, channel: &MediaChannel) -> bool {
+        let cfg = channel.config();
+        self.stt_provider.is_some()
+            && (cfg.transcription || (self.safety_enabled && cfg.safety_voice))
     }
 
     pub fn set_stt_callback<F>(&mut self, f: F)
@@ -122,8 +144,7 @@ impl AudioAnalysisPipeline {
 
     /// True when packets in `channel` are worth decoding at all.
     pub fn wants_channel(&self, channel: &MediaChannel) -> bool {
-        !self.content_analyzers.is_empty()
-            || (self.stt_provider.is_some() && channel.config().transcription)
+        !self.content_analyzers.is_empty() || self.transcribes(channel)
     }
 
     /// Feed a raw Opus packet from the router. Decodes to PCM with a stateful per-speaker
@@ -237,8 +258,10 @@ impl AudioAnalysisPipeline {
         if let Some(stt) = self
             .stt_provider
             .as_ref()
-            .filter(|_| channel.config().transcription)
+            .filter(|_| self.transcribes(channel))
         {
+            let deliver = channel.config().transcription;
+            let safety = self.safety_enabled && channel.config().safety_voice;
             match Arc::clone(&self.stt_permits).try_acquire_owned() {
                 Ok(permit) => {
                     let stt = stt.clone();
@@ -260,6 +283,10 @@ impl AudioAnalysisPipeline {
                                             started_at,
                                             audio_ms,
                                             result,
+                                            pcm,
+                                            sample_rate: sr,
+                                            deliver,
+                                            safety,
                                         });
                                     }
                                 }
@@ -461,6 +488,44 @@ mod tests {
         assert_eq!(segs[0].user_id, user);
         assert_eq!(segs[0].audio_ms, 100);
         assert_eq!(segs[0].result.text, "4800 samples");
+        assert!(segs[0].deliver && !segs[0].safety);
+        assert_eq!(segs[0].pcm.len(), 4800);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn safety_voice_channels_transcribe_only_with_a_safety_consumer() {
+        let stt = Arc::new(FakeStt {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let safety_only = MediaChannel::new(
+            ChannelId::new(),
+            AppId::new(),
+            ChannelConfig {
+                safety_voice: true,
+                ..ChannelConfig::default()
+            },
+        );
+        let user = UserId::new();
+        let frame = opus_frame();
+
+        let (p, _) = pipeline(stt.clone(), options(100));
+        assert!(!p.wants_channel(&safety_only), "no safety consumer wired");
+
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut p = AudioAnalysisPipeline::new(options(100), Some(stt.clone()), vec![]);
+        let sink = out.clone();
+        p.set_stt_callback(move |seg| sink.lock().push(seg));
+        p.set_safety_enabled(true);
+        assert!(p.wants_channel(&safety_only));
+        for _ in 0..5 {
+            p.process_opus_packet(&safety_only, user, &frame);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(stt.calls.load(Ordering::SeqCst), 1);
+        let segs = out.lock();
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].safety && !segs[0].deliver);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -93,7 +93,7 @@ pub struct HttpProviderOptions {
     pub timeout: Option<Duration>,
 }
 
-fn http_client(timeout: Duration) -> reqwest::Client {
+pub(crate) fn http_client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -101,7 +101,7 @@ fn http_client(timeout: Duration) -> reqwest::Client {
         .expect("HTTP client creation should not fail")
 }
 
-fn trim_endpoint(endpoint: &str) -> String {
+pub(crate) fn trim_endpoint(endpoint: &str) -> String {
     endpoint.trim().trim_end_matches('/').to_string()
 }
 
@@ -220,7 +220,10 @@ const MAX_STT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Hard cap on a TTS response body (~10 minutes of 48 kHz stereo 16-bit).
 const MAX_TTS_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
-async fn read_body_limited(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(crate) async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
     if let Some(len) = response.content_length() {
         if len > limit as u64 {
             return Err(AurixError::Internal(format!(

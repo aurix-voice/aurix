@@ -129,9 +129,30 @@ async fn main() -> anyhow::Result<()> {
         options.max_concurrent_stt = config.stt.max_concurrent_requests as usize;
         let mut pipeline =
             aurix_media::audio_pipeline::AudioAnalysisPipeline::new(options, Some(stt), Vec::new());
+        let safety = control.safety.clone();
+        if safety.voice_enabled() {
+            pipeline.set_safety_enabled(true);
+            info!("Voice content safety enabled for channels with `safety_voice`");
+        }
         let events = control.events.clone();
         let include_words = config.stt.include_words;
         pipeline.set_stt_callback(move |seg| {
+            if seg.safety {
+                safety.handle_voice(aurix_control::VoiceSegment {
+                    app_id: seg.app_id,
+                    channel_id: seg.channel_id,
+                    user_id: seg.user_id,
+                    text: seg.result.text.clone(),
+                    language: Some(seg.result.language.clone()).filter(|l| !l.is_empty()),
+                    started_at: seg.started_at,
+                    audio_ms: seg.audio_ms,
+                    pcm: seg.pcm.clone(),
+                    sample_rate: seg.sample_rate,
+                });
+            }
+            if !seg.deliver {
+                return;
+            }
             let words = if include_words {
                 seg.result
                     .words
@@ -171,6 +192,9 @@ async fn main() -> anyhow::Result<()> {
         )?);
         sfu.set_audio_sink(svc.clone());
         control.users.set_media_purger(svc.clone());
+        if svc.storage_enabled() {
+            control.safety.set_evidence_store(svc.clone());
+        }
         if config.recording.live.enabled {
             info!(
                 "Live audio streams enabled (max {}/channel, {}/app, push {})",
@@ -193,6 +217,14 @@ async fn main() -> anyhow::Result<()> {
     info!("SFU node started on {}", media_bind);
     control.speech.start(&sfu);
     let sfu = Arc::new(RwLock::new(sfu));
+    if control.safety.enabled() {
+        control
+            .safety
+            .set_enforcer(Arc::new(aurix_control::ControlPlaneEnforcer::new(
+                &control,
+                sfu.clone(),
+            )));
+    }
 
     let node_address = config
         .media

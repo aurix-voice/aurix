@@ -214,6 +214,9 @@ public:
         }
         return out;
     }
+    bool channel_transcribes(const Uuid& channel) const { return aurix_client_channel_transcribes(c_, &channel.raw); }
+    /// Speech in `channel` is analysed by the server's content-safety classifier — disclose it.
+    bool channel_monitored(const Uuid& channel) const { return aurix_client_channel_monitored(c_, &channel.raw); }
     std::vector<AurixParticipant> participants(const Uuid& channel) const {
         std::vector<AurixParticipant> buf(32);
         std::size_t n = aurix_client_participants(c_, &channel.raw, buf.data(), buf.size());

@@ -61,7 +61,10 @@ pub enum Event {
         request_id: RequestId,
         channel_id: ChannelId,
         participants: Vec<Participant>,
+        /// Speech is transcribed and captions delivered.
         transcription: bool,
+        /// Speech is analysed by the server's content-safety classifier.
+        safety_voice: bool,
     },
     ChannelLeft {
         channel_id: ChannelId,

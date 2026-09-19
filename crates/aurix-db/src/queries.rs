@@ -1169,6 +1169,75 @@ pub async fn list_moderation_events(
     }
 }
 
+/// Incidents raised by the safety pipeline (`event_type` `safety.voice` / `safety.text`),
+/// newest first, optionally narrowed to one user, one source or one status.
+pub async fn list_safety_incidents(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Option<Uuid>,
+    event_type: Option<&str>,
+    status: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ModerationEventRow>, sqlx::Error> {
+    sqlx::query_as::<_, ModerationEventRow>(
+        r#"SELECT * FROM moderation_events
+           WHERE app_id = $1 AND event_type LIKE 'safety.%'
+             AND ($2::uuid IS NULL OR target_user_id = $2)
+             AND ($3::text IS NULL OR event_type = $3)
+             AND ($4::text IS NULL OR status = $4)
+           ORDER BY created_at DESC LIMIT $5 OFFSET $6"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(event_type)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+/// `(score, created_at)` of the user's safety incidents since `since`, newest first, for
+/// decayed risk scoring.
+pub async fn list_safety_incident_scores(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    since: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<(f64, DateTime<Utc>)>, sqlx::Error> {
+    sqlx::query_as::<_, (f64, DateTime<Utc>)>(
+        r#"SELECT COALESCE((evidence->>'score')::float8, 0), created_at FROM moderation_events
+           WHERE app_id = $1 AND target_user_id = $2 AND event_type LIKE 'safety.%'
+             AND created_at > $3
+           ORDER BY created_at DESC LIMIT $4"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Channels of `app_id` the user currently has an open membership in.
+pub async fn get_user_channels_in_app(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<ChannelMembershipRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChannelMembershipRow>(
+        r#"SELECT m.* FROM channel_memberships m
+           JOIN channels c ON c.id = m.channel_id
+           WHERE c.app_id = $1 AND m.user_id = $2 AND m.left_at IS NULL"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_moderation_event(
     pool: &DbPool,
     app_id: Uuid,
@@ -1203,14 +1272,14 @@ pub async fn create_recording(
     rec: &RecordingRow,
 ) -> Result<RecordingRow, sqlx::Error> {
     sqlx::query_as::<_, RecordingRow>(
-        r#"INSERT INTO recordings (id, app_id, channel_id, session_id, user_id, file_path, file_size_bytes, duration_secs, format, encrypted, encryption_key_id, started_at, expires_at, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *"#
+        r#"INSERT INTO recordings (id, app_id, channel_id, session_id, user_id, file_path, file_size_bytes, duration_secs, format, encrypted, encryption_key_id, started_at, ended_at, expires_at, created_at, kind)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *"#
     )
     .bind(rec.id).bind(rec.app_id).bind(rec.channel_id).bind(rec.session_id)
     .bind(rec.user_id).bind(&rec.file_path).bind(rec.file_size_bytes)
     .bind(rec.duration_secs).bind(&rec.format).bind(rec.encrypted)
-    .bind(&rec.encryption_key_id).bind(rec.started_at).bind(rec.expires_at)
-    .bind(rec.created_at)
+    .bind(&rec.encryption_key_id).bind(rec.started_at).bind(rec.ended_at).bind(rec.expires_at)
+    .bind(rec.created_at).bind(&rec.kind)
     .fetch_one(pool).await
 }
 

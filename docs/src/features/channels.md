@@ -36,6 +36,7 @@ action token decides them at join time.
     "audio_profile": "voice",
     "recording_enabled": false,
     "transcription": false,
+    "safety_voice": false,
     "positional_config": {
       "near_distance": 1.0,
       "far_distance": 50.0,
@@ -68,7 +69,9 @@ action token decides them at join time.
   `BitrateCommand` (32 kbit/s, 16 kbit/s above 20 % loss, clamped to
   `min_bitrate..=bitrate` of the merged policy) and lifts it again when the link recovers.
 * `recording_enabled` allows `POST /v1/recordings/start` for the channel; `transcription`
-  turns on STT (when the node has an `[stt]` provider).
+  turns on STT (when the node has an `[stt]` provider); `safety_voice` sends the speakers'
+  transcripts to the [content-safety](safety.md) classifier (disclosed to clients as
+  `ChannelJoinAck.safety_voice`).
 * `positional_config`: attenuation is 1.0 up to `near_distance`, follows `rolloff`
   (`linear`, `logarithmic`, `custom_spline`) to `far_distance`, and speakers beyond
   `max_radius` are not delivered at all. `coordinate_system` (`left_handed` — Unity/Unreal —

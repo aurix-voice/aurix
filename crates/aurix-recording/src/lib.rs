@@ -8,7 +8,7 @@ use aes_gcm::{
 };
 use aurix_common::config::RecordingConfig;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::sink::AudioSink;
+use aurix_common::sink::{AudioEvidence, AudioSink, EvidenceStore, StoredEvidence};
 use aurix_common::types::*;
 use aurix_db::models::RecordingRow;
 use aurix_db::DbPool;
@@ -302,6 +302,7 @@ impl RecordingService {
             ended_at: None,
             expires_at,
             created_at: now,
+            kind: RECORDING_KIND_RECORDING.to_string(),
         };
         let created = aurix_db::queries::create_recording(&self.pool, &row)
             .await
@@ -867,6 +868,171 @@ async fn discard_file(path: &str) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!("Failed to discard recording file {path}: {e}"),
     }
+}
+
+pub const RECORDING_KIND_RECORDING: &str = "recording";
+pub const RECORDING_KIND_EVIDENCE: &str = "evidence";
+
+/// Longest evidence clip accepted from the safety pipeline (pre-roll + flagged segment).
+const MAX_EVIDENCE_SECS: usize = 120;
+const EVIDENCE_FRAME_MS: usize = 20;
+
+#[async_trait::async_trait]
+impl EvidenceStore for RecordingService {
+    /// Encodes the clip to Ogg/Opus and stores it exactly like a stopped recording (encrypted
+    /// at rest when a key is configured, mirrored to object storage, expiring after the
+    /// safety retention), as a `recordings` row of kind `evidence`. Requires
+    /// `recording.enabled`; the safety config validator enforces that pairing.
+    async fn store_audio_evidence(&self, evidence: AudioEvidence) -> Result<StoredEvidence> {
+        if !self.config.enabled {
+            return Err(AurixError::InvalidConfiguration(
+                "Stored recordings are disabled (recording.enabled)".into(),
+            ));
+        }
+        let AudioEvidence {
+            app_id,
+            channel_id,
+            session_id,
+            user_id,
+            pcm,
+            sample_rate,
+            started_at,
+            retention_days,
+        } = evidence;
+        if pcm.is_empty() {
+            return Err(AurixError::Recording("Evidence clip is empty".into()));
+        }
+        let sample_rate = match sample_rate {
+            8_000 | 12_000 | 16_000 | 24_000 | 48_000 => sample_rate,
+            other => {
+                return Err(AurixError::Recording(format!(
+                    "Unsupported evidence sample rate {other}"
+                )))
+            }
+        };
+        let frame = sample_rate as usize * EVIDENCE_FRAME_MS / 1000;
+        let max_samples = sample_rate as usize * MAX_EVIDENCE_SECS;
+        let pcm = if pcm.len() > max_samples {
+            &pcm[pcm.len() - max_samples..]
+        } else {
+            &pcm[..]
+        };
+
+        let recording_id = Uuid::now_v7();
+        let dir = PathBuf::from(&self.config.storage_path)
+            .join(app_id.0.to_string())
+            .join(channel_id.0.to_string());
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AurixError::Recording(format!("Failed to create directory: {e}")))?;
+        let file_path = dir
+            .join(format!("{}_{}_evidence.ogg", recording_id, user_id.0))
+            .to_string_lossy()
+            .to_string();
+
+        let pcm_owned = pcm.to_vec();
+        let serial = crc32fast::hash(recording_id.as_bytes());
+        let (mut ogg, duration_secs) = tokio::task::spawn_blocking(move || {
+            encode_evidence_ogg(&pcm_owned, sample_rate, frame, serial)
+        })
+        .await
+        .map_err(|e| AurixError::Recording(format!("Evidence encoder task failed: {e}")))??;
+        if let Some(ref key) = self.encryption_key {
+            ogg = encrypt_blob(key, &ogg)?;
+        }
+        tokio::fs::write(&file_path, &ogg)
+            .await
+            .map_err(|e| AurixError::Recording(format!("Evidence write failed: {e}")))?;
+
+        let now = Utc::now();
+        let row = RecordingRow {
+            id: recording_id,
+            app_id: app_id.0,
+            channel_id: channel_id.0,
+            session_id: session_id.0,
+            user_id: user_id.0,
+            file_path: file_path.clone(),
+            file_size_bytes: ogg.len() as i64,
+            duration_secs,
+            format: "ogg_opus".to_string(),
+            encrypted: self.encryption_key.is_some(),
+            encryption_key_id: self.encryption_key_id.clone(),
+            started_at,
+            ended_at: Some(now),
+            expires_at: now + Duration::days(retention_days.max(1) as i64),
+            created_at: now,
+            kind: RECORDING_KIND_EVIDENCE.to_string(),
+        };
+        if let Err(e) = aurix_db::queries::create_recording(&self.pool, &row).await {
+            discard_file(&file_path).await;
+            return Err(AurixError::Database(format!(
+                "Evidence row creation failed: {e}"
+            )));
+        }
+
+        if let Some(ref s3) = self.s3 {
+            let key = object_key(app_id, recording_id);
+            match s3.put_object(&key, ogg.clone(), "audio/ogg").await {
+                Ok(()) => info!(
+                    "Evidence clip {} uploaded to object storage as {}",
+                    recording_id, key
+                ),
+                Err(e) => warn!(
+                    "Object storage upload failed for evidence {}: {e} (file kept locally)",
+                    recording_id
+                ),
+            }
+        }
+        info!(
+            "Evidence clip stored: {} ({:.1}s, {} bytes)",
+            recording_id,
+            duration_secs,
+            ogg.len()
+        );
+        Ok(StoredEvidence {
+            recording_id,
+            duration_secs,
+            size_bytes: ogg.len() as u64,
+        })
+    }
+}
+
+/// Encodes mono PCM into a complete Ogg/Opus stream; returns the bytes and the audio length.
+fn encode_evidence_ogg(
+    pcm: &[i16],
+    sample_rate: u32,
+    frame: usize,
+    serial: u32,
+) -> Result<(Vec<u8>, f64)> {
+    let mut encoder =
+        opus::Encoder::new(sample_rate, opus::Channels::Mono, opus::Application::Voip)
+            .map_err(|e| AurixError::Recording(format!("Opus encoder init failed: {e}")))?;
+    let mut bytes = Vec::new();
+    let mut writer = OggOpusWriter::new(&mut bytes, serial, sample_rate, 1)
+        .map_err(|e| AurixError::Recording(format!("Failed to init Ogg writer: {e}")))?;
+    let mut out = vec![0u8; 4000];
+    let mut padded = vec![0i16; frame];
+    for chunk in pcm.chunks(frame) {
+        let input: &[i16] = if chunk.len() == frame {
+            chunk
+        } else {
+            padded.fill(0);
+            padded[..chunk.len()].copy_from_slice(chunk);
+            &padded
+        };
+        let n = encoder
+            .encode(input, &mut out)
+            .map_err(|e| AurixError::Recording(format!("Opus encode failed: {e}")))?;
+        writer
+            .write_packet_with_duration(&out[..n], frame as u64)
+            .map_err(|e| AurixError::Recording(format!("Write failed: {e}")))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| AurixError::Recording(format!("Ogg finalize failed: {e}")))?;
+    let secs = writer.granule() as f64 / sample_rate.max(1) as f64;
+    drop(writer);
+    Ok((bytes, secs))
 }
 
 fn object_key(app_id: AppId, recording_id: Uuid) -> String {

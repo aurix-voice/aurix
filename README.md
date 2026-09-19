@@ -270,6 +270,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `GET /v1/channels/:id/messages`, `GET /v1/users/:id/messages` | history, newest first, `?before=<rfc3339>&limit=1..200` — only when `chat.persist = true`, otherwise `404 NOT_FOUND` (`chat:read`) |
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
 | API key | `POST /v1/moderation/{mute-all,kick-all}` | channel-wide server mute / kick of everyone currently present minus `except: [user ids]`; response lists `affected`, `skipped`, `failed`; every target still gets its own `user.muted`/`user.kicked` event and audit entry plus one `channel_mute_all`/`channel_kick_all` summary |
+| API key | `GET /v1/safety/incidents[/:id]`, `GET …/:id/export`, `GET /v1/safety/users/:id/risk` | content-safety incidents (moderation events `safety.voice`/`safety.text`), self-contained evidence bundle (inline decrypted audio when the key also has `recordings:read`), decayed per-user risk (`moderation:read`; see [Content safety](#content-safety)) |
 | API key | `POST /v1/channels/:id/tts`, `GET /v1/tts/voices` | speak a server announcement into a channel with the configured TTS provider (`tts:write`; `{"text":…,"voice":…}` → `request_id`, progress as `tts.status` events) / list voices and limits (see [Transcripts and text-to-speech](#transcripts-and-text-to-speech)) |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
 | API key | `GET /v1/channels/:id/audio/streams/pull` (WebSocket), `POST|GET /v1/channels/:id/audio/streams`, `GET|DELETE …/audio/streams/:sid`, `GET /v1/audio/streams` | real-time audio out of the node — pull it over a WebSocket or have the node push it to yours (`audio_streams:read|write`; see [Live audio streams](#live-audio-streams)) |
@@ -374,6 +375,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__WEBHOOKS__*` | `ENABLED` (`true`), `TIMEOUT_MS` (5000), `RETRY_DELAYS_SECS` (`5,30,120,600,1800,3600,7200`), `CONCURRENCY` (16), `BATCH_SIZE` (100), `MAX_PENDING_PER_SUBSCRIPTION` (10000 — older events are dropped for a dead endpoint), `RETENTION_HOURS` (72, delivery log), `MAX_SUBSCRIPTIONS_PER_APP` (20), `REQUIRE_HTTPS` / `ALLOW_PRIVATE_URLS` (default: strict in production), `SSE_KEEPALIVE_SECS` (15) |
 | `AURIX__STT__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/transcriptions`), `API_KEY`, `MODEL`, `LANGUAGE` (unset = auto-detect), `SEGMENT_SECS` (3.0), `SILENCE_FLUSH_MS` (700), `MIN_SEGMENT_MS` (400), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (8), `INCLUDE_WORDS` (`false`) — see [Transcripts and text-to-speech](#transcripts-and-text-to-speech) |
 | `AURIX__TTS__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/speech`, WAV), `API_KEY`, `MODEL`, `VOICES` (`alloy`), `DEFAULT_VOICE`, `ALLOW_CLIENT_REQUESTS` (`true`), `MAX_TEXT_CHARS` (500), `MAX_AUDIO_SECS` (30), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (4), `MAX_QUEUED_PER_SESSION` (3), `MAX_QUEUED_PER_CHANNEL` (8), `REQUESTS_PER_MINUTE_PER_SESSION` (10) |
+| `AURIX__SAFETY__*` | `ENABLED` (`false`), `INCIDENT_THRESHOLD` (0.7), `CATEGORIES` (empty = all), `RISK_HALF_LIFE_SECS` (900), `RISK_ELEVATED` (1.0), `RISK_HIGH` (2.5); `CLASSIFIER__ENDPOINT` + `FORMAT` (`openai_moderation` / `aurix`) + `API_KEY` + `MODEL` + `TIMEOUT_MS` (5000) + `MAX_CONCURRENT_REQUESTS` (8); `VOICE__ENABLED` (`true`), `VOICE__EVIDENCE` (`true`), `VOICE__EVIDENCE_PRE_SEGMENTS` (2), `VOICE__EVIDENCE_RETENTION_DAYS` (30), `VOICE__AUTO_MUTE` / `VOICE__AUTO_KICK` (`never` / `incident` / `elevated` / `high`); `TEXT__ENABLED` (`true`), `TEXT__LEXICON_PATH`, `TEXT__MASK_CHAR` (`*`), `TEXT__CLASSIFY` (`true`), `TEXT__BLOCK_THRESHOLD` (0.9), `TEXT__CONTEXT_MESSAGES` (5), `TEXT__FAIL_OPEN` (`true`), `TEXT__AUTO_MUTE` / `TEXT__AUTO_KICK` — see [Content safety](#content-safety) |
 
 #### Chat content filter webhook
 
@@ -487,6 +489,31 @@ Operators announce with `POST /v1/channels/:id/tts` (`tts:write`): every node ho
 channel plays the announcement to its participants on a per-channel system SSRC (no
 participant attached), and progress is published as `tts.status` events. `GET /v1/tts/voices`
 lists the configured voices and limits.
+
+### Content safety
+
+`[safety]` (off by default) turns what a node already sees into moderation data: transcripts of
+channels with `"safety_voice": true` (transcribed for the classifier only — never shown to
+participants unless `transcription` is also on, never for E2EE frames) and every chat message go
+through a **lexicon** with obfuscation-resistant normalization (`sh1t`, `k.y.s`, Cyrillic
+look-alikes; `mask` / `block` / `flag` rules in a TOML file, `configs/lexicon.example.toml`) and an
+**HTTP classifier you host** (`openai_moderation` response format — OpenAI, llama-guard and
+Detoxify/Perspective wrappers — or the `aurix` format with chat context). Scores ≥
+`incident_threshold` become moderation events (`safety.voice` / `safety.text`, resolved like any
+other) with the flagged text, categories, the preceding chat messages and — for voice, when
+`recording.enabled` — an **Ogg/Opus evidence clip** of that speaker (offending segment +
+`evidence_pre_segments`), stored as a recording of kind `evidence` with the same encryption,
+object storage, download audit and retention. Each user carries a **risk score**, the decayed sum
+of their incidents (`risk_half_life_secs`), rebuilt from the database so it is the same on every
+node and survives restarts; `auto_mute` / `auto_kick` per source fire on `incident`, `elevated`
+or `high` through the normal server-mute / kick path. Chat at `block_threshold` is rejected
+(`MESSAGE_BLOCKED`), below that delivered (masked) but recorded; the `chat.filter_webhook` runs
+last. Game servers get `safety.incident` / `safety.risk_changed` (webhooks/SSE), query
+`GET /v1/safety/incidents`, `GET /v1/safety/users/:id/risk` and export a hand-off bundle with the
+decrypted audio inline from `GET /v1/safety/incidents/:id/export`. Players are told a channel is
+monitored through `ChannelJoinAck.safety_voice` (Web `isChannelMonitored()`, Unity
+`IsChannelMonitored()`). The `mock_speech` example also serves `/v1/moderations` for local runs.
+Details: [Content safety](docs/src/features/safety.md).
 
 ### Live audio streams
 
@@ -767,8 +794,8 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 * No SIP/PSTN gateway, no server-side noise suppression (clients do that).
 * Text chat is deliberately "lite": live channel/directed messages and typing only — no offline
   delivery, conversations, read markers or attachments; history is an opt-in per deployment.
-* STT/TTS talk to OpenAI-compatible HTTP servers you host; no speech model ships with Aurix, and
-  transcripts are not stored server-side.
+* STT/TTS and the content-safety classifier talk to OpenAI-compatible HTTP servers you host; no
+  speech or moderation model ships with Aurix, and transcripts are not stored server-side.
 * Live audio streams are per participant (no server-side mix) and node-local; the node does not
   buffer them across a consumer outage beyond `recording.live.queue_frames`.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);

@@ -66,6 +66,8 @@ clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "http2"] }
 url = "2.5"
 regex = "1.10"
+aho-corasick = "1.1"
+unicode-normalization = "0.1"
 ipnetwork = "0.20"
 crc32fast = "1.4"
 crossbeam-channel = "0.5"

@@ -25,6 +25,8 @@ server = [
     "dep:reqwest",
     "dep:sqlx",
     "dep:url",
+    "dep:aho-corasick",
+    "dep:unicode-normalization",
 ]
 
 [dependencies]
@@ -59,3 +61,5 @@ flume = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+aho-corasick = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }

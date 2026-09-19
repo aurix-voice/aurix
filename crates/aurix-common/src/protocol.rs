@@ -768,6 +768,10 @@ pub enum ControlMessage {
         /// The channel transcribes speech and delivers `Transcript` events.
         #[serde(default)]
         transcription: bool,
+        /// Speech in this channel is transcribed and classified by the operator's content
+        /// safety pipeline (`ChannelConfig.safety_voice`); games should disclose this to players.
+        #[serde(default)]
+        safety_voice: bool,
         /// Encoder settings this channel requires; merge over all joined channels.
         #[serde(default)]
         audio: AudioPolicy,
