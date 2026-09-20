@@ -406,4 +406,9 @@ pub struct AdminUserRow {
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub auth_source: String,
+    pub sso_issuer: Option<String>,
+    pub sso_subject: Option<String>,
+    pub token_generation: i64,
+    pub tokens_revoked_at: Option<DateTime<Utc>>,
 }

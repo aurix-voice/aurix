@@ -2067,7 +2067,11 @@ async fn submit_report(
 
 // ── Media nodes (admin) ──
 
-pub async fn list_media_nodes(State(state): State<AppState>) -> JsonResult {
+pub async fn list_media_nodes(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+) -> JsonResult {
+    admin.require(AdminPermission::NodesRead)?;
     state.control.nodes.refresh_from_db().await;
     to_json(state.control.nodes.get_all_nodes())
 }
@@ -2353,8 +2357,10 @@ pub async fn list_audit_logs(
 
 pub async fn admin_list_audit_logs(
     State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
     Query(query): Query<ListQuery>,
 ) -> JsonResult {
+    admin.require(AdminPermission::AuditRead)?;
     let (limit, offset) = paging(query.page, query.per_page);
     let logs = aurix_db::queries::list_audit_logs(&state.control.pool, None, limit, offset).await?;
     to_json(logs)
@@ -2912,9 +2918,257 @@ pub async fn admin_login(
     );
     Ok(Json(serde_json::json!({
         "token": token,
-        "expires_in_secs": state.control.config.auth.admin_token_ttl_secs,
-        "admin": { "id": admin.id, "email": admin.email, "display_name": admin.display_name, "role": admin.role }
+        "expires_in_secs": state.control.admin_auth.token_ttl_secs(),
+        "admin": admin_json(&admin),
     })))
+}
+
+/// Which sign-in methods this deployment offers (for login pages).
+pub async fn admin_auth_methods(State(state): State<AppState>) -> JsonResult {
+    let oidc = state.control.admin_oidc.as_ref().map(|p| {
+        serde_json::json!({
+            "issuer": p.issuer(),
+            "login_url": "/admin/oidc/login",
+        })
+    });
+    Ok(Json(serde_json::json!({
+        "password_login": state.control.admin_auth.password_login_enabled(),
+        "oidc": oidc,
+    })))
+}
+
+fn admin_json(admin: &aurix_db::models::AdminUserRow) -> serde_json::Value {
+    let role = AdminRole::parse(&admin.role);
+    serde_json::json!({
+        "id": admin.id,
+        "email": admin.email,
+        "display_name": admin.display_name,
+        "role": admin.role,
+        "permissions": role.map(|r| r.permissions()).unwrap_or_default(),
+        "active": admin.active,
+        "auth_source": admin.auth_source,
+        "sso_bound": admin.sso_subject.is_some(),
+        "has_password": admin.password_hash != "!",
+        "last_login_at": admin.last_login_at,
+        "created_at": admin.created_at,
+        "updated_at": admin.updated_at,
+    })
+}
+
+const OIDC_COOKIE: &str = "aurix_oidc_login";
+
+fn oidc_cookie_header(value: &str, max_age_secs: u64, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{OIDC_COOKIE}={value}; Path=/admin/oidc; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax{secure}")
+}
+
+fn oidc_cookie_value(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|line| line.split(';'))
+        .filter_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == OIDC_COOKIE).then(|| value.trim().to_string())
+        })
+        .next()
+}
+
+fn oidc_provider(state: &AppState) -> Result<std::sync::Arc<aurix_auth::OidcProvider>, ApiError> {
+    state
+        .control
+        .admin_oidc
+        .clone()
+        .ok_or_else(|| AurixError::NotFound("Admin SSO is not enabled".into()).into())
+}
+
+#[derive(Deserialize)]
+pub struct OidcLoginQuery {
+    /// Relative path in the dashboard to return to after login.
+    pub return_to: Option<String>,
+}
+
+/// Starts an SSO login: sets the login cookie and redirects to the provider.
+pub async fn admin_oidc_login(
+    State(state): State<AppState>,
+    ip: Option<Extension<ClientIp>>,
+    Query(query): Query<OidcLoginQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let provider = oidc_provider(&state)?;
+    let ip_key = ip
+        .map(|Extension(c)| state.control.limits.ip_subject(c.0))
+        .unwrap_or_else(|| "unknown".into());
+    state
+        .control
+        .limits
+        .check(LimitScope::AdminLogin, &ip_key)
+        .await?;
+    let start = provider.begin(query.return_to.as_deref()).await?;
+    let secure = provider.config().redirect_url.starts_with("https://");
+    let response = (
+        axum::http::StatusCode::FOUND,
+        [
+            (
+                axum::http::header::LOCATION,
+                start.authorization_url.clone(),
+            ),
+            (
+                axum::http::header::SET_COOKIE,
+                oidc_cookie_header(&start.cookie_value, start.cookie_max_age_secs, secure),
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+    )
+        .into_response();
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+pub struct OidcCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+}
+
+/// Provider redirect target. Verifies the code/state/cookie triple, signs the administrator
+/// in and either answers with JSON or forwards the browser to `auth.oidc.frontend_redirect`
+/// with the token in the URL fragment.
+pub async fn admin_oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ip: Option<Extension<ClientIp>>,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let provider = oidc_provider(&state)?;
+    let ip_key = ip
+        .as_ref()
+        .map(|Extension(c)| state.control.limits.ip_subject(c.0))
+        .unwrap_or_else(|| "unknown".into());
+    state
+        .control
+        .limits
+        .check(LimitScope::AdminLogin, &ip_key)
+        .await?;
+    let secure = provider.config().redirect_url.starts_with("https://");
+    let clear_cookie = (
+        axum::http::header::SET_COOKIE,
+        oidc_cookie_header("", 0, secure),
+    );
+    let frontend = provider.config().frontend_redirect.clone();
+
+    let outcome: Result<(String, aurix_db::models::AdminUserRow, Option<String>), AurixError> =
+        async {
+            if let Some(err) = query.error.as_deref() {
+                return Err(AurixError::AuthenticationFailed(format!(
+                    "Identity provider returned {err}: {}",
+                    query.error_description.as_deref().unwrap_or_default()
+                )));
+            }
+            let (Some(code), Some(sealed)) = (query.code.as_deref(), query.state.as_deref()) else {
+                return Err(AurixError::Validation("code and state are required".into()));
+            };
+            let cookie = oidc_cookie_value(&headers);
+            let identity = provider.complete(code, sealed, cookie.as_deref()).await?;
+            let cfg = provider.config();
+            let (admin, token) = state
+                .control
+                .admin_auth
+                .login_sso(aurix_auth::SsoLogin {
+                    issuer: identity.issuer,
+                    subject: identity.subject,
+                    email: identity.email,
+                    display_name: identity.display_name,
+                    role: identity.role,
+                    auto_provision: cfg.auto_provision,
+                    sync_role: cfg.sync_roles,
+                })
+                .await?;
+            Ok((token, admin, identity.return_to))
+        }
+        .await;
+
+    match outcome {
+        Ok((token, admin, return_to)) => {
+            state.control.audit.log(
+                None,
+                UserId(admin.id),
+                AuditAction::AdminLogin,
+                "admin",
+                &admin.id.to_string(),
+                serde_json::json!({"source": "oidc", "role": admin.role}),
+                client_ip_string(ip),
+            );
+            let expires = state.control.admin_auth.token_ttl_secs();
+            match frontend {
+                Some(front) => {
+                    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+                    fragment
+                        .append_pair("token", &token)
+                        .append_pair("expires_in_secs", &expires.to_string());
+                    if let Some(path) = return_to {
+                        fragment.append_pair("return_to", &path);
+                    }
+                    let location = format!("{front}#{}", fragment.finish());
+                    Ok((
+                        axum::http::StatusCode::FOUND,
+                        [
+                            (axum::http::header::LOCATION, location),
+                            clear_cookie,
+                            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+                        ],
+                    )
+                        .into_response())
+                }
+                None => Ok((
+                    [
+                        clear_cookie,
+                        (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+                    ],
+                    Json(serde_json::json!({
+                        "token": token,
+                        "expires_in_secs": expires,
+                        "admin": admin_json(&admin),
+                        "return_to": return_to,
+                    })),
+                )
+                    .into_response()),
+            }
+        }
+        Err(err) => {
+            tracing::warn!(ip = %ip_key, "admin SSO login failed: {err}");
+            match frontend {
+                Some(front) if !err.is_internal() => {
+                    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+                    fragment
+                        .append_pair("error", err.error_code())
+                        .append_pair("error_description", &err.public_message());
+                    Ok((
+                        axum::http::StatusCode::FOUND,
+                        [
+                            (
+                                axum::http::header::LOCATION,
+                                format!("{front}#{}", fragment.finish()),
+                            ),
+                            clear_cookie,
+                            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+                        ],
+                    )
+                        .into_response())
+                }
+                _ => {
+                    let mut response = ApiError::from(err).into_response();
+                    if let Ok(value) = clear_cookie.1.parse() {
+                        response
+                            .headers_mut()
+                            .append(axum::http::header::SET_COOKIE, value);
+                    }
+                    Ok(response)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2962,9 +3216,7 @@ pub async fn admin_setup(
         serde_json::json!({"bootstrap": true}),
         client_ip_string(ip),
     );
-    Ok(Json(
-        serde_json::json!({ "id": admin.id, "email": admin.email, "display_name": admin.display_name, "role": admin.role }),
-    ))
+    Ok(Json(admin_json(&admin)))
 }
 
 #[derive(Deserialize)]
@@ -2972,7 +3224,7 @@ pub struct CreateAdminRequest {
     pub email: String,
     pub password: String,
     pub display_name: String,
-    pub role: Option<String>,
+    pub role: Option<AdminRole>,
 }
 
 pub async fn create_admin(
@@ -2981,13 +3233,8 @@ pub async fn create_admin(
     ip: Option<Extension<ClientIp>>,
     Json(req): Json<CreateAdminRequest>,
 ) -> JsonResult {
-    if admin.role != "superadmin" {
-        return Err(AurixError::AuthorizationDenied(
-            "Only superadmins can create administrators".into(),
-        )
-        .into());
-    }
-    let role = req.role.as_deref().unwrap_or("admin");
+    admin.require(AdminPermission::AdminsManage)?;
+    let role = req.role.unwrap_or(AdminRole::Admin);
     let created = state
         .control
         .admin_auth
@@ -3002,15 +3249,199 @@ pub async fn create_admin(
         serde_json::json!({"role": role}),
         client_ip_string(ip),
     );
+    Ok(Json(admin_json(&created)))
+}
+
+pub async fn list_admins(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+) -> JsonResult {
+    admin.require(AdminPermission::AdminsManage)?;
+    let admins = state.control.admin_auth.list_admins().await?;
+    let data: Vec<serde_json::Value> = admins.iter().map(admin_json).collect();
     Ok(Json(
-        serde_json::json!({ "id": created.id, "email": created.email, "display_name": created.display_name, "role": created.role }),
+        serde_json::json!({ "data": data, "total": data.len() }),
     ))
 }
 
-pub async fn admin_me(Extension(admin): Extension<AdminContext>) -> JsonResult {
+pub async fn get_admin(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    Path(admin_id): Path<Uuid>,
+) -> JsonResult {
+    admin.require(AdminPermission::AdminsManage)?;
+    let target = state.control.admin_auth.get_admin(admin_id).await?;
+    Ok(Json(admin_json(&target)))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAdminRequest {
+    pub role: Option<AdminRole>,
+    pub display_name: Option<String>,
+    /// `false` deactivates the account and revokes its tokens; `true` reactivates it.
+    pub active: Option<bool>,
+}
+
+pub async fn update_admin(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(admin_id): Path<Uuid>,
+    Json(req): Json<UpdateAdminRequest>,
+) -> JsonResult {
+    admin.require(AdminPermission::AdminsManage)?;
+    let updated = state
+        .control
+        .admin_auth
+        .update_admin(
+            &admin,
+            admin_id,
+            aurix_auth::AdminUpdate {
+                role: req.role,
+                display_name: req.display_name.clone(),
+                active: req.active,
+            },
+        )
+        .await?;
+    let action = if req.active == Some(false) {
+        AuditAction::AdminDeactivated
+    } else {
+        AuditAction::AdminUpdated
+    };
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        action,
+        "admin",
+        &admin_id.to_string(),
+        serde_json::json!({
+            "role": req.role,
+            "display_name": req.display_name,
+            "active": req.active,
+        }),
+        client_ip_string(ip),
+    );
+    Ok(Json(admin_json(&updated)))
+}
+
+#[derive(Deserialize)]
+pub struct ResetAdminPasswordRequest {
+    pub password: String,
+}
+
+/// Superadmin password reset for another administrator; revokes that admin's tokens.
+pub async fn reset_admin_password(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(admin_id): Path<Uuid>,
+    Json(req): Json<ResetAdminPasswordRequest>,
+) -> JsonResult {
+    admin.require(AdminPermission::AdminsManage)?;
+    state
+        .control
+        .admin_auth
+        .reset_password(admin_id, &req.password)
+        .await?;
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        AuditAction::AdminPasswordChanged,
+        "admin",
+        &admin_id.to_string(),
+        serde_json::json!({"reset": true}),
+        client_ip_string(ip),
+    );
     Ok(Json(
-        serde_json::json!({ "id": admin.admin_id, "email": admin.email, "role": admin.role }),
+        serde_json::json!({"updated": true, "tokens_revoked": true}),
     ))
+}
+
+/// Signs another administrator out everywhere (all of their tokens stop working).
+pub async fn revoke_admin_tokens(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(admin_id): Path<Uuid>,
+) -> JsonResult {
+    admin.require(AdminPermission::AdminsManage)?;
+    state.control.admin_auth.revoke_tokens(admin_id).await?;
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        AuditAction::AdminUpdated,
+        "admin",
+        &admin_id.to_string(),
+        serde_json::json!({"tokens_revoked": true}),
+        client_ip_string(ip),
+    );
+    Ok(Json(serde_json::json!({"tokens_revoked": true})))
+}
+
+pub async fn admin_me(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+) -> JsonResult {
+    let row = state.control.admin_auth.get_admin(admin.admin_id).await?;
+    let mut json = admin_json(&row);
+    json["auth_source"] = serde_json::json!(admin.auth_source);
+    Ok(Json(json))
+}
+
+#[derive(Deserialize)]
+pub struct ChangeOwnPasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Own password change. Every token issued so far (this one included) is revoked; sign in
+/// again afterwards.
+pub async fn change_own_password(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Json(req): Json<ChangeOwnPasswordRequest>,
+) -> JsonResult {
+    state
+        .control
+        .admin_auth
+        .change_own_password(admin.admin_id, &req.current_password, &req.new_password)
+        .await?;
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        AuditAction::AdminPasswordChanged,
+        "admin",
+        &admin.admin_id.to_string(),
+        serde_json::json!({}),
+        client_ip_string(ip),
+    );
+    Ok(Json(
+        serde_json::json!({"updated": true, "tokens_revoked": true}),
+    ))
+}
+
+/// "Sign out everywhere" for the caller.
+pub async fn admin_logout_all(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+) -> JsonResult {
+    state
+        .control
+        .admin_auth
+        .revoke_tokens(admin.admin_id)
+        .await?;
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        AuditAction::AdminUpdated,
+        "admin",
+        &admin.admin_id.to_string(),
+        serde_json::json!({"tokens_revoked": true, "self": true}),
+        client_ip_string(ip),
+    );
+    Ok(Json(serde_json::json!({"tokens_revoked": true})))
 }
 
 /// Runs one retention sweep now (also when the periodic sweep is disabled). `409` while
@@ -3019,12 +3450,7 @@ pub async fn admin_retention_sweep(
     State(state): State<AppState>,
     Extension(admin): Extension<AdminContext>,
 ) -> JsonResult {
-    if admin.role != "superadmin" {
-        return Err(AurixError::AuthorizationDenied(
-            "Only superadmins can run retention sweeps".into(),
-        )
-        .into());
-    }
+    admin.require(AdminPermission::RetentionRun)?;
     let report = state.control.retention.sweep_once().await?.ok_or_else(|| {
         AurixError::Conflict("A retention sweep is already running on another node".into())
     })?;
@@ -3047,6 +3473,7 @@ pub async fn create_app(
     ip: Option<Extension<ClientIp>>,
     Json(req): Json<CreateAppRequest>,
 ) -> JsonResult {
+    admin.require(AdminPermission::AppsWrite)?;
     let name = req.name.trim();
     if name.is_empty() || name.len() > 128 {
         return Err(AurixError::Validation("name must be 1..=128 characters".into()).into());
@@ -3099,8 +3526,10 @@ pub async fn create_app(
 
 pub async fn list_apps(
     State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
     Query(query): Query<ListQuery>,
 ) -> JsonResult {
+    admin.require(AdminPermission::AppsRead)?;
     let (limit, offset) = paging(query.page, query.per_page);
     let apps = aurix_db::queries::list_apps(&state.control.pool, limit, offset).await?;
     let total = aurix_db::queries::count_apps(&state.control.pool).await?;
@@ -3113,7 +3542,12 @@ pub async fn list_apps(
     ))
 }
 
-pub async fn get_app(State(state): State<AppState>, Path(app_id): Path<Uuid>) -> JsonResult {
+pub async fn get_app(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    Path(app_id): Path<Uuid>,
+) -> JsonResult {
+    admin.require(AdminPermission::AppsRead)?;
     let a = aurix_db::queries::get_app(&state.control.pool, app_id)
         .await?
         .ok_or_else(|| AurixError::NotFound("Application not found".into()))?;
@@ -3156,6 +3590,7 @@ pub async fn update_app(
     Path(app_id): Path<Uuid>,
     Json(req): Json<UpdateAppRequest>,
 ) -> JsonResult {
+    admin.require(AdminPermission::AppsWrite)?;
     let name = req.name.as_deref().map(str::trim);
     if name.is_some_and(|n| n.is_empty() || n.len() > 128) {
         return Err(AurixError::Validation("name must be 1..=128 characters".into()).into());
@@ -3201,12 +3636,7 @@ pub async fn delete_app(
     ip: Option<Extension<ClientIp>>,
     Path(app_id): Path<Uuid>,
 ) -> JsonResult {
-    if admin.role != "superadmin" {
-        return Err(AurixError::AuthorizationDenied(
-            "Only superadmins can delete applications".into(),
-        )
-        .into());
-    }
+    admin.require(AdminPermission::AppsDelete)?;
     aurix_db::queries::delete_app(&state.control.pool, app_id).await?;
     state.control.audit.log(
         Some(AppId(app_id)),
@@ -3227,6 +3657,7 @@ pub async fn admin_rotate_app_key(
     ip: Option<Extension<ClientIp>>,
     Path(app_id): Path<Uuid>,
 ) -> JsonResult {
+    admin.require(AdminPermission::KeysRotate)?;
     aurix_db::queries::get_app(&state.control.pool, app_id)
         .await?
         .ok_or_else(|| AurixError::NotFound("Application not found".into()))?;

@@ -117,6 +117,11 @@ the chapter that explains the boundary.
   `useinbandfec`/`usedtx`/`maxplaybackrate` is up to that browser's WebRTC stack.
 * **Windows/macOS native builds** of `aurix-client` are scripted (`build_native.ps1`) but only
   the Linux build runs in CI.
+* **Admin SSO against real identity providers.** The OIDC relying party is exercised end to end
+  against the repository's mock provider (discovery, PKCE, nonce, JWKS rotation, userinfo,
+  role mapping) and follows the OpenID Connect Core rules, but no Keycloak / Entra ID / Okta /
+  Google tenant has been wired up in CI — claim names and group formats of your provider are
+  the thing to verify first ([Administrator accounts and SSO](operations/admin-sso.md)).
 
 ## Planned
 

@@ -40,6 +40,7 @@
 # Operations
 
 - [Deployment and configuration](operations/deployment.md)
+- [Administrator accounts and SSO](operations/admin-sso.md)
 - [Scaling out](operations/scaling.md)
 - [High availability](operations/high-availability.md)
 - [Backups and observability](operations/observability.md)

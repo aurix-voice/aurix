@@ -13,6 +13,7 @@ use crate::speech::SpeechService;
 use crate::user_lifecycle::{RetentionService, UserLifecycle};
 use crate::webhooks::WebhookService;
 use aurix_auth::admin::AdminAuthService;
+use aurix_auth::oidc::OidcProvider;
 use aurix_auth::{AnyToken, ApiKeyService, JwtService, RbacService, ValidatedToken};
 use aurix_common::audit::AuditLogger;
 use aurix_common::config::AurixConfig;
@@ -29,6 +30,8 @@ pub struct ControlPlane {
     pub rbac: Arc<RbacService>,
     pub api_keys: Arc<ApiKeyService>,
     pub admin_auth: Arc<AdminAuthService>,
+    /// Admin SSO; `None` unless `auth.oidc.enabled`.
+    pub admin_oidc: Option<Arc<OidcProvider>>,
     pub nodes: Arc<NodeManager>,
     pub channels: Arc<ChannelManager>,
     pub sessions: Arc<SessionManager>,
@@ -59,8 +62,25 @@ impl ControlPlane {
         let admin_auth = Arc::new(
             AdminAuthService::new(pool.clone(), config.auth.jwt_secret.clone())
                 .with_token_ttl(config.auth.admin_token_ttl_secs)
-                .with_bootstrap_token(config.auth.admin_bootstrap_token.clone()),
+                .with_bootstrap_token(config.auth.admin_bootstrap_token.clone())
+                .with_password_login(config.auth.admin_password_login),
         );
+        let admin_oidc = if config.auth.oidc.enabled {
+            let provider = Arc::new(OidcProvider::new(
+                config.auth.oidc.clone(),
+                &config.auth.jwt_secret,
+            )?);
+            match provider.warm_up().await {
+                Ok(()) => tracing::info!(issuer = %provider.issuer(), "Admin OIDC SSO ready"),
+                Err(e) => tracing::warn!(
+                    issuer = %provider.issuer(),
+                    "Admin OIDC discovery failed at start-up (will retry on first login): {e}"
+                ),
+            }
+            Some(provider)
+        } else {
+            None
+        };
         let nodes = Arc::new(NodeManager::new(pool.clone()));
         if let Err(e) = nodes.load_from_db().await {
             tracing::warn!("Could not load media nodes from database: {e}");
@@ -223,6 +243,7 @@ impl ControlPlane {
             rbac,
             api_keys,
             admin_auth,
+            admin_oidc,
             nodes,
             channels,
             sessions,
@@ -358,11 +379,10 @@ impl ControlPlane {
         }
     }
 
-    /// Validate an admin JWT and confirm the account is still active.
+    /// Validate an admin JWT against the account's current state (active, not revoked, role
+    /// as stored now rather than as it was when the token was issued).
     pub async fn authenticate_admin(&self, token: &str) -> Result<AdminContext> {
-        let ctx = self.admin_auth.validate_admin_token(token)?;
-        self.admin_auth.ensure_active(ctx.admin_id).await?;
-        Ok(ctx)
+        self.admin_auth.authenticate_token(token).await
     }
 
     /// Validates the credential a client opens a WebSocket session with, runs the ban and

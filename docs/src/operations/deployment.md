@@ -85,7 +85,7 @@ are never echoed back by the API or logs.
 | `database` | `url`, pool sizes, `run_migrations` (`true`: embedded migrations run at start; the server refuses to start on an outdated schema) |
 | `redis` | `url`, `pool_size`, `sentinels` + `sentinel_master` for [Redis Sentinel](high-availability.md#sentinel-mode) |
 | `cluster` | `session_mirror` (`true`; needs Redis), `session_mirror_ttl_secs` (180), `node_lost_after_secs` (30), `failover_endpoints` (3) — [cross-node failover](high-availability.md#cross-node-session-failover) |
-| `auth` | `jwt_secret` or `jwt_public_key_path`, `token_ttl_secs` (3600), `action_token_ttl_secs` (90) / `action_token_max_ttl_secs` (600), `require_action_tokens`, `admin_bootstrap_token` |
+| `auth` | `jwt_secret` or `jwt_public_key_path`, `token_ttl_secs` (3600), `action_token_ttl_secs` (90) / `action_token_max_ttl_secs` (600), `require_action_tokens`, `admin_bootstrap_token`, `admin_password_login` (`true`; `false` = SSO only), `oidc.*` (`enabled`, `issuer`, `client_id`, `client_secret`, `redirect_url`, `frontend_redirect`, `role_mapping`, `superadmin_emails`, `allowed_domains`, … — [Administrator accounts and SSO](admin-sso.md)) |
 | `media` | `host` (`0.0.0.0` IPv4-only, `::` dual-stack, an IPv6 literal IPv6-only — [IPv6](#ipv6-and-dual-stack)), `external_ip` (public IPv4), `external_ipv6` (public IPv6, advertised after IPv4), `port` (10000; cascade uses `port + 1`), `require_packet_auth` (`true`), `rx_workers` (`0` = CPUs clamped 2–8), `session_timeout_secs` (60), `speaking_timeout_ms` (400), `speaking_energy_threshold` (0.01), `energy_interval_ms` (200), `quality_interval_ms` (2000), `unfocused_channel_gain` (0.5), `max_channels_per_session` (10), `max_positional_channels_per_session` (1), `pcmu_fallback` (`true`; [G.711 sessions](../features/channels.md#codecs-opus-and-the-pcmu-fallback) cost the node an Opus encoder + a decoder per speaker heard), `media_tunnel` (`true`; native media as binary frames on the control WebSocket when UDP is blocked — [tunnel](../api/aurx.md#tunnel-aurx-over-the-control-websocket)), `tunnel_queue_packets` (128, 8–4096; per-session downlink queue, drops when the client's TCP stalls), `cascade_secret`, `cascade_discovery` (`true`), `cascade_discovery_interval_ms` (3000), `cascade_peers` |
 | `turn` | `enabled`, `host` (same semantics as `media.host`), `external_ip`, `external_ipv6` (default to the media addresses), `realm`, `auth_secret`, `udp_port` / `tcp_port` (3478), `min_port` / `max_port` relay range, `allocation_lifetime_secs`, `max_allocations` |
 | `recording` | `enabled`, `storage_path`, `max_recording_duration_secs` (7200), `retention_days` (90), `require_consent` (`true`), `encryption_enabled` + `encryption_key` (≥ 32 chars), `s3.*`; `recording.live.*` for [live streams](../features/recordings.md#live-audio-streams); `recording.processing.*` (`max_concurrent` 2, `max_queued` 64, `max_sources` 64, `mixdown_bitrate` 64000, `stt_chunk_secs` 30, `stt_sample_rate` 16000) for [mixdowns and transcripts](../features/recordings.md#mixdowns-and-transcripts-of-stored-recordings) |
@@ -170,7 +170,9 @@ encryption + HMAC, DTLS-SRTP for WebRTC, encrypted relay envelopes between nodes
 
 1. Start PostgreSQL and Redis, then the server; migrations apply automatically.
 2. `POST /admin/setup` with `X-Bootstrap-Token` creates the first administrator — then unset
-   `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN`.
+   `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN`. With [OIDC SSO](admin-sso.md) configured and your
+   address in `auth.oidc.superadmin_emails`, `GET /admin/oidc/login` does the same without a
+   bootstrap password.
 3. `POST /admin/login` → admin JWT → `POST /v1/apps` → `POST /v1/apps/{app_id}/api-keys` with the
    permissions your backend needs.
 4. Your backend mints player tokens (`POST /v1/tokens`) — the API key never reaches a client.

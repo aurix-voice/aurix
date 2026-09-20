@@ -38,7 +38,30 @@ action_token_ttl_secs = 90
 action_token_max_ttl_secs = 600
 # true: WebSocket login and ChannelJoin accept only one-time `login` / `join` action tokens.
 require_action_tokens = false
-oauth_enabled = false
+# false: administrators sign in through SSO only (POST /admin/login refused).
+admin_password_login = true
+
+# Admin single sign-on (OpenID Connect, authorization code + PKCE).
+[auth.oidc]
+enabled = false
+# issuer = "https://login.example.com/realms/aurix"
+# client_id = "aurix-admin"
+# client_secret = ""                    # or AURIX__AUTH__OIDC__CLIENT_SECRET
+# redirect_url = "https://api.example.com/admin/oidc/callback"
+# frontend_redirect = "https://panel.example.com/auth/callback"
+# scopes = ["openid", "email", "profile"]
+# email_claim = "email"
+# groups_claim = "groups"
+# role_mapping = { "aurix-superadmins" = "superadmin", "aurix-admins" = "admin", "aurix-mods" = "moderator" }
+# default_role = ""                     # "" refuses users without a mapped group
+# superadmin_emails = ["ops@example.com"]
+# allowed_domains = ["example.com"]
+# require_email_verified = true
+# auto_provision = true
+# sync_roles = true
+# state_ttl_secs = 600
+# timeout_ms = 10000
+# allow_insecure = false   # http issuer / private provider addresses — development and CI only
 
 [media]
 host = "0.0.0.0"

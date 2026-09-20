@@ -2526,12 +2526,14 @@ pub async fn create_admin_user(
     admin: &AdminUserRow,
 ) -> Result<AdminUserRow, sqlx::Error> {
     sqlx::query_as::<_, AdminUserRow>(
-        r#"INSERT INTO admin_users (id, email, password_hash, display_name, role, active, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *"#
+        r#"INSERT INTO admin_users (id, email, password_hash, display_name, role, active, created_at, updated_at,
+                                    auth_source, sso_issuer, sso_subject)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *"#
     )
     .bind(admin.id).bind(&admin.email).bind(&admin.password_hash)
     .bind(&admin.display_name).bind(&admin.role).bind(admin.active)
     .bind(admin.created_at).bind(admin.updated_at)
+    .bind(&admin.auth_source).bind(&admin.sso_issuer).bind(&admin.sso_subject)
     .fetch_one(pool).await
 }
 
@@ -2542,8 +2544,36 @@ pub async fn count_admin_users(pool: &DbPool) -> Result<i64, sqlx::Error> {
     Ok(row.0)
 }
 
+pub async fn count_active_admins_with_role(pool: &DbPool, role: &str) -> Result<i64, sqlx::Error> {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM admin_users WHERE active = true AND role = $1")
+            .bind(role)
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
+}
+
+/// Every account, deactivated ones included, newest first.
+pub async fn list_admin_users(pool: &DbPool) -> Result<Vec<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>(
+        "SELECT * FROM admin_users ORDER BY active DESC, created_at DESC LIMIT 1000",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_admin_by_id(pool: &DbPool, id: Uuid) -> Result<Option<AdminUserRow>, sqlx::Error> {
     sqlx::query_as::<_, AdminUserRow>("SELECT * FROM admin_users WHERE id = $1 AND active = true")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn get_admin_by_id_any(
+    pool: &DbPool,
+    id: Uuid,
+) -> Result<Option<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>("SELECT * FROM admin_users WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -2561,10 +2591,104 @@ pub async fn get_admin_by_email(
     .await
 }
 
+pub async fn get_admin_by_sso(
+    pool: &DbPool,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>(
+        "SELECT * FROM admin_users WHERE sso_issuer = $1 AND sso_subject = $2",
+    )
+    .bind(issuer)
+    .bind(subject)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn update_admin_login(pool: &DbPool, admin_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE admin_users SET last_login_at = NOW() WHERE id = $1")
         .bind(admin_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Binds an existing account to an SSO identity (first SSO login of a password account with
+/// the same email) and records the login.
+pub async fn bind_admin_sso(
+    pool: &DbPool,
+    admin_id: Uuid,
+    issuer: &str,
+    subject: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE admin_users SET sso_issuer = $2, sso_subject = $3, auth_source = 'oidc',
+                                 last_login_at = NOW(), updated_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(admin_id)
+    .bind(issuer)
+    .bind(subject)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Role / display name / active flag edit. With `revoke_tokens` the token generation is bumped
+/// so every admin JWT issued so far is refused on the next request (on every node).
+pub async fn update_admin_user(
+    pool: &DbPool,
+    admin_id: Uuid,
+    role: Option<&str>,
+    display_name: Option<&str>,
+    active: Option<bool>,
+    revoke_tokens: bool,
+) -> Result<Option<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>(
+        r#"UPDATE admin_users SET
+               role = COALESCE($2, role),
+               display_name = COALESCE($3, display_name),
+               active = COALESCE($4, active),
+               token_generation = token_generation + CASE WHEN $5 THEN 1 ELSE 0 END,
+               tokens_revoked_at = CASE WHEN $5 THEN NOW() ELSE tokens_revoked_at END,
+               updated_at = NOW()
+           WHERE id = $1 RETURNING *"#,
+    )
+    .bind(admin_id)
+    .bind(role)
+    .bind(display_name)
+    .bind(active)
+    .bind(revoke_tokens)
+    .fetch_optional(pool)
+    .await
+}
+
+/// New password hash; every token issued so far is revoked.
+pub async fn set_admin_password(
+    pool: &DbPool,
+    admin_id: Uuid,
+    password_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE admin_users SET password_hash = $2, token_generation = token_generation + 1,
+               tokens_revoked_at = NOW(), updated_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(admin_id)
+    .bind(password_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn revoke_admin_tokens(pool: &DbPool, admin_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE admin_users SET token_generation = token_generation + 1, tokens_revoked_at = NOW(),
+               updated_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(admin_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }

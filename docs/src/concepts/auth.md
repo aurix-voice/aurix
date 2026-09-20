@@ -15,7 +15,7 @@ is reported as `404 NOT_FOUND`.
 | **API key** `aurx_…` | `X-API-Key: aurx_…` or `Authorization: Bearer aurx_…` | your game backend / game server | everything under `/v1/*` except the player routes |
 | **Player JWT** | `Authorization: Bearer <jwt>` (REST), `bearer.<jwt>` sub-protocol or header (WebSocket) | the game client | opening a session, `/v1/me/*`, `/v1/webrtc/offer` |
 | **Action token** | same places as the player JWT | the game client, one action | `login`, `join`, `kick`, `mute`, `unmute` — single use |
-| **Admin JWT** | `Authorization: Bearer <jwt>` from `POST /admin/login` | operators | `/admin/*`, `/v1/apps*`, `/v1/nodes` |
+| **Admin JWT** | `Authorization: Bearer <jwt>` from `POST /admin/login` or the SSO callback | operators | `/admin/*`, `/v1/apps*`, `/v1/nodes` |
 | **Bootstrap token** | `X-Bootstrap-Token` | the operator installing the system | `POST /admin/setup` after the first admin exists |
 
 The OpenAPI document declares these as the security schemes `ApiKeyHeader`, `ApiKeyBearer`,
@@ -48,9 +48,48 @@ enforced on top of the per-IP limit — see
 | `events:read` | `GET /v1/events`, `GET /v1/events/snapshot` (and the event catalogue) |
 
 In the OpenAPI document every operation lists its requirement in the `x-aurix-permissions`
-extension; operations reserved to the `superadmin` role carry `x-aurix-admin-role`. A contract
-test in `crates/aurix-api/tests/openapi_contract.rs` keeps the router, the permission checks in
-the handlers and the specification in sync.
+extension; administrator operations carry the [admin permission](#administrators) they need in
+`x-aurix-admin-permission`. A contract test in `crates/aurix-api/tests/openapi_contract.rs`
+keeps the router, the permission checks in the handlers and the specification in sync.
+
+## Administrators
+
+Administrators are not tenant-scoped: they manage applications, nodes and each other. Every
+account has one of four **roles**; a role grants a fixed set of **admin permissions** and each
+`/admin/*`, `/v1/apps*` and `/v1/nodes` operation requires exactly one of them (`403
+FORBIDDEN` otherwise).
+
+| Permission | Grants | `viewer` | `moderator` | `admin` | `superadmin` |
+| --- | --- | :-: | :-: | :-: | :-: |
+| `apps:read` | `GET /v1/apps`, `GET /v1/apps/{id}` | ✓ | ✓ | ✓ | ✓ |
+| `nodes:read` | `GET /v1/nodes` | ✓ | ✓ | ✓ | ✓ |
+| `analytics:read` | reserved for fleet analytics | ✓ | ✓ | ✓ | ✓ |
+| `audit:read` | `GET /admin/audit-log` | | ✓ | ✓ | ✓ |
+| `moderation:read` | reserved for cross-app moderation views | | ✓ | ✓ | ✓ |
+| `apps:write` | `POST /v1/apps`, `PATCH /v1/apps/{id}` | | | ✓ | ✓ |
+| `keys:rotate` | `POST /v1/apps/{id}/rotate-key` | | | ✓ | ✓ |
+| `apps:delete` | `DELETE /v1/apps/{id}` | | | | ✓ |
+| `retention:run` | `POST /admin/retention/sweep` | | | | ✓ |
+| `admins:manage` | `GET/POST /admin/admins`, `GET/PATCH /admin/admins/{id}`, password reset, `logout-all` of others | | | | ✓ |
+
+`GET /admin/me`, `POST /admin/me/password` and `POST /admin/logout-all` need only an active
+account. `GET /admin/me` returns the role and the `permissions` list, so a dashboard can hide
+what the operator cannot do.
+
+**Tokens follow the database, not their claims.** An admin JWT is checked against the account
+row on every request: the *current* role and active flag apply, and the token carries a
+generation number that must match the account's. Role changes, deactivation, password
+changes/resets and `logout-all` bump the generation, so every token issued before them is refused
+with `401 TOKEN_INVALID` on every node at once — no revocation list, no waiting for expiry.
+
+Safeguards: an administrator cannot change their own role or deactivate themself, the last
+active `superadmin` cannot be demoted or deactivated (`409 CONFLICT`), and SSO role sync never
+strips the last superadmin either.
+
+Accounts are created by `POST /admin/setup` (the first one), `POST /admin/admins` (password
+accounts) or on first SSO login — see
+[Administrator accounts and SSO](../operations/admin-sso.md) for OpenID Connect, role mapping
+and the lifecycle API.
 
 ## Player token grants
 

@@ -34,3 +34,4 @@ sqlx = { workspace = true }
 ipnetwork = { workspace = true }
 rand = { workspace = true }
 futures-util = { workspace = true }
+url = { workspace = true }

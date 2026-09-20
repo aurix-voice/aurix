@@ -4,7 +4,7 @@
     "title": "Aurix Voice Platform API",
     "version": "1.2.0",
     "summary": "Self-hosted low-latency game voice: control-plane REST API",
-    "description": "REST control plane of the Aurix voice platform. Real-time media never crosses this API: players talk to a node\nover the WebSocket control plane (`/ws`, see the *WebSocket protocol* chapter of the docs) and stream audio over\nnative AURX/UDP or WebRTC.\n\n## Authentication\n\n| Caller | Credential | Routes |\n|---|---|---|\n| Your game backend | **API key** — `X-API-Key: aurx_…` or `Authorization: Bearer aurx_…` | everything under `/v1/*` except `/v1/me/*`, `/v1/webrtc/*`, `/v1/apps*`, `/v1/nodes` |\n| Player (game client) | **Session JWT** from `POST /v1/tokens` — `Authorization: Bearer <jwt>` | `/v1/me/*`, `/v1/webrtc/offer`, the WebSocket |\n| Operator | **Admin JWT** from `POST /admin/login` — `Authorization: Bearer <jwt>` | `/admin/*`, `/v1/apps*`, `/v1/nodes` |\n| First run | `X-Bootstrap-Token` (or no admins yet) | `POST /admin/setup` |\n\nEvery API-key and player route is scoped to the **application (tenant) of the credential**; ids from other\napplications behave as if they did not exist (`404`). API keys carry a permission list — each operation\ndocuments what it needs in `x-aurix-permissions` (`*` grants everything). Admin-only operations that require the\n`superadmin` role say so in `x-aurix-admin-role`.\n\nKnown permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read`, `channels:write`, `users:read`, `users:write`, `users:erase`, `users:export`, `moderation:read`, `moderation:write`, `recordings:read`, `recordings:write`, `audio_streams:read`, `audio_streams:write`, `chat:read`, `chat:write`, `tts:write`, `keys:manage`, `analytics:read`, `audit:read`, `webhooks:read`, `webhooks:write`, `events:read`.\n\n## Errors\n\nNon-2xx responses use one envelope: `{\"error\": {\"code\": \"…\", \"message\": \"…\"}}`. Codes map to statuses as\nfollows: authentication → `401`; missing permission, action-token, ban or server-mute refusals → `403`;\nunknown or foreign-tenant ids (and chat/TTS when disabled) → `404`; quota, channel-full and other conflicts →\n`409`; validation → `400`; a chat message rejected by the filter → `422`; rate limit (per IP or per key, fleet-wide) → `429`\n(`Retry-After` is set); features not configured on this deployment → `501`; speech-provider failures → `502`;\nno media node available → `503`; provider timeouts → `504`.\n\n## Conventions\n\n* Identifiers are UUIDs, timestamps are RFC 3339 in UTC.\n* Lists that paginate take `page` (from 1) and `per_page` and return `{data, page, per_page, total}` unless\n  documented otherwise.\n* Some resources are **node-local** (session stats, live audio streams): behind a load balancer, address the\n  node that hosts the session/channel (it is listed in `GET /v1/users/{user_id}`).\n* Secrets (API keys, webhook secrets, TURN passwords) appear exactly once, in the response that creates them.\n",
+    "description": "REST control plane of the Aurix voice platform. Real-time media never crosses this API: players talk to a node\nover the WebSocket control plane (`/ws`, see the *WebSocket protocol* chapter of the docs) and stream audio over\nnative AURX/UDP or WebRTC.\n\n## Authentication\n\n| Caller | Credential | Routes |\n|---|---|---|\n| Your game backend | **API key** — `X-API-Key: aurx_…` or `Authorization: Bearer aurx_…` | everything under `/v1/*` except `/v1/me/*`, `/v1/webrtc/*`, `/v1/apps*`, `/v1/nodes` |\n| Player (game client) | **Session JWT** from `POST /v1/tokens` — `Authorization: Bearer <jwt>` | `/v1/me/*`, `/v1/webrtc/offer`, the WebSocket |\n| Operator | **Admin JWT** from `POST /admin/login` (password) or `GET /admin/oidc/login` (SSO) — `Authorization: Bearer <jwt>` | `/admin/*`, `/v1/apps*`, `/v1/nodes` |\n| First run | `X-Bootstrap-Token` (or no admins yet) | `POST /admin/setup` |\n\nEvery API-key and player route is scoped to the **application (tenant) of the credential**; ids from other\napplications behave as if they did not exist (`404`). API keys carry a permission list — each operation\ndocuments what it needs in `x-aurix-permissions` (`*` grants everything). Admin operations document the\nadministrator permission they need in `x-aurix-admin-permission`; roles grant permissions cumulatively:\n\n| Role | Admin permissions |\n|---|---|\n| `viewer` | `apps:read`, `nodes:read`, `analytics:read` |\n| `moderator` | + `audit:read`, `moderation:read` |\n| `admin` | + `apps:write`, `keys:rotate` |\n| `superadmin` | + `apps:delete`, `retention:run`, `admins:manage` |\n\nAdmin tokens are checked against the account on every request: deactivation, a role change, a password\nchange or *sign out everywhere* invalidate the tokens issued before it.\n\nKnown permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read`, `channels:write`, `users:read`, `users:write`, `users:erase`, `users:export`, `moderation:read`, `moderation:write`, `recordings:read`, `recordings:write`, `audio_streams:read`, `audio_streams:write`, `chat:read`, `chat:write`, `tts:write`, `keys:manage`, `analytics:read`, `audit:read`, `webhooks:read`, `webhooks:write`, `events:read`.\n\n## Errors\n\nNon-2xx responses use one envelope: `{\"error\": {\"code\": \"…\", \"message\": \"…\"}}`. Codes map to statuses as\nfollows: authentication → `401`; missing permission, action-token, ban or server-mute refusals → `403`;\nunknown or foreign-tenant ids (and chat/TTS when disabled) → `404`; quota, channel-full and other conflicts →\n`409`; validation → `400`; a chat message rejected by the filter → `422`; rate limit (per IP or per key, fleet-wide) → `429`\n(`Retry-After` is set); features not configured on this deployment → `501`; speech-provider failures → `502`;\nno media node available → `503`; provider timeouts → `504`.\n\n## Conventions\n\n* Identifiers are UUIDs, timestamps are RFC 3339 in UTC.\n* Lists that paginate take `page` (from 1) and `per_page` and return `{data, page, per_page, total}` unless\n  documented otherwise.\n* Some resources are **node-local** (session stats, live audio streams): behind a load balancer, address the\n  node that hosts the session/channel (it is listed in `GET /v1/users/{user_id}`).\n* Secrets (API keys, webhook secrets, TURN passwords) appear exactly once, in the response that creates them.\n",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -117,6 +117,9 @@
                 }
               }
             }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
           }
         },
         "security": []
@@ -149,6 +152,9 @@
                 }
               }
             }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
           }
         },
         "security": []
@@ -171,6 +177,9 @@
                 }
               }
             }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
           }
         },
         "security": []
@@ -261,6 +270,199 @@
         "security": []
       }
     },
+    "/admin/auth/methods": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Sign-in methods offered by this deployment",
+        "operationId": "adminAuthMethods",
+        "description": "For login pages: whether password login is on and whether (and where) SSO starts.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAuthMethods"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": []
+      }
+    },
+    "/admin/oidc/login": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Start an SSO login",
+        "operationId": "adminOidcLogin",
+        "description": "Authorization-code flow with PKCE. Answers `302` to the identity provider's authorization endpoint and sets the `aurix_oidc_login` cookie (HttpOnly, SameSite=Lax, `Secure` when the callback URL is https, path `/admin/oidc`) that the callback binds the encrypted `state` to. Rate-limited like `POST /admin/login`. `404` unless `auth.oidc.enabled`.",
+        "parameters": [
+          {
+            "name": "return_to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            },
+            "description": "Relative dashboard path (`/…`, no `//`) handed back in the callback result."
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the identity provider",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              },
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "502": {
+            "description": "Provider discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/admin/oidc/callback": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "SSO callback (identity provider redirect target)",
+        "operationId": "adminOidcCallback",
+        "description": "Verifies `state` (encrypted, single-use, bound to the login cookie, expires after `auth.oidc.state_ttl_secs`), exchanges `code` (PKCE), validates the ID token (signature via the provider's JWKS, `iss`, `aud`, `nonce`, `exp`, email verification, allowed domains) and maps the provider's groups to a role. With `auth.oidc.frontend_redirect` set, the browser is sent there with `#token=…&expires_in_secs=…[&return_to=…]` (or `#error=…&error_description=…`); otherwise the token is returned as JSON. The login cookie is cleared either way. Roles come from `auth.oidc.superadmin_emails`, then the highest role in `role_mapping` matched by the groups claim, then `default_role`; identities that resolve to no role are refused (`403`).",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Set by the provider when it refused the login."
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed in (no `frontend_redirect` configured)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/AdminLoginResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "return_to": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "Redirect to `auth.oidc.frontend_redirect` with the result in the URL fragment",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "502": {
+            "description": "Token exchange or discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
     "/admin/me": {
       "get": {
         "tags": [
@@ -274,19 +476,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "id": {
-                      "type": "string",
-                      "format": "uuid"
-                    },
-                    "email": {
-                      "type": "string"
-                    },
-                    "role": {
-                      "type": "string"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Admin"
                 }
               }
             }
@@ -296,6 +486,80 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "description": "The account as stored now (role, permissions, SSO binding). `auth_source` reflects how the presented token was obtained."
+      }
+    },
+    "/admin/me/password": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Change own password",
+        "operationId": "adminChangeOwnPassword",
+        "description": "Revokes every token issued to the caller so far, including the one used for this call — sign in again afterwards.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeOwnPasswordRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokensRevoked"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ]
+      }
+    },
+    "/admin/logout-all": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Sign out everywhere",
+        "operationId": "adminLogoutAll",
+        "description": "Revokes every token issued to the caller so far.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokensRevoked"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           }
         },
         "security": [
@@ -351,7 +615,260 @@
             "AdminToken": []
           }
         ],
-        "x-aurix-admin-role": "superadmin"
+        "x-aurix-admin-permission": "admins:manage",
+        "description": "Creates a password account. SSO accounts are provisioned on their first SSO login instead (`auth.oidc.auto_provision`)."
+      },
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "List administrators",
+        "operationId": "listAdmins",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Admin"
+                      }
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "total"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "admins:manage"
+      }
+    },
+    "/admin/admins/{admin_id}": {
+      "parameters": [
+        {
+          "name": "admin_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Get an administrator",
+        "operationId": "getAdmin",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Admin"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "admins:manage"
+      },
+      "patch": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Update role, display name or active state",
+        "operationId": "updateAdmin",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAdminRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Admin"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "admins:manage"
+      }
+    },
+    "/admin/admins/{admin_id}/password": {
+      "parameters": [
+        {
+          "name": "admin_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Reset an administrator's password",
+        "operationId": "resetAdminPassword",
+        "description": "Sets a new password (also for SSO-provisioned accounts) and revokes the target's tokens.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetAdminPasswordRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokensRevoked"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "admins:manage"
+      }
+    },
+    "/admin/admins/{admin_id}/logout-all": {
+      "parameters": [
+        {
+          "name": "admin_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Sign an administrator out everywhere",
+        "operationId": "revokeAdminTokens",
+        "description": "Revokes every token issued to the target so far; the account stays active.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokensRevoked"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "admins:manage"
       }
     },
     "/admin/audit-log": {
@@ -406,7 +923,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "audit:read"
       }
     },
     "/admin/retention/sweep": {
@@ -443,7 +961,7 @@
             "AdminToken": []
           }
         ],
-        "x-aurix-admin-role": "superadmin"
+        "x-aurix-admin-permission": "retention:run"
       }
     },
     "/v1/apps": {
@@ -489,7 +1007,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "apps:write"
       },
       "get": {
         "tags": [
@@ -555,7 +1074,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "apps:read"
       }
     },
     "/v1/apps/{app_id}": {
@@ -598,7 +1118,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "apps:read"
       },
       "patch": {
         "tags": [
@@ -653,7 +1174,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "apps:write"
       },
       "delete": {
         "tags": [
@@ -704,7 +1226,7 @@
             "AdminToken": []
           }
         ],
-        "x-aurix-admin-role": "superadmin"
+        "x-aurix-admin-permission": "apps:delete"
       }
     },
     "/v1/apps/{app_id}/rotate-key": {
@@ -761,7 +1283,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "keys:rotate"
       }
     },
     "/v1/nodes": {
@@ -797,7 +1320,8 @@
           {
             "AdminToken": []
           }
-        ]
+        ],
+        "x-aurix-admin-permission": "nodes:read"
       }
     },
     "/v1/tokens": {
@@ -6489,17 +7013,57 @@
             "type": "string"
           },
           "role": {
+            "$ref": "#/components/schemas/AdminRole"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminPermission"
+            }
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "auth_source": {
             "type": "string",
             "enum": [
-              "superadmin",
-              "admin"
-            ]
+              "password",
+              "oidc"
+            ],
+            "description": "How the account was created; in `GET /admin/me`, how the presented token was obtained."
+          },
+          "sso_bound": {
+            "type": "boolean",
+            "description": "An SSO identity (issuer + subject) is linked to this account."
+          },
+          "has_password": {
+            "type": "boolean",
+            "description": "`false` for SSO-only accounts, which cannot use `POST /admin/login`."
+          },
+          "last_login_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
           }
         },
         "required": [
           "id",
           "email",
-          "role"
+          "display_name",
+          "role",
+          "permissions",
+          "active",
+          "auth_source"
         ]
       },
       "AdminLoginRequest": {
@@ -7537,7 +8101,7 @@
             "type": "string"
           },
           "role": {
-            "type": "string",
+            "$ref": "#/components/schemas/AdminRole",
             "default": "admin"
           }
         },
@@ -10273,6 +10837,127 @@
         },
         "required": [
           "message_id"
+        ]
+      },
+      "AdminRole": {
+        "type": "string",
+        "enum": [
+          "viewer",
+          "moderator",
+          "admin",
+          "superadmin"
+        ],
+        "description": "Administrator role. Each role includes the permissions of the ones before it."
+      },
+      "AdminPermission": {
+        "type": "string",
+        "enum": [
+          "apps:read",
+          "apps:write",
+          "apps:delete",
+          "keys:rotate",
+          "nodes:read",
+          "audit:read",
+          "moderation:read",
+          "analytics:read",
+          "retention:run",
+          "admins:manage"
+        ]
+      },
+      "UpdateAdminRequest": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/AdminRole"
+          },
+          "display_name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "active": {
+            "type": "boolean",
+            "description": "`false` deactivates the account and revokes its tokens, `true` reactivates it."
+          }
+        },
+        "description": "Only the fields present change. Callers cannot change their own role or deactivate themselves, and the last active superadmin cannot be demoted or deactivated. A role change or deactivation revokes the target's tokens."
+      },
+      "ResetAdminPasswordRequest": {
+        "type": "object",
+        "properties": {
+          "password": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "password"
+        ]
+      },
+      "ChangeOwnPasswordRequest": {
+        "type": "object",
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "description": "Password accounts must present `current_password`; SSO-provisioned accounts without a password set one here (any `current_password`) and can then also use `POST /admin/login` while `auth.admin_password_login` is on."
+      },
+      "AdminAuthMethods": {
+        "type": "object",
+        "properties": {
+          "password_login": {
+            "type": "boolean",
+            "description": "`POST /admin/login` is accepted (`auth.admin_password_login`)."
+          },
+          "oidc": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "issuer": {
+                "type": "string"
+              },
+              "login_url": {
+                "type": "string",
+                "example": "/admin/oidc/login"
+              }
+            },
+            "required": [
+              "issuer",
+              "login_url"
+            ],
+            "description": "Present when `auth.oidc.enabled`."
+          }
+        },
+        "required": [
+          "password_login",
+          "oidc"
+        ]
+      },
+      "TokensRevoked": {
+        "type": "object",
+        "properties": {
+          "tokens_revoked": {
+            "type": "boolean",
+            "const": true
+          },
+          "updated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tokens_revoked"
         ]
       }
     }

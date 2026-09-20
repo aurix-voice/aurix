@@ -24,7 +24,8 @@ npx @openapitools/openapi-generator-cli generate -i openapi.json -g typescript-f
   aurx_…`), `PlayerToken`, `AdminToken`, `BootstrapToken` — are attached to each operation. See
   [Tenancy, credentials and permissions](../concepts/auth.md).
 * `x-aurix-permissions` on an operation lists the API-key permission(s) it needs;
-  `x-aurix-admin-role: superadmin` marks admin operations restricted to super-administrators.
+  `x-aurix-admin-permission` names the [admin permission](../concepts/auth.md#administrators)
+  (and therefore the minimum admin role) an administrator operation requires.
 * Every non-2xx response is the `Error` envelope; status-to-code mapping is in the
   specification's introduction and in [Errors](../concepts/auth.md#errors).
 * Paginated lists take `page` (from 1) and `per_page` and return `{data, page, per_page, total}`.
@@ -36,8 +37,8 @@ npx @openapitools/openapi-generator-cli generate -i openapi.json -g typescript-f
 | Area | Routes | Credential |
 | --- | --- | --- |
 | Health | `GET /health`, `GET /ready`, `GET /openapi.json` | none |
-| Admin | `POST /admin/setup`, `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log`, `POST /admin/retention/sweep` | admin JWT (`superadmin` where marked), bootstrap token for setup |
-| Applications & nodes | `GET/POST /v1/apps`, `GET/PATCH/DELETE /v1/apps/{app_id}` (`PATCH` edits name, description and the `max_channels` / `max_participants_per_channel` quotas — up to 100 000 — for [large channels](../features/channels.md#large-channels-and-audiences)), `POST /v1/apps/{app_id}/rotate-key`, `GET /v1/nodes` | admin JWT |
+| Admin | `POST /admin/setup`, `GET /admin/auth/methods`, `POST /admin/login`, `GET /admin/oidc/login`, `GET /admin/oidc/callback`, `GET /admin/me`, `POST /admin/me/password`, `POST /admin/logout-all`, `GET/POST /admin/admins`, `GET/PATCH /admin/admins/{id}`, `POST /admin/admins/{id}/password`, `POST /admin/admins/{id}/logout-all`, `GET /admin/audit-log`, `POST /admin/retention/sweep` — [Administrator accounts and SSO](../operations/admin-sso.md) | admin JWT with the `x-aurix-admin-permission` of the operation; bootstrap token for setup; none for `auth/methods` and the SSO routes |
+| Applications & nodes | `GET/POST /v1/apps`, `GET/PATCH/DELETE /v1/apps/{app_id}` (`PATCH` edits name, description and the `max_channels` / `max_participants_per_channel` quotas — up to 100 000 — for [large channels](../features/channels.md#large-channels-and-audiences)), `POST /v1/apps/{app_id}/rotate-key`, `GET /v1/nodes` | admin JWT (`apps:read` / `apps:write` / `apps:delete` / `keys:rotate` / `nodes:read`) |
 | Tokens & TURN | `POST /v1/tokens`, `POST /v1/tokens/action`, `POST /v1/turn/credentials` | API key |
 | Channels | `GET/POST /v1/channels`, `GET/DELETE /v1/channels/{id}`, `PUT /v1/channels/{id}/config`, `GET /v1/channels/{id}/participants`, `POST /v1/channels/{id}/tts`, `GET /v1/tts/voices` | API key |
 | Chat | `GET/POST /v1/channels/{id}/messages`, `GET/POST /v1/users/{id}/messages` | API key |

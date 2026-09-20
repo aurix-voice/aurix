@@ -201,12 +201,47 @@ jobs:
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8100/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8100/ready
           cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture speech_transcripts content_safety recording_mixdown
+      - name: E2E (admin SSO against the mock OIDC provider + administrator lifecycle)
+        env:
+          AURIX__TURN__ENABLED: "false"
+          AURIX__RECORDING__ENABLED: "false"
+          AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          AURIX__MEDIA__CASCADE_DISCOVERY: "false"
+          AURIX__SERVER__API_PORT: "8110"
+          AURIX__SERVER__WS_PORT: "8111"
+          AURIX__MEDIA__PORT: "10007"
+          AURIX__METRICS__PORT: "9097"
+          AURIX__AUTH__OIDC__ENABLED: "true"
+          AURIX__AUTH__OIDC__ISSUER: http://127.0.0.1:18791
+          AURIX__AUTH__OIDC__CLIENT_ID: aurix-admin
+          AURIX__AUTH__OIDC__CLIENT_SECRET: ci-only-oidc-secret
+          AURIX__AUTH__OIDC__REDIRECT_URL: http://127.0.0.1:8110/admin/oidc/callback
+          AURIX__AUTH__OIDC__ALLOW_INSECURE: "true"
+          AURIX__AUTH__OIDC__ROLE_MAPPING__AURIX_ADMINS: admin
+          AURIX__AUTH__OIDC__ROLE_MAPPING__AURIX_OPS: moderator
+          AURIX__AUTH__OIDC__SUPERADMIN_EMAILS: root.sso@example.com
+          AURIX__AUTH__OIDC__ALLOWED_DOMAINS: example.com
+          AURIX__TRACING__LOG_FORMAT: text
+          AURIX_E2E_OIDC: "1"
+          AURIX_E2E_API: http://127.0.0.1:8110
+          AURIX_E2E_WS: ws://127.0.0.1:8111
+          AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
+          AURIX_E2E_ADMIN_TOKEN: ${{ steps.bootstrap.outputs.admin_token }}
+        run: |
+          cargo build --locked -p aurix-server --example mock_oidc
+          nohup ./target/debug/examples/mock_oidc 127.0.0.1:18791 aurix-admin ci-only-oidc-secret > mock-oidc.log 2>&1 &
+          nohup ./target/debug/aurix-server > server-oidc.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8110/ready && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8110/ready
+          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture admin_sso
       - if: failure()
         run: |
           tail -n 200 server.log
           tail -n 100 server-strict.log || true
           tail -n 200 server-speech.log || true
           tail -n 50 mock-speech.log || true
+          tail -n 200 server-oidc.log || true
+          tail -n 50 mock-oidc.log || true
 
   audit:
     name: cargo audit / deny

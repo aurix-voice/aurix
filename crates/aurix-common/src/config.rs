@@ -49,7 +49,10 @@ impl AurixConfig {
                 .with_list_parse_key("redis.sentinels")
                 .with_list_parse_key("webhooks.retry_delays_secs")
                 .with_list_parse_key("tts.voices")
-                .with_list_parse_key("safety.categories"),
+                .with_list_parse_key("safety.categories")
+                .with_list_parse_key("auth.oidc.scopes")
+                .with_list_parse_key("auth.oidc.superadmin_emails")
+                .with_list_parse_key("auth.oidc.allowed_domains"),
         );
         let cfg = builder.build()?;
         let mut config: AurixConfig = cfg.try_deserialize()?;
@@ -126,6 +129,10 @@ impl AurixConfig {
             anyhow::bail!(
                 "auth.action_token_ttl_secs must be within 1..=auth.action_token_max_ttl_secs"
             );
+        }
+        self.auth.oidc.validate()?;
+        if !self.auth.admin_password_login && !self.auth.oidc.enabled {
+            anyhow::bail!("auth.admin_password_login = false requires auth.oidc.enabled = true");
         }
         if self.media.max_participants_per_node == 0 {
             anyhow::bail!("max_participants_per_node must be > 0");
@@ -850,10 +857,206 @@ pub struct AuthConfig {
     /// `POST /v1/tokens` is refused for both (it stays valid for end-user REST calls).
     #[serde(default)]
     pub require_action_tokens: bool,
-    pub oauth_enabled: bool,
-    pub oauth_client_id: Option<String>,
-    pub oauth_client_secret: Option<String>,
-    pub oauth_issuer_url: Option<String>,
+    /// `false` turns `POST /admin/login` off: administrators sign in through `[auth.oidc]` only
+    /// (`POST /admin/setup` still works for the first-run bootstrap).
+    #[serde(default = "default_true")]
+    pub admin_password_login: bool,
+    /// Single sign-on for the admin dashboard (OpenID Connect authorization code + PKCE).
+    #[serde(default)]
+    pub oidc: OidcConfig,
+}
+
+/// OpenID Connect SSO for administrators. Roles come from a group claim (`role_mapping`) or
+/// `default_role`; accounts are provisioned on first login when `auto_provision` is on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Issuer URL; `{issuer}/.well-known/openid-configuration` is fetched at start-up and
+    /// re-fetched when keys rotate. Must be `https` unless `allow_insecure` is set.
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub client_id: String,
+    /// Confidential-client secret (`client_secret_basic`). Optional: public clients rely on
+    /// PKCE alone.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Public URL of `GET /admin/oidc/callback` as registered at the provider.
+    #[serde(default)]
+    pub redirect_url: String,
+    /// Where the browser lands after a successful login; the admin JWT travels in the URL
+    /// fragment (`#token=…&expires_in_secs=…`). Unset: the callback answers with JSON.
+    #[serde(default)]
+    pub frontend_redirect: Option<String>,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// ID-token claim holding the administrator's email.
+    #[serde(default = "default_email_claim")]
+    pub email_claim: String,
+    /// ID-token claim listing groups/roles (array of strings or a space/comma separated string).
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    /// Group value → Aurix admin role. A user in several mapped groups gets the highest role.
+    #[serde(default)]
+    pub role_mapping: std::collections::BTreeMap<String, String>,
+    /// Role for users without a mapped group; empty refuses them.
+    #[serde(default)]
+    pub default_role: String,
+    /// Emails (lower-case) that always get `superadmin`, so the first administrator can be
+    /// bootstrapped through SSO without a password.
+    #[serde(default)]
+    pub superadmin_emails: Vec<String>,
+    /// Accept only emails under these domains (empty = any domain the provider vouches for).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Require `email_verified: true` in the ID token.
+    #[serde(default = "default_true")]
+    pub require_email_verified: bool,
+    /// Create administrator accounts on first SSO login.
+    #[serde(default = "default_true")]
+    pub auto_provision: bool,
+    /// Re-apply the mapped role on every login (`false`: roles set in Aurix stick).
+    #[serde(default = "default_true")]
+    pub sync_roles: bool,
+    /// Login attempts must complete within this many seconds.
+    #[serde(default = "default_oidc_state_ttl_secs")]
+    pub state_ttl_secs: u64,
+    /// Allow `http` issuers / private addresses. Development and tests only.
+    #[serde(default)]
+    pub allow_insecure: bool,
+    #[serde(default = "default_oidc_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "email".into(), "profile".into()]
+}
+
+fn default_email_claim() -> String {
+    "email".into()
+}
+
+fn default_groups_claim() -> String {
+    "groups".into()
+}
+
+fn default_oidc_state_ttl_secs() -> u64 {
+    600
+}
+
+fn default_oidc_timeout_ms() -> u64 {
+    10_000
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: None,
+            redirect_url: String::new(),
+            frontend_redirect: None,
+            scopes: default_oidc_scopes(),
+            email_claim: default_email_claim(),
+            groups_claim: default_groups_claim(),
+            role_mapping: Default::default(),
+            default_role: String::new(),
+            superadmin_emails: Vec::new(),
+            allowed_domains: Vec::new(),
+            require_email_verified: true,
+            auto_provision: true,
+            sync_roles: true,
+            state_ttl_secs: default_oidc_state_ttl_secs(),
+            allow_insecure: false,
+            timeout_ms: default_oidc_timeout_ms(),
+        }
+    }
+}
+
+impl OidcConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let issuer = crate::net::validate_outbound_url(
+            self.issuer.trim_end_matches('/'),
+            "https",
+            "http",
+            !self.allow_insecure,
+            self.allow_insecure,
+            "auth.oidc.issuer",
+        )
+        .map_err(|e| anyhow::anyhow!("auth.oidc.issuer: {e}"))?;
+        if issuer.query().is_some() || issuer.fragment().is_some() {
+            anyhow::bail!("auth.oidc.issuer must not carry a query or fragment");
+        }
+        if self.client_id.trim().is_empty() {
+            anyhow::bail!("auth.oidc.client_id is required");
+        }
+        crate::net::validate_outbound_url(
+            &self.redirect_url,
+            "https",
+            "http",
+            !self.allow_insecure,
+            true,
+            "auth.oidc.redirect_url",
+        )
+        .map_err(|e| anyhow::anyhow!("auth.oidc.redirect_url: {e}"))?;
+        if let Some(front) = &self.frontend_redirect {
+            let url = crate::net::validate_outbound_url(
+                front,
+                "https",
+                "http",
+                !self.allow_insecure,
+                true,
+                "auth.oidc.frontend_redirect",
+            )
+            .map_err(|e| anyhow::anyhow!("auth.oidc.frontend_redirect: {e}"))?;
+            if url.fragment().is_some() {
+                anyhow::bail!("auth.oidc.frontend_redirect must not carry a fragment");
+            }
+        }
+        if !self.scopes.iter().any(|s| s == "openid") {
+            anyhow::bail!("auth.oidc.scopes must include \"openid\"");
+        }
+        if self.email_claim.trim().is_empty() {
+            anyhow::bail!("auth.oidc.email_claim is required");
+        }
+        for (group, role) in &self.role_mapping {
+            if crate::types::AdminRole::parse(role).is_none() {
+                anyhow::bail!("auth.oidc.role_mapping[{group:?}] = {role:?} is not an admin role");
+            }
+        }
+        if !self.default_role.is_empty()
+            && crate::types::AdminRole::parse(&self.default_role).is_none()
+        {
+            anyhow::bail!(
+                "auth.oidc.default_role {:?} is not an admin role",
+                self.default_role
+            );
+        }
+        if self.role_mapping.is_empty()
+            && self.default_role.is_empty()
+            && self.superadmin_emails.is_empty()
+        {
+            anyhow::bail!(
+                "auth.oidc needs role_mapping, default_role or superadmin_emails, otherwise nobody can sign in"
+            );
+        }
+        if !(30..=3600).contains(&self.state_ttl_secs) {
+            anyhow::bail!("auth.oidc.state_ttl_secs must be within 30..=3600");
+        }
+        if !(500..=60_000).contains(&self.timeout_ms) {
+            anyhow::bail!("auth.oidc.timeout_ms must be within 500..=60000");
+        }
+        Ok(())
+    }
+
+    pub fn issuer_trimmed(&self) -> &str {
+        self.issuer.trim().trim_end_matches('/')
+    }
 }
 
 fn default_admin_token_ttl_secs() -> i64 {
@@ -881,10 +1084,8 @@ impl Default for AuthConfig {
             action_token_ttl_secs: default_action_token_ttl_secs(),
             action_token_max_ttl_secs: default_action_token_max_ttl_secs(),
             require_action_tokens: false,
-            oauth_enabled: false,
-            oauth_client_id: None,
-            oauth_client_secret: None,
-            oauth_issuer_url: None,
+            admin_password_login: true,
+            oidc: OidcConfig::default(),
         }
     }
 }

@@ -17,8 +17,9 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 * **Built-in TURN/STUN** with time-limited HMAC credentials issued by the API.
 * **Horizontal scale**: PostgreSQL + Redis control plane, media nodes register and heartbeat,
   channel events replicate across nodes, authenticated SFU-to-SFU cascade.
-* **Ops**: Prometheus metrics, JSON logs, OpenTelemetry tracing, graceful drain, health/readiness,
-  distroless-ish non-root container, CI with a live end-to-end test.
+* **Ops**: administrator roles with OIDC SSO, Prometheus metrics, JSON logs, OpenTelemetry
+  tracing, graceful drain, health/readiness, distroless-ish non-root container, CI with a live
+  end-to-end test.
 
 > Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
@@ -51,7 +52,7 @@ quick start, protocols, SDK guides, operations. The REST contract is
 |---|---|
 | `aurix-common` | types, AURX wire protocol, crypto, config, errors, jitter buffer |
 | `aurix-db` | SQLx models, queries, embedded migrations |
-| `aurix-auth` | player JWTs, admin JWTs (Argon2), API keys, TURN credentials |
+| `aurix-auth` | player JWTs, admin JWTs (Argon2) + OIDC SSO, API keys, TURN credentials |
 | `aurix-media` | SFU: sessions, channels, routing, Opus mixing, WebRTC (str0m), cascade |
 | `aurix-turn` | RFC 5766/5389 TURN/STUN server (UDP + TCP, long-term credentials) |
 | `aurix-control` | control plane: sessions, channels, nodes, events, rate limits, audit |
@@ -284,8 +285,9 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 |---|---|---|
 | none | `GET /health`, `GET /ready` | liveness / readiness (DB + Redis) |
 | bootstrap | `POST /admin/setup` | first admin (see above) |
-| admin JWT | `POST /admin/login`, `GET /admin/me`, `POST /admin/admins`, `GET /admin/audit-log`, `POST /admin/retention/sweep` | operators (`sweep` runs one retention pass now, superadmin; `409` while another node holds the sweep lock) |
-| admin JWT | `POST|GET /v1/apps`, `GET|DELETE /v1/apps/:id`, `POST /v1/apps/:id/rotate-key`, `GET /v1/nodes` | tenants & fleet |
+| none | `GET /admin/auth/methods`, `GET /admin/oidc/login`, `GET /admin/oidc/callback` | login page discovery and [OIDC SSO](docs/src/operations/admin-sso.md) |
+| admin JWT | `POST /admin/login`, `GET /admin/me`, `POST /admin/me/password`, `POST /admin/logout-all`, `GET|POST /admin/admins`, `GET|PATCH /admin/admins/:id`, `POST /admin/admins/:id/password`, `POST /admin/admins/:id/logout-all`, `GET /admin/audit-log`, `POST /admin/retention/sweep` | operators — roles `viewer` / `moderator` / `admin` / `superadmin` with a [permission matrix](docs/src/concepts/auth.md#administrators); tokens are revoked on role change, deactivation, password change and `logout-all`; `sweep` runs one retention pass now (`409` while another node holds the sweep lock) |
+| admin JWT | `POST|GET /v1/apps`, `GET|PATCH|DELETE /v1/apps/:id`, `POST /v1/apps/:id/rotate-key`, `GET /v1/nodes` | tenants & fleet (`apps:read` / `apps:write` / `apps:delete` / `keys:rotate` / `nodes:read`) |
 | API key | `POST /v1/tokens` | issue player JWT; a channel grant is `{"channel_id":…}` or `{"ad_hoc":{"name":…,"channel_type":…,"max_participants":…}}` (created on first join, dropped when empty; `max_participants` is clamped to the app limit, creation counts against the app's channel quota) |
 | API key | `POST /v1/tokens/action` | one-time `login`/`join`/`kick`/`mute`/`unmute` token (moderation actions also need `moderation:write`; `join` accepts `ad_hoc` too) |
 | API key | `POST /v1/turn/credentials` | TURN credentials for a user |
@@ -388,6 +390,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__CLUSTER__SESSION_MIRROR`, `AURIX__CLUSTER__SESSION_MIRROR_TTL_SECS`, `AURIX__CLUSTER__NODE_LOST_AFTER_SECS`, `AURIX__CLUSTER__FAILOVER_ENDPOINTS` | cross-node failover: mirror sessions in Redis (default on, TTL 180), reap nodes silent for 30 s, advertise 3 failover nodes per session |
 | `AURIX__AUTH__JWT_SECRET` | ≥ 32 random bytes; or `AURIX__AUTH__JWT_PUBLIC_KEY_PATH` for RS256 |
 | `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN` | allows `/admin/setup` after the first admin exists; unset after use |
+| `AURIX__AUTH__ADMIN_PASSWORD_LOGIN`, `AURIX__AUTH__OIDC__*` | `false` makes the deployment SSO-only; `OIDC__ENABLED`, `ISSUER`, `CLIENT_ID`, `CLIENT_SECRET`, `REDIRECT_URL`, `FRONTEND_REDIRECT`, `SUPERADMIN_EMAILS`, `ALLOWED_DOMAINS`, `DEFAULT_ROLE`, `SYNC_ROLES`, `AUTO_PROVISION` (group → role mapping is best kept in TOML) — [Administrator accounts and SSO](docs/src/operations/admin-sso.md) |
 | `AURIX__AUTH__ACTION_TOKEN_TTL_SECS`, `AURIX__AUTH__ACTION_TOKEN_MAX_TTL_SECS` | default (90) and maximum (600) lifetime of one-time action tokens |
 | `AURIX__AUTH__REQUIRE_ACTION_TOKENS` | `true` — WebSocket login and `ChannelJoin` accept only one-time action tokens (player JWTs stay valid for REST) |
 | `AURIX__MEDIA__EXTERNAL_IP` | public IPv4 advertised to clients for UDP media |

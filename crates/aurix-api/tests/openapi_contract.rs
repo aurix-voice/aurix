@@ -183,3 +183,112 @@ fn spec_metadata_matches_crate() {
         );
     }
 }
+
+/// Admin operations: every `admin.require(AdminPermission::…)` in the handlers must be one of
+/// the typed permissions and documented on some operation, every admin-token operation must
+/// document its permission (or be in the explicit "any active administrator" list), and the
+/// documented role table must match the code's matrix.
+#[test]
+fn admin_permissions_are_documented() {
+    use aurix_common::types::{AdminPermission, AdminRole};
+
+    let spec = spec();
+    let variants: BTreeMap<String, &str> = AdminPermission::ALL
+        .iter()
+        .map(|p| (format!("{p:?}"), p.as_str()))
+        .collect();
+    let known: BTreeSet<&str> = variants.values().copied().collect();
+
+    let mut checked = BTreeSet::new();
+    for src in HANDLER_SOURCES {
+        let needle = "admin.require(AdminPermission::";
+        let mut rest = *src;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            let end = rest.find(')').expect("closing paren");
+            let variant = &rest[..end];
+            let name = variants
+                .get(variant)
+                .unwrap_or_else(|| panic!("unknown AdminPermission::{variant}"));
+            checked.insert(name.to_string());
+        }
+    }
+    assert!(
+        checked.len() >= 8,
+        "admin permission scan found too few checks"
+    );
+
+    let any_admin: BTreeSet<&str> = ["/admin/me", "/admin/me/password", "/admin/logout-all"]
+        .into_iter()
+        .collect();
+    let mut documented = BTreeSet::new();
+    for (path, item) in spec["paths"].as_object().unwrap() {
+        for (method, op) in item.as_object().unwrap() {
+            if !["get", "post", "put", "patch", "delete"].contains(&method.as_str()) {
+                continue;
+            }
+            let admin_token = op["security"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|s| s.get("AdminToken").is_some()));
+            let perm = op.get("x-aurix-admin-permission").and_then(|p| p.as_str());
+            match (admin_token, perm) {
+                (true, Some(p)) => {
+                    assert!(
+                        known.contains(p),
+                        "{method} {path} documents unknown admin permission '{p}'"
+                    );
+                    documented.insert(p.to_string());
+                }
+                (true, None) => assert!(
+                    any_admin.contains(path.as_str()),
+                    "{method} {path} takes an admin token but documents no x-aurix-admin-permission"
+                ),
+                (false, Some(_)) => {
+                    panic!("{method} {path} documents an admin permission without AdminToken")
+                }
+                (false, None) => {}
+            }
+        }
+    }
+    for perm in &checked {
+        assert!(
+            documented.contains(perm),
+            "'{perm}' is required by a handler but no operation documents it"
+        );
+    }
+
+    let listed = spec["info"]["description"].as_str().unwrap();
+    for role in AdminRole::ALL {
+        assert!(
+            listed.contains(&format!("| `{role}` |")),
+            "info.description lacks the row for role {role}"
+        );
+    }
+    for perm in AdminPermission::ALL {
+        assert!(
+            listed.contains(&format!("`{}`", perm.as_str())),
+            "info.description does not list admin permission '{}'",
+            perm.as_str()
+        );
+    }
+    let enum_roles: Vec<&str> = spec["components"]["schemas"]["AdminRole"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        enum_roles,
+        AdminRole::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+    );
+    let enum_perms: BTreeSet<&str> = spec["components"]["schemas"]["AdminPermission"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(enum_perms, known);
+}

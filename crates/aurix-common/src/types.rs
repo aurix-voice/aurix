@@ -1342,6 +1342,9 @@ pub enum AuditAction {
     RecordingDeleted,
     AdminLogin,
     AdminCreated,
+    AdminUpdated,
+    AdminDeactivated,
+    AdminPasswordChanged,
     AppCreated,
     AppUpdated,
     AppDeleted,
@@ -1436,12 +1439,181 @@ pub struct OcclusionInfo {
     pub factor: f32,
 }
 
-/// Admin authentication context injected by admin middleware.
+/// Dashboard role of an administrator. Roles are ordered: a higher role holds every permission
+/// of the lower ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRole {
+    /// Read-only view of applications, nodes and health.
+    Viewer,
+    /// Viewer plus the audit log and moderation data across applications.
+    Moderator,
+    /// Moderator plus application management (create/update, API-key rotation).
+    Admin,
+    /// Everything, including administrator accounts, application deletion and retention sweeps.
+    Superadmin,
+}
+
+impl AdminRole {
+    pub const ALL: [AdminRole; 4] = [Self::Viewer, Self::Moderator, Self::Admin, Self::Superadmin];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Moderator => "moderator",
+            Self::Admin => "admin",
+            Self::Superadmin => "superadmin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "viewer" => Some(Self::Viewer),
+            "moderator" => Some(Self::Moderator),
+            "admin" => Some(Self::Admin),
+            "superadmin" => Some(Self::Superadmin),
+            _ => None,
+        }
+    }
+
+    pub fn allows(self, permission: AdminPermission) -> bool {
+        self >= permission.minimum_role()
+    }
+
+    pub fn permissions(self) -> Vec<AdminPermission> {
+        AdminPermission::ALL
+            .into_iter()
+            .filter(|p| self.allows(*p))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for AdminRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Fine-grained dashboard capabilities, each granted from a minimum [`AdminRole`] upwards.
+/// Serialised as the `scope:action` strings from [`AdminPermission::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdminPermission {
+    AppsRead,
+    AppsWrite,
+    AppsDelete,
+    KeysRotate,
+    NodesRead,
+    AuditRead,
+    ModerationRead,
+    AnalyticsRead,
+    RetentionRun,
+    AdminsManage,
+}
+
+impl AdminPermission {
+    pub const ALL: [AdminPermission; 10] = [
+        Self::AppsRead,
+        Self::AppsWrite,
+        Self::AppsDelete,
+        Self::KeysRotate,
+        Self::NodesRead,
+        Self::AuditRead,
+        Self::ModerationRead,
+        Self::AnalyticsRead,
+        Self::RetentionRun,
+        Self::AdminsManage,
+    ];
+
+    pub fn minimum_role(self) -> AdminRole {
+        match self {
+            Self::AppsRead | Self::NodesRead | Self::AnalyticsRead => AdminRole::Viewer,
+            Self::AuditRead | Self::ModerationRead => AdminRole::Moderator,
+            Self::AppsWrite | Self::KeysRotate => AdminRole::Admin,
+            Self::AppsDelete | Self::RetentionRun | Self::AdminsManage => AdminRole::Superadmin,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppsRead => "apps:read",
+            Self::AppsWrite => "apps:write",
+            Self::AppsDelete => "apps:delete",
+            Self::KeysRotate => "keys:rotate",
+            Self::NodesRead => "nodes:read",
+            Self::AuditRead => "audit:read",
+            Self::ModerationRead => "moderation:read",
+            Self::AnalyticsRead => "analytics:read",
+            Self::RetentionRun => "retention:run",
+            Self::AdminsManage => "admins:manage",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+impl Serialize for AdminPermission {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AdminPermission {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown admin permission {s:?}")))
+    }
+}
+
+/// How an administrator authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAuthSource {
+    Password,
+    Oidc,
+}
+
+impl AdminAuthSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Oidc => "oidc",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "password" => Some(Self::Password),
+            "oidc" => Some(Self::Oidc),
+            _ => None,
+        }
+    }
+}
+
+/// Admin authentication context injected by admin middleware. `role` is the account's current
+/// role (read from the database on every request, not from the token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminContext {
     pub admin_id: uuid::Uuid,
     pub email: String,
-    pub role: String,
+    pub role: AdminRole,
+    pub auth_source: AdminAuthSource,
+}
+
+impl AdminContext {
+    pub fn require(&self, permission: AdminPermission) -> crate::error::Result<()> {
+        if self.role.allows(permission) {
+            Ok(())
+        } else {
+            Err(crate::error::AurixError::AuthorizationDenied(format!(
+                "Admin role '{}' lacks {}",
+                self.role,
+                permission.as_str()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1672,5 +1844,23 @@ mod tests {
             AudioPolicy::default().max_bandwidth.max_playback_rate_hz(),
             48_000
         );
+    }
+
+    #[test]
+    fn admin_permissions_use_scope_action_strings_on_the_wire() {
+        for p in AdminPermission::ALL {
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.as_str()));
+            assert_eq!(serde_json::from_str::<AdminPermission>(&json).unwrap(), p);
+            assert_eq!(AdminPermission::parse(p.as_str()), Some(p));
+            assert!(p.minimum_role().allows(p));
+        }
+        assert!(serde_json::from_str::<AdminPermission>("\"audit_read\"").is_err());
+        assert_eq!(
+            serde_json::to_value(AdminRole::Viewer.permissions()).unwrap(),
+            serde_json::json!(["apps:read", "nodes:read", "analytics:read"])
+        );
+        assert!(AdminRole::Superadmin.permissions().len() == AdminPermission::ALL.len());
+        assert!(!AdminRole::Admin.allows(AdminPermission::AdminsManage));
     }
 }

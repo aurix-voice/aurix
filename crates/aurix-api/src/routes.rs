@@ -57,11 +57,33 @@ pub fn create_router(state: AppState) -> Router {
     // Bootstrap is gated inside the handler (no admins yet, or X-Bootstrap-Token).
     let admin_public = Router::new()
         .route("/admin/login", post(handlers::admin_login))
-        .route("/admin/setup", post(handlers::admin_setup));
+        .route("/admin/setup", post(handlers::admin_setup))
+        .route("/admin/auth/methods", get(handlers::admin_auth_methods))
+        .route("/admin/oidc/login", get(handlers::admin_oidc_login))
+        .route("/admin/oidc/callback", get(handlers::admin_oidc_callback));
 
+    // Every handler here starts with `admin.require(<permission>)`; the middleware only
+    // authenticates. Routes without a `require` call are open to any active administrator.
     let admin_routes = Router::new()
         .route("/admin/me", get(handlers::admin_me))
-        .route("/admin/admins", post(handlers::create_admin))
+        .route("/admin/me/password", post(handlers::change_own_password))
+        .route("/admin/logout-all", post(handlers::admin_logout_all))
+        .route(
+            "/admin/admins",
+            post(handlers::create_admin).get(handlers::list_admins),
+        )
+        .route(
+            "/admin/admins/:admin_id",
+            get(handlers::get_admin).patch(handlers::update_admin),
+        )
+        .route(
+            "/admin/admins/:admin_id/password",
+            post(handlers::reset_admin_password),
+        )
+        .route(
+            "/admin/admins/:admin_id/logout-all",
+            post(handlers::revoke_admin_tokens),
+        )
         .route("/admin/audit-log", get(handlers::admin_list_audit_logs))
         .route(
             "/admin/retention/sweep",

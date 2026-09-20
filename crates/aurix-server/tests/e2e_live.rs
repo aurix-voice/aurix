@@ -10668,3 +10668,807 @@ async fn recording_mixdown_and_post_hoc_transcript() {
     let _ = alice.ws.close(None).await;
     let _ = bob.ws.close(None).await;
 }
+
+// ── Admin SSO (OIDC) and administrator lifecycle ──
+
+struct SsoHarness {
+    api: String,
+    mock: String,
+    http: reqwest::Client,
+}
+
+struct SsoLoginResult {
+    status: u16,
+    body: serde_json::Value,
+}
+
+impl SsoHarness {
+    async fn set_user(&self, user: serde_json::Value) {
+        self.http
+            .post(format!("{}/_mock/user", self.mock))
+            .json(&user)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    async fn mock_stats(&self) -> serde_json::Value {
+        self.http
+            .get(format!("{}/_mock/stats", self.mock))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    /// `GET /admin/oidc/login` → (authorization URL at the provider, login cookie value).
+    async fn begin(&self, return_to: Option<&str>) -> (reqwest::Url, String) {
+        let mut url = format!("{}/admin/oidc/login", self.api);
+        if let Some(path) = return_to {
+            url.push_str("?return_to=");
+            url.push_str(path);
+        }
+        let resp = self.http.get(url).send().await.unwrap();
+        assert_eq!(resp.status(), 302, "login must redirect to the provider");
+        let location = resp.headers()[reqwest::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie = resp.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            cookie.starts_with("aurix_oidc_login="),
+            "login cookie: {cookie}"
+        );
+        for attr in ["Path=/admin/oidc", "HttpOnly", "SameSite=Lax"] {
+            assert!(cookie.contains(attr), "login cookie lacks {attr}: {cookie}");
+        }
+        assert!(
+            !cookie.contains("Secure"),
+            "plain-http redirect_url must not set a Secure cookie (browsers would drop it)"
+        );
+        let value = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("aurix_oidc_login=")
+            .to_string();
+        (reqwest::Url::parse(&location).unwrap(), value)
+    }
+
+    /// Plays the browser: visits the provider's authorization endpoint and returns the URL the
+    /// provider redirects back to (Aurix's callback with `code`/`state` or `error`).
+    async fn authorize(&self, auth_url: &reqwest::Url) -> reqwest::Url {
+        let resp = self.http.get(auth_url.clone()).send().await.unwrap();
+        assert_eq!(resp.status(), 303, "mock provider redirects back");
+        reqwest::Url::parse(resp.headers()[reqwest::header::LOCATION].to_str().unwrap()).unwrap()
+    }
+
+    async fn callback(&self, url: &reqwest::Url, cookie: Option<&str>) -> SsoLoginResult {
+        let mut req = self.http.get(url.clone());
+        if let Some(cookie) = cookie {
+            req = req.header(
+                reqwest::header::COOKIE,
+                format!("aurix_oidc_login={cookie}"),
+            );
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let clear = resp
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .map(|v| v.to_str().unwrap().to_string());
+        if status != 500 {
+            let clear = clear.expect("callback clears the login cookie");
+            assert!(
+                clear.starts_with("aurix_oidc_login=;") && clear.contains("Max-Age=0"),
+                "{clear}"
+            );
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        SsoLoginResult { status, body }
+    }
+
+    /// Full happy-path browser dance for the currently configured mock user.
+    async fn login(&self) -> SsoLoginResult {
+        let (auth_url, cookie) = self.begin(None).await;
+        let back = self.authorize(&auth_url).await;
+        self.callback(&back, Some(&cookie)).await
+    }
+
+    async fn me(&self, token: &str) -> (u16, serde_json::Value) {
+        let resp = self
+            .http
+            .get(format!("{}/admin/me", self.api))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn status_of(&self, method: reqwest::Method, path: &str, token: &str) -> u16 {
+        self.http
+            .request(method, format!("{}{path}", self.api))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    async fn admin_call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}", self.api))
+            .bearer_auth(token);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn password_login(&self, email: &str, password: &str) -> (u16, serde_json::Value) {
+        let resp = self
+            .http
+            .post(format!("{}/admin/login", self.api))
+            .json(&serde_json::json!({"email": email, "password": password}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+    }
+}
+
+fn sso_user(sub: &str, email: &str, groups: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "sub": sub,
+        "email": email,
+        "email_verified": true,
+        "name": format!("{sub} (sso)"),
+        "groups": groups,
+    })
+}
+
+/// Admin single sign-on against the `mock_oidc` example provider plus the administrator
+/// lifecycle API. The node must run with `auth.oidc` pointing at the mock (see the
+/// "admin SSO" CI step): client `aurix-admin`, `role_mapping = { aurix_admins = "admin",
+/// aurix_ops = "moderator" }`, no `default_role`, `superadmin_emails = [root.sso@example.com]`,
+/// `allowed_domains = [example.com]`, verified email required, auto-provision and role sync
+/// on, no `frontend_redirect` (JSON callback). Opt in with `AURIX_E2E_OIDC=1`; the mock is at
+/// `AURIX_E2E_OIDC_MOCK` (default `http://127.0.0.1:18791`); `AURIX_E2E_ADMIN_TOKEN` is a
+/// superadmin token for the lifecycle part.
+#[tokio::test]
+#[ignore = "requires an Aurix node with auth.oidc pointed at the mock_oidc example (AURIX_E2E_OIDC=1)"]
+async fn admin_sso_login_roles_and_lifecycle() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    if std::env::var("AURIX_E2E_OIDC").ok().as_deref() != Some("1") {
+        eprintln!("AURIX_E2E_OIDC not set; skipping");
+        return;
+    }
+    let superadmin = std::env::var("AURIX_E2E_ADMIN_TOKEN").expect("AURIX_E2E_ADMIN_TOKEN");
+    let h = SsoHarness {
+        api: env.api.clone(),
+        mock: std::env::var("AURIX_E2E_OIDC_MOCK")
+            .unwrap_or_else(|_| "http://127.0.0.1:18791".into()),
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+    };
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let run = &run[..8];
+    let alice_email = format!("Alice.{run}@Example.com");
+    let alice_lower = alice_email.to_ascii_lowercase();
+
+    // ── discovery for login pages ──
+    let methods: serde_json::Value = h
+        .http
+        .get(format!("{}/admin/auth/methods", h.api))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(methods["password_login"], true);
+    assert_eq!(methods["oidc"]["issuer"], h.mock.trim_end_matches('/'));
+    assert_eq!(methods["oidc"]["login_url"], "/admin/oidc/login");
+
+    // ── authorization request shape ──
+    let (auth_url, cookie) = h.begin(Some("/apps")).await;
+    assert!(
+        auth_url
+            .as_str()
+            .starts_with(&format!("{}/authorize?", h.mock)),
+        "{auth_url}"
+    );
+    let q: std::collections::HashMap<_, _> = auth_url.query_pairs().into_owned().collect();
+    assert_eq!(q["response_type"], "code");
+    assert_eq!(q["client_id"], "aurix-admin");
+    assert!(q["redirect_uri"].ends_with("/admin/oidc/callback"), "{q:?}");
+    assert!(q["scope"].split(' ').any(|s| s == "openid"), "{q:?}");
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert!(q["code_challenge"].len() >= 43 && q["state"].len() >= 32 && q["nonce"].len() >= 16);
+
+    // Provider error (user cancelled) is reported, not treated as a login.
+    h.set_user(serde_json::json!({"sub": format!("cancel-{run}"), "deny": true}))
+        .await;
+    let back = h.authorize(&auth_url).await;
+    assert!(
+        back.query().unwrap().contains("error=access_denied"),
+        "{back}"
+    );
+    let res = h.callback(&back, Some(&cookie)).await;
+    assert_eq!(res.status, 401, "{}", res.body);
+    assert_eq!(res.body["error"]["code"], "AUTH_FAILED");
+
+    // ── happy path: provisioning + group → role mapping ──
+    h.set_user(sso_user(
+        &format!("sso-alice-{run}"),
+        &alice_email,
+        &["aurix_ops", "unrelated-group"],
+    ))
+    .await;
+    let (auth_url, cookie) = h.begin(Some("/apps")).await;
+    let back = h.authorize(&auth_url).await;
+    let bq: std::collections::HashMap<_, _> = back.query_pairs().into_owned().collect();
+    let aq: std::collections::HashMap<_, _> = auth_url.query_pairs().into_owned().collect();
+    assert_eq!(bq["state"], aq["state"], "provider echoes the sealed state");
+    assert!(bq.contains_key("code"));
+
+    // Without the login cookie the callback is refused (CSRF / login fixation) and the state
+    // is not consumed, so the same browser can finish with the cookie.
+    let res = h.callback(&back, None).await;
+    assert_eq!(res.status, 401, "{}", res.body);
+    let res = h.callback(&back, Some("not-the-cookie")).await;
+    assert_eq!(res.status, 401, "{}", res.body);
+    let first_login_at = std::time::Instant::now();
+    let res = h.callback(&back, Some(&cookie)).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    let alice_token = res.body["token"].as_str().unwrap().to_string();
+    assert_eq!(res.body["return_to"], "/apps");
+    assert!(res.body["expires_in_secs"].as_i64().unwrap() > 0);
+    let alice = &res.body["admin"];
+    assert_eq!(alice["email"], alice_lower, "emails are normalised");
+    assert_eq!(alice["role"], "moderator", "highest mapped group wins");
+    assert_eq!(alice["auth_source"], "oidc");
+    assert_eq!(alice["sso_bound"], true);
+    assert_eq!(alice["has_password"], false);
+    assert_eq!(alice["display_name"], format!("sso-alice-{run} (sso)"));
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    assert!(alice["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "audit:read"));
+
+    // Replaying the same code/state/cookie triple is refused.
+    let res = h.callback(&back, Some(&cookie)).await;
+    assert_eq!(res.status, 401, "replay: {}", res.body);
+
+    // ── the token carries the *current* role and permission checks bite ──
+    let (status, me) = h.me(&alice_token).await;
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["role"], "moderator");
+    assert_eq!(me["auth_source"], "oidc");
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/admin/audit-log", &alice_token)
+            .await,
+        200
+    );
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/v1/apps", &alice_token)
+            .await,
+        200
+    );
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/v1/nodes", &alice_token)
+            .await,
+        200
+    );
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::POST,
+            "/v1/apps",
+            &alice_token,
+            Some(serde_json::json!({"name": format!("sso-e2e-{run}")})),
+        )
+        .await;
+    assert_eq!(status, 403, "moderators cannot create apps");
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/admin/admins", &alice_token)
+            .await,
+        403
+    );
+    assert_eq!(
+        h.status_of(
+            reqwest::Method::POST,
+            "/admin/retention/sweep",
+            &alice_token
+        )
+        .await,
+        403
+    );
+
+    // ── role sync: the provider now says "admin"; the moderator token dies ──
+    h.set_user(sso_user(
+        &format!("sso-alice-{run}"),
+        &alice_email,
+        &["aurix_admins", "aurix_ops"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        res.body["admin"]["id"], alice_id,
+        "same account, not a duplicate"
+    );
+    assert_eq!(res.body["admin"]["role"], "admin");
+    let alice_admin_token = res.body["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        h.me(&alice_token).await.0,
+        401,
+        "a role change revokes tokens issued before it"
+    );
+    assert_eq!(h.me(&alice_admin_token).await.1["role"], "admin");
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/admin/admins", &alice_admin_token)
+            .await,
+        403,
+        "admins still cannot manage administrators"
+    );
+
+    // ── superadmin allow-list beats groups; unmapped / foreign / unverified users are refused ──
+    // The allow-listed email is fixed by the node config, so the subject is fixed as well:
+    // the account persists between runs and a different subject would be a hijack.
+    h.set_user(sso_user("sso-root", "Root.SSO@example.com", &[]))
+        .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(res.body["admin"]["role"], "superadmin");
+    let root_sso_token = res.body["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/admin/admins", &root_sso_token)
+            .await,
+        200
+    );
+
+    h.set_user(sso_user(
+        &format!("sso-nobody-{run}"),
+        &format!("nobody.{run}@example.com"),
+        &["random"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 403, "no default role → denied: {}", res.body);
+    assert_eq!(res.body["error"]["code"], "AUTH_DENIED");
+
+    h.set_user(sso_user(
+        &format!("sso-evil-{run}"),
+        &format!("mallory.{run}@evil.example.net"),
+        &["aurix_admins"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 403, "domain allow-list: {}", res.body);
+
+    let mut unverified = sso_user(
+        &format!("sso-unverified-{run}"),
+        &format!("unverified.{run}@example.com"),
+        &["aurix_ops"],
+    );
+    unverified["email_verified"] = serde_json::Value::Bool(false);
+    h.set_user(unverified).await;
+    let res = h.login().await;
+    assert_eq!(res.status, 401, "unverified email: {}", res.body);
+
+    let mut tampered = sso_user(&format!("sso-alice-{run}"), &alice_email, &["aurix_admins"]);
+    tampered["wrong_nonce"] = serde_json::Value::Bool(true);
+    h.set_user(tampered).await;
+    let res = h.login().await;
+    assert_eq!(res.status, 401, "nonce mismatch: {}", res.body);
+
+    let mut wrong_aud = sso_user(&format!("sso-alice-{run}"), &alice_email, &["aurix_admins"]);
+    wrong_aud["wrong_audience"] = serde_json::Value::Bool(true);
+    h.set_user(wrong_aud).await;
+    let res = h.login().await;
+    assert_eq!(res.status, 401, "audience mismatch: {}", res.body);
+
+    // Providers that keep e-mail/groups out of the ID token are served from userinfo.
+    let users_before = h.mock_stats().await["userinfo"].as_u64().unwrap();
+    let mut via_userinfo = sso_user(
+        &format!("sso-carol-{run}"),
+        &format!("carol.{run}@example.com"),
+        &["aurix_ops"],
+    );
+    via_userinfo["email_in_userinfo_only"] = serde_json::Value::Bool(true);
+    h.set_user(via_userinfo).await;
+    let res = h.login().await;
+    assert_eq!(res.status, 200, "userinfo fallback: {}", res.body);
+    assert_eq!(res.body["admin"]["role"], "moderator");
+    assert!(
+        h.mock_stats().await["userinfo"].as_u64().unwrap() > users_before,
+        "email/groups missing from the ID token are fetched from userinfo"
+    );
+
+    // ── binding an SSO identity to an existing password account by e-mail ──
+    let bob_email = format!("bob.{run}@example.com");
+    let (status, bob) = h
+        .admin_call(
+            reqwest::Method::POST,
+            "/admin/admins",
+            &superadmin,
+            Some(serde_json::json!({
+                "email": bob_email,
+                "password": "bob-password-0123456789",
+                "display_name": "Bob",
+                "role": "viewer",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{bob}");
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+    assert_eq!(bob["auth_source"], "password");
+    assert_eq!(bob["sso_bound"], false);
+    h.set_user(sso_user(
+        &format!("sso-bob-{run}"),
+        &bob_email,
+        &["aurix_ops"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        res.body["admin"]["id"], bob_id,
+        "bound to the existing account"
+    );
+    assert_eq!(
+        res.body["admin"]["role"], "moderator",
+        "role synced from the provider"
+    );
+    assert_eq!(res.body["admin"]["sso_bound"], true);
+    assert_eq!(res.body["admin"]["has_password"], true);
+    let (status, _) = h
+        .password_login(&bob_email, "bob-password-0123456789")
+        .await;
+    assert_eq!(
+        status, 200,
+        "the local password keeps working after binding"
+    );
+    // Someone else at the provider claiming Bob's e-mail cannot take over his account.
+    h.set_user(sso_user(
+        &format!("sso-bob-impostor-{run}"),
+        &bob_email,
+        &["aurix_admins"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 401, "identity hijack: {}", res.body);
+    assert_eq!(
+        h.admin_call(
+            reqwest::Method::GET,
+            &format!("/admin/admins/{bob_id}"),
+            &superadmin,
+            None
+        )
+        .await
+        .1["role"],
+        "moderator",
+        "the refused login changed nothing"
+    );
+
+    // ── lifecycle via the REST API (superadmin) ──
+    let (status, list) = h
+        .admin_call(reqwest::Method::GET, "/admin/admins", &superadmin, None)
+        .await;
+    assert_eq!(status, 200, "{list}");
+    let listed: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["email"].as_str())
+        .collect();
+    assert!(listed.contains(&alice_lower.as_str()) && listed.contains(&bob_email.as_str()));
+
+    // Demote Alice → her admin token dies; a display-name edit alone keeps tokens.
+    let (status, updated) = h
+        .admin_call(
+            reqwest::Method::PATCH,
+            &format!("/admin/admins/{alice_id}"),
+            &superadmin,
+            Some(serde_json::json!({"role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["role"], "viewer");
+    assert_eq!(h.me(&alice_admin_token).await.0, 401);
+    let res = h.password_login(&alice_lower, "irrelevant").await;
+    assert_eq!(res.0, 401, "SSO-only accounts have no usable password");
+    // Give her a local password (break-glass when the IdP is down); that revokes tokens too.
+    h.set_user(sso_user(
+        &format!("sso-alice-{run}"),
+        &alice_email,
+        &["aurix_ops"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 200);
+    assert_eq!(
+        res.body["admin"]["role"], "moderator",
+        "sync_roles re-applies the provider role"
+    );
+    let alice_token = res.body["token"].as_str().unwrap().to_string();
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::PATCH,
+            &format!("/admin/admins/{alice_id}"),
+            &superadmin,
+            Some(serde_json::json!({"display_name": "Alice Renamed"})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        h.me(&alice_token).await.0,
+        200,
+        "display-name edits keep tokens"
+    );
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::POST,
+            &format!("/admin/admins/{alice_id}/password"),
+            &superadmin,
+            Some(serde_json::json!({"password": "alice-break-glass-0123"})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        h.me(&alice_token).await.0,
+        401,
+        "password reset revokes tokens"
+    );
+    let (status, login) = h
+        .password_login(&alice_lower, "alice-break-glass-0123")
+        .await;
+    assert_eq!(status, 200, "{login}");
+    let alice_pw_token = login["token"].as_str().unwrap().to_string();
+    let (_, me) = h.me(&alice_pw_token).await;
+    assert_eq!(me["auth_source"], "password");
+    assert_eq!(me["has_password"], true);
+    assert_eq!(me["sso_bound"], true);
+    assert_eq!(me["display_name"], "Alice Renamed");
+
+    // Own password change: wrong current password refused, correct one revokes everything.
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::POST,
+            "/admin/me/password",
+            &alice_pw_token,
+            Some(serde_json::json!({
+                "current_password": "wrong-password-0123456",
+                "new_password": "alice-new-password-0123",
+            })),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::POST,
+            "/admin/me/password",
+            &alice_pw_token,
+            Some(serde_json::json!({
+                "current_password": "alice-break-glass-0123",
+                "new_password": "alice-new-password-0123",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.me(&alice_pw_token).await.0, 401);
+    let (status, login) = h
+        .password_login(&alice_lower, "alice-new-password-0123")
+        .await;
+    assert_eq!(status, 200, "{login}");
+    let alice_pw_token = login["token"].as_str().unwrap().to_string();
+
+    // Logout-all (self), then logout-all by a superadmin for another admin.
+    let res = h.login().await;
+    let alice_sso_token = res.body["token"].as_str().unwrap().to_string();
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::POST,
+            "/admin/logout-all",
+            &alice_pw_token,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.me(&alice_pw_token).await.0, 401);
+    assert_eq!(
+        h.me(&alice_sso_token).await.0,
+        401,
+        "logout-all covers SSO tokens too"
+    );
+    let (_, login) = h
+        .password_login(&alice_lower, "alice-new-password-0123")
+        .await;
+    let alice_pw_token = login["token"].as_str().unwrap().to_string();
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::POST,
+            &format!("/admin/admins/{alice_id}/logout-all"),
+            &superadmin,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.me(&alice_pw_token).await.0, 401);
+
+    // Deactivate: tokens die, SSO and password logins are refused, reactivation restores.
+    let (status, deactivated) = h
+        .admin_call(
+            reqwest::Method::PATCH,
+            &format!("/admin/admins/{alice_id}"),
+            &superadmin,
+            Some(serde_json::json!({"active": false})),
+        )
+        .await;
+    assert_eq!(status, 200, "{deactivated}");
+    assert_eq!(deactivated["active"], false);
+    assert_eq!(
+        h.login().await.status,
+        401,
+        "deactivated accounts cannot sign in via SSO"
+    );
+    assert_eq!(
+        h.password_login(&alice_lower, "alice-new-password-0123")
+            .await
+            .0,
+        401
+    );
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::PATCH,
+            &format!("/admin/admins/{alice_id}"),
+            &superadmin,
+            Some(serde_json::json!({"active": true})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.login().await.status, 200, "reactivated");
+
+    // Guards: nobody can demote or deactivate themself; deactivating another superadmin is
+    // fine while one remains, and a superadmin signed in through SSO manages admins too.
+    let (_, me) = h.me(&superadmin).await;
+    let super_id = me["id"].as_str().unwrap();
+    for body in [
+        serde_json::json!({"role": "admin"}),
+        serde_json::json!({"active": false}),
+    ] {
+        let (status, err) = h
+            .admin_call(
+                reqwest::Method::PATCH,
+                &format!("/admin/admins/{super_id}"),
+                &superadmin,
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, 400, "{err}");
+    }
+    let (_, root_me) = h.me(&root_sso_token).await;
+    let root_sso_id = root_me["id"].as_str().unwrap();
+    let (status, err) = h
+        .admin_call(
+            reqwest::Method::PATCH,
+            &format!("/admin/admins/{root_sso_id}"),
+            &root_sso_token,
+            Some(serde_json::json!({"role": "admin"})),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "SSO superadmin cannot demote themself either: {err}"
+    );
+    let second_email = format!("second.{run}@example.com");
+    let (status, second) = h
+        .admin_call(
+            reqwest::Method::POST,
+            "/admin/admins",
+            &root_sso_token,
+            Some(serde_json::json!({
+                "email": second_email,
+                "password": "second-password-0123456789",
+                "display_name": "Second",
+                "role": "superadmin",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{second}");
+    let second_id = second["id"].as_str().unwrap().to_string();
+    let (_, login) = h
+        .password_login(&second_email, "second-password-0123456789")
+        .await;
+    let second_token = login["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        h.status_of(reqwest::Method::GET, "/admin/admins", &second_token)
+            .await,
+        200
+    );
+    let (status, _) = h
+        .admin_call(
+            reqwest::Method::PATCH,
+            &format!("/admin/admins/{second_id}"),
+            &root_sso_token,
+            Some(serde_json::json!({"active": false})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        h.me(&second_token).await.0,
+        401,
+        "deactivation revokes tokens"
+    );
+    assert_eq!(
+        h.password_login(&second_email, "second-password-0123456789")
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        h.me(&superadmin).await.0,
+        200,
+        "the bootstrap superadmin is untouched"
+    );
+
+    // ── signing-key rotation at the provider: unknown kid → JWKS refetch ──
+    // The provider refetches JWKS for an unknown `kid` at most once per 30 s.
+    let since = first_login_at.elapsed();
+    if since < Duration::from_secs(31) {
+        tokio::time::sleep(Duration::from_secs(31) - since).await;
+    }
+    let jwks_before = h.mock_stats().await["jwks"].as_u64().unwrap();
+    let rotated: serde_json::Value = h
+        .http
+        .post(format!("{}/_mock/rotate", h.mock))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rotated["alg"], "ES256");
+    h.set_user(sso_user(
+        &format!("sso-alice-{run}"),
+        &alice_email,
+        &["aurix_ops"],
+    ))
+    .await;
+    let res = h.login().await;
+    assert_eq!(res.status, 200, "login after key rotation: {}", res.body);
+    assert!(h.mock_stats().await["jwks"].as_u64().unwrap() > jwks_before);
+
+    let stats = h.mock_stats().await;
+    assert_eq!(
+        stats["token_rejected"], 0,
+        "every code exchange carried the right PKCE verifier, redirect and client secret"
+    );
+}

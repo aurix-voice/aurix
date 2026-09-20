@@ -1,0 +1,6 @@
+# This file instructs Redocly's linter to ignore the rules contained for specific parts of your API.
+# See https://redocly.com/docs/cli/ for more information.
+api/openapi.json:
+  operation-2xx-response:
+    - '#/paths/~1admin~1oidc~1login/get/responses'
+    - '#/paths/~1v1~1channels~1{channel_id}~1audio~1streams~1pull/get/responses'
