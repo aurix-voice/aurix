@@ -44,6 +44,10 @@ namespace Aurix.Unity
         public bool OutputMuted = false;
         [Tooltip("Force the WebRTC media through the node's TURN relay (restrictive networks).")]
         public bool UseTurn = false;
+        [Tooltip("Per-participant downlink tracks to negotiate next to the server mix (-1 = as many as the node allows, 0 = mix only). Each is spatialized by the browser from UpdatePositionAsync positions.")]
+        public int ParticipantStreams = -1;
+        [Tooltip("How the browser renders per-participant tracks: HRTF (binaural), equal-power panning, or none (tracks negotiated, playback left to the page).")]
+        public WebGLSpatialAudio SpatialAudio = WebGLSpatialAudio.Hrtf;
 
         /// <summary>The live client, or null before <see cref="Connect"/> / after <see cref="Disconnect"/>.</summary>
         public AurixWebGLVoiceClient Client { get; private set; }
@@ -81,6 +85,8 @@ namespace Aurix.Unity
             client.Options.AutoGainControl = AutoGainControl;
             client.Options.InputGain = InputGain;
             client.Options.UseTurn = UseTurn;
+            client.Options.ParticipantStreams = ParticipantStreams < 0 ? (int?)null : ParticipantStreams;
+            client.Options.SpatialAudio = SpatialAudio;
             client.OnRemoteAudio += (playing, reason) =>
             {
                 RemoteAudioPlaying = playing;

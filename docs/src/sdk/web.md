@@ -79,9 +79,10 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | Action tokens | `token`, `refreshToken()`, `joinToken(channelId)`, `moderate(channelId, userId, 'kick'\|'mute'\|'unmute', token, reason)` | mandatory under `auth.require_action_tokens` |
 | Local mute / volume / block | `setParticipantMuted(userId, muted, channelId?)`, `setParticipantVolume(userId, 0..2)`, `setUserBlocked(userId, blocked)`, `receiverPreferences`, `userBlockChanged` | enforced server-side before fan-out; replayed after a non-resumed reconnect |
 | Multiple channels | `setTransmission({type:'all'\|'none'\|'single', channelId?})`, `transmitToChannel(id)`, `setChannelFocus(id?)`, `transmissionChanged`, `channelFocusChanged` | `CHANNEL_LIMIT_EXCEEDED` when `media.max_channels_per_session` is hit |
-| Positional / directional | `updatePosition(channelId, {x,y,z}, {forward_*, up_*})`, `positions` | stereo downlink (`stereo=1`) — do not re-pan |
+| Positional / directional | `updatePosition(channelId, {x,y,z}, {forward_*, up_*})`, `positions` | mixed track: server-panned stereo (`stereo=1`) — do not re-pan; per-participant tracks: the SDK attenuates/pans them itself with HRTF from the same positions, see [below](#per-participant-tracks-and-spatial-audio) |
+| Per-participant tracks / HRTF | `participantStreams`, `spatialAudio: true \| 'equalpower' \| false`, `audioContext`; `participantStreamCap`, `negotiatedParticipantStreams`, `setPinnedParticipants(ids)`, `getPinnedParticipants()`, `getParticipantStreams()` / `getParticipantStream(userId)`, `isParticipantSpatialized(userId)`, `participantStreams` event, `resumeAudio()` | bounded by the node's `webrtc_participant_streams`; everyone else stays in the mixed track |
 | Presence / text range | `channelScope(channelId)` → `{ rosterRadius?, textRadius? }`; `participantJoined` / `participantLeft` also fire as players move in and out of the roster radius (`Participant.role` / `muted` are filled from the event) | see [radius-scoped presence](../features/channels.md#radius-scoped-presence-and-text) |
-| Large channels | `channelInfo(channelId)` → `ChannelInfo { role, participantCount, hiddenListeners, transcription, safetyVoice }`, `canSpeakIn(channelId)`; `channelJoined` still delivers the visible roster | `participantCount` counts every node and the listeners hidden from the roster; a `listener` is receive-only (the mic track is still sent, the node drops it). Browsers always get the server's WebRTC mix, so `SetDownlinkMode` does not apply — see [large channels](../features/channels.md#large-channels-and-audiences) |
+| Large channels | `channelInfo(channelId)` → `ChannelInfo { role, participantCount, hiddenListeners, transcription, safetyVoice }`, `canSpeakIn(channelId)`; `channelJoined` still delivers the visible roster | `participantCount` counts every node and the listeners hidden from the roster; a `listener` is receive-only (the mic track is still sent, the node drops it). Browsers always get the server's WebRTC mix (plus bounded per-participant tracks), so `SetDownlinkMode` does not apply — see [large channels](../features/channels.md#large-channels-and-audiences) |
 | Energy / VAD | `energy`, `localVoiceActivity: true \| {...}`, `localEnergy`, `localSpeaking` | remote levels from the server's `ChannelEnergy` |
 | Devices | `AurixClient.enumerateAudioDevices()`, `setInputDevice()`, `setInputGain(0..4)`, `attachAudioOutput(el)`, `setOutputDevice()` (`supportsOutputSelection`), `setOutputVolume()`, `setOutputMuted()`, `devicesChanged`, `inputDeviceChanged` | mic hot-swap via `replaceTrack`, no renegotiation |
 | Echo test / injection | echo channel + `injectAudio(AudioBuffer \| MediaStream, {loop, gain, mixWithMicrophone})`, `stopAudioInjection()`, `decodeAudio()`, `audioInjection` | same Web Audio graph as the input gain |
@@ -91,6 +92,46 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | Stats / quality | `getStats()` → `ClientStats`, `stats`, `networkQuality`, `client.networkQuality`, `qualityReportIntervalMs`, `bitrate` | see [Network quality](../features/quality.md) |
 | Opus controls | `opus: {maxBitrateBps, fec, dtx, maxBandwidth, cbr, followChannelPolicy}`, `setOpusOptions()`, `audioPolicy` / `channelAudioPolicy(id)`, `opusPreferences`, `negotiatedOpus`, `renegotiateMedia()`, `audioPolicy` event | see [Opus in the browser](#opus-in-the-browser) |
 | Errors | rejected promises carry `Error('<CODE>: <message>')`; unsolicited server errors arrive as `serverError` | codes listed in [Errors](../concepts/auth.md#errors) |
+
+## Per-participant tracks and spatial audio
+
+Next to the mixed downlink the SDK offers `recvonly` audio m-lines the node fills with
+**one speaker each** ([per-participant tracks](../features/channels.md#per-participant-tracks-for-browsers)):
+as many as `participantStreams` asks for, capped by `SessionInitAck.webrtc_participant_streams`
+(`participantStreamCap`, `0` on nodes without the feature — then the client is the mixed-only
+browser of before). Each track's Opus frames are the speaker's own, so the SDK renders them
+through a Web Audio graph — `MediaStreamAudioSourceNode → GainNode → PannerNode → master gain →
+destination`:
+
+* **gain** = your local volume for that user × focus (`unfocused_channel_gain` from the node
+  for channels other than the focused one) × distance attenuation reproduced from
+  `ChannelJoinAck.positional` (near/far distance, rolloff, `max_radius`) — and `0` for users
+  you muted or blocked. The server has already dropped what you may not hear at all (mutes,
+  blocks, `max_streams`, radius); the local gain only shapes what arrives.
+* **position** — `PannerNode` with `panningModel = 'HRTF'` (`spatialAudio: 'equalpower'` for the
+  cheaper model) fed from the same `updatePosition` calls: your last position/orientation is the
+  listener frame, the speaker's `positions` entry the source, handedness converted per the
+  channel's `coordinate_system`. Non-positional channels skip the panner (plain gain).
+* **layout** arrives asynchronously as the `participantStreams` event
+  (`[{ mid, userId | undefined, stream | undefined }]`) and `getParticipantStreams()`; a track
+  changes hands with a short server-side hold, and the SDK re-renders on every layout, roster,
+  position, mute, block, volume and focus change. `setPinnedParticipants(ids)` keeps the given
+  users on a dedicated track while audible (`RangeError` above the cap; replayed after a
+  reconnect); everyone without a track is in the mixed track, which keeps playing in the
+  attached `<audio>` elements.
+* **fallback**: `spatialAudio: false` still negotiates the tracks but leaves rendering to you
+  (`getParticipantStream(userId)` → `MediaStream`, mute/volume/position are then yours to
+  apply); no `AudioContext` (old browser, `createAudioContext()` returns `undefined`) or
+  `participantStreams: 0` → mixed only. The autoplay policy applies to the `AudioContext` as
+  to `<audio>`: call `resumeAudio()` from a user gesture — it resumes the graph and the attached
+  elements together. `setOutputVolume` / `setOutputMuted` / `setOutputDevice` apply to both paths
+  (`AudioContext.setSinkId` where the browser has it). On reconnect the tracks are re-offered,
+  the layout is re-pushed by the node and the graph rebuilt; `disconnect()` closes the context
+  the SDK created (a caller-supplied `audioContext` is left open).
+
+Ambient channels never hand out dedicated tracks (their ranking/dimming is server-only state);
+`isParticipantSpatialized(userId)` says whether a voice currently goes through the panner. Nodes
+cap the count (`media.webrtc_participant_streams`, ≤ 64); expect ~1 RTP stream per track.
 
 ## Opus in the browser
 
@@ -134,7 +175,8 @@ device and the browser's Opus implementation.
 | SDK | server |
 |---|---|
 | `new WebSocket(wsUrl, ['aurix', 'bearer.<jwt>'])` | JWT authenticated at upgrade; `SessionInitAck` carries `session_id` / `ssrc` |
-| `connect()` → `WebRtcOffer` | `SfuNode::attach_webrtc` (str0m, ICE-lite, host candidate = `media.external_ip:media.port`) |
+| `connect()` → `WebRtcOffer` (1 `sendrecv` + N `recvonly` audio m-lines) | `SfuNode::attach_webrtc` (str0m, ICE-lite, host candidate = `media.external_ip:media.port`); first m-line = server mix, the rest per-participant tracks up to `media.webrtc_participant_streams` |
+| `setPinnedParticipants()` → `SetParticipantStreams {pinned}` | `ParticipantStreams {streams: [{mid, user_id}]}` on negotiation and every layout change |
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's relay candidates |
 | `joinChannel()` → `ChannelJoin {channel_id, token}` | membership check against the token's channel claims / ad-hoc grant |
 | `setMuted()` → track `enabled` + `MuteStateChanged` | broadcast to channel members |
@@ -151,7 +193,10 @@ façade (`create(optionsJson)` → handle, `invoke(handle, method, argsJson, rid
 `drain(handle)` → JSON event array, `destroy(handle)`) for hosts that can only exchange strings.
 Promise results arrive as `result` events keyed by `rid`, token callbacks are inverted into
 `tokenRequest` events answered with `provideToken`, remote audio is attached to a hidden `<audio>`
-element with `remoteAudio` / `resumeAudio` for the autoplay policy, and the per-client queue is
+element (mixed track) and the Web Audio graph (per-participant tracks) with `remoteAudio` /
+`resumeAudio` for the autoplay policy — `participantStreams` events and `setPinnedParticipants` /
+`participantStreamCap` / `participantStreams` / `isParticipantSpatialized` expose the track
+layout without ever passing a `MediaStream` through the string bridge — and the per-client queue is
 bounded (`overflow` reports drops). This is the contract the Unity WebGL client is built on
 ([Unity WebGL](unity.md#unity-webgl)); details in `sdk/web/README.md`.
 

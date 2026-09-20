@@ -5,6 +5,7 @@ import type {
   ChatScope,
   ConnectionState,
   HistoryOptions,
+  ParticipantStreamInfo,
   ReconnectPolicy,
   SendMessageOptions,
   SpeakOptions,
@@ -60,6 +61,10 @@ export interface BridgeClientOptions {
   rawMessages?: boolean;
   /** Queue `localEnergy` samples (~20/s while media is up); off by default, `localSpeaking` is always queued. */
   localEnergyEvents?: boolean;
+  /** Per-participant downlink tracks to negotiate (see `AurixClientOptions.participantStreams`). */
+  participantStreams?: number;
+  /** `true` (default) HRTF, `'equalpower'`, or `false` for mixed-only style rendering by the host. */
+  spatialAudio?: boolean | 'equalpower';
 }
 
 export interface AurixBridgeOptions {
@@ -133,6 +138,8 @@ export class AurixBridge {
     if (raw.requestTimeoutMs !== undefined) options.requestTimeoutMs = raw.requestTimeoutMs;
     if (raw.autoReconnect !== undefined) options.autoReconnect = raw.autoReconnect;
     if (raw.reconnect !== undefined) options.reconnect = raw.reconnect;
+    if (raw.participantStreams !== undefined) options.participantStreams = raw.participantStreams;
+    if (raw.spatialAudio !== undefined) options.spatialAudio = raw.spatialAudio;
     if (raw.refreshToken) options.refreshToken = () => this.requestToken(entry, 'refresh', undefined);
     if (raw.joinToken) options.joinToken = (channelId) => this.requestToken(entry, 'join', channelId);
 
@@ -306,6 +313,17 @@ export class AurixBridge {
       case 'setChannelFocus':
         c.setChannelFocus(optString(a, 'channelId'));
         return null;
+      case 'setPinnedParticipants':
+        c.setPinnedParticipants(strArray(a, 'userIds'));
+        return null;
+      case 'pinnedParticipants':
+        return c.getPinnedParticipants();
+      case 'participantStreamCap':
+        return c.participantStreamCap;
+      case 'participantStreams':
+        return participantStreamsEvent(c.getParticipantStreams());
+      case 'isParticipantSpatialized':
+        return c.isParticipantSpatialized(str(a, 'userId'));
       case 'channelFocus':
         return c.getChannelFocus() ?? null;
       case 'setTranscripts':
@@ -457,6 +475,7 @@ export class AurixBridge {
     on('userBlockChanged', (userId, blocked) => q({ type: 'userBlockChanged', userId, blocked }));
     on('transmissionChanged', (mode) => q({ type: 'transmissionChanged', mode }));
     on('channelFocusChanged', (channelId) => q({ type: 'channelFocusChanged', channelId: channelId ?? null }));
+    on('participantStreams', (streams) => q({ type: 'participantStreams', streams: participantStreamsEvent(streams) }));
     on('recovering', (attempt, delayMs, cause) => q({ type: 'recovering', attempt, delayMs, cause }));
     on('recovered', (info) => q({ type: 'recovered', info }));
     on('endpointChanged', (url) => q({ type: 'endpointChanged', url }));
@@ -511,14 +530,18 @@ export class AurixBridge {
     }
   }
 
-  /** Retry playback after a user gesture (autoplay policy); resolves `true` when audio is playing. */
+  /**
+   * Retry playback after a user gesture (autoplay policy): the mixed track's element and the
+   * Web Audio graph of per-participant tracks. Resolves `true` when audio is playing.
+   */
   private async resumeAudio(entry: Entry): Promise<boolean> {
+    const graph = await entry.client.resumeAudio();
     const el = entry.audio;
-    if (!el || !el.srcObject) return false;
+    if (!el || !el.srcObject) return graph;
     try {
       await el.play();
       this.push(entry, { type: 'remoteAudio', playing: true });
-      return true;
+      return graph;
     } catch (e) {
       this.push(entry, { type: 'remoteAudio', playing: false, reason: errorInfo(e).message });
       return false;
@@ -566,6 +589,17 @@ function optString(a: Args, key: string): string | undefined {
   if (v === undefined || v === null) return undefined;
   if (typeof v !== 'string') throw new Error(`${key} must be a string`);
   return v;
+}
+
+function strArray(a: Args, key: string): string[] {
+  const v = a[key];
+  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) throw new Error(`${key} must be an array of strings`);
+  return v as string[];
+}
+
+/** Wire form of the track layout: a `MediaStream` cannot cross a string bridge, its presence can. */
+function participantStreamsEvent(streams: ParticipantStreamInfo[]): Array<{ mid: string; userId: string | null; live: boolean }> {
+  return streams.map((s) => ({ mid: s.mid, userId: s.userId ?? null, live: s.stream !== undefined }));
 }
 
 function num(a: Args, key: string): number {

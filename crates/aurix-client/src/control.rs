@@ -200,6 +200,7 @@ impl ControlConnection {
                     migrated,
                     failover,
                     translation,
+                    ..
                 }) => {
                     let media_key = base64::engine::general_purpose::STANDARD
                         .decode(media_key.as_bytes())

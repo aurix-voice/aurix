@@ -411,6 +411,18 @@ impl MediaChannel {
             .and_then(|p| p.text_radius)
     }
 
+    pub fn positional_config(&self) -> Option<PositionalConfig> {
+        self.config.read().positional_config.clone()
+    }
+
+    /// True when a browser can reproduce the receiver-side gain of this channel's speakers
+    /// from what it knows (its own preferences, focus and positions): the gain then contains
+    /// no ambient slot table, whose state only the server tracks. Speakers of channels where
+    /// this is false stay in the browser's mixed track.
+    pub fn browser_reproducible_gain(&self) -> bool {
+        self.config.read().ambient.is_none()
+    }
+
     /// Whether `observer` currently sees `subject` in this channel: never when `subject` is a
     /// hidden listener, always without a roster radius, otherwise only while the pair is
     /// within it (both poses known). Everybody sees themselves.

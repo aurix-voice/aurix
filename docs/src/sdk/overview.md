@@ -12,11 +12,11 @@ where they differ.
 | Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) | bundled libopus (static) |
 | PCMU (G.711) fallback | — (WebRTC negotiates Opus) | `SetAudioCodecAsync` / `PreferredCodec`, `PcmuCodec` | `set_audio_codec` / `aurix_client_set_audio_codec` | `SetAudioCodec` | `set_audio_codec` |
 | Platforms | Chromium, Firefox, Safari | Unity 2021.3+ incl. WebGL (`AurixWebGLVoiceClient`), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac | Godot 4.3+ Linux/Windows/macOS (no Web export) |
-| Downlink | server-mixed stereo track | per-participant streams, client mixer | per-participant streams, client mixer | client mixer → procedural `USoundWave` | client mixer → `AudioStreamGenerator`; `AurixParticipantPlayer` (`AudioStreamPlayer3D`) per speaker |
+| Downlink | server-mixed stereo track + up to `webrtc_participant_streams` per-participant tracks (Web Audio HRTF) | per-participant streams, client mixer; WebGL: as Web | per-participant streams, client mixer | client mixer → procedural `USoundWave` | client mixer → `AudioStreamGenerator`; `AurixParticipantPlayer` (`AudioStreamPlayer3D`) per speaker |
 | Reconnect / resume | yes | yes | yes | yes | yes |
 | Local mute / volume / block | yes | yes | yes | yes | yes |
 | Transmission mode / focus | yes | yes | yes | yes | yes |
-| Positional + directional | yes (stereo mix) | yes (client pan) | yes | yes | yes (`update_transforms`) |
+| Positional + directional | yes (HRTF on per-participant tracks, stereo mix for the rest) | yes (client pan; WebGL: browser HRTF) | yes | yes | yes (`update_transforms`) |
 | Echo channel / audio injection | yes | yes | capture push API | capture push API | `push_capture` |
 | Text chat lite | yes | yes | yes | yes | yes |
 | Transcripts / TTS | yes | yes | yes | yes | yes |

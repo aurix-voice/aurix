@@ -361,12 +361,20 @@ C#  AurixWebGLVoiceClient ──JSON──▶ AurixWebGL.jslib ──▶ window.
 4. Same server-side requirements as the Web SDK: page origin in `AURIX__SERVER__CORS_ORIGINS`,
    `https://` for `getUserMedia`, `media.external_ip` or TURN reachable from the browser.
 
-Differences from the native client, all inherent to the browser: remote voices play through a hidden
-`<audio>` element (no `AudioSource`, mixer, spatializer plugin or per-participant PCM; positional
-audio is the server's stereo mix), capture processing is the browser's, `IOpusCodec` / DSP /
+Differences from the native client, all inherent to the browser: remote voices play through the
+browser — the server mix in a hidden `<audio>` element plus up to `WebGLClientOptions.ParticipantStreams`
+[per-participant WebRTC tracks](../features/channels.md#per-participant-tracks-for-browsers)
+(capped by the node's `webrtc_participant_streams`) that the Web SDK spatializes itself with Web
+Audio HRTF (`SpatialAudio = Hrtf | EqualPower | None`) from the positions you send with
+`UpdatePositionAsync` — so no `AudioSource`, mixer, spatializer plugin or per-participant PCM
+(`AurixParticipantAudioSource` is native-only). `SetPinnedParticipantsAsync(ids)` keeps chosen
+users on their own track, `OnParticipantStreams` / `GetParticipantStreamsAsync()` report the
+`mid → UserId` layout (`Live` = a track is attached), `GetParticipantStreamCapAsync()` the node's
+cap and `IsParticipantSpatialized(id)` whether a voice currently goes through the HRTF panner;
+speakers beyond the tracks stay in the mix. Capture processing is the browser's, `IOpusCodec` / DSP /
 `MediaPathPolicy` / PCMU / downlink-mix settings do not apply, and audio starts only after a user
-gesture — `OnRemoteAudio(playing: false, reason)` reports the block and `ResumeAudio()` from a UI
-click retries. Results are tasks completed from `Update()` on the main thread; browser event queues
+gesture — `OnRemoteAudio(playing: false, reason)` reports the block and `ResumeAudioAsync()` from a UI
+click retries both the `<audio>` element and the Web Audio graph. Results are tasks completed from `Update()` on the main thread; browser event queues
 are bounded and report drops through `OnEventsDropped`. In the Editor and on other platforms the
 jslib is not linked (`NativeWebGLBridge` throws) — use `AurixVoiceBehaviour` there or inject a test
 `IWebGLBridge`. Verified here: the jslib against the real bundle under an Emscripten-like harness,

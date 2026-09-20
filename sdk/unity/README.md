@@ -492,7 +492,7 @@ Setup:
    `Update()` every frame). Inspector fields: API URL (`https://…:8080`, used for TURN credentials and
    chat history), WebSocket URL (`wss://` on `https://` pages), token, channel id(s), `SdkUrl`,
    browser microphone processing (echo cancellation / noise suppression / AGC), input gain, output
-   volume / speaker mute, `UseTurn`.
+   volume / speaker mute, `UseTurn`, `ParticipantStreams` (-1 = node's cap) and `SpatialAudio`.
 4. The page origin must be allowed by `AURIX__SERVER__CORS_ORIGINS`, and `media.external_ip` (UDP) or the
    built-in TURN server must be reachable from the browser — the same requirements as the Web SDK.
 
@@ -518,15 +518,26 @@ How it works and what is different from the native client:
   `Update()`, so continuations run on the main thread (there is no thread pool in WebGL). Token
   callbacks are inverted: when the browser client needs a fresh JWT or a join token it queues a
   `tokenRequest`, the C# client calls your `TokenRefresher` / `JoinTokenProvider` and answers.
-* **Audio is the browser's.** Remote voices play through a hidden `<audio>` element, not through an
-  `AudioSource` — no `AudioListener`, mixer groups, spatializer plugins or `AurixParticipantAudioSource`;
-  positional audio is the server's stereo mix (like the Web SDK), and there are no PCM frames to pull.
+* **Audio is the browser's.** Remote voices play through the browser, not through an `AudioSource` —
+  no `AudioListener`, mixer groups, spatializer plugins or `AurixParticipantAudioSource`, and there are
+  no PCM frames to pull. The server mix plays in a hidden `<audio>` element; on top of it the Web SDK
+  negotiates up to `WebGLClientOptions.ParticipantStreams` **per-participant WebRTC tracks** (default:
+  as many as the node allows, `media.webrtc_participant_streams`, ≤ 64; `0` = mix only) and
+  spatializes them itself with Web Audio — `SpatialAudio = Hrtf` (default), `EqualPower` or `None`
+  (tracks negotiated, rendering left to the page) — from the positions you send with
+  `UpdatePositionAsync`, exactly as the native client would pan per-participant PCM. Speakers beyond
+  the tracks stay in the mix; ambient channels are always mixed. `SetPinnedParticipantsAsync(ids)` keeps
+  chosen users on their own track while audible (at most the cap), `OnParticipantStreams` /
+  `GetParticipantStreamsAsync()` give the current `WebGLParticipantStream { Mid, UserId?, Live }`
+  layout, `GetParticipantStreamCapAsync()` the node's cap, `IsParticipantSpatialized(id)` whether a voice
+  currently goes through the HRTF panner.
   Capture uses `getUserMedia` with the browser's echo cancellation / noise suppression / AGC; the
   `IOpusCodec`, `Dsp*`, `MediaPathPolicy`, `PreferredCodec`/PCMU and downlink-mix settings do not apply
   (WebRTC negotiates Opus itself). `GetStatsAsync()` returns `WebGLStats` (WebRTC RTT/jitter/loss/MOS).
 * **Autoplay.** Browsers only start audio after a user gesture. `OnRemoteAudio(playing: false, reason)`
   (and `RemoteAudioPlaying` / `RemoteAudioBlockedReason` on the behaviour) tell you playback is blocked;
-  call `ResumeAudio()` from a UI button/tap handler to retry (the browser's transient user activation
+  call `ResumeAudioAsync()` from a UI button/tap handler to retry — it resumes both the `<audio>` element
+  and the Web Audio graph of the per-participant tracks (the browser's transient user activation
   covers a Unity click processed in the same frame). `getUserMedia` requires `https://` (or `localhost`) and prompts for the microphone on connect.
 * **Devices.** `EnumerateDevicesAsync`, `SetInputDeviceAsync`, `SetOutputDeviceAsync` (output selection
   only where the browser supports `setSinkId`), `SetInputGain`, `SetOutputVolume`, `SetOutputMuted`.
@@ -541,7 +552,8 @@ How it works and what is different from the native client:
 
 What was verified here: the `.jslib` is evaluated under an Emscripten-like harness against the real
 browser bundle (`sdk/web/test/unity-jslib.test.mjs`), the C# client is tested against a scripted
-bridge (`WebGLBridgeTests`: results, events, token callbacks, timeouts, overflow, disposal), and the
+bridge (`WebGLBridgeTests`: results, events, token callbacks, timeouts, overflow, disposal,
+participant-track options/layout), and the
 Unity compile check runs with `UNITY_WEBGL` (player and editor). A real Unity WebGL build in a browser
 was **not** run in this repository — that is the first thing to try in your project.
 

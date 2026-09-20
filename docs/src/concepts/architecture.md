@@ -44,7 +44,9 @@ preferences, chat, moderation with action tokens, quality, recording consent, We
 with optional level/direction metadata — and browsers speak WebRTC (ICE/DTLS-SRTP) on the same
 UDP port. The SFU routes per channel and per receiver (positional attenuation, receiver-local
 mutes/volumes/blocks, transmission mode, focus), re-sealing every downlink packet with the
-receiver's keys. WebRTC downlinks are mixed on the server (stereo for directional channels).
+receiver's keys. WebRTC downlinks are mixed on the server (stereo for directional channels), plus
+a bounded set of per-participant tracks — the speaker's own Opus frames forwarded as-is — that the
+browser spatializes itself with Web Audio HRTF ([channels](../features/channels.md#per-participant-tracks-for-browsers)).
 
 **Event plane.** Everything that happens is published as a `ServerEvent`: to other nodes over
 Redis pub/sub (with the origin node id so a node never re-applies its own events), to game

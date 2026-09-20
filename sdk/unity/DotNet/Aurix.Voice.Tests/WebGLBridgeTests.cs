@@ -152,6 +152,70 @@ namespace Aurix.Voice.Tests
             Assert.Equal(7, client.Handle);
             Assert.Equal(7, bridge.Last("connect").handle);
             Assert.Equal(0, bridge.Loads);
+            Assert.False(o.ContainsKey("participantStreams"), "default: as many dedicated tracks as the node allows");
+            Assert.False(o.ContainsKey("spatialAudio"), "default: HRTF");
+        }
+
+        [Fact]
+        public void ParticipantStreamOptionsReachTheBrowserClient()
+        {
+            var (client, bridge) = NewClient();
+            client.Options.ParticipantStreams = 4;
+            client.Options.SpatialAudio = WebGLSpatialAudio.EqualPower;
+            _ = client.ConnectAsync();
+            Assert.Equal(4, (int)MiniJson.GetNumber(bridge.CreateOptions, "participantStreams"));
+            Assert.Equal("equalpower", MiniJson.GetString(bridge.CreateOptions, "spatialAudio"));
+
+            var (mixedOnly, bridge2) = NewClient();
+            mixedOnly.Options.ParticipantStreams = -3;
+            mixedOnly.Options.SpatialAudio = WebGLSpatialAudio.None;
+            _ = mixedOnly.ConnectAsync();
+            Assert.Equal(0, (int)MiniJson.GetNumber(bridge2.CreateOptions, "participantStreams"));
+            Assert.False(MiniJson.GetBool(bridge2.CreateOptions, "spatialAudio", true));
+        }
+
+        [Fact]
+        public async Task ParticipantStreamCallsAndEventsUseTheSharedTypes()
+        {
+            var (client, bridge) = NewClient();
+            bridge.Async.Add("participantStreamCap");
+            bridge.Async.Add("participantStreams");
+            await Connect(client, bridge);
+
+            await client.SetPinnedParticipantsAsync(new[] { Alice, Bob });
+            var ids = MiniJson.AsArray(bridge.Last("setPinnedParticipants").args["userIds"]);
+            Assert.Equal(new[] { Alice.ToString(), Bob.ToString() }, ids.ConvertAll(x => (string)x));
+
+            var cap = client.GetParticipantStreamCapAsync();
+            bridge.Resolve(bridge.Last("participantStreamCap").rid, 16.0);
+            client.Update();
+            Assert.Equal(16, await cap);
+
+            var layoutJson = new List<object>
+            {
+                new Dictionary<string, object> { { "mid", "1" }, { "userId", Bob.ToString() }, { "live", true } },
+                new Dictionary<string, object> { { "mid", "2" }, { "userId", null }, { "live", false } },
+            };
+            var layout = client.GetParticipantStreamsAsync();
+            bridge.Resolve(bridge.Last("participantStreams").rid, layoutJson);
+            client.Update();
+            var streams = await layout;
+            Assert.Equal(2, streams.Count);
+            Assert.Equal("1", streams[0].Mid);
+            Assert.Equal(Bob, streams[0].UserId);
+            Assert.True(streams[0].Live);
+            Assert.Null(streams[1].UserId);
+            Assert.False(streams[1].Live);
+
+            IReadOnlyList<WebGLParticipantStream> fromEvent = null;
+            client.OnParticipantStreams += s => fromEvent = s;
+            bridge.Emit("participantStreams", ("streams", layoutJson));
+            client.Update();
+            Assert.Equal(Bob, fromEvent[0].UserId);
+
+            bridge.Replies["isParticipantSpatialized"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            Assert.True(client.IsParticipantSpatialized(Bob));
+            Assert.Equal(Bob.ToString(), MiniJson.GetString(bridge.Last("isParticipantSpatialized").args, "userId"));
         }
 
         [Fact]

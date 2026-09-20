@@ -78,6 +78,9 @@ pub struct SfuOptions {
     /// Serve native sessions one server-mixed stream per channel on request
     /// (see `MediaConfig::downlink_mix`).
     pub downlink_mix: bool,
+    /// Per-participant WebRTC downlink tracks a browser may negotiate
+    /// (see `MediaConfig::webrtc_participant_streams`).
+    pub webrtc_participant_streams: u32,
 }
 
 impl Default for SfuOptions {
@@ -102,6 +105,7 @@ impl Default for SfuOptions {
             media_tunnel: true,
             tunnel_queue_packets: 128,
             downlink_mix: true,
+            webrtc_participant_streams: 16,
         }
     }
 }
@@ -268,6 +272,7 @@ impl SfuNode {
             advertised.clone(),
             webrtc_event_tx,
             self.options.downlink_bitrate,
+            self.options.webrtc_participant_streams,
         ));
         self.webrtc_manager = Some(webrtc_mgr.clone());
 
@@ -370,6 +375,15 @@ impl SfuNode {
                                 }
                             }
                             info!("WebRTC session {} disconnected", session_id);
+                        }
+                        WebRtcMediaEvent::ParticipantStreams {
+                            session_id,
+                            streams,
+                        } => {
+                            let _ = events.send(MediaEvent::ParticipantStreams {
+                                session_id,
+                                streams,
+                            });
                         }
                     }
                 }
@@ -830,6 +844,44 @@ impl SfuNode {
     /// Whether this node serves server-mixed downlinks (`SessionInitAck.downlink_mix`).
     pub fn downlink_mix_enabled(&self) -> bool {
         self.options.downlink_mix
+    }
+
+    /// Per-participant WebRTC downlink tracks a browser may negotiate
+    /// (`SessionInitAck.webrtc_participant_streams`).
+    pub fn webrtc_participant_streams(&self) -> u32 {
+        self.options.webrtc_participant_streams
+    }
+
+    /// Gain applied to voices of unfocused channels (`SessionInitAck.unfocused_channel_gain`).
+    pub fn unfocused_channel_gain(&self) -> f32 {
+        self.options.unfocused_channel_gain
+    }
+
+    /// `SetParticipantStreams`: participants a WebRTC session keeps on their own downlink
+    /// track while heard. Rejected for sessions without a WebRTC media path.
+    pub fn set_participant_streams(
+        &self,
+        session_id: &SessionId,
+        pinned: Vec<UserId>,
+    ) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        if session.transport() != Transport::WebRtc {
+            return Err(AurixError::Validation(
+                "per-participant downlink tracks are a WebRTC feature".into(),
+            ));
+        }
+        if pinned.len() > self.options.webrtc_participant_streams as usize {
+            return Err(AurixError::Validation(format!(
+                "at most {} participants can be pinned",
+                self.options.webrtc_participant_streams
+            )));
+        }
+        self.webrtc_manager
+            .as_ref()
+            .ok_or_else(|| AurixError::Validation("WebRTC is not available".into()))?
+            .set_pinned(session_id, pinned)
     }
 
     pub fn server_mute_user(&self, user_id: &UserId, muted: bool) -> Result<()> {

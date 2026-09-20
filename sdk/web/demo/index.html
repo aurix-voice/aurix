@@ -138,7 +138,8 @@ function renderRoster() {
       li.className = (p.speaking ? 'speaking ' : '') + (p.muted || p.serverMuted ? 'muted' : '');
       li.textContent = `${p.displayName} (${p.userId.slice(0, 8)}) ${p.role !== 'unknown' ? p.role : ''}` +
         `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.speaking ? ' 🔊' : ''}` +
-        `${client.isUserBlocked(p.userId) ? ' [blocked]' : ''}`;
+        `${client.isUserBlocked(p.userId) ? ' [blocked]' : ''}` +
+        `${client.getParticipantStream(p.userId) ? (client.isParticipantSpatialized(p.userId) ? ' [own track, HRTF]' : ' [own track]') : ''}`;
       const meter = document.createElement('span');
       meter.className = 'meter';
       const bar = document.createElement('i');
@@ -273,7 +274,11 @@ $('connect').onclick = async () => {
   client.setOutputMuted($('spkmute').textContent === 'Unmute speaker');
   if ($('spk').value) client.setOutputDevice($('spk').value).catch((e) => log('speaker select failed:', e.message));
   client.on('connectionState', (s) => { $('state').textContent = s; setButtons(s !== 'disconnected' && s !== 'failed', client.joinedChannels().length > 0); });
-  client.on('sessionReady', (i) => log('session', i));
+  client.on('sessionReady', (i) => { log('session', i, `per-participant tracks: ${client.participantStreamCap}`); client.resumeAudio().catch(() => {}); });
+  client.on('participantStreams', (streams) => {
+    log('participant tracks', streams.map((s) => `${s.mid}:${s.userId ? s.userId.slice(0, 8) : '-'}${s.stream ? '' : ' (no track)'}`).join(' '));
+    renderRoster();
+  });
   client.on('remoteStream', () => { log('remote stream attached'); fillDevices().catch(() => {}); });
   client.on('devicesChanged', () => { log('audio devices changed'); fillDevices().catch(() => {}); });
   client.on('inputDeviceChanged', (id) => { log('microphone now', id ?? 'default'); fillDevices().catch(() => {}); });

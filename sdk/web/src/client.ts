@@ -14,7 +14,9 @@ import {
   type ModerationAction,
   type ParticipantBrief,
   type ParticipantEnergy,
+  type ParticipantStreamWire,
   type ParticipantVolume,
+  type PositionalConfigWire,
   type RecordingConsent,
   type ServerMessage,
   type TransmissionModeWire,
@@ -26,6 +28,13 @@ import {
   type UserPosition,
 } from './protocol.js';
 import { AudioLevelMeter, type AudioLevelMeterOptions, type AudioLevelSample } from './audio.js';
+import {
+  SpatialRenderer,
+  createAudioContext,
+  renderParams,
+  type RenderInputs,
+  type SpatialAudioContextLike,
+} from './spatial.js';
 import {
   InputPipeline,
   MAX_INPUT_GAIN,
@@ -130,6 +139,32 @@ export interface AurixClientOptions {
   autoReconnect?: boolean;
   /** Exponential backoff for reconnect attempts. */
   reconnect?: Partial<ReconnectPolicy>;
+  /**
+   * How many per-participant downlink tracks to negotiate next to the mixed track (each
+   * carries one participant's voice untouched; the client renders volume, mute, focus and
+   * positional HRTF itself). Capped by the node's `webrtc_participant_streams`; defaults to
+   * that cap. `0` = mixed track only (server-side spatialisation as stereo pan).
+   */
+  participantStreams?: number;
+  /**
+   * Rendering of per-participant tracks: `true` (default) builds a Web Audio graph
+   * (`PannerNode`, HRTF); `'equalpower'` uses the cheaper panner; `false` leaves playback to
+   * the app (`participantStreams` event / `getParticipantStream`), which then applies
+   * volume, mute and position itself.
+   */
+  spatialAudio?: boolean | 'equalpower';
+  /** Use this `AudioContext` for participant tracks instead of creating one. */
+  audioContext?: AudioContext;
+}
+
+/** One negotiated per-participant downlink track and who is on it. */
+export interface ParticipantStreamInfo {
+  /** SDP media id of the track (stable for the life of the peer connection). */
+  mid: string;
+  /** Participant currently carried; `undefined` = idle (heard in the mix, if at all). */
+  userId: string | undefined;
+  /** The browser-side track, once it arrived. */
+  stream: MediaStream | undefined;
 }
 
 export interface ReconnectPolicy {
@@ -173,6 +208,8 @@ export interface SessionInfo {
    * operator has not configured translation.
    */
   translation?: TranslationInfo;
+  /** Per-participant downlink tracks the node serves this browser at most (`0` = mixed only). */
+  participantStreamCap: number;
 }
 
 /** Live-translation capability of the node. */
@@ -458,6 +495,11 @@ export interface AurixEvents {
   /** Audio injection started (`true`) or ended (`false`: buffer finished, `stopAudioInjection`, media closed). */
   audioInjection: (active: boolean) => void;
   positions: (channelId: string, positions: UserPosition[]) => void;
+  /**
+   * The `mid → participant` layout of the per-participant downlink tracks changed (a speaker
+   * got or lost a dedicated track, a track arrived or went away). Full snapshot.
+   */
+  participantStreams: (streams: ParticipantStreamInfo[]) => void;
   /** `live` — a real-time stream to an operator service rather than a stored file; same consent flow. */
   recording: (channelId: string, recordingId: string, active: boolean, initiatedBy: string, live: boolean) => void;
   /**
@@ -594,6 +636,8 @@ export function transmissionFromWire(mode: TransmissionModeWire | undefined): Tr
 
 /** Marker for "in every channel" in the local-mute table. */
 const ALL_CHANNELS = '*';
+/** `media.unfocused_channel_gain` of a node that does not advertise it. */
+const DEFAULT_UNFOCUSED_GAIN = 0.5;
 
 interface Pending<T> {
   resolve: (value: T) => void;
@@ -727,6 +771,22 @@ export class AurixClient {
   private inputGainValue = 1;
   private inputDeviceIdValue: string | undefined;
   private remoteStream: MediaStream | undefined;
+  /** Transceiver of the mixed downlink (the one that also carries the microphone). */
+  private mixedTransceiver: RTCRtpTransceiver | undefined;
+  /** mid → browser-side stream of a negotiated per-participant track. */
+  private participantTracks = new Map<string, MediaStream>();
+  /** mid → participant it carries (`ParticipantStreams`; `undefined` = idle). */
+  private participantLayout = new Map<string, string | undefined>();
+  /** Per-participant tracks the node serves at most (`SessionInitAck`). */
+  private participantStreamCapValue = 0;
+  /** Gain of unfocused channels' voices, mirrored from the node. */
+  private unfocusedGain = DEFAULT_UNFOCUSED_GAIN;
+  private pinnedParticipants: string[] = [];
+  private renderer: SpatialRenderer | undefined;
+  /** channel id → positional model of a positional channel (`ChannelJoinAck.positional`). */
+  private channelPositional = new Map<string, PositionalConfigWire>();
+  /** channel id → user id → last known position (ours from `updatePosition`, theirs from `PositionUpdate`). */
+  private positions = new Map<string, Map<string, UserPosition>>();
   private readonly outputElements = new Set<HTMLMediaElement>();
   private outputVolumeValue = 1;
   private outputMutedValue = false;
@@ -1077,7 +1137,10 @@ export class AurixClient {
     const previous = this.outputDeviceIdValue;
     this.outputDeviceIdValue = deviceId;
     try {
-      await Promise.all(Array.from(this.outputElements, (el) => el.setSinkId(deviceId ?? '')));
+      await Promise.all([
+        ...Array.from(this.outputElements, (el) => el.setSinkId(deviceId ?? '')),
+        this.renderer?.setSinkId(deviceId) ?? Promise.resolve(),
+      ]);
     } catch (e) {
       this.outputDeviceIdValue = previous;
       throw e;
@@ -1093,6 +1156,7 @@ export class AurixClient {
     if (!(volume >= 0 && volume <= 1)) throw new RangeError('output volume must be within 0..1');
     this.outputVolumeValue = volume;
     for (const el of this.outputElements) el.volume = volume;
+    this.renderer?.setMasterVolume(volume);
   }
 
   get isOutputMuted(): boolean {
@@ -1110,6 +1174,27 @@ export class AurixClient {
       t.enabled = !muted;
     });
     for (const el of this.outputElements) el.muted = muted;
+    this.renderer?.setMasterMuted(muted);
+  }
+
+  /**
+   * Autoplay policy: call from a user gesture (click/tap) to start playback that the browser
+   * held back — attached output elements and the Web Audio graph of per-participant tracks.
+   * Resolves to `true` when audio can play.
+   */
+  async resumeAudio(): Promise<boolean> {
+    let ok = true;
+    if (this.renderer) ok = await this.renderer.resume();
+    for (const el of this.outputElements) {
+      if (el.paused && el.srcObject) {
+        try {
+          await el.play();
+        } catch {
+          ok = false;
+        }
+      }
+    }
+    return ok;
   }
 
   /** Smoothed local microphone energy 0..1 (0 when metering is off or media is down). */
@@ -1144,6 +1229,7 @@ export class AurixClient {
     }
     if (scopes.size === 0) this.localMutes.delete(userId);
     else this.localMutes.set(userId, scopes);
+    this.renderParticipant(userId);
     if (channelId !== undefined && !this.channels.has(channelId)) return;
     this.trySend({
       type: 'SetParticipantMute',
@@ -1161,7 +1247,8 @@ export class AurixClient {
 
   /**
    * Receiver-local gain for `userId`: `0` silence, `1` as sent, up to `2` (≈ +6 dB).
-   * Multiplies positional attenuation; applied by the server before mixing.
+   * Multiplies positional attenuation; applied by the server before mixing and by this
+   * client on the participant's own downlink track.
    */
   setParticipantVolume(userId: string, volume: number): void {
     if (!Number.isFinite(volume) || volume < 0 || volume > MAX_PARTICIPANT_VOLUME) {
@@ -1169,6 +1256,7 @@ export class AurixClient {
     }
     if (volume === 1) this.volumes.delete(userId);
     else this.volumes.set(userId, volume);
+    this.renderParticipant(userId);
     this.trySend({ type: 'SetParticipantVolume', data: { user_id: userId, volume } });
   }
 
@@ -1231,12 +1319,194 @@ export class AurixClient {
    */
   setChannelFocus(channelId: string | undefined): void {
     this.focusChannel = channelId;
+    this.renderParticipants();
     if (channelId !== undefined && !this.channels.has(channelId)) return; // sent on join
     this.trySend({ type: 'SetChannelFocus', data: { channel_id: channelId ?? null } });
   }
 
   getChannelFocus(): string | undefined {
     return this.focusChannel;
+  }
+
+  // ── Per-participant downlink tracks ──
+
+  /** Per-participant downlink tracks the node serves this browser at most (`0` = mixed only). */
+  get participantStreamCap(): number {
+    return this.participantStreamCapValue;
+  }
+
+  /** Per-participant tracks actually negotiated with the current peer connection. */
+  get negotiatedParticipantStreams(): number {
+    return this.participantTracks.size;
+  }
+
+  /**
+   * Keep these participants on their own downlink track whenever they are audible (a raid
+   * leader, party members) — others share the remaining tracks by recent activity and fall
+   * back to the mix. At most `participantStreamCap` ids; survives reconnects.
+   */
+  setPinnedParticipants(userIds: readonly string[]): void {
+    const pinned = Array.from(new Set(userIds));
+    if (this.session && pinned.length > this.participantStreamCapValue) {
+      throw new RangeError(`at most ${this.participantStreamCapValue} participants can be pinned`);
+    }
+    this.pinnedParticipants = pinned;
+    if (this.pc) this.trySend({ type: 'SetParticipantStreams', data: { pinned } });
+  }
+
+  getPinnedParticipants(): string[] {
+    return [...this.pinnedParticipants];
+  }
+
+  /** Current layout of the per-participant tracks (see the `participantStreams` event). */
+  getParticipantStreams(): ParticipantStreamInfo[] {
+    const mids = new Set([...this.participantLayout.keys(), ...this.participantTracks.keys()]);
+    return Array.from(mids, (mid) => ({
+      mid,
+      userId: this.participantLayout.get(mid),
+      stream: this.participantTracks.get(mid),
+    }));
+  }
+
+  /** The dedicated downlink stream carrying `userId` right now, if any. */
+  getParticipantStream(userId: string): MediaStream | undefined {
+    for (const [mid, user] of this.participantLayout) {
+      if (user === userId) return this.participantTracks.get(mid);
+    }
+    return undefined;
+  }
+
+  /** `true` when `userId`'s voice is rendered through the HRTF panner right now. */
+  isParticipantSpatialized(userId: string): boolean {
+    for (const [mid, user] of this.participantLayout) {
+      if (user === userId) return this.renderer?.isSpatial(mid) === true;
+    }
+    return false;
+  }
+
+  /** Whether this client builds the Web Audio graph for participant tracks. */
+  private rendersParticipantTracks(): boolean {
+    return this.opts.spatialAudio !== false;
+  }
+
+  /** Per-participant tracks to offer: the app's wish, capped by the node, `0` without Web Audio rendering. */
+  private participantStreamsToOffer(): number {
+    const cap = this.participantStreamCapValue;
+    const wanted = this.opts.participantStreams ?? cap;
+    const n = Math.max(0, Math.min(cap, Math.floor(wanted)));
+    if (n === 0) return 0;
+    if (!this.rendersParticipantTracks()) return n;
+    if (!this.renderer) {
+      const ctx = (this.opts.audioContext as SpatialAudioContextLike | undefined) ?? createAudioContext();
+      if (!ctx) return 0;
+      this.renderer = new SpatialRenderer(ctx, {
+        panningModel: this.opts.spatialAudio === 'equalpower' ? 'equalpower' : 'HRTF',
+      });
+      this.renderer.setMasterVolume(this.outputVolumeValue);
+      this.renderer.setMasterMuted(this.outputMutedValue);
+      if (this.outputDeviceIdValue !== undefined) {
+        void this.renderer.setSinkId(this.outputDeviceIdValue).catch(() => undefined);
+      }
+    }
+    return n;
+  }
+
+  private onParticipantTrack(mid: string, stream: MediaStream): void {
+    this.participantTracks.set(mid, stream);
+    this.renderer?.addTrack(mid, stream);
+    const track = stream.getAudioTracks()[0];
+    track?.addEventListener('ended', () => {
+      if (this.participantTracks.get(mid) !== stream) return;
+      this.participantTracks.delete(mid);
+      this.renderer?.removeTrack(mid);
+      this.emitParticipantStreams();
+    });
+    this.renderMid(mid);
+    this.emitParticipantStreams();
+  }
+
+  private applyParticipantLayout(streams: ParticipantStreamWire[]): void {
+    this.participantLayout = new Map(streams.map((s) => [s.mid, s.user_id ?? undefined]));
+    this.renderParticipants();
+    this.emitParticipantStreams();
+  }
+
+  private emitParticipantStreams(): void {
+    this.emit('participantStreams', this.getParticipantStreams());
+  }
+
+  /** Channels this client shares with `userId` (where they are in the roster). */
+  private sharedChannels(userId: string): string[] {
+    const out: string[] = [];
+    for (const [channelId, roster] of this.channels) if (roster.has(userId)) out.push(channelId);
+    return out;
+  }
+
+  /** What the server would have applied to `userId`'s voice, for the browser to apply instead. */
+  private renderInputsFor(userId: string): RenderInputs {
+    const shared = this.sharedChannels(userId);
+    const silenced =
+      this.blockedUsers.has(userId) ||
+      (shared.length > 0
+        ? shared.every((ch) => this.isParticipantMuted(userId, ch))
+        : this.isParticipantMuted(userId));
+    const focus = this.focusChannel;
+    const focusFactor =
+      focus === undefined || shared.length === 0 || shared.includes(focus) ? 1 : this.unfocusedGain;
+    const inputs: RenderInputs = { volume: this.getParticipantVolume(userId), silenced, focusFactor };
+    for (const ch of shared) {
+      const config = this.channelPositional.get(ch);
+      const known = this.positions.get(ch);
+      const me = this.userId ? known?.get(this.userId) : undefined;
+      const them = known?.get(userId);
+      if (config && me && them) {
+        inputs.positional = { config, listener: me.position, orientation: me.orientation, source: them.position };
+        break;
+      }
+    }
+    return inputs;
+  }
+
+  private renderMid(mid: string): void {
+    if (!this.renderer || !this.participantTracks.has(mid)) return;
+    const userId = this.participantLayout.get(mid);
+    this.renderer.render(mid, userId ? renderParams(this.renderInputsFor(userId)) : { gain: 0 });
+  }
+
+  private renderParticipant(userId: string): void {
+    if (!this.renderer) return;
+    for (const [mid, user] of this.participantLayout) if (user === userId) this.renderMid(mid);
+  }
+
+  private renderParticipants(): void {
+    if (!this.renderer) return;
+    for (const mid of this.participantTracks.keys()) this.renderMid(mid);
+  }
+
+  /** Remember a position of `channelId`'s member for browser-side spatialisation. */
+  private rememberPositions(channelId: string, positions: readonly UserPosition[]): void {
+    if (!this.channelPositional.has(channelId)) return;
+    let known = this.positions.get(channelId);
+    if (!known) {
+      known = new Map();
+      this.positions.set(channelId, known);
+    }
+    for (const p of positions) known.set(p.user_id, p);
+  }
+
+  private forgetChannelSpatial(channelId: string): void {
+    this.channelPositional.delete(channelId);
+    this.positions.delete(channelId);
+  }
+
+  /** Drop every negotiated participant track (peer connection gone); the layout is the server's to resend. */
+  private clearParticipantTracks(): void {
+    const had = this.participantTracks.size > 0 || this.participantLayout.size > 0;
+    this.participantTracks.clear();
+    this.participantLayout.clear();
+    this.mixedTransceiver = undefined;
+    this.renderer?.clear();
+    if (had) this.emitParticipantStreams();
   }
 
   /** Re-send the client-held local mutes/volumes after a fresh (non-resumed) session. */
@@ -1346,6 +1616,11 @@ export class AurixClient {
     this.stopLocalMeter();
     this.pc?.close();
     this.pc = undefined;
+    this.clearParticipantTracks();
+    if (this.renderer && this.opts.audioContext === undefined) {
+      void this.renderer.close();
+      this.renderer = undefined;
+    }
     this.releaseLocalStream(this.localStream);
     this.localStream = undefined;
     const wasInjecting = this.inputPipeline?.injecting ?? false;
@@ -1359,6 +1634,8 @@ export class AurixClient {
     }
     for (const channelId of this.channels.keys()) this.emit('channelLeft', channelId);
     this.channels.clear();
+    this.channelPositional.clear();
+    this.positions.clear();
     this.session = undefined;
     this.resumeToken = undefined;
     this.stopQualityTimer();
@@ -1483,8 +1760,10 @@ export class AurixClient {
     this.monitoredChannels.delete(channelId);
     this.channelScopes.delete(channelId);
     this.channelInfos.delete(channelId);
+    this.forgetChannelSpatial(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
     if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
+    this.renderParticipants();
   }
 
   /** Whether the server transcribes `channelId` (speech-to-text is enabled for it). */
@@ -1769,6 +2048,8 @@ export class AurixClient {
       type: 'PositionUpdate',
       data: { channel_id: channelId, positions: [{ user_id: this.userId, position, orientation }] },
     });
+    this.rememberPositions(channelId, [{ user_id: this.userId, position, orientation }]);
+    this.renderParticipants();
   }
 
   respondToRecording(recordingId: string, consent: RecordingConsent): void {
@@ -2002,6 +2283,7 @@ export class AurixClient {
     }
     this.pc?.close();
     this.pc = undefined;
+    this.clearParticipantTracks();
     await this.startMedia();
   }
 
@@ -2141,6 +2423,7 @@ export class AurixClient {
           migrated: d.migrated === true,
           endpoint,
           failover: [...this.failoverEndpoints],
+          participantStreamCap: d.webrtc_participant_streams ?? 0,
           ...(d.translation
             ? {
                 translation: {
@@ -2152,6 +2435,11 @@ export class AurixClient {
         };
         this.resumeToken = d.resume_token || undefined;
         this.resumeGraceMs = d.resume_grace_ms ?? 0;
+        this.participantStreamCapValue = d.webrtc_participant_streams ?? 0;
+        this.unfocusedGain = d.unfocused_channel_gain ?? DEFAULT_UNFOCUSED_GAIN;
+        if (this.pinnedParticipants.length > this.participantStreamCapValue) {
+          this.pinnedParticipants = this.pinnedParticipants.slice(0, this.participantStreamCapValue);
+        }
         const pending = this.pendingInit;
         this.pendingInit = undefined;
         if (pending) {
@@ -2191,6 +2479,9 @@ export class AurixClient {
         this.channelInfos.set(d.channel_id, channelInfoFromJoinAck(d));
         this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
         this.refreshAudioPolicy();
+        if (d.positional) this.channelPositional.set(d.channel_id, d.positional);
+        else this.forgetChannelSpatial(d.channel_id);
+        this.renderParticipants();
         const list = Array.from(roster.values());
         const pending = this.pendingJoins.get(d.channel_id);
         if (pending) {
@@ -2218,12 +2509,15 @@ export class AurixClient {
           energy: 0,
         };
         roster.set(d.user_id, p);
+        this.renderParticipant(d.user_id);
         this.emit('participantJoined', d.channel_id, p);
         return;
       }
       case 'ParticipantLeft': {
         const d = (msg as Extract<ServerMessage, { type: 'ParticipantLeft' }>).data;
         this.channels.get(d.channel_id)?.delete(d.user_id);
+        this.positions.get(d.channel_id)?.delete(d.user_id);
+        this.renderParticipant(d.user_id);
         this.emit('participantLeft', d.channel_id, d.user_id);
         return;
       }
@@ -2260,6 +2554,8 @@ export class AurixClient {
       }
       case 'PositionUpdate': {
         const d = (msg as Extract<ServerMessage, { type: 'PositionUpdate' }>).data;
+        this.rememberPositions(d.channel_id, d.positions);
+        for (const p of d.positions) this.renderParticipant(p.user_id);
         this.emit('positions', d.channel_id, d.positions);
         return;
       }
@@ -2287,7 +2583,9 @@ export class AurixClient {
         if (this.channels.delete(d.channel_id)) this.emit('channelLeft', d.channel_id);
         this.channelInfos.delete(d.channel_id);
         this.channelScopes.delete(d.channel_id);
+        this.forgetChannelSpatial(d.channel_id);
         if (this.channelPolicies.delete(d.channel_id)) this.refreshAudioPolicy();
+        this.renderParticipants();
         this.emit('kicked', d.channel_id, d.reason);
         return;
       }
@@ -2295,6 +2593,7 @@ export class AurixClient {
         const d = (msg as Extract<ServerMessage, { type: 'UserBlockChanged' }>).data;
         if (d.blocked) this.blockedUsers.add(d.user_id);
         else this.blockedUsers.delete(d.user_id);
+        this.renderParticipant(d.user_id);
         this.emit('userBlockChanged', d.user_id, d.blocked);
         return;
       }
@@ -2317,6 +2616,7 @@ export class AurixClient {
       case 'ChannelFocusChanged': {
         const d = (msg as Extract<ServerMessage, { type: 'ChannelFocusChanged' }>).data;
         this.focusChannel = d.channel_id ?? undefined;
+        this.renderParticipants();
         this.emit('channelFocusChanged', this.focusChannel);
         return;
       }
@@ -2342,6 +2642,7 @@ export class AurixClient {
           this.transmission = transmission;
           this.focusChannel = focusChannel;
         }
+        this.renderParticipants();
         this.emit('receiverPreferences', {
           blockedUsers: d.blocked_users,
           localMutes: d.local_mutes,
@@ -2349,6 +2650,11 @@ export class AurixClient {
           transmission,
           focusChannel,
         });
+        return;
+      }
+      case 'ParticipantStreams': {
+        const d = (msg as Extract<ServerMessage, { type: 'ParticipantStreams' }>).data;
+        this.applyParticipantLayout(d.streams);
         return;
       }
       case 'WebRtcAnswer': {
@@ -2570,13 +2876,24 @@ export class AurixClient {
     this.pc = pc;
     this.lossWindow.reset();
     this.startQualityTimer();
-    // One sendrecv audio transceiver: uplink microphone, downlink server-side mix.
+    // One sendrecv audio transceiver: uplink microphone, downlink server-side mix. Then up to
+    // `participantStreams` recvonly ones, each carrying one participant of the server's choice
+    // (`ParticipantStreams` says who); the server answers them all, uses at most its cap.
     const track = sent.getAudioTracks()[0];
     if (!track) throw new Error('no audio track');
-    pc.addTransceiver(track, { direction: 'sendrecv', streams: [sent] });
+    const mixed = pc.addTransceiver(track, { direction: 'sendrecv', streams: [sent] });
+    this.mixedTransceiver = mixed;
+    const extra = this.participantStreamsToOffer();
+    for (let i = 0; i < extra; i++) pc.addTransceiver('audio', { direction: 'recvonly' });
 
     pc.ontrack = (ev) => {
+      if (this.pc !== pc) return;
       const stream = ev.streams[0] ?? new MediaStream([ev.track]);
+      const mid = ev.transceiver?.mid ?? null;
+      if (ev.transceiver !== mixed && mid !== null && mid !== mixed.mid) {
+        this.onParticipantTrack(mid, stream);
+        return;
+      }
       this.remoteStream = stream;
       stream.getAudioTracks().forEach((t) => {
         t.enabled = !this.outputMutedValue;
@@ -2632,6 +2949,9 @@ export class AurixClient {
     });
     this.appliedSenderPrefs = undefined;
     await this.applySenderPreferences(pc);
+    if (this.pc === pc && extra > 0 && this.pinnedParticipants.length > 0) {
+      this.trySend({ type: 'SetParticipantStreams', data: { pinned: [...this.pinnedParticipants] } });
+    }
   }
 
   private requestAnswer(sdp: string): Promise<string> {

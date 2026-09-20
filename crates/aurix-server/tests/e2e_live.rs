@@ -276,6 +276,7 @@ async fn connect_with(
         migrated,
         failover,
         translation,
+        ..
     } = msg
     else {
         panic!("{name}: expected SessionInitAck, got {t}");

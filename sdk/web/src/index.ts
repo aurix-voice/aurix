@@ -8,6 +8,14 @@ export {
   transmissionToWire,
 } from './client.js';
 export { AurixBridge, errorInfo } from './bridge.js';
+export {
+  SpatialRenderer,
+  createAudioContext,
+  directionFromListener,
+  distanceGain,
+  renderParams,
+} from './spatial.js';
+export type { Direction, RenderInputs, RenderParams, SpatialRendererOptions } from './spatial.js';
 export type { AurixBridgeOptions, BridgeClientOptions, BridgeErrorInfo, BridgeEvent } from './bridge.js';
 export {
   AUDIO_LEVEL_SILENCE,
@@ -60,6 +68,7 @@ export type {
   ReadMarker,
   ReadMarkers,
   Participant,
+  ParticipantStreamInfo,
   ReceiverPreferences,
   ReconnectPolicy,
   SendMessageOptions,
@@ -88,8 +97,10 @@ export type {
   Orientation3D,
   ParticipantBrief,
   ParticipantEnergy,
+  ParticipantStreamWire,
   ParticipantVolume,
   Position3D,
+  PositionalConfigWire,
   RecordingConsent,
   ServerMessage,
   TranscriptWire,

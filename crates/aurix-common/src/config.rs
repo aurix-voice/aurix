@@ -2,6 +2,9 @@ use crate::types::Region;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Upper bound for `media.webrtc_participant_streams` (one RTP stream per track per browser).
+pub const MAX_WEBRTC_PARTICIPANT_STREAMS: u32 = 64;
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AurixConfig {
     pub server: ServerConfig,
@@ -189,6 +192,11 @@ impl AurixConfig {
         }
         if !(8..=4096).contains(&self.media.tunnel_queue_packets) {
             anyhow::bail!("media.tunnel_queue_packets must be within 8..=4096");
+        }
+        if self.media.webrtc_participant_streams > MAX_WEBRTC_PARTICIPANT_STREAMS {
+            anyhow::bail!(
+                "media.webrtc_participant_streams must be at most {MAX_WEBRTC_PARTICIPANT_STREAMS}"
+            );
         }
         if self.redis.sentinels.is_empty() != self.redis.sentinel_master.is_none() {
             anyhow::bail!("redis.sentinels and redis.sentinel_master must be set together");
@@ -1309,6 +1317,13 @@ pub struct MediaConfig {
     /// mixer (one encode each). Disable on CPU-bound nodes to force per-speaker streams.
     #[serde(default = "default_true")]
     pub downlink_mix: bool,
+    /// Per-participant WebRTC downlink tracks a browser may negotiate on top of the mixed
+    /// track (`SessionInitAck.webrtc_participant_streams`): each carries one speaker's own
+    /// Opus frames so the browser can spatialize (Web Audio HRTF) and mix them itself; speakers
+    /// beyond that many stay in the mixed track. Costs no transcoding — the SFU forwards
+    /// frames as-is — but one RTP stream per track. `0` disables (mix only).
+    #[serde(default = "default_webrtc_participant_streams")]
+    pub webrtc_participant_streams: u32,
     /// Concurrent UDP receive workers for the SFU socket (0 = auto, based on CPU count).
     #[serde(default)]
     pub rx_workers: usize,
@@ -1384,6 +1399,10 @@ fn default_tunnel_queue_packets() -> usize {
     128
 }
 
+fn default_webrtc_participant_streams() -> u32 {
+    16
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
@@ -1415,6 +1434,7 @@ impl Default for MediaConfig {
             pcmu_fallback: true,
             media_tunnel: true,
             downlink_mix: true,
+            webrtc_participant_streams: default_webrtc_participant_streams(),
             tunnel_queue_packets: default_tunnel_queue_packets(),
             rx_workers: 0,
             cascade_secret: None,

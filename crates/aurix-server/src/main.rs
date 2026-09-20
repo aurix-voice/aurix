@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             media_tunnel: config.media.media_tunnel,
             tunnel_queue_packets: config.media.tunnel_queue_packets,
             downlink_mix: config.media.downlink_mix,
+            webrtc_participant_streams: config.media.webrtc_participant_streams,
         },
     );
 

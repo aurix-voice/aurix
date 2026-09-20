@@ -94,6 +94,11 @@ pub enum MediaEvent {
         user_id: UserId,
         quality: NetworkQuality,
     },
+    /// A WebRTC session's per-participant downlink tracks changed hands (full snapshot).
+    ParticipantStreams {
+        session_id: SessionId,
+        streams: Vec<aurix_common::protocol::ParticipantStream>,
+    },
 }
 
 /// Where an uplink packet came from.
@@ -558,7 +563,8 @@ impl PacketRouter {
         }
         for ((channel, packet), receivers) in per_channel.iter().zip(receivers) {
             if !receivers.is_empty() {
-                self.deliver(channel, receivers, packet).await;
+                self.deliver(channel, receivers, packet, Some(sender.user_id))
+                    .await;
             }
         }
         Ok(())
@@ -589,7 +595,8 @@ impl PacketRouter {
             self.tap_sink(&channel, *sender, packet.header.ssrc, &packet);
         }
         let receivers = channel.get_receivers_for_relayed_audio(sender, level);
-        self.deliver(&channel, receivers, &packet).await;
+        self.deliver(&channel, receivers, &packet, Some(*sender))
+            .await;
         Ok(())
     }
 
@@ -643,8 +650,14 @@ impl PacketRouter {
         }
         if to_self {
             // Meant for this receiver only: must never enter a mixer shared with others.
-            self.deliver_scoped(&channel, vec![(sender.clone(), Mix::UNITY)], &packet, false)
-                .await;
+            self.deliver_scoped(
+                &channel,
+                vec![(sender.clone(), Mix::UNITY)],
+                &packet,
+                false,
+                None,
+            )
+            .await;
         }
         Ok(())
     }
@@ -671,7 +684,7 @@ impl PacketRouter {
         }
         let packet = frame.into_packet(channel_id);
         let receivers = channel.get_receivers_for_announcement();
-        self.deliver(&channel, receivers, &packet).await;
+        self.deliver(&channel, receivers, &packet, None).await;
         Ok(())
     }
 
@@ -694,6 +707,7 @@ impl PacketRouter {
             vec![(listener.clone(), Mix::UNITY)],
             &packet,
             false,
+            None,
         )
         .await;
         Ok(())
@@ -850,7 +864,8 @@ impl PacketRouter {
         packet: &AurixPacket,
     ) {
         let receivers = channel.get_receivers_for_audio(sender.ssrc);
-        self.deliver(channel, receivers, packet).await;
+        self.deliver(channel, receivers, packet, Some(sender.user_id))
+            .await;
     }
 
     /// Hands the native receivers served by a server mix (`DownlinkMode::Mixed` or listeners
@@ -890,13 +905,17 @@ impl PacketRouter {
         streams
     }
 
+    /// `speaker`: the participant whose microphone the frame is (a WebRTC receiver may carry
+    /// them on a per-participant track); `None` for synthesized audio, which is always mixed.
     async fn deliver(
         &self,
         channel: &Arc<MediaChannel>,
         receivers: Vec<(Arc<MediaSession>, Mix)>,
         packet: &AurixPacket,
+        speaker: Option<UserId>,
     ) {
-        self.deliver_scoped(channel, receivers, packet, true).await;
+        self.deliver_scoped(channel, receivers, packet, true, speaker)
+            .await;
     }
 
     async fn deliver_scoped(
@@ -905,11 +924,13 @@ impl PacketRouter {
         receivers: Vec<(Arc<MediaSession>, Mix)>,
         packet: &AurixPacket,
         shared_ok: bool,
+        speaker: Option<UserId>,
     ) {
         // Downlink packets are sealed per receiver (encrypted + authenticated with the receiver's
         // session keys) with that receiver's gain/direction metadata in front of the frame.
         let e2ee = packet.header.has_flag(PacketFlags::E2ee);
         let receivers = self.split_mixed(channel, receivers, packet, e2ee, shared_ok);
+        let speaker = speaker.filter(|_| channel.browser_reproducible_gain());
         // Computed once per packet, on the first PCMU receiver.
         let mut pcmu_frame: Option<Option<Bytes>> = None;
         for (receiver, mix) in receivers {
@@ -925,7 +946,9 @@ impl PacketRouter {
                         let ok = webrtc.send_to_session(
                             &receiver.session_id,
                             ForwardMedia {
+                                speaker,
                                 sender_ssrc: packet.header.ssrc,
+                                sender_ts: packet.header.timestamp,
                                 volume: mix.volume,
                                 direction: mix.direction,
                                 payload: packet.payload.to_vec(),

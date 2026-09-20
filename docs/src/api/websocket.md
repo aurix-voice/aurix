@@ -21,7 +21,8 @@ Immediately after the upgrade the server sends
   "media_addrs":["203.0.113.10:10000","[2001:db8::10]:10000"],
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
   "migrated":false,"failover":["wss://eu2.voice.example.com/ws","wss://eu3.voice.example.com/ws"],
-  "media_tunnel":true,"downlink_mix":true,"translation":{"speech":true,"languages":["en","de","fr"]}}}
+  "media_tunnel":true,"downlink_mix":true,"webrtc_participant_streams":16,"unfocused_channel_gain":0.3,
+  "translation":{"speech":true,"languages":["en","de","fr"]}}}
 ```
 
 `media_key` is the master secret for the [AURX media path](aurx.md); `media_addr` is the UDP
@@ -35,7 +36,10 @@ messages, binary frames are always media; `downlink_mix` says native sessions ma
 [server-mixed downlink](../features/channels.md#server-mix-for-native-clients); `translation`
 (absent when the node does not translate) lists the target languages listeners may request with
 `SetTranslation` and whether translations can also be spoken to them
-([live translation](../features/speech.md#live-translation)). With
+([live translation](../features/speech.md#live-translation)); `webrtc_participant_streams`
+(absent/`0` on older nodes) is how many [per-participant WebRTC tracks](../features/channels.md#per-participant-tracks-for-browsers)
+a browser may negotiate next to its mixed track, and `unfocused_channel_gain` the factor the node
+applies to channels other than the focused one, so a browser can reproduce it on those tracks. With
 `AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` a
 plain player JWT is refused for the handshake (`ACTION_TOKEN_REQUIRED`).
 `failover` lists other healthy nodes (same region first, least loaded first; up to
@@ -80,7 +84,7 @@ See [High availability](../operations/high-availability.md#cross-node-session-fa
 
 | Client → server | Server → client | Notes |
 | --- | --- | --- |
-| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, role, participant_count, hidden_listeners, transcription, safety_voice, audio, roster_radius?, text_radius? }` | `token` = player JWT listing the channel, or a `join` action token; `role` is yours (`listener` = receive-only), `participant_count` the headcount across nodes including listeners hidden from `participants` when `hidden_listeners` is set ([audiences](../features/channels.md#large-channels-and-audiences)); the radii are present only for [radius-scoped](../features/channels.md#radius-scoped-presence-and-text) positional channels |
+| `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, role, participant_count, hidden_listeners, transcription, safety_voice, audio, positional?, roster_radius?, text_radius? }` | `token` = player JWT listing the channel, or a `join` action token; `role` is yours (`listener` = receive-only), `participant_count` the headcount across nodes including listeners hidden from `participants` when `hidden_listeners` is set ([audiences](../features/channels.md#large-channels-and-audiences)); `positional` (the channel's distance/direction settings, present for positional channels) lets a client reproduce the node's attenuation on [per-participant tracks](../features/channels.md#per-participant-tracks-for-browsers); the radii are present only for [radius-scoped](../features/channels.md#radius-scoped-presence-and-text) positional channels |
 | `ChannelLeave { channel_id }` | `ParticipantJoined { channel_id, user_id, display_name, ssrc, role, is_muted }`, `ParticipantLeft` | roster; `ssrc` identifies the sender's AURX packets; in a radius-scoped channel these also report players moving in and out of `roster_radius` |
 | — | `MediaBound { session_id, transport }` | the `SessionBind` was accepted; `transport` = `udp` or `tunnel` (the WebSocket itself) |
 | — | `SessionClose { session_id, reason }`, `Kick { channel_id, user_id, reason }` | session is gone / removed from a channel |
@@ -88,6 +92,7 @@ See [High availability](../operations/high-availability.md#cross-node-session-fa
 | `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…, codec, downlink}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |
 | `SetAudioCodec { codec }` | `AudioCodecChanged { codec }` | native AURX only; `codec` = `opus` (default) / `pcmu` — G.711 fallback transcoded by the node, see [codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback); `CODEC_NOT_AVAILABLE` when `media.pcmu_fallback` is off or the session is WebRTC |
 | `SetDownlinkMode { mode }` | `DownlinkModeChanged { mode }` | native AURX only; `mode` = `streams` (default, one stream per speaker) / `mixed` (one server-mixed stereo stream per channel, `PacketFlags::Mixed`), see [server mix](../features/channels.md#server-mix-for-native-clients); `VALIDATION_ERROR` when `media.downlink_mix` is off or the session is WebRTC; frames already in flight may still be of the previous kind |
+| `SetParticipantStreams { pinned }` | `ParticipantStreams { streams: [{ mid, user_id? }] }` | WebRTC only, see [per-participant tracks](../features/channels.md#per-participant-tracks-for-browsers); `streams` is the full current layout of the browser's dedicated tracks (SDP `mid` → who is forwarded on it, `null` = idle), sent once the tracks are negotiated and whenever it changes; `pinned` names users that keep a track while audible (at most `webrtc_participant_streams`, else `VALIDATION_ERROR`); `VALIDATION_ERROR` on a native session |
 | `SetTransmission { mode }`, `SetChannelFocus { channel_id? }` | `TransmissionChanged`, `ChannelFocusChanged` | `mode` = `none` / `single { channel_id }` / `all`; server resets both when the target channel is left |
 | — | `SpeakingStateChanged { channel_id, user_id, speaking }`, `ChannelEnergy { channel_id, levels }` | voice activity, see [Channels](../features/channels.md#speaking-energy-and-roster) |
 | `PositionUpdate { channel_id, positions }`, `OcclusionUpdate`, `ReverbZoneUpdate` | — | positional channels; players may only move themselves unless they hold a moderator role |

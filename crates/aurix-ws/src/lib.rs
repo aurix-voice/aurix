@@ -1782,6 +1782,15 @@ impl WsState {
                         });
                     }
                 }
+                MediaEvent::ParticipantStreams {
+                    session_id,
+                    streams,
+                } => {
+                    self.send_to_session(
+                        &session_id,
+                        &ControlMessage::ParticipantStreams { streams },
+                    );
+                }
                 MediaEvent::MuteChanged {
                     session_id,
                     user_id,
@@ -2628,7 +2637,7 @@ fn channel_join_ack(
     channel_id: &ChannelId,
 ) -> ControlMessage {
     let participants = channel_snapshot(state, session_id, channel_id);
-    let (role, participant_count, hidden_listeners, roster_radius, text_radius) = state
+    let (role, participant_count, hidden_listeners, roster_radius, text_radius, positional) = state
         .sfu
         .read()
         .get_channel(channel_id)
@@ -2639,9 +2648,10 @@ fn channel_join_ack(
                 c.hides_listeners(),
                 c.roster_radius(),
                 c.text_radius(),
+                c.positional_config(),
             )
         })
-        .unwrap_or((ChannelRole::Listener, 0, false, None, None));
+        .unwrap_or((ChannelRole::Listener, 0, false, None, None, None));
     ControlMessage::ChannelJoinAck {
         channel_id: *channel_id,
         participants,
@@ -2653,6 +2663,7 @@ fn channel_join_ack(
         role,
         participant_count,
         hidden_listeners,
+        positional,
     }
 }
 
@@ -2771,6 +2782,8 @@ async fn handle_ws_connection(
         resumed,
         media_tunnel: tunnel.is_some(),
         downlink_mix: state.sfu.read().downlink_mix_enabled(),
+        webrtc_participant_streams: state.sfu.read().webrtc_participant_streams(),
+        unfocused_channel_gain: Some(state.sfu.read().unfocused_channel_gain()),
         migrated: attached.migrated,
         failover: state.failover_endpoints(),
         translation: state.control.translation.info(),
@@ -4306,6 +4319,16 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetParticipantStreams { pinned } => {
+            let result = state
+                .sfu
+                .read()
+                .set_participant_streams(&session_id, pinned);
+            if let Err(e) = result {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+        }
+
         ControlMessage::Ping { nonce } => send_msg(tx, &ControlMessage::Pong { nonce }).await,
 
         ControlMessage::SessionClose { .. } => {
@@ -4344,6 +4367,7 @@ async fn handle_control_message(
         | ControlMessage::Transcript { .. }
         | ControlMessage::TtsStatus { .. }
         | ControlMessage::WebRtcAnswer { .. }
+        | ControlMessage::ParticipantStreams { .. }
         | ControlMessage::Pong { .. } => {
             send_error(
                 tx,

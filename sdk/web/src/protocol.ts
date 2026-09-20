@@ -54,6 +54,24 @@ export interface UserPosition {
   orientation: Orientation3D;
 }
 
+/** Distance / direction model of a positional channel (`ChannelConfig.positional_config`). */
+export interface PositionalConfigWire {
+  near_distance: number;
+  far_distance: number;
+  rolloff: 'linear' | 'logarithmic' | 'custom_spline';
+  max_radius: number;
+  directional: boolean;
+  coordinate_system: 'left_handed' | 'right_handed';
+  roster_radius?: number | null;
+  text_radius?: number | null;
+}
+
+/** One negotiated per-participant downlink track: `user_id` is who it carries right now (`null` = idle). */
+export interface ParticipantStreamWire {
+  mid: string;
+  user_id: string | null;
+}
+
 /** Receiver-local mute of one participant; `channel_id: null` means in every channel. */
 export interface LocalMute {
   user_id: string;
@@ -191,6 +209,8 @@ export type ClientMessage =
   | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number } }
   | { type: 'RecordingConsentResponse'; data: { recording_id: string; consent: RecordingConsent } }
   | { type: 'WebRtcOffer'; data: { sdp: string } }
+  /** Participants to keep on their own downlink track while audible (bounded by `webrtc_participant_streams`). */
+  | { type: 'SetParticipantStreams'; data: { pinned: string[] } }
   | { type: 'Ping'; data: { nonce: number } }
   | { type: 'SessionClose'; data: { session_id: string; reason: string } };
 
@@ -221,6 +241,10 @@ export type ServerMessage =
         failover?: string[];
         /** The node translates transcripts on request; absent when translation is not configured. */
         translation?: TranslationInfoWire;
+        /** Per-participant WebRTC downlink tracks the node serves at most (absent / 0 = mixed only). */
+        webrtc_participant_streams?: number;
+        /** Gain the node applies to voices of unfocused channels; the browser mirrors it on per-participant tracks. */
+        unfocused_channel_gain?: number;
       };
     }
   | { type: 'MediaBound'; data: { session_id: string } }
@@ -243,6 +267,8 @@ export type ServerMessage =
         participant_count?: number;
         /** Listeners are hidden from presence in this channel (`audience.hide_listeners`). */
         hidden_listeners?: boolean;
+        /** Positional channel: the model the browser applies to per-participant tracks. */
+        positional?: PositionalConfigWire | null;
       };
     }
   | { type: 'ChannelAudioPolicy'; data: { channel_id: string; audio: AudioPolicyWire } }
@@ -334,6 +360,8 @@ export type ServerMessage =
       data: { channel_id: string; user_id: string; action: ModerationAction };
     }
   | { type: 'WebRtcAnswer'; data: { sdp: string } }
+  /** Current `mid → participant` layout of the per-participant downlink tracks (full snapshot). */
+  | { type: 'ParticipantStreams'; data: { streams: ParticipantStreamWire[] } }
   | { type: 'Pong'; data: { nonce: number } };
 
 export interface UnknownMessage {

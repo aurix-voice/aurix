@@ -198,7 +198,9 @@ rate (10 Hz is plenty). For each speaker/listener pair the SFU computes the dist
 attenuation and, for directional channels, the azimuth/elevation of the speaker relative to the
 listener's forward/up vectors. Native receivers get the gain in the per-frame volume byte
 (`VolumeAttenuated`) and the direction in two extra bytes (`Directional`), and pan locally;
-WebRTC receivers get a server-mixed stereo downlink (`sprop-stereo=1`). `OcclusionUpdate`
+WebRTC receivers get a server-mixed stereo downlink (`sprop-stereo=1`) plus, when they negotiate
+[per-participant tracks](#per-participant-tracks-for-browsers), the nearest speakers as
+separate tracks they attenuate and pan themselves (Web Audio HRTF). `OcclusionUpdate`
 (a listener-side 0–1 factor towards one speaker, validated and echoed to the listener's own
 client) and `ReverbZoneUpdate` (broadcast to the channel) are relayed as hints for client-side
 DSP; the server does not process audio for them.
@@ -286,7 +288,9 @@ receiver hears a bounded number of voices. `ChannelConfig.audience` controls all
   the roster is partial. Game servers see the full membership over REST as usual.
 * **`mix_for_listeners`** (default `true`) serves native listeners one server-mixed stereo
   stream per channel instead of a stream per speaker, whatever downlink mode they asked for —
-  see [server mix](#server-mix-for-native-clients). Browsers are always mixed.
+  see [server mix](#server-mix-for-native-clients). Browsers always have the mixed track and
+  hear at most `media.webrtc_participant_streams` speakers on
+  [dedicated tracks](#per-participant-tracks-for-browsers) next to it.
 * **`max_speakers`** (`0` = no separate limit) caps how many members that *may* speak the
   channel admits; the next speaker join fails with `CHANNEL_FULL` while listeners keep
   joining up to `max_participants`. Counted over the members a node knows of (its own plus
@@ -331,6 +335,46 @@ Metrics: `aurix_downlink_mixers{kind="shared"|"private"}`,
 `media.downlink_mix = false`; native clients then receive per-speaker streams (their request is
 refused with `VALIDATION_ERROR`, as it is for a WebRTC session) and `mix_for_listeners` has no
 effect on that node.
+
+### Per-participant tracks for browsers
+
+A browser's WebRTC session always has one **mixed** downlink track — the server mix above,
+built with that receiver's rules, so any browser on any node hears everyone. On top of it a
+browser may offer extra `recvonly` audio m-lines in its SDP; the node accepts up to
+`media.webrtc_participant_streams` of them (default 16, at most 64; advertised as
+`SessionInitAck.webrtc_participant_streams`, `0` = mixed only) as **per-participant tracks**:
+
+* each track carries **one speaker's own Opus frames, forwarded as-is** (no decode/re-encode,
+  the sender's timestamp cadence is preserved, a talkspurt starts with an RTP marker) — the
+  browser decodes, attenuates, pans (Web Audio `PannerNode`, HRTF) and mixes them itself, which
+  is what gives a browser per-speaker positioning the server mix cannot: binaural
+  direction instead of stereo panning, and gains that follow the listener's own head frame
+  between server updates;
+* the mapping `mid → user_id` is pushed as `ParticipantStreams` (the full layout; once the tracks
+  are negotiated and whenever it changes) — a track that changes hands changes the layout, an idle
+  track has `user_id: null` and carries nothing;
+* slots are **bounded and sticky**: a speaker keeps its track while audible and for a short
+  hold after going quiet (1 s) before another speaker may take it, and a silent slot is
+  released after 30 s; `SetParticipantStreams { pinned }` names users that keep a track while
+  audible whatever the ranking (at most the cap, else `VALIDATION_ERROR`), a pinned speaker may
+  displace an unpinned one;
+* **everyone the browser may hear is still in the mixed track except the speakers currently on
+  a dedicated track** — so a channel with more speakers than tracks degrades to "the N most
+  recent/pinned voices spatialized, the rest mixed", never to silence, and a browser or node
+  without the feature (older SDK, `0` tracks, no `AudioContext`) is exactly the mixed-only
+  browser of before. The server-side receiver rules (mute, block, volume, focus, `max_streams`,
+  radius visibility, positional attenuation and range) decide *whether* a frame reaches the
+  browser at all on either path; the browser re-applies gain/attenuation locally on dedicated
+  tracks since those frames carry no volume byte;
+* **ambient channels keep everyone in the mixed track**: their per-slot ranking and dimming
+  are server-only state the browser cannot reproduce, so dedicated tracks are not handed out
+  there;
+* recording, transcription, safety and the cascade are untouched (they tap frames before
+  fan-out); `E2ee` speakers reach no browser on either path (the node cannot decode them
+  for the mix — see [limitations](../limitations.md)).
+
+Cost: no transcoding, one RTP stream and one SRTP context per track per browser; a node caps the
+count, a browser can ask for fewer (`participantStreams` in the Web SDK / Unity WebGL options).
 
 ## Speaking, energy and roster
 

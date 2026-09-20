@@ -21,14 +21,22 @@ struct BrowserClient {
     sock: UdpSocket,
     local: SocketAddr,
     mid: Mid,
+    /// Extra recvonly audio m-lines (per-participant tracks), in offer order.
+    extra_mids: Vec<Mid>,
     connected: bool,
-    received: Vec<Vec<u8>>,
+    /// Downlink Opus frames by the m-line they arrived on.
+    received: Vec<(Mid, Vec<u8>)>,
     rtp_time: u64,
     pending: Option<(String, str0m::change::SdpPendingOffer)>,
 }
 
 impl BrowserClient {
     async fn new() -> Self {
+        Self::with_participant_tracks(0).await
+    }
+
+    /// Like a browser that pre-negotiates `extra` per-participant downlink tracks.
+    async fn with_participant_tracks(extra: usize) -> Self {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = sock.local_addr().unwrap();
         let mut rtc = Rtc::builder()
@@ -38,12 +46,16 @@ impl BrowserClient {
         rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
         let mut api = rtc.sdp_api();
         let mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let extra_mids = (0..extra)
+            .map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None))
+            .collect();
         let (offer, pending) = api.apply().unwrap();
         Self {
             rtc,
             sock,
             local,
             mid,
+            extra_mids,
             connected: false,
             received: Vec::new(),
             rtp_time: 0,
@@ -77,7 +89,7 @@ impl BrowserClient {
                     Output::Event(Event::Connected) => self.connected = true,
                     Output::Event(Event::MediaData(d)) => {
                         assert_eq!(d.params.spec().codec, Codec::Opus);
-                        self.received.push(d.data.to_vec());
+                        self.received.push((d.mid, d.data.to_vec()));
                     }
                     Output::Event(_) => {}
                     Output::Timeout(t) => break t,
@@ -105,6 +117,14 @@ impl BrowserClient {
                 }
             }
         }
+    }
+
+    fn received_on(&self, mid: Mid) -> Vec<&Vec<u8>> {
+        self.received
+            .iter()
+            .filter(|(m, _)| *m == mid)
+            .map(|(_, d)| d)
+            .collect()
     }
 
     fn send_opus(&mut self, data: Vec<u8>) {
@@ -262,7 +282,7 @@ async fn browser_and_aurx_client_hear_each_other() {
     );
     let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
     let mut pcm = vec![0i16; FRAME_SAMPLES * OUTPUT_CHANNELS];
-    let n = dec.decode(&browser.received[1], &mut pcm, false).unwrap();
+    let n = dec.decode(&browser.received[1].1, &mut pcm, false).unwrap();
     assert_eq!(n, FRAME_SAMPLES);
     assert!(
         pcm.iter().any(|s| s.abs() > 200),
@@ -276,4 +296,259 @@ async fn browser_and_aurx_client_hear_each_other() {
         .unwrap()
         .has_session(&browser_session.session_id));
     assert!(sfu.get_session(&browser_session.session_id).is_none());
+}
+
+struct NativeSpeaker {
+    session: std::sync::Arc<aurix_media::MediaSession>,
+    sock: UdpSocket,
+    seq: u32,
+}
+
+impl NativeSpeaker {
+    async fn join(sfu: &SfuNode, sfu_addr: SocketAddr, app: AppId, channel: ChannelId) -> Self {
+        let session = sfu
+            .create_session(SessionId::new(), UserId::new(), app, "native".into())
+            .unwrap();
+        sfu.join_channel(
+            &session.session_id,
+            channel,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = AurixPacket::session_bind(
+            &session.session_id,
+            session.ssrc,
+            chrono::Utc::now().timestamp_millis(),
+            1,
+        );
+        sock.send_to(&bind.encode_authenticated(&session.keys), sfu_addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        Self {
+            session,
+            sock,
+            seq: 0,
+        }
+    }
+
+    async fn speak(&mut self, sfu_addr: SocketAddr, channel: &ChannelId, frame: &[u8]) {
+        self.seq += 1;
+        let pkt = AurixPacket::audio(
+            self.seq,
+            self.seq * 960,
+            self.session.ssrc,
+            channel_id_hash(channel),
+            Bytes::copy_from_slice(frame),
+        );
+        self.sock
+            .send_to(&pkt.seal(&self.session.keys), sfu_addr)
+            .await
+            .unwrap();
+    }
+}
+
+/// Latest `ParticipantStreams` snapshot for `session` (waits for at least one, then drains
+/// what followed), as `(mid, user)` pairs.
+async fn next_layout(
+    events: &mut tokio::sync::broadcast::Receiver<aurix_media::MediaEvent>,
+    session: &SessionId,
+) -> Vec<(String, Option<UserId>)> {
+    let mut latest = None;
+    loop {
+        let wait = if latest.is_some() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(3)
+        };
+        let ev = match tokio::time::timeout(wait, events.recv()).await {
+            Ok(ev) => ev.unwrap(),
+            Err(_) => return latest.expect("ParticipantStreams snapshot"),
+        };
+        if let aurix_media::MediaEvent::ParticipantStreams {
+            session_id,
+            streams,
+        } = ev
+        {
+            if session_id == *session {
+                latest = Some(streams.into_iter().map(|s| (s.mid, s.user_id)).collect());
+            }
+        }
+    }
+}
+
+/// A browser that offers extra recvonly audio m-lines gets speakers forwarded on their own
+/// tracks (frames byte-identical to the uplink), speakers beyond the tracks in the mix, the
+/// layout announced on every change, and pinning that reserves a track for a participant.
+#[tokio::test]
+async fn browser_gets_per_participant_tracks() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let mut sfu = SfuNode::new(
+        MediaNodeId::new(),
+        Region::EuWest,
+        SfuOptions {
+            webrtc_participant_streams: 2,
+            ..SfuOptions::default()
+        },
+    );
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let sfu_addr = sfu.local_addr().unwrap();
+    let mut events = sfu.subscribe_events();
+    let app = AppId::new();
+    let channel = ChannelId::new();
+
+    let mut alice = NativeSpeaker::join(&sfu, sfu_addr, app, channel).await;
+    let mut bob = NativeSpeaker::join(&sfu, sfu_addr, app, channel).await;
+    let mut carol = NativeSpeaker::join(&sfu, sfu_addr, app, channel).await;
+
+    let browser_session = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "browser".into())
+        .unwrap();
+    sfu.join_channel(
+        &browser_session.session_id,
+        channel,
+        ChannelConfig::default(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+    // Three tracks offered, the node serves two: the third m-line is answered but stays silent.
+    let mut browser = BrowserClient::with_participant_tracks(3).await;
+    let offer = browser.offer();
+    let answer = sfu
+        .attach_webrtc(&browser_session.session_id, &offer)
+        .unwrap();
+    assert_eq!(
+        answer.matches("m=audio").count(),
+        4,
+        "answer keeps every audio m-line: {answer}"
+    );
+    assert_eq!(answer.matches("a=sendonly").count(), 3, "{answer}");
+    browser.accept_answer(&answer);
+    for _ in 0..40 {
+        browser.run_for(Duration::from_millis(100)).await;
+        if browser.connected && browser_session.get_remote_addr().is_some() {
+            break;
+        }
+    }
+    assert!(browser.connected, "browser did not connect");
+
+    let layout = next_layout(&mut events, &browser_session.session_id).await;
+    let served: Vec<String> = browser.extra_mids[..2]
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
+    assert_eq!(
+        layout,
+        served.iter().map(|m| (m.clone(), None)).collect::<Vec<_>>(),
+        "initial layout: two idle tracks"
+    );
+
+    // Alice and Bob speak: each gets a track; Carol arrives while both are busy -> mix.
+    let frame_a = encode_pcm_frame(&tone()).unwrap();
+    let quiet: Vec<i16> = tone().iter().map(|s| s / 4).collect();
+    let frame_b = encode_pcm_frame(&quiet).unwrap();
+    assert_ne!(frame_a, frame_b);
+    for _ in 0..10 {
+        alice.speak(sfu_addr, &channel, &frame_a).await;
+        bob.speak(sfu_addr, &channel, &frame_b).await;
+        carol.speak(sfu_addr, &channel, &frame_a).await;
+        browser.run_for(Duration::from_millis(20)).await;
+    }
+    browser.run_for(Duration::from_millis(300)).await;
+    let layout = next_layout(&mut events, &browser_session.session_id).await;
+    let user_on = |layout: &[(String, Option<UserId>)], user: UserId| -> Option<Mid> {
+        layout
+            .iter()
+            .find(|(_, u)| *u == Some(user))
+            .map(|(m, _)| Mid::from(m.as_str()))
+    };
+    // Alice's frame reaches the SFU first, so she binds first; Bob second.
+    let mid_a = user_on(&layout, alice.session.user_id).expect("alice has a track");
+    let mid_b = user_on(&layout, bob.session.user_id).expect("bob has a track");
+    assert_ne!(mid_a, mid_b);
+    assert!(
+        user_on(&layout, carol.session.user_id).is_none(),
+        "carol stays in the mix: {layout:?}"
+    );
+    let on_a = browser.received_on(mid_a);
+    let on_b = browser.received_on(mid_b);
+    assert!(
+        on_a.len() >= 5 && on_b.len() >= 5,
+        "{} / {}",
+        on_a.len(),
+        on_b.len()
+    );
+    assert!(
+        on_a.iter().all(|f| **f == frame_a) && on_b.iter().all(|f| **f == frame_b),
+        "per-participant tracks carry the speaker's own frames untouched"
+    );
+    let mixed = browser.received_on(browser.mid);
+    assert!(
+        mixed.len() >= 3,
+        "carol is heard in the mix ({})",
+        mixed.len()
+    );
+    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0i16; FRAME_SAMPLES * OUTPUT_CHANNELS];
+    dec.decode(mixed[mixed.len() / 2], &mut pcm, false).unwrap();
+    assert!(pcm.iter().any(|s| s.abs() > 200), "mix is not silent");
+    assert!(
+        browser
+            .received
+            .iter()
+            .all(|(m, _)| *m == browser.mid || *m == mid_a || *m == mid_b),
+        "the unserved third track stays silent"
+    );
+
+    // Pin Carol: she takes over a track from an active unpinned speaker with her next frame.
+    sfu.set_participant_streams(&browser_session.session_id, vec![carol.session.user_id])
+        .unwrap();
+    browser.received.clear();
+    for _ in 0..10 {
+        alice.speak(sfu_addr, &channel, &frame_a).await;
+        bob.speak(sfu_addr, &channel, &frame_b).await;
+        carol.speak(sfu_addr, &channel, &frame_a).await;
+        browser.run_for(Duration::from_millis(20)).await;
+    }
+    browser.run_for(Duration::from_millis(300)).await;
+    let layout = next_layout(&mut events, &browser_session.session_id).await;
+    let mid_c = user_on(&layout, carol.session.user_id).expect("pinned carol has a track");
+    assert!(browser.received_on(mid_c).len() >= 5);
+    let displaced = [alice.session.user_id, bob.session.user_id]
+        .into_iter()
+        .filter(|u| user_on(&layout, *u).is_none())
+        .count();
+    assert_eq!(
+        displaced, 1,
+        "exactly one unpinned speaker moved to the mix: {layout:?}"
+    );
+    assert!(
+        browser.received_on(browser.mid).len() >= 3,
+        "the displaced speaker is heard in the mix"
+    );
+
+    // Pinning too many, or a native session, is rejected.
+    assert!(sfu
+        .set_participant_streams(
+            &browser_session.session_id,
+            vec![UserId::new(), UserId::new(), UserId::new()],
+        )
+        .is_err());
+    assert!(sfu
+        .set_participant_streams(&alice.session.session_id, vec![])
+        .is_err());
+
+    sfu.destroy_session(&browser_session.session_id).unwrap();
+    assert!(!sfu
+        .webrtc_manager()
+        .unwrap()
+        .has_session(&browser_session.session_id));
 }

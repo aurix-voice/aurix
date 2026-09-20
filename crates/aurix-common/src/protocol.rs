@@ -2,7 +2,8 @@ use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, DownlinkMode,
-    MediaTransportKind, Orientation3D, Position3D, ReverbDescriptor, SessionId, UserId,
+    MediaTransportKind, Orientation3D, Position3D, PositionalConfig, ReverbDescriptor, SessionId,
+    UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -870,6 +871,14 @@ pub enum ControlMessage {
         /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
         #[serde(default)]
         downlink_mix: bool,
+        /// Per-participant WebRTC downlink tracks this node serves a browser at most, on top
+        /// of the mixed track (see `ParticipantStreams`). `0`: browsers get the mix only.
+        #[serde(default)]
+        webrtc_participant_streams: u32,
+        /// Gain the node applies to voices of unfocused channels (`media.unfocused_channel_gain`),
+        /// so a browser rendering per-participant tracks attenuates them the same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unfocused_channel_gain: Option<f32>,
         /// The session was resumed on a different node than the one that opened it: same
         /// session id and SSRC, new `media_addr` and `media_key`. Its downlink audio sequence
         /// jumps forward (never back) on the new node, so peers' anti-replay windows keep
@@ -934,6 +943,11 @@ pub enum ControlMessage {
         /// Listeners are hidden from presence in this channel (`audience.hide_listeners`).
         #[serde(default)]
         hidden_listeners: bool,
+        /// Positional channels: the distance model the server applies to the mixed downlink,
+        /// so a client rendering per-participant tracks itself (`ParticipantStreams`) can
+        /// attenuate and pan the same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        positional: Option<PositionalConfig>,
     },
     /// Server→client: an operator changed the channel's audio settings while you are in it.
     ChannelAudioPolicy {
@@ -1021,7 +1035,8 @@ pub enum ControlMessage {
     /// Client→server (native AURX only): receive channel audio as one server-mixed stream per
     /// channel (`mixed`, see `PacketFlags::Mixed`) or as one stream per speaker (`streams`,
     /// the default). Rejected when the node disables `media.downlink_mix` or the session is
-    /// WebRTC (browsers are always mixed).
+    /// WebRTC (browsers always keep the mixed track; extra per-participant tracks are
+    /// negotiated in the SDP offer instead, see `ParticipantStreams`).
     SetDownlinkMode {
         mode: DownlinkMode,
     },
@@ -1029,6 +1044,22 @@ pub enum ControlMessage {
     /// previous kind.
     DownlinkModeChanged {
         mode: DownlinkMode,
+    },
+    /// Client→server (WebRTC only): participants that must keep their own downlink track
+    /// while they are heard (never displaced by another speaker when every track is busy).
+    /// Replaces the previous list; at most as many as the session negotiated tracks.
+    SetParticipantStreams {
+        #[serde(default)]
+        pinned: Vec<UserId>,
+    },
+    /// Server→client (WebRTC only): which participant is currently carried by each of the
+    /// per-participant downlink tracks the browser offered (`a=mid` of the m-line). Sent once
+    /// the media path is up and whenever a binding changes; a full snapshot every time. A
+    /// track with `user_id: null` is idle. Speakers without a track are heard in the mixed
+    /// track. Frames on these tracks are the speaker's own Opus, unmodified: gain, mute,
+    /// positional attenuation and panning are the browser's job.
+    ParticipantStreams {
+        streams: Vec<ParticipantStream>,
     },
     /// Client→server: which of the joined channels receive this session's microphone.
     /// `single` must name a joined channel; leaving that channel switches to `none`.
@@ -1514,6 +1545,15 @@ pub struct ParticipantVolume {
 pub struct ParticipantEnergy {
     pub user_id: UserId,
     pub energy: f32,
+}
+
+/// One per-participant WebRTC downlink track (see `ControlMessage::ParticipantStreams`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantStream {
+    /// `a=mid` of the audio m-line in the browser's offer.
+    pub mid: String,
+    /// Participant currently carried by the track; `None` when idle.
+    pub user_id: Option<UserId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

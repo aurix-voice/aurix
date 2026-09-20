@@ -27,7 +27,8 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > PCMU fallback, a WebSocket tunnel for blocked UDP, large channels (listeners, per-receiver stream
 > caps, a server mix for native clients), cross-node failover with Redis session mirrors, a
 > region-aware cascade backbone, stereo/music uplinks, per-participant PCM for engine
-> spatialization, fleet-wide rate limits, recording mixdown + post-hoc STT, live translation,
+> spatialization, per-participant WebRTC tracks with Web Audio HRTF for browsers / Unity WebGL,
+> fleet-wide rate limits, recording mixdown + post-hoc STT, live translation,
 > chat history/offline delivery/read markers, IPv6 dual-stack, admin SSO + roles, usage
 > analytics/quotas, and Web / Unity (incl. WebGL) / native (C ABI) / Unreal / Godot SDKs.
 > See [Limitations](#limitations) before deploying at scale.
@@ -254,7 +255,9 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
     (`AurixPacket::take_downlink_meta`); the Unity mixer pans each stream with constant-power
     gains. The WebRTC downlink is mixed in stereo on the server (Opus `sprop-stereo=1`, the Web
     SDK offers `stereo=1` so browsers decode both channels; uplinks are mono unless the channel
-    opts into stereo — see below). End-to-end
+    opts into stereo — see below), and browsers additionally negotiate up to
+    `media.webrtc_participant_streams` per-participant tracks they spatialize themselves with
+    Web Audio HRTF — see below. End-to-end
     encrypted native frames are forwarded untouched (no server-side metadata).
     `positional_config.roster_radius` / `text_radius` additionally scope *presence* (join
     ack roster, `ParticipantJoined`/`Left`, positions, mute/speaking/energy) and *text*
@@ -754,7 +757,22 @@ mixer routing instead of the server's stereo panning: `aurix_client_pull_partici
 `SpawnParticipantAudioComponent` in Unreal. Claiming a user takes their streams out of the
 aggregate mix, so spatialized avatars and the 2D mix for everyone else coexist without double
 playback; claims are by user id and survive rejoins and node failover. Not available for the
-server-mixed downlink (one aggregate stream) or browsers.
+server-mixed downlink (one aggregate stream).
+
+**Per-participant WebRTC tracks + HRTF for browsers and Unity WebGL.** A browser's peer connection
+always carries the server mix on its first audio m-line; the Web SDK offers extra `recvonly`
+m-lines and the node fills up to `media.webrtc_participant_streams` of them (default 16, ≤ 64,
+advertised as `SessionInitAck.webrtc_participant_streams`) with **one speaker each, Opus frames
+forwarded as-is** (no transcoding, sender cadence kept). The SDK decodes them through a Web Audio
+graph — gain (local volume × focus × distance roll-off from `ChannelJoinAck.positional`, `0` for
+muted/blocked) → `PannerNode` (`HRTF`, or `equalpower`) placed from the same `updatePosition`
+poses — so browsers get binaural per-speaker positioning instead of the server's stereo pan.
+Slots are bounded and sticky (1 s hold, released after 30 s of silence), `SetParticipantStreams
+{ pinned }` keeps chosen users on a track, `ParticipantStreams { streams: [{ mid, user_id }] }`
+pushes the layout on every change; speakers beyond the tracks, ambient channels, and clients or
+nodes without the feature stay in the mixed track. Unity WebGL exposes it as
+`WebGLClientOptions.ParticipantStreams` / `SpatialAudio`, `SetPinnedParticipantsAsync`,
+`OnParticipantStreams`, `IsParticipantSpatialized`.
 
 ### PCMU (G.711) fallback for weak devices
 

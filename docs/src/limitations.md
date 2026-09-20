@@ -48,13 +48,22 @@ the chapter that explains the boundary.
   WebRTC interop. Clients may set the `E2ee` flag on frames they encrypt themselves; such frames
   are forwarded opaquely to native receivers only and never reach browsers, recordings, live
   streams or STT ([Native AURX media](api/aurx.md), [Security](concepts/security.md)).
-* **Browsers get a server-side mix.** The Web SDK receives one mixed (stereo) downlink per
-  session; per-participant tracks, insertable-stream encryption and native AURX over UDP are not
-  available in browsers ([Web SDK](sdk/web.md)).
+* **Browsers get a server-side mix plus a bounded number of per-participant tracks.** The
+  Web SDK always receives one mixed (stereo) downlink per session; on top of it a node hands out
+  at most `media.webrtc_participant_streams` (default 16, hard cap 64) dedicated tracks, each
+  forwarding one speaker's Opus frames as-is, which the browser spatializes with Web Audio
+  (`PannerNode`, HRTF by default). Speakers beyond that many, and everyone in ambient channels,
+  stay in the mix (stereo panning only); the mapping changes hands with a short hold, so a
+  speaker you first heard in the mix may move to a dedicated track (and back) mid-sentence.
+  Web Audio needs a user gesture (autoplay policy) and a running `AudioContext`; without it the
+  SDK falls back to the mixed track. Insertable-stream encryption and native AURX over UDP are
+  not available in browsers ([Web SDK](sdk/web.md#per-participant-tracks-and-spatial-audio)).
 * **Unity WebGL is a browser client.** `AurixWebGLVoiceClient` reuses the Web SDK through a
-  JavaScript bridge, so everything above applies: WebRTC media with one server-mixed stereo
-  downlink, the browser's Opus/AEC/NS/AGC, playback through a hidden `<audio>` element rather than
-  Unity's `AudioSource`/mixer/spatializer (no per-participant PCM, no `AurixParticipantAudioSource`),
+  JavaScript bridge, so everything above applies: WebRTC media with a server-mixed stereo
+  downlink plus bounded per-participant tracks, the browser's Opus/AEC/NS/AGC, playback through a
+  hidden `<audio>` element and the browser's Web Audio HRTF rather than Unity's
+  `AudioSource`/mixer/spatializer (no per-participant PCM, no `AurixParticipantAudioSource`;
+  positions reach the browser renderer through `UpdatePositionAsync`),
   no PCMU, no `IOpusCodec`/DSP/media-path settings, and audio only after a user gesture (autoplay
   policy). The native `AurixVoiceClient` throws `PlatformNotSupportedException` in WebGL players
   ([Unity WebGL](sdk/unity.md#unity-webgl)).
@@ -89,7 +98,9 @@ the chapter that explains the boundary.
   reported loudness only (no server-side voice-activity analysis of the payload). Directional panning applies to native and WebRTC
   downlinks; TTS/echo follow the same routing. Engine-side spatialization (HRTF, occlusion,
   reverb) is available to native / Unity / Unreal clients through per-participant PCM
-  pulls — one unpanned decoded stream per talker — not to browsers, and not for a
+  pulls — one unpanned decoded stream per talker — and to browsers through per-participant
+  WebRTC tracks (Web Audio HRTF, distance/rolloff reproduced from `ChannelJoinAck.positional`;
+  no occlusion/reverb, and `OcclusionUpdate` is not applied by the Web SDK) — not for a
   server-mixed downlink, which is one aggregate stream.
 
 ## Server behaviour
@@ -156,6 +167,11 @@ the chapter that explains the boundary.
   scripted bridge, the `.jslib` against the real browser bundle under an Emscripten-like harness,
   the Unity compile check with `UNITY_WEBGL` — but no Unity WebGL player has been built and run
   in a browser from this repository ([Unity WebGL](sdk/unity.md#unity-webgl)).
+* **Browser spatial audio is tested against a fake Web Audio graph.** The Web SDK's per-track
+  graph (gain → `PannerNode` → master), listener/source placement and mute/block/focus gains are
+  unit-tested on a scripted `AudioContext`, and the multi-track SDP negotiation, slot handout,
+  pinning and mixed fallback against the real node with a `str0m` browser stand-in; no real
+  browser rendered HRTF audio in CI.
 * **Browser Opus negotiation.** The Web SDK's `fmtp` rewrite and `setParameters` path are unit-
   tested on SDP text and applied in the E2E browser runs; whether a given browser honours
   `useinbandfec`/`usedtx`/`maxplaybackrate` is up to that browser's WebRTC stack.

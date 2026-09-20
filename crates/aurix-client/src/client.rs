@@ -3125,7 +3125,9 @@ async fn handle_message(
         | ControlMessage::TtsSpeak { .. }
         | ControlMessage::TtsCancel
         | ControlMessage::WebRtcOffer { .. }
-        | ControlMessage::WebRtcAnswer { .. } => {}
+        | ControlMessage::WebRtcAnswer { .. }
+        | ControlMessage::SetParticipantStreams { .. }
+        | ControlMessage::ParticipantStreams { .. } => {}
     }
     None
 }

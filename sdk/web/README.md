@@ -1,7 +1,8 @@
 # @aurix/web-sdk
 
 Browser client for [Aurix](../../README.md): JSON control channel over WebSocket and a single
-WebRTC peer connection (Opus) carrying the microphone uplink and the server-mixed downlink.
+WebRTC peer connection (Opus) carrying the microphone uplink, the server-mixed downlink and a
+bounded set of per-participant downlink tracks the SDK spatializes with Web Audio (HRTF).
 No runtime dependencies; ES2020 module with type declarations.
 
 ```bash
@@ -134,6 +135,39 @@ the channel's `coordinate_system` (`left_handed` — Unity/Unreal — by default
 OpenGL/Three.js/Godot conventions). The SDK offers Opus with `stereo=1` so the browser decodes
 both channels; play the remote stream through a stereo output (or `attachAudioOutput`) and do
 not re-pan it yourself. Your microphone is still sent in mono.
+
+### Per-participant tracks and HRTF
+
+Next to the mixed track the SDK offers extra `recvonly` audio m-lines; the node fills up to
+`media.webrtc_participant_streams` of them (`client.participantStreamCap`, advertised in
+`SessionInitAck`; `0` on older nodes = mixed only) with **one speaker each**, Opus frames forwarded
+untouched. Those tracks are rendered by the SDK through a Web Audio graph — `MediaStreamAudioSourceNode
+→ GainNode → PannerNode (HRTF) → master → destination` — with your local volume, mute/block, channel
+focus (`unfocused_channel_gain` from the node) and the channel's distance roll-off
+(`ChannelJoinAck.positional`) applied locally, and the panner placed from the same `updatePosition`
+poses (listener = you, source = the speaker's last `positions` entry). Speakers without a track,
+ambient channels, and everything on nodes without the feature stay in the mixed track — the two
+paths never double-play a voice.
+
+```ts
+const client = new AurixClient({
+  ..., participantStreams: 8,  // default: as many as the node allows; 0 = mixed only
+  spatialAudio: true,          // true = HRTF (default) | 'equalpower' | false (render it yourself)
+});
+client.on('participantStreams', (streams) => {
+  // [{ mid, userId | undefined, stream | undefined }] — the full layout, on every change
+});
+client.setPinnedParticipants([raidLeaderId]);   // keep them on a track while audible; RangeError above the cap
+client.isParticipantSpatialized(userId);        // true = through the HRTF panner right now
+await client.resumeAudio();                     // from a click: resumes the AudioContext and the <audio> elements
+```
+
+`spatialAudio: false` still negotiates the tracks but leaves playback to you
+(`getParticipantStream(userId)` → `MediaStream`, `participantStreams` event); pass `audioContext`
+to share your own context (it is not closed on `disconnect()`). Output volume / mute / device
+apply to both paths. Layout changes are asynchronous — a speaker may move between the mix and a
+dedicated track with a short server-side hold; the SDK re-renders on every layout, position,
+mute, block, volume and focus change and rebuilds the graph after a reconnect.
 
 ### Reconnect / session resume
 
@@ -482,9 +516,13 @@ bridge.destroy(h);
   later queue `{"type":"result","rid":N,"ok":true|false,…}`. Errors are
   `{"ok":false,"error":{"message","name","code?"}}`.
 * `drain(handle)` returns the ordered event queue (one entry per client event, same names and
-  payloads as `client.on(...)`), plus `result`, `tokenRequest`, `remoteAudio` (playback state of the
-  hidden `<audio>` element the bridge attaches to the remote stream; `resumeAudio` retries after an
-  autoplay block) and `overflow` (`{"dropped":N}` when the bounded queue, default 4096, wrapped).
+  payloads as `client.on(...)` — `participantStreams` is serialized as `[{mid, userId | null, live}]`,
+  a `MediaStream` never crosses the string bridge), plus `result`, `tokenRequest`, `remoteAudio`
+  (playback state of the hidden `<audio>` element the bridge attaches to the mixed stream;
+  `resumeAudio` retries it and resumes the Web Audio graph after an autoplay block) and `overflow`
+  (`{"dropped":N}` when the bounded queue, default 4096, wrapped). `participantStreams` /
+  `spatialAudio` in the options, `setPinnedParticipants` / `pinnedParticipants` /
+  `participantStreamCap` / `participantStreams` / `isParticipantSpatialized` as methods.
   `pending(handle)` is the queue length.
 * `refreshToken: true` / `joinToken: true` in the options invert the token callbacks: the client
   queues a `tokenRequest` and waits for `provideToken` (`{"requestId","token"}` or

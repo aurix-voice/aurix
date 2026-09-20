@@ -35,6 +35,13 @@ namespace Aurix.WebGL
         public ReconnectPolicy Reconnect = new ReconnectPolicy();
         /// <summary>Also surface the raw server control messages through <see cref="AurixWebGLVoiceClient.OnControlMessage"/>.</summary>
         public bool RawMessages;
+        /// <summary>
+        /// Per-participant WebRTC downlink tracks to negotiate on top of the mixed one (browser-side gain/HRTF per
+        /// speaker). null = as many as the node allows (<c>webrtc_participant_streams</c>), 0 = mixed only.
+        /// </summary>
+        public int? ParticipantStreams;
+        /// <summary>How the browser renders the dedicated tracks; <see cref="WebGLSpatialAudio.Hrtf"/> by default.</summary>
+        public WebGLSpatialAudio SpatialAudio = WebGLSpatialAudio.Hrtf;
 
         internal Dictionary<string, object> ToBridge(string apiUrl, string wsUrl, string token, bool refreshToken, bool joinToken)
         {
@@ -64,6 +71,12 @@ namespace Aurix.WebGL
                 },
             };
             if (Stereo) o["opus"] = new Dictionary<string, object> { { "stereo", true } };
+            if (ParticipantStreams.HasValue) o["participantStreams"] = Math.Max(0, ParticipantStreams.Value);
+            switch (SpatialAudio)
+            {
+                case WebGLSpatialAudio.EqualPower: o["spatialAudio"] = "equalpower"; break;
+                case WebGLSpatialAudio.None: o["spatialAudio"] = false; break;
+            }
             if (!string.IsNullOrEmpty(IceServersJson)) o["iceServers"] = Protocol.MiniJson.Parse(IceServersJson);
             if (!string.IsNullOrEmpty(InputDeviceId)) o["inputDeviceId"] = InputDeviceId;
             if (Reconnect != null)
@@ -77,6 +90,32 @@ namespace Aurix.WebGL
                 };
             return o;
         }
+    }
+
+    /// <summary>Rendering of per-participant downlink tracks in the browser (Web Audio <c>PannerNode</c>).</summary>
+    public enum WebGLSpatialAudio
+    {
+        /// <summary>Binaural HRTF panning for positional channels, plain gain elsewhere.</summary>
+        Hrtf,
+        /// <summary>Cheaper stereo panning (<c>panningModel: "equalpower"</c>).</summary>
+        EqualPower,
+        /// <summary>
+        /// Negotiate the tracks but do not play them from the SDK: the host page renders the
+        /// <c>MediaStream</c>s itself (only the mixed track is played). Without a host-side renderer
+        /// the dedicated speakers stay silent — prefer <see cref="Hrtf"/> unless you know why.
+        /// </summary>
+        None,
+    }
+
+    /// <summary>One negotiated per-participant WebRTC track (<c>ParticipantStreams</c> snapshot).</summary>
+    public struct WebGLParticipantStream
+    {
+        /// <summary>SDP media id of the track.</summary>
+        public string Mid;
+        /// <summary>Who the node currently forwards on this track; null while the slot is idle.</summary>
+        public Guid? UserId;
+        /// <summary>True once the browser received the track (a <c>MediaStream</c> exists on the page).</summary>
+        public bool Live;
     }
 
     /// <summary>Browser media statistics (WebRTC <c>getStats</c> plus the control-plane RTT); see <see cref="AurixWebGLVoiceClient.GetStatsAsync"/>.</summary>
