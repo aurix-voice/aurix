@@ -18,10 +18,13 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
   non-root container, CI with a live end-to-end test.
 
 > Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
-> the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
-> audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
-> PCMU fallback, and Web / Unity / native (C ABI) / Unreal SDKs.
-> Read [Limitations](limitations.md) before deploying at scale.
+> the full player feature set: reconnect/resume and cross-node failover, chat with history /
+> offline delivery / read markers, energy/VAD, positional/directional/ambient audio with
+> radius-scoped presence, per-participant PCM for engine spatialization, stereo/music uplinks,
+> action tokens, webhooks/SSE, transcripts/TTS/live translation, content safety, PCMU fallback,
+> a WebSocket tunnel for blocked UDP, large channels, a region-aware cascade backbone, IPv6
+> dual-stack, admin SSO + roles, usage analytics/quotas, and Web / Unity (incl. WebGL) / native
+> (C ABI) / Unreal / Godot SDKs. Read [Limitations](limitations.md) before deploying at scale.
 
 ## How to read this book
 
@@ -29,7 +32,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 | --- | --- |
 | run a node and hear two players talk | [Quick start](getting-started/quick-start.md), then [Client flow](getting-started/client-flow.md) |
 | integrate a game backend | [Tenancy, credentials and permissions](concepts/auth.md), [REST API and OpenAPI](api/rest.md), [Webhooks and the event stream](api/webhooks-sse.md) |
-| integrate a game client | [Client SDKs](sdk/overview.md) — Web, Unity, native / Unreal |
+| integrate a game client | [Client SDKs](sdk/overview.md) — Web, Unity, native / Unreal, Godot; [consoles](sdk/consoles.md), [Flutter / React Native](sdk/mobile-frameworks.md) |
 | implement your own client | [WebSocket control plane](api/websocket.md), [Native AURX media](api/aurx.md) |
 | operate it in production | [Deployment and configuration](operations/deployment.md), [Scaling out](operations/scaling.md), [Backups and observability](operations/observability.md) |
 

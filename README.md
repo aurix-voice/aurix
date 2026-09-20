@@ -25,7 +25,11 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
 > audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
 > PCMU fallback, a WebSocket tunnel for blocked UDP, large channels (listeners, per-receiver stream
-> caps, a server mix for native clients), and Web / Unity / native (C ABI) / Unreal / Godot SDKs.
+> caps, a server mix for native clients), cross-node failover with Redis session mirrors, a
+> region-aware cascade backbone, stereo/music uplinks, per-participant PCM for engine
+> spatialization, fleet-wide rate limits, recording mixdown + post-hoc STT, live translation,
+> chat history/offline delivery/read markers, IPv6 dual-stack, admin SSO + roles, usage
+> analytics/quotas, and Web / Unity (incl. WebGL) / native (C ABI) / Unreal / Godot SDKs.
 > See [Limitations](#limitations) before deploying at scale.
 
 **Documentation**: the full book lives in [`docs/`](docs/src/SUMMARY.md) (`mdbook serve docs`) —
@@ -990,8 +994,10 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
 * No SIP/PSTN gateway, no server-side noise suppression (the native core / SDKs do it on the client).
-* Text chat is deliberately "lite": live channel/directed messages and typing only — no offline
-  delivery, conversations, read markers or attachments; history is an opt-in per deployment.
+* Text chat is deliberately "lite": channel/directed messages and typing, no attachments,
+  threads or reactions. History, offline delivery of directed messages and read markers exist
+  only with `chat.persist = true`, and offline replay is per user (read-marker driven), not an
+  exactly-once per-device queue.
 * STT/TTS, live translation and the content-safety classifier talk to HTTP servers you host
   (OpenAI-compatible, LibreTranslate-compatible); no speech, translation or moderation model
   ships with Aurix, transcripts and translations are not stored server-side, and translation is
@@ -999,8 +1005,11 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
   translator voice, not the speaker's).
 * Live audio streams are per participant (no server-side mix) and node-local; the node does not
   buffer them across a consumer outage beyond `recording.live.queue_frames`.
-* Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);
-  it assumes nodes can reach each other directly on `media.port + 1`/UDP.
+* Cascade is a two-level tree: direct links inside a region, one deterministic hub per region
+  between regions (`media.cascade_topology`); hubs are picked from the node registry, not by
+  measured RTT, and nodes must reach each other directly on `media.port + 1`/UDP.
+* Cross-node failover needs Redis (session mirrors); Redis Sentinel is supported, Redis Cluster
+  is not (multi-key Lua + classic Pub/Sub).
 * Browsers cannot set Opus complexity, signal mode, VBR mode or expected loss — only the
   bitrate ceiling, FEC, DTX, max bandwidth and CBR that WebRTC exposes; the native, Unity and
   Unreal SDKs have the full set.
