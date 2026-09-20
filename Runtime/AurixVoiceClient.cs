@@ -94,6 +94,16 @@ namespace Aurix
         public string MediaAddr;
         /// <summary>True when this is the same session as before a connection loss (same SSRC, channels kept).</summary>
         public bool Resumed;
+        /// <summary>
+        /// The resume landed on a different node than the one that created the session (the previous node
+        /// stopped answering): same session id and SSRC, new media key and endpoint — media is rebound and
+        /// the playout buffers re-synchronised by the SDK.
+        /// </summary>
+        public bool Migrated;
+        /// <summary>WebSocket URL of the node serving this session.</summary>
+        public string Endpoint;
+        /// <summary>Other nodes the server advertised for failover, tried in order after <see cref="Endpoint"/> on a reconnect.</summary>
+        public IReadOnlyList<string> Failover = Array.Empty<string>();
         /// <summary>The node accepts AURX media as binary frames on the control WebSocket (UDP fallback).</summary>
         public bool MediaTunnel;
         /// <summary>
@@ -457,6 +467,11 @@ namespace Aurix
         public event Action<int, TimeSpan, string> OnRecovering;
         /// <summary>Reconnected. <see cref="SessionInfo.Resumed"/> tells whether the old session (and SSRC) survived.</summary>
         public event Action<SessionInfo> OnRecovered;
+        /// <summary>
+        /// A failover node answered while the previous one did not; the client now talks to the given URL
+        /// (<see cref="Endpoint"/>). Raised before that connection's <see cref="OnRecovered"/>.
+        /// </summary>
+        public event Action<string> OnEndpointChanged;
         /// <summary>All reconnect attempts failed; the client is now <see cref="VoiceConnectionState.Failed"/>.</summary>
         public event Action<Exception> OnFailedToRecover;
         /// <summary>The server ended the session (kick, ban, shutdown, replaced by another login); no reconnect follows.</summary>
@@ -472,6 +487,23 @@ namespace Aurix
         {
             _wsUrl = wsUrl ?? throw new ArgumentNullException(nameof(wsUrl));
             _token = token ?? throw new ArgumentNullException(nameof(token));
+            Endpoint = _wsUrl;
+        }
+
+        /// <summary>WebSocket URL of the node the client talks to (the constructor URL until a failover moved it).</summary>
+        public string Endpoint { get; private set; }
+        /// <summary>Alternate nodes advertised by the server for this session (see <see cref="OnEndpointChanged"/>).</summary>
+        public IReadOnlyList<string> FailoverEndpoints { get; private set; } = Array.Empty<string>();
+
+        /// <summary>
+        /// Reconnect target for <paramref name="attempt"/> (1-based): the node that holds the session first — a
+        /// same-node resume is the cheapest recovery — then each advertised alternate, round-robin.
+        /// </summary>
+        public static string ReconnectEndpoint(string active, IReadOnlyList<string> failover, int attempt)
+        {
+            int n = 1 + (failover?.Count ?? 0);
+            int i = (Math.Max(1, attempt) - 1) % n;
+            return i == 0 ? active : failover[i - 1];
         }
 
         /// <summary>Open the control channel, receive the session, then authenticate the UDP media path.</summary>
@@ -483,10 +515,12 @@ namespace Aurix
             _closedByUser = false;
             _resumeToken = null;
             _lastMediaSequence = 0;
+            Endpoint = _wsUrl;
+            FailoverEndpoints = Array.Empty<string>();
             SetState(VoiceConnectionState.Connecting);
             try
             {
-                var info = await OpenSessionAsync(null, _cts.Token).ConfigureAwait(false);
+                var info = await OpenSessionAsync(_wsUrl, null, _cts.Token).ConfigureAwait(false);
                 Post(() => OnSessionReady?.Invoke(info));
                 await ReplayReceiverPrefsAsync(_cts.Token).ConfigureAwait(false);
                 await BindMediaAsync(info, _cts.Token).ConfigureAwait(false);
@@ -543,7 +577,7 @@ namespace Aurix
         }
 
         /// <summary>Open a control channel (optionally resuming) and wait for <c>SessionInitAck</c>.</summary>
-        private async Task<SessionInfo> OpenSessionAsync(string resume, CancellationToken ct)
+        private async Task<SessionInfo> OpenSessionAsync(string url, string resume, CancellationToken ct)
         {
             var control = new ControlChannel();
             control.Closed += reason => Post(() => HandleClosed(control, reason));
@@ -553,7 +587,7 @@ namespace Aurix
             control.Received += CompletePendingSpeak;
             try
             {
-                await control.ConnectAsync(new Uri(_wsUrl), _token, ct, resume).ConfigureAwait(false);
+                await control.ConnectAsync(new Uri(url), _token, ct, resume).ConfigureAwait(false);
                 ControlMessage ack;
                 while (true)
                 {
@@ -561,12 +595,20 @@ namespace Aurix
                     if (ack.Type == "SessionInitAck") break;
                     if (ack.Type == "Error") throw new InvalidOperationException($"{ack.Str("code")}: {ack.Str("message")}");
                 }
+                var failover = new List<string>();
+                var advertised = MiniJson.AsArray(ack.Data != null && ack.Data.TryGetValue("failover", out var f) ? f : null);
+                if (advertised != null)
+                    foreach (var item in advertised)
+                        if (item is string s && s != url) failover.Add(s);
                 var info = new SessionInfo
                 {
                     SessionId = ack.Id("session_id"),
                     Ssrc = ack.U32("ssrc"),
                     MediaAddr = ack.Str("media_addr"),
                     Resumed = ack.Bool("resumed"),
+                    Migrated = ack.Bool("migrated"),
+                    Endpoint = url,
+                    Failover = failover,
                     MediaTunnel = ack.Bool("media_tunnel"),
                     DownlinkMix = ack.Bool("downlink_mix"),
                 };
@@ -575,6 +617,12 @@ namespace Aurix
                 _resumeToken = string.IsNullOrEmpty(token) ? null : token;
                 ResumeGrace = TimeSpan.FromMilliseconds(ack.Num("resume_grace_ms"));
                 Session = info;
+                FailoverEndpoints = failover;
+                if (Endpoint != url)
+                {
+                    Endpoint = url;
+                    Post(() => OnEndpointChanged?.Invoke(url));
+                }
                 // Publish only now so Update() cannot drain the handshake messages from under us.
                 _control = control;
                 _lastPing = DateTime.UtcNow;
@@ -1616,7 +1664,7 @@ namespace Aurix
                 if (_closedByUser) return;
                 try
                 {
-                    await ReattachAsync(ct).ConfigureAwait(false);
+                    await ReattachAsync(attempt, ct).ConfigureAwait(false);
                     return;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -1654,12 +1702,15 @@ namespace Aurix
         /// <summary>
         /// One reconnect attempt: resume the previous session if the server still holds it, otherwise
         /// accept the fresh session and re-join the channels we were in. Rebinds media either way,
-        /// since the UDP path may have changed with the network.
+        /// since the UDP path may have changed with the network. The node that holds the session is
+        /// tried first; later attempts rotate through the nodes it advertised for failover, where a
+        /// takeover hands back the same session (<see cref="SessionInfo.Migrated"/>).
         /// </summary>
-        private async Task ReattachAsync(CancellationToken ct)
+        private async Task ReattachAsync(int attempt, CancellationToken ct)
         {
             var previous = Session;
             string resume = previous != null && _resumeToken != null ? $"{previous.SessionId:D}.{_resumeToken}" : null;
+            var url = ReconnectEndpoint(Endpoint, FailoverEndpoints, attempt);
             var refresher = TokenRefresher;
             if (refresher != null)
             {
@@ -1667,7 +1718,7 @@ namespace Aurix
                 if (string.IsNullOrEmpty(fresh)) throw new InvalidOperationException("TokenRefresher returned no token");
                 _token = fresh;
             }
-            var info = await OpenSessionAsync(resume, ct).ConfigureAwait(false);
+            var info = await OpenSessionAsync(url, resume, ct).ConfigureAwait(false);
             List<Guid> rejoin = null;
             if (!info.Resumed)
             {
@@ -1682,6 +1733,12 @@ namespace Aurix
                 }
                 foreach (var ch in rejoin) { var id = ch; Post(() => OnChannelLeft?.Invoke(id)); }
                 await ReplayReceiverPrefsAsync(ct).ConfigureAwait(false);
+            }
+            else if (info.Migrated)
+            {
+                // Same speakers, new node: downlink numbering restarts and the old node's frames
+                // still in flight must not be played.
+                Mixer?.Resync();
             }
             await BindMediaAsync(info, ct).ConfigureAwait(false);
             if (rejoin != null)

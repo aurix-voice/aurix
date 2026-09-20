@@ -50,6 +50,7 @@ namespace Aurix.Demo
             }
             var channelId = Guid.Parse(channel);
             if (Get(opt, "scenario", "audio") == "reconnect") return await ReconnectScenario(ws, channelId, tokenA, tokenB);
+            if (Get(opt, "scenario", "audio") == "failover") return await FailoverScenario(ws, Get(opt, "ws-b", ws), channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "chat") return await ChatScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "pcmu") return await PcmuScenario(ws, channelId, tokenA, tokenB);
@@ -1119,6 +1120,107 @@ namespace Aurix.Demo
                       && forcedReconnecting && forcedBack && forcedSame && audioAfterForce
                       && probeFast && probeBack && probeSame && probeReason.Contains("probe timeout")
                       && freshOk && rejoined && codecAfterFresh && bobSawRejoin && failed && failedEvent;
+            Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Cross-node failover. Alice reaches node 1 through a local proxy that is then blocked for good
+        /// (the node "died" from her point of view); the node advertised at least one other node in
+        /// <c>SessionInitAck.failover</c>, so the reconnect rotation lands on it and that node takes the
+        /// session over: same session id and SSRC, <c>Migrated</c>, channel and codec preference kept,
+        /// audio flows both ways again (Bob stayed on node 1, so the new path is cascaded). Needs two
+        /// nodes with Redis and <c>server.external_ws_url</c> set on both.
+        /// </summary>
+        private static async Task<int> FailoverScenario(string ws, string wsB, Guid channelId, string tokenA, string tokenB)
+        {
+            var upstream = new Uri(ws);
+            using var proxy = new CutProxy(upstream.Host, upstream.Port);
+            var proxied = new UriBuilder(upstream) { Host = "127.0.0.1", Port = proxy.Port }.Uri.ToString();
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(proxied, tokenA) { PingInterval = TimeSpan.FromSeconds(1) };
+            var bob = new AurixVoiceClient(wsB, tokenB);
+            alice.Reconnect.InitialDelay = TimeSpan.FromMilliseconds(300);
+            alice.Reconnect.MaxDelay = TimeSpan.FromSeconds(1);
+            alice.Reconnect.Jitter = 0;
+            alice.Reconnect.MaxAttempts = 15;
+            alice.RequestTimeout = TimeSpan.FromSeconds(3);
+            Hook(alice, "alice", log);
+            Hook(bob, "bob", log);
+            alice.OnRecovering += (n, d, why) => Add(log, $"alice: recovering #{n} in {d.TotalMilliseconds:F0} ms ({why})");
+            alice.OnRecovered += i => Add(log, $"alice: recovered resumed={i.Resumed} migrated={i.Migrated} ssrc={i.Ssrc} endpoint={i.Endpoint}");
+            alice.OnEndpointChanged += url => Add(log, $"alice: endpoint -> {url}");
+            alice.OnFailedToRecover += e => Add(log, $"alice: failed to recover: {e.Message}");
+
+            var a = await alice.ConnectAsync();
+            await bob.ConnectAsync();
+            Console.WriteLine($"alice session {a.SessionId} ssrc {a.Ssrc} on {a.Endpoint}; failover: [{string.Join(", ", a.Failover)}]");
+            if (a.Failover.Count == 0)
+            {
+                Console.WriteLine("the node advertised no failover endpoints (second node down or external_ws_url unset)");
+                await alice.DisconnectAsync(); await bob.DisconnectAsync();
+                return 2;
+            }
+            await alice.JoinChannelAsync(channelId);
+            await bob.JoinChannelAsync(channelId);
+            await alice.SetAudioCodecAsync(AudioCodec.Pcmu); // preference must survive the takeover
+            await bob.SetAudioCodecAsync(AudioCodec.Pcmu);
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); await Task.Delay(10); } });
+            var hash = AurixVoiceClient.ChannelHash(channelId);
+            var ulaw = new byte[G711.FrameSamples];
+            Array.Fill(ulaw, (byte)0xff);
+            async Task Stream(int frames)
+            {
+                for (int i = 0; i < frames; i++)
+                {
+                    alice.SendAudioFrame(hash, AudioCodec.Pcmu, ulaw);
+                    bob.SendAudioFrame(hash, AudioCodec.Pcmu, ulaw);
+                    await Task.Delay(20);
+                }
+            }
+            await Stream(25);
+            await Task.Delay(300);
+            long bobBefore = bob.Media.PacketsReceived;
+            bool audioBefore = bobBefore > 0 && alice.Media.PacketsReceived > 0;
+
+            Console.WriteLine("node 1 becomes unreachable for alice (proxy blocked + cut)");
+            proxy.Block(true);
+            proxy.Cut();
+            var lostAt = DateTime.UtcNow;
+            bool reconnecting = await WaitState(alice, VoiceConnectionState.Reconnecting, TimeSpan.FromSeconds(5));
+            bool back = await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(30));
+            var took = DateTime.UtcNow - lostAt;
+            var s = alice.Session;
+            bool migrated = back && s.SessionId == a.SessionId && s.Ssrc == a.Ssrc && s.Resumed && s.Migrated;
+            bool moved = alice.Endpoint != proxied && a.Failover.Contains(alice.Endpoint);
+            // Events are delivered through the main-thread pump, so the notification may trail the state flip.
+            bool endpointEvent = false;
+            for (int i = 0; i < 50 && !endpointEvent; i++)
+            {
+                lock (log) endpointEvent = log.Exists(l => l.StartsWith("alice: endpoint -> ") && l.EndsWith(alice.Endpoint));
+                if (!endpointEvent) await Task.Delay(20);
+            }
+            bool stillJoined = alice.JoinedChannels.Count == 1;
+            for (int i = 0; i < 50 && alice.AudioCodec != AudioCodec.Pcmu; i++) await Task.Delay(20);
+            bool codecKept = alice.AudioCodec == AudioCodec.Pcmu;
+            await Task.Delay(300);
+            await Stream(25);
+            await Task.Delay(500);
+            // alice.Media is a fresh transport after the rebind (new node, new key), so her counter restarts.
+            bool audioAfter = bob.Media.PacketsReceived > bobBefore && alice.Media.PacketsReceived > 0;
+            bool bobSawLeave; lock (log) bobSawLeave = log.Contains("bob: left alice");
+            Console.WriteLine($"reconnecting={reconnecting} back={back} in {took.TotalMilliseconds:F0} ms migrated={migrated} moved={moved} ({alice.Endpoint}) " +
+                              $"endpointEvent={endpointEvent} stillJoined={stillJoined} codec={alice.AudioCodec} audioBefore={audioBefore} audioAfter={audioAfter} " +
+                              $"(bob {bobBefore}→{bob.Media.PacketsReceived}, alice rx {alice.Media.PacketsReceived}) bobSawLeave={bobSawLeave}");
+
+            cts.Cancel();
+            await pump;
+            await alice.DisconnectAsync();
+            await bob.DisconnectAsync();
+            Console.WriteLine("events:");
+            lock (log) foreach (var l in log) Console.WriteLine("  " + l);
+            bool ok = reconnecting && migrated && moved && endpointEvent && stillJoined && codecKept && audioBefore && audioAfter && !bobSawLeave;
             Console.WriteLine(ok ? "RESULT: PASS" : "RESULT: FAIL");
             return ok ? 0 : 1;
         }

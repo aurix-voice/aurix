@@ -332,6 +332,13 @@ client.OnSessionClosed   += reason => { /* kicked/banned/shutdown: no reconnect 
   The server replays one `ChannelJoinAck` per channel, so `OnChannelJoined` fires again with a fresh roster.
 * After the grace window a fresh session is issued (`info.Resumed == false`): `OnChannelLeft` fires for the
   old channels and they are re-joined with the same token; the SSRC changes.
+* If the node itself is gone, reconnect attempts rotate through the failover nodes the server advertised
+  (`FailoverEndpoints`; attempt 1 → current node, 2 → first failover, 3 → second, … then around again).
+  A node that answers takes the session over from its Redis mirror: `OnEndpointChanged(url)` fires, then
+  `OnRecovered` with `info.Migrated == true` — same session id and SSRC, new media key and media endpoint
+  (re-bound transparently), channels/mutes/codec/downlink mode restored, other players see no leave.
+  `Endpoint` names the node in use from then on. Without Redis mirrors on the server such a reconnect is a
+  fresh session.
 * The UDP media path is re-bound from a new local port either way (`SessionBind` with the kept key), and the
   uplink sequence continues where it left off so the server's replay window keeps accepting packets.
 * `SendOpusFrame` is a silent no-op while `State == Reconnecting`; keep the microphone running.
@@ -647,6 +654,12 @@ RMS ≈ 0.21), tunnel heartbeats are acked, a forced reconnect resumes the sessi
 sequence continuing, 0 auth/replay failures. `--udp-block 1` (needs passwordless `sudo iptables`) adds carol
 on `Auto` behind a UDP black hole scoped to her port: fallback at bind, audio through the tunnel, return to
 UDP on the re-probe once the rule is lifted, fallback again on heartbeat loss when it comes back.
+
+`--scenario failover` (needs two nodes: `--ws ws://node1/ws --ws-b ws://node2/ws`) cuts alice's control
+connection through a local proxy that never comes back: the node advertised failover endpoints, alice's
+reconnect rotates to node 2 within ~1 s (`OnRecovering` → `OnEndpointChanged` → `OnRecovered` with
+`Migrated == true`), session id and SSRC are unchanged, `Endpoint` moved, she is still joined with her
+codec preference, bob on node 2 hears her before and after the move and never sees a `ParticipantLeft`.
 
 ## Notes
 
