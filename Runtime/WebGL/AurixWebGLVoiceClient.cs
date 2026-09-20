@@ -123,6 +123,12 @@ namespace Aurix.WebGL
         public event Action<Guid?> OnChannelFocusChanged;
         /// <summary>The node changed which participant is forwarded on which dedicated WebRTC track (see <see cref="GetParticipantStreamsAsync"/>).</summary>
         public event Action<IReadOnlyList<WebGLParticipantStream>> OnParticipantStreams;
+        /// <summary>A peer in a shared encrypted channel announced its E2EE identity (fingerprint, previous fingerprint if it changed).</summary>
+        public event Action<Guid, string, string> OnE2eePeerKey;
+        /// <summary>Whether this client holds a sender key of the peer (true: its encrypted voice is audible).</summary>
+        public event Action<Guid, bool> OnE2eePeerDecryptable;
+        /// <summary>This client's sender key rotated (new generation) — on join/leave of members, or on demand.</summary>
+        public event Action<int> OnE2eeKeyRotated;
         public event Action<ChatMessage> OnChatMessage;
         public event Action<ChatReadMarker> OnChatReadMarker;
         public event Action<int, bool> OnChatInboxSynced;
@@ -407,6 +413,57 @@ namespace Aurix.WebGL
         /// <summary>True while <paramref name="userId"/> plays through the browser's HRTF/equal-power panner (positional channel, known positions).</summary>
         public bool IsParticipantSpatialized(Guid userId) =>
             _handle > 0 && Value("isParticipantSpatialized", new Dictionary<string, object> { { "userId", userId } }) is bool b && b;
+
+        // ---- end-to-end encryption ----------------------------------------------------------------
+
+        /// <summary>True when the browser can join encrypted channels (WebCrypto plus an encoded-frame API); false before connect.</summary>
+        public bool E2eeAvailable => _handle > 0 && Value("e2eeAvailable", null) is bool b && b;
+
+        /// <summary><c>"script"</c> (RTCRtpScriptTransform) or <c>"streams"</c> (createEncodedStreams); null when unavailable.</summary>
+        public string E2eeTransformApi => _handle > 0 ? Value("e2eeTransformApi", null) as string : null;
+
+        /// <summary>Hex SHA-256 of this client's E2EE identity key — show it so peers can verify it out of band.</summary>
+        public string E2eeFingerprint => _handle > 0 ? Value("e2eeFingerprint", null) as string : null;
+
+        /// <summary>Generation of this client's current sender key; null without E2EE.</summary>
+        public int? E2eeGeneration => _handle > 0 && Value("e2eeGeneration", null) is double g ? (int)g : (int?)null;
+
+        /// <summary>The 32-byte identity secret to store and pass as <see cref="WebGLClientOptions.E2eeIdentity"/> next time; null without E2EE.</summary>
+        public byte[] ExportE2eeIdentity()
+        {
+            var b64 = _handle > 0 ? Value("e2eeIdentitySecret", null) as string : null;
+            return b64 == null ? null : Convert.FromBase64String(b64);
+        }
+
+        /// <summary>Fingerprint of a peer's identity key once it announced itself in a shared encrypted channel.</summary>
+        public string E2eePeerFingerprint(Guid userId) =>
+            _handle > 0 ? Value("e2eePeerFingerprint", new Dictionary<string, object> { { "userId", userId } }) as string : null;
+
+        /// <summary>Whether this client holds a sender key of <paramref name="userId"/> (its encrypted frames are audible).</summary>
+        public bool IsE2eePeerDecryptable(Guid userId) =>
+            _handle > 0 && Value("isE2eePeerDecryptable", new Dictionary<string, object> { { "userId", userId } }) is bool b && b;
+
+        /// <summary>Peers whose encrypted frames this client can decrypt.</summary>
+        public IReadOnlyList<Guid> GetE2eeDecryptablePeers()
+        {
+            var ids = new List<Guid>();
+            if (_handle <= 0) return ids;
+            foreach (var s in BridgeJson.Strings(Invoke("e2eeDecryptablePeers", null), "value"))
+                if (Guid.TryParse(s, out var id)) ids.Add(id);
+            return ids;
+        }
+
+        /// <summary>The node flagged this joined channel as end-to-end encrypted.</summary>
+        public bool IsChannelEncrypted(Guid channelId) =>
+            _handle > 0 && Value("isChannelEncrypted", new Dictionary<string, object> { { "channelId", channelId } }) is bool b && b;
+
+        /// <summary>Fresh counters of the encrypted-frame path.</summary>
+        public Task<WebGLE2eeStats> GetE2eeStatsAsync(CancellationToken ct = default) =>
+            CallAsync("refreshE2eeStats", null, o => BridgeJson.E2eeStats(o), ct);
+
+        /// <summary>Rotates this client's sender key now (normally automatic on join/leave); the new generation, or null without E2EE.</summary>
+        public Task<int?> RotateE2eeKeyAsync(CancellationToken ct = default) =>
+            CallAsync("rotateE2eeKey", null, o => o.TryGetValue("value", out var v) && v is double g ? (int)g : (int?)null, ct, rawValue: true);
 
         // ---- chat ---------------------------------------------------------------------------------
 
@@ -864,6 +921,15 @@ namespace Aurix.WebGL
                 }
                 case "participantStreams":
                     OnParticipantStreams?.Invoke(BridgeJson.ParticipantStreams(BridgeJson.Arr(e, "streams")));
+                    return;
+                case "e2eePeerKey":
+                    OnE2eePeerKey?.Invoke(BridgeJson.Id(e, "userId"), MiniJson.GetString(e, "fingerprint") ?? string.Empty, MiniJson.GetString(e, "previousFingerprint"));
+                    return;
+                case "e2eePeerDecryptable":
+                    OnE2eePeerDecryptable?.Invoke(BridgeJson.Id(e, "userId"), MiniJson.GetBool(e, "decryptable"));
+                    return;
+                case "e2eeKeyRotated":
+                    OnE2eeKeyRotated?.Invoke((int)MiniJson.GetNumber(e, "generation"));
                     return;
                 case "recovering":
                     OnRecovering?.Invoke((int)MiniJson.GetNumber(e, "attempt"), TimeSpan.FromMilliseconds(MiniJson.GetNumber(e, "delayMs")),

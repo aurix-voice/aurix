@@ -821,6 +821,25 @@ namespace Aurix.Protocol
         public static string SetTranscripts(bool enabled) =>
             Serialize("SetTranscripts", new Dictionary<string, object> { { "enabled", enabled } });
 
+        /// <summary>
+        /// E2EE identity announcement: session-wide capability when <paramref name="channelId"/> is null,
+        /// otherwise "I joined this encrypted channel, send me your sender keys".
+        /// </summary>
+        public static string E2eeHello(Guid? channelId, byte[] publicKey) =>
+            Serialize("E2eeHello", new Dictionary<string, object>
+            {
+                { "channel_id", channelId.HasValue ? (object)channelId.Value : null },
+                { "public_key", E2ee.EncodeBytes(publicKey) },
+            });
+
+        /// <summary>Our sender key of <paramref name="generation"/>, wrapped for one member of an encrypted channel.</summary>
+        public static string E2eeSenderKey(Guid channelId, Guid to, byte[] publicKey, byte generation, byte[] wrapped) =>
+            Serialize("E2eeSenderKey", new Dictionary<string, object>
+            {
+                { "channel_id", channelId }, { "to", to }, { "public_key", E2ee.EncodeBytes(publicKey) },
+                { "generation", (int)generation }, { "key", E2ee.EncodeBytes(wrapped) },
+            });
+
         public static string SetTranslation(TranslationPrefs prefs) =>
             Serialize("SetTranslation", new Dictionary<string, object>
             {

@@ -337,6 +337,13 @@ namespace Aurix.WebGL
             UplinkPacketsLost = I64(o, "uplinkPacketsLost"),
         };
 
+        internal static WebGLE2eeStats E2eeStats(Dictionary<string, object> o) => new WebGLE2eeStats
+        {
+            FramesE2ee = (long)MiniJson.GetNumber(o, "framesE2ee"),
+            Undecryptable = (long)MiniJson.GetNumber(o, "undecryptable"),
+            Held = (long)MiniJson.GetNumber(o, "held"),
+        };
+
         internal static WebGLStats Stats(Dictionary<string, object> o) => new WebGLStats
         {
             RttMs = F32(o, "rttMs"),
