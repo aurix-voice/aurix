@@ -35,6 +35,7 @@ test('listener join ack exposes role, total count and hidden listeners', () => {
     hiddenListeners: true,
     transcription: true,
     safetyVoice: false,
+    priority: false,
   });
   assert.equal(info.role !== 'listener', false);
 });
@@ -53,6 +54,7 @@ test('legacy join ack without audience fields defaults to a visible speaker', ()
     hiddenListeners: false,
     transcription: false,
     safetyVoice: false,
+    priority: false,
   });
 });
 

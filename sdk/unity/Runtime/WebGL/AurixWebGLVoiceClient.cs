@@ -119,6 +119,13 @@ namespace Aurix.WebGL
         public event Action<Guid, string> OnKicked;
         public event Action<ReceiverPreferences> OnReceiverPreferences;
         public event Action<Guid, bool> OnUserBlockChanged;
+        public event Action<Guid, Guid, bool> OnParticipantPriorityChanged;
+        /// <summary>Game-audio ducking hook: a priority speaker started / stopped ducking a channel in the browser (transitions only).</summary>
+        public event Action<Guid, bool, DuckingConfig> OnDuckingChanged;
+        /// <summary>Only with <see cref="WebGLClientOptions.VisemeEvents"/>: a participant's mouth state, 50/s while it speaks.</summary>
+        public event Action<Guid, Audio.VisemeFrame> OnParticipantVisemes;
+        /// <summary>Only with <see cref="WebGLClientOptions.VisemeEvents"/>: the local microphone's mouth state, 50/s.</summary>
+        public event Action<Audio.VisemeFrame> OnLocalVisemes;
         public event Action<TransmissionMode> OnTransmissionChanged;
         public event Action<Guid?> OnChannelFocusChanged;
         /// <summary>The node changed which participant is forwarded on which dedicated WebRTC track (see <see cref="GetParticipantStreamsAsync"/>).</summary>
@@ -387,6 +394,61 @@ namespace Aurix.WebGL
             if (channelId.HasValue) args["channelId"] = channelId.Value;
             return Sync("setChannelFocus", args);
         }
+
+        // ---- priority speaker + ducking ---------------------------------------------------------
+
+        public Task SetPriorityAsync(Guid channelId, Guid? userId, bool priority, CancellationToken ct = default)
+        {
+            var args = new Dictionary<string, object> { { "channelId", channelId }, { "priority", priority } };
+            if (userId.HasValue) args["userId"] = userId.Value;
+            return Sync("setPriority", args);
+        }
+
+        public bool IsPriority(Guid channelId) => _handle > 0 && Value("isPriority", Channel(channelId)) is bool b && b;
+
+        /// <summary>The ducking envelope of a joined channel, null when the channel has none (or is not joined).</summary>
+        public DuckingConfig? GetChannelDucking(Guid channelId) =>
+            _handle > 0 ? BridgeJson.Ducking(MiniJson.AsObject(Value("channelDucking", Channel(channelId)))) : null;
+
+        /// <summary>Whether a priority speaker is ducking the channel in the browser right now (also reported by <see cref="OnDuckingChanged"/>).</summary>
+        public bool IsDuckingActive(Guid channelId) => _handle > 0 && Value("isDuckingActive", Channel(channelId)) is bool b && b;
+
+        // ---- lip-sync + voice effects -----------------------------------------------------------
+
+        /// <summary>The browser can run the lip-sync AudioWorklet (false before the SDK is created).</summary>
+        public bool SupportsVisemes => _handle > 0 && Value("supportsVisemes", null) is bool b && b;
+
+        public bool VisemesEnabled => _handle > 0 && Value("visemesEnabled", null) is bool b && b;
+
+        /// <summary>Turn browser-side lip-sync analysis on/off (every heard participant + the microphone); the browser needs a user gesture first.</summary>
+        public Task SetVisemesAsync(bool enabled, CancellationToken ct = default) =>
+            CallAsync("setVisemes", new Dictionary<string, object> { { "enabled", enabled } }, o => true, ct);
+
+        /// <summary>Latest mouth state of a heard participant (its dedicated track, see <see cref="OnParticipantStreams"/>), null when unknown / off.</summary>
+        public Audio.VisemeFrame? GetParticipantVisemes(Guid userId) =>
+            _handle > 0 ? BridgeJson.Visemes(MiniJson.AsObject(Value("participantVisemes", new Dictionary<string, object> { { "userId", userId } }))) : null;
+
+        /// <summary>Latest mouth state of the local microphone (after effects), null when off.</summary>
+        public Audio.VisemeFrame? GetLocalVisemes() =>
+            _handle > 0 ? BridgeJson.Visemes(MiniJson.AsObject(Value("localVisemes", null))) : null;
+
+        /// <summary>The browser can run the voice-effects AudioWorklet (false before the SDK is created).</summary>
+        public bool SupportsVoiceEffects => _handle > 0 && Value("supportsVoiceEffects", null) is bool b && b;
+
+        /// <summary>The active (sanitised) microphone effect chain, bypass when none or before connect.</summary>
+        public Audio.VoiceEffectParams VoiceEffects =>
+            _handle > 0 ? BridgeJson.VoiceEffects(MiniJson.AsObject(Value("voiceEffects", null))) : Audio.VoiceEffectParams.Bypass;
+
+        /// <summary>Apply a microphone effect chain in the browser (<see cref="Audio.VoiceEffectParams.Bypass"/> to switch off); presets via <see cref="Audio.VoiceEffectParams.Preset"/>.</summary>
+        public Task SetVoiceEffectsAsync(Audio.VoiceEffectParams effects, CancellationToken ct = default)
+        {
+            var sanitized = effects.Sanitized();
+            var args = new Dictionary<string, object> { { "effects", sanitized.IsBypass ? null : BridgeJson.VoiceEffectsToBridge(sanitized) } };
+            return CallAsync("setVoiceEffects", args, o => true, ct);
+        }
+
+        public Task SetVoiceEffectsAsync(Audio.VoiceEffectPreset preset, CancellationToken ct = default) =>
+            SetVoiceEffectsAsync(Audio.VoiceEffectParams.Preset(preset), ct);
 
         // ---- per-participant tracks ---------------------------------------------------------------
 
@@ -905,6 +967,32 @@ namespace Aurix.WebGL
                 case "userBlockChanged":
                     OnUserBlockChanged?.Invoke(BridgeJson.Id(e, "userId"), MiniJson.GetBool(e, "blocked"));
                     return;
+                case "participantPriorityChanged":
+                {
+                    var channelId = BridgeJson.Id(e, "channelId");
+                    var userId = BridgeJson.Id(e, "userId");
+                    bool priority = MiniJson.GetBool(e, "priority");
+                    lock (_channels)
+                        if (_channels.TryGetValue(channelId, out var members) && members.TryGetValue(userId, out var p)) p.IsPriority = priority;
+                    OnParticipantPriorityChanged?.Invoke(channelId, userId, priority);
+                    return;
+                }
+                case "duckingChanged":
+                    OnDuckingChanged?.Invoke(BridgeJson.Id(e, "channelId"), MiniJson.GetBool(e, "active"),
+                        BridgeJson.Ducking(BridgeJson.Obj(e, "config")) ?? DuckingConfig.Default);
+                    return;
+                case "participantVisemes":
+                {
+                    var frame = BridgeJson.Visemes(BridgeJson.Obj(e, "frame"));
+                    if (frame.HasValue) OnParticipantVisemes?.Invoke(BridgeJson.Id(e, "userId"), frame.Value);
+                    return;
+                }
+                case "localVisemes":
+                {
+                    var frame = BridgeJson.Visemes(BridgeJson.Obj(e, "frame"));
+                    if (frame.HasValue) OnLocalVisemes?.Invoke(frame.Value);
+                    return;
+                }
                 case "transmissionChanged":
                 {
                     var mode = BridgeJson.Transmission(e.TryGetValue("mode", out var m) ? m : null);

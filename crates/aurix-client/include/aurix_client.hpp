@@ -154,6 +154,9 @@ public:
     /// `AURIX_EVENT_CHANNEL_JOINED` only: this session's role, the member count (all nodes,
     /// hidden listeners included) and the roster policy.
     AurixChannelInfo channel_info() const { return aurix_event_channel_info(ev_); }
+    /// `AURIX_EVENT_DUCKING_CHANGED` only: depth and timings for the game's own audio bus
+    /// (`flag()` says whether ducking just started or stopped).
+    AurixDucking ducking() const { return aurix_event_ducking(ev_); }
 
     std::vector<AurixParticipant> participants() const {
         std::vector<AurixParticipant> out(aurix_event_participant_count(ev_));
@@ -368,9 +371,21 @@ public:
     AurixResult set_dsp(const AurixDspConfig& config) { return aurix_client_set_dsp(c_, &config); }
     bool dsp(AurixDspConfig& out) const { return aurix_client_dsp(c_, &out) == AURIX_OK; }
     bool dsp_stats(AurixDspStats& out) const { return aurix_client_dsp_stats(c_, &out) == AURIX_OK; }
-    /// Built-in microphone voice effects (pitch shift / ring modulator); all-zero = off.
+    /// Built-in microphone voice effects (filters, formant / pitch shift, ring modulator,
+    /// distortion, tremolo, static, reverb); all-zero = off. `voice_preset()` fills a struct
+    /// from a named preset to tweak.
     AurixResult set_voice_effects(const AurixVoiceEffects& effects) { return aurix_client_set_voice_effects(c_, &effects); }
     bool voice_effects(AurixVoiceEffects& out) const { return aurix_client_voice_effects(c_, &out) == AURIX_OK; }
+    static AurixVoiceEffects voice_preset(AurixVoicePreset preset) { return aurix_voice_effects_preset(preset); }
+    AurixResult set_voice_preset(AurixVoicePreset preset) { return aurix_client_set_voice_preset(c_, preset); }
+    /// Local lip-sync analysis of decoded participants and our own voice (off by default).
+    AurixResult set_visemes(bool enabled) { return aurix_client_set_visemes(c_, enabled); }
+    bool visemes_enabled() const { return aurix_client_visemes_enabled(c_); }
+    /// Mouth state of `user` from the audio last played for them; `false` if not analysed.
+    bool participant_visemes(const Uuid& user, AurixVisemeFrame& out) const {
+        return aurix_client_participant_visemes(c_, &user.raw, &out);
+    }
+    bool local_visemes(AurixVisemeFrame& out) const { return aurix_client_local_visemes(c_, &out); }
     /// Host effect run on every 20 ms 48 kHz capture frame after the built-ins (`nullptr` removes it).
     AurixResult set_voice_effect_callback(AurixVoiceEffectFn callback, void* user_data) {
         return aurix_client_set_voice_effect_callback(c_, callback, user_data);
@@ -408,6 +423,12 @@ public:
     AurixResult set_user_block(const Uuid& user, bool blocked) {
         return aurix_client_set_user_block(c_, &user.raw, blocked);
     }
+    /// Grant / revoke priority speaker for `user` (`nullptr` = ourselves) in `channel`.
+    AurixResult set_priority(const Uuid& channel, const Uuid* user, bool priority) {
+        return aurix_client_set_priority(c_, &channel.raw, user ? &user->raw : nullptr, priority);
+    }
+    /// Another member's priority speech is ducking `channel` right now.
+    bool ducking_active(const Uuid& channel) const { return aurix_client_ducking_active(c_, &channel.raw); }
     AurixResult set_transmission(AurixTransmissionMode mode, const Uuid* channel) {
         return aurix_client_set_transmission(c_, mode, channel ? &channel->raw : nullptr);
     }
@@ -631,6 +652,88 @@ private:
         }
     }
     AurixOpusDecoder* d_;
+};
+
+/// Bare voice-effect chain (the same stages `Client::set_voice_effects` runs) for hosts with
+/// their own capture pipeline. Interleaved 48 kHz PCM in place. Move-only.
+class VoiceEffects {
+public:
+    /// `effects == nullptr` is the bypass.
+    explicit VoiceEffects(const AurixVoiceEffects* effects = nullptr) : p_(aurix_voice_effects_create(effects)) {}
+    explicit VoiceEffects(AurixVoicePreset preset) : p_(nullptr) {
+        AurixVoiceEffects e = aurix_voice_effects_preset(preset);
+        p_ = aurix_voice_effects_create(&e);
+    }
+    VoiceEffects(VoiceEffects&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+    VoiceEffects& operator=(VoiceEffects&& o) noexcept {
+        if (this != &o) {
+            release();
+            p_ = o.p_;
+            o.p_ = nullptr;
+        }
+        return *this;
+    }
+    ~VoiceEffects() { release(); }
+    VoiceEffects(const VoiceEffects&) = delete;
+    VoiceEffects& operator=(const VoiceEffects&) = delete;
+
+    bool valid() const { return p_ != nullptr; }
+    AurixResult set(const AurixVoiceEffects& effects) { return aurix_voice_effects_set(p_, &effects); }
+    AurixResult set(AurixVoicePreset preset) {
+        AurixVoiceEffects e = aurix_voice_effects_preset(preset);
+        return aurix_voice_effects_set(p_, &e);
+    }
+    bool get(AurixVoiceEffects& out) const { return aurix_voice_effects_get(p_, &out) == AURIX_OK; }
+    bool is_bypass() const { return aurix_voice_effects_is_bypass(p_); }
+    AurixResult process(float* pcm, std::size_t sample_count, std::uint8_t channels) {
+        return aurix_voice_effects_process_f32(p_, pcm, sample_count, channels);
+    }
+    void reset() { aurix_voice_effects_reset(p_); }
+
+private:
+    void release() {
+        if (p_) {
+            aurix_voice_effects_destroy(p_);
+            p_ = nullptr;
+        }
+    }
+    AurixVoiceEffectsProcessor* p_;
+};
+
+/// Bare lip-sync analyser for one audio stream (the `Client` runs these itself when
+/// `set_visemes(true)`). Move-only.
+class VisemeAnalyzer {
+public:
+    VisemeAnalyzer() : a_(aurix_viseme_analyzer_create()) {}
+    VisemeAnalyzer(VisemeAnalyzer&& o) noexcept : a_(o.a_) { o.a_ = nullptr; }
+    VisemeAnalyzer& operator=(VisemeAnalyzer&& o) noexcept {
+        if (this != &o) {
+            release();
+            a_ = o.a_;
+            o.a_ = nullptr;
+        }
+        return *this;
+    }
+    ~VisemeAnalyzer() { release(); }
+    VisemeAnalyzer(const VisemeAnalyzer&) = delete;
+    VisemeAnalyzer& operator=(const VisemeAnalyzer&) = delete;
+
+    bool valid() const { return a_ != nullptr; }
+    /// One 20 ms frame of interleaved 48 kHz PCM (`sample_count` total samples).
+    AurixResult push(const float* pcm, std::size_t sample_count, std::uint8_t channels) {
+        return aurix_viseme_analyzer_push_f32(a_, pcm, sample_count, channels);
+    }
+    bool frame(AurixVisemeFrame& out) const { return aurix_viseme_analyzer_frame(a_, &out) == AURIX_OK; }
+    void reset() { aurix_viseme_analyzer_reset(a_); }
+
+private:
+    void release() {
+        if (a_) {
+            aurix_viseme_analyzer_destroy(a_);
+            a_ = nullptr;
+        }
+    }
+    AurixVisemeAnalyzer* a_;
 };
 
 }  // namespace aurix

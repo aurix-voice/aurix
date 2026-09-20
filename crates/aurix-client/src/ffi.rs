@@ -31,8 +31,8 @@ use aurix_common::protocol::{
     ChatMessage, TransmissionMode, TtsDestination, TtsState, UserPosition,
 };
 use aurix_common::types::{
-    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
-    OpusBandwidth, OpusSignal, Orientation3D, Position3D, RecordingConsent, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, DuckingConfig,
+    NetworkQuality, OpusBandwidth, OpusSignal, Orientation3D, Position3D, RecordingConsent, UserId,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -46,11 +46,14 @@ use crate::client::Client;
 use crate::config::ClientConfig;
 use crate::dsp::{DspConfig, DspStats, NoiseSuppression};
 use crate::effects::{
-    CallbackEffect, EffectChain, PitchShift, RingModulator, MAX_PITCH_SEMITONES, MAX_RING_MOD_HZ,
+    CallbackEffect, EffectChain, EffectPreset, VoiceEffectParams, MAX_DISTORTION_DRIVE,
+    MAX_FILTER_HZ, MAX_FORMANT_SEMITONES, MAX_PITCH_SEMITONES, MAX_RING_MOD_HZ, MAX_TREMOLO_HZ,
+    MIN_FILTER_HZ,
 };
 use crate::error::ClientError;
 use crate::events::{ChannelScope, ChatScope, ConnectionState, Event};
 use crate::media::{MediaPath, MediaPathPolicy};
+use crate::visemes::{Viseme, VisemeAnalyzer, VisemeFrame, VISEME_COUNT};
 
 // ------------------------------------------------------------------------------- results
 
@@ -930,23 +933,128 @@ pub type AurixVoiceEffectFn = Option<
     ),
 >;
 
-/// Built-in voice effects (`aurix_client_set_voice_effects`); zero = that stage is off.
+/// Built-in voice effects (`aurix_client_set_voice_effects`); zero = that stage is off, so a
+/// zeroed struct is a bypass. Stages run in field order: filters, formant, pitch, ring
+/// modulator, distortion, tremolo, static, reverb, then the host callback. Start from a
+/// preset with `aurix_voice_effects_preset`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AurixVoiceEffects {
+    /// High-pass corner in Hz (`AURIX_MIN_FILTER_HZ..=AURIX_MAX_FILTER_HZ`, 0 = off).
+    pub highpass_hz: f32,
+    /// Low-pass corner in Hz (0 = off).
+    pub lowpass_hz: f32,
+    /// Formant (vocal-tract) shift in semitones, pitch unchanged, clamped to
+    /// ±`AURIX_MAX_FORMANT_SEMITONES`. Adds ~43 ms of latency while non-zero.
+    pub formant_semitones: f32,
     /// Pitch shift in semitones, clamped to ±`AURIX_MAX_PITCH_SEMITONES`.
     pub pitch_semitones: f32,
     /// Ring-modulator ("robot") carrier in Hz, clamped to `0..=AURIX_MAX_RING_MOD_HZ`.
     pub ring_mod_hz: f32,
+    /// Saturation drive (`1..=AURIX_MAX_DISTORTION_DRIVE`, 0 = off).
+    pub distortion_drive: f32,
+    /// Tremolo rate in Hz (`0..=AURIX_MAX_TREMOLO_HZ`, 0 = off).
+    pub tremolo_hz: f32,
+    /// Tremolo depth `0..=1`.
+    pub tremolo_depth: f32,
+    /// Static / hiss level `0..=1`, gated by the voice (silence stays silent).
+    pub static_level: f32,
+    /// Reverb wet mix `0..=1` (0 = off).
+    pub reverb_mix: f32,
+    /// Reverb room size `0..=1`.
+    pub reverb_size: f32,
+    /// Reverb high-frequency damping `0..=1`.
+    pub reverb_damping: f32,
+}
+
+impl From<AurixVoiceEffects> for VoiceEffectParams {
+    fn from(e: AurixVoiceEffects) -> Self {
+        Self {
+            highpass_hz: e.highpass_hz,
+            lowpass_hz: e.lowpass_hz,
+            formant_semitones: e.formant_semitones,
+            pitch_semitones: e.pitch_semitones,
+            ring_mod_hz: e.ring_mod_hz,
+            distortion_drive: e.distortion_drive,
+            tremolo_hz: e.tremolo_hz,
+            tremolo_depth: e.tremolo_depth,
+            static_level: e.static_level,
+            reverb_mix: e.reverb_mix,
+            reverb_size: e.reverb_size,
+            reverb_damping: e.reverb_damping,
+        }
+    }
+}
+
+impl From<VoiceEffectParams> for AurixVoiceEffects {
+    fn from(p: VoiceEffectParams) -> Self {
+        Self {
+            highpass_hz: p.highpass_hz,
+            lowpass_hz: p.lowpass_hz,
+            formant_semitones: p.formant_semitones,
+            pitch_semitones: p.pitch_semitones,
+            ring_mod_hz: p.ring_mod_hz,
+            distortion_drive: p.distortion_drive,
+            tremolo_hz: p.tremolo_hz,
+            tremolo_depth: p.tremolo_depth,
+            static_level: p.static_level,
+            reverb_mix: p.reverb_mix,
+            reverb_size: p.reverb_size,
+            reverb_damping: p.reverb_damping,
+        }
+    }
+}
+
+/// Ready-made voices for `aurix_voice_effects_preset`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixVoicePreset {
+    /// Ring-modulated, band-limited, slightly saturated.
+    AurixVoicePresetRobot = 0,
+    /// Pitched and formant-shifted down, growly, in a large space.
+    AurixVoicePresetMonster = 1,
+    /// Telephone band, crunchy, static under the voice.
+    AurixVoicePresetRadio = 2,
+    /// Pitched and formant-shifted up.
+    AurixVoicePresetHelium = 3,
+    /// Hollow, wavering, drenched in reverb.
+    AurixVoicePresetGhost = 4,
+}
+
+impl From<AurixVoicePreset> for EffectPreset {
+    fn from(p: AurixVoicePreset) -> Self {
+        match p {
+            AurixVoicePreset::AurixVoicePresetRobot => EffectPreset::Robot,
+            AurixVoicePreset::AurixVoicePresetMonster => EffectPreset::Monster,
+            AurixVoicePreset::AurixVoicePresetRadio => EffectPreset::Radio,
+            AurixVoicePreset::AurixVoicePresetHelium => EffectPreset::Helium,
+            AurixVoicePreset::AurixVoicePresetGhost => EffectPreset::Ghost,
+        }
+    }
 }
 
 /// Largest built-in pitch shift either way, in semitones.
 pub const AURIX_MAX_PITCH_SEMITONES: f32 = 24.0;
 /// Highest built-in ring-modulator carrier, in Hz.
 pub const AURIX_MAX_RING_MOD_HZ: f32 = 2000.0;
+/// Largest built-in formant shift either way, in semitones.
+pub const AURIX_MAX_FORMANT_SEMITONES: f32 = 12.0;
+/// Hardest distortion drive.
+pub const AURIX_MAX_DISTORTION_DRIVE: f32 = 20.0;
+/// Fastest tremolo, in Hz.
+pub const AURIX_MAX_TREMOLO_HZ: f32 = 20.0;
+/// Lowest filter corner, in Hz.
+pub const AURIX_MIN_FILTER_HZ: f32 = 20.0;
+/// Highest filter corner, in Hz.
+pub const AURIX_MAX_FILTER_HZ: f32 = 20000.0;
 
 const _: () = assert!(AURIX_MAX_PITCH_SEMITONES == MAX_PITCH_SEMITONES);
 const _: () = assert!(AURIX_MAX_RING_MOD_HZ == MAX_RING_MOD_HZ);
+const _: () = assert!(AURIX_MAX_FORMANT_SEMITONES == MAX_FORMANT_SEMITONES);
+const _: () = assert!(AURIX_MAX_DISTORTION_DRIVE == MAX_DISTORTION_DRIVE);
+const _: () = assert!(AURIX_MAX_TREMOLO_HZ == MAX_TREMOLO_HZ);
+const _: () = assert!(AURIX_MIN_FILTER_HZ == MIN_FILTER_HZ);
+const _: () = assert!(AURIX_MAX_FILTER_HZ == MAX_FILTER_HZ);
 
 struct HostEffect {
     f: unsafe extern "C" fn(*mut c_void, *mut f32, u32, u8),
@@ -975,20 +1083,14 @@ impl HostEffect {
 
 #[derive(Default)]
 struct VoiceEffectsState {
-    builtin: AurixVoiceEffects,
+    builtin: VoiceEffectParams,
     host: Option<HostEffect>,
 }
 
 impl VoiceEffectsState {
-    /// Built-in stages first (pitch, then ring modulator), the host callback last.
+    /// Built-in stages first, the host callback last.
     fn chain(&self) -> EffectChain {
-        let mut chain = EffectChain::default();
-        if self.builtin.pitch_semitones != 0.0 {
-            chain.push(Box::new(PitchShift::new(self.builtin.pitch_semitones)));
-        }
-        if self.builtin.ring_mod_hz > 0.0 {
-            chain.push(Box::new(RingModulator::new(self.builtin.ring_mod_hz)));
-        }
+        let mut chain = self.builtin.chain();
         if let Some(host) = &self.host {
             let holder = HostEffect {
                 f: host.f,
@@ -1309,6 +1411,13 @@ pub enum AurixEventType {
     AurixEventE2eePeerDecryptable = 42,
     /// `number` = generation of our new sender key (a member joined or left).
     AurixEventE2eeKeyRotated = 43,
+    /// `channel_id`, `user_id`, `flag` = priority speaker: their speech now ducks (or no
+    /// longer ducks) the channel.
+    AurixEventParticipantPriorityChanged = 44,
+    /// `channel_id`, `flag` = another member's priority speech started (`true`) / stopped
+    /// ducking the channel; `aurix_event_ducking` = the depth and timing to apply to the
+    /// game's own music/SFX bus (the voice mix is ducked server-side already).
+    AurixEventDuckingChanged = 45,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1323,6 +1432,8 @@ pub struct AurixParticipant {
     pub speaking: bool,
     /// `0..=1`.
     pub energy: f32,
+    /// Priority speaker (`ChannelConfig.ducking`).
+    pub priority: bool,
     /// UTF-8, NUL-terminated, truncated to fit.
     pub display_name: [c_char; AURIX_NAME_LEN],
 }
@@ -1348,6 +1459,7 @@ fn participant_to_c(p: &crate::events::Participant) -> AurixParticipant {
         server_muted: p.server_muted,
         speaking: p.speaking,
         energy: p.energy,
+        priority: p.priority,
         display_name: name_buf(&p.display_name),
     }
 }
@@ -1538,6 +1650,7 @@ impl AurixEvent {
                         server_muted: false,
                         speaking: l.energy > 0.0,
                         energy: l.energy,
+                        priority: false,
                         display_name: [0; AURIX_NAME_LEN],
                     })
                     .collect();
@@ -1632,6 +1745,8 @@ impl AurixEvent {
             Event::ParticipantJoined { .. } => T::AurixEventParticipantJoined,
             Event::ParticipantLeft { .. } => T::AurixEventParticipantLeft,
             Event::ParticipantMuteChanged { .. } => T::AurixEventParticipantMuteChanged,
+            Event::ParticipantPriorityChanged { .. } => T::AurixEventParticipantPriorityChanged,
+            Event::DuckingChanged { .. } => T::AurixEventDuckingChanged,
             Event::ParticipantSpeaking { .. } => T::AurixEventParticipantSpeaking,
             Event::ChannelEnergy { .. } => T::AurixEventChannelEnergy,
             Event::LocalSpeaking(_) => T::AurixEventLocalSpeaking,
@@ -1800,6 +1915,8 @@ pub unsafe extern "C" fn aurix_event_channel_id(event: *const AurixEvent) -> Aur
         | Event::ParticipantJoined { channel_id, .. }
         | Event::ParticipantLeft { channel_id, .. }
         | Event::ParticipantMuteChanged { channel_id, .. }
+        | Event::ParticipantPriorityChanged { channel_id, .. }
+        | Event::DuckingChanged { channel_id, .. }
         | Event::ParticipantSpeaking { channel_id, .. }
         | Event::ChannelEnergy { channel_id, .. }
         | Event::Recording { channel_id, .. }
@@ -1829,6 +1946,7 @@ pub unsafe extern "C" fn aurix_event_user_id(event: *const AurixEvent) -> AurixU
         Event::ParticipantJoined { participant, .. } => Some(participant.user_id),
         Event::ParticipantLeft { user_id, .. }
         | Event::ParticipantMuteChanged { user_id, .. }
+        | Event::ParticipantPriorityChanged { user_id, .. }
         | Event::ParticipantSpeaking { user_id, .. }
         | Event::UserBlockChanged { user_id, .. }
         | Event::ModerationApplied { user_id, .. }
@@ -1869,6 +1987,8 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
     match self::event(event).map(|e| &e.event) {
         Some(Event::ChannelJoined { transcription, .. }) => *transcription,
         Some(Event::ParticipantMuteChanged { muted, .. }) => *muted,
+        Some(Event::ParticipantPriorityChanged { priority, .. }) => *priority,
+        Some(Event::DuckingChanged { active, .. }) => *active,
         Some(Event::ParticipantSpeaking { speaking, .. }) => *speaking,
         Some(Event::LocalSpeaking(s)) => *s,
         Some(Event::UserBlockChanged { blocked, .. }) => *blocked,
@@ -2423,7 +2543,7 @@ pub unsafe extern "C" fn aurix_client_channel_scope(
 
 /// Membership facts of a joined channel.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AurixChannelInfo {
     /// This session's role; `AurixRoleListener` cannot transmit (the server drops its frames).
     pub role: AurixRole,
@@ -2435,6 +2555,42 @@ pub struct AurixChannelInfo {
     pub transcription: bool,
     /// Speech is analysed by the content-safety classifier (disclose it).
     pub safety_voice: bool,
+    /// This session is a priority speaker here.
+    pub priority: bool,
+    /// Priority-speaker ducking the server applies (`enabled == false`: off).
+    pub ducking: AurixDucking,
+}
+
+/// Priority-speaker ducking (`ChannelConfig.ducking`): while a priority speaker talks, every
+/// other stream is attenuated to `gain` with these timings. The same numbers are what a game
+/// should apply to its own music/SFX on `AurixEventDuckingChanged`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AurixDucking {
+    pub enabled: bool,
+    /// Linear gain non-priority audio is attenuated to (`0..=1`).
+    pub gain: f32,
+    pub attack_ms: u32,
+    pub release_ms: u32,
+    pub hold_ms: u32,
+    /// Moderators / administrators duck too, not only explicit priority grants.
+    pub moderators: bool,
+}
+
+impl From<Option<DuckingConfig>> for AurixDucking {
+    fn from(d: Option<DuckingConfig>) -> Self {
+        match d {
+            Some(d) => Self {
+                enabled: true,
+                gain: d.gain,
+                attack_ms: d.attack_ms,
+                release_ms: d.release_ms,
+                hold_ms: d.hold_ms,
+                moderators: d.moderators,
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 impl Default for AurixChannelInfo {
@@ -2445,6 +2601,8 @@ impl Default for AurixChannelInfo {
             hidden_listeners: false,
             transcription: false,
             safety_voice: false,
+            priority: false,
+            ducking: AurixDucking::default(),
         }
     }
 }
@@ -2471,6 +2629,8 @@ pub unsafe extern "C" fn aurix_client_channel_info(
                         hidden_listeners: c.channel_hidden_listeners(id),
                         transcription: c.channel_transcribes(id),
                         safety_voice: c.channel_monitored(id),
+                        priority: c.is_priority(id),
+                        ducking: c.channel_ducking(id).into(),
                     };
                     true
                 }
@@ -2492,6 +2652,8 @@ pub unsafe extern "C" fn aurix_event_channel_info(event: *const AurixEvent) -> A
             hidden_listeners,
             transcription,
             safety_voice,
+            ducking,
+            priority,
             ..
         }) => AurixChannelInfo {
             role: (*role).into(),
@@ -2499,8 +2661,31 @@ pub unsafe extern "C" fn aurix_event_channel_info(event: *const AurixEvent) -> A
             hidden_listeners: *hidden_listeners,
             transcription: *transcription,
             safety_voice: *safety_voice,
+            priority: *priority,
+            ducking: (*ducking).into(),
         },
         _ => AurixChannelInfo::default(),
+    }
+}
+
+/// `DuckingChanged` only: the channel's ducking depth and timings (disabled for other events).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_ducking(event: *const AurixEvent) -> AurixDucking {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::DuckingChanged { config, .. }) => Some(*config).into(),
+        _ => AurixDucking::default(),
+    }
+}
+
+/// Whether another member's priority speech is ducking `channel_id` right now.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_ducking_active(
+    client: *const AurixClient,
+    channel_id: *const AurixUuid,
+) -> bool {
+    match (self::client(client), uuid_arg(channel_id, "channel_id")) {
+        (Ok(c), Ok(id)) => c.ducking_active(ChannelId(id)),
+        _ => false,
     }
 }
 
@@ -2934,6 +3119,139 @@ pub unsafe extern "C" fn aurix_client_dsp_stats(
     AurixResult::AurixOk
 }
 
+/// Mouth-shape buckets of `AurixVisemeFrame.weights` (index = value). `PP`/`FF`/`SS` follow
+/// the common lip-sync naming (lips closed, labiodental, sibilant); the rest are vowels.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixViseme {
+    AurixVisemeSilence = 0,
+    AurixVisemePP = 1,
+    AurixVisemeFF = 2,
+    AurixVisemeSS = 3,
+    AurixVisemeAA = 4,
+    AurixVisemeE = 5,
+    AurixVisemeIH = 6,
+    AurixVisemeOH = 7,
+    AurixVisemeOU = 8,
+}
+
+/// Number of `AurixViseme` buckets.
+pub const AURIX_VISEME_COUNT: usize = 9;
+const _: () = assert!(AURIX_VISEME_COUNT == VISEME_COUNT);
+
+impl From<Viseme> for AurixViseme {
+    fn from(v: Viseme) -> Self {
+        match v {
+            Viseme::Silence => AurixViseme::AurixVisemeSilence,
+            Viseme::PP => AurixViseme::AurixVisemePP,
+            Viseme::FF => AurixViseme::AurixVisemeFF,
+            Viseme::SS => AurixViseme::AurixVisemeSS,
+            Viseme::AA => AurixViseme::AurixVisemeAA,
+            Viseme::E => AurixViseme::AurixVisemeE,
+            Viseme::IH => AurixViseme::AurixVisemeIH,
+            Viseme::OH => AurixViseme::AurixVisemeOH,
+            Viseme::OU => AurixViseme::AurixVisemeOU,
+        }
+    }
+}
+
+/// Mouth state derived locally from a participant's (or our own) most recent audio frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AurixVisemeFrame {
+    /// Smoothed weight per `AurixViseme`, summing to ~1.
+    pub weights: [f32; AURIX_VISEME_COUNT],
+    /// Heaviest bucket.
+    pub dominant: AurixViseme,
+    /// Jaw openness `0..=1`.
+    pub mouth_open: f32,
+    /// RMS level of the frame `0..=1`.
+    pub energy: f32,
+    /// Margin between the top two buckets `0..=1`.
+    pub confidence: f32,
+    /// Frames analysed so far: unchanged between two reads = no new audio.
+    pub sequence: u64,
+}
+
+impl From<VisemeFrame> for AurixVisemeFrame {
+    fn from(f: VisemeFrame) -> Self {
+        Self {
+            weights: f.weights,
+            dominant: f.dominant.into(),
+            mouth_open: f.mouth_open,
+            energy: f.energy,
+            confidence: f.confidence,
+            sequence: f.sequence,
+        }
+    }
+}
+
+/// Analyse decoded participant audio and our own outgoing voice for lip-sync (off by
+/// default; one small FFT per stream per 20 ms when on). Purely local: no audio or mouth
+/// data leaves the machine, and E2EE channels work because frames are decrypted here. Read
+/// with `aurix_client_participant_visemes` / `aurix_client_local_visemes` every render tick.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_visemes(
+    client: *mut AurixClient,
+    enabled: bool,
+) -> AurixResult {
+    match self::client(client) {
+        Ok(c) => {
+            c.set_visemes(enabled);
+            AurixResult::AurixOk
+        }
+        Err(r) => r,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_visemes_enabled(client: *const AurixClient) -> bool {
+    self::client(client).is_ok_and(|c| c.visemes_enabled())
+}
+
+/// Mouth state of `user_id` from the audio most recently played for them (voice or their
+/// TTS). `false` (and `out` untouched) with analysis off or for a participant whose audio
+/// is not decoded here (unknown, or only inside the server mix).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_participant_visemes(
+    client: *const AurixClient,
+    user_id: *const AurixUuid,
+    out: *mut AurixVisemeFrame,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match (self::client(client), uuid_arg(user_id, "user_id")) {
+        (Ok(c), Ok(id)) => match c.participant_visemes(UserId(id)) {
+            Some(f) => {
+                *out = f.into();
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Mouth state of our own voice as sent (after DSP, gain and effects); `false` with analysis
+/// off. Frozen while nothing is captured — watch `sequence`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_local_visemes(
+    client: *const AurixClient,
+    out: *mut AurixVisemeFrame,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match self::client(client).ok().and_then(|c| c.local_visemes()) {
+        Some(f) => {
+            *out = f.into();
+            true
+        }
+        None => false,
+    }
+}
+
 /// Built-in voice effects on the microphone (after the DSP and input gain, before VAD and
 /// encoding; injected audio and the downlink are untouched). `NULL` or all-zero = off.
 /// Read back (clamped) with `aurix_client_voice_effects`. Runs before the host callback.
@@ -2952,14 +3270,26 @@ pub unsafe extern "C" fn aurix_client_set_voice_effects(
     };
     let handle = &*client;
     let mut state = handle.effects.lock();
-    state.builtin = AurixVoiceEffects {
-        pitch_semitones: requested
-            .pitch_semitones
-            .clamp(-MAX_PITCH_SEMITONES, MAX_PITCH_SEMITONES),
-        ring_mod_hz: requested.ring_mod_hz.clamp(0.0, MAX_RING_MOD_HZ),
-    };
+    state.builtin = VoiceEffectParams::from(requested).sanitized();
     handle.client.set_voice_effects(state.chain());
     AurixResult::AurixOk
+}
+
+/// The parameters of a built-in preset (a starting point: tweak and pass to
+/// `aurix_client_set_voice_effects`). Unknown `preset` values yield the bypass.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_preset(preset: AurixVoicePreset) -> AurixVoiceEffects {
+    EffectPreset::from(preset).params().into()
+}
+
+/// Apply a preset directly (`aurix_voice_effects_preset` + `aurix_client_set_voice_effects`).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_voice_preset(
+    client: *mut AurixClient,
+    preset: AurixVoicePreset,
+) -> AurixResult {
+    let effects = aurix_voice_effects_preset(preset);
+    aurix_client_set_voice_effects(client, &effects)
 }
 
 #[no_mangle]
@@ -2973,7 +3303,7 @@ pub unsafe extern "C" fn aurix_client_voice_effects(
     if out.is_null() {
         return null_ptr("out");
     }
-    *out = (*client).effects.lock().builtin;
+    *out = (*client).effects.lock().builtin.into();
     AurixResult::AurixOk
 }
 
@@ -3200,6 +3530,26 @@ pub unsafe extern "C" fn aurix_client_set_user_block(
     };
     match uuid_arg(user_id, "user_id") {
         Ok(u) => ok(c.set_user_block(UserId(u), blocked)),
+        Err(r) => r,
+    }
+}
+
+/// Make `user_id` (ourselves when `NULL`) a priority speaker of `channel_id`, or revoke it.
+/// Others need a moderator role; our own flag can be raised with a `priority` grant and
+/// always lowered. Everyone learns the outcome through `ParticipantPriorityChanged`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_priority(
+    client: *mut AurixClient,
+    channel_id: *const AurixUuid,
+    user_id: *const AurixUuid,
+    priority: bool,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match uuid_arg(channel_id, "channel_id") {
+        Ok(ch) => ok(c.set_priority(ChannelId(ch), opt_uuid_arg(user_id).map(UserId), priority)),
         Err(r) => r,
     }
 }
@@ -4461,6 +4811,188 @@ pub unsafe extern "C" fn aurix_dsp_push_render_f32(
         .push(std::slice::from_raw_parts(pcm, sample_count), channels);
 }
 
+// ----------------------------------------------- standalone voice effects / visemes
+//
+// The same built-in effect stages and lip-sync analyser the client runs internally, as bare
+// processors for hosts with their own capture/playback path (the Unity SDK, engines with
+// their own Opus pipeline). 48 kHz interleaved PCM, in place.
+
+/// Opaque standalone voice-effect chain (see `aurix_voice_effects_create`).
+pub struct AurixVoiceEffectsProcessor {
+    params: VoiceEffectParams,
+    chain: EffectChain,
+}
+
+/// Create a standalone effect chain from `effects` (NULL or all-zero = bypass, which passes
+/// audio through untouched).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_create(
+    effects: *const AurixVoiceEffects,
+) -> *mut AurixVoiceEffectsProcessor {
+    let requested = if effects.is_null() {
+        AurixVoiceEffects::default()
+    } else {
+        *effects
+    };
+    let params = VoiceEffectParams::from(requested).sanitized();
+    let chain = params.chain();
+    Box::into_raw(Box::new(AurixVoiceEffectsProcessor { params, chain }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_destroy(processor: *mut AurixVoiceEffectsProcessor) {
+    if !processor.is_null() {
+        drop(Box::from_raw(processor));
+    }
+}
+
+/// Replace the parameters (clamped; read back with `aurix_voice_effects_get`). Rebuilds the
+/// stages, so any tails (reverb, pitch buffers) restart. Not thread-safe against
+/// `aurix_voice_effects_process_f32`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_set(
+    processor: *mut AurixVoiceEffectsProcessor,
+    effects: *const AurixVoiceEffects,
+) -> AurixResult {
+    if processor.is_null() {
+        return null_ptr("processor");
+    }
+    let requested = if effects.is_null() {
+        AurixVoiceEffects::default()
+    } else {
+        *effects
+    };
+    let params = VoiceEffectParams::from(requested).sanitized();
+    let p = &mut *processor;
+    if params != p.params {
+        p.params = params;
+        p.chain = params.chain();
+    }
+    AurixResult::AurixOk
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_get(
+    processor: *const AurixVoiceEffectsProcessor,
+    out: *mut AurixVoiceEffects,
+) -> AurixResult {
+    if processor.is_null() || out.is_null() {
+        return null_ptr("processor/out");
+    }
+    *out = (*processor).params.into();
+    AurixResult::AurixOk
+}
+
+/// True when every stage is off (processing is a no-op).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_is_bypass(
+    processor: *const AurixVoiceEffectsProcessor,
+) -> bool {
+    !processor.is_null() && (*processor).params.is_bypass()
+}
+
+/// Process `sample_count` interleaved 48 kHz samples (`channels` 1 or 2) in place; the chain
+/// is stateful, so feed consecutive frames of one stream. `sample_count` must be a non-zero
+/// multiple of `channels`. Not thread-safe against itself or `aurix_voice_effects_set`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_process_f32(
+    processor: *mut AurixVoiceEffectsProcessor,
+    pcm: *mut f32,
+    sample_count: usize,
+    channels: u8,
+) -> AurixResult {
+    if processor.is_null() || pcm.is_null() {
+        return null_ptr("processor/pcm");
+    }
+    if !(1..=2).contains(&channels) {
+        set_error("channels must be 1 or 2");
+        return AurixResult::AurixInvalidArgument;
+    }
+    if sample_count == 0 || !sample_count.is_multiple_of(channels as usize) {
+        set_error("sample_count must be a non-zero multiple of channels");
+        return AurixResult::AurixInvalidArgument;
+    }
+    (*processor)
+        .chain
+        .process(std::slice::from_raw_parts_mut(pcm, sample_count), channels);
+    AurixResult::AurixOk
+}
+
+/// Clear the stages' internal state (tails, phases) without changing parameters — call on
+/// a stream discontinuity such as a device switch.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_voice_effects_reset(processor: *mut AurixVoiceEffectsProcessor) {
+    if !processor.is_null() {
+        (*processor).chain.reset();
+    }
+}
+
+/// Opaque standalone lip-sync analyser (see `aurix_viseme_analyzer_create`).
+pub struct AurixVisemeAnalyzer {
+    inner: VisemeAnalyzer,
+}
+
+/// Create a standalone lip-sync analyser for one audio stream (one per participant, one for
+/// the local microphone).
+#[no_mangle]
+pub extern "C" fn aurix_viseme_analyzer_create() -> *mut AurixVisemeAnalyzer {
+    Box::into_raw(Box::new(AurixVisemeAnalyzer {
+        inner: VisemeAnalyzer::new(),
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_viseme_analyzer_destroy(analyzer: *mut AurixVisemeAnalyzer) {
+    if !analyzer.is_null() {
+        drop(Box::from_raw(analyzer));
+    }
+}
+
+/// Analyse one 20 ms frame of interleaved 48 kHz PCM (`sample_count` total samples across
+/// `channels`, downmixed to mono; shorter frames are zero-padded, longer ones truncated to
+/// `AURIX_FRAME_SAMPLES` per channel). Not thread-safe against itself.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_viseme_analyzer_push_f32(
+    analyzer: *mut AurixVisemeAnalyzer,
+    pcm: *const f32,
+    sample_count: usize,
+    channels: u8,
+) -> AurixResult {
+    if analyzer.is_null() || pcm.is_null() {
+        return null_ptr("analyzer/pcm");
+    }
+    if channels == 0 || sample_count == 0 || !sample_count.is_multiple_of(channels as usize) {
+        set_error("sample_count must be a non-zero multiple of channels (>= 1)");
+        return AurixResult::AurixInvalidArgument;
+    }
+    (*analyzer)
+        .inner
+        .push(std::slice::from_raw_parts(pcm, sample_count), channels);
+    AurixResult::AurixOk
+}
+
+/// The smoothed mouth state after the last pushed frame (`sequence` counts pushes).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_viseme_analyzer_frame(
+    analyzer: *const AurixVisemeAnalyzer,
+    out: *mut AurixVisemeFrame,
+) -> AurixResult {
+    if analyzer.is_null() || out.is_null() {
+        return null_ptr("analyzer/out");
+    }
+    *out = (*analyzer).inner.frame().into();
+    AurixResult::AurixOk
+}
+
+/// Back to silence (keeps `sequence` so readers still see a change) — call when the stream
+/// stops or switches to another speaker.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_viseme_analyzer_reset(analyzer: *mut AurixVisemeAnalyzer) {
+    if !analyzer.is_null() {
+        (*analyzer).inner.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4855,6 +5387,8 @@ mod tests {
             role: ChannelRole::Listener,
             participant_count: 1200,
             hidden_listeners: true,
+            ducking: None,
+            priority: false,
         })));
         let other = Box::into_raw(Box::new(AurixEvent::new(Event::ChannelLeft { channel_id })));
         unsafe {
@@ -4998,6 +5532,120 @@ mod tests {
                 ),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn standalone_effects_and_visemes_round_trip() {
+        unsafe {
+            // Bypass passes audio through untouched.
+            let fx = aurix_voice_effects_create(ptr::null());
+            assert!(!fx.is_null());
+            assert!(aurix_voice_effects_is_bypass(fx));
+            let mut pcm: Vec<f32> = (0..960)
+                .map(|i| (i as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+                .collect();
+            let original = pcm.clone();
+            assert_eq!(
+                aurix_voice_effects_process_f32(fx, pcm.as_mut_ptr(), pcm.len(), 1),
+                AurixResult::AurixOk
+            );
+            assert_eq!(pcm, original);
+
+            // Bad geometry is rejected before touching the buffer.
+            assert_eq!(
+                aurix_voice_effects_process_f32(fx, pcm.as_mut_ptr(), 0, 1),
+                AurixResult::AurixInvalidArgument
+            );
+            assert_eq!(
+                aurix_voice_effects_process_f32(fx, pcm.as_mut_ptr(), 3, 2),
+                AurixResult::AurixInvalidArgument
+            );
+            assert_eq!(
+                aurix_voice_effects_process_f32(fx, pcm.as_mut_ptr(), pcm.len(), 3),
+                AurixResult::AurixInvalidArgument
+            );
+
+            // A preset changes the signal and reads back clamped.
+            let mut robot = aurix_voice_effects_preset(AurixVoicePreset::AurixVoicePresetRobot);
+            robot.pitch_semitones = 99.0;
+            assert_eq!(aurix_voice_effects_set(fx, &robot), AurixResult::AurixOk);
+            assert!(!aurix_voice_effects_is_bypass(fx));
+            let mut back = AurixVoiceEffects::default();
+            assert_eq!(aurix_voice_effects_get(fx, &mut back), AurixResult::AurixOk);
+            assert_eq!(back.ring_mod_hz, robot.ring_mod_hz);
+            assert_eq!(back.pitch_semitones, MAX_PITCH_SEMITONES);
+            assert_eq!(
+                aurix_voice_effects_process_f32(fx, pcm.as_mut_ptr(), pcm.len(), 1),
+                AurixResult::AurixOk
+            );
+            assert_ne!(pcm, original);
+            assert!(pcm.iter().all(|s| s.abs() <= 1.0));
+            aurix_voice_effects_reset(fx);
+            aurix_voice_effects_destroy(fx);
+            aurix_voice_effects_destroy(ptr::null_mut());
+
+            // Standalone lip-sync analyser: silence, then a loud vowel-like tone.
+            let an = aurix_viseme_analyzer_create();
+            assert!(!an.is_null());
+            let mut frame = AurixVisemeFrame {
+                weights: [0.0; AURIX_VISEME_COUNT],
+                dominant: AurixViseme::AurixVisemeAA,
+                mouth_open: 1.0,
+                energy: 1.0,
+                confidence: 0.0,
+                sequence: 7,
+            };
+            assert_eq!(
+                aurix_viseme_analyzer_frame(an, &mut frame),
+                AurixResult::AurixOk
+            );
+            assert_eq!(frame.dominant, AurixViseme::AurixVisemeSilence);
+            assert_eq!(frame.sequence, 0);
+            let silence = vec![0.0f32; 960];
+            assert_eq!(
+                aurix_viseme_analyzer_push_f32(an, silence.as_ptr(), silence.len(), 1),
+                AurixResult::AurixOk
+            );
+            assert_eq!(
+                aurix_viseme_analyzer_push_f32(an, silence.as_ptr(), 0, 1),
+                AurixResult::AurixInvalidArgument
+            );
+            assert_eq!(
+                aurix_viseme_analyzer_push_f32(an, silence.as_ptr(), silence.len(), 0),
+                AurixResult::AurixInvalidArgument
+            );
+            let voiced: Vec<f32> = (0..1920)
+                .flat_map(|i| {
+                    let t = i as f32 / 48_000.0;
+                    let v = (t * 150.0 * std::f32::consts::TAU).sin() * 0.2
+                        + (t * 750.0 * std::f32::consts::TAU).sin() * 0.2
+                        + (t * 1200.0 * std::f32::consts::TAU).sin() * 0.1;
+                    [v, v]
+                })
+                .collect();
+            for _ in 0..10 {
+                assert_eq!(
+                    aurix_viseme_analyzer_push_f32(an, voiced.as_ptr(), voiced.len(), 2),
+                    AurixResult::AurixOk
+                );
+            }
+            assert_eq!(
+                aurix_viseme_analyzer_frame(an, &mut frame),
+                AurixResult::AurixOk
+            );
+            assert_eq!(frame.sequence, 11);
+            assert_ne!(frame.dominant, AurixViseme::AurixVisemeSilence);
+            assert!(frame.mouth_open > 0.0 && frame.energy > 0.0);
+            aurix_viseme_analyzer_reset(an);
+            assert_eq!(
+                aurix_viseme_analyzer_frame(an, &mut frame),
+                AurixResult::AurixOk
+            );
+            assert_eq!(frame.dominant, AurixViseme::AurixVisemeSilence);
+            assert_eq!(frame.sequence, 11);
+            aurix_viseme_analyzer_destroy(an);
+            aurix_viseme_analyzer_destroy(ptr::null_mut());
         }
     }
 }

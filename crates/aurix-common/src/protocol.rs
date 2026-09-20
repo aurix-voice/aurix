@@ -2,8 +2,8 @@ use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
 use crate::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, DownlinkMode,
-    MediaTransportKind, Orientation3D, Position3D, PositionalConfig, ReverbDescriptor, SessionId,
-    UserId,
+    DuckingConfig, MediaTransportKind, Orientation3D, Position3D, PositionalConfig,
+    ReverbDescriptor, SessionId, UserId,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -948,11 +948,23 @@ pub enum ControlMessage {
         /// attenuate and pan the same way.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         positional: Option<PositionalConfig>,
+        /// Priority-speaker ducking the server applies to what it mixes and forwards; a
+        /// client rendering per-participant tracks itself reproduces it from the priority
+        /// members' speaking state (`SpeakingStateChanged`). `None`: no ducking.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ducking: Option<DuckingConfig>,
+        /// You are a priority speaker in this channel.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        priority: bool,
     },
     /// Server→client: an operator changed the channel's audio settings while you are in it.
+    /// Carries the current priority-speaker `ducking` as well (`None`: off) so clients that
+    /// duck per-participant tracks themselves follow live edits.
     ChannelAudioPolicy {
         channel_id: ChannelId,
         audio: AudioPolicy,
+        #[serde(default)]
+        ducking: Option<DuckingConfig>,
     },
     ChannelLeave {
         channel_id: ChannelId,
@@ -966,10 +978,29 @@ pub enum ControlMessage {
         role: ChannelRole,
         #[serde(default)]
         is_muted: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_priority: bool,
     },
     ParticipantLeft {
         channel_id: ChannelId,
         user_id: UserId,
+    },
+    /// Client→server: make `user_id` (yourself when omitted) a priority speaker of
+    /// `channel_id`, or revoke it. Promoting or demoting another member takes a moderator
+    /// role; a member whose grant carries `priority: true` may toggle their own state (to
+    /// speak without ducking the raid for a moment). Rejected (`VALIDATION_ERROR`) in
+    /// channels without `ducking`.
+    SetPriority {
+        channel_id: ChannelId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        priority: bool,
+    },
+    /// Server→client: a member's priority-speaker state changed (ack, or another member's).
+    PriorityChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        priority: bool,
     },
     MuteStateChanged {
         channel_id: ChannelId,
@@ -1595,6 +1626,9 @@ pub struct ParticipantBrief {
     pub role: ChannelRole,
     pub is_muted: bool,
     pub is_speaking: bool,
+    /// Priority speaker (`ChannelConfig.ducking`): their speech attenuates everyone else.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_priority: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2140,10 +2174,11 @@ mod tests {
                 stereo: false,
                 e2ee: false,
             },
+            ducking: None,
         };
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice","stereo":false,"e2ee":false}}}"#
+            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice","stereo":false,"e2ee":false},"ducking":null}}"#
         );
         let no_hint = serde_json::to_string(&AudioPolicy::default()).unwrap();
         assert_eq!(

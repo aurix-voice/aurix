@@ -112,6 +112,26 @@ public:
         SIGNAL_VOICE = AURIX_SIGNAL_VOICE,
         SIGNAL_MUSIC = AURIX_SIGNAL_MUSIC,
     };
+    /// Ready-made voices for `set_voice_preset` / `get_voice_preset`.
+    enum VoicePreset {
+        VOICE_PRESET_ROBOT = AURIX_VOICE_PRESET_ROBOT,
+        VOICE_PRESET_MONSTER = AURIX_VOICE_PRESET_MONSTER,
+        VOICE_PRESET_RADIO = AURIX_VOICE_PRESET_RADIO,
+        VOICE_PRESET_HELIUM = AURIX_VOICE_PRESET_HELIUM,
+        VOICE_PRESET_GHOST = AURIX_VOICE_PRESET_GHOST,
+    };
+    /// Mouth-shape buckets of a viseme frame's `weights` (index = value).
+    enum Viseme {
+        VISEME_SILENCE = AURIX_VISEME_SILENCE,
+        VISEME_PP = AURIX_VISEME_PP,
+        VISEME_FF = AURIX_VISEME_FF,
+        VISEME_SS = AURIX_VISEME_SS,
+        VISEME_AA = AURIX_VISEME_AA,
+        VISEME_E = AURIX_VISEME_E,
+        VISEME_IH = AURIX_VISEME_IH,
+        VISEME_OH = AURIX_VISEME_OH,
+        VISEME_OU = AURIX_VISEME_OU,
+    };
     /// How remote voices reach the speakers.
     enum PlaybackMode {
         /// Everyone through the node's own stereo `AudioStreamPlayer` (`start_playback`).
@@ -207,9 +227,17 @@ public:
     int set_dsp(const Dictionary& config);
     Dictionary get_dsp() const;
     Dictionary get_dsp_stats() const;
-    int set_voice_effects(double pitch_semitones, double ring_mod_hz);
+    int set_voice_effects(const Dictionary& effects);
     Dictionary get_voice_effects() const;
+    Dictionary get_voice_preset(VoicePreset preset) const;
+    int set_voice_preset(VoicePreset preset);
     void reset_capture();
+
+    // --- lip-sync (local analysis of decoded audio; nothing leaves the machine)
+    void set_visemes_enabled(bool enabled);
+    bool get_visemes_enabled() const;
+    Dictionary get_participant_visemes(const String& user_id) const;
+    Dictionary get_local_visemes() const;
 
     // --- playback / downlink
     bool start_playback();
@@ -227,6 +255,8 @@ public:
     int set_participant_mute(const String& user_id, const String& channel_id, bool muted);
     int set_participant_volume(const String& user_id, double volume);
     int set_user_block(const String& user_id, bool blocked);
+    int set_priority(const String& channel_id, const String& user_id, bool priority);
+    bool is_ducking_active(const String& channel_id) const;
     int set_transmission(TransmissionMode mode, const String& channel_id);
     int set_channel_focus(const String& channel_id);
     int set_audio_codec(AudioCodec codec);
@@ -275,6 +305,7 @@ private:
     aurix::Client client_;
     AurixClientConfig config_{};
     bool dsp_bypass_ = false;
+    bool visemes_enabled_ = false;
     int64_t client_generation_ = 0;
     bool auto_capture_ = true;
     bool auto_playback_ = true;
@@ -313,3 +344,5 @@ VARIANT_ENUM_CAST(godot::AurixVoiceClient::NoiseSuppression);
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::OpusBandwidth);
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::OpusSignal);
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::PlaybackMode);
+VARIANT_ENUM_CAST(godot::AurixVoiceClient::VoicePreset);
+VARIANT_ENUM_CAST(godot::AurixVoiceClient::Viseme);

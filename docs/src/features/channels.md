@@ -52,7 +52,8 @@ action token decides them at join time. A grant with `speak: false` makes the me
       "text_radius": 20.0
     },
     "ambient": { "max_voices": 4, "ambient_gain": 0.15 },
-    "audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 0, "max_streams": 0 }
+    "audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 0, "max_streams": 0 },
+    "ducking": { "gain": 0.25, "attack_ms": 60, "release_ms": 400, "hold_ms": 250, "moderators": false }
   }
 }
 ```
@@ -101,6 +102,8 @@ action token decides them at join time. A grant with `speak: false` makes the me
   server mix for them, a speaker admission limit and a per-receiver cap on concurrent voices.
   `max_participants` may go up to the application's `max_participants_per_channel` quota
   (`PATCH /v1/apps/{app_id}` raises it; the hard ceiling is 100 000).
+* `ducking` (absent by default) turns on [priority speakers](#priority-speakers-and-ducking):
+  while a raid leader / shoutcaster / moderator talks, everybody else is attenuated to `gain`.
 
 `PUT /v1/channels/{id}/config` updates the configuration live; participants on every node hosting
 the channel pick it up (channel type changes take effect for subsequent frames).
@@ -196,6 +199,58 @@ senders:
 | own microphone | `MuteStateChanged` | broadcast to the channel as roster state |
 
 Server-side (moderator) mutes and bans are covered in [moderation](moderation.md).
+
+## Priority speakers and ducking
+
+A channel with `config.ducking` has **priority speakers**: while any of them is audible, every
+other voice in the channel is attenuated for every receiver. Who counts:
+
+* members whose channel grant carries `priority: true` (`POST /v1/tokens` →
+  `channels[].priority`; requires `speak`) — the raid leader, the shoutcaster, the commander;
+* members a moderator promoted at runtime — `SetPriority { channel_id, user_id, priority }`
+  over the control plane or `POST /v1/moderation/priority` from your backend
+  (`moderation:write`), both audited and both answered to the whole channel with
+  `PriorityChanged`; a granted member may toggle *themselves* off and on again (to chat
+  without ducking the raid for a moment), nobody else can self-promote (`AUTH_DENIED`);
+* with `ducking.moderators: true`, every `moderator` / `administrator` as well.
+
+The flag is per membership: it is disclosed as `ParticipantBrief.is_priority` in rosters and
+`ChannelJoinAck.priority` for yourself, survives resume and cross-node failover, and is
+cleared when the member leaves. `SetPriority` in a channel without `ducking` is a
+`VALIDATION_ERROR`; the REST toggle stores the flag regardless (so a grant can be prepared
+before ducking is switched on with `PUT /v1/channels/{id}/config`).
+
+The **envelope** is the channel's: a priority speaker's audible frame (labelled with an energy
+level above the speaking threshold, or — unlabelled — while the node considers them speaking)
+ramps every non-priority voice down to `gain` over `attack_ms`, keeps it there for `hold_ms`
+past their last audible frame so pauses between words do not pump the mix, and ramps back over
+`release_ms`. Several priority speakers at once simply keep it engaged; a priority speaker is
+**never** attenuated — not by their own speech and not by another priority speaker's.
+
+Where it is applied:
+
+* **On the node**, for everything the node delivers with a gain — native per-participant
+  streams (as the same `VolumeAttenuated` byte that carries participant volume), the server
+  mix for listeners, cascaded frames. The duck multiplies with the receiver's own participant
+  volume, after local mute / block / positional attenuation (a muted voice stays muted, a
+  voice at `0.5` ends up at `0.125`) and before ambient gating and the `max_streams` ranking,
+  so a ducked voice competes for a slot at the level it is actually heard.
+* **In the browser**, for dedicated WebRTC tracks the node forwards unchanged
+  ([per-participant tracks](#per-participant-tracks-for-browsers)): the Web SDK reproduces the
+  same envelope on its per-participant `GainNode`s from the priority members' speaking state
+  and the `ducking` it received in `ChannelJoinAck` / `ChannelAudioPolicy`. The mixed track is
+  ducked by the node like any other mix.
+* **In the game**: every SDK raises a *ducking changed* event (`duckingChanged`,
+  `OnDuckingChanged`, `AURIX_EVENT_DUCKING_CHANGED`) exactly on the transitions — with the
+  channel's `DuckingConfig` — so music and SFX can follow the same curve; Unity ships a
+  ready-made `AurixGameAudioDucker`. Your own priority speech never ducks your own game
+  audio or downlink.
+
+Ducking is a channel-level effect that does not touch the receiver's private controls: local
+mute, volume, block, focus and positional attenuation keep working underneath it. It works in
+[E2EE channels](e2ee.md) as well: the node drives it from the sender-reported level byte, which
+stays outside the ciphertext, and applies it through the gain byte; browsers duck their
+per-participant tracks locally as everywhere else.
 
 ## Positional audio
 

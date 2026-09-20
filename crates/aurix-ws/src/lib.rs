@@ -98,6 +98,9 @@ pub struct ConnectionInfo {
     pub display_name: String,
     pub ssrc: u32,
     pub channels: Vec<ChannelId>,
+    /// Channels joined with an explicit `priority` grant; the participant may re-enable
+    /// their own priority there after a moderator demotes them.
+    pub priority_grants: Vec<ChannelId>,
     pub ip: String,
     pub user_agent: Option<String>,
     resume_token_hash: [u8; 32],
@@ -375,6 +378,14 @@ impl WsState {
         }
     }
 
+    fn grant_priority(&self, channel_id: ChannelId, session_id: SessionId) {
+        if let Some(mut conn) = self.connections.get_mut(&session_id) {
+            if !conn.priority_grants.contains(&channel_id) {
+                conn.priority_grants.push(channel_id);
+            }
+        }
+    }
+
     /// `broadcast_channel_in_app` narrowed to the members that currently see `subject`
     /// (channels with a `roster_radius`; everyone otherwise).
     fn broadcast_visible(
@@ -449,6 +460,7 @@ impl WsState {
                     ssrc: entry.ssrc,
                     role: entry.role,
                     is_muted: entry.is_muted,
+                    is_priority: entry.is_priority,
                 }
             } else {
                 ControlMessage::ParticipantLeft {
@@ -588,6 +600,7 @@ impl WsState {
                     ssrc: row.ssrc as u32,
                     role: parse_role(&row.role),
                     is_muted: row.is_muted || row.is_server_muted,
+                    is_priority: row.is_priority,
                 },
             ));
         }
@@ -608,6 +621,7 @@ impl WsState {
         }
         if let Some(mut conn) = self.connections.get_mut(session_id) {
             conn.channels.retain(|c| c != channel_id);
+            conn.priority_grants.retain(|c| c != channel_id);
         }
     }
 
@@ -632,12 +646,18 @@ impl WsState {
         let session = sfu.get_session(&session_id).filter(|s| s.is_active())?;
         let channels = channels
             .into_iter()
-            .map(|channel_id| MirroredChannel {
-                channel_id,
-                role: sfu
-                    .get_channel(&channel_id)
-                    .map(|c| c.role_of(&conn.user_id))
-                    .unwrap_or(ChannelRole::Speaker),
+            .map(|channel_id| {
+                let channel = sfu.get_channel(&channel_id);
+                MirroredChannel {
+                    channel_id,
+                    role: channel
+                        .as_ref()
+                        .map(|c| c.role_of(&conn.user_id))
+                        .unwrap_or(ChannelRole::Speaker),
+                    priority: channel
+                        .as_ref()
+                        .is_some_and(|c| c.has_priority_flag(&conn.user_id)),
+                }
             })
             .collect();
         let prefs = session.prefs.read();
@@ -727,6 +747,7 @@ impl WsState {
                     continue;
                 };
                 let role = channel.role_of(&conn.user_id);
+                let is_priority = channel.has_priority_flag(&conn.user_id);
                 let _ = sfu.leave_channel(&session_id, channel_id);
                 if sfu.get_channel(channel_id).is_some() {
                     channel.add_remote(
@@ -737,6 +758,7 @@ impl WsState {
                             ssrc: conn.ssrc,
                             role,
                             is_muted,
+                            is_priority,
                         },
                     );
                 }
@@ -811,6 +833,7 @@ impl WsState {
                     session_id,
                     ssrc,
                     role,
+                    is_priority,
                     ..
                 } => {
                     let local = self.connections.get(&session_id).map(|c| c.ssrc);
@@ -826,6 +849,7 @@ impl WsState {
                                     ssrc,
                                     role,
                                     is_muted: false,
+                                    is_priority,
                                 },
                             );
                             self.emit_roster_changes(app_id, &channel_id, channel, changes);
@@ -851,6 +875,7 @@ impl WsState {
                             ssrc,
                             role,
                             is_muted: false,
+                            is_priority,
                         },
                         Some(&session_id),
                     );
@@ -962,6 +987,32 @@ impl WsState {
                         None,
                     );
                 }
+                ServerEvent::PriorityChanged {
+                    app_id,
+                    channel_id,
+                    user_id,
+                    priority,
+                    ..
+                } => {
+                    let known =
+                        self.sfu.read().get_channel(&channel_id).is_some_and(|c| {
+                            c.app_id == app_id && c.set_priority(&user_id, priority)
+                        });
+                    if !known {
+                        continue;
+                    }
+                    self.broadcast_visible(
+                        app_id,
+                        &channel_id,
+                        &user_id,
+                        &ControlMessage::PriorityChanged {
+                            channel_id,
+                            user_id,
+                            priority,
+                        },
+                        None,
+                    );
+                }
                 ServerEvent::UserBlockChanged {
                     app_id,
                     user_id,
@@ -978,6 +1029,7 @@ impl WsState {
                     ..
                 } => {
                     let audio = config.audio_policy();
+                    let ducking = config.ducking;
                     let updated =
                         self.sfu
                             .read()
@@ -986,7 +1038,11 @@ impl WsState {
                         self.broadcast_channel_in_app(
                             app_id,
                             &channel_id,
-                            &ControlMessage::ChannelAudioPolicy { channel_id, audio },
+                            &ControlMessage::ChannelAudioPolicy {
+                                channel_id,
+                                audio,
+                                ducking,
+                            },
                         );
                     }
                 }
@@ -2307,6 +2363,7 @@ async fn adopt_mirrored_session(
             display_name: token.display_name.clone(),
             ssrc: mirror.ssrc,
             channels: Vec::new(),
+            priority_grants: Vec::new(),
             ip: ip.to_string(),
             user_agent: user_agent.map(str::to_string),
             resume_token_hash: resume_hash,
@@ -2434,6 +2491,11 @@ async fn restore_channel(
         close_open_membership("restore_failed").await;
         return false;
     }
+    if channel.priority {
+        if let Some(c) = state.sfu.read().get_channel(&channel_id) {
+            c.set_priority(&user_id, true);
+        }
+    }
     let ssrc = state
         .connections
         .get(&session_id)
@@ -2443,7 +2505,14 @@ async fn restore_channel(
         if let Err(e) = state
             .control
             .sessions
-            .add_channel_membership(channel_id, user_id, session_id, channel.role, ssrc)
+            .add_channel_membership(
+                channel_id,
+                user_id,
+                session_id,
+                channel.role,
+                ssrc,
+                channel.priority,
+            )
             .await
         {
             warn!("membership restore failed for {session_id} in {channel_id}: {e}");
@@ -2467,6 +2536,9 @@ async fn restore_channel(
         }
     }
     state.index_join(channel_id, session_id);
+    if channel.priority {
+        state.grant_priority(channel_id, session_id);
+    }
     if let Some(redis) = &state.control.redis {
         let _ = redis.add_user_channel(user_id, channel_id).await;
     }
@@ -2483,6 +2555,7 @@ async fn restore_channel(
                 display_name: token.display_name.clone(),
                 ssrc,
                 role: channel.role,
+                is_priority: channel.priority,
                 timestamp: chrono::Utc::now(),
             });
     }
@@ -2571,6 +2644,7 @@ async fn open_session(
             display_name: token.display_name.clone(),
             ssrc: media_session.ssrc,
             channels: Vec::new(),
+            priority_grants: Vec::new(),
             ip: ip.to_string(),
             user_agent: user_agent.map(str::to_string),
             resume_token_hash: resume_hash,
@@ -2662,6 +2736,7 @@ fn brief_from_entry(e: RosterEntry) -> ParticipantBrief {
         role: e.role,
         is_muted: e.is_muted,
         is_speaking: e.is_speaking,
+        is_priority: e.is_priority,
     }
 }
 
@@ -2684,21 +2759,25 @@ fn channel_join_ack(
     channel_id: &ChannelId,
 ) -> ControlMessage {
     let participants = channel_snapshot(state, session_id, channel_id);
-    let (role, participant_count, hidden_listeners, roster_radius, text_radius, positional) = state
-        .sfu
-        .read()
-        .get_channel(channel_id)
-        .map(|c| {
-            (
-                c.role_of(user_id),
-                (c.participant_count() as usize + c.remote_count()) as u32,
-                c.hides_listeners(),
-                c.roster_radius(),
-                c.text_radius(),
-                c.positional_config(),
-            )
-        })
-        .unwrap_or((ChannelRole::Listener, 0, false, None, None, None));
+    let channel = state.sfu.read().get_channel(channel_id);
+    let (role, participant_count, hidden_listeners, roster_radius, text_radius, positional) =
+        channel
+            .as_ref()
+            .map(|c| {
+                (
+                    c.role_of(user_id),
+                    (c.participant_count() as usize + c.remote_count()) as u32,
+                    c.hides_listeners(),
+                    c.roster_radius(),
+                    c.text_radius(),
+                    c.positional_config(),
+                )
+            })
+            .unwrap_or((ChannelRole::Listener, 0, false, None, None, None));
+    let ducking = channel.as_ref().and_then(|c| c.ducking_config());
+    let priority = channel
+        .as_ref()
+        .is_some_and(|c| c.has_priority_flag(user_id));
     ControlMessage::ChannelJoinAck {
         channel_id: *channel_id,
         participants,
@@ -2711,6 +2790,8 @@ fn channel_join_ack(
         participant_count,
         hidden_listeners,
         positional,
+        ducking,
+        priority,
     }
 }
 
@@ -3632,6 +3713,10 @@ async fn handle_control_message(
                 .control
                 .rbac
                 .role_from_permissions(&channel_id, &perms);
+            let priority = state
+                .control
+                .rbac
+                .priority_from_permissions(&channel_id, &perms);
             if let Err(e) = e2ee_join_allowed(state, &session_id, &config) {
                 if resolved.created {
                     state.control.release_ad_hoc(token.app_id, channel_id).await;
@@ -3659,6 +3744,11 @@ async fn handle_control_message(
                     return send_error(tx, e.error_code(), &e.public_message()).await;
                 }
             };
+            if priority {
+                if let Some(channel) = state.sfu.read().get_channel(&channel_id) {
+                    channel.set_priority(&token.user_id, true);
+                }
+            }
             let ssrc = state
                 .connections
                 .get(&session_id)
@@ -3667,7 +3757,7 @@ async fn handle_control_message(
             if let Err(e) = state
                 .control
                 .sessions
-                .add_channel_membership(channel_id, token.user_id, session_id, role, ssrc)
+                .add_channel_membership(channel_id, token.user_id, session_id, role, ssrc, priority)
                 .await
             {
                 warn!("membership persistence failed: {e}");
@@ -3682,6 +3772,9 @@ async fn handle_control_message(
                     .await;
             }
             state.index_join(channel_id, session_id);
+            if priority {
+                state.grant_priority(channel_id, session_id);
+            }
             let count = state
                 .control
                 .channels
@@ -3753,6 +3846,7 @@ async fn handle_control_message(
                         .map(|c| c.ssrc)
                         .unwrap_or(0),
                     role,
+                    is_priority: priority,
                     timestamp: chrono::Utc::now(),
                 });
         }
@@ -4452,6 +4546,77 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetPriority {
+            channel_id,
+            user_id,
+            priority,
+        } => {
+            let target = user_id.unwrap_or(token.user_id);
+            let (member, granted) = state
+                .connections
+                .get(&session_id)
+                .map(|c| {
+                    (
+                        c.channels.contains(&channel_id),
+                        c.priority_grants.contains(&channel_id),
+                    )
+                })
+                .unwrap_or((false, false));
+            if !member {
+                return send_error(tx, "NOT_IN_CHANNEL", "Not a member of this channel").await;
+            }
+            let Some(channel) = state.sfu.read().get_channel(&channel_id) else {
+                return send_error(tx, "CHANNEL_NOT_FOUND", "Channel not found").await;
+            };
+            if channel.ducking_config().is_none() {
+                return send_error(
+                    tx,
+                    "VALIDATION_ERROR",
+                    "Priority speakers require `ducking` in the channel config",
+                )
+                .await;
+            }
+            let moderator = channel.role_of(&token.user_id).can_moderate();
+            let allowed = if target == token.user_id {
+                moderator || granted || (!priority && channel.has_priority_flag(&target))
+            } else {
+                moderator
+            };
+            if !allowed {
+                return send_error(
+                    tx,
+                    "AUTH_DENIED",
+                    "Priority speaker changes require a moderator role or a priority grant",
+                )
+                .await;
+            }
+            if channel.member_role(&target).is_none() {
+                return send_error(tx, "NOT_FOUND", "Participant not in channel").await;
+            }
+            if channel.has_priority_flag(&target) == priority {
+                return;
+            }
+            if let Err(e) = state
+                .control
+                .sessions
+                .set_membership_priority(token.app_id, channel_id, target, priority)
+                .await
+            {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+            channel.set_priority(&target, priority);
+            state.control.events.publish(ServerEvent::PriorityChanged {
+                app_id: token.app_id,
+                channel_id,
+                user_id: target,
+                priority,
+                changed_by: token.user_id,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        ControlMessage::PriorityChanged { .. } => {}
+
         ControlMessage::E2eeHello {
             channel_id,
             public_key,
@@ -4724,6 +4889,7 @@ mod tests {
             display_name: "p".into(),
             ssrc: 7,
             channels: vec![],
+            priority_grants: vec![],
             ip: "127.0.0.1".into(),
             user_agent: None,
             resume_token_hash: token.hash,

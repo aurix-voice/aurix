@@ -7,12 +7,14 @@
 
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
 namespace aurix_godot {
 
 using godot::Array;
 using godot::Dictionary;
+using godot::PackedFloat32Array;
 using godot::String;
 
 inline String uuid_to_string(const AurixUuid& id) {
@@ -58,7 +60,19 @@ inline Dictionary participant_to_dict(const AurixParticipant& p) {
     d["server_muted"] = p.server_muted;
     d["speaking"] = p.speaking;
     d["energy"] = p.energy;
+    d["priority"] = p.priority;
     d["display_name"] = cstr(p.display_name);
+    return d;
+}
+
+inline Dictionary ducking_to_dict(const AurixDucking& k) {
+    Dictionary d;
+    d["enabled"] = k.enabled;
+    d["gain"] = k.gain;
+    d["attack_ms"] = static_cast<int64_t>(k.attack_ms);
+    d["release_ms"] = static_cast<int64_t>(k.release_ms);
+    d["hold_ms"] = static_cast<int64_t>(k.hold_ms);
+    d["moderators"] = k.moderators;
     return d;
 }
 
@@ -69,6 +83,57 @@ inline Dictionary channel_info_to_dict(const AurixChannelInfo& c) {
     d["hidden_listeners"] = c.hidden_listeners;
     d["transcription"] = c.transcription;
     d["safety_voice"] = c.safety_voice;
+    d["priority"] = c.priority;
+    d["ducking"] = ducking_to_dict(c.ducking);
+    return d;
+}
+
+inline Dictionary voice_effects_to_dict(const AurixVoiceEffects& fx) {
+    Dictionary d;
+    d["highpass_hz"] = fx.highpass_hz;
+    d["lowpass_hz"] = fx.lowpass_hz;
+    d["formant_semitones"] = fx.formant_semitones;
+    d["pitch_semitones"] = fx.pitch_semitones;
+    d["ring_mod_hz"] = fx.ring_mod_hz;
+    d["distortion_drive"] = fx.distortion_drive;
+    d["tremolo_hz"] = fx.tremolo_hz;
+    d["tremolo_depth"] = fx.tremolo_depth;
+    d["static_level"] = fx.static_level;
+    d["reverb_mix"] = fx.reverb_mix;
+    d["reverb_size"] = fx.reverb_size;
+    d["reverb_damping"] = fx.reverb_damping;
+    return d;
+}
+
+inline void voice_effects_from_dict(const Dictionary& d, AurixVoiceEffects& fx) {
+    auto f = [&](const char* key, float& field) {
+        if (d.has(key)) field = static_cast<float>(static_cast<double>(d[key]));
+    };
+    f("highpass_hz", fx.highpass_hz);
+    f("lowpass_hz", fx.lowpass_hz);
+    f("formant_semitones", fx.formant_semitones);
+    f("pitch_semitones", fx.pitch_semitones);
+    f("ring_mod_hz", fx.ring_mod_hz);
+    f("distortion_drive", fx.distortion_drive);
+    f("tremolo_hz", fx.tremolo_hz);
+    f("tremolo_depth", fx.tremolo_depth);
+    f("static_level", fx.static_level);
+    f("reverb_mix", fx.reverb_mix);
+    f("reverb_size", fx.reverb_size);
+    f("reverb_damping", fx.reverb_damping);
+}
+
+inline Dictionary viseme_frame_to_dict(const AurixVisemeFrame& f) {
+    Dictionary d;
+    PackedFloat32Array weights;
+    weights.resize(AURIX_VISEME_COUNT);
+    for (int i = 0; i < AURIX_VISEME_COUNT; ++i) weights[i] = f.weights[i];
+    d["weights"] = weights;
+    d["dominant"] = static_cast<int>(f.dominant);
+    d["mouth_open"] = f.mouth_open;
+    d["energy"] = f.energy;
+    d["confidence"] = f.confidence;
+    d["sequence"] = static_cast<int64_t>(f.sequence);
     return d;
 }
 

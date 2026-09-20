@@ -33,7 +33,7 @@ namespace Aurix.Unity
     /// Assign <see cref="CodecFactory"/> before calling <see cref="Connect"/> (see the Concentus sample).
     /// </summary>
     [RequireComponent(typeof(AudioSource))]
-    public sealed class AurixVoiceBehaviour : MonoBehaviour
+    public sealed class AurixVoiceBehaviour : MonoBehaviour, IAurixVoiceHost
     {
         [Header("Connection")]
         [Tooltip("ws://host:8081/ws or wss://...")]
@@ -167,7 +167,18 @@ namespace Aurix.Unity
                  "Server-mixed downlink (PreferredDownlinkMode = Mixed) has no per-participant streams.")]
         public VoicePlaybackMode Playback = VoicePlaybackMode.Mixed;
 
+        [Header("Voice")]
+        [Tooltip("Microphone voice effect (aurix_client native library), applied after the capture DSP and input gain, " +
+                 "before VAD and encoding — never to injected clips or to what you hear. Custom = CustomVoiceEffect below. " +
+                 "Change at runtime with ApplyVoiceSettings().")]
+        public VoiceEffectSelection VoiceEffect = VoiceEffectSelection.None;
+        public VoiceEffectParams CustomVoiceEffect;
+        [Tooltip("Analyse the microphone (as sent) and every heard participant for lip-sync (aurix_client native library): " +
+                 "Client.GetLocalVisemes() / GetParticipantVisemes(), or AurixLipSync components (which turn this on by themselves).")]
+        public bool LipSync = false;
+
         public AurixVoiceClient Client { get; private set; }
+        IAurixVoiceClient IAurixVoiceHost.VoiceClient => Client;
         public bool IsConnected => Client != null && Client.State == VoiceConnectionState.MediaBound;
 
         /// <summary>Local microphone meter/VAD; read <see cref="VoiceActivityDetector.Energy"/> for a level bar.</summary>
@@ -302,6 +313,7 @@ namespace Aurix.Unity
         private byte[] _opusOut = new byte[1275];
         private IOpusCodec _encoder;
         private bool _warnedNoStereoCodec;
+        private bool _warnedNoNativeVoice;
         private readonly PcmuCodec _pcmuEncoder = new PcmuCodec();
         private readonly byte[] _pcmuOut = new byte[AudioFormat.FrameSamples / PcmuCodec.Decimation];
         private RemoteMixer _mixer;
@@ -385,6 +397,7 @@ namespace Aurix.Unity
             Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();
             Client.OnAudioCodecChanged += _ => _pcmuEncoder.Reset();
+            ApplyVoiceSettings();
             if (PreferredCodec != AudioCodec.Opus) await Client.SetAudioCodecAsync(PreferredCodec);
             if (PreferredDownlinkMode != DownlinkMode.Streams) await Client.SetDownlinkModeAsync(PreferredDownlinkMode);
             await Client.ConnectAsync();
@@ -461,6 +474,31 @@ namespace Aurix.Unity
             Client.FollowChannelPolicy = FollowChannelPolicy;
             Client.SetComplexity(Complexity);
             Client.SetEncoderSettings(EncoderSettingsFromInspector());
+        }
+
+        /// <summary>
+        /// Re-read <see cref="VoiceEffect"/> / <see cref="CustomVoiceEffect"/> / <see cref="LipSync"/> at runtime and
+        /// apply them. Both need the native library: without it the effect stays off and lip-sync is
+        /// unavailable (a warning is logged once per connect).
+        /// </summary>
+        public void ApplyVoiceSettings()
+        {
+            var client = Client;
+            if (client == null) return;
+            var effects = VoiceEffectSelectionExtensions.Params(VoiceEffect, CustomVoiceEffect);
+            bool missing = false;
+            if (effects.IsBypass || client.SupportsVoiceEffects) client.SetVoiceEffectsAsync(effects);
+            else missing = true;
+            if (!LipSync || client.SupportsVisemes)
+            {
+                if (LipSync != client.VisemesEnabled) client.SetVisemesAsync(LipSync);
+            }
+            else missing = true;
+            if (missing && !_warnedNoNativeVoice)
+            {
+                _warnedNoNativeVoice = true;
+                Debug.LogWarning("Aurix: voice effects and lip-sync need the aurix_client native library; sending the plain microphone");
+            }
         }
 
         public async Task Disconnect()
@@ -657,6 +695,7 @@ namespace Aurix.Unity
             {
                 Microphone.End(_activeDevice);
                 _micClip = null;
+                Client?.ResetLocalVoice();
             }
         }
 
@@ -746,6 +785,8 @@ namespace Aurix.Unity
                     SplitStereo(_micScratch, _micChannels, frameAtMicRate, _stereo, AudioFormat.FrameSamples);
                     // The capture DSP is a voice (mono) chain: a music/broadcast source skips it.
                     AudioLevel.ApplyGain(_stereo, AudioFormat.FrameSamples * 2, InputGain);
+                    Client.ApplyVoiceEffects(_stereo, AudioFormat.FrameSamples, 2);
+                    Client.AnalyzeLocalVoice(_stereo, AudioFormat.FrameSamples, 2);
                     InjectIntoStereo();
                     EncodeAndSendStereo();
                     continue;
@@ -754,6 +795,8 @@ namespace Aurix.Unity
                 Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
                 Dsp?.Process(_mono, AudioFormat.FrameSamples);
                 AudioLevel.ApplyGain(_mono, AudioFormat.FrameSamples, InputGain);
+                Client.ApplyVoiceEffects(_mono, AudioFormat.FrameSamples, 1);
+                Client.AnalyzeLocalVoice(_mono, AudioFormat.FrameSamples, 1);
                 Injector.Fill(_mono, AudioFormat.FrameSamples);
                 EncodeAndSend();
             }

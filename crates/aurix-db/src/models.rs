@@ -78,6 +78,8 @@ pub struct ChannelMembershipRow {
     pub role: String,
     pub is_muted: bool,
     pub is_server_muted: bool,
+    #[sqlx(default)]
+    pub is_priority: bool,
     pub ssrc: i64,
     pub joined_at: DateTime<Utc>,
     pub left_at: Option<DateTime<Utc>>,
@@ -92,6 +94,7 @@ pub struct ChannelRosterRow {
     pub role: String,
     pub is_muted: bool,
     pub is_server_muted: bool,
+    pub is_priority: bool,
     pub ssrc: i64,
 }
 

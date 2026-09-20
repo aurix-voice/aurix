@@ -43,6 +43,8 @@ namespace Aurix
         event Action<NetworkQuality> OnNetworkQuality;
         event Action<Guid, string> OnKicked;
         event Action<Guid, bool> OnUserBlockChanged;
+        event Action<Guid, Guid, bool> OnParticipantPriorityChanged;
+        event Action<Guid, bool, DuckingConfig> OnDuckingChanged;
         event Action<TransmissionMode> OnTransmissionChanged;
         event Action<Guid?> OnChannelFocusChanged;
         event Action<ChatMessage> OnChatMessage;
@@ -75,10 +77,26 @@ namespace Aurix
         float GetParticipantVolume(Guid userId);
         Task SetUserBlockedAsync(Guid userId, bool blocked, CancellationToken ct = default);
         bool IsUserBlocked(Guid userId);
+        Task SetPriorityAsync(Guid channelId, Guid? userId, bool priority, CancellationToken ct = default);
+        bool IsPriority(Guid channelId);
+        bool IsDuckingActive(Guid channelId);
         Task SetTransmissionAsync(TransmissionMode mode, CancellationToken ct = default);
         Task TransmitToChannelAsync(Guid channelId, CancellationToken ct = default);
         bool TransmitsTo(Guid channelId);
         Task SetChannelFocusAsync(Guid? channelId, CancellationToken ct = default);
+
+        /// <summary>Lip-sync analysis can run on this platform (native library / browser AudioWorklet).</summary>
+        bool SupportsVisemes { get; }
+        bool VisemesEnabled { get; }
+        Task SetVisemesAsync(bool enabled, CancellationToken ct = default);
+        /// <summary>Latest mouth state of a heard participant; null when unknown or with lip-sync off.</summary>
+        Audio.VisemeFrame? GetParticipantVisemes(Guid userId);
+        /// <summary>Latest mouth state of the local microphone; null with lip-sync off.</summary>
+        Audio.VisemeFrame? GetLocalVisemes();
+        /// <summary>Voice effects can run on this platform (native library / browser AudioWorklet).</summary>
+        bool SupportsVoiceEffects { get; }
+        Audio.VoiceEffectParams VoiceEffects { get; }
+        Task SetVoiceEffectsAsync(Audio.VoiceEffectParams effects, CancellationToken ct = default);
 
         IReadOnlyList<Participant> GetParticipants(Guid channelId);
         Participant FindByUser(Guid userId);

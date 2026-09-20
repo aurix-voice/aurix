@@ -123,6 +123,7 @@ int AurixVoiceClient::connect_to_server(const String& ws_url, const String& toke
         UtilityFunctions::push_error(String("AurixVoiceClient: create failed: ") + String::utf8(aurix::last_error().c_str()));
         return AURIX_INVALID_ARGUMENT;
     }
+    if (visemes_enabled_) client_.set_visemes(true);
     const AurixResult r = client_.connect();
     if (r != AURIX_OK) {
         UtilityFunctions::push_error(String("AurixVoiceClient: connect failed: ") + String::utf8(aurix::last_error().c_str()));
@@ -414,21 +415,48 @@ Dictionary AurixVoiceClient::get_dsp_stats() const {
     return dsp_stats_to_dict(s);
 }
 
-int AurixVoiceClient::set_voice_effects(double pitch_semitones, double ring_mod_hz) {
+int AurixVoiceClient::set_voice_effects(const Dictionary& effects) {
     if (!client_) return AURIX_NOT_CONNECTED;
     AurixVoiceEffects fx{};
-    fx.pitch_semitones = static_cast<float>(pitch_semitones);
-    fx.ring_mod_hz = static_cast<float>(ring_mod_hz);
+    voice_effects_from_dict(effects, fx);
     return client_.set_voice_effects(fx);
 }
 
 Dictionary AurixVoiceClient::get_voice_effects() const {
     AurixVoiceEffects fx{};
-    Dictionary d;
     if (client_) client_.voice_effects(fx);
-    d["pitch_semitones"] = fx.pitch_semitones;
-    d["ring_mod_hz"] = fx.ring_mod_hz;
-    return d;
+    return voice_effects_to_dict(fx);
+}
+
+Dictionary AurixVoiceClient::get_voice_preset(VoicePreset preset) const {
+    return voice_effects_to_dict(aurix::Client::voice_preset(static_cast<AurixVoicePreset>(preset)));
+}
+
+int AurixVoiceClient::set_voice_preset(VoicePreset preset) {
+    if (!client_) return AURIX_NOT_CONNECTED;
+    return client_.set_voice_preset(static_cast<AurixVoicePreset>(preset));
+}
+
+void AurixVoiceClient::set_visemes_enabled(bool enabled) {
+    visemes_enabled_ = enabled;
+    if (client_) client_.set_visemes(enabled);
+}
+
+bool AurixVoiceClient::get_visemes_enabled() const { return visemes_enabled_; }
+
+Dictionary AurixVoiceClient::get_participant_visemes(const String& user_id) const {
+    AurixUuid user;
+    AurixVisemeFrame f;
+    if (!client_ || !uuid_from_string(user_id, user) || !client_.participant_visemes(aurix::Uuid(user), f)) {
+        return Dictionary();
+    }
+    return viseme_frame_to_dict(f);
+}
+
+Dictionary AurixVoiceClient::get_local_visemes() const {
+    AurixVisemeFrame f;
+    if (!client_ || !client_.local_visemes(f)) return Dictionary();
+    return viseme_frame_to_dict(f);
 }
 
 void AurixVoiceClient::reset_capture() { if (client_) client_.reset_capture(); }
@@ -574,6 +602,21 @@ int AurixVoiceClient::set_user_block(const String& user_id, bool blocked) {
     if (!client_) return AURIX_NOT_CONNECTED;
     if (!parse_uuid_arg(user_id, user, "user")) return AURIX_INVALID_ARGUMENT;
     return client_.set_user_block(aurix::Uuid(user), blocked);
+}
+
+int AurixVoiceClient::set_priority(const String& channel_id, const String& user_id, bool priority) {
+    AurixUuid channel;
+    AurixUuid user;
+    if (!client_) return AURIX_NOT_CONNECTED;
+    if (!parse_uuid_arg(channel_id, channel, "channel")) return AURIX_INVALID_ARGUMENT;
+    if (!user_id.is_empty() && !parse_uuid_arg(user_id, user, "user")) return AURIX_INVALID_ARGUMENT;
+    const aurix::Uuid self(user);
+    return client_.set_priority(aurix::Uuid(channel), user_id.is_empty() ? nullptr : &self, priority);
+}
+
+bool AurixVoiceClient::is_ducking_active(const String& channel_id) const {
+    AurixUuid channel;
+    return client_ && uuid_from_string(channel_id, channel) && client_.ducking_active(aurix::Uuid(channel));
 }
 
 int AurixVoiceClient::set_transmission(TransmissionMode mode, const String& channel_id) {
@@ -853,6 +896,12 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     case AURIX_EVENT_PARTICIPANT_SPEAKING:
         emit_signal("participant_speaking", channel, user, ev.flag());
         break;
+    case AURIX_EVENT_PARTICIPANT_PRIORITY_CHANGED:
+        emit_signal("participant_priority_changed", channel, user, ev.flag());
+        break;
+    case AURIX_EVENT_DUCKING_CHANGED:
+        emit_signal("ducking_changed", channel, ev.flag(), ducking_to_dict(ev.ducking()));
+        break;
     case AURIX_EVENT_CHANNEL_ENERGY: {
         Dictionary levels;
         for (const AurixParticipant& p : ev.participants()) levels[uuid_to_string(p.user_id)] = p.energy;
@@ -1010,6 +1059,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_max_events_per_frame"), &AurixVoiceClient::get_max_events_per_frame);
     ClassDB::bind_method(D_METHOD("set_dsp_bypass", "bypass"), &AurixVoiceClient::set_dsp_bypass);
     ClassDB::bind_method(D_METHOD("get_dsp_bypass"), &AurixVoiceClient::get_dsp_bypass);
+    ClassDB::bind_method(D_METHOD("set_visemes_enabled", "enabled"), &AurixVoiceClient::set_visemes_enabled);
+    ClassDB::bind_method(D_METHOD("get_visemes_enabled"), &AurixVoiceClient::get_visemes_enabled);
 
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_reconnect"), "set_auto_reconnect", "get_auto_reconnect");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "reconnect_max_attempts"), "set_reconnect_max_attempts", "get_reconnect_max_attempts");
@@ -1025,6 +1076,7 @@ void AurixVoiceClient::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::INT, "playback_mode", PROPERTY_HINT_ENUM, "Mixed,Per Participant,Per Participant Only"), "set_playback_mode", "get_playback_mode");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "max_events_per_frame"), "set_max_events_per_frame", "get_max_events_per_frame");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dsp_bypass"), "set_dsp_bypass", "get_dsp_bypass");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "visemes_enabled"), "set_visemes_enabled", "get_visemes_enabled");
 
     // lifecycle
     ClassDB::bind_method(D_METHOD("connect_to_server", "ws_url", "token"), &AurixVoiceClient::connect_to_server);
@@ -1073,8 +1125,12 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_dsp", "config"), &AurixVoiceClient::set_dsp);
     ClassDB::bind_method(D_METHOD("get_dsp"), &AurixVoiceClient::get_dsp);
     ClassDB::bind_method(D_METHOD("get_dsp_stats"), &AurixVoiceClient::get_dsp_stats);
-    ClassDB::bind_method(D_METHOD("set_voice_effects", "pitch_semitones", "ring_mod_hz"), &AurixVoiceClient::set_voice_effects);
+    ClassDB::bind_method(D_METHOD("set_voice_effects", "effects"), &AurixVoiceClient::set_voice_effects);
     ClassDB::bind_method(D_METHOD("get_voice_effects"), &AurixVoiceClient::get_voice_effects);
+    ClassDB::bind_method(D_METHOD("get_voice_preset", "preset"), &AurixVoiceClient::get_voice_preset);
+    ClassDB::bind_method(D_METHOD("set_voice_preset", "preset"), &AurixVoiceClient::set_voice_preset);
+    ClassDB::bind_method(D_METHOD("get_participant_visemes", "user_id"), &AurixVoiceClient::get_participant_visemes);
+    ClassDB::bind_method(D_METHOD("get_local_visemes"), &AurixVoiceClient::get_local_visemes);
     ClassDB::bind_method(D_METHOD("reset_capture"), &AurixVoiceClient::reset_capture);
 
     // playback / downlink
@@ -1093,6 +1149,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_participant_mute", "user_id", "channel_id", "muted"), &AurixVoiceClient::set_participant_mute);
     ClassDB::bind_method(D_METHOD("set_participant_volume", "user_id", "volume"), &AurixVoiceClient::set_participant_volume);
     ClassDB::bind_method(D_METHOD("set_user_block", "user_id", "blocked"), &AurixVoiceClient::set_user_block);
+    ClassDB::bind_method(D_METHOD("set_priority", "channel_id", "user_id", "priority"), &AurixVoiceClient::set_priority, DEFVAL(String()), DEFVAL(true));
+    ClassDB::bind_method(D_METHOD("is_ducking_active", "channel_id"), &AurixVoiceClient::is_ducking_active);
     ClassDB::bind_method(D_METHOD("set_transmission", "mode", "channel_id"), &AurixVoiceClient::set_transmission, DEFVAL(String()));
     ClassDB::bind_method(D_METHOD("set_channel_focus", "channel_id"), &AurixVoiceClient::set_channel_focus, DEFVAL(String()));
     ClassDB::bind_method(D_METHOD("set_audio_codec", "codec"), &AurixVoiceClient::set_audio_codec);
@@ -1138,6 +1196,10 @@ void AurixVoiceClient::_bind_methods() {
                           PropertyInfo(Variant::BOOL, "muted"), PropertyInfo(Variant::BOOL, "server_muted")));
     ADD_SIGNAL(MethodInfo("participant_speaking", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
                           PropertyInfo(Variant::BOOL, "speaking")));
+    ADD_SIGNAL(MethodInfo("participant_priority_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
+                          PropertyInfo(Variant::BOOL, "priority")));
+    ADD_SIGNAL(MethodInfo("ducking_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::BOOL, "active"),
+                          PropertyInfo(Variant::DICTIONARY, "ducking")));
     ADD_SIGNAL(MethodInfo("channel_energy", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::DICTIONARY, "levels")));
     ADD_SIGNAL(MethodInfo("local_speaking", PropertyInfo(Variant::BOOL, "speaking")));
     ADD_SIGNAL(MethodInfo("transmission_changed", PropertyInfo(Variant::INT, "mode"), PropertyInfo(Variant::STRING, "channel_id")));
@@ -1240,6 +1302,20 @@ void AurixVoiceClient::_bind_methods() {
     BIND_ENUM_CONSTANT(PLAYBACK_MIXED);
     BIND_ENUM_CONSTANT(PLAYBACK_PER_PARTICIPANT);
     BIND_ENUM_CONSTANT(PLAYBACK_PER_PARTICIPANT_ONLY);
+    BIND_ENUM_CONSTANT(VOICE_PRESET_ROBOT);
+    BIND_ENUM_CONSTANT(VOICE_PRESET_MONSTER);
+    BIND_ENUM_CONSTANT(VOICE_PRESET_RADIO);
+    BIND_ENUM_CONSTANT(VOICE_PRESET_HELIUM);
+    BIND_ENUM_CONSTANT(VOICE_PRESET_GHOST);
+    BIND_ENUM_CONSTANT(VISEME_SILENCE);
+    BIND_ENUM_CONSTANT(VISEME_PP);
+    BIND_ENUM_CONSTANT(VISEME_FF);
+    BIND_ENUM_CONSTANT(VISEME_SS);
+    BIND_ENUM_CONSTANT(VISEME_AA);
+    BIND_ENUM_CONSTANT(VISEME_E);
+    BIND_ENUM_CONSTANT(VISEME_IH);
+    BIND_ENUM_CONSTANT(VISEME_OH);
+    BIND_ENUM_CONSTANT(VISEME_OU);
 }
 
 }  // namespace godot

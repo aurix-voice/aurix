@@ -99,6 +99,18 @@ AurixDownlinkMode FromDownlinkMode(EAurixDownlinkMode M)
 	return M == EAurixDownlinkMode::Mixed ? AURIX_DOWNLINK_MIXED : AURIX_DOWNLINK_STREAMS;
 }
 
+FAurixDucking ToDucking(const AurixDucking& D)
+{
+	FAurixDucking Out;
+	Out.bEnabled = D.enabled;
+	Out.Gain = D.gain;
+	Out.AttackMs = static_cast<int32>(D.attack_ms);
+	Out.ReleaseMs = static_cast<int32>(D.release_ms);
+	Out.HoldMs = static_cast<int32>(D.hold_ms);
+	Out.bModerators = D.moderators;
+	return Out;
+}
+
 FAurixChannelInfo ToChannelInfo(const AurixChannelInfo& I)
 {
 	FAurixChannelInfo Out;
@@ -107,6 +119,73 @@ FAurixChannelInfo ToChannelInfo(const AurixChannelInfo& I)
 	Out.bHiddenListeners = I.hidden_listeners;
 	Out.bTranscription = I.transcription;
 	Out.bSafetyVoice = I.safety_voice;
+	Out.bPriority = I.priority;
+	Out.Ducking = ToDucking(I.ducking);
+	return Out;
+}
+
+AurixVoiceEffects ToRawEffects(const FAurixVoiceEffects& E)
+{
+	AurixVoiceEffects Raw;
+	Raw.highpass_hz = E.HighpassHz;
+	Raw.lowpass_hz = E.LowpassHz;
+	Raw.formant_semitones = E.FormantSemitones;
+	Raw.pitch_semitones = E.PitchSemitones;
+	Raw.ring_mod_hz = E.RingModHz;
+	Raw.distortion_drive = E.DistortionDrive;
+	Raw.tremolo_hz = E.TremoloHz;
+	Raw.tremolo_depth = E.TremoloDepth;
+	Raw.static_level = E.StaticLevel;
+	Raw.reverb_mix = E.ReverbMix;
+	Raw.reverb_size = E.ReverbSize;
+	Raw.reverb_damping = E.ReverbDamping;
+	return Raw;
+}
+
+FAurixVoiceEffects ToEffects(const AurixVoiceEffects& Raw)
+{
+	FAurixVoiceEffects Out;
+	Out.HighpassHz = Raw.highpass_hz;
+	Out.LowpassHz = Raw.lowpass_hz;
+	Out.FormantSemitones = Raw.formant_semitones;
+	Out.PitchSemitones = Raw.pitch_semitones;
+	Out.RingModHz = Raw.ring_mod_hz;
+	Out.DistortionDrive = Raw.distortion_drive;
+	Out.TremoloHz = Raw.tremolo_hz;
+	Out.TremoloDepth = Raw.tremolo_depth;
+	Out.StaticLevel = Raw.static_level;
+	Out.ReverbMix = Raw.reverb_mix;
+	Out.ReverbSize = Raw.reverb_size;
+	Out.ReverbDamping = Raw.reverb_damping;
+	return Out;
+}
+
+AurixVoicePreset ToRawPreset(EAurixVoicePreset P)
+{
+	switch (P)
+	{
+	case EAurixVoicePreset::Monster: return AURIX_VOICE_PRESET_MONSTER;
+	case EAurixVoicePreset::Radio: return AURIX_VOICE_PRESET_RADIO;
+	case EAurixVoicePreset::Helium: return AURIX_VOICE_PRESET_HELIUM;
+	case EAurixVoicePreset::Ghost: return AURIX_VOICE_PRESET_GHOST;
+	case EAurixVoicePreset::Robot:
+	default: return AURIX_VOICE_PRESET_ROBOT;
+	}
+}
+
+FAurixVisemeFrame ToVisemeFrame(const AurixVisemeFrame& F)
+{
+	FAurixVisemeFrame Out;
+	Out.Weights.SetNumUninitialized(AURIX_VISEME_COUNT);
+	for (int32 i = 0; i < AURIX_VISEME_COUNT; ++i)
+	{
+		Out.Weights[i] = F.weights[i];
+	}
+	Out.Dominant = static_cast<EAurixViseme>(static_cast<uint8>(F.dominant));
+	Out.MouthOpen = F.mouth_open;
+	Out.Energy = F.energy;
+	Out.Confidence = F.confidence;
+	Out.Sequence = static_cast<int64>(F.sequence);
 	return Out;
 }
 
@@ -234,6 +313,7 @@ FAurixParticipant ToParticipant(const AurixParticipant& P)
 	Out.bServerMuted = P.server_muted;
 	Out.bSpeaking = P.speaking;
 	Out.Energy = P.energy;
+	Out.bPriority = P.priority;
 	return Out;
 }
 
@@ -902,10 +982,7 @@ bool UAurixVoiceSubsystem::GetDspStats(FAurixDspStats& OutStats) const
 
 bool UAurixVoiceSubsystem::SetVoiceEffects(const FAurixVoiceEffects& Effects)
 {
-	AurixVoiceEffects Raw;
-	Raw.pitch_semitones = Effects.PitchSemitones;
-	Raw.ring_mod_hz = Effects.RingModHz;
-	return Native && Check(Native->Client.set_voice_effects(Raw), TEXT("set_voice_effects"));
+	return Native && Check(Native->Client.set_voice_effects(ToRawEffects(Effects)), TEXT("set_voice_effects"));
 }
 
 bool UAurixVoiceSubsystem::GetVoiceEffects(FAurixVoiceEffects& OutEffects) const
@@ -916,8 +993,51 @@ bool UAurixVoiceSubsystem::GetVoiceEffects(FAurixVoiceEffects& OutEffects) const
 		OutEffects = FAurixVoiceEffects();
 		return false;
 	}
-	OutEffects.PitchSemitones = Raw.pitch_semitones;
-	OutEffects.RingModHz = Raw.ring_mod_hz;
+	OutEffects = ToEffects(Raw);
+	return true;
+}
+
+FAurixVoiceEffects UAurixVoiceSubsystem::MakeVoicePreset(EAurixVoicePreset Preset)
+{
+	return ToEffects(aurix::Client::voice_preset(ToRawPreset(Preset)));
+}
+
+bool UAurixVoiceSubsystem::SetVoicePreset(EAurixVoicePreset Preset)
+{
+	return Native && Check(Native->Client.set_voice_preset(ToRawPreset(Preset)), TEXT("set_voice_preset"));
+}
+
+bool UAurixVoiceSubsystem::SetVisemesEnabled(bool bEnabled)
+{
+	return Native && Check(Native->Client.set_visemes(bEnabled), TEXT("set_visemes"));
+}
+
+bool UAurixVoiceSubsystem::AreVisemesEnabled() const
+{
+	return Native && Native->Client.visemes_enabled();
+}
+
+bool UAurixVoiceSubsystem::GetParticipantVisemes(FGuid UserId, FAurixVisemeFrame& OutFrame) const
+{
+	AurixVisemeFrame Raw;
+	if (!Native || !UserId.IsValid() || !Native->Client.participant_visemes(ToUuid(UserId), Raw))
+	{
+		OutFrame = FAurixVisemeFrame();
+		return false;
+	}
+	OutFrame = ToVisemeFrame(Raw);
+	return true;
+}
+
+bool UAurixVoiceSubsystem::GetLocalVisemes(FAurixVisemeFrame& OutFrame) const
+{
+	AurixVisemeFrame Raw;
+	if (!Native || !Native->Client.local_visemes(Raw))
+	{
+		OutFrame = FAurixVisemeFrame();
+		return false;
+	}
+	OutFrame = ToVisemeFrame(Raw);
 	return true;
 }
 
@@ -1177,6 +1297,21 @@ bool UAurixVoiceSubsystem::SetParticipantVolume(FGuid UserId, float Volume)
 bool UAurixVoiceSubsystem::SetUserBlocked(FGuid UserId, bool bBlocked)
 {
 	return Native && Check(Native->Client.set_user_block(ToUuid(UserId), bBlocked), TEXT("set_user_block"));
+}
+
+bool UAurixVoiceSubsystem::SetPriority(FGuid ChannelId, FGuid UserId, bool bPriority)
+{
+	if (!Native)
+	{
+		return false;
+	}
+	const aurix::Uuid User = ToUuid(UserId);
+	return Check(Native->Client.set_priority(ToUuid(ChannelId), UserId.IsValid() ? &User : nullptr, bPriority), TEXT("set_priority"));
+}
+
+bool UAurixVoiceSubsystem::IsDuckingActive(FGuid ChannelId) const
+{
+	return Native && Native->Client.ducking_active(ToUuid(ChannelId));
 }
 
 bool UAurixVoiceSubsystem::SetTransmission(EAurixTransmissionMode Mode, FGuid ChannelId)
@@ -1629,6 +1764,14 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_PARTICIPANT_SPEAKING:
 		OnParticipantSpeaking.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_PARTICIPANT_PRIORITY_CHANGED:
+		OnParticipantPriorityChanged.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_DUCKING_CHANGED:
+		OnDuckingChanged.Broadcast(ChannelId, aurix_event_flag(Raw), ToDucking(aurix_event_ducking(Raw)));
 		break;
 
 	case AURIX_EVENT_CHANNEL_ENERGY:

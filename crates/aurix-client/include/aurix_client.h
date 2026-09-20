@@ -64,6 +64,36 @@
 #define AURIX_MAX_RING_MOD_HZ 2000.0
 
 /**
+ * Largest built-in formant shift either way, in semitones.
+ */
+#define AURIX_MAX_FORMANT_SEMITONES 12.0
+
+/**
+ * Hardest distortion drive.
+ */
+#define AURIX_MAX_DISTORTION_DRIVE 20.0
+
+/**
+ * Fastest tremolo, in Hz.
+ */
+#define AURIX_MAX_TREMOLO_HZ 20.0
+
+/**
+ * Lowest filter corner, in Hz.
+ */
+#define AURIX_MIN_FILTER_HZ 20.0
+
+/**
+ * Highest filter corner, in Hz.
+ */
+#define AURIX_MAX_FILTER_HZ 20000.0
+
+/**
+ * Number of `AurixViseme` buckets.
+ */
+#define AURIX_VISEME_COUNT 9
+
+/**
  * Capacity of fixed-size URL buffers in this ABI (including the NUL).
  */
 #define AURIX_URL_LEN 512
@@ -362,6 +392,17 @@ typedef enum AurixEventType {
    * `number` = generation of our new sender key (a member joined or left).
    */
   AURIX_EVENT_E2EE_KEY_ROTATED = 43,
+  /**
+   * `channel_id`, `user_id`, `flag` = priority speaker: their speech now ducks (or no
+   * longer ducks) the channel.
+   */
+  AURIX_EVENT_PARTICIPANT_PRIORITY_CHANGED = 44,
+  /**
+   * `channel_id`, `flag` = another member's priority speech started (`true`) / stopped
+   * ducking the channel; `aurix_event_ducking` = the depth and timing to apply to the
+   * game's own music/SFX bus (the voice mix is ducked server-side already).
+   */
+  AURIX_EVENT_DUCKING_CHANGED = 45,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -430,6 +471,48 @@ typedef enum AurixTtsState {
   AURIX_TTS_FAILED = 4,
 } AurixTtsState;
 
+/**
+ * Mouth-shape buckets of `AurixVisemeFrame.weights` (index = value). `PP`/`FF`/`SS` follow
+ * the common lip-sync naming (lips closed, labiodental, sibilant); the rest are vowels.
+ */
+typedef enum AurixViseme {
+  AURIX_VISEME_SILENCE = 0,
+  AURIX_VISEME_PP = 1,
+  AURIX_VISEME_FF = 2,
+  AURIX_VISEME_SS = 3,
+  AURIX_VISEME_AA = 4,
+  AURIX_VISEME_E = 5,
+  AURIX_VISEME_IH = 6,
+  AURIX_VISEME_OH = 7,
+  AURIX_VISEME_OU = 8,
+} AurixViseme;
+
+/**
+ * Ready-made voices for `aurix_voice_effects_preset`.
+ */
+typedef enum AurixVoicePreset {
+  /**
+   * Ring-modulated, band-limited, slightly saturated.
+   */
+  AURIX_VOICE_PRESET_ROBOT = 0,
+  /**
+   * Pitched and formant-shifted down, growly, in a large space.
+   */
+  AURIX_VOICE_PRESET_MONSTER = 1,
+  /**
+   * Telephone band, crunchy, static under the voice.
+   */
+  AURIX_VOICE_PRESET_RADIO = 2,
+  /**
+   * Pitched and formant-shifted up.
+   */
+  AURIX_VOICE_PRESET_HELIUM = 3,
+  /**
+   * Hollow, wavering, drenched in reverb.
+   */
+  AURIX_VOICE_PRESET_GHOST = 4,
+} AurixVoicePreset;
+
 typedef enum AurixRecordingConsent {
   AURIX_CONSENT_ACCEPTED = 0,
   AURIX_CONSENT_DECLINED = 1,
@@ -473,6 +556,16 @@ typedef struct AurixOpusEncoder AurixOpusEncoder;
  * Opaque, mutable list of regions; release with `aurix_regions_free`.
  */
 typedef struct AurixRegionList AurixRegionList;
+
+/**
+ * Opaque standalone lip-sync analyser (see `aurix_viseme_analyzer_create`).
+ */
+typedef struct AurixVisemeAnalyzer AurixVisemeAnalyzer;
+
+/**
+ * Opaque standalone voice-effect chain (see `aurix_voice_effects_create`).
+ */
+typedef struct AurixVoiceEffectsProcessor AurixVoiceEffectsProcessor;
 
 /**
  * 128-bit id (session, channel, user, recording) in RFC 4122 byte order.
@@ -699,6 +792,10 @@ typedef struct AurixParticipant {
    */
   float energy;
   /**
+   * Priority speaker (`ChannelConfig.ducking`).
+   */
+  bool priority;
+  /**
    * UTF-8, NUL-terminated, truncated to fit.
    */
   char display_name[AURIX_NAME_LEN];
@@ -860,6 +957,26 @@ typedef struct AurixChannelScope {
 } AurixChannelScope;
 
 /**
+ * Priority-speaker ducking (`ChannelConfig.ducking`): while a priority speaker talks, every
+ * other stream is attenuated to `gain` with these timings. The same numbers are what a game
+ * should apply to its own music/SFX on `AurixEventDuckingChanged`.
+ */
+typedef struct AurixDucking {
+  bool enabled;
+  /**
+   * Linear gain non-priority audio is attenuated to (`0..=1`).
+   */
+  float gain;
+  uint32_t attack_ms;
+  uint32_t release_ms;
+  uint32_t hold_ms;
+  /**
+   * Moderators / administrators duck too, not only explicit priority grants.
+   */
+  bool moderators;
+} AurixDucking;
+
+/**
  * Membership facts of a joined channel.
  */
 typedef struct AurixChannelInfo {
@@ -883,6 +1000,14 @@ typedef struct AurixChannelInfo {
    * Speech is analysed by the content-safety classifier (disclose it).
    */
   bool safety_voice;
+  /**
+   * This session is a priority speaker here.
+   */
+  bool priority;
+  /**
+   * Priority-speaker ducking the server applies (`enabled == false`: off).
+   */
+  struct AurixDucking ducking;
 } AurixChannelInfo;
 
 /**
@@ -948,9 +1073,55 @@ typedef struct AurixDspStats {
 } AurixDspStats;
 
 /**
- * Built-in voice effects (`aurix_client_set_voice_effects`); zero = that stage is off.
+ * Mouth state derived locally from a participant's (or our own) most recent audio frame.
+ */
+typedef struct AurixVisemeFrame {
+  /**
+   * Smoothed weight per `AurixViseme`, summing to ~1.
+   */
+  float weights[AURIX_VISEME_COUNT];
+  /**
+   * Heaviest bucket.
+   */
+  enum AurixViseme dominant;
+  /**
+   * Jaw openness `0..=1`.
+   */
+  float mouth_open;
+  /**
+   * RMS level of the frame `0..=1`.
+   */
+  float energy;
+  /**
+   * Margin between the top two buckets `0..=1`.
+   */
+  float confidence;
+  /**
+   * Frames analysed so far: unchanged between two reads = no new audio.
+   */
+  uint64_t sequence;
+} AurixVisemeFrame;
+
+/**
+ * Built-in voice effects (`aurix_client_set_voice_effects`); zero = that stage is off, so a
+ * zeroed struct is a bypass. Stages run in field order: filters, formant, pitch, ring
+ * modulator, distortion, tremolo, static, reverb, then the host callback. Start from a
+ * preset with `aurix_voice_effects_preset`.
  */
 typedef struct AurixVoiceEffects {
+  /**
+   * High-pass corner in Hz (`AURIX_MIN_FILTER_HZ..=AURIX_MAX_FILTER_HZ`, 0 = off).
+   */
+  float highpass_hz;
+  /**
+   * Low-pass corner in Hz (0 = off).
+   */
+  float lowpass_hz;
+  /**
+   * Formant (vocal-tract) shift in semitones, pitch unchanged, clamped to
+   * ±`AURIX_MAX_FORMANT_SEMITONES`. Adds ~43 ms of latency while non-zero.
+   */
+  float formant_semitones;
   /**
    * Pitch shift in semitones, clamped to ±`AURIX_MAX_PITCH_SEMITONES`.
    */
@@ -959,6 +1130,34 @@ typedef struct AurixVoiceEffects {
    * Ring-modulator ("robot") carrier in Hz, clamped to `0..=AURIX_MAX_RING_MOD_HZ`.
    */
   float ring_mod_hz;
+  /**
+   * Saturation drive (`1..=AURIX_MAX_DISTORTION_DRIVE`, 0 = off).
+   */
+  float distortion_drive;
+  /**
+   * Tremolo rate in Hz (`0..=AURIX_MAX_TREMOLO_HZ`, 0 = off).
+   */
+  float tremolo_hz;
+  /**
+   * Tremolo depth `0..=1`.
+   */
+  float tremolo_depth;
+  /**
+   * Static / hiss level `0..=1`, gated by the voice (silence stays silent).
+   */
+  float static_level;
+  /**
+   * Reverb wet mix `0..=1` (0 = off).
+   */
+  float reverb_mix;
+  /**
+   * Reverb room size `0..=1`.
+   */
+  float reverb_size;
+  /**
+   * Reverb high-frequency damping `0..=1`.
+   */
+  float reverb_damping;
 } AurixVoiceEffects;
 
 /**
@@ -1148,6 +1347,12 @@ typedef struct AurixRegionEndpoint {
    */
   bool probe_failed;
 } AurixRegionEndpoint;
+
+
+
+
+
+
 
 
 
@@ -1468,6 +1673,17 @@ bool aurix_client_channel_info(const struct AurixClient *client,
 struct AurixChannelInfo aurix_event_channel_info(const struct AurixEvent *event);
 
 /**
+ * `DuckingChanged` only: the channel's ducking depth and timings (disabled for other events).
+ */
+struct AurixDucking aurix_event_ducking(const struct AurixEvent *event);
+
+/**
+ * Whether another member's priority speech is ducking `channel_id` right now.
+ */
+bool aurix_client_ducking_active(const struct AurixClient *client,
+                                 const struct AurixUuid *channel_id);
+
+/**
  * `ChannelJoined` only: the channel's presence / text range (zeros for other events).
  */
 struct AurixChannelScope aurix_event_channel_scope(const struct AurixEvent *event);
@@ -1630,12 +1846,49 @@ enum AurixResult aurix_client_dsp_stats(const struct AurixClient *client,
                                         struct AurixDspStats *out);
 
 /**
+ * Analyse decoded participant audio and our own outgoing voice for lip-sync (off by
+ * default; one small FFT per stream per 20 ms when on). Purely local: no audio or mouth
+ * data leaves the machine, and E2EE channels work because frames are decrypted here. Read
+ * with `aurix_client_participant_visemes` / `aurix_client_local_visemes` every render tick.
+ */
+enum AurixResult aurix_client_set_visemes(struct AurixClient *client, bool enabled);
+
+bool aurix_client_visemes_enabled(const struct AurixClient *client);
+
+/**
+ * Mouth state of `user_id` from the audio most recently played for them (voice or their
+ * TTS). `false` (and `out` untouched) with analysis off or for a participant whose audio
+ * is not decoded here (unknown, or only inside the server mix).
+ */
+bool aurix_client_participant_visemes(const struct AurixClient *client,
+                                      const struct AurixUuid *user_id,
+                                      struct AurixVisemeFrame *out);
+
+/**
+ * Mouth state of our own voice as sent (after DSP, gain and effects); `false` with analysis
+ * off. Frozen while nothing is captured — watch `sequence`.
+ */
+bool aurix_client_local_visemes(const struct AurixClient *client, struct AurixVisemeFrame *out);
+
+/**
  * Built-in voice effects on the microphone (after the DSP and input gain, before VAD and
  * encoding; injected audio and the downlink are untouched). `NULL` or all-zero = off.
  * Read back (clamped) with `aurix_client_voice_effects`. Runs before the host callback.
  */
 enum AurixResult aurix_client_set_voice_effects(struct AurixClient *client,
                                                 const struct AurixVoiceEffects *effects);
+
+/**
+ * The parameters of a built-in preset (a starting point: tweak and pass to
+ * `aurix_client_set_voice_effects`). Unknown `preset` values yield the bypass.
+ */
+struct AurixVoiceEffects aurix_voice_effects_preset(enum AurixVoicePreset preset);
+
+/**
+ * Apply a preset directly (`aurix_voice_effects_preset` + `aurix_client_set_voice_effects`).
+ */
+enum AurixResult aurix_client_set_voice_preset(struct AurixClient *client,
+                                               enum AurixVoicePreset preset);
 
 enum AurixResult aurix_client_voice_effects(const struct AurixClient *client,
                                             struct AurixVoiceEffects *out);
@@ -1728,6 +1981,16 @@ enum AurixResult aurix_client_set_participant_volume(struct AurixClient *client,
 enum AurixResult aurix_client_set_user_block(struct AurixClient *client,
                                              const struct AurixUuid *user_id,
                                              bool blocked);
+
+/**
+ * Make `user_id` (ourselves when `NULL`) a priority speaker of `channel_id`, or revoke it.
+ * Others need a moderator role; our own flag can be raised with a `priority` grant and
+ * always lowered. Everyone learns the outcome through `ParticipantPriorityChanged`.
+ */
+enum AurixResult aurix_client_set_priority(struct AurixClient *client,
+                                           const struct AurixUuid *channel_id,
+                                           const struct AurixUuid *user_id,
+                                           bool priority);
 
 /**
  * Which joined channels receive the microphone. `channel_id` is required for `Single`.
@@ -2048,6 +2311,76 @@ void aurix_dsp_push_render_f32(const struct AurixDsp *dsp,
                                const float *pcm,
                                size_t sample_count,
                                uint8_t channels);
+
+/**
+ * Create a standalone effect chain from `effects` (NULL or all-zero = bypass, which passes
+ * audio through untouched).
+ */
+struct AurixVoiceEffectsProcessor *aurix_voice_effects_create(const struct AurixVoiceEffects *effects);
+
+void aurix_voice_effects_destroy(struct AurixVoiceEffectsProcessor *processor);
+
+/**
+ * Replace the parameters (clamped; read back with `aurix_voice_effects_get`). Rebuilds the
+ * stages, so any tails (reverb, pitch buffers) restart. Not thread-safe against
+ * `aurix_voice_effects_process_f32`.
+ */
+enum AurixResult aurix_voice_effects_set(struct AurixVoiceEffectsProcessor *processor,
+                                         const struct AurixVoiceEffects *effects);
+
+enum AurixResult aurix_voice_effects_get(const struct AurixVoiceEffectsProcessor *processor,
+                                         struct AurixVoiceEffects *out);
+
+/**
+ * True when every stage is off (processing is a no-op).
+ */
+bool aurix_voice_effects_is_bypass(const struct AurixVoiceEffectsProcessor *processor);
+
+/**
+ * Process `sample_count` interleaved 48 kHz samples (`channels` 1 or 2) in place; the chain
+ * is stateful, so feed consecutive frames of one stream. `sample_count` must be a non-zero
+ * multiple of `channels`. Not thread-safe against itself or `aurix_voice_effects_set`.
+ */
+enum AurixResult aurix_voice_effects_process_f32(struct AurixVoiceEffectsProcessor *processor,
+                                                 float *pcm,
+                                                 size_t sample_count,
+                                                 uint8_t channels);
+
+/**
+ * Clear the stages' internal state (tails, phases) without changing parameters — call on
+ * a stream discontinuity such as a device switch.
+ */
+void aurix_voice_effects_reset(struct AurixVoiceEffectsProcessor *processor);
+
+/**
+ * Create a standalone lip-sync analyser for one audio stream (one per participant, one for
+ * the local microphone).
+ */
+struct AurixVisemeAnalyzer *aurix_viseme_analyzer_create(void);
+
+void aurix_viseme_analyzer_destroy(struct AurixVisemeAnalyzer *analyzer);
+
+/**
+ * Analyse one 20 ms frame of interleaved 48 kHz PCM (`sample_count` total samples across
+ * `channels`, downmixed to mono; shorter frames are zero-padded, longer ones truncated to
+ * `AURIX_FRAME_SAMPLES` per channel). Not thread-safe against itself.
+ */
+enum AurixResult aurix_viseme_analyzer_push_f32(struct AurixVisemeAnalyzer *analyzer,
+                                                const float *pcm,
+                                                size_t sample_count,
+                                                uint8_t channels);
+
+/**
+ * The smoothed mouth state after the last pushed frame (`sequence` counts pushes).
+ */
+enum AurixResult aurix_viseme_analyzer_frame(const struct AurixVisemeAnalyzer *analyzer,
+                                             struct AurixVisemeFrame *out);
+
+/**
+ * Back to silence (keeps `sequence` so readers still see a change) — call when the stream
+ * stops or switches to another speaker.
+ */
+void aurix_viseme_analyzer_reset(struct AurixVisemeAnalyzer *analyzer);
 
 #ifdef __cplusplus
 }  // extern "C"

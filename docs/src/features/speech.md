@@ -164,15 +164,74 @@ back to the original. `aurix_translations_total{outcome="ok"|"cached"|"error"|"b
 and `aurix_translation_latency_seconds` count it all. Provider keys stay on the node; translated
 text is as ephemeral as the transcripts it comes from.
 
-## Voice effects (native SDK)
+## Voice effects
 
-The native core (and thus Unreal) can run a chain of **voice effects** on the microphone uplink,
-after noise suppression / AEC / AGC and input gain and before the VAD meter and the encoder, so
-what peers hear, the level bars and the transcripts all reflect the effected voice. Built in:
-`PitchShift` (±24 semitones), `RingModulator` (robot voice, up to 2 kHz) and `CallbackEffect`
-for the host's own DSP (`aurix_client_set_voice_effect_callback`: called on the capture thread
-with a 20 ms 48 kHz frame, mono or interleaved stereo — no blocking, no allocation). Effects
-touch only the microphone: injected audio, TTS and the downlink are untouched, and the mono /
-stereo / PCMU paths all see the processed frame. Rust `Client::set_voice_effects(EffectChain)`,
-C `aurix_client_set_voice_effects(&AurixVoiceEffects)`, Unreal `SetVoiceEffects`. Unity and the
-Web SDK run the engine's / browser's own audio graph and have no effect chain.
+Every SDK can run the same library of **voice effects** on the microphone uplink — after noise
+suppression / AEC / AGC and the input gain, before the VAD meter, the viseme analyser and the
+encoder — so what peers hear, the level bars, the transcripts and the recordings all reflect
+the effected voice, and the server never sees the raw one. Effects touch only the microphone:
+injected audio, TTS, translations and the downlink are untouched, and the mono, stereo and
+PCMU paths all see the processed frame.
+
+The chain, in order, with one parameter set (`VoiceEffectParams` / `AurixVoiceEffects`;
+`0` = stage off, everything clamped):
+
+| Stage | Parameters | Range |
+| --- | --- | --- |
+| high-pass / low-pass filters | `highpass_hz`, `lowpass_hz` | 20–20 000 Hz |
+| formant shift (vocal-tract size, pitch kept) | `formant_semitones` | ±12 |
+| pitch shift | `pitch_semitones` | ±24 |
+| ring modulation (robot) | `ring_mod_hz` | ≤ 2 000 Hz |
+| distortion (soft clip) | `distortion_drive` | ≤ 20 |
+| tremolo | `tremolo_hz`, `tremolo_depth` | ≤ 20 Hz, 0–1 |
+| radio static | `static_level` | 0–1 |
+| reverb | `reverb_mix`, `reverb_size`, `reverb_damping` | 0–1 each |
+
+Presets — `robot`, `monster`, `radio`, `helium`, `ghost` — are fixed parameter sets you can
+start from and tweak (`aurix_voice_effects_preset`, `voiceEffectPreset()`,
+`VoiceEffectParams.Preset()`). Where it runs:
+
+* **Native core** (Rust, C ABI, Unreal, Godot): `Client::set_voice_effects`,
+  `aurix_client_set_voice_effects(&AurixVoiceEffects)`, `SetVoiceEffects`,
+  `set_voice_effects(Dictionary)`; the host may still append its own stage with
+  `aurix_client_set_voice_effect_callback` (capture thread, 20 ms 48 kHz frame — no
+  blocking, no allocation). The processor is also exposed stand-alone
+  (`aurix_voice_effects_create/process_f32`) for engines that own their capture.
+* **Unity (native players)**: the C# SDK drives that stand-alone processor on its own
+  capture path (`SetVoiceEffectsAsync`, the `VoiceEffect` field of `AurixVoiceBehaviour`);
+  it is available wherever the native library ships (Windows, macOS, Linux, Android, iOS).
+* **Browsers and Unity WebGL**: a pure-TypeScript port of the same chain runs in an
+  `AudioWorklet` between the microphone and the encoder (`setVoiceEffects`,
+  `AurixWebGLVoiceBehaviour.VoiceEffect`); it needs Web Audio worklets and reports
+  `supportsVoiceEffects() == false` otherwise.
+
+## Visemes (lip-sync)
+
+Lip-sync is computed **on the receiver, from audio it plays anyway**: every decoded 20 ms frame
+of a participant — and, for the local avatar, of your own processed microphone — is reduced to
+a `VisemeFrame`: a weight per mouth-shape bucket (`sil PP FF SS aa E ih oh ou`, the
+conventional lip-sync set: bilabial closure, labiodental, sibilant and five vowels), the
+`dominant` bucket, `mouth_open` (0–1 from level), `energy`, `confidence` and a `sequence`
+that advances per analysed frame. Nothing is sent to the server, no phoneme data crosses the
+wire, and it works in E2EE channels because the analysis runs after decryption. The analysis
+sees the audio *before* the receiver's volume, mute, panning and positional attenuation, so a
+far-away or turned-down speaker still moves their mouth.
+
+It is a signal-processing heuristic, not a phoneme recogniser: a spectrum per frame gives the
+level, a voiced / fricative split and the first two formants, the vowels are the nearest of
+five formant centroids, and the weights are smoothed (fast attack, slower release) so the mouth
+does not flicker. Expect convincing openness and vowel motion, not text-accurate articulation.
+
+* **Native core** (Rust, C ABI, Unreal, Godot): `Client::set_visemes(true)` /
+  `aurix_client_set_visemes` / `SetVisemesEnabled` / `set_visemes_enabled` switches the
+  analysis on for every heard stream and the microphone; poll `participant_visemes(user_id)`
+  and `local_visemes()` each render frame (`aurix_client_participant_visemes`,
+  `GetParticipantVisemes`, `get_participant_visemes`). A stand-alone analyser
+  (`aurix_viseme_analyzer_create/push_f32/frame`) serves engines that decode elsewhere.
+* **Unity (native players)**: `SetVisemesAsync`, `GetParticipantVisemes`, `GetLocalVisemes`
+  on the client and the `AurixLipSync` component, which smooths frames and drives blend
+  shapes (or `OnFrame` for custom rigs) for one participant or the local microphone.
+* **Browsers and Unity WebGL**: the same analysis in a worklet on each dedicated
+  per-participant track and on the microphone (`setVisemes(true)`, `participantVisemes` /
+  `localVisemes` events); participants heard only through the mixed track cannot be
+  separated and get no frames.

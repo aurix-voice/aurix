@@ -21,7 +21,9 @@ where they differ.
 | Text chat lite | yes | yes | yes | yes | yes |
 | Transcripts / TTS | yes | yes | yes | yes | yes |
 | Live translation (`setTranslation`, `original` on transcripts, private translated speech) | yes | yes (native + WebGL) | yes | yes | yes |
-| Voice effects on the uplink | browser audio graph (bring your own) | Unity audio graph (bring your own) | `EffectChain` (pitch, ring mod, callback) | `SetVoiceEffects` / callback | `set_voice_effects` (pitch, ring mod) |
+| Voice effects on the uplink (same library: filters, formant, pitch, ring mod, distortion, tremolo, static, reverb; 5 presets) | `setVoiceEffects` — `AudioWorklet` port | `SetVoiceEffectsAsync` — native library; WebGL: as Web | `VoiceEffectParams::chain()` / `EffectPreset` + `CallbackEffect` | `SetVoiceEffects` / `MakeVoicePreset` / callback | `set_voice_effects` |
+| Lip-sync visemes (local analysis of decoded audio) | `setVisemes`, dedicated tracks only | `SetVisemesAsync`, `AurixLipSync`; WebGL: as Web | `set_visemes`, `participant_visemes` / `local_visemes` | `SetVisemesEnabled`, `GetParticipantVisemes` | `set_visemes_enabled`, `get_participant_visemes` |
+| Priority speakers / ducking | `setPriority`, `duckingChanged` (SDK ducks its own tracks) | `SetPriorityAsync`, `OnDuckingChanged`, `AurixGameAudioDucker` | `set_priority`, `Event::DuckingChanged` | `SetPriority`, `OnDuckingChanged` | `set_priority`, `ducking_changed` |
 | Stats / quality bars | `getStats()` | `GetStats()` | `aurix_client_stats` | `GetStats` | `get_stats` / `network_quality` signal |
 | Devices / input gain / speaker mute | yes | yes | host-provided capture | engine `AudioCapture` | `AudioStreamMicrophone` + `AudioEffectCapture` |
 | Action tokens (`refreshToken`/`joinToken`) | yes | yes | yes | yes | yes |

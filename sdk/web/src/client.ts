@@ -9,6 +9,7 @@ import {
   type ChatMessageWire,
   type ChatReadMarkerWire,
   type ClientMessage,
+  type DuckingConfigWire,
   type JsonValue,
   type LocalMute,
   type ModerationAction,
@@ -50,6 +51,7 @@ import {
   createAudioContext,
   renderParams,
   type RenderInputs,
+  type DuckParams,
   type SpatialAudioContextLike,
 } from './spatial.js';
 import {
@@ -61,6 +63,20 @@ import {
   type AudioInjectionOptions,
   type AudioInjectionSource,
 } from './devices.js';
+import {
+  VOICE_EFFECTS_BYPASS,
+  createVoiceEffectsNode,
+  isVoiceEffectsBypass,
+  loadVoiceEffectsWorklet,
+  sanitizeVoiceEffects,
+  supportsVoiceEffects,
+  voiceEffectPreset,
+  type ResolvedVoiceEffectParams,
+  type VoiceEffectParams,
+  type VoiceEffectPreset,
+  type VoiceEffectsWorkletMessage,
+} from './effects.js';
+import { createVisemeNode, loadVisemeWorklet, supportsVisemes, type VisemeFrame } from './visemes.js';
 import {
   LossWindow,
   RttTracker,
@@ -172,6 +188,14 @@ export interface AurixClientOptions {
   spatialAudio?: boolean | 'equalpower';
   /** Use this `AudioContext` for participant tracks instead of creating one. */
   audioContext?: AudioContext;
+  /**
+   * Start with local lip-sync analysis on (see {@link AurixClient.setVisemes}): a
+   * `VisemeFrame` per 20 ms for every participant with a dedicated track and for our own
+   * microphone. Analysed here, after decryption; nothing is sent.
+   */
+  visemes?: boolean;
+  /** Voice effects on the microphone from the start (a preset name or parameters). */
+  voiceEffects?: VoiceEffectParams | VoiceEffectPreset;
   /**
    * Group end-to-end encryption (`e2ee.ts`). `true` (default): announce the capability when
    * the browser has WebCrypto and an encoded-frame API, so channels created with
@@ -293,6 +317,8 @@ export interface Participant {
   speaking: boolean;
   /** Last server-reported audio energy 0..1 (`0` when silent). */
   energy: number;
+  /** Priority speaker: their speech ducks the other voices (see {@link ChannelInfo.ducking}). */
+  priority: boolean;
 }
 
 /**
@@ -328,20 +354,78 @@ export interface ChannelInfo {
   transcription: boolean;
   /** Speech is monitored by content safety (same as {@link AurixClient.isChannelMonitored}). */
   safetyVoice: boolean;
+  /**
+   * Priority-speaker ducking of the channel (`ChannelConfig.ducking`); `undefined` = off. The
+   * server applies it to what it mixes, the SDK reproduces it on per-participant tracks and
+   * exposes it to game audio through {@link AurixEvents.duckingChanged}.
+   */
+  ducking?: DuckingConfig;
+  /** You are a priority speaker here (from the grant, or promoted at runtime). */
+  priority: boolean;
+}
+
+/** Priority-speaker ducking parameters; see {@link ChannelInfo.ducking}. */
+export interface DuckingConfig {
+  /** Gain of non-priority voices while a priority speaker talks (`0` = silenced). */
+  gain: number;
+  attackMs: number;
+  releaseMs: number;
+  /** Ducking persists this long past the priority speaker's last audible frame. */
+  holdMs: number;
+  /** Moderators and administrators duck the channel as well. */
+  moderators: boolean;
+}
+
+/** `DuckingConfig` defaults of the server, reported when a channel's config is already gone. */
+export const DEFAULT_DUCKING: DuckingConfig = Object.freeze({
+  gain: 0.25,
+  attackMs: 60,
+  releaseMs: 400,
+  holdMs: 250,
+  moderators: false,
+});
+
+function resolveVoiceEffects(effects: VoiceEffectParams | VoiceEffectPreset | undefined): ResolvedVoiceEffectParams {
+  if (effects === undefined) return VOICE_EFFECTS_BYPASS;
+  if (typeof effects === 'string') return voiceEffectPreset(effects);
+  return sanitizeVoiceEffects(effects);
+}
+
+/** The renderer's context when it is a real `BaseAudioContext` with worklet support. */
+function workletContext(ctx: SpatialAudioContextLike): BaseAudioContext | undefined {
+  const candidate = ctx as unknown as { audioWorklet?: unknown };
+  return typeof candidate.audioWorklet === 'object' && candidate.audioWorklet !== null
+    ? (ctx as unknown as BaseAudioContext)
+    : undefined;
+}
+
+export function parseDucking(d: DuckingConfigWire | null | undefined): DuckingConfig | undefined {
+  if (!d) return undefined;
+  return {
+    gain: Math.min(1, Math.max(0, typeof d.gain === 'number' ? d.gain : 0.25)),
+    attackMs: typeof d.attack_ms === 'number' ? d.attack_ms : 60,
+    releaseMs: typeof d.release_ms === 'number' ? d.release_ms : 400,
+    holdMs: typeof d.hold_ms === 'number' ? d.hold_ms : 250,
+    moderators: d.moderators === true,
+  };
 }
 
 /** `ChannelJoinAck` → {@link ChannelInfo}, filling the defaults older servers imply. */
 export function channelInfoFromJoinAck(
   d: Extract<ServerMessage, { type: 'ChannelJoinAck' }>['data'],
 ): ChannelInfo {
-  return {
+  const info: ChannelInfo = {
     role: d.role ?? 'speaker',
     participantCount:
       typeof d.participant_count === 'number' ? d.participant_count : d.participants.length,
     hiddenListeners: d.hidden_listeners === true,
     transcription: d.transcription === true,
     safetyVoice: d.safety_voice === true,
+    priority: d.priority === true,
   };
+  const ducking = parseDucking(d.ducking);
+  if (ducking) info.ducking = ducking;
+  return info;
 }
 
 /** A text-chat message; see {@link AurixEvents.chatMessage}. */
@@ -564,6 +648,25 @@ export interface AurixEvents {
   receiverPreferences: (prefs: ReceiverPreferences) => void;
   /** A cross-mute placed or lifted by this user (from this or any other device/REST). */
   userBlockChanged: (userId: string, blocked: boolean) => void;
+  /**
+   * A member's priority-speaker state changed — including this user's (the ack of
+   * `setPriority`, or a moderator's grant). `Participant.priority` / `ChannelInfo.priority`
+   * are updated before the event fires.
+   */
+  participantPriorityChanged: (channelId: string, userId: string, priority: boolean) => void;
+  /**
+   * Game-audio ducking hook: another member's priority speech started (`true`) or stopped
+   * (`false`, after the channel's `holdMs`) ducking `channelId`. Fires on transitions only;
+   * `config` is the channel's ducking so the game can match the ramps on its own mix.
+   */
+  duckingChanged: (channelId: string, active: boolean, config: DuckingConfig) => void;
+  /**
+   * Lip-sync frame for a participant's dedicated track (every 20 ms while visemes are on and
+   * the participant holds a track; see {@link AurixClient.setVisemes}).
+   */
+  participantVisemes: (userId: string, frame: VisemeFrame) => void;
+  /** Lip-sync frame for our own processed microphone (every 20 ms while visemes are on). */
+  localVisemes: (frame: VisemeFrame) => void;
   /**
    * The server acknowledged a new transmission policy — after `setTransmission`, or reset to
    * `none` because the single target channel was left.
@@ -830,6 +933,18 @@ export class AurixClient {
   private unfocusedGain = DEFAULT_UNFOCUSED_GAIN;
   private pinnedParticipants: string[] = [];
   private renderer: SpatialRenderer | undefined;
+  private visemesEnabledValue = false;
+  /** mid → viseme analyser tapped off that track's decoded audio. */
+  private visemeTaps = new Map<string, AudioWorkletNode>();
+  /** mid → participant the tap's smoothing history belongs to (reset when the track is reassigned). */
+  private visemeTapUsers = new Map<string, string | undefined>();
+  /** user id → latest lip-sync frame from their track. */
+  private participantVisemeFrames = new Map<string, VisemeFrame>();
+  private localVisemeTap: AudioWorkletNode | undefined;
+  private localVisemeFrame: VisemeFrame | undefined;
+  private voiceEffectsValue: ResolvedVoiceEffectParams = VOICE_EFFECTS_BYPASS;
+  private effectsNode: AudioWorkletNode | undefined;
+  private effectsTask: Promise<void> = Promise.resolve();
   /** channel id → positional model of a positional channel (`ChannelJoinAck.positional`). */
   private channelPositional = new Map<string, PositionalConfigWire>();
   /** channel id → user id → last known position (ours from `updatePosition`, theirs from `PositionUpdate`). */
@@ -867,6 +982,10 @@ export class AurixClient {
   private channelInfos = new Map<string, ChannelInfo>();
   /** channel id → its audio policy (from `ChannelJoinAck.audio` / `ChannelAudioPolicy`). */
   private channelPolicies = new Map<string, AudioPolicy>();
+  /** Channels a priority member is currently ducking (`duckingChanged` fired `true`). */
+  private duckedChannels = new Set<string>();
+  /** channel id → timer running the `holdMs` before ducking is released. */
+  private duckHolds = new Map<string, ReturnType<typeof setTimeout>>();
   /** Merge of `channelPolicies`; kept after the last channel is left. */
   private audioPolicyValue: AudioPolicy | undefined;
   /** Last server `BitrateCommand` (bit/s); cleared when the policy or options change. */
@@ -930,6 +1049,8 @@ export class AurixClient {
     this.userId = decodeJwtSubject(options.token);
     if (options.inputGain !== undefined) this.inputGainValue = checkInputGain(options.inputGain);
     this.inputDeviceIdValue = options.inputDeviceId;
+    this.visemesEnabledValue = options.visemes === true;
+    if (options.voiceEffects !== undefined) this.voiceEffectsValue = resolveVoiceEffects(options.voiceEffects);
   }
 
   // ── Events ──
@@ -1466,6 +1587,206 @@ export class AurixClient {
     return this.inputPipeline?.injecting ?? false;
   }
 
+  // ── Voice effects (uplink) ──
+
+  /** Whether this browser can run the effects worklet (`AudioWorklet` + `blob:` modules). */
+  static supportsVoiceEffects(): boolean {
+    return supportsVoiceEffects();
+  }
+
+  /**
+   * Voice effects on the outgoing microphone: a preset (`robot`, `monster`, `radio`,
+   * `helium`, `ghost`), explicit {@link VoiceEffectParams}, or `undefined` / all-zero for
+   * bypass. Runs in an `AudioWorklet` on the microphone path only — injected audio and the
+   * downlink are untouched — after the input gain and before the encoder, so the server and
+   * the other participants only ever hear the effected voice. Applied to the current
+   * microphone at once and to every later one; rejects when Web Audio / worklets are missing.
+   */
+  async setVoiceEffects(effects: VoiceEffectParams | VoiceEffectPreset | undefined): Promise<void> {
+    const resolved = resolveVoiceEffects(effects);
+    this.voiceEffectsValue = resolved;
+    if (!this.localStream) return;
+    if (isVoiceEffectsBypass(resolved) && !this.effectsNode) return;
+    if (!supportsVoiceEffects()) throw new Error('AudioWorklet is unavailable: voice effects are not supported here');
+    this.ensureInputPipeline(this.localStream);
+    await this.applyVoiceEffects();
+  }
+
+  /** Effects currently applied to the microphone (all zero = bypass). */
+  get voiceEffects(): ResolvedVoiceEffectParams {
+    return { ...this.voiceEffectsValue };
+  }
+
+  // ── Visemes (lip-sync) ──
+
+  /** Whether this browser can run the viseme worklet. */
+  static supportsVisemes(): boolean {
+    return supportsVisemes();
+  }
+
+  /**
+   * Turn local lip-sync analysis on or off. On: every participant with a dedicated track
+   * (per-participant streams + Web Audio rendering; the mixed track cannot be split) and our
+   * own processed microphone get a {@link VisemeFrame} per 20 ms — `participantVisemes` /
+   * `localVisemes` events plus {@link getParticipantVisemes} / {@link getLocalVisemes}.
+   * The analysis runs here on decoded (decrypted) audio; no phoneme data leaves the browser.
+   * Rejects when Web Audio / worklets are missing.
+   */
+  async setVisemes(enabled: boolean): Promise<void> {
+    if (enabled && !supportsVisemes()) throw new Error('AudioWorklet is unavailable: visemes are not supported here');
+    this.visemesEnabledValue = enabled;
+    if (!enabled) {
+      this.detachAllVisemeTaps();
+      return;
+    }
+    if (this.localStream) this.ensureInputPipeline(this.localStream);
+    await this.syncVisemeTaps();
+  }
+
+  get visemesEnabled(): boolean {
+    return this.visemesEnabledValue;
+  }
+
+  /** Latest lip-sync frame of `userId` (`undefined` without visemes or a dedicated track for them). */
+  getParticipantVisemes(userId: string): VisemeFrame | undefined {
+    return this.participantVisemeFrames.get(userId);
+  }
+
+  /** Latest lip-sync frame of our own microphone (`undefined` before any audio was analysed). */
+  getLocalVisemes(): VisemeFrame | undefined {
+    return this.localVisemeFrame;
+  }
+
+  /** Whether gain, effects or visemes need the microphone routed through Web Audio. */
+  private needsInputPipeline(): boolean {
+    return this.inputGainValue !== 1 || !isVoiceEffectsBypass(this.voiceEffectsValue) || this.visemesEnabledValue;
+  }
+
+  /** (Re)attach effects and the local viseme tap to the current input pipeline. */
+  private syncMicrophoneWorklets(): void {
+    if (!this.inputPipeline) return;
+    if (!isVoiceEffectsBypass(this.voiceEffectsValue) || this.effectsNode) {
+      void this.applyVoiceEffects().catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      });
+    }
+    if (this.visemesEnabledValue) {
+      void this.syncVisemeTaps().catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      });
+    }
+  }
+
+  /** Serialised: loading the worklet is async and two callers must not both create a node. */
+  private applyVoiceEffects(): Promise<void> {
+    const run = (): Promise<void> => this.applyVoiceEffectsNow();
+    this.effectsTask = this.effectsTask.then(run, run);
+    return this.effectsTask;
+  }
+
+  private async applyVoiceEffectsNow(): Promise<void> {
+    const pipeline = this.inputPipeline;
+    const ctx = pipeline?.audioContext;
+    if (!pipeline || !ctx) return;
+    const params = this.voiceEffectsValue;
+    if (isVoiceEffectsBypass(params)) {
+      if (this.effectsNode) {
+        pipeline.setEffects(undefined);
+        this.effectsNode.port.close();
+        this.effectsNode = undefined;
+      }
+      return;
+    }
+    if (this.effectsNode && pipeline.hasEffects) {
+      const msg: VoiceEffectsWorkletMessage = { type: 'params', params };
+      this.effectsNode.port.postMessage(msg);
+      return;
+    }
+    await loadVoiceEffectsWorklet(ctx);
+    if (this.inputPipeline !== pipeline) return;
+    // Parameters may have changed while the module loaded.
+    const node = createVoiceEffectsNode(ctx, this.voiceEffectsValue);
+    this.effectsNode = node;
+    pipeline.setEffects(node);
+  }
+
+  /** Attach viseme taps to every participant track and the microphone that lack one. */
+  private async syncVisemeTaps(): Promise<void> {
+    if (!this.visemesEnabledValue) return;
+    const pipeline = this.inputPipeline;
+    const micCtx = pipeline?.audioContext;
+    if (pipeline && micCtx && !this.localVisemeTap) {
+      await loadVisemeWorklet(micCtx);
+      if (this.visemesEnabledValue && this.inputPipeline === pipeline && !this.localVisemeTap) {
+        const tap = createVisemeNode(micCtx, (frame) => {
+          this.localVisemeFrame = frame;
+          this.emit('localVisemes', frame);
+        });
+        this.localVisemeTap = tap;
+        pipeline.addTap(tap);
+      }
+    }
+    const renderer = this.renderer;
+    const ctx = renderer ? workletContext(renderer.context) : undefined;
+    if (!renderer || !ctx) return;
+    await loadVisemeWorklet(ctx);
+    if (!this.visemesEnabledValue || this.renderer !== renderer) return;
+    for (const mid of this.participantTracks.keys()) this.attachVisemeTap(mid);
+  }
+
+  private attachVisemeTap(mid: string): void {
+    const renderer = this.renderer;
+    if (!renderer || this.visemeTaps.has(mid)) return;
+    const ctx = workletContext(renderer.context);
+    if (!ctx) return;
+    const tap = createVisemeNode(ctx, (frame) => {
+      const userId = this.participantLayout.get(mid);
+      if (userId === undefined || this.visemeTaps.get(mid) !== tap) return;
+      this.participantVisemeFrames.set(userId, frame);
+      this.emit('participantVisemes', userId, frame);
+    });
+    if (!renderer.addTap(mid, tap)) {
+      tap.port.close();
+      return;
+    }
+    this.visemeTaps.set(mid, tap);
+    this.visemeTapUsers.set(mid, this.participantLayout.get(mid));
+  }
+
+  private detachVisemeTap(mid: string): void {
+    const tap = this.visemeTaps.get(mid);
+    if (!tap) return;
+    this.visemeTaps.delete(mid);
+    this.renderer?.removeTap(mid, tap);
+    tap.port.close();
+    const user = this.visemeTapUsers.get(mid);
+    this.visemeTapUsers.delete(mid);
+    if (user !== undefined) this.participantVisemeFrames.delete(user);
+  }
+
+  private detachAllVisemeTaps(): void {
+    for (const mid of Array.from(this.visemeTaps.keys())) this.detachVisemeTap(mid);
+    this.participantVisemeFrames.clear();
+    if (this.localVisemeTap) {
+      this.inputPipeline?.removeTap(this.localVisemeTap);
+      this.localVisemeTap.port.close();
+      this.localVisemeTap = undefined;
+    }
+    this.localVisemeFrame = undefined;
+  }
+
+  /** The track behind `mid` now carries someone else: their frames start clean. */
+  private visemeLayoutChanged(): void {
+    for (const [mid, tap] of this.visemeTaps) {
+      const now = this.participantLayout.get(mid);
+      const before = this.visemeTapUsers.get(mid);
+      if (now === before) continue;
+      this.visemeTapUsers.set(mid, now);
+      if (before !== undefined) this.participantVisemeFrames.delete(before);
+      tap.port.postMessage({ type: 'reset' });
+    }
+  }
+
   /**
    * Decode an encoded audio file (wav/ogg/mp3/… — whatever the browser decodes) for
    * {@link injectAudio}. Usable before media is up.
@@ -1685,6 +2006,137 @@ export class AurixClient {
   }
 
   /**
+   * Make `userId` (this user when omitted) a priority speaker of `channelId` — or take it
+   * back. Promoting others needs a moderator role; a member whose grant carries `priority`
+   * may toggle their own state. Confirmed via `participantPriorityChanged`; rejected in
+   * channels without ducking (`VALIDATION_ERROR`).
+   */
+  setPriority(channelId: string, priority: boolean, userId?: string): void {
+    this.requireOpen();
+    this.send({
+      type: 'SetPriority',
+      data: { channel_id: channelId, user_id: userId ?? null, priority },
+    });
+  }
+
+  /** Whether this user is a priority speaker of `channelId`. */
+  isPriority(channelId: string): boolean {
+    return this.channelInfos.get(channelId)?.priority === true;
+  }
+
+  /** Priority-speaker ducking of a joined channel (`undefined` = off / not joined). */
+  getChannelDucking(channelId: string): DuckingConfig | undefined {
+    return this.channelInfos.get(channelId)?.ducking;
+  }
+
+  /**
+   * Whether another member's priority speech is ducking `channelId` right now (what
+   * `duckingChanged` last reported).
+   */
+  isDuckingActive(channelId: string): boolean {
+    return this.duckedChannels.has(channelId);
+  }
+
+  /** Whether `p`'s speech ducks `channelId` for this listener (never our own speech). */
+  private ducks(channelId: string, p: Participant): boolean {
+    return p.userId !== this.userId && p.speaking && this.isPriorityMember(channelId, p);
+  }
+
+  /** Whether `p` counts as a priority member of `channelId` (never ducked; ducks the others when speaking). */
+  private isPriorityMember(channelId: string, p: Participant): boolean {
+    const cfg = this.channelInfos.get(channelId)?.ducking;
+    if (!cfg) return false;
+    return p.priority || (cfg.moderators && (p.role === 'moderator' || p.role === 'administrator'));
+  }
+
+  /**
+   * Whether the other voices of `channelId` are ducked on their tracks right now: another
+   * priority member holds it (as reported by `duckingChanged`), or our own priority speech
+   * does — the server ducks the mix for the speaker too, so the tracks follow.
+   */
+  private isChannelDucked(channelId: string): boolean {
+    if (this.duckedChannels.has(channelId)) return true;
+    if (!this.userId) return false;
+    const me = this.channels.get(channelId)?.get(this.userId);
+    return me !== undefined && me.speaking && this.isPriorityMember(channelId, me);
+  }
+
+  /**
+   * Re-evaluate ducking of `channelId` from its members. Activation is immediate; release
+   * waits the channel's `holdMs` so pauses between words do not pump the game mix.
+   */
+  private refreshDucking(channelId: string): void {
+    const info = this.channelInfos.get(channelId);
+    const roster = this.channels.get(channelId);
+    let active = false;
+    if (info?.ducking && roster) {
+      for (const p of roster.values()) {
+        if (this.ducks(channelId, p)) {
+          active = true;
+          break;
+        }
+      }
+    }
+    const hold = this.duckHolds.get(channelId);
+    if (active) {
+      if (hold !== undefined) {
+        clearTimeout(hold);
+        this.duckHolds.delete(channelId);
+      }
+      if (!this.duckedChannels.has(channelId) && info?.ducking) {
+        this.duckedChannels.add(channelId);
+        this.renderParticipants();
+        this.emit('duckingChanged', channelId, true, info.ducking);
+      }
+      return;
+    }
+    if (!this.duckedChannels.has(channelId) || hold !== undefined) return;
+    const release = (): void => {
+      this.duckHolds.delete(channelId);
+      if (!this.duckedChannels.delete(channelId)) return;
+      this.renderParticipants();
+      const cfg = this.channelInfos.get(channelId)?.ducking ?? info?.ducking;
+      this.emit('duckingChanged', channelId, false, cfg ?? DEFAULT_DUCKING);
+    };
+    const holdMs = info?.ducking?.holdMs ?? 0;
+    if (holdMs > 0) this.duckHolds.set(channelId, setTimeout(release, holdMs));
+    else release();
+  }
+
+  /** Channel left / kicked / session gone: release its ducking at once. */
+  private dropDucking(channelId: string): void {
+    const hold = this.duckHolds.get(channelId);
+    if (hold !== undefined) {
+      clearTimeout(hold);
+      this.duckHolds.delete(channelId);
+    }
+    if (!this.duckedChannels.delete(channelId)) return;
+    this.renderParticipants();
+    this.emit('duckingChanged', channelId, false, this.channelInfos.get(channelId)?.ducking ?? DEFAULT_DUCKING);
+  }
+
+  private dropAllDucking(): void {
+    for (const channelId of Array.from(this.duckedChannels)) this.dropDucking(channelId);
+    for (const timer of this.duckHolds.values()) clearTimeout(timer);
+    this.duckHolds.clear();
+  }
+
+  /** Ducking to apply to `userId`'s own track: the strongest of the ducked shared channels they do not lead. */
+  private duckingFor(userId: string, shared: readonly string[]): DuckParams | undefined {
+    let out: DuckParams | undefined;
+    for (const ch of shared) {
+      if (!this.isChannelDucked(ch)) continue;
+      const cfg = this.channelInfos.get(ch)?.ducking;
+      const p = this.channels.get(ch)?.get(userId);
+      if (!cfg || !p) continue;
+      // A priority member's own voice is never ducked (they may be silent between words).
+      if (this.isPriorityMember(ch, p)) continue;
+      if (!out || cfg.gain < out.gain) out = { gain: cfg.gain, attackMs: cfg.attackMs, releaseMs: cfg.releaseMs };
+    }
+    return out;
+  }
+
+  /**
    * Choose where the microphone goes: `{ type: 'all' }` (default), `{ type: 'single',
    * channelId }` for exactly one joined channel or `{ type: 'none' }` to send nowhere while
    * still receiving. Applied by the server; confirmed via `transmissionChanged`. A `single`
@@ -1817,10 +2269,16 @@ export class AurixClient {
   private onParticipantTrack(mid: string, stream: MediaStream): void {
     this.participantTracks.set(mid, stream);
     this.renderer?.addTrack(mid, stream);
+    if (this.visemesEnabledValue) {
+      void this.syncVisemeTaps().catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      });
+    }
     const track = stream.getAudioTracks()[0];
     track?.addEventListener('ended', () => {
       if (this.participantTracks.get(mid) !== stream) return;
       this.participantTracks.delete(mid);
+      this.detachVisemeTap(mid);
       this.renderer?.removeTrack(mid);
       this.emitParticipantStreams();
     });
@@ -1830,6 +2288,7 @@ export class AurixClient {
 
   private applyParticipantLayout(streams: ParticipantStreamWire[]): void {
     this.participantLayout = new Map(streams.map((s) => [s.mid, s.user_id ?? undefined]));
+    this.visemeLayoutChanged();
     this.pushE2eeLayout();
     this.renderParticipants();
     this.emitParticipantStreams();
@@ -1858,6 +2317,8 @@ export class AurixClient {
     const focusFactor =
       focus === undefined || shared.length === 0 || shared.includes(focus) ? 1 : this.unfocusedGain;
     const inputs: RenderInputs = { volume: this.getParticipantVolume(userId), silenced, focusFactor };
+    const ducking = this.duckingFor(userId, shared);
+    if (ducking) inputs.ducking = ducking;
     for (const ch of shared) {
       const config = this.channelPositional.get(ch);
       const known = this.positions.get(ch);
@@ -1906,6 +2367,8 @@ export class AurixClient {
   /** Drop every negotiated participant track (peer connection gone); the layout is the server's to resend. */
   private clearParticipantTracks(): void {
     const had = this.participantTracks.size > 0 || this.participantLayout.size > 0;
+    for (const mid of Array.from(this.visemeTaps.keys())) this.detachVisemeTap(mid);
+    this.participantVisemeFrames.clear();
     this.participantTracks.clear();
     this.participantLayout.clear();
     this.pushE2eeLayout();
@@ -2031,6 +2494,16 @@ export class AurixClient {
     this.releaseLocalStream(this.localStream);
     this.localStream = undefined;
     const wasInjecting = this.inputPipeline?.injecting ?? false;
+    if (this.localVisemeTap) {
+      this.inputPipeline?.removeTap(this.localVisemeTap);
+      this.localVisemeTap.port.close();
+      this.localVisemeTap = undefined;
+    }
+    this.localVisemeFrame = undefined;
+    if (this.effectsNode) {
+      this.effectsNode.port.close();
+      this.effectsNode = undefined;
+    }
     this.inputPipeline?.close();
     this.inputPipeline = undefined;
     if (wasInjecting) this.emit('audioInjection', false);
@@ -2041,6 +2514,7 @@ export class AurixClient {
     }
     for (const channelId of this.channels.keys()) this.emit('channelLeft', channelId);
     this.channels.clear();
+    this.dropAllDucking();
     this.channelPositional.clear();
     this.positions.clear();
     this.e2eeSessionEnded();
@@ -2166,6 +2640,7 @@ export class AurixClient {
   leaveChannel(channelId: string): void {
     this.requireOpen();
     this.send({ type: 'ChannelLeave', data: { channel_id: channelId } });
+    this.dropDucking(channelId);
     this.typingSentAt.delete(channelId);
     this.transcribedChannels.delete(channelId);
     this.monitoredChannels.delete(channelId);
@@ -2657,6 +3132,7 @@ export class AurixClient {
       for (const channelId of wanted) {
         if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
       }
+      this.dropAllDucking();
       this.e2eeSessionEnded();
       this.channelPolicies.clear();
       this.channelInfos.clear();
@@ -2789,6 +3265,7 @@ export class AurixClient {
       throw new Error('Web Audio is unavailable: input gain is not supported here');
     }
     this.inputPipeline = pipeline;
+    this.syncMicrophoneWorklets();
     const processed = pipeline.stream;
     const track = processed?.getAudioTracks()[0];
     if (track) track.enabled = !this.muted;
@@ -2892,6 +3369,7 @@ export class AurixClient {
             serverMuted: false,
             speaking: p.is_speaking,
             energy: 0,
+            priority: p.is_priority === true,
           });
         }
         if (!this.userId && this.session) {
@@ -2913,6 +3391,7 @@ export class AurixClient {
         if (d.positional) this.channelPositional.set(d.channel_id, d.positional);
         else this.forgetChannelSpatial(d.channel_id);
         this.renderParticipants();
+        this.refreshDucking(d.channel_id);
         if (encrypted) this.e2eeChannelJoined(d.channel_id, replayed, new Set(roster.keys()));
         else this.e2eeChannelLeft(d.channel_id);
         const list = Array.from(roster.values());
@@ -2941,6 +3420,7 @@ export class AurixClient {
           serverMuted: false,
           speaking: false,
           energy: 0,
+          priority: d.is_priority === true,
         };
         roster.set(d.user_id, p);
         this.renderParticipant(d.user_id);
@@ -2954,6 +3434,7 @@ export class AurixClient {
         this.renderParticipant(d.user_id);
         this.e2eePeerLeft(d.channel_id, d.user_id);
         this.emit('participantLeft', d.channel_id, d.user_id);
+        this.refreshDucking(d.channel_id);
         return;
       }
       case 'MuteStateChanged': {
@@ -2974,6 +3455,10 @@ export class AurixClient {
           this.emit('participantUpdated', d.channel_id, p);
         }
         this.emit('speaking', d.channel_id, d.user_id, d.speaking);
+        if (p && this.isPriorityMember(d.channel_id, p)) {
+          this.refreshDucking(d.channel_id);
+          if (d.user_id === this.userId) this.renderParticipants();
+        }
         return;
       }
       case 'ChannelEnergy': {
@@ -3011,10 +3496,35 @@ export class AurixClient {
         if (!this.channels.has(d.channel_id)) return;
         this.channelPolicies.set(d.channel_id, parseAudioPolicy(d.audio));
         this.refreshAudioPolicy();
+        if ('ducking' in d) {
+          const info = this.channelInfos.get(d.channel_id);
+          if (info) {
+            const ducking = parseDucking(d.ducking);
+            if (ducking) info.ducking = ducking;
+            else delete info.ducking;
+            this.renderParticipants();
+            this.refreshDucking(d.channel_id);
+          }
+        }
+        return;
+      }
+      case 'PriorityChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'PriorityChanged' }>).data;
+        if (!this.channels.has(d.channel_id)) return;
+        const p = this.channels.get(d.channel_id)?.get(d.user_id);
+        if (p) p.priority = d.priority;
+        if (d.user_id === this.userId) {
+          const info = this.channelInfos.get(d.channel_id);
+          if (info) info.priority = d.priority;
+        }
+        this.renderParticipants();
+        this.emit('participantPriorityChanged', d.channel_id, d.user_id, d.priority);
+        this.refreshDucking(d.channel_id);
         return;
       }
       case 'Kick': {
         const d = (msg as Extract<ServerMessage, { type: 'Kick' }>).data;
+        this.dropDucking(d.channel_id);
         if (this.channels.delete(d.channel_id)) this.emit('channelLeft', d.channel_id);
         this.channelInfos.delete(d.channel_id);
         this.channelScopes.delete(d.channel_id);
@@ -3306,11 +3816,12 @@ export class AurixClient {
     this.localStream.getAudioTracks().forEach((t) => {
       t.enabled = !this.muted;
     });
-    if (this.inputGainValue !== 1 && !this.inputPipeline) {
+    if (this.needsInputPipeline() && !this.inputPipeline) {
       const pipeline = new InputPipeline();
       if (pipeline.open(this.localStream, this.inputGainValue)) this.inputPipeline = pipeline;
-      else this.emit('error', new Error('Web Audio is unavailable: input gain ignored'));
+      else this.emit('error', new Error('Web Audio is unavailable: input gain / voice effects / visemes ignored'));
     }
+    this.syncMicrophoneWorklets();
     const sent = this.sentStream() ?? this.localStream;
     this.startLocalMeter(sent);
     if (typeof navigator !== 'undefined') {

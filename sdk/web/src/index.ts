@@ -1,7 +1,9 @@
 export {
   AurixClient,
+  DEFAULT_DUCKING,
   channelInfoFromJoinAck,
   defaultAudioConstraints,
+  parseDucking,
   encodeChatCursor,
   reconnectEndpoint,
   transmissionFromWire,
@@ -94,6 +96,7 @@ export type {
   ChatMessage,
   ChatScope,
   ConnectionState,
+  DuckingConfig,
   HistoryOptions,
   HistoryPage,
   ReadMarker,
@@ -116,9 +119,49 @@ export type {
   TtsState,
   TtsStatus,
 } from './client.js';
+export {
+  MAX_DISTORTION_DRIVE,
+  MAX_FILTER_HZ,
+  MAX_FORMANT_SEMITONES,
+  MAX_PITCH_SEMITONES,
+  MAX_RING_MOD_HZ,
+  MAX_TREMOLO_HZ,
+  MIN_FILTER_HZ,
+  VOICE_EFFECTS_BYPASS,
+  VOICE_EFFECTS_PROCESSOR,
+  VOICE_EFFECT_PRESETS,
+  VoiceEffectChain,
+  createVoiceEffectsNode,
+  isVoiceEffectsBypass,
+  loadVoiceEffectsWorklet,
+  sanitizeVoiceEffects,
+  supportsVoiceEffects,
+  voiceEffectPreset,
+  voiceEffectsWorkletSource,
+} from './effects.js';
+export type {
+  ResolvedVoiceEffectParams,
+  VoiceEffectParams,
+  VoiceEffectPreset,
+  VoiceEffectStage,
+  VoiceEffectsWorkletMessage,
+} from './effects.js';
+export {
+  VISEMES,
+  VISEME_COUNT,
+  VISEME_PROCESSOR,
+  VisemeAnalyzer,
+  createVisemeNode,
+  loadVisemeWorklet,
+  silentVisemeFrame,
+  supportsVisemes,
+  visemeWorkletSource,
+} from './visemes.js';
+export type { Viseme, VisemeFrame, VisemeWorkletFrame } from './visemes.js';
 export type {
   AudioPolicyWire,
   ChannelRole,
+  DuckingConfigWire,
   ChatMessageWire,
   ChatReadMarkerWire,
   ClientMessage,

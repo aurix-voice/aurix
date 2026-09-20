@@ -13,7 +13,7 @@ namespace Aurix.Unity
     /// (see the WebGL section of the SDK README). Ship <c>aurix-web-sdk.js</c> in <c>StreamingAssets/</c>
     /// or point <see cref="SdkUrl"/> at it.
     /// </summary>
-    public sealed class AurixWebGLVoiceBehaviour : MonoBehaviour
+    public sealed class AurixWebGLVoiceBehaviour : MonoBehaviour, IAurixVoiceHost
     {
         [Header("Connection")]
         [Tooltip("REST base URL of the Aurix API (https://host:8080), used for TURN credentials and history.")]
@@ -48,9 +48,15 @@ namespace Aurix.Unity
         public int ParticipantStreams = -1;
         [Tooltip("How the browser renders per-participant tracks: HRTF (binaural), equal-power panning, or none (tracks negotiated, playback left to the page).")]
         public WebGLSpatialAudio SpatialAudio = WebGLSpatialAudio.Hrtf;
+        [Tooltip("Microphone voice effect (browser AudioWorklet); Custom = CustomVoiceEffect below. Changeable at runtime with ApplyVoiceSettings().")]
+        public VoiceEffectSelection VoiceEffect = VoiceEffectSelection.None;
+        public Audio.VoiceEffectParams CustomVoiceEffect;
+        [Tooltip("Analyse the microphone and every heard participant for lip-sync from the start (AurixLipSync components turn it on by themselves).")]
+        public bool LipSync = false;
 
         /// <summary>The live client, or null before <see cref="Connect"/> / after <see cref="Disconnect"/>.</summary>
         public AurixWebGLVoiceClient Client { get; private set; }
+        IAurixVoiceClient IAurixVoiceHost.VoiceClient => Client;
         /// <summary>Set before <see cref="Connect"/> to supply a fresh JWT when the server reports the current one expired.</summary>
         public Func<System.Threading.CancellationToken, Task<string>> TokenRefresher;
         /// <summary>Set before <see cref="Connect"/> to supply per-channel join tokens on demand.</summary>
@@ -87,6 +93,7 @@ namespace Aurix.Unity
             client.Options.UseTurn = UseTurn;
             client.Options.ParticipantStreams = ParticipantStreams < 0 ? (int?)null : ParticipantStreams;
             client.Options.SpatialAudio = SpatialAudio;
+            client.Options.VoiceEffects = VoiceEffectSelectionExtensions.Params(VoiceEffect, CustomVoiceEffect);
             client.OnRemoteAudio += (playing, reason) =>
             {
                 RemoteAudioPlaying = playing;
@@ -99,6 +106,7 @@ namespace Aurix.Unity
 
             await client.ConnectAsync();
             if (Client != client) return;
+            if (LipSync) await ApplyLipSync(client);
 
             foreach (var id in (ChannelId ?? string.Empty).Split(','))
             {
@@ -118,6 +126,25 @@ namespace Aurix.Unity
 
         /// <summary>Retry remote playback after the browser blocked autoplay; call from a button/click handler.</summary>
         public Task ResumeAudio() => Client?.ResumeAudioAsync() ?? Task.CompletedTask;
+
+        /// <summary>Re-read <see cref="VoiceEffect"/> / <see cref="CustomVoiceEffect"/> / <see cref="LipSync"/> at runtime and push them to the browser.</summary>
+        public async Task ApplyVoiceSettings()
+        {
+            var client = Client;
+            if (client == null || !client.IsCreated) return;
+            await client.SetVoiceEffectsAsync(VoiceEffectSelectionExtensions.Params(VoiceEffect, CustomVoiceEffect));
+            if (Client == client && LipSync != client.VisemesEnabled) await ApplyLipSync(client);
+        }
+
+        private async Task ApplyLipSync(AurixWebGLVoiceClient client)
+        {
+            if (LipSync && !client.SupportsVisemes)
+            {
+                Debug.LogWarning("Aurix: this browser cannot run the lip-sync worklet");
+                return;
+            }
+            await client.SetVisemesAsync(LipSync);
+        }
 
         private void Update()
         {

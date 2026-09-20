@@ -21,6 +21,9 @@ pub enum ServerEvent {
         ssrc: u32,
         #[serde(default = "default_participant_role")]
         role: ChannelRole,
+        /// Priority speaker from the start (grant `priority: true`).
+        #[serde(default)]
+        is_priority: bool,
         timestamp: DateTime<Utc>,
     },
     ParticipantLeft {
@@ -79,6 +82,16 @@ pub enum ServerEvent {
         channel_id: ChannelId,
         user_id: UserId,
         unmuted_by: UserId,
+        timestamp: DateTime<Utc>,
+    },
+    /// A member became (or stopped being) a priority speaker whose speech ducks the channel
+    /// (`ChannelConfig.ducking`), by grant at join, by a moderator, or by REST.
+    PriorityChanged {
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        priority: bool,
+        changed_by: UserId,
         timestamp: DateTime<Utc>,
     },
     UserBanned {
@@ -350,6 +363,7 @@ impl ServerEvent {
             | Self::ChannelDeactivated { app_id, .. }
             | Self::UserMuted { app_id, .. }
             | Self::UserUnmuted { app_id, .. }
+            | Self::PriorityChanged { app_id, .. }
             | Self::UserBanned { app_id, .. }
             | Self::UserDeleted { app_id, .. }
             | Self::UserKicked { app_id, .. }
@@ -405,6 +419,7 @@ impl ServerEvent {
             Self::ChannelDeactivated { .. } => "channel.deactivated",
             Self::UserMuted { .. } => "participant.muted",
             Self::UserUnmuted { .. } => "participant.unmuted",
+            Self::PriorityChanged { .. } => "participant.priority_changed",
             Self::UserBanned { .. } => "user.banned",
             Self::UserDeleted { .. } => "user.deleted",
             Self::UserKicked { .. } => "participant.kicked",
@@ -448,6 +463,7 @@ impl ServerEvent {
         "participant.left",
         "participant.muted",
         "participant.unmuted",
+        "participant.priority_changed",
         "participant.kicked",
         "user.banned",
         "user.deleted",

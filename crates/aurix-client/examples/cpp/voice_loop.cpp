@@ -47,6 +47,13 @@ bool handle_event(const aurix::Event& ev) {
     case AURIX_EVENT_PARTICIPANT_SPEAKING:
         std::printf("speaking %s = %d\n", ev.user_id().str().c_str(), static_cast<int>(ev.flag()));
         return false;
+    case AURIX_EVENT_DUCKING_CHANGED: {
+        // A priority speaker started/stopped: the game would fade its own music/SFX bus here.
+        const AurixDucking d = ev.ducking();
+        std::printf("game audio ducking %s (gain %.2f, attack %u ms, release %u ms)\n", ev.flag() ? "on" : "off",
+                    d.gain, d.attack_ms, d.release_ms);
+        return false;
+    }
     case AURIX_EVENT_CHAT_MESSAGE: {
         AurixChatMessage m;
         if (ev.chat(m)) {
@@ -184,6 +191,10 @@ int main(int argc, char** argv) {
         return 4;
     }
 
+    // Optional extras: a preset voice on the microphone and local lip-sync analysis.
+    client.set_voice_preset(AURIX_VOICE_PRESET_RADIO);
+    client.set_visemes(true);
+
     std::vector<float> tone(AURIX_FRAME_SAMPLES);
     std::vector<float> out(AURIX_FRAME_SAMPLES * 2);
     double phase = 0.0;
@@ -201,6 +212,7 @@ int main(int argc, char** argv) {
         //   client.set_participant_claimed(user, true);
         //   client.pull_participant(user, buf, n, 1);
         //   for (const AurixParticipantStream& s : client.participant_streams()) ...
+        //   AurixVisemeFrame mouth; if (client.participant_visemes(user, mouth)) drive_blendshapes(mouth);
         if (client.mix_output(out.data(), out.size(), 2) > 0) {
             ++active_frames;
         }

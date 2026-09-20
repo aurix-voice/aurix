@@ -58,6 +58,14 @@ namespace Aurix.WebGL
         public WebGLE2eeTransform E2eeTransform = WebGLE2eeTransform.Auto;
         /// <summary>Serve the E2EE transform worker from this URL instead of a <c>blob:</c> URL (CSP without <c>worker-src blob:</c>).</summary>
         public string E2eeWorkerUrl;
+        /// <summary>
+        /// Push <see cref="AurixWebGLVoiceClient.OnParticipantVisemes"/> / <see cref="AurixWebGLVoiceClient.OnLocalVisemes"/>
+        /// (50 events/s per analysed voice) while lip-sync is on. Off by default — poll
+        /// <see cref="AurixWebGLVoiceClient.GetParticipantVisemes"/> once per rendered frame instead.
+        /// </summary>
+        public bool VisemeEvents;
+        /// <summary>Microphone effect chain from the start (<see cref="Audio.VoiceEffectParams.Bypass"/> = none).</summary>
+        public Audio.VoiceEffectParams VoiceEffects = Audio.VoiceEffectParams.Bypass;
 
         internal Dictionary<string, object> ToBridge(string apiUrl, string wsUrl, string token, bool refreshToken, bool joinToken)
         {
@@ -76,6 +84,7 @@ namespace Aurix.WebGL
                 { "requestTimeoutMs", RequestTimeout.TotalMilliseconds },
                 { "autoReconnect", AutoReconnect },
                 { "rawMessages", RawMessages },
+                { "visemeEvents", VisemeEvents },
                 {
                     "audioConstraints", new Dictionary<string, object>
                     {
@@ -87,6 +96,8 @@ namespace Aurix.WebGL
                 },
             };
             if (Stereo) o["opus"] = new Dictionary<string, object> { { "stereo", true } };
+            var effects = VoiceEffects.Sanitized();
+            if (!effects.IsBypass) o["voiceEffects"] = BridgeJson.VoiceEffectsToBridge(effects);
             if (ParticipantStreams.HasValue) o["participantStreams"] = Math.Max(0, ParticipantStreams.Value);
             switch (SpatialAudio)
             {

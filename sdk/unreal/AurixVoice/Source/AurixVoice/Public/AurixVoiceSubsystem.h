@@ -60,6 +60,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixEndpointChanged, const FString
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixE2eePeerKey, FGuid, UserId, const FString&, Fingerprint, const FString&, PreviousFingerprint);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixE2eePeerDecryptable, FGuid, UserId, bool, bDecryptable);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixE2eeKeyRotated, int32, Generation);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantPriorityChanged, FGuid, ChannelId, FGuid, UserId, bool, bPriority);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixDuckingChanged, FGuid, ChannelId, bool, bActive, const FAurixDucking&, Ducking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixConnectionEnded, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRawEvent, const FString&, Json);
 DECLARE_DYNAMIC_DELEGATE_ThreeParams(FAurixRegionsDiscovered, bool, bSuccess, const TArray<FAurixRegionEndpoint>&, Regions, const FString&, Error);
@@ -235,15 +237,47 @@ public:
 	bool GetDspStats(FAurixDspStats& OutStats) const;
 
 	/**
-	 * Built-in voice effects on the microphone (pitch shift / ring modulator), after the DSP
-	 * and input gain and before VAD / encoding. Only your uplink is affected. Values are
-	 * clamped by the core; read back with GetVoiceEffects.
+	 * Built-in voice effects on the microphone (filters, formant / pitch shift, ring modulator,
+	 * distortion, tremolo, static, reverb), after the DSP and input gain and before VAD /
+	 * encoding. Only your uplink is affected. Values are clamped by the core; read back with
+	 * GetVoiceEffects. An all-zero struct switches the effects off.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	bool SetVoiceEffects(const FAurixVoiceEffects& Effects);
 
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool GetVoiceEffects(FAurixVoiceEffects& OutEffects) const;
+
+	/** The parameters behind a named preset — a starting point to tweak and pass to SetVoiceEffects. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	static FAurixVoiceEffects MakeVoicePreset(EAurixVoicePreset Preset);
+
+	/** Apply a named preset voice. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	bool SetVoicePreset(EAurixVoicePreset Preset);
+
+	/**
+	 * Analyse decoded participant audio and our own outgoing voice for lip-sync (off by default;
+	 * one small FFT per stream per 20 ms when on). Purely local: no audio or mouth data leaves
+	 * the machine. Read with GetParticipantVisemes / GetLocalVisemes every tick.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Lip Sync")
+	bool SetVisemesEnabled(bool bEnabled);
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Lip Sync")
+	bool AreVisemesEnabled() const;
+
+	/**
+	 * Mouth state of UserId from the audio most recently played for them (their voice or TTS).
+	 * False with analysis off or for someone whose audio is not decoded here (unknown, or only
+	 * inside the server mix).
+	 */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Lip Sync")
+	bool GetParticipantVisemes(FGuid UserId, FAurixVisemeFrame& OutFrame) const;
+
+	/** Mouth state of our own voice as sent (after DSP, gain and effects); frozen while nothing is captured. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Lip Sync")
+	bool GetLocalVisemes(FAurixVisemeFrame& OutFrame) const;
 
 	/**
 	 * Native-only: install a custom effect run on every 20 ms 48 kHz capture frame after the
@@ -350,6 +384,18 @@ public:
 	/** Persistent mutual block (acked by OnUserBlockChanged). */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetUserBlocked(FGuid UserId, bool bBlocked);
+
+	/**
+	 * Grant / revoke priority speaker for UserId (invalid GUID = ourselves) in ChannelId. Others
+	 * need a moderator role; our own flag can be raised with a `priority` grant and always
+	 * lowered. Everyone learns the outcome through OnParticipantPriorityChanged.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
+	bool SetPriority(FGuid ChannelId, FGuid UserId, bool bPriority);
+
+	/** Another member's priority speech is ducking ChannelId right now (see OnDuckingChanged). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
+	bool IsDuckingActive(FGuid ChannelId) const;
 
 	/** Which joined channels receive the microphone; ChannelId is required for Single. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
@@ -531,6 +577,15 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantLeft OnParticipantLeft;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantMuteChanged OnParticipantMuteChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantSpeaking OnParticipantSpeaking;
+	/** A member (possibly us) became or stopped being a priority speaker. */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantPriorityChanged OnParticipantPriorityChanged;
+	/**
+	 * Game-audio hook: another member's priority speech started (bActive) or stopped ducking
+	 * the channel — fade your music / SFX bus to Ducking.Gain over AttackMs and back over
+	 * ReleaseMs. Remote voices are already attenuated by the server; our own speech never
+	 * triggers this.
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixDuckingChanged OnDuckingChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelEnergy OnChannelEnergy;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixLocalSpeaking OnLocalSpeaking;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTransmissionChanged OnTransmissionChanged;

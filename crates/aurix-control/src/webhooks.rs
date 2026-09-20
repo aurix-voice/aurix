@@ -1065,6 +1065,7 @@ mod tests {
             session_id: SessionId::new(),
             ssrc: 7,
             role: ChannelRole::Speaker,
+            is_priority: false,
             timestamp: Utc::now(),
         };
         let env = PublicEvent::from_event(&ev).unwrap();

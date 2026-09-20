@@ -3525,6 +3525,69 @@
         ]
       }
     },
+    "/v1/moderation/priority": {
+      "post": {
+        "tags": [
+          "Moderation"
+        ],
+        "summary": "Promote or demote a priority speaker",
+        "operationId": "setPriority",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPriorityRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "priority": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "moderation:write"
+        ],
+        "description": "Sets the priority-speaker flag on the user's open membership in the channel and notifies every member (`PriorityChanged`). While a priority speaker talks, non-priority streams are attenuated per `ChannelConfig.ducking`. `404` when the user is not currently a member."
+      }
+    },
     "/v1/moderation/kick": {
       "post": {
         "tags": [
@@ -7423,6 +7486,11 @@
             "type": "boolean",
             "default": false
           },
+          "priority": {
+            "type": "boolean",
+            "default": false,
+            "description": "`join` only: grant priority speaker (see `ChannelGrant.priority`)."
+          },
           "ad_hoc": {
             "oneOf": [
               {
@@ -8268,6 +8336,17 @@
             ],
             "description": "Cocktail-party mode; absent/`null` (default) delivers every audible speaker at full gain."
           },
+          "ducking": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DuckingConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Priority-speaker ducking; absent/`null` (default) disables it (priority flags are still tracked and disclosed). Disclosed to members as `ChannelJoinAck.ducking`."
+          },
           "audience": {
             "oneOf": [
               {
@@ -8364,6 +8443,11 @@
           "moderate": {
             "type": "boolean",
             "default": false
+          },
+          "priority": {
+            "type": "boolean",
+            "default": false,
+            "description": "Priority speaker: while the member speaks, every non-priority stream is attenuated for all receivers per `ChannelConfig.ducking` (no effect without it); their own stream is never ducked. Requires `speak`. Also lets the member toggle themselves with `SetPriority`; moderators can promote/demote others."
           },
           "ad_hoc": {
             "oneOf": [
@@ -8496,6 +8580,10 @@
           },
           "moderate": {
             "type": "boolean"
+          },
+          "priority": {
+            "type": "boolean",
+            "default": false
           }
         },
         "required": [
@@ -9616,6 +9704,45 @@
         },
         "description": "Cocktail-party mixing, ranked per receiver by delivery gain × the sender-reported audio level (sticky slots, 400 ms hold)."
       },
+      "DuckingConfig": {
+        "type": "object",
+        "properties": {
+          "gain": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "default": 0.25,
+            "description": "Gain applied to every non-priority stream while a priority speaker is audible (`0` mutes them)."
+          },
+          "attack_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 60,
+            "description": "Ramp from full gain down to `gain`."
+          },
+          "release_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 400,
+            "description": "Ramp back to full gain once the hold expires."
+          },
+          "hold_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 250,
+            "description": "How long ducking stays fully engaged after the last priority speaker goes silent."
+          },
+          "moderators": {
+            "type": "boolean",
+            "default": false,
+            "description": "Members with role `moderator`/`administrator` count as priority speakers too (explicit `priority` grants always do)."
+          }
+        },
+        "description": "Priority-speaker ducking. Applied by the node to server-mixed and native per-participant delivery (after the receiver's own mute/volume/block and positional attenuation, before ambient/`max_streams` ranking); receivers of dedicated WebRTC tracks apply the same envelope locally. Several simultaneous priority speakers keep the duck engaged; priority streams are never attenuated."
+      },
       "AudienceConfig": {
         "type": "object",
         "properties": {
@@ -9942,6 +10069,35 @@
           "user_id",
           "channel_id",
           "muted"
+        ]
+      },
+      "SetPriorityRequest": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "channel_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "priority": {
+            "type": "boolean"
+          },
+          "moderator_user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Attribute the change to this user in the audit log and `participant.priority_changed`; defaults to the API key's service identity."
+          }
+        },
+        "required": [
+          "user_id",
+          "channel_id",
+          "priority"
         ]
       },
       "Session": {

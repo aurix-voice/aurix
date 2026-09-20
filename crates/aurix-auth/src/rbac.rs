@@ -107,6 +107,18 @@ impl RbacService {
         }
     }
 
+    /// Whether the grant for `channel_id` makes its holder a priority speaker (needs `speak`).
+    pub fn priority_from_permissions(
+        &self,
+        channel_id: &ChannelId,
+        permissions: &[ChannelPermission],
+    ) -> bool {
+        permissions
+            .iter()
+            .find(|p| p.channel_id == *channel_id)
+            .is_some_and(|p| p.priority && p.speak)
+    }
+
     pub fn can_kick(actor_role: ChannelRole, target_role: ChannelRole) -> bool {
         actor_role.can_moderate() && actor_role.precedence() > target_role.precedence()
     }

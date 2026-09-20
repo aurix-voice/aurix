@@ -3,8 +3,8 @@ use aurix_common::protocol::{
     TtsState, UserPosition,
 };
 use aurix_common::types::{
-    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
-    SessionId, UserId,
+    ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, DuckingConfig,
+    NetworkQuality, SessionId, UserId,
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -66,6 +66,8 @@ pub struct Participant {
     pub speaking: bool,
     /// Last reported linear energy, `0..=1`.
     pub energy: f32,
+    /// Priority speaker: their speech ducks everyone else (`ChannelConfig.ducking`).
+    pub priority: bool,
 }
 
 /// How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
@@ -142,6 +144,10 @@ pub enum Event {
         participant_count: u32,
         /// Receive-only listeners are absent from the roster and never announced.
         hidden_listeners: bool,
+        /// Priority-speaker ducking the server applies here (`None`: off).
+        ducking: Option<DuckingConfig>,
+        /// We are a priority speaker in this channel.
+        priority: bool,
     },
     ChannelLeft {
         channel_id: ChannelId,
@@ -159,6 +165,20 @@ pub enum Event {
         user_id: UserId,
         muted: bool,
         server_muted: bool,
+    },
+    /// A member (possibly us) became or stopped being a priority speaker.
+    ParticipantPriorityChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        priority: bool,
+    },
+    /// Game-audio hook: another member's priority speech started (`active`) or stopped
+    /// ducking `channel_id`. Lower the game's music/SFX bus by `config.gain` with the
+    /// config's attack/hold/release; the voice mix itself is ducked by the server already.
+    DuckingChanged {
+        channel_id: ChannelId,
+        active: bool,
+        config: DuckingConfig,
     },
     ParticipantSpeaking {
         channel_id: ChannelId,

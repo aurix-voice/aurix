@@ -127,6 +127,40 @@ class FakeClient {
     this.e2ee.generation += 1;
     return Promise.resolve(this.e2ee.generation);
   }
+  setPriority(channelId, priority, userId) {
+    this.record('setPriority', channelId, priority, userId);
+  }
+  isPriority(channelId) {
+    return channelId === 'raid';
+  }
+  getChannelDucking(channelId) {
+    return channelId === 'raid' ? { gain: 0.3, attackMs: 40, releaseMs: 300, holdMs: 200, moderators: true } : undefined;
+  }
+  isDuckingActive(channelId) {
+    return channelId === 'raid';
+  }
+  setVoiceEffects(effects) {
+    this.record('setVoiceEffects', effects);
+    this.effects = effects;
+    return Promise.resolve();
+  }
+  get voiceEffects() {
+    return this.effects ?? { ringModHz: 0 };
+  }
+  setVisemes(enabled) {
+    this.record('setVisemes', enabled);
+    this.visemes = enabled;
+    return Promise.resolve();
+  }
+  get visemesEnabled() {
+    return this.visemes === true;
+  }
+  getParticipantVisemes(userId) {
+    return userId === 'alice' ? { dominant: 'AA', mouthOpen: 0.7, sequence: 3 } : undefined;
+  }
+  getLocalVisemes() {
+    return this.visemes ? { dominant: 'silence', mouthOpen: 0, sequence: 0 } : undefined;
+  }
 }
 
 function make(extraOptions = {}, bridgeOptions = {}) {
@@ -228,6 +262,66 @@ test('e2ee state, stats and rotation are exposed; events are queued with named f
     { type: 'e2eePeerKey', userId: 'alice', fingerprint: 'ef56', previousFingerprint: 'cd34' },
     { type: 'e2eePeerDecryptable', userId: 'alice', decryptable: true },
     { type: 'e2eeKeyRotated', generation: 4 },
+  ]);
+});
+
+test('priority/ducking, voice effects and visemes are mapped; viseme frames are queued only on request', async () => {
+  const { bridge, handle, client } = make({ visemes: true, voiceEffects: 'robot' });
+  assert.equal(client.options.visemes, true);
+  assert.equal(client.options.voiceEffects, 'robot');
+  const v = (method, args = {}) => ok(bridge.invoke(handle, method, JSON.stringify(args))).value;
+
+  v('setPriority', { channelId: 'raid', priority: true });
+  v('setPriority', { channelId: 'raid', priority: false, userId: 'bob' });
+  assert.deepEqual(client.calls.slice(-2), [
+    ['setPriority', 'raid', true, undefined],
+    ['setPriority', 'raid', false, 'bob'],
+  ]);
+  assert.equal(v('isPriority', { channelId: 'raid' }), true);
+  assert.equal(v('isDuckingActive', { channelId: 'lobby' }), false);
+  assert.deepEqual(v('channelDucking', { channelId: 'raid' }), { gain: 0.3, attackMs: 40, releaseMs: 300, holdMs: 200, moderators: true });
+  assert.equal(v('channelDucking', { channelId: 'lobby' }), null);
+  assert.match(JSON.parse(bridge.invoke(handle, 'setPriority', '{"channelId":"raid"}')).error.message, /priority/);
+
+  assert.equal(typeof v('supportsVoiceEffects'), 'boolean');
+  assert.equal(typeof v('supportsVisemes'), 'boolean');
+  assert.equal(JSON.parse(bridge.invoke(handle, 'setVoiceEffects', '{"effects":"radio"}', 21)).pending, true);
+  assert.equal(JSON.parse(bridge.invoke(handle, 'setVoiceEffects', '{"effects":{"pitchSemitones":4}}', 22)).pending, true);
+  assert.equal(JSON.parse(bridge.invoke(handle, 'setVoiceEffects', '{"effects":null}', 23)).pending, true);
+  assert.match(JSON.parse(bridge.invoke(handle, 'setVoiceEffects', '{"effects":7}')).error.message, /preset/);
+  assert.deepEqual(client.calls.slice(-3), [
+    ['setVoiceEffects', 'radio'],
+    ['setVoiceEffects', { pitchSemitones: 4 }],
+    ['setVoiceEffects', undefined],
+  ]);
+  assert.deepEqual(v('voiceEffects'), { ringModHz: 0 });
+
+  assert.equal(v('visemesEnabled'), false);
+  assert.equal(v('localVisemes'), null);
+  assert.equal(JSON.parse(bridge.invoke(handle, 'setVisemes', '{"enabled":true}', 24)).pending, true);
+  assert.equal(v('visemesEnabled'), true);
+  assert.deepEqual(v('localVisemes'), { dominant: 'silence', mouthOpen: 0, sequence: 0 });
+  assert.deepEqual(v('participantVisemes', { userId: 'alice' }), { dominant: 'AA', mouthOpen: 0.7, sequence: 3 });
+  assert.equal(v('participantVisemes', { userId: 'bob' }), null);
+  await tick();
+  assert.deepEqual(drain(bridge, handle).map((e) => e.rid), [21, 22, 23, 24]);
+
+  const cfg = { gain: 0.3, attackMs: 40, releaseMs: 300, holdMs: 200, moderators: true };
+  client.emit('participantPriorityChanged', 'raid', 'bob', true);
+  client.emit('duckingChanged', 'raid', true, cfg);
+  client.emit('participantVisemes', 'alice', { dominant: 'OH', mouthOpen: 0.5, sequence: 9 });
+  client.emit('localVisemes', { dominant: 'E', mouthOpen: 0.2, sequence: 1 });
+  assert.deepEqual(drain(bridge, handle), [
+    { type: 'participantPriorityChanged', channelId: 'raid', userId: 'bob', priority: true },
+    { type: 'duckingChanged', channelId: 'raid', active: true, config: cfg },
+  ]);
+
+  const chatty = make({ visemeEvents: true });
+  chatty.client.emit('participantVisemes', 'alice', { dominant: 'OH', mouthOpen: 0.5, sequence: 9 });
+  chatty.client.emit('localVisemes', { dominant: 'E', mouthOpen: 0.2, sequence: 1 });
+  assert.deepEqual(drain(chatty.bridge, chatty.handle), [
+    { type: 'participantVisemes', userId: 'alice', frame: { dominant: 'OH', mouthOpen: 0.5, sequence: 9 } },
+    { type: 'localVisemes', frame: { dominant: 'E', mouthOpen: 0.2, sequence: 1 } },
   ]);
 });
 

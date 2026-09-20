@@ -15,7 +15,7 @@ no_includes = true
 [export]
 prefix = ""
 include = ["AurixClient", "AurixEvent"]
-exclude = ["SYNTH_SSRC_FLAG", "TUNNEL_UPLINK_QUEUE", "SAMPLE_RATE", "FRAME_SAMPLES", "MAX_INPUT_GAIN", "MAX_OUTPUT_VOLUME", "VERSION", "BLOCK", "MAX_ECHO_TAIL_MS", "MIN_ECHO_TAIL_MS", "MAX_STREAM_DELAY_MS", "DspConfig", "DspStats", "NoiseSuppression", "MAX_PITCH_SEMITONES", "MAX_RING_MOD_HZ", "VoiceEffect", "EffectChain", "PitchShift", "RingModulator", "CallbackEffect"]
+exclude = ["SYNTH_SSRC_FLAG", "TUNNEL_UPLINK_QUEUE", "SAMPLE_RATE", "FRAME_SAMPLES", "MAX_INPUT_GAIN", "MAX_OUTPUT_VOLUME", "VERSION", "BLOCK", "MAX_ECHO_TAIL_MS", "MIN_ECHO_TAIL_MS", "MAX_STREAM_DELAY_MS", "DspConfig", "DspStats", "NoiseSuppression", "MAX_PITCH_SEMITONES", "MAX_RING_MOD_HZ", "VoiceEffect", "EffectChain", "PitchShift", "RingModulator", "CallbackEffect", "MAX_FORMANT_SEMITONES", "MAX_DISTORTION_DRIVE", "MAX_TREMOLO_HZ", "MIN_FILTER_HZ", "MAX_FILTER_HZ", "VISEME_COUNT", "Viseme", "EffectPreset", "VoiceEffectParams", "VisemeFrame", "VisemeAnalyzer"]
 
 [export.rename]
 "AurixClient" = "AurixClient"

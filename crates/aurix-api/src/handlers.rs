@@ -138,6 +138,9 @@ pub struct ChannelGrant {
     pub receive: bool,
     #[serde(default)]
     pub moderate: bool,
+    /// Priority speaker: the channel's `ducking` attenuates everyone else while they talk.
+    #[serde(default)]
+    pub priority: bool,
     #[serde(default)]
     pub ad_hoc: Option<AdHocChannel>,
 }
@@ -260,6 +263,7 @@ pub async fn generate_token(
                 speak: grant.speak,
                 receive: grant.receive,
                 moderate: grant.moderate,
+                priority: grant.priority,
                 ad_hoc,
             });
         }
@@ -387,6 +391,9 @@ pub struct ActionTokenRequest {
     pub receive: bool,
     #[serde(default)]
     pub moderate: bool,
+    /// `join` only: priority speaker for the channel's `ducking`.
+    #[serde(default)]
+    pub priority: bool,
     /// `join` only: create the channel on first join instead of requiring it to exist.
     #[serde(default)]
     pub ad_hoc: Option<AdHocChannel>,
@@ -559,6 +566,7 @@ pub async fn generate_action_token(
         speak: req.speak,
         receive: req.receive,
         moderate: req.moderate,
+        priority: req.priority,
         ad_hoc,
         metadata: req.metadata,
         ttl_secs,
@@ -1560,6 +1568,46 @@ pub async fn server_mute(
     )
     .await?;
     Ok(Json(serde_json::json!({"muted": req.muted})))
+}
+
+#[derive(Deserialize)]
+pub struct SetPriorityRequest {
+    pub user_id: String,
+    pub channel_id: String,
+    pub priority: bool,
+    pub moderator_user_id: Option<String>,
+}
+
+pub async fn set_priority(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Json(req): Json<SetPriorityRequest>,
+) -> JsonResult {
+    ctx.require("moderation:write")?;
+    let app_id = ctx.app_id;
+    let user_id = UserId::from_uuid(parse_uuid(&req.user_id, "user_id")?);
+    let channel_id = ChannelId::from_uuid(parse_uuid(&req.channel_id, "channel_id")?);
+    state
+        .control
+        .channels
+        .require_channel(app_id, channel_id)
+        .await?;
+    require_user(&state, app_id, user_id).await?;
+    let actor = resolve_actor(&state, &ctx, req.moderator_user_id.as_deref()).await?;
+    moderation_actions::set_priority(
+        &state.control,
+        ModerationTarget {
+            app_id,
+            channel_id,
+            user_id,
+            actor,
+            ip: client_ip_string(ip),
+        },
+        req.priority,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({"priority": req.priority})))
 }
 
 #[derive(Deserialize)]

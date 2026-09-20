@@ -33,6 +33,7 @@ pub mod ffi;
 
 pub mod media;
 pub mod regions;
+pub mod visemes;
 
 pub use audio::EncoderSettings;
 pub use aurix_common::protocol::{
@@ -53,6 +54,7 @@ pub use events::{
 };
 pub use media::{IncomingAudio, MediaPath, MediaPathPolicy, MediaStats};
 pub use regions::{GeoLocation, ProbedRegion, Region, RegionEndpoint, RegionsResponse};
+pub use visemes::{Viseme, VisemeAnalyzer, VisemeFrame, VISEME_COUNT};
 
 /// Top bit of a synthesized (TTS / announcement) stream SSRC; session SSRCs never have it.
 pub const SYNTH_SSRC_FLAG: u32 = 0x8000_0000;

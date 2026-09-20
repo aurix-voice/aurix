@@ -25,6 +25,11 @@ export interface RenderInputs {
   silenced: boolean;
   /** `1`, or the node's unfocused-channel gain when another channel holds the focus. */
   focusFactor: number;
+  /**
+   * Priority-speaker ducking currently applying to this voice (`DuckingConfig.gain` of the
+   * channel whose priority member speaks); absent / `1` = not ducked.
+   */
+  ducking?: DuckParams;
   /** Present when the speaker shares a positional channel with the listener and both positions are known. */
   positional?: {
     config: PositionalConfigWire;
@@ -39,13 +44,26 @@ export interface RenderParams {
   gain: number;
   /** Direction to pan towards; `undefined` = no spatialisation (centred, unprocessed). */
   direction?: Direction;
+  /** Ducking stage: target gain plus the ramps (`undefined` = ramp back to unity with `releaseMs`). */
+  ducking?: DuckParams;
+}
+
+/** Ducking applied on top of the receiver gains; kept a separate stage so its ramps are its own. */
+export interface DuckParams {
+  /** `0..1`; `1` = not ducked. */
+  gain: number;
+  attackMs: number;
+  releaseMs: number;
 }
 
 /** Below this the server drops the frame, so the browser treats the voice as inaudible too. */
 const AUDIBLE_GAIN = 0.001;
 
 export function renderParams(inputs: RenderInputs): RenderParams {
-  if (inputs.silenced || !(inputs.volume > 0)) return { gain: 0 };
+  // Ducking survives silence so a voice unmuted / walking back into range mid-duck does not pump.
+  const ducking = inputs.ducking && inputs.ducking.gain < 1 ? inputs.ducking : undefined;
+  const silent = (): RenderParams => (ducking ? { gain: 0, ducking } : { gain: 0 });
+  if (inputs.silenced || !(inputs.volume > 0)) return silent();
   let gain = inputs.volume * inputs.focusFactor;
   let direction: Direction | undefined;
   const p = inputs.positional;
@@ -59,8 +77,11 @@ export function renderParams(inputs: RenderInputs): RenderParams {
       };
     }
   }
-  if (!(gain > AUDIBLE_GAIN)) return { gain: 0 };
-  return direction ? { gain, direction } : { gain };
+  if (!(gain > AUDIBLE_GAIN)) return silent();
+  const out: RenderParams = { gain };
+  if (direction) out.direction = direction;
+  if (ducking) out.ducking = ducking;
+  return out;
 }
 
 export function distance(a: Position3D, b: Position3D): number {
@@ -144,7 +165,7 @@ export interface AudioParamLike {
 }
 export interface AudioNodeLike {
   connect(destination: AudioNodeLike): unknown;
-  disconnect(): void;
+  disconnect(destination?: AudioNodeLike): void;
 }
 export interface GainNodeLike extends AudioNodeLike {
   gain: AudioParamLike;
@@ -185,16 +206,23 @@ interface Slot {
   stream: MediaStream;
   source: AudioNodeLike;
   gain: GainNodeLike;
+  duck: GainNodeLike;
+  duckTarget: number;
+  /** Release ramp of the ducking last applied, for the ramp back once ducking is gone. */
+  lastRelease: number | undefined;
   panner: PannerNodeLike | undefined;
   spatial: boolean;
   keepAlive: HTMLAudioElement | undefined;
+  taps: Set<AudioNodeLike>;
 }
 
 /** Time constant of gain / position ramps (s): fast enough to follow movement, no zipper noise. */
 const RAMP_TC = 0.02;
+/** `setTargetAtTime` reaches ~95 % of the target after three time constants. */
+const RAMP_SETTLE = 3;
 
 /**
- * One Web Audio graph per client: `source → gain → [panner] → master → destination`, a slot
+ * One Web Audio graph per client: `source → gain → duck → [panner] → master → destination`, a slot
  * per negotiated `mid`. Slots are keyed by `mid` because the participant on a track changes
  * while the track stays; the client re-applies the new participant's parameters.
  */
@@ -232,8 +260,11 @@ export class SpatialRenderer {
     const source = this.context.createMediaStreamSource(stream);
     const gain = this.context.createGain();
     gain.gain.value = 0;
+    const duck = this.context.createGain();
+    duck.gain.value = 1;
     source.connect(gain);
-    gain.connect(this.master);
+    gain.connect(duck);
+    duck.connect(this.master);
     let keepAlive: HTMLAudioElement | undefined;
     if (this.document) {
       keepAlive = this.document.createElement('audio');
@@ -242,7 +273,18 @@ export class SpatialRenderer {
       keepAlive.srcObject = stream;
       void keepAlive.play().catch(() => undefined);
     }
-    this.slots.set(mid, { stream, source, gain, panner: undefined, spatial: false, keepAlive });
+    this.slots.set(mid, {
+      stream,
+      source,
+      gain,
+      duck,
+      duckTarget: 1,
+      lastRelease: undefined,
+      panner: undefined,
+      spatial: false,
+      keepAlive,
+      taps: new Set(),
+    });
   }
 
   removeTrack(mid: string): void {
@@ -251,10 +293,30 @@ export class SpatialRenderer {
     this.slots.delete(mid);
     slot.source.disconnect();
     slot.gain.disconnect();
+    slot.duck.disconnect();
     slot.panner?.disconnect();
+    for (const tap of slot.taps) tap.disconnect();
     if (slot.keepAlive) {
       slot.keepAlive.srcObject = null;
     }
+  }
+
+  /**
+   * Feed slot `mid`'s raw decoded audio (before any receiver gain) into `node` as well — a
+   * viseme analyser, a meter. Removed with the slot or {@link removeTap}.
+   */
+  addTap(mid: string, node: AudioNodeLike): boolean {
+    const slot = this.slots.get(mid);
+    if (!slot) return false;
+    slot.source.connect(node);
+    slot.taps.add(node);
+    return true;
+  }
+
+  removeTap(mid: string, node: AudioNodeLike): void {
+    const slot = this.slots.get(mid);
+    if (!slot || !slot.taps.delete(node)) return;
+    slot.source.disconnect(node);
   }
 
   /** Drop every slot (media torn down); the context stays usable. */
@@ -268,14 +330,25 @@ export class SpatialRenderer {
     if (!slot) return;
     const now = this.context.currentTime;
     slot.gain.gain.setTargetAtTime(params.gain, now, RAMP_TC);
+    const duckTarget = params.ducking?.gain ?? 1;
+    if (duckTarget !== slot.duckTarget) {
+      const rampMs = params.ducking
+        ? duckTarget < slot.duckTarget
+          ? params.ducking.attackMs
+          : params.ducking.releaseMs
+        : slot.lastRelease ?? 0;
+      slot.duckTarget = duckTarget;
+      slot.duck.gain.setTargetAtTime(duckTarget, now, Math.max(RAMP_TC, rampMs / 1000 / RAMP_SETTLE));
+    }
+    if (params.ducking) slot.lastRelease = params.ducking.releaseMs;
     const wantSpatial = params.direction !== undefined && params.gain > 0;
     if (wantSpatial !== slot.spatial) {
-      slot.gain.disconnect();
+      slot.duck.disconnect();
       if (wantSpatial) {
         slot.panner ??= this.createPanner();
-        slot.gain.connect(slot.panner);
+        slot.duck.connect(slot.panner);
       } else {
-        slot.gain.connect(this.master);
+        slot.duck.connect(this.master);
       }
       slot.spatial = wantSpatial;
     }

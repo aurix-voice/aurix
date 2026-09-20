@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 
 use crate::dsp::{Dsp, DspConfig};
 use crate::effects::EffectChain;
+use crate::visemes::{VisemeAnalyzer, VisemeFrame};
 
 /// Opus on the wire runs at 48 kHz; the mixer and the capture path work at this rate and
 /// PCMU frames are resampled to/from it at the edge.
 pub const SAMPLE_RATE: u32 = 48_000;
 /// One packet carries 20 ms of audio.
 pub const FRAME_SAMPLES: usize = 960;
+pub const FRAME_DURATION: Duration = Duration::from_millis(20);
 /// 48 kHz → 8 kHz decimation factor of the PCMU path.
 const PCMU_DECIMATION: usize = (SAMPLE_RATE / PCMU_SAMPLE_RATE) as usize;
 /// Largest software input gain (+12 dB).
@@ -694,6 +696,8 @@ pub struct CaptureEncoder {
     pub dsp: Dsp,
     /// Voice effects applied after the DSP and gain, before VAD metering and encoding.
     pub effects: EffectChain,
+    /// Lip-sync of our own voice as sent (after DSP, gain and effects), when enabled.
+    visemes: Option<Box<VisemeAnalyzer>>,
     settings: EncoderSettings,
     out: [u8; 1275],
     ulaw: Vec<u8>,
@@ -718,6 +722,7 @@ impl CaptureEncoder {
             vad: VoiceActivityDetector::default(),
             dsp: Dsp::new(DspConfig::BYPASS),
             effects: EffectChain::default(),
+            visemes: None,
             settings,
             out: [0u8; 1275],
             ulaw: Vec::with_capacity(PCMU_FRAME_SAMPLES),
@@ -874,6 +879,9 @@ impl CaptureEncoder {
                     }
                 }
                 self.effects.process(frame, 1);
+                if let Some(v) = &mut self.visemes {
+                    v.push(frame, 1);
+                }
                 self.vad.process(frame);
                 let energy = rms(frame);
                 match self.codec {
@@ -915,6 +923,9 @@ impl CaptureEncoder {
                     self.interleaved[n * 2 + 1] = r;
                 }
                 self.effects.process(&mut self.interleaved, 2);
+                if let Some(v) = &mut self.visemes {
+                    v.push(&self.interleaved, 2);
+                }
                 for (n, [l, r]) in self.interleaved.as_chunks::<2>().0.iter().enumerate() {
                     self.meter[n] = 0.5 * (l + r);
                 }
@@ -950,12 +961,29 @@ impl CaptureEncoder {
         self.push_f32(&f, sample_rate, channels, sink);
     }
 
+    /// Analyse (or stop analysing) the outgoing voice for lip-sync; read [`Self::visemes`].
+    pub fn set_visemes(&mut self, enabled: bool) {
+        match (&self.visemes, enabled) {
+            (None, true) => self.visemes = Some(Box::default()),
+            (Some(_), false) => self.visemes = None,
+            _ => {}
+        }
+    }
+
+    /// Mouth state of the last encoded frame, `None` unless [`Self::set_visemes`] is on.
+    pub fn visemes(&self) -> Option<VisemeFrame> {
+        self.visemes.as_ref().map(|v| v.frame())
+    }
+
     /// Drop buffered samples (device switch, unmute after a long pause).
     pub fn reset(&mut self) {
         self.pending.clear();
         self.resamplers.clear();
         self.vad.reset();
         self.effects.reset();
+        if let Some(v) = &mut self.visemes {
+            v.reset();
+        }
         let _ = self.encoder.reset_state();
         self.pcmu.reset();
     }
@@ -1088,6 +1116,10 @@ struct Stream {
     last_activity: Instant,
     starved: bool,
     starved_at: Instant,
+    /// Lip-sync of this stream's decoded audio, when the mixer analyses visemes.
+    visemes: Option<Box<VisemeAnalyzer>>,
+    /// Last time the analyser was fed; gaps feed it silence once per frame period at most.
+    viseme_fed_at: Instant,
 }
 
 /// Statistics of one decoded sender stream.
@@ -1138,6 +1170,8 @@ pub struct RemoteMixer {
     /// Lost/late of streams already dropped, so totals never go backwards.
     retired: MixerTotals,
     underruns: u64,
+    /// Every stream gets a [`VisemeAnalyzer`] fed from its decoded frames.
+    visemes: bool,
 }
 
 impl RemoteMixer {
@@ -1152,7 +1186,34 @@ impl RemoteMixer {
             scratch: Vec::new(),
             retired: MixerTotals::default(),
             underruns: 0,
+            visemes: false,
         }
+    }
+
+    /// Analyse every stream's decoded audio for lip-sync (see [`Self::visemes`]). Streams
+    /// are analysed as they are rendered by [`Self::mix`] / [`Self::pull`]; a stream nobody
+    /// plays keeps its last state.
+    pub fn set_visemes(&mut self, enabled: bool) {
+        self.visemes = enabled;
+        for s in self.streams.values_mut() {
+            match (&s.visemes, enabled) {
+                (None, true) => s.visemes = Some(Box::default()),
+                (Some(_), false) => s.visemes = None,
+                _ => {}
+            }
+        }
+    }
+
+    pub fn visemes_enabled(&self) -> bool {
+        self.visemes
+    }
+
+    /// Mouth state of `ssrc`: `None` for an unknown stream or with analysis off.
+    pub fn visemes(&self, ssrc: u32) -> Option<VisemeFrame> {
+        self.streams
+            .get(&ssrc)
+            .and_then(|s| s.visemes.as_ref())
+            .map(|v| v.frame())
     }
 
     /// Master volume on top of per-participant gains, `0..=MAX_OUTPUT_VOLUME`.
@@ -1243,6 +1304,7 @@ impl RemoteMixer {
                 s.len = 0;
             }
         }
+        let visemes = self.visemes;
         let stream = match self.streams.get_mut(&ssrc) {
             Some(s) => s,
             None => {
@@ -1264,6 +1326,8 @@ impl RemoteMixer {
                     last_activity: Instant::now(),
                     starved: false,
                     starved_at: Instant::now(),
+                    visemes: visemes.then(Box::default),
+                    viseme_fed_at: Instant::now() - FRAME_DURATION,
                 })
             }
         };
@@ -1284,6 +1348,9 @@ impl RemoteMixer {
             // A talk spurt after silence: refill the target depth before playing again.
             stream.jitter.reset();
             stream.starved = false;
+            if let Some(v) = &mut stream.visemes {
+                v.reset();
+            }
             if now.duration_since(stream.starved_at) < UNDERRUN_RESUME_WINDOW {
                 self.underruns += 1;
             }
@@ -1418,6 +1485,15 @@ impl RemoteMixer {
                 if s.len == 0 {
                     break;
                 }
+                if let Some(v) = &mut s.visemes {
+                    let width = if s.stereo && s.codec == AudioCodec::Opus {
+                        2
+                    } else {
+                        1
+                    };
+                    v.push(&s.frame[..s.len * width], width as u8);
+                    s.viseme_fed_at = now;
+                }
             }
             let take = (s.len - s.pos).min(frames_needed - written);
             let gain = s.volume * master;
@@ -1462,6 +1538,13 @@ impl RemoteMixer {
             }
             s.pos += take;
             written += take;
+        }
+        if written < frames_needed && now.duration_since(s.viseme_fed_at) >= FRAME_DURATION {
+            // Nothing (more) to play: the mouth relaxes towards closed.
+            if let Some(v) = &mut s.visemes {
+                v.push(&[], 1);
+                s.viseme_fed_at = now;
+            }
         }
         (written, contributed)
     }
@@ -2379,5 +2462,114 @@ mod tests {
         mixed.fill(0.0);
         assert_eq!(mixer.mix(&mut mixed, 1), 1);
         assert!(rms(&mixed) > 0.2, "{}", rms(&mixed));
+    }
+
+    /// A harmonic-rich "vowel" (fundamental plus two formant partials), loud enough to open
+    /// the analysed mouth; a bare sine reads as a closed-lip hum.
+    fn vowel(len: usize) -> Vec<f32> {
+        let mut pcm = sine(len, 48_000, 150.0, 0.25);
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f32 / 48_000.0;
+            *s += 0.2 * (2.0 * std::f32::consts::PI * 750.0 * t).sin()
+                + 0.15 * (2.0 * std::f32::consts::PI * 1250.0 * t).sin();
+        }
+        pcm
+    }
+
+    #[test]
+    fn mixer_tracks_visemes_per_stream_and_relaxes_in_gaps() {
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        let mut voiced = Vec::new();
+        enc.push_f32(&vowel(FRAME_SAMPLES * 10), 48_000, 1, |f| voiced.push(f));
+
+        let mut mixer = RemoteMixer::new(1, 12);
+        assert!(!mixer.visemes_enabled());
+        mixer
+            .push(7, 0, 1.0, None, voiced[0].payload.clone())
+            .unwrap();
+        let mut out = vec![0f32; FRAME_SAMPLES];
+        mixer.mix(&mut out, 1);
+        // Off: no analysis is kept even for a stream that is playing.
+        assert_eq!(mixer.visemes(7), None);
+
+        mixer.set_visemes(true);
+        assert!(mixer.visemes_enabled());
+        // Turning it on retrofits existing streams and applies to new ones.
+        assert_eq!(mixer.visemes(7).unwrap().sequence, 0);
+        for i in 1..8 {
+            mixer
+                .push(7, i, 1.0, None, voiced[i as usize].payload.clone())
+                .unwrap();
+            out.fill(0.0);
+            mixer.mix(&mut out, 1);
+        }
+        let talking = mixer.visemes(7).unwrap();
+        assert!(talking.sequence >= 6, "{talking:?}");
+        assert!(talking.mouth_open > 0.3, "{talking:?}");
+        assert_ne!(talking.dominant, crate::visemes::Viseme::Silence);
+        assert_eq!(mixer.visemes(8), None, "unknown stream");
+
+        // The stream stops: rendering gaps feed silence so the mouth closes, one push per
+        // frame period at most no matter how small the host buffers are.
+        std::thread::sleep(FRAME_DURATION);
+        for _ in 0..4 {
+            mixer.mix(&mut out[..FRAME_SAMPLES / 4], 1);
+        }
+        let after_gap = mixer.visemes(7).unwrap().sequence;
+        assert!(after_gap > talking.sequence);
+        for _ in 0..4 {
+            mixer.mix(&mut out[..FRAME_SAMPLES / 4], 1);
+        }
+        assert_eq!(mixer.visemes(7).unwrap().sequence, after_gap);
+        for _ in 0..40 {
+            std::thread::sleep(FRAME_DURATION);
+            mixer.mix(&mut out, 1);
+            if mixer.visemes(7).unwrap().mouth_open < 0.05 {
+                break;
+            }
+        }
+        let quiet = mixer.visemes(7).unwrap();
+        assert!(quiet.mouth_open < 0.05, "{quiet:?}");
+        assert_eq!(quiet.dominant, crate::visemes::Viseme::Silence);
+
+        mixer.set_visemes(false);
+        assert_eq!(mixer.visemes(7), None);
+    }
+
+    #[test]
+    fn encoder_tracks_visemes_of_the_voice_as_sent() {
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        assert_eq!(enc.visemes(), None);
+        enc.set_visemes(true);
+        let mut frames = 0;
+        enc.push_f32(&vowel(FRAME_SAMPLES * 6), 48_000, 1, |_| frames += 1);
+        let mouth = enc.visemes().unwrap();
+        assert_eq!(mouth.sequence, frames as u64);
+        assert!(mouth.mouth_open > 0.3, "{mouth:?}");
+
+        // Stereo capture is downmixed for the analysis like everything else.
+        let mut stereo = CaptureEncoder::new(EncoderSettings {
+            channels: 2,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        stereo.set_visemes(true);
+        let mono = vowel(FRAME_SAMPLES * 6);
+        let interleaved: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
+        stereo.push_f32(&interleaved, 48_000, 2, |_| {});
+        assert!(stereo.visemes().unwrap().mouth_open > 0.3);
+
+        enc.reset();
+        let cleared = enc.visemes().unwrap();
+        assert_eq!(
+            cleared.mouth_open, 0.0,
+            "reset closes the mouth: {cleared:?}"
+        );
+        assert_eq!(
+            cleared.sequence, mouth.sequence,
+            "but the counter stays monotonic"
+        );
+        enc.set_visemes(false);
+        assert_eq!(enc.visemes(), None);
     }
 }

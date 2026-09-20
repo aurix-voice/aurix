@@ -2,11 +2,11 @@ use crate::session::MediaSession;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
 use dashmap::DashMap;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A sender-reported level older than this no longer describes the frame being routed.
 const AMBIENT_LEVEL_STALE_MS: i64 = 500;
@@ -49,6 +49,7 @@ pub struct RemoteParticipant {
     pub ssrc: u32,
     pub role: ChannelRole,
     pub is_muted: bool,
+    pub is_priority: bool,
 }
 
 /// Presence of one channel member as seen by another (`ChannelJoinAck.participants` entry
@@ -61,6 +62,7 @@ pub struct RosterEntry {
     pub role: ChannelRole,
     pub is_muted: bool,
     pub is_speaking: bool,
+    pub is_priority: bool,
     pub local: bool,
 }
 
@@ -81,6 +83,78 @@ fn pair(a: UserId, b: UserId) -> (UserId, UserId) {
     }
 }
 
+/// Ducking state of one channel (`ChannelConfig::ducking`): `depth` is how far the
+/// non-priority voices are currently pushed towards `DuckingConfig::gain` (`0.0` = not at
+/// all, `1.0` = fully), ramped linearly towards its target — `1.0` while a priority speaker
+/// was audible within `hold_ms`, `0.0` otherwise — at the configured attack/release speed.
+#[derive(Debug, Clone, Copy)]
+pub struct DuckEnvelope {
+    depth: f32,
+    updated: Option<Instant>,
+    held_until: Option<Instant>,
+}
+
+impl Default for DuckEnvelope {
+    fn default() -> Self {
+        Self {
+            depth: 0.0,
+            updated: None,
+            held_until: None,
+        }
+    }
+}
+
+impl DuckEnvelope {
+    /// A priority speaker's frame was audible at `now`.
+    pub fn trigger(&mut self, now: Instant, cfg: &DuckingConfig) {
+        self.advance(now, cfg);
+        self.held_until = Some(now + Duration::from_millis(u64::from(cfg.hold_ms)));
+    }
+
+    /// Gain for a non-priority voice at `now`.
+    pub fn gain(&mut self, now: Instant, cfg: &DuckingConfig) -> f32 {
+        self.advance(now, cfg);
+        1.0 - self.depth * (1.0 - cfg.gain)
+    }
+
+    /// Whether priority speech is holding the mix down (before the release completes).
+    pub fn is_active(&self, now: Instant) -> bool {
+        self.held_until.is_some_and(|t| t > now)
+    }
+
+    fn advance(&mut self, now: Instant, cfg: &DuckingConfig) {
+        let Some(updated) = self.updated else {
+            self.depth = if self.is_active(now) { 1.0 } else { 0.0 };
+            self.updated = Some(now);
+            return;
+        };
+        // A hold that ended between two frames: attack up to its end, release from there.
+        if let Some(held) = self.held_until.filter(|h| *h > updated && *h <= now) {
+            self.ramp(1.0, held.saturating_duration_since(updated), cfg);
+            self.ramp(0.0, now.saturating_duration_since(held), cfg);
+        } else {
+            let target = if self.is_active(now) { 1.0 } else { 0.0 };
+            self.ramp(target, now.saturating_duration_since(updated), cfg);
+        }
+        self.updated = Some(now);
+    }
+
+    fn ramp(&mut self, target: f32, elapsed: Duration, cfg: &DuckingConfig) {
+        let elapsed_ms = elapsed.as_secs_f32() * 1000.0;
+        let ramp_ms = if target > self.depth {
+            cfg.attack_ms
+        } else {
+            cfg.release_ms
+        } as f32;
+        if ramp_ms <= 0.0 {
+            self.depth = target;
+            return;
+        }
+        let step = (elapsed_ms / ramp_ms).min(1.0);
+        self.depth += (target - self.depth).clamp(-step, step);
+    }
+}
+
 pub struct MediaChannel {
     pub channel_id: ChannelId,
     pub app_id: AppId,
@@ -89,6 +163,9 @@ pub struct MediaChannel {
     config: RwLock<ChannelConfig>,
     participants: DashMap<UserId, Arc<MediaSession>>,
     participant_roles: DashMap<UserId, ChannelRole>,
+    /// Local members that are priority speakers (grant or runtime promotion).
+    priority: DashMap<UserId, ()>,
+    ducking: Mutex<DuckEnvelope>,
     ssrc_map: DashMap<u32, UserId>,
     participant_count: AtomicU32,
     /// Local members whose role may speak (`audience.max_speakers` admission).
@@ -111,6 +188,8 @@ impl MediaChannel {
             config: RwLock::new(config),
             participants: DashMap::new(),
             participant_roles: DashMap::new(),
+            priority: DashMap::new(),
+            ducking: Mutex::new(DuckEnvelope::default()),
             ssrc_map: DashMap::new(),
             participant_count: AtomicU32::new(0),
             local_speakers: AtomicU32::new(0),
@@ -202,6 +281,7 @@ impl MediaChannel {
         }
         self.ssrc_map.insert(session.ssrc, session.user_id);
         self.participant_roles.insert(session.user_id, role);
+        self.priority.remove(&session.user_id);
         self.remote.remove(&session.user_id);
         self.participants.insert(session.user_id, session);
         Ok(())
@@ -210,6 +290,7 @@ impl MediaChannel {
     pub fn remove_participant(&self, user_id: &UserId) -> Option<Arc<MediaSession>> {
         if let Some((_, session)) = self.participants.remove(user_id) {
             self.ssrc_map.remove(&session.ssrc);
+            self.priority.remove(user_id);
             if let Some((_, role)) = self.participant_roles.remove(user_id) {
                 if role.can_speak() {
                     self.local_speakers.fetch_sub(1, Ordering::AcqRel);
@@ -273,6 +354,66 @@ impl MediaChannel {
 
     pub fn remote_count(&self) -> usize {
         self.remote.len()
+    }
+
+    /// Marks a member (local or remote) as a priority speaker or not. Returns `false` when
+    /// they are not in the channel.
+    pub fn set_priority(&self, user_id: &UserId, priority: bool) -> bool {
+        if self.participants.contains_key(user_id) {
+            if priority {
+                self.priority.insert(*user_id, ());
+            } else {
+                self.priority.remove(user_id);
+            }
+            return true;
+        }
+        if let Some(mut r) = self.remote.get_mut(user_id) {
+            r.is_priority = priority;
+            return true;
+        }
+        false
+    }
+
+    /// Whether `user_id` was explicitly made a priority speaker (grant or promotion); the
+    /// flag carried in rosters. See [`MediaChannel::is_priority`] for the effective state.
+    pub fn has_priority_flag(&self, user_id: &UserId) -> bool {
+        self.priority.contains_key(user_id)
+            || self.remote.get(user_id).is_some_and(|r| r.is_priority)
+    }
+
+    /// Whether `user_id`'s speech ducks the others: the explicit flag, or a moderator role
+    /// when `ducking.moderators` is on. Always `false` in channels without `ducking`.
+    pub fn is_priority(&self, user_id: &UserId) -> bool {
+        let Some(cfg) = self.config.read().ducking else {
+            return false;
+        };
+        self.has_priority_flag(user_id)
+            || (cfg.moderators && self.member_role(user_id).is_some_and(|r| r.can_moderate()))
+    }
+
+    pub fn ducking_config(&self) -> Option<DuckingConfig> {
+        self.config.read().ducking
+    }
+
+    /// Whether a priority speaker is currently holding the channel ducked.
+    pub fn ducking_active(&self) -> bool {
+        self.ducking.lock().is_active(Instant::now())
+    }
+
+    /// Ducking gain to apply to `sender_uid`'s current frame (`1.0` = none). A priority
+    /// speaker's audible frame re-arms the hold instead and is never ducked itself.
+    fn ducking_gain(&self, sender_uid: &UserId, audible: bool, now: Instant) -> f32 {
+        let Some(cfg) = self.config.read().ducking else {
+            return 1.0;
+        };
+        let mut env = self.ducking.lock();
+        if self.is_priority(sender_uid) {
+            if audible {
+                env.trigger(now, &cfg);
+            }
+            return 1.0;
+        }
+        env.gain(now, &cfg)
     }
 
     /// Members (local and remote) that may speak.
@@ -476,6 +617,7 @@ impl MediaChannel {
                 is_muted: s.is_muted.load(Ordering::Relaxed)
                     || s.is_server_muted.load(Ordering::Relaxed),
                 is_speaking: s.is_speaking.load(Ordering::Relaxed),
+                is_priority: self.priority.contains_key(&s.user_id),
                 local: true,
             });
         }
@@ -491,6 +633,7 @@ impl MediaChannel {
                 role: r.role,
                 is_muted: r.is_muted,
                 is_speaking: false,
+                is_priority: r.is_priority,
                 local: false,
             });
         }
@@ -510,6 +653,7 @@ impl MediaChannel {
                 is_muted: s.is_muted.load(Ordering::Relaxed)
                     || s.is_server_muted.load(Ordering::Relaxed),
                 is_speaking: s.is_speaking.load(Ordering::Relaxed),
+                is_priority: self.priority.contains_key(&s.user_id),
                 local: true,
             });
         }
@@ -520,6 +664,7 @@ impl MediaChannel {
             role: r.role,
             is_muted: r.is_muted,
             is_speaking: false,
+            is_priority: r.is_priority,
             local: false,
         })
     }
@@ -745,8 +890,9 @@ impl MediaChannel {
     ) -> Vec<(Arc<MediaSession>, Mix)> {
         let ambient = self.config.read().ambient;
         let cap = self.stream_cap();
+        let ducking = self.config.read().ducking.is_some();
         let ranked = ambient.is_some() || cap.is_some();
-        let now = ranked.then(Instant::now);
+        let now = (ranked || ducking).then(Instant::now);
         // Sender-reported level of the current frame (unlabeled frames rank at nominal
         // loudness).
         let level = now
@@ -760,11 +906,28 @@ impl MediaChannel {
             .filter(|l| *l < aurix_common::protocol::AUDIO_LEVEL_SILENCE)
             .map(aurix_common::protocol::decode_audio_level)
             .unwrap_or(1.0);
+        // Priority ducking: one gain per frame for every receiver, computed before the
+        // per-receiver ranking so a ducked voice competes for slots at what is heard. A frame
+        // counts as speech when its label says so, or — unlabeled — when the sender's
+        // speaking state (just refreshed by the router for local senders) does.
+        let duck = match now {
+            Some(now) if ducking => {
+                let audible = match reported_level {
+                    Some(l) => l < aurix_common::protocol::AUDIO_LEVEL_SILENCE,
+                    None => self
+                        .participants
+                        .get(sender_uid)
+                        .is_none_or(|s| s.is_speaking.load(Ordering::Relaxed)),
+                };
+                self.ducking_gain(sender_uid, audible, now)
+            }
+            _ => 1.0,
+        };
         receivers
             .into_iter()
             .filter_map(|(receiver, mix)| {
                 let gain = receiver.gain_for(sender_uid, &self.channel_id)?;
-                let mut v = mix.volume * gain;
+                let mut v = mix.volume * gain * duck;
                 if let (Some(cfg), Some(now)) = (ambient.as_ref(), now) {
                     if v > 0.001 {
                         v *= receiver.ambient.lock().gate(
@@ -938,6 +1101,7 @@ impl MediaChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aurix_common::protocol::AUDIO_LEVEL_SILENCE;
     use std::time::Duration;
 
     fn session(app: AppId, ssrc: u32) -> Arc<MediaSession> {
@@ -1324,6 +1488,7 @@ mod tests {
                 ssrc: 77,
                 role: ChannelRole::Moderator,
                 is_muted: true,
+                is_priority: false,
             },
         );
         assert_eq!(changes.len(), 1);
@@ -1685,6 +1850,7 @@ mod tests {
                 ssrc: 99,
                 role: ChannelRole::Listener,
                 is_muted: false,
+                is_priority: false,
             },
         );
 
@@ -1792,6 +1958,7 @@ mod tests {
                 ssrc: 5000,
                 role: ChannelRole::Speaker,
                 is_muted: false,
+                is_priority: false,
             },
         );
         let admitted = Arc::new(AtomicU32::new(0));
@@ -1889,5 +2056,176 @@ mod tests {
         assert!(got
             .iter()
             .all(|(s, m)| s.user_id != speaker.user_id && m.volume == 1.0));
+    }
+
+    #[test]
+    fn duck_envelope_attacks_holds_and_releases() {
+        let cfg = DuckingConfig {
+            gain: 0.2,
+            attack_ms: 100,
+            release_ms: 400,
+            hold_ms: 250,
+            moderators: false,
+        };
+        let t0 = Instant::now();
+        let mut env = DuckEnvelope::default();
+        assert_eq!(env.gain(t0, &cfg), 1.0, "idle: unity");
+        env.trigger(t0, &cfg);
+        assert!(env.is_active(t0));
+        // Half-way through the attack the depth is 0.5 → gain 0.6.
+        let g = env.gain(t0 + Duration::from_millis(50), &cfg);
+        assert!((g - 0.6).abs() < 1e-4, "mid-attack gain {g}");
+        let g = env.gain(t0 + Duration::from_millis(200), &cfg);
+        assert!((g - 0.2).abs() < 1e-4, "fully ducked {g}");
+        // Still held at 240 ms; release starts after the hold elapses.
+        assert!(env.is_active(t0 + Duration::from_millis(240)));
+        assert!(!env.is_active(t0 + Duration::from_millis(251)));
+        let g = env.gain(t0 + Duration::from_millis(450), &cfg);
+        assert!((g - 0.6).abs() < 1e-3, "half released {g}");
+        // A new trigger during the release ramps back up along the attack.
+        env.trigger(t0 + Duration::from_millis(450), &cfg);
+        let g = env.gain(t0 + Duration::from_millis(500), &cfg);
+        assert!((g - 0.2).abs() < 1e-3, "re-attacked {g}");
+        let g = env.gain(t0 + Duration::from_millis(2000), &cfg);
+        assert_eq!(g, 1.0, "released to unity");
+    }
+
+    fn ducked(cfg: DuckingConfig) -> ChannelConfig {
+        ChannelConfig {
+            channel_type: ChannelType::Team,
+            ducking: Some(cfg),
+            ..ChannelConfig::default()
+        }
+    }
+
+    const INSTANT_DUCK: DuckingConfig = DuckingConfig {
+        gain: 0.25,
+        attack_ms: 0,
+        release_ms: 0,
+        hold_ms: 10_000,
+        moderators: false,
+    };
+
+    #[test]
+    fn priority_speech_ducks_everyone_else_but_keeps_local_prefs() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(ChannelId::new(), app, ducked(INSTANT_DUCK));
+        let leader = session(app, 1);
+        let bob = session(app, 2);
+        let carol = session(app, 3);
+        for s in [&leader, &bob, &carol] {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        assert!(ch.set_priority(&leader.user_id, true));
+        assert!(!ch.set_priority(&UserId::new(), true), "non-member");
+        assert!(ch.is_priority(&leader.user_id));
+        assert!(!ch.is_priority(&bob.user_id));
+        carol.prefs.write().set_gain(bob.user_id, 0.5);
+
+        // Nobody with priority is talking: unity everywhere.
+        let f = ch.get_receivers_for_audio(2);
+        assert_eq!(hears(&f, &leader), Some(1.0));
+        assert_eq!(hears(&f, &carol), Some(0.5));
+        assert!(!ch.ducking_active());
+
+        // The leader's own frames arrive at full volume and arm the envelope.
+        leader.mark_audio_activity();
+        let f = ch.get_receivers_for_audio(1);
+        assert_eq!(hears(&f, &bob), Some(1.0));
+        assert_eq!(hears(&f, &carol), Some(1.0));
+        assert!(ch.ducking_active());
+
+        // Bob is ducked for everyone — including the leader — on top of local gain.
+        let f = ch.get_receivers_for_audio(2);
+        assert_eq!(hears(&f, &leader), Some(0.25));
+        assert_eq!(hears(&f, &carol), Some(0.125));
+        // Local mute and zero gain still remove the voice entirely.
+        carol
+            .prefs
+            .write()
+            .set_muted(bob.user_id, Some(ch.channel_id), true);
+        assert_eq!(hears(&ch.get_receivers_for_audio(2), &carol), None);
+
+        // A second priority speaker is never ducked, even while the first one talks.
+        assert!(ch.set_priority(&carol.user_id, true));
+        carol.mark_audio_activity();
+        let f = ch.get_receivers_for_audio(3);
+        assert_eq!(hears(&f, &leader), Some(1.0));
+        assert_eq!(hears(&f, &bob), Some(1.0));
+
+        // Demotion takes effect on the next frame.
+        assert!(ch.set_priority(&carol.user_id, false));
+        assert_eq!(hears(&ch.get_receivers_for_audio(3), &bob), Some(0.25));
+    }
+
+    #[test]
+    fn ducking_needs_channel_config_and_may_include_moderators() {
+        let app = AppId::new();
+        let plain = MediaChannel::new(ChannelId::new(), app, ChannelConfig::default());
+        let leader = session(app, 1);
+        let bob = session(app, 2);
+        for s in [&leader, &bob] {
+            plain
+                .add_participant(s.clone(), ChannelRole::Moderator)
+                .unwrap();
+        }
+        plain.set_priority(&leader.user_id, true);
+        leader.mark_audio_activity();
+        assert!(plain.has_priority_flag(&leader.user_id));
+        assert!(!plain.is_priority(&leader.user_id), "no ducking config");
+        plain.get_receivers_for_audio(1);
+        assert_eq!(hears(&plain.get_receivers_for_audio(2), &leader), Some(1.0));
+        assert!(!plain.ducking_active());
+
+        let mods = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ducked(DuckingConfig {
+                moderators: true,
+                ..INSTANT_DUCK
+            }),
+        );
+        let gm = session(app, 3);
+        let player = session(app, 4);
+        mods.add_participant(gm.clone(), ChannelRole::Moderator)
+            .unwrap();
+        mods.add_participant(player.clone(), ChannelRole::Speaker)
+            .unwrap();
+        assert!(mods.is_priority(&gm.user_id));
+        assert!(!mods.has_priority_flag(&gm.user_id), "role, not flag");
+        gm.mark_audio_activity();
+        mods.get_receivers_for_audio(3);
+        assert_eq!(hears(&mods.get_receivers_for_audio(4), &gm), Some(0.25));
+
+        // Relayed frames from a remote priority speaker arm the envelope by their level label.
+        let remote = MediaChannel::new(ChannelId::new(), app, ducked(INSTANT_DUCK));
+        let listener = session(app, 5);
+        let talker = session(app, 6);
+        remote
+            .add_participant(listener.clone(), ChannelRole::Speaker)
+            .unwrap();
+        remote
+            .add_participant(talker.clone(), ChannelRole::Speaker)
+            .unwrap();
+        let far = UserId::new();
+        remote.add_remote(
+            far,
+            RemoteParticipant {
+                session_id: SessionId::new(),
+                display_name: "far".into(),
+                ssrc: 99,
+                role: ChannelRole::Speaker,
+                is_muted: false,
+                is_priority: true,
+            },
+        );
+        remote.get_receivers_for_relayed_audio(&far, Some(AUDIO_LEVEL_SILENCE));
+        assert!(!remote.ducking_active(), "silence label does not arm");
+        remote.get_receivers_for_relayed_audio(&far, Some(30));
+        assert!(remote.ducking_active());
+        assert_eq!(
+            hears(&remote.get_receivers_for_audio(6), &listener),
+            Some(0.25)
+        );
     }
 }

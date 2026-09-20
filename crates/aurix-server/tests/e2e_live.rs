@@ -209,6 +209,16 @@ async fn issue_token_for(
             serde_json::json!({"channel_id": ch, "join": true, "speak": true, "receive": true, "moderate": false})
         })
         .collect();
+    issue_token_grants(env, http, external_id, name, grants).await
+}
+
+async fn issue_token_grants(
+    env: &Env,
+    http: &reqwest::Client,
+    external_id: &str,
+    name: &str,
+    grants: Vec<serde_json::Value>,
+) -> (String, String) {
     let r: serde_json::Value = http
         .post(format!("{}/v1/tokens", env.api))
         .header("x-api-key", &env.api_key)
@@ -2050,6 +2060,287 @@ async fn local_mute_volume_and_persistent_cross_mute() {
     assert_eq!(r.status(), 400);
 
     for mut p in [alice, bob, carol] {
+        let _ = p.ws.close(None).await;
+    }
+}
+
+/// Priority speakers (`ChannelConfig.ducking`): a `priority` grant is reflected in the join
+/// ack and the roster; while a priority speaker's frames flow every other voice is attenuated
+/// by `gain` for every receiver — multiplied with local volume, never applied to the priority
+/// speaker themselves, never to a second priority speaker — and the hold keeps the duck on
+/// over pauses before it releases. `SetPriority` takes a moderator role or a grant, is acked
+/// to the whole channel as `PriorityChanged` (WS and REST alike) and is rejected where the
+/// channel has no `ducking`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn priority_speaker_ducks_everyone_else() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let ducking = serde_json::json!({
+        "gain": 0.25, "attack_ms": 0, "release_ms": 0, "hold_ms": 1500, "moderators": false
+    });
+    let channel_id =
+        create_channel_with(&env, &http, serde_json::json!({"ducking": ducking})).await;
+    let plain = create_channel(&env, &http).await;
+    let grant = |ch: ChannelId, moderate: bool, priority: bool| {
+        serde_json::json!({
+            "channel_id": ch, "join": true, "speak": true, "receive": true,
+            "moderate": moderate, "priority": priority
+        })
+    };
+    let (tok_lead, uid_lead) = issue_token_grants(
+        &env,
+        &http,
+        "e2e:duck-lead",
+        "Lead",
+        vec![grant(channel_id, false, true), grant(plain, false, true)],
+    )
+    .await;
+    let (tok_mod, _) = issue_token_grants(
+        &env,
+        &http,
+        "e2e:duck-mod",
+        "Mod",
+        vec![grant(channel_id, true, false)],
+    )
+    .await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e:duck-bob", "Bob", channel_id).await;
+    let (tok_c, _) = issue_token(&env, &http, "e2e:duck-carol", "Carol", channel_id).await;
+    let uid_lead = UserId::from_uuid(uid_lead.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+
+    let mut lead = connect(&env, "lead", tok_lead).await;
+    let mut moderator = connect(&env, "mod", tok_mod).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    for p in [&mut lead, &mut moderator, &mut bob, &mut carol] {
+        bind_media(p).await;
+    }
+
+    // The join ack carries the channel's ducking and your own priority; the roster carries
+    // the others'.
+    lead.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: lead.token.clone(),
+    })
+    .await;
+    let ack = lead
+        .expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id)
+        })
+        .await;
+    let ControlMessage::ChannelJoinAck {
+        ducking: Some(cfg),
+        priority: true,
+        ..
+    } = ack
+    else {
+        panic!("lead must join as a priority speaker of a ducking channel: {ack:?}");
+    };
+    assert_eq!((cfg.gain, cfg.hold_ms, cfg.moderators), (0.25, 1500, false));
+    for p in [&mut moderator, &mut bob, &mut carol] {
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: p.token.clone(),
+        })
+        .await;
+        let ack = p
+            .expect("ChannelJoinAck", |m| {
+                matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id)
+            })
+            .await;
+        let ControlMessage::ChannelJoinAck {
+            participants,
+            priority,
+            ducking,
+            ..
+        } = ack
+        else {
+            unreachable!()
+        };
+        assert!(!priority && ducking.is_some(), "{}", p.name);
+        let lead_brief = participants
+            .iter()
+            .find(|b| b.user_id == uid_lead)
+            .expect("lead in roster");
+        assert!(lead_brief.is_priority, "{}: roster flags the lead", p.name);
+        assert!(participants
+            .iter()
+            .all(|b| b.user_id == uid_lead || !b.is_priority));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let hello = Bytes::from_static(b"hello");
+
+    // Nobody with priority is talking: Bob arrives at unity everywhere.
+    send_audio(&bob, channel_id, 1, &hello).await;
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (None, 10));
+    assert_eq!(audio_from(&lead, bob.ssrc, &hello).await, (None, 10));
+    drain_udp(&moderator).await;
+
+    // The lead speaks: their own frames are never attenuated, and within the hold Bob is
+    // ducked to `gain` for every receiver, the lead included.
+    send_audio(&lead, channel_id, 1, &hello).await;
+    assert_eq!(audio_from(&bob, lead.ssrc, &hello).await, (None, 10));
+    assert_eq!(audio_from(&carol, lead.ssrc, &hello).await, (None, 10));
+    send_audio(&bob, channel_id, 100, &hello).await;
+    let ducked = Some(encode_volume_byte(0.25));
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (ducked, 10));
+    assert_eq!(audio_from(&lead, bob.ssrc, &hello).await, (ducked, 10));
+    assert_eq!(audio_from(&moderator, bob.ssrc, &hello).await, (ducked, 10));
+
+    // Ducking multiplies with the receiver's own volume for that participant.
+    carol
+        .send(&ControlMessage::SetParticipantVolume {
+            user_id: uid_b,
+            volume: 0.5,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_audio(&lead, channel_id, 100, &hello).await;
+    send_audio(&bob, channel_id, 200, &hello).await;
+    assert_eq!(
+        audio_from(&carol, bob.ssrc, &hello).await,
+        (Some(encode_volume_byte(0.125)), 10)
+    );
+    assert_eq!(audio_from(&lead, bob.ssrc, &hello).await, (ducked, 10));
+    carol
+        .send(&ControlMessage::SetParticipantVolume {
+            user_id: uid_b,
+            volume: 1.0,
+        })
+        .await;
+
+    // Once the hold has elapsed without priority speech the duck releases.
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    send_audio(&bob, channel_id, 300, &hello).await;
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (None, 10));
+    drain_udp(&lead).await;
+
+    // Bob cannot promote himself; a moderator can, and everyone learns about it.
+    for p in [&mut lead, &mut moderator, &mut bob, &mut carol] {
+        drain_ws(p).await;
+    }
+    bob.send(&ControlMessage::SetPriority {
+        channel_id,
+        user_id: None,
+        priority: true,
+    })
+    .await;
+    expect_error(&mut bob, "self-promotion", "AUTH_DENIED").await;
+    moderator
+        .send(&ControlMessage::SetPriority {
+            channel_id,
+            user_id: Some(uid_b),
+            priority: true,
+        })
+        .await;
+    for p in [&mut moderator, &mut bob, &mut carol, &mut lead] {
+        p.expect("PriorityChanged(bob, true)", |m| {
+            matches!(
+                m,
+                ControlMessage::PriorityChanged { channel_id: c, user_id, priority: true }
+                    if *c == channel_id && *user_id == uid_b
+            )
+        })
+        .await;
+    }
+
+    // Two priority speakers at once: neither is ducked, Carol is ducked for both.
+    send_audio(&lead, channel_id, 200, &hello).await;
+    send_audio(&bob, channel_id, 400, &hello).await;
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (None, 10));
+    assert_eq!(audio_from(&lead, bob.ssrc, &hello).await, (None, 10));
+    send_audio(&carol, channel_id, 1, &hello).await;
+    assert_eq!(audio_from(&bob, carol.ssrc, &hello).await, (ducked, 10));
+    assert_eq!(
+        audio_from(&moderator, carol.ssrc, &hello).await,
+        (ducked, 10)
+    );
+
+    // Demotion over REST is broadcast the same way and takes effect on the next frame.
+    let r: serde_json::Value = http
+        .post(format!("{}/v1/moderation/priority", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "user_id": uid_b, "channel_id": channel_id, "priority": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["priority"], false);
+    for p in [&mut bob, &mut carol] {
+        p.expect("PriorityChanged(bob, false)", |m| {
+            matches!(
+                m,
+                ControlMessage::PriorityChanged { channel_id: c, user_id, priority: false }
+                    if *c == channel_id && *user_id == uid_b
+            )
+        })
+        .await;
+    }
+    send_audio(&lead, channel_id, 300, &hello).await;
+    send_audio(&bob, channel_id, 500, &hello).await;
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (ducked, 10));
+
+    // A granted member may step down (and back up) on their own; while nobody holds
+    // priority the channel is flat.
+    for p in [&mut lead, &mut carol] {
+        drain_ws(p).await;
+    }
+    lead.send(&ControlMessage::SetPriority {
+        channel_id,
+        user_id: None,
+        priority: false,
+    })
+    .await;
+    for p in [&mut lead, &mut carol] {
+        p.expect("PriorityChanged(lead, false)", |m| {
+            matches!(
+                m,
+                ControlMessage::PriorityChanged { channel_id: c, user_id, priority: false }
+                    if *c == channel_id && *user_id == uid_lead
+            )
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    send_audio(&lead, channel_id, 400, &hello).await;
+    send_audio(&bob, channel_id, 600, &hello).await;
+    assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (None, 10));
+    lead.send(&ControlMessage::SetPriority {
+        channel_id,
+        user_id: None,
+        priority: true,
+    })
+    .await;
+    lead.expect("PriorityChanged(lead, true)", |m| {
+        matches!(
+            m,
+            ControlMessage::PriorityChanged { channel_id: c, user_id, priority: true }
+                if *c == channel_id && *user_id == uid_lead
+        )
+    })
+    .await;
+
+    // Priority speakers need a ducking channel.
+    join(&mut lead, plain).await;
+    lead.send(&ControlMessage::SetPriority {
+        channel_id: plain,
+        user_id: None,
+        priority: true,
+    })
+    .await;
+    expect_error(&mut lead, "priority without ducking", "VALIDATION_ERROR").await;
+
+    for mut p in [lead, moderator, bob, carol] {
         let _ = p.ws.close(None).await;
     }
 }

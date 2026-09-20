@@ -28,7 +28,8 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > caps, a server mix for native clients), cross-node failover with Redis session mirrors, a
 > region-aware cascade backbone, stereo/music uplinks, per-participant PCM for engine
 > spatialization, per-participant WebRTC tracks with Web Audio HRTF for browsers / Unity WebGL,
-> group end-to-end encrypted channels (native + browser),
+> group end-to-end encrypted channels (native + browser), priority speakers with
+> attack/hold/release ducking, lip-sync visemes and a voice-effects library in every SDK,
 > fleet-wide rate limits, recording mixdown + post-hoc STT, live translation,
 > chat history/offline delivery/read markers, IPv6 dual-stack, admin SSO + roles, usage
 > analytics/quotas, and Web / Unity (incl. WebGL) / native (C ABI) / Unreal / Godot SDKs.
@@ -590,6 +591,23 @@ and are re-checked after the provider round trip; provider failures, timeouts, o
 segments or a busy node fall back to the original text; `SessionInitAck.translation`
 advertises the offered languages, `max_languages_per_channel`, `max_concurrent_requests`,
 `cache_entries` and `timeout_ms` bound the cost, `aurix_translations_total{outcome}` counts it.
+
+**Voice effects, lip-sync, priority speakers.** One effects library — high/low-pass, formant and
+pitch shift, ring modulation, distortion, tremolo, static, reverb, with `robot` / `monster` /
+`radio` / `helium` / `ghost` presets — runs on the microphone uplink only (after DSP and input
+gain, before VAD and the encoder; injected audio, TTS and the downlink are untouched) in the native
+core (Rust / C ABI / Unreal / Godot / Unity players) and as an `AudioWorklet` port in the Web SDK /
+Unity WebGL. Lip-sync visemes (`sil PP FF SS aa E ih oh ou` + mouth openness) are analysed on the
+receiving device from decoded — in E2EE channels decrypted — audio for every heard participant and
+the local microphone; nothing about them is sent anywhere (browsers analyse dedicated
+per-participant tracks only). Channels with `"ducking": {gain, attack_ms, release_ms, hold_ms,
+moderators}` get priority speakers — `priority` token grant, moderator promotion via `SetPriority` /
+`POST /v1/moderation/priority`, optionally every moderator — whose speech makes the node attenuate
+the other voices for every receiver with that envelope (several priority speakers at once, never the
+speaker themselves; local mute/volume/block stay separate), while `DuckingChanged` events and the
+Unity `AurixGameAudioDucker` let the game duck its own music/SFX
+([docs](docs/src/features/speech.md#voice-effects),
+[ducking](docs/src/features/channels.md#priority-speakers-and-ducking)).
 
 ### Content safety
 

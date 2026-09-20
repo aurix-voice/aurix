@@ -5,7 +5,7 @@
 
 use crate::event_bus::ServerEvent;
 use crate::plane::ControlPlane;
-use aurix_common::error::Result;
+use aurix_common::error::{AurixError, Result};
 use aurix_common::types::*;
 use aurix_media::SfuNode;
 use parking_lot::RwLock;
@@ -256,6 +256,43 @@ pub async fn set_server_mute(
             unmuted_by: t.actor,
             timestamp: now,
         }
+    });
+    Ok(())
+}
+
+/// Promotes or demotes a channel member as a priority speaker: persists the flag on their
+/// open membership and publishes `PriorityChanged` (every node applies it to its channel
+/// copy and tells the members). `NOT_FOUND` when the user has no open membership.
+pub async fn set_priority(
+    control: &ControlPlane,
+    t: ModerationTarget,
+    priority: bool,
+) -> Result<()> {
+    let updated = control
+        .sessions
+        .set_membership_priority(t.app_id, t.channel_id, t.user_id, priority)
+        .await?;
+    if updated == 0 {
+        return Err(AurixError::NotFound(
+            "User is not a member of this channel".into(),
+        ));
+    }
+    control.audit.log(
+        Some(t.app_id),
+        t.actor,
+        AuditAction::PriorityChanged,
+        "user",
+        &t.user_id.to_string(),
+        serde_json::json!({"channel_id": t.channel_id, "priority": priority}),
+        t.ip,
+    );
+    control.events.publish(ServerEvent::PriorityChanged {
+        app_id: t.app_id,
+        channel_id: t.channel_id,
+        user_id: t.user_id,
+        priority,
+        changed_by: t.actor,
+        timestamp: chrono::Utc::now(),
     });
     Ok(())
 }

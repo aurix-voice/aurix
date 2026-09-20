@@ -37,9 +37,31 @@ the chapter that explains the boundary.
   spoken translation is a synthesized voice on a channel-level translator SSRC — not the
   speaker's voice — and word timings are dropped from translated segments. Each node
   translates once per (segment, target language); there is no fleet-wide translation cache.
-* **Voice effects are native-only.** The pitch shifter / ring modulator / host callback chain
-  runs in the native core (Unreal, C ABI); Unity and the Web SDK use the engine's / browser's
-  own audio graph for effects.
+* **Voice effects are microphone-only and pre-encode.** The effects chain (filters, formant,
+  pitch, ring modulation, distortion, tremolo, static, reverb) runs on the sender's uplink in
+  the native core (C ABI, Unreal, Godot, Unity native players) or in a browser `AudioWorklet`
+  (Web SDK, Unity WebGL). Nothing is applied on the node or on the receiver: injected audio,
+  TTS, translations and the downlink are untouched, everyone hears the same effected voice,
+  and there is no per-listener "hear X as a robot". The two implementations share parameters
+  and presets but are separate ports (Rust and TypeScript), tuned by ear, not by measurement
+  ([Voice effects](features/speech.md#voice-effects)).
+* **Lip-sync is a receiver-side heuristic, not phoneme recognition.** Visemes are derived from
+  the spectrum of decoded audio (level, voiced/fricative split, two formants → nearest of five
+  vowels), locally, one frame per 20 ms; there is no speech model, no language awareness, no
+  network transport of mouth shapes and no server-side analysis. Browsers analyse only
+  participants on a dedicated per-participant track (the mixed track cannot be split); Unity
+  native players need the native library (`SupportsVisemes` / `SupportsVoiceEffects` are
+  `false` without it) ([Visemes](features/speech.md#visemes-lip-sync)).
+* **Priority-speaker ducking is one envelope per channel, driven by speech.** It engages on
+  a priority member's audible frames (level byte, or speaking state for unlabelled frames)
+  with the channel's attack / hold / release, for every receiver on the node alike: a
+  receiver who muted or blocked the priority speaker is still ducked while they talk (the
+  mute removes that voice, the duck attenuates the others), and a priority speaker on another
+  node ducks through the cascaded frames. Browsers reproduce the envelope on dedicated tracks
+  from `SpeakingStateChanged` — up to `media.speaking_timeout_ms` behind the node's own gain
+  on the mix. Game-audio ducking is an event plus a helper (`AurixGameAudioDucker`), not an
+  engine mixer integration
+  ([Priority speakers and ducking](features/channels.md#priority-speakers-and-ducking)).
 
 ## Protocol and media
 

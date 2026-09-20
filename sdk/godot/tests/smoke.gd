@@ -84,8 +84,19 @@ func _init() -> void:
 	client.set_vad(0.02, 5)
 	client.reset_capture()
 	_check(client.set_bitrate(24000) == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_bitrate without client → NOT_CONNECTED")
-	_check(client.set_voice_effects(3.0, 0.0) == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_voice_effects without client → NOT_CONNECTED")
-	_check(client.get_voice_effects().has("pitch_semitones"), "voice effects dictionary")
+	_check(client.set_voice_effects({"pitch_semitones": 3.0}) == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_voice_effects without client → NOT_CONNECTED")
+	_check(client.get_voice_effects().has("reverb_mix"), "voice effects dictionary")
+	var monster: Dictionary = client.get_voice_preset(AurixVoiceClient.VOICE_PRESET_MONSTER)
+	_check(monster.get("pitch_semitones", 0.0) < 0.0 and monster.get("reverb_mix", 0.0) > 0.0, "monster preset is pitched down with reverb")
+	_check(client.get_voice_preset(AurixVoiceClient.VOICE_PRESET_HELIUM).get("formant_semitones", 0.0) > 0.0, "helium preset raises formants")
+	_check(client.set_voice_preset(AurixVoiceClient.VOICE_PRESET_RADIO) == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_voice_preset without client → NOT_CONNECTED")
+	client.visemes_enabled = true
+	_check(client.visemes_enabled, "visemes_enabled stored for connect_to_server()")
+	_check(client.get_local_visemes().is_empty(), "no local visemes before connect")
+	_check(client.get_participant_visemes("00000000-0000-4000-8000-000000000001").is_empty(), "no participant visemes before connect")
+	_check(client.set_priority("00000000-0000-4000-8000-000000000001") == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_priority without client → NOT_CONNECTED")
+	_check(not client.is_ducking_active("00000000-0000-4000-8000-000000000001"), "ducking inactive before connect")
+	_check(AurixVoiceClient.VISEME_OU == 8 and AurixVoiceClient.VISEME_SILENCE == 0, "viseme constants")
 
 	# Configuration properties live on the node and are applied at connect_to_server().
 	client.playback_mode = AurixVoiceClient.PLAYBACK_PER_PARTICIPANT
@@ -131,6 +142,7 @@ func _init() -> void:
 	# Signals declared on the node.
 	for sig in ["state_changed", "session_ready", "media_bound", "channel_joined", "channel_left",
 			"participant_joined", "participant_left", "participant_speaking", "participant_mute_changed",
+			"participant_priority_changed", "ducking_changed",
 			"channel_energy", "local_speaking", "chat_message", "participant_typing", "transcript", "tts_status",
 			"recovering", "recovered", "failed_to_recover", "network_quality", "media_path_changed",
 			"downlink_mode_changed", "endpoint_changed", "chat_history", "chat_read_marker",

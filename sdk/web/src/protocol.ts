@@ -33,6 +33,22 @@ export interface ParticipantBrief {
   role: ChannelRole;
   is_muted: boolean;
   is_speaking: boolean;
+  /** Priority speaker (`ChannelConfig.ducking`): their speech attenuates everyone else. */
+  is_priority?: boolean;
+}
+
+/**
+ * Priority-speaker ducking of a channel (`ChannelConfig.ducking`): while a priority member
+ * speaks, every other voice is ramped to `gain` over `attack_ms`, held `hold_ms` past their
+ * last audible frame and ramped back over `release_ms`. `moderators`: moderators and
+ * administrators count as priority speakers too.
+ */
+export interface DuckingConfigWire {
+  gain: number;
+  attack_ms: number;
+  release_ms: number;
+  hold_ms: number;
+  moderators: boolean;
 }
 
 export interface Position3D {
@@ -165,6 +181,10 @@ export type ClientMessage =
       data: { user_id: string; channel_id: string | null; muted: boolean };
     }
   | { type: 'SetParticipantVolume'; data: { user_id: string; volume: number } }
+  | {
+      type: 'SetPriority';
+      data: { channel_id: string; user_id?: string | null; priority: boolean };
+    }
   | { type: 'SetUserBlock'; data: { user_id: string; blocked: boolean } }
   | { type: 'SetTransmission'; data: { mode: TransmissionModeWire } }
   | { type: 'SetChannelFocus'; data: { channel_id?: string | null } }
@@ -274,9 +294,16 @@ export type ServerMessage =
         hidden_listeners?: boolean;
         /** Positional channel: the model the browser applies to per-participant tracks. */
         positional?: PositionalConfigWire | null;
+        /** Priority-speaker ducking the node applies to what it mixes; browsers reproduce it on per-participant tracks. */
+        ducking?: DuckingConfigWire | null;
+        /** You are a priority speaker in this channel. */
+        priority?: boolean;
       };
     }
-  | { type: 'ChannelAudioPolicy'; data: { channel_id: string; audio: AudioPolicyWire } }
+  | {
+      type: 'ChannelAudioPolicy';
+      data: { channel_id: string; audio: AudioPolicyWire; ducking?: DuckingConfigWire | null };
+    }
   | {
       type: 'ParticipantJoined';
       data: {
@@ -286,9 +313,11 @@ export type ServerMessage =
         ssrc: number;
         role?: ParticipantBrief['role'];
         is_muted?: boolean;
+        is_priority?: boolean;
       };
     }
   | { type: 'ParticipantLeft'; data: { channel_id: string; user_id: string } }
+  | { type: 'PriorityChanged'; data: { channel_id: string; user_id: string; priority: boolean } }
   | {
       type: 'MuteStateChanged';
       data: { channel_id: string; user_id: string; muted: boolean; server_muted: boolean };

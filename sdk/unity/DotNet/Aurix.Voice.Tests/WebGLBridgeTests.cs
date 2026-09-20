@@ -311,6 +311,119 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public async Task PriorityDuckingVisemesAndEffectsUseTheSharedTypes()
+        {
+            var (client, bridge) = NewClient();
+            await Connect(client, bridge);
+
+            var join = client.JoinChannelAsync(Channel, "join-token");
+            var call = bridge.Last("joinChannel");
+            var roster = new List<object> { ParticipantJson(Alice, "alice"), ParticipantJson(Bob, "bob") };
+            bridge.Emit("channelJoined", ("channelId", Channel.ToString()), ("participants", roster));
+            bridge.Resolve(call.rid, roster);
+            client.Update();
+            await join;
+
+            // Priority toggle: own (no userId) and moderator-on-someone forms.
+            await client.SetPriorityAsync(Channel, null, true);
+            var own = bridge.Last("setPriority").args;
+            Assert.Equal(Channel.ToString(), MiniJson.GetString(own, "channelId"));
+            Assert.True(MiniJson.GetBool(own, "priority"));
+            Assert.False(own.ContainsKey("userId"));
+            await client.SetPriorityAsync(Channel, Bob, false);
+            Assert.Equal(Bob.ToString(), MiniJson.GetString(bridge.Last("setPriority").args, "userId"));
+
+            var priorityEvents = new List<(Guid, Guid, bool)>();
+            client.OnParticipantPriorityChanged += (c, u, p) => priorityEvents.Add((c, u, p));
+            Assert.False(client.FindByUser(Bob).IsPriority);
+            bridge.Emit("participantPriorityChanged", ("channelId", Channel.ToString()), ("userId", Bob.ToString()), ("priority", true));
+            client.Update();
+            Assert.Equal(new[] { (Channel, Bob, true) }, priorityEvents);
+            Assert.True(client.FindByUser(Bob).IsPriority);
+
+            bridge.Replies["isPriority"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            Assert.True(client.IsPriority(Channel));
+            bridge.Replies["isDuckingActive"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            Assert.True(client.IsDuckingActive(Channel));
+            Assert.Equal(Channel.ToString(), MiniJson.GetString(bridge.Last("isDuckingActive").args, "channelId"));
+            bridge.Replies["channelDucking"] = (_, __) => "{\"ok\":true,\"value\":{\"gain\":0.5,\"attackMs\":10,\"releaseMs\":20,\"holdMs\":30,\"moderators\":true}}";
+            var ducking = client.GetChannelDucking(Channel);
+            Assert.True(ducking.HasValue);
+            Assert.Equal(0.5f, ducking.Value.Gain);
+            Assert.Equal((10, 20, 30, true), (ducking.Value.AttackMs, ducking.Value.ReleaseMs, ducking.Value.HoldMs, ducking.Value.Moderators));
+            bridge.Replies["channelDucking"] = (_, __) => "{\"ok\":true,\"value\":null}";
+            Assert.Null(client.GetChannelDucking(Channel));
+
+            var duckingEvents = new List<(Guid, bool, DuckingConfig)>();
+            client.OnDuckingChanged += (c, a, cfg) => duckingEvents.Add((c, a, cfg));
+            bridge.Emit("duckingChanged", ("channelId", Channel.ToString()), ("active", true),
+                ("config", new Dictionary<string, object> { { "gain", 0.3 }, { "attackMs", 60.0 }, { "releaseMs", 400.0 }, { "holdMs", 250.0 }, { "moderators", false } }));
+            bridge.Emit("duckingChanged", ("channelId", Channel.ToString()), ("active", false));
+            client.Update();
+            Assert.Equal(2, duckingEvents.Count);
+            Assert.True(duckingEvents[0].Item2);
+            Assert.Equal(0.3f, duckingEvents[0].Item3.Gain);
+            Assert.False(duckingEvents[1].Item2);
+            Assert.Equal(DuckingConfig.Default, duckingEvents[1].Item3);
+
+            // Visemes: capability flags, toggle, pull + push shapes in the native enum order.
+            bridge.Replies["supportsVisemes"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            Assert.True(client.SupportsVisemes);
+            Assert.False(client.VisemesEnabled);
+            await client.SetVisemesAsync(true);
+            Assert.True(MiniJson.GetBool(bridge.Last("setVisemes").args, "enabled"));
+            var frameJson = new Dictionary<string, object>
+            {
+                { "weights", new List<object> { 0.0, 0.1, 0.0, 0.0, 0.7, 0.2, 0.0, 0.0, 0.0 } },
+                { "dominant", "aa" }, { "mouthOpen", 0.8 }, { "energy", 0.4 }, { "confidence", 0.9 }, { "sequence", 42.0 },
+            };
+            bridge.Replies["participantVisemes"] = (a, __) => MiniJson.GetString(a, "userId") == Bob.ToString()
+                ? "{\"ok\":true,\"value\":" + MiniJson.Serialize(frameJson) + "}" : "{\"ok\":true,\"value\":null}";
+            var bob = client.GetParticipantVisemes(Bob);
+            Assert.True(bob.HasValue);
+            Assert.Equal(Audio.Viseme.AA, bob.Value.Dominant);
+            Assert.Equal(0.7f, bob.Value[(int)Audio.Viseme.AA]);
+            Assert.Equal(0.2f, bob.Value[(int)Audio.Viseme.E]);
+            Assert.Equal(0.8f, bob.Value.MouthOpen);
+            Assert.Equal(42UL, bob.Value.Sequence);
+            Assert.Null(client.GetParticipantVisemes(Alice));
+            Assert.Null(client.GetLocalVisemes());
+
+            var remote = new List<(Guid, Audio.VisemeFrame)>();
+            var local = new List<Audio.VisemeFrame>();
+            client.OnParticipantVisemes += (u, f) => remote.Add((u, f));
+            client.OnLocalVisemes += f => local.Add(f);
+            bridge.Emit("participantVisemes", ("userId", Bob.ToString()), ("frame", frameJson));
+            bridge.Emit("localVisemes", ("frame", new Dictionary<string, object> { { "weights", new List<object> { 1.0 } }, { "dominant", "sil" }, { "sequence", 1.0 } }));
+            bridge.Emit("localVisemes", ("frame", null));
+            client.Update();
+            Assert.Single(remote);
+            Assert.Equal(Bob, remote[0].Item1);
+            Assert.Equal(Audio.Viseme.AA, remote[0].Item2.Dominant);
+            Assert.Single(local);
+            Assert.Equal(Audio.Viseme.Silence, local[0].Dominant);
+            Assert.Equal(1f, local[0][(int)Audio.Viseme.Silence]);
+
+            // Voice effects: sanitised params cross the bridge in camelCase; bypass is sent as null.
+            bridge.Replies["supportsVoiceEffects"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            Assert.True(client.SupportsVoiceEffects);
+            Assert.True(client.VoiceEffects.IsBypass);
+            await client.SetVoiceEffectsAsync(new Audio.VoiceEffectParams { PitchSemitones = 99f, RingModHz = 50f, HighpassHz = 5f });
+            var fx = MiniJson.AsObject(bridge.Last("setVoiceEffects").args["effects"]);
+            Assert.Equal(24.0, MiniJson.GetNumber(fx, "pitchSemitones"));
+            Assert.Equal(50.0, MiniJson.GetNumber(fx, "ringModHz"));
+            Assert.Equal(20.0, MiniJson.GetNumber(fx, "highpassHz"));
+            Assert.Equal(0.0, MiniJson.GetNumber(fx, "reverbMix"));
+            await client.SetVoiceEffectsAsync(Audio.VoiceEffectPreset.Robot);
+            var robot = Audio.VoiceEffectParams.Preset(Audio.VoiceEffectPreset.Robot);
+            Assert.Equal((double)robot.RingModHz, MiniJson.GetNumber(MiniJson.AsObject(bridge.Last("setVoiceEffects").args["effects"]), "ringModHz"));
+            await client.SetVoiceEffectsAsync(Audio.VoiceEffectParams.Bypass);
+            Assert.Null(bridge.Last("setVoiceEffects").args["effects"]);
+            bridge.Replies["voiceEffects"] = (_, __) => "{\"ok\":true,\"value\":" + MiniJson.Serialize(BridgeJson.VoiceEffectsToBridge(robot)) + "}";
+            Assert.Equal(robot, client.VoiceEffects);
+        }
+
+        [Fact]
         public async Task ConnectWaitsForTheSdkBundleAndFailsWhenItDoesNotLoad()
         {
             var (client, bridge) = NewClient();

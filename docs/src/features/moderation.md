@@ -27,6 +27,16 @@ fan-out and a `participant.kicked` event. The session itself stays open, so the 
 rejoin unless your backend refuses to issue a new join grant. `kick-all` mirrors `mute-all`
 (`{channel_id, reason, except}` → `{affected, skipped, failed}`, audit `channel.kick_all`).
 
+## Priority speakers
+
+`POST /v1/moderation/priority` `{user_id, channel_id, priority, moderator_user_id?}`
+(`moderation:write`) promotes or demotes a **priority speaker** — while they talk, every
+non-priority voice in the channel is ducked per `ChannelConfig.ducking`. The flag is set on the
+user's open membership (`404` when they are not a member), announced to the channel as
+`PriorityChanged` on every node, audited (`priority_changed`) and published as
+`participant.priority_changed`. Moderators can do the same from the client with `SetPriority`;
+see [Priority speakers and ducking](channels.md#priority-speakers-and-ducking).
+
 ## Bans
 
 `POST /v1/moderation/ban` (`moderation:write`):

@@ -11,7 +11,7 @@ emit:
 | Family | Events |
 | --- | --- |
 | channels | `channel.created`, `channel.destroyed`, `channel.config_updated`, `channel.activated`, `channel.deactivated`, `channel.energy`, `channel.transcript` |
-| participants | `participant.joined`, `participant.left`, `participant.muted`, `participant.unmuted`, `participant.kicked`, `participant.speaking`, `participant.typing` |
+| participants | `participant.joined`, `participant.left`, `participant.muted`, `participant.unmuted`, `participant.priority_changed`, `participant.kicked`, `participant.speaking`, `participant.typing` |
 | users / moderation | `user.banned`, `user.deleted`, `user.block_changed`, `moderation.event`, `safety.incident`, `safety.risk_changed` |
 | recordings / streams | `recording.started`, `recording.stopped`, `recording.consent_required`, `recording.processed`, `audio_stream.started`, `audio_stream.stopped` |
 | chat / speech | `chat.message`, `chat.read_marker` (stored chat: `{marker}` whenever a user's position moves), `tts.status` |

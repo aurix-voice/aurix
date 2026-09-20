@@ -132,8 +132,8 @@ test('renderer routes each track through gain and, when directional, an HRTF pan
   const r = new SpatialRenderer(ctx, { document: null });
   r.addTrack('1', { mid: '1' });
   assert.deepEqual(r.mids, ['1']);
-  // Idle slot: muted, straight to master.
-  assert.deepEqual(pathOf(ctx, '1'), ['gain', 'gain', 'destination']);
+  // Idle slot: muted, volume → duck → master.
+  assert.deepEqual(pathOf(ctx, '1'), ['gain', 'gain', 'gain', 'destination']);
   const gain = ctx.created.find((n) => n.kind === 'gain' && n !== ctx.created[1]);
   assert.equal(gain.gain.value, 0);
 
@@ -143,7 +143,7 @@ test('renderer routes each track through gain and, when directional, an HRTF pan
 
   r.render('1', { gain: 0.25, direction: { azimuth: Math.PI / 2, elevation: 0 } });
   assert.equal(r.isSpatial('1'), true);
-  assert.deepEqual(pathOf(ctx, '1'), ['gain', 'panner', 'gain', 'destination']);
+  assert.deepEqual(pathOf(ctx, '1'), ['gain', 'gain', 'panner', 'gain', 'destination']);
   const panner = ctx.created.find((n) => n.kind === 'panner');
   assert.equal(panner.panningModel, 'HRTF');
   assert.equal(panner.rolloffFactor, 0, 'distance is the gain node’s job');
@@ -154,7 +154,7 @@ test('renderer routes each track through gain and, when directional, an HRTF pan
   // Back to a non-positional participant on the same mid: panner bypassed, not duplicated.
   r.render('1', { gain: 1 });
   assert.equal(r.isSpatial('1'), false);
-  assert.deepEqual(pathOf(ctx, '1'), ['gain', 'gain', 'destination']);
+  assert.deepEqual(pathOf(ctx, '1'), ['gain', 'gain', 'gain', 'destination']);
   r.render('1', { gain: 1, direction: { azimuth: 0, elevation: 0 } });
   assert.equal(ctx.created.filter((n) => n.kind === 'panner').length, 1, 'panner reused');
 

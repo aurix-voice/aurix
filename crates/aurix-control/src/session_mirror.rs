@@ -21,6 +21,8 @@ pub type ResumeHashHex = String;
 pub struct MirroredChannel {
     pub channel_id: ChannelId,
     pub role: ChannelRole,
+    #[serde(default)]
+    pub priority: bool,
 }
 
 /// Receiver-side state that a takeover restores so the participant hears the same thing on

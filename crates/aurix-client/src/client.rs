@@ -24,7 +24,7 @@ use aurix_common::protocol::{
 };
 use aurix_common::types::{
     quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode,
-    NetworkQuality, RecordingConsent, SessionId, UserId,
+    DuckingConfig, NetworkQuality, RecordingConsent, SessionId, UserId,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -50,6 +50,7 @@ use crate::media::{
     resolve_media_candidates, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
     MediaTransport, SequenceCounter, TUNNEL_UPLINK_QUEUE,
 };
+use crate::visemes::VisemeFrame;
 
 const MAX_QUEUED_EVENTS: usize = 4096;
 const REQUEST_TICK: Duration = Duration::from_millis(200);
@@ -198,6 +199,30 @@ struct ChannelState {
     participant_count: u32,
     hidden_listeners: bool,
     participants: HashMap<UserId, Participant>,
+    /// Priority-speaker ducking the server applies (`None`: off).
+    ducking: Option<DuckingConfig>,
+    /// We are a priority speaker here.
+    priority: bool,
+    /// Another member's priority speech is currently ducking the channel (game-audio hook).
+    duck_active: bool,
+}
+
+impl ChannelState {
+    /// Whether `p`'s speech ducks the others: the explicit flag, or a moderator role when
+    /// `ducking.moderators` is on. Our own speech never counts (the game audio hook is for
+    /// what we hear).
+    fn ducks(&self, p: &Participant, me: Option<UserId>) -> bool {
+        let Some(cfg) = self.ducking else {
+            return false;
+        };
+        Some(p.user_id) != me
+            && p.speaking
+            && (p.priority || (cfg.moderators && p.role.can_moderate()))
+    }
+
+    fn compute_duck_active(&self, me: Option<UserId>) -> bool {
+        self.participants.values().any(|p| self.ducks(p, me))
+    }
 }
 
 /// RFC 3550 inter-arrival jitter over all downlink audio (one estimator is enough for a UI bar).
@@ -381,6 +406,32 @@ impl Inner {
             sent += 1;
         }
         (sent, encrypted)
+    }
+
+    /// Re-evaluates the game-audio ducking state of `channel_id` from its members and emits
+    /// `DuckingChanged` on a transition.
+    fn refresh_ducking(&self, channel_id: ChannelId) {
+        let me = self.identity.lock().user_id;
+        let changed = {
+            let mut channels = self.channels.lock();
+            let Some(c) = channels.get_mut(&channel_id) else {
+                return;
+            };
+            let active = c.compute_duck_active(me);
+            if active == c.duck_active {
+                None
+            } else {
+                c.duck_active = active;
+                Some((active, c.ducking.unwrap_or_default()))
+            }
+        };
+        if let Some((active, config)) = changed {
+            self.emit(Event::DuckingChanged {
+                channel_id,
+                active,
+                config,
+            });
+        }
     }
 
     fn user_for_ssrc(&self, ssrc: u32) -> Option<UserId> {
@@ -1061,6 +1112,37 @@ impl Client {
         self.inner.encoder.lock().effects.len()
     }
 
+    /// Analyse decoded participant audio and our own outgoing voice for lip-sync
+    /// ([`Self::participant_visemes`], [`Self::local_visemes`]). Off by default (one FFT per
+    /// stream per frame when on). Everything happens on this machine: no audio or mouth data
+    /// is sent anywhere, and encrypted channels work because frames are decrypted here.
+    pub fn set_visemes(&self, enabled: bool) {
+        self.inner.mixer.lock().set_visemes(enabled);
+        self.inner.encoder.lock().set_visemes(enabled);
+    }
+
+    pub fn visemes_enabled(&self) -> bool {
+        self.inner.mixer.lock().visemes_enabled()
+    }
+
+    /// Mouth state of `user_id` from the audio most recently played for them (their voice or
+    /// their synthesized TTS, whichever spoke last). `None` with analysis off or for a
+    /// participant whose audio we do not decode (not in a roster, or only in the server mix).
+    pub fn participant_visemes(&self, user_id: UserId) -> Option<VisemeFrame> {
+        let ssrcs = self.inner.ssrcs_for_user(user_id)?;
+        let mixer = self.inner.mixer.lock();
+        ssrcs
+            .iter()
+            .filter_map(|&ssrc| mixer.visemes(ssrc))
+            .max_by_key(|f| f.sequence)
+    }
+
+    /// Mouth state of our own voice as sent (after DSP, gain and effects); `None` with
+    /// analysis off. Frozen while no capture is pushed — check `sequence`.
+    pub fn local_visemes(&self) -> Option<VisemeFrame> {
+        self.inner.encoder.lock().visemes()
+    }
+
     /// Runtime DSP diagnostics (ERLE, echo delay, speech probability, AGC gain).
     pub fn dsp_stats(&self) -> DspStats {
         self.inner.encoder.lock().dsp.stats()
@@ -1198,6 +1280,50 @@ impl Client {
             user_id,
             blocked,
         }))
+    }
+
+    /// Makes `user_id` (ourselves when `None`) a priority speaker of `channel_id`, or revokes
+    /// it. Others need a moderator role; our own flag can be toggled with a `priority` grant
+    /// (and always revoked). Acked to everyone by `ParticipantPriorityChanged`.
+    pub fn set_priority(
+        &self,
+        channel_id: ChannelId,
+        user_id: Option<UserId>,
+        priority: bool,
+    ) -> Result<()> {
+        self.send_cmd(Command::Send(ControlMessage::SetPriority {
+            channel_id,
+            user_id,
+            priority,
+        }))
+    }
+
+    /// Whether we are a priority speaker in `channel_id` (false for unknown channels).
+    pub fn is_priority(&self, channel_id: ChannelId) -> bool {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .is_some_and(|c| c.priority)
+    }
+
+    /// Priority-speaker ducking the server applies in `channel_id` (`None`: off or unknown).
+    pub fn channel_ducking(&self, channel_id: ChannelId) -> Option<DuckingConfig> {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .and_then(|c| c.ducking)
+    }
+
+    /// Whether another member's priority speech is ducking `channel_id` right now (the
+    /// state last reported by `DuckingChanged`).
+    pub fn ducking_active(&self, channel_id: ChannelId) -> bool {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .is_some_and(|c| c.duck_active)
     }
 
     /// Which joined channels get the microphone. Applied locally at once and acked by
@@ -1868,6 +1994,7 @@ fn participant_from_brief(b: &ParticipantBrief) -> Participant {
         server_muted: false,
         speaking: b.is_speaking,
         energy: 0.0,
+        priority: b.is_priority,
     }
 }
 
@@ -2953,6 +3080,8 @@ async fn handle_message(
             role,
             participant_count,
             hidden_listeners,
+            ducking,
+            priority,
             ..
         } => {
             let scope = ChannelScope {
@@ -2987,6 +3116,9 @@ async fn handle_message(
                         participant_count,
                         hidden_listeners,
                         participants: roster,
+                        ducking,
+                        priority,
+                        duck_active: false,
                     },
                 )
                 .is_some();
@@ -3011,8 +3143,11 @@ async fn handle_message(
                     role,
                     participant_count,
                     hidden_listeners,
+                    ducking,
+                    priority,
                 });
             }
+            inner.refresh_ducking(channel_id);
             if request_id == 0 && !existed {
                 for m in replay_channel_prefs(inner, channel_id) {
                     if conn.send(&m).await.is_err() {
@@ -3031,6 +3166,7 @@ async fn handle_message(
             ssrc,
             role,
             is_muted,
+            is_priority,
         } => {
             let participant = Participant {
                 user_id,
@@ -3041,6 +3177,7 @@ async fn handle_message(
                 server_muted: false,
                 speaking: false,
                 energy: 0.0,
+                priority: is_priority,
             };
             let known = {
                 let mut channels = inner.channels.lock();
@@ -3093,6 +3230,7 @@ async fn handle_message(
                     channel_id,
                     user_id,
                 });
+                inner.refresh_ducking(channel_id);
             }
         }
         ControlMessage::MuteStateChanged {
@@ -3117,6 +3255,31 @@ async fn handle_message(
                 server_muted,
             });
         }
+        ControlMessage::PriorityChanged {
+            channel_id,
+            user_id,
+            priority,
+        } => {
+            if let Some(p) = inner
+                .channels
+                .lock()
+                .get_mut(&channel_id)
+                .and_then(|c| c.participants.get_mut(&user_id))
+            {
+                p.priority = priority;
+            }
+            if let Some(c) = inner.channels.lock().get_mut(&channel_id) {
+                if inner.identity.lock().user_id == Some(user_id) {
+                    c.priority = priority;
+                }
+            }
+            inner.emit(Event::ParticipantPriorityChanged {
+                channel_id,
+                user_id,
+                priority,
+            });
+            inner.refresh_ducking(channel_id);
+        }
         ControlMessage::SpeakingStateChanged {
             channel_id,
             user_id,
@@ -3138,6 +3301,7 @@ async fn handle_message(
                 user_id,
                 speaking,
             });
+            inner.refresh_ducking(channel_id);
         }
         ControlMessage::ChannelEnergy { channel_id, levels } => {
             {
@@ -3228,11 +3392,17 @@ async fn handle_message(
                 speech,
             });
         }
-        ControlMessage::ChannelAudioPolicy { channel_id, audio } => {
+        ControlMessage::ChannelAudioPolicy {
+            channel_id,
+            audio,
+            ducking,
+        } => {
             if let Some(ch) = inner.channels.lock().get_mut(&channel_id) {
                 ch.audio = audio;
+                ch.ducking = ducking;
             }
             refresh_audio_policy(inner);
+            inner.refresh_ducking(channel_id);
         }
         ControlMessage::BitrateCommand {
             target_bitrate_kbps,
@@ -3460,6 +3630,7 @@ async fn handle_message(
         | ControlMessage::SetParticipantMute { .. }
         | ControlMessage::SetParticipantVolume { .. }
         | ControlMessage::SetUserBlock { .. }
+        | ControlMessage::SetPriority { .. }
         | ControlMessage::SetTransmission { .. }
         | ControlMessage::SetChannelFocus { .. }
         | ControlMessage::SetAudioCodec { .. }
@@ -3598,6 +3769,9 @@ mod tests {
                 participant_count: 1,
                 hidden_listeners: false,
                 participants: HashMap::new(),
+                ducking: None,
+                priority: false,
+                duck_active: false,
             },
         )
     }

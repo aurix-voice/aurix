@@ -197,6 +197,12 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Optional extras: a preset voice on the microphone and local lip-sync analysis. */
+    struct AurixVoiceEffects robot = aurix_voice_effects_preset(AURIX_VOICE_PRESET_ROBOT);
+    robot.distortion_drive = 0.0f; /* presets are starting points: tweak any field */
+    aurix_client_set_voice_effects(client, &robot);
+    aurix_client_set_visemes(client, true);
+
     /* 20 ms of a 440 Hz tone at 48 kHz mono, and a stereo output buffer of the same length. */
     float tone[AURIX_FRAME_SAMPLES];
     float out[AURIX_FRAME_SAMPLES * 2];
@@ -226,6 +232,11 @@ int main(int argc, char **argv) {
                (unsigned long long)st.packets_sent, (unsigned long long)st.packets_received,
                (unsigned long long)st.audio_frames_received, st.rtt_ms, st.loss_percent,
                active_frames);
+    }
+    struct AurixVisemeFrame mouth;
+    if (aurix_client_local_visemes(client, &mouth)) {
+        printf("own mouth: open %.2f, bucket %d (confidence %.2f) after %llu frames\n", mouth.mouth_open,
+               (int)mouth.dominant, mouth.confidence, (unsigned long long)mouth.sequence);
     }
     struct AurixDspStats dsp;
     if (aurix_client_dsp_stats(client, &dsp) == AURIX_OK) {

@@ -120,6 +120,7 @@ impl SessionManager {
         session_id: SessionId,
         role: ChannelRole,
         ssrc: u32,
+        priority: bool,
     ) -> Result<ChannelMembershipRow> {
         let row = ChannelMembershipRow {
             id: Uuid::now_v7(),
@@ -129,6 +130,7 @@ impl SessionManager {
             role: format!("{:?}", role).to_lowercase(),
             is_muted: false,
             is_server_muted: false,
+            is_priority: priority,
             ssrc: ssrc as i64,
             joined_at: Utc::now(),
             left_at: None,
@@ -147,6 +149,25 @@ impl SessionManager {
         aurix_db::queries::remove_channel_member(&self.pool, channel_id.0, session_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
+    }
+
+    /// Persists the priority-speaker flag on the user's open memberships in the channel.
+    pub async fn set_membership_priority(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        priority: bool,
+    ) -> Result<u64> {
+        aurix_db::queries::set_membership_priority(
+            &self.pool,
+            app_id.0,
+            channel_id.0,
+            user_id.0,
+            priority,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Membership priority update failed: {e}")))
     }
 
     pub async fn remove_user_from_channel(

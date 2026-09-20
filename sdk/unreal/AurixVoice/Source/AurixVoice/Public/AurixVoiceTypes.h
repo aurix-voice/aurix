@@ -309,6 +309,37 @@ struct AURIXVOICE_API FAurixChannelScope
 	float TextRadius = 0.f;
 };
 
+/**
+ * Priority-speaker ducking (`ChannelConfig.ducking`): while a priority speaker talks, every
+ * other voice in the channel is attenuated to Gain with these timings. The server applies it to
+ * the mixed downlink; OnDuckingChanged asks the game to treat its own music / SFX bus the same.
+ */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixDucking
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bEnabled = false;
+
+	/** Linear gain non-priority audio is attenuated to, 0..1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float Gain = 0.25f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 AttackMs = 60;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 ReleaseMs = 400;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 HoldMs = 250;
+
+	/** Moderators / administrators duck too, not only explicit priority grants. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bModerators = false;
+};
+
 /** This session's role and the roster policy of a joined channel (from `ChannelJoinAck`). */
 USTRUCT(BlueprintType)
 struct AURIXVOICE_API FAurixChannelInfo
@@ -334,6 +365,14 @@ struct AURIXVOICE_API FAurixChannelInfo
 	/** Speech in the channel is analysed by the server's content-safety classifier. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bSafetyVoice = false;
+
+	/** This session is a priority speaker here. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bPriority = false;
+
+	/** Priority-speaker ducking the server applies in this channel (bEnabled = false: off). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FAurixDucking Ducking;
 };
 
 UENUM(BlueprintType)
@@ -539,6 +578,10 @@ struct AURIXVOICE_API FAurixParticipant
 	/** 0..1 */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float Energy = 0.f;
+
+	/** Priority speaker: their speech ducks everyone else (`ChannelConfig.ducking`). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bPriority = false;
 };
 
 USTRUCT(BlueprintType)
@@ -675,11 +718,43 @@ struct AURIXVOICE_API FAurixTranscript
 	FString OriginalLanguage;
 };
 
-/** Built-in microphone voice effects; zero disables a stage. Applied after the DSP, before encoding. */
+/** Ready-made voices for UAurixVoiceSubsystem::MakeVoicePreset / SetVoicePreset. */
+UENUM(BlueprintType)
+enum class EAurixVoicePreset : uint8
+{
+	/** Band-limited, ring-modulated, lightly distorted. */
+	Robot,
+	/** Formant and pitch down, growl distortion, cavernous reverb. */
+	Monster,
+	/** 400-3000 Hz band, distortion, static. */
+	Radio,
+	/** Formant and pitch up. */
+	Helium,
+	/** Muffled, formant up over lower pitch, slow tremolo, long reverb. */
+	Ghost,
+};
+
+/**
+ * Built-in microphone voice effects; zero disables a stage. Applied after the DSP and input gain,
+ * before VAD / encoding, in this order: high-pass, low-pass, formant shift, pitch shift, ring
+ * modulator, distortion, tremolo, static, reverb. Only your uplink is affected.
+ */
 USTRUCT(BlueprintType)
 struct AURIXVOICE_API FAurixVoiceEffects
 {
 	GENERATED_BODY()
+
+	/** High-pass cutoff in Hz, 20..20000 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "20000"))
+	float HighpassHz = 0.f;
+
+	/** Low-pass cutoff in Hz, 20..20000 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "20000"))
+	float LowpassHz = 0.f;
+
+	/** Formant (vocal-tract size) shift in semitones without changing the pitch, -12..12 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "-12", ClampMax = "12"))
+	float FormantSemitones = 0.f;
 
 	/** Pitch shift in semitones, -24..24 (0 = off). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "-24", ClampMax = "24"))
@@ -688,6 +763,84 @@ struct AURIXVOICE_API FAurixVoiceEffects
 	/** Ring-modulator ("robot") carrier in Hz, 0..2000 (0 = off). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "2000"))
 	float RingModHz = 0.f;
+
+	/** Soft-clip drive, 0..20 (0 = off; 1 is gentle warmth, 8+ is a growl). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "20"))
+	float DistortionDrive = 0.f;
+
+	/** Tremolo rate in Hz, 0..20 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "20"))
+	float TremoloHz = 0.f;
+
+	/** Tremolo depth, 0..1. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "1"))
+	float TremoloDepth = 0.f;
+
+	/** Radio static mixed in while you talk, 0..1 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "1"))
+	float StaticLevel = 0.f;
+
+	/** Reverb wet mix, 0..1 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "1"))
+	float ReverbMix = 0.f;
+
+	/** Reverb room size, 0..1. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "1"))
+	float ReverbSize = 0.5f;
+
+	/** Reverb high-frequency damping, 0..1. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "1"))
+	float ReverbDamping = 0.5f;
+};
+
+/** Mouth-shape buckets of FAurixVisemeFrame (PP / FF / SS = closed lips, labiodental, sibilant; the rest are vowels). */
+UENUM(BlueprintType)
+enum class EAurixViseme : uint8
+{
+	Silence,
+	PP,
+	FF,
+	SS,
+	AA,
+	E,
+	IH,
+	OH,
+	OU,
+};
+
+/**
+ * Mouth state derived on this machine from a participant's (or our own) most recent 20 ms of
+ * decoded audio — drive jaw / blend-shape / bone weights from it every frame. Nothing is sent
+ * anywhere and encrypted channels work, since frames are decrypted locally.
+ */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixVisemeFrame
+{
+	GENERATED_BODY()
+
+	/** Smoothed weight per EAurixViseme (index = enum value), summing to ~1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	TArray<float> Weights;
+
+	/** Heaviest bucket. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	EAurixViseme Dominant = EAurixViseme::Silence;
+
+	/** Jaw openness 0..1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float MouthOpen = 0.f;
+
+	/** RMS level of the frame 0..1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float Energy = 0.f;
+
+	/** Margin between the top two buckets 0..1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float Confidence = 0.f;
+
+	/** Frames analysed so far; unchanged between two reads = no new audio. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 Sequence = 0;
 };
 
 USTRUCT(BlueprintType)

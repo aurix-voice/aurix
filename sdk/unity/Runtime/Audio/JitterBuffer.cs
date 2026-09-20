@@ -174,6 +174,9 @@ namespace Aurix.Audio
             public long LastActivityTicks;
             public bool Starved;
             public long StarvedAtTicks;
+            /// <summary>Lip-sync analyser fed with this stream's decoded PCM while visemes are on.</summary>
+            public NativeVisemeAnalyzer Visemes;
+            public long VisemesFedTicks;
         }
 
         private readonly Func<IOpusCodec> _decoderFactory;
@@ -182,6 +185,7 @@ namespace Aurix.Audio
         private readonly List<uint> _stale = new List<uint>();
         private float _outputVolume = 1f;
         private volatile bool _outputMuted;
+        private volatile bool _visemes;
         private long _retiredLost, _retiredLate, _retiredFec, _underruns;
 
         public RemoteMixer(Func<IOpusCodec> decoderFactory) : this(decoderFactory, null) { }
@@ -217,6 +221,73 @@ namespace Aurix.Audio
         {
             get => _outputMuted;
             set => _outputMuted = value;
+        }
+
+        /// <summary>
+        /// Per-stream lip-sync analysis (<see cref="TryGetVisemes"/>): every decoded frame — after
+        /// jitter buffering, PLC/FEC and E2EE decryption, before volume/pan — is also fed to a
+        /// <see cref="NativeVisemeAnalyzer"/>. Costs one FFT per stream per 20 ms; off by default.
+        /// Throws <see cref="PlatformNotSupportedException"/> when the native library is missing.
+        /// </summary>
+        public bool VisemesEnabled
+        {
+            get => _visemes;
+            set
+            {
+                if (value && !NativeVisemeAnalyzer.IsAvailable)
+                    throw new PlatformNotSupportedException("lip-sync needs the aurix_client native library");
+                lock (_streams)
+                {
+                    _visemes = value;
+                    foreach (var s in _streams.Values)
+                    {
+                        if (value) { if (s.Visemes == null) s.Visemes = new NativeVisemeAnalyzer(); }
+                        else if (s.Visemes != null) { s.Visemes.Dispose(); s.Visemes = null; }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Latest mouth state of one stream (mic or TTS SSRC); false when the stream is unknown or
+        /// <see cref="VisemesEnabled"/> is off. Decays to silence between talk spurts.
+        /// </summary>
+        public bool TryGetVisemes(uint ssrc, out VisemeFrame frame)
+        {
+            lock (_streams)
+            {
+                if (_streams.TryGetValue(ssrc, out var s) && s.Visemes != null)
+                {
+                    frame = s.Visemes.Frame;
+                    return true;
+                }
+            }
+            frame = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Mouth state of a participant — its microphone stream or its TTS voice, whichever received
+        /// audio last; false without a stream or while visemes are off.
+        /// </summary>
+        public bool TryGetParticipantVisemes(uint ssrc, out VisemeFrame frame)
+        {
+            uint mic = ssrc & ~Aurix.Protocol.AurxPacket.SynthSsrcFlag;
+            lock (_streams)
+            {
+                Stream best = null;
+                if (_streams.TryGetValue(mic, out var s) && s.Visemes != null) best = s;
+                if (_streams.TryGetValue(mic | Aurix.Protocol.AurxPacket.SynthSsrcFlag, out var tts) && tts.Visemes != null
+                    && (best == null || tts.LastActivityTicks > best.LastActivityTicks))
+                    best = tts;
+                if (best != null)
+                {
+                    frame = best.Visemes.Frame;
+                    return true;
+                }
+            }
+            frame = default;
+            return false;
         }
 
         /// <summary>Queue a verified frame from the transport (any thread).</summary>
@@ -302,6 +373,7 @@ namespace Aurix.Audio
             s.Codec = codec;
             s.Mixed = mixed;
             s.Stereo = codec == AudioCodec.Opus && stereo;
+            if (_visemes && s.Visemes == null) s.Visemes = new NativeVisemeAnalyzer();
         }
 
         public void Remove(uint ssrc)
@@ -331,6 +403,7 @@ namespace Aurix.Audio
                     s.Jitter.Reset();
                     s.FramePos = s.FrameLen = 0;
                     s.Starved = false;
+                    s.Visemes?.Reset();
                 }
             }
         }
@@ -358,6 +431,8 @@ namespace Aurix.Audio
             _retiredLate += s.Jitter.Late;
             _retiredFec += s.FecRecovered;
             s.Decoder.Dispose();
+            s.Visemes?.Dispose();
+            s.Visemes = null;
         }
 
         /// <summary>
@@ -486,7 +561,11 @@ namespace Aurix.Audio
                 {
                     if (!s.Jitter.Pop(out var opus, out var fecFrom))
                     {
-                        if (s.Jitter.Count == 0 && !s.Starved) { s.Starved = true; s.StarvedAtTicks = now; }
+                        if (s.Jitter.Count == 0 && !s.Starved)
+                        {
+                            s.Starved = true;
+                            s.StarvedAtTicks = now;
+                        }
                         break;
                     }
                     int dc = s.Decoder.Channels;
@@ -506,6 +585,12 @@ namespace Aurix.Audio
                     s.FrameLen = Math.Max(0, n) * dc;
                     s.FramePos = 0;
                     if (s.FrameLen == 0) break;
+                    if (s.Visemes != null)
+                    {
+                        for (int p = 0; p < n; p += AudioFormat.FrameSamples)
+                            s.Visemes.Push(s.Frame, p * dc, Math.Min(AudioFormat.FrameSamples, n - p), dc);
+                        s.VisemesFedTicks = now;
+                    }
                 }
                 int dch = s.Decoder.Channels;
                 int availFrames = (s.FrameLen - s.FramePos) / dch;
@@ -535,6 +620,12 @@ namespace Aurix.Audio
                 }
                 s.FramePos += take * dch;
                 written += take;
+            }
+            if (written < framesNeeded && s.Visemes != null && now - s.VisemesFedTicks >= TimeSpan.TicksPerMillisecond * AudioFormat.FrameMs)
+            {
+                // Nothing (more) to play: the mouth relaxes towards closed, one analyser tick per 20 ms.
+                s.Visemes.Relax();
+                s.VisemesFedTicks = now;
             }
             return written;
         }

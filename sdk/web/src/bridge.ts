@@ -15,6 +15,7 @@ import type {
 import { enumerateAudioDevices } from './devices.js';
 import { base64ToBytes, bytesToBase64 } from './e2ee.js';
 import type { E2eeTransformApi } from './e2ee.js';
+import type { VoiceEffectParams, VoiceEffectPreset } from './effects.js';
 import type { OpusBrowserOptions } from './opus.js';
 import type { JsonValue, ModerationAction, Orientation3D, Position3D, RecordingConsent } from './protocol.js';
 
@@ -73,6 +74,15 @@ export interface BridgeClientOptions {
    * the base64 32-byte secret exported earlier by `e2eeIdentitySecret`.
    */
   e2ee?: boolean | { identity?: string; transform?: 'auto' | E2eeTransformApi; workerUrl?: string };
+  /** Local lip-sync analysis from the start (see `AurixClientOptions.visemes`). */
+  visemes?: boolean;
+  /**
+   * Queue `participantVisemes` / `localVisemes` frames (50/s per analysed voice); off by default —
+   * hosts usually poll `participantVisemes` / `localVisemes` once per rendered frame instead.
+   */
+  visemeEvents?: boolean;
+  /** Microphone voice effects from the start: a preset name or explicit parameters. */
+  voiceEffects?: VoiceEffectParams | VoiceEffectPreset;
 }
 
 export interface AurixBridgeOptions {
@@ -149,12 +159,14 @@ export class AurixBridge {
     if (raw.participantStreams !== undefined) options.participantStreams = raw.participantStreams;
     if (raw.spatialAudio !== undefined) options.spatialAudio = raw.spatialAudio;
     if (raw.e2ee !== undefined) options.e2ee = e2eeOptions(raw.e2ee);
+    if (raw.visemes !== undefined) options.visemes = raw.visemes;
+    if (raw.voiceEffects !== undefined) options.voiceEffects = raw.voiceEffects;
     if (raw.refreshToken) options.refreshToken = () => this.requestToken(entry, 'refresh', undefined);
     if (raw.joinToken) options.joinToken = (channelId) => this.requestToken(entry, 'join', channelId);
 
     entry.client = this.createClient(options);
     this.clients.set(handle, entry);
-    this.subscribe(entry, raw.rawMessages === true, raw.localEnergyEvents === true);
+    this.subscribe(entry, raw.rawMessages === true, raw.localEnergyEvents === true, raw.visemeEvents === true);
     return handle;
   }
 
@@ -333,6 +345,15 @@ export class AurixBridge {
         return participantStreamsEvent(c.getParticipantStreams());
       case 'isParticipantSpatialized':
         return c.isParticipantSpatialized(str(a, 'userId'));
+      case 'setPriority':
+        c.setPriority(str(a, 'channelId'), bool(a, 'priority'), optString(a, 'userId'));
+        return null;
+      case 'isPriority':
+        return c.isPriority(str(a, 'channelId'));
+      case 'channelDucking':
+        return c.getChannelDucking(str(a, 'channelId')) ?? null;
+      case 'isDuckingActive':
+        return c.isDuckingActive(str(a, 'channelId'));
       case 'channelFocus':
         return c.getChannelFocus() ?? null;
       case 'setTranscripts':
@@ -439,6 +460,22 @@ export class AurixBridge {
         return c.renegotiateMedia();
       case 'resumeAudio':
         return this.resumeAudio(entry);
+      case 'supportsVoiceEffects':
+        return AurixClient.supportsVoiceEffects();
+      case 'setVoiceEffects':
+        return c.setVoiceEffects(voiceEffects(a['effects']));
+      case 'voiceEffects':
+        return c.voiceEffects;
+      case 'supportsVisemes':
+        return AurixClient.supportsVisemes();
+      case 'setVisemes':
+        return c.setVisemes(bool(a, 'enabled'));
+      case 'visemesEnabled':
+        return c.visemesEnabled;
+      case 'participantVisemes':
+        return c.getParticipantVisemes(str(a, 'userId')) ?? null;
+      case 'localVisemes':
+        return c.getLocalVisemes() ?? null;
       case 'e2eeAvailable':
         return c.e2eeAvailable;
       case 'e2eeTransformApi':
@@ -473,7 +510,7 @@ export class AurixBridge {
 
   // ── Events ──
 
-  private subscribe(entry: Entry, rawMessages: boolean, localEnergy: boolean): void {
+  private subscribe(entry: Entry, rawMessages: boolean, localEnergy: boolean, visemes: boolean): void {
     const c = entry.client;
     const on = <K extends keyof AurixEvents>(event: K, listener: AurixEvents[K]) => {
       entry.unsubscribe.push(c.on(event, listener));
@@ -511,6 +548,14 @@ export class AurixBridge {
     on('transmissionChanged', (mode) => q({ type: 'transmissionChanged', mode }));
     on('channelFocusChanged', (channelId) => q({ type: 'channelFocusChanged', channelId: channelId ?? null }));
     on('participantStreams', (streams) => q({ type: 'participantStreams', streams: participantStreamsEvent(streams) }));
+    on('participantPriorityChanged', (channelId, userId, priority) =>
+      q({ type: 'participantPriorityChanged', channelId, userId, priority }),
+    );
+    on('duckingChanged', (channelId, active, config) => q({ type: 'duckingChanged', channelId, active, config }));
+    if (visemes) {
+      on('participantVisemes', (userId, frame) => q({ type: 'participantVisemes', userId, frame }));
+      on('localVisemes', (frame) => q({ type: 'localVisemes', frame }));
+    }
     on('e2eePeerKey', (userId, fingerprint, previousFingerprint) =>
       q({ type: 'e2eePeerKey', userId, fingerprint, previousFingerprint: previousFingerprint ?? null }),
     );
@@ -653,6 +698,14 @@ function e2eeOptions(raw: NonNullable<BridgeClientOptions['e2ee']>): boolean | E
   if (raw.transform !== undefined) options.transform = raw.transform;
   if (raw.workerUrl !== undefined) options.workerUrl = raw.workerUrl;
   return options;
+}
+
+/** `undefined` / `null` = bypass; a preset name; or a parameter object (sanitised by the client). */
+function voiceEffects(v: unknown): VoiceEffectParams | VoiceEffectPreset | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === 'string') return v as VoiceEffectPreset;
+  if (typeof v !== 'object') throw new Error('effects must be a preset name or an object');
+  return v as VoiceEffectParams;
 }
 
 function num(a: Args, key: string): number {

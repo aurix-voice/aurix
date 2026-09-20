@@ -28,6 +28,8 @@ pub struct ChannelPermClaim {
     pub speak: bool,
     pub receive: bool,
     pub moderate: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub priority: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ad_hoc: Option<AdHocChannel>,
 }
@@ -63,6 +65,8 @@ pub struct ActionClaims {
     pub receive: bool,
     #[serde(default)]
     pub moderate: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub priority: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ad_hoc: Option<AdHocChannel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,7 @@ pub struct ActionTokenSpec {
     pub speak: bool,
     pub receive: bool,
     pub moderate: bool,
+    pub priority: bool,
     pub ad_hoc: Option<AdHocChannel>,
     pub metadata: Option<serde_json::Value>,
     pub ttl_secs: i64,
@@ -102,6 +107,7 @@ pub struct ValidatedActionToken {
     pub speak: bool,
     pub receive: bool,
     pub moderate: bool,
+    pub priority: bool,
     pub ad_hoc: Option<AdHocChannel>,
     pub metadata: Option<serde_json::Value>,
     pub jti: String,
@@ -121,6 +127,7 @@ impl ValidatedActionToken {
             speak: self.speak,
             receive: self.receive,
             moderate: self.moderate,
+            priority: self.priority,
             ad_hoc: self.ad_hoc.clone(),
         })
     }
@@ -261,6 +268,7 @@ impl JwtService {
                     speak: c.speak,
                     receive: c.receive,
                     moderate: c.moderate,
+                    priority: c.priority,
                     ad_hoc: c.ad_hoc.clone(),
                 })
                 .collect(),
@@ -301,6 +309,7 @@ impl JwtService {
                         speak: c.speak,
                         receive: c.receive,
                         moderate: c.moderate,
+                        priority: c.priority,
                         ad_hoc: c.ad_hoc.clone(),
                     })
             })
@@ -373,6 +382,7 @@ impl JwtService {
             speak: spec.speak,
             receive: spec.receive,
             moderate: spec.moderate,
+            priority: spec.priority,
             ad_hoc: spec.ad_hoc.clone(),
             metadata: spec.metadata.clone(),
             exp,
@@ -428,6 +438,7 @@ impl JwtService {
             speak: claims.speak,
             receive: claims.receive,
             moderate: claims.moderate,
+            priority: claims.priority,
             ad_hoc: claims.ad_hoc,
             metadata: claims.metadata,
             jti: claims.jti,
@@ -483,6 +494,7 @@ mod tests {
             speak: true,
             receive: true,
             moderate: false,
+            priority: false,
             ad_hoc: None,
             metadata: None,
             ttl_secs: 90,
@@ -537,6 +549,7 @@ mod tests {
             speak: true,
             receive: true,
             moderate: false,
+            priority: false,
             ad_hoc: Some(template.clone()),
         };
         let token = s

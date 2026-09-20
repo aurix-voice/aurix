@@ -215,28 +215,75 @@ browser SDK relies on the browser's own AEC/NS/AGC instead (`getUserMedia` const
 After the DSP and the input gain — and before the VAD meter and the encoder, so peers, level
 bars and transcripts all get the effected voice — the capture path runs an
 `EffectChain` (`aurix_client::effects`) of `VoiceEffect` stages on each 20 ms 48 kHz frame
-(mono or interleaved stereo, output clamped to ±1). Built in: `PitchShift::new(semitones)`
-(±24), `RingModulator::new(hz)` (robot voice, ≤ 2 kHz) and `CallbackEffect::new(|frame, channels| …)`
-for the host's own processing. Effects touch only the microphone uplink — injected audio, TTS
-and the downlink are untouched — and the mono, stereo and PCMU encoders all see the processed
-frame. The chain runs on the capture thread: no blocking, no allocation.
+(mono or interleaved stereo, output clamped to ±1). The library — `VoiceEffectParams` builds
+the chain in the fixed order *filters → formant → pitch → ring modulation → distortion →
+tremolo → static → reverb* — is documented with its ranges and presets in
+[Voice effects](../features/speech.md#voice-effects); the individual stages (`Biquad`,
+`FormantShift`, `PitchShift`, `RingModulator`, `Distortion`, `Tremolo`, `Static`, `Reverb`) are
+public too, and `CallbackEffect::new(|frame, channels| …)` wraps the host's own processing.
+Effects touch only the microphone uplink — injected audio, TTS and the downlink are untouched —
+and the mono, stereo and PCMU encoders all see the processed frame. The chain runs on the
+capture thread: no blocking, no allocation.
 
 ```rust
-use aurix_client::effects::{EffectChain, PitchShift, RingModulator, CallbackEffect};
-client.set_voice_effects(EffectChain::new(vec![
-    Box::new(PitchShift::new(-5.0)),
-    Box::new(RingModulator::new(60.0)),
-    Box::new(CallbackEffect::new(|frame: &mut [f32], channels: u8| my_dsp(frame, channels))),
-]));
+use aurix_client::effects::{CallbackEffect, EffectChain, EffectPreset, VoiceEffectParams};
+client.set_voice_effects(EffectPreset::Radio.chain());
+let mut p = EffectPreset::Monster.params();           // tweak a preset …
+p.pitch_semitones = -10.0;
+p.reverb_mix = 0.3;
+client.set_voice_effects(p.chain());                   // … (`sanitized()` clamps to the limits)
+let mut chain = VoiceEffectParams { ring_mod_hz: 60.0, ..VoiceEffectParams::BYPASS }.chain();
+chain.push(Box::new(CallbackEffect::new(|frame: &mut [f32], channels: u8| my_dsp(frame, channels))));
+client.set_voice_effects(chain);
 client.set_voice_effects(EffectChain::default()); // bypass
 ```
 
-C: `aurix_client_set_voice_effects(&AurixVoiceEffects { pitch_semitones, ring_mod_hz })` (zero =
-stage off, clamped to `AURIX_MAX_PITCH_SEMITONES` / `AURIX_MAX_RING_MOD_HZ`),
-`aurix_client_voice_effects`, and `aurix_client_set_voice_effect_callback(client, fn, user_data)`
-for a host stage `void fn(void* user_data, float* frame, uint32_t samples_per_channel, uint8_t channels)`
-run after the built-ins (`NULL` removes it). Unreal: `SetVoiceEffects` / `GetVoiceEffects` /
-`SetVoiceEffectCallback`.
+C: `aurix_client_set_voice_effects(&AurixVoiceEffects { highpass_hz, lowpass_hz, formant_semitones,
+pitch_semitones, ring_mod_hz, distortion_drive, tremolo_hz, tremolo_depth, static_level,
+reverb_mix, reverb_size, reverb_damping })` (zero = stage off, clamped to the `AURIX_MAX_*` /
+`AURIX_MIN_FILTER_HZ` limits, `NULL` = bypass), `aurix_voice_effects_preset(AURIX_VOICE_PRESET_*)`
+/ `aurix_client_set_voice_preset`, `aurix_client_voice_effects` (read back clamped), and
+`aurix_client_set_voice_effect_callback(client, fn, user_data)` for a host stage
+`void fn(void* user_data, float* frame, uint32_t samples_per_channel, uint8_t channels)` run after
+the built-ins (`NULL` removes it). The same chain is also usable standalone on any 48 kHz PCM —
+`aurix_voice_effects_create/set/get/process_f32/reset/destroy` — which is how the Unity native
+client runs it on its own capture. Unreal: `SetVoiceEffects` / `GetVoiceEffects` /
+`MakeVoicePreset` / `SetVoiceEffectCallback`; Godot: `set_voice_effects(Dictionary)`.
+
+## Visemes (lip-sync)
+
+`client.set_visemes(true)` analyses every decoded participant stream and the outgoing voice
+(after DSP, gain and effects) for lip-sync — one small FFT per stream per 20 ms — and
+`client.participant_visemes(user_id)` / `client.local_visemes()` return the latest
+`VisemeFrame { weights: [f32; 9], dominant, mouth_open, energy, confidence, sequence }`
+(buckets `sil PP FF SS aa E ih oh ou`, see [Visemes](../features/speech.md#visemes-lip-sync)).
+Participant frames are taken right after decoding (and, in E2EE channels, decrypting), before
+the per-participant volume, mute and panning, so a quiet or distant speaker still moves their
+mouth; a participant heard only through the server mix has none (`None`). Everything is local
+— no audio or mouth data leaves the machine — and the analysers go with their streams (leave,
+reconnect, `set_visemes(false)`). `aurix_client::visemes::VisemeAnalyzer` (`push`, `frame`,
+`reset`) is public for hosts that decode elsewhere. C: `aurix_client_set_visemes`,
+`aurix_client_visemes_enabled`, `aurix_client_participant_visemes(client, &user, &out)` /
+`aurix_client_local_visemes` (return `false` when unknown), `AurixVisemeFrame`,
+`AURIX_VISEME_COUNT`; standalone `aurix_viseme_analyzer_create/push_f32/frame/reset/destroy`.
+Unreal: `SetVisemesEnabled` / `AreVisemesEnabled` / `GetParticipantVisemes` / `GetLocalVisemes`;
+Godot: `set_visemes_enabled`, `get_participant_visemes`, `get_local_visemes`.
+
+## Priority speakers and ducking
+
+In a channel with `ducking` the node attenuates the other voices you receive while a priority
+speaker talks ([Priority speakers and ducking](../features/channels.md#priority-speakers-and-ducking))
+— nothing to do on the client. `client.set_priority(channel, Some(user) | None, bool)` promotes
+or demotes (others need a moderator role; yourself a `priority` grant; `VALIDATION_ERROR` without
+`ducking`), `client.is_priority(channel)` / `Participant::priority` / `channel_ducking(channel)`
+read the state, and `Event::ParticipantPriorityChanged { channel_id, user_id, priority }` /
+`Event::DuckingChanged { channel_id, active, config }` report transitions — the latter is the hook
+for game audio: engage your own envelope on `active`, release on `!active`
+(`client.ducking_active(channel)` for polling). C: `aurix_client_set_priority`,
+`aurix_client_ducking_active`, `AURIX_EVENT_PARTICIPANT_PRIORITY_CHANGED` /
+`AURIX_EVENT_DUCKING_CHANGED` with `aurix_event_ducking(event)` → `AurixDucking`; Unreal:
+`SetPriority`, `IsDuckingActive`, `OnParticipantPriorityChanged`, `OnDuckingChanged`; Godot:
+`set_priority`, `is_ducking_active` and the matching signals.
 
 ## Live translation
 

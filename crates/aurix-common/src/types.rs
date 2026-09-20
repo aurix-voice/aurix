@@ -495,6 +495,11 @@ pub struct ChannelConfig {
     /// Large-channel / audience settings (see [`AudienceConfig`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audience: Option<AudienceConfig>,
+    /// Priority speakers (see [`DuckingConfig`]): while a member whose grant has
+    /// `priority: true` (or a moderator, when `moderators` is set) is talking, every other
+    /// voice in the channel is attenuated for every receiver. `None` = nobody is ducked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ducking: Option<DuckingConfig>,
     pub recording_enabled: bool,
     /// Transcribe participants' speech (when `[stt]` is configured on the node) and deliver
     /// `Transcript` events to the channel's participants.
@@ -533,6 +538,7 @@ impl Default for ChannelConfig {
             stereo: false,
             ambient: None,
             audience: None,
+            ducking: None,
             recording_enabled: false,
             transcription: false,
             safety_voice: false,
@@ -588,6 +594,9 @@ impl ChannelConfig {
         }
         if let Some(a) = &self.audience {
             a.validate(self.max_participants)?;
+        }
+        if let Some(d) = &self.ducking {
+            d.validate()?;
         }
         if self.e2ee {
             if self.recording_enabled {
@@ -892,6 +901,61 @@ impl AudienceConfig {
     pub fn validate(&self, max_participants: u32) -> std::result::Result<(), String> {
         if self.max_speakers > max_participants {
             return Err("audience.max_speakers must not exceed max_participants".into());
+        }
+        Ok(())
+    }
+}
+
+/// Priority speaker ducking ([`ChannelConfig::ducking`]). Priority members are those whose
+/// channel grant carries `priority: true` (a raid leader, a shoutcaster) or whom a moderator
+/// promoted at runtime; with `moderators` set, moderators and administrators count too.
+/// While any priority member's frames are audible the gain of every non-priority voice is
+/// ramped down to `gain` over `attack_ms`, held for `hold_ms` past their last audible frame
+/// and ramped back over `release_ms`. Applied by the node to everything it mixes or
+/// forwards with a gain (native streams, server mixes) and reproduced by browsers on their
+/// per-participant tracks from the priority members' speaking state.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DuckingConfig {
+    /// Gain of non-priority voices while a priority speaker talks (`0.0` = silenced,
+    /// `1.0` = no ducking).
+    pub gain: f32,
+    pub attack_ms: u32,
+    pub release_ms: u32,
+    /// How long ducking persists after the priority speaker's last audible frame, so
+    /// pauses between words do not pump the mix.
+    pub hold_ms: u32,
+    /// Moderators and administrators are priority speakers as well.
+    pub moderators: bool,
+}
+
+impl Default for DuckingConfig {
+    fn default() -> Self {
+        Self {
+            gain: 0.25,
+            attack_ms: 60,
+            release_ms: 400,
+            hold_ms: 250,
+            moderators: false,
+        }
+    }
+}
+
+impl DuckingConfig {
+    pub const MAX_MS: u32 = 10_000;
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.gain.is_finite() || !(0.0..=1.0).contains(&self.gain) {
+            return Err("ducking.gain must be within 0.0..=1.0".into());
+        }
+        for (name, ms) in [
+            ("attack_ms", self.attack_ms),
+            ("release_ms", self.release_ms),
+            ("hold_ms", self.hold_ms),
+        ] {
+            if ms > Self::MAX_MS {
+                return Err(format!("ducking.{name} must be <= {}", Self::MAX_MS));
+            }
         }
         Ok(())
     }
@@ -1248,6 +1312,10 @@ pub struct ChannelPermission {
     pub receive: bool,
     #[serde(default)]
     pub moderate: bool,
+    /// Priority speaker: while this member talks, the channel's [`DuckingConfig`] (if any)
+    /// attenuates everyone else. Meaningless without `speak`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub priority: bool,
     /// When set, joining a channel that does not exist yet creates it with this template
     /// instead of failing with `CHANNEL_NOT_FOUND`. `channel_id` must equal
     /// `ChannelId::ad_hoc(app_id, template.name)`.
@@ -1362,6 +1430,7 @@ pub enum AuditAction {
     UserUnbanned,
     UserMuted,
     UserUnmuted,
+    PriorityChanged,
     ChannelCreated,
     ChannelDeleted,
     ChannelConfigUpdated,

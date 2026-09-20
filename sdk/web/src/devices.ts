@@ -67,6 +67,8 @@ export class InputPipeline {
   private source: MediaStreamAudioSourceNode | undefined;
   private gain: GainNode | undefined;
   private micSwitch: GainNode | undefined;
+  private effects: AudioNode | undefined;
+  private readonly taps = new Set<AudioNode>();
   private injectGain: GainNode | undefined;
   private injectNode: AudioBufferSourceNode | MediaStreamAudioSourceNode | undefined;
   private destination: MediaStreamAudioDestinationNode | undefined;
@@ -113,7 +115,7 @@ export class InputPipeline {
       this.injectGain = this.ctx.createGain();
       this.destination = this.ctx.createMediaStreamDestination();
       this.gain.connect(this.micSwitch);
-      this.micSwitch.connect(this.destination);
+      this.wireMic();
       this.injectGain.connect(this.destination);
       this.setSource(raw);
       this.setGain(gain);
@@ -131,6 +133,47 @@ export class InputPipeline {
     this.source?.disconnect();
     this.source = this.ctx.createMediaStreamSource(raw);
     this.source.connect(this.gain);
+  }
+
+  /**
+   * Insert (or remove, with `undefined`) a processing node on the microphone path — voice
+   * effects. Sits after the gain and the mute switch, before the output, so injected audio
+   * bypasses it. The previous node is disconnected.
+   */
+  setEffects(node: AudioNode | undefined): void {
+    if (!this.micSwitch || !this.destination) return;
+    this.micSwitch.disconnect();
+    this.effects?.disconnect();
+    this.effects = node;
+    this.wireMic();
+  }
+
+  /** Whether an effects node is inserted. */
+  get hasEffects(): boolean {
+    return this.effects !== undefined;
+  }
+
+  /**
+   * Feed the processed microphone (after gain, mute switch and effects; never the injection)
+   * into `node` as well — a viseme analyser, a meter.
+   */
+  addTap(node: AudioNode): void {
+    this.taps.add(node);
+    (this.effects ?? this.micSwitch)?.connect(node);
+  }
+
+  removeTap(node: AudioNode): void {
+    if (!this.taps.delete(node)) return;
+    (this.effects ?? this.micSwitch)?.disconnect(node);
+  }
+
+  /** `micSwitch → [effects] → destination (+ taps)`. */
+  private wireMic(): void {
+    if (!this.micSwitch || !this.destination) return;
+    const tail = this.effects ?? this.micSwitch;
+    if (this.effects) this.micSwitch.connect(this.effects);
+    tail.connect(this.destination);
+    for (const tap of this.taps) tail.connect(tap);
   }
 
   /** Linear gain `0..MAX_INPUT_GAIN` (`1` = unity), ramped over ~20 ms to avoid clicks. */
@@ -211,11 +254,15 @@ export class InputPipeline {
     this.source?.disconnect();
     this.gain?.disconnect();
     this.micSwitch?.disconnect();
+    this.effects?.disconnect();
+    for (const tap of this.taps) tap.disconnect();
+    this.taps.clear();
     this.injectGain?.disconnect();
     this.destination?.stream.getTracks().forEach((t) => t.stop());
     this.source = undefined;
     this.gain = undefined;
     this.micSwitch = undefined;
+    this.effects = undefined;
     this.injectGain = undefined;
     this.destination = undefined;
     if (this.ownsContext && this.ctx) void this.ctx.close().catch(() => undefined);

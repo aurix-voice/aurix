@@ -104,6 +104,7 @@ namespace Aurix.WebGL
                 IsMuted = MiniJson.GetBool(o, "muted"),
                 IsServerMuted = MiniJson.GetBool(o, "serverMuted"),
                 IsSpeaking = MiniJson.GetBool(o, "speaking"),
+                IsPriority = MiniJson.GetBool(o, "priority"),
                 Energy = Math.Max(0f, Math.Min(1f, F32(o, "energy"))),
             };
         }
@@ -128,6 +129,7 @@ namespace Aurix.WebGL
             target.IsMuted = update.IsMuted;
             target.IsServerMuted = update.IsServerMuted;
             target.IsSpeaking = update.IsSpeaking;
+            target.IsPriority = update.IsPriority;
             target.Energy = update.Energy;
         }
 
@@ -141,8 +143,87 @@ namespace Aurix.WebGL
                 HiddenListeners = MiniJson.GetBool(o, "hiddenListeners"),
                 Transcription = MiniJson.GetBool(o, "transcription"),
                 SafetyVoice = MiniJson.GetBool(o, "safetyVoice"),
+                Ducking = Ducking(Obj(o, "ducking")),
+                IsPriority = MiniJson.GetBool(o, "priority"),
             };
         }
+
+        internal static DuckingConfig? Ducking(Dictionary<string, object> o)
+        {
+            if (o == null) return null;
+            return new DuckingConfig
+            {
+                Gain = F32(o, "gain", 0.25),
+                AttackMs = (int)MiniJson.GetNumber(o, "attackMs", 60),
+                ReleaseMs = (int)MiniJson.GetNumber(o, "releaseMs", 400),
+                HoldMs = (int)MiniJson.GetNumber(o, "holdMs", 250),
+                Moderators = MiniJson.GetBool(o, "moderators"),
+            };
+        }
+
+        /// <summary>A Web SDK <c>VisemeFrame</c> (<c>weights[]</c> in <see cref="Audio.VisemeFrame.Names"/> order).</summary>
+        internal static Audio.VisemeFrame? Visemes(Dictionary<string, object> o)
+        {
+            if (o == null) return null;
+            var frame = new Audio.VisemeFrame
+            {
+                MouthOpen = F32(o, "mouthOpen"),
+                Energy = F32(o, "energy"),
+                Confidence = F32(o, "confidence"),
+                Sequence = (ulong)Math.Max(0, MiniJson.GetNumber(o, "sequence")),
+                Dominant = ParseViseme(MiniJson.GetString(o, "dominant")),
+            };
+            var weights = Arr(o, "weights");
+            if (weights != null)
+                for (int i = 0; i < weights.Count && i < Audio.VisemeFrame.Count; i++)
+                    if (weights[i] is double w) frame[i] = (float)w;
+            return frame;
+        }
+
+        internal static Audio.Viseme ParseViseme(string name)
+        {
+            if (name != null)
+                for (int i = 0; i < Audio.VisemeFrame.Names.Length; i++)
+                    if (Audio.VisemeFrame.Names[i] == name) return (Audio.Viseme)i;
+            return Audio.Viseme.Silence;
+        }
+
+        /// <summary>The Web SDK's (resolved) <c>VoiceEffectParams</c> object; missing keys read as off.</summary>
+        internal static Audio.VoiceEffectParams VoiceEffects(Dictionary<string, object> o)
+        {
+            if (o == null) return Audio.VoiceEffectParams.Bypass;
+            return new Audio.VoiceEffectParams
+            {
+                HighpassHz = F32(o, "highpassHz"),
+                LowpassHz = F32(o, "lowpassHz"),
+                FormantSemitones = F32(o, "formantSemitones"),
+                PitchSemitones = F32(o, "pitchSemitones"),
+                RingModHz = F32(o, "ringModHz"),
+                DistortionDrive = F32(o, "distortionDrive"),
+                TremoloHz = F32(o, "tremoloHz"),
+                TremoloDepth = F32(o, "tremoloDepth"),
+                StaticLevel = F32(o, "staticLevel"),
+                ReverbMix = F32(o, "reverbMix"),
+                ReverbSize = F32(o, "reverbSize"),
+                ReverbDamping = F32(o, "reverbDamping"),
+            }.Sanitized();
+        }
+
+        internal static Dictionary<string, object> VoiceEffectsToBridge(Audio.VoiceEffectParams e) => new Dictionary<string, object>
+        {
+            { "highpassHz", (double)e.HighpassHz },
+            { "lowpassHz", (double)e.LowpassHz },
+            { "formantSemitones", (double)e.FormantSemitones },
+            { "pitchSemitones", (double)e.PitchSemitones },
+            { "ringModHz", (double)e.RingModHz },
+            { "distortionDrive", (double)e.DistortionDrive },
+            { "tremoloHz", (double)e.TremoloHz },
+            { "tremoloDepth", (double)e.TremoloDepth },
+            { "staticLevel", (double)e.StaticLevel },
+            { "reverbMix", (double)e.ReverbMix },
+            { "reverbSize", (double)e.ReverbSize },
+            { "reverbDamping", (double)e.ReverbDamping },
+        };
 
         internal static ChannelScope? ChannelScope(Dictionary<string, object> o)
         {
