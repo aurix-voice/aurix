@@ -127,6 +127,17 @@ pub enum ServerEvent {
         threshold: f64,
         timestamp: DateTime<Utc>,
     },
+    /// The debounced condition behind a `quality.alert` cleared (`metric: "mos"` only:
+    /// the MOS held above `threshold` + hysteresis for `quality.mos_alert_periods`).
+    QualityRecovered {
+        app_id: AppId,
+        session_id: SessionId,
+        user_id: UserId,
+        metric: String,
+        value: f64,
+        threshold: f64,
+        timestamp: DateTime<Utc>,
+    },
     NodeHealthChanged {
         node_id: MediaNodeId,
         healthy: bool,
@@ -368,6 +379,7 @@ impl ServerEvent {
             | Self::UserDeleted { app_id, .. }
             | Self::UserKicked { app_id, .. }
             | Self::QualityAlert { app_id, .. }
+            | Self::QualityRecovered { app_id, .. }
             | Self::ModerationEvent { app_id, .. }
             | Self::RecordingStarted { app_id, .. }
             | Self::RecordingStopped { app_id, .. }
@@ -424,6 +436,7 @@ impl ServerEvent {
             Self::UserDeleted { .. } => "user.deleted",
             Self::UserKicked { .. } => "participant.kicked",
             Self::QualityAlert { .. } => "quality.alert",
+            Self::QualityRecovered { .. } => "quality.recovered",
             Self::ModerationEvent { .. } => "moderation.event",
             Self::RecordingStarted { .. } => "recording.started",
             Self::RecordingStopped { .. } => "recording.stopped",
@@ -476,6 +489,7 @@ impl ServerEvent {
         "audio_stream.started",
         "audio_stream.stopped",
         "quality.alert",
+        "quality.recovered",
         "chat.message",
         "chat.read_marker",
         "participant.typing",

@@ -1244,6 +1244,238 @@ impl NetworkQuality {
     }
 }
 
+/// Lifetime quality record of one session, built from every `NetworkQuality` evaluation the
+/// node made for it (`media.quality_interval_ms`). Persisted as `sessions.quality_stats`
+/// (refreshed while the session lives, final on disconnect) and shown in the session stats
+/// and user APIs. Averages are time-weighted per evaluation period; `jitter` and `loss` take
+/// the worse direction of each sample, like the rating itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualitySummary {
+    /// Evaluations folded in.
+    pub samples: u64,
+    /// Rated time (sum of the evaluation periods), seconds.
+    pub seconds: f64,
+    pub mos_avg: f32,
+    pub mos_min: f32,
+    pub mos_last: f32,
+    pub r_factor_avg: f32,
+    pub rtt_avg_ms: f32,
+    pub rtt_max_ms: f32,
+    pub jitter_avg_ms: f32,
+    pub loss_avg_percent: f32,
+    pub loss_max_percent: f32,
+    /// Evaluations per bar count, index 0 = 1 bar.
+    pub bars: [u64; 5],
+    /// Rated time at 1–2 bars (R < 60, "many users dissatisfied").
+    pub poor_seconds: f64,
+    /// `quality.alert {metric: "mos"}` events raised for the session.
+    pub mos_alerts: u32,
+    /// The most recent evaluation.
+    pub last: Option<NetworkQuality>,
+}
+
+/// Quality metered into the usage buckets since the last flush (see
+/// [`crate::usage::UsageMetric`]): integer sums so the counters stay additive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QualityDelta {
+    pub samples: u64,
+    pub mos_milli: u64,
+    pub rtt_ms: u64,
+    pub jitter_ms: u64,
+    pub loss_permille: u64,
+    pub poor_samples: u64,
+}
+
+impl QualityDelta {
+    pub fn is_empty(&self) -> bool {
+        self.samples == 0
+    }
+}
+
+/// Accumulates [`NetworkQuality`] evaluations into a [`QualitySummary`] and the not yet
+/// metered [`QualityDelta`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QualityAccumulator {
+    samples: u64,
+    seconds: f64,
+    mos_sum: f64,
+    mos_min: f32,
+    r_sum: f64,
+    rtt_sum: f64,
+    rtt_max: f32,
+    jitter_sum: f64,
+    loss_sum: f64,
+    loss_max: f32,
+    bars: [u64; 5],
+    poor_seconds: f64,
+    mos_alerts: u32,
+    last: Option<NetworkQuality>,
+    pending: QualityDelta,
+}
+
+impl QualityAccumulator {
+    /// Continues a summary persisted by a previous host of the session (cross-node resume):
+    /// the averages are re-weighted by their sample count, so later samples extend them.
+    pub fn from_summary(s: &QualitySummary) -> Self {
+        let n = s.samples as f64;
+        Self {
+            samples: s.samples,
+            seconds: s.seconds.max(0.0),
+            mos_sum: f64::from(s.mos_avg) * n,
+            mos_min: s.mos_min,
+            r_sum: f64::from(s.r_factor_avg) * n,
+            rtt_sum: f64::from(s.rtt_avg_ms) * n,
+            rtt_max: s.rtt_max_ms,
+            jitter_sum: f64::from(s.jitter_avg_ms) * n,
+            loss_sum: f64::from(s.loss_avg_percent) * n,
+            loss_max: s.loss_max_percent,
+            bars: s.bars,
+            poor_seconds: s.poor_seconds.max(0.0),
+            mos_alerts: s.mos_alerts,
+            last: s.last,
+            pending: QualityDelta::default(),
+        }
+    }
+
+    /// Folds one evaluation covering `period_secs` of the session in.
+    pub fn record(&mut self, q: &NetworkQuality, period_secs: f64) {
+        let period = if period_secs.is_finite() {
+            period_secs.max(0.0)
+        } else {
+            0.0
+        };
+        let jitter = q.downlink_jitter_ms.max(q.uplink_jitter_ms);
+        let loss = q.downlink_loss_percent.max(q.uplink_loss_percent);
+        if self.samples == 0 {
+            self.mos_min = q.mos;
+        } else {
+            self.mos_min = self.mos_min.min(q.mos);
+        }
+        self.samples += 1;
+        self.seconds += period;
+        self.mos_sum += f64::from(q.mos);
+        self.r_sum += f64::from(q.r_factor);
+        self.rtt_sum += f64::from(q.rtt_ms);
+        self.rtt_max = self.rtt_max.max(q.rtt_ms);
+        self.jitter_sum += f64::from(jitter);
+        self.loss_sum += f64::from(loss);
+        self.loss_max = self.loss_max.max(loss);
+        let bar = usize::from(q.bars.clamp(1, 5)) - 1;
+        self.bars[bar] += 1;
+        let poor = q.bars <= 2;
+        if poor {
+            self.poor_seconds += period;
+        }
+        self.last = Some(*q);
+        self.pending.samples += 1;
+        self.pending.mos_milli += (q.mos.clamp(0.0, 5.0) * 1000.0).round() as u64;
+        self.pending.rtt_ms += q.rtt_ms.clamp(0.0, 60_000.0).round() as u64;
+        self.pending.jitter_ms += jitter.clamp(0.0, 60_000.0).round() as u64;
+        self.pending.loss_permille += (loss.clamp(0.0, 100.0) * 10.0).round() as u64;
+        if poor {
+            self.pending.poor_samples += 1;
+        }
+    }
+
+    pub fn note_mos_alert(&mut self) {
+        self.mos_alerts = self.mos_alerts.saturating_add(1);
+    }
+
+    /// Quality metered since the previous call.
+    pub fn take_unmetered(&mut self) -> QualityDelta {
+        std::mem::take(&mut self.pending)
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    pub fn last(&self) -> Option<NetworkQuality> {
+        self.last
+    }
+
+    pub fn summary(&self) -> QualitySummary {
+        let n = self.samples as f64;
+        let avg = |sum: f64| {
+            if self.samples == 0 {
+                0.0
+            } else {
+                (sum / n) as f32
+            }
+        };
+        QualitySummary {
+            samples: self.samples,
+            seconds: self.seconds,
+            mos_avg: avg(self.mos_sum),
+            mos_min: self.mos_min,
+            mos_last: self.last.map(|q| q.mos).unwrap_or(0.0),
+            r_factor_avg: avg(self.r_sum),
+            rtt_avg_ms: avg(self.rtt_sum),
+            rtt_max_ms: self.rtt_max,
+            jitter_avg_ms: avg(self.jitter_sum),
+            loss_avg_percent: avg(self.loss_sum),
+            loss_max_percent: self.loss_max,
+            bars: self.bars,
+            poor_seconds: self.poor_seconds,
+            mos_alerts: self.mos_alerts,
+            last: self.last,
+        }
+    }
+}
+
+/// Debounced MOS threshold detector for one session: `Degraded` after `periods` consecutive
+/// evaluations below `threshold`, `Recovered` after as many consecutive evaluations at or
+/// above `threshold + MOS_RECOVERY_MARGIN`. A threshold of `0` disables it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MosAlertState {
+    below: u32,
+    above: u32,
+    alerting: bool,
+}
+
+/// Hysteresis above the alert threshold before a session counts as recovered.
+pub const MOS_RECOVERY_MARGIN: f32 = 0.2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MosTransition {
+    Degraded,
+    Recovered,
+}
+
+impl MosAlertState {
+    pub fn is_alerting(&self) -> bool {
+        self.alerting
+    }
+
+    pub fn observe(&mut self, mos: f32, threshold: f32, periods: u32) -> Option<MosTransition> {
+        if threshold.is_nan() || threshold <= 0.0 || !mos.is_finite() {
+            return None;
+        }
+        let periods = periods.max(1);
+        if mos < threshold {
+            self.below = self.below.saturating_add(1);
+            self.above = 0;
+            if !self.alerting && self.below >= periods {
+                self.alerting = true;
+                return Some(MosTransition::Degraded);
+            }
+        } else {
+            self.below = 0;
+            if mos >= threshold + MOS_RECOVERY_MARGIN {
+                self.above = self.above.saturating_add(1);
+                if self.alerting && self.above >= periods {
+                    self.alerting = false;
+                    self.above = 0;
+                    return Some(MosTransition::Recovered);
+                }
+            } else {
+                self.above = 0;
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioProcessingConfig {
     pub agc_enabled: bool,
@@ -1968,5 +2200,86 @@ mod tests {
         );
         assert!(AdminRole::Superadmin.permissions().len() == AdminPermission::ALL.len());
         assert!(!AdminRole::Admin.allows(AdminPermission::AdminsManage));
+    }
+
+    fn rated(rtt: f32, loss: f32) -> NetworkQuality {
+        let client = QualityMetrics {
+            rtt_ms: rtt,
+            jitter_ms: 5.0,
+            packet_loss_percent: loss,
+            bitrate_kbps: 32,
+            mos_score: 0.0,
+        };
+        NetworkQuality::compose(&client, 2.0, 0.0, 30, 100, 0)
+    }
+
+    #[test]
+    fn quality_accumulator_averages_and_meters() {
+        let mut acc = QualityAccumulator::default();
+        assert_eq!(acc.summary().samples, 0);
+        assert_eq!(acc.summary().mos_avg, 0.0);
+        let good = rated(40.0, 0.0);
+        let bad = rated(40.0, 25.0);
+        acc.record(&good, 2.0);
+        acc.record(&good, 2.0);
+        acc.record(&bad, 2.0);
+        let s = acc.summary();
+        assert_eq!(s.samples, 3);
+        assert_eq!(s.seconds, 6.0);
+        assert_eq!(s.bars, [1, 0, 0, 0, 2]);
+        assert_eq!(s.poor_seconds, 2.0);
+        assert_eq!(s.mos_min, bad.mos);
+        assert_eq!(s.mos_last, bad.mos);
+        assert!((s.mos_avg - (2.0 * good.mos + bad.mos) / 3.0).abs() < 1e-4);
+        assert_eq!(s.loss_max_percent, 25.0);
+        assert!((s.loss_avg_percent - 25.0 / 3.0).abs() < 1e-4);
+        assert_eq!(s.rtt_avg_ms, 40.0);
+        assert_eq!(s.last, Some(bad));
+
+        let d = acc.take_unmetered();
+        assert_eq!(d.samples, 3);
+        assert_eq!(d.poor_samples, 1);
+        assert_eq!(d.rtt_ms, 120);
+        assert_eq!(d.loss_permille, 250);
+        assert_eq!(
+            d.mos_milli,
+            (good.mos * 1000.0).round() as u64 * 2 + (bad.mos * 1000.0).round() as u64
+        );
+        assert!(acc.take_unmetered().is_empty());
+
+        // A node that adopts the session continues the averages.
+        let mut resumed = QualityAccumulator::from_summary(&s);
+        resumed.record(&good, 2.0);
+        let r = resumed.summary();
+        assert_eq!(r.samples, 4);
+        assert_eq!(r.bars, [1, 0, 0, 0, 3]);
+        assert!((r.mos_avg - (3.0 * good.mos + bad.mos) / 4.0).abs() < 1e-4);
+        assert_eq!(r.mos_min, bad.mos);
+        assert!(resumed.take_unmetered().samples == 1);
+    }
+
+    #[test]
+    fn mos_alert_debounces_and_recovers_with_hysteresis() {
+        let mut st = MosAlertState::default();
+        assert_eq!(st.observe(2.0, 0.0, 3), None, "disabled");
+        assert_eq!(st.observe(2.0, 3.1, 3), None);
+        assert_eq!(st.observe(2.0, 3.1, 3), None);
+        assert_eq!(st.observe(4.0, 3.1, 3), None, "streak broken");
+        assert_eq!(st.observe(2.0, 3.1, 3), None);
+        assert_eq!(st.observe(2.0, 3.1, 3), None);
+        assert_eq!(st.observe(2.0, 3.1, 3), Some(MosTransition::Degraded));
+        assert!(st.is_alerting());
+        assert_eq!(st.observe(2.0, 3.1, 3), None, "no repeat while alerting");
+        // Inside the hysteresis band: neither recovers nor re-alerts.
+        assert_eq!(st.observe(3.2, 3.1, 3), None);
+        assert_eq!(st.observe(3.2, 3.1, 3), None);
+        assert_eq!(st.observe(3.2, 3.1, 3), None);
+        assert!(st.is_alerting());
+        assert_eq!(st.observe(3.5, 3.1, 3), None);
+        assert_eq!(st.observe(3.5, 3.1, 3), None);
+        assert_eq!(st.observe(3.5, 3.1, 3), Some(MosTransition::Recovered));
+        assert!(!st.is_alerting());
+        assert_eq!(st.observe(1.5, 3.1, 1), Some(MosTransition::Degraded));
+        assert_eq!(st.observe(f32::NAN, 3.1, 1), None);
     }
 }

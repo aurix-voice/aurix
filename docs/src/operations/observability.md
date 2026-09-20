@@ -33,6 +33,8 @@ docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < auri
 | `aurix_packets_received_total`, `aurix_packets_sent_total`, `aurix_bytes_*_total` | SFU traffic |
 | `aurix_packets_dropped_total` | packets rejected before routing: bad authentication tag, replay, unknown session, malformed |
 | `aurix_packet_loss_rate`, `aurix_jitter_milliseconds`, `aurix_rtt_milliseconds` | quality aggregates |
+| `aurix_session_mos`, `aurix_uplink_loss_percent`, `aurix_uplink_jitter_milliseconds` | histograms with one observation per rated session per `media.quality_interval_ms` — `histogram_quantile(0.5, sum by (le) (rate(aurix_session_mos_bucket[5m])))` is the fleet median MOS, `_sum / _count` the mean |
+| `aurix_sessions_by_bars{bars}`, `aurix_sessions_mos_degraded`, `aurix_quality_events_total{metric,event}` | rated sessions per bar level, sessions with an open MOS alert, `quality.alert` / `quality.recovered` published (`metric` `packet_loss` / `uplink_packet_loss` / `mos`, `event` `alert` / `recovered`). No session or user labels anywhere — per-session detail lives in `GET /v1/analytics/sessions` and the stats endpoint ([Network quality](../features/quality.md)) |
 | `aurix_pcmu_sessions`, `aurix_pcmu_frames_total{direction,outcome}` | sessions on the G.711 fallback and the frames transcoded for them (`uplink`/`downlink`, `ok`/`error`) — CPU the node spends on their behalf |
 | `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}` | native sessions whose media rides the control WebSocket because UDP is blocked, and their packets (`uplink` `received`/`rejected`, `downlink` `sent`/`dropped`) — many `dropped` means a client's TCP connection is stalling behind loss |
 | `aurix_api_requests_total{method,path,status}`, `aurix_api_request_duration_seconds` | REST (path templated, ids collapsed) |
@@ -43,8 +45,13 @@ docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < auri
 | `aurix_webhook_deliveries_total{result}`, `aurix_webhook_deliveries_leased`, `aurix_event_stream_clients` | webhooks / SSE |
 | `aurix_node_cpu_usage`, `aurix_node_memory_usage`, `aurix_node_bandwidth_in_mbps` / `_out_mbps` | node health as reported to the registry |
 
-`deploy/prometheus.yml` scrapes the node; `deploy/grafana/dashboards/aurix-overview.json` is a
-ready dashboard (`docker compose --profile observability up -d`). Alert on
+`deploy/prometheus.yml` scrapes the node and loads `deploy/prometheus-alerts.yml` — fleet-level
+voice-quality rules (`AurixMedianMosLow`, `AurixP10MosPoor`, `AurixDegradedSessionsHigh`,
+`AurixUplinkLossHigh`, `AurixUplinkJitterHigh`, `AurixQualityAlertStorm`,
+`AurixNodeQualityOutlier`), each with a minimum number of ratings so a handful of sessions
+cannot page you; `deploy/grafana/dashboards/aurix-overview.json` and `aurix-quality.json`
+(MOS percentiles and heatmap, bars, alerts/recoveries, uplink loss/jitter, per-node mean MOS)
+are ready dashboards (`docker compose --profile observability up -d`). Also alert on
 `aurix_packets_dropped_total` rising (forged or misconfigured clients),
 `aurix_packet_loss_rate`, webhook failures and `aurix_ws_sessions_detached` staying high
 (clients that cannot resume).

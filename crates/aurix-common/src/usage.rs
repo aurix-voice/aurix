@@ -30,16 +30,35 @@ pub enum UsageMetric {
     TtsCharacters,
     /// Milliseconds of audio submitted to the STT provider.
     SttAudioMs,
+    /// Per-session `NetworkQuality` evaluations folded into the bucket (application level
+    /// only; the E-model rating is per session, not per channel).
+    QualitySamples,
+    /// Sum of MOS × 1000 over those evaluations (`/ quality_samples / 1000` = mean MOS).
+    MosSumMilli,
+    /// Sum of client RTT (ms) over those evaluations.
+    RttSumMs,
+    /// Sum of the worse-direction jitter (ms) over those evaluations.
+    JitterSumMs,
+    /// Sum of the worse-direction packet loss × 10 (permille) over those evaluations.
+    LossSumPermille,
+    /// Evaluations at 1–2 bars (R < 60).
+    PoorQualitySamples,
 }
 
 impl UsageMetric {
-    pub const ALL: [UsageMetric; 6] = [
+    pub const ALL: [UsageMetric; 12] = [
         UsageMetric::MediaBytesIn,
         UsageMetric::MediaBytesOut,
         UsageMetric::ChatMessages,
         UsageMetric::TtsRequests,
         UsageMetric::TtsCharacters,
         UsageMetric::SttAudioMs,
+        UsageMetric::QualitySamples,
+        UsageMetric::MosSumMilli,
+        UsageMetric::RttSumMs,
+        UsageMetric::JitterSumMs,
+        UsageMetric::LossSumPermille,
+        UsageMetric::PoorQualitySamples,
     ];
 
     /// Column/wire name.
@@ -51,6 +70,12 @@ impl UsageMetric {
             UsageMetric::TtsRequests => "tts_requests",
             UsageMetric::TtsCharacters => "tts_characters",
             UsageMetric::SttAudioMs => "stt_audio_ms",
+            UsageMetric::QualitySamples => "quality_samples",
+            UsageMetric::MosSumMilli => "mos_sum_milli",
+            UsageMetric::RttSumMs => "rtt_sum_ms",
+            UsageMetric::JitterSumMs => "jitter_sum_ms",
+            UsageMetric::LossSumPermille => "loss_sum_permille",
+            UsageMetric::PoorQualitySamples => "poor_quality_samples",
         }
     }
 

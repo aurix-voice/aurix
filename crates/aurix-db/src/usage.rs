@@ -28,6 +28,12 @@ pub struct UsageAppBucketRow {
     pub tts_requests: i64,
     pub tts_characters: i64,
     pub stt_audio_ms: i64,
+    pub quality_samples: i64,
+    pub mos_sum_milli: i64,
+    pub rtt_sum_ms: i64,
+    pub jitter_sum_ms: i64,
+    pub loss_sum_permille: i64,
+    pub poor_quality_samples: i64,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -63,6 +69,12 @@ pub struct UsageTotalsRow {
     pub tts_requests: i64,
     pub tts_characters: i64,
     pub stt_audio_ms: i64,
+    pub quality_samples: i64,
+    pub mos_sum_milli: i64,
+    pub rtt_sum_ms: i64,
+    pub jitter_sum_ms: i64,
+    pub loss_sum_permille: i64,
+    pub poor_quality_samples: i64,
 }
 
 /// One metered increment for [`add_counters`].
@@ -319,13 +331,19 @@ pub async fn aggregate_channel_buckets(
     Ok(rows)
 }
 
-const METERED_COLUMNS: [&str; 6] = [
+const METERED_COLUMNS: [&str; 12] = [
     "media_bytes_in",
     "media_bytes_out",
     "chat_messages",
     "tts_requests",
     "tts_characters",
     "stt_audio_ms",
+    "quality_samples",
+    "mos_sum_milli",
+    "rtt_sum_ms",
+    "jitter_sum_ms",
+    "loss_sum_permille",
+    "poor_quality_samples",
 ];
 
 /// Counters that channel rows carry (media bytes are only known per session, hence per app).
@@ -454,6 +472,12 @@ pub async fn app_series_rollup(
                   SUM(tts_requests)::bigint AS tts_requests,
                   SUM(tts_characters)::bigint AS tts_characters,
                   SUM(stt_audio_ms)::bigint AS stt_audio_ms,
+                  SUM(quality_samples)::bigint AS quality_samples,
+                  SUM(mos_sum_milli)::bigint AS mos_sum_milli,
+                  SUM(rtt_sum_ms)::bigint AS rtt_sum_ms,
+                  SUM(jitter_sum_ms)::bigint AS jitter_sum_ms,
+                  SUM(loss_sum_permille)::bigint AS loss_sum_permille,
+                  SUM(poor_quality_samples)::bigint AS poor_quality_samples,
                   MAX(updated_at) AS updated_at
            FROM usage_app_buckets
            WHERE app_id = $1 AND bucket >= $2 AND bucket < $3
@@ -569,7 +593,13 @@ const TOTALS_SELECT: &str = r#"SELECT app_id,
            SUM(chat_messages)::bigint AS chat_messages,
            SUM(tts_requests)::bigint AS tts_requests,
            SUM(tts_characters)::bigint AS tts_characters,
-           SUM(stt_audio_ms)::bigint AS stt_audio_ms
+           SUM(stt_audio_ms)::bigint AS stt_audio_ms,
+           SUM(quality_samples)::bigint AS quality_samples,
+           SUM(mos_sum_milli)::bigint AS mos_sum_milli,
+           SUM(rtt_sum_ms)::bigint AS rtt_sum_ms,
+           SUM(jitter_sum_ms)::bigint AS jitter_sum_ms,
+           SUM(loss_sum_permille)::bigint AS loss_sum_permille,
+           SUM(poor_quality_samples)::bigint AS poor_quality_samples
     FROM usage_app_buckets"#;
 
 /// Every application's buckets in `[from, to)` for the fleet export, oldest first.

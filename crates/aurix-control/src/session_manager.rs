@@ -33,6 +33,8 @@ pub struct MigratedSession {
     pub reaped: bool,
     /// Channels whose membership rows are still open.
     pub open_channels: Vec<ChannelId>,
+    /// Running quality summary the previous node persisted, if any.
+    pub quality_stats: Option<serde_json::Value>,
 }
 
 /// Where a session connects from, as recorded on its row.
@@ -111,6 +113,40 @@ impl SessionManager {
             .await
             .map(|n| n > 0)
             .map_err(|e| AurixError::Database(format!("Session close failed: {e}")))
+    }
+
+    /// Periodic checkpoint of a live session's quality summary (owning node only).
+    pub async fn update_session_quality(
+        &self,
+        session_id: SessionId,
+        node: MediaNodeId,
+        quality: serde_json::Value,
+    ) -> Result<bool> {
+        aurix_db::queries::update_session_quality(&self.pool, session_id.0, node.0, quality)
+            .await
+            .map(|n| n > 0)
+            .map_err(|e| AurixError::Database(format!("Session quality update failed: {e}")))
+    }
+
+    /// Worst-rated sessions of an application in a range (see `queries::worst_quality_sessions`).
+    pub async fn worst_quality_sessions(
+        &self,
+        app_id: AppId,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+        min_samples: i64,
+        limit: i64,
+    ) -> Result<Vec<SessionRow>> {
+        aurix_db::queries::worst_quality_sessions(
+            &self.pool,
+            app_id.0,
+            from,
+            to,
+            min_samples,
+            limit,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Session quality query failed: {e}")))
     }
 
     pub async fn add_channel_membership(
@@ -313,6 +349,7 @@ impl SessionManager {
                 .into_iter()
                 .map(ChannelId::from_uuid)
                 .collect(),
+            quality_stats: m.quality_stats,
         }))
     }
 

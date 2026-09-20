@@ -13,7 +13,7 @@ There are two kinds of numbers, produced by two different mechanisms:
 | kind | metrics | source |
 |---|---|---|
 | **derived** | `peak_sessions` (CCU), `session_minutes`, `sessions_started`, `unique_users`, `peak_participants`, `participant_minutes`, `active_channels`, `recording_seconds`; per channel `peak_participants`, `participant_minutes`, `joins`, `unique_users` | recomputed from the `sessions`, `channel_memberships` and `recordings` intervals in PostgreSQL by **one node at a time** (advisory lock) every `usage.aggregate_interval_secs` |
-| **metered** | `media_bytes_in/out`, `chat_messages`, `tts_requests`, `tts_characters`, `stt_audio_ms` | counted in memory on the node that did the work and **added** to the buckets by every node every `usage.flush_interval_secs` |
+| **metered** | `media_bytes_in/out`, `chat_messages`, `tts_requests`, `tts_characters`, `stt_audio_ms`; quality sums `quality_samples`, `mos_sum_milli`, `rtt_sum_ms`, `jitter_sum_ms`, `loss_sum_permille`, `poor_quality_samples` (application rows only) | counted in memory on the node that did the work and **added** to the buckets by every node every `usage.flush_interval_secs` |
 
 Derived metrics are interval arithmetic, not sampling: a session connected 10:03–10:19 puts
 2 minutes into the 10:00 bucket, 5 into 10:05, 5 into 10:10 and 4 into 10:15, and the peak
@@ -29,6 +29,16 @@ last 15 minutes before the watermark, which covers the largest `cluster.node_los
 A session whose node has vanished from the registry altogether — pruned 24 h after its last
 heartbeat before any node reaped it — is closed by the reaper as of the moment it is noticed,
 so nothing accrues forever.
+
+The quality sums are integer-scaled so that the buckets stay additive and idempotent: one
+`quality_samples` per rated period per session (`media.quality_interval_ms`), MOS × 1000, RTT
+and jitter in whole milliseconds, loss × 10, `poor_quality_samples` for samples at 1–2 bars.
+Every response derives `quality {samples, mos_avg, rtt_avg_ms, jitter_avg_ms,
+loss_avg_percent, poor_samples, poor_percent}` from them (`null` averages when nothing was
+rated), on `totals` and on every application series point; exports carry the raw sums.
+Quality is per session, not per channel, so channel rows and channel totals have none. The
+per-session view — worst average MOS first — is `GET /v1/analytics/sessions`
+([Network quality](../features/quality.md)).
 
 Buckets are 5 minutes for applications and 1 hour for channels, aligned to UTC epoch
 multiples. The aggregator keeps a **watermark**: buckets before it are final, later ones and
@@ -55,6 +65,7 @@ application rows, 1 hour for channel rows) and the effective value is echoed in
 | `GET /v1/analytics[?from&to&step]` | `current` (live sessions/channels/users), `range` (with `step_secs`, `finalized_through`), `totals` over the range and `series` of application buckets. `step` is a multiple of 300 s; left out, the finest of 5 min / 1 h / 1 day that keeps the series under 5 000 points is chosen (an explicit step over 10 000 points is `400`). Rolled-up buckets sum counters and take the maximum of peaks |
 | `GET /v1/analytics/channels[?from&to&limit]` | per-channel totals, busiest first — includes channels deleted since, usage outlives the channel |
 | `GET /v1/analytics/channels/{id}[?from&to]` | one channel's hourly series and totals (`404` if the channel neither exists in your application nor has usage there) |
+| `GET /v1/analytics/sessions[?from&to&min_samples&limit]` | sessions that connected in the range, worst average MOS first, with each one's persisted quality summary (`min_samples` 3, `limit` ≤ 500; live sessions are at most `quality.persist_interval_secs` stale) |
 | `GET /v1/analytics/quota` | your limits and how much of them is used (below) |
 | `GET /v1/analytics/export[?from&to&scope=app\|channels&format=json\|csv]` | every raw bucket in the range — 5-minute application rows or hourly channel rows — as JSON (`rows`, `count`, `truncated`) or CSV (`text/csv`, `Content-Disposition: attachment`, `X-Aurix-Truncated: true` when cut). At most 200 000 rows per call; page by narrowing the range |
 

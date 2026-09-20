@@ -350,6 +350,34 @@ async fn app_and_channel_buckets_are_derived_from_intervals() {
             value: 1000,
         },
         CounterDelta {
+            app_id: a,
+            channel_id: Some(c1),
+            bucket: t0,
+            metric: "quality_samples",
+            value: 3,
+        },
+        CounterDelta {
+            app_id: a,
+            channel_id: None,
+            bucket: t0 + minutes(5),
+            metric: "quality_samples",
+            value: 1,
+        },
+        CounterDelta {
+            app_id: a,
+            channel_id: None,
+            bucket: t0,
+            metric: "mos_sum_milli",
+            value: 12_300,
+        },
+        CounterDelta {
+            app_id: a,
+            channel_id: None,
+            bucket: t0,
+            metric: "poor_quality_samples",
+            value: 2,
+        },
+        CounterDelta {
             app_id: Uuid::new_v4(),
             channel_id: None,
             bucket: t0,
@@ -369,6 +397,13 @@ async fn app_and_channel_buckets_are_derived_from_intervals() {
     assert_eq!(rows[0].chat_messages, 2);
     assert_eq!(rows[1].chat_messages, 2);
     assert_eq!(rows[0].media_bytes_in, 1000);
+    assert_eq!(
+        rows[0].quality_samples, 3,
+        "quality counters are additive too"
+    );
+    assert_eq!(rows[0].mos_sum_milli, 12_300);
+    assert_eq!(rows[0].poor_quality_samples, 2);
+    assert_eq!(rows[1].quality_samples, 1);
     let ch = usage::channel_series(&pool, a, Some(c1), t0, t0 + hour, 10)
         .await
         .unwrap();
@@ -380,6 +415,25 @@ async fn app_and_channel_buckets_are_derived_from_intervals() {
         ch[0].peak_participants, 2,
         "derived columns untouched by counters"
     );
+    let rolled = usage::app_series_rollup(&pool, a, t0, t0 + hour, CHANNEL_BUCKET_SECS, 10)
+        .await
+        .unwrap();
+    assert_eq!(rolled[0].quality_samples, 4, "rollups sum quality counters");
+    assert_eq!(rolled[0].mos_sum_milli, 12_300);
+    let totals = usage::app_totals(&pool, a, t0, t0 + hour)
+        .await
+        .unwrap()
+        .expect("totals");
+    assert_eq!(totals.quality_samples, 4);
+    assert_eq!(totals.poor_quality_samples, 2);
+    assert_eq!(
+        usage::app_totals(&pool, b, t0, t0 + hour)
+            .await
+            .unwrap()
+            .map(|t| t.quality_samples),
+        Some(0),
+        "tenant separation"
+    );
     // …and a re-derivation keeps the counters.
     usage::aggregate_app_buckets(&pool, t0, t0 + hour, APP_BUCKET_SECS)
         .await
@@ -389,6 +443,7 @@ async fn app_and_channel_buckets_are_derived_from_intervals() {
         .unwrap();
     assert_eq!(rows[0].chat_messages, 2);
     assert_eq!(rows[0].peak_sessions, 2);
+    assert_eq!(rows[0].quality_samples, 3);
 
     let busiest = usage::channel_totals(&pool, a, t0, t0 + hour, 10)
         .await
@@ -448,6 +503,143 @@ async fn open_intervals_are_capped_at_now_and_quota_sees_live_minutes() {
         .unwrap();
     assert!((all_live - split).abs() < 0.1, "{all_live} vs {split}");
     cleanup(&pool, &[a]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL (AURIX_E2E_DATABASE_URL)"]
+async fn session_quality_checkpoints_hand_over_and_rank_worst_first() {
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let a = app(&pool, "Q", 0).await;
+    let b = app(&pool, "Q-other", 0).await;
+    let u = user(&pool, a).await;
+    let ub = user(&pool, b).await;
+    let t0 = base();
+    let node1 = Uuid::new_v4();
+    let node2 = Uuid::new_v4();
+    let quality = |samples: i64, mos_avg: f64| serde_json::json!({ "samples": samples, "mos_avg": mos_avg, "bars": [0, 0, 0, 0, samples] });
+
+    let mut rows = Vec::new();
+    for i in 0..3 {
+        let mut row = session_row(a, u, t0 + minutes(i));
+        row.media_node_id = node1;
+        rows.push(queries::create_session(&pool, &row).await.unwrap().id);
+    }
+    let mut other = session_row(b, ub, t0);
+    other.media_node_id = node1;
+    let other = queries::create_session(&pool, &other).await.unwrap().id;
+
+    // Checkpoints are fenced by the owning node; a closed session is not rewritten.
+    assert_eq!(
+        queries::update_session_quality(&pool, rows[0], node1, quality(10, 2.4))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        queries::update_session_quality(&pool, rows[1], node2, quality(10, 1.0))
+            .await
+            .unwrap(),
+        0,
+        "another node cannot overwrite the owner's record"
+    );
+    queries::update_session_quality(&pool, rows[1], node1, quality(10, 4.1))
+        .await
+        .unwrap();
+    queries::update_session_quality(&pool, rows[2], node1, quality(2, 1.5))
+        .await
+        .unwrap();
+    queries::update_session_quality(&pool, other, node1, quality(10, 1.2))
+        .await
+        .unwrap();
+    queries::close_session(&pool, rows[1], node1, "client", Some(quality(12, 4.2)))
+        .await
+        .unwrap();
+    assert_eq!(
+        queries::update_session_quality(&pool, rows[1], node1, quality(99, 1.0))
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Takeover hands the persisted record to the adopting node.
+    let migrated = queries::migrate_session(&pool, rows[0], a, u, node2)
+        .await
+        .unwrap()
+        .expect("adoptable");
+    assert!(!migrated.reaped);
+    assert_eq!(migrated.quality_stats, Some(quality(10, 2.4)));
+    assert_eq!(
+        queries::update_session_quality(&pool, rows[0], node2, quality(11, 2.3))
+            .await
+            .unwrap(),
+        1,
+        "the new owner continues the checkpoints"
+    );
+    assert_eq!(
+        queries::update_session_quality(&pool, rows[0], node1, quality(1, 1.0))
+            .await
+            .unwrap(),
+        0,
+        "the old owner is fenced out"
+    );
+
+    // Worst first, tenant-scoped, thinly rated sessions excluded by `min_samples`.
+    let worst = queries::worst_quality_sessions(&pool, a, t0, t0 + minutes(60), 3, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        worst.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![rows[0], rows[1]]
+    );
+    assert_eq!(worst[0].quality_stats, Some(quality(11, 2.3)));
+    assert!(worst[1].disconnected_at.is_some());
+    let all = queries::worst_quality_sessions(&pool, a, t0, t0 + minutes(60), 1, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![rows[2], rows[0], rows[1]]
+    );
+    let limited = queries::worst_quality_sessions(&pool, a, t0, t0 + minutes(60), 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert!(
+        queries::worst_quality_sessions(&pool, a, t0 + minutes(10), t0 + minutes(60), 1, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "range applies to connected_at"
+    );
+
+    // A hand-edited or foreign-shaped record is skipped rather than failing the listing.
+    for (i, junk) in [
+        serde_json::json!({ "samples": "ten", "mos_avg": 1.0 }),
+        serde_json::json!({ "samples": 10, "mos_avg": "bad" }),
+        serde_json::json!(["not", "an", "object"]),
+        serde_json::json!({}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut row = session_row(a, u, t0 + minutes(20 + i as i64));
+        row.media_node_id = node1;
+        let id = queries::create_session(&pool, &row).await.unwrap().id;
+        queries::update_session_quality(&pool, id, node1, junk)
+            .await
+            .unwrap();
+    }
+    let all = queries::worst_quality_sessions(&pool, a, t0, t0 + minutes(60), 1, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![rows[2], rows[0], rows[1]],
+        "malformed quality_stats rows are ignored"
+    );
+    cleanup(&pool, &[a, b]).await;
 }
 
 #[tokio::test]

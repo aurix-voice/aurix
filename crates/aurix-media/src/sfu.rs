@@ -2,6 +2,7 @@ use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::MediaChannel;
 use crate::mix::MixHub;
+use crate::quality::{MosAlertPolicy, QualityTick};
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
 use crate::transport::bind_media_socket;
@@ -26,6 +27,7 @@ use tracing::{error, info, warn};
 const ENERGY_REPORT_MIN_STEP_DB: u8 = 3;
 /// `NetworkQuality` is sent unconditionally every this many quality periods.
 const QUALITY_SUMMARY_EVERY: u64 = 5;
+const BARS_LABELS: [&str; 5] = ["1", "2", "3", "4", "5"];
 
 /// Side effects of leaving a channel that the client must be told about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub struct SfuOptions {
     pub energy_interval_ms: u64,
     /// Period of per-session `MediaEvent::NetworkQuality` evaluation (0 = disabled).
     pub quality_interval_ms: u64,
+    /// Debounced per-session MOS alerting on those evaluations.
+    pub mos_alert: MosAlertPolicy,
     /// Channels a single session may be joined to at once.
     pub max_channels_per_session: u32,
     /// Positional channels a single session may be joined to at once (0 = unlimited).
@@ -93,6 +97,7 @@ impl Default for SfuOptions {
             speaking_energy_threshold: 0.01,
             energy_interval_ms: 200,
             quality_interval_ms: 2000,
+            mos_alert: MosAlertPolicy::default(),
             max_channels_per_session: 10,
             max_positional_channels_per_session: 1,
             unfocused_channel_gain: DEFAULT_UNFOCUSED_GAIN,
@@ -191,10 +196,35 @@ impl SfuNode {
         }
     }
 
+    /// Quality summaries of live sessions that gained evaluations since the previous call,
+    /// for the periodic `sessions.quality_stats` checkpoint.
+    pub fn dirty_quality_summaries(&self) -> Vec<(SessionId, QualitySummary)> {
+        self.sessions_by_id
+            .iter()
+            .filter(|e| e.value().is_active())
+            .filter_map(|e| {
+                e.value()
+                    .take_quality_summary_if_dirty()
+                    .map(|s| (*e.key(), s))
+            })
+            .collect()
+    }
+
     fn meter_session(meter: &UsageMeter, session: &MediaSession) {
         let (rx, tx) = session.take_unmetered_bytes();
         meter.record(session.app_id, None, UsageMetric::MediaBytesIn, rx);
         meter.record(session.app_id, None, UsageMetric::MediaBytesOut, tx);
+        let q = session.take_unmetered_quality();
+        if q.is_empty() {
+            return;
+        }
+        let app = session.app_id;
+        meter.record(app, None, UsageMetric::QualitySamples, q.samples);
+        meter.record(app, None, UsageMetric::MosSumMilli, q.mos_milli);
+        meter.record(app, None, UsageMetric::RttSumMs, q.rtt_ms);
+        meter.record(app, None, UsageMetric::JitterSumMs, q.jitter_ms);
+        meter.record(app, None, UsageMetric::LossSumPermille, q.loss_permille);
+        meter.record(app, None, UsageMetric::PoorQualitySamples, q.poor_samples);
     }
 
     pub fn webrtc_manager(&self) -> Option<&Arc<WebRtcManager>> {
@@ -1148,14 +1178,17 @@ impl SfuNode {
     }
 
     /// Every `quality_interval_ms`, close each bound session's uplink interval, merge it with
-    /// the client's report and emit `NetworkQuality` when the bar count moved (and at least
-    /// every fifth period so a client that missed one still converges). Sessions without a
-    /// media path yet are not rated.
+    /// the client's report, fold it into the session's summary and emit `NetworkQuality` when
+    /// the bar count moved, the MOS alert state flipped, or at least every fifth period so a
+    /// client that missed one still converges. Sessions without a media path yet are not
+    /// rated. Node-wide Prometheus gauges/histograms are refreshed from the same pass.
     fn start_quality_reports(&self) {
         let interval_ms = self.options.quality_interval_ms;
         if interval_ms == 0 {
             return;
         }
+        let mos_policy = self.options.mos_alert;
+        let period_secs = interval_ms as f64 / 1000.0;
         let sessions = self.sessions_by_id.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -1166,21 +1199,42 @@ impl SfuNode {
                 interval.tick().await;
                 tick = tick.wrapping_add(1);
                 let summary = tick.is_multiple_of(QUALITY_SUMMARY_EVERY);
+                let mut by_bars = [0i64; 5];
+                let mut degraded = 0i64;
                 for entry in sessions.iter() {
                     let s = entry.value();
                     if !s.is_active() || !s.is_bound() {
                         continue;
                     }
-                    let (quality, changed) = s.refresh_network_quality();
-                    if changed || summary {
+                    let QualityTick {
+                        quality,
+                        bars_changed,
+                        transition,
+                    } = s.refresh_network_quality(period_secs, mos_policy);
+                    by_bars[usize::from(quality.bars.clamp(1, 5)) - 1] += 1;
+                    if s.is_mos_alerting() {
+                        degraded += 1;
+                    }
+                    aurix_metrics::SESSION_MOS.observe(f64::from(quality.mos));
+                    aurix_metrics::UPLINK_LOSS_PERCENT
+                        .observe(f64::from(quality.uplink_loss_percent));
+                    aurix_metrics::UPLINK_JITTER_MS.observe(f64::from(quality.uplink_jitter_ms));
+                    if bars_changed || transition.is_some() || summary {
                         let _ = events.send(MediaEvent::NetworkQuality {
                             session_id: s.session_id,
                             app_id: s.app_id,
                             user_id: s.user_id,
                             quality,
+                            transition,
                         });
                     }
                 }
+                for (i, n) in by_bars.iter().enumerate() {
+                    aurix_metrics::SESSIONS_BY_BARS
+                        .with_label_values(&[BARS_LABELS[i]])
+                        .set(*n);
+                }
+                aurix_metrics::SESSIONS_MOS_DEGRADED.set(degraded);
             }
         });
     }

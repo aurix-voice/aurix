@@ -36,6 +36,8 @@ pub struct AurixConfig {
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub usage: UsageConfig,
+    #[serde(default)]
+    pub quality: QualityConfig,
 }
 
 impl AurixConfig {
@@ -226,6 +228,20 @@ impl AurixConfig {
             if self.usage.quota_cache_secs > 300 {
                 anyhow::bail!("usage.quota_cache_secs must be at most 300");
             }
+        }
+        if !(0.0..=4.5).contains(&self.quality.mos_alert_threshold) {
+            anyhow::bail!("quality.mos_alert_threshold must be within 0.0 (off)..=4.5");
+        }
+        if !(1..=60).contains(&self.quality.mos_alert_periods) {
+            anyhow::bail!("quality.mos_alert_periods must be within 1..=60");
+        }
+        if !(0.0..=100.0).contains(&self.quality.loss_alert_percent) {
+            anyhow::bail!("quality.loss_alert_percent must be within 0.0 (off)..=100.0");
+        }
+        if self.quality.persist_interval_secs != 0
+            && !(10..=3600).contains(&self.quality.persist_interval_secs)
+        {
+            anyhow::bail!("quality.persist_interval_secs must be 0 (off) or within 10..=3600");
         }
         if !(0.0..=1.0).contains(&self.media.unfocused_channel_gain) {
             anyhow::bail!("media.unfocused_channel_gain must be within 0.0..=1.0");
@@ -979,6 +995,52 @@ impl Default for UsageConfig {
             retention_days: default_usage_retention_days(),
             channel_retention_days: default_usage_channel_retention_days(),
             quota_cache_secs: default_usage_quota_cache_secs(),
+        }
+    }
+}
+
+/// Per-session quality analytics and alerting (E-model MOS; see the quality chapter).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct QualityConfig {
+    /// Raise `quality.alert {metric: "mos"}` when a session's MOS stays below this for
+    /// `mos_alert_periods` consecutive evaluations (`media.quality_interval_ms` each);
+    /// `quality.recovered` follows once it stays 0.2 above the threshold as long. `0` disables
+    /// MOS alerts. 3.1 is the E-model "some users dissatisfied" boundary (R = 60, 2 bars).
+    #[serde(default = "default_mos_alert_threshold")]
+    pub mos_alert_threshold: f32,
+    #[serde(default = "default_mos_alert_periods")]
+    pub mos_alert_periods: u32,
+    /// Packet loss (percent, either direction, one period) that raises
+    /// `quality.alert {metric: "packet_loss" | "uplink_packet_loss"}`. `0` disables.
+    #[serde(default = "default_loss_alert_percent")]
+    pub loss_alert_percent: f32,
+    /// How often a node writes the running per-session quality summary to
+    /// `sessions.quality_stats` (seconds); it is always written on disconnect. `0` writes only
+    /// on disconnect (a node crash then loses the summaries of its live sessions).
+    #[serde(default = "default_quality_persist_interval_secs")]
+    pub persist_interval_secs: u64,
+}
+
+fn default_mos_alert_threshold() -> f32 {
+    3.1
+}
+fn default_mos_alert_periods() -> u32 {
+    3
+}
+fn default_loss_alert_percent() -> f32 {
+    20.0
+}
+fn default_quality_persist_interval_secs() -> u64 {
+    60
+}
+
+impl Default for QualityConfig {
+    fn default() -> Self {
+        Self {
+            mos_alert_threshold: default_mos_alert_threshold(),
+            mos_alert_periods: default_mos_alert_periods(),
+            loss_alert_percent: default_loss_alert_percent(),
+            persist_interval_secs: default_quality_persist_interval_secs(),
         }
     }
 }

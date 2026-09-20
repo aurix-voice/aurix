@@ -15,7 +15,7 @@ emit:
 | users / moderation | `user.banned`, `user.deleted`, `user.block_changed`, `moderation.event`, `safety.incident`, `safety.risk_changed` |
 | recordings / streams | `recording.started`, `recording.stopped`, `recording.consent_required`, `recording.processed`, `audio_stream.started`, `audio_stream.stopped` |
 | chat / speech | `chat.message`, `chat.read_marker` (stored chat: `{marker}` whenever a user's position moves), `tts.status` |
-| quality | `quality.alert` |
+| quality | `quality.alert` (`metric` `packet_loss` / `uplink_packet_loss` per period, `mos` once per debounced episode), `quality.recovered` (`mos` only, after the hysteresis — [Network quality](../features/quality.md)) |
 | synthetic | `webhook.test`, `webhook.resync` (produced by the webhook service itself) |
 
 `channel.activated` / `channel.deactivated` fire when a channel gets its first participant /

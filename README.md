@@ -11,7 +11,8 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
   (cocktail-party) mixing; whisper, command & echo (mic test) channels, audio injection, server
   mute, kick, ban, reports, channel-wide mute-all / kick-all.
 * **Player features**: auto-reconnect with session resume and cross-node failover, text chat lite, energy/VAD,
-  receiver-local mute/volume/blocks, transmission modes & channel focus, network-quality bars,
+  receiver-local mute/volume/blocks, transmission modes & channel focus, network-quality bars
+  with per-session MOS history, debounced MOS alerts and quality analytics,
   live transcripts and TTS, single-use action tokens, per-app webhooks and an SSE event stream.
 * **Recording** (Ogg/Opus, consent-gated, optional AES-GCM at rest, S3 / local storage).
 * **Built-in TURN/STUN** with time-limited HMAC credentials issued by the API.
@@ -325,7 +326,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id`, `POST /v1/recordings/mixdown`, `POST …/:id/transcribe`, `GET …/:id/transcript[?format=srt\|vtt]` | per-participant recording, channel mixdown (Ogg/Opus or WAV) and post-hoc transcript with speakers |
 | API key | `GET /v1/channels/:id/audio/streams/pull` (WebSocket), `POST|GET /v1/channels/:id/audio/streams`, `GET|DELETE …/audio/streams/:sid`, `GET /v1/audio/streams` | real-time audio out of the node — pull it over a WebSocket or have the node push it to yours (`audio_streams:read|write`; see [Live audio streams](#live-audio-streams)) |
 | API key | `POST|GET /v1/api-keys`, `PATCH|DELETE /v1/api-keys/:id`, `GET /v1/audit-log` | account |
-| API key | `GET /v1/analytics[?from&to&step]`, `GET /v1/analytics/channels[/:id]`, `GET /v1/analytics/quota`, `GET /v1/analytics/export[?scope=app\|channels&format=json\|csv]` | usage time series — CCU, session/participant minutes, unique users, media bytes, chat/TTS/STT — per application (5-minute buckets) and per channel (hourly), quota state, raw bucket export for billing (`analytics:read`; see [Usage analytics and quotas](#usage-analytics-and-quotas)) |
+| API key | `GET /v1/analytics[?from&to&step]`, `GET /v1/analytics/channels[/:id]`, `GET /v1/analytics/sessions[?min_samples&limit]`, `GET /v1/analytics/quota`, `GET /v1/analytics/export[?scope=app\|channels&format=json\|csv]` | usage time series — CCU, session/participant minutes, unique users, media bytes, chat/TTS/STT, average MOS / RTT / jitter / loss and poor-quality share — per application (5-minute buckets) and per channel (hourly), the worst-rated sessions of a range, quota state, raw bucket export for billing (`analytics:read`; see [Usage analytics and quotas](#usage-analytics-and-quotas)) |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
 | API key | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | live server event stream for game servers (`events:read`) |
 | player JWT | `GET /v1/me/turn-credentials`, `GET /v1/me/regions`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users (`/me/regions` is the same discovery list for the SDKs' RTT probing) |
@@ -350,7 +351,7 @@ Event types (`GET /v1/webhooks/events` lists them): `channel.created|destroyed|a
 (activated = first participant in, deactivated = last one out — also emitted for channels a
 crashed node left behind), `participant.joined|left|muted|unmuted|kicked`, `user.banned`,
 `user.block_changed`, `moderation.event`, `recording.started|stopped|consent_required|processed`,
-`audio_stream.started|stopped`, `quality.alert`, `chat.message`, `chat.read_marker`. `participant.typing`, `participant.speaking` and `channel.energy`
+`audio_stream.started|stopped`, `quality.alert`, `quality.recovered`, `chat.message`, `chat.read_marker`. `participant.typing`, `participant.speaking` and `channel.energy`
 are high-frequency UX signals: SSE delivers them only when named in `?types=`, webhooks refuse them.
 
 **Webhooks.** `POST /v1/webhooks {"url","events":["*"]|[…],"description"}` returns the signing
@@ -428,6 +429,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__CHAT__*` | `ENABLED` (default `true`), `MAX_MESSAGE_BYTES` (1024, text + metadata, ≤ 16384), `MESSAGES_PER_SECOND`/`MESSAGE_BURST` (2 / 10 per session), `TYPING_INTERVAL_MS` (1500), `SERVER_MUTE_BLOCKS_TEXT` (`true`), `FILTER_WEBHOOK` + `FILTER_TIMEOUT_MS` (1500) + `FILTER_FAIL_OPEN` (`false`), `PERSIST` (`false`) + `RETENTION_DAYS` (30) |
 | `AURIX__RETENTION__*` | `ENABLED` (`true`), `SESSIONS_DAYS` (90), `MODERATION_EVENTS_DAYS` (365, resolved cases only), `AUDIT_LOG_DAYS` (0 = keep), `ANALYTICS_DAYS` (400, legacy snapshot rows), `TOMBSTONES_DAYS` (30, must cover the longest token lifetime), `INACTIVE_USERS_DAYS` (0 = never auto-erase), `BATCH_SIZE` (5000), `INTERVAL_SECS` (3600, ≥ 60) — see [User erasure, export and retention](#user-erasure-export-and-retention) |
 | `AURIX__USAGE__*` | `ENABLED` (`true`), `FLUSH_INTERVAL_SECS` (15), `AGGREGATE_INTERVAL_SECS` (60), `RETENTION_DAYS` (400, application buckets), `CHANNEL_RETENTION_DAYS` (90), `QUOTA_CACHE_SECS` (30) — see [Usage analytics and quotas](#usage-analytics-and-quotas) |
+| `AURIX__QUALITY__*` | `MOS_ALERT_THRESHOLD` (3.1, `0` disables), `MOS_ALERT_PERIODS` (3 consecutive `media.quality_interval_ms` periods), `LOSS_ALERT_PERCENT` (20), `PERSIST_INTERVAL_SECS` (60, checkpoint of the per-session summary; `0` = on disconnect only) — see [Network quality and client statistics](#network-quality-and-client-statistics) |
 | `AURIX__WEBHOOKS__*` | `ENABLED` (`true`), `TIMEOUT_MS` (5000), `RETRY_DELAYS_SECS` (`5,30,120,600,1800,3600,7200`), `CONCURRENCY` (16), `BATCH_SIZE` (100), `MAX_PENDING_PER_SUBSCRIPTION` (10000 — older events are dropped for a dead endpoint), `RETENTION_HOURS` (72, delivery log), `MAX_SUBSCRIPTIONS_PER_APP` (20), `REQUIRE_HTTPS` / `ALLOW_PRIVATE_URLS` (default: strict in production), `SSE_KEEPALIVE_SECS` (15) |
 | `AURIX__STT__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/transcriptions`), `API_KEY`, `MODEL`, `LANGUAGE` (unset = auto-detect), `SEGMENT_SECS` (3.0), `SILENCE_FLUSH_MS` (700), `MIN_SEGMENT_MS` (400), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (8), `INCLUDE_WORDS` (`false`) — see [Transcripts and text-to-speech](#transcripts-and-text-to-speech) |
 | `AURIX__TTS__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/speech`, WAV), `API_KEY`, `MODEL`, `VOICES` (`alloy`), `DEFAULT_VOICE`, `ALLOW_CLIENT_REQUESTS` (`true`), `MAX_TEXT_CHARS` (500), `MAX_AUDIO_SECS` (30), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (4), `MAX_QUEUED_PER_SESSION` (3), `MAX_QUEUED_PER_CHANNEL` (8), `REQUESTS_PER_MINUTE_PER_SESSION` (10) |
@@ -519,8 +521,12 @@ heartbeat by the fleet reaper and the buckets are re-derived — while the meter
 one is still accruing.
 
 `GET /v1/analytics?from&to[&step]` returns live counters, range totals and the series (step
-auto-picked among 5 min / 1 h / 1 day, or an explicit multiple of 300 s), `GET
+auto-picked among 5 min / 1 h / 1 day, or an explicit multiple of 300 s) — totals and every
+application point carry a derived `quality {mos_avg, rtt_avg_ms, jitter_avg_ms,
+loss_avg_percent, poor_percent, samples}` from the metered quality sums — `GET
 /v1/analytics/channels[/:id]` the busiest channels and one channel's hourly series, `GET
+/v1/analytics/sessions?from&to&min_samples&limit` the sessions of the range worst average MOS
+first with their persisted summaries, `GET
 /v1/analytics/export?scope=app|channels&format=json|csv` every raw bucket for your billing or BI
 (200 000 rows per call, `truncated` / `X-Aurix-Truncated` when cut), `GET /v1/analytics/quota`
 the limits below. Administrators (`analytics:read`) see the fleet under `/admin/analytics/*`.
@@ -730,11 +736,26 @@ period as a summary:
  "uplink_loss_percent":4.0,"uplink_bitrate_kbps":31,"uplink_packets_received":4120,"uplink_packets_lost":170}}}
 ```
 
-Uplink loss above 20 % over a period raises `quality.alert` with `metric: "uplink_packet_loss"`
-(webhooks/SSE) even if the client reports nothing. Operators read the same view per session
-with `GET /v1/sessions/:id/stats` (node-local; the session's node is listed in
-`GET /v1/users/:id`). Client counters are cumulative for the current transport; loss, R-factor,
-MOS and bars describe the latest period.
+Uplink loss above `quality.loss_alert_percent` (20 %) over a period raises `quality.alert` with
+`metric: "uplink_packet_loss"` (webhooks/SSE) even if the client reports nothing. **MOS alerts**
+are debounced per session: MOS below `quality.mos_alert_threshold` (3.1) for
+`quality.mos_alert_periods` (3) consecutive periods raises one `quality.alert {metric: "mos"}`,
+and `quality.recovered` follows only after it has stayed 0.2 above the threshold as long —
+no event per bad sample, no flapping at the threshold. Every rated period also feeds a
+per-session **summary** (`samples`, `seconds`, `mos_avg/min/last`, `r_factor_avg`, RTT/jitter/loss
+avg and max, samples per bar, `poor_seconds`, `mos_alerts`) that is live in
+`GET /v1/sessions/:id/stats` (`quality_summary`, `mos_alerting`), checkpointed to
+`sessions.quality_stats` every `quality.persist_interval_secs` and on disconnect, continued by
+the adopting node on cross-node failover, and ranked worst-first by
+`GET /v1/analytics/sessions`; the fleet aggregates (average MOS/RTT/jitter/loss, poor share)
+ride the usage buckets of `GET /v1/analytics`. Prometheus gets distributions only
+(`aurix_session_mos`, `aurix_uplink_loss_percent`, `aurix_uplink_jitter_milliseconds`,
+`aurix_sessions_by_bars{bars}`, `aurix_sessions_mos_degraded`,
+`aurix_quality_events_total{metric,event}` — never a session or user label) with alert rules in
+`deploy/prometheus-alerts.yml` and the `aurix-quality` Grafana dashboard. Operators read the
+live view per session with `GET /v1/sessions/:id/stats` (node-local; the session's node is
+listed in `GET /v1/users/:id`). Client counters are cumulative for the current transport; loss,
+R-factor, MOS and bars describe the latest period.
 
 ### Opus controls and channel audio policy
 
@@ -968,7 +989,9 @@ Migrations are embedded in the binary and applied at start when `database.run_mi
 * `GET :4040/metrics` — `aurix_active_sessions`, `aurix_packets_*_total`, `aurix_bytes_*_total`,
   `aurix_api_requests_total{method,path,status}`, `aurix_turn_allocations`, `aurix_rate_limit_hits_total`, `aurix_rate_limit_scope_hits_total{scope,backend}`,
   `aurix_ws_sessions_detached` / `aurix_ws_sessions_resumed_total` (reconnects), …
-* Grafana dashboard: `deploy/grafana/dashboards/aurix-overview.json`.
+* Grafana dashboards: `deploy/grafana/dashboards/aurix-overview.json`, `aurix-quality.json` (MOS
+  percentiles/heatmap, bars, alerts, uplink loss/jitter, per-node outliers); Prometheus alert
+  rules: `deploy/prometheus-alerts.yml`.
 * Logs: JSON (`AURIX__TRACING__LOG_FORMAT=json`), OTLP export via `AURIX__TRACING__OTLP_ENDPOINT`.
 * Every privileged action (admin login, app/key changes, bans, kicks, recording access) is written
   to `audit_log` and readable via the API.

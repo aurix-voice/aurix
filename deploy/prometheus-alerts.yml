@@ -1,0 +1,110 @@
+# Voice-quality alerting for a fleet of Aurix nodes. Every rule works on fleet-wide
+# distributions only (`aurix_session_mos` is one observation per rated session per
+# `media.quality_interval_ms`); the metrics carry no session or user labels, so use
+# `GET /v1/analytics/sessions` (or the `quality.alert` webhook) to find *who* had a bad call.
+#
+# `min_rated` guards: with a handful of sessions a single bad link moves every percentile,
+# so the fleet rules require a floor of ratings per interval. Tune the thresholds to the
+# fleet: 3.1 MOS matches the default `quality.mos_alert_threshold`; 3.6 is "fair" on the
+# E-model scale (4.3 is the Opus ceiling).
+groups:
+  - name: aurix-quality
+    rules:
+      - alert: AurixMedianMosLow
+        expr: |
+          histogram_quantile(0.5, sum by (le) (rate(aurix_session_mos_bucket[10m]))) < 3.6
+            and sum(rate(aurix_session_mos_count[10m])) * 600 > 200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet median MOS below 3.6 for 10 minutes"
+          description: >-
+            Half of all rated sessions have been below "fair" quality (MOS {{ $value | printf "%.2f" }}).
+            Check aurix_uplink_loss_percent / aurix_uplink_jitter_milliseconds for the network side
+            and GET /v1/analytics/sessions?min_samples=5 for the sessions involved.
+
+      - alert: AurixP10MosPoor
+        expr: |
+          histogram_quantile(0.1, sum by (le) (rate(aurix_session_mos_bucket[10m]))) < 3.1
+            and sum(rate(aurix_session_mos_count[10m])) * 600 > 200
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worst 10% of sessions below the MOS alert threshold"
+          description: >-
+            The 10th percentile MOS is {{ $value | printf "%.2f" }}; more than a tenth of the fleet
+            would trigger quality.alert {metric: "mos"} if it stayed there.
+
+      - alert: AurixDegradedSessionsHigh
+        expr: |
+          sum(aurix_sessions_mos_degraded) / clamp_min(sum(aurix_sessions_by_bars), 1) > 0.1
+            and sum(aurix_sessions_by_bars) >= 20
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 10% of rated sessions are in the MOS alert state"
+          description: >-
+            {{ $value | humanizePercentage }} of rated sessions hold an open quality.alert
+            (metric "mos"). A fleet-wide share this high points at a node, region or upstream
+            path rather than individual players' networks.
+
+      - alert: AurixUplinkLossHigh
+        expr: |
+          histogram_quantile(0.9, sum by (le) (rate(aurix_uplink_loss_percent_bucket[10m]))) > 5
+            and sum(rate(aurix_uplink_loss_percent_count[10m])) * 600 > 200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p90 uplink packet loss above 5%"
+          description: >-
+            The server-measured uplink loss of the worst decile is {{ $value | printf "%.1f" }}%.
+            Opus in-band FEC covers isolated losses up to a few percent; sustained loss at this
+            level degrades every listener of the affected speakers.
+
+      - alert: AurixUplinkJitterHigh
+        expr: |
+          histogram_quantile(0.9, sum by (le) (rate(aurix_uplink_jitter_milliseconds_bucket[10m]))) > 30
+            and sum(rate(aurix_uplink_jitter_milliseconds_count[10m])) * 600 > 200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p90 uplink jitter above 30 ms"
+          description: >-
+            Inter-arrival jitter of the worst decile is {{ $value | printf "%.0f" }} ms, which the
+            E-model weighs twice as heavily as RTT. Check for CPU saturation on the node
+            (aurix_node_cpu_usage, aurix_packets_dropped_total) before blaming the network.
+
+      - alert: AurixQualityAlertStorm
+        expr: sum(rate(aurix_quality_events_total{event="alert"}[5m])) * 300 > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 50 quality.alert events per 5 minutes"
+          description: >-
+            {{ $value | printf "%.0f" }} quality alerts were published in the last 5 minutes across
+            packet_loss / uplink_packet_loss / mos. Webhook consumers may be flooded; see the
+            per-metric breakdown on the "Aurix Voice — Quality" dashboard.
+
+      - alert: AurixNodeQualityOutlier
+        expr: |
+          (
+            sum by (instance) (rate(aurix_session_mos_sum[10m]))
+              / clamp_min(sum by (instance) (rate(aurix_session_mos_count[10m])), 0.001)
+          )
+          < scalar(sum(rate(aurix_session_mos_sum[10m])) / clamp_min(sum(rate(aurix_session_mos_count[10m])), 0.001)) - 0.5
+            and sum by (instance) (rate(aurix_session_mos_count[10m])) * 600 > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} rates its sessions 0.5 MOS below the fleet"
+          description: >-
+            One node's mean MOS trails the fleet mean by more than half a point: a saturated or
+            badly placed node, not the players. Compare its media path metrics before
+            draining it.

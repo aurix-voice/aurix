@@ -224,6 +224,10 @@ pub fn create_router(state: AppState) -> Router {
             get(analytics::get_channel_usage),
         )
         .route(
+            "/v1/analytics/sessions",
+            get(analytics::list_session_quality),
+        )
+        .route(
             "/v1/api-keys",
             post(handlers::create_api_key).get(handlers::list_api_keys),
         )

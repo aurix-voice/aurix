@@ -845,6 +845,8 @@ pub async fn get_session_stats(
         "bytes_received": stats.bytes_received,
         "client_report": stats.quality,
         "quality": session.get_network_quality(),
+        "quality_summary": session.quality_summary(),
+        "mos_alerting": session.is_mos_alerting(),
     })))
 }
 

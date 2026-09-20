@@ -5,7 +5,7 @@ use aurix_common::protocol::{
 };
 use aurix_common::types::*;
 
-use crate::quality::{UplinkEstimator, UplinkSample};
+use crate::quality::{MosAlertPolicy, QualityTick, QualityTrack, UplinkEstimator, UplinkSample};
 use crate::tunnel::MediaTunnel;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -270,10 +270,11 @@ pub struct MediaSession {
     /// Uplink bitrate (kbit/s) the server last asked this client to use via `BitrateCommand`;
     /// `0` while the client is at the channel policy's target.
     pub commanded_bitrate_kbps: AtomicU32,
-    /// Server-measured uplink (fed by the router) and the latest merged report sent to the
-    /// client / shown to operators.
+    /// Server-measured uplink (fed by the router) and the session's quality record: every
+    /// merged report (the latest is sent to the client / shown to operators), the lifetime
+    /// summary and the MOS alert state.
     pub uplink: Mutex<UplinkEstimator>,
-    pub network_quality: RwLock<Option<NetworkQuality>>,
+    pub quality_track: Mutex<QualityTrack>,
     pub created_at: DateTime<Utc>,
     pub replay: Mutex<ReplayWindow>,
     /// Highest `SessionBind` timestamp accepted so far (rejects replayed binds).
@@ -340,7 +341,7 @@ impl MediaSession {
             }),
             commanded_bitrate_kbps: AtomicU32::new(0),
             uplink: Mutex::new(UplinkEstimator::default()),
-            network_quality: RwLock::new(None),
+            quality_track: Mutex::new(QualityTrack::default()),
             created_at: Utc::now(),
             replay: Mutex::new(ReplayWindow::default()),
             last_bind_ms: AtomicI64::new(i64::MIN),
@@ -750,9 +751,10 @@ impl MediaSession {
             .record(seq, rtp_ts, bytes, std::time::Instant::now());
     }
 
-    /// Close the current uplink interval and merge it with the client's last `QualityReport`.
-    /// Returns the new report and whether its bar count differs from the previous one.
-    pub fn refresh_network_quality(&self) -> (NetworkQuality, bool) {
+    /// Close the current uplink interval and merge it with the client's last `QualityReport`,
+    /// fold the result into the session's summary (`period_secs` of rated time) and run the
+    /// MOS alert detector.
+    pub fn refresh_network_quality(&self, period_secs: f64, mos: MosAlertPolicy) -> QualityTick {
         let sample: UplinkSample = self.uplink.lock().sample(std::time::Instant::now());
         let client = self.get_quality();
         let quality = NetworkQuality::compose(
@@ -763,14 +765,59 @@ impl MediaSession {
             sample.packets_received,
             sample.packets_lost,
         );
-        let mut slot = self.network_quality.write();
-        let changed = slot.map(|q| q.bars) != Some(quality.bars);
-        *slot = Some(quality);
-        (quality, changed)
+        let mut track = self.quality_track.lock();
+        let bars_changed = track.summary.last().map(|q| q.bars) != Some(quality.bars);
+        track.summary.record(&quality, period_secs);
+        let transition = track
+            .mos_alert
+            .observe(quality.mos, mos.threshold, mos.periods);
+        if transition == Some(MosTransition::Degraded) {
+            track.summary.note_mos_alert();
+        }
+        QualityTick {
+            quality,
+            bars_changed,
+            transition,
+        }
     }
 
     pub fn get_network_quality(&self) -> Option<NetworkQuality> {
-        *self.network_quality.read()
+        self.quality_track.lock().summary.last()
+    }
+
+    /// Lifetime quality summary (`None` until the first evaluation).
+    pub fn quality_summary(&self) -> Option<QualitySummary> {
+        let track = self.quality_track.lock();
+        (track.summary.samples() > 0).then(|| track.summary.summary())
+    }
+
+    /// The summary, if it gained evaluations since the last call (for periodic persistence).
+    pub fn take_quality_summary_if_dirty(&self) -> Option<QualitySummary> {
+        let mut track = self.quality_track.lock();
+        let samples = track.summary.samples();
+        if samples == 0 || samples == track.persisted_samples {
+            return None;
+        }
+        track.persisted_samples = samples;
+        Some(track.summary.summary())
+    }
+
+    /// Continue the summary a previous node persisted for this session (cross-node resume).
+    pub fn seed_quality_summary(&self, summary: &QualitySummary) {
+        let mut track = self.quality_track.lock();
+        if track.summary.samples() == 0 {
+            track.summary = QualityAccumulator::from_summary(summary);
+            track.persisted_samples = summary.samples;
+        }
+    }
+
+    /// Quality metered since the previous call (usage buckets).
+    pub fn take_unmetered_quality(&self) -> QualityDelta {
+        self.quality_track.lock().summary.take_unmetered()
+    }
+
+    pub fn is_mos_alerting(&self) -> bool {
+        self.quality_track.lock().mos_alert.is_alerting()
     }
 
     pub fn next_sequence(&self) -> u32 {
@@ -987,5 +1034,93 @@ mod tests {
 
         s.set_transmission(TransmissionMode::All).unwrap();
         assert!(s.transmits_to(&party));
+    }
+
+    #[test]
+    fn quality_track_alerts_once_checkpoints_deltas_and_resumes() {
+        let s = session();
+        let policy = MosAlertPolicy {
+            threshold: 3.1,
+            periods: 2,
+        };
+        assert!(s.quality_summary().is_none());
+        assert!(s.take_quality_summary_if_dirty().is_none());
+
+        let report = |loss: f32| QualityMetrics {
+            rtt_ms: 40.0,
+            jitter_ms: 5.0,
+            packet_loss_percent: loss,
+            bitrate_kbps: 32,
+            mos_score: 0.0,
+        };
+        s.update_quality(report(0.0));
+        let good = s.refresh_network_quality(2.0, policy);
+        assert_eq!(good.quality.bars, 5);
+        assert!(good.bars_changed);
+        assert_eq!(good.transition, None);
+
+        s.update_quality(report(15.0));
+        let first_bad = s.refresh_network_quality(2.0, policy);
+        assert!(first_bad.quality.mos < 3.1);
+        assert_eq!(first_bad.transition, None, "one bad period is not an alert");
+        assert!(!s.is_mos_alerting());
+        let second_bad = s.refresh_network_quality(2.0, policy);
+        assert_eq!(second_bad.transition, Some(MosTransition::Degraded));
+        assert!(!second_bad.bars_changed);
+        assert!(s.is_mos_alerting());
+        assert_eq!(
+            s.refresh_network_quality(2.0, policy).transition,
+            None,
+            "an open alert is not re-raised"
+        );
+
+        let checkpoint = s
+            .take_quality_summary_if_dirty()
+            .expect("rated since start");
+        assert_eq!(checkpoint.samples, 4);
+        assert_eq!(checkpoint.seconds, 8.0);
+        assert_eq!(checkpoint.mos_alerts, 1);
+        assert_eq!(checkpoint.bars[4], 1);
+        assert_eq!(checkpoint.poor_seconds, 6.0);
+        assert_eq!(
+            checkpoint.last.map(|q| q.bars),
+            Some(second_bad.quality.bars)
+        );
+        assert!(
+            s.take_quality_summary_if_dirty().is_none(),
+            "nothing new since the checkpoint"
+        );
+
+        s.update_quality(report(0.0));
+        assert_eq!(s.refresh_network_quality(2.0, policy).transition, None);
+        assert_eq!(
+            s.refresh_network_quality(2.0, policy).transition,
+            Some(MosTransition::Recovered)
+        );
+        assert!(!s.is_mos_alerting());
+        let delta = s.take_unmetered_quality();
+        assert_eq!(delta.samples, 6);
+        assert_eq!(delta.poor_samples, 3);
+        assert!(s.take_unmetered_quality().is_empty());
+
+        // A node adopting the session continues the persisted record without recounting it.
+        let adopted = session();
+        let persisted = s.quality_summary().unwrap();
+        adopted.seed_quality_summary(&persisted);
+        assert_eq!(adopted.quality_summary(), Some(persisted.clone()));
+        assert!(adopted.take_quality_summary_if_dirty().is_none());
+        assert!(adopted.take_unmetered_quality().is_empty());
+        adopted.update_quality(report(0.0));
+        adopted.refresh_network_quality(2.0, policy);
+        let continued = adopted.take_quality_summary_if_dirty().unwrap();
+        assert_eq!(continued.samples, persisted.samples + 1);
+        assert_eq!(continued.mos_alerts, 1);
+        assert_eq!(adopted.take_unmetered_quality().samples, 1);
+        // Seeding never overwrites a record the node already started.
+        adopted.seed_quality_summary(&checkpoint);
+        assert_eq!(
+            adopted.quality_summary().unwrap().samples,
+            continued.samples
+        );
     }
 }

@@ -62,9 +62,6 @@ use tracing::{debug, info, warn};
 
 const OUTBOUND_QUEUE: usize = 256;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
-/// Uplink loss (server-measured, per quality period) above which a `quality.alert` is raised;
-/// mirrors the client-reported downlink threshold.
-const UPLINK_LOSS_ALERT_PERCENT: f32 = 20.0;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_TEXT_FRAME: usize = 64 * 1024;
 /// Largest binary (tunneled AURX) frame accepted on the control socket.
@@ -194,6 +191,37 @@ impl WsState {
         tokio::spawn(async move { st.run_server_event_fanout().await });
         let st = self.clone();
         tokio::spawn(async move { st.run_media_event_fanout().await });
+        let st = self.clone();
+        tokio::spawn(async move { st.run_quality_checkpoints().await });
+    }
+
+    /// Every `quality.persist_interval_secs`, writes the running `QualitySummary` of every
+    /// live session that was rated since the previous pass to `sessions.quality_stats`, so a
+    /// session lost with its node keeps its history and another node can continue it.
+    async fn run_quality_checkpoints(&self) {
+        let every = self.control.config.quality.persist_interval_secs;
+        if every == 0 {
+            return;
+        }
+        let mut interval = tokio::time::interval(Duration::from_secs(every));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let dirty = self.sfu.read().dirty_quality_summaries();
+            for (session_id, summary) in dirty {
+                let Ok(value) = serde_json::to_value(&summary) else {
+                    continue;
+                };
+                if let Err(e) = self
+                    .control
+                    .sessions
+                    .update_session_quality(session_id, self.control.node_id, value)
+                    .await
+                {
+                    warn!("quality checkpoint of {session_id} failed: {e}");
+                }
+            }
+        }
     }
 
     /// Sends `SessionClose` to every player and closes their sockets (non-resumable).
@@ -1871,18 +1899,54 @@ impl WsState {
                     app_id,
                     user_id,
                     quality,
+                    transition,
                 } => {
                     self.send_to_session(&session_id, &ControlMessage::NetworkQuality { quality });
-                    if quality.uplink_loss_percent > UPLINK_LOSS_ALERT_PERCENT {
+                    let policy = &self.control.config.quality;
+                    if quality.uplink_loss_percent > policy.loss_alert_percent {
+                        aurix_metrics::QUALITY_EVENTS
+                            .with_label_values(&["uplink_packet_loss", "alert"])
+                            .inc();
                         self.control.events.publish(ServerEvent::QualityAlert {
                             app_id,
                             session_id,
                             user_id,
                             metric: "uplink_packet_loss".into(),
                             value: quality.uplink_loss_percent as f64,
-                            threshold: UPLINK_LOSS_ALERT_PERCENT as f64,
+                            threshold: policy.loss_alert_percent as f64,
                             timestamp: chrono::Utc::now(),
                         });
+                    }
+                    match transition {
+                        Some(MosTransition::Degraded) => {
+                            aurix_metrics::QUALITY_EVENTS
+                                .with_label_values(&["mos", "alert"])
+                                .inc();
+                            self.control.events.publish(ServerEvent::QualityAlert {
+                                app_id,
+                                session_id,
+                                user_id,
+                                metric: "mos".into(),
+                                value: quality.mos as f64,
+                                threshold: policy.mos_alert_threshold as f64,
+                                timestamp: chrono::Utc::now(),
+                            });
+                        }
+                        Some(MosTransition::Recovered) => {
+                            aurix_metrics::QUALITY_EVENTS
+                                .with_label_values(&["mos", "recovered"])
+                                .inc();
+                            self.control.events.publish(ServerEvent::QualityRecovered {
+                                app_id,
+                                session_id,
+                                user_id,
+                                metric: "mos".into(),
+                                value: quality.mos as f64,
+                                threshold: policy.mos_alert_threshold as f64,
+                                timestamp: chrono::Utc::now(),
+                            });
+                        }
+                        None => {}
                     }
                 }
                 MediaEvent::ParticipantStreams {
@@ -2305,6 +2369,7 @@ async fn adopt_mirrored_session(
             aurix_control::session_manager::MigratedSession {
                 reaped: true,
                 open_channels: Vec::new(),
+                quality_stats: None,
             }
         }
         Err(e) => {
@@ -2315,6 +2380,13 @@ async fn adopt_mirrored_session(
             return None;
         }
     };
+    if let Some(summary) = migrated
+        .quality_stats
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<QualitySummary>(v.clone()).ok())
+    {
+        media_session.seed_quality_summary(&summary);
+    }
     match state
         .control
         .blocks
@@ -3150,11 +3222,14 @@ async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: Use
     for ch in &channels {
         state.leave_channel_full(session_id, *ch, reason).await;
     }
+    // The session's lifetime `QualitySummary` (its `last` is the final merged report); a
+    // session that was never rated keeps `quality_stats` NULL.
     let quality = {
         let sfu = state.sfu.read();
         let q = sfu
             .get_session(&session_id)
-            .map(|s| serde_json::to_value(&*s.quality.read()).unwrap_or_default());
+            .and_then(|s| s.quality_summary())
+            .and_then(|summary| serde_json::to_value(summary).ok());
         let _ = sfu.destroy_session(&session_id);
         q
     };
@@ -4291,14 +4366,18 @@ async fn handle_control_message(
                 )
                 .await;
             }
-            if packet_loss > 20.0 {
+            let loss_threshold = state.control.config.quality.loss_alert_percent;
+            if packet_loss > loss_threshold {
+                aurix_metrics::QUALITY_EVENTS
+                    .with_label_values(&["packet_loss", "alert"])
+                    .inc();
                 state.control.events.publish(ServerEvent::QualityAlert {
                     app_id: token.app_id,
                     session_id,
                     user_id: token.user_id,
                     metric: "packet_loss".into(),
                     value: packet_loss as f64,
-                    threshold: 20.0,
+                    threshold: loss_threshold as f64,
                     timestamp: chrono::Utc::now(),
                 });
             }

@@ -1,14 +1,50 @@
 //! Server-side view of one session's uplink: sequence gaps, RFC 3550 inter-arrival jitter and
 //! bitrate of the audio the client sends us. Fed from the packet router, sampled periodically
 //! by the SFU quality reporter and merged with the client's own `QualityReport` into
-//! [`aurix_common::types::NetworkQuality`].
+//! [`aurix_common::types::NetworkQuality`]; [`QualityTrack`] keeps the session's lifetime
+//! summary and MOS alert state next to it.
 
+use aurix_common::types::{MosAlertState, MosTransition, NetworkQuality, QualityAccumulator};
 use std::time::Instant;
 
 /// Reordering deeper than this counts as a loss followed by a duplicate, not a late packet.
 const MAX_REORDER: u64 = 64;
 /// Sequence jumps beyond this are a stream restart (new SSRC / resumed session), not loss.
 const MAX_GAP: u64 = 3000;
+
+/// `quality.mos_alert_threshold` / `quality.mos_alert_periods` (threshold `0` = off).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MosAlertPolicy {
+    pub threshold: f32,
+    pub periods: u32,
+}
+
+impl Default for MosAlertPolicy {
+    fn default() -> Self {
+        Self {
+            threshold: 3.1,
+            periods: 3,
+        }
+    }
+}
+
+/// Per-session quality record kept by the SFU.
+#[derive(Debug, Default)]
+pub struct QualityTrack {
+    pub summary: QualityAccumulator,
+    pub mos_alert: MosAlertState,
+    /// `summary.samples()` at the last persistence, to skip idle sessions.
+    pub persisted_samples: u64,
+}
+
+/// Outcome of one periodic evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QualityTick {
+    pub quality: NetworkQuality,
+    /// The bar count differs from the previous evaluation (or this is the first).
+    pub bars_changed: bool,
+    pub transition: Option<MosTransition>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UplinkSample {

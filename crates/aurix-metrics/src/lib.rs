@@ -72,6 +72,71 @@ pub static JITTER_MS: Lazy<Histogram> = Lazy::new(|| {
     .unwrap()
 });
 
+// ── Session quality (E-model) ──
+
+/// One observation per rated session per `media.quality_interval_ms`: the merged E-model MOS.
+/// `histogram_quantile(0.5, rate(aurix_session_mos_bucket[5m]))` is the fleet median MOS;
+/// `_sum / _count` the mean.
+pub static SESSION_MOS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "aurix_session_mos",
+        "E-model MOS of rated sessions, one observation per session per quality period",
+        vec![1.5, 2.0, 2.5, 2.8, 3.1, 3.4, 3.6, 3.8, 4.0, 4.2, 4.3, 4.4]
+    )
+    .unwrap()
+});
+
+/// Server-measured uplink packet loss per rated session per quality period (percent).
+pub static UPLINK_LOSS_PERCENT: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "aurix_uplink_loss_percent",
+        "Uplink packet loss per rated session per quality period, percent",
+        vec![0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0]
+    )
+    .unwrap()
+});
+
+/// Server-measured uplink jitter per rated session per quality period (RFC 3550, ms).
+pub static UPLINK_JITTER_MS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "aurix_uplink_jitter_milliseconds",
+        "Uplink inter-arrival jitter per rated session per quality period, milliseconds",
+        vec![1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 50.0, 100.0]
+    )
+    .unwrap()
+});
+
+/// Rated sessions on this node by their current bar count (`bars` = `1`..`5`).
+pub static SESSIONS_BY_BARS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aurix_sessions_by_bars",
+        "Rated sessions by current network-quality bars",
+        &["bars"]
+    )
+    .unwrap()
+});
+
+/// Sessions currently in the MOS alert state (`quality.alert {metric: "mos"}` raised, not yet
+/// recovered).
+pub static SESSIONS_MOS_DEGRADED: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_sessions_mos_degraded",
+        "Sessions whose MOS is below quality.mos_alert_threshold (debounced)"
+    )
+    .unwrap()
+});
+
+/// `metric` is `packet_loss`, `uplink_packet_loss` or `mos`; `event` is `alert` or
+/// `recovered` (only `mos` recovers).
+pub static QUALITY_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_quality_events_total",
+        "quality.alert / quality.recovered events published",
+        &["metric", "event"]
+    )
+    .unwrap()
+});
+
 // ── API Metrics ──
 
 pub static API_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {

@@ -130,6 +130,34 @@ struct RangeView {
     finalized_through: Option<DateTime<Utc>>,
 }
 
+/// Averages over the metered quality sums of a range: MOS, RTT, jitter, loss and the share of
+/// samples rated poor (bars ≤ 2). `None` averages when nothing was rated.
+fn quality_json(
+    samples: i64,
+    mos_sum_milli: i64,
+    rtt_sum_ms: i64,
+    jitter_sum_ms: i64,
+    loss_sum_permille: i64,
+    poor_samples: i64,
+) -> serde_json::Value {
+    if samples <= 0 {
+        return serde_json::json!({
+            "samples": 0, "mos_avg": null, "rtt_avg_ms": null, "jitter_avg_ms": null,
+            "loss_avg_percent": null, "poor_samples": 0, "poor_percent": null,
+        });
+    }
+    let n = samples as f64;
+    serde_json::json!({
+        "samples": samples,
+        "mos_avg": mos_sum_milli as f64 / 1000.0 / n,
+        "rtt_avg_ms": rtt_sum_ms as f64 / n,
+        "jitter_avg_ms": jitter_sum_ms as f64 / n,
+        "loss_avg_percent": loss_sum_permille as f64 / 10.0 / n,
+        "poor_samples": poor_samples,
+        "poor_percent": poor_samples as f64 * 100.0 / n,
+    })
+}
+
 fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
     match t {
         Some(t) => serde_json::json!({
@@ -145,12 +173,21 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
             "tts_requests": t.tts_requests,
             "tts_characters": t.tts_characters,
             "stt_audio_ms": t.stt_audio_ms,
+            "quality": quality_json(
+                t.quality_samples,
+                t.mos_sum_milli,
+                t.rtt_sum_ms,
+                t.jitter_sum_ms,
+                t.loss_sum_permille,
+                t.poor_quality_samples,
+            ),
         }),
         None => serde_json::json!({
             "peak_sessions": 0, "session_minutes": 0.0, "sessions_started": 0,
             "peak_participants": 0, "participant_minutes": 0.0, "recording_seconds": 0.0,
             "media_bytes_in": 0, "media_bytes_out": 0, "chat_messages": 0,
             "tts_requests": 0, "tts_characters": 0, "stt_audio_ms": 0,
+            "quality": quality_json(0, 0, 0, 0, 0, 0),
         }),
     }
 }
@@ -174,12 +211,27 @@ async fn app_usage_body(
     let active_sessions = state.control.sessions.count_active_sessions(app_id).await?;
     let active_channels = state.control.channels.count_active_channels(app_id).await?;
     let users = aurix_db::queries::count_users(pool, app_id.0).await?;
+    let series: Vec<serde_json::Value> = series.iter().map(app_point_json).collect();
     Ok(serde_json::json!({
         "current": { "active_sessions": active_sessions, "active_channels": active_channels, "users": users },
         "range": RangeView { from: range.from, to: range.to, step_secs: step, finalized_through },
         "totals": totals_json(totals),
         "series": series,
     }))
+}
+
+/// One series point: the bucket row plus the `quality` averages derived from its sums.
+fn app_point_json(r: &UsageAppBucketRow) -> serde_json::Value {
+    let mut v = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
+    v["quality"] = quality_json(
+        r.quality_samples,
+        r.mos_sum_milli,
+        r.rtt_sum_ms,
+        r.jitter_sum_ms,
+        r.loss_sum_permille,
+        r.poor_quality_samples,
+    );
+    v
 }
 
 /// `GET /v1/analytics` — current counters, range totals and the application time series.
@@ -275,6 +327,63 @@ pub async fn get_channel_usage(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct SessionQualityQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: Option<i64>,
+    /// Sessions rated fewer times than this are skipped (default 3).
+    pub min_samples: Option<i64>,
+}
+
+/// `GET /v1/analytics/sessions` — sessions that started in the range, worst average MOS
+/// first, each with its persisted `QualitySummary` (running for live sessions — the owning
+/// node checkpoints it every `quality.persist_interval_secs` — final once closed).
+pub async fn list_session_quality(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Query(q): Query<SessionQualityQuery>,
+) -> JsonResult {
+    ctx.require("analytics:read")?;
+    let range = parse_range(
+        &RangeQuery {
+            from: q.from.clone(),
+            to: q.to.clone(),
+            step: None,
+            limit: None,
+            format: None,
+            scope: None,
+        },
+        1,
+    )?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let min_samples = q.min_samples.unwrap_or(3).clamp(1, 1_000_000);
+    let rows = state
+        .control
+        .sessions
+        .worst_quality_sessions(ctx.app_id, range.from, range.to, min_samples, limit)
+        .await?;
+    let sessions: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "session_id": s.id,
+                "user_id": s.user_id,
+                "media_node_id": s.media_node_id,
+                "connected_at": s.connected_at,
+                "disconnected_at": s.disconnected_at,
+                "disconnect_reason": s.disconnect_reason,
+                "quality": s.quality_stats,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "range": { "from": range.from, "to": range.to },
+        "min_samples": min_samples,
+        "sessions": sessions,
+    })))
+}
+
 /// `GET /v1/analytics/quota` — limits and how much of them the application has used.
 pub async fn get_quota(
     State(state): State<AppState>,
@@ -309,7 +418,7 @@ async fn quota_body(
     }))
 }
 
-const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms";
+const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples";
 const CHANNEL_CSV_HEADER: &str = "app_id,channel_id,bucket,peak_participants,participant_minutes,joins,unique_users,chat_messages,tts_requests,tts_characters,stt_audio_ms";
 
 fn app_csv(rows: &[UsageAppBucketRow]) -> String {
@@ -318,7 +427,7 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
     out.push('\n');
     for r in rows {
         out.push_str(&format!(
-            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{}\n",
+            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.app_id,
             r.bucket.to_rfc3339(),
             r.peak_sessions,
@@ -334,7 +443,13 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
             r.chat_messages,
             r.tts_requests,
             r.tts_characters,
-            r.stt_audio_ms
+            r.stt_audio_ms,
+            r.quality_samples,
+            r.mos_sum_milli,
+            r.rtt_sum_ms,
+            r.jitter_sum_ms,
+            r.loss_sum_permille,
+            r.poor_quality_samples
         ));
     }
     out
@@ -638,15 +753,27 @@ mod tests {
             tts_requests: 0,
             tts_characters: 0,
             stt_audio_ms: 0,
+            quality_samples: 2,
+            mos_sum_milli: 8400,
+            rtt_sum_ms: 90,
+            jitter_sum_ms: 10,
+            loss_sum_permille: 5,
+            poor_quality_samples: 0,
             updated_at: now,
         };
+        let point = app_point_json(&row);
+        assert_eq!(point["quality"]["samples"], 2);
+        assert!((point["quality"]["mos_avg"].as_f64().unwrap() - 4.2).abs() < 1e-9);
+        assert!((point["quality"]["loss_avg_percent"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+        assert_eq!(point["quality"]["poor_percent"], 0.0);
+        assert!(quality_json(0, 0, 0, 0, 0, 0)["mos_avg"].is_null());
         let csv = app_csv(&[row]);
         let mut lines = csv.lines();
         let header = lines.next().unwrap();
         let data = lines.next().unwrap();
         assert_eq!(header.split(',').count(), data.split(',').count());
         assert!(data.starts_with(&format!("{},{}", Uuid::nil(), now.to_rfc3339())));
-        assert!(data.ends_with(",100,200,5,0,0,0"));
+        assert!(data.ends_with(",100,200,5,0,0,0,2,8400,90,10,5,0"));
         let ch = UsageChannelBucketRow {
             app_id: Uuid::nil(),
             channel_id: Uuid::nil(),

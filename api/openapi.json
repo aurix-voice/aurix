@@ -4369,6 +4369,92 @@
         ]
       }
     },
+    "/v1/analytics/sessions": {
+      "get": {
+        "tags": [
+          "Analytics"
+        ],
+        "summary": "Sessions with the worst MOS over a range",
+        "operationId": "listSessionQuality",
+        "description": "Sessions (live and closed) that connected in the range, ordered by mean MOS ascending, each with its persisted `QualitySummary`. Live sessions show the summary as of their last checkpoint (`quality.persist_interval_secs`); `GET /v1/sessions/{session_id}/stats` has the live value. Use this to find who had a bad call instead of high-cardinality metrics — Prometheus only carries fleet-wide distributions.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339) of `connected_at`. Default: `to` minus 7 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50
+            },
+            "description": "Maximum number of sessions returned."
+          },
+          {
+            "name": "min_samples",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3
+            },
+            "description": "Ignore sessions rated fewer times than this (a session is rated every `media.quality_interval_ms`)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionQualityList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "analytics:read"
+        ]
+      }
+    },
     "/v1/analytics/channels": {
       "get": {
         "tags": [
@@ -10228,6 +10314,21 @@
                 "type": "null"
               }
             ]
+          },
+          "quality_summary": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/QualitySummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lifetime record (`null` until the first rating)"
+          },
+          "mos_alerting": {
+            "type": "boolean",
+            "description": "A `quality.alert` with `metric: \"mos\"` is open for the session (no `quality.recovered` yet)"
           }
         },
         "required": [
@@ -10238,7 +10339,8 @@
           "packets_sent",
           "bytes_sent",
           "packets_received",
-          "bytes_received"
+          "bytes_received",
+          "mos_alerting"
         ]
       },
       "StreamFormat": {
@@ -11700,6 +11802,39 @@
             "type": "integer",
             "format": "int64",
             "description": "Audio milliseconds submitted to the STT provider"
+          },
+          "quality_samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-session quality ratings taken in the bucket"
+          },
+          "mos_sum_milli": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of MOS × 1000 over the ratings (`/ quality_samples / 1000` = mean MOS)"
+          },
+          "rtt_sum_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "jitter_sum_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of the worse direction's jitter"
+          },
+          "loss_sum_permille": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of the worse direction's loss × 10"
+          },
+          "poor_quality_samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratings at 1–2 bars"
+          },
+          "quality": {
+            "$ref": "#/components/schemas/QualityAggregate",
+            "description": "Derived from the `quality_*` counters"
           }
         },
         "required": [
@@ -11714,7 +11849,14 @@
           "chat_messages",
           "tts_requests",
           "tts_characters",
-          "stt_audio_ms"
+          "stt_audio_ms",
+          "quality_samples",
+          "mos_sum_milli",
+          "rtt_sum_ms",
+          "jitter_sum_ms",
+          "loss_sum_permille",
+          "poor_quality_samples",
+          "quality"
         ]
       },
       "UsageAppBucket": {
@@ -11790,9 +11932,42 @@
             "format": "int64",
             "description": "Audio milliseconds submitted to the STT provider"
           },
+          "quality_samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-session quality ratings taken in the bucket"
+          },
+          "mos_sum_milli": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of MOS × 1000 over the ratings (`/ quality_samples / 1000` = mean MOS)"
+          },
+          "rtt_sum_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "jitter_sum_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of the worse direction's jitter"
+          },
+          "loss_sum_permille": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of the worse direction's loss × 10"
+          },
+          "poor_quality_samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratings at 1–2 bars"
+          },
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "quality": {
+            "$ref": "#/components/schemas/QualityAggregate",
+            "description": "Derived from the `quality_*` counters"
           }
         },
         "required": [
@@ -11812,7 +11987,14 @@
           "tts_requests",
           "tts_characters",
           "stt_audio_ms",
-          "updated_at"
+          "updated_at",
+          "quality_samples",
+          "mos_sum_milli",
+          "rtt_sum_ms",
+          "jitter_sum_ms",
+          "loss_sum_permille",
+          "poor_quality_samples",
+          "quality"
         ]
       },
       "UsageChannelBucket": {
@@ -12290,6 +12472,247 @@
         "required": [
           "range",
           "apps"
+        ]
+      },
+      "QualityAggregate": {
+        "type": "object",
+        "description": "MOS (ITU-T G.107 E-model) quality aggregated from every per-session rating in the range (one rating per session per `media.quality_interval_ms`). Averages are `null` when there were no ratings.",
+        "properties": {
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of per-session quality ratings"
+          },
+          "mos_avg": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean MOS (1.0–4.5)"
+          },
+          "rtt_avg_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "jitter_avg_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean of the worse direction's jitter"
+          },
+          "loss_avg_percent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean of the worse direction's packet loss"
+          },
+          "poor_samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratings at 1–2 bars"
+          },
+          "poor_percent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "`poor_samples / samples * 100`"
+          }
+        },
+        "required": [
+          "samples",
+          "mos_avg",
+          "rtt_avg_ms",
+          "jitter_avg_ms",
+          "loss_avg_percent",
+          "poor_samples",
+          "poor_percent"
+        ]
+      },
+      "QualitySummary": {
+        "type": "object",
+        "description": "Lifetime quality record of one session: every rating (`media.quality_interval_ms`) since it connected, continued across cross-node failover. Persisted to the session row every `quality.persist_interval_secs` and at disconnect.",
+        "properties": {
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratings taken"
+          },
+          "seconds": {
+            "type": "number",
+            "format": "double",
+            "description": "Rated connection time"
+          },
+          "mos_avg": {
+            "type": "number"
+          },
+          "mos_min": {
+            "type": "number"
+          },
+          "mos_last": {
+            "type": "number"
+          },
+          "r_factor_avg": {
+            "type": "number"
+          },
+          "rtt_avg_ms": {
+            "type": "number"
+          },
+          "rtt_max_ms": {
+            "type": "number"
+          },
+          "jitter_avg_ms": {
+            "type": "number",
+            "description": "Worse direction per rating"
+          },
+          "loss_avg_percent": {
+            "type": "number",
+            "description": "Worse direction per rating"
+          },
+          "loss_max_percent": {
+            "type": "number"
+          },
+          "bars": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "minItems": 5,
+            "maxItems": 5,
+            "description": "Ratings per bar level, index 0 = 1 bar"
+          },
+          "poor_seconds": {
+            "type": "number",
+            "format": "double",
+            "description": "Time rated at 1–2 bars"
+          },
+          "mos_alerts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`quality.alert` events with `metric: \"mos\"` raised for the session"
+          },
+          "last": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NetworkQuality"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most recent rating"
+          }
+        },
+        "required": [
+          "samples",
+          "seconds",
+          "mos_avg",
+          "mos_min",
+          "mos_last",
+          "r_factor_avg",
+          "rtt_avg_ms",
+          "rtt_max_ms",
+          "jitter_avg_ms",
+          "loss_avg_percent",
+          "loss_max_percent",
+          "bars",
+          "poor_seconds",
+          "mos_alerts"
+        ]
+      },
+      "SessionQuality": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "media_node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "connected_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "disconnected_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` while the session is still connected"
+          },
+          "disconnect_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quality": {
+            "$ref": "#/components/schemas/QualitySummary"
+          }
+        },
+        "required": [
+          "session_id",
+          "user_id",
+          "connected_at",
+          "quality"
+        ]
+      },
+      "SessionQualityList": {
+        "type": "object",
+        "properties": {
+          "range": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          },
+          "min_samples": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionQuality"
+            },
+            "description": "Worst mean MOS first"
+          }
+        },
+        "required": [
+          "range",
+          "min_samples",
+          "sessions"
         ]
       }
     }

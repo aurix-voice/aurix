@@ -8217,6 +8217,320 @@ async fn network_quality_bars_bitrate_adaptation_and_session_stats() {
     }
 }
 
+/// Polls `GET /v1/analytics/sessions` (persisted `sessions.quality_stats`, worst MOS first)
+/// until the session shows up with at least `min_samples` rated periods.
+async fn wait_persisted_quality(
+    env: &Env,
+    http: &reqwest::Client,
+    from: chrono::DateTime<chrono::Utc>,
+    session_id: SessionId,
+    min_samples: u64,
+    wait: Duration,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + wait;
+    let path = format!(
+        "/v1/analytics/sessions?from={}&min_samples=1&limit=500",
+        from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+    let want = session_id.to_string();
+    loop {
+        let (status, body) = tenant_get(env, http, &path).await;
+        assert_eq!(status, 200, "{body}");
+        if let Some(s) = body["sessions"].as_array().and_then(|s| {
+            s.iter()
+                .find(|s| s["session_id"].as_str() == Some(want.as_str()))
+        }) {
+            if s["quality"]["samples"].as_u64().unwrap_or(0) >= min_samples {
+                return s.clone();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session {want} with >= {min_samples} persisted quality samples not listed within {wait:?}: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// MOS is rated per `media.quality_interval_ms` and alerts are debounced: a session whose
+/// client-reported RTT/jitter drags the E-model MOS under `quality.mos_alert_threshold` raises
+/// exactly one `quality.alert {metric: "mos"}` after `quality.mos_alert_periods` consecutive bad
+/// periods, stays silent while it remains bad, and gets one `quality.recovered` once it has been
+/// clearly above the threshold as long. Every rated period feeds the per-session summary shown
+/// by `GET /v1/sessions/:id/stats`, checkpointed to `sessions.quality_stats` (ranked worst-first
+/// by `GET /v1/analytics/sessions`) and summed into the application's usage buckets
+/// (`totals.quality` of `GET /v1/analytics`). Needs `AURIX__QUALITY__PERSIST_INTERVAL_SECS`
+/// short enough to observe a checkpoint while the session is alive (the dev nodes use 10 s).
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn mos_alert_debounced_recovered_and_summary_persisted_into_analytics() {
+    let Some(base) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let started = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let (env, _app_id) = isolated_env(&base, &http, "mos").await;
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, _) = issue_token(&env, &http, "mos:alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "mos:bob", "Bob", channel_id).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    join(&mut alice, channel_id).await;
+    join(&mut bob, channel_id).await;
+    let mut sse = SseClient::open(&env, &env.api_key, Some("quality.alert,quality.recovered"))
+        .await
+        .expect("open SSE");
+    let sid_b = bob.session_id.to_string();
+
+    // A clean first rating: healthy MOS, nothing alerting, summary already counting.
+    let clean = expect_within(&mut bob, "NetworkQuality", Duration::from_secs(12), |m| {
+        matches!(m, ControlMessage::NetworkQuality { .. })
+    })
+    .await;
+    let ControlMessage::NetworkQuality { quality } = clean else {
+        unreachable!()
+    };
+    assert!(quality.mos > 4.0, "{quality:?}");
+
+    // Bob's link degrades: 350 ms RTT + 40 ms jitter + 5 % loss → MOS ≈ 2.5 (1 bar) without
+    // crossing the 20 % packet-loss alert. One MOS alert after the debounce, not one per period.
+    bob.send(&ControlMessage::QualityReport {
+        rtt_ms: 350.0,
+        jitter_ms: 40.0,
+        packet_loss: 5.0,
+    })
+    .await;
+    let t_bad = tokio::time::Instant::now();
+    let alert = loop {
+        let a = sse.expect("quality.alert", Duration::from_secs(20)).await;
+        if a["data"]["session_id"].as_str() == Some(sid_b.as_str()) {
+            break a;
+        }
+    };
+    assert_eq!(alert["data"]["metric"], "mos", "{alert}");
+    assert_eq!(
+        alert["data"]["user_id"].as_str(),
+        Some(uid_b.as_str()),
+        "{alert}"
+    );
+    let mos = alert["data"]["value"].as_f64().unwrap();
+    let threshold = alert["data"]["threshold"].as_f64().unwrap();
+    assert!(mos < threshold && mos < 3.0, "{alert}");
+    assert!(
+        t_bad.elapsed() >= Duration::from_millis(3500),
+        "the alert must wait for {} consecutive bad periods, fired after {:?}",
+        3,
+        t_bad.elapsed()
+    );
+    let stats_path = format!("/v1/sessions/{sid_b}/stats");
+    let (status, stats) = tenant_get(&env, &http, &stats_path).await;
+    assert_eq!(status, 200, "{stats}");
+    assert_eq!(stats["mos_alerting"], true, "{stats}");
+    assert_eq!(stats["quality_summary"]["mos_alerts"], 1, "{stats}");
+    assert!(
+        stats["quality_summary"]["samples"].as_u64().unwrap() >= 4,
+        "{stats}"
+    );
+    assert!(
+        stats["quality_summary"]["mos_min"].as_f64().unwrap() < 3.0,
+        "{stats}"
+    );
+    assert!(
+        stats["quality_summary"]["poor_seconds"].as_f64().unwrap() > 0.0,
+        "{stats}"
+    );
+    assert!(
+        stats["quality_summary"]["bars"][0].as_u64().unwrap() >= 3,
+        "1-bar periods are counted: {stats}"
+    );
+    // Still bad for two more periods: no second alert for Bob.
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Some((ev, data)) = sse
+        .next(quiet.saturating_duration_since(tokio::time::Instant::now()))
+        .await
+    {
+        assert!(
+            data["data"]["session_id"].as_str() != Some(sid_b.as_str()),
+            "no repeated `{ev}` while the session stays degraded: {data}"
+        );
+    }
+
+    // The link recovers: `quality.recovered` only after the hysteresis periods, once.
+    bob.send(&ControlMessage::QualityReport {
+        rtt_ms: 30.0,
+        jitter_ms: 3.0,
+        packet_loss: 0.0,
+    })
+    .await;
+    let t_good = tokio::time::Instant::now();
+    let recovered = loop {
+        let a = sse
+            .expect("quality.recovered", Duration::from_secs(20))
+            .await;
+        if a["data"]["session_id"].as_str() == Some(sid_b.as_str()) {
+            break a;
+        }
+    };
+    assert_eq!(recovered["data"]["metric"], "mos", "{recovered}");
+    assert!(
+        recovered["data"]["value"].as_f64().unwrap() > threshold + 0.2,
+        "{recovered}"
+    );
+    assert!(
+        t_good.elapsed() >= Duration::from_millis(3500),
+        "recovery is debounced too, fired after {:?}",
+        t_good.elapsed()
+    );
+    let (_, stats) = tenant_get(&env, &http, &stats_path).await;
+    assert_eq!(stats["mos_alerting"], false, "{stats}");
+    assert_eq!(stats["quality_summary"]["mos_alerts"], 1, "{stats}");
+    let live_samples = stats["quality_summary"]["samples"].as_u64().unwrap();
+    assert!(
+        stats["quality_summary"]["mos_last"].as_f64().unwrap() > 4.0
+            && stats["quality_summary"]["mos_min"].as_f64().unwrap() < 3.0
+            && stats["quality_summary"]["mos_avg"].as_f64().unwrap() < 4.0,
+        "{stats}"
+    );
+
+    // The running summary is checkpointed while the session is alive and ranked worst-first;
+    // Alice's clean session sorts after Bob's, another tenant sees neither.
+    let persisted = wait_persisted_quality(
+        &env,
+        &http,
+        started,
+        bob.session_id,
+        live_samples.min(8),
+        Duration::from_secs(40),
+    )
+    .await;
+    assert_eq!(
+        persisted["user_id"].as_str(),
+        Some(uid_b.as_str()),
+        "{persisted}"
+    );
+    assert!(persisted["disconnected_at"].is_null(), "{persisted}");
+    assert_eq!(persisted["quality"]["mos_alerts"], 1, "{persisted}");
+    assert!(
+        persisted["quality"]["mos_min"].as_f64().unwrap() < 3.0,
+        "{persisted}"
+    );
+    let (_, listing) = tenant_get(
+        &env,
+        &http,
+        &format!(
+            "/v1/analytics/sessions?from={}&min_samples=1",
+            started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    let ids: Vec<&str> = listing["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids.first(),
+        Some(&sid_b.as_str()),
+        "worst MOS first: {listing}"
+    );
+    if ids.len() > 1 {
+        assert_eq!(ids[1], alice.session_id.to_string(), "{listing}");
+        let mos: Vec<f64> = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["quality"]["mos_avg"].as_f64().unwrap())
+            .collect();
+        assert!(mos[0] < mos[1], "{listing}");
+    }
+    let (_, strict) = tenant_get(
+        &env,
+        &http,
+        &format!(
+            "/v1/analytics/sessions?from={}&min_samples=1000000",
+            started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(
+        strict["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "{strict}"
+    );
+    assert_eq!(
+        status_of(&env, &http, "/v1/analytics/sessions?limit=0").await,
+        200
+    );
+    assert_eq!(
+        status_of(&env, &http, "/v1/analytics/sessions?from=yesterday").await,
+        400
+    );
+    let (status, other) = tenant_get(
+        &base,
+        &http,
+        &format!(
+            "/v1/analytics/sessions?from={}&min_samples=1&limit=500",
+            started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{other}");
+    assert!(
+        !other["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(sid_b.as_str())),
+        "another tenant must not list the session: {other}"
+    );
+
+    // Usage buckets carry the quality sums; the application totals derive the averages.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let totals = loop {
+        let (status, body) = tenant_get(
+            &env,
+            &http,
+            &format!(
+                "/v1/analytics?from={}",
+                started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let q = &body["totals"]["quality"];
+        if q["samples"].as_u64().unwrap_or(0) >= live_samples {
+            break body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "quality sums not flushed into the usage buckets: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    };
+    let q = &totals["totals"]["quality"];
+    let mos_avg = q["mos_avg"].as_f64().unwrap();
+    assert!((1.0..=5.0).contains(&mos_avg) && mos_avg < 4.6, "{q}");
+    assert!(q["poor_samples"].as_u64().unwrap() >= 3, "{q}");
+    assert!(q["poor_percent"].as_f64().unwrap() > 0.0, "{q}");
+    assert!(q["rtt_avg_ms"].as_f64().unwrap() > 0.0, "{q}");
+    assert!(
+        totals["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["quality"]["samples"].as_u64().unwrap_or(0) > 0),
+        "{totals}"
+    );
+
+    for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::ChannelLeave { channel_id }).await;
+    }
+}
+
 // ── Channel audio policy ──
 
 fn expect_bitrate(m: ControlMessage) -> (u32, u8) {
@@ -10187,7 +10501,10 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
 /// Node 1 fences itself off: the used credential can no longer resume there, and node 1
 /// closing its stale copy must not close the migrated membership. With
 /// `AURIX_E2E_NODE2_STOP` / `AURIX_E2E_NODE2_START` set (shell commands), the test also
-/// kills node 2, waits for the lost-node reaper and resumes Bob on node 1.
+/// kills node 2, waits for the lost-node reaper and resumes Bob on node 1. Her per-session
+/// quality summary, checkpointed by node 1 to `sessions.quality_stats`, seeds node 2's
+/// accumulator so the history continues (no restart from zero, no double count) and node 2
+/// takes over the checkpoints.
 #[tokio::test]
 #[ignore = "requires two running Aurix nodes; see README (Scaling)"]
 async fn two_nodes_session_failover_resumes_on_the_other_node() {
@@ -10205,6 +10522,7 @@ async fn two_nodes_session_failover_resumes_on_the_other_node() {
         api_key: env.api_key.clone(),
     };
     let http = reqwest::Client::new();
+    let started = chrono::Utc::now() - chrono::Duration::minutes(1);
     let channel_id = create_channel(&env, &http).await;
 
     let (tok_a, uid_a) = issue_token(&env, &http, "failover:alice", "Alice", channel_id).await;
@@ -10299,6 +10617,18 @@ async fn two_nodes_session_failover_resumes_on_the_other_node() {
         );
     }
 
+    // Node 1 rates Alice and checkpoints her running summary before the move.
+    let persisted_before = wait_persisted_quality(
+        &env,
+        &http,
+        started,
+        alice.session_id,
+        1,
+        Duration::from_secs(40),
+    )
+    .await;
+    let samples_before = persisted_before["quality"]["samples"].as_u64().unwrap();
+
     // ── Alice's socket to node 1 dies; she reconnects to node 2 with the same credential ──
     let Player {
         session_id: sid_a,
@@ -10331,6 +10661,18 @@ async fn two_nodes_session_failover_resumes_on_the_other_node() {
         "media must now be bound to node 2"
     );
     assert_ne!(alice.resume_token, token_a1);
+    let (status, stats) = tenant_get(
+        &env2,
+        &http,
+        &format!("/v1/sessions/{}/stats", alice.session_id),
+    )
+    .await;
+    assert_eq!(status, 200, "{stats}");
+    assert!(
+        stats["quality_summary"]["samples"].as_u64().unwrap() >= samples_before,
+        "node 2 must continue the persisted quality history ({samples_before} samples): {stats}"
+    );
+    assert_eq!(stats["mos_alerting"], false, "{stats}");
     let prefs = alice
         .expect("ReceiverPreferences", |m| {
             matches!(m, ControlMessage::ReceiverPreferences { .. })
@@ -10437,6 +10779,26 @@ async fn two_nodes_session_failover_resumes_on_the_other_node() {
     send_audio(&bob, channel_id, 5000, &bob_payload).await;
     let (_, n) = audio_from(&alice, bob.ssrc, &bob_payload).await;
     assert_eq!(n, 0, "Alice's local mute of Bob must survive the move");
+
+    // Node 2 now owns the checkpoints: the persisted history grows past what node 1 wrote,
+    // attributed to node 2, without node 1's stale copy overwriting it.
+    let persisted_after = wait_persisted_quality(
+        &env,
+        &http,
+        started,
+        alice.session_id,
+        samples_before + 1,
+        Duration::from_secs(40),
+    )
+    .await;
+    assert_ne!(
+        persisted_after["media_node_id"], persisted_before["media_node_id"],
+        "{persisted_after}"
+    );
+    assert!(
+        persisted_after["disconnected_at"].is_null(),
+        "{persisted_after}"
+    );
 
     // ── node 1 is fenced: the spent credential opens nothing there ──
     let mut stale = connect_with(

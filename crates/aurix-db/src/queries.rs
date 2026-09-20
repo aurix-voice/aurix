@@ -1011,6 +1011,8 @@ pub struct MigratedSession {
     pub reaped: bool,
     /// Channels whose membership rows are still open.
     pub open_channels: Vec<Uuid>,
+    /// `sessions.quality_stats` as persisted by the previous node (running summary).
+    pub quality_stats: Option<serde_json::Value>,
 }
 
 /// Moves a live session to another node (cross-node resume). Reopens a session the lost-node
@@ -1024,7 +1026,7 @@ pub async fn migrate_session(
     user_id: Uuid,
     to_node: Uuid,
 ) -> Result<Option<MigratedSession>, sqlx::Error> {
-    let previous = sqlx::query_scalar::<_, Option<String>>(
+    let previous = sqlx::query_as::<_, (Option<String>, Option<serde_json::Value>)>(
         r#"WITH before AS (
                SELECT id, disconnect_reason FROM sessions
                WHERE id = $1 AND app_id = $2 AND user_id = $3
@@ -1032,7 +1034,7 @@ pub async fn migrate_session(
            )
            UPDATE sessions s SET media_node_id = $4, disconnected_at = NULL, disconnect_reason = NULL
            FROM before WHERE s.id = before.id
-           RETURNING before.disconnect_reason"#,
+           RETURNING before.disconnect_reason, s.quality_stats"#,
     )
     .bind(session_id)
     .bind(app_id)
@@ -1040,7 +1042,7 @@ pub async fn migrate_session(
     .bind(to_node)
     .fetch_optional(pool)
     .await?;
-    let Some(previous) = previous else {
+    let Some((previous, quality_stats)) = previous else {
         return Ok(None);
     };
     let open = sqlx::query_scalar::<_, Uuid>(
@@ -1052,7 +1054,58 @@ pub async fn migrate_session(
     Ok(Some(MigratedSession {
         reaped: previous.is_some(),
         open_channels: open,
+        quality_stats,
     }))
+}
+
+/// Stores the running quality summary of a live session (periodic checkpoint so a session
+/// lost with its node still has its quality history). Only the owning node may write it.
+pub async fn update_session_quality(
+    pool: &DbPool,
+    session_id: Uuid,
+    media_node_id: Uuid,
+    quality: serde_json::Value,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE sessions SET quality_stats = $3 WHERE id = $1 AND media_node_id = $2 AND disconnected_at IS NULL",
+    )
+    .bind(session_id)
+    .bind(media_node_id)
+    .bind(quality)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Sessions of the application that started in `[from, to)` and have a quality summary,
+/// worst average MOS first (ties: most recent first). Sessions rated fewer than `min_samples`
+/// times are skipped so one bad first sample does not top the list. Only summaries whose
+/// `samples` and `mos_avg` are JSON numbers qualify, so a hand-edited row cannot break the
+/// listing for the whole application.
+pub async fn worst_quality_sessions(
+    pool: &DbPool,
+    app_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    min_samples: i64,
+    limit: i64,
+) -> Result<Vec<SessionRow>, sqlx::Error> {
+    sqlx::query_as::<_, SessionRow>(
+        r#"SELECT * FROM sessions
+           WHERE app_id = $1 AND connected_at >= $2 AND connected_at < $3
+             AND jsonb_typeof(quality_stats->'mos_avg') = 'number'
+             AND CASE WHEN jsonb_typeof(quality_stats->'samples') = 'number'
+                      THEN (quality_stats->>'samples')::bigint ELSE -1 END >= $4
+           ORDER BY (quality_stats->>'mos_avg')::double precision ASC, connected_at DESC
+           LIMIT $5"#,
+    )
+    .bind(app_id)
+    .bind(from)
+    .bind(to)
+    .bind(min_samples)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn get_active_sessions_for_user(

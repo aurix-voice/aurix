@@ -1,0 +1,739 @@
+{
+  "title": "Aurix Voice — Quality",
+  "uid": "aurix-quality",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "tags": [
+    "aurix",
+    "voice",
+    "quality"
+  ],
+  "description": "Fleet-wide E-model voice quality: MOS distribution, bars, alerts, uplink loss/jitter, per-node outliers. No per-session labels — use GET /v1/analytics/sessions for individual sessions.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Rated sessions",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_sessions_by_bars)",
+          "refId": "A"
+        }
+      ],
+      "description": "Sessions that produced a quality rating in the last period (sum over bars)."
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Mean MOS (5m)",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3.1
+              },
+              {
+                "color": "yellow",
+                "value": 3.6
+              },
+              {
+                "color": "green",
+                "value": 4.0
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(aurix_session_mos_sum[5m])) / clamp_min(sum(rate(aurix_session_mos_count[5m])), 0.001)",
+          "refId": "A"
+        }
+      ],
+      "description": "Fleet mean E-model MOS over all ratings in the window. 4.3 is the Opus ceiling."
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Median MOS (5m)",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3.1
+              },
+              {
+                "color": "yellow",
+                "value": 3.6
+              },
+              {
+                "color": "green",
+                "value": 4.0
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aurix_session_mos_bucket[5m])))",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "p10 MOS (5m)",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3.1
+              },
+              {
+                "color": "yellow",
+                "value": 3.6
+              },
+              {
+                "color": "green",
+                "value": 4.0
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.1, sum by (le) (rate(aurix_session_mos_bucket[5m])))",
+          "refId": "A"
+        }
+      ],
+      "description": "Worst decile — the players who are actually suffering."
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "MOS-degraded sessions",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_sessions_mos_degraded)",
+          "refId": "A"
+        }
+      ],
+      "description": "Sessions with an open quality.alert {metric: \"mos\"} (debounced, not yet recovered)."
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Degraded share",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.05
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_sessions_mos_degraded) / clamp_min(sum(aurix_sessions_by_bars), 1)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "MOS distribution (5m percentiles)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 1,
+          "max": 4.5,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3.1
+              },
+              {
+                "color": "green",
+                "value": 3.6
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(aurix_session_mos_bucket[5m])))",
+          "legendFormat": "p90",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aurix_session_mos_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.1, sum by (le) (rate(aurix_session_mos_bucket[5m])))",
+          "legendFormat": "p10",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(aurix_session_mos_sum[5m])) / clamp_min(sum(rate(aurix_session_mos_count[5m])), 0.001)",
+          "legendFormat": "mean",
+          "refId": "D"
+        }
+      ],
+      "description": "Percentiles of aurix_session_mos (one observation per rated session per quality period). Lines at 3.1 (default alert threshold) and 3.6 (fair)."
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Sessions by quality bars",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "fillOpacity": 40
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5 bars"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "4 bars"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "light-green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "3 bars"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "2 bars"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "1 bars"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_sessions_by_bars{bars=\"5\"})",
+          "legendFormat": "5 bars",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aurix_sessions_by_bars{bars=\"4\"})",
+          "legendFormat": "4 bars",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(aurix_sessions_by_bars{bars=\"3\"})",
+          "legendFormat": "3 bars",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(aurix_sessions_by_bars{bars=\"2\"})",
+          "legendFormat": "2 bars",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(aurix_sessions_by_bars{bars=\"1\"})",
+          "legendFormat": "1 bars",
+          "refId": "E"
+        }
+      ],
+      "description": "Stacked count of rated sessions per current bar level (R ≥ 80 → 5 … R < 50 → 1). Bars 1–2 count as poor time in analytics."
+    },
+    {
+      "id": 9,
+      "type": "heatmap",
+      "title": "MOS heatmap",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(aurix_session_mos_bucket[$__rate_interval]))",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Native histogram buckets of aurix_session_mos; green/red split is the fleet's quality spread over time.",
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "unit": "none"
+        },
+        "color": {
+          "scheme": "RdYlGn",
+          "mode": "scheme"
+        },
+        "cellGap": 1
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Quality alerts / recoveries per minute",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (metric) (rate(aurix_quality_events_total{event=\"alert\"}[5m])) * 60",
+          "legendFormat": "alert {{metric}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (metric) (rate(aurix_quality_events_total{event=\"recovered\"}[5m])) * 60",
+          "legendFormat": "recovered {{metric}}",
+          "refId": "B"
+        }
+      ],
+      "description": "quality.alert / quality.recovered events published to webhooks and SSE. Only metric=mos recovers (debounced with hysteresis)."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Uplink packet loss (percentiles)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(aurix_uplink_loss_percent_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(aurix_uplink_loss_percent_bucket[5m])))",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aurix_uplink_loss_percent_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "C"
+        }
+      ],
+      "description": "Server-measured uplink loss per rated session. Opus FEC absorbs isolated losses of a few percent; sustained p90 > 5% is an alert."
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Uplink jitter (percentiles)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(aurix_uplink_jitter_milliseconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(aurix_uplink_jitter_milliseconds_bucket[5m])))",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aurix_uplink_jitter_milliseconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "C"
+        }
+      ],
+      "description": "RFC 3550 inter-arrival jitter per rated session. The E-model weighs jitter twice as heavily as RTT."
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Mean MOS by node",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 1,
+          "max": 4.5
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(aurix_session_mos_sum[5m])) / clamp_min(sum by (instance) (rate(aurix_session_mos_count[5m])), 0.001)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "description": "A node that trails the fleet by > 0.5 MOS is saturated or badly placed (AurixNodeQualityOutlier)."
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Degraded sessions by node",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (aurix_sessions_mos_degraded)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (instance) (rate(aurix_packets_dropped_total[5m]))",
+          "legendFormat": "dropped pkt/s {{instance}}",
+          "refId": "B"
+        }
+      ]
+    }
+  ]
+}

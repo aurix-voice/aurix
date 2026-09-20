@@ -146,6 +146,16 @@ the chapter that explains the boundary.
   (channel) buckets, UTC only, with no per-user breakdown; the monthly minute quota is admission
   control at channel join, not a kill switch for members already present
   ([Usage analytics and quotas](operations/usage-analytics.md)).
+* **Voice quality is a network model, not a listening test.** MOS is the simplified E-model
+  (RTT, jitter, loss) — it does not hear the audio, so clipping, a muted microphone, DSP
+  artefacts or a starved encoder do not lower it, and codec differences (Opus vs PCMU) are not
+  modelled. Ratings are per `media.quality_interval_ms`, so a session's history has that
+  resolution and a node crash loses the samples since its last `quality.persist_interval_secs`
+  checkpoint; the MOS alert state machine restarts on cross-node takeover (one duplicate alert
+  possible). Prometheus carries distributions only — no per-session or per-user series; the
+  fleet alert rules assume enough concurrent sessions to make percentiles meaningful and
+  need tuning below a few dozen. Quality aggregates exist per application, not per channel
+  ([Network quality](features/quality.md)).
 * **Redis Sentinel yes, Redis Cluster no.** The ownership claim is a multi-key Lua script
   without hash tags and the event bus is classic Pub/Sub; point the fleet at a Sentinel set or
   a managed endpoint with a stable address.

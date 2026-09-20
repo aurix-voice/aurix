@@ -87,12 +87,14 @@ pub enum MediaEvent {
         channel_id: ChannelId,
         levels: Vec<(UserId, u8)>,
     },
-    /// Periodic per-session link report (see `SfuOptions::quality_interval_ms`).
+    /// Periodic per-session link report (see `SfuOptions::quality_interval_ms`);
+    /// `transition` is set when the debounced MOS alert state flipped on this evaluation.
     NetworkQuality {
         session_id: SessionId,
         app_id: AppId,
         user_id: UserId,
         quality: NetworkQuality,
+        transition: Option<aurix_common::types::MosTransition>,
     },
     /// A WebRTC session's per-participant downlink tracks changed hands (full snapshot).
     ParticipantStreams {

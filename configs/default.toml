@@ -261,6 +261,23 @@ aggregate_interval_secs = 60    # lifecycle → 5-minute app / hourly channel bu
 retention_days = 400            # application buckets
 channel_retention_days = 90     # per-channel buckets (must not exceed retention_days)
 quota_cache_secs = 30           # how long a node trusts a cached monthly-minutes total (0 = query per join)
+
+[quality]
+# Per-session voice-quality analytics and alerting on top of the E-model rating computed every
+# `media.quality_interval_ms`. A session's MOS below `mos_alert_threshold` for
+# `mos_alert_periods` consecutive periods raises `quality.alert {metric: "mos"}`; it recovers
+# (`quality.recovered`) once it stays 0.2 above the threshold as long — one alert per episode,
+# never one per bad sample. 3.1 is the E-model "some users dissatisfied" boundary (2 bars).
+mos_alert_threshold = 3.1       # 0 disables MOS alerts (0..=4.5)
+mos_alert_periods = 3           # consecutive periods (1..=60)
+# Packet loss over one period (percent, client-reported downlink or SFU-measured uplink) that
+# raises `quality.alert {metric: "packet_loss" | "uplink_packet_loss"}`. 0 disables.
+loss_alert_percent = 20.0
+# How often a node checkpoints each live session's running quality summary to
+# `sessions.quality_stats` (also written on disconnect and read on cross-node takeover).
+# 0 = only on disconnect; 10..=3600 otherwise.
+persist_interval_secs = 60
+
 [stt]
 # Speech-to-text of channels created with `transcription = true` (OpenAI-compatible
 # `/v1/audio/transcriptions`, e.g. faster-whisper-server). Transcripts are pushed to the

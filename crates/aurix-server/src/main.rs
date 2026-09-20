@@ -108,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
             tunnel_queue_packets: config.media.tunnel_queue_packets,
             downlink_mix: config.media.downlink_mix,
             webrtc_participant_streams: config.media.webrtc_participant_streams,
+            mos_alert: aurix_media::quality::MosAlertPolicy {
+                threshold: config.quality.mos_alert_threshold,
+                periods: config.quality.mos_alert_periods,
+            },
         },
     );
 
