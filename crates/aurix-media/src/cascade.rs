@@ -11,28 +11,73 @@
 //! allowed peers (statically configured via `media.cascade_peers` and/or discovered from the
 //! `media_nodes` registry), only with a valid tag and only once per (peer, sequence).
 //!
-//! Topology is per channel: a packet is forwarded only to the nodes that currently host
-//! participants of that channel (see `set_channel_peers`, driven by `CascadeTopology`).
+//! Topology is per channel (see [`ChannelRoute`], driven by `CascadeTopology`): a locally
+//! received client packet goes to the channel's `origin` peers, and a node that is a relay-tree
+//! *hub* re-forwards envelopes arriving from one peer to the peers listed for it in `forward`
+//! (never back to the peer it came from). Re-forwarded envelopes carry a hop byte
+//! (`PacketFlags::RelayHop`) and nothing travels more than `MAX_RELAY_HOPS` node-to-node hops,
+//! so a stale or inconsistent plan can at worst lose a packet, never loop one. One-hop mesh
+//! envelopes (no hop byte) are what every node has always sent, so a relay-tree hub can be
+//! introduced next to nodes that predate relay trees.
 
 use crate::transport::{bind_media_socket, MediaSocket};
 use aurix_common::crypto::MediaKeys;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{
-    AurixPacket, PacketFlags, PacketType, ReplayWindow, HEADER_SIZE, MAX_RELAY_PACKET_SIZE,
+    channel_id_hash, AurixPacket, PacketFlags, PacketType, ReplayWindow, HEADER_SIZE,
+    MAX_RELAY_HOPS, MAX_RELAY_PACKET_SIZE,
 };
 use aurix_common::types::*;
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
+/// Forwarding plan of one channel on this node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelRoute {
+    /// Peers that receive packets originating from this node's own participants.
+    pub origin: Vec<SocketAddr>,
+    /// Hub rules: an envelope arriving from the key peer is re-forwarded to the listed peers.
+    pub forward: BTreeMap<SocketAddr, Vec<SocketAddr>>,
+}
+
+impl ChannelRoute {
+    /// A plain one-hop mesh route: send to `peers`, never re-forward.
+    pub fn mesh(peers: &[SocketAddr]) -> Self {
+        Self {
+            origin: peers.to_vec(),
+            forward: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.origin.is_empty() && self.forward.values().all(|v| v.is_empty())
+    }
+
+    pub fn is_hub(&self) -> bool {
+        self.forward.values().any(|v| !v.is_empty())
+    }
+}
+
+/// An authenticated inbound relay envelope.
+#[derive(Debug, Clone)]
+pub struct InboundRelay {
+    pub sender: UserId,
+    /// Node-to-node hops the client packet has travelled so far (1 for a mesh envelope).
+    pub hops: u8,
+    pub packet: AurixPacket,
+}
+
 pub struct CascadeRelay {
-    /// channel_id -> remote node addresses with participants in that channel
-    channel_peers: Arc<DashMap<ChannelId, Vec<SocketAddr>>>,
+    /// channel_id -> where this node sends and re-forwards that channel's audio.
+    routes: Arc<DashMap<ChannelId, ChannelRoute>>,
+    /// `channel_id_hash` -> channel for the routes above (envelopes only carry the hash).
+    routes_by_hash: Arc<DashMap<u32, ChannelId>>,
     /// Peers we accept relayed traffic from, each with its own anti-replay window.
     allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>>,
     /// Peers from static configuration; never removed by discovery.
@@ -82,7 +127,8 @@ impl CascadeRelay {
             allowed_peers.len()
         );
         Ok(Self {
-            channel_peers: Arc::new(DashMap::new()),
+            routes: Arc::new(DashMap::new()),
+            routes_by_hash: Arc::new(DashMap::new()),
             allowed_peers,
             static_peers,
             dynamic_peers: Mutex::new(HashSet::new()),
@@ -130,7 +176,7 @@ impl CascadeRelay {
 
     /// Replace the set of discovered peers. Newly seen addresses become accepted sources
     /// (fresh replay window); addresses that disappeared and are not statically configured
-    /// are dropped from the allow-list and from every channel's forwarding list.
+    /// are dropped from the allow-list and from every channel's route.
     pub fn set_dynamic_peers(&self, peers: HashSet<SocketAddr>) {
         let mut current = self.dynamic_peers.lock();
         for added in peers.difference(&current) {
@@ -144,12 +190,18 @@ impl CascadeRelay {
                 continue;
             }
             self.allowed_peers.remove(removed);
-            for mut entry in self.channel_peers.iter_mut() {
-                entry.value_mut().retain(|a| a != removed);
+            for mut entry in self.routes.iter_mut() {
+                let route = entry.value_mut();
+                route.origin.retain(|a| a != removed);
+                route.forward.remove(removed);
+                for targets in route.forward.values_mut() {
+                    targets.retain(|a| a != removed);
+                }
             }
             info!("Cascade peer gone: {}", removed);
         }
         *current = peers;
+        self.refresh_hub_gauge();
     }
 
     /// Register a remote node as having participants in a given channel. Unknown peers are refused.
@@ -159,26 +211,74 @@ impl CascadeRelay {
                 "{peer_addr} is not an allowed cascade peer"
             )));
         }
-        let mut entry = self.channel_peers.entry(channel_id).or_default();
-        if !entry.contains(&peer_addr) {
-            entry.push(peer_addr);
+        let mut entry = self.routes.entry(channel_id).or_default();
+        if !entry.origin.contains(&peer_addr) {
+            entry.origin.push(peer_addr);
         }
+        drop(entry);
+        self.routes_by_hash
+            .insert(channel_id_hash(&channel_id), channel_id);
         Ok(())
     }
 
-    /// Replace the forwarding list for a channel with exactly the allowed peers in `peers`.
-    /// Used by discovery; an empty list removes the channel from the relay entirely.
+    /// Replace the route of a channel with a one-hop mesh to exactly the allowed peers in
+    /// `peers`; an empty list removes the channel from the relay entirely.
     pub fn set_channel_peers(&self, channel_id: ChannelId, peers: &[SocketAddr]) {
-        let filtered: Vec<SocketAddr> = peers
-            .iter()
-            .copied()
-            .filter(|p| self.allowed_peers.contains_key(p))
-            .collect();
-        if filtered.is_empty() {
-            self.channel_peers.remove(&channel_id);
-        } else {
-            self.channel_peers.insert(channel_id, filtered);
+        self.set_channel_route(channel_id, ChannelRoute::mesh(peers));
+    }
+
+    /// Replace the route of a channel. Unknown peers are dropped from every list, a forward
+    /// rule never targets the peer it is keyed by, and an empty result removes the channel.
+    pub fn set_channel_route(&self, channel_id: ChannelId, route: ChannelRoute) {
+        let allowed = |p: &SocketAddr| self.allowed_peers.contains_key(p);
+        let mut origin: Vec<SocketAddr> = route.origin.into_iter().filter(allowed).collect();
+        origin.sort_unstable();
+        origin.dedup();
+        let mut forward = BTreeMap::new();
+        for (from, targets) in route.forward {
+            if !allowed(&from) {
+                continue;
+            }
+            let mut targets: Vec<SocketAddr> = targets
+                .into_iter()
+                .filter(|t| *t != from && allowed(t))
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            if !targets.is_empty() {
+                forward.insert(from, targets);
+            }
         }
+        let route = ChannelRoute { origin, forward };
+        let hash = channel_id_hash(&channel_id);
+        if route.is_empty() {
+            self.routes.remove(&channel_id);
+            self.routes_by_hash
+                .remove_if(&hash, |_, c| *c == channel_id);
+        } else {
+            self.routes.insert(channel_id, route);
+            self.routes_by_hash.insert(hash, channel_id);
+        }
+        self.refresh_hub_gauge();
+    }
+
+    /// Drop every route whose channel is not in `keep` (channels that vanished from the plan,
+    /// e.g. hub duty for a channel this node never hosted).
+    pub fn retain_channels(&self, keep: &HashSet<ChannelId>) {
+        let stale: Vec<ChannelId> = self
+            .routes
+            .iter()
+            .map(|e| *e.key())
+            .filter(|c| !keep.contains(c))
+            .collect();
+        for c in stale {
+            self.remove_channel(&c);
+        }
+    }
+
+    fn refresh_hub_gauge(&self) {
+        let hubs = self.routes.iter().filter(|e| e.value().is_hub()).count();
+        aurix_metrics::CASCADE_HUB_CHANNELS.set(hubs as i64);
     }
 
     /// Subscribe every statically configured peer to `channel_id` (legacy full-mesh mode,
@@ -190,20 +290,33 @@ impl CascadeRelay {
     }
 
     pub fn remove_peer(&self, channel_id: ChannelId, peer_addr: &SocketAddr) {
-        if let Some(mut entry) = self.channel_peers.get_mut(&channel_id) {
-            entry.retain(|a| a != peer_addr);
+        if let Some(mut entry) = self.routes.get_mut(&channel_id) {
+            entry.origin.retain(|a| a != peer_addr);
         }
     }
 
     pub fn remove_channel(&self, channel_id: &ChannelId) {
-        self.channel_peers.remove(channel_id);
+        self.routes.remove(channel_id);
+        self.routes_by_hash
+            .remove_if(&channel_id_hash(channel_id), |_, c| c == channel_id);
+        self.refresh_hub_gauge();
     }
 
+    /// Peers that receive this node's own participants' audio for the channel.
     pub fn channel_peers(&self, channel_id: &ChannelId) -> Vec<SocketAddr> {
-        self.channel_peers
+        self.routes
             .get(channel_id)
-            .map(|p| p.value().clone())
+            .map(|r| r.origin.clone())
             .unwrap_or_default()
+    }
+
+    pub fn channel_route(&self, channel_id: &ChannelId) -> Option<ChannelRoute> {
+        self.routes.get(channel_id).map(|r| r.value().clone())
+    }
+
+    /// Channels this node currently has any route for (hosted or hub duty).
+    pub fn routed_channels(&self) -> Vec<ChannelId> {
+        self.routes.iter().map(|e| *e.key()).collect()
     }
 
     /// Forward a locally originated audio packet from `sender` to all peers for this channel.
@@ -219,8 +332,8 @@ impl CascadeRelay {
         if packet.header.has_flag(PacketFlags::Relay) {
             return;
         }
-        let peers: Vec<SocketAddr> = match self.channel_peers.get(channel_id) {
-            Some(p) if !p.is_empty() => p.value().clone(),
+        let peers: Vec<SocketAddr> = match self.routes.get(channel_id) {
+            Some(r) if !r.origin.is_empty() => r.origin.clone(),
             _ => return,
         };
         let labelled = level.map(|l| packet.with_audio_level(l));
@@ -229,20 +342,68 @@ impl CascadeRelay {
         let data = AurixPacket::relay_envelope(packet, self.relay_ssrc, counter, sender)
             .seal(&self.keys)
             .freeze();
+        self.send_all(&data, &peers, "origin").await;
+    }
+
+    async fn send_all(&self, data: &[u8], peers: &[SocketAddr], role: &str) {
         for peer_addr in peers {
-            if let Err(e) = self.socket.send_to(&data, peer_addr).await {
+            if let Err(e) = self.socket.send_to(data, *peer_addr).await {
                 warn!("Cascade forward to {} failed: {}", peer_addr, e);
+            } else {
+                aurix_metrics::CASCADE_FORWARDED
+                    .with_label_values(&[role])
+                    .inc();
             }
         }
     }
 
+    /// Peers an envelope that arrived from `src` for the channel with `hash` must be
+    /// re-forwarded to, if this node is a hub for that channel and the envelope may still hop.
+    /// Returns `None` when there is no rule, `Some(vec![])` when a rule exists but the hop
+    /// limit was reached (counted as `hop_limit`).
+    pub fn forward_targets(&self, hash: u32, src: SocketAddr, hops: u8) -> Option<Vec<SocketAddr>> {
+        let channel = *self.routes_by_hash.get(&hash)?.value();
+        let route = self.routes.get(&channel)?;
+        let targets = route.forward.get(&src)?;
+        if targets.is_empty() {
+            return None;
+        }
+        if hops >= MAX_RELAY_HOPS {
+            aurix_metrics::CASCADE_FORWARDED
+                .with_label_values(&["hop_limit"])
+                .inc();
+            return Some(Vec::new());
+        }
+        Some(targets.iter().copied().filter(|t| *t != src).collect())
+    }
+
+    /// Re-forward an authenticated inbound envelope along this node's hub rules (no-op when
+    /// there are none). The client packet is re-wrapped with the same sender and `hops + 1`.
+    pub async fn forward_inbound(&self, src: SocketAddr, inbound: &InboundRelay) {
+        let Some(targets) =
+            self.forward_targets(inbound.packet.header.channel_id_hash, src, inbound.hops)
+        else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let counter = self.relay_counter.fetch_add(1, Ordering::Relaxed);
+        let data = AurixPacket::relay_envelope_hop(
+            &inbound.packet,
+            self.relay_ssrc,
+            counter,
+            &inbound.sender,
+            inbound.hops + 1,
+        )
+        .seal(&self.keys)
+        .freeze();
+        self.send_all(&data, &targets, "hub").await;
+    }
+
     /// Validate an inbound relayed datagram (known peer, tag, Relay envelope, replay window)
-    /// and return the sending user plus the plaintext client packet it carries.
-    pub fn authenticate_inbound(
-        &self,
-        data: &[u8],
-        src: SocketAddr,
-    ) -> Result<(UserId, AurixPacket)> {
+    /// and return the sending user, the hop count and the plaintext client packet it carries.
+    pub fn authenticate_inbound(&self, data: &[u8], src: SocketAddr) -> Result<InboundRelay> {
         let window = self.allowed_peers.get(&src).ok_or_else(|| {
             AurixError::AuthorizationDenied(format!("Cascade packet from unknown peer {src}"))
         })?;
@@ -265,7 +426,7 @@ impl CascadeRelay {
                 "Replayed cascade packet".into(),
             ));
         }
-        let (sender, inner) = envelope.relay_inner()?;
+        let (sender, hop, inner) = envelope.relay_inner_hop()?;
         if inner.header.packet_type != PacketType::Audio
             && inner.header.packet_type != PacketType::AudioFec
         {
@@ -273,10 +434,24 @@ impl CascadeRelay {
                 "Relay envelope must carry an audio packet".into(),
             ));
         }
-        Ok((sender, inner))
+        let hops = match hop {
+            None => 1,
+            Some(h) if (1..=MAX_RELAY_HOPS).contains(&h) => h,
+            Some(h) => {
+                return Err(AurixError::Transport(format!(
+                    "Relay envelope hop count {h} out of range"
+                )))
+            }
+        };
+        Ok(InboundRelay {
+            sender,
+            hops,
+            packet: inner,
+        })
     }
 
-    /// Receive relayed packets from peers and hand authenticated ones to `on_packet`.
+    /// Receive relayed packets from peers, re-forward them along this node's hub rules and
+    /// hand authenticated ones to `on_packet` for local delivery.
     pub fn start_receiver(
         self: Arc<Self>,
         on_packet: Arc<dyn Fn(UserId, AurixPacket) + Send + Sync>,
@@ -291,7 +466,10 @@ impl CascadeRelay {
                             continue;
                         }
                         match self.authenticate_inbound(&buf[..len], src) {
-                            Ok((sender, packet)) => on_packet(sender, packet),
+                            Ok(inbound) => {
+                                self.forward_inbound(src, &inbound).await;
+                                on_packet(inbound.sender, inbound.packet);
+                            }
                             Err(e) => {
                                 aurix_metrics::PACKETS_DROPPED.inc();
                                 debug!("Dropping cascade packet from {}: {}", src, e);
@@ -308,9 +486,9 @@ impl CascadeRelay {
     }
 
     pub fn has_peers(&self, channel_id: &ChannelId) -> bool {
-        self.channel_peers
+        self.routes
             .get(channel_id)
-            .is_some_and(|p| !p.is_empty())
+            .is_some_and(|r| !r.origin.is_empty())
     }
 }
 
@@ -348,10 +526,11 @@ mod tests {
         assert!(relay.authenticate_inbound(&bad, peer).is_err());
         assert!(relay.authenticate_inbound(&unauth, peer).is_err());
         assert!(relay.authenticate_inbound(&bare, peer).is_err());
-        let (from, inner) = relay.authenticate_inbound(&good, peer).unwrap();
-        assert_eq!(from, sender);
-        assert_eq!(inner.header.ssrc, 42);
-        assert_eq!(&inner.payload[..], b"opus");
+        let inbound = relay.authenticate_inbound(&good, peer).unwrap();
+        assert_eq!(inbound.sender, sender);
+        assert_eq!(inbound.hops, 1);
+        assert_eq!(inbound.packet.header.ssrc, 42);
+        assert_eq!(&inbound.packet.payload[..], b"opus");
         assert!(
             relay.authenticate_inbound(&good, peer).is_err(),
             "replay must be rejected"
@@ -456,5 +635,211 @@ mod tests {
                 .is_err(),
             "replay must still be rejected"
         );
+    }
+
+    fn audio(ch: &ChannelId, ssrc: u32) -> AurixPacket {
+        AurixPacket::audio(1, 0, ssrc, channel_id_hash(ch), Bytes::from_static(b"opus"))
+    }
+
+    #[tokio::test]
+    async fn routes_filter_unknown_peers_and_never_forward_back_to_source() {
+        let a: SocketAddr = "127.0.0.1:45030".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:45031".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:45032".parse().unwrap();
+        let stranger: SocketAddr = "127.0.0.1:45039".parse().unwrap();
+        let relay = CascadeRelay::new(
+            "127.0.0.1:0".parse().unwrap(),
+            MediaNodeId::new(),
+            "0123456789abcdef",
+            &[],
+        )
+        .await
+        .unwrap();
+        relay.set_dynamic_peers([a, b, c].into_iter().collect());
+        let ch = ChannelId::new();
+        let hash = channel_id_hash(&ch);
+        relay.set_channel_route(
+            ch,
+            ChannelRoute {
+                origin: vec![a, stranger, a],
+                forward: [
+                    (a, vec![b, c, a, stranger]),
+                    (b, vec![b]),
+                    (stranger, vec![a]),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let route = relay.channel_route(&ch).unwrap();
+        assert_eq!(route.origin, vec![a]);
+        assert_eq!(route.forward.len(), 1, "self-only and unknown rules vanish");
+        assert_eq!(route.forward[&a], vec![b, c]);
+        assert!(route.is_hub());
+        assert_eq!(relay.forward_targets(hash, a, 1), Some(vec![b, c]));
+        assert_eq!(relay.forward_targets(hash, b, 1), None);
+        assert_eq!(relay.forward_targets(hash, a, MAX_RELAY_HOPS), Some(vec![]));
+        assert_eq!(relay.forward_targets(hash ^ 1, a, 1), None);
+
+        // Peer C disappears: it leaves the forward lists; peer A disappearing removes its rule.
+        relay.set_dynamic_peers([a, b].into_iter().collect());
+        assert_eq!(relay.forward_targets(hash, a, 2), Some(vec![b]));
+        relay.set_dynamic_peers([b].into_iter().collect());
+        assert!(relay.channel_route(&ch).is_none() || !relay.channel_route(&ch).unwrap().is_hub());
+        assert_eq!(relay.forward_targets(hash, a, 1), None);
+
+        // retain_channels drops hub duty for channels no longer planned.
+        relay.set_dynamic_peers([a, b].into_iter().collect());
+        relay.set_channel_route(
+            ch,
+            ChannelRoute {
+                origin: vec![],
+                forward: [(a, vec![b])].into_iter().collect(),
+            },
+        );
+        assert_eq!(relay.routed_channels(), vec![ch]);
+        relay.retain_channels(&HashSet::new());
+        assert!(relay.routed_channels().is_empty());
+        assert_eq!(relay.forward_targets(hash, a, 1), None);
+    }
+
+    /// Origin → hub → remote hub → leaf over real loopback sockets: the leaf receives the
+    /// packet once with the original sender / SSRC / payload and hop count 3; the origin's
+    /// own envelope never comes back to it, and a leaf never re-forwards.
+    #[tokio::test]
+    async fn three_hop_tree_delivers_once_and_stops_at_leaf() {
+        let secret = "0123456789abcdef";
+        let mk = || async {
+            Arc::new(
+                CascadeRelay::new(
+                    "127.0.0.1:0".parse().unwrap(),
+                    MediaNodeId::new(),
+                    secret,
+                    &[],
+                )
+                .await
+                .unwrap(),
+            )
+        };
+        let origin = mk().await;
+        let hub1 = mk().await;
+        let hub2 = mk().await;
+        let leaf = mk().await;
+        let (ao, a1, a2, al) = (
+            origin.local_addr(),
+            hub1.local_addr(),
+            hub2.local_addr(),
+            leaf.local_addr(),
+        );
+        for r in [&origin, &hub1, &hub2, &leaf] {
+            r.set_dynamic_peers([ao, a1, a2, al].into_iter().collect());
+        }
+        let ch = ChannelId::new();
+        origin.set_channel_route(ch, ChannelRoute::mesh(&[a1]));
+        hub1.set_channel_route(
+            ch,
+            ChannelRoute {
+                origin: vec![],
+                forward: [(ao, vec![a2])].into_iter().collect(),
+            },
+        );
+        hub2.set_channel_route(
+            ch,
+            ChannelRoute {
+                origin: vec![],
+                forward: [(a1, vec![al])].into_iter().collect(),
+            },
+        );
+        // The leaf has a (bogus) rule pointing back at the origin: a hop-3 envelope must
+        // still not be re-forwarded.
+        leaf.set_channel_route(
+            ch,
+            ChannelRoute {
+                origin: vec![],
+                forward: [(a2, vec![ao])].into_iter().collect(),
+            },
+        );
+
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(&'static str, UserId, AurixPacket)>();
+        for (name, relay) in [
+            ("origin", &origin),
+            ("hub1", &hub1),
+            ("hub2", &hub2),
+            ("leaf", &leaf),
+        ] {
+            let tx = tx.clone();
+            relay
+                .clone()
+                .start_receiver(Arc::new(move |sender, packet| {
+                    let _ = tx.send((name, sender, packet));
+                }));
+        }
+        let sender = UserId::new();
+        origin
+            .forward_to_peers(&ch, &sender, &audio(&ch, 4242), Some(30))
+            .await;
+
+        let mut got = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+        while let Ok(Some(item)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            got.push(item);
+            if got.len() >= 3 {
+                // Give any stray (looped / duplicated) datagram a chance to show up.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                while let Ok(item) = rx.try_recv() {
+                    got.push(item);
+                }
+                break;
+            }
+        }
+        let mut names: Vec<&str> = got.iter().map(|g| g.0).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["hub1", "hub2", "leaf"],
+            "each node delivers locally exactly once, nothing returns to the origin"
+        );
+        for (_, from, mut pkt) in got {
+            assert_eq!(from, sender);
+            assert_eq!(pkt.header.ssrc, 4242);
+            assert_eq!(pkt.take_audio_level(), Some(30));
+            assert_eq!(&pkt.payload[..], b"opus");
+        }
+    }
+
+    #[tokio::test]
+    async fn hop_count_is_validated_and_incremented() {
+        let peer: SocketAddr = "127.0.0.1:45040".parse().unwrap();
+        let relay = CascadeRelay::new(
+            "127.0.0.1:0".parse().unwrap(),
+            MediaNodeId::new(),
+            "0123456789abcdef",
+            &[peer.to_string()],
+        )
+        .await
+        .unwrap();
+        let keys = MediaKeys::derive(b"0123456789abcdef");
+        let ch = ChannelId::new();
+        let sender = UserId::new();
+        let env = |counter: u64, hop: u8| {
+            AurixPacket::relay_envelope_hop(&audio(&ch, 1), 0x1234, counter, &sender, hop)
+                .seal(&keys)
+        };
+        assert_eq!(
+            relay.authenticate_inbound(&env(1, 2), peer).unwrap().hops,
+            2
+        );
+        assert_eq!(
+            relay
+                .authenticate_inbound(&env(2, MAX_RELAY_HOPS), peer)
+                .unwrap()
+                .hops,
+            MAX_RELAY_HOPS
+        );
+        assert!(relay.authenticate_inbound(&env(3, 0), peer).is_err());
+        assert!(relay
+            .authenticate_inbound(&env(4, MAX_RELAY_HOPS + 1), peer)
+            .is_err());
     }
 }

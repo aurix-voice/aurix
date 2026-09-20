@@ -1978,6 +1978,11 @@ pub async fn ws_handler(
     peer: Option<ConnectInfo<SocketAddr>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
+    if state.control.config.media.cascade_relay_only {
+        // A relay-only hub hosts no clients; discovery never advertises it, but a stale or
+        // hand-written endpoint may still point here.
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let Some(creds) = extract_ws_credentials(&headers, &query) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };

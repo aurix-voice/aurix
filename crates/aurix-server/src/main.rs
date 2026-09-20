@@ -274,6 +274,9 @@ async fn main() -> anyhow::Result<()> {
     let advertised_ws_url = config.server.advertised_ws_url(config.is_production());
     let advertised_api_url = config.server.advertised_api_url();
     match &advertised_ws_url {
+        _ if config.media.cascade_relay_only => {
+            info!("Relay-only cascade hub: not advertised to clients, /ws refuses connections")
+        }
         Some(ws) => info!("Advertising WebSocket endpoint {ws} for region discovery"),
         None => warn!(
             "no public wss:// endpoint to advertise (set server.external_ws_url, or an https \
@@ -285,11 +288,18 @@ async fn main() -> anyhow::Result<()> {
         let api_url = advertised_api_url.clone();
         let location = config.server.location;
         let address_ipv6 = node_address_ipv6.clone();
+        let relay_only = config.media.cascade_relay_only;
         move |mut info: aurix_common::types::MediaNodeInfo| {
             info.ws_url = ws_url.clone();
             info.api_url = api_url.clone();
             info.location = location;
             info.address_ipv6 = address_ipv6.clone();
+            info.relay_only = relay_only;
+            if relay_only {
+                // Pure inter-regional hub: never offered to clients or picked for failover.
+                info.ws_url = None;
+                info.capacity = 0;
+            }
             info
         }
     };
@@ -515,7 +525,12 @@ async fn main() -> anyhow::Result<()> {
         let topology = Arc::new(aurix_control::cascade_topology::CascadeTopology::new(
             pool.clone(),
             control.nodes.clone(),
-            node_id,
+            aurix_control::cascade_topology::LocalNode {
+                id: node_id,
+                region: config.server.region,
+                relay_only: config.media.cascade_relay_only,
+            },
+            config.media.cascade_topology,
             cascade,
             sfu.clone(),
         ));
@@ -524,8 +539,8 @@ async fn main() -> anyhow::Result<()> {
         let cancel = shutdown.clone();
         tasks.spawn(topology.run(events, interval, cancel));
         info!(
-            "Cascade auto-discovery enabled (interval {} ms)",
-            config.media.cascade_discovery_interval_ms
+            "Cascade auto-discovery enabled (interval {} ms, topology {:?})",
+            config.media.cascade_discovery_interval_ms, config.media.cascade_topology
         );
     }
 

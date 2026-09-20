@@ -89,9 +89,59 @@ Channels whose members sit on different nodes are relayed **automatically**:
    nodes; echo channels are never relayed.
 
 `media.cascade_peers` is an optional static allow-list (nodes outside the registry), and
-`media.cascade_discovery = false` switches to a fully static full mesh. Cascade is a one-hop
-mesh between the nodes hosting a channel — there are no relay trees — and it needs node-to-node
-reachability on `media.port + 1`/UDP.
+`media.cascade_discovery = false` switches to a fully static full mesh. Hand-configured peers
+always receive every channel the node hosts, whatever the topology below says.
+
+### Topology: mesh or region tree
+
+`media.cascade_topology` decides how the hosting nodes of a channel are connected:
+
+* `mesh` — every hosting node sends its participants' audio directly to every other hosting
+  node (one hop). Simple and lowest-latency, but a channel with `n` hosting nodes spread over
+  regions puts `n − 1` copies of every stream on the WAN, and **all** nodes need direct UDP
+  reachability to each other.
+* `region_tree` (default) — hosting nodes in the same region still talk directly, but traffic
+  between regions goes through exactly one **hub per region**: origin → own region's hub →
+  remote region's hub → hosting nodes there (at most 3 node-to-node hops, typically 2–3; hub
+  to hub is a single WAN hop). Each inter-regional link carries one copy of each stream no
+  matter how many nodes host the channel in the destination region, and only the hubs need
+  cross-region reachability on `media.port + 1`/UDP — in-region nodes only need to reach each
+  other and their hub.
+
+Hubs are elected **per channel** and deterministically from the same registry snapshot every
+node sees: relay-only nodes of the region first, then the region's hosting nodes, tie-broken by
+a channel/node hash so hub duty spreads across a region instead of pinning to one node. There
+is no coordination protocol; every node plans only its own part of the tree (whom it sends its
+participants' audio to, and which ingress peer's packets it forwards where), and a hub forwards
+a packet only to the edges of that ingress — never back to where it came from. Re-forwarded
+envelopes carry a hop byte ([`RelayHop`](../api/aurx.md#flags)) and a node never forwards an
+envelope whose count reached the cap, so a stale or inconsistent plan during a reconciliation
+window cannot loop traffic; the per-peer anti-replay window still applies at every hop and
+the envelope is re-sealed hop by hop under the same `cascade_secret` (original sender, SSRC,
+audio level and E2EE payload are preserved; receiver preferences are still applied only on the
+node that hosts the receiver). A mesh node and a tree node can share a cluster while you roll
+the setting out: envelopes without the hop byte are accepted and delivered locally, just never
+re-forwarded.
+
+**Relay-only hubs.** A node started with `media.cascade_relay_only = true` (requires
+`cascade_secret`, `cascade_discovery` and `region_tree`) hosts no clients: it registers with
+no `ws_url` and `capacity = 0` (`relay_only: true` in `GET /v1/nodes`), `/ws` answers `503`,
+region discovery and failover never offer it, and it is the preferred hub of its region for
+every channel that has participants there. It sizes like a packet forwarder (no Opus, no mixing)
+and is the piece you place next to your inter-regional backbone; a region without one simply
+elects one of its hosting nodes. When a hub disappears from the healthy registry (missed
+heartbeats, `NodeHealthChanged`), every node re-plans on its next pass — the periodic interval
+or the event fast path — and a new hub is elected; until then cross-region audio for the
+affected channels is lost, in-region audio is unaffected.
+
+`aurix_cascade_forwarded_total{role="origin"|"hub"|"hop_limit"}` counts envelopes this node
+sent as an origin, re-forwarded as a hub, or refused to re-forward because the hop cap was
+reached (`hop_limit` staying at zero is the healthy state); `aurix_cascade_hub_channels` is the
+number of channels this node currently hubs.
+
+Not covered: the planner knows regions, health and address families, not measured RTT or link
+cost — a region is one hub set, there is no multi-level tree inside a region, and the hop cap
+means a channel is never relayed through more than two hubs.
 
 ## Regions
 

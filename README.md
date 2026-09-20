@@ -863,6 +863,13 @@ directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regard
   registry) and `media.cascade_discovery=false` returns to fully static full-mesh mode. Node
   addresses must be reachable between nodes on `media.port + 1`/UDP (the `media.external_ip` you
   register is what peers dial).
+* **Inter-regional backbone.** `media.cascade_topology = "region_tree"` (default) keeps
+  in-region nodes on direct one-hop links but routes cross-region audio through one
+  deterministically elected hub per region (origin → hub → hub → node, ≤ 3 hops, one copy per
+  WAN link, hop-capped and never forwarded back to its ingress). `media.cascade_relay_only = true`
+  runs a node as a pure hub (no clients, `503` on `/ws`, never selected for failover) next to
+  your backbone; `"mesh"` is the previous full mesh. See
+  [Scaling](docs/src/operations/scaling.md#topology-mesh-or-region-tree).
 * Put the API/WS behind a load balancer; UDP media must reach the node the session was created on
   (`media_addr` in `SessionInitAck` already points there).
 * **Regions.** Label nodes with `server.region` and `server.location = { latitude, longitude }`,

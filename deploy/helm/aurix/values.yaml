@@ -96,6 +96,9 @@ config:
       endpoint: ""
   # Any additional AURIX__* variables (non-secret). Example:
   #   AURIX__MEDIA__MAX_PARTICIPANTS_PER_NODE: "20000"
+  #   AURIX__MEDIA__CASCADE_TOPOLOGY: "region_tree"   # or "mesh"
+  # A release deployed as a pure inter-regional cascade hub (no clients, /ws → 503):
+  #   AURIX__MEDIA__CASCADE_RELAY_ONLY: "true"
   extraEnv: {}
 
 # Secret material. Either set `existingSecret` to a Secret that already carries the keys

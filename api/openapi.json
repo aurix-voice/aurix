@@ -9274,6 +9274,11 @@
               "null"
             ]
           },
+          "relay_only": {
+            "type": "boolean",
+            "default": false,
+            "description": "The node is a pure cascade relay hub (`media.cascade_relay_only`): it hosts no client sessions (no `ws_url`, `capacity` 0, never selected for failover) and forwards inter-regional cascade traffic in the `region_tree` topology."
+          },
           "capacity": {
             "type": "integer"
           },

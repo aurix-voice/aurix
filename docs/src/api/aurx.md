@@ -59,6 +59,7 @@ have packet-type values but the WebSocket control plane is used for them.
 | `Directional` | `0x1000` | downlink payload carries 2 signed bytes (azimuth in π/127, elevation in π/254 units) after the gain byte |
 | `Pcmu` | `0x2000` | the audio frame is G.711 μ-law, not Opus — only on sessions that negotiated `SetAudioCodec {codec: "pcmu"}` ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)); the server sets it on the downlink copies sent to such sessions |
 | `Mixed` | `0x4000` | downlink only: the frame is the server's stereo mix of a whole channel for this receiver (`SetDownlinkMode {mode: "mixed"}`, [server mix](../features/channels.md#server-mix-for-native-clients)), under the channel's synthetic mix SSRC with its own sequence; per-receiver gains are baked in — never combined with `E2ee` or `Directional`, combined with `Pcmu` for PCMU sessions |
+| `RelayHop` | `0x8000` | `Relay` envelopes only: a hop byte (`0x80 \| hops`) follows the 16-byte sender id, so a [relay-tree](../operations/scaling.md#cascade-sfu-to-sfu-relay) hub can re-forward the envelope; hops are capped at 3 and a receiver never re-forwards an envelope without it |
 
 ## Keys and sealing
 

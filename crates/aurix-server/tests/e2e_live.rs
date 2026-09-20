@@ -1386,6 +1386,357 @@ async fn two_nodes_auto_cascade_relays_audio() {
     let _ = bob.ws.close(None).await;
 }
 
+/// Collects distinct audio sequence numbers from `ssrc` arriving at `to` until the link is
+/// quiet for 500 ms; panics on a duplicate (a relay tree must deliver every packet once).
+async fn audio_seqs_from(to: &Player, ssrc: u32, payload: &Bytes) -> Vec<u32> {
+    let mut seqs = Vec::new();
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(500), to.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
+        if p.header.packet_type != PacketType::Audio || p.header.ssrc != ssrc {
+            continue;
+        }
+        assert_eq!(&p.payload[..], &payload[..], "{}: payload intact", to.name);
+        assert!(
+            !seqs.contains(&p.header.sequence),
+            "{}: sequence {} from {ssrc} delivered twice (relay tree duplicated a packet)",
+            to.name,
+            p.header.sequence
+        );
+        seqs.push(p.header.sequence);
+    }
+    seqs
+}
+
+/// `seqs` is one burst of `expected` consecutive per-sender sequence numbers (the origin node
+/// renumbers a sender's audio once; the cascade preserves it), allowing two lost packets.
+fn assert_burst(seqs: &[u32], expected: usize, what: &str) {
+    let (min, max) = (
+        seqs.iter().copied().min().unwrap_or(0),
+        seqs.iter().copied().max().unwrap_or(0),
+    );
+    assert!(
+        seqs.len() + 2 >= expected && (max - min) < expected as u32,
+        "{what}: {} of {expected} packets, sequences {min}..={max}",
+        seqs.len()
+    );
+}
+
+fn metric_sum(body: &str, name: &str, label: &str) -> f64 {
+    body.lines()
+        .filter(|l| l.starts_with(name) && l.contains(label))
+        .filter_map(|l| l.split_whitespace().last()?.parse::<f64>().ok())
+        .sum()
+}
+
+/// Region-tree cascade over four nodes: nodes 1 and 2 (`us_east`) and node 3 (`eu_west`) host
+/// players, node 4 (`eu_west`) is a `cascade_relay_only` hub. Given by `AURIX_E2E_API3` /
+/// `AURIX_E2E_WS3`, `AURIX_E2E_WS4` and `AURIX_E2E_METRICS4`. Alice (node 1) talks to Carol
+/// (node 2, same region — direct) and Bob (node 3 — via the `us_east` hub and the relay-only
+/// `eu_west` hub, 3 hops); every packet arrives exactly once, the hub is never offered to
+/// clients, and — with `AURIX_E2E_NODE4_STOP` — losing the hub re-elects node 3 as the
+/// `eu_west` hub and cross-region audio recovers.
+#[tokio::test]
+#[ignore = "requires four Aurix nodes in two regions with a relay-only hub; see docs/operations/scaling.md"]
+async fn region_tree_relays_through_hub_exactly_once_and_survives_hub_loss() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let (Ok(ws2), Ok(ws3), Ok(ws4)) = (
+        std::env::var("AURIX_E2E_WS2"),
+        std::env::var("AURIX_E2E_WS3"),
+        std::env::var("AURIX_E2E_WS4"),
+    ) else {
+        eprintln!("AURIX_E2E_WS2/WS3/WS4 not set; skipping");
+        return;
+    };
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: ws2,
+        api_key: env.api_key.clone(),
+    };
+    let env3 = Env {
+        api: std::env::var("AURIX_E2E_API3").unwrap_or_else(|_| "http://127.0.0.1:8100".into()),
+        ws: ws3,
+        api_key: env.api_key.clone(),
+    };
+    let http = reqwest::Client::new();
+
+    // The relay-only hub is registered (admin registry) but never offered to clients.
+    let mut hub_id = None;
+    if let Ok(admin) = std::env::var("AURIX_E2E_ADMIN_TOKEN") {
+        let nodes: Vec<serde_json::Value> = http
+            .get(format!("{}/v1/nodes", env.api))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let hubs: Vec<&serde_json::Value> = nodes
+            .iter()
+            .filter(|n| n["relay_only"].as_bool() == Some(true))
+            .collect();
+        assert_eq!(
+            hubs.len(),
+            1,
+            "exactly one relay-only node registered: {nodes:?}"
+        );
+        assert!(
+            hubs[0]["ws_url"].is_null(),
+            "relay-only hub advertises no ws_url"
+        );
+        assert_eq!(hubs[0]["capacity"].as_u64(), Some(0));
+        assert_eq!(hubs[0]["region"].as_str(), Some("eu_west"));
+        hub_id = Some(hubs[0]["id"].as_str().unwrap().to_string());
+    } else {
+        eprintln!("AURIX_E2E_ADMIN_TOKEN not set; skipping the node-registry check");
+    }
+    let regions: serde_json::Value = http
+        .get(format!("{}/v1/regions", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let regions = regions["regions"].as_array().expect("regions array");
+    assert!(
+        regions.iter().any(|r| r["region"] == "eu_west"),
+        "eu_west is still offered through its hosting node: {regions:?}"
+    );
+    for r in regions {
+        assert!(
+            hub_id.is_none() || r["node_id"].as_str() != hub_id.as_deref(),
+            "region discovery must not hand out the relay-only hub: {r}"
+        );
+        let hub_hostport = ws4.trim_start_matches("ws://");
+        assert!(
+            r["ws_url"]
+                .as_str()
+                .is_some_and(|u| !u.contains(hub_hostport)),
+            "region discovery must not hand out the relay-only hub: {r}"
+        );
+    }
+    let mut req = format!("{ws4}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer bogus".parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => assert_eq!(
+            resp.status(),
+            503,
+            "a relay-only node refuses client sessions before authentication"
+        ),
+        other => panic!("relay-only /ws must answer 503, got {other:?}"),
+    }
+
+    let ch: serde_json::Value = http
+        .post(format!("{}/v1/channels", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"name": format!("tree-{}", uuid::Uuid::now_v7())}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let channel_id = ChannelId::from_uuid(ch["id"].as_str().unwrap().parse().unwrap());
+
+    let (tok_a, _) = issue_token(&env, &http, "tree:alice", "Alice", channel_id).await;
+    let (tok_c, _) = issue_token(&env2, &http, "tree:carol", "Carol", channel_id).await;
+    let (tok_b, _) = issue_token(&env3, &http, "tree:bob", "Bob", channel_id).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut carol = connect(&env2, "carol", tok_c).await;
+    let mut bob = connect(&env3, "bob", tok_b).await;
+    let ports: std::collections::HashSet<u16> = [&alice, &carol, &bob]
+        .iter()
+        .map(|p| p.media_addr.port())
+        .collect();
+    assert_eq!(ports.len(), 3, "players must land on three different nodes");
+    for p in [&mut alice, &mut carol, &mut bob] {
+        bind_media(p).await;
+    }
+    for p in [&mut alice, &mut carol, &mut bob] {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id,
+            token: tok,
+        })
+        .await;
+        p.expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    }
+    // Presence replicates through Redis: everyone sees the players that joined after them.
+    for (p, later) in [
+        (&mut alice, vec!["Carol", "Bob"]),
+        (&mut carol, vec!["Bob"]),
+    ] {
+        for other in later {
+            p.expect("ParticipantJoined from other nodes", |m| {
+                matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == other)
+            })
+            .await;
+        }
+    }
+
+    // Every node re-plans on the join events; wait until Alice reaches both regions.
+    let payload = Bytes::from_static(&[0xFC, 3, 1, 4, 1, 5, 9, 2, 6]);
+    let mut seq = 1u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        send_audio(&alice, channel_id, seq, &payload).await;
+        seq += 10;
+        let to_carol = audio_seqs_from(&carol, alice.ssrc, &payload).await;
+        let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+        if to_carol.len() >= 8 && to_bob.len() >= 8 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Alice's audio did not reach both regions (Carol {} / Bob {} packets)",
+            to_carol.len(),
+            to_bob.len()
+        );
+    }
+
+    // Steady state: 30 packets from Alice, each delivered exactly once in both regions, and
+    // Bob's audio takes the tree back (eu_west hub → us_east hub → nodes 1 and 2).
+    while alice.recv_udp().await.is_some() {}
+    while carol.recv_udp().await.is_some() {}
+    while bob.recv_udp().await.is_some() {}
+    for _ in 0..3 {
+        send_audio(&alice, channel_id, seq, &payload).await;
+        seq += 10;
+    }
+    let to_carol = audio_seqs_from(&carol, alice.ssrc, &payload).await;
+    let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+    assert_burst(&to_carol, 30, "Carol (same region, direct)");
+    assert_burst(&to_bob, 30, "Bob (other region, via two hubs)");
+    let bob_payload = Bytes::from_static(&[0xFC, 2, 7, 1, 8, 2, 8]);
+    let mut bob_seq = 5000u32;
+    send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
+    bob_seq += 10;
+    let back_a = audio_seqs_from(&alice, bob.ssrc, &bob_payload).await;
+    let back_c = audio_seqs_from(&carol, bob.ssrc, &bob_payload).await;
+    assert!(
+        back_a.len() >= 8,
+        "Alice got {} packets from Bob",
+        back_a.len()
+    );
+    assert!(
+        back_c.len() >= 8,
+        "Carol got {} packets from Bob",
+        back_c.len()
+    );
+
+    // The relay-only node really is the eu_west hub: it re-forwarded envelopes and hubs the
+    // channel, and never hit the hop cap.
+    if let Ok(metrics4) = std::env::var("AURIX_E2E_METRICS4") {
+        let body = http
+            .get(&metrics4)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let forwarded = metric_sum(&body, "aurix_cascade_forwarded_total", "role=\"hub\"");
+        assert!(
+            forwarded >= 40.0,
+            "relay-only hub forwarded only {forwarded} envelopes:\n{body}"
+        );
+        assert_eq!(
+            metric_sum(&body, "aurix_cascade_forwarded_total", "role=\"origin\""),
+            0.0,
+            "a relay-only node hosts nobody and originates nothing"
+        );
+        assert_eq!(
+            metric_sum(&body, "aurix_cascade_forwarded_total", "role=\"hop_limit\""),
+            0.0,
+            "hop cap must never be reached on a 3-hop path"
+        );
+        let hub_channels = metric_sum(&body, "aurix_cascade_hub_channels", "");
+        assert!(hub_channels >= 1.0, "hub gauge {hub_channels}");
+    } else {
+        eprintln!("AURIX_E2E_METRICS4 not set; skipping hub metric checks");
+    }
+
+    // Hub loss: kill node 4. Node 3 becomes its own region's hub once the registry marks node
+    // 4 unhealthy, and Alice ↔ Bob audio recovers without anyone re-joining.
+    if let Ok(stop) = std::env::var("AURIX_E2E_NODE4_STOP") {
+        let status = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&stop)
+            .status()
+            .await
+            .expect("run AURIX_E2E_NODE4_STOP");
+        assert!(status.success(), "AURIX_E2E_NODE4_STOP failed");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        let mut recovered = false;
+        while tokio::time::Instant::now() < deadline {
+            while bob.recv_udp().await.is_some() {}
+            send_audio(&alice, channel_id, seq, &payload).await;
+            seq += 10;
+            let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+            if to_bob.len() >= 8 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "cross-region audio did not recover after losing the hub"
+        );
+        // Same-region delivery was never affected and the tree still delivers once.
+        while carol.recv_udp().await.is_some() {}
+        while bob.recv_udp().await.is_some() {}
+        for _ in 0..2 {
+            send_audio(&alice, channel_id, seq, &payload).await;
+            seq += 10;
+        }
+        let to_carol = audio_seqs_from(&carol, alice.ssrc, &payload).await;
+        let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+        assert_burst(&to_carol, 20, "Carol after hub loss");
+        assert_burst(&to_bob, 20, "Bob after hub loss");
+        send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
+        let back_a = audio_seqs_from(&alice, bob.ssrc, &bob_payload).await;
+        assert!(
+            back_a.len() >= 8,
+            "Alice got {} packets from Bob after hub loss",
+            back_a.len()
+        );
+        if let Ok(start) = std::env::var("AURIX_E2E_NODE4_START") {
+            let status = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&start)
+                .status()
+                .await
+                .expect("run AURIX_E2E_NODE4_START");
+            assert!(status.success(), "AURIX_E2E_NODE4_START failed");
+        }
+    } else {
+        eprintln!("AURIX_E2E_NODE4_STOP not set; skipping the hub-loss scenario");
+    }
+
+    let _ = alice.ws.close(None).await;
+    let _ = carol.ws.close(None).await;
+    let _ = bob.ws.close(None).await;
+}
+
 /// Drains every audio packet from `ssrc` arriving at `to` until the link is quiet for 400 ms,
 /// returning the gain byte of the first one (`None` when not attenuated) and the packet count.
 async fn audio_from(to: &Player, ssrc: u32, payload: &Bytes) -> (Option<u8>, usize) {

@@ -70,8 +70,12 @@ the chapter that explains the boundary.
   per node. `audience.max_speakers` is enforced when a speaker joins — nobody is demoted once
   admitted — and `max_streams` ranks by receiver gains and sender-reported level, not by
   server-side voice analysis ([Large channels](features/channels.md#large-channels-and-audiences)).
-* **Cascade is a one-hop mesh** between the nodes that host a channel — no relay trees; nodes
-  must reach each other directly on `media.port + 1`/UDP ([Scaling](operations/scaling.md)).
+* **Cascade trees are region-deep only.** `region_tree` elects one hub per region per channel
+  from registry metadata (region, health, address family, `relay_only`) — not from measured RTT
+  or link cost — and caps a path at 3 hops (origin → hub → hub → node); there is no multi-level
+  tree inside a region and no per-link bandwidth awareness. Hub loss drops cross-region audio
+  for the affected channels until the next reconciliation pass (≤ `cascade_discovery_interval_ms`
+  plus the health timeout) ([Scaling](operations/scaling.md#topology-mesh-or-region-tree)).
 * **Positional audio is server-side attenuation, panning and radius scoping** from
   client-reported positions; the server does no occlusion, reverb or HRTF, and the ambient mix ranks by
   reported loudness only (no server-side voice-activity analysis of the payload). Directional panning applies to native and WebRTC

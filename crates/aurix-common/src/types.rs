@@ -91,7 +91,7 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MediaNodeId(pub Uuid);
 
 impl Default for MediaNodeId {
@@ -254,7 +254,7 @@ pub enum MuteScope {
     Server,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Region {
     UsEast,
@@ -942,6 +942,10 @@ pub struct MediaNodeInfo {
     pub healthy: bool,
     pub last_heartbeat: DateTime<Utc>,
     pub capacity: u32,
+    /// Pure cascade relay hub (`media.cascade_relay_only`): never hosts clients, never
+    /// selected for sessions or failover, preferred as a regional hub for relay trees.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 impl MediaNodeInfo {
@@ -953,7 +957,7 @@ impl MediaNodeInfo {
     }
 
     pub fn is_available(&self) -> bool {
-        self.healthy && self.load_factor() < 0.9
+        self.healthy && !self.relay_only && self.load_factor() < 0.9
     }
 }
 

@@ -99,6 +99,7 @@ impl NodeManager {
             healthy: row.healthy && age <= HEARTBEAT_TIMEOUT_SECS,
             last_heartbeat: row.last_heartbeat,
             capacity: row.capacity.max(0) as u32,
+            relay_only: row.relay_only,
         }
     }
 
@@ -123,6 +124,7 @@ impl NodeManager {
             bandwidth_in_mbps: info.bandwidth_in_mbps as f64,
             bandwidth_out_mbps: info.bandwidth_out_mbps as f64,
             healthy: info.healthy,
+            relay_only: info.relay_only,
             version: env!("CARGO_PKG_VERSION").to_string(),
             last_heartbeat: Utc::now(),
             registered_at: Utc::now(),
@@ -388,6 +390,7 @@ mod tests {
             healthy: true,
             last_heartbeat: Utc::now(),
             capacity: 100,
+            relay_only: false,
         }
     }
 

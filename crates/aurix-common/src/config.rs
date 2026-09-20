@@ -146,6 +146,21 @@ impl AurixConfig {
         if self.media.max_participants_per_node == 0 {
             anyhow::bail!("max_participants_per_node must be > 0");
         }
+        if self.media.cascade_relay_only {
+            if self.media.cascade_secret.is_none() {
+                anyhow::bail!("media.cascade_relay_only = true requires media.cascade_secret");
+            }
+            if !self.media.cascade_discovery {
+                anyhow::bail!(
+                    "media.cascade_relay_only = true requires media.cascade_discovery = true"
+                );
+            }
+            if self.media.cascade_topology != CascadeTopologyMode::RegionTree {
+                anyhow::bail!(
+                    "media.cascade_relay_only = true requires media.cascade_topology = \"region_tree\""
+                );
+            }
+        }
         validate_families(
             "media",
             &self.media.host,
@@ -1311,6 +1326,30 @@ pub struct MediaConfig {
     /// How often (ms) the cascade topology is reconciled against the registry.
     #[serde(default = "default_cascade_discovery_interval_ms")]
     pub cascade_discovery_interval_ms: u64,
+    /// How discovered nodes are connected for a channel spanning several of them:
+    /// `mesh` — every hosting node sends directly to every other hosting node (one hop);
+    /// `region_tree` — nodes send to the other hosting nodes *in their own region* directly
+    /// and cross-region traffic goes through one hub per region (relay-only nodes first,
+    /// then the healthiest hosting node), so each inter-regional link carries one copy of
+    /// each stream regardless of how many nodes host the channel there.
+    #[serde(default)]
+    pub cascade_topology: CascadeTopologyMode,
+    /// Run this node as a pure cascade hub: it registers with no client endpoint and zero
+    /// capacity (never selected for sessions or failover), rejects `/ws`, and forwards relay
+    /// traffic between regions. Requires `cascade_secret`.
+    #[serde(default)]
+    pub cascade_relay_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CascadeTopologyMode {
+    /// One-hop full mesh between the nodes hosting a channel.
+    Mesh,
+    /// Direct within a region, one hub per region for inter-regional traffic (at most 3 hops:
+    /// origin → own hub → remote hub → hosting node).
+    #[default]
+    RegionTree,
 }
 
 fn default_true() -> bool {
@@ -1382,6 +1421,8 @@ impl Default for MediaConfig {
             cascade_peers: Vec::new(),
             cascade_discovery: true,
             cascade_discovery_interval_ms: 3000,
+            cascade_topology: CascadeTopologyMode::RegionTree,
+            cascade_relay_only: false,
         }
     }
 }

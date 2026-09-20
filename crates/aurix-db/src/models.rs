@@ -334,6 +334,9 @@ pub struct MediaNodeRow {
     pub bandwidth_in_mbps: f64,
     pub bandwidth_out_mbps: f64,
     pub healthy: bool,
+    /// Pure inter-regional cascade hub: hosts no clients, only forwards relay traffic.
+    #[sqlx(default)]
+    pub relay_only: bool,
     pub version: String,
     pub last_heartbeat: DateTime<Utc>,
     pub registered_at: DateTime<Utc>,

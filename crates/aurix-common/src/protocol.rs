@@ -210,6 +210,10 @@ impl PacketHeader {
         self.flags |= flag as u16;
     }
 
+    pub fn clear_flag(&mut self, flag: PacketFlags) {
+        self.flags &= !(flag as u16);
+    }
+
     pub fn has_flag(&self, flag: PacketFlags) -> bool {
         self.flags & (flag as u16) != 0
     }
@@ -248,6 +252,9 @@ pub enum PacketFlags {
     /// (`system_voice_ssrc`), with the receiver's mutes, volumes, focus and positional /
     /// ambient gains already applied. Never combined with `E2ee` or `Directional`.
     Mixed = 0x4000,
+    /// `Relay` envelopes only: the payload carries a hop byte after the sender id
+    /// (`AurixPacket::relay_envelope_hop`), so hub nodes of a relay tree can re-forward it.
+    RelayHop = 0x8000,
 }
 
 #[derive(Debug, Clone)]
@@ -595,6 +602,31 @@ impl AurixPacket {
         counter: u64,
         sender: &UserId,
     ) -> Self {
+        Self::relay_envelope_inner(inner, relay_ssrc, counter, sender, None)
+    }
+
+    /// A `Relay` envelope that also carries its relay-tree hop count (`RelayHop` flag): the
+    /// payload is `sender` (16 bytes), one hop byte (`RELAY_HOP_MARK | hop`) and the client
+    /// packet. Hub nodes re-forward such envelopes with `hop + 1` (see `aurix-media`'s cascade)
+    /// and never beyond `MAX_RELAY_HOPS`; envelopes without the flag are one-hop mesh traffic
+    /// and are never re-forwarded.
+    pub fn relay_envelope_hop(
+        inner: &AurixPacket,
+        relay_ssrc: u32,
+        counter: u64,
+        sender: &UserId,
+        hop: u8,
+    ) -> Self {
+        Self::relay_envelope_inner(inner, relay_ssrc, counter, sender, Some(hop))
+    }
+
+    fn relay_envelope_inner(
+        inner: &AurixPacket,
+        relay_ssrc: u32,
+        counter: u64,
+        sender: &UserId,
+        hop: Option<u8>,
+    ) -> Self {
         let mut hdr = PacketHeader::new(
             PacketType::Relay,
             counter as u32,
@@ -604,27 +636,58 @@ impl AurixPacket {
         hdr.set_flag(PacketFlags::Relay);
         hdr.channel_id_hash = inner.header.channel_id_hash;
         let encoded = inner.encode();
-        let mut payload = BytesMut::with_capacity(16 + encoded.len());
+        let mut payload = BytesMut::with_capacity(17 + encoded.len());
         payload.put_slice(sender.0.as_bytes());
+        if let Some(hop) = hop {
+            hdr.set_flag(PacketFlags::RelayHop);
+            payload.put_u8(RELAY_HOP_MARK | (hop & RELAY_HOP_MASK));
+        }
         payload.put_slice(&encoded);
         Self::new(hdr, payload.freeze())
     }
 
     /// Extract the sending user and the client packet carried by an opened `Relay` envelope.
     pub fn relay_inner(&self) -> Result<(UserId, AurixPacket)> {
+        let (sender, _, inner) = self.relay_inner_hop()?;
+        Ok((sender, inner))
+    }
+
+    /// Like [`Self::relay_inner`], also returning the relay-tree hop count when the envelope
+    /// carries one (`None` for one-hop mesh envelopes).
+    pub fn relay_inner_hop(&self) -> Result<(UserId, Option<u8>, AurixPacket)> {
         if self.header.packet_type != PacketType::Relay {
             return Err(AurixError::Transport("Not a Relay packet".into()));
         }
-        if self.payload.len() < 16 + HEADER_SIZE {
+        let with_hop = self.header.has_flag(PacketFlags::RelayHop);
+        let prefix = if with_hop { 17 } else { 16 };
+        if self.payload.len() < prefix + HEADER_SIZE {
             return Err(AurixError::Transport("Relay envelope too short".into()));
         }
         let sender = UserId(
             uuid::Uuid::from_slice(&self.payload[..16])
                 .map_err(|_| AurixError::Transport("Invalid relay sender id".into()))?,
         );
-        Ok((sender, AurixPacket::decode(&self.payload[16..])?))
+        let hop = if with_hop {
+            let b = self.payload[16];
+            if b & !RELAY_HOP_MASK != RELAY_HOP_MARK {
+                return Err(AurixError::Transport("Invalid relay hop byte".into()));
+            }
+            Some(b & RELAY_HOP_MASK)
+        } else {
+            None
+        };
+        Ok((sender, hop, AurixPacket::decode(&self.payload[prefix..])?))
     }
 }
+
+/// Most node-to-node hops a client packet may take through the cascade: origin node →
+/// regional hub (1) → remote hub (2) → hosting node (3). A node never re-forwards an envelope
+/// whose hop count already reached this, so an inconsistent topology cannot loop traffic.
+pub const MAX_RELAY_HOPS: u8 = 3;
+/// High bit of the hop byte, so it can never be mistaken for a packet version by a node that
+/// does not understand the `RelayHop` flag.
+pub const RELAY_HOP_MARK: u8 = 0x80;
+const RELAY_HOP_MASK: u8 = 0x0F;
 
 /// Anti-replay window over a monotonic sequence (RFC 3711 §3.3.2 style, 64-packet window).
 /// Works on 32-bit client sequences and on the 64-bit cascade envelope counter.
@@ -1745,6 +1808,39 @@ mod tests {
         assert_eq!(back.header.channel_id_hash, 88);
         assert_eq!(&back.payload[..], b"frame");
         assert!(!back.is_authenticated());
+        assert_eq!(got.relay_inner_hop().unwrap().1, None);
+    }
+
+    #[test]
+    fn relay_envelope_hop_roundtrip_and_mesh_compat() {
+        let keys = MediaKeys::derive(b"cluster-cascade-secret");
+        let inner = AurixPacket::audio(5, 960, 77, 88, Bytes::from_static(b"frame"));
+        let sender = UserId::new();
+        let env = AurixPacket::relay_envelope_hop(&inner, 1, 7, &sender, 1);
+        assert!(env.header.has_flag(PacketFlags::Relay));
+        assert!(env.header.has_flag(PacketFlags::RelayHop));
+        let wire = env.seal(&keys);
+        let mut got = AurixPacket::decode_bounded(&wire, MAX_RELAY_PACKET_SIZE).unwrap();
+        assert!(got.open(&keys));
+        let (from, hop, back) = got.relay_inner_hop().unwrap();
+        assert_eq!(from, sender);
+        assert_eq!(hop, Some(1));
+        assert_eq!(&back.payload[..], b"frame");
+        assert_eq!(back.header.ssrc, 77);
+        // `relay_inner` skips the hop byte too.
+        assert_eq!(got.relay_inner().unwrap().1.header.ssrc, 77);
+        // A hop byte without the mark is rejected (garbage / old format under the new flag).
+        let mut tampered = got.clone();
+        let mut p = tampered.payload.to_vec();
+        p[16] = 0x02;
+        tampered.payload = Bytes::from(p);
+        assert!(tampered.relay_inner_hop().is_err());
+        // A mesh node that does not know the flag reads the hop byte as the inner version
+        // and rejects the packet instead of misparsing it.
+        let mut legacy_view = got.clone();
+        legacy_view.header.clear_flag(PacketFlags::RelayHop);
+        assert!(legacy_view.relay_inner().is_err());
+        assert_eq!(MAX_RELAY_HOPS, 3);
     }
 
     #[test]

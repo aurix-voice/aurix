@@ -384,6 +384,28 @@ pub static STREAMS_CAPPED: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `role` is `origin` (a locally received client packet sent to peers), `hub` (a relay
+/// envelope from a peer re-forwarded along the relay tree) or `hop_limit` (an envelope that
+/// had a forwarding rule but already travelled `MAX_RELAY_HOPS`, dropped).
+pub static CASCADE_FORWARDED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_cascade_forwarded_total",
+        "Cascade relay envelopes sent to peer nodes, by the sending node's role",
+        &["role"]
+    )
+    .unwrap()
+});
+
+/// Channels this node currently forwards for as a relay-tree hub (it re-forwards envelopes
+/// between its region and other regions), including channels it does not host itself.
+pub static CASCADE_HUB_CHANNELS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_cascade_hub_channels",
+        "Channels for which this node acts as a cascade relay-tree hub"
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
     let _ = &*PCMU_FRAMES;
     let _ = &*PCMU_SESSIONS;
