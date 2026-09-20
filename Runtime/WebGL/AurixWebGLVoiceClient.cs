@@ -121,6 +121,8 @@ namespace Aurix.WebGL
         public event Action<Guid, bool> OnUserBlockChanged;
         public event Action<TransmissionMode> OnTransmissionChanged;
         public event Action<Guid?> OnChannelFocusChanged;
+        /// <summary>The node changed which participant is forwarded on which dedicated WebRTC track (see <see cref="GetParticipantStreamsAsync"/>).</summary>
+        public event Action<IReadOnlyList<WebGLParticipantStream>> OnParticipantStreams;
         public event Action<ChatMessage> OnChatMessage;
         public event Action<ChatReadMarker> OnChatReadMarker;
         public event Action<int, bool> OnChatInboxSynced;
@@ -380,6 +382,32 @@ namespace Aurix.WebGL
             return Sync("setChannelFocus", args);
         }
 
+        // ---- per-participant tracks ---------------------------------------------------------------
+
+        /// <summary>
+        /// Participants that must keep a dedicated WebRTC track while they are audible (at most
+        /// <see cref="GetParticipantStreamCapAsync"/>); the rest of the slots follow who is speaking.
+        /// Unpinned speakers without a slot stay audible through the mixed track. Replayed after reconnects.
+        /// </summary>
+        public Task SetPinnedParticipantsAsync(IReadOnlyList<Guid> userIds, CancellationToken ct = default)
+        {
+            var ids = new List<object>();
+            if (userIds != null) foreach (var id in userIds) ids.Add(id);
+            return Sync("setPinnedParticipants", new Dictionary<string, object> { { "userIds", ids } });
+        }
+
+        /// <summary>Dedicated tracks the node allows per browser session (0: mixed only / older node).</summary>
+        public Task<int> GetParticipantStreamCapAsync(CancellationToken ct = default) =>
+            CallAsync("participantStreamCap", null, o => (int)MiniJson.GetNumber(o, "value"), ct, rawValue: true);
+
+        /// <summary>Current track → participant layout; also delivered through <see cref="OnParticipantStreams"/>.</summary>
+        public Task<IReadOnlyList<WebGLParticipantStream>> GetParticipantStreamsAsync(CancellationToken ct = default) =>
+            CallAsync("participantStreams", null, o => BridgeJson.ParticipantStreams(BridgeJson.Arr(o, "value")), ct, rawValue: true);
+
+        /// <summary>True while <paramref name="userId"/> plays through the browser's HRTF/equal-power panner (positional channel, known positions).</summary>
+        public bool IsParticipantSpatialized(Guid userId) =>
+            _handle > 0 && Value("isParticipantSpatialized", new Dictionary<string, object> { { "userId", userId } }) is bool b && b;
+
         // ---- chat ---------------------------------------------------------------------------------
 
         public Task<ChatMessage> SendMessageAsync(Guid channelId, string text, object metadata = null, string clientRef = null, CancellationToken ct = default) =>
@@ -467,7 +495,10 @@ namespace Aurix.WebGL
 
         // ---- browser audio ------------------------------------------------------------------------
 
-        /// <summary>Retry starting remote playback; call from a user gesture after <see cref="OnRemoteAudio"/> reported it blocked.</summary>
+        /// <summary>
+        /// Retry starting remote playback (the mixed track's element and the Web Audio graph of the
+        /// per-participant tracks); call from a user gesture after <see cref="OnRemoteAudio"/> reported it blocked.
+        /// </summary>
         public Task ResumeAudioAsync(CancellationToken ct = default) => CallAsync("resumeAudio", null, o => true, ct);
 
         /// <summary>Microphones and speakers the browser exposes; output selection needs <c>setSinkId</c> support (Chromium).</summary>
@@ -831,6 +862,9 @@ namespace Aurix.WebGL
                     OnChannelFocusChanged?.Invoke(focus);
                     return;
                 }
+                case "participantStreams":
+                    OnParticipantStreams?.Invoke(BridgeJson.ParticipantStreams(BridgeJson.Arr(e, "streams")));
+                    return;
                 case "recovering":
                     OnRecovering?.Invoke((int)MiniJson.GetNumber(e, "attempt"), TimeSpan.FromMilliseconds(MiniJson.GetNumber(e, "delayMs")),
                         MiniJson.GetString(e, "cause") ?? string.Empty);

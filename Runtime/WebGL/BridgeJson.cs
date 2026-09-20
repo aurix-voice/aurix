@@ -361,6 +361,24 @@ namespace Aurix.WebGL
             Bars = (int)MiniJson.GetNumber(o, "bars"),
         };
 
+        internal static IReadOnlyList<WebGLParticipantStream> ParticipantStreams(List<object> arr)
+        {
+            var list = new List<WebGLParticipantStream>();
+            if (arr == null) return list;
+            foreach (var item in arr)
+            {
+                var s = MiniJson.AsObject(item);
+                if (s == null) continue;
+                list.Add(new WebGLParticipantStream
+                {
+                    Mid = MiniJson.GetString(s, "mid") ?? string.Empty,
+                    UserId = MiniJson.GetGuid(s, "userId"),
+                    Live = MiniJson.GetBool(s, "live"),
+                });
+            }
+            return list;
+        }
+
         internal static WebGLAudioDevices Devices(Dictionary<string, object> o)
         {
             var devices = new WebGLAudioDevices();
