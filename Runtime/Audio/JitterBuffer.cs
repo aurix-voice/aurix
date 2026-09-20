@@ -23,6 +23,10 @@ namespace Aurix.Audio
         private bool _started;
 
         public int Count => _frames.Count;
+        /// <summary>Sequence of the next playout slot; meaningful once playout has started.</summary>
+        public uint NextSeq { get { lock (_frames) return _nextSeq; } }
+        /// <summary>Whether playout has started (the target depth was reached once since the last reset).</summary>
+        public bool Started { get { lock (_frames) return _started; } }
         public int Lost { get; private set; }
         public int Late { get; private set; }
         /// <summary>Lost slots for which the following packet was already here (FEC recovery possible).</summary>
@@ -80,8 +84,23 @@ namespace Aurix.Audio
         /// </summary>
         public bool Pop(out byte[] opus, out byte[] fecFrom)
         {
+            bool r = Pop(out opus, out var later, out int framesBefore);
+            fecFrom = framesBefore == 1 ? later : null;
+            return r;
+        }
+
+        /// <summary>
+        /// <see cref="Pop(out byte[])"/> that, for a lost slot, also hands out the nearest later packet already
+        /// buffered (<paramref name="laterPacket"/>) and how many frames after the lost one it sits
+        /// (<paramref name="framesBefore"/>: 1 = the very next packet, usable for in-band FEC; more = only its
+        /// Deep REDundancy can rebuild the slot, see <see cref="IOpusDredDecoder"/>). Both are null/0 when the
+        /// slot is not lost or nothing later is buffered.
+        /// </summary>
+        public bool Pop(out byte[] opus, out byte[] laterPacket, out int framesBefore)
+        {
             opus = null;
-            fecFrom = null;
+            laterPacket = null;
+            framesBefore = 0;
             lock (_frames)
             {
                 if (_frames.Count == 0) return false;
@@ -105,9 +124,11 @@ namespace Aurix.Audio
                 if (SeqBefore(_nextSeq, en.Current.Key))
                 {
                     Lost++;
+                    laterPacket = en.Current.Value;
+                    framesBefore = (int)(en.Current.Key - _nextSeq);
+                    if (framesBefore == 1) Recoverable++;
                     _nextSeq++;
-                    if (_frames.TryGetValue(_nextSeq, out fecFrom)) Recoverable++;
-                    return true; // opus == null → PLC
+                    return true; // opus == null → FEC / DRED / PLC
                 }
                 return false;
             }
@@ -135,6 +156,11 @@ namespace Aurix.Audio
         public long Lost;
         /// <summary>Lost frames rebuilt from the next packet's in-band FEC (a subset of <see cref="Lost"/>).</summary>
         public long FecRecovered;
+        /// <summary>
+        /// Lost frames rebuilt from a later packet's Deep REDundancy (libopus 1.5+, <see cref="IOpusDredDecoder"/>;
+        /// a subset of <see cref="Lost"/>). Whatever neither FEC nor DRED covers is concealed with PLC.
+        /// </summary>
+        public long DredRecovered;
         /// <summary>Frames that arrived after their playout slot and were dropped.</summary>
         public long Late;
         /// <summary>
@@ -159,12 +185,14 @@ namespace Aurix.Audio
             public JitterBuffer Jitter = new JitterBuffer();
             public IOpusCodec Decoder;
             public IOpusFecDecoder Fec;
+            public IOpusDredDecoder Dred;
             public AudioCodec Codec;
             public bool Mixed;
             /// <summary>Decoded two-wide: a server mix or a sender that has sent at least one stereo packet.</summary>
             public bool Stereo;
             public bool Panned;
             public long FecRecovered;
+            public long DredRecovered;
             public float Volume = 1f;
             public float LeftGain = 1f;
             public float RightGain = 1f;
@@ -186,7 +214,8 @@ namespace Aurix.Audio
         private float _outputVolume = 1f;
         private volatile bool _outputMuted;
         private volatile bool _visemes;
-        private long _retiredLost, _retiredLate, _retiredFec, _underruns;
+        private long _retiredLost, _retiredLate, _retiredFec, _retiredDred, _underruns;
+        private OpusDecoderSettings _decoderSettings = OpusDecoderSettings.Default;
 
         public RemoteMixer(Func<IOpusCodec> decoderFactory) : this(decoderFactory, null) { }
 
@@ -221,6 +250,25 @@ namespace Aurix.Audio
         {
             get => _outputMuted;
             set => _outputMuted = value;
+        }
+
+        /// <summary>
+        /// Tuning of every stream's Opus decoder (libopus 1.5+ neural PLC / OSCE), applied to the decoders
+        /// already running and to every one created later. Only decoders implementing
+        /// <see cref="IOpusDecoderControls"/> (<see cref="NativeOpusCodec"/>) honour it; Concentus and PCMU ignore it.
+        /// </summary>
+        public OpusDecoderSettings DecoderSettings
+        {
+            get { lock (_streams) return _decoderSettings; }
+            set
+            {
+                lock (_streams)
+                {
+                    _decoderSettings = value.Clamped();
+                    foreach (var s in _streams.Values)
+                        if (s.Decoder is IOpusDecoderControls c) c.ApplyDecoder(_decoderSettings);
+                }
+            }
         }
 
         /// <summary>
@@ -336,6 +384,7 @@ namespace Aurix.Audio
                     Retire(s);
                     s.Jitter = new JitterBuffer();
                     s.FecRecovered = 0;
+                    s.DredRecovered = 0;
                     s.FramePos = s.FrameLen = 0;
                     Attach(s, codec, mixed, stereo);
                 }
@@ -354,13 +403,31 @@ namespace Aurix.Audio
                 s.LastActivityTicks = now;
                 if (s.Starved)
                 {
-                    // A talk spurt after silence: refill the target depth before playing again.
-                    s.Jitter.Reset();
+                    bool resumed = now - s.StarvedAtTicks < UnderrunResumeWindow.Ticks;
+                    // A talk spurt after silence refills the target depth before playing again — unless the
+                    // stream ran dry mid-spurt and this packet's redundancy can rebuild the frames missed
+                    // meanwhile: then it keeps its sequence and the gap plays late, rebuilt.
+                    if (!(resumed && codec == AudioCodec.Opus && PacketBridgesGap(s, seq, payload))) s.Jitter.Reset();
                     s.Starved = false;
-                    if (now - s.StarvedAtTicks < UnderrunResumeWindow.Ticks) _underruns++;
+                    if (resumed) _underruns++;
                 }
             }
             s.Jitter.Push(seq, payload);
+        }
+
+        /// <summary>Longest gap DRED is asked to bridge, in 20 ms frames (libopus codes up to ~1 s).</summary>
+        public const int MaxDredGapFrames = 52;
+
+        private static bool PacketBridgesGap(Stream s, uint seq, byte[] packet)
+        {
+            if (!s.Jitter.Started || s.Jitter.Count > 0) return true;
+            int gap = (int)(seq - s.Jitter.NextSeq);
+            if (gap <= 0 || gap > MaxDredGapFrames) return false;
+            if (gap == 1 && s.Fec != null) return true;
+            if (s.Dred == null) return false;
+            int cap = AudioFormat.FrameSamples * 3 * s.Decoder.Channels;
+            if (s.Frame == null || s.Frame.Length < cap) s.Frame = new float[cap];
+            return s.Dred.DecodeDred(packet, gap, s.Frame, AudioFormat.FrameSamples) > 0;
         }
 
         private void Attach(Stream s, AudioCodec codec, bool mixed, bool stereo)
@@ -370,6 +437,8 @@ namespace Aurix.Audio
                 : _decoderFactory();
             s.Decoder = decoder;
             s.Fec = decoder as IOpusFecDecoder;
+            s.Dred = decoder as IOpusDredDecoder;
+            if (decoder is IOpusDecoderControls controls) controls.ApplyDecoder(_decoderSettings);
             s.Codec = codec;
             s.Mixed = mixed;
             s.Stereo = codec == AudioCodec.Opus && stereo;
@@ -415,8 +484,14 @@ namespace Aurix.Audio
             {
                 lock (_streams)
                 {
-                    var t = new MixerTotals { Lost = _retiredLost, Late = _retiredLate, FecRecovered = _retiredFec, Underruns = _underruns };
-                    foreach (var s in _streams.Values) { t.Lost += s.Jitter.Lost; t.Late += s.Jitter.Late; t.FecRecovered += s.FecRecovered; }
+                    var t = new MixerTotals { Lost = _retiredLost, Late = _retiredLate, FecRecovered = _retiredFec, DredRecovered = _retiredDred, Underruns = _underruns };
+                    foreach (var s in _streams.Values)
+                    {
+                        t.Lost += s.Jitter.Lost;
+                        t.Late += s.Jitter.Late;
+                        t.FecRecovered += s.FecRecovered;
+                        t.DredRecovered += s.DredRecovered;
+                    }
                     return t;
                 }
             }
@@ -430,6 +505,7 @@ namespace Aurix.Audio
             _retiredLost += s.Jitter.Lost;
             _retiredLate += s.Jitter.Late;
             _retiredFec += s.FecRecovered;
+            _retiredDred += s.DredRecovered;
             s.Decoder.Dispose();
             s.Visemes?.Dispose();
             s.Visemes = null;
@@ -551,6 +627,25 @@ namespace Aurix.Audio
             foreach (var k in _stale) { Retire(_streams[k]); _streams.Remove(k); }
         }
 
+        /// <summary>
+        /// One lost 20 ms slot: the very next packet's in-band FEC first, a later packet's Deep REDundancy
+        /// next, plain PLC for whatever neither carries.
+        /// </summary>
+        private static int Recover(Stream s, byte[] later, int framesBefore)
+        {
+            if (later != null && framesBefore == 1 && s.Fec != null)
+            {
+                int n = s.Fec.DecodeFec(later, s.Frame, AudioFormat.FrameSamples);
+                if (n > 0) { s.FecRecovered++; return n; }
+            }
+            if (later != null && framesBefore >= 1 && s.Dred != null)
+            {
+                int n = s.Dred.DecodeDred(later, framesBefore, s.Frame, AudioFormat.FrameSamples);
+                if (n > 0) { s.DredRecovered++; return n; }
+            }
+            return s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
+        }
+
         /// <summary>Render one stream (added) and return the frames written.</summary>
         private static int RenderStream(Stream s, float[] output, int offset, int framesNeeded, int outputChannels, float master, bool panAllowed, long now)
         {
@@ -559,7 +654,7 @@ namespace Aurix.Audio
             {
                 if (s.FramePos >= s.FrameLen)
                 {
-                    if (!s.Jitter.Pop(out var opus, out var fecFrom))
+                    if (!s.Jitter.Pop(out var opus, out var later, out int framesBefore))
                     {
                         if (s.Jitter.Count == 0 && !s.Starved)
                         {
@@ -574,14 +669,8 @@ namespace Aurix.Audio
                     int n;
                     if (opus != null)
                         n = s.Decoder.Decode(opus, s.Frame, AudioFormat.FrameSamples * 3);
-                    else if (fecFrom != null && s.Fec != null)
-                    {
-                        n = s.Fec.DecodeFec(fecFrom, s.Frame, AudioFormat.FrameSamples);
-                        if (n > 0) s.FecRecovered++;
-                        else n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
-                    }
                     else
-                        n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
+                        n = Recover(s, later, framesBefore);
                     s.FrameLen = Math.Max(0, n) * dc;
                     s.FramePos = 0;
                     if (s.FrameLen == 0) break;
