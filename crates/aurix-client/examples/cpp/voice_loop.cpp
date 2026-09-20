@@ -196,6 +196,11 @@ int main(int argc, char** argv) {
             phase += kTwoPi * 440.0 / AURIX_SAMPLE_RATE;
         }
         client.push_capture(tone.data(), tone.size(), AURIX_SAMPLE_RATE, 1);
+        // Engine spatialization would claim each talker (so mix_output skips it) and pull it
+        // from its own emitter instead:
+        //   client.set_participant_claimed(user, true);
+        //   client.pull_participant(user, buf, n, 1);
+        //   for (const AurixParticipantStream& s : client.participant_streams()) ...
         if (client.mix_output(out.data(), out.size(), 2) > 0) {
             ++active_frames;
         }

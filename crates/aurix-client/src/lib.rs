@@ -41,7 +41,7 @@ pub use aurix_common::types::{
     Orientation3D, Position3D, SessionId, UserId,
 };
 
-pub use client::{Client, ClientStats, TransmitStats};
+pub use client::{Client, ClientStats, ParticipantStream, TransmitStats};
 pub use config::{ClientConfig, ReconnectPolicy};
 pub use dsp::{DspConfig, DspStats, NoiseSuppression};
 pub use error::{ClientError, Result};

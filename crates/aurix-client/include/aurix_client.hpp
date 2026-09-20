@@ -286,6 +286,30 @@ public:
     std::size_t mix_output(std::int16_t* out, std::size_t samples, std::uint8_t channels) {
         return aurix_client_mix_output_i16(c_, out, samples, channels);
     }
+    /// Per-participant playout for engine spatialization: overwrites `out` with `user`'s voice
+    /// only (no local panning). Returns frames that carried audio; the rest is silence. Not fed
+    /// to the AEC — `push_render` the engine's final output.
+    std::size_t pull_participant(const Uuid& user, float* out, std::size_t samples, std::uint8_t channels) {
+        return aurix_client_pull_participant_f32(c_, &user.raw, out, samples, channels);
+    }
+    std::size_t pull_participant(const Uuid& user, std::int16_t* out, std::size_t samples, std::uint8_t channels) {
+        return aurix_client_pull_participant_i16(c_, &user.raw, out, samples, channels);
+    }
+    /// Take `user` out of `mix_output` while a per-participant emitter pulls it (and back).
+    AurixResult set_participant_claimed(const Uuid& user, bool claimed) {
+        return aurix_client_set_participant_claimed(c_, &user.raw, claimed);
+    }
+    /// Downlink streams currently buffered, with their owners.
+    std::vector<AurixParticipantStream> participant_streams() const {
+        std::vector<AurixParticipantStream> buf(32);
+        std::size_t n = aurix_client_participant_streams(c_, buf.data(), buf.size());
+        if (n > buf.size()) {
+            buf.resize(n);
+            n = aurix_client_participant_streams(c_, buf.data(), buf.size());
+        }
+        buf.resize(n < buf.size() ? n : buf.size());
+        return buf;
+    }
     /// Echo-canceller reference for audio played outside `mix_output` (48 kHz interleaved).
     void push_render(const float* pcm, std::size_t samples, std::uint8_t channels) {
         aurix_client_push_render_f32(c_, pcm, samples, channels);

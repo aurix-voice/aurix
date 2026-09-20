@@ -602,6 +602,42 @@ struct AURIXVOICE_API FAurixTtsStatus
 	FString Message;
 };
 
+/** One downlink audio stream held by the client's jitter buffers (see GetParticipantStreams). */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixParticipantStream
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 Ssrc = 0;
+
+	/** Owner across the joined channels; invalid for a server mix or an unknown sender. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid UserId;
+
+	/** Server-synthesized voice (TTS / announcement) of UserId rather than its microphone. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bSynthesized = false;
+
+	/** Server-mixed channel downlink (DownlinkMode Mixed) — no per-participant identity. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bMixed = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bStereo = false;
+
+	/** False while the stream is starved (nothing buffered). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bActive = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 BufferedFrames = 0;
+
+	/** Rendered by a participant sound (CreateParticipantSound) instead of the aggregate mix. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bClaimed = false;
+};
+
 /** Pose of one user for a positional channel, in metres (the channel config decides handedness). */
 USTRUCT(BlueprintType)
 struct AURIXVOICE_API FAurixPosition

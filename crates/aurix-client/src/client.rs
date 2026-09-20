@@ -108,6 +108,24 @@ pub struct ClientStats {
     pub streams: Vec<StreamStats>,
 }
 
+/// One downlink stream held by the jitter buffers (see [`Client::participant_streams`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParticipantStream {
+    pub ssrc: u32,
+    /// Owner across the joined channels; `None` for a server mix or a sender whose roster
+    /// entry has not arrived (yet).
+    pub user_id: Option<UserId>,
+    /// Server-synthesized voice (TTS / announcement) of `user_id` rather than its microphone.
+    pub synthesized: bool,
+    /// Server-mixed channel downlink (`DownlinkMode::Mixed`), not a single participant.
+    pub mixed: bool,
+    /// Decoded two-wide (stereo uplink or server mix).
+    pub stereo: bool,
+    pub buffered_frames: usize,
+    /// Has audio buffered or arriving; `false` between talk spurts.
+    pub active: bool,
+}
+
 /// Downlink loss over the last quality period, updated on every heartbeat tick.
 #[derive(Debug, Default)]
 struct LossWindow {
@@ -205,6 +223,8 @@ struct Inner {
     muted: AtomicBool,
     local_speaking: AtomicBool,
     channels: Mutex<HashMap<ChannelId, ChannelState>>,
+    /// Participants rendered by the host through `pull_participant_*`, kept out of the mix.
+    claimed_users: Mutex<HashSet<UserId>>,
     prefs: Mutex<Prefs>,
     session: Mutex<Option<SessionInfo>>,
     identity: Mutex<TokenIdentity>,
@@ -307,6 +327,34 @@ impl Inner {
             .filter(|(id, _)| prefs.transmission.allows(id))
             .map(|(_, c)| c.hash)
             .collect()
+    }
+
+    /// Microphone and TTS-voice SSRCs of `user_id`, if it is in a joined channel's roster.
+    fn ssrcs_for_user(&self, user_id: UserId) -> Option<[u32; 2]> {
+        self.channels.lock().values().find_map(|c| {
+            c.participants
+                .get(&user_id)
+                .map(|p| [p.ssrc, p.ssrc | crate::SYNTH_SSRC_FLAG])
+        })
+    }
+
+    /// Re-resolve the claimed users' SSRCs (rosters change under them) into the mixer.
+    fn refresh_claims(&self) {
+        let ssrcs: Vec<u32> = {
+            let users = self.claimed_users.lock();
+            if users.is_empty() {
+                Vec::new()
+            } else {
+                self.channels
+                    .lock()
+                    .values()
+                    .flat_map(|c| c.participants.values())
+                    .filter(|p| users.contains(&p.user_id))
+                    .flat_map(|p| [p.ssrc, p.ssrc | crate::SYNTH_SSRC_FLAG])
+                    .collect()
+            }
+        };
+        self.mixer.lock().set_claimed(ssrcs);
     }
 
     fn on_incoming_audio(&self, audio: IncomingAudio) {
@@ -446,6 +494,7 @@ impl Client {
             muted: AtomicBool::new(false),
             local_speaking: AtomicBool::new(false),
             channels: Mutex::new(HashMap::new()),
+            claimed_users: Mutex::new(HashSet::new()),
             prefs: Mutex::new(Prefs {
                 transcripts_enabled: true,
                 ..Prefs::default()
@@ -789,6 +838,88 @@ impl Client {
             let f: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
             self.inner.far_end.push(&f, channels);
         }
+    }
+
+    /// Per-participant playout for engine spatialization: **overwrite** `output` (interleaved,
+    /// `channels` wide) with `user_id`'s voice only — microphone plus its synthesized TTS
+    /// voice — with no local panning, so the host can attach it to a positioned emitter
+    /// (HRTF, occlusion, reverb zones). Per-participant volume, server gain and master volume
+    /// / mute still apply. Returns the frames that carried decoded audio; the rest is silence.
+    /// Each stream is consumed by whoever pulls it, so pull every participant you want to
+    /// hear, or mix the remainder with [`Self::mix_output_f32`]. The pulled audio is **not**
+    /// fed to the echo canceller — pass the engine's final output to [`Self::push_render_f32`].
+    /// A server-mixed downlink (`DownlinkMode::Mixed`) has no per-participant streams.
+    pub fn pull_participant_f32(&self, user_id: UserId, output: &mut [f32], channels: u8) -> usize {
+        let Some(ssrcs) = self.inner.ssrcs_for_user(user_id) else {
+            output.fill(0.0);
+            return 0;
+        };
+        self.inner.mixer.lock().pull(&ssrcs, output, channels)
+    }
+
+    /// [`Self::pull_participant_f32`] into i16.
+    pub fn pull_participant_i16(&self, user_id: UserId, output: &mut [i16], channels: u8) -> usize {
+        let Some(ssrcs) = self.inner.ssrcs_for_user(user_id) else {
+            output.fill(0);
+            return 0;
+        };
+        self.inner.mixer.lock().pull_i16(&ssrcs, output, channels)
+    }
+
+    /// Hand a participant's playout to the host: while claimed, [`Self::mix_output_f32`]
+    /// skips its microphone and TTS streams and only [`Self::pull_participant_f32`] renders
+    /// them, so a spatialized per-participant emitter and the aggregate mix for everyone
+    /// else can run side by side without double-playing anyone. Claims follow the user
+    /// across SSRC changes (rejoin, failover) and are dropped with `claimed = false`.
+    pub fn set_participant_claimed(&self, user_id: UserId, claimed: bool) {
+        let changed = {
+            let mut users = self.inner.claimed_users.lock();
+            if claimed {
+                users.insert(user_id)
+            } else {
+                users.remove(&user_id)
+            }
+        };
+        if changed {
+            self.inner.refresh_claims();
+        }
+    }
+
+    /// Participants currently claimed with [`Self::set_participant_claimed`].
+    pub fn claimed_participants(&self) -> Vec<UserId> {
+        self.inner.claimed_users.lock().iter().copied().collect()
+    }
+
+    /// Downlink streams currently held by the jitter buffers, with their owners, for hosts
+    /// that spawn one emitter per talking participant.
+    pub fn participant_streams(&self) -> Vec<ParticipantStream> {
+        let stats = self.inner.mixer.lock().stream_stats();
+        let channels = self.inner.channels.lock();
+        stats
+            .into_iter()
+            .map(|s| {
+                let base = crate::source_ssrc(s.ssrc);
+                let user_id = if s.mixed {
+                    None
+                } else {
+                    channels.values().find_map(|c| {
+                        c.participants
+                            .values()
+                            .find(|p| p.ssrc == base)
+                            .map(|p| p.user_id)
+                    })
+                };
+                ParticipantStream {
+                    ssrc: s.ssrc,
+                    user_id,
+                    synthesized: crate::is_synthesized_ssrc(s.ssrc),
+                    mixed: s.mixed,
+                    stereo: s.stereo,
+                    buffered_frames: s.buffered_frames,
+                    active: !s.starved,
+                }
+            })
+            .collect()
     }
 
     /// Capture DSP configuration (high-pass / AEC / noise suppression / AGC); applies to the
@@ -2235,6 +2366,7 @@ fn forget_channel(inner: &Inner, channel_id: ChannelId) {
         drop(mixer);
         inner.emit(Event::ChannelLeft { channel_id });
         refresh_audio_policy(inner);
+        inner.refresh_claims();
     }
 }
 
@@ -2357,6 +2489,7 @@ async fn handle_message(
                 .is_some();
             pending.desired.insert(channel_id);
             refresh_audio_policy(inner);
+            inner.refresh_claims();
             // A resume replays acks for channels we already track: refresh silently.
             if !(existed && request_id == 0) {
                 inner.emit(Event::ChannelJoined {
@@ -2411,6 +2544,7 @@ async fn handle_message(
                 }
             };
             if known {
+                inner.refresh_claims();
                 inner.emit(Event::ParticipantJoined {
                     channel_id,
                     participant,
@@ -2444,6 +2578,7 @@ async fn handle_message(
                         m.forget_sender(ssrc | crate::SYNTH_SSRC_FLAG);
                     }
                 }
+                inner.refresh_claims();
                 inner.emit(Event::ParticipantLeft {
                     channel_id,
                     user_id,

@@ -12,6 +12,21 @@ using UnityEngine.Android;
 
 namespace Aurix.Unity
 {
+    /// <summary>How remote voices reach the speakers.</summary>
+    public enum VoicePlaybackMode
+    {
+        /// <summary>Everyone through this component's AudioSource, panned by the server's directions (2D).</summary>
+        Mixed,
+        /// <summary>
+        /// Participants bound to an <see cref="AurixParticipantAudioSource"/> play through that source
+        /// (Unity's 3D attenuation / spatializer plugin / mixer groups); everyone else still comes out of
+        /// this component's AudioSource, so a talker whose emitter is not spawned yet is never lost.
+        /// </summary>
+        PerParticipant,
+        /// <summary>Like <see cref="PerParticipant"/>, but unbound participants stay silent.</summary>
+        PerParticipantOnly,
+    }
+
     /// <summary>
     /// Drop-in Unity component: captures the microphone, encodes with the codec you provide,
     /// sends AURX/UDP audio, and plays the mixed remote participants through an AudioSource.
@@ -145,6 +160,13 @@ namespace Aurix.Unity
                  "are applied by the node. Requires media.downlink_mix on the node.")]
         public DownlinkMode PreferredDownlinkMode = DownlinkMode.Streams;
 
+        [Header("Playback")]
+        [Tooltip("Mixed: one 2D AudioSource with the server's panning. PerParticipant: talkers with an " +
+                 "AurixParticipantAudioSource on a positioned GameObject are played there (Unity 3D audio, HRTF " +
+                 "spatializer plugins, occlusion), the rest through this AudioSource; PerParticipantOnly drops the rest. " +
+                 "Server-mixed downlink (PreferredDownlinkMode = Mixed) has no per-participant streams.")]
+        public VoicePlaybackMode Playback = VoicePlaybackMode.Mixed;
+
         public AurixVoiceClient Client { get; private set; }
         public bool IsConnected => Client != null && Client.State == VoiceConnectionState.MediaBound;
 
@@ -166,6 +188,50 @@ namespace Aurix.Unity
         /// canceller aware of sounds this component does not play.
         /// </summary>
         public ICaptureProcessor Dsp { get; private set; }
+
+        /// <summary>
+        /// Set by <see cref="AurixListenerTap"/>: the echo canceller gets the listener's final output, so
+        /// this component must not feed its own mix a second time.
+        /// </summary>
+        public bool RenderFedExternally { get; set; }
+
+        /// <summary>The downlink mixer (null before <see cref="Connect"/>). <see cref="AurixParticipantAudioSource"/> pulls from it.</summary>
+        public RemoteMixer Mixer => _mixer;
+
+        private readonly System.Collections.Generic.List<AurixParticipantAudioSource> _participantSources = new System.Collections.Generic.List<AurixParticipantAudioSource>();
+        private readonly System.Collections.Generic.HashSet<uint> _claimed = new System.Collections.Generic.HashSet<uint>();
+
+        internal void RegisterParticipantSource(AurixParticipantAudioSource source)
+        {
+            lock (_participantSources) if (!_participantSources.Contains(source)) _participantSources.Add(source);
+            RefreshClaims();
+        }
+
+        internal void UnregisterParticipantSource(AurixParticipantAudioSource source)
+        {
+            lock (_participantSources) _participantSources.Remove(source);
+            RefreshClaims();
+        }
+
+        /// <summary>Recompute which streams the participant sources own (called when one resolves a new SSRC).</summary>
+        internal void RefreshClaims()
+        {
+            lock (_participantSources)
+            lock (_claimed)
+            {
+                _claimed.Clear();
+                foreach (var s in _participantSources)
+                {
+                    uint ssrc = s.ClaimedSsrc;
+                    if (ssrc == 0) continue;
+                    _claimed.Add(ssrc);
+                    _claimed.Add(ssrc | AurxPacket.SynthSsrcFlag);
+                }
+            }
+        }
+
+        /// <summary>Participant sources currently bound to this component (main thread).</summary>
+        public int ParticipantSourceCount { get { lock (_participantSources) return _participantSources.Count; } }
 
         /// <summary>The inspector's capture-processing fields as a settings block.</summary>
         public DspSettings DspSettingsFromInspector() => new DspSettings
@@ -253,8 +319,22 @@ namespace Aurix.Unity
         {
             _fillFromMixer = (buf, off, frames, ch) =>
             {
-                _mixer?.Mix(buf, off, frames, ch);
-                Dsp?.PushRender(buf, off, frames * ch, ch);
+                var mixer = _mixer;
+                if (mixer != null)
+                {
+                    switch (Playback)
+                    {
+                        case VoicePlaybackMode.Mixed:
+                            mixer.Mix(buf, off, frames, ch);
+                            break;
+                        case VoicePlaybackMode.PerParticipant:
+                            lock (_claimed) mixer.Mix(buf, off, frames, ch, _claimed);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (!RenderFedExternally) Dsp?.PushRender(buf, off, frames * ch, ch);
             };
             _outputRate = AudioSettings.outputSampleRate;
         }

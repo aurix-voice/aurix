@@ -9,7 +9,7 @@ use aurix_common::protocol::{
     decode_audio_level, encode_audio_level, opus_packet_is_stereo, AUDIO_LEVEL_SILENCE,
 };
 use aurix_common::types::{AudioCodec, AudioPolicy, Direction, OpusBandwidth, OpusSignal};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::dsp::{Dsp, DspConfig};
@@ -1088,6 +1088,12 @@ pub struct StreamStats {
     pub buffered_frames: usize,
     pub lost: u64,
     pub late: u64,
+    /// Decoded two-wide (a stereo uplink or a server mix).
+    pub stereo: bool,
+    /// Server-mixed channel stream (`PacketFlags::Mixed`), never a single participant.
+    pub mixed: bool,
+    /// Ran dry: nothing buffered and nothing arriving (between talk spurts or gone).
+    pub starved: bool,
 }
 
 /// Downlink counters accumulated over every stream the mixer has ever seen.
@@ -1113,6 +1119,8 @@ pub const UNDERRUN_RESUME_WINDOW: Duration = Duration::from_millis(250);
 /// lock.
 pub struct RemoteMixer {
     streams: HashMap<u32, Stream>,
+    /// Streams an engine plays itself through [`Self::pull`]; [`Self::mix`] skips them.
+    claimed: HashSet<u32>,
     output_volume: f32,
     output_muted: bool,
     target_depth: usize,
@@ -1127,6 +1135,7 @@ impl RemoteMixer {
     pub fn new(target_depth: usize, max_depth: usize) -> Self {
         Self {
             streams: HashMap::new(),
+            claimed: HashSet::new(),
             output_volume: 1.0,
             output_muted: false,
             target_depth,
@@ -1154,6 +1163,18 @@ impl RemoteMixer {
 
     pub fn output_muted(&self) -> bool {
         self.output_muted
+    }
+
+    /// Replace the set of SSRCs [`Self::mix`] leaves alone because they are rendered through
+    /// [`Self::pull`] (a spatialized per-participant source). Frames of claimed streams stay in
+    /// their jitter buffers until pulled.
+    pub fn set_claimed(&mut self, ssrcs: impl IntoIterator<Item = u32>) {
+        self.claimed.clear();
+        self.claimed.extend(ssrcs);
+    }
+
+    pub fn claimed(&self) -> impl Iterator<Item = u32> + '_ {
+        self.claimed.iter().copied()
     }
 
     /// Queue one verified downlink Opus frame. `volume` is the server-applied gain byte and
@@ -1273,6 +1294,7 @@ impl RemoteMixer {
             self.retired.lost += s.jitter.lost;
             self.retired.late += s.jitter.late;
         }
+        self.claimed.clear();
     }
 
     /// Keep the streams (decoders, gains) but drop buffered frames and sequence expectations:
@@ -1298,6 +1320,9 @@ impl RemoteMixer {
                 buffered_frames: s.jitter.len(),
                 lost: s.jitter.lost,
                 late: s.jitter.late,
+                stereo: s.stereo,
+                mixed: s.mixed,
+                starved: s.starved,
             })
             .collect()
     }
@@ -1313,20 +1338,15 @@ impl RemoteMixer {
         t
     }
 
-    /// Mix into `output` (interleaved, `channels` wide; **adds** to its contents). Streams
-    /// with a direction are panned between the first two channels (a stereo sender is
-    /// downmixed first); stereo streams without one keep their L/R image, or are downmixed
-    /// for a mono output. Returns the number of streams that contributed audio.
-    pub fn mix(&mut self, output: &mut [f32], channels: u8) -> usize {
-        let channels = channels.clamp(1, 8) as usize;
-        let frames_needed = output.len() / channels;
-        let master = if self.output_muted {
+    fn master_gain(&self) -> f32 {
+        if self.output_muted {
             0.0
         } else {
             self.output_volume
-        };
-        let now = Instant::now();
-        let mut active = 0;
+        }
+    }
+
+    fn expire_idle(&mut self, now: Instant) {
         let mut retired = self.retired;
         self.streams.retain(|_, s| {
             let keep = now.duration_since(s.last_activity) < STREAM_IDLE_TIMEOUT;
@@ -1337,95 +1357,122 @@ impl RemoteMixer {
             keep
         });
         self.retired = retired;
-        for s in self.streams.values_mut() {
-            let mut written = 0;
-            let mut contributed = false;
-            while written < frames_needed {
-                if s.pos >= s.len {
-                    let slot = s.jitter.pop();
-                    let n = match slot {
-                        JitterSlot::Wait => {
-                            if s.jitter.is_empty() && !s.starved {
-                                s.starved = true;
-                                s.starved_at = now;
-                            }
-                            break;
+    }
+
+    /// Render one stream **into** `output` (added). With `pan` a directional stream is panned
+    /// between the first two channels; without it every stream is delivered centred (the
+    /// caller spatializes). Returns `(frames written, contributed audible samples)`.
+    fn render_stream(
+        s: &mut Stream,
+        output: &mut [f32],
+        channels: usize,
+        master: f32,
+        pan_allowed: bool,
+        now: Instant,
+    ) -> (usize, bool) {
+        let frames_needed = output.len() / channels;
+        let mut written = 0;
+        let mut contributed = false;
+        while written < frames_needed {
+            if s.pos >= s.len {
+                let slot = s.jitter.pop();
+                let n = match slot {
+                    JitterSlot::Wait => {
+                        if s.jitter.is_empty() && !s.starved {
+                            s.starved = true;
+                            s.starved_at = now;
                         }
-                        JitterSlot::Frame(WireFrame { codec, data }) => {
-                            s.codec = codec;
-                            match codec {
-                                AudioCodec::Opus => {
-                                    s.decoder.decode_float(&data, &mut s.frame, false)
-                                }
-                                AudioCodec::Pcmu => {
-                                    Ok(s.pcmu.decode(&data, &mut s.frame).unwrap_or(0))
-                                }
-                            }
-                        }
-                        JitterSlot::Lost => match s.codec {
-                            AudioCodec::Opus => {
-                                let width = if s.stereo { 2 } else { 1 };
-                                s.decoder.decode_float(
-                                    &[],
-                                    &mut s.frame[..FRAME_SAMPLES * width],
-                                    false,
-                                )
-                            }
-                            AudioCodec::Pcmu => Ok(s.pcmu.conceal(&mut s.frame)),
-                        },
-                    };
-                    // PCMU is always mono, even on a stream that also carried stereo Opus.
-                    s.len = n.unwrap_or(0);
-                    s.pos = 0;
-                    if s.len == 0 {
                         break;
                     }
-                }
-                let take = (s.len - s.pos).min(frames_needed - written);
-                let gain = s.volume * master;
-                if gain != 0.0 {
-                    contributed = true;
-                    let stereo_frame = s.stereo && s.codec == AudioCodec::Opus;
-                    let pan = channels >= 2 && s.panned;
-                    for f in 0..take {
-                        let base = (written + f) * channels;
-                        if stereo_frame && !pan {
-                            let l = s.frame[(s.pos + f) * 2];
-                            let r = s.frame[(s.pos + f) * 2 + 1];
-                            for c in 0..channels {
-                                let sample = match (channels, c) {
-                                    (1, _) => 0.5 * (l + r),
-                                    (_, 0) => l,
-                                    (_, 1) => r,
-                                    _ => 0.5 * (l + r),
-                                };
-                                output[base + c] += sample * gain;
-                            }
-                            continue;
-                        }
-                        let sample = if stereo_frame {
-                            0.5 * (s.frame[(s.pos + f) * 2] + s.frame[(s.pos + f) * 2 + 1])
-                        } else {
-                            s.frame[s.pos + f]
-                        };
-                        for c in 0..channels {
-                            let g = if pan {
-                                match c {
-                                    0 => gain * s.left,
-                                    1 => gain * s.right,
-                                    _ => gain,
-                                }
-                            } else {
-                                gain
-                            };
-                            output[base + c] += sample * g;
+                    JitterSlot::Frame(WireFrame { codec, data }) => {
+                        s.codec = codec;
+                        match codec {
+                            AudioCodec::Opus => s.decoder.decode_float(&data, &mut s.frame, false),
+                            AudioCodec::Pcmu => Ok(s.pcmu.decode(&data, &mut s.frame).unwrap_or(0)),
                         }
                     }
+                    JitterSlot::Lost => match s.codec {
+                        AudioCodec::Opus => {
+                            let width = if s.stereo { 2 } else { 1 };
+                            s.decoder.decode_float(
+                                &[],
+                                &mut s.frame[..FRAME_SAMPLES * width],
+                                false,
+                            )
+                        }
+                        AudioCodec::Pcmu => Ok(s.pcmu.conceal(&mut s.frame)),
+                    },
+                };
+                // PCMU is always mono, even on a stream that also carried stereo Opus.
+                s.len = n.unwrap_or(0);
+                s.pos = 0;
+                if s.len == 0 {
+                    break;
                 }
-                s.pos += take;
-                written += take;
             }
-            if contributed {
+            let take = (s.len - s.pos).min(frames_needed - written);
+            let gain = s.volume * master;
+            if gain != 0.0 {
+                contributed = true;
+                let stereo_frame = s.stereo && s.codec == AudioCodec::Opus;
+                let pan = pan_allowed && channels >= 2 && s.panned;
+                for f in 0..take {
+                    let base = (written + f) * channels;
+                    if stereo_frame && !pan {
+                        let l = s.frame[(s.pos + f) * 2];
+                        let r = s.frame[(s.pos + f) * 2 + 1];
+                        for c in 0..channels {
+                            let sample = match (channels, c) {
+                                (1, _) => 0.5 * (l + r),
+                                (_, 0) => l,
+                                (_, 1) => r,
+                                _ => 0.5 * (l + r),
+                            };
+                            output[base + c] += sample * gain;
+                        }
+                        continue;
+                    }
+                    let sample = if stereo_frame {
+                        0.5 * (s.frame[(s.pos + f) * 2] + s.frame[(s.pos + f) * 2 + 1])
+                    } else {
+                        s.frame[s.pos + f]
+                    };
+                    for c in 0..channels {
+                        let g = if pan {
+                            match c {
+                                0 => gain * s.left,
+                                1 => gain * s.right,
+                                _ => gain,
+                            }
+                        } else {
+                            gain
+                        };
+                        output[base + c] += sample * g;
+                    }
+                }
+            }
+            s.pos += take;
+            written += take;
+        }
+        (written, contributed)
+    }
+
+    /// Mix into `output` (interleaved, `channels` wide; **adds** to its contents). Streams
+    /// with a direction are panned between the first two channels (a stereo sender is
+    /// downmixed first); stereo streams without one keep their L/R image, or are downmixed
+    /// for a mono output. Returns the number of streams that contributed audio.
+    pub fn mix(&mut self, output: &mut [f32], channels: u8) -> usize {
+        let channels = channels.clamp(1, 8) as usize;
+        let master = self.master_gain();
+        let now = Instant::now();
+        self.expire_idle(now);
+        let mut active = 0;
+        let claimed = &self.claimed;
+        for (ssrc, s) in self.streams.iter_mut() {
+            if claimed.contains(ssrc) {
+                continue;
+            }
+            if Self::render_stream(s, output, channels, master, true, now).1 {
                 active += 1;
             }
         }
@@ -1446,6 +1493,54 @@ impl RemoteMixer {
         }
         self.scratch = scratch;
         active
+    }
+
+    /// Per-participant playout: **overwrite** `output` (interleaved, `channels` wide) with
+    /// the sum of the listed streams only — a participant's microphone and its synthesized
+    /// TTS voice, typically. No local panning is applied (the engine positions the source
+    /// itself); a stereo sender keeps its L/R image on a stereo output and is downmixed for a
+    /// mono one. Per-participant volume, the server's gain byte and the master volume / mute
+    /// still apply. Frames past what the jitter buffers hold are silence. Returns the number
+    /// of frames that carried decoded audio (`0` while the participant is silent or unknown).
+    /// Streams not pulled by anyone keep their newest frames and drop the oldest, so pulling
+    /// some participants and mixing the rest with [`Self::mix`] does not double-play anyone.
+    pub fn pull(&mut self, ssrcs: &[u32], output: &mut [f32], channels: u8) -> usize {
+        output.fill(0.0);
+        let channels = channels.clamp(1, 8) as usize;
+        let master = self.master_gain();
+        let now = Instant::now();
+        self.expire_idle(now);
+        let mut frames = 0;
+        for ssrc in ssrcs {
+            if let Some(s) = self.streams.get_mut(ssrc) {
+                let (written, _) = Self::render_stream(s, output, channels, master, false, now);
+                frames = frames.max(written);
+            }
+        }
+        if frames > 0 {
+            for v in output.iter_mut() {
+                *v = v.clamp(-1.0, 1.0);
+            }
+        }
+        frames
+    }
+
+    /// [`Self::pull`] into an i16 buffer.
+    pub fn pull_i16(&mut self, ssrcs: &[u32], output: &mut [i16], channels: u8) -> usize {
+        self.scratch.clear();
+        self.scratch.resize(output.len(), 0.0);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let frames = self.pull(ssrcs, &mut scratch, channels);
+        for (o, s) in output.iter_mut().zip(scratch.iter()) {
+            *o = (s * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+        }
+        self.scratch = scratch;
+        frames
+    }
+
+    /// SSRCs of the streams currently held.
+    pub fn stream_ids(&self) -> Vec<u32> {
+        self.streams.keys().copied().collect()
     }
 }
 
@@ -2018,5 +2113,160 @@ mod tests {
         assert_eq!((t.lost, t.late, t.underruns), (1, 1, 1), "{t:?}");
         mixer.clear();
         assert_eq!(mixer.totals(), t);
+    }
+
+    #[test]
+    fn pull_isolates_one_participant_and_leaves_the_rest_to_the_mix() {
+        // Two mono senders: 440 Hz at 0.5 (A) and 880 Hz at 0.25 (B). A stereo sender C.
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        let mut a = Vec::new();
+        enc.push_f32(
+            &sine(FRAME_SAMPLES * 20, 48_000, 440.0, 0.5),
+            48_000,
+            1,
+            |f| a.push(f),
+        );
+        let mut enc_b = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        let mut b = Vec::new();
+        enc_b.push_f32(
+            &sine(FRAME_SAMPLES * 20, 48_000, 880.0, 0.25),
+            48_000,
+            1,
+            |f| b.push(f),
+        );
+        let mut enc_c = CaptureEncoder::new(EncoderSettings {
+            channels: 2,
+            bitrate_bps: 96_000,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let c = left_only_capture(&mut enc_c);
+
+        let right = Direction {
+            azimuth: std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+        };
+        let mut mixer = RemoteMixer::new(1, 12);
+        let n = 20;
+        let mut pulled_a = vec![0f32; FRAME_SAMPLES * 2 * n];
+        let mut pulled_c = vec![0f32; FRAME_SAMPLES * 2 * n];
+        let mut mixed = vec![0f32; FRAME_SAMPLES * 2 * n];
+        let mut frames_a = 0;
+        for i in 0..n {
+            // A arrives with a server direction (hard right) — pull ignores it.
+            mixer
+                .push(1, i as u32, 1.0, Some(right), a[i].payload.clone())
+                .unwrap();
+            mixer
+                .push(2, i as u32, 1.0, None, b[i].payload.clone())
+                .unwrap();
+            mixer
+                .push(3, i as u32, 1.0, None, c[i].payload.clone())
+                .unwrap();
+            let range = i * FRAME_SAMPLES * 2..(i + 1) * FRAME_SAMPLES * 2;
+            // Unknown SSRC in the list is ignored, output is overwritten (not added).
+            pulled_a[range.clone()].fill(0.7);
+            frames_a += mixer.pull(&[1, 0x8000_0001], &mut pulled_a[range.clone()], 2);
+            mixer.pull(&[3], &mut pulled_c[range.clone()], 2);
+            mixer.mix(&mut mixed[range], 2);
+        }
+        assert!(
+            frames_a >= FRAME_SAMPLES * (n - 1) && frames_a <= FRAME_SAMPLES * n,
+            "{frames_a}"
+        );
+        let skip = FRAME_SAMPLES * 2 * 4;
+        // A: centred (no panning) at its own level on both channels.
+        let (l, r) = split_lr(&pulled_a, 4);
+        assert!((rms(&l) - 0.3535).abs() < 0.03, "{}", rms(&l));
+        assert!((rms(&r) - 0.3535).abs() < 0.03, "{}", rms(&r));
+        // C: stereo image preserved.
+        let (l, r) = split_lr(&pulled_c, 4);
+        assert!((rms(&l) - 0.3535).abs() < 0.05, "{}", rms(&l));
+        assert!(rms(&r) < 0.02, "{}", rms(&r));
+        // The aggregate mix now holds only B: neither A's 440 Hz nor C leaked into it.
+        let (l, r) = split_lr(&mixed, 4);
+        assert!((rms(&l) - 0.177).abs() < 0.03, "{}", rms(&l));
+        assert!((rms(&r) - 0.177).abs() < 0.03, "{}", rms(&r));
+        let period = 48_000.0 / 880.0;
+        let zero_crossings = mixed[skip..]
+            .chunks(2)
+            .map(|s| s[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count() as f32;
+        let expected = (FRAME_SAMPLES * (n - 4)) as f32 / period * 2.0;
+        assert!(
+            (zero_crossings - expected).abs() / expected < 0.1,
+            "{zero_crossings} vs {expected}"
+        );
+
+        // Mono pull of the stereo sender downmixes; master mute silences pulls too.
+        let mut mono = vec![0f32; FRAME_SAMPLES];
+        mixer
+            .push(3, n as u32, 1.0, None, c[n].payload.clone())
+            .unwrap();
+        mixer.pull(&[3], &mut mono, 1);
+        assert!(rms(&mono) > 0.1, "{}", rms(&mono));
+        mixer.set_output_muted(true);
+        mixer
+            .push(3, n as u32 + 1, 1.0, None, c[n + 1].payload.clone())
+            .unwrap();
+        assert_eq!(mixer.pull(&[3], &mut mono, 1), FRAME_SAMPLES);
+        assert_eq!(rms(&mono), 0.0);
+
+        let stats = mixer.stream_stats();
+        assert_eq!(stats.len(), 3);
+        assert!(stats.iter().find(|s| s.ssrc == 3).unwrap().stereo);
+        assert!(!stats.iter().find(|s| s.ssrc == 1).unwrap().stereo);
+    }
+
+    #[test]
+    fn claimed_streams_survive_a_mix_that_runs_before_their_pull() {
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        let mut a = Vec::new();
+        enc.push_f32(
+            &sine(FRAME_SAMPLES * 12, 48_000, 440.0, 0.5),
+            48_000,
+            1,
+            |f| a.push(f),
+        );
+        let mut mixer = RemoteMixer::new(1, 12);
+        let mut mixed = vec![0f32; FRAME_SAMPLES];
+        let mut pulled = vec![0f32; FRAME_SAMPLES];
+
+        // Unclaimed: whoever renders first (here the mix) consumes the frame.
+        for i in 0..4 {
+            mixer
+                .push(1, i, 1.0, None, a[i as usize].payload.clone())
+                .unwrap();
+            mixed.fill(0.0);
+            mixer.mix(&mut mixed, 1);
+        }
+        assert!(rms(&mixed) > 0.2, "{}", rms(&mixed));
+        assert_eq!(mixer.pull(&[1], &mut pulled, 1), 0);
+
+        // Claimed: the mix skips it, the pull that follows gets the audio.
+        mixer.set_claimed([1, 1 | crate::SYNTH_SSRC_FLAG]);
+        assert_eq!(mixer.claimed().count(), 2);
+        let mut pulled_frames = 0;
+        for i in 4..10 {
+            mixer
+                .push(1, i, 1.0, None, a[i as usize].payload.clone())
+                .unwrap();
+            mixed.fill(0.0);
+            assert_eq!(mixer.mix(&mut mixed, 1), 0);
+            assert_eq!(rms(&mixed), 0.0);
+            pulled_frames += mixer.pull(&[1], &mut pulled, 1);
+        }
+        assert!(pulled_frames >= FRAME_SAMPLES * 5, "{pulled_frames}");
+        assert!(rms(&pulled) > 0.2, "{}", rms(&pulled));
+
+        // Releasing the claim hands the stream back to the mix.
+        mixer.set_claimed([]);
+        mixer.push(1, 10, 1.0, None, a[10].payload.clone()).unwrap();
+        mixed.fill(0.0);
+        assert_eq!(mixer.mix(&mut mixed, 1), 1);
+        assert!(rms(&mixed) > 0.2, "{}", rms(&mixed));
     }
 }

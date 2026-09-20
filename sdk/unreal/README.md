@@ -150,9 +150,29 @@ void AMyPlayerController::Tick(float DeltaSeconds)
   capture path (any sample rate/channel count; the native side resamples to 48 kHz mono).
 * **Custom playback:** leave `bAutoStartPlayback` off and call `MixOutputAudio` from your own
   procedural sound / submix; the native mixer adds the remote voices into your float buffer.
+* **Per-participant playback (engine spatialization):** `CreateParticipantSound(UserId)`
+  returns a `UAurixParticipantSoundWave` — a mono 48 kHz procedural sound carrying only that
+  user's voice (microphone + TTS) with **no** local panning. Play it from an in-world
+  `UAudioComponent` on the avatar (`SpawnParticipantAudioComponent(UserId, HeadComponent,
+  Attenuation)` does that in one call) and let Unreal apply attenuation, the spatializer plugin
+  (Steam Audio, Resonance, …), occlusion, reverb sends and submix routing. The user is
+  *claimed* while the sound exists: the aggregate 2D mix skips it, so unclaimed talkers keep
+  playing through `bAutoStartPlayback` / `MixOutputAudio` and nobody is heard twice — a hybrid
+  "avatars in range spatialized, everyone else 2D" needs no extra code; for "spatialized
+  only" leave `bAutoStartPlayback` off. Claims follow the user across rejoins and node
+  failover; `ReleaseParticipantSound(UserId)` when the avatar is destroyed (leaving does not
+  release it, the sound just goes silent; `IsReceivingAudio()` tells whether it carries
+  audio). Per-participant volume/mute, the server's gain byte and the master volume still
+  apply; `bStereo = true` keeps a music sender's L/R image but Unreal will not spatialize it.
+  For a custom graph, `SetParticipantClaimed(UserId, true)` + `PullParticipantAudio(UserId,
+  Buffer, Channels)` (float, overwritten) do the same without a sound wave;
+  `GetParticipantStreams()` lists the buffered streams with owners/TTS/stereo/claimed flags. A
+  server-mixed downlink (`SetDownlinkMode(Mixed)`) has no per-participant streams. The pulled
+  audio is not fed to the echo canceller — pass the engine's final output to
+  `PushRenderAudio` (submix listener) if AEC matters.
 
 Both native entry points are audio-thread safe and stay valid until `Disconnect()`, which
-stops capture, unbinds the sound wave and only then destroys the client.
+stops capture, unbinds the sound waves and only then destroys the client.
 
 * **Capture processing (DSP):** `FAurixVoiceSettings.Dsp` (`FAurixDspSettings`) configures the
   core's microphone chain — 80 Hz high-pass, acoustic echo cancellation (`EchoTailMs` 40–500,
@@ -270,4 +290,6 @@ engine, the `HTTP` module request/response API used by `AurixRegionDiscovery.cpp
 Windows/macOS. Treat the first build in your project as a required
 verification step; the plugin sources are small and any mismatch surfaces as a compile error
 in one of the three bridge files (`AurixAudioCapture.cpp`, `AurixVoiceSoundWave.cpp`,
-`AurixRegionDiscovery.cpp`).
+`AurixRegionDiscovery.cpp`) or in `AurixParticipantSoundWave.cpp`; the participant sound
+wave's spatialization behaviour (mono source + attenuation / spatializer plugin) has likewise
+not been heard through a real engine build.

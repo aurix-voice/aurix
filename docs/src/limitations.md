@@ -55,9 +55,12 @@ the chapter that explains the boundary.
 * **Cascade is a one-hop mesh** between the nodes that host a channel — no relay trees; nodes
   must reach each other directly on `media.port + 1`/UDP ([Scaling](operations/scaling.md)).
 * **Positional audio is server-side attenuation, panning and radius scoping** from
-  client-reported positions; there is no occlusion, reverb or HRTF, and the ambient mix ranks by
+  client-reported positions; the server does no occlusion, reverb or HRTF, and the ambient mix ranks by
   reported loudness only (no server-side voice-activity analysis of the payload). Directional panning applies to native and WebRTC
-  downlinks; TTS/echo follow the same routing.
+  downlinks; TTS/echo follow the same routing. Engine-side spatialization (HRTF, occlusion,
+  reverb) is available to native / Unity / Unreal clients through per-participant PCM
+  pulls — one unpanned decoded stream per talker — not to browsers, and not for a
+  server-mixed downlink, which is one aggregate stream.
 
 ## Server behaviour
 

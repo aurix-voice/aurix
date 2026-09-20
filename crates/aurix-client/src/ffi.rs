@@ -2251,6 +2251,128 @@ pub unsafe extern "C" fn aurix_client_mix_output_i16(
     c.mix_output_i16(std::slice::from_raw_parts_mut(out, sample_count), channels)
 }
 
+/// One downlink stream held by the jitter buffers (see `aurix_client_participant_streams`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AurixParticipantStream {
+    pub ssrc: u32,
+    /// Owner across joined channels; nil UUID for a server mix or an unknown sender.
+    pub user_id: AurixUuid,
+    /// Server-synthesized voice (TTS / announcement) of `user_id`, not its microphone.
+    pub synthesized: bool,
+    /// Server-mixed channel downlink (`AurixDownlinkMode::Mixed`), not one participant.
+    pub mixed: bool,
+    /// Decoded two-wide (stereo uplink or server mix).
+    pub stereo: bool,
+    /// Has audio buffered or arriving; `false` between talk spurts.
+    pub active: bool,
+    pub buffered_frames: u32,
+}
+
+/// Copy up to `capacity` downlink streams with their owners; returns the total count.
+/// For hosts that spawn one positioned emitter per talking participant.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_participant_streams(
+    client: *const AurixClient,
+    out: *mut AurixParticipantStream,
+    capacity: usize,
+) -> usize {
+    let Ok(c) = self::client(client) else {
+        return 0;
+    };
+    let streams = c.participant_streams();
+    if !out.is_null() {
+        for (i, s) in streams.iter().take(capacity).enumerate() {
+            *out.add(i) = AurixParticipantStream {
+                ssrc: s.ssrc,
+                user_id: s.user_id.map(|u| u.0).unwrap_or(uuid::Uuid::nil()).into(),
+                synthesized: s.synthesized,
+                mixed: s.mixed,
+                stereo: s.stereo,
+                active: s.active,
+                buffered_frames: s.buffered_frames.min(u32::MAX as usize) as u32,
+            };
+        }
+    }
+    streams.len()
+}
+
+/// Per-participant playout for engine spatialization: **overwrite** `out` (interleaved f32,
+/// `sample_count` total samples, `channels` 1 or 2) with `user_id`'s voice only — microphone
+/// plus its TTS voice — with no local panning, so the host attaches it to a positioned
+/// emitter (HRTF, occlusion, reverb). Per-participant volume, server gain and master volume
+/// / mute still apply. Returns the frames that carried audio; the rest is silence. A stream
+/// is consumed by whoever pulls it: pull every participant you want to hear, or mix the rest
+/// with `aurix_client_mix_output_*`. Not fed to the AEC — push the engine's final output with
+/// `aurix_client_push_render_*`. Audio-thread safe.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_pull_participant_f32(
+    client: *mut AurixClient,
+    user_id: *const AurixUuid,
+    out: *mut f32,
+    sample_count: usize,
+    channels: u8,
+) -> usize {
+    let Ok(c) = self::client(client) else {
+        return 0;
+    };
+    if out.is_null() || sample_count == 0 {
+        return 0;
+    }
+    let out = std::slice::from_raw_parts_mut(out, sample_count);
+    let Ok(user) = uuid_arg(user_id, "user_id") else {
+        out.fill(0.0);
+        return 0;
+    };
+    c.pull_participant_f32(UserId(user), out, channels)
+}
+
+/// Like `aurix_client_pull_participant_f32` with i16 samples.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_pull_participant_i16(
+    client: *mut AurixClient,
+    user_id: *const AurixUuid,
+    out: *mut i16,
+    sample_count: usize,
+    channels: u8,
+) -> usize {
+    let Ok(c) = self::client(client) else {
+        return 0;
+    };
+    if out.is_null() || sample_count == 0 {
+        return 0;
+    }
+    let out = std::slice::from_raw_parts_mut(out, sample_count);
+    let Ok(user) = uuid_arg(user_id, "user_id") else {
+        out.fill(0);
+        return 0;
+    };
+    c.pull_participant_i16(UserId(user), out, channels)
+}
+
+/// Keep `user_id`'s microphone and TTS streams out of `aurix_client_mix_output_*` while the
+/// host renders them itself with `aurix_client_pull_participant_*`, so one spatialized
+/// emitter per talker and the aggregate mix for everyone else never double-play. The claim
+/// follows the user across SSRC changes; `claimed = false` returns the user to the mix.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_participant_claimed(
+    client: *mut AurixClient,
+    user_id: *const AurixUuid,
+    claimed: bool,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match uuid_arg(user_id, "user_id") {
+        Ok(u) => {
+            c.set_participant_claimed(UserId(u), claimed);
+            AurixResult::AurixOk
+        }
+        Err(r) => r,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_client_set_muted(client: *mut AurixClient, muted: bool) {
     if let Ok(c) = self::client(client) {

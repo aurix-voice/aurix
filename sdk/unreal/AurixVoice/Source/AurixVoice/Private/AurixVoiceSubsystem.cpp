@@ -2,13 +2,17 @@
 
 #include "AurixAudioCapture.h"
 #include "AurixNativeConversions.h"
+#include "AurixParticipantSoundWave.h"
 #include "AurixRegionDiscovery.h"
 #include "AurixVoiceLog.h"
 #include "AurixVoiceSoundWave.h"
 #include "Components/AudioComponent.h"
+#include "Components/SceneComponent.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "Kismet/GameplayStatics.h"
+#include "Sound/SoundAttenuation.h"
 #include "Sound/SoundClass.h"
 
 #include "aurix_client.hpp"
@@ -512,6 +516,20 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	}
 	Native = MoveTemp(Created);
 
+	// Participant sounds and claims outlive the native client (reconnect with a new token).
+	for (const TPair<FGuid, TObjectPtr<UAurixParticipantSoundWave>>& Pair : ParticipantSounds)
+	{
+		if (Pair.Value)
+		{
+			Pair.Value->SetSource(Native->Client.raw(), Pair.Key);
+		}
+		Native->Client.set_participant_claimed(ToUuid(Pair.Key), true);
+	}
+	for (const FGuid& UserId : ManualClaims)
+	{
+		Native->Client.set_participant_claimed(ToUuid(UserId), true);
+	}
+
 	if (Settings.bAutoStartPlayback)
 	{
 		StartPlayback();
@@ -534,6 +552,13 @@ void UAurixVoiceSubsystem::ReleaseNative()
 	if (SoundWave)
 	{
 		SoundWave->SetClient(nullptr);
+	}
+	for (const TPair<FGuid, TObjectPtr<UAurixParticipantSoundWave>>& Pair : ParticipantSounds)
+	{
+		if (Pair.Value)
+		{
+			Pair.Value->SetSource(nullptr, Pair.Key);
+		}
 	}
 	if (PlaybackComponent)
 	{
@@ -919,6 +944,127 @@ int32 UAurixVoiceSubsystem::MixOutputAudio(TArray<float>& InterleavedPcm, int32 
 		return 0;
 	}
 	return static_cast<int32>(Native->Client.mix_output(InterleavedPcm.GetData(), static_cast<size_t>(InterleavedPcm.Num()), static_cast<uint8_t>(Channels)));
+}
+
+// ---- per-participant playback --------------------------------------------------------------
+
+UAurixParticipantSoundWave* UAurixVoiceSubsystem::CreateParticipantSound(FGuid UserId, bool bStereo)
+{
+	if (!UserId.IsValid())
+	{
+		return nullptr;
+	}
+	if (const TObjectPtr<UAurixParticipantSoundWave>* Existing = ParticipantSounds.Find(UserId))
+	{
+		if (*Existing)
+		{
+			return *Existing;
+		}
+	}
+	UAurixParticipantSoundWave* Wave = NewObject<UAurixParticipantSoundWave>(this, *FString::Printf(TEXT("AurixVoice_%s"), *UserId.ToString(EGuidFormats::Digits)));
+	Wave->SetStereo(bStereo);
+	Wave->SoundClassObject = ActiveSettings.PlaybackSoundClass;
+	Wave->SetSource(Native ? Native->Client.raw() : nullptr, UserId);
+	ParticipantSounds.Add(UserId, Wave);
+	if (Native)
+	{
+		Native->Client.set_participant_claimed(ToUuid(UserId), true);
+	}
+	return Wave;
+}
+
+UAudioComponent* UAurixVoiceSubsystem::SpawnParticipantAudioComponent(FGuid UserId, USceneComponent* AttachTo, USoundAttenuation* Attenuation, bool bStereo)
+{
+	UAurixParticipantSoundWave* Wave = CreateParticipantSound(UserId, bStereo);
+	if (!Wave || !AttachTo)
+	{
+		return nullptr;
+	}
+	UAudioComponent* Component = UGameplayStatics::SpawnSoundAttached(Wave, AttachTo, NAME_None, FVector::ZeroVector, FRotator::ZeroRotator, EAttachLocation::KeepRelativeOffset, /*bStopWhenAttachedToDestroyed*/ true, 1.f, 1.f, 0.f, Attenuation, nullptr, /*bAutoDestroy*/ false);
+	if (!Component)
+	{
+		UE_LOG(LogAurixVoice, Warning, TEXT("SpawnParticipantAudioComponent: SpawnSoundAttached failed (no audio device?)"));
+		return nullptr;
+	}
+	Component->bAllowSpatialization = true;
+	Component->bIsUISound = false;
+	if (!Component->IsPlaying())
+	{
+		Component->Play();
+	}
+	return Component;
+}
+
+void UAurixVoiceSubsystem::ReleaseParticipantSound(FGuid UserId)
+{
+	TObjectPtr<UAurixParticipantSoundWave> Wave;
+	if (ParticipantSounds.RemoveAndCopyValue(UserId, Wave) && Wave)
+	{
+		Wave->SetSource(nullptr, UserId);
+	}
+	if (Native && !ManualClaims.Contains(UserId))
+	{
+		Native->Client.set_participant_claimed(ToUuid(UserId), false);
+	}
+}
+
+UAurixParticipantSoundWave* UAurixVoiceSubsystem::GetParticipantSound(FGuid UserId) const
+{
+	const TObjectPtr<UAurixParticipantSoundWave>* Found = ParticipantSounds.Find(UserId);
+	return Found ? Found->Get() : nullptr;
+}
+
+int32 UAurixVoiceSubsystem::PullParticipantAudio(FGuid UserId, TArray<float>& InterleavedPcm, int32 Channels)
+{
+	if (!Native || Channels < 1 || Channels > 2 || InterleavedPcm.Num() == 0)
+	{
+		return 0;
+	}
+	return static_cast<int32>(Native->Client.pull_participant(ToUuid(UserId), InterleavedPcm.GetData(), static_cast<size_t>(InterleavedPcm.Num()), static_cast<uint8_t>(Channels)));
+}
+
+void UAurixVoiceSubsystem::SetParticipantClaimed(FGuid UserId, bool bClaimed)
+{
+	if (!UserId.IsValid())
+	{
+		return;
+	}
+	if (bClaimed)
+	{
+		ManualClaims.Add(UserId);
+	}
+	else
+	{
+		ManualClaims.Remove(UserId);
+	}
+	if (Native)
+	{
+		// A participant sound keeps its own claim.
+		Native->Client.set_participant_claimed(ToUuid(UserId), bClaimed || ParticipantSounds.Contains(UserId));
+	}
+}
+
+TArray<FAurixParticipantStream> UAurixVoiceSubsystem::GetParticipantStreams() const
+{
+	TArray<FAurixParticipantStream> Out;
+	if (!Native)
+	{
+		return Out;
+	}
+	for (const AurixParticipantStream& S : Native->Client.participant_streams())
+	{
+		FAurixParticipantStream Info;
+		Info.Ssrc = static_cast<int64>(S.ssrc);
+		Info.UserId = ToGuid(S.user_id);
+		Info.bSynthesized = S.synthesized;
+		Info.bMixed = S.mixed;
+		Info.bStereo = S.stereo;
+		Info.bActive = S.active;
+		Info.BufferedFrames = static_cast<int32>(S.buffered_frames);
+		Info.bClaimed = Info.UserId.IsValid() && (ParticipantSounds.Contains(Info.UserId) || ManualClaims.Contains(Info.UserId));
+		Out.Add(Info);
+	}
+	return Out;
 }
 
 void UAurixVoiceSubsystem::SetOutputVolume(float Volume)

@@ -685,6 +685,17 @@ older SDKs) get libopus' downmix. Recordings of a stereo channel carry a 2-chann
 The capture DSP is a voice chain and is bypassed for stereo frames; browsers are opened with a
 2-channel track and voice processing off. PCMU stays mono.
 
+**Per-participant PCM for engine spatialization.** Native, Unity and Unreal clients can pull
+each talker's decoded voice separately — unpanned, microphone + TTS, per-participant volume /
+server gain / master volume applied — and let the game engine do HRTF, occlusion, reverb and
+mixer routing instead of the server's stereo panning: `aurix_client_pull_participant_*` +
+`aurix_client_set_participant_claimed` in the C ABI, `AurixParticipantAudioSource` +
+`VoicePlaybackMode.PerParticipant` in Unity, `UAurixParticipantSoundWave` /
+`SpawnParticipantAudioComponent` in Unreal. Claiming a user takes their streams out of the
+aggregate mix, so spatialized avatars and the 2D mix for everyone else coexist without double
+playback; claims are by user id and survive rejoins and node failover. Not available for the
+server-mixed downlink (one aggregate stream) or browsers.
+
 ### PCMU (G.711) fallback for weak devices
 
 Channels are Opus internally, but a native AURX session can ask to run on **G.711 μ-law** —
@@ -907,7 +918,7 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 | Web (TypeScript) | [`sdk/web`](sdk/web) | WebRTC/Opus via the SFU, WS control plane, demo page | two-browser smoke test (ICE/DTLS, RTP both ways, decoded audio) |
 | Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane; capture DSP via the native core (AEC/NS/AGC) with a managed high-pass + AGC fallback | `dotnet test` + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus) |
 | Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, capture DSP (high-pass, acoustic echo cancellation, RNNoise-derived noise suppression, AGC), reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
-| Unreal Engine 5.3+ (C++/Blueprint) | [`sdk/unreal`](sdk/unreal) | `AurixVoice` plugin over the `aurix-client` C ABI: `UAurixVoiceSubsystem` with typed Blueprint events, `AudioCapture` microphone bridge, procedural playback wave; static-Opus native library staged by `sdk/unreal/scripts/build_native.*` | native library build for Linux + ABI-reference test in CI; UHT/engine compile **not** run here (no Unreal in the dev environment — see the [README](sdk/unreal/README.md)) |
+| Unreal Engine 5.3+ (C++/Blueprint) | [`sdk/unreal`](sdk/unreal) | `AurixVoice` plugin over the `aurix-client` C ABI: `UAurixVoiceSubsystem` with typed Blueprint events, `AudioCapture` microphone bridge, procedural playback wave + per-participant sound waves for engine spatialization; static-Opus native library staged by `sdk/unreal/scripts/build_native.*` | native library build for Linux + ABI-reference test in CI; UHT/engine compile **not** run here (no Unreal in the dev environment — see the [README](sdk/unreal/README.md)) |
 
 All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
 

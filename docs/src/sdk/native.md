@@ -90,6 +90,23 @@ Rules that matter:
 * Every Rust enum has a `#[repr(C)]` mirror; `aurix_event_json` exposes the full serialised
   event for fields without a dedicated accessor.
 
+Per-participant playout (engine spatialization): instead of `aurix_client_mix_output_*`
+(everyone, directional panning already applied), pull each talker separately with
+`aurix_client_pull_participant_f32/i16(client, &user_id, out, samples, channels)` — the user's
+microphone and TTS streams only, **overwriting** `out`, no local panning (a stereo sender keeps
+L/R on a stereo output, is downmixed for mono), per-participant volume / server gain / master
+volume still applied; the return value is the number of frames that carried audio.
+`aurix_client_set_participant_claimed(client, &user_id, true)` takes that user out of
+`mix_output_*` so a spatialized emitter per talker and the aggregate mix for everyone else run
+side by side without double-playing (each frame is consumed by whoever renders it; the claim
+follows the user across SSRC changes). `aurix_client_participant_streams` lists the buffered
+streams (`AurixParticipantStream`: ssrc, owner, synthesized, mixed, stereo, active,
+buffered_frames) for hosts that spawn an emitter per talker. Pulled audio is not fed to the
+echo canceller — `aurix_client_push_render_*` the engine's final output. A server-mixed
+downlink (`DownlinkMode::Mixed`) carries no per-participant streams. C++: `pull_participant`,
+`set_participant_claimed`, `participant_streams`; Rust: `Client::pull_participant_f32/i16`,
+`set_participant_claimed`, `participant_streams`.
+
 Statistics: `aurix_client_stats` (`AurixStats`: media counters, `bad_auth`, `replayed`,
 `heartbeats_lost`, RTT last/min/avg/max, jitter, `loss_percent`, `r_factor`, `mos`, `bars`),
 `aurix_client_network_quality` and the `NETWORK_QUALITY` event — see
@@ -335,7 +352,13 @@ Voice->Connect(Settings);
 Audio options: default engine capture + 2D `UAudioComponent` (`PlaybackSoundClass` routes it
 through your mixer/ducking); or `PushCaptureAudio` from your own capture path and
 `MixOutputAudio` from your own procedural sound/submix — both audio-thread safe until
-`Disconnect()`.
+`Disconnect()`. For engine spatialization, `CreateParticipantSound(UserId)` /
+`SpawnParticipantAudioComponent(UserId, HeadComponent, Attenuation)` give each talker its own
+mono `UAurixParticipantSoundWave` (no local panning; the user is claimed so the 2D mix skips
+it — unclaimed talkers stay 2D), spatialized by Unreal's attenuation / spatializer plugin /
+occlusion / reverb like any in-world sound; `ReleaseParticipantSound`, `GetParticipantSound`,
+`GetParticipantStreams`, and `SetParticipantClaimed` + `PullParticipantAudio` for a custom
+graph. Details in `sdk/unreal/README.md` ("Audio integration options").
 
 Capture processing: `FAurixVoiceSettings.Dsp` (`FAurixDspSettings`: high-pass, echo
 cancellation + tail, noise suppression strength, AGC target/max gain) is applied by the core;

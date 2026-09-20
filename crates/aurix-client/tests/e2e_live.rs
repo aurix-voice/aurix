@@ -1472,3 +1472,185 @@ async fn native_stereo_uplink_keeps_the_image_and_stays_mono_elsewhere() {
     bob.disconnect();
     dave.disconnect();
 }
+
+/// One 20 ms round of the per-participant scenario: Alice and Dave push tones (amplitude 0 =
+/// silent), Bob renders his aggregate mix (stereo i16) and, when `pull` names her, pulls Alice
+/// alone (stereo f32).
+/// Returns `(mix_rms, mix_active_frames, pull_rms_left, pull_rms_right, pull_active_frames)`.
+async fn stream_split(
+    alice: &Client,
+    dave: &Client,
+    bob: &Client,
+    alice_amp: f32,
+    dave_amp: f32,
+    secs: f32,
+    pull: Option<UserId>,
+) -> (f32, usize, f32, f32, usize) {
+    let frames = (secs * 50.0) as usize;
+    let (mut pa, mut pd) = (0.0f32, 0.0f32);
+    let mut pcm_a = vec![0f32; FRAME_SAMPLES];
+    let mut pcm_d = vec![0f32; FRAME_SAMPLES];
+    let mut mixed = vec![0i16; FRAME_SAMPLES * 2];
+    let mut pulled = vec![0f32; FRAME_SAMPLES * 2];
+    let (mut mix_active, mut pull_active) = (0usize, 0usize);
+    let (mut mix_sq, mut mix_n) = (0f64, 0usize);
+    let (mut l_sq, mut r_sq, mut pull_n) = (0f64, 0f64, 0usize);
+    for _ in 0..frames {
+        for (a, d) in pcm_a.iter_mut().zip(pcm_d.iter_mut()) {
+            *a = alice_amp * pa.sin();
+            *d = dave_amp * pd.sin();
+            pa += 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32;
+            pd += 2.0 * std::f32::consts::PI * 660.0 / SAMPLE_RATE as f32;
+        }
+        if alice_amp > 0.0 {
+            alice.push_capture_f32(&pcm_a, SAMPLE_RATE, 1);
+        }
+        if dave_amp > 0.0 {
+            dave.push_capture_f32(&pcm_d, SAMPLE_RATE, 1);
+        }
+        if bob.mix_output_i16(&mut mixed, 2) > 0 {
+            mix_active += 1;
+            for s in &mixed {
+                let v = *s as f64 / 32768.0;
+                mix_sq += v * v;
+            }
+            mix_n += mixed.len();
+        }
+        let pulled_frames = pull.map_or(0, |user| bob.pull_participant_f32(user, &mut pulled, 2));
+        if pulled_frames > 0 {
+            pull_active += 1;
+            for [l, r] in pulled.as_chunks::<2>().0 {
+                l_sq += (*l as f64).powi(2);
+                r_sq += (*r as f64).powi(2);
+            }
+            pull_n += pulled.len() / 2;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rms = |sq: f64, n: usize| {
+        if n > 0 {
+            (sq / n as f64).sqrt() as f32
+        } else {
+            0.0
+        }
+    };
+    (
+        rms(mix_sq, mix_n),
+        mix_active,
+        rms(l_sq, pull_n),
+        rms(r_sq, pull_n),
+        pull_active,
+    )
+}
+
+/// Bob claims Alice and renders her through `pull_participant_*` (an engine emitter) while
+/// Dave stays in the aggregate mix: the mix carries one voice, not two, the pull carries only
+/// Alice (unpanned, L == R), `participant_streams` names her; with Dave silent the mix is
+/// completely quiet; releasing the claim puts Alice back into the mix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_per_participant_pull_keeps_claimed_talkers_out_of_the_mix() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel = create_channel(&env, &http).await;
+    let (alice_token, alice_id) = issue_token(&env, &http, "pull-alice", "Alice", channel).await;
+    let (dave_token, dave_id) = issue_token(&env, &http, "pull-dave", "Dave", channel).await;
+    let (bob_token, bob_id) = issue_token(&env, &http, "pull-bob", "Bob", channel).await;
+
+    let mk = |token: String| {
+        let mut cfg = ClientConfig::new(ws_with_path(&env.ws), token);
+        cfg.dsp = DspConfig::BYPASS;
+        Client::new(cfg).unwrap()
+    };
+    let alice = mk(alice_token);
+    let dave = mk(dave_token);
+    let bob = mk(bob_token);
+    for c in [&alice, &dave, &bob] {
+        c.connect().unwrap();
+    }
+    for (c, who) in [(&alice, "alice"), (&dave, "dave"), (&bob, "bob")] {
+        wait_for(c, who, Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaBound)
+        })
+        .await;
+    }
+
+    // Bob claims Alice *before* the roster is known: the claim is by user id and resolves to
+    // her SSRC when the join ack arrives.
+    bob.set_participant_claimed(alice_id, true);
+    assert_eq!(bob.claimed_participants(), vec![alice_id]);
+
+    for (c, who) in [(&alice, "alice"), (&dave, "dave"), (&bob, "bob")] {
+        c.join_channel(channel, None).unwrap();
+        wait_for(c, &format!("{who} join"), Duration::from_secs(10), |e| {
+            matches!(e, Event::ChannelJoined { .. })
+        })
+        .await;
+    }
+    // Bob joined last, so Alice and Dave arrived with his join ack (roster), not as events.
+    let seen: std::collections::HashSet<UserId> = bob
+        .participants(channel)
+        .into_iter()
+        .map(|p| p.user_id)
+        .filter(|u| *u != bob_id)
+        .collect();
+    assert!(
+        seen.contains(&alice_id) && seen.contains(&dave_id),
+        "{seen:?}"
+    );
+
+    // --- both talk: the mix carries Dave only (one voice ≈ 0.21, two would be ≈ 0.30), the
+    // pull carries Alice, centred.
+    let (mix, mix_active, l, r, pull_active) =
+        stream_split(&alice, &dave, &bob, 0.3, 0.3, 1.6, Some(alice_id)).await;
+    eprintln!("both talking: mix {mix:.3} ({mix_active} frames), pull L={l:.3} R={r:.3} ({pull_active} frames)");
+    assert!(mix_active >= 50, "mix active {mix_active}");
+    assert!(pull_active >= 50, "pull active {pull_active}");
+    assert!(
+        (0.15..0.26).contains(&mix),
+        "mix rms {mix} (Alice leaked into the mix?)"
+    );
+    assert!((0.15..0.26).contains(&l), "pull L {l}");
+    assert!((l - r).abs() < 0.01, "pull must be unpanned: L={l} R={r}");
+
+    let streams = bob.participant_streams();
+    eprintln!("streams: {streams:?}");
+    let alice_stream = streams
+        .iter()
+        .find(|s| s.user_id == Some(alice_id))
+        .expect("alice's stream is listed");
+    assert!(!alice_stream.synthesized && !alice_stream.mixed && !alice_stream.stereo);
+    assert!(
+        streams.iter().any(|s| s.user_id == Some(dave_id)),
+        "dave's stream is listed"
+    );
+
+    // --- Dave silent, Alice talking: the aggregate mix goes quiet once Dave's last buffered
+    // frames (jitter depth + concealment) have drained.
+    let (mix, mix_active, l, _r, pull_active) =
+        stream_split(&alice, &dave, &bob, 0.3, 0.0, 1.0, Some(alice_id)).await;
+    eprintln!(
+        "alice only: mix {mix:.3} ({mix_active} frames), pull L={l:.3} ({pull_active} frames)"
+    );
+    assert!(pull_active >= 30, "pull active {pull_active}");
+    assert!((0.15..0.26).contains(&l), "pull L {l}");
+    assert!(
+        mix_active <= 6,
+        "claimed Alice must not reach the mix: rms {mix} over {mix_active} frames"
+    );
+
+    // --- release: Alice is mixed again.
+    bob.set_participant_claimed(alice_id, false);
+    assert!(bob.claimed_participants().is_empty());
+    let (mix, mix_active, _l, _r, _p) =
+        stream_split(&alice, &dave, &bob, 0.3, 0.0, 1.0, None).await;
+    eprintln!("released: mix {mix:.3} ({mix_active} frames)");
+    assert!(mix_active >= 30, "mix active {mix_active}");
+    assert!((0.15..0.26).contains(&mix), "mix rms {mix}");
+
+    alice.disconnect();
+    dave.disconnect();
+    bob.disconnect();
+}

@@ -8,6 +8,9 @@
 
 class UAudioComponent;
 class UAurixVoiceSoundWave;
+class UAurixParticipantSoundWave;
+class USceneComponent;
+class USoundAttenuation;
 class FAurixAudioCapture;
 class FAurixRegionDiscovery;
 struct FAurixNativeClient;
@@ -249,6 +252,56 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
 	int32 MixOutputAudio(UPARAM(ref) TArray<float>& InterleavedPcm, int32 Channels);
 
+	// ---- per-participant playback (engine spatialization) ----------------------------------
+
+	/**
+	 * A procedural sound carrying only UserId's voice (microphone + TTS), with no local
+	 * panning — play it through an in-world UAudioComponent with attenuation / spatializer
+	 * plugin / occlusion / reverb of your choice. The participant is claimed: the aggregate
+	 * 2D mix (StartPlayback / MixOutputAudio) skips it, unclaimed talkers keep playing there,
+	 * so both can run side by side without anyone being heard twice. One sound per user;
+	 * repeated calls return the same object. Stereo keeps a music sender's L/R image but is
+	 * not spatialized by Unreal. Survives reconnects and node failover; release it with
+	 * ReleaseParticipantSound when the actor goes away (the user leaving does not release it).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback", meta = (AdvancedDisplay = "bStereo"))
+	UAurixParticipantSoundWave* CreateParticipantSound(FGuid UserId, bool bStereo = false);
+
+	/**
+	 * CreateParticipantSound + an audio component attached to AttachTo (typically the avatar's
+	 * head), spatialized with Attenuation (or the component's defaults when null) and playing
+	 * immediately. Returns nullptr without a world or audio device. The component is owned by
+	 * AttachTo's actor; stopping/destroying it does not release the claim — call
+	 * ReleaseParticipantSound.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback", meta = (AdvancedDisplay = "Attenuation,bStereo"))
+	UAudioComponent* SpawnParticipantAudioComponent(FGuid UserId, USceneComponent* AttachTo, USoundAttenuation* Attenuation = nullptr, bool bStereo = false);
+
+	/** Return UserId to the aggregate mix and silence its participant sound (if any). */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
+	void ReleaseParticipantSound(FGuid UserId);
+
+	/** The participant sound created for UserId, or nullptr. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Playback")
+	UAurixParticipantSoundWave* GetParticipantSound(FGuid UserId) const;
+
+	/**
+	 * Pull UserId's voice into your own buffer (interleaved float, 48 kHz, 1 or 2 channels,
+	 * **overwritten**, no panning) for a custom audio graph. Claim the user first with
+	 * SetParticipantClaimed so the aggregate mix leaves the frames for you. Returns frames
+	 * that carried audio; the rest is silence.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
+	int32 PullParticipantAudio(FGuid UserId, UPARAM(ref) TArray<float>& InterleavedPcm, int32 Channels);
+
+	/** Keep UserId out of the aggregate mix while you render it yourself with PullParticipantAudio. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
+	void SetParticipantClaimed(FGuid UserId, bool bClaimed);
+
+	/** Downlink streams currently buffered, with their owners (one per talker, plus TTS voices). */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
+	TArray<FAurixParticipantStream> GetParticipantStreams() const;
+
 	/** Master playback volume 0..2. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
 	void SetOutputVolume(float Volume);
@@ -456,6 +509,12 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UAudioComponent> PlaybackComponent;
+
+	UPROPERTY(Transient)
+	TMap<FGuid, TObjectPtr<UAurixParticipantSoundWave>> ParticipantSounds;
+
+	/** Users claimed through SetParticipantClaimed (without a participant sound). */
+	TSet<FGuid> ManualClaims;
 
 	FDelegateHandle PostLoadMapHandle;
 	bool bPlaybackRequested = false;

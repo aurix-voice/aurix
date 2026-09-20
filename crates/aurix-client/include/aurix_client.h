@@ -743,6 +743,34 @@ typedef struct AurixChannelInfo {
 } AurixChannelInfo;
 
 /**
+ * One downlink stream held by the jitter buffers (see `aurix_client_participant_streams`).
+ */
+typedef struct AurixParticipantStream {
+  uint32_t ssrc;
+  /**
+   * Owner across joined channels; nil UUID for a server mix or an unknown sender.
+   */
+  struct AurixUuid user_id;
+  /**
+   * Server-synthesized voice (TTS / announcement) of `user_id`, not its microphone.
+   */
+  bool synthesized;
+  /**
+   * Server-mixed channel downlink (`AurixDownlinkMode::Mixed`), not one participant.
+   */
+  bool mixed;
+  /**
+   * Decoded two-wide (stereo uplink or server mix).
+   */
+  bool stereo;
+  /**
+   * Has audio buffered or arriving; `false` between talk spurts.
+   */
+  bool active;
+  uint32_t buffered_frames;
+} AurixParticipantStream;
+
+/**
  * Runtime DSP diagnostics.
  */
 typedef struct AurixDspStats {
@@ -1294,6 +1322,49 @@ size_t aurix_client_mix_output_i16(struct AurixClient *client,
                                    int16_t *out,
                                    size_t sample_count,
                                    uint8_t channels);
+
+/**
+ * Copy up to `capacity` downlink streams with their owners; returns the total count.
+ * For hosts that spawn one positioned emitter per talking participant.
+ */
+size_t aurix_client_participant_streams(const struct AurixClient *client,
+                                        struct AurixParticipantStream *out,
+                                        size_t capacity);
+
+/**
+ * Per-participant playout for engine spatialization: **overwrite** `out` (interleaved f32,
+ * `sample_count` total samples, `channels` 1 or 2) with `user_id`'s voice only — microphone
+ * plus its TTS voice — with no local panning, so the host attaches it to a positioned
+ * emitter (HRTF, occlusion, reverb). Per-participant volume, server gain and master volume
+ * / mute still apply. Returns the frames that carried audio; the rest is silence. A stream
+ * is consumed by whoever pulls it: pull every participant you want to hear, or mix the rest
+ * with `aurix_client_mix_output_*`. Not fed to the AEC — push the engine's final output with
+ * `aurix_client_push_render_*`. Audio-thread safe.
+ */
+size_t aurix_client_pull_participant_f32(struct AurixClient *client,
+                                         const struct AurixUuid *user_id,
+                                         float *out,
+                                         size_t sample_count,
+                                         uint8_t channels);
+
+/**
+ * Like `aurix_client_pull_participant_f32` with i16 samples.
+ */
+size_t aurix_client_pull_participant_i16(struct AurixClient *client,
+                                         const struct AurixUuid *user_id,
+                                         int16_t *out,
+                                         size_t sample_count,
+                                         uint8_t channels);
+
+/**
+ * Keep `user_id`'s microphone and TTS streams out of `aurix_client_mix_output_*` while the
+ * host renders them itself with `aurix_client_pull_participant_*`, so one spatialized
+ * emitter per talker and the aggregate mix for everyone else never double-play. The claim
+ * follows the user across SSRC changes; `claimed = false` returns the user to the mix.
+ */
+enum AurixResult aurix_client_set_participant_claimed(struct AurixClient *client,
+                                                      const struct AurixUuid *user_id,
+                                                      bool claimed);
 
 void aurix_client_set_muted(struct AurixClient *client, bool muted);
 

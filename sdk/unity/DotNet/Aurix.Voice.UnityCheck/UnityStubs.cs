@@ -11,6 +11,7 @@ namespace UnityEngine
         public static bool operator !=(Object a, Object b) => !ReferenceEquals(a, b);
         public override bool Equals(object o) => ReferenceEquals(this, o);
         public override int GetHashCode() => base.GetHashCode();
+        public static T FindObjectOfType<T>() where T : Object => default;
     }
     public class GameObject : Object { public T AddComponent<T>() where T : Component => default; }
     public class Component : Object
@@ -29,6 +30,7 @@ namespace UnityEngine
     [AttributeUsage(AttributeTargets.All)] public class RangeAttribute : Attribute { public RangeAttribute(float a, float b) { } }
     public class AudioClip : Object { public int samples; public int channels; public int frequency; public bool GetData(float[] d, int off) => true; }
     public class AudioSource : Behaviour { public AudioClip clip; public bool loop; public float spatialBlend; public bool isPlaying; public void Play() { } }
+    public class AudioListener : Behaviour { }
     public static class Microphone
     {
         public static string[] devices => Array.Empty<string>();
