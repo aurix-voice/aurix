@@ -27,6 +27,54 @@ namespace Aurix.Protocol
         public ChannelRole Role;
         public bool IsMuted;
         public bool IsSpeaking;
+        /// <summary>Priority speaker: their speech ducks everyone else (<see cref="DuckingConfig"/>).</summary>
+        public bool IsPriority;
+    }
+
+    /// <summary>
+    /// Priority-speaker ducking of a channel (<c>ChannelConfig.ducking</c>): while a priority member speaks
+    /// the node ramps every non-priority voice it mixes or forwards down to <see cref="Gain"/> over
+    /// <see cref="AttackMs"/>, holds for <see cref="HoldMs"/> after their last audible frame and ramps back
+    /// over <see cref="ReleaseMs"/>. Clients reproduce the same envelope on their game audio
+    /// (<c>OnDuckingChanged</c>) and, in browsers, on per-participant tracks.
+    /// </summary>
+    public struct DuckingConfig : IEquatable<DuckingConfig>
+    {
+        /// <summary>Gain of non-priority voices while a priority speaker talks (0 = silenced, 1 = no ducking).</summary>
+        public float Gain;
+        public int AttackMs;
+        public int ReleaseMs;
+        public int HoldMs;
+        /// <summary>Moderators and administrators are priority speakers as well.</summary>
+        public bool Moderators;
+
+        public static DuckingConfig Default => new DuckingConfig { Gain = 0.25f, AttackMs = 60, ReleaseMs = 400, HoldMs = 250 };
+
+        public static DuckingConfig FromObject(Dictionary<string, object> o)
+        {
+            var d = Default;
+            if (o == null) return d;
+            if (o.ContainsKey("gain")) d.Gain = Math.Max(0f, Math.Min(1f, (float)MiniJson.GetNumber(o, "gain", d.Gain)));
+            if (o.ContainsKey("attack_ms")) d.AttackMs = (int)MiniJson.GetNumber(o, "attack_ms", d.AttackMs);
+            if (o.ContainsKey("release_ms")) d.ReleaseMs = (int)MiniJson.GetNumber(o, "release_ms", d.ReleaseMs);
+            if (o.ContainsKey("hold_ms")) d.HoldMs = (int)MiniJson.GetNumber(o, "hold_ms", d.HoldMs);
+            d.Moderators = MiniJson.GetBool(o, "moderators");
+            return d;
+        }
+
+        /// <summary>The <c>ducking</c> field of a <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>; <c>null</c> when absent or off.</summary>
+        public static DuckingConfig? FromMessage(ControlMessage m)
+        {
+            if (m.Data == null || !m.Data.TryGetValue("ducking", out var v) || v == null) return null;
+            var o = MiniJson.AsObject(v);
+            return o == null ? (DuckingConfig?)null : FromObject(o);
+        }
+
+        public bool Equals(DuckingConfig o) =>
+            Gain == o.Gain && AttackMs == o.AttackMs && ReleaseMs == o.ReleaseMs && HoldMs == o.HoldMs && Moderators == o.Moderators;
+        public override bool Equals(object obj) => obj is DuckingConfig o && Equals(o);
+        public override int GetHashCode() => HashCode.Combine(Gain, AttackMs, ReleaseMs, HoldMs, Moderators);
+        public override string ToString() => $"gain {Gain:0.00} attack {AttackMs} ms hold {HoldMs} ms release {ReleaseMs} ms{(Moderators ? " +moderators" : "")}";
     }
 
     public struct Position3D { public float X, Y, Z; }
@@ -376,6 +424,7 @@ namespace Aurix.Protocol
                     Role = ParseRole(MiniJson.GetString(o, "role")),
                     IsMuted = MiniJson.GetBool(o, "is_muted"),
                     IsSpeaking = MiniJson.GetBool(o, "is_speaking"),
+                    IsPriority = MiniJson.GetBool(o, "is_priority"),
                 });
             }
             return list;
@@ -760,6 +809,14 @@ namespace Aurix.Protocol
 
         public static string SetUserBlock(Guid userId, bool blocked) =>
             Serialize("SetUserBlock", new Dictionary<string, object> { { "user_id", userId }, { "blocked", blocked } });
+
+        /// <summary><paramref name="userId"/> <c>null</c> = yourself.</summary>
+        public static string SetPriority(Guid channelId, Guid? userId, bool priority)
+        {
+            var data = new Dictionary<string, object> { { "channel_id", channelId }, { "priority", priority } };
+            if (userId.HasValue) data["user_id"] = userId.Value;
+            return Serialize("SetPriority", data);
+        }
 
         public static string SetTransmission(TransmissionMode mode) =>
             Serialize("SetTransmission", new Dictionary<string, object> { { "mode", mode.ToWire() } });

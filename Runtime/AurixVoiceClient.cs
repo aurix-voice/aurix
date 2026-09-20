@@ -33,6 +33,11 @@ namespace Aurix
         public bool IsSpeaking;
         /// <summary>Last reported audio energy 0..1 (from <c>ChannelEnergy</c>; decays to 0 when silent).</summary>
         public float Energy;
+        /// <summary>
+        /// Priority speaker: while they talk the node ducks every non-priority voice in the channel
+        /// (<see cref="ChannelInfo.Ducking"/>) and <see cref="AurixVoiceClient.OnDuckingChanged"/> fires for your game audio.
+        /// </summary>
+        public bool IsPriority;
     }
 
     /// <summary>
@@ -74,6 +79,13 @@ namespace Aurix
         public bool Transcription;
         /// <summary>Speech in the channel is analysed by the operator's content-safety pipeline.</summary>
         public bool SafetyVoice;
+        /// <summary>
+        /// Priority-speaker ducking the node applies in this channel; <c>null</c> when the channel has none
+        /// (then <see cref="AurixVoiceClient.SetPriorityAsync"/> is rejected and nobody is ever a priority speaker).
+        /// </summary>
+        public DuckingConfig? Ducking;
+        /// <summary>Whether we are a priority speaker here (the grant's <c>priority</c> or a later <c>SetPriority</c>).</summary>
+        public bool IsPriority;
 
         /// <summary>Whether this session may transmit in the channel.</summary>
         public bool CanSpeak => Role != ChannelRole.Listener;
@@ -159,6 +171,7 @@ namespace Aurix
 
         private readonly string _wsUrl;
         private string _token;
+        private Guid _localUserId;
         private readonly Dictionary<Guid, Dictionary<Guid, Participant>> _channels = new Dictionary<Guid, Dictionary<Guid, Participant>>();
         private readonly Dictionary<uint, Participant> _bySsrc = new Dictionary<uint, Participant>();
         private readonly Queue<Action> _mainThreadQueue = new Queue<Action>();
@@ -207,6 +220,8 @@ namespace Aurix
         private readonly HashSet<Guid> _monitoredChannels = new HashSet<Guid>();
         private readonly Dictionary<Guid, ChannelScope> _channelScopes = new Dictionary<Guid, ChannelScope>();
         private readonly Dictionary<Guid, ChannelInfo> _channelInfos = new Dictionary<Guid, ChannelInfo>();
+        /// <summary>Channels another member's priority speech is ducking right now (see <see cref="RefreshDucking"/>).</summary>
+        private readonly HashSet<Guid> _duckedChannels = new HashSet<Guid>();
         /// <summary>Audio policy of every joined channel (from <c>ChannelJoinAck</c> / <c>ChannelAudioPolicy</c>).</summary>
         private readonly Dictionary<Guid, AudioPolicy> _channelPolicies = new Dictionary<Guid, AudioPolicy>();
         private AudioPolicy? _audioPolicy;
@@ -262,7 +277,21 @@ namespace Aurix
         /// The playout mixer whose jitter-buffer counters feed <see cref="GetStats"/> and the periodic
         /// quality report (set by <c>AurixVoiceBehaviour</c>; assign it yourself when driving the mixer manually).
         /// </summary>
-        public RemoteMixer Mixer { get; set; }
+        public RemoteMixer Mixer
+        {
+            get => _mixer;
+            set
+            {
+                _mixer = value;
+                if (value != null) lock (_capture) value.VisemesEnabled = _visemesEnabled;
+            }
+        }
+        private RemoteMixer _mixer;
+        private readonly object _capture = new object();
+        private bool _visemesEnabled;
+        private NativeVisemeAnalyzer _localVisemes;
+        private NativeVoiceEffects _voiceEffects;
+        private VoiceEffectParams _voiceEffectParams;
         /// <summary>Wall-clock RTT of the last WebSocket ping, in ms.</summary>
         public float ControlRttMs { get; private set; }
         public TimeSpan PingInterval { get; set; } = TimeSpan.FromSeconds(15);
@@ -620,6 +649,17 @@ namespace Aurix
         public event Action<Guid, Participant> OnParticipantLeft;
         public event Action<Guid, Participant> OnParticipantUpdated;
         public event Action<Guid, Participant, bool> OnSpeaking;
+        /// <summary>
+        /// (channel, user, priority): a member's priority-speaker state changed — including yourself, as the ack of
+        /// <see cref="SetPriorityAsync"/> or a moderator's grant. <see cref="Participant.IsPriority"/> is already updated.
+        /// </summary>
+        public event Action<Guid, Guid, bool> OnParticipantPriorityChanged;
+        /// <summary>
+        /// Another member's priority speech started (<c>true</c>) or stopped (<c>false</c>) ducking the channel —
+        /// the hook to attenuate game audio with the same envelope (<see cref="DuckingConfig"/>). Fires on
+        /// transitions only, never per speaking update; your own speech never ducks what you hear.
+        /// </summary>
+        public event Action<Guid, bool, DuckingConfig> OnDuckingChanged;
         public event Action<Guid, IReadOnlyList<UserPosition>> OnPositions;
         public event Action<RecordingNotice> OnRecording;
         /// <summary>
@@ -745,6 +785,7 @@ namespace Aurix
 #else
             _wsUrl = wsUrl ?? throw new ArgumentNullException(nameof(wsUrl));
             _token = token ?? throw new ArgumentNullException(nameof(token));
+            _localUserId = TokenUserId(_token);
             Endpoint = _wsUrl;
 #endif
         }
@@ -1188,6 +1229,7 @@ namespace Aurix
         {
             EnsureConnected();
             await _control.SendAsync(ControlMessage.ChannelLeave(channelId), ct).ConfigureAwait(false);
+            DropDucking(channelId);
             lock (_channels)
             {
                 _joinedChannels.Remove(channelId);
@@ -1284,6 +1326,242 @@ namespace Aurix
         }
 
         public IReadOnlyCollection<Guid> BlockedUsers { get { lock (_blockedUsers) return new List<Guid>(_blockedUsers); } }
+
+        // ---- priority speaker + ducking ---------------------------------------------------------
+
+        /// <summary>
+        /// Make <paramref name="userId"/> (<c>null</c> = yourself) a priority speaker of <paramref name="channelId"/>, or
+        /// revoke it. Others need a moderator role; your own flag can be set with a <c>priority</c> grant and always
+        /// revoked. Rejected in channels without <see cref="ChannelInfo.Ducking"/>. Acked to everyone by
+        /// <see cref="OnParticipantPriorityChanged"/> (the <c>ChannelInfo</c> and <see cref="Participant.IsPriority"/> follow).
+        /// </summary>
+        public Task SetPriorityAsync(Guid channelId, Guid? userId, bool priority, CancellationToken ct = default)
+        {
+            EnsureConnected();
+            return _control.SendAsync(ControlMessage.SetPriority(channelId, userId, priority), ct);
+        }
+
+        /// <summary>Whether we are a priority speaker in <paramref name="channelId"/> (false for channels not joined).</summary>
+        public bool IsPriority(Guid channelId)
+        {
+            lock (_channels) return _channelInfos.TryGetValue(channelId, out var i) && i.IsPriority;
+        }
+
+        /// <summary>
+        /// Whether another member's priority speech is ducking <paramref name="channelId"/> right now — the state
+        /// <see cref="OnDuckingChanged"/> last reported.
+        /// </summary>
+        public bool IsDuckingActive(Guid channelId)
+        {
+            lock (_channels) return _duckedChannels.Contains(channelId);
+        }
+
+        /// <summary>
+        /// This client's user id as claimed by the connect token (an unverified JWT claim, <see cref="Guid.Empty"/> when the
+        /// token carries none). Used to keep your own speech from ducking what you hear.
+        /// </summary>
+        public Guid LocalUserId
+        {
+            get { lock (_channels) return _localUserId; }
+        }
+
+        private static Guid TokenUserId(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return Guid.Empty;
+            var parts = token.Split('.');
+            if (parts.Length < 2) return Guid.Empty;
+            var payload = parts[1].Replace('-', '+').Replace('_', '/');
+            switch (payload.Length % 4) { case 2: payload += "=="; break; case 3: payload += "="; break; case 1: return Guid.Empty; }
+            try
+            {
+                var claims = MiniJson.AsObject(MiniJson.Parse(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(payload))));
+                return MiniJson.GetGuid(claims, "user_id") ?? Guid.Empty;
+            }
+            catch (Exception) { return Guid.Empty; }
+        }
+
+        /// <summary>
+        /// Whether <paramref name="p"/>'s speech ducks the others in a channel with <paramref name="ducking"/>: the explicit
+        /// flag, or a moderator role when <see cref="DuckingConfig.Moderators"/> is on. Never our own speech.
+        /// </summary>
+        private bool Ducks(Participant p, DuckingConfig ducking) =>
+            p.IsSpeaking && p.UserId != _localUserId &&
+            (p.IsPriority || (ducking.Moderators && (p.Role == ChannelRole.Moderator || p.Role == ChannelRole.Administrator)));
+
+        /// <summary>Re-evaluates the game-audio ducking state of <paramref name="channelId"/>; fires <see cref="OnDuckingChanged"/> on a transition.</summary>
+        private void RefreshDucking(Guid channelId)
+        {
+            bool active;
+            DuckingConfig ducking;
+            lock (_channels)
+            {
+                active = false;
+                ducking = default;
+                if (_channelInfos.TryGetValue(channelId, out var info) && info.Ducking.HasValue && _channels.TryGetValue(channelId, out var map))
+                {
+                    ducking = info.Ducking.Value;
+                    foreach (var p in map.Values)
+                        if (Ducks(p, ducking)) { active = true; break; }
+                }
+                if (active == _duckedChannels.Contains(channelId)) return;
+                if (active) _duckedChannels.Add(channelId); else _duckedChannels.Remove(channelId);
+            }
+            OnDuckingChanged?.Invoke(channelId, active, ducking);
+        }
+
+        /// <summary>The channel is gone (left, kicked, disconnected): release its game-audio ducking, if any.</summary>
+        private void DropDucking(Guid channelId)
+        {
+            DuckingConfig ducking;
+            lock (_channels)
+            {
+                if (!_duckedChannels.Remove(channelId)) return;
+                ducking = _channelInfos.TryGetValue(channelId, out var info) && info.Ducking.HasValue ? info.Ducking.Value : DuckingConfig.Default;
+            }
+            OnDuckingChanged?.Invoke(channelId, false, ducking);
+        }
+
+        private void DropAllDucking()
+        {
+            List<Guid> ducked;
+            lock (_channels) ducked = _duckedChannels.Count == 0 ? null : new List<Guid>(_duckedChannels);
+            if (ducked == null) return;
+            foreach (var ch in ducked) DropDucking(ch);
+        }
+
+        // ---- lip-sync (visemes) + voice effects ---------------------------------------------------
+
+        /// <summary>
+        /// Whether lip-sync analysis is available here: the <c>aurix_client</c> native library with its
+        /// viseme analyser is loadable (the same binary <see cref="NativeOpusCodec"/> uses).
+        /// </summary>
+        public bool SupportsVisemes => NativeVisemeAnalyzer.IsAvailable;
+
+        /// <summary>Whether <see cref="SetVisemesAsync"/> turned lip-sync analysis on.</summary>
+        public bool VisemesEnabled { get { lock (_capture) return _visemesEnabled; } }
+
+        /// <summary>
+        /// Turn lip-sync analysis on or off for every participant heard through <see cref="Mixer"/> and for
+        /// the local microphone (frames the behaviour hands to <see cref="AnalyzeLocalVoice"/>). Purely local:
+        /// audio is analysed after decoding / E2EE decryption and nothing is sent to the server. Costs one
+        /// FFT per stream per 20 ms. Throws <see cref="PlatformNotSupportedException"/> without the native library.
+        /// </summary>
+        public Task SetVisemesAsync(bool enabled, CancellationToken ct = default)
+        {
+            if (enabled && !NativeVisemeAnalyzer.IsAvailable)
+                throw new PlatformNotSupportedException("lip-sync needs the aurix_client native library");
+            lock (_capture)
+            {
+                _visemesEnabled = enabled;
+                if (enabled) { if (_localVisemes == null) _localVisemes = new NativeVisemeAnalyzer(); }
+                else if (_localVisemes != null) { _localVisemes.Dispose(); _localVisemes = null; }
+                var mixer = _mixer;
+                if (mixer != null) mixer.VisemesEnabled = enabled;
+            }
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Mouth state of <paramref name="userId"/> — the last analysed 20 ms of its voice (or its TTS voice,
+        /// whichever spoke last) in any joined channel; null when unknown, not heard through <see cref="Mixer"/>
+        /// or with lip-sync off. Silence (mouth closed) between talk spurts.
+        /// </summary>
+        public VisemeFrame? GetParticipantVisemes(Guid userId)
+        {
+            var mixer = _mixer;
+            if (mixer == null || !VisemesEnabled) return null;
+            uint ssrc = 0;
+            lock (_channels)
+            {
+                foreach (var map in _channels.Values)
+                    if (map.TryGetValue(userId, out var p) && p.Ssrc != 0) { ssrc = p.Ssrc; break; }
+            }
+            if (ssrc == 0) return null;
+            return mixer.TryGetParticipantVisemes(ssrc, out var frame) ? frame : (VisemeFrame?)null;
+        }
+
+        /// <summary>Mouth state of the local microphone as encoded (effects included); null with lip-sync off.</summary>
+        public VisemeFrame? GetLocalVisemes()
+        {
+            lock (_capture) return _localVisemes?.Frame;
+        }
+
+        /// <summary>
+        /// Feed the interleaved 48 kHz frame about to be encoded (call from the capture thread, one 20 ms frame
+        /// at a time); a no-op with lip-sync off. <c>AurixVoiceBehaviour</c> does this for you.
+        /// </summary>
+        public void AnalyzeLocalVoice(float[] pcm, int frames, int channels)
+        {
+            lock (_capture) _localVisemes?.Push(pcm, 0, frames, channels);
+        }
+
+        /// <summary>The microphone stopped (device switch, mute, disconnect): the local mouth closes.</summary>
+        public void ResetLocalVoice()
+        {
+            lock (_capture)
+            {
+                _localVisemes?.Reset();
+                _voiceEffects?.Reset();
+            }
+        }
+
+        /// <summary>Whether voice effects can run here (the <c>aurix_client</c> native library is loadable).</summary>
+        public bool SupportsVoiceEffects => NativeVoiceEffects.IsAvailable;
+
+        /// <summary>The active voice-effect parameters (clamped), <see cref="VoiceEffectParams.Bypass"/> by default.</summary>
+        public VoiceEffectParams VoiceEffects { get { lock (_capture) return _voiceEffectParams; } }
+
+        /// <summary>
+        /// Apply a voice-effect chain to the local microphone — presets via <see cref="VoiceEffectParams.Preset"/>,
+        /// <see cref="VoiceEffectParams.Bypass"/> to switch off. Runs on the captured frames the behaviour hands to
+        /// <see cref="ApplyVoiceEffects"/> before encoding: injected audio and what you hear are untouched, and
+        /// listeners get the processed voice (encrypted channels included, since it is applied before sealing).
+        /// Throws <see cref="PlatformNotSupportedException"/> for a non-bypass chain without the native library.
+        /// </summary>
+        public Task SetVoiceEffectsAsync(VoiceEffectParams effects, CancellationToken ct = default)
+        {
+            var sanitized = effects.Sanitized();
+            lock (_capture)
+            {
+                if (sanitized.IsBypass)
+                {
+                    _voiceEffects?.Dispose();
+                    _voiceEffects = null;
+                    _voiceEffectParams = sanitized;
+                    return Task.CompletedTask;
+                }
+                if (!NativeVoiceEffects.IsAvailable)
+                    throw new PlatformNotSupportedException("voice effects need the aurix_client native library");
+                if (_voiceEffects == null) _voiceEffects = new NativeVoiceEffects(sanitized);
+                else _voiceEffects.Apply(sanitized);
+                _voiceEffectParams = _voiceEffects.Params;
+            }
+            return Task.CompletedTask;
+        }
+
+        /// <summary><see cref="SetVoiceEffectsAsync(VoiceEffectParams, CancellationToken)"/> with a built-in preset.</summary>
+        public Task SetVoiceEffectsAsync(VoiceEffectPreset preset, CancellationToken ct = default) =>
+            SetVoiceEffectsAsync(VoiceEffectParams.Preset(preset), ct);
+
+        /// <summary>
+        /// Run the active effect chain in place over one interleaved 48 kHz microphone frame (1 or 2 channels);
+        /// a no-op in bypass. Call from the capture thread, before mixing in injected audio and before encoding.
+        /// </summary>
+        public void ApplyVoiceEffects(float[] pcm, int frames, int channels)
+        {
+            lock (_capture) _voiceEffects?.Process(pcm, frames, channels);
+        }
+
+        private void DisposeCaptureProcessors()
+        {
+            lock (_capture)
+            {
+                _localVisemes?.Dispose();
+                _localVisemes = null;
+                _voiceEffects?.Dispose();
+                _voiceEffects = null;
+            }
+        }
 
         // ---- multi-channel: transmission policy (sender side) and focus (receiver side) ---------
 
@@ -2086,6 +2364,7 @@ namespace Aurix
         {
             _closedByUser = true;
             Teardown();
+            DisposeCaptureProcessors();
         }
 
         // ---- internals ----------------------------------------------------------------------
@@ -2119,6 +2398,8 @@ namespace Aurix
             _resumeToken = null;
             _joinTcs?.TrySetException(new OperationCanceledException("disconnected"));
             FailPendingChat(new OperationCanceledException("disconnected"));
+            DropAllDucking();
+            ResetLocalVoice();
             lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; _activeDownlink = DownlinkMode.Streams; }
             E2eeReset();
         }
@@ -2221,12 +2502,14 @@ namespace Aurix
                 var fresh = await refresher(ct).ConfigureAwait(false);
                 if (string.IsNullOrEmpty(fresh)) throw new InvalidOperationException("TokenRefresher returned no token");
                 _token = fresh;
+                lock (_channels) _localUserId = TokenUserId(fresh);
             }
             var info = await OpenSessionAsync(url, resume, ct).ConfigureAwait(false);
             List<Guid> rejoin = null;
             if (!info.Resumed)
             {
                 // New session: the old memberships are gone on the server; drop the stale rosters and re-join.
+                DropAllDucking();
                 lock (_channels)
                 {
                     rejoin = new List<Guid>(_joinedChannels);
@@ -2269,7 +2552,7 @@ namespace Aurix
                             var p = new Participant
                             {
                                 UserId = b.UserId, DisplayName = b.DisplayName, Ssrc = b.Ssrc,
-                                Role = b.Role, IsMuted = b.IsMuted, IsSpeaking = b.IsSpeaking,
+                                Role = b.Role, IsMuted = b.IsMuted, IsSpeaking = b.IsSpeaking, IsPriority = b.IsPriority,
                             };
                             map[p.UserId] = p;
                             _bySsrc[p.Ssrc] = p;
@@ -2291,6 +2574,8 @@ namespace Aurix
                             HiddenListeners = m.Bool("hidden_listeners"),
                             Transcription = m.Bool("transcription"),
                             SafetyVoice = m.Bool("safety_voice"),
+                            Ducking = DuckingConfig.FromMessage(m),
+                            IsPriority = m.Bool("priority"),
                         };
                         var policy = Audio.AudioPolicy.FromMessage(m);
                         if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
@@ -2305,19 +2590,26 @@ namespace Aurix
                     }
                     else E2eeLeft(channelId);
                     OnChannelJoined?.Invoke(channelId, roster);
+                    RefreshDucking(channelId);
                     break;
                 }
                 case "ChannelAudioPolicy":
                 {
                     var channelId = m.Id("channel_id");
                     var policy = Audio.AudioPolicy.FromMessage(m);
-                    if (!policy.HasValue) break;
+                    var ducking = DuckingConfig.FromMessage(m);
                     lock (_channels)
                     {
                         if (!_joinedChannels.Contains(channelId)) break;
-                        _channelPolicies[channelId] = policy.Value;
+                        if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
+                        if (_channelInfos.TryGetValue(channelId, out var info))
+                        {
+                            info.Ducking = ducking;
+                            _channelInfos[channelId] = info;
+                        }
                     }
-                    RefreshAudioPolicy();
+                    if (policy.HasValue) RefreshAudioPolicy();
+                    RefreshDucking(channelId);
                     break;
                 }
                 case "ParticipantJoined":
@@ -2329,6 +2621,7 @@ namespace Aurix
                         Ssrc = m.U32("ssrc"),
                         Role = m.Has("role") ? ControlMessage.ParseRole(m.Str("role")) : ChannelRole.Speaker,
                         IsMuted = m.Bool("is_muted"),
+                        IsPriority = m.Bool("is_priority"),
                     };
                     lock (_channels)
                     {
@@ -2356,6 +2649,7 @@ namespace Aurix
                     {
                         E2eePeerLeft(channelId, p.UserId);
                         OnParticipantLeft?.Invoke(channelId, p);
+                        RefreshDucking(channelId);
                     }
                     break;
                 }
@@ -2374,6 +2668,26 @@ namespace Aurix
                     if (p == null) break;
                     p.IsSpeaking = m.Bool("speaking");
                     OnSpeaking?.Invoke(m.Id("channel_id"), p, p.IsSpeaking);
+                    RefreshDucking(m.Id("channel_id"));
+                    break;
+                }
+                case "PriorityChanged":
+                {
+                    var channelId = m.Id("channel_id");
+                    var userId = m.Id("user_id");
+                    var priority = m.Bool("priority");
+                    var p = Lookup(channelId, userId);
+                    lock (_channels)
+                    {
+                        if (userId == _localUserId && _channelInfos.TryGetValue(channelId, out var info))
+                        {
+                            info.IsPriority = priority;
+                            _channelInfos[channelId] = info;
+                        }
+                    }
+                    if (p != null) p.IsPriority = priority;
+                    OnParticipantPriorityChanged?.Invoke(channelId, userId, priority);
+                    RefreshDucking(channelId);
                     break;
                 }
                 case "PositionUpdate":
@@ -2416,6 +2730,7 @@ namespace Aurix
                 case "Kick":
                 {
                     var channelId = m.Id("channel_id");
+                    DropDucking(channelId);
                     lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); _channelPolicies.Remove(channelId); _channelInfos.Remove(channelId); }
                     E2eeLeft(channelId);
                     RefreshAudioPolicy();

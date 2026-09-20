@@ -794,6 +794,97 @@ returns null, `IsSynthesizedSsrc` is true). Tags are BCP-47 (`DE_de` → `de-de`
 preference is replayed after reconnect and failover, and the WebGL client exposes the same members.
 Statuses go to the requesting session only; disconnecting cancels pending requests.
 
+### Voice effects (robot, monster, radio, …)
+
+```csharp
+// inspector: AurixVoiceBehaviour.VoiceEffect = Robot | Monster | Radio | Helium | Ghost | Custom (+ CustomVoiceEffect)
+// or from code, at any time, connected or not:
+await voice.Client.SetVoiceEffectsAsync(VoiceEffectPreset.Radio);
+var p = VoiceEffectParams.Preset(VoiceEffectPreset.Monster);
+p.PitchSemitones = -10f; p.ReverbMix = 0.3f;              // tweak a preset …
+await voice.Client.SetVoiceEffectsAsync(p);                // … (clamped to the library's limits)
+await voice.Client.SetVoiceEffectsAsync(VoiceEffectParams.Bypass);
+voice.Client.SupportsVoiceEffects;                         // native library present (false = plain microphone)
+voice.Client.VoiceEffects.IsBypass;
+```
+
+`VoiceEffectParams` is the same parameter set as the native core and the Web SDK — `HighpassHz` /
+`LowpassHz`, `FormantSemitones` (±12), `PitchSemitones` (±24), `RingModHz` (≤ 2 kHz), `DistortionDrive`
+(≤ 20), `TremoloHz` / `TremoloDepth`, `StaticLevel`, `ReverbMix` / `ReverbSize` / `ReverbDamping`
+(`0` = stage off; `Sanitized()` clamps). The chain runs on the **capture path only**, after the
+capture DSP and `InputGain` and before VAD, lip-sync analysis, injection mixing and the encoder — so the
+server, the other players, the level meters and any transcript get the effected voice, while
+`InjectClip` / `Injector` audio and everything you hear are untouched. Mono and stereo uplinks are
+both processed (channels are independent). On native players the stages are the native core's
+(`aurix_voice_effects_*` in the `aurix_client` library that also carries `NativeOpusCodec` /
+`NativeCaptureDsp`); without the library `SupportsVoiceEffects` is `false`, `SetVoiceEffectsAsync`
+of anything but bypass faults with `PlatformNotSupportedException`, and `AurixVoiceBehaviour` logs one
+warning and sends the plain microphone. In WebGL the same presets and parameters run in a browser
+`AudioWorklet` inside the Web SDK (`AurixWebGLVoiceBehaviour.VoiceEffect`, `SupportsVoiceEffects`
+= worklets available). The setting is client-side state: it survives reconnects and failover, its
+delay lines are cleared whenever the microphone stops (`ResetLocalVoice()` — device switch, mute,
+disconnect), and `Dispose` frees it.
+
+### Lip-sync (visemes)
+
+```csharp
+// on the avatar: AurixLipSync (Target = face SkinnedMeshRenderer, BlendShapes per viseme, JawBlendShape)
+var lips = avatar.GetComponent<AurixLipSync>();
+lips.Bind(participant.UserId);                             // or lips.BindLocal() for your own avatar
+lips.OnFrame += f => myRig.SetMouth(f.Dominant, f.MouthOpen);   // custom rigs / sprite sheets
+
+// or raw, per render frame:
+await voice.Client.SetVisemesAsync(true);                  // client-wide switch (AurixLipSync does this itself)
+var f = voice.Client.GetParticipantVisemes(userId);        // VisemeFrame? — null with analysis off / unknown user
+var mine = voice.Client.GetLocalVisemes();
+// f.Weights[(int)Viseme.aa], f.Dominant, f.MouthOpen (0..1), f.Energy, f.Confidence, f.Sequence
+```
+
+`VisemeFrame` holds a weight per `Viseme` (`sil PP FF SS aa E ih oh ou` — `VisemeFrame.Names` in the same
+order; `AurixLipSync.BlendShapes` defaults to the common `viseme_PP` … `viseme_U` blend-shape names, `""` =
+not driven), the dominant bucket, the
+mouth openness from the level, energy, confidence and a `Sequence` that advances per analysed 20 ms frame
+(`AurixLipSync.IsAnalysing` turns off when frames stop arriving; the component eases to a closed mouth after
+0.1 s without audio and smooths with `Smoothing`). The analysis runs **on this device** over audio it
+plays anyway: every heard participant's frames are analysed right after decoding (and, in E2EE channels,
+decrypting) — before the per-participant volume, local mute, panning and positional attenuation, so a
+quiet or far-away speaker still moves their mouth — and your own microphone is analysed as sent (after
+DSP, gain and effects, without injected clips). Nothing about the mouth shapes is sent anywhere. It is a
+spectral heuristic (level, voiced/fricative split, two formants → nearest vowel), good for openness and
+vowel motion, not for text-accurate articulation. Analysers are dropped when a participant leaves, on
+`SetVisemesAsync(false)`, reconnect and disconnect. Native players need the `aurix_client` library
+(`SupportsVisemes`); WebGL uses the Web SDK's worklet and — like the browser — only gets frames for
+participants on a dedicated per-participant track, not for voices heard through the mix.
+
+### Priority speakers and ducking game audio
+
+```csharp
+// channel: PUT /v1/channels/{id}/config {"ducking": {"gain": 0.25, "attack_ms": 60, "release_ms": 400, "hold_ms": 250, "moderators": false}}
+// token grant: channels[].priority = true (raid leader) — or promote at runtime as a moderator:
+await voice.Client.SetPriorityAsync(raidId, leaderUserId, true);
+await voice.Client.SetPriorityAsync(raidId, null, false);   // a granted member toggles themselves
+voice.Client.IsPriority(raidId);                            // me
+participant.IsPriority;                                     // roster flag
+voice.Client.GetChannelInfo(raidId)?.Ducking;               // DuckingConfig? (null = no ducking)
+voice.Client.OnParticipantPriorityChanged += (ch, user, priority) => { … };
+voice.Client.OnDuckingChanged += (ch, active, cfg) => { … }; // another priority speaker starts / stops holding the duck
+voice.Client.IsDuckingActive(raidId);
+```
+
+While a priority speaker talks the **node** attenuates every other voice you receive with the channel's
+envelope (attack → `Gain` → hold → release), multiplied with your own participant volumes and after your
+local mutes / blocks — nothing to do on the client, and your own priority voice is never ducked. To make
+the game's music and SFX follow, add `AurixGameAudioDucker` next to the voice behaviour and give it an
+`AudioMixer` exposed parameter (`MixerParameter`, in dB relative to its value when ducking starts) or a set
+of `AudioSource`s (`ChannelId` to follow one channel only); it tracks `OnDuckingChanged` across channels
+(several priority speakers keep it engaged),
+runs the same `DuckingEnvelope` on the main thread (`OverrideEnvelope` for your own curve), exposes
+`CurrentGain` / `IsDucked` / `IsActive` / `OnGainChanged` for custom targets and releases on leave, kick and
+disconnect. `SetPriorityAsync` for someone else needs a moderator role; promoting yourself needs a
+`priority` grant (`AUTH_DENIED` otherwise), and a channel without `ducking` rejects it with
+`VALIDATION_ERROR`. WebGL: identical members; the browser applies the envelope itself to its
+per-participant tracks from the priority members' speaking state.
+
 ## .NET: build, test, end-to-end demo
 
 ```bash

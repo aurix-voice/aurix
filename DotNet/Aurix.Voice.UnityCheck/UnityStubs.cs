@@ -17,7 +17,7 @@ namespace UnityEngine
     public class Component : Object
     {
         public GameObject gameObject => null;
-        public T GetComponent<T>() where T : Component => default;
+        public T GetComponent<T>() => default;
     }
     public class Behaviour : Component { }
     public class Coroutine { }
@@ -29,8 +29,11 @@ namespace UnityEngine
     [AttributeUsage(AttributeTargets.All)] public class HeaderAttribute : Attribute { public HeaderAttribute(string s) { } }
     [AttributeUsage(AttributeTargets.All)] public class RangeAttribute : Attribute { public RangeAttribute(float a, float b) { } }
     public class AudioClip : Object { public int samples; public int channels; public int frequency; public bool GetData(float[] d, int off) => true; }
-    public class AudioSource : Behaviour { public AudioClip clip; public bool loop; public float spatialBlend; public bool isPlaying; public void Play() { } }
+    public class AudioSource : Behaviour { public AudioClip clip; public bool loop; public float spatialBlend; public float volume; public bool isPlaying; public void Play() { } }
     public class AudioListener : Behaviour { }
+    public class Mesh : Object { public int blendShapeCount; public int GetBlendShapeIndex(string name) => -1; }
+    public class Renderer : Component { }
+    public class SkinnedMeshRenderer : Renderer { public Mesh sharedMesh; public void SetBlendShapeWeight(int index, float value) { } }
     public static class Microphone
     {
         public static string[] devices => Array.Empty<string>();
@@ -51,7 +54,7 @@ namespace UnityEngine
         public static AsyncOperation RequestUserAuthorization(UserAuthorization m) => null;
     }
     public static class Debug { public static void LogWarning(object o) { } public static void Log(object o) { } }
-    public static class Time { public static float unscaledTime; public static float unscaledDeltaTime; public static float realtimeSinceStartup; }
+    public static class Time { public static float deltaTime; public static float unscaledTime; public static float unscaledDeltaTime; public static float realtimeSinceStartup; }
     public static class Mathf
     {
         public static int Clamp(int v, int min, int max) => Math.Min(Math.Max(v, min), max);
@@ -96,4 +99,9 @@ namespace UnityEngine.Android
         public static bool HasUserAuthorizedPermission(string p) => true;
         public static void RequestUserPermission(string p, PermissionCallbacks cb) { }
     }
+}
+
+namespace UnityEngine.Audio
+{
+    public class AudioMixer : Object { public bool GetFloat(string name, out float value) { value = 0f; return true; } public bool SetFloat(string name, float value) => true; }
 }
