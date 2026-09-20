@@ -43,8 +43,9 @@ or a TURN server (built-in `[turn]` or your own).
 
 ## Region selection
 
-Players should connect to the nearest node with capacity — and reconnect to the *same* node,
-because session resume is node-local. Either pass the `endpoint.ws_url` your backend receives
+Players should connect to the nearest node with capacity — and reconnect to the *same* node
+while it is up (a resume elsewhere is a [takeover](../operations/high-availability.md#cross-node-session-failover),
+which works but moves media). Either pass the `endpoint.ws_url` your backend receives
 from `POST /v1/tokens` (with `region` / `location` hints), or let the browser choose:
 
 ```ts
@@ -74,6 +75,7 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | Feature | API | Notes |
 |---|---|---|
 | Reconnect / resume | `autoReconnect` (default on), `reconnect: {...}` backoff, `recovering` / `recovered` / `failedToRecover` / `sessionClosed`, `reconnectNow()` | resumed session keeps SSRC and channels; `channelJoined` fires again with a fresh roster |
+| Failover | `endpoint`, `failover`, `endpointChanged(url)`, `recovered(info)` with `info.migrated` | attempts rotate current node → advertised failover nodes; a takeover keeps session id/SSRC, new media key/endpoint |
 | Action tokens | `token`, `refreshToken()`, `joinToken(channelId)`, `moderate(channelId, userId, 'kick'\|'mute'\|'unmute', token, reason)` | mandatory under `auth.require_action_tokens` |
 | Local mute / volume / block | `setParticipantMuted(userId, muted, channelId?)`, `setParticipantVolume(userId, 0..2)`, `setUserBlocked(userId, blocked)`, `receiverPreferences`, `userBlockChanged` | enforced server-side before fan-out; replayed after a non-resumed reconnect |
 | Multiple channels | `setTransmission({type:'all'\|'none'\|'single', channelId?})`, `transmitToChannel(id)`, `setChannelFocus(id?)`, `transmissionChanged`, `channelFocusChanged` | `CHANNEL_LIMIT_EXCEEDED` when `media.max_channels_per_session` is hit |

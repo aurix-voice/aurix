@@ -179,6 +179,13 @@ export type ServerMessage =
         resume_grace_ms?: number;
         /** `true` when this ack reattached an existing session (channels are replayed). */
         resumed?: boolean;
+        /**
+         * `true` when the resumed session was taken over from another node (same session id
+         * and SSRC, new media path — the client must renegotiate media).
+         */
+        migrated?: boolean;
+        /** WebSocket URLs of other nodes to try when this one stops answering. */
+        failover?: string[];
       };
     }
   | { type: 'MediaBound'; data: { session_id: string } }

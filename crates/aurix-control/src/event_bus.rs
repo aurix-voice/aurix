@@ -119,6 +119,18 @@ pub enum ServerEvent {
         healthy: bool,
         timestamp: DateTime<Utc>,
     },
+    /// A client resumed its session on `to` after losing `from` (cross-node failover). `from`
+    /// drops its copy of the session without touching the database or the rosters; every
+    /// other node re-points the participant's cascade source. Node-scoped.
+    SessionMigrated {
+        app_id: AppId,
+        session_id: SessionId,
+        user_id: UserId,
+        from: MediaNodeId,
+        to: MediaNodeId,
+        ssrc: u32,
+        channels: Vec<ChannelId>,
+    },
     /// A tenant's webhook subscriptions changed; every node drops its cached copy. Internal,
     /// never exported.
     WebhooksChanged { app_id: AppId },
@@ -323,7 +335,8 @@ impl ServerEvent {
             | Self::TtsAnnouncement { app_id, .. }
             | Self::TtsStatus { app_id, .. }
             | Self::SafetyIncident { app_id, .. }
-            | Self::SafetyRiskChanged { app_id, .. } => Some(*app_id),
+            | Self::SafetyRiskChanged { app_id, .. }
+            | Self::SessionMigrated { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => None,
         }
     }
@@ -373,6 +386,7 @@ impl ServerEvent {
             Self::SafetyRiskChanged { .. } => "safety.risk_changed",
             Self::NodeHealthChanged { .. }
             | Self::WebhooksChanged { .. }
+            | Self::SessionMigrated { .. }
             | Self::RecordingConsentGiven { .. }
             | Self::ParticipantPositions { .. }
             | Self::TtsAnnouncement { .. } => return None,

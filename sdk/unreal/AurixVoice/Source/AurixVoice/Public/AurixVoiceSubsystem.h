@@ -44,7 +44,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRequestFailed, int64, Reque
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixServerError, const FString&, Code, const FString&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRejoinFailed, FGuid, ChannelId, const FString&, Code, const FString&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRecovering, int32, Attempt, int32, DelayMs, const FString&, Cause);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRecovered, bool, bResumed);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixRecovered, bool, bResumed, bool, bMigrated);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixEndpointChanged, const FString&, Url);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixConnectionEnded, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRawEvent, const FString&, Json);
 DECLARE_DYNAMIC_DELEGATE_ThreeParams(FAurixRegionsDiscovered, bool, bSuccess, const TArray<FAurixRegionEndpoint>&, Regions, const FString&, Error);
@@ -309,6 +310,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
 	EAurixMediaPath GetMediaPath() const;
 
+	/** WebSocket URL of the node serving the session (the configured URL until a failover moved it). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Connection")
+	FString GetEndpoint() const;
+
+	/**
+	 * Alternate nodes the server advertised for this session. A dropped connection retries the
+	 * current node first, then these in order; OnEndpointChanged reports a switch.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Connection")
+	TArray<FString> GetFailoverEndpoints() const;
+
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetTranscripts(bool bEnabled);
 
@@ -411,6 +423,8 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRejoinFailed OnRejoinFailed;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRecovering OnRecovering;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRecovered OnRecovered;
+	/** A failover node answered while the previous one did not; fires before that connection's OnSessionReady. */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixEndpointChanged OnEndpointChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixConnectionEnded OnFailedToRecover;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixConnectionEnded OnDisconnected;
 	/** Every event as JSON (positions arrive only here). */

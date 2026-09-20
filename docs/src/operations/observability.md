@@ -4,8 +4,9 @@
 
 Everything durable lives in **PostgreSQL** and, if enabled, the **recording store** (local
 volume or S3). Redis holds only ephemeral state (events, one-time token claims, session→node
-mapping, rate limits, global mutes) and needs no backup — after a Redis loss, clients reconnect
-and state rebuilds.
+mapping and session mirrors, node liveness, rate limits, global mutes) and needs no backup —
+after a Redis loss, clients reconnect and state rebuilds. Failover, Sentinel and PostgreSQL HA
+are covered in [High availability](high-availability.md).
 
 ```bash
 docker compose exec db pg_dump -U "$POSTGRES_USER" -Fc aurix > aurix-$(date +%F).dump

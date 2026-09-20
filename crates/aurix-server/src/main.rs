@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     let control = Arc::new(ControlPlane::new(config.clone(), pool.clone(), node_id).await?);
     info!("Control plane initialized");
+    control.start_lost_node_reaper();
 
     let mut deactivated_on_recovery = Vec::new();
     match control.sessions.recover_node_state(node_id).await {
@@ -365,6 +366,14 @@ async fn main() -> anyhow::Result<()> {
                 };
                 if let Err(e) = control.nodes.heartbeat(info.id, info).await {
                     error!("Heartbeat failed: {}", e);
+                }
+                if let Some(redis) = &control.redis {
+                    if let Err(e) = redis
+                        .beacon_alive(config.cluster.node_lost_after_secs)
+                        .await
+                    {
+                        warn!("Redis liveness beacon failed: {e}");
+                    }
                 }
             }
         });

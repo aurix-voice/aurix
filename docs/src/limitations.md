@@ -61,9 +61,16 @@ the chapter that explains the boundary.
 
 ## Server behaviour
 
-* **Node-local resources.** Session statistics, live audio streams and WebSocket resume state
-  live on the node that hosts the session; the fleet-wide views are webhooks/SSE, the database
-  and metrics ([Scaling](operations/scaling.md)).
+* **Node-local resources.** Session statistics, live audio streams and live media state live
+  on the node that hosts the session; the fleet-wide views are webhooks/SSE, the database and
+  metrics ([Scaling](operations/scaling.md)). Failover moves a *session* to another node (same
+  id/SSRC, new media key) from its Redis mirror; a per-participant recording file or live
+  stream on the old node is finalised at that point and continues on the new node only if
+  that node records/streams the channel. Failover needs Redis — without it a resume elsewhere
+  is a fresh session ([High availability](operations/high-availability.md)).
+* **Redis Sentinel yes, Redis Cluster no.** The ownership claim is a multi-key Lua script
+  without hash tags and the event bus is classic Pub/Sub; point the fleet at a Sentinel set or
+  a managed endpoint with a stable address.
 * **Live audio streams are per participant**, not mixed, and are dropped (counted) when the
   consumer falls behind `recording.live.queue_frames`; no buffering across a consumer outage
   ([Recordings and live streams](features/recordings.md)).
@@ -103,5 +110,4 @@ the chapter that explains the boundary.
 
 ## Planned
 
-The operator web panel is tracked separately. Cross-node session failover (resuming on another
-node when the hosting node dies) is the next backlog item.
+The operator web panel is tracked separately.

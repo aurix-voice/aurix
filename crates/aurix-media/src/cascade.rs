@@ -4,7 +4,10 @@
 //! original client packet, sealed (AES-256-CTR + HMAC) with keys derived from the cluster-wide
 //! `media.cascade_secret`. The envelope's SSRC is a per-process random node id and its 64-bit
 //! counter is spread over the sequence/timestamp fields, so IVs never repeat between nodes and
-//! the per-peer anti-replay window sees one monotonic sequence. Packets are accepted only from
+//! the per-peer anti-replay window sees one monotonic sequence. The counter starts at the
+//! process start time (Unix seconds `<< 32`), so a restarted node continues *above* everything
+//! its peers already accepted from the same address instead of being rejected as a replay
+//! until it overtakes the previous process. Packets are accepted only from
 //! allowed peers (statically configured via `media.cascade_peers` and/or discovered from the
 //! `media_nodes` registry), only with a valid tag and only once per (peer, sequence).
 //!
@@ -23,6 +26,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
@@ -84,9 +88,21 @@ impl CascadeRelay {
             local_addr,
             keys: MediaKeys::derive(secret.as_bytes()),
             relay_ssrc: rand::random(),
-            relay_counter: AtomicU64::new(0),
+            relay_counter: AtomicU64::new(Self::initial_relay_counter()),
             local_node_id,
         })
+    }
+
+    /// First envelope counter of this process: the start time in the high 32 bits. A peer's
+    /// replay window for our address survives our restart, and a process never sends
+    /// `2^32` envelopes per second of uptime, so this is always above the last counter the
+    /// previous process could have used (assuming the host clock did not go backwards).
+    fn initial_relay_counter() -> u64 {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (secs & 0xFFFF_FFFF) << 32
     }
 
     pub fn node_id(&self) -> MediaNodeId {
@@ -383,5 +399,55 @@ mod tests {
         assert!(relay.channel_peers(&ch).is_empty());
         relay.set_channel_peers(ch, &[]);
         assert!(!relay.has_peers(&ch));
+    }
+
+    #[tokio::test]
+    async fn restarted_peer_continues_above_its_previous_counters() {
+        let peer: SocketAddr = "127.0.0.1:45020".parse().unwrap();
+        let relay = CascadeRelay::new(
+            "127.0.0.1:0",
+            MediaNodeId::new(),
+            "0123456789abcdef",
+            &[peer.to_string()],
+        )
+        .await
+        .unwrap();
+        let keys = MediaKeys::derive(b"0123456789abcdef");
+        let sender = UserId::new();
+        let envelope = |counter: u64| {
+            AurixPacket::relay_envelope(
+                &AurixPacket::audio(1, 0, 42, 7, Bytes::from_static(b"opus")),
+                0x1234,
+                counter,
+                &sender,
+            )
+            .seal(&keys)
+        };
+
+        // The previous process on `peer` started now and relayed 1000 envelopes.
+        let start = CascadeRelay::initial_relay_counter();
+        assert!(start >= 1 << 32, "counter must carry the start time");
+        for i in 0..1000 {
+            assert!(relay
+                .authenticate_inbound(&envelope(start + i), peer)
+                .is_ok());
+        }
+        // A process that restarted from zero would be stuck behind the replay window ...
+        assert!(relay.authenticate_inbound(&envelope(0), peer).is_err());
+        assert!(relay.authenticate_inbound(&envelope(500), peer).is_err());
+        // ... whereas one started a second later is accepted at once.
+        let restarted = start + (1 << 32);
+        assert!(relay
+            .authenticate_inbound(&envelope(restarted), peer)
+            .is_ok());
+        assert!(relay
+            .authenticate_inbound(&envelope(restarted + 1), peer)
+            .is_ok());
+        assert!(
+            relay
+                .authenticate_inbound(&envelope(restarted), peer)
+                .is_err(),
+            "replay must still be rejected"
+        );
     }
 }

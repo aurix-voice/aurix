@@ -112,7 +112,10 @@ static int handle_event(struct AurixClient *client, struct AurixEvent *ev) {
                (unsigned long long)aurix_event_number2(ev), aurix_event_message(ev));
         break;
     case AURIX_EVENT_RECOVERED:
-        printf("recovered (resumed=%d)\n", (int)aurix_event_flag(ev));
+        printf("recovered (resumed=%d migrated=%d)\n", (int)aurix_event_flag(ev), (int)aurix_event_flag2(ev));
+        break;
+    case AURIX_EVENT_ENDPOINT_CHANGED:
+        printf("endpoint -> %s\n", aurix_event_message(ev));
         break;
     case AURIX_EVENT_FAILED_TO_RECOVER:
     case AURIX_EVENT_DISCONNECTED:

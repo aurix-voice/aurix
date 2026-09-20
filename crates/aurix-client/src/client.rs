@@ -219,6 +219,28 @@ struct Inner {
     /// A UDP bind failed or UDP heartbeats died at least until this instant: `Auto` sessions
     /// opened before it go straight to the tunnel and let the re-probe find UDP again.
     udp_blocked_until: Mutex<Option<Instant>>,
+    endpoints: Mutex<Endpoints>,
+}
+
+/// Where the control connection lives and where it may move to.
+#[derive(Debug, Clone, Default)]
+struct Endpoints {
+    /// URL of the node currently (or last) serving the session.
+    active: String,
+    /// Alternates advertised by that node's `SessionInitAck.failover`.
+    failover: Vec<String>,
+}
+
+impl Endpoints {
+    /// Reconnect `attempt` (1-based) targets: the node that holds the session first — a
+    /// same-node resume is the cheapest recovery — then each advertised alternate, round-robin.
+    fn for_attempt(&self, attempt: u32) -> &str {
+        let n = 1 + self.failover.len();
+        match (attempt.max(1) as usize - 1) % n {
+            0 => &self.active,
+            i => &self.failover[i - 1],
+        }
+    }
 }
 
 impl Inner {
@@ -402,6 +424,10 @@ impl Client {
             .build()
             .map_err(|e| ClientError::Transport(format!("tokio runtime: {e}")))?;
         let identity = token_identity(&cfg.token);
+        let endpoints = Endpoints {
+            active: cfg.ws_url.clone(),
+            failover: Vec::new(),
+        };
         let inner = Arc::new(Inner {
             mixer: Mutex::new(RemoteMixer::new(
                 cfg.jitter_target_frames,
@@ -435,6 +461,7 @@ impl Client {
             closing: AtomicBool::new(false),
             resume_seq: Mutex::new(None),
             udp_blocked_until: Mutex::new(None),
+            endpoints: Mutex::new(endpoints),
         });
         Ok(Self {
             inner,
@@ -518,6 +545,17 @@ impl Client {
 
     pub fn session(&self) -> Option<SessionInfo> {
         self.inner.session.lock().clone()
+    }
+
+    /// WebSocket URL of the node serving (or, while reconnecting, last serving) the session;
+    /// `ClientConfig::ws_url` until a failover moved it.
+    pub fn endpoint(&self) -> String {
+        self.inner.endpoints.lock().active.clone()
+    }
+
+    /// Alternate nodes advertised by the server; tried in order when reconnecting.
+    pub fn failover_endpoints(&self) -> Vec<String> {
+        self.inner.endpoints.lock().failover.clone()
     }
 
     /// This client's user id as claimed by the token (unverified), or learned from a `Kick`.
@@ -1228,8 +1266,16 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         } else {
             ConnectionState::Reconnecting
         });
+        let url = if first {
+            let mut ep = inner.endpoints.lock();
+            ep.active = cfg.ws_url.clone();
+            ep.failover.clear();
+            cfg.ws_url.clone()
+        } else {
+            inner.endpoints.lock().for_attempt(attempt).to_string()
+        };
         let connect = ControlConnection::connect(
-            &cfg.ws_url,
+            &url,
             &cfg.token,
             resume.as_ref().map(|(s, t)| (*s, t.as_str())),
             cfg.request_timeout,
@@ -1254,9 +1300,25 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         match connected {
             Ok((conn, ack)) => {
                 attempt = 0;
+                {
+                    let mut ep = inner.endpoints.lock();
+                    if ep.active != url {
+                        ep.active = url.clone();
+                        drop(ep);
+                        inner.emit(Event::EndpointChanged { url: url.clone() });
+                        ep = inner.endpoints.lock();
+                    }
+                    ep.failover = ack
+                        .failover
+                        .iter()
+                        .filter(|f| **f != url)
+                        .cloned()
+                        .collect();
+                }
                 let exit = session(
                     &inner,
                     &cfg,
+                    &url,
                     conn,
                     ack,
                     &mut cmd_rx,
@@ -1475,6 +1537,7 @@ fn participant_from_brief(b: &ParticipantBrief) -> Participant {
 async fn session(
     inner: &Arc<Inner>,
     cfg: &ClientConfig,
+    url: &str,
     mut conn: ControlConnection,
     ack: SessionAck,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
@@ -1490,6 +1553,9 @@ async fn session(
         resumed: ack.resumed,
         media_tunnel: ack.media_tunnel,
         downlink_mix: ack.downlink_mix,
+        migrated: ack.migrated,
+        endpoint: url.to_string(),
+        failover: ack.failover.clone(),
     };
     *inner.session.lock() = Some(info.clone());
     *resume = Some((ack.session_id, ack.resume_token.clone()));
@@ -1503,6 +1569,10 @@ async fn session(
         for channel_id in old {
             inner.emit(Event::ChannelLeft { channel_id });
         }
+    } else if ack.migrated {
+        // Same speakers, new node: every downlink stream restarts its sequence numbering and
+        // the old node's frames still in flight must not be played.
+        inner.mixer.lock().resync();
     }
 
     let links = MediaLinks {
@@ -1512,7 +1582,7 @@ async fn session(
         seq: Arc::new(AtomicU32::new(take_pending_sequence(inner))),
         udp_addr: resolve_media_addr(
             &ack.media_addr,
-            &ws_host(&cfg.ws_url).unwrap_or_else(|| "127.0.0.1".into()),
+            &ws_host(url).unwrap_or_else(|| "127.0.0.1".into()),
         ),
         tunnel_offered: ack.media_tunnel,
     };
@@ -1542,6 +1612,7 @@ async fn session(
     if !first {
         inner.emit(Event::Recovered {
             resumed: ack.resumed,
+            migrated: ack.migrated,
         });
     }
     if !ack.resumed {
@@ -2721,6 +2792,27 @@ mod tests {
     use super::*;
     use aurix_common::types::{OpusBandwidth, OpusSignal};
     use uuid::Uuid;
+
+    #[test]
+    fn reconnects_try_the_session_node_first_then_rotate_through_failover() {
+        let ep = Endpoints {
+            active: "wss://a".into(),
+            failover: vec!["wss://b".into(), "wss://c".into()],
+        };
+        let order: Vec<&str> = (1..=7).map(|a| ep.for_attempt(a)).collect();
+        assert_eq!(
+            order,
+            ["wss://a", "wss://b", "wss://c", "wss://a", "wss://b", "wss://c", "wss://a"]
+        );
+        // Attempt 0 (defensive) behaves like the first.
+        assert_eq!(ep.for_attempt(0), "wss://a");
+
+        let alone = Endpoints {
+            active: "wss://a".into(),
+            failover: vec![],
+        };
+        assert!((1..5).all(|a| alone.for_attempt(a) == "wss://a"));
+    }
 
     #[test]
     fn loss_window_reports_the_last_period_only() {

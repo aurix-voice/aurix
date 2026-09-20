@@ -27,6 +27,8 @@ pub struct AurixConfig {
     pub tts: TtsConfig,
     #[serde(default)]
     pub safety: SafetyConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 impl AurixConfig {
@@ -44,6 +46,7 @@ impl AurixConfig {
                 .with_list_parse_key("server.cors_origins")
                 .with_list_parse_key("server.trusted_proxies")
                 .with_list_parse_key("media.cascade_peers")
+                .with_list_parse_key("redis.sentinels")
                 .with_list_parse_key("webhooks.retry_delays_secs")
                 .with_list_parse_key("tts.voices")
                 .with_list_parse_key("safety.categories"),
@@ -136,6 +139,18 @@ impl AurixConfig {
         }
         if !(8..=4096).contains(&self.media.tunnel_queue_packets) {
             anyhow::bail!("media.tunnel_queue_packets must be within 8..=4096");
+        }
+        if self.redis.sentinels.is_empty() != self.redis.sentinel_master.is_none() {
+            anyhow::bail!("redis.sentinels and redis.sentinel_master must be set together");
+        }
+        if !(10..=600).contains(&self.cluster.node_lost_after_secs) {
+            anyhow::bail!("cluster.node_lost_after_secs must be within 10..=600");
+        }
+        if !(60..=3600).contains(&self.cluster.session_mirror_ttl_secs) {
+            anyhow::bail!("cluster.session_mirror_ttl_secs must be within 60..=3600");
+        }
+        if self.cluster.failover_endpoints > 16 {
+            anyhow::bail!("cluster.failover_endpoints must be <= 16");
         }
         if !(0.0..=1.0).contains(&self.media.unfocused_channel_gain) {
             anyhow::bail!("media.unfocused_channel_gain must be within 0.0..=1.0");
@@ -543,8 +558,19 @@ impl Default for DatabaseConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RedisConfig {
+    /// `redis://[:password@]host:port/db` (`rediss://` for TLS). With Sentinel this URL only
+    /// supplies the credentials, database and TLS mode used for the resolved master; its host
+    /// is ignored.
     pub url: String,
     pub pool_size: u32,
+    /// Redis Sentinel endpoints (`redis://sentinel-1:26379`, …). When set, the node asks the
+    /// sentinels for the current master of `sentinel_master`, follows failovers at runtime
+    /// and re-subscribes the cross-node event bus to the new master.
+    #[serde(default)]
+    pub sentinels: Vec<String>,
+    /// Name of the monitored master set (`sentinel monitor <name> …`).
+    #[serde(default)]
+    pub sentinel_master: Option<String>,
 }
 
 impl Default for RedisConfig {
@@ -552,6 +578,53 @@ impl Default for RedisConfig {
         Self {
             url: "redis://localhost:6379".into(),
             pool_size: 20,
+            sentinels: Vec::new(),
+            sentinel_master: None,
+        }
+    }
+}
+
+/// Multi-node behaviour: what happens to player sessions when a node disappears.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterConfig {
+    /// Mirror every live session (identity, channels, receiver preferences, resume-token hash)
+    /// into Redis so a client whose node died can resume on any other node with the same
+    /// session id and SSRC. Requires Redis; silently off without it.
+    #[serde(default = "default_true")]
+    pub session_mirror: bool,
+    /// Lifetime of a session mirror after its node stops refreshing it (seconds): the window
+    /// in which a client can still take its session to another node after a node crash.
+    #[serde(default = "default_session_mirror_ttl_secs")]
+    pub session_mirror_ttl_secs: u64,
+    /// A node whose registry heartbeat is older than this is treated as lost (seconds): its
+    /// open sessions and memberships are closed in the database with reason `node_lost`,
+    /// participants leave the rosters of every other node and cascade stops relaying to it.
+    /// Sessions taken over by another node before or after that are not affected.
+    #[serde(default = "default_node_lost_after_secs")]
+    pub node_lost_after_secs: u64,
+    /// How many other nodes' public WebSocket URLs `SessionInitAck.failover` lists (same
+    /// region first, then the rest, least loaded first). `0` disables the hint.
+    #[serde(default = "default_failover_endpoints")]
+    pub failover_endpoints: usize,
+}
+
+fn default_session_mirror_ttl_secs() -> u64 {
+    180
+}
+fn default_node_lost_after_secs() -> u64 {
+    30
+}
+fn default_failover_endpoints() -> usize {
+    3
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            session_mirror: true,
+            session_mirror_ttl_secs: default_session_mirror_ttl_secs(),
+            node_lost_after_secs: default_node_lost_after_secs(),
+            failover_endpoints: default_failover_endpoints(),
         }
     }
 }

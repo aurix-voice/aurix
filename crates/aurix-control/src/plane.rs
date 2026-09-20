@@ -44,6 +44,8 @@ pub struct ControlPlane {
     pub audit: Arc<AuditLogger>,
     pub rate_limiter: Arc<RateLimiter>,
     pub redis: Option<Arc<RedisStore>>,
+    /// Nodes this node already declared lost, until they heartbeat again.
+    reaped_nodes: dashmap::DashSet<MediaNodeId>,
 }
 
 impl ControlPlane {
@@ -104,11 +106,17 @@ impl ControlPlane {
         rate_limiter.start_cleanup_task();
 
         // Redis
-        let redis = match aurix_common::redis_pool::create_redis_client(&config.redis).await {
-            Ok(client) => match RedisStore::connect(client, node_id).await {
+        let redis = match aurix_common::redis_pool::RedisSource::open(&config.redis).await {
+            Ok(source) => match RedisStore::connect(source, node_id).await {
                 Ok(store) => {
-                    tracing::info!("Redis connected");
-                    Some(Arc::new(store))
+                    tracing::info!(
+                        master = %store.master_addr(),
+                        sentinel = store.is_sentinel(),
+                        "Redis connected"
+                    );
+                    let store = Arc::new(store);
+                    store.start_sentinel_supervisor();
+                    Some(store)
                 }
                 Err(e) => {
                     if config.is_production() {
@@ -130,16 +138,6 @@ impl ControlPlane {
                 None
             }
         };
-
-        // Node health checker
-        let nodes_clone = nodes.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-            loop {
-                interval.tick().await;
-                nodes_clone.check_node_health().await;
-            }
-        });
 
         // Analytics collector
         let analytics = AnalyticsCollector::new(pool.clone());
@@ -207,6 +205,16 @@ impl ControlPlane {
             audit.clone(),
         ));
 
+        // Node health checker
+        let nodes_clone = nodes.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                nodes_clone.check_node_health().await;
+            }
+        });
+
         Ok(Self {
             node_id,
             config: Arc::new(config),
@@ -230,7 +238,88 @@ impl ControlPlane {
             audit,
             rate_limiter,
             redis,
+            reaped_nodes: dashmap::DashSet::new(),
         })
+    }
+
+    /// Periodically declares nodes lost and cleans up after them (see [`Self::reap_lost_nodes`]).
+    pub fn start_lost_node_reaper(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(plane) = weak.upgrade() else { return };
+                plane.reap_lost_nodes().await;
+            }
+        });
+    }
+
+    /// A node silent for `cluster.node_lost_after_secs` is lost: its sessions and memberships
+    /// are closed in the database with reason `node_lost` and every roster is told, so the
+    /// fleet does not show ghosts until the 24 h registry prune. Exactly one node does this per
+    /// lost node (Redis `SET NX`); the mirrors stay, so a client of the lost node that shows up
+    /// here within the mirror TTL still gets its session back (`migrate_session` reopens it).
+    pub async fn reap_lost_nodes(&self) {
+        let after = self.config.cluster.node_lost_after_secs;
+        let lost = self.nodes.lost_nodes(self.node_id, after);
+        self.reaped_nodes.retain(|id| lost.contains(id));
+        for node in lost {
+            if self.reaped_nodes.contains(&node) {
+                continue;
+            }
+            if let Some(redis) = &self.redis {
+                match redis.is_node_alive(node).await {
+                    Ok(true) => continue, // database lag, not a dead node
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!("lost-node check for {node} skipped, Redis: {e}");
+                        continue;
+                    }
+                }
+                match redis.claim_reaper(node, after.max(10)).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.reaped_nodes.insert(node);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("reaper claim for {node} failed: {e}");
+                        continue;
+                    }
+                }
+            }
+            match self.sessions.reap_lost_node(node).await {
+                Ok(reaped) => {
+                    self.reaped_nodes.insert(node);
+                    aurix_metrics::NODES_REAPED.inc();
+                    if reaped.sessions > 0 || !reaped.memberships.is_empty() {
+                        tracing::warn!(
+                            "node {node} lost: closed {} sessions and {} memberships",
+                            reaped.sessions,
+                            reaped.memberships.len()
+                        );
+                    }
+                    let now = chrono::Utc::now();
+                    for m in reaped.memberships {
+                        self.events.publish(ServerEvent::ParticipantLeft {
+                            app_id: AppId::from_uuid(m.app_id),
+                            channel_id: ChannelId::from_uuid(m.channel_id),
+                            user_id: UserId::from_uuid(m.user_id),
+                            session_id: SessionId::from_uuid(m.session_id),
+                            reason: "node_lost".into(),
+                            hidden: false,
+                            timestamp: now,
+                        });
+                    }
+                    for (app_id, channel_id) in reaped.deactivated_channels {
+                        self.channel_emptied(app_id, channel_id).await;
+                    }
+                }
+                Err(e) => tracing::warn!("reaping lost node {node} failed: {e}"),
+            }
+        }
     }
 
     /// End-user REST authentication. Accepts the session JWT and — because a client that

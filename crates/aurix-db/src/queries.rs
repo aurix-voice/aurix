@@ -828,13 +828,21 @@ pub async fn create_session(pool: &DbPool, s: &SessionRow) -> Result<SessionRow,
 pub async fn close_session(
     pool: &DbPool,
     session_id: Uuid,
+    media_node_id: Uuid,
     reason: &str,
     quality: Option<serde_json::Value>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE sessions SET disconnected_at = NOW(), disconnect_reason = $2, quality_stats = $3 WHERE id = $1")
-        .bind(session_id).bind(reason).bind(quality)
-        .execute(pool).await?;
-    Ok(())
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE sessions SET disconnected_at = NOW(), disconnect_reason = $3, quality_stats = $4
+           WHERE id = $1 AND media_node_id = $2"#,
+    )
+    .bind(session_id)
+    .bind(media_node_id)
+    .bind(reason)
+    .bind(quality)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn get_session(
@@ -870,6 +878,77 @@ pub async fn close_stale_memberships_for_node(
     sqlx::query_scalar::<_, Uuid>(
         "UPDATE channel_memberships SET left_at = NOW() WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1) RETURNING channel_id"
     ).bind(media_node_id).fetch_all(pool).await
+}
+
+/// Closes the open memberships of every session still marked live on a node that stopped
+/// heartbeating, returning what was closed so the leave can be announced to the fleet.
+/// Sessions a client already resumed elsewhere carry the new node id and are untouched.
+pub async fn close_memberships_for_lost_node(
+    pool: &DbPool,
+    media_node_id: Uuid,
+) -> Result<Vec<LostMembershipRow>, sqlx::Error> {
+    sqlx::query_as::<_, LostMembershipRow>(
+        r#"UPDATE channel_memberships m SET left_at = NOW()
+           FROM sessions s, channels c
+           WHERE s.id = m.session_id AND c.id = m.channel_id
+             AND m.left_at IS NULL AND s.media_node_id = $1 AND s.disconnected_at IS NULL
+           RETURNING c.app_id, m.channel_id, m.user_id, m.session_id, m.role"#,
+    )
+    .bind(media_node_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Outcome of [`migrate_session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedSession {
+    /// The session had been closed by node cleanup (`node_lost` / `node_restart`) and was
+    /// reopened; its memberships were closed by that cleanup too and may be restored.
+    pub reaped: bool,
+    /// Channels whose membership rows are still open.
+    pub open_channels: Vec<Uuid>,
+}
+
+/// Moves a live session to another node (cross-node resume). Reopens a session the lost-node
+/// reaper (or the node's own restart cleanup) already closed; a session closed for any other
+/// reason (logout, kick, ban) is not resurrected. Returns `None` if the session does not exist
+/// for this tenant/user or is not migratable.
+pub async fn migrate_session(
+    pool: &DbPool,
+    session_id: Uuid,
+    app_id: Uuid,
+    user_id: Uuid,
+    to_node: Uuid,
+) -> Result<Option<MigratedSession>, sqlx::Error> {
+    let previous = sqlx::query_scalar::<_, Option<String>>(
+        r#"WITH before AS (
+               SELECT id, disconnect_reason FROM sessions
+               WHERE id = $1 AND app_id = $2 AND user_id = $3
+                 AND (disconnected_at IS NULL OR disconnect_reason IN ('node_lost', 'node_restart'))
+           )
+           UPDATE sessions s SET media_node_id = $4, disconnected_at = NULL, disconnect_reason = NULL
+           FROM before WHERE s.id = before.id
+           RETURNING before.disconnect_reason"#,
+    )
+    .bind(session_id)
+    .bind(app_id)
+    .bind(user_id)
+    .bind(to_node)
+    .fetch_optional(pool)
+    .await?;
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let open = sqlx::query_scalar::<_, Uuid>(
+        "SELECT channel_id FROM channel_memberships WHERE session_id = $1 AND left_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(MigratedSession {
+        reaped: previous.is_some(),
+        open_channels: open,
+    }))
 }
 
 pub async fn get_active_sessions_for_user(
@@ -941,11 +1020,16 @@ pub async fn remove_user_channel_memberships(
 pub async fn close_session_memberships(
     pool: &DbPool,
     session_id: Uuid,
+    media_node_id: Uuid,
 ) -> Result<u64, sqlx::Error> {
     let r = sqlx::query(
-        "UPDATE channel_memberships SET left_at = NOW() WHERE session_id = $1 AND left_at IS NULL",
+        r#"UPDATE channel_memberships m SET left_at = NOW()
+           FROM sessions s
+           WHERE s.id = m.session_id AND m.session_id = $1 AND s.media_node_id = $2
+             AND m.left_at IS NULL"#,
     )
     .bind(session_id)
+    .bind(media_node_id)
     .execute(pool)
     .await?;
     Ok(r.rows_affected())

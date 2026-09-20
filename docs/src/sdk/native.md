@@ -34,8 +34,12 @@ Full reference: `crates/aurix-client/README.md` and `sdk/unreal/README.md`.
 * **Client:** one voice session on a small private Tokio runtime; reconnect with backoff and
   session resume (same session / SSRC / media key / channels), automatic re-join after a fresh
   session (`REJOIN_FAILED` per channel that needs a new join token), receiver preferences that
-  survive resume, chat, moderation with action tokens, transcripts, TTS, recording consent,
-  positions, statistics — behind a synchronous, thread-safe API with a poll-based event queue.
+  survive resume, failover to the nodes the server advertised (`aurix_client_endpoint`,
+  `aurix_client_failover_endpoint*`, `AURIX_EVENT_ENDPOINT_CHANGED`, `migrated` on
+  `RECOVERED` — same session/SSRC, new media key/endpoint, see
+  [High availability](../operations/high-availability.md#cross-node-session-failover)), chat,
+  moderation with action tokens, transcripts, TTS, recording consent, positions, statistics —
+  behind a synchronous, thread-safe API with a poll-based event queue.
 
 ## Rust
 

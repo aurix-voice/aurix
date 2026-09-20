@@ -20,10 +20,14 @@ node-local resources (WebRTC peer connection, recordings, live audio streams, pe
 stats) are served there. Consequences:
 
 * Put the REST API and the WebSocket behind an ordinary L7 load balancer — no sticky sessions
-  are required for the API. A WebSocket stays on the node it landed on; a **resume** must hit
-  the same node, so either enable client-IP affinity on the balancer for `/ws`, or accept that
-  a resume that lands elsewhere becomes a fresh session (`recovered {resumed: false}`) — the
-  SDKs handle both.
+  are required for the API. A WebSocket stays on the node it landed on; a **resume** is
+  cheapest on the same node (nothing moves), so keep client-IP affinity on the balancer for
+  `/ws` or hand out per-node URLs. A resume that lands on another node is a **takeover**: with
+  Redis session mirrors (default) the session moves there with the same id and SSRC and a new
+  media key/endpoint (`recovered {resumed: true, migrated: true}`); without mirrors it becomes
+  a fresh session (`recovered {resumed: false}`) — see
+  [High availability](high-availability.md#cross-node-session-failover). The SDKs handle all
+  three.
 * UDP media must reach the node directly (`media.external_ip`), not through the balancer.
 * REST calls that touch live media are node-local: `GET /v1/sessions/{id}/stats` answers `404`
   for a session hosted elsewhere, live-stream routes answer `409` when the channel's media is
@@ -35,10 +39,11 @@ stats) are served there. Consequences:
 ## Cross-node events
 
 Channel/participant events (join, leave, mute, ban, kick, block, chat, transcripts, energy,
-webhook-subscription invalidation, `user.deleted`) are published on Redis pub/sub with the
+webhook-subscription invalidation, `user.deleted`, `SessionMigrated`) are published on Redis pub/sub with the
 origin node id; a node never re-applies its own events. Redis also holds one-time token claims
-(`jti`), session→node mapping, global mutes and distributed rate limits. Without Redis a single
-node works; a fleet does not.
+(`jti`), session→node mapping and session mirrors for failover, node liveness beacons, global
+mutes and distributed rate limits. Without Redis a single node works; a fleet does not. Redis
+Sentinel is supported, Redis Cluster is not — see [High availability](high-availability.md#redis).
 
 ## Cascade (SFU-to-SFU relay)
 
@@ -81,8 +86,10 @@ registry turns that into **region discovery**:
   [native / Unreal](../sdk/native.md#region-selection)) probe each `probe_url` over HTTP and
   rank by measured RTT, so a mis-set `location` or a routing detour is corrected client-side.
 
-Discovery returns **node** URLs rather than a regional balancer on purpose: sessions and resume
-are node-local (above), so the client should connect where it will reconnect. Put a per-node
+Discovery returns **node** URLs rather than a regional balancer on purpose: sessions are
+node-local (above), so the client should connect where it will reconnect; the node then
+advertises up to `cluster.failover_endpoints` peers in `SessionInitAck.failover` for the case
+where it disappears. Put a per-node
 DNS name and TLS certificate in front of every node (the Helm chart and Terraform example do
 this) and keep the shared hostname for the REST API. Cross-region channels still work through
 cascade — with WAN latency between the nodes, so let players of one party land in one region.

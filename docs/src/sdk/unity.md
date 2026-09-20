@@ -84,8 +84,10 @@ frame, `TryDequeueAudio(out IncomingAudio)` → `RemoteMixer.Push(...)` and `Mix
 
 ## Region selection
 
-Session resume is node-local, so connect to the nearest node with capacity and keep its direct
-URL. Either use the `endpoint.ws_url` your backend receives from `POST /v1/tokens` (with
+Connect to the nearest node with capacity and keep its direct URL — a resume on the same node
+moves nothing, a resume elsewhere is a
+[takeover](../operations/high-availability.md#cross-node-session-failover). Either use the
+`endpoint.ws_url` your backend receives from `POST /v1/tokens` (with
 `region` / `location` hints), or measure from the device:
 
 ```csharp
@@ -114,6 +116,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Feature | API |
 |---|---|
 | Reconnect / resume | `AutoReconnect`, `Reconnect` policy, `ForceReconnect()`, `OnRecovering(attempt, delay, cause)`, `OnRecovered(SessionInfo)`, `OnFailedToRecover`, `OnSessionClosed` |
+| Failover | `Endpoint`, `FailoverEndpoints`, `OnEndpointChanged(url)`, `SessionInfo.Migrated`, `SessionInfo.Failover` — attempts rotate current node → advertised failover nodes; a takeover keeps session id/SSRC, new media key/endpoint |
 | Action tokens | `TokenRefresher`, `JoinTokenProvider`, `JoinChannelAsync(id, joinToken)`, `ModerateAsync(channel, user, ModerationAction, token, reason)` |
 | Local mute / volume / block | `SetParticipantMutedAsync(user, muted, channel?)`, `SetParticipantVolumeAsync(user, 0..2)`, `SetUserBlockedAsync`, `OnReceiverPreferences`, `OnUserBlockChanged` |
 | Multiple channels | `SetTransmissionAsync(TransmissionMode)`, `TransmitToChannelAsync`, `SetChannelFocusAsync(Guid?)`, `OnTransmissionChanged`, `OnChannelFocusChanged`, `TransmitOpusFrame` (one frame to every allowed channel) |

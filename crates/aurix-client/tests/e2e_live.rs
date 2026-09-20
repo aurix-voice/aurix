@@ -515,7 +515,7 @@ async fn native_clients_talk_chat_resume_and_leave() {
         matches!(e, Event::Recovered { .. })
     })
     .await;
-    assert!(matches!(recovered, Event::Recovered { resumed: true }));
+    assert!(matches!(recovered, Event::Recovered { resumed: true, .. }));
     let after = alice.session().unwrap();
     assert_eq!(after.session_id, alice_session.session_id);
     assert_eq!(after.ssrc, alice_session.ssrc);
@@ -1049,7 +1049,7 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     })
     .await;
     assert!(
-        matches!(recovered, Event::Recovered { resumed: true }),
+        matches!(recovered, Event::Recovered { resumed: true, .. }),
         "{recovered:?}"
     );
     eprintln!("resumed over the tunnel in {:?}", t0.elapsed());

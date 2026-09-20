@@ -19,6 +19,7 @@ Immediately after the upgrade the server sends
 ```json
 {"type":"SessionInitAck","data":{"session_id":"…","ssrc":123456,"media_addr":"203.0.113.10:10000",
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
+  "migrated":false,"failover":["wss://eu2.voice.example.com/ws","wss://eu3.voice.example.com/ws"],
   "media_tunnel":true,"downlink_mix":true}}
 ```
 
@@ -30,6 +31,9 @@ messages, binary frames are always media; `downlink_mix` says native sessions ma
 [server-mixed downlink](../features/channels.md#server-mix-for-native-clients). With
 `AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` a
 plain player JWT is refused for the handshake (`ACTION_TOKEN_REQUIRED`).
+`failover` lists other healthy nodes (same region first, least loaded first; up to
+`cluster.failover_endpoints`, empty when none advertise a public `wss://` URL) — a client that
+loses this node should rotate through them on its reconnect attempts (below).
 
 `Ping { nonce }` / `Pong { nonce }` keep the connection alive; the server also drops sessions
 whose media path stops heart-beating.
@@ -42,6 +46,28 @@ On success `SessionInitAck.resumed` is `true`, session id / SSRC / media key are
 `ChannelJoinAck` per still-joined channel follows and a fresh `resume_token` is issued (tokens are
 single-use). On failure — grace expired, session closed by the server, token mismatch — the same
 connection simply yields a new session and the client must re-join its channels.
+
+### Resume on another node (failover)
+
+When the resume reaches a node that does not host the session and the fleet runs with Redis
+session mirrors (`cluster.session_mirror`, default on), that node **takes the session over**:
+`resumed` and `migrated` are both `true`, session id and SSRC are unchanged, but `media_addr`
+and `media_key` are new — the client must re-derive its media keys, re-send `SessionBind` to the
+new endpoint (or continue on the tunnel of the new connection) and reset its own receive-side
+replay windows and jitter buffers. Channels (`ChannelJoinAck` each), roles, local mutes, gains,
+blocks, transmission mode, focus, codec, downlink mode and transcript preference are restored
+from the mirror; other participants see no leave/join, only the downlink audio sequence jumps
+forward (by 65 536) so their anti-replay windows keep accepting the stream and jitter buffers
+resynchronise. The takeover is fenced with an atomic ownership claim in Redis, so two
+simultaneous reconnects cannot both adopt the session; the loser (and any resume whose mirror
+expired after `cluster.session_mirror_ttl_secs`, default 180 s) gets a fresh session.
+
+Reconnect order recommended for clients (all SDKs do this): attempt 1 → the node you were on,
+attempt 2 → `failover[0]`, attempt 3 → `failover[1]`, …, then wrap around, with the usual
+backoff between attempts. Once a failover node answers, treat it as the current node and use
+the `failover` list of the new ack from then on. `SessionClose {reason: "server_shutdown"}`
+is final: do not resume, open a fresh session (on the next endpoint) and re-join.
+See [High availability](../operations/high-availability.md#cross-node-session-failover).
 
 ## Messages by purpose
 

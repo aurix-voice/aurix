@@ -8,8 +8,8 @@
 //!   channel this node also hosts.
 //!
 //! Reconciliation runs periodically and immediately after remote `ParticipantJoined` /
-//! `ParticipantLeft` / `NodeHealthChanged` events, so a channel spanning two nodes starts
-//! relaying within one event round-trip rather than a full interval.
+//! `ParticipantLeft` / `SessionMigrated` / `NodeHealthChanged` events, so a channel spanning
+//! two nodes starts relaying within one event round-trip rather than a full interval.
 
 use crate::event_bus::{EventBus, ServerEvent};
 use crate::node_manager::NodeManager;
@@ -178,6 +178,7 @@ impl CascadeTopology {
             ServerEvent::ParticipantJoined { .. }
                 | ServerEvent::ParticipantLeft { .. }
                 | ServerEvent::ChannelDestroyed { .. }
+                | ServerEvent::SessionMigrated { .. }
                 | ServerEvent::NodeHealthChanged { .. }
         )
     }

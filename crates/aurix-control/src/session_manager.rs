@@ -1,6 +1,6 @@
 use aurix_common::error::{AurixError, Result};
 use aurix_common::types::*;
-use aurix_db::models::{ChannelMembershipRow, ChannelRosterRow, SessionRow};
+use aurix_db::models::{ChannelMembershipRow, ChannelRosterRow, LostMembershipRow, SessionRow};
 use aurix_db::DbPool;
 use chrono::Utc;
 use uuid::Uuid;
@@ -16,6 +16,23 @@ pub struct RecoveredState {
     /// Channels that lost their last participant to the cleanup; the caller publishes
     /// `ChannelDeactivated` for them once its event consumers are running.
     pub deactivated_channels: Vec<(AppId, ChannelId)>,
+}
+
+/// Outcome of [`SessionManager::reap_lost_node`].
+pub struct ReapedState {
+    pub sessions: u64,
+    /// Every membership closed, for the `ParticipantLeft` announcements.
+    pub memberships: Vec<LostMembershipRow>,
+    pub deactivated_channels: Vec<(AppId, ChannelId)>,
+}
+
+/// Outcome of [`SessionManager::migrate_session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedSession {
+    /// Node cleanup had already closed the session (and its memberships).
+    pub reaped: bool,
+    /// Channels whose membership rows are still open.
+    pub open_channels: Vec<ChannelId>,
 }
 
 impl SessionManager {
@@ -50,14 +67,18 @@ impl SessionManager {
             .map_err(|e| AurixError::Database(format!("Session creation failed: {e}")))
     }
 
+    /// Closes the session row if it is still hosted by `node`. A row re-homed by a cross-node
+    /// resume belongs to the new host and is left alone (returns `false`).
     pub async fn close_session(
         &self,
         session_id: SessionId,
+        node: MediaNodeId,
         reason: &str,
         quality: Option<serde_json::Value>,
-    ) -> Result<()> {
-        aurix_db::queries::close_session(&self.pool, session_id.0, reason, quality)
+    ) -> Result<bool> {
+        aurix_db::queries::close_session(&self.pool, session_id.0, node.0, reason, quality)
             .await
+            .map(|n| n > 0)
             .map_err(|e| AurixError::Database(format!("Session close failed: {e}")))
     }
 
@@ -113,9 +134,14 @@ impl SessionManager {
         .map_err(|e| AurixError::Database(format!("Membership remove failed: {e}")))
     }
 
-    /// Mark every open membership of a session as left (disconnect cleanup).
-    pub async fn close_session_memberships(&self, session_id: SessionId) -> Result<u64> {
-        aurix_db::queries::close_session_memberships(&self.pool, session_id.0)
+    /// Mark every open membership of a session as left (disconnect cleanup) — only while the
+    /// session is still hosted by `node`.
+    pub async fn close_session_memberships(
+        &self,
+        session_id: SessionId,
+        node: MediaNodeId,
+    ) -> Result<u64> {
+        aurix_db::queries::close_session_memberships(&self.pool, session_id.0, node.0)
             .await
             .map_err(|e| AurixError::Database(format!("Membership cleanup failed: {e}")))
     }
@@ -177,6 +203,65 @@ impl SessionManager {
         aurix_db::queries::get_active_sessions_for_user(&self.pool, user_id.0)
             .await
             .map_err(|e| AurixError::Database(format!("Session lookup failed: {e}")))
+    }
+
+    /// Closes what a node that stopped heartbeating still owned: memberships first (so
+    /// counters and rosters settle), then the sessions, with reason `node_lost`. Sessions that
+    /// were resumed on another node in the meantime point at that node and are left alone.
+    pub async fn reap_lost_node(&self, media_node_id: MediaNodeId) -> Result<ReapedState> {
+        let memberships =
+            aurix_db::queries::close_memberships_for_lost_node(&self.pool, media_node_id.0)
+                .await
+                .map_err(|e| AurixError::Database(format!("Lost-node membership cleanup: {e}")))?;
+        let mut channels: Vec<Uuid> = memberships.iter().map(|m| m.channel_id).collect();
+        channels.sort_unstable();
+        channels.dedup();
+        let emptied = aurix_db::queries::recount_channel_participants(&self.pool, &channels)
+            .await
+            .map_err(|e| AurixError::Database(format!("Participant recount failed: {e}")))?;
+        let sessions = aurix_db::queries::close_stale_sessions_for_node(
+            &self.pool,
+            media_node_id.0,
+            "node_lost",
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Lost-node session cleanup: {e}")))?;
+        Ok(ReapedState {
+            sessions,
+            memberships,
+            deactivated_channels: emptied
+                .into_iter()
+                .map(|(app, ch)| (AppId::from_uuid(app), ChannelId::from_uuid(ch)))
+                .collect(),
+        })
+    }
+
+    /// Re-homes a session on this node (cross-node resume). `None` when no such session
+    /// exists for the tenant/user or it was closed for a reason other than node loss.
+    pub async fn migrate_session(
+        &self,
+        session_id: SessionId,
+        app_id: AppId,
+        user_id: UserId,
+        to_node: MediaNodeId,
+    ) -> Result<Option<MigratedSession>> {
+        let moved = aurix_db::queries::migrate_session(
+            &self.pool,
+            session_id.0,
+            app_id.0,
+            user_id.0,
+            to_node.0,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Session migration failed: {e}")))?;
+        Ok(moved.map(|m| MigratedSession {
+            reaped: m.reaped,
+            open_channels: m
+                .open_channels
+                .into_iter()
+                .map(ChannelId::from_uuid)
+                .collect(),
+        }))
     }
 
     pub async fn get_channel_members(

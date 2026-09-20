@@ -793,6 +793,16 @@ pub enum ControlMessage {
         /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
         #[serde(default)]
         downlink_mix: bool,
+        /// The session was resumed on a different node than the one that opened it: same
+        /// session id and SSRC, new `media_addr` and `media_key`. Its downlink audio sequence
+        /// jumps forward (never back) on the new node, so peers' anti-replay windows keep
+        /// accepting it and their jitter buffers resynchronise on the gap.
+        #[serde(default)]
+        migrated: bool,
+        /// Public WebSocket URLs of other healthy nodes (same region first). When this node
+        /// stops answering, reconnect with the same resume credential to one of them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failover: Vec<String>,
     },
     /// Sent by the server once a media path has been authenticated via `SessionBind`:
     /// `transport` is `udp`, `tunnel` (AURX over this WebSocket) or `webrtc`.

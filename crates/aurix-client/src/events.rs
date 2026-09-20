@@ -66,6 +66,14 @@ pub struct SessionInfo {
     /// The node can deliver one server-mixed stream per channel instead of one stream per
     /// speaker (`Client::set_downlink_mode`).
     pub downlink_mix: bool,
+    /// The session was resumed on a different node than the one that opened it: same session
+    /// id and SSRC, but a new media key and endpoint (the client rebinds transparently).
+    pub migrated: bool,
+    /// The WebSocket URL this session is served from (differs from `ClientConfig::ws_url`
+    /// after a failover).
+    pub endpoint: String,
+    /// Other healthy nodes the client will try, in order, when this one stops answering.
+    pub failover: Vec<String>,
 }
 
 /// Everything the integration observes. Poll with `Client::poll_event`.
@@ -218,8 +226,16 @@ pub enum Event {
     },
     /// Back online. `resumed == false` means the server issued a fresh session and the
     /// previous channels were re-joined (integrations see `ChannelLeft`/`ChannelJoined`).
+    /// `migrated` means the session now lives on another node (see `SessionInfo::migrated`).
     Recovered {
         resumed: bool,
+        migrated: bool,
+    },
+    /// The control connection moved to another node's WebSocket URL (a failover endpoint
+    /// answered while the previous node did not). Fires before the `SessionReady` of that
+    /// connection.
+    EndpointChanged {
+        url: String,
     },
     FailedToRecover {
         reason: String,

@@ -269,7 +269,8 @@ typedef enum AurixEventType {
    */
   AURIX_EVENT_RECOVERING = 26,
   /**
-   * `flag` = resumed (else channels were re-joined with fresh state).
+   * `flag` = resumed (else channels were re-joined with fresh state), `flag2` = migrated
+   * (resumed on another node; `aurix_client_endpoint` names it).
    */
   AURIX_EVENT_RECOVERED = 27,
   /**
@@ -302,6 +303,11 @@ typedef enum AurixEventType {
    * mode; a fresh session reports `Streams` and the requested mode is re-applied.
    */
   AURIX_EVENT_DOWNLINK_MODE_CHANGED = 34,
+  /**
+   * `message` = the WebSocket URL the client now talks to: a failover endpoint answered
+   * while the previous node did not. Precedes that connection's `SessionReady`.
+   */
+  AURIX_EVENT_ENDPOINT_CHANGED = 35,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -593,6 +599,11 @@ typedef struct AurixSessionInfo {
    * (`aurix_client_set_downlink_mode`).
    */
   bool downlink_mix;
+  /**
+   * The latest (re)connect resumed the session on a *different* node (same session id
+   * and SSRC, new media key/endpoint). See `aurix_client_endpoint`.
+   */
+  bool migrated;
 } AurixSessionInfo;
 
 /**
@@ -998,6 +1009,28 @@ enum AurixConnectionState aurix_client_state(const struct AurixClient *client);
 bool aurix_client_session(const struct AurixClient *client, struct AurixSessionInfo *out);
 
 /**
+ * WebSocket URL of the node serving (or last serving) the session — `AurixConfig.ws_url`
+ * until a failover moved it. Returns the number of bytes needed (excluding NUL); `buf` may
+ * be `NULL` to size it. 0 for an invalid handle.
+ */
+size_t aurix_client_endpoint(const struct AurixClient *client, char *buf, size_t capacity);
+
+/**
+ * Number of alternate nodes advertised by the server for this session (tried in order,
+ * after the current node, when the connection drops).
+ */
+size_t aurix_client_failover_endpoint_count(const struct AurixClient *client);
+
+/**
+ * The `index`-th failover URL (see `aurix_client_failover_endpoint_count`); same buffer
+ * contract as `aurix_client_endpoint`. 0 when `index` is out of range.
+ */
+size_t aurix_client_failover_endpoint(const struct AurixClient *client,
+                                      size_t index,
+                                      char *buf,
+                                      size_t capacity);
+
+/**
  * Link the media currently uses; `AurixMediaNone` before the first bind.
  */
 enum AurixMediaPath aurix_client_media_path(const struct AurixClient *client);
@@ -1063,7 +1096,8 @@ bool aurix_event_flag(const struct AurixEvent *event);
 
 /**
  * Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`,
- * `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`.
+ * `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`, `migrated`
+ * for `Recovered`.
  */
 bool aurix_event_flag2(const struct AurixEvent *event);
 

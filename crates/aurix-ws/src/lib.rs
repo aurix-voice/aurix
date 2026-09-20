@@ -11,6 +11,15 @@
 //! `resume.<session_id>.<token>` or query `resume=`) together with a valid JWT for the same
 //! user and receives `SessionInitAck { resumed: true }` plus one `ChannelJoinAck` per channel.
 //! Peers never see a leave/join pair. A failed resume falls back to a fresh session.
+//!
+//! Cross-node failover: with Redis, every live session is mirrored (`SessionMirror`) and its
+//! ownership fenced. A client that cannot reach its node reconnects to one of the
+//! `SessionInitAck.failover` URLs with the same resume credential; the new node validates it
+//! against the mirror, claims ownership atomically, rebuilds the media session with the same
+//! session id and SSRC (new media key and endpoint), rejoins its channels and answers
+//! `SessionInitAck { resumed: true, migrated: true }`. The previous node, if still alive,
+//! learns about it (`SessionMigrated` or a refused mirror write) and drops its copy without
+//! announcing a leave.
 
 use aurix_auth::{JwtService, ValidatedToken};
 use aurix_common::crypto::{constant_time_eq, ResumeToken};
@@ -22,7 +31,10 @@ use aurix_common::protocol::{
 use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
-use aurix_control::{ActionTokenService, ControlPlane, ParticipantSpeak, ServerEvent};
+use aurix_control::{
+    ActionTokenService, ControlPlane, MirroredChannel, MirroredPrefs, ParticipantSpeak,
+    ServerEvent, SessionMirror, TakeoverRefused, MIGRATION_SEQUENCE_GAP,
+};
 use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
 use aurix_media::tunnel::MediaTunnel;
@@ -82,6 +94,8 @@ pub struct ConnectionInfo {
     pub display_name: String,
     pub ssrc: u32,
     pub channels: Vec<ChannelId>,
+    pub ip: String,
+    pub user_agent: Option<String>,
     resume_token_hash: [u8; 32],
     /// Set while the socket is gone and the session waits for the client to resume.
     detached_since: Option<Instant>,
@@ -125,6 +139,14 @@ struct Attached {
     media_key: [u8; 32],
     /// Channels restored from a detached session (`None` for a fresh session).
     resumed_channels: Option<Vec<ChannelId>>,
+    /// Adopted from another node (cross-node resume).
+    migrated: bool,
+}
+
+/// A resume credential that names no local session but a mirrored one this node may adopt.
+struct TakeoverCandidate {
+    session_id: SessionId,
+    mirror: SessionMirror,
 }
 
 impl WsState {
@@ -568,6 +590,183 @@ impl WsState {
         }
     }
 
+    /// Public WebSocket URLs of other healthy nodes, best first, for `SessionInitAck.failover`.
+    fn failover_endpoints(&self) -> Vec<String> {
+        self.control.nodes.failover_endpoints(
+            self.control.node_id,
+            self.control.config.cluster.failover_endpoints,
+        )
+    }
+
+    /// Snapshot of a live session for the Redis mirror; `None` once it is closing or gone.
+    fn build_mirror(&self, session_id: SessionId) -> Option<SessionMirror> {
+        let (conn, channels) = {
+            let conn = self.connections.get(&session_id)?;
+            if conn.closing.is_some() {
+                return None;
+            }
+            (conn.clone(), conn.channels.clone())
+        };
+        let sfu = self.sfu.read();
+        let session = sfu.get_session(&session_id).filter(|s| s.is_active())?;
+        let channels = channels
+            .into_iter()
+            .map(|channel_id| MirroredChannel {
+                channel_id,
+                role: sfu
+                    .get_channel(&channel_id)
+                    .map(|c| c.role_of(&conn.user_id))
+                    .unwrap_or(ChannelRole::Speaker),
+            })
+            .collect();
+        let prefs = session.prefs.read();
+        let mirrored = MirroredPrefs {
+            local_mutes: prefs.local_mutes(),
+            gains: prefs.gains(),
+            transmission: session.transmission(),
+            focus: prefs.focus(),
+            codec: session.codec(),
+            downlink: session.downlink_mode(),
+            muted: session.is_muted.load(Ordering::Relaxed),
+            transcripts: conn.transcripts,
+        };
+        Some(SessionMirror {
+            session_id,
+            user_id: conn.user_id,
+            app_id: conn.app_id,
+            display_name: conn.display_name.clone(),
+            ssrc: conn.ssrc,
+            audio_seq: session.audio_sequence(),
+            resume_hash: SessionMirror::resume_hash_hex(&conn.resume_token_hash),
+            ip: conn.ip.clone(),
+            user_agent: conn.user_agent.clone(),
+            channels,
+            prefs: mirrored,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Writes/refreshes the session's Redis locator and mirror. A refused write means another
+    /// node adopted the session while this one still held it: the local copy is dropped.
+    async fn mirror_session(&self, session_id: SessionId) {
+        let Some(redis) = self.control.redis.as_ref() else {
+            return;
+        };
+        let cluster = &self.control.config.cluster;
+        if !cluster.session_mirror {
+            let _ = redis
+                .set_session_node(session_id, self.control.node_id)
+                .await;
+            return;
+        }
+        let Some(mirror) = self.build_mirror(session_id) else {
+            return;
+        };
+        match redis
+            .write_session_mirror(&mirror, cluster.session_mirror_ttl_secs)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let owner = redis.get_session_node(session_id).await.ok().flatten();
+                self.evict_migrated(session_id, owner).await;
+            }
+            Err(e) => debug!("session mirror write for {session_id} failed: {e}"),
+        }
+    }
+
+    /// Drops this node's copy of a session that now lives on `to`: media state and channel
+    /// membership go, but nothing is announced or closed in the database — the participant is
+    /// still in their channels, hosted elsewhere, so local peers keep them as a remote member.
+    async fn evict_migrated(&self, session_id: SessionId, to: Option<MediaNodeId>) {
+        let Some((_, conn)) = self.connections.remove(&session_id) else {
+            return;
+        };
+        if conn.detached_since.is_some() {
+            aurix_metrics::WS_SESSIONS_DETACHED.dec();
+        }
+        let _ = conn.tx.try_send(CLOSE_SENTINEL.to_string());
+        for channel_id in &conn.channels {
+            if let Some(members) = self.channel_members.get(channel_id) {
+                members.remove(&session_id);
+            }
+            self.channel_members
+                .remove_if(channel_id, |_, m| m.is_empty());
+        }
+        {
+            let sfu = self.sfu.read();
+            let is_muted = sfu.get_session(&session_id).is_some_and(|s| {
+                s.is_muted.load(Ordering::Relaxed) || s.is_server_muted.load(Ordering::Relaxed)
+            });
+            for channel_id in &conn.channels {
+                let Some(channel) = sfu.get_channel(channel_id) else {
+                    continue;
+                };
+                let role = channel.role_of(&conn.user_id);
+                let _ = sfu.leave_channel(&session_id, channel_id);
+                if sfu.get_channel(channel_id).is_some() {
+                    channel.add_remote(
+                        conn.user_id,
+                        RemoteParticipant {
+                            session_id,
+                            display_name: conn.display_name.clone(),
+                            ssrc: conn.ssrc,
+                            role,
+                            is_muted,
+                        },
+                    );
+                }
+            }
+            let _ = sfu.destroy_session(&session_id);
+        }
+        self.control.chat.forget_session(session_id);
+        self.control.speech.cancel_for_session(session_id, None);
+        info!(
+            "WS session {} for user {} migrated to {}",
+            session_id,
+            conn.user_id,
+            to.map(|n| n.to_string())
+                .unwrap_or_else(|| "another node".into())
+        );
+    }
+
+    /// A resume credential for a session this node does not host: valid against the Redis
+    /// mirror (tenant, user, token) means the session may be adopted here.
+    async fn takeover_candidate(
+        &self,
+        session_id: SessionId,
+        token: &str,
+        jwt: &ValidatedToken,
+    ) -> Option<TakeoverCandidate> {
+        let redis = self.control.redis.as_ref()?;
+        if !self.control.config.cluster.session_mirror || self.connections.contains_key(&session_id)
+        {
+            return None;
+        }
+        let presented = ResumeToken::hash_presented(token)?;
+        let mirror = match redis.get_session_mirror(session_id).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                takeover_refused("not_mirrored");
+                return None;
+            }
+            Err(e) => {
+                debug!("session mirror lookup for {session_id} failed: {e}");
+                takeover_refused("redis");
+                return None;
+            }
+        };
+        if mirror.session_id != session_id
+            || mirror.app_id != jwt.app_id
+            || mirror.user_id != jwt.user_id
+            || !mirror.resume_hash_matches(&presented)
+        {
+            takeover_refused("denied");
+            return None;
+        }
+        Some(TakeoverCandidate { session_id, mirror })
+    }
+
     async fn run_server_event_fanout(self) {
         let mut rx = self.control.events.subscribe();
         loop {
@@ -640,6 +839,16 @@ impl WsState {
                     hidden,
                     ..
                 } => {
+                    // A leave for a session this node hosts *and* still has in the channel is
+                    // stale: the lost-node reaper closed memberships the session had already
+                    // brought here by cross-node resume.
+                    if self
+                        .channel_members
+                        .get(&channel_id)
+                        .is_some_and(|m| m.contains(&session_id))
+                    {
+                        continue;
+                    }
                     if let Some(rec) = &self.recording {
                         rec.live().on_participant_left(channel_id, user_id);
                     }
@@ -869,6 +1078,12 @@ impl WsState {
                             },
                         );
                         self.leave_channel_full(sid, channel_id, "kicked").await;
+                        self.mirror_session(sid).await;
+                    }
+                }
+                ServerEvent::SessionMigrated { session_id, to, .. } => {
+                    if to != self.control.node_id {
+                        self.evict_migrated(session_id, Some(to)).await;
                     }
                 }
                 ServerEvent::UserBanned {
@@ -1000,6 +1215,7 @@ impl WsState {
                     for sid in members {
                         self.leave_channel_full(sid, channel_id, "channel_destroyed")
                             .await;
+                        self.mirror_session(sid).await;
                     }
                 }
                 _ => {}
@@ -1564,12 +1780,19 @@ pub async fn ws_handler(
             }
         }
     }
-    // Claimed before the upgrade so two racing reconnects cannot both take the session.
-    let resume = creds
-        .resume
-        .filter(|(sid, tok)| state.claim_resume(*sid, tok, &validated))
-        .map(|(sid, _)| sid);
-    if !fresh_allowed && resume.is_none() {
+    // Claimed before the upgrade so two racing reconnects cannot both take the session. A
+    // credential for a session hosted elsewhere is checked against its Redis mirror here; the
+    // ownership claim itself happens after the upgrade (`adopt_mirrored_session`).
+    let mut takeover = None;
+    let resume = match creds.resume {
+        Some((sid, tok)) if state.claim_resume(sid, &tok, &validated) => Some(sid),
+        Some((sid, tok)) => {
+            takeover = state.takeover_candidate(sid, &tok, &validated).await;
+            None
+        }
+        None => None,
+    };
+    if !fresh_allowed && resume.is_none() && takeover.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let ws = ws.max_message_size(MAX_TEXT_FRAME);
@@ -1579,7 +1802,7 @@ pub async fn ws_handler(
         ws
     };
     ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, state, validated, ip, user_agent, resume)
+        handle_ws_connection(socket, state, validated, ip, user_agent, resume, takeover)
     })
 }
 
@@ -1615,7 +1838,340 @@ fn reattach_session(
         ssrc: media.ssrc,
         media_key: media.media_key,
         resumed_channels: Some(conn.channels.clone()),
+        migrated: false,
     })
+}
+
+fn takeover_refused(reason: &str) {
+    aurix_metrics::WS_TAKEOVERS_REFUSED
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Adopts a session mirrored by another node: claims ownership in Redis (fencing out the
+/// previous host and any concurrent takeover), rebuilds the media session with the same id
+/// and SSRC (fresh media key/endpoint), re-homes the database row and restores channels and
+/// preferences. `None` when the takeover was refused — the caller opens a fresh session.
+async fn adopt_mirrored_session(
+    state: &WsState,
+    token: &ValidatedToken,
+    candidate: TakeoverCandidate,
+    ip: IpAddr,
+    user_agent: Option<&str>,
+    tx: &mpsc::Sender<String>,
+    resume_hash: [u8; 32],
+) -> Option<Attached> {
+    let redis = state.control.redis.as_ref()?;
+    let cluster = &state.control.config.cluster;
+    let node_id = state.control.node_id;
+    let TakeoverCandidate { session_id, mirror } = candidate;
+    let previous = redis.get_session_node(session_id).await.ok().flatten();
+    match redis
+        .claim_session(
+            session_id,
+            previous.unwrap_or(node_id),
+            cluster.session_mirror_ttl_secs,
+        )
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(refused)) => {
+            takeover_refused(match refused {
+                TakeoverRefused::NotMirrored => "not_mirrored",
+                TakeoverRefused::Denied => "denied",
+                TakeoverRefused::Raced => "raced",
+            });
+            return None;
+        }
+        Err(e) => {
+            warn!("session takeover claim for {session_id} failed: {e}");
+            takeover_refused("redis");
+            return None;
+        }
+    }
+    // Owned by this node from here on; a refusal below hands ownership back to the previous
+    // host (the mirror stays) so a still-alive node can carry on or another node can try.
+    for old in state.sessions_of_user(token.app_id, token.user_id) {
+        if state.take_detached(old) {
+            cleanup_connection(state, old, token.user_id, "replaced").await;
+        } else {
+            state.request_close(old, "replaced");
+        }
+    }
+    let adopted = state.sfu.read().adopt_session(
+        session_id,
+        token.user_id,
+        token.app_id,
+        token.display_name.clone(),
+        mirror.ssrc,
+        mirror.audio_seq.wrapping_add(MIGRATION_SEQUENCE_GAP),
+    );
+    let media_session = match adopted {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("session takeover of {session_id} refused by the SFU: {e}");
+            let _ = redis.release_session_claim(session_id, previous).await;
+            takeover_refused("capacity");
+            return None;
+        }
+    };
+    let migrated = match state
+        .control
+        .sessions
+        .migrate_session(session_id, token.app_id, token.user_id, node_id)
+        .await
+    {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            // No row (retention) or closed for good elsewhere: a fresh row under the same id
+            // keeps the session's history continuous; a conflict means it is not migratable.
+            let created = state
+                .control
+                .sessions
+                .create_session(
+                    session_id,
+                    token.user_id,
+                    token.app_id,
+                    node_id,
+                    &ip.to_string(),
+                    user_agent,
+                )
+                .await;
+            if let Err(e) = created {
+                warn!("session takeover of {session_id} has no migratable row: {e}");
+                let _ = state.sfu.read().destroy_session(&session_id);
+                let _ = redis.release_session_claim(session_id, previous).await;
+                takeover_refused("db");
+                return None;
+            }
+            aurix_control::session_manager::MigratedSession {
+                reaped: true,
+                open_channels: Vec::new(),
+            }
+        }
+        Err(e) => {
+            warn!("session takeover of {session_id} could not update the database: {e}");
+            let _ = state.sfu.read().destroy_session(&session_id);
+            let _ = redis.release_session_claim(session_id, previous).await;
+            takeover_refused("db");
+            return None;
+        }
+    };
+    match state
+        .control
+        .blocks
+        .load_for_user(token.app_id, token.user_id)
+        .await
+    {
+        Ok(blocks) => media_session
+            .prefs
+            .write()
+            .load_blocks(blocks.blocked, blocks.blocked_by),
+        Err(e) => warn!("block list load failed for {}: {e}", token.user_id),
+    }
+    {
+        let mut prefs = media_session.prefs.write();
+        for (sender, channel) in &mirror.prefs.local_mutes {
+            prefs.set_muted(*sender, *channel, true);
+        }
+        for (sender, gain) in &mirror.prefs.gains {
+            prefs.set_gain(*sender, *gain);
+        }
+    }
+    media_session
+        .is_muted
+        .store(mirror.prefs.muted, Ordering::Relaxed);
+    if mirror.prefs.codec == AudioCodec::Pcmu && state.control.config.media.pcmu_fallback {
+        let _ = media_session.set_codec(AudioCodec::Pcmu);
+    }
+    state.connections.insert(
+        session_id,
+        ConnectionInfo {
+            tx: tx.clone(),
+            user_id: token.user_id,
+            app_id: token.app_id,
+            display_name: token.display_name.clone(),
+            ssrc: mirror.ssrc,
+            channels: Vec::new(),
+            ip: ip.to_string(),
+            user_agent: user_agent.map(str::to_string),
+            resume_token_hash: resume_hash,
+            detached_since: None,
+            generation: 0,
+            closing: None,
+            transcripts: mirror.prefs.transcripts,
+        },
+    );
+
+    let mut restored = Vec::with_capacity(mirror.channels.len());
+    for channel in &mirror.channels {
+        let open = migrated.open_channels.contains(&channel.channel_id);
+        // A membership closed by anything other than node cleanup (leave, kick) stays closed.
+        if !open && !migrated.reaped {
+            continue;
+        }
+        if restore_channel(state, token, session_id, channel, open).await {
+            restored.push(channel.channel_id);
+        }
+    }
+    if let Some(focus) = mirror.prefs.focus {
+        let _ = media_session.set_focus(Some(focus));
+    }
+    let _ = media_session.set_transmission(mirror.prefs.transmission);
+    if mirror.prefs.downlink == DownlinkMode::Mixed && state.sfu.read().downlink_mix_enabled() {
+        let _ = state
+            .sfu
+            .read()
+            .set_downlink_mode(&session_id, DownlinkMode::Mixed);
+    }
+    state.mirror_session(session_id).await;
+    state.control.events.publish(ServerEvent::SessionMigrated {
+        app_id: token.app_id,
+        session_id,
+        user_id: token.user_id,
+        from: previous.unwrap_or(node_id),
+        to: node_id,
+        ssrc: mirror.ssrc,
+        channels: restored.clone(),
+    });
+    aurix_metrics::WS_SESSIONS_MIGRATED.inc();
+    aurix_metrics::WS_SESSIONS_RESUMED.inc();
+    info!(
+        "WS session {} for user {} adopted from {} with {} channel(s)",
+        session_id,
+        token.user_id,
+        previous
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "an unknown node".into()),
+        restored.len()
+    );
+    Some(Attached {
+        session_id,
+        ssrc: mirror.ssrc,
+        media_key: media_session.media_key,
+        resumed_channels: Some(restored),
+        migrated: true,
+    })
+}
+
+/// Re-joins an adopted session to one of its mirrored channels. `open` says the membership
+/// row survived (the previous node is merely unreachable); otherwise node cleanup closed it
+/// and it is re-created and announced. Returns whether the session is in the channel.
+async fn restore_channel(
+    state: &WsState,
+    token: &ValidatedToken,
+    session_id: SessionId,
+    channel: &MirroredChannel,
+    open: bool,
+) -> bool {
+    let channel_id = channel.channel_id;
+    let (app_id, user_id) = (token.app_id, token.user_id);
+    let close_open_membership = |reason: &'static str| async move {
+        if !open {
+            return;
+        }
+        let _ = state
+            .control
+            .sessions
+            .remove_channel_membership(channel_id, session_id)
+            .await;
+        let count = state
+            .control
+            .channels
+            .update_participant_count(channel_id, -1)
+            .await;
+        if let Some(redis) = &state.control.redis {
+            let _ = redis.remove_user_channel(user_id, channel_id).await;
+            let _ = redis.decr_channel_participants(channel_id).await;
+        }
+        state.control.events.publish(ServerEvent::ParticipantLeft {
+            app_id,
+            channel_id,
+            user_id,
+            session_id,
+            reason: reason.into(),
+            hidden: false,
+            timestamp: chrono::Utc::now(),
+        });
+        if let Ok(0) = count {
+            state.control.channel_emptied(app_id, channel_id).await;
+        }
+    };
+    let config = match state
+        .control
+        .channels
+        .resolve_join(app_id, channel_id, None)
+        .await
+    {
+        Ok(resolved) => resolved.config,
+        Err(e) => {
+            debug!("channel {channel_id} not restored for {session_id}: {e}");
+            close_open_membership("channel_gone").await;
+            return false;
+        }
+    };
+    let joined = state
+        .sfu
+        .read()
+        .join_channel(&session_id, channel_id, config, channel.role);
+    if let Err(e) = joined {
+        warn!("channel {channel_id} not restored for {session_id}: {e}");
+        close_open_membership("restore_failed").await;
+        return false;
+    }
+    let ssrc = state
+        .connections
+        .get(&session_id)
+        .map(|c| c.ssrc)
+        .unwrap_or_default();
+    if !open {
+        if let Err(e) = state
+            .control
+            .sessions
+            .add_channel_membership(channel_id, user_id, session_id, channel.role, ssrc)
+            .await
+        {
+            warn!("membership restore failed for {session_id} in {channel_id}: {e}");
+            let _ = state.sfu.read().leave_channel(&session_id, &channel_id);
+            return false;
+        }
+        if let Ok(1) = state
+            .control
+            .channels
+            .update_participant_count(channel_id, 1)
+            .await
+        {
+            state.control.events.publish(ServerEvent::ChannelActivated {
+                app_id,
+                channel_id,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        if let Some(redis) = &state.control.redis {
+            let _ = redis.incr_channel_participants(channel_id).await;
+        }
+    }
+    state.index_join(channel_id, session_id);
+    if let Some(redis) = &state.control.redis {
+        let _ = redis.add_user_channel(user_id, channel_id).await;
+    }
+    state.sync_remote_members(app_id, channel_id).await;
+    if !open {
+        state
+            .control
+            .events
+            .publish(ServerEvent::ParticipantJoined {
+                app_id,
+                channel_id,
+                user_id,
+                session_id,
+                display_name: token.display_name.clone(),
+                ssrc,
+                role: channel.role,
+                timestamp: chrono::Utc::now(),
+            });
+    }
+    true
 }
 
 async fn open_session(
@@ -1691,6 +2247,8 @@ async fn open_session(
             display_name: token.display_name.clone(),
             ssrc: media_session.ssrc,
             channels: Vec::new(),
+            ip: ip.to_string(),
+            user_agent: user_agent.map(str::to_string),
             resume_token_hash: resume_hash,
             detached_since: None,
             generation: 0,
@@ -1703,6 +2261,7 @@ async fn open_session(
         ssrc: media_session.ssrc,
         media_key: media_session.media_key,
         resumed_channels: None,
+        migrated: false,
     })
 }
 
@@ -1817,6 +2376,7 @@ async fn handle_ws_connection(
     ip: IpAddr,
     user_agent: Option<String>,
     resume: Option<SessionId>,
+    takeover: Option<TakeoverCandidate>,
 ) {
     state.start_fanout();
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -1846,6 +2406,20 @@ async fn handle_ws_connection(
         if attached.is_none() {
             // Claimed, but the media session died meanwhile: release it and start over.
             cleanup_connection(&state, sid, token.user_id, "resume_failed").await;
+        }
+    }
+    if attached.is_none() {
+        if let Some(candidate) = takeover {
+            attached = adopt_mirrored_session(
+                &state,
+                &token,
+                candidate,
+                ip,
+                user_agent.as_deref(),
+                &tx,
+                resume_token.hash,
+            )
+            .await;
         }
     }
     let attached = match attached {
@@ -1879,11 +2453,8 @@ async fn handle_ws_connection(
     let session_id = attached.session_id;
     let resumed = attached.resumed_channels.is_some();
 
-    if let Some(ref redis) = state.control.redis {
-        let _ = redis
-            .set_session_node(session_id, state.control.node_id)
-            .await;
-    }
+    // Locator + mirror under this node's ownership (a plain resume refreshes the token hash).
+    state.mirror_session(session_id).await;
 
     // UDP-blocked fallback: this connection may carry AURX packets as binary frames. The
     // tunnel is owned by the connection and only becomes the session's media path after an
@@ -1915,6 +2486,8 @@ async fn handle_ws_connection(
         resumed,
         media_tunnel: tunnel.is_some(),
         downlink_mix: state.sfu.read().downlink_mix_enabled(),
+        migrated: attached.migrated,
+        failover: state.failover_endpoints(),
     };
     if tx
         .send(serde_json::to_string(&init_ack).unwrap_or_default())
@@ -1954,7 +2527,13 @@ async fn handle_ws_connection(
     info!(
         "WS session {} {} for user {} ({})",
         session_id,
-        if resumed { "resumed" } else { "opened" },
+        if attached.migrated {
+            "migrated"
+        } else if resumed {
+            "resumed"
+        } else {
+            "opened"
+        },
         token.user_id,
         ip
     );
@@ -2001,6 +2580,7 @@ async fn handle_ws_connection(
                 Message::Text(text) => match serde_json::from_str::<ControlMessage>(&text) {
                     Ok(ControlMessage::SessionClose { .. }) => return Disconnect::ClientClose,
                     Ok(cm) => {
+                        let mirror = touches_mirror(&cm);
                         handle_control_message(
                             &recv_state,
                             session_id,
@@ -2009,7 +2589,10 @@ async fn handle_ws_connection(
                             cm,
                             &recv_tx,
                         )
-                        .await
+                        .await;
+                        if mirror {
+                            recv_state.mirror_session(session_id).await;
+                        }
                     }
                     Err(_) => {
                         send_error(&recv_tx, "VALIDATION_ERROR", "Malformed control message").await
@@ -2044,20 +2627,22 @@ async fn handle_ws_connection(
         }
     });
 
-    // Keep the session→node mapping alive in Redis while connected.
+    // Keep the session→node mapping and mirror alive in Redis while connected.
     let redis_state = state.clone();
     let redis_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let cluster = &redis_state.control.config.cluster;
+        let period = if cluster.session_mirror {
+            (cluster.session_mirror_ttl_secs / 3).clamp(10, 60)
+        } else {
+            60
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(period));
         loop {
             interval.tick().await;
             if redis_state.connections.get(&session_id).is_none() {
                 return;
             }
-            if let Some(ref redis) = redis_state.control.redis {
-                let _ = redis
-                    .set_session_node(session_id, redis_state.control.node_id)
-                    .await;
-            }
+            redis_state.mirror_session(session_id).await;
         }
     });
 
@@ -2089,7 +2674,42 @@ async fn handle_ws_connection(
     }
 }
 
+/// Control messages after which the Redis mirror must be refreshed so a takeover restores
+/// the same channels and preferences.
+fn touches_mirror(msg: &ControlMessage) -> bool {
+    matches!(
+        msg,
+        ControlMessage::ChannelJoin { .. }
+            | ControlMessage::ChannelLeave { .. }
+            | ControlMessage::SetParticipantMute { .. }
+            | ControlMessage::SetParticipantVolume { .. }
+            | ControlMessage::SetTransmission { .. }
+            | ControlMessage::SetChannelFocus { .. }
+            | ControlMessage::SetAudioCodec { .. }
+            | ControlMessage::SetDownlinkMode { .. }
+            | ControlMessage::MuteStateChanged { .. }
+            | ControlMessage::SetTranscripts { .. }
+    )
+}
+
 async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: UserId, reason: &str) {
+    // Fencing: a session another node adopted is theirs to close. Tearing it down here would
+    // destroy live memberships and announce a leave for a participant who is still in the
+    // channel. Deleting the mirror first (owner-guarded) also ends the takeover window: with
+    // no mirror nobody can adopt the session while it is being torn down here. (The database
+    // updates below are additionally guarded by `media_node_id`.)
+    if let Some(redis) = &state.control.redis {
+        if state.control.config.cluster.session_mirror {
+            if let Ok(false) = redis.delete_session_mirror(session_id).await {
+                let owner = redis.get_session_node(session_id).await.ok().flatten();
+                state.evict_migrated(session_id, owner).await;
+                return;
+            }
+        } else {
+            let _ = redis.delete_session_mirror(session_id).await;
+        }
+    }
+    let node_id = state.control.node_id;
     let channels: Vec<ChannelId> = state
         .connections
         .get(&session_id)
@@ -2112,12 +2732,12 @@ async fn cleanup_connection(state: &WsState, session_id: SessionId, user_id: Use
     let _ = state
         .control
         .sessions
-        .close_session_memberships(session_id)
+        .close_session_memberships(session_id, node_id)
         .await;
     if let Err(e) = state
         .control
         .sessions
-        .close_session(session_id, reason, quality)
+        .close_session(session_id, node_id, reason, quality)
         .await
     {
         warn!("session close persistence failed: {e}");
@@ -3339,6 +3959,8 @@ mod tests {
             display_name: "p".into(),
             ssrc: 7,
             channels: vec![],
+            ip: "127.0.0.1".into(),
+            user_agent: None,
             resume_token_hash: token.hash,
             detached_since: Some(Instant::now()),
             generation: 1,

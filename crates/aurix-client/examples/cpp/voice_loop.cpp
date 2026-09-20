@@ -67,6 +67,9 @@ bool handle_event(const aurix::Event& ev) {
         std::printf("media path -> %s (%s)\n", ev.media_path() == AURIX_MEDIA_TUNNEL ? "ws-tunnel" : "udp",
                     ev.message().c_str());
         return false;
+    case AURIX_EVENT_ENDPOINT_CHANGED:
+        std::printf("endpoint -> %s\n", ev.message().c_str());
+        return false;
     case AURIX_EVENT_REQUEST_FAILED:
     case AURIX_EVENT_SERVER_ERROR:
     case AURIX_EVENT_REJOIN_FAILED:
@@ -173,6 +176,7 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    std::printf("node %s, %zu failover node(s)\n", client.endpoint().c_str(), client.failover_endpoints().size());
 
     std::uint64_t join_request = 0;
     if (client.join_channel(channel, nullptr, &join_request) != AURIX_OK) {

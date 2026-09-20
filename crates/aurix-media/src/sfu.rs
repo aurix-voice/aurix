@@ -419,6 +419,43 @@ impl SfuNode {
         app_id: AppId,
         display_name: String,
     ) -> Result<Arc<MediaSession>> {
+        let ssrc = self.crypto.generate_ssrc();
+        self.create_session_with_ssrc(session_id, user_id, app_id, display_name, ssrc)
+    }
+
+    /// Recreates a session another node was hosting (cross-node failover): the identity the
+    /// client already knows (`session_id`, `ssrc`) is kept, everything else — media key,
+    /// endpoint, channels, preferences — starts fresh and is restored by the caller.
+    /// `audio_seq` is where the participant's downlink audio sequence continues: receivers
+    /// keep a per-SSRC anti-replay window, so it must lie above anything the old node sent.
+    pub fn adopt_session(
+        &self,
+        session_id: SessionId,
+        user_id: UserId,
+        app_id: AppId,
+        display_name: String,
+        ssrc: u32,
+        audio_seq: u32,
+    ) -> Result<Arc<MediaSession>> {
+        if self.sessions_by_id.contains_key(&session_id) {
+            return Err(AurixError::Validation(
+                "session already hosted on this node".into(),
+            ));
+        }
+        let session =
+            self.create_session_with_ssrc(session_id, user_id, app_id, display_name, ssrc)?;
+        session.sequence.store(audio_seq, Ordering::Relaxed);
+        Ok(session)
+    }
+
+    fn create_session_with_ssrc(
+        &self,
+        session_id: SessionId,
+        user_id: UserId,
+        app_id: AppId,
+        display_name: String,
+        ssrc: u32,
+    ) -> Result<Arc<MediaSession>> {
         if let Some((_, old)) = self.sessions_by_user.remove(&user_id) {
             self.teardown_session(&old);
             info!("Replaced existing session for user {}", user_id);
@@ -437,7 +474,6 @@ impl SfuNode {
         {
             return Err(AurixError::MediaNodeUnavailable("Node at capacity".into()));
         }
-        let ssrc = self.crypto.generate_ssrc();
         let mut media_key = [0u8; 32];
         match self.crypto.generate_random_bytes(32) {
             Ok(k) => media_key.copy_from_slice(&k),

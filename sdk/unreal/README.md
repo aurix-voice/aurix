@@ -73,7 +73,10 @@ files and build. The plugin enables the engine's `AudioCapture` plugin as a depe
 * A dropped connection is resumed within the server's grace window with the same session,
   SSRC and key (`OnRecovering` → `OnRecovered(bResumed=true)`); after the window a fresh
   session is opened and channels are rejoined (`bResumed=false`, `OnRejoinFailed` per channel
-  that needs a new join token).
+  that needs a new join token). When the node is gone, attempts rotate through the failover
+  nodes it advertised (`GetFailoverEndpoints`); the node that answers takes the session over —
+  `OnEndpointChanged(Url)`, then `OnRecovered(bResumed=true, bMigrated=true)` with the same
+  session/SSRC and a new media key and endpoint; `GetEndpoint` names the node in use.
 
 ## 4. Usage
 

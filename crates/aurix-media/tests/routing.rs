@@ -2147,3 +2147,92 @@ async fn listeners_get_one_server_mixed_stream_per_channel() {
     assert!(drain_udp(&l).await.is_empty());
     assert!(!drain_udp(&p).await.is_empty());
 }
+
+/// A session adopted after a cross-node failover keeps its SSRC, so the receivers that were
+/// already listening to it keep their per-SSRC anti-replay windows: its downlink sequence
+/// must continue above what the old node handed out, not restart at zero.
+#[tokio::test]
+async fn adopted_session_downlink_sequence_continues_above_the_mirrored_one() {
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let alice_id = SessionId::new();
+    let alice_user = UserId::new();
+    let alice = sfu
+        .create_session(alice_id, alice_user, app, "alice".into())
+        .unwrap();
+    let bob = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "bob".into())
+        .unwrap();
+    for s in [&alice, &bob] {
+        sfu.join_channel(
+            &s.session_id,
+            channel,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut a = Client::new(alice.clone()).await;
+    let mut b = Client::new(bob.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+
+    // Bob's receive side behaves like a real client: one replay window per sender SSRC.
+    let mut window = ReplayWindow::default();
+    for i in 0..3 {
+        a.send_audio(addr, &channel, b"before").await;
+        let pkt = b.recv().await.expect("downlink before the move");
+        assert_eq!(pkt.header.ssrc, alice.ssrc);
+        assert!(window.check_and_update(pkt.header.sequence), "packet {i}");
+    }
+    let mirrored = alice.audio_sequence();
+    assert!(mirrored >= 3);
+    let ssrc = alice.ssrc;
+
+    // "Node 1 died": the session goes away here and is adopted with the same id/SSRC, its
+    // sequence resumed from the mirror plus the migration gap.
+    sfu.destroy_session(&alice_id).unwrap();
+    let gap = 1u32 << 16;
+    let adopted = sfu
+        .adopt_session(
+            alice_id,
+            alice_user,
+            app,
+            "alice".into(),
+            ssrc,
+            mirrored + gap,
+        )
+        .unwrap();
+    assert_eq!(adopted.ssrc, ssrc);
+    assert_ne!(
+        adopted.media_key, alice.media_key,
+        "media key must be fresh"
+    );
+    sfu.join_channel(
+        &alice_id,
+        channel,
+        ChannelConfig::default(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+    let mut a2 = Client::new(adopted.clone()).await;
+    a2.bind(addr).await;
+    while b.recv().await.is_some() {}
+
+    a2.send_audio(addr, &channel, b"after").await;
+    let pkt = b.recv().await.expect("downlink after the move");
+    assert_eq!(pkt.header.ssrc, ssrc);
+    assert!(
+        pkt.header.sequence >= mirrored + gap,
+        "sequence {} must continue above the mirrored {mirrored} + gap",
+        pkt.header.sequence
+    );
+    assert!(
+        window.check_and_update(pkt.header.sequence),
+        "a receiver's anti-replay window must accept the migrated stream"
+    );
+
+    // Restarting at zero (what a plain re-creation would do) is exactly what the window rejects.
+    assert!(!window.check_and_update(0));
+}

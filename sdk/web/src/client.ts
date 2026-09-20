@@ -155,6 +155,25 @@ export interface SessionInfo {
   ssrc: number;
   /** `true` when this session was resumed after a dropped connection. */
   resumed: boolean;
+  /**
+   * `true` when the resume landed on a different node than the one that created the session
+   * (the previous node stopped answering): same session id and SSRC, media renegotiated.
+   */
+  migrated: boolean;
+  /** WebSocket URL of the node serving this session. */
+  endpoint: string;
+  /** Other nodes advertised for failover, tried in order after `endpoint` on a reconnect. */
+  failover: string[];
+}
+
+/**
+ * Reconnect target for `attempt` (1-based): the node that holds the session first — a
+ * same-node resume is the cheapest recovery — then each advertised alternate, round-robin.
+ */
+export function reconnectEndpoint(active: string, failover: readonly string[], attempt: number): string {
+  const n = 1 + failover.length;
+  const i = (Math.max(1, attempt) - 1) % n;
+  return i === 0 ? active : (failover[i - 1] ?? active);
 }
 
 export interface Participant {
@@ -396,9 +415,15 @@ export interface AurixEvents {
   recovering: (attempt: number, delayMs: number, cause: string) => void;
   /**
    * Reconnected. `info.resumed` tells whether the server handed back the same session
-   * (peers never noticed) or a fresh one that the client re-joined to its channels.
+   * (peers never noticed) or a fresh one that the client re-joined to its channels;
+   * `info.migrated` when another node took the session over.
    */
   recovered: (info: SessionInfo) => void;
+  /**
+   * A failover node answered while the previous one did not; the client now talks to `url`
+   * (`endpoint` reflects it). Fires before that connection's `recovered`.
+   */
+  endpointChanged: (url: string) => void;
   /** Reconnect attempts exhausted or a definite refusal; the client is now `failed`. */
   failedToRecover: (error: Error) => void;
   /** The server ended the session (kick from the platform, ban, shutdown). No reconnect. */
@@ -614,7 +639,7 @@ export class AurixClient {
   /** Sender preferences last pushed through `setParameters`. */
   private appliedSenderPrefs: OpusSenderPreferences | undefined;
   private pendingAnswer: Pending<string> | undefined;
-  private pendingInit: Pending<SessionInfo> | undefined;
+  private pendingInit: (Pending<SessionInfo> & { url: string }) | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pingNonce = 1;
   private lastPingSentAt = 0;
@@ -642,6 +667,8 @@ export class AurixClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
   private lastPongAt = 0;
+  private activeEndpoint: string;
+  private failoverEndpoints: string[] = [];
 
   constructor(options: AurixClientOptions) {
     this.opts = {
@@ -653,6 +680,7 @@ export class AurixClient {
       ...options,
     };
     this.reconnectPolicy = { ...DEFAULT_RECONNECT, ...(options.reconnect ?? {}) };
+    this.activeEndpoint = options.wsUrl;
     this.userId = decodeJwtSubject(options.token);
     if (options.inputGain !== undefined) this.inputGainValue = checkInputGain(options.inputGain);
     this.inputDeviceIdValue = options.inputDeviceId;
@@ -699,6 +727,16 @@ export class AurixClient {
 
   get sessionInfo(): SessionInfo | undefined {
     return this.session;
+  }
+
+  /** WebSocket URL of the node the client talks to (`wsUrl` until a failover moved it). */
+  get endpoint(): string {
+    return this.activeEndpoint;
+  }
+
+  /** Alternate nodes advertised by the server for this session (see `endpointChanged`). */
+  get failover(): readonly string[] {
+    return this.failoverEndpoints;
   }
 
   get isMuted(): boolean {
@@ -1130,12 +1168,14 @@ export class AurixClient {
     this.closedByUser = false;
     this.resumeToken = undefined;
     this.session = undefined;
+    this.activeEndpoint = this.opts.wsUrl;
+    this.failoverEndpoints = [];
     this.rtt.reset();
     this.serverQuality = undefined;
     this.statsSnapshot = undefined;
     this.setState('connecting');
 
-    const info = await this.openControlChannel();
+    const info = await this.openControlChannel(this.opts.wsUrl);
     this.session = info;
     this.setState('connected');
     this.emit('sessionReady', info);
@@ -1565,7 +1605,7 @@ export class AurixClient {
 
   // ── Internals: control channel ──
 
-  private openControlChannel(): Promise<SessionInfo> {
+  private openControlChannel(url: string): Promise<SessionInfo> {
     return new Promise<SessionInfo>((resolve, reject) => {
       // Browsers cannot set the Authorization header on a WebSocket upgrade; the server
       // accepts the JWT as a `bearer.<jwt>` sub-protocol and echoes `aurix` back. The
@@ -1574,14 +1614,14 @@ export class AurixClient {
       if (this.session && this.resumeToken) {
         protocols.push(`${RESUME_SUBPROTOCOL_PREFIX}${this.session.sessionId}.${this.resumeToken}`);
       }
-      const ws = new WebSocket(this.opts.wsUrl, protocols);
+      const ws = new WebSocket(url, protocols);
       this.ws = ws;
       const timer = setTimeout(() => {
         this.pendingInit = undefined;
         ws.close();
         reject(new Error('session init timed out'));
       }, this.opts.requestTimeoutMs);
-      this.pendingInit = { resolve, reject, timer };
+      this.pendingInit = { resolve, reject, timer, url };
 
       ws.onmessage = (ev) => {
         if (typeof ev.data !== 'string') return;
@@ -1655,13 +1695,14 @@ export class AurixClient {
     this.reconnectAttempt += 1;
     const previous = this.session;
     const wanted = Array.from(this.channels.keys());
+    const url = reconnectEndpoint(this.activeEndpoint, this.failoverEndpoints, this.reconnectAttempt);
     let info: SessionInfo;
     try {
       if (this.opts.refreshToken) {
         this.opts.token = await this.opts.refreshToken();
         if (this.closedByUser) return;
       }
-      info = await this.openControlChannel();
+      info = await this.openControlChannel(url);
     } catch (e) {
       if (this.closedByUser) return;
       this.scheduleReconnect(e instanceof Error ? e.message : String(e));
@@ -1669,6 +1710,10 @@ export class AurixClient {
     }
     if (this.closedByUser) return;
 
+    if (url !== this.activeEndpoint) {
+      this.activeEndpoint = url;
+      this.emit('endpointChanged', url);
+    }
     this.session = info;
     this.reconnectAttempt = 0;
     this.startPing();
@@ -1684,7 +1729,9 @@ export class AurixClient {
     }
     this.setState('connected');
     try {
-      await this.restoreMedia(info.resumed && previous?.ssrc === info.ssrc);
+      // A takeover rebuilt the media session on another node: the old peer connection may
+      // still look connected for a while but nobody is listening at the other end.
+      await this.restoreMedia(info.resumed && !info.migrated && previous?.ssrc === info.ssrc);
       if (!info.resumed) {
         for (const channelId of wanted) await this.joinChannel(channelId);
       }
@@ -1846,11 +1893,16 @@ export class AurixClient {
     switch (msg.type) {
       case 'SessionInitAck': {
         const d = (msg as Extract<ServerMessage, { type: 'SessionInitAck' }>).data;
+        const endpoint = this.pendingInit?.url ?? this.activeEndpoint;
+        this.failoverEndpoints = (d.failover ?? []).filter((u) => u !== endpoint);
         const info: SessionInfo = {
           sessionId: d.session_id,
           userId: this.userId ?? '',
           ssrc: d.ssrc,
           resumed: d.resumed === true,
+          migrated: d.migrated === true,
+          endpoint,
+          failover: [...this.failoverEndpoints],
         };
         this.resumeToken = d.resume_token || undefined;
         this.resumeGraceMs = d.resume_grace_ms ?? 0;

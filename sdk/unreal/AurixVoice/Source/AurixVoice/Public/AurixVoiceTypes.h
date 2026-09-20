@@ -465,6 +465,13 @@ struct AURIXVOICE_API FAurixSessionInfo
 	/** The node can deliver one server-mixed stream per channel (SetDownlinkMode Mixed). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bDownlinkMix = false;
+
+	/**
+	 * The latest (re)connect resumed the session on a different node (same session id and
+	 * SSRC, new media key/endpoint). GetEndpoint names it.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bMigrated = false;
 };
 
 /** Channel member snapshot. For OnChannelEnergy only UserId and Energy are meaningful. */

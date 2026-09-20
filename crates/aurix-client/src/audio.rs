@@ -26,6 +26,9 @@ pub const MAX_OUTPUT_VOLUME: f32 = 2.0;
 /// Decoders accept frames up to 60 ms.
 const MAX_DECODE_SAMPLES: usize = FRAME_SAMPLES * 3;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A sequence jump this far from the expected one (in either direction) means the sender's
+/// numbering restarted — e.g. the session moved to another node — rather than jitter.
+const JITTER_RESYNC_GAP: u32 = 500;
 
 /// RMS of a PCM float buffer, `0..=1`.
 pub fn rms(pcm: &[f32]) -> f32 {
@@ -845,9 +848,13 @@ impl<F> JitterBuffer<F> {
     }
 
     pub fn push(&mut self, seq: u32, frame: F) {
-        if self.started && Self::seq_before(seq, self.next_seq) {
-            self.late += 1;
-            return;
+        if self.started {
+            if (seq.wrapping_sub(self.next_seq) as i32).unsigned_abs() > JITTER_RESYNC_GAP {
+                self.reset();
+            } else if Self::seq_before(seq, self.next_seq) {
+                self.late += 1;
+                return;
+            }
         }
         self.frames.insert(seq, frame);
         if self.frames.len() > self.max_depth {
@@ -1094,6 +1101,16 @@ impl RemoteMixer {
         for (_, s) in self.streams.drain() {
             self.retired.lost += s.jitter.lost;
             self.retired.late += s.jitter.late;
+        }
+    }
+
+    /// Keep the streams (decoders, gains) but drop buffered frames and sequence expectations:
+    /// after a move to another node every downlink stream restarts its numbering.
+    pub fn resync(&mut self) {
+        for s in self.streams.values_mut() {
+            s.jitter.reset();
+            s.pos = 0;
+            s.len = 0;
         }
     }
 
@@ -1440,6 +1457,26 @@ mod tests {
         jb.push(5, vec![9]);
         assert_eq!(jb.late, 1);
         assert_eq!(jb.lost, 1);
+    }
+
+    #[test]
+    fn jitter_buffer_resyncs_after_a_sequence_restart() {
+        let mut jb = JitterBuffer::new(2, 8);
+        jb.push(1000, vec![0]);
+        jb.push(1001, vec![1]);
+        assert_eq!(jb.pop(), JitterSlot::Frame(vec![0]));
+        assert_eq!(jb.pop(), JitterSlot::Frame(vec![1]));
+        // The sender restarted far below: not "late", the buffer re-primes on the new numbering.
+        jb.push(7, vec![7]);
+        jb.push(8, vec![8]);
+        assert_eq!(jb.pop(), JitterSlot::Frame(vec![7]));
+        assert_eq!(jb.pop(), JitterSlot::Frame(vec![8]));
+        // …and far above: no endless run of loss markers.
+        jb.push(900_000, vec![9]);
+        jb.push(900_001, vec![10]);
+        assert_eq!(jb.pop(), JitterSlot::Frame(vec![9]));
+        assert_eq!(jb.late, 0);
+        assert_eq!(jb.lost, 0);
     }
 
     #[test]

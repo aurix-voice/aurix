@@ -194,6 +194,22 @@ public:
     AurixResult set_token(const std::string& token) { return aurix_client_set_token(c_, token.c_str()); }
     AurixConnectionState state() const { return aurix_client_state(c_); }
     bool session(AurixSessionInfo& out) const { return aurix_client_session(c_, &out); }
+    /// WebSocket URL of the node serving the session (`ws_url` until a failover moved it).
+    std::string endpoint() const {
+        std::string out(aurix_client_endpoint(c_, nullptr, 0), '\0');
+        if (!out.empty()) aurix_client_endpoint(c_, &out[0], out.size() + 1);
+        return out;
+    }
+    /// Alternate nodes advertised for this session; reconnects try the current node first,
+    /// then these in order (`AURIX_EVENT_ENDPOINT_CHANGED` reports a switch).
+    std::vector<std::string> failover_endpoints() const {
+        std::vector<std::string> out(aurix_client_failover_endpoint_count(c_));
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            out[i].assign(aurix_client_failover_endpoint(c_, i, nullptr, 0), '\0');
+            if (!out[i].empty()) aurix_client_failover_endpoint(c_, i, &out[i][0], out[i].size() + 1);
+        }
+        return out;
+    }
 
     // --- events
     Event poll_event() { return Event(aurix_client_poll_event(c_)); }

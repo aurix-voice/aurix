@@ -155,6 +155,12 @@ client.on('sessionClosed', (reason) => { /* kicked/banned/shutdown: no reconnect
   A still-connected `RTCPeerConnection` is kept; otherwise a new offer is negotiated.
 * After the grace window the server hands out a fresh session (`info.resumed === false`); the
   client emits `channelLeft` for the old channels and re-joins them with the same token.
+* If the node itself is gone, reconnect attempts rotate through the failover nodes the server
+  advertised (`client.failover`; attempt 1 → current node, 2 → first failover, 3 → second, …).
+  A node that answers takes the session over from its Redis mirror: `endpointChanged(url)`
+  fires, then `recovered` with `info.migrated === true` — same session id and SSRC, new media
+  key/endpoint, channels and preferences restored, peers see no leave; a new
+  `RTCPeerConnection` is negotiated with the new node. `client.endpoint` names the node in use.
 * Two missed `Pong`s close the socket proactively so half-open connections are detected within
   ~2.5 × `pingIntervalMs`. `reconnectNow()` skips the current backoff delay (e.g. on `online`).
 * `disconnect()` cancels any pending reconnect; a `SessionClose` from the server never reconnects.

@@ -213,7 +213,11 @@ c++ -std=c++11 -Icrates/aurix-client/include crates/aurix-client/examples/cpp/vo
 * Reconnect: with `auto_reconnect` the client emits `RECOVERING` (per attempt), then either
   `RECOVERED` (with `resumed` = same session) or `FAILED_TO_RECOVER`; when the server issued a
   fresh session, channels are re-joined automatically and `REJOIN_FAILED` names the ones that
-  did not come back.
+  did not come back. Attempts rotate through the failover nodes the server advertised
+  (`aurix_client_failover_endpoint*`): a node that answers takes the session over
+  (`AURIX_EVENT_ENDPOINT_CHANGED`, then `RECOVERED` with `resumed` and `migrated` set — same
+  session/SSRC, new media key and endpoint, re-bound transparently); `aurix_client_endpoint`
+  names the node in use.
 
 Rust enums never cross the ABI as-is; every event, mode and role has a `#[repr(C)]` mirror, and
 `aurix_event_json` exposes the full serialised event for fields that have no dedicated accessor.

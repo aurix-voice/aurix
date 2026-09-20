@@ -750,6 +750,11 @@ impl MediaSession {
         self.sequence.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Next per-sender downlink audio sequence this session will hand out.
+    pub fn audio_sequence(&self) -> u32 {
+        self.sequence.load(Ordering::Relaxed)
+    }
+
     pub fn stats(&self) -> SessionStats {
         SessionStats {
             packets_sent: self.packets_sent.load(Ordering::Relaxed),

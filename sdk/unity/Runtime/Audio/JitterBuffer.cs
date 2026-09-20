@@ -9,6 +9,13 @@ namespace Aurix.Audio
     /// </summary>
     public sealed class JitterBuffer
     {
+        /// <summary>
+        /// A sequence jump beyond this (either direction) is a restarted sender — new node after a
+        /// failover, re-created stream — not reordering: the buffer re-synchronises instead of
+        /// treating every following frame as late.
+        /// </summary>
+        public const int ResyncGap = 500;
+
         private readonly SortedDictionary<uint, byte[]> _frames = new SortedDictionary<uint, byte[]>();
         private readonly int _targetDepth;
         private readonly int _maxDepth;
@@ -33,7 +40,15 @@ namespace Aurix.Audio
         {
             lock (_frames)
             {
-                if (_started && SeqBefore(seq, _nextSeq)) { Late++; return; }
+                if (_started)
+                {
+                    if (Math.Abs((int)(seq - _nextSeq)) > ResyncGap)
+                    {
+                        _frames.Clear();
+                        _started = false;
+                    }
+                    else if (SeqBefore(seq, _nextSeq)) { Late++; return; }
+                }
                 _frames[seq] = opus;
                 if (_frames.Count > _maxDepth)
                 {
@@ -281,6 +296,25 @@ namespace Aurix.Audio
                 {
                     Retire(s);
                     _streams.Remove(ssrc);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The same senders now arrive over a new media path (session migrated to another node):
+        /// flush every jitter buffer and half-played frame so stale in-flight audio is not played
+        /// and the restarted sequence numbering is picked up at once. Streams, decoders, volumes and
+        /// counters are kept.
+        /// </summary>
+        public void Resync()
+        {
+            lock (_streams)
+            {
+                foreach (var s in _streams.Values)
+                {
+                    s.Jitter.Reset();
+                    s.FramePos = s.FrameLen = 0;
+                    s.Starved = false;
                 }
             }
         }

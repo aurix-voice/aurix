@@ -91,6 +91,16 @@ pub struct ChannelRosterRow {
     pub ssrc: i64,
 }
 
+/// A membership closed by the lost-node reaper (see `queries::close_memberships_for_lost_node`).
+#[derive(Debug, Clone, FromRow)]
+pub struct LostMembershipRow {
+    pub app_id: Uuid,
+    pub channel_id: Uuid,
+    pub user_id: Uuid,
+    pub session_id: Uuid,
+    pub role: String,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct BanRow {
     pub id: Uuid,

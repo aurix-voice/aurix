@@ -163,6 +163,39 @@ pub static WS_SESSIONS_RESUMED: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
+pub static WS_SESSIONS_MIGRATED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_ws_sessions_migrated_total",
+        "Player sessions adopted from another node (cross-node resume)"
+    )
+    .unwrap()
+});
+
+pub static WS_TAKEOVERS_REFUSED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_ws_takeovers_refused_total",
+        "Cross-node resume attempts that fell back to a fresh session",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+pub static NODES_REAPED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_nodes_reaped_total",
+        "Media nodes declared lost by this node and cleaned up in the database"
+    )
+    .unwrap()
+});
+
+pub static REDIS_FAILOVERS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_redis_failovers_total",
+        "Redis master switches followed via Sentinel"
+    )
+    .unwrap()
+});
+
 pub static RATE_LIMIT_HITS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_rate_limit_hits_total", "Total rate limit hits").unwrap()
 });

@@ -256,6 +256,52 @@ impl NodeManager {
         self.nodes.get(id).map(|e| e.value().clone())
     }
 
+    /// Public WebSocket URLs of up to `limit` other healthy, non-saturated nodes for
+    /// `SessionInitAck.failover`: same region as `self_id` first, then by load.
+    pub fn failover_endpoints(&self, self_id: MediaNodeId, limit: usize) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let home = self.nodes.get(&self_id).map(|n| n.region);
+        let mut candidates: Vec<(bool, f32, String)> = self
+            .nodes
+            .iter()
+            .filter(|e| *e.key() != self_id)
+            .filter_map(|e| {
+                let node = e.value();
+                let url = node.ws_url.as_deref().filter(|u| !u.is_empty())?;
+                node.is_available().then(|| {
+                    (
+                        home != Some(node.region),
+                        node.load_factor(),
+                        url.to_string(),
+                    )
+                })
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.total_cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        candidates.into_iter().take(limit).map(|c| c.2).collect()
+    }
+
+    /// Nodes (other than `self_id`) whose last heartbeat is older than `after_secs`.
+    pub fn lost_nodes(&self, self_id: MediaNodeId, after_secs: u64) -> Vec<MediaNodeId> {
+        let now = Utc::now();
+        self.nodes
+            .iter()
+            .filter(|e| *e.key() != self_id)
+            .filter(|e| {
+                now.signed_duration_since(e.value().last_heartbeat)
+                    .num_seconds()
+                    > after_secs as i64
+            })
+            .map(|e| *e.key())
+            .collect()
+    }
+
     /// Graceful shutdown: stop receiving new sessions immediately instead of waiting for the
     /// heartbeat timeout.
     pub async fn mark_offline(&self, node_id: MediaNodeId) {

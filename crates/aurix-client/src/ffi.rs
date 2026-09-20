@@ -988,6 +988,9 @@ pub struct AurixSessionInfo {
     /// The node can deliver one server-mixed stream per channel
     /// (`aurix_client_set_downlink_mode`).
     pub downlink_mix: bool,
+    /// The latest (re)connect resumed the session on a *different* node (same session id
+    /// and SSRC, new media key/endpoint). See `aurix_client_endpoint`.
+    pub migrated: bool,
 }
 
 /// `false` when no session is open.
@@ -1012,11 +1015,65 @@ pub unsafe extern "C" fn aurix_client_session(
                 user_id: c.user_id().map(|u| u.0).unwrap_or(Uuid::nil()).into(),
                 media_tunnel: s.media_tunnel,
                 downlink_mix: s.downlink_mix,
+                migrated: s.migrated,
             };
             true
         }
         None => false,
     }
+}
+
+/// WebSocket URL of the node serving (or last serving) the session — `AurixConfig.ws_url`
+/// until a failover moved it. Returns the number of bytes needed (excluding NUL); `buf` may
+/// be `NULL` to size it. 0 for an invalid handle.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_endpoint(
+    client: *const AurixClient,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    match self::client(client) {
+        Ok(c) => copy_out(&c.endpoint(), buf, capacity),
+        Err(_) => 0,
+    }
+}
+
+/// Number of alternate nodes advertised by the server for this session (tried in order,
+/// after the current node, when the connection drops).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_failover_endpoint_count(client: *const AurixClient) -> usize {
+    match self::client(client) {
+        Ok(c) => c.failover_endpoints().len(),
+        Err(_) => 0,
+    }
+}
+
+/// The `index`-th failover URL (see `aurix_client_failover_endpoint_count`); same buffer
+/// contract as `aurix_client_endpoint`. 0 when `index` is out of range.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_failover_endpoint(
+    client: *const AurixClient,
+    index: usize,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    match self::client(client) {
+        Ok(c) => match c.failover_endpoints().get(index) {
+            Some(url) => copy_out(url, buf, capacity),
+            None => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// Copies `s` (NUL-terminated, truncated to fit) into `buf`; returns the full length.
+unsafe fn copy_out(s: &str, buf: *mut c_char, capacity: usize) -> usize {
+    if !buf.is_null() && capacity > 0 {
+        let n = s.len().min(capacity - 1);
+        ptr::copy_nonoverlapping(s.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    s.len()
 }
 
 /// Link the media currently uses; `AurixMediaNone` before the first bind.
@@ -1088,7 +1145,8 @@ pub enum AurixEventType {
     AurixEventServerError = 25,
     /// `number` = attempt, `number2` = delay ms, `message` = cause.
     AurixEventRecovering = 26,
-    /// `flag` = resumed (else channels were re-joined with fresh state).
+    /// `flag` = resumed (else channels were re-joined with fresh state), `flag2` = migrated
+    /// (resumed on another node; `aurix_client_endpoint` names it).
     AurixEventRecovered = 27,
     /// `message` = reason.
     AurixEventFailedToRecover = 28,
@@ -1106,6 +1164,9 @@ pub enum AurixEventType {
     /// `downlink_mode` (`aurix_event_downlink_mode`): the server acknowledged a downlink
     /// mode; a fresh session reports `Streams` and the requested mode is re-applied.
     AurixEventDownlinkModeChanged = 34,
+    /// `message` = the WebSocket URL the client now talks to: a failover endpoint answered
+    /// while the previous node did not. Precedes that connection's `SessionReady`.
+    AurixEventEndpointChanged = 35,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1246,6 +1307,7 @@ impl AurixEvent {
             }
             Event::BitrateChanged { reason, .. } => message = reason.clone(),
             Event::MediaPathChanged { reason, .. } => message = reason.clone(),
+            Event::EndpointChanged { url } => message = url.clone(),
             Event::Kicked { reason, .. }
             | Event::FailedToRecover { reason }
             | Event::Disconnected { reason } => message = reason.clone(),
@@ -1317,6 +1379,7 @@ impl AurixEvent {
             Event::ChannelFocusChanged(_) => T::AurixEventChannelFocusChanged,
             Event::AudioCodecChanged(_) => T::AurixEventAudioCodecChanged,
             Event::DownlinkModeChanged(_) => T::AurixEventDownlinkModeChanged,
+            Event::EndpointChanged { .. } => T::AurixEventEndpointChanged,
             Event::UserBlockChanged { .. } => T::AurixEventUserBlockChanged,
             Event::Recording { .. } => T::AurixEventRecording,
             Event::BitrateChanged { .. } => T::AurixEventBitrateChanged,
@@ -1536,19 +1599,21 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
         Some(Event::UserBlockChanged { blocked, .. }) => *blocked,
         Some(Event::Recording { active, .. }) => *active,
         Some(Event::ParticipantTyping { typing, .. }) => *typing,
-        Some(Event::Recovered { resumed }) => *resumed,
+        Some(Event::Recovered { resumed, .. }) => *resumed,
         _ => false,
     }
 }
 
 /// Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`,
-/// `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`.
+/// `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`, `migrated`
+/// for `Recovered`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_flag2(event: *const AurixEvent) -> bool {
     match self::event(event).map(|e| &e.event) {
         Some(Event::ChannelJoined { safety_voice, .. }) => *safety_voice,
         Some(Event::ParticipantMuteChanged { server_muted, .. }) => *server_muted,
         Some(Event::Recording { live, .. }) => *live,
+        Some(Event::Recovered { migrated, .. }) => *migrated,
         _ => false,
     }
 }
@@ -1661,6 +1726,7 @@ pub unsafe extern "C" fn aurix_event_session(
                 user_id: zero(),
                 media_tunnel: s.media_tunnel,
                 downlink_mix: s.downlink_mix,
+                migrated: s.migrated,
             };
             true
         }

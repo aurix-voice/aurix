@@ -35,7 +35,10 @@ carries a stable `code` — the table at the end maps codes to causes.
 
 | symptom | cause / fix |
 |---|---|
-| `recovered {resumed: false}` every time | resume landed on another node (enable client-IP affinity for `/ws` on the balancer) or the grace window is too short (`server.session_resume_grace_secs`, default 30) |
+| `recovered {resumed: false}` every time | the grace window is too short (`server.session_resume_grace_secs`, default 30), or the resume lands on another node while session mirrors are off (`cluster.session_mirror`, needs Redis) — enable them or add client-IP affinity for `/ws` on the balancer |
+| `recovered {resumed: true, migrated: true}` on every reconnect | the balancer spreads `/ws` across nodes: takeovers work but rebind media each time; hand out per-node URLs (region discovery) or add client-IP affinity |
+| takeover refused after a node crash (`aurix_ws_takeovers_refused_total{reason}`) | `not_mirrored`: the mirror expired (`cluster.session_mirror_ttl_secs`) or Redis lost it; `denied`: token/tenant mismatch (client presented an old resume token); `raced`: two reconnects at once — the loser gets a fresh session; `redis`: Redis unreachable ([High availability](high-availability.md)) |
+| `SessionInitAck.failover` is empty | other nodes have no `server.external_ws_url` (`wss://` in production) or `cluster.failover_endpoints = 0` |
 | `failedToRecover` | token expired during the outage (wire `refreshToken` / `TokenRefresher`), user banned/erased, or the node was shut down (`SessionClose {reason: "server_shutdown"}` is final — open a fresh session) |
 | channels missing after a fresh session (native `REJOIN_FAILED`, Unity `OnServerError`, Web `error`) | join tokens are one-time; with `require_action_tokens` supply a `joinToken` / `JoinTokenProvider` callback so the SDK can mint a new one for the automatic re-join |
 | `aurix_ws_sessions_detached` stays high | clients drop without resuming — mobile background, aggressive NAT timeouts; see [Unity mobile](../sdk/unity.md#ios--android-notes) |

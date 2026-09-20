@@ -39,6 +39,10 @@ pub struct SessionAck {
     pub media_tunnel: bool,
     /// The node offers server-side mixed downlink (`SetDownlinkMode`).
     pub downlink_mix: bool,
+    /// Resumed on a different node than the one that opened the session.
+    pub migrated: bool,
+    /// Public WebSocket URLs of other healthy nodes to try when this one stops answering.
+    pub failover: Vec<String>,
 }
 
 /// Informational (unverified) claims of the session JWT; lets the client recognise itself in
@@ -186,6 +190,8 @@ impl ControlConnection {
                     resumed,
                     media_tunnel,
                     downlink_mix,
+                    migrated,
+                    failover,
                 }) => {
                     let media_key = base64::engine::general_purpose::STANDARD
                         .decode(media_key.as_bytes())
@@ -203,6 +209,8 @@ impl ControlConnection {
                         resumed,
                         media_tunnel,
                         downlink_mix,
+                        migrated,
+                        failover,
                     });
                 }
                 Some(ControlMessage::Error { code, message, .. }) => {

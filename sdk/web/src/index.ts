@@ -1,6 +1,7 @@
 export {
   AurixClient,
   channelInfoFromJoinAck,
+  reconnectEndpoint,
   transmissionFromWire,
   transmissionToWire,
 } from './client.js';

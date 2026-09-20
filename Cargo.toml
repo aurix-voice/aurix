@@ -55,7 +55,7 @@ opentelemetry = { version = "0.30", features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "grpc-tonic", "tls", "tls-roots"] }
 opentelemetry_sdk = { version = "0.30", features = ["trace", "metrics", "rt-tokio"] }
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
-redis = { version = "0.32", features = ["tokio-comp", "tokio-rustls-comp", "connection-manager"] }
+redis = { version = "0.32", features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "sentinel"] }
 dashmap = "5.5"
 parking_lot = "0.12"
 bytes = "1.5"

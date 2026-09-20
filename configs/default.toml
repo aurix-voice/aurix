@@ -24,6 +24,10 @@ run_migrations = true
 [redis]
 url = "redis://localhost:6379"
 pool_size = 20
+# Redis Sentinel: list the sentinels and the master set name; `url` then only carries the
+# password/db/TLS mode for the resolved master.
+# sentinels = ["redis://sentinel-1:26379", "redis://sentinel-2:26379", "redis://sentinel-3:26379"]
+# sentinel_master = "aurix"
 
 [auth]
 jwt_secret = "change-me-in-production-this-is-not-secure-32bytes!"
@@ -268,3 +272,15 @@ context_messages = 5
 fail_open = true
 auto_mute = "never"
 auto_kick = "never"
+
+[cluster]
+# Mirror live sessions into Redis so a client can resume on another node (same session id and
+# SSRC) when its node dies; off without Redis.
+session_mirror = true
+# How long a mirror outlives its node (seconds) — the takeover window after a crash.
+session_mirror_ttl_secs = 180
+# A node silent in the registry for this long is lost: its sessions/memberships are closed with
+# reason `node_lost` and its participants leave every roster.
+node_lost_after_secs = 30
+# Other nodes' public `wss://` URLs listed in `SessionInitAck.failover` (0 = none).
+failover_endpoints = 3

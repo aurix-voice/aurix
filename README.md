@@ -10,7 +10,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 * **Positional / 3D audio** with directional panning, radius-scoped presence and text, ambient
   (cocktail-party) mixing; whisper, command & echo (mic test) channels, audio injection, server
   mute, kick, ban, reports, channel-wide mute-all / kick-all.
-* **Player features**: auto-reconnect with session resume, text chat lite, energy/VAD,
+* **Player features**: auto-reconnect with session resume and cross-node failover, text chat lite, energy/VAD,
   receiver-local mute/volume/blocks, transmission modes & channel focus, network-quality bars,
   live transcripts and TTS, single-use action tokens, per-app webhooks and an SSE event stream.
 * **Recording** (Ogg/Opus, consent-gated, optional AES-GCM at rest, S3 / local storage).
@@ -178,6 +178,11 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
    grace period expired; then the same handshake simply yields a fresh session. Native clients
    re-send `SessionBind` from their (possibly new) UDP port. The SDKs do this automatically with
    exponential backoff and expose `Recovering` / `Recovered` / `FailedToRecover` events.
+   If the node itself is gone, the SDKs rotate through the failover nodes advertised in
+   `SessionInitAck.failover` and the node that answers **takes the session over** from its Redis
+   mirror (`resumed: true, migrated: true`): same session id and SSRC, new media key and
+   endpoint, channels/mutes/codec restored, peers see no leave — see
+   [High availability](docs/src/operations/high-availability.md).
 6. **Receiver-local mute / volume / block**: `SetParticipantMute { user_id, channel_id?, muted }`
    silences one player for *you only* (in one channel or, with `channel_id: null`, everywhere),
    `SetParticipantVolume { user_id, volume }` scales them for you (`0.0`–`2.0`, `1.0` = unity,
@@ -374,6 +379,8 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | variable | notes |
 |---|---|
 | `AURIX__DATABASE__URL`, `AURIX__REDIS__URL` | Redis is optional for a single node but required for multi-node events / distributed rate limits |
+| `AURIX__REDIS__SENTINELS`, `AURIX__REDIS__SENTINEL_MASTER` | Redis Sentinel mode (comma-separated sentinel URLs + master name; `REDIS__URL` then only supplies credentials/db/TLS) |
+| `AURIX__CLUSTER__SESSION_MIRROR`, `AURIX__CLUSTER__SESSION_MIRROR_TTL_SECS`, `AURIX__CLUSTER__NODE_LOST_AFTER_SECS`, `AURIX__CLUSTER__FAILOVER_ENDPOINTS` | cross-node failover: mirror sessions in Redis (default on, TTL 180), reap nodes silent for 30 s, advertise 3 failover nodes per session |
 | `AURIX__AUTH__JWT_SECRET` | ≥ 32 random bytes; or `AURIX__AUTH__JWT_PUBLIC_KEY_PATH` for RS256 |
 | `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN` | allows `/admin/setup` after the first admin exists; unset after use |
 | `AURIX__AUTH__ACTION_TOKEN_TTL_SECS`, `AURIX__AUTH__ACTION_TOKEN_MAX_TTL_SECS` | default (90) and maximum (600) lifetime of one-time action tokens |
@@ -782,8 +789,18 @@ directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regard
   regions by requested region → distance → load and hand out the least-loaded node's own
   `ws_url` plus a `probe_url`; the Web, Unity, native and Unreal SDKs probe the RTT and connect
   to the winner (`discoverRegions`, `RegionDiscovery.DiscoverAsync`, `aurix_regions_*` /
-  `aurix::Regions`, `DiscoverRegions`). Direct node URLs are deliberate: session resume is
-  node-local. Nodes without an advertised `wss://` URL keep serving but are not offered.
+  `aurix::Regions`, `DiscoverRegions`). Direct node URLs are deliberate: a resume on the same
+  node moves nothing. Nodes without an advertised `wss://` URL keep serving but are not offered.
+* **Failover.** With Redis, every node mirrors its sessions (`cluster.session_mirror`, TTL
+  `cluster.session_mirror_ttl_secs`) and advertises `cluster.failover_endpoints` peers per
+  session. A client whose node died resumes on a peer with the same session id/SSRC (new media
+  key/endpoint; the downlink sequence jumps forward so receivers' replay windows and jitter
+  buffers carry on), ownership is fenced with an atomic Redis claim, a `SessionMigrated` fleet event updates
+  rosters and cascade routes, and a node silent for `cluster.node_lost_after_secs` is reaped by
+  the fleet (`node_lost`) while its mirrors stay usable. Redis Sentinel is supported
+  (`redis.sentinels` + `redis.sentinel_master`, master changes followed at runtime); Redis
+  Cluster is not. Details, PostgreSQL HA, outage behaviour:
+  [docs/src/operations/high-availability.md](docs/src/operations/high-availability.md).
 * **Kubernetes / cloud.** `deploy/helm/aurix` deploys a regional pool as a host-network
   `StatefulSet` (per-pod public IP for UDP media/TURN, per-pod hostname for discovery and resume,
   external PostgreSQL/Redis, secrets from an existing `Secret`); `deploy/terraform/aws` is a

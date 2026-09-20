@@ -63,6 +63,8 @@ struct Player {
     resume_grace: Duration,
     resumed: bool,
     media_tunnel: bool,
+    migrated: bool,
+    failover: Vec<String>,
 }
 
 impl Player {
@@ -236,6 +238,8 @@ async fn connect_with(
         resumed,
         media_tunnel,
         downlink_mix,
+        migrated,
+        failover,
     } = msg
     else {
         panic!("{name}: expected SessionInitAck, got {t}");
@@ -267,6 +271,8 @@ async fn connect_with(
         resume_grace: Duration::from_millis(resume_grace_ms),
         resumed,
         media_tunnel,
+        migrated,
+        failover,
     }
 }
 
@@ -8366,4 +8372,377 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
         .await;
     expect_presence(&mut alice, stage, uid_b, false).await;
     assert_ne!(uid_l, uid_n);
+}
+
+/// Cross-node failover. Alice (node 1) loses her WebSocket and reconnects to node 2 with her
+/// resume credential: node 2 adopts the session from the Redis mirror — same session id and
+/// SSRC, fresh media key on node 2's media port, channel membership restored, `migrated`
+/// flagged — while Bob (node 2) and Carol (node 1) never see her leave and keep hearing her.
+/// Node 1 fences itself off: the used credential can no longer resume there, and node 1
+/// closing its stale copy must not close the migrated membership. With
+/// `AURIX_E2E_NODE2_STOP` / `AURIX_E2E_NODE2_START` set (shell commands), the test also
+/// kills node 2, waits for the lost-node reaper and resumes Bob on node 1.
+#[tokio::test]
+#[ignore = "requires two running Aurix nodes; see README (Scaling)"]
+async fn two_nodes_session_failover_resumes_on_the_other_node() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Ok(ws2) = std::env::var("AURIX_E2E_WS2") else {
+        eprintln!("AURIX_E2E_WS2 not set; skipping");
+        return;
+    };
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: ws2,
+        api_key: env.api_key.clone(),
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+
+    let (tok_a, uid_a) = issue_token(&env, &http, "failover:alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env2, &http, "failover:bob", "Bob", channel_id).await;
+    let (tok_c, _) = issue_token(&env, &http, "failover:carol", "Carol", channel_id).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env2, "bob", tok_b.clone()).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    assert_ne!(alice.media_addr.port(), bob.media_addr.port());
+    assert!(!alice.migrated && !bob.migrated);
+    assert!(
+        alice.failover.iter().any(|u| u.contains(":8091")) || alice.failover.is_empty(),
+        "node 1 must advertise node 2 as failover: {:?}",
+        alice.failover
+    );
+    assert!(
+        !alice.failover.is_empty(),
+        "SessionInitAck.failover must list the other healthy node"
+    );
+    for p in [&mut alice, &mut bob, &mut carol] {
+        bind_media(p).await;
+        join(p, channel_id).await;
+    }
+    for p in [&mut alice, &mut bob] {
+        p.expect("ParticipantJoined(Carol)", |m| {
+            matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == "Carol")
+        })
+        .await;
+    }
+    // Alice prefers the fallback codec and mutes Bob locally: both must survive the move.
+    alice
+        .send(&ControlMessage::SetParticipantMute {
+            user_id: uid_b,
+            channel_id: None,
+            muted: true,
+        })
+        .await;
+    alice
+        .send(&ControlMessage::SetAudioCodec {
+            codec: AudioCodec::Pcmu,
+        })
+        .await;
+    alice
+        .expect("AudioCodecChanged(pcmu)", |m| {
+            matches!(
+                m,
+                ControlMessage::AudioCodecChanged {
+                    codec: AudioCodec::Pcmu,
+                    ..
+                }
+            )
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 3);
+
+    // Alice talks before the move; Bob (node 2) and Carol (node 1) remember the highest
+    // downlink sequence they accepted from her SSRC, like a real client's anti-replay window.
+    let pcmu = Bytes::from(vec![0xFFu8; 160]);
+    let hash = channel_id_hash(&channel_id);
+    let mut seq = 0u32;
+    let mut highest_before: std::collections::HashMap<&str, u32> = Default::default();
+    for _ in 0..10 {
+        seq += 1;
+        let mut pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, pcmu.clone());
+        pkt.header.set_flag(PacketFlags::Pcmu);
+        alice
+            .udp
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for p in [&bob, &carol] {
+        let mut buf = vec![0u8; 2048];
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_millis(400), p.udp.recv_from(&mut buf)).await
+        {
+            let mut d = AurixPacket::decode(&buf[..len]).expect("bad AURX packet");
+            assert!(d.open(&p.keys), "{}: downlink must verify", p.name);
+            if d.header.packet_type == PacketType::Audio && d.header.ssrc == alice.ssrc {
+                let h = highest_before.entry(p.name).or_insert(0);
+                *h = (*h).max(d.header.sequence);
+            }
+        }
+        assert!(
+            highest_before.contains_key(p.name),
+            "{} must hear Alice before the move",
+            p.name
+        );
+    }
+
+    // ── Alice's socket to node 1 dies; she reconnects to node 2 with the same credential ──
+    let Player {
+        session_id: sid_a,
+        ssrc: ssrc_a,
+        media_key: key_a,
+        resume_token: token_a1,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut alice = connect_with(
+        &env2,
+        "alice@node2",
+        tok_a.clone(),
+        Some((sid_a, &token_a1)),
+    )
+    .await;
+    assert!(alice.resumed, "node 2 must adopt the mirrored session");
+    assert!(alice.migrated, "the ack must flag the cross-node move");
+    assert_eq!(alice.session_id, sid_a);
+    assert_eq!(alice.ssrc, ssrc_a);
+    assert_ne!(
+        alice.media_key, key_a,
+        "the media key must not travel between nodes"
+    );
+    assert_eq!(
+        alice.media_addr.port(),
+        bob.media_addr.port(),
+        "media must now be bound to node 2"
+    );
+    assert_ne!(alice.resume_token, token_a1);
+    let prefs = alice
+        .expect("ReceiverPreferences", |m| {
+            matches!(m, ControlMessage::ReceiverPreferences { .. })
+        })
+        .await;
+    if let ControlMessage::ReceiverPreferences { local_mutes, .. } = prefs {
+        assert!(
+            local_mutes.iter().any(|m| m.user_id == uid_b),
+            "local mute of Bob must survive the move: {local_mutes:?}"
+        );
+    }
+
+    let ack = alice
+        .expect("ChannelJoinAck (restored)", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { .. })
+        })
+        .await;
+    let ControlMessage::ChannelJoinAck {
+        channel_id: c,
+        participants,
+        ..
+    } = ack
+    else {
+        unreachable!()
+    };
+    assert_eq!(c, channel_id);
+    let mut names: Vec<_> = participants
+        .iter()
+        .map(|p| p.display_name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["Bob", "Carol"],
+        "roster on the new node: {participants:?}"
+    );
+    // Nobody saw Alice leave; the membership row is intact.
+    for (p, what) in [(&mut bob, "Bob (node 2)"), (&mut carol, "Carol (node 1)")] {
+        if let Some(m) = p.try_recv(Duration::from_millis(700)).await {
+            assert!(
+                !matches!(m, ControlMessage::ParticipantLeft { .. }),
+                "{what} must not see Alice leave during failover, got {m:?}"
+            );
+        }
+    }
+    assert_eq!(membership_count(&env, &http, channel_id).await, 3);
+
+    // Media re-binds on node 2 (PCMU, as before the move): Bob hears her locally, Carol via
+    // cascade from node 2 to node 1, and her downlink sequence continues above what they had
+    // already accepted (a restart at zero would be dropped by their replay windows); Alice
+    // does not hear Bob (local mute restored).
+    bind_media(&mut alice).await;
+    let mut to_bob = 0;
+    let mut to_carol = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while (to_bob < 5 || to_carol < 5) && tokio::time::Instant::now() < deadline {
+        for _ in 0..5 {
+            seq += 1;
+            let mut pkt = AurixPacket::audio(seq, seq * 960, ssrc_a, hash, pcmu.clone());
+            pkt.header.set_flag(PacketFlags::Pcmu);
+            alice
+                .udp
+                .send_to(&pkt.seal(&alice.keys), alice.media_addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut buf = vec![0u8; 2048];
+        for (p, n) in [(&bob, &mut to_bob), (&carol, &mut to_carol)] {
+            while let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_millis(250), p.udp.recv_from(&mut buf)).await
+            {
+                let mut d = AurixPacket::decode(&buf[..len]).expect("bad AURX packet");
+                assert!(d.open(&p.keys), "{}: downlink must verify", p.name);
+                if d.header.packet_type == PacketType::Audio && d.header.ssrc == ssrc_a {
+                    assert!(
+                        !d.header.has_flag(PacketFlags::Pcmu),
+                        "{}: Opus receivers get transcoded Opus",
+                        p.name
+                    );
+                    assert!(
+                        d.header.sequence > highest_before[p.name],
+                        "{}: downlink sequence {} after the move must continue above {} \
+                         (per-SSRC replay windows on receivers)",
+                        p.name,
+                        d.header.sequence,
+                        highest_before[p.name]
+                    );
+                    *n += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        to_bob >= 5,
+        "Bob heard {to_bob} packets from migrated Alice"
+    );
+    assert!(
+        to_carol >= 5,
+        "Carol (node 1) heard {to_carol} packets from Alice via cascade after failover"
+    );
+    let bob_payload = Bytes::from_static(&[0xFC, 1, 1, 2, 3, 5, 8, 13]);
+    while alice.recv_udp().await.is_some() {}
+    send_audio(&bob, channel_id, 5000, &bob_payload).await;
+    let (_, n) = audio_from(&alice, bob.ssrc, &bob_payload).await;
+    assert_eq!(n, 0, "Alice's local mute of Bob must survive the move");
+
+    // ── node 1 is fenced: the spent credential opens nothing there ──
+    let mut stale = connect_with(
+        &env,
+        "alice-stale@node1",
+        tok_a.clone(),
+        Some((sid_a, &token_a1)),
+    )
+    .await;
+    assert!(!stale.resumed && !stale.migrated);
+    assert_ne!(stale.session_id, sid_a);
+    stale.ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Closing that unrelated session on node 1 must not touch the migrated membership.
+    assert_eq!(membership_count(&env, &http, channel_id).await, 3);
+    while let Some(m) = alice.try_recv(Duration::from_millis(300)).await {
+        assert!(
+            matches!(
+                m,
+                ControlMessage::NetworkQuality { .. }
+                    | ControlMessage::ChannelEnergy { .. }
+                    | ControlMessage::SpeakingStateChanged { .. }
+            ),
+            "the migrated session is unaffected by node 1, got {m:?}"
+        );
+    }
+    // Node 1's detached copy has been evicted, not closed: Alice's own leave is announced
+    // exactly once, by node 2.
+    alice.ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 2);
+    let mut left = 0;
+    while let Some(m) = carol.try_recv(Duration::from_millis(500)).await {
+        if let ControlMessage::ParticipantLeft { user_id, .. } = m {
+            if user_id == uid_a {
+                left += 1;
+            }
+        }
+    }
+    assert_eq!(left, 1, "exactly one leave for Alice seen on node 1");
+
+    // ── optional: node 2 dies for real; the reaper closes its rows, Bob resumes on node 1 ──
+    let (Ok(stop), Ok(start)) = (
+        std::env::var("AURIX_E2E_NODE2_STOP"),
+        std::env::var("AURIX_E2E_NODE2_START"),
+    ) else {
+        eprintln!("AURIX_E2E_NODE2_STOP/START not set; skipping the lost-node scenario");
+        let _ = bob.ws.close(None).await;
+        let _ = carol.ws.close(None).await;
+        return;
+    };
+    let Player {
+        session_id: sid_b,
+        ssrc: ssrc_b,
+        resume_token: token_b,
+        ws: bob_ws,
+        ..
+    } = bob;
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&stop)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "AURIX_E2E_NODE2_STOP failed");
+    drop(bob_ws);
+    // The reaper announces Bob's membership as lost (`node_lost`) once node 2 is silent for
+    // cluster.node_lost_after_secs; membership count drops to Carol alone.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match carol.try_recv(wait).await {
+            Some(ControlMessage::ParticipantLeft { user_id, .. }) if user_id == uid_b => break,
+            Some(_) => continue,
+            None => panic!("Carol never saw Bob reaped after node 2 died"),
+        }
+    }
+    assert_eq!(membership_count(&env, &http, channel_id).await, 1);
+    // Bob comes back on node 1 within the mirror TTL: adopted from the mirror, membership
+    // re-created and announced.
+    let mut bob = connect_with(&env, "bob@node1", tok_b, Some((sid_b, &token_b))).await;
+    assert!(
+        bob.resumed && bob.migrated,
+        "Bob must be adopted after the reaper"
+    );
+    assert_eq!(bob.session_id, sid_b);
+    assert_eq!(bob.ssrc, ssrc_b);
+    bob.expect("ChannelJoinAck (restored after reap)", |m| {
+        matches!(m, ControlMessage::ChannelJoinAck { .. })
+    })
+    .await;
+    carol
+        .expect(
+            "ParticipantJoined(Bob) after reap",
+            |m| matches!(m, ControlMessage::ParticipantJoined { user_id, .. } if *user_id == uid_b),
+        )
+        .await;
+    assert_eq!(membership_count(&env, &http, channel_id).await, 2);
+    bind_media(&mut bob).await;
+    send_audio(&bob, channel_id, 7000, &bob_payload).await;
+    let (_, n) = audio_from(&carol, ssrc_b, &bob_payload).await;
+    assert!(
+        n >= 8,
+        "Carol heard {n} packets from Bob after his node died"
+    );
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&start)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "AURIX_E2E_NODE2_START failed");
+    let _ = bob.ws.close(None).await;
+    let _ = carol.ws.close(None).await;
 }

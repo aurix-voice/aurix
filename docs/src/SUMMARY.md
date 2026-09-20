@@ -41,6 +41,7 @@
 
 - [Deployment and configuration](operations/deployment.md)
 - [Scaling out](operations/scaling.md)
+- [High availability](operations/high-availability.md)
 - [Backups and observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
 

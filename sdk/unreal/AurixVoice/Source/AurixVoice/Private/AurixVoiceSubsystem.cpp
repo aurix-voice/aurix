@@ -184,6 +184,7 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	Out.bResumed = S.resumed;
 	Out.bMediaTunnel = S.media_tunnel;
 	Out.bDownlinkMix = S.downlink_mix;
+	Out.bMigrated = S.migrated;
 	return Out;
 }
 
@@ -1000,6 +1001,24 @@ EAurixMediaPath UAurixVoiceSubsystem::GetMediaPath() const
 	return Native ? ToMediaPath(Native->Client.media_path()) : EAurixMediaPath::None;
 }
 
+FString UAurixVoiceSubsystem::GetEndpoint() const
+{
+	return Native ? FromUtf8(Native->Client.endpoint().c_str()) : FString();
+}
+
+TArray<FString> UAurixVoiceSubsystem::GetFailoverEndpoints() const
+{
+	TArray<FString> Out;
+	if (Native)
+	{
+		for (const std::string& Url : Native->Client.failover_endpoints())
+		{
+			Out.Add(FromUtf8(Url.c_str()));
+		}
+	}
+	return Out;
+}
+
 bool UAurixVoiceSubsystem::SetTranscripts(bool bEnabled)
 {
 	return Native && Check(Native->Client.set_transcripts(bEnabled), TEXT("set_transcripts"));
@@ -1453,7 +1472,11 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		break;
 
 	case AURIX_EVENT_RECOVERED:
-		OnRecovered.Broadcast(aurix_event_flag(Raw));
+		OnRecovered.Broadcast(aurix_event_flag(Raw), aurix_event_flag2(Raw));
+		break;
+
+	case AURIX_EVENT_ENDPOINT_CHANGED:
+		OnEndpointChanged.Broadcast(FromUtf8(aurix_event_message(Raw)));
 		break;
 
 	case AURIX_EVENT_FAILED_TO_RECOVER:
