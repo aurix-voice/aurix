@@ -158,10 +158,26 @@ impl AurixConfig {
         if self.media.max_channels_per_session == 0 {
             anyhow::bail!("media.max_channels_per_session must be > 0");
         }
-        if self.chat.enabled {
-            if self.chat.max_message_bytes == 0 || self.chat.max_message_bytes > 16 * 1024 {
-                anyhow::bail!("chat.max_message_bytes must be within 1..=16384");
+        if self.chat.enabled
+            && (self.chat.max_message_bytes == 0 || self.chat.max_message_bytes > 16 * 1024)
+        {
+            anyhow::bail!("chat.max_message_bytes must be within 1..=16384");
+        }
+        if self.rate_limiting.enabled {
+            let rl = &self.rate_limiting;
+            if rl.requests_per_second == 0 || rl.burst_size == 0 {
+                anyhow::bail!("rate_limiting.requests_per_second and burst_size must be > 0");
             }
+            if rl.channel_joins_per_minute == 0
+                || rl.connects_per_minute == 0
+                || rl.block_changes_per_minute == 0
+                || rl.reports_per_minute == 0
+                || rl.admin_login_per_minute == 0
+            {
+                anyhow::bail!("rate_limiting.*_per_minute limits must be > 0");
+            }
+        }
+        if self.chat.enabled {
             if self.chat.messages_per_second == 0 || self.chat.message_burst == 0 {
                 anyhow::bail!("chat.messages_per_second and chat.message_burst must be > 0");
             }
@@ -1083,13 +1099,53 @@ impl Default for TracingConfig {
     }
 }
 
+/// Abuse limits. Every bucket is keyed by caller (IP, API key, user) and, with Redis, shared by
+/// the whole fleet so a client cannot multiply its quota by spreading requests over nodes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RateLimitConfig {
     pub enabled: bool,
+    /// REST requests per client IP: sustained rate and burst.
     pub requests_per_second: u32,
     pub burst_size: u32,
     pub channel_joins_per_minute: u32,
     pub messages_per_second: u32,
+    /// Share the buckets across nodes through Redis (node-local when Redis is not configured).
+    #[serde(default = "default_true")]
+    pub fleet: bool,
+    /// When Redis is unreachable: reject (`true`) or fall back to node-local buckets (`false`).
+    #[serde(default)]
+    pub fail_closed: bool,
+    /// Enforce each API key's own `rate_limit` (requests per minute, `0` = unlimited).
+    #[serde(default = "default_true")]
+    pub per_key: bool,
+    /// Control-WebSocket connections per user.
+    #[serde(default = "default_connects_per_minute")]
+    pub connects_per_minute: u32,
+    /// Local block/unblock toggles per user.
+    #[serde(default = "default_block_changes_per_minute")]
+    pub block_changes_per_minute: u32,
+    /// Player reports per user.
+    #[serde(default = "default_reports_per_minute")]
+    pub reports_per_minute: u32,
+    /// Operator login / setup attempts per client IP.
+    #[serde(default = "default_admin_login_per_minute")]
+    pub admin_login_per_minute: u32,
+}
+
+fn default_connects_per_minute() -> u32 {
+    60
+}
+
+fn default_block_changes_per_minute() -> u32 {
+    60
+}
+
+fn default_reports_per_minute() -> u32 {
+    10
+}
+
+fn default_admin_login_per_minute() -> u32 {
+    10
 }
 
 impl Default for RateLimitConfig {
@@ -1100,6 +1156,13 @@ impl Default for RateLimitConfig {
             burst_size: 200,
             channel_joins_per_minute: 30,
             messages_per_second: 10,
+            fleet: true,
+            fail_closed: false,
+            per_key: true,
+            connects_per_minute: default_connects_per_minute(),
+            block_changes_per_minute: default_block_changes_per_minute(),
+            reports_per_minute: default_reports_per_minute(),
+            admin_login_per_minute: default_admin_login_per_minute(),
         }
     }
 }

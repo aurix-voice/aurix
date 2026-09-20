@@ -4,6 +4,7 @@ use crate::block_manager::BlockManager;
 use crate::channel_manager::ChannelManager;
 use crate::chat::ChatService;
 use crate::event_bus::{EventBus, ServerEvent};
+use crate::limits::{FleetLimiter, Scope};
 use crate::node_manager::NodeManager;
 use crate::redis_store::RedisStore;
 use crate::safety::SafetyService;
@@ -16,7 +17,6 @@ use aurix_auth::{AnyToken, ApiKeyService, JwtService, RbacService, ValidatedToke
 use aurix_common::audit::AuditLogger;
 use aurix_common::config::AurixConfig;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::rate_limit::RateLimiter;
 use aurix_common::types::*;
 use aurix_db::DbPool;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub struct ControlPlane {
     pub retention: Arc<RetentionService>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
-    pub rate_limiter: Arc<RateLimiter>,
+    pub limits: Arc<FleetLimiter>,
     pub redis: Option<Arc<RedisStore>>,
     /// Nodes this node already declared lost, until they heartbeat again.
     reaped_nodes: dashmap::DashSet<MediaNodeId>,
@@ -99,12 +99,6 @@ impl ControlPlane {
             }
         });
 
-        let rate_limiter = Arc::new(RateLimiter::new(
-            config.rate_limiting.requests_per_second,
-            config.rate_limiting.burst_size,
-        ));
-        rate_limiter.start_cleanup_task();
-
         // Redis
         let redis = match aurix_common::redis_pool::RedisSource::open(&config.redis).await {
             Ok(source) => match RedisStore::connect(source, node_id).await {
@@ -138,6 +132,12 @@ impl ControlPlane {
                 None
             }
         };
+
+        let limits = Arc::new(FleetLimiter::new(
+            config.rate_limiting.clone(),
+            redis.clone(),
+        ));
+        limits.start_cleanup_task();
 
         // Analytics collector
         let analytics = AnalyticsCollector::new(pool.clone());
@@ -236,7 +236,7 @@ impl ControlPlane {
             blocks,
             events,
             audit,
-            rate_limiter,
+            limits,
             redis,
             reaped_nodes: dashmap::DashSet::new(),
         })
@@ -396,8 +396,12 @@ impl ControlPlane {
             }
         };
 
-        let key = format!("session:{}", validated.user_id);
-        if !self.rate_limiter.check(&key) {
+        if self
+            .limits
+            .check(Scope::Connect, &validated.user_id.to_string())
+            .await
+            .is_err()
+        {
             return Err(AurixError::RateLimitExceeded(
                 "Too many connection attempts".into(),
             ));

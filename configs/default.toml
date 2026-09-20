@@ -136,12 +136,29 @@ service_name = "aurix"
 log_level = "info"
 log_format = "json"
 
+# Abuse limits. Buckets are keyed by client IP / API key / user and, with Redis, shared by the
+# whole fleet (a client cannot multiply its quota by spreading requests over nodes). `429`
+# responses carry `Retry-After`; hits show up in `aurix_rate_limit_scope_hits_total{scope,backend}`.
 [rate_limiting]
 enabled = false
+# REST requests per client IP (sustained / burst).
 requests_per_second = 100
 burst_size = 200
 channel_joins_per_minute = 30
+# Unused (chat flood control lives in [chat]); kept for compatibility.
 messages_per_second = 50
+# Share buckets through Redis; node-local buckets without it.
+fleet = true
+# When Redis is unreachable: false = enforce node-local, true = reject with 429.
+fail_closed = false
+# Enforce each API key's own `rate_limit` (requests/minute, 0 = unlimited; see POST/PATCH /v1/api-keys).
+per_key = true
+# Control-WebSocket connections per user, block toggles per user, reports per user,
+# operator login/setup attempts per IP.
+connects_per_minute = 60
+block_changes_per_minute = 60
+reports_per_minute = 10
+admin_login_per_minute = 10
 
 # Lightweight in-game text chat over the control WebSocket (channel + directed messages,
 # typing). History is optional and off by default; the filter webhook is the moderation hook.

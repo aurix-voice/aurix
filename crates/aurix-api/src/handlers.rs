@@ -7,7 +7,7 @@ use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::safety::{event_type_for_source, is_safety_event, IncidentExport};
-use aurix_control::SelectionHint;
+use aurix_control::{LimitScope, SelectionHint};
 use axum::{
     extract::{Extension, State},
     http::HeaderMap,
@@ -1846,10 +1846,11 @@ pub async fn report_user_self(
         return Err(AurixError::Validation("Cannot report yourself".into()).into());
     }
     require_user(&state, token.app_id, target).await?;
-    let key = format!("report:{}", token.user_id);
-    if !state.control.rate_limiter.check_with_cost(&key, 10.0) {
-        return Err(AurixError::RateLimitExceeded("Too many reports".into()).into());
-    }
+    state
+        .control
+        .limits
+        .check(LimitScope::Report, &token.user_id.to_string())
+        .await?;
     submit_report(
         &state,
         token.app_id,
@@ -2020,6 +2021,20 @@ fn validate_permissions(value: &serde_json::Value) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Requests per minute a new key may make across the fleet unless the caller says otherwise.
+const DEFAULT_KEY_RATE_LIMIT: i32 = 6_000;
+
+/// `0` disables the per-key budget (the per-IP limit still applies).
+fn key_rate_limit(requested: i32) -> Result<i32, ApiError> {
+    if !(0..=10_000_000).contains(&requested) {
+        return Err(AurixError::Validation(
+            "rate_limit must be within 0..=10000000 requests per minute".into(),
+        )
+        .into());
+    }
+    Ok(requested)
+}
+
 #[derive(Deserialize)]
 pub struct CreateApiKeyRequest {
     pub name: String,
@@ -2059,7 +2074,7 @@ pub async fn create_api_key(
             }
         }
     }
-    let rate_limit = req.rate_limit.unwrap_or(100).clamp(1, 100_000);
+    let rate_limit = key_rate_limit(req.rate_limit.unwrap_or(DEFAULT_KEY_RATE_LIMIT))?;
     let expires_at = match req.expires_in_days {
         Some(d) if d <= 0 || d > 3650 => {
             return Err(
@@ -2110,6 +2125,46 @@ pub async fn list_api_keys(
         })
         .collect();
     to_json(redacted)
+}
+
+#[derive(Deserialize)]
+pub struct UpdateApiKeyRequest {
+    pub rate_limit: i32,
+}
+
+pub async fn update_api_key(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(key_id): Path<Uuid>,
+    Json(req): Json<UpdateApiKeyRequest>,
+) -> JsonResult {
+    ctx.require("keys:manage")?;
+    let rate_limit = key_rate_limit(req.rate_limit)?;
+    let key = state
+        .control
+        .api_keys
+        .set_rate_limit(ctx.app_id.0, key_id, rate_limit)
+        .await?;
+    state.control.audit.log(
+        Some(ctx.app_id),
+        ctx.actor(),
+        AuditAction::ApiKeyUpdated,
+        "api_key",
+        &key_id.to_string(),
+        serde_json::json!({"rate_limit": rate_limit}),
+        client_ip_string(ip),
+    );
+    Ok(Json(serde_json::json!({
+        "id": key.id,
+        "name": key.name,
+        "key_prefix": key.key_prefix,
+        "permissions": key.permissions,
+        "rate_limit": key.rate_limit,
+        "active": key.active,
+        "expires_at": key.expires_at,
+        "created_at": key.created_at,
+    })))
 }
 
 pub async fn revoke_api_key(
@@ -2535,13 +2590,11 @@ pub async fn admin_login(
     Json(req): Json<AdminLoginRequest>,
 ) -> JsonResult {
     let ip_key = client_ip_string(ip).unwrap_or_else(|| "unknown".into());
-    if !state
+    state
         .control
-        .rate_limiter
-        .check_with_cost(&format!("admin-login:{ip_key}"), 5.0)
-    {
-        return Err(AurixError::RateLimitExceeded("Too many login attempts".into()).into());
-    }
+        .limits
+        .check(LimitScope::AdminLogin, &ip_key)
+        .await?;
     let (admin, token) = state
         .control
         .admin_auth
@@ -2579,13 +2632,16 @@ pub async fn admin_setup(
     Json(req): Json<BootstrapAdminRequest>,
 ) -> JsonResult {
     let ip_key = client_ip_string(ip).unwrap_or_else(|| "unknown".into());
-    if !state
+    state
         .control
-        .rate_limiter
-        .check_with_cost(&format!("admin-setup:{ip_key}"), 10.0)
-    {
-        return Err(AurixError::RateLimitExceeded("Too many attempts".into()).into());
-    }
+        .limits
+        .check_with(
+            LimitScope::AdminLogin,
+            &ip_key,
+            state.control.limits.limit(LimitScope::AdminLogin),
+            2.0,
+        )
+        .await?;
     let presented = headers
         .get("x-bootstrap-token")
         .and_then(|v| v.to_str().ok());

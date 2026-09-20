@@ -24,7 +24,10 @@ The OpenAPI document declares these as the security schemes `ApiKeyHeader`, `Api
 ## Permissions
 
 An API key carries a list of permissions. `*` grants everything; a key can only mint keys
-(`POST /v1/api-keys`, `keys:manage`) with a subset of its own permissions.
+(`POST /v1/api-keys`, `keys:manage`) with a subset of its own permissions. Each key also has its
+own request budget (`rate_limit`, requests per minute across the whole fleet; `0` = unlimited),
+enforced on top of the per-IP limit — see
+[Fleet-wide rate limits](../operations/scaling.md#fleet-wide-rate-limits).
 
 | Permission | Grants |
 | --- | --- |

@@ -493,6 +493,68 @@ impl RedisStore {
         Ok(count <= limit as i64)
     }
 
+    /// Fleet-wide token bucket: atomically takes `cost` tokens from `key`'s bucket (`rate`
+    /// tokens/s, capacity `burst`) using the Redis clock, so every node sees the same bucket.
+    /// Returns `Ok(None)` when admitted, `Ok(Some(wait))` when the caller must wait. The bucket
+    /// expires once it would be full again.
+    pub async fn take_tokens(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+    ) -> Result<Option<Duration>> {
+        let mut conn = self.conn().await?;
+        let redis_key = format!("bucket:{{{key}}}");
+        let script = redis::Script::new(
+            r#"
+            local rate = tonumber(ARGV[1])
+            local burst = tonumber(ARGV[2])
+            local cost = tonumber(ARGV[3])
+            local t = redis.call('TIME')
+            local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+            local b = redis.call('HMGET', KEYS[1], 'tokens', 'at')
+            local tokens = tonumber(b[1])
+            local at = tonumber(b[2])
+            if tokens == nil or at == nil then
+                tokens = burst
+                at = now
+            elseif now > at then
+                tokens = math.min(burst, tokens + (now - at) * rate / 1000)
+                at = now
+            end
+            local wait = 0
+            if tokens >= cost then
+                tokens = tokens - cost
+            elseif rate > 0 then
+                wait = math.ceil((cost - tokens) * 1000 / rate)
+            else
+                wait = -1
+            end
+            redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'at', tostring(at))
+            local ttl = 1000
+            if rate > 0 then ttl = ttl + math.ceil(burst * 1000 / rate) end
+            redis.call('PEXPIRE', KEYS[1], ttl)
+            return wait
+            "#,
+        );
+        let wait: i64 = Self::with_timeout(
+            script
+                .key(&redis_key)
+                .arg(rate)
+                .arg(burst)
+                .arg(cost)
+                .invoke_async(&mut conn),
+            "take_tokens",
+        )
+        .await?;
+        Ok(match wait {
+            0 => None,
+            w if w < 0 => Some(Duration::MAX),
+            w => Some(Duration::from_millis(w as u64)),
+        })
+    }
+
     /// Atomically claims `key` for `ttl_secs` (`SET NX EX`). Returns `false` when it was
     /// already claimed. Used for one-time `jti` consumption across nodes.
     pub async fn claim_once(&self, key: &str, ttl_secs: u64) -> Result<bool> {

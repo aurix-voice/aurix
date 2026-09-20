@@ -7,7 +7,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue, Method},
     middleware as axum_middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::time::Duration;
@@ -179,7 +179,10 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/api-keys",
             post(handlers::create_api_key).get(handlers::list_api_keys),
         )
-        .route("/v1/api-keys/:key_id", delete(handlers::revoke_api_key))
+        .route(
+            "/v1/api-keys/:key_id",
+            patch(handlers::update_api_key).delete(handlers::revoke_api_key),
+        )
         .route("/v1/audit-log", get(handlers::list_audit_logs))
         .route("/v1/recordings", get(handlers::list_recordings))
         .route("/v1/recordings/start", post(handlers::start_recording))

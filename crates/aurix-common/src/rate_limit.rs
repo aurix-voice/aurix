@@ -23,24 +23,37 @@ struct TokenBucket {
 
 impl TokenBucket {
     fn new(rate: u32, burst: u32) -> Self {
+        Self::with_f64(rate as f64, burst as f64)
+    }
+
+    fn with_f64(rate: f64, burst: f64) -> Self {
         Self {
-            tokens: burst as f64,
-            max_tokens: burst as f64,
-            refill_rate: rate as f64,
+            tokens: burst,
+            max_tokens: burst,
+            refill_rate: rate,
             last_refill: Instant::now(),
         }
     }
 
     fn try_consume(&mut self, count: f64) -> bool {
+        self.try_consume_or_wait(count).is_ok()
+    }
+
+    /// Consumes `count` tokens, or reports how long until they will be available.
+    fn try_consume_or_wait(&mut self, count: f64) -> std::result::Result<(), Duration> {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
         self.last_refill = now;
         if self.tokens >= count {
             self.tokens -= count;
-            true
+            Ok(())
+        } else if self.refill_rate > 0.0 {
+            Err(Duration::from_secs_f64(
+                (count - self.tokens) / self.refill_rate,
+            ))
         } else {
-            false
+            Err(Duration::MAX)
         }
     }
 }
@@ -98,17 +111,38 @@ impl RateLimiter {
     /// Token-bucket check with per-key limits. If a bucket already exists for `key` with
     /// different parameters it is re-parameterised in place (tokens are clamped to the new burst).
     pub fn check_custom(&self, key: &str, rate: u32, burst: u32) -> bool {
+        self.try_acquire(key, rate as f64, burst as f64, 1.0)
+            .is_ok()
+    }
+
+    /// Takes `cost` tokens from `key`'s bucket of `rate` tokens/s and capacity `burst`, or
+    /// returns how long the caller should wait. Re-parameterises an existing bucket in place
+    /// (tokens are clamped to the new burst). Bounded like [`Self::check_with_cost`].
+    pub fn try_acquire(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+    ) -> std::result::Result<(), Duration> {
+        if self.buckets.len() >= MAX_BUCKETS && !self.buckets.contains_key(key) {
+            self.buckets
+                .retain(|_, bucket| bucket.last_refill.elapsed() < Duration::from_secs(60));
+            if self.buckets.len() >= MAX_BUCKETS {
+                return Err(Duration::from_secs(1));
+            }
+        }
         let mut entry = self
             .buckets
             .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(rate, burst));
+            .or_insert_with(|| TokenBucket::with_f64(rate, burst));
         let bucket = entry.value_mut();
-        if bucket.refill_rate != rate as f64 || bucket.max_tokens != burst as f64 {
-            bucket.refill_rate = rate as f64;
-            bucket.max_tokens = burst as f64;
+        if bucket.refill_rate != rate || bucket.max_tokens != burst {
+            bucket.refill_rate = rate;
+            bucket.max_tokens = burst;
             bucket.tokens = bucket.tokens.min(bucket.max_tokens);
         }
-        bucket.try_consume(1.0)
+        bucket.try_consume_or_wait(cost)
     }
 
     pub fn bucket_count(&self) -> usize {
@@ -131,5 +165,19 @@ mod tests {
         assert!(!rl.check_custom("c", 10, 1));
         // re-parameterising to a larger burst does not grant tokens retroactively
         assert!(!rl.check_custom("c", 10, 5));
+    }
+
+    #[test]
+    fn try_acquire_reports_the_wait() {
+        let rl = RateLimiter::new(1, 1);
+        assert!(rl.try_acquire("w", 2.0, 1.0, 1.0).is_ok());
+        let wait = rl.try_acquire("w", 2.0, 1.0, 1.0).unwrap_err();
+        assert!(wait > Duration::from_millis(400) && wait <= Duration::from_millis(500));
+        // a zero-rate bucket never refills
+        assert!(rl.try_acquire("z", 0.0, 1.0, 1.0).is_ok());
+        assert_eq!(
+            rl.try_acquire("z", 0.0, 1.0, 1.0).unwrap_err(),
+            Duration::MAX
+        );
     }
 }

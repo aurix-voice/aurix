@@ -82,8 +82,10 @@ the chapter that explains the boundary.
 * **Webhook and SSE delivery is at-least-once** with the same event id — consumers must be
   idempotent; SSE has no replay, only `lagged` + snapshot resync
   ([Webhooks and SSE](api/webhooks-sse.md)).
-* **Rate limits and quotas are per node** except where backed by Redis (action tokens,
-  bans, session registry); a client hopping between nodes can exceed a per-node limit.
+* **Rate limits are fleet-wide only with Redis.** Without it (single node) or while Redis is down
+  with `rate_limiting.fail_closed = false`, buckets are per node and a client hopping between
+  nodes can exceed a limit. Chat flood control and TTS queue limits are per session by design
+  (sessions never span nodes).
 * **TLS**: native rustls with PEM files, or terminate at your proxy; ACME/auto-renewal is left to
   the proxy ([Deployment](operations/deployment.md)).
 * **Region discovery is per node, not per player location service**: nodes are placed by

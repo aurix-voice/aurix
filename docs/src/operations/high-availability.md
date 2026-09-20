@@ -133,7 +133,7 @@ suite.
 | Cross-node presence/chat/moderation events | not delivered; the cascade topology is re-derived from PostgreSQL every few seconds so relays keep working, rosters catch up on the next join or reconnect |
 | Session mirrors / takeover | writes fail (logged); a reconnect that reaches another node in the window becomes a fresh session with automatic re-join |
 | One-time tokens (`require_action_tokens`, join/resume tokens) | fail closed — the request is refused rather than replayed |
-| API rate limits | fall back to the per-node limiter |
+| Rate limits (API per IP/key, connects, joins, blocks, reports, admin login) | `rate_limiting.fail_closed = false` (default): enforced per node until Redis is back; `true`: refused with `429` |
 | `/ready` | fails, so a balancer stops sending *new* connections to the node; existing sessions stay |
 
 ## PostgreSQL

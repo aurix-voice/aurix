@@ -89,7 +89,7 @@ are never echoed back by the API or logs.
 | `media` | `external_ip`, `port` (10000; cascade uses `port + 1`), `require_packet_auth` (`true`), `rx_workers` (`0` = CPUs clamped 2–8), `session_timeout_secs` (60), `speaking_timeout_ms` (400), `speaking_energy_threshold` (0.01), `energy_interval_ms` (200), `quality_interval_ms` (2000), `unfocused_channel_gain` (0.5), `max_channels_per_session` (10), `max_positional_channels_per_session` (1), `pcmu_fallback` (`true`; [G.711 sessions](../features/channels.md#codecs-opus-and-the-pcmu-fallback) cost the node an Opus encoder + a decoder per speaker heard), `media_tunnel` (`true`; native media as binary frames on the control WebSocket when UDP is blocked — [tunnel](../api/aurx.md#tunnel-aurx-over-the-control-websocket)), `tunnel_queue_packets` (128, 8–4096; per-session downlink queue, drops when the client's TCP stalls), `cascade_secret`, `cascade_discovery` (`true`), `cascade_discovery_interval_ms` (3000), `cascade_peers` |
 | `turn` | `enabled`, `external_ip`, `realm`, `auth_secret`, `udp_port` / `tcp_port` (3478), `min_port` / `max_port` relay range, `allocation_lifetime_secs`, `max_allocations` |
 | `recording` | `enabled`, `storage_path`, `max_recording_duration_secs` (7200), `retention_days` (90), `require_consent` (`true`), `encryption_enabled` + `encryption_key` (≥ 32 chars), `s3.*`; `recording.live.*` for [live streams](../features/recordings.md#live-audio-streams) |
-| `rate_limiting` | `enabled`, `requests_per_second` / `burst_size`, `channel_joins_per_minute`, `messages_per_second` (Redis-backed when available) |
+| `rate_limiting` | `enabled`, `requests_per_second` / `burst_size` (per client IP), `per_key` (each API key's own requests/minute), `channel_joins_per_minute`, `connects_per_minute`, `block_changes_per_minute`, `reports_per_minute`, `admin_login_per_minute`, `fleet` (share buckets through Redis), `fail_closed` — [Rate limits](scaling.md#fleet-wide-rate-limits) |
 | `chat` | see [Text chat](../features/chat.md) — `enabled`, `max_message_bytes`, flood limits, `filter_webhook`, `persist` |
 | `webhooks` | `enabled`, `timeout_ms`, `retry_delays_secs`, `concurrency`, `batch_size`, `max_pending_per_subscription`, `retention_hours`, `max_subscriptions_per_app`, `require_https` / `allow_private_urls` (strict in production), `sse_keepalive_secs` |
 | `retention` | see [Moderation and lifecycle](../features/moderation.md#retention-sweep) |
@@ -143,6 +143,13 @@ Deploy the new image node by node. Migrations are embedded in the binary and run
 explicitly, run `aurix-server --migrate-only` first — a node whose schema is behind the compiled
 migrations refuses to start. Migrations are additive, so an older node keeps working against a
 newer schema during the roll-out.
+
+Per-key request budgets (`[rate_limiting].per_key`, see [Fleet-wide rate limits](scaling.md#fleet-wide-rate-limits))
+are enforced since the fleet limiter landed. Keys created before that carry the old, never
+enforced default of `100` requests/minute; with `rate_limiting.enabled = true` they now throttle
+at that rate. Raise them before the roll-out (`PATCH /v1/api-keys/{id}` with `{"rate_limit": 6000}`,
+or `UPDATE api_keys SET rate_limit = 6000 WHERE rate_limit = 100;`) or keep `per_key = false`
+until you have.
 
 On `SIGTERM` a node marks itself offline in `media_nodes`, sends every connected player a
 `SessionClose {reason: "server_shutdown"}` (final — SDKs do not try to resume; they open a fresh

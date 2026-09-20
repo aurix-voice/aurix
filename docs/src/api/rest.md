@@ -48,7 +48,7 @@ npx @openapitools/openapi-generator-cli generate -i openapi.json -g typescript-f
 | Live audio streams | `GET /v1/audio/streams`, `GET/POST /v1/channels/{id}/audio/streams`, `GET …/streams/pull` (WebSocket upgrade), `GET/DELETE …/streams/{stream_id}` | API key |
 | Webhooks | `GET/POST /v1/webhooks`, `GET /v1/webhooks/events`, `GET/PATCH/DELETE /v1/webhooks/{id}`, `POST …/rotate-secret`, `POST …/test`, `POST …/resync`, `GET …/deliveries`, `GET …/deliveries/{id}`, `POST …/deliveries/{id}/retry` | API key |
 | Events | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | API key |
-| Analytics, keys, audit | `GET /v1/analytics`, `GET/POST /v1/api-keys`, `DELETE /v1/api-keys/{id}`, `GET /v1/audit-log` | API key |
+| Analytics, keys, audit | `GET /v1/analytics`, `GET/POST /v1/api-keys`, `PATCH/DELETE /v1/api-keys/{id}`, `GET /v1/audit-log` | API key |
 | Player | `GET /v1/me/turn-credentials`, `POST /v1/me/reports`, `POST /v1/me/recordings/{id}/consent`, `POST /v1/webrtc/offer` | player JWT |
 
 The exact paths, parameters and schemas are in the specification; the table only orients you.
@@ -61,7 +61,10 @@ server, or if the versions drift.
 * **Node-local resources.** Session statistics and live audio streams live on the node hosting
   the session/channel. Behind a load balancer address that node directly (its address is part of
   the user's session information) or expect `404`/`409 CONFLICT` from other nodes.
-* **Rate limits.** `429` carries `Retry-After`. Limits are per API key and per IP.
+* **Rate limits.** `429` carries `Retry-After`. Limits are per client IP (`rate_limiting.requests_per_second`
+  / `burst_size`) and per API key (the key's own `rate_limit`, requests per minute, `0` = unlimited; set at
+  creation or with `PATCH /v1/api-keys/{key_id}`). With Redis the buckets are shared by every node, so the
+  budget is for the fleet, not per node ([Fleet-wide rate limits](../operations/scaling.md#fleet-wide-rate-limits)).
 * **Idempotency.** `DELETE` on a missing resource is `404`; moderation actions on a user who is
   already in the requested state succeed without a second event.
 * **Downloads.** `GET /v1/recordings/{id}` returns `download_url` only for S3 storage (15-minute

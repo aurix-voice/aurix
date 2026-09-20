@@ -68,6 +68,10 @@ jobs:
           AURIX__SERVER__SESSION_RESUME_GRACE_SECS: "4"
           AURIX__CHAT__PERSIST: "true"
           AURIX__MEDIA__MAX_CHANNELS_PER_SESSION: "4"
+          AURIX__RATE_LIMITING__ENABLED: "true"
+          AURIX__RATE_LIMITING__REQUESTS_PER_SECOND: "500"
+          AURIX__RATE_LIMITING__BURST_SIZE: "1000"
+          AURIX__RATE_LIMITING__REPORTS_PER_MINUTE: "3"
           AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
           AURIX__TRACING__LOG_FORMAT: text
         run: |
@@ -101,6 +105,7 @@ jobs:
           AURIX_E2E_API_KEY2: ${{ steps.bootstrap.outputs.key2 }}
           AURIX_E2E_ADMIN_TOKEN: ${{ steps.bootstrap.outputs.admin_token }}
           AURIX_E2E_MAX_CHANNELS: "4"
+          AURIX_E2E_REPORTS_PER_MINUTE: "3"
         run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture
       - name: E2E (native client core)
         env:

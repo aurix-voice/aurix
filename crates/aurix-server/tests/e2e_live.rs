@@ -8748,3 +8748,181 @@ async fn two_nodes_session_failover_resumes_on_the_other_node() {
     let _ = bob.ws.close(None).await;
     let _ = carol.ws.close(None).await;
 }
+
+async fn expect_throttled(resp: reqwest::Response, what: &str) -> u64 {
+    assert_eq!(resp.status(), 429, "{what}");
+    let retry_after: u64 = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{what}: Retry-After missing"));
+    assert!(retry_after >= 1, "{what}: Retry-After {retry_after}");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"], "RATE_LIMIT_EXCEEDED",
+        "{what}: {body}"
+    );
+    retry_after
+}
+
+/// Rate limits are one budget for the whole fleet: an API key's own `rate_limit` and a player's
+/// report allowance are exhausted by requests spread over node 1 and node 2 (`AURIX_E2E_API2`;
+/// the same node twice without it), the refusal is `429` + `Retry-After`, `PATCH /v1/api-keys`
+/// changes the budget live and `0` lifts it. Needs nodes with `rate_limiting.enabled` and
+/// `AURIX_E2E_REPORTS_PER_MINUTE` set to their `reports_per_minute`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server (AURIX_E2E_API_KEY)"]
+async fn fleet_rate_limits_hold_across_nodes() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Some(reports_per_minute) = std::env::var("AURIX_E2E_REPORTS_PER_MINUTE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        eprintln!("AURIX_E2E_REPORTS_PER_MINUTE not set; skipping");
+        return;
+    };
+    let api2 = std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| env.api.clone());
+    let nodes = [env.api.clone(), api2];
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+
+    // A key with a budget of 4 requests per minute.
+    let created: serde_json::Value = http
+        .post(format!("{}/v1/api-keys", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({
+            "name": "e2e-budget",
+            "permissions": ["channels:read"],
+            "rate_limit": 4,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key_id = created["id"].as_str().unwrap().to_string();
+    let key = created["key"].as_str().unwrap().to_string();
+    let get_channel = |node: &str| {
+        http.get(format!("{node}/v1/channels/{channel_id}"))
+            .header("x-api-key", &key)
+            .send()
+    };
+    for i in 0..4 {
+        let r = get_channel(&nodes[i % 2]).await.unwrap();
+        assert_eq!(r.status(), 200, "request {i} within the key budget");
+    }
+    let wait = expect_throttled(get_channel(&nodes[0]).await.unwrap(), "5th key request").await;
+    assert!(wait <= 15, "one token per 15 s, got Retry-After {wait}");
+    expect_throttled(
+        get_channel(&nodes[1]).await.unwrap(),
+        "same bucket on the other node",
+    )
+    .await;
+    // The owning key is untouched by the sub-key's bucket.
+    assert_eq!(
+        http.get(format!("{}/v1/channels/{channel_id}", nodes[1]))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // Lift the budget on node 2; node 1 honours it at once.
+    let patched: serde_json::Value = http
+        .patch(format!("{}/v1/api-keys/{key_id}", nodes[1]))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"rate_limit": 0}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(patched["rate_limit"], 0);
+    assert!(
+        patched.get("key").is_none(),
+        "PATCH never returns the secret"
+    );
+    for i in 0..6 {
+        let r = get_channel(&nodes[i % 2]).await.unwrap();
+        assert_eq!(r.status(), 200, "unlimited key, request {i}");
+    }
+    assert_eq!(
+        http.patch(format!("{}/v1/api-keys/{key_id}", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&serde_json::json!({"rate_limit": -1}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        assert_eq!(
+            http.patch(format!("{}/v1/api-keys/{key_id}", env.api))
+                .header("x-api-key", &api_key2)
+                .json(&serde_json::json!({"rate_limit": 1}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "another tenant cannot see the key"
+        );
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation check");
+    }
+    http.delete(format!("{}/v1/api-keys/{key_id}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Player reports: `reports_per_minute` for the reporter across both nodes.
+    let (tok_a, uid_a) = issue_token(&env, &http, "e2e-rl-alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "e2e-rl-bob", "Bob", channel_id).await;
+    let alice = connect(&env, "alice", tok_a).await;
+    let bob = connect(&env, "bob", tok_b).await;
+    let report = |node: &str| {
+        http.post(format!("{node}/v1/me/reports"))
+            .bearer_auth(&alice.token)
+            .json(&serde_json::json!({"target_user_id": uid_b, "reason": "e2e fleet limit"}))
+            .send()
+    };
+    for i in 0..reports_per_minute {
+        let r = report(&nodes[i % 2]).await.unwrap();
+        assert_eq!(r.status(), 200, "report {i} within the allowance");
+    }
+    expect_throttled(
+        report(&nodes[reports_per_minute % 2]).await.unwrap(),
+        "report above the allowance",
+    )
+    .await;
+    expect_throttled(
+        report(&nodes[(reports_per_minute + 1) % 2]).await.unwrap(),
+        "report above the allowance on the other node",
+    )
+    .await;
+    // Bob's allowance is his own.
+    let r = http
+        .post(format!("{}/v1/me/reports", nodes[1]))
+        .bearer_auth(&bob.token)
+        .json(&serde_json::json!({"target_user_id": uid_a, "reason": "e2e"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "another reporter is not throttled");
+}

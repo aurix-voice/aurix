@@ -200,6 +200,27 @@ pub static RATE_LIMIT_HITS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_rate_limit_hits_total", "Total rate limit hits").unwrap()
 });
 
+/// `scope` is the protected action (`api_ip`, `api_key`, `connect`, `join`, `block`, `report`,
+/// `admin_login`); `backend` is `fleet` (shared Redis bucket) or `local` (this node only).
+pub static RATE_LIMIT_HITS_BY_SCOPE: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_rate_limit_scope_hits_total",
+        "Rate limit hits by scope and backend",
+        &["scope", "backend"]
+    )
+    .unwrap()
+});
+
+/// Redis errors while checking a fleet-wide bucket (the node then falls back to local
+/// buckets or rejects, per `rate_limiting.fail_closed`).
+pub static RATE_LIMIT_BACKEND_ERRORS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_rate_limit_backend_errors_total",
+        "Fleet rate limiter Redis errors"
+    )
+    .unwrap()
+});
+
 // ── Webhook / event stream Metrics ──
 
 /// `result` is `delivered`, `retry` (attempt failed, rescheduled), `failed` (gave up),

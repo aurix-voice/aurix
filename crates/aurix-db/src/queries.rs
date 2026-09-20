@@ -2033,6 +2033,22 @@ pub async fn revoke_api_key(pool: &DbPool, app_id: Uuid, key_id: Uuid) -> Result
     Ok(r.rows_affected())
 }
 
+pub async fn update_api_key_rate_limit(
+    pool: &DbPool,
+    app_id: Uuid,
+    key_id: Uuid,
+    rate_limit: i32,
+) -> Result<Option<ApiKeyRow>, sqlx::Error> {
+    sqlx::query_as::<_, ApiKeyRow>(
+        "UPDATE api_keys SET rate_limit = $3 WHERE app_id = $1 AND id = $2 AND active = true RETURNING *",
+    )
+    .bind(app_id)
+    .bind(key_id)
+    .bind(rate_limit)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn list_api_keys(pool: &DbPool, app_id: Uuid) -> Result<Vec<ApiKeyRow>, sqlx::Error> {
     sqlx::query_as::<_, ApiKeyRow>(
         "SELECT * FROM api_keys WHERE app_id = $1 ORDER BY created_at DESC",

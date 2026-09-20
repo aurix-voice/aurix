@@ -99,6 +99,20 @@ impl ApiKeyService {
         Ok(())
     }
 
+    /// Changes the per-key request budget (requests per minute, `0` = unlimited) of an active
+    /// key owned by `app_id`.
+    pub async fn set_rate_limit(
+        &self,
+        app_id: Uuid,
+        key_id: Uuid,
+        rate_limit: i32,
+    ) -> Result<ApiKeyRow> {
+        aurix_db::queries::update_api_key_rate_limit(&self.pool, app_id, key_id, rate_limit)
+            .await
+            .map_err(|e| AurixError::Database(format!("Failed to update API key: {e}")))?
+            .ok_or_else(|| AurixError::NotFound("API key not found".into()))
+    }
+
     pub async fn list_keys(&self, app_id: Uuid) -> Result<Vec<ApiKeyRow>> {
         aurix_db::queries::list_api_keys(&self.pool, app_id)
             .await

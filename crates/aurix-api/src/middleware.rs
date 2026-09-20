@@ -2,6 +2,7 @@ use crate::errors::ApiError;
 use crate::state::AppState;
 use aurix_common::error::AurixError;
 use aurix_common::types::{AdminContext, AppId, UserId};
+use aurix_control::{Limit, LimitScope};
 use aurix_db::models::ApiKeyRow;
 use axum::{
     extract::{ConnectInfo, Request, State},
@@ -127,6 +128,17 @@ pub async fn api_key_middleware(
         .ok_or_else(|| AurixError::AuthenticationFailed("Missing API key".into()))?;
     let key_row = state.control.api_keys.validate_key(api_key).await?;
     let ctx = ApiKeyContext::from_row(&key_row);
+    let limits = &state.control.limits;
+    if limits.enabled() && limits.config().per_key && key_row.rate_limit > 0 {
+        limits
+            .check_with(
+                LimitScope::ApiKey,
+                &key_row.id.to_string(),
+                Limit::per_minute(key_row.rate_limit as u32),
+                1.0,
+            )
+            .await?;
+    }
     request.extensions_mut().insert(ctx.app_id);
     request.extensions_mut().insert(ctx);
     Ok(next.run(request).await)
@@ -150,7 +162,7 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if !state.control.config.rate_limiting.enabled {
+    if !state.control.limits.enabled() {
         return Ok(next.run(request).await);
     }
     let ip = request
@@ -158,23 +170,11 @@ pub async fn rate_limit_middleware(
         .get::<ClientIp>()
         .map(|c| c.0)
         .unwrap_or_else(|| resolve_client_ip(&state, &request));
-    let key = format!("api:{ip}");
-    let allowed = if let Some(ref redis) = state.control.redis {
-        redis
-            .check_rate_limit(
-                &key,
-                state.control.config.rate_limiting.requests_per_second,
-                1,
-            )
-            .await
-            .unwrap_or_else(|_| state.control.rate_limiter.check(&key))
-    } else {
-        state.control.rate_limiter.check(&key)
-    };
-    if !allowed {
-        aurix_metrics::RATE_LIMIT_HITS.inc();
-        return Err(AurixError::RateLimitExceeded("API rate limit exceeded".into()).into());
-    }
+    state
+        .control
+        .limits
+        .check(LimitScope::ApiIp, &ip.to_string())
+        .await?;
     Ok(next.run(request).await)
 }
 

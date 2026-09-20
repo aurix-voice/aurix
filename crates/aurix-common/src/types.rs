@@ -1327,6 +1327,7 @@ pub enum AuditAction {
     RecordingStarted,
     RecordingStopped,
     ApiKeyCreated,
+    ApiKeyUpdated,
     ApiKeyRevoked,
     RoleChanged,
     ConfigUpdated,

@@ -45,6 +45,34 @@ origin node id; a node never re-applies its own events. Redis also holds one-tim
 mutes and distributed rate limits. Without Redis a single node works; a fleet does not. Redis
 Sentinel is supported, Redis Cluster is not — see [High availability](high-availability.md#redis).
 
+## Fleet-wide rate limits
+
+`[rate_limiting]` protects every abusable entry point with a token bucket keyed by the caller,
+and with Redis (`fleet = true`, the default) **the bucket is one per fleet**, not one per node: a
+client that spreads its requests over ten nodes gets the same budget as one that talks to a
+single node. The bucket is advanced atomically in a Lua script with the Redis clock, so every
+node takes the same decision and the limit does not depend on node clocks.
+
+| scope | subject | limit |
+|---|---|---|
+| `api_ip` | client IP (after `server.trusted_proxies`) | `requests_per_second` sustained, `burst_size` burst |
+| `api_key` | API key | the key's own `rate_limit` (requests/minute; default 6000 at creation, `0` = unlimited; `PATCH /v1/api-keys/{key_id}` changes it live) — off with `per_key = false` |
+| `connect` | user | `connects_per_minute` control-WebSocket connections (60) |
+| `join` | user | `channel_joins_per_minute` (30) |
+| `block` | user | `block_changes_per_minute` (60) |
+| `report` | user | `reports_per_minute` (10) |
+| `admin_login` | client IP | `admin_login_per_minute` (10; a setup attempt costs two) |
+
+Per-minute limits allow the whole minute as a burst and refill continuously. REST callers get
+`429 RATE_LIMIT_EXCEEDED` with `Retry-After`; WebSocket clients get an `Error` with the same
+code (or `429` on the upgrade for `connect`). Chat flood control (`[chat]`) and TTS queue
+limits stay per session — sessions never span nodes.
+
+When Redis is unreachable the node falls back to its own buckets (same limits, per node) and
+counts `aurix_rate_limit_backend_errors_total`; set `fail_closed = true` to refuse instead.
+`aurix_rate_limit_scope_hits_total{scope,backend}` shows which scopes are throttling and whether
+the decision was `fleet` or `local`.
+
 ## Cascade (SFU-to-SFU relay)
 
 Channels whose members sit on different nodes are relayed **automatically**:

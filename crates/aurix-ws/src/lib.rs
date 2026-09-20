@@ -32,7 +32,7 @@ use aurix_common::types::*;
 use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::{
-    ActionTokenService, ControlPlane, MirroredChannel, MirroredPrefs, ParticipantSpeak,
+    ActionTokenService, ControlPlane, LimitScope, MirroredChannel, MirroredPrefs, ParticipantSpeak,
     ServerEvent, SessionMirror, TakeoverRefused, MIGRATION_SEQUENCE_GAP,
 };
 use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
@@ -3020,18 +3020,12 @@ async fn handle_control_message(
             channel_id,
             token: join_token,
         } => {
-            let key = format!("join:{}", token.user_id);
-            let per_minute = state
+            if state
                 .control
-                .config
-                .rate_limiting
-                .channel_joins_per_minute
-                .max(1) as f64;
-            if state.control.config.rate_limiting.enabled
-                && !state
-                    .control
-                    .rate_limiter
-                    .check_with_cost(&key, 60.0 / per_minute)
+                .limits
+                .check(LimitScope::Join, &token.user_id.to_string())
+                .await
+                .is_err()
             {
                 return send_error(tx, "RATE_LIMIT_EXCEEDED", "Too many channel joins").await;
             }
@@ -3410,9 +3404,12 @@ async fn handle_control_message(
             if user_id == token.user_id {
                 return send_error(tx, "VALIDATION_ERROR", "Cannot block yourself").await;
             }
-            let key = format!("block:{}", token.user_id);
-            if state.control.config.rate_limiting.enabled
-                && !state.control.rate_limiter.check_with_cost(&key, 1.0)
+            if state
+                .control
+                .limits
+                .check(LimitScope::Block, &token.user_id.to_string())
+                .await
+                .is_err()
             {
                 return send_error(tx, "RATE_LIMIT_EXCEEDED", "Too many block changes").await;
             }
