@@ -133,7 +133,7 @@ jobs:
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8090/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8090/ready
           cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture strict_mode
-      - name: E2E (speech + content safety against the mock provider)
+      - name: E2E (speech, content safety and recording post-processing against the mock provider)
         env:
           AURIX__TURN__ENABLED: "false"
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
@@ -173,7 +173,7 @@ jobs:
           nohup ./target/debug/aurix-server > server-speech.log 2>&1 &
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8100/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8100/ready
-          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture speech_transcripts content_safety
+          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture speech_transcripts content_safety recording_mixdown
       - if: failure()
         run: |
           tail -n 200 server.log
