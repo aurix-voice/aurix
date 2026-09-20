@@ -484,6 +484,10 @@ pub struct ChannelConfig {
     pub complexity: Option<u8>,
     pub positional_config: Option<PositionalConfig>,
     pub audio_profile: AudioProfile,
+    /// Participants may send two-channel (stereo) Opus — music, DJ and broadcast sources.
+    /// Off (the default) tells clients to encode mono; the SFU forwards whatever arrives
+    /// either way, so a stereo receiver decodes stereo and a mono one downmixes.
+    pub stereo: bool,
     /// Cocktail-party mixing: each receiver hears at most `max_voices` speakers at their
     /// computed gain, every other concurrent speaker at `ambient_gain` (`0` drops them).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -518,6 +522,7 @@ impl Default for ChannelConfig {
             complexity: None,
             positional_config: None,
             audio_profile: AudioProfile::Voice,
+            stereo: false,
             ambient: None,
             audience: None,
             recording_enabled: false,
@@ -603,6 +608,7 @@ impl ChannelConfig {
                 AudioProfile::Music => OpusSignal::Music,
                 AudioProfile::Broadcast => OpusSignal::Auto,
             },
+            stereo: self.stereo,
         }
     }
 }
@@ -660,6 +666,8 @@ pub struct AudioPolicy {
     pub max_bandwidth: OpusBandwidth,
     pub complexity: Option<u8>,
     pub signal: OpusSignal,
+    /// Senders may encode two channels; `false` asks for mono.
+    pub stereo: bool,
 }
 
 impl Default for AudioPolicy {
@@ -671,7 +679,8 @@ impl Default for AudioPolicy {
 impl AudioPolicy {
     /// Combined policy for a sender whose one encoder feeds several channels: the widest
     /// bitrate and bandwidth so no channel is starved, FEC if any channel wants it, DTX only if
-    /// every channel allows it, the highest complexity hint, and `Music` if any channel is music.
+    /// every channel allows it, the highest complexity hint, `Music` if any channel is music,
+    /// and stereo if any channel accepts it.
     pub fn merge(self, other: AudioPolicy) -> AudioPolicy {
         AudioPolicy {
             bitrate_bps: self.bitrate_bps.max(other.bitrate_bps),
@@ -688,6 +697,7 @@ impl AudioPolicy {
                 (OpusSignal::Voice, _) | (_, OpusSignal::Voice) => OpusSignal::Voice,
                 _ => OpusSignal::Auto,
             },
+            stereo: self.stereo || other.stereo,
         }
     }
 

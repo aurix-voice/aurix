@@ -19,6 +19,11 @@
 #define EncoderSettings_MAX_BITRATE 300000
 
 /**
+ * libopus' ceiling for a stereo stream.
+ */
+#define EncoderSettings_MAX_STEREO_BITRATE 510000
+
+/**
  * libopus' own default.
  */
 #define EncoderSettings_DEFAULT_COMPLEXITY 9
@@ -432,7 +437,7 @@ typedef struct AurixUuid {
  */
 typedef struct AurixEncoderSettings {
   /**
-   * 6000..=300000 (libopus' mono ceiling).
+   * 6000..=300000 for mono, ..=510000 for stereo (libopus' ceilings).
    */
   uint32_t bitrate_bps;
   /**
@@ -461,6 +466,11 @@ typedef struct AurixEncoderSettings {
    * Discontinuous transmission during silence.
    */
   bool dtx;
+  /**
+   * 1 (mono voice, default) or 2 (stereo music / broadcast). Only honoured in channels
+   * whose policy allows `stereo`; PCMU is always mono. Other values are read as 1.
+   */
+  uint8_t channels;
 } AurixEncoderSettings;
 
 /**
@@ -784,6 +794,10 @@ typedef struct AurixAudioPolicy {
   enum AurixOpusBandwidth max_bandwidth;
   int8_t complexity;
   enum AurixOpusSignal signal;
+  /**
+   * Senders may encode two channels (stereo music / broadcast); `false` asks for mono.
+   */
+  bool stereo;
 } AurixAudioPolicy;
 
 /**

@@ -20,6 +20,7 @@ const WIRE = {
   max_bandwidth: 'wideband',
   complexity: 5,
   signal: 'voice',
+  stereo: false,
 };
 
 test('policy parses the server wire shape and fills defaults', () => {
@@ -32,7 +33,9 @@ test('policy parses the server wire shape and fills defaults', () => {
     maxBandwidth: 'wideband',
     complexity: 5,
     signal: 'voice',
+    stereo: false,
   });
+  assert.equal(parseAudioPolicy({ stereo: true }).stereo, true);
   const sparse = parseAudioPolicy({ bitrate_bps: 16000, signal: 'music', complexity: null });
   assert.equal(sparse.bitrateBps, 16000);
   assert.equal(sparse.signal, 'music');
@@ -46,10 +49,10 @@ test('policy parses the server wire shape and fills defaults', () => {
 });
 
 test('merge matches the native/Unity semantics', () => {
-  const quiet = { bitrateBps: 16000, minBitrateBps: 8000, fec: false, dtx: true, maxBandwidth: 'wideband', complexity: 3, signal: 'voice' };
-  const music = { bitrateBps: 96000, minBitrateBps: 32000, fec: true, dtx: false, maxBandwidth: 'fullband', signal: 'music' };
+  const quiet = { bitrateBps: 16000, minBitrateBps: 8000, fec: false, dtx: true, maxBandwidth: 'wideband', complexity: 3, signal: 'voice', stereo: false };
+  const music = { bitrateBps: 96000, minBitrateBps: 32000, fec: true, dtx: false, maxBandwidth: 'fullband', signal: 'music', stereo: true };
   const m = mergeAudioPolicies(quiet, music);
-  assert.deepEqual(m, { bitrateBps: 96000, minBitrateBps: 32000, fec: true, dtx: false, maxBandwidth: 'fullband', signal: 'music', complexity: 3 });
+  assert.deepEqual(m, { bitrateBps: 96000, minBitrateBps: 32000, fec: true, dtx: false, maxBandwidth: 'fullband', signal: 'music', stereo: true, complexity: 3 });
   assert.deepEqual(mergeAudioPolicies(music, quiet), m);
   assert.deepEqual(mergeAllAudioPolicies([]), DEFAULT_AUDIO_POLICY);
   assert.deepEqual(mergeAllAudioPolicies([quiet]), quiet);
@@ -80,6 +83,13 @@ test('sender preferences: options pin, policy fills, bitrate command caps', () =
   assert.deepEqual(resolveOpusSenderPreferences({ followChannelPolicy: false, fec: false }, policy), { fec: false });
   assert.deepEqual(resolveOpusSenderPreferences({ followChannelPolicy: false }, policy, 16000), { maxBitrateBps: 16000 });
   assert.deepEqual(resolveOpusSenderPreferences(undefined, undefined), {});
+  // stereo uplink: opt-in, and only where the channel policy allows it
+  assert.equal(resolveOpusSenderPreferences({ stereo: true }, policy).stereo, false);
+  assert.equal(resolveOpusSenderPreferences({ stereo: true }, undefined).stereo, false);
+  assert.equal(resolveOpusSenderPreferences({ stereo: true }, { ...policy, stereo: true }).stereo, true);
+  assert.equal(resolveOpusSenderPreferences({ stereo: true, followChannelPolicy: false }, policy).stereo, true);
+  assert.equal(resolveOpusSenderPreferences({ stereo: false }, { ...policy, stereo: true }).stereo, false);
+  assert.equal(resolveOpusSenderPreferences(undefined, { ...policy, stereo: true }).stereo, undefined);
 });
 
 const ANSWER = [
@@ -127,5 +137,9 @@ test('answer fmtp is rewritten for the Opus payload only, preserving other param
     'm=audio 9 UDP/TLS/RTP/SAVPF 111\na=rtpmap:111 opus/48000/2\na=fmtp:111 usedtx=0\na=sendrecv',
   );
   assert.deepEqual(negotiatedOpusPreferences(ANSWER), { fec: true });
+  const stereo = applyOpusSenderPreferences(ANSWER, { stereo: true });
+  assert.match(stereo, /a=fmtp:111 minptime=10;useinbandfec=1;sprop-stereo=1;stereo=1/);
+  assert.equal(negotiatedOpusPreferences(stereo).stereo, true);
+  assert.equal(negotiatedOpusPreferences(applyOpusSenderPreferences(stereo, { stereo: false })).stereo, false);
   assert.deepEqual(negotiatedOpusPreferences(undefined), {});
 });

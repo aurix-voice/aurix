@@ -61,6 +61,16 @@ namespace Aurix.Audio
         int DecodeFec(ReadOnlySpan<byte> nextPacket, Span<float> pcm, int frameSamplesPerChannel);
     }
 
+    /// <summary>Opus packet inspection (RFC 6716 table of contents byte).</summary>
+    public static class OpusPacket
+    {
+        /// <summary>
+        /// True when the packet was encoded with two channels (TOC bit <c>s</c>). Empty (DTX) packets count as mono.
+        /// A stereo decoder plays mono packets fine (upmixed), so a stream is upgraded on its first stereo packet.
+        /// </summary>
+        public static bool IsStereo(ReadOnlySpan<byte> packet) => packet.Length > 0 && (packet[0] & 0x04) != 0;
+    }
+
     /// <summary>Constants shared by the capture/playback helpers.</summary>
     public static class AudioFormat
     {

@@ -93,6 +93,8 @@ namespace Aurix.Audio
         public const int MinBitrate = 6000;
         /// <summary>libopus clamps a mono encoder here regardless of what is requested.</summary>
         public const int MaxBitrate = 300000;
+        /// <summary>Ceiling for a stereo encoder.</summary>
+        public const int MaxStereoBitrate = 510000;
         public const int MaxComplexity = 10;
 
         /// <summary>Target bitrate, bits per second.</summary>
@@ -111,6 +113,13 @@ namespace Aurix.Audio
         public int ExpectedLossPercent;
         /// <summary>Discontinuous transmission during silence.</summary>
         public bool Dtx;
+        /// <summary>
+        /// 1 = mono (voice), 2 = stereo (music / broadcast: the first two capture channels are kept as L/R).
+        /// Only honoured when the channel policy allows stereo (<see cref="AudioPolicy.Stereo"/>); PCMU is always mono.
+        /// </summary>
+        public int Channels;
+
+        public bool Stereo => Channels == 2;
 
         public static OpusEncoderSettings Default => new OpusEncoderSettings
         {
@@ -123,13 +132,15 @@ namespace Aurix.Audio
             Fec = true,
             ExpectedLossPercent = 5,
             Dtx = false,
+            Channels = 1,
         };
 
         /// <summary>Copy with every numeric field pulled into the range libopus accepts.</summary>
         public OpusEncoderSettings Clamped()
         {
             var s = this;
-            s.BitrateBps = Math.Clamp(s.BitrateBps, MinBitrate, MaxBitrate);
+            s.Channels = s.Channels == 2 ? 2 : 1;
+            s.BitrateBps = Math.Clamp(s.BitrateBps, MinBitrate, s.Channels == 2 ? MaxStereoBitrate : MaxBitrate);
             s.Complexity = Math.Clamp(s.Complexity, 0, MaxComplexity);
             s.ExpectedLossPercent = Math.Clamp(s.ExpectedLossPercent, 0, 100);
             return s;
@@ -138,12 +149,14 @@ namespace Aurix.Audio
         /// <summary>
         /// These settings under a channel policy: bitrate, FEC, DTX, bandwidth and signal come from the
         /// policy; complexity from <paramref name="localComplexity"/> (a local pin), else the policy's
-        /// hint, else unchanged. VBR/constrained VBR/expected loss stay local.
+        /// hint, else unchanged. VBR/constrained VBR/expected loss stay local; stereo is kept only when
+        /// the policy allows it.
         /// </summary>
         public OpusEncoderSettings WithPolicy(AudioPolicy policy, int? localComplexity)
         {
             var s = this;
             s.BitrateBps = policy.BitrateBps;
+            if (!policy.Stereo) s.Channels = 1;
             s.Fec = policy.Fec;
             s.Dtx = policy.Dtx;
             s.MaxBandwidth = policy.MaxBandwidth;
@@ -156,16 +169,16 @@ namespace Aurix.Audio
         public bool Equals(OpusEncoderSettings o) =>
             BitrateBps == o.BitrateBps && Complexity == o.Complexity && MaxBandwidth == o.MaxBandwidth &&
             Signal == o.Signal && Vbr == o.Vbr && ConstrainedVbr == o.ConstrainedVbr && Fec == o.Fec &&
-            ExpectedLossPercent == o.ExpectedLossPercent && Dtx == o.Dtx;
+            ExpectedLossPercent == o.ExpectedLossPercent && Dtx == o.Dtx && Channels == o.Channels;
 
         public override bool Equals(object obj) => obj is OpusEncoderSettings o && Equals(o);
 
         public override int GetHashCode() =>
             HashCode.Combine(BitrateBps, Complexity, (int)MaxBandwidth, (int)Signal,
-                (Vbr ? 1 : 0) | (ConstrainedVbr ? 2 : 0) | (Fec ? 4 : 0) | (Dtx ? 8 : 0), ExpectedLossPercent);
+                (Vbr ? 1 : 0) | (ConstrainedVbr ? 2 : 0) | (Fec ? 4 : 0) | (Dtx ? 8 : 0), ExpectedLossPercent, Channels);
 
         public override string ToString() =>
-            $"{BitrateBps} bps c{Complexity} {MaxBandwidth} {Signal}" +
+            $"{BitrateBps} bps c{Complexity} {MaxBandwidth} {Signal}{(Channels == 2 ? " stereo" : "")}" +
             $"{(Vbr ? (ConstrainedVbr ? " cvbr" : " vbr") : " cbr")}{(Fec ? $" fec({ExpectedLossPercent}%)" : "")}{(Dtx ? " dtx" : "")}";
     }
 
@@ -184,8 +197,10 @@ namespace Aurix.Audio
         /// <summary>Complexity hint, or null when the channel leaves it to the client.</summary>
         public int? Complexity;
         public OpusSignal Signal;
+        /// <summary>Senders may encode two channels (stereo music / broadcast); false asks for mono.</summary>
+        public bool Stereo;
 
-        /// <summary>The server's default channel policy (48 kbit/s, FEC+DTX, fullband, voice, no complexity hint).</summary>
+        /// <summary>The server's default channel policy (48 kbit/s, FEC+DTX, fullband, voice, no complexity hint, mono).</summary>
         public static AudioPolicy Default => new AudioPolicy
         {
             BitrateBps = 48000,
@@ -195,12 +210,13 @@ namespace Aurix.Audio
             MaxBandwidth = OpusBandwidth.Fullband,
             Complexity = null,
             Signal = OpusSignal.Voice,
+            Stereo = false,
         };
 
         /// <summary>
         /// Combined policy for one encoder feeding several channels: the widest bitrate and bandwidth so
         /// no channel is starved, FEC if any wants it, DTX only if every channel allows it, the highest
-        /// complexity hint, and Music if any channel is music.
+        /// complexity hint, Music if any channel is music, and stereo if any channel allows it.
         /// </summary>
         public AudioPolicy Merge(AudioPolicy o) => new AudioPolicy
         {
@@ -215,6 +231,7 @@ namespace Aurix.Audio
             Signal = Signal == OpusSignal.Music || o.Signal == OpusSignal.Music ? OpusSignal.Music
                 : Signal == OpusSignal.Voice || o.Signal == OpusSignal.Voice ? OpusSignal.Voice
                 : OpusSignal.Auto,
+            Stereo = Stereo || o.Stereo,
         };
 
         /// <summary>Merge of all policies; <see cref="Default"/> when there are none.</summary>
@@ -238,6 +255,7 @@ namespace Aurix.Audio
                 Dtx = MiniJson.GetBool(o, "dtx", d.Dtx),
                 MaxBandwidth = OpusEnums.ParseBandwidth(MiniJson.GetString(o, "max_bandwidth"), d.MaxBandwidth),
                 Signal = OpusEnums.ParseSignal(MiniJson.GetString(o, "signal"), d.Signal),
+                Stereo = MiniJson.GetBool(o, "stereo", d.Stereo),
             };
             if (o.TryGetValue("complexity", out var c) && c is double cd) p.Complexity = (int)cd;
             return p;
@@ -253,15 +271,15 @@ namespace Aurix.Audio
 
         public bool Equals(AudioPolicy o) =>
             BitrateBps == o.BitrateBps && MinBitrateBps == o.MinBitrateBps && Fec == o.Fec && Dtx == o.Dtx &&
-            MaxBandwidth == o.MaxBandwidth && Complexity == o.Complexity && Signal == o.Signal;
+            MaxBandwidth == o.MaxBandwidth && Complexity == o.Complexity && Signal == o.Signal && Stereo == o.Stereo;
 
         public override bool Equals(object obj) => obj is AudioPolicy o && Equals(o);
 
         public override int GetHashCode() =>
-            HashCode.Combine(BitrateBps, MinBitrateBps, Fec, Dtx, (int)MaxBandwidth, Complexity ?? -1, (int)Signal);
+            HashCode.Combine(BitrateBps, MinBitrateBps, Fec, Dtx, (int)MaxBandwidth, Complexity ?? -1, (int)Signal, Stereo);
 
         public override string ToString() =>
-            $"{BitrateBps} bps (min {MinBitrateBps}) {MaxBandwidth} {Signal}" +
+            $"{BitrateBps} bps (min {MinBitrateBps}) {MaxBandwidth} {Signal}{(Stereo ? " stereo" : "")}" +
             $"{(Fec ? " fec" : "")}{(Dtx ? " dtx" : "")}{(Complexity.HasValue ? $" c{Complexity.Value}" : "")}";
     }
 }

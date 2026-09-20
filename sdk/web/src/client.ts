@@ -86,7 +86,10 @@ export interface AurixClientOptions {
   useTurn?: boolean;
   /** Extra ICE servers (public STUN etc.). */
   iceServers?: RTCIceServer[];
-  /** Constraints for `getUserMedia`; defaults to echo cancellation + noise suppression. */
+  /**
+   * Constraints for `getUserMedia`; defaults to echo cancellation + noise suppression + AGC, or —
+   * with `opus.stereo` — to a 2-channel track with that voice processing off.
+   */
   audioConstraints?: MediaTrackConstraints;
   /** Use this stream instead of calling `getUserMedia` (device management done by the app). */
   localStream?: MediaStream;
@@ -542,10 +545,22 @@ function decodeJwtSubject(token: string): string | undefined {
 }
 
 /**
+ * Voice: the browser's echo cancellation / noise suppression / AGC. Stereo uplink: two channels
+ * with that processing off — browsers downmix to mono inside their voice processing chain.
+ */
+export function defaultAudioConstraints(opus: OpusBrowserOptions | undefined): MediaTrackConstraints {
+  if (opus?.stereo === true) {
+    return { channelCount: { ideal: 2 }, echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+  }
+  return { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+}
+
+/**
  * Ask the browser to *decode* Opus in stereo (`stereo=1` = our receive preference, RFC 7587).
  * libwebrtc sizes its decoder from that parameter of the local description, not from the
  * packets, so without it the server's stereo downlink (directional positional channels) is
- * downmixed to mono before playout. The microphone uplink stays mono.
+ * downmixed to mono before playout. The microphone uplink stays mono unless the server's answer
+ * (rewritten with `opus.stereo`) asks for stereo.
  */
 function preferStereoOpus(sdp: string): string {
   const lines = sdp.split(/\r?\n/);
@@ -1797,11 +1812,7 @@ export class AurixClient {
   }
 
   private async openMicrophone(): Promise<MediaStream> {
-    const base: MediaTrackConstraints = this.opts.audioConstraints ?? {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    };
+    const base: MediaTrackConstraints = this.opts.audioConstraints ?? defaultAudioConstraints(this.opts.opus);
     const deviceId = this.inputDeviceIdValue;
     const audio: MediaTrackConstraints = deviceId ? { ...base, deviceId: { exact: deviceId } } : base;
     const stream = await navigator.mediaDevices.getUserMedia({ audio, video: false });

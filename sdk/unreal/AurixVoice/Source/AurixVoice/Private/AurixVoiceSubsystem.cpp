@@ -286,6 +286,7 @@ AurixEncoderSettings ToNativeEncoderSettings(const FAurixEncoderSettings& S)
 	Out.fec = S.bFec;
 	Out.expected_loss_percent = static_cast<uint8_t>(FMath::Clamp(S.ExpectedLossPercent, 0, 100));
 	Out.dtx = S.bDtx;
+	Out.channels = S.bStereo ? 2 : 1;
 	return Out;
 }
 
@@ -301,6 +302,7 @@ FAurixEncoderSettings FromNativeEncoderSettings(const AurixEncoderSettings& S)
 	Out.bFec = S.fec;
 	Out.ExpectedLossPercent = static_cast<int32>(S.expected_loss_percent);
 	Out.bDtx = S.dtx;
+	Out.bStereo = S.channels == 2;
 	return Out;
 }
 
@@ -378,6 +380,7 @@ FAurixAudioPolicy ToAudioPolicy(const AurixAudioPolicy& P)
 	Out.MaxBandwidth = FromNativeBandwidth(P.max_bandwidth);
 	Out.Complexity = static_cast<int32>(P.complexity);
 	Out.Signal = FromNativeSignal(P.signal);
+	Out.bStereo = P.stereo;
 	return Out;
 }
 

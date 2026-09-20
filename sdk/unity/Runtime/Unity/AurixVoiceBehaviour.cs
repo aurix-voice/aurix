@@ -82,6 +82,11 @@ namespace Aurix.Unity
         [Range(0, 100)] public int ExpectedLossPercent = 5;
         [Tooltip("Opus discontinuous transmission: ~1 packet per 400 ms during silence. GateOnVad is the stronger variant.")]
         public bool Dtx = false;
+        [Tooltip("Encode two channels (music / DJ / broadcast sources): the microphone's first two channels are kept as " +
+                 "L/R (a mono microphone is duplicated). Needs StereoCodecFactory and a channel whose policy allows stereo " +
+                 "(followed policy forces mono otherwise); PCMU stays mono. The capture DSP (AEC/NS/AGC) is voice-only " +
+                 "and is bypassed for stereo frames; use Signal = Music with it.")]
+        public bool Stereo = false;
         [Tooltip("Retune the encoder from the joined channels' audio policy (bitrate, bandwidth, FEC, DTX, signal). " +
                  "Off: the settings above are used verbatim.")]
         public bool FollowChannelPolicy = true;
@@ -123,10 +128,11 @@ namespace Aurix.Unity
         public Func<IOpusCodec> CodecFactory;
 
         /// <summary>
-        /// Creates 2-channel decoders for server-mixed channel streams (<see cref="PreferredDownlinkMode"/>
-        /// <see cref="DownlinkMode.Mixed"/>), e.g. <c>() => new ConcentusOpusCodec(48000, 2)</c>. Optional: without
-        /// it mixed frames are decoded by <see cref="CodecFactory"/>, which downmixes them to mono when that codec
-        /// is mono (the server's panning is lost, playback still works).
+        /// Creates 2-channel codecs: decoders for server-mixed channel streams (<see cref="PreferredDownlinkMode"/>
+        /// <see cref="DownlinkMode.Mixed"/>) and for senders whose packets are stereo, and the uplink encoder when
+        /// <see cref="Stereo"/> is on — e.g. <c>() => new ConcentusOpusCodec(48000, 2)</c>. Optional: without it
+        /// stereo frames are decoded by <see cref="CodecFactory"/>, which downmixes them to mono when that codec
+        /// is mono (the image / server panning is lost, playback still works), and the uplink stays mono.
         /// </summary>
         public Func<IOpusCodec> StereoCodecFactory;
 
@@ -225,8 +231,11 @@ namespace Aurix.Unity
         private int _micReadPos;
         private float[] _micScratch;
         private float[] _mono;
+        private float[] _stereo;
+        private float[] _injectScratch;
         private byte[] _opusOut = new byte[1275];
         private IOpusCodec _encoder;
+        private bool _warnedNoStereoCodec;
         private readonly PcmuCodec _pcmuEncoder = new PcmuCodec();
         private readonly byte[] _pcmuOut = new byte[AudioFormat.FrameSamples / PcmuCodec.Decimation];
         private RemoteMixer _mixer;
@@ -291,6 +300,8 @@ namespace Aurix.Unity
             Client.SetEncoderSettings(EncoderSettingsFromInspector());
             Client.SetComplexity(Complexity);
             Client.Encoder = _encoder;
+            Client.OnEncoderSettingsChanged += MatchEncoderWidth;
+            MatchEncoderWidth(Client.EffectiveEncoderSettings);
             Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();
             Client.OnAudioCodecChanged += _ => _pcmuEncoder.Reset();
@@ -324,7 +335,41 @@ namespace Aurix.Unity
             Fec = Fec,
             ExpectedLossPercent = ExpectedLossPercent,
             Dtx = Dtx,
+            Channels = Stereo ? 2 : 1,
         }.Clamped();
+
+        /// <summary>Channels the uplink encoder is running with (2 only with a stereo codec in a stereo-policy channel).</summary>
+        public int UplinkChannels => _encoder != null && Client != null && Client.AudioCodec == AudioCodec.Opus ? _encoder.Channels : 1;
+
+        /// <summary>
+        /// The effective settings ask for a channel count the bound codec does not have: swap the encoder
+        /// (mono from <see cref="CodecFactory"/>, stereo from <see cref="StereoCodecFactory"/>). Runs on
+        /// the main thread (client events are dispatched from <c>Update</c>).
+        /// </summary>
+        private void MatchEncoderWidth(OpusEncoderSettings s)
+        {
+            var client = Client;
+            if (client == null || _encoder == null) return;
+            int want = s.Channels == 2 ? 2 : 1;
+            if (want == 2 && StereoCodecFactory == null)
+            {
+                if (!_warnedNoStereoCodec) Debug.LogWarning("Aurix: Stereo uplink requested but StereoCodecFactory is not set; encoding mono");
+                _warnedNoStereoCodec = true;
+                want = 1;
+            }
+            if (_encoder.Channels == want) return;
+            var next = want == 2 ? StereoCodecFactory() : CodecFactory();
+            if (next.Channels != want)
+            {
+                Debug.LogWarning($"Aurix: the {(want == 2 ? "Stereo" : "")}CodecFactory produced a {next.Channels}-channel codec, expected {want}");
+                next.Dispose();
+                return;
+            }
+            var old = _encoder;
+            _encoder = next;
+            client.Encoder = next;
+            old.Dispose();
+        }
 
         /// <summary>
         /// Re-read the encoder fields at runtime (e.g. from a settings menu) and push them to the codec.
@@ -344,6 +389,7 @@ namespace Aurix.Unity
             Injector.Stop();
             var c = Client;
             Client = null;
+            if (c != null) c.OnEncoderSettingsChanged -= MatchEncoderWidth;
             if (c != null) await c.DisconnectAsync();
             _encoder?.Dispose(); _encoder = null;
             _mixer?.Dispose(); _mixer = null;
@@ -614,6 +660,16 @@ namespace Aurix.Unity
                 _micReadPos = (_micReadPos + frameAtMicRate) % _micClip.samples;
                 available -= frameAtMicRate;
 
+                if (UplinkChannels == 2)
+                {
+                    if (_stereo == null || _stereo.Length != AudioFormat.FrameSamples * 2) _stereo = new float[AudioFormat.FrameSamples * 2];
+                    SplitStereo(_micScratch, _micChannels, frameAtMicRate, _stereo, AudioFormat.FrameSamples);
+                    // The capture DSP is a voice (mono) chain: a music/broadcast source skips it.
+                    AudioLevel.ApplyGain(_stereo, AudioFormat.FrameSamples * 2, InputGain);
+                    InjectIntoStereo();
+                    EncodeAndSendStereo();
+                    continue;
+                }
                 if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
                 Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
                 Dsp?.Process(_mono, AudioFormat.FrameSamples);
@@ -637,6 +693,14 @@ namespace Aurix.Unity
             while (_injectClock >= frameSeconds && frames++ < 5 && Injector.Active)
             {
                 _injectClock -= frameSeconds;
+                if (UplinkChannels == 2)
+                {
+                    if (_stereo == null || _stereo.Length != AudioFormat.FrameSamples * 2) _stereo = new float[AudioFormat.FrameSamples * 2];
+                    Array.Clear(_stereo, 0, _stereo.Length);
+                    InjectIntoStereo();
+                    EncodeAndSendStereo();
+                    continue;
+                }
                 if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
                 Array.Clear(_mono, 0, _mono.Length);
                 Injector.Fill(_mono, AudioFormat.FrameSamples);
@@ -665,6 +729,63 @@ namespace Aurix.Unity
             {
                 int n = _encoder.Encode(_mono, AudioFormat.FrameSamples, _opusOut);
                 if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
+            }
+        }
+
+        /// <summary>
+        /// VAD (on the L/R average), gating and stereo Opus encoding of the frame in <see cref="_stereo"/>.
+        /// Only reached with a 2-channel Opus encoder bound (PCMU sessions always take the mono path).
+        /// </summary>
+        private void EncodeAndSendStereo()
+        {
+            if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
+            for (int i = 0; i < AudioFormat.FrameSamples; i++) _mono[i] = (_stereo[i * 2] + _stereo[i * 2 + 1]) * 0.5f;
+            Vad.Threshold = VadThreshold;
+            Vad.HangoverFrames = VadHangoverFrames;
+            if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
+            if (GateOnVad && !Vad.Speaking)
+            {
+                Client.SkipFrame(AudioFormat.FrameSamples);
+                return;
+            }
+            int n = _encoder.Encode(_stereo, AudioFormat.FrameSamples, _opusOut);
+            if (n > 0) Client.TransmitOpusFrame(_opusOut, n, AudioFormat.FrameSamples, Vad.Level);
+        }
+
+        /// <summary>The (mono) injector applied to both channels of <see cref="_stereo"/>.</summary>
+        private void InjectIntoStereo()
+        {
+            if (!Injector.Active) return;
+            if (_injectScratch == null || _injectScratch.Length != AudioFormat.FrameSamples) _injectScratch = new float[AudioFormat.FrameSamples];
+            Array.Clear(_injectScratch, 0, _injectScratch.Length);
+            Injector.Fill(_injectScratch, AudioFormat.FrameSamples);
+            if (!Injector.MixWithMicrophone) Array.Clear(_stereo, 0, _stereo.Length);
+            for (int i = 0; i < AudioFormat.FrameSamples; i++)
+            {
+                float v = _injectScratch[i];
+                float l = _stereo[i * 2] + v, r = _stereo[i * 2 + 1] + v;
+                _stereo[i * 2] = l > 1f ? 1f : (l < -1f ? -1f : l);
+                _stereo[i * 2 + 1] = r > 1f ? 1f : (r < -1f ? -1f : r);
+            }
+        }
+
+        /// <summary>
+        /// Keep the first two capture channels as L/R (a mono capture is duplicated, extra channels are
+        /// dropped) with the same naive linear resample to 48 kHz as <see cref="Downmix"/>.
+        /// </summary>
+        private static void SplitStereo(float[] src, int srcCh, int srcFrames, float[] dst, int dstFrames)
+        {
+            int right = srcCh >= 2 ? 1 : 0;
+            for (int i = 0; i < dstFrames; i++)
+            {
+                float pos = (float)i * srcFrames / dstFrames;
+                int i0 = (int)pos;
+                int i1 = Math.Min(i0 + 1, srcFrames - 1);
+                float t = pos - i0;
+                float l0 = src[i0 * srcCh], l1 = src[i1 * srcCh];
+                float r0 = src[i0 * srcCh + right], r1 = src[i1 * srcCh + right];
+                dst[i * 2] = l0 + (l1 - l0) * t;
+                dst[i * 2 + 1] = r0 + (r1 - r0) * t;
             }
         }
 

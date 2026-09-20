@@ -40,6 +40,7 @@ namespace Aurix.Audio
             public byte Fec;
             public byte ExpectedLossPercent;
             public byte Dtx;
+            public byte Channels;
 
             public static NativeSettings From(OpusEncoderSettings s)
             {
@@ -55,6 +56,7 @@ namespace Aurix.Audio
                     Fec = (byte)(s.Fec ? 1 : 0),
                     ExpectedLossPercent = (byte)s.ExpectedLossPercent,
                     Dtx = (byte)(s.Dtx ? 1 : 0),
+                    Channels = (byte)s.Channels,
                 };
             }
 
@@ -69,6 +71,7 @@ namespace Aurix.Audio
                 Fec = Fec != 0,
                 ExpectedLossPercent = ExpectedLossPercent,
                 Dtx = Dtx != 0,
+                Channels = Channels,
             };
         }
 

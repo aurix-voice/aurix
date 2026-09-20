@@ -4,7 +4,10 @@
 //! participant in the channel is decoded, summed with per-sender volume (positional
 //! attenuation, whisper, etc.) and re-encoded as one stereo Opus stream. Senders in a
 //! directional positional channel are panned across the stereo field by their direction
-//! relative to the listener; everybody else sits in the centre.
+//! relative to the listener; everybody else sits in the centre. Every sender is decoded as
+//! stereo (libopus upmixes mono packets to identical channels at no extra cost), so a stereo
+//! uplink — music, a DJ, a broadcast — keeps its image; a directional sender is downmixed
+//! before panning since a stereo image and a positional pan are mutually exclusive.
 
 use aurix_common::error::{AurixError, Result};
 use aurix_common::types::Direction;
@@ -19,16 +22,18 @@ pub const OUTPUT_CHANNELS: usize = 2;
 /// Largest Opus frame we accept from a single packet (120 ms @ 48 kHz).
 const MAX_DECODE_SAMPLES: usize = 5760;
 /// Drop a sender's queued PCM if it grows past this (network burst / clock drift).
-const MAX_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 10;
+const MAX_QUEUE_SAMPLES: usize = FRAME_SAMPLES * OUTPUT_CHANNELS * 10;
 /// Forget decoders for senders that have been silent this long.
 const SENDER_IDLE_SECS: u64 = 30;
 
 struct SenderState {
     decoder: opus::Decoder,
+    /// Interleaved stereo PCM awaiting the next mix.
     queue: VecDeque<i16>,
     volume: f32,
-    /// Constant-power `(left, right)` gains from the sender's direction.
-    pan: (f32, f32),
+    /// Constant-power `(left, right)` gains from the sender's direction; `None` keeps the
+    /// sender's own stereo image.
+    pan: Option<(f32, f32)>,
     last_seen: Instant,
 }
 
@@ -58,7 +63,7 @@ impl OpusMixer {
             encoder,
             mix_buf: vec![0i32; FRAME_SAMPLES * OUTPUT_CHANNELS],
             frame_buf: vec![0i16; FRAME_SAMPLES * OUTPUT_CHANNELS],
-            decode_buf: vec![0i16; MAX_DECODE_SAMPLES],
+            decode_buf: vec![0i16; MAX_DECODE_SAMPLES * OUTPUT_CHANNELS],
             out_buf: vec![0u8; 1275],
             frames_mixed: 0,
         })
@@ -76,11 +81,11 @@ impl OpusMixer {
         if packet.is_empty() {
             return Ok(());
         }
-        let pan = direction.as_ref().map_or(CENTRE, Direction::stereo_gains);
+        let pan = direction.as_ref().map(Direction::stereo_gains);
         let state = match self.senders.get_mut(&sender) {
             Some(s) => s,
             None => {
-                let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
+                let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo)
                     .map_err(|e| AurixError::Codec(format!("opus decoder: {e}")))?;
                 self.senders.insert(
                     sender,
@@ -102,7 +107,9 @@ impl OpusMixer {
             .decoder
             .decode(packet, &mut self.decode_buf, false)
             .map_err(|e| AurixError::Codec(format!("opus decode: {e}")))?;
-        state.queue.extend(self.decode_buf[..n].iter().copied());
+        state
+            .queue
+            .extend(self.decode_buf[..n * OUTPUT_CHANNELS].iter().copied());
         while state.queue.len() > MAX_QUEUE_SAMPLES {
             state.queue.pop_front();
         }
@@ -125,14 +132,20 @@ impl OpusMixer {
             let vol = state
                 .volume
                 .clamp(0.0, crate::session::MAX_PARTICIPANT_GAIN);
-            let (left, right) = (state.pan.0 * vol, state.pan.1 * vol);
             for frame in self.mix_buf.as_chunks_mut::<OUTPUT_CHANNELS>().0 {
-                match state.queue.pop_front() {
-                    Some(sample) => {
-                        frame[0] += (sample as f32 * left) as i32;
-                        frame[1] += (sample as f32 * right) as i32;
+                let (Some(l), Some(r)) = (state.queue.pop_front(), state.queue.pop_front()) else {
+                    break;
+                };
+                match state.pan {
+                    Some((left, right)) => {
+                        let mono = (l as f32 + r as f32) * 0.5;
+                        frame[0] += (mono * left * vol) as i32;
+                        frame[1] += (mono * right * vol) as i32;
                     }
-                    None => break,
+                    None => {
+                        frame[0] += (l as f32 * vol) as i32;
+                        frame[1] += (r as f32 * vol) as i32;
+                    }
                 }
             }
         }
@@ -155,13 +168,28 @@ impl OpusMixer {
     }
 }
 
-/// Pan of a sender without a direction: unchanged in both ears.
-const CENTRE: (f32, f32) = (1.0, 1.0);
-
 /// Encode a 20 ms PCM frame — used by tests and tooling to synthesize valid Opus packets.
 pub fn encode_pcm_frame(pcm: &[i16]) -> Result<Vec<u8>> {
     let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
         .map_err(|e| AurixError::Codec(format!("opus encoder: {e}")))?;
+    let mut out = vec![0u8; 1275];
+    let n = enc
+        .encode(pcm, &mut out)
+        .map_err(|e| AurixError::Codec(format!("opus encode: {e}")))?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Encode a 20 ms interleaved stereo PCM frame (tests and tooling).
+pub fn encode_stereo_pcm_frame(pcm: &[i16]) -> Result<Vec<u8>> {
+    let mut enc = opus::Encoder::new(
+        SAMPLE_RATE,
+        opus::Channels::Stereo,
+        opus::Application::Audio,
+    )
+    .map_err(|e| AurixError::Codec(format!("opus encoder: {e}")))?;
+    enc.set_bitrate(opus::Bitrate::Bits(96_000))
+        .map_err(|e| AurixError::Codec(format!("opus bitrate: {e}")))?;
     let mut out = vec![0u8; 1275];
     let n = enc
         .encode(pcm, &mut out)
@@ -273,5 +301,52 @@ mod tests {
     fn rejects_garbage_packets() {
         let mut mixer = OpusMixer::new(32_000).unwrap();
         assert!(mixer.push_opus(7, 1.0, None, &[0xff; 3]).is_err());
+    }
+
+    #[test]
+    fn stereo_sender_keeps_its_image_unless_panned() {
+        let mut mixer = OpusMixer::new(96_000).unwrap();
+        // Tone hard left only: L = tone, R = silence.
+        let left_only: Vec<i16> = tone(440.0, 0.3).into_iter().flat_map(|s| [s, 0]).collect();
+        let packet = encode_stereo_pcm_frame(&left_only).unwrap();
+        assert!(
+            aurix_common::protocol::opus_packet_is_stereo(&packet),
+            "test packet must carry the stereo TOC bit"
+        );
+        for _ in 0..3 {
+            mixer.push_opus(1, 1.0, None, &packet).unwrap();
+            mixer.mix_frame().unwrap().unwrap();
+        }
+        mixer.push_opus(1, 1.0, None, &packet).unwrap();
+        let frame = mixer.mix_frame().unwrap().unwrap().to_vec();
+        let (l, r) = decode_stereo(&frame);
+        assert!(
+            rms(&r) < rms(&l) * 0.2,
+            "image preserved: left {} vs right {}",
+            rms(&l),
+            rms(&r)
+        );
+
+        // With a direction the image collapses to mono and follows the pan (hard right here).
+        let right = Direction {
+            azimuth: std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+        };
+        for _ in 0..3 {
+            mixer.push_opus(1, 1.0, Some(right), &packet).unwrap();
+            mixer.mix_frame().unwrap().unwrap();
+        }
+        mixer.push_opus(1, 1.0, Some(right), &packet).unwrap();
+        let frame = mixer.mix_frame().unwrap().unwrap().to_vec();
+        let (l, r) = decode_stereo(&frame);
+        assert!(rms(&l) < rms(&r) * 0.25, "panned right after downmix");
+
+        // A mono sender still mixes alongside (same decoder type, upmixed by libopus).
+        let mono = encode_pcm_frame(&tone(880.0, 0.3)).unwrap();
+        assert!(!aurix_common::protocol::opus_packet_is_stereo(&mono));
+        mixer.push_opus(2, 1.0, None, &mono).unwrap();
+        let frame = mixer.mix_frame().unwrap().unwrap().to_vec();
+        let (l, r) = decode_stereo(&frame);
+        assert!(rms(&l) > 500.0 && rms(&r) > 500.0);
     }
 }

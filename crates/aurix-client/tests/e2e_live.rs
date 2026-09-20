@@ -14,7 +14,8 @@ use aurix_client::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use aurix_client::events::{ConnectionState, Event};
 use aurix_client::{Client, ClientConfig, DspConfig, EncoderSettings, MediaPath, MediaPathPolicy};
 use aurix_common::types::{
-    AudioPolicy, ChannelId, ChannelRole, DownlinkMode, OpusBandwidth, OpusSignal, UserId,
+    AudioPolicy, ChannelId, ChannelRole, DownlinkMode, OpusBandwidth, OpusSignal, RecordingConsent,
+    UserId,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -598,6 +599,7 @@ async fn native_client_follows_channel_audio_policy() {
         max_bandwidth: OpusBandwidth::Wideband,
         complexity: Some(6),
         signal: OpusSignal::Music,
+        stereo: false,
     };
     let (alice_token, _) = issue_token(&env, &http, "native-opus-alice", "Alice", channel).await;
     let (bob_token, _) = issue_token(&env, &http, "native-opus-bob", "Bob", channel).await;
@@ -721,6 +723,7 @@ async fn native_client_follows_channel_audio_policy() {
         max_bandwidth: OpusBandwidth::Fullband,
         complexity: None,
         signal: OpusSignal::Voice,
+        stereo: false,
     };
     let ev = wait_for(
         &alice,
@@ -1255,4 +1258,217 @@ async fn native_client_takes_a_server_mixed_downlink_and_listener_role() {
     alice.disconnect();
     bob.disconnect();
     carol.disconnect();
+}
+
+/// Alice pushes `secs` of a left-only 440 Hz tone as two-channel capture while Bob mixes
+/// `channels`-wide output; returns Bob's per-channel RMS and the active frame count.
+async fn stream_left_tone(
+    alice: &Client,
+    bob: &Client,
+    secs: f32,
+    channels: u8,
+) -> (Vec<f32>, usize) {
+    let frames = (secs * 50.0) as usize;
+    let ch = channels as usize;
+    let mut phase = 0.0f32;
+    let mut pcm = vec![0f32; FRAME_SAMPLES * 2];
+    let mut out = vec![0i16; FRAME_SAMPLES * ch];
+    let mut active = 0usize;
+    let mut sum_sq = vec![0f64; ch];
+    let mut samples = 0usize;
+    for _ in 0..frames {
+        for s in pcm.as_chunks_mut::<2>().0 {
+            s[0] = 0.3 * phase.sin();
+            s[1] = 0.0;
+            phase += 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32;
+        }
+        alice.push_capture_f32(&pcm, SAMPLE_RATE, 2);
+        if bob.mix_output_i16(&mut out, channels) > 0 {
+            active += 1;
+            for (i, s) in out.iter().enumerate() {
+                let v = *s as f64 / 32768.0;
+                sum_sq[i % ch] += v * v;
+            }
+            samples += FRAME_SAMPLES;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rms = sum_sq
+        .iter()
+        .map(|s| {
+            if samples > 0 {
+                (s / samples as f64).sqrt() as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    (rms, active)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_stereo_uplink_keeps_the_image_and_stays_mono_elsewhere() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let music = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({"stereo": true, "audio_profile": "music", "bitrate": 96000}),
+    )
+    .await;
+    let voice = create_channel(&env, &http).await;
+    let (alice_token, alice_id) = issue_token(&env, &http, "stereo-alice", "Alice", music).await;
+    let (bob_token, _) = issue_token(&env, &http, "stereo-bob", "Bob", music).await;
+    let (dave_token, _) = issue_token(&env, &http, "stereo-dave", "Dave", voice).await;
+
+    // Alice and Dave both *ask* for stereo; only the music channel's policy grants it.
+    let stereo_cfg = |token: String| {
+        let mut cfg = ClientConfig::new(ws_with_path(&env.ws), token);
+        cfg.dsp = DspConfig::BYPASS;
+        cfg.encoder = EncoderSettings {
+            channels: 2,
+            ..EncoderSettings::default()
+        };
+        cfg
+    };
+    let alice = Client::new(stereo_cfg(alice_token)).unwrap();
+    let dave = Client::new(stereo_cfg(dave_token)).unwrap();
+    let bob = Client::new(ClientConfig::new(ws_with_path(&env.ws), bob_token)).unwrap();
+    for c in [&alice, &bob, &dave] {
+        c.connect().unwrap();
+    }
+    for (c, who) in [(&alice, "alice"), (&bob, "bob"), (&dave, "dave")] {
+        wait_for(c, who, Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaBound)
+        })
+        .await;
+    }
+
+    // --- policy: music channel → stereo + music application; voice channel → forced mono.
+    alice.join_channel(music, None).unwrap();
+    let Event::AudioPolicyChanged(p) =
+        wait_for(&alice, "alice policy", Duration::from_secs(10), |e| {
+            matches!(e, Event::AudioPolicyChanged(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(p.stereo, "{p:?}");
+    assert_eq!(p.signal, OpusSignal::Music);
+    let s = alice.encoder_settings();
+    assert_eq!(s.channels, 2, "{s:?}");
+    assert_eq!(s.signal, OpusSignal::Music);
+    assert_eq!(s.bitrate_bps, 96_000);
+
+    dave.join_channel(voice, None).unwrap();
+    let Event::AudioPolicyChanged(p) =
+        wait_for(&dave, "dave policy", Duration::from_secs(10), |e| {
+            matches!(e, Event::AudioPolicyChanged(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(!p.stereo, "{p:?}");
+    assert_eq!(
+        dave.encoder_settings().channels,
+        1,
+        "voice channels force mono"
+    );
+
+    bob.join_channel(music, None).unwrap();
+    wait_for(&bob, "bob join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await;
+    wait_for(&alice, "bob joined", Duration::from_secs(10), |e| {
+        matches!(e, Event::ParticipantJoined { participant, .. } if participant.user_id != alice_id)
+    })
+    .await;
+
+    // --- Bob (stereo output) hears Alice's left-only tone on the left; the right stays quiet.
+    let (rms, active) = stream_left_tone(&alice, &bob, 1.6, 2).await;
+    eprintln!(
+        "bob heard stereo L={:.3} R={:.3} over {active} frames",
+        rms[0], rms[1]
+    );
+    assert!(active >= 50, "bob mixed only {active} active frames");
+    assert!((0.15..0.30).contains(&rms[0]), "left rms {}", rms[0]);
+    assert!(
+        rms[1] < rms[0] * 0.1,
+        "stereo image lost: L={} R={}",
+        rms[0],
+        rms[1]
+    );
+
+    // --- a mono output gets the downmix (half the left level), not silence and not full level.
+    let (rms_m, active_m) = stream_left_tone(&alice, &bob, 1.0, 1).await;
+    eprintln!("bob heard mono {:.3} over {active_m} frames", rms_m[0]);
+    assert!(active_m >= 30);
+    assert!(
+        (0.07..0.16).contains(&rms_m[0]),
+        "mono downmix rms {}",
+        rms_m[0]
+    );
+
+    // --- recording of the stereo channel: 2-channel OpusHead, stereo packets inside.
+    let rec: serde_json::Value = http
+        .post(format!("{}/v1/recordings/start", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": music, "user_id": alice_id}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let recording_id: uuid::Uuid = rec["id"].as_str().unwrap().parse().unwrap();
+    wait_for(&alice, "recording", Duration::from_secs(10), |e| {
+        matches!(e, Event::Recording { recording_id: r, active: true, .. } if *r == recording_id)
+    })
+    .await;
+    alice
+        .respond_recording_consent(recording_id, RecordingConsent::Accepted)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = stream_left_tone(&alice, &bob, 0.6, 2).await;
+    http.post(format!("{}/v1/recordings/{}/stop", env.api, recording_id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let ogg = http
+        .get(format!(
+            "{}/v1/recordings/{}/download",
+            env.api, recording_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let head = ogg
+        .windows(8)
+        .position(|w| w == b"OpusHead")
+        .expect("OpusHead");
+    // OpusHead: magic(8) version(1) channel_count(1) ...
+    assert_eq!(ogg[head + 9], 2, "recording OpusHead must be 2-channel");
+    let pages = ogg.windows(4).filter(|w| *w == b"OggS").count();
+    assert!(pages >= 3, "no audio pages recorded ({pages})");
+
+    alice.disconnect();
+    bob.disconnect();
+    dave.disconnect();
 }

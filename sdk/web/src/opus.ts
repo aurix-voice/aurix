@@ -12,6 +12,7 @@
  * | DTX                         | `usedtx` in the remote answer's Opus `fmtp`                    | no    |
  * | max bandwidth               | `maxplaybackrate` in the remote answer's Opus `fmtp`           | no    |
  * | constant bitrate            | `cbr` in the remote answer's Opus `fmtp`                       | no    |
+ * | stereo uplink               | `stereo=1` in the remote answer's `fmtp` + a 2-channel track    | no    |
  * | complexity, signal, VBR, expected loss | **not controllable** — the browser owns them        | —     |
  *
  * RFC 7587 defines the `fmtp` parameters as the *receiver's* preferences, which the sender (the
@@ -51,6 +52,8 @@ export interface AudioPolicy {
   complexity?: number;
   /** Content hint; browsers cannot honour it. */
   signal: OpusSignal;
+  /** Senders may encode two channels (stereo music / broadcast); `false` asks for mono. */
+  stereo: boolean;
 }
 
 /** The server's default channel policy. */
@@ -61,6 +64,7 @@ export const DEFAULT_AUDIO_POLICY: AudioPolicy = Object.freeze({
   dtx: true,
   maxBandwidth: 'fullband',
   signal: 'voice',
+  stereo: false,
 });
 
 export function isOpusBandwidth(v: unknown): v is OpusBandwidth {
@@ -104,6 +108,7 @@ export function parseAudioPolicy(wire: AudioPolicyWire | undefined | null): Audi
     dtx: typeof wire.dtx === 'boolean' ? wire.dtx : d.dtx,
     maxBandwidth: isOpusBandwidth(wire.max_bandwidth) ? wire.max_bandwidth : d.maxBandwidth,
     signal: isOpusSignal(wire.signal) ? wire.signal : d.signal,
+    stereo: typeof wire.stereo === 'boolean' ? wire.stereo : d.stereo,
   };
   if (typeof wire.complexity === 'number' && Number.isFinite(wire.complexity)) {
     policy.complexity = Math.min(10, Math.max(0, Math.round(wire.complexity)));
@@ -114,8 +119,8 @@ export function parseAudioPolicy(wire: AudioPolicyWire | undefined | null): Audi
 /**
  * Combined policy for one uplink feeding several channels, with the same semantics as the
  * native and Unity SDKs: the widest bitrate and bandwidth so no channel is starved, FEC if any
- * channel wants it, DTX only if every channel allows it, the highest complexity hint, and
- * `music` over `voice` over `auto`.
+ * channel wants it, DTX only if every channel allows it, the highest complexity hint,
+ * `music` over `voice` over `auto`, and stereo if any channel allows it.
  */
 export function mergeAudioPolicies(a: AudioPolicy, b: AudioPolicy): AudioPolicy {
   const merged: AudioPolicy = {
@@ -130,6 +135,7 @@ export function mergeAudioPolicies(a: AudioPolicy, b: AudioPolicy): AudioPolicy 
         : a.signal === 'voice' || b.signal === 'voice'
           ? 'voice'
           : 'auto',
+    stereo: a.stereo || b.stereo,
   };
   if (a.complexity !== undefined && b.complexity !== undefined) {
     merged.complexity = Math.max(a.complexity, b.complexity);
@@ -158,7 +164,8 @@ export function audioPoliciesEqual(a: AudioPolicy | undefined, b: AudioPolicy | 
     a.dtx === b.dtx &&
     a.maxBandwidth === b.maxBandwidth &&
     a.complexity === b.complexity &&
-    a.signal === b.signal
+    a.signal === b.signal &&
+    a.stereo === b.stereo
   );
 }
 
@@ -179,6 +186,16 @@ export interface OpusBrowserOptions {
   /** Constant bitrate (`cbr=1`); default off (VBR). */
   cbr?: boolean;
   /**
+   * Encode the microphone in stereo (music / DJ / broadcast sources): asks the browser through
+   * `stereo=1` in the negotiated Opus parameters. Honoured only in channels whose policy allows
+   * stereo while `followChannelPolicy` is on (mono otherwise); takes effect at the next media
+   * negotiation. The browser still needs a 2-channel track: the default `getUserMedia` constraints
+   * switch to `channelCount: 2` with echo cancellation / noise suppression / AGC **off** (browsers
+   * downmix to mono inside their voice processing), unless `audioConstraints` / `localStream` are
+   * given. Default off — voice stays mono.
+   */
+  stereo?: boolean;
+  /**
    * Follow the server's channel audio policy for everything not pinned above (default `true`).
    * With `false` only the explicit options are applied and the browser defaults do the rest.
    */
@@ -192,6 +209,8 @@ export interface OpusSenderPreferences {
   dtx?: boolean;
   maxPlaybackRateHz?: number;
   cbr?: boolean;
+  /** `true`: the browser is asked to encode two channels; `false`: mono; unset: not mentioned. */
+  stereo?: boolean;
 }
 
 /** Resolve local options over the (merged) channel policy into concrete sender preferences. */
@@ -219,6 +238,7 @@ export function resolveOpusSenderPreferences(
   const bw = o.maxBandwidth ?? p?.maxBandwidth;
   if (bw !== undefined) prefs.maxPlaybackRateHz = opusPlaybackRateHz(bw);
   if (o.cbr !== undefined) prefs.cbr = o.cbr;
+  if (o.stereo !== undefined) prefs.stereo = o.stereo && (follow ? policy?.stereo === true : true);
   return prefs;
 }
 
@@ -228,14 +248,16 @@ export function senderPreferencesEqual(a: OpusSenderPreferences, b: OpusSenderPr
     a.fec === b.fec &&
     a.dtx === b.dtx &&
     a.maxPlaybackRateHz === b.maxPlaybackRateHz &&
-    a.cbr === b.cbr
+    a.cbr === b.cbr &&
+    a.stereo === b.stereo
   );
 }
 
 /**
  * Rewrite the Opus `a=fmtp:` lines of an SDP (the server's answer, i.e. what *we* receive and
  * therefore what the browser's encoder honours) with `prefs`. Parameters not covered by `prefs`
- * (e.g. `sprop-stereo`, `minptime`) are preserved; `stereo=`, if present, is left untouched.
+ * (e.g. `sprop-stereo`, `minptime`) are preserved; `stereo=` is only touched when `prefs.stereo`
+ * is set.
  */
 export function applyOpusSenderPreferences(sdp: string, prefs: OpusSenderPreferences): string {
   const overrides = new Map<string, string | undefined>();
@@ -244,6 +266,7 @@ export function applyOpusSenderPreferences(sdp: string, prefs: OpusSenderPrefere
   if (prefs.maxBitrateBps !== undefined) overrides.set('maxaveragebitrate', String(prefs.maxBitrateBps));
   if (prefs.maxPlaybackRateHz !== undefined) overrides.set('maxplaybackrate', String(prefs.maxPlaybackRateHz));
   if (prefs.cbr !== undefined) overrides.set('cbr', prefs.cbr ? '1' : '0');
+  if (prefs.stereo !== undefined) overrides.set('stereo', prefs.stereo ? '1' : '0');
   if (overrides.size === 0) return sdp;
 
   const lines = sdp.split(/\r?\n/);
@@ -318,6 +341,9 @@ export function negotiatedOpusPreferences(sdp: string | undefined): OpusSenderPr
           break;
         case 'cbr':
           prefs.cbr = v === '1';
+          break;
+        case 'stereo':
+          prefs.stereo = v === '1';
           break;
         default:
           break;

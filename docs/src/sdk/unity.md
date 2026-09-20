@@ -176,8 +176,9 @@ The SDK does not bundle Opus; two codecs are provided and the client is codec-ag
   can fall back to Concentus — the quick-start scene does exactly that.
 
 Both expose every libopus encoder control through `OpusEncoderSettings` (`BitrateBps`
-6 000..300 000, `Complexity` 0..10, `MaxBandwidth`, `Signal` Auto/Voice/Music, `Vbr`,
-`ConstrainedVbr`, `Fec`, `ExpectedLossPercent`, `Dtx`) and recover lost frames from the next
+6 000..300 000 mono / ..510 000 stereo, `Complexity` 0..10, `MaxBandwidth`, `Signal`
+Auto/Voice/Music, `Vbr`, `ConstrainedVbr`, `Fec`, `ExpectedLossPercent`, `Dtx`, `Channels`
+1|2) and recover lost frames from the next
 packet's FEC data (`IOpusFecDecoder`; `RemoteMixer` uses it before falling back to PLC,
 `VoiceStats.FramesFecRecovered`).
 
@@ -190,6 +191,19 @@ transient **`BitrateCommand`** (clamped to the policy's floor/target, also raise
 `ExpectedLossPercent`) on top of that — `EffectiveEncoderSettings` shows the result. Semantics
 are identical in the native and Web SDKs; see [Channels](../features/channels.md#configuration)
 and [Network quality](../features/quality.md).
+
+**Stereo uplink.** `Channels = 2` (behaviour: *Stereo*) encodes the microphone's first two
+channels as L/R (a mono device is duplicated) and needs a codec built for two channels —
+`AurixVoiceBehaviour.StereoCodecFactory` (e.g. `() => new ConcentusOpusCodec(48000, 2)`),
+the same factory the server mix uses; without it the behaviour logs a warning and stays mono.
+It is honoured only in channels whose policy has `AudioPolicy.Stereo`
+([Stereo and music uplinks](../features/channels.md#stereo-and-music-uplinks)); voice channels
+force mono and PCMU is always mono. The capture DSP is bypassed for stereo frames (input gain,
+VAD and energy run on the L/R average). Receiving needs nothing: `RemoteMixer` inspects each
+Opus packet (`OpusPacket.IsStereo`), switches a stream to the stereo factory on its first stereo
+packet (falling back to the mono factory, which downmixes, when none is set), keeps the image
+for non-positional senders, downmixes before panning directional ones and averages L/R for a
+mono output.
 
 ## PCMU (G.711) fallback
 

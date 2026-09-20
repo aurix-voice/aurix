@@ -2863,6 +2863,7 @@ mod tests {
             max_bandwidth: OpusBandwidth::Wideband,
             complexity: Some(4),
             signal: OpusSignal::Voice,
+            stereo: false,
         };
         let (id_a, a) = channel(1, voice);
         inner.channels.lock().insert(id_a, a);
@@ -2884,6 +2885,7 @@ mod tests {
             max_bandwidth: OpusBandwidth::Fullband,
             complexity: None,
             signal: OpusSignal::Music,
+            stereo: false,
         };
         let (id_b, b) = channel(2, music);
         inner.channels.lock().insert(id_b, b);

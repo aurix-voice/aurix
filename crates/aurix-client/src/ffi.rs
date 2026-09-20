@@ -473,7 +473,7 @@ impl From<AurixOpusSignal> for OpusSignal {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AurixEncoderSettings {
-    /// 6000..=300000 (libopus' mono ceiling).
+    /// 6000..=300000 for mono, ..=510000 for stereo (libopus' ceilings).
     pub bitrate_bps: u32,
     /// 0..=10 (10 = best quality, most CPU).
     pub complexity: u8,
@@ -489,6 +489,9 @@ pub struct AurixEncoderSettings {
     pub expected_loss_percent: u8,
     /// Discontinuous transmission during silence.
     pub dtx: bool,
+    /// 1 (mono voice, default) or 2 (stereo music / broadcast). Only honoured in channels
+    /// whose policy allows `stereo`; PCMU is always mono. Other values are read as 1.
+    pub channels: u8,
 }
 
 impl From<EncoderSettings> for AurixEncoderSettings {
@@ -503,6 +506,7 @@ impl From<EncoderSettings> for AurixEncoderSettings {
             fec: s.fec,
             expected_loss_percent: s.expected_loss_percent,
             dtx: s.dtx,
+            channels: s.channels,
         }
     }
 }
@@ -519,6 +523,7 @@ impl From<AurixEncoderSettings> for EncoderSettings {
             fec: s.fec,
             expected_loss_percent: s.expected_loss_percent,
             dtx: s.dtx,
+            channels: s.channels,
         }
         .clamped()
     }
@@ -538,6 +543,8 @@ pub struct AurixAudioPolicy {
     pub max_bandwidth: AurixOpusBandwidth,
     pub complexity: i8,
     pub signal: AurixOpusSignal,
+    /// Senders may encode two channels (stereo music / broadcast); `false` asks for mono.
+    pub stereo: bool,
 }
 
 impl From<AudioPolicy> for AurixAudioPolicy {
@@ -550,6 +557,7 @@ impl From<AudioPolicy> for AurixAudioPolicy {
             max_bandwidth: p.max_bandwidth.into(),
             complexity: p.complexity.map_or(-1, |c| c.min(10) as i8),
             signal: p.signal.into(),
+            stereo: p.stereo,
         }
     }
 }

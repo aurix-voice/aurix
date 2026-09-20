@@ -677,6 +677,13 @@ pub fn channel_id_hash(id: &ChannelId) -> u32 {
     crc32fast::hash(id.0.as_bytes())
 }
 
+/// Whether an Opus packet was encoded with two channels: bit 2 of the TOC byte (RFC 6716
+/// §3.1). Receivers use it to pick a stereo decoder for a stereo uplink; an empty packet
+/// (DTX) is neither.
+pub fn opus_packet_is_stereo(packet: &[u8]) -> bool {
+    packet.first().is_some_and(|toc| toc & 0x04 != 0)
+}
+
 /// Detect if raw bytes are an RTP packet (version 2, first 2 bits = 10)
 pub fn is_rtp_packet(data: &[u8]) -> bool {
     if data.len() < RTP_HEADER_MIN_SIZE {
@@ -1760,16 +1767,17 @@ mod tests {
                 max_bandwidth: OpusBandwidth::Wideband,
                 complexity: Some(5),
                 signal: OpusSignal::Voice,
+                stereo: false,
             },
         };
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice"}}}"#
+            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice","stereo":false}}}"#
         );
         let no_hint = serde_json::to_string(&AudioPolicy::default()).unwrap();
         assert_eq!(
             no_hint,
-            r#"{"bitrate_bps":48000,"min_bitrate_bps":12000,"fec":true,"dtx":true,"max_bandwidth":"fullband","complexity":null,"signal":"voice"}"#
+            r#"{"bitrate_bps":48000,"min_bitrate_bps":12000,"fec":true,"dtx":true,"max_bandwidth":"fullband","complexity":null,"signal":"voice","stereo":false}"#
         );
         let partial: AudioPolicy =
             serde_json::from_str(r#"{"bitrate_bps":16000,"signal":"music"}"#).unwrap();
@@ -1777,5 +1785,6 @@ mod tests {
         assert_eq!(partial.signal, OpusSignal::Music);
         assert_eq!(partial.max_bandwidth, OpusBandwidth::Fullband);
         assert!(partial.dtx);
+        assert!(!partial.stereo);
     }
 }

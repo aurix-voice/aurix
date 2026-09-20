@@ -245,7 +245,8 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
     `-π/2..π/2`) after the optional volume byte and before the Opus payload
     (`AurixPacket::take_downlink_meta`); the Unity mixer pans each stream with constant-power
     gains. The WebRTC downlink is mixed in stereo on the server (Opus `sprop-stereo=1`, the Web
-    SDK offers `stereo=1` so browsers decode both channels; uplinks stay mono). End-to-end
+    SDK offers `stereo=1` so browsers decode both channels; uplinks are mono unless the channel
+    opts into stereo — see below). End-to-end
     encrypted native frames are forwarded untouched (no server-side metadata).
     `positional_config.roster_radius` / `text_radius` additionally scope *presence* (join
     ack roster, `ParticipantJoined`/`Left`, positions, mute/speaking/energy) and *text*
@@ -655,20 +656,34 @@ sample rate ∈ {8, 12, 16, 24, 48} kHz). The policy is delivered in `ChannelJoi
 when a channel is edited over REST, pushed live as `ChannelAudioPolicy` to everyone in it
 (`channel.config_updated` on webhooks/SSE). A client in several channels merges them: highest
 bitrate and floor, widest bandwidth, FEC if any channel wants it, DTX only if all allow it,
-music > voice > auto, highest complexity hint.
+music > voice > auto, highest complexity hint, stereo if any channel allows it.
 
-The native core, Unity and Unreal SDKs expose every libopus encoder control (bitrate 6–300 kbit/s,
-complexity, max bandwidth, signal, VBR / constrained VBR, FEC, expected loss, DTX) as a
+The native core, Unity and Unreal SDKs expose every libopus encoder control (bitrate 6–300 kbit/s
+mono / up to 510 stereo, complexity, max bandwidth, signal, VBR / constrained VBR, FEC, expected
+loss, DTX, channels) as a
 **baseline**, apply the merged policy on top unless `follow_channel_policy` is off (complexity
 can always be pinned locally — the CPU budget is the game's decision), and finally the server's
 transient `BitrateCommand {target_bitrate_kbps, reason, expected_loss_percent}`, which the node
 clamps to the policy's `min_bitrate..=bitrate` and which also raises the FEC loss tuning.
 Browsers own their encoder, so the Web SDK sets only what WebRTC allows: bitrate ceiling
 (`RTCRtpSender.setParameters` + `maxaveragebitrate`), `useinbandfec`, `usedtx`,
-`maxplaybackrate` and `cbr` on the answer's Opus `fmtp`. Unity gets libopus through
+`maxplaybackrate`, `cbr` and `stereo` on the answer's Opus `fmtp`. Unity gets libopus through
 `NativeOpusCodec` (P/Invoke into `libaurix_client`, non-variadic entry points, FEC recovery) as
 an alternative to the pure-C# Concentus sample; the C ABI exposes the same encoder/decoder
 standalone (`aurix_opus_*`).
+
+**Stereo / music uplinks.** `ChannelConfig.stereo = true` (default `false`; pair it with
+`audio_profile: music` and a higher `bitrate`) lets senders encode two-channel Opus — music bots,
+DJ decks, broadcast feeds. It is opt-in on both sides (the policy allows it, the client asks for
+`channels = 2` / `Stereo` / `opus.stereo`); a voice channel forces stereo-configured clients back
+to mono. Nothing is negotiated on the wire: an Opus packet's TOC byte says how many channels it
+carries, so the SFU forwards mono and stereo frames alike and every receiver decides per packet —
+native and Unity mixers upgrade a stream to a stereo decoder on its first stereo packet, keep the
+L/R image for non-positional senders, downmix before panning directional ones and average for
+mono outputs; mono-only decoders (recording, transcription, safety, live PCM taps, PCMU edges,
+older SDKs) get libopus' downmix. Recordings of a stereo channel carry a 2-channel `OpusHead`.
+The capture DSP is a voice chain and is bypassed for stereo frames; browsers are opened with a
+2-channel track and voice processing off. PCMU stays mono.
 
 ### PCMU (G.711) fallback for weak devices
 

@@ -122,7 +122,7 @@ struct AURIXVOICE_API FAurixEncoderSettings
 {
 	GENERATED_BODY()
 
-	/** 6000..300000 bit/s. */
+	/** 6000..300000 bit/s for mono, ..510000 for stereo. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
 	int32 BitrateBps = 32000;
 
@@ -155,6 +155,14 @@ struct AURIXVOICE_API FAurixEncoderSettings
 	/** Discontinuous transmission during silence. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
 	bool bDtx = false;
+
+	/**
+	 * Encode two channels (stereo music / broadcast; the first two capture channels are L/R).
+	 * Only honoured in channels whose policy allows stereo; voice channels and PCMU stay mono.
+	 * The capture DSP (AEC / NS / AGC) is voice-only and is bypassed for stereo frames.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bStereo = false;
 };
 
 /** A channel's audio policy (operator-set ChannelConfig), merged over the joined channels. */
@@ -185,6 +193,10 @@ struct AURIXVOICE_API FAurixAudioPolicy
 
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	EAurixOpusSignal Signal = EAurixOpusSignal::Auto;
+
+	/** Senders may encode two channels (stereo music / broadcast); false asks for mono. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bStereo = false;
 };
 
 /** Strength of the RNNoise-derived neural noise suppressor in the capture chain. */

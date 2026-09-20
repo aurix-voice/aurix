@@ -5,7 +5,9 @@
 //! panning). Mirrors `sdk/unity/Runtime/Audio` so all clients sound the same.
 
 use aurix_common::g711::{self, PCMU_FRAME_SAMPLES, PCMU_FRAME_SIZES, PCMU_SAMPLE_RATE};
-use aurix_common::protocol::{decode_audio_level, encode_audio_level, AUDIO_LEVEL_SILENCE};
+use aurix_common::protocol::{
+    decode_audio_level, encode_audio_level, opus_packet_is_stereo, AUDIO_LEVEL_SILENCE,
+};
 use aurix_common::types::{AudioCodec, AudioPolicy, Direction, OpusBandwidth, OpusSignal};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -339,7 +341,7 @@ pub struct EncodedFrame {
 /// clamped by [`EncoderSettings::clamped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderSettings {
-    /// `6_000..=300_000` bit/s (libopus' ceiling for a mono stream).
+    /// `6_000..=300_000` bit/s for mono, `..=510_000` for stereo (libopus' ceilings).
     pub bitrate_bps: u32,
     /// `0..=10`; lower is cheaper on the CPU, higher sounds better at the same bitrate.
     pub complexity: u8,
@@ -357,17 +359,28 @@ pub struct EncoderSettings {
     pub expected_loss_percent: u8,
     /// Discontinuous transmission: near-empty frames during silence.
     pub dtx: bool,
+    /// Channels the uplink is encoded with: `1` (voice, the default) or `2` (stereo music /
+    /// broadcast). A channel policy without `stereo` forces `1`; PCMU is always mono.
+    pub channels: u8,
 }
 
 impl EncoderSettings {
     pub const MIN_BITRATE: u32 = 6_000;
     /// libopus clamps a mono stream's bitrate to 300 kbit/s internally.
     pub const MAX_BITRATE: u32 = 300_000;
+    /// libopus' ceiling for a stereo stream.
+    pub const MAX_STEREO_BITRATE: u32 = 510_000;
     /// libopus' own default.
     pub const DEFAULT_COMPLEXITY: u8 = 9;
 
     pub fn clamped(mut self) -> Self {
-        self.bitrate_bps = self.bitrate_bps.clamp(Self::MIN_BITRATE, Self::MAX_BITRATE);
+        self.channels = if self.channels == 2 { 2 } else { 1 };
+        let max = if self.channels == 2 {
+            Self::MAX_STEREO_BITRATE
+        } else {
+            Self::MAX_BITRATE
+        };
+        self.bitrate_bps = self.bitrate_bps.clamp(Self::MIN_BITRATE, max);
         self.complexity = self.complexity.min(10);
         self.expected_loss_percent = self.expected_loss_percent.min(100);
         self
@@ -375,7 +388,7 @@ impl EncoderSettings {
 
     /// The channel's policy laid over these settings. `complexity` is the app's own choice
     /// (`None`: follow the policy's hint, or keep the current value if it has none); VBR mode
-    /// stays local.
+    /// and the channel count stay local, except that a policy without `stereo` forces mono.
     pub fn with_policy(mut self, policy: &AudioPolicy, local_complexity: Option<u8>) -> Self {
         self.bitrate_bps = policy.bitrate_bps;
         self.fec = policy.fec;
@@ -385,7 +398,18 @@ impl EncoderSettings {
         if let Some(c) = local_complexity.or(policy.complexity) {
             self.complexity = c;
         }
+        if !policy.stereo {
+            self.channels = 1;
+        }
         self.clamped()
+    }
+
+    /// `Application::Audio` for music, `Voip` otherwise; fixed at encoder creation.
+    fn application(&self) -> opus::Application {
+        match self.signal {
+            OpusSignal::Music => opus::Application::Audio,
+            _ => opus::Application::Voip,
+        }
     }
 }
 
@@ -401,6 +425,7 @@ impl Default for EncoderSettings {
             fec: true,
             expected_loss_percent: 5,
             dtx: false,
+            channels: 1,
         }
     }
 }
@@ -471,6 +496,7 @@ pub fn probe_encoder_settings(e: &mut opus::Encoder) -> Result<EncoderSettings, 
         fec: e.get_inband_fec()?,
         expected_loss_percent: e.get_packet_loss_perc()?.clamp(0, 100) as u8,
         dtx: e.get_dtx()?,
+        channels: 1,
     })
 }
 
@@ -510,6 +536,14 @@ fn opus_channels(channels: u8) -> Result<opus::Channels, CodecError> {
     }
 }
 
+fn opus_width(stereo: bool) -> opus::Channels {
+    if stereo {
+        opus::Channels::Stereo
+    } else {
+        opus::Channels::Mono
+    }
+}
+
 /// A bare Opus encoder (any supported rate, mono or stereo) with the same settings model as
 /// the capture path; backs the C ABI `aurix_opus_encoder_*` family used by the Unity SDK's
 /// native codec.
@@ -526,11 +560,11 @@ impl OpusEncoder {
         settings: EncoderSettings,
     ) -> Result<Self, CodecError> {
         let ch = opus_channels(channels)?;
-        let application = match settings.signal {
-            OpusSignal::Music => opus::Application::Audio,
-            _ => opus::Application::Voip,
+        let settings = EncoderSettings {
+            channels,
+            ..settings
         };
-        let mut encoder = opus::Encoder::new(sample_rate_hz, ch, application)?;
+        let mut encoder = opus::Encoder::new(sample_rate_hz, ch, settings.application())?;
         let settings = apply_encoder_settings(&mut encoder, settings)?;
         Ok(Self {
             encoder,
@@ -547,13 +581,21 @@ impl OpusEncoder {
         self.channels
     }
 
+    /// Applies new settings; the channel count is fixed at construction and ignored here.
     pub fn apply(&mut self, settings: EncoderSettings) -> Result<(), opus::Error> {
+        let settings = EncoderSettings {
+            channels: self.channels as u8,
+            ..settings
+        };
         self.settings = apply_encoder_settings(&mut self.encoder, settings)?;
         Ok(())
     }
 
     pub fn probe(&mut self) -> Result<EncoderSettings, opus::Error> {
-        probe_encoder_settings(&mut self.encoder)
+        Ok(EncoderSettings {
+            channels: self.channels as u8,
+            ..probe_encoder_settings(&mut self.encoder)?
+        })
     }
 
     /// Encodes one interleaved frame (a valid Opus frame size for the encoder's rate:
@@ -622,15 +664,29 @@ impl OpusDecoder {
 }
 
 /// Turns arbitrary captured PCM (any rate, 1..=8 interleaved channels, i16 or f32) into
-/// 20 ms mono frames — 48 kHz Opus, or 8 kHz μ-law when the session codec is PCMU — with
-/// input gain and VAD metering applied.
+/// 20 ms frames — 48 kHz Opus (mono, or stereo when [`EncoderSettings::channels`] is 2), or
+/// 8 kHz mono μ-law when the session codec is PCMU — with input gain and VAD metering applied.
+///
+/// Mono encoding averages every input channel. Stereo encoding keeps the first two input
+/// channels as L/R (a mono source is duplicated) and meters VAD / energy on their average;
+/// the capture DSP (AEC / NS / AGC) is voice-only and is bypassed for stereo frames.
 pub struct CaptureEncoder {
     encoder: opus::Encoder,
+    /// Channels the current `encoder` was created with.
+    encoder_channels: u8,
+    music: bool,
     pcmu: PcmuEncoder,
     codec: AudioCodec,
-    resampler: Option<Resampler>,
-    mono: Vec<f32>,
-    pending: Vec<f32>,
+    /// One resampler per encoded channel.
+    resamplers: Vec<Resampler>,
+    /// De-interleaved input per encoded channel (scratch).
+    split: Vec<Vec<f32>>,
+    /// Resampled 48 kHz samples per encoded channel waiting for a whole frame.
+    pending: Vec<Vec<f32>>,
+    /// Interleaved stereo frame scratch.
+    interleaved: Vec<f32>,
+    /// Downmix of a stereo frame for VAD / energy metering.
+    meter: Vec<f32>,
     gain: f32,
     pub vad: VoiceActivityDetector,
     /// Capture DSP (high-pass / AEC / NS / AGC), bypassed until configured.
@@ -642,24 +698,37 @@ pub struct CaptureEncoder {
 
 impl CaptureEncoder {
     pub fn new(settings: EncoderSettings) -> Result<Self, opus::Error> {
-        let encoder =
-            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)?;
+        let settings = settings.clamped();
+        let encoder = Self::make_encoder(&settings)?;
         let mut this = Self {
             encoder,
+            encoder_channels: settings.channels,
+            music: settings.signal == OpusSignal::Music,
             pcmu: PcmuEncoder::new(),
             codec: AudioCodec::Opus,
-            resampler: None,
-            mono: Vec::with_capacity(FRAME_SAMPLES * 4),
-            pending: Vec::with_capacity(FRAME_SAMPLES * 4),
+            resamplers: Vec::new(),
+            split: Vec::new(),
+            pending: Vec::new(),
+            interleaved: vec![0.0; FRAME_SAMPLES * 2],
+            meter: vec![0.0; FRAME_SAMPLES],
             gain: 1.0,
             vad: VoiceActivityDetector::default(),
             dsp: Dsp::new(DspConfig::BYPASS),
-            settings: settings.clamped(),
+            settings,
             out: [0u8; 1275],
             ulaw: Vec::with_capacity(PCMU_FRAME_SAMPLES),
         };
         this.apply(this.settings)?;
         Ok(this)
+    }
+
+    fn make_encoder(settings: &EncoderSettings) -> Result<opus::Encoder, opus::Error> {
+        let ch = if settings.channels == 2 {
+            opus::Channels::Stereo
+        } else {
+            opus::Channels::Mono
+        };
+        opus::Encoder::new(SAMPLE_RATE, ch, settings.application())
     }
 
     /// Which codec the produced frames use. Switching resets both codecs' state so the first
@@ -674,6 +743,15 @@ impl CaptureEncoder {
 
     pub fn codec(&self) -> AudioCodec {
         self.codec
+    }
+
+    /// Channels of the frames currently produced: `settings.channels` for Opus, always 1
+    /// for PCMU.
+    pub fn channels(&self) -> u8 {
+        match self.codec {
+            AudioCodec::Opus => self.settings.channels,
+            AudioCodec::Pcmu => 1,
+        }
     }
 
     pub fn bitrate(&self) -> u32 {
@@ -691,16 +769,32 @@ impl CaptureEncoder {
         self.settings
     }
 
-    /// Pushes every setting into libopus; takes effect from the next frame. On error the
+    /// Pushes every setting into libopus; takes effect from the next frame. A change of the
+    /// channel count or of the music/voice application recreates the encoder (the receiver's
+    /// decoder follows the packets, so nothing else has to be renegotiated). On error the
     /// encoder keeps whatever libopus accepted so far and `settings()` is unchanged.
     pub fn apply(&mut self, settings: EncoderSettings) -> Result<(), opus::Error> {
+        let settings = settings.clamped();
+        let music = settings.signal == OpusSignal::Music;
+        if settings.channels != self.encoder_channels || music != self.music {
+            let mut encoder = Self::make_encoder(&settings)?;
+            let applied = apply_encoder_settings(&mut encoder, settings)?;
+            self.encoder = encoder;
+            self.encoder_channels = settings.channels;
+            self.music = music;
+            self.settings = applied;
+            return Ok(());
+        }
         self.settings = apply_encoder_settings(&mut self.encoder, settings)?;
         Ok(())
     }
 
     /// What libopus reports back, for tests and diagnostics.
     pub fn probe(&mut self) -> Result<EncoderSettings, opus::Error> {
-        probe_encoder_settings(&mut self.encoder)
+        Ok(EncoderSettings {
+            channels: self.encoder_channels,
+            ..probe_encoder_settings(&mut self.encoder)?
+        })
     }
 
     /// Software input gain, clamped to `0..=MAX_INPUT_GAIN`.
@@ -724,57 +818,116 @@ impl CaptureEncoder {
         if pcm.is_empty() || sample_rate == 0 {
             return;
         }
-        self.mono.clear();
+        let enc = usize::from(self.channels());
+        // A change of encoded width or input rate restarts the resamplers (a few ms of
+        // capture are dropped, no clicks: every frame handed on is still whole).
+        if self.pending.len() != enc
+            || self
+                .resamplers
+                .first()
+                .is_some_and(|r| r.from != sample_rate)
+        {
+            self.resamplers = (0..enc)
+                .map(|_| Resampler::new(sample_rate, SAMPLE_RATE))
+                .collect();
+            self.split = (0..enc).map(|_| Vec::with_capacity(pcm.len())).collect();
+            self.pending = (0..enc)
+                .map(|_| Vec::with_capacity(FRAME_SAMPLES * 4))
+                .collect();
+        }
+        for s in &mut self.split {
+            s.clear();
+        }
         for frame in pcm.chunks_exact(channels) {
-            let sum: f32 = frame.iter().sum();
-            self.mono.push(sum / channels as f32);
+            if enc == 1 {
+                let sum: f32 = frame.iter().sum();
+                self.split[0].push(sum / channels as f32);
+            } else if channels == 1 {
+                self.split[0].push(frame[0]);
+                self.split[1].push(frame[0]);
+            } else {
+                self.split[0].push(frame[0]);
+                self.split[1].push(frame[1]);
+            }
         }
-        match &mut self.resampler {
-            Some(r) if r.from == sample_rate => {}
-            _ => self.resampler = Some(Resampler::new(sample_rate, SAMPLE_RATE)),
+        for ((r, input), pending) in self
+            .resamplers
+            .iter_mut()
+            .zip(&self.split)
+            .zip(&mut self.pending)
+        {
+            r.push(input, pending);
         }
-        let mono = std::mem::take(&mut self.mono);
-        if let Some(r) = self.resampler.as_mut() {
-            r.push(&mono, &mut self.pending);
-        }
-        self.mono = mono;
-        let mut offset = 0;
-        while self.pending.len() - offset >= FRAME_SAMPLES {
-            let frame = &mut self.pending[offset..offset + FRAME_SAMPLES];
-            self.dsp.process_frame(frame);
-            if self.gain != 1.0 {
-                for s in frame.iter_mut() {
-                    *s = (*s * self.gain).clamp(-1.0, 1.0);
+        let ready = self.pending.iter().map(Vec::len).min().unwrap_or(0) / FRAME_SAMPLES;
+        for i in 0..ready {
+            let offset = i * FRAME_SAMPLES;
+            if enc == 1 {
+                let frame = &mut self.pending[0][offset..offset + FRAME_SAMPLES];
+                self.dsp.process_frame(frame);
+                if self.gain != 1.0 {
+                    for s in frame.iter_mut() {
+                        *s = (*s * self.gain).clamp(-1.0, 1.0);
+                    }
+                }
+                self.vad.process(frame);
+                let energy = rms(frame);
+                match self.codec {
+                    AudioCodec::Opus => match self.encoder.encode_float(frame, &mut self.out) {
+                        Ok(n) if n > 0 => sink(EncodedFrame {
+                            payload: self.out[..n].to_vec(),
+                            codec: AudioCodec::Opus,
+                            level: self.vad.level(),
+                            energy,
+                            speech: self.vad.speaking(),
+                        }),
+                        _ => {}
+                    },
+                    AudioCodec::Pcmu => {
+                        self.ulaw.clear();
+                        self.pcmu.encode(frame, &mut self.ulaw);
+                        sink(EncodedFrame {
+                            payload: self.ulaw.clone(),
+                            codec: AudioCodec::Pcmu,
+                            level: self.vad.level(),
+                            energy,
+                            speech: self.vad.speaking(),
+                        });
+                    }
+                }
+            } else {
+                let left = &self.pending[0][offset..offset + FRAME_SAMPLES];
+                let right = &self.pending[1][offset..offset + FRAME_SAMPLES];
+                for (n, (l, r)) in left.iter().zip(right).enumerate() {
+                    let (l, r) = if self.gain != 1.0 {
+                        (
+                            (l * self.gain).clamp(-1.0, 1.0),
+                            (r * self.gain).clamp(-1.0, 1.0),
+                        )
+                    } else {
+                        (*l, *r)
+                    };
+                    self.interleaved[n * 2] = l;
+                    self.interleaved[n * 2 + 1] = r;
+                    self.meter[n] = 0.5 * (l + r);
+                }
+                self.vad.process(&self.meter);
+                let energy = rms(&self.meter);
+                if let Ok(n) = self.encoder.encode_float(&self.interleaved, &mut self.out) {
+                    if n > 0 {
+                        sink(EncodedFrame {
+                            payload: self.out[..n].to_vec(),
+                            codec: AudioCodec::Opus,
+                            level: self.vad.level(),
+                            energy,
+                            speech: self.vad.speaking(),
+                        });
+                    }
                 }
             }
-            self.vad.process(frame);
-            let energy = rms(frame);
-            match self.codec {
-                AudioCodec::Opus => match self.encoder.encode_float(frame, &mut self.out) {
-                    Ok(n) if n > 0 => sink(EncodedFrame {
-                        payload: self.out[..n].to_vec(),
-                        codec: AudioCodec::Opus,
-                        level: self.vad.level(),
-                        energy,
-                        speech: self.vad.speaking(),
-                    }),
-                    _ => {}
-                },
-                AudioCodec::Pcmu => {
-                    self.ulaw.clear();
-                    self.pcmu.encode(frame, &mut self.ulaw);
-                    sink(EncodedFrame {
-                        payload: self.ulaw.clone(),
-                        codec: AudioCodec::Pcmu,
-                        level: self.vad.level(),
-                        energy,
-                        speech: self.vad.speaking(),
-                    });
-                }
-            }
-            offset += FRAME_SAMPLES;
         }
-        self.pending.drain(..offset);
+        for pending in &mut self.pending {
+            pending.drain(..ready * FRAME_SAMPLES);
+        }
     }
 
     /// Feed interleaved i16 PCM (see [`Self::push_f32`]).
@@ -792,7 +945,7 @@ impl CaptureEncoder {
     /// Drop buffered samples (device switch, unmute after a long pause).
     pub fn reset(&mut self) {
         self.pending.clear();
-        self.resampler = None;
+        self.resamplers.clear();
         self.vad.reset();
         let _ = self.encoder.reset_state();
         self.pcmu.reset();
@@ -909,8 +1062,14 @@ struct Stream {
     pcmu: PcmuDecoder,
     /// Codec of the last frame decoded; the concealment path follows it.
     codec: AudioCodec,
-    /// Server-mixed stereo stream: `frame` holds interleaved L/R and is not panned.
+    /// The Opus decoder is stereo and `frame` holds interleaved L/R: a server-mixed stream,
+    /// or a sender whose packets carry two channels (a stream upgrades on its first stereo
+    /// packet and stays stereo — libopus upmixes any later mono packet).
     stereo: bool,
+    /// Server-mixed stream: never panned, restarts its decoder if the flag flips.
+    mixed: bool,
+    /// Has a direction: a mono frame is panned, a stereo frame is downmixed and then panned.
+    panned: bool,
     volume: f32,
     left: f32,
     right: f32,
@@ -1023,9 +1182,10 @@ impl RemoteMixer {
         self.push_wire_frame(ssrc, seq, volume, direction, codec, false, data)
     }
 
-    /// [`Self::push_frame`] with `stereo` set for a server-mixed stream (`PacketFlags::Mixed`
+    /// [`Self::push_frame`] with `mixed` set for a server-mixed stream (`PacketFlags::Mixed`
     /// with Opus): the payload is decoded as interleaved stereo and played without panning.
-    /// A stream that flips between mono and stereo restarts its decoder.
+    /// A stream that flips the flag restarts its decoder. Any other Opus stream whose packet
+    /// TOC says stereo (a stereo uplink) switches to a stereo decoder as well.
     #[allow(clippy::too_many_arguments)]
     pub fn push_wire_frame(
         &mut self,
@@ -1034,18 +1194,21 @@ impl RemoteMixer {
         volume: f32,
         direction: Option<Direction>,
         codec: AudioCodec,
-        stereo: bool,
+        mixed: bool,
         data: Vec<u8>,
     ) -> Result<(), opus::Error> {
-        let channels = if stereo {
-            opus::Channels::Stereo
-        } else {
-            opus::Channels::Mono
-        };
+        let stereo_packet = codec == AudioCodec::Opus && opus_packet_is_stereo(&data);
+        let stereo = mixed || stereo_packet;
         if let Some(s) = self.streams.get_mut(&ssrc) {
-            if s.stereo != stereo {
-                s.decoder = opus::Decoder::new(SAMPLE_RATE, channels)?;
-                s.stereo = stereo;
+            let want_stereo = if s.mixed != mixed {
+                stereo
+            } else {
+                s.stereo || stereo
+            };
+            if s.mixed != mixed || s.stereo != want_stereo {
+                s.decoder = opus::Decoder::new(SAMPLE_RATE, opus_width(want_stereo))?;
+                s.stereo = want_stereo;
+                s.mixed = mixed;
                 s.pos = 0;
                 s.len = 0;
             }
@@ -1053,13 +1216,15 @@ impl RemoteMixer {
         let stream = match self.streams.get_mut(&ssrc) {
             Some(s) => s,
             None => {
-                let decoder = opus::Decoder::new(SAMPLE_RATE, channels)?;
+                let decoder = opus::Decoder::new(SAMPLE_RATE, opus_width(stereo))?;
                 self.streams.entry(ssrc).or_insert(Stream {
                     jitter: JitterBuffer::new(self.target_depth, self.max_depth),
                     decoder,
                     pcmu: PcmuDecoder::new(),
                     codec,
                     stereo,
+                    mixed,
+                    panned: false,
                     volume: 1.0,
                     left: 1.0,
                     right: 1.0,
@@ -1074,8 +1239,14 @@ impl RemoteMixer {
         };
         stream.volume = volume;
         match direction {
-            Some(d) if !stereo => (stream.left, stream.right) = d.stereo_gains(),
-            _ => (stream.left, stream.right) = (1.0, 1.0),
+            Some(d) if !mixed => {
+                (stream.left, stream.right) = d.stereo_gains();
+                stream.panned = true;
+            }
+            _ => {
+                (stream.left, stream.right) = (1.0, 1.0);
+                stream.panned = false;
+            }
         }
         let now = Instant::now();
         stream.last_activity = now;
@@ -1142,9 +1313,10 @@ impl RemoteMixer {
         t
     }
 
-    /// Mix into `output` (interleaved, `channels` wide; **adds** to its contents). Mono
-    /// streams with a direction are panned between the first two channels. Returns the
-    /// number of streams that contributed audio.
+    /// Mix into `output` (interleaved, `channels` wide; **adds** to its contents). Streams
+    /// with a direction are panned between the first two channels (a stereo sender is
+    /// downmixed first); stereo streams without one keep their L/R image, or are downmixed
+    /// for a mono output. Returns the number of streams that contributed audio.
     pub fn mix(&mut self, output: &mut [f32], channels: u8) -> usize {
         let channels = channels.clamp(1, 8) as usize;
         let frames_needed = output.len() / channels;
@@ -1214,10 +1386,10 @@ impl RemoteMixer {
                 if gain != 0.0 {
                     contributed = true;
                     let stereo_frame = s.stereo && s.codec == AudioCodec::Opus;
-                    let pan = channels >= 2 && !stereo_frame;
+                    let pan = channels >= 2 && s.panned;
                     for f in 0..take {
                         let base = (written + f) * channels;
-                        if stereo_frame {
+                        if stereo_frame && !pan {
                             let l = s.frame[(s.pos + f) * 2];
                             let r = s.frame[(s.pos + f) * 2 + 1];
                             for c in 0..channels {
@@ -1231,7 +1403,11 @@ impl RemoteMixer {
                             }
                             continue;
                         }
-                        let sample = s.frame[s.pos + f];
+                        let sample = if stereo_frame {
+                            0.5 * (s.frame[(s.pos + f) * 2] + s.frame[(s.pos + f) * 2 + 1])
+                        } else {
+                            s.frame[s.pos + f]
+                        };
                         for c in 0..channels {
                             let g = if pan {
                                 match c {
@@ -1491,6 +1667,7 @@ mod tests {
             fec: false,
             expected_loss_percent: 20,
             dtx: true,
+            channels: 1,
         };
         let mut enc = CaptureEncoder::new(wanted).unwrap();
         assert_eq!(enc.settings(), wanted);
@@ -1560,6 +1737,7 @@ mod tests {
             max_bandwidth: OpusBandwidth::Superwideband,
             complexity: Some(4),
             signal: OpusSignal::Music,
+            stereo: false,
         };
         let base = EncoderSettings {
             vbr: false,
@@ -1627,6 +1805,172 @@ mod tests {
             .collect();
         assert!(rms(&l) < 0.01, "{}", rms(&l));
         assert!((rms(&r) - 0.25).abs() < 0.05, "{}", rms(&r));
+    }
+
+    /// Left-only 44.1 kHz stereo capture, chunked like a device callback.
+    fn left_only_capture(enc: &mut CaptureEncoder) -> Vec<EncodedFrame> {
+        let pcm = sine(44_100, 44_100, 440.0, 0.5);
+        let stereo: Vec<f32> = pcm.iter().flat_map(|&s| [s, 0.0]).collect();
+        let mut frames = Vec::new();
+        for chunk in stereo.chunks(2 * 441) {
+            enc.push_f32(chunk, 44_100, 2, |f| frames.push(f));
+        }
+        frames
+    }
+
+    /// Paced like a real downlink: one frame in, one 20 ms mix out.
+    fn play(
+        mixer: &mut RemoteMixer,
+        ssrc: u32,
+        seq0: u32,
+        frames: &[EncodedFrame],
+        direction: Option<Direction>,
+        channels: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; FRAME_SAMPLES * channels * frames.len()];
+        for (i, f) in frames.iter().enumerate() {
+            mixer
+                .push(ssrc, seq0 + i as u32, 1.0, direction, f.payload.clone())
+                .unwrap();
+            let slice = &mut out[i * FRAME_SAMPLES * channels..(i + 1) * FRAME_SAMPLES * channels];
+            mixer.mix(slice, channels as u8);
+        }
+        out
+    }
+
+    fn split_lr(out: &[f32], skip_frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let l = out
+            .iter()
+            .step_by(2)
+            .skip(FRAME_SAMPLES * skip_frames)
+            .copied()
+            .collect();
+        let r = out
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .skip(FRAME_SAMPLES * skip_frames)
+            .copied()
+            .collect();
+        (l, r)
+    }
+
+    #[test]
+    fn stereo_capture_keeps_the_image_and_the_mixer_follows_the_packets() {
+        let stereo = EncoderSettings {
+            channels: 2,
+            signal: OpusSignal::Music,
+            bitrate_bps: 96_000,
+            ..EncoderSettings::default()
+        };
+        let mut enc = CaptureEncoder::new(stereo).unwrap();
+        assert_eq!(enc.channels(), 2);
+        assert_eq!(enc.probe().unwrap().channels, 2);
+        let frames = left_only_capture(&mut enc);
+        assert!((frames.len() as i64 - 50).abs() <= 1, "{}", frames.len());
+        assert!(frames.iter().all(|f| opus_packet_is_stereo(&f.payload)));
+        // VAD / level are metered on the downmix, so a left-only source still counts.
+        assert!(frames.iter().all(|f| f.speech));
+
+        // Plain receiver (no direction): the image survives.
+        let mut mixer = RemoteMixer::new(1, 12);
+        let out = play(&mut mixer, 1, 0, &frames, None, 2);
+        let (l, r) = split_lr(&out, 4);
+        assert!((rms(&l) - 0.3535).abs() < 0.05, "{}", rms(&l));
+        assert!(rms(&r) < 0.02, "{}", rms(&r));
+
+        // Mono output: downmixed, not dropped.
+        let mut mono = RemoteMixer::new(1, 12);
+        let out1 = play(&mut mono, 2, 0, &frames, None, 1);
+        let e = rms(&out1[FRAME_SAMPLES * 4..]);
+        assert!((e - 0.177).abs() < 0.03, "{e}");
+
+        // Positional receiver: the sender's own image is replaced by the direction.
+        let right = Direction {
+            azimuth: std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+        };
+        let mut positional = RemoteMixer::new(1, 12);
+        let out = play(&mut positional, 3, 0, &frames, Some(right), 2);
+        let (l, r) = split_lr(&out, 4);
+        assert!(rms(&l) < 0.02, "{}", rms(&l));
+        // Downmix (−6 dB) then the constant-power hard-right gain (+3 dB).
+        assert!((rms(&r) - 0.25).abs() < 0.03, "{}", rms(&r));
+
+        // A mono-policy channel and PCMU both force a mono uplink from the same source.
+        let policy = AudioPolicy {
+            bitrate_bps: 64_000,
+            min_bitrate_bps: 16_000,
+            fec: true,
+            dtx: false,
+            max_bandwidth: OpusBandwidth::Fullband,
+            complexity: None,
+            signal: OpusSignal::Music,
+            stereo: false,
+        };
+        assert_eq!(stereo.with_policy(&policy, None).channels, 1);
+        assert_eq!(
+            stereo
+                .with_policy(
+                    &AudioPolicy {
+                        stereo: true,
+                        ..policy
+                    },
+                    None
+                )
+                .channels,
+            2
+        );
+        enc.apply(stereo.with_policy(&policy, None)).unwrap();
+        assert_eq!(enc.channels(), 1);
+        let mono_frames = left_only_capture(&mut enc);
+        assert!(mono_frames.len() >= 45, "{}", mono_frames.len());
+        assert!(mono_frames
+            .iter()
+            .all(|f| !opus_packet_is_stereo(&f.payload)));
+        enc.apply(stereo).unwrap();
+        enc.set_codec(AudioCodec::Pcmu);
+        assert_eq!(enc.channels(), 1);
+        let ulaw = left_only_capture(&mut enc);
+        assert!(ulaw
+            .iter()
+            .all(|f| f.codec == AudioCodec::Pcmu && f.payload.len() == PCMU_FRAME_SAMPLES));
+    }
+
+    #[test]
+    fn mixer_upgrades_a_stream_to_stereo_on_its_first_stereo_packet() {
+        let mut mono_enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        let pcm = sine(FRAME_SAMPLES * 10, 48_000, 440.0, 0.5);
+        let mut mono_frames = Vec::new();
+        mono_enc.push_f32(&pcm, 48_000, 1, |f| mono_frames.push(f));
+        let mut stereo_enc = CaptureEncoder::new(EncoderSettings {
+            channels: 2,
+            bitrate_bps: 96_000,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let stereo_frames = left_only_capture(&mut stereo_enc);
+
+        let mut mixer = RemoteMixer::new(1, 12);
+        let mut seq = 0u32;
+        let out = play(&mut mixer, 9, seq, &mono_frames, None, 2);
+        seq += mono_frames.len() as u32;
+        let (l, r) = split_lr(&out, 4);
+        assert!((rms(&l) - rms(&r)).abs() < 0.01);
+        assert!(rms(&r) > 0.3, "{}", rms(&r));
+
+        // Same SSRC starts sending stereo: decoder upgrades, image appears.
+        let out = play(&mut mixer, 9, seq, &stereo_frames[..20], None, 2);
+        seq += 20;
+        let (l, r) = split_lr(&out, 4);
+        assert!(rms(&l) > 0.3, "{}", rms(&l));
+        assert!(rms(&r) < 0.02, "{}", rms(&r));
+
+        // …and back to mono packets on the (now stereo) decoder: libopus upmixes, no restart.
+        let out = play(&mut mixer, 9, seq, &mono_frames, None, 2);
+        let (l, r) = split_lr(&out, 4);
+        assert!((rms(&l) - rms(&r)).abs() < 0.01);
+        assert!(rms(&r) > 0.3, "{}", rms(&r));
     }
 
     #[test]

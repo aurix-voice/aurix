@@ -2187,11 +2187,13 @@ pub async fn start_recording(
     let app_id = ctx.app_id;
     let channel_id = ChannelId::from_uuid(parse_uuid(&req.channel_id, "channel_id")?);
     let user_id = UserId::from_uuid(parse_uuid(&req.user_id, "user_id")?);
-    state
+    let channel_row = state
         .control
         .channels
         .require_channel(app_id, channel_id)
         .await?;
+    let stereo =
+        aurix_control::channel_manager::ChannelManager::config_from_row(&channel_row).stereo;
     require_user(&state, app_id, user_id).await?;
 
     // The recording is tied to a live session of the user in this channel.
@@ -2229,7 +2231,14 @@ pub async fn start_recording(
     };
 
     let rec = svc
-        .start_recording(app_id, channel_id, session_id, user_id, 48000, 1)
+        .start_recording(
+            app_id,
+            channel_id,
+            session_id,
+            user_id,
+            48000,
+            if stereo { 2 } else { 1 },
+        )
         .await?;
     state.control.audit.log(
         Some(app_id),

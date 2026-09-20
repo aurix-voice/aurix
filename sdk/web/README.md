@@ -373,13 +373,14 @@ const client = new AurixClient({
     dtx: false,              // fmtp usedtx
     maxBandwidth: 'wideband',// fmtp maxplaybackrate=16000
     cbr: false,              // fmtp cbr (local only; default VBR)
+    stereo: false,           // fmtp stereo=1 + 2-channel mic track (music sources; needs a stereo channel policy)
     followChannelPolicy: true, // unset fields come from the server's channel policy (default)
   },
 });
 
 client.on('audioPolicy', (p) => {
   // merged policy of all joined channels: bitrateBps, minBitrateBps, fec, dtx, maxBandwidth,
-  // complexity?, signal — as configured by the operator (ChannelJoinAck.audio / ChannelAudioPolicy)
+  // complexity?, signal, stereo — as configured by the operator (ChannelJoinAck.audio / ChannelAudioPolicy)
   console.log(p, client.opusPreferences, client.negotiatedOpus);
 });
 client.on('bitrate', (kbps, reason, expectedLossPercent) => { /* server adaptation */ });
@@ -390,13 +391,22 @@ await client.renegotiateMedia();                          // … fmtp part at th
 
 Everything goes through WebRTC, so only these controls exist: the bitrate ceiling (live, via
 `setParameters`, and `maxaveragebitrate` at negotiation), in-band FEC, DTX, maximum bandwidth
-and CBR — all `fmtp` parameters of the Opus payload in the server's answer (RFC 7587: the
+, CBR and stereo — all `fmtp` parameters of the Opus payload in the server's answer (RFC 7587: the
 receiver states what the sender should do). **Complexity, signal mode, VBR mode and expected
 loss are owned by the browser** and cannot be set; the policy still exposes them for parity with
 the native SDKs. The server's `BitrateCommand` moves the ceiling within the policy's
 `minBitrateBps..=bitrateBps`; the browser's congestion control keeps running underneath. Helpers
 (`parseAudioPolicy`, `mergeAudioPolicies`, `resolveOpusSenderPreferences`,
-`applyOpusSenderPreferences`, `negotiatedOpusPreferences`) are exported for custom pipelines.
+`applyOpusSenderPreferences`, `negotiatedOpusPreferences`, `defaultAudioConstraints`) are
+exported for custom pipelines.
+
+`opus.stereo: true` is for music sources (a DJ deck, a stereo interface, a bot): it is honoured
+only when the channel policy has `stereo: true` (or `followChannelPolicy: false`), rewrites
+`stereo=1` into the answer and — unless you pass `audioConstraints` — opens the microphone with
+`channelCount: {ideal: 2}` and echo cancellation / noise suppression / auto-gain **off**, since the
+browser's voice processing downmixes to mono. Takes effect at the next negotiation
+(`renegotiateMedia()`); whether two channels really go out also depends on the device and the
+browser's Opus implementation. Voice channels stay mono whatever the client asks.
 
 ## How it maps to the server
 

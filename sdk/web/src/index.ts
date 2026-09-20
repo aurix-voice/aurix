@@ -1,6 +1,7 @@
 export {
   AurixClient,
   channelInfoFromJoinAck,
+  defaultAudioConstraints,
   reconnectEndpoint,
   transmissionFromWire,
   transmissionToWire,

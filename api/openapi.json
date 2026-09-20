@@ -6659,6 +6659,11 @@
             "$ref": "#/components/schemas/AudioProfile",
             "default": "voice"
           },
+          "stereo": {
+            "type": "boolean",
+            "default": false,
+            "description": "Participants may send two-channel (stereo) Opus (music, DJ, broadcast sources); delivered to clients as `audio.stereo`. Off: clients encode mono. The SFU forwards either; stereo receivers keep the image, mono receivers and server-side recording/STT downmix. Recordings started while this is on are written with a 2-channel OpusHead."
+          },
           "recording_enabled": {
             "type": "boolean",
             "default": false

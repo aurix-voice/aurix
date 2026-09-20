@@ -104,13 +104,14 @@ use aurix_client::{EncoderSettings, OpusBandwidth, OpusSignal};
 
 let mut cfg = ClientConfig::new(ws_url, jwt);
 cfg.encoder = EncoderSettings {
-    bitrate_bps: 32_000,                 // 6_000..=300_000 (mono libopus ceiling)
+    bitrate_bps: 32_000,                 // 6_000..=300_000 mono, ..=510_000 stereo
     complexity: 9,                       // 0..=10
     max_bandwidth: OpusBandwidth::Fullband,
     signal: OpusSignal::Voice,           // Auto | Voice | Music → application + signal hint
     vbr: true, constrained_vbr: true,
     fec: true, expected_loss_percent: 5,
     dtx: false,
+    channels: 1,                         // 2 = stereo uplink (music / broadcast sources)
 };
 cfg.follow_channel_policy = true;        // default
 
@@ -129,6 +130,16 @@ all allow it, Music > Voice > Auto, complexity hint unless pinned) and the serve
 `BitrateCommand` (clamped to the policy's floor/target; its `expected_loss_percent` also raises
 the FEC tuning). Same semantics in Unity and — where WebRTC permits — the Web SDK
 ([Channels](../features/channels.md#configuration), [Network quality](../features/quality.md)).
+
+**Stereo.** `channels: 2` encodes the first two capture channels as L/R (a mono device is
+duplicated); it is honoured only while the merged policy has `stereo: true`
+([Stereo and music uplinks](../features/channels.md#stereo-and-music-uplinks)) — a voice
+channel forces the encoder back to mono, PCMU is always mono. The capture DSP is bypassed for
+stereo frames (gain, VAD and energy still run on the L/R average), so pair it with
+`OpusSignal::Music` and a music source rather than a microphone. On the receive side nothing is
+configured: the mixer switches a stream to a stereo decoder on its first stereo packet, keeps the
+image for non-positional senders, downmixes before panning directional ones, and averages L/R
+for `mix_output_*(…, 1)`.
 
 The codec is also available **standalone**, for hosts that run their own transport or want
 libopus without the client: `aurix_opus_encoder_create/apply/settings/encode_f32/encode_i16`,
@@ -334,9 +345,10 @@ sound wave play; call `PushRenderAudio` with any other speaker audio (game mix, 
 can cancel that too.
 
 Opus: `FAurixVoiceSettings.Encoder` (`FAurixEncoderSettings`: bitrate, complexity, max
-bandwidth, signal, VBR/constrained VBR, FEC, expected loss, DTX) and `bFollowChannelPolicy`;
+bandwidth, signal, VBR/constrained VBR, FEC, expected loss, DTX, `bStereo`) and
+`bFollowChannelPolicy`;
 at runtime `SetEncoderSettings`, `GetEncoderSettings`, `SetComplexity` (pin, `-1` un-pins),
-`GetAudioPolicy` (`FAurixAudioPolicy`) and the `OnAudioPolicyChanged` / `OnBitrateChanged`
+`GetAudioPolicy` (`FAurixAudioPolicy`, with `bStereo`) and the `OnAudioPolicyChanged` / `OnBitrateChanged`
 delegates — the same layering as the Rust API above.
 
 `GetStats(FAurixStats&)`, `GetNetworkQuality(FAurixNetworkQuality&)` and `OnNetworkQuality`

@@ -392,5 +392,146 @@ namespace Aurix.Voice.Tests
             public void SetBitrate(int bitsPerSecond) { }
             public void Dispose() { }
         }
+
+        [Fact]
+        public void StereoIsOptInAndFollowsTheChannelPolicy()
+        {
+            var d = OpusEncoderSettings.Default;
+            Assert.Equal(1, d.Channels);
+            Assert.False(d.Stereo);
+            Assert.Equal(1, new OpusEncoderSettings { Channels = 7 }.Clamped().Channels);
+
+            var music = new OpusEncoderSettings { Channels = 2, BitrateBps = 400_000, Signal = OpusSignal.Music }.Clamped();
+            Assert.True(music.Stereo);
+            Assert.Equal(400_000, music.BitrateBps); // stereo ceiling is 510 kbit/s, mono 300
+            Assert.Equal(OpusEncoderSettings.MaxBitrate, new OpusEncoderSettings { Channels = 1, BitrateBps = 400_000 }.Clamped().BitrateBps);
+
+            // Policy: default mono; `stereo` parsed; merge = any.
+            Assert.False(AudioPolicy.Default.Stereo);
+            var mono = AudioPolicy.FromMessage(ControlMessage.Parse("{\"type\":\"ChannelAudioPolicy\",\"data\":{\"channel_id\":\"" + Team + "\",\"audio\":" + PolicyJson + "}}")).Value;
+            Assert.False(mono.Stereo);
+            var wide = AudioPolicy.FromMessage(ControlMessage.Parse(
+                "{\"type\":\"ChannelAudioPolicy\",\"data\":{\"channel_id\":\"" + Party + "\",\"audio\":{\"bitrate_bps\":128000,\"signal\":\"music\",\"stereo\":true}}}")).Value;
+            Assert.True(wide.Stereo);
+            Assert.True(mono.Merge(wide).Stereo);
+            Assert.True(wide.Merge(mono).Stereo);
+            Assert.NotEqual(mono, mono.Merge(wide));
+
+            // A stereo request survives only a stereo-policy channel.
+            var want = OpusEncoderSettings.Default;
+            want.Channels = 2;
+            Assert.Equal(1, want.WithPolicy(mono, null).Channels);
+            Assert.Equal(2, want.WithPolicy(wide, null).Channels);
+            Assert.Equal(1, OpusEncoderSettings.Default.WithPolicy(wide, null).Channels); // the policy allows, it never forces
+        }
+
+        [Fact]
+        public void StereoPacketsUpgradeTheStreamAndPanningDownmixes()
+        {
+            // RFC 6716 TOC: bit 2 is the stereo flag.
+            Assert.False(OpusPacket.IsStereo(new byte[] { 0xF8 }));
+            Assert.True(OpusPacket.IsStereo(new byte[] { 0xFC }));
+            Assert.False(OpusPacket.IsStereo(ReadOnlySpan<byte>.Empty));
+
+            int stereoDecoders = 0, monoDecoders = 0;
+            var mixer = new RemoteMixer(() => { monoDecoders++; return new HalfStub(1); }, () => { stereoDecoders++; return new HalfStub(2); });
+            var mono = new byte[] { 0xF8, 1 };
+            var stereo = new byte[] { 0xFC, 1 };
+            uint seq = 0;
+            for (int i = 0; i < 3; i++) mixer.Push(7, seq++, 1f, null, AudioCodec.Opus, false, mono);
+            Assert.Equal(1, monoDecoders);
+            Assert.Equal(0, stereoDecoders);
+            for (int i = 0; i < 3; i++) mixer.Push(7, seq++, 1f, null, AudioCodec.Opus, false, stereo);
+            Assert.Equal(1, stereoDecoders);
+            // Later mono packets keep the stereo decoder (it upmixes), no churn.
+            for (int i = 0; i < 6; i++) mixer.Push(7, seq++, 1f, null, AudioCodec.Opus, false, mono);
+            Assert.Equal(1, stereoDecoders);
+            Assert.Equal(1, monoDecoders);
+
+            // No direction: the image is kept (L=+0.5, R=−0.5).
+            var outp = new float[AudioFormat.FrameSamples * 2];
+            for (int i = 0; i < 6; i++) { Array.Clear(outp, 0, outp.Length); mixer.Mix(outp, 2); }
+            Assert.Equal(0.5f, outp[outp.Length - 2], 3);
+            Assert.Equal(-0.5f, outp[outp.Length - 1], 3);
+
+            // Hard-right direction: downmixed to one point ((0.5 − 0.5) / 2 = 0) and panned — silence both sides,
+            // where keeping the image would have leaked −0.5 into the right channel.
+            for (int i = 0; i < 3; i++) mixer.Push(7, seq++, 1f, new Direction(MathF.PI / 2f, 0f), AudioCodec.Opus, false, stereo);
+            for (int i = 0; i < 3; i++) { Array.Clear(outp, 0, outp.Length); mixer.Mix(outp, 2); }
+            Assert.Equal(0f, outp[outp.Length - 2], 3);
+            Assert.Equal(0f, outp[outp.Length - 1], 3);
+
+            // A mono receiver gets the downmix.
+            var one = new float[AudioFormat.FrameSamples];
+            for (int i = 0; i < 3; i++) mixer.Push(7, seq++, 1f, null, AudioCodec.Opus, false, stereo);
+            for (int i = 0; i < 3; i++) { Array.Clear(one, 0, one.Length); mixer.Mix(one, 1); }
+            Assert.Equal(0f, one[one.Length - 1], 3);
+
+            // Without a stereo factory the mono factory decodes stereo packets too.
+            var fallback = new RemoteMixer(() => { monoDecoders++; return new HalfStub(1); });
+            fallback.Push(8, 0, 1f, null, AudioCodec.Opus, false, stereo);
+            Assert.Equal(2, monoDecoders);
+        }
+
+        [Fact]
+        public void ConcentusStereoRoundTripKeepsTheImage()
+        {
+            using var enc = new ConcentusOpusCodec(AudioFormat.SampleRate, 2, new OpusEncoderSettings { Channels = 2, BitrateBps = 128_000, Signal = OpusSignal.Music, Vbr = true, Complexity = 5 });
+            Assert.Equal(2, enc.Channels);
+            Assert.Equal(2, enc.Settings.Channels);
+            enc.Apply(OpusEncoderSettings.Default); // a mono request cannot narrow a stereo codec
+            Assert.Equal(2, enc.Settings.Channels);
+
+            using var dec = new ConcentusOpusCodec(AudioFormat.SampleRate, 2);
+            var pcm = new float[AudioFormat.FrameSamples * 2];
+            var packet = new byte[NativeOpusCodec.MaxPacketBytes];
+            var outp = new float[AudioFormat.FrameSamples * 2];
+            double l = 0, r = 0;
+            for (int frame = 0; frame < 25; frame++)
+            {
+                for (int i = 0; i < AudioFormat.FrameSamples; i++)
+                {
+                    int n = frame * AudioFormat.FrameSamples + i;
+                    pcm[i * 2] = 0.5f * MathF.Sin(2f * MathF.PI * 440f * n / AudioFormat.SampleRate); // left only
+                    pcm[i * 2 + 1] = 0f;
+                }
+                int len = enc.Encode(pcm, AudioFormat.FrameSamples, packet);
+                Assert.True(len > 0);
+                Assert.True(OpusPacket.IsStereo(packet.AsSpan(0, len)));
+                Assert.Equal(AudioFormat.FrameSamples, dec.Decode(packet.AsSpan(0, len), outp, AudioFormat.FrameSamples));
+                if (frame < 5) continue; // encoder warm-up
+                for (int i = 0; i < AudioFormat.FrameSamples; i++) { l += outp[i * 2] * outp[i * 2]; r += outp[i * 2 + 1] * outp[i * 2 + 1]; }
+            }
+            double rmsL = Math.Sqrt(l / (20 * AudioFormat.FrameSamples)), rmsR = Math.Sqrt(r / (20 * AudioFormat.FrameSamples));
+            Assert.InRange(rmsL, 0.28, 0.42); // 0.5 · 1/√2 ≈ 0.354
+            Assert.True(rmsR < rmsL * 0.1, $"right leaked: {rmsR} vs {rmsL}");
+
+            // A mono encoder never produces the stereo flag.
+            using var monoEnc = new ConcentusOpusCodec(AudioFormat.SampleRate, 1, OpusEncoderSettings.Default);
+            int monoLen = monoEnc.Encode(new float[AudioFormat.FrameSamples], AudioFormat.FrameSamples, packet);
+            Assert.True(monoLen > 0);
+            Assert.False(OpusPacket.IsStereo(packet.AsSpan(0, monoLen)));
+        }
+
+        /// <summary>Decodes every packet to +0.5 left / −0.5 right (or +0.5 when mono).</summary>
+        private sealed class HalfStub : IOpusCodec
+        {
+            public HalfStub(int channels) { Channels = channels; }
+            public int SampleRate => AudioFormat.SampleRate;
+            public int Channels { get; }
+            public int Encode(ReadOnlySpan<float> pcm, int frameSamplesPerChannel, Span<byte> output) => 0;
+            public int Decode(ReadOnlySpan<byte> opus, Span<float> pcm, int maxFrameSamplesPerChannel)
+            {
+                for (int i = 0; i < AudioFormat.FrameSamples; i++)
+                {
+                    if (Channels == 1) pcm[i] = 0.5f;
+                    else { pcm[i * 2] = 0.5f; pcm[i * 2 + 1] = -0.5f; }
+                }
+                return AudioFormat.FrameSamples;
+            }
+            public int DecodeLost(Span<float> pcm, int frameSamplesPerChannel) { pcm.Slice(0, frameSamplesPerChannel * Channels).Fill(0f); return frameSamplesPerChannel; }
+            public void SetBitrate(int bitsPerSecond) { }
+            public void Dispose() { }
+        }
     }
 }

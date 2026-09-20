@@ -21,6 +21,7 @@ export interface AudioPolicyWire {
   max_bandwidth?: string;
   complexity?: number | null;
   signal?: string;
+  stereo?: boolean;
 }
 
 export interface ParticipantBrief {

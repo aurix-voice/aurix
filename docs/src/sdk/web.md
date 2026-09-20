@@ -104,6 +104,7 @@ WebRTC has a knob for it:
 | DTX | `usedtx` in the Opus `fmtp` | negotiation |
 | max bandwidth | `maxplaybackrate` in the Opus `fmtp` (`wideband` → 16000 …) | negotiation |
 | constant bitrate | `cbr` in the Opus `fmtp` (`opus.cbr`, local only) | negotiation |
+| stereo uplink | `stereo=1` in the Opus `fmtp` + a 2-channel track (`opus.stereo`, `defaultAudioConstraints`) | negotiation |
 | complexity, signal mode, VBR mode, expected loss | **not controllable** — the browser decides | — |
 
 RFC 7587 makes the `fmtp` parameters the *receiver's* wishes, so the SDK rewrites the Opus
@@ -115,6 +116,17 @@ bandwidth changes wait for the next negotiation — compare `client.negotiatedOp
 `BitrateCommand` lowers the ceiling within the policy floor and the SDK never disables the
 browser's own congestion control underneath `maxBitrate`. Set `opus.followChannelPolicy: false`
 to keep only your explicit options.
+
+`opus: { stereo: true }` asks the browser to encode two channels — honoured only when the merged
+channel policy has `stereo: true` (see
+[Stereo and music uplinks](../features/channels.md#stereo-and-music-uplinks)) unless
+`followChannelPolicy: false`. Because browsers' voice processing downmixes the input, the
+default microphone constraints for a stereo client (`defaultAudioConstraints(opts.opus)`) request
+`channelCount: {ideal: 2}` with echo cancellation, noise suppression and auto-gain **off** —
+meant for music sources and stereo interfaces, not a headset; pass your own `audioConstraints`
+to override. Stereo takes effect at the next negotiation (`renegotiateMedia()`) and shows up in
+`negotiatedOpus.stereo`; whether the browser actually sends two channels also depends on the
+device and the browser's Opus implementation.
 
 ## How it maps to the server
 

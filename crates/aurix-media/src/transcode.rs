@@ -179,4 +179,33 @@ mod tests {
         let out = down.transcode(&buf[..n]).unwrap();
         assert_eq!(out.len(), PCMU_FRAME_SAMPLES);
     }
+
+    #[test]
+    fn downlink_downmixes_a_stereo_uplink() {
+        // Stereo (music) senders reach PCMU receivers, recording, STT and live taps through mono
+        // decoders: libopus downmixes, nothing needs to inspect the packet first.
+        let mut enc =
+            opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let pcm: Vec<i16> = (0..960)
+            .flat_map(|i| {
+                let l =
+                    ((i as f32 / 48_000.0 * 300.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+                [l, 0]
+            })
+            .collect();
+        let mut buf = vec![0u8; 1275];
+        let mut down = PcmuDownlink::new().unwrap();
+        let mut last = Vec::new();
+        for _ in 0..8 {
+            let n = enc.encode(&pcm, &mut buf).unwrap();
+            assert!(aurix_common::protocol::opus_packet_is_stereo(&buf[..n]));
+            let out = down.transcode(&buf[..n]).unwrap();
+            assert_eq!(out.len(), PCMU_FRAME_SAMPLES);
+            last.clear();
+            g711::decode(&out, &mut last);
+        }
+        // Left-only 8000 → downmix ≈ 4000 peak, so the μ-law frame carries signal, not silence.
+        let level = rms(&last);
+        assert!(level > 0.05 && level < 0.12, "rms {level}");
+    }
 }

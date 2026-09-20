@@ -172,6 +172,14 @@ stops capture, unbinds the sound wave and only then destroys the client.
   playback switch codec inside the native core, nothing changes in the bridge. Refused with
   `CODEC_NOT_AVAILABLE` when the node runs `media.pcmu_fallback = false`.
 
+* **Stereo uplink:** `FAurixEncoderSettings.bStereo` encodes the first two capture channels as
+  L/R (a mono device is duplicated) for music / broadcast sources; honoured only while the joined
+  channels' policy has `FAurixAudioPolicy.bStereo` (`ChannelConfig.stereo`), otherwise the core
+  falls back to mono — `GetEncoderSettings().bStereo` shows the effective value. The capture DSP
+  is bypassed for stereo frames; PCMU is always mono. Playback needs nothing: the mixer switches
+  to a stereo decoder on the first stereo packet and downmixes before panning directional
+  senders.
+
 * **Blocked UDP:** `FAurixVoiceSettings.MediaPath` (`EAurixMediaPathPolicy::Auto` by default)
   binds media over UDP and falls back to the authenticated control WebSocket when the bind gets
   no answer or `UdpFallbackLostHeartbeats` heartbeats vanish mid-call; while tunnelled UDP is

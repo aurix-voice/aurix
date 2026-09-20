@@ -36,6 +36,7 @@ action token decides them at join time. A grant with `speak: false` makes the me
     "max_bandwidth": "fullband",
     "complexity": null,
     "audio_profile": "voice",
+    "stereo": false,
     "recording_enabled": false,
     "transcription": false,
     "safety_voice": false,
@@ -63,11 +64,15 @@ action token decides them at join time. A grant with `speak: false` makes the me
   `null` = client default) is a CPU/quality hint and `audio_profile` (`voice`, `music`,
   `broadcast`, `low_bandwidth`) selects the encoder's signal mode (`music` → `OPUS_SIGNAL_MUSIC`,
   `broadcast` → auto, otherwise voice). Invalid combinations are rejected with `400`.
+* `stereo` (default `false`) lets participants send **two-channel Opus** — music, DJ and
+  broadcast sources; see [Stereo and music uplinks](#stereo-and-music-uplinks). Off, every
+  SDK encodes mono whatever the app asked for.
 * The policy is delivered to participants as `ChannelJoinAck.audio` and, when an operator edits
   the channel, as `ChannelAudioPolicy` to everyone in it on every node (`channel.config_updated`
   event for your backend). A session in several channels applies the **merge**: the highest
   target/floor bitrate and widest bandwidth, FEC if any channel wants it, DTX only if all allow
-  it, the highest complexity hint, `music` over `voice` over auto. The server forwards native
+  it, the highest complexity hint, `music` over `voice` over auto, stereo if any channel allows
+  it. The server forwards native
   frames without transcoding, so the client's encoder is what actually goes on the wire;
   native/Unity/Unreal clients apply the policy to libopus (or Concentus) directly and browsers
   apply the WebRTC-controllable part (see [quality](quality.md) and the SDK chapters).
@@ -121,6 +126,39 @@ instead of an Opus encoder/decoder — for devices where Opus does not fit the C
 
 SDKs: Unity `client.SetAudioCodecAsync(AudioCodec.Pcmu)` / `AurixVoiceBehaviour.PreferredCodec`,
 native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec` ([overview](../sdk/overview.md)).
+
+## Stereo and music uplinks
+
+Voice channels are mono end to end. A channel with `"stereo": true` (typically together with
+`"audio_profile": "music"` and a higher `bitrate`) lets a sender encode **two channels**: a
+music bot, a DJ deck, a broadcast feed, a stereo microphone pair.
+
+* **Opt-in twice.** The channel policy allows stereo (`audio.stereo: true` in the join ack /
+  `ChannelAudioPolicy`); the client asks for it (native `EncoderSettings.channels = 2`, Unity
+  `OpusEncoderSettings.Channels = 2` / behaviour `Stereo`, Unreal `bStereo`, Web
+  `opus: { stereo: true }`). Either side alone yields mono: a stereo-configured client that
+  joins a voice channel is forced to one channel by the policy, and a mono client in a stereo
+  channel keeps sending mono. Clients that opted out of following the policy
+  (`follow_channel_policy = false`) decide alone. Stereo raises the encoder's bitrate ceiling
+  to 510 kbit/s (300 mono); `music` maps to `OPUS_APPLICATION_AUDIO`.
+* **Nothing to negotiate on the wire.** An Opus packet declares its channel count in its
+  first byte (RFC 6716 TOC bit `s`), so the SFU forwards stereo and mono frames alike and every
+  receiver decides per packet: native/Unity mixers upgrade a stream to a stereo decoder on its
+  first stereo packet (and keep it — a stereo decoder plays later mono packets upmixed), keep
+  the L/R image for non-positional senders, **downmix before panning** when the sender has a
+  direction, and average L/R for mono outputs. Mono-only receivers (older SDKs, PCMU edges,
+  the server's own decoders) simply get libopus' downmix — recording, transcription, content
+  safety and live PCM taps run mono decoders and need no change. WebRTC receivers keep
+  getting the server-mixed stereo downlink.
+* **Captured, not processed.** The client DSP (AEC / NS / AGC) is a voice chain and is bypassed
+  for stereo frames; input gain, VAD and energy reporting still apply (on the L/R average).
+  Native and Unity keep the first two capture channels as L/R and duplicate a mono device;
+  browsers are asked for a two-channel track with echo cancellation, noise suppression and
+  auto-gain off (`defaultAudioConstraints`) because their voice processing downmixes.
+* **PCMU stays mono** (G.711 has one channel); a PCMU session in a stereo channel hears the
+  downmix and sends mono.
+* **Recordings** started while the channel is stereo are written with a 2-channel `OpusHead`
+  (mono packets inside decode fine); recordings of mono channels stay 1-channel.
 
 ## Multiple channels per session
 
