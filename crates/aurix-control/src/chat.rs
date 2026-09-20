@@ -10,6 +10,7 @@ use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{ChatMessage, ChatReadMarker};
 use aurix_common::rate_limit::RateLimiter;
 use aurix_common::types::{AppId, ChannelId, SessionId, UserId};
+use aurix_common::usage::{UsageMeter, UsageMetric};
 use aurix_db::models::{ChatConversation, ChatMessageRow, ChatReadMarkerRow, MessageCursor};
 use aurix_db::DbPool;
 use chrono::Utc;
@@ -185,6 +186,7 @@ pub struct ChatService {
     filters: Vec<Arc<dyn TextFilter>>,
     flood: RateLimiter,
     typing: DashMap<(SessionId, ChannelId), Instant>,
+    usage: Option<Arc<UsageMeter>>,
 }
 
 impl ChatService {
@@ -232,7 +234,14 @@ impl ChatService {
             filters,
             flood,
             typing: DashMap::new(),
+            usage: None,
         }
+    }
+
+    /// Counts accepted messages into the usage meter.
+    pub fn with_usage(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.usage = Some(meter);
+        self
     }
 
     pub fn config(&self) -> &ChatConfig {
@@ -368,6 +377,9 @@ impl ChatService {
                 .map_err(|e| AurixError::Database(format!("chat_messages insert: {e}")))?;
         }
 
+        if let Some(meter) = &self.usage {
+            meter.record(msg.app_id, message.channel_id, UsageMetric::ChatMessages, 1);
+        }
         let mut published = message.clone();
         published.client_ref = msg.client_ref;
         self.events.publish(ServerEvent::ChatMessage {

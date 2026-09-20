@@ -22,6 +22,8 @@ pub mod sink;
 #[cfg(feature = "server")]
 pub mod tts_stt;
 pub mod types;
+#[cfg(feature = "server")]
+pub mod usage;
 
 #[cfg(feature = "server")]
 pub use config::AurixConfig;

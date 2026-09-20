@@ -238,11 +238,22 @@ enabled = true
 sessions_days = 90
 moderation_events_days = 365
 audit_log_days = 0          # 0 = keep forever
-analytics_days = 400
+analytics_days = 400        # legacy analytics_snapshots rows; usage buckets follow [usage]
 inactive_users_days = 0     # 0 = never auto-erase idle users
 tombstones_days = 30
 batch_size = 5000
 interval_secs = 3600
+[usage]
+# Usage accounting behind `GET /v1/analytics*`, the exports and the per-application quotas
+# (`max_concurrent_sessions`, `monthly_participant_minutes`). CCU and minutes are derived
+# from session/membership intervals by one node at a time (advisory lock); media bytes,
+# chat, TTS and STT counters are flushed by every node.
+enabled = true
+flush_interval_secs = 15        # metered counters → database (5..=300)
+aggregate_interval_secs = 60    # lifecycle → 5-minute app / hourly channel buckets (30..=3600)
+retention_days = 400            # application buckets
+channel_retention_days = 90     # per-channel buckets (must not exceed retention_days)
+quota_cache_secs = 30           # how long a node trusts a cached monthly-minutes total (0 = query per join)
 [stt]
 # Speech-to-text of channels created with `transcription = true` (OpenAI-compatible
 # `/v1/audio/transcriptions`, e.g. faster-whisper-server). Transcripts are pushed to the

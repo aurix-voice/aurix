@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod errors;
 pub mod handlers;
 pub mod middleware;

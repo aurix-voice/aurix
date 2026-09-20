@@ -2078,46 +2078,6 @@ pub async fn list_media_nodes(
 
 // ── Analytics ──
 
-#[derive(Deserialize)]
-pub struct AnalyticsQuery {
-    pub from: Option<String>,
-    pub to: Option<String>,
-}
-
-pub async fn get_analytics(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<ApiKeyContext>,
-    Query(query): Query<AnalyticsQuery>,
-) -> JsonResult {
-    ctx.require("analytics:read")?;
-    let app_id = ctx.app_id;
-    let from = query
-        .from
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|| Utc::now() - Duration::days(7));
-    let to = query
-        .to
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-    if to < from || to - from > Duration::days(90) {
-        return Err(AurixError::Validation(
-            "Analytics range must be positive and at most 90 days".into(),
-        )
-        .into());
-    }
-    let snapshots =
-        aurix_db::queries::get_analytics(&state.control.pool, app_id.0, from, to).await?;
-    let active_sessions = state.control.sessions.count_active_sessions(app_id).await?;
-    let active_channels = state.control.channels.count_active_channels(app_id).await?;
-    let users = aurix_db::queries::count_users(&state.control.pool, app_id.0).await?;
-    Ok(Json(serde_json::json!({
-        "current": { "active_sessions": active_sessions, "active_channels": active_channels, "users": users },
-        "history": snapshots,
-    })))
-}
-
 // ── API keys ──
 
 pub const DEFAULT_KEY_PERMISSIONS: &[&str] = &["*"];
@@ -3465,6 +3425,10 @@ pub struct CreateAppRequest {
     pub description: Option<String>,
     pub max_channels: Option<i32>,
     pub max_participants_per_channel: Option<i32>,
+    /// Fleet-wide cap on open sessions; `0` (default) = unlimited.
+    pub max_concurrent_sessions: Option<i32>,
+    /// Participant-minutes per UTC month after which channel joins are refused; `0` = unlimited.
+    pub monthly_participant_minutes: Option<i64>,
 }
 
 pub async fn create_app(
@@ -3480,7 +3444,14 @@ pub async fn create_app(
     }
     let max_channels = req.max_channels.unwrap_or(10_000);
     let max_participants = req.max_participants_per_channel.unwrap_or(256);
-    if max_channels <= 0 || max_participants <= 0 || max_participants > 100_000 {
+    let max_concurrent_sessions = req.max_concurrent_sessions.unwrap_or(0);
+    let monthly_participant_minutes = req.monthly_participant_minutes.unwrap_or(0);
+    if max_channels <= 0
+        || max_participants <= 0
+        || max_participants > 100_000
+        || max_concurrent_sessions < 0
+        || monthly_participant_minutes < 0
+    {
         return Err(AurixError::Validation("Invalid quota values".into()).into());
     }
     let app_id = Uuid::now_v7();
@@ -3494,6 +3465,8 @@ pub async fn create_app(
         active: true,
         max_channels,
         max_participants_per_channel: max_participants,
+        max_concurrent_sessions,
+        monthly_participant_minutes,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -3535,7 +3508,7 @@ pub async fn list_apps(
     let total = aurix_db::queries::count_apps(&state.control.pool).await?;
     let redacted: Vec<serde_json::Value> = apps
         .into_iter()
-        .map(|a| serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "created_at": a.created_at }))
+        .map(|a| serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "max_concurrent_sessions": a.max_concurrent_sessions, "monthly_participant_minutes": a.monthly_participant_minutes, "created_at": a.created_at }))
         .collect();
     Ok(Json(
         serde_json::json!({ "data": redacted, "total": total }),
@@ -3558,7 +3531,7 @@ pub async fn get_app(
         .count_active_sessions(AppId(app_id))
         .await?;
     Ok(Json(
-        serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "created_at": a.created_at, "channels": channels, "active_sessions": sessions }),
+        serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "max_concurrent_sessions": a.max_concurrent_sessions, "monthly_participant_minutes": a.monthly_participant_minutes, "created_at": a.created_at, "channels": channels, "active_sessions": sessions }),
     ))
 }
 
@@ -3570,6 +3543,10 @@ pub struct UpdateAppRequest {
     pub description: Option<Option<String>>,
     pub max_channels: Option<i32>,
     pub max_participants_per_channel: Option<i32>,
+    /// `0` = unlimited.
+    pub max_concurrent_sessions: Option<i32>,
+    /// `0` = unlimited.
+    pub monthly_participant_minutes: Option<i64>,
 }
 
 fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -3599,19 +3576,26 @@ pub async fn update_app(
         || req
             .max_participants_per_channel
             .is_some_and(|m| m <= 0 || m > 100_000)
+        || req.max_concurrent_sessions.is_some_and(|m| m < 0)
+        || req.monthly_participant_minutes.is_some_and(|m| m < 0)
     {
         return Err(AurixError::Validation("Invalid quota values".into()).into());
     }
     let a = aurix_db::queries::update_app(
         &state.control.pool,
         app_id,
-        name,
-        req.description.as_ref().map(|d| d.as_deref()),
-        req.max_channels,
-        req.max_participants_per_channel,
+        aurix_db::queries::AppUpdate {
+            name,
+            description: req.description.as_ref().map(|d| d.as_deref()),
+            max_channels: req.max_channels,
+            max_participants_per_channel: req.max_participants_per_channel,
+            max_concurrent_sessions: req.max_concurrent_sessions,
+            monthly_participant_minutes: req.monthly_participant_minutes,
+        },
     )
     .await?
     .ok_or_else(|| AurixError::NotFound("Application not found".into()))?;
+    state.control.usage.forget_cached(AppId(app_id));
     state.control.audit.log(
         Some(AppId(app_id)),
         UserId(admin.admin_id),
@@ -3622,11 +3606,13 @@ pub async fn update_app(
             "name": name,
             "max_channels": req.max_channels,
             "max_participants_per_channel": req.max_participants_per_channel,
+            "max_concurrent_sessions": req.max_concurrent_sessions,
+            "monthly_participant_minutes": req.monthly_participant_minutes,
         }),
         client_ip_string(ip),
     );
     Ok(Json(
-        serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "created_at": a.created_at, "updated_at": a.updated_at }),
+        serde_json::json!({ "id": a.id, "name": a.name, "description": a.description, "owner_id": a.owner_id, "active": a.active, "max_channels": a.max_channels, "max_participants_per_channel": a.max_participants_per_channel, "max_concurrent_sessions": a.max_concurrent_sessions, "monthly_participant_minutes": a.monthly_participant_minutes, "created_at": a.created_at, "updated_at": a.updated_at }),
     ))
 }
 
@@ -3637,7 +3623,18 @@ pub async fn delete_app(
     Path(app_id): Path<Uuid>,
 ) -> JsonResult {
     admin.require(AdminPermission::AppsDelete)?;
+    aurix_db::queries::get_app(&state.control.pool, app_id)
+        .await?
+        .ok_or_else(|| AurixError::NotFound("Application not found".into()))?;
     aurix_db::queries::delete_app(&state.control.pool, app_id).await?;
+    state
+        .control
+        .events
+        .publish(aurix_control::ServerEvent::AppDeactivated {
+            app_id: AppId(app_id),
+            deleted_by: UserId(admin.admin_id),
+            timestamp: chrono::Utc::now(),
+        });
     state.control.audit.log(
         Some(AppId(app_id)),
         UserId(admin.admin_id),

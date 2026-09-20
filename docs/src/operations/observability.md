@@ -37,6 +37,7 @@ docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < auri
 | `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}` | native sessions whose media rides the control WebSocket because UDP is blocked, and their packets (`uplink` `received`/`rejected`, `downlink` `sent`/`dropped`) — many `dropped` means a client's TCP connection is stalling behind loss |
 | `aurix_api_requests_total{method,path,status}`, `aurix_api_request_duration_seconds` | REST (path templated, ids collapsed) |
 | `aurix_ws_connections`, `aurix_ws_sessions_detached`, `aurix_ws_sessions_resumed_total` | control plane and reconnects |
+| `aurix_quota_rejections_total{quota}`, `aurix_usage_deltas_flushed_total` | per-application quota refusals (`concurrent_sessions` / `participant_minutes`) and metered usage counters written to the database ([Usage analytics and quotas](usage-analytics.md)) |
 | `aurix_rate_limit_hits_total`, `aurix_rate_limit_scope_hits_total{scope,backend}`, `aurix_rate_limit_backend_errors_total`, `aurix_moderation_events_total` | abuse signals — `scope` is `api_ip` / `api_key` / `connect` / `join` / `block` / `report` / `admin_login`, `backend` is `fleet` (shared Redis bucket) or `local`; backend errors mean the fleet limiter fell back to per-node buckets (or refused, with `fail_closed`) |
 | `aurix_turn_allocations`, `aurix_stun_requests_total` | TURN |
 | `aurix_webhook_deliveries_total{result}`, `aurix_webhook_deliveries_leased`, `aurix_event_stream_clients` | webhooks / SSE |

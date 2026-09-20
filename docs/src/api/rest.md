@@ -37,8 +37,8 @@ npx @openapitools/openapi-generator-cli generate -i openapi.json -g typescript-f
 | Area | Routes | Credential |
 | --- | --- | --- |
 | Health | `GET /health`, `GET /ready`, `GET /openapi.json` | none |
-| Admin | `POST /admin/setup`, `GET /admin/auth/methods`, `POST /admin/login`, `GET /admin/oidc/login`, `GET /admin/oidc/callback`, `GET /admin/me`, `POST /admin/me/password`, `POST /admin/logout-all`, `GET/POST /admin/admins`, `GET/PATCH /admin/admins/{id}`, `POST /admin/admins/{id}/password`, `POST /admin/admins/{id}/logout-all`, `GET /admin/audit-log`, `POST /admin/retention/sweep` — [Administrator accounts and SSO](../operations/admin-sso.md) | admin JWT with the `x-aurix-admin-permission` of the operation; bootstrap token for setup; none for `auth/methods` and the SSO routes |
-| Applications & nodes | `GET/POST /v1/apps`, `GET/PATCH/DELETE /v1/apps/{app_id}` (`PATCH` edits name, description and the `max_channels` / `max_participants_per_channel` quotas — up to 100 000 — for [large channels](../features/channels.md#large-channels-and-audiences)), `POST /v1/apps/{app_id}/rotate-key`, `GET /v1/nodes` | admin JWT (`apps:read` / `apps:write` / `apps:delete` / `keys:rotate` / `nodes:read`) |
+| Admin | `POST /admin/setup`, `GET /admin/auth/methods`, `POST /admin/login`, `GET /admin/oidc/login`, `GET /admin/oidc/callback`, `GET /admin/me`, `POST /admin/me/password`, `POST /admin/logout-all`, `GET/POST /admin/admins`, `GET/PATCH /admin/admins/{id}`, `POST /admin/admins/{id}/password`, `POST /admin/admins/{id}/logout-all`, `GET /admin/audit-log`, `POST /admin/retention/sweep`, `GET /admin/analytics/usage`, `GET /admin/analytics/apps/{app_id}`, `GET /admin/analytics/export` — [Administrator accounts and SSO](../operations/admin-sso.md) | admin JWT with the `x-aurix-admin-permission` of the operation; bootstrap token for setup; none for `auth/methods` and the SSO routes |
+| Applications & nodes | `GET/POST /v1/apps`, `GET/PATCH/DELETE /v1/apps/{app_id}` (`PATCH` edits name, description and the quotas: `max_channels` / `max_participants_per_channel` — up to 100 000 — for [large channels](../features/channels.md#large-channels-and-audiences), `max_concurrent_sessions` / `monthly_participant_minutes` for [usage limits](../operations/usage-analytics.md#per-application-limits)), `POST /v1/apps/{app_id}/rotate-key`, `GET /v1/nodes` | admin JWT (`apps:read` / `apps:write` / `apps:delete` / `keys:rotate` / `nodes:read`) |
 | Tokens & TURN | `POST /v1/tokens`, `POST /v1/tokens/action`, `POST /v1/turn/credentials` | API key |
 | Channels | `GET/POST /v1/channels`, `GET/DELETE /v1/channels/{id}`, `PUT /v1/channels/{id}/config`, `GET /v1/channels/{id}/participants`, `POST /v1/channels/{id}/tts`, `GET /v1/tts/voices` | API key |
 | Chat | `GET/POST /v1/channels/{id}/messages`, `GET/POST /v1/users/{id}/messages` | API key |
@@ -49,7 +49,8 @@ npx @openapitools/openapi-generator-cli generate -i openapi.json -g typescript-f
 | Live audio streams | `GET /v1/audio/streams`, `GET/POST /v1/channels/{id}/audio/streams`, `GET …/streams/pull` (WebSocket upgrade), `GET/DELETE …/streams/{stream_id}` | API key |
 | Webhooks | `GET/POST /v1/webhooks`, `GET /v1/webhooks/events`, `GET/PATCH/DELETE /v1/webhooks/{id}`, `POST …/rotate-secret`, `POST …/test`, `POST …/resync`, `GET …/deliveries`, `GET …/deliveries/{id}`, `POST …/deliveries/{id}/retry` | API key |
 | Events | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | API key |
-| Analytics, keys, audit | `GET /v1/analytics`, `GET/POST /v1/api-keys`, `PATCH/DELETE /v1/api-keys/{id}`, `GET /v1/audit-log` | API key |
+| Analytics | `GET /v1/analytics`, `GET /v1/analytics/channels[/{id}]`, `GET /v1/analytics/quota`, `GET /v1/analytics/export` — [Usage analytics and quotas](../operations/usage-analytics.md) | API key (`analytics:read`) |
+| Keys, audit | `GET/POST /v1/api-keys`, `PATCH/DELETE /v1/api-keys/{id}`, `GET /v1/audit-log` | API key |
 | Player | `GET /v1/me/turn-credentials`, `POST /v1/me/reports`, `POST /v1/me/recordings/{id}/consent`, `POST /v1/webrtc/offer` | player JWT |
 
 The exact paths, parameters and schemas are in the specification; the table only orients you.

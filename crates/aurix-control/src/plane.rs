@@ -1,5 +1,4 @@
 use crate::action_tokens::{ActionTokenService, PendingClaim};
-use crate::analytics::AnalyticsCollector;
 use crate::block_manager::BlockManager;
 use crate::channel_manager::ChannelManager;
 use crate::chat::ChatService;
@@ -10,6 +9,7 @@ use crate::redis_store::RedisStore;
 use crate::safety::SafetyService;
 use crate::session_manager::SessionManager;
 use crate::speech::SpeechService;
+use crate::usage::UsageService;
 use crate::user_lifecycle::{RetentionService, UserLifecycle};
 use crate::webhooks::WebhookService;
 use aurix_auth::admin::AdminAuthService;
@@ -43,6 +43,7 @@ pub struct ControlPlane {
     pub webhooks: Arc<WebhookService>,
     pub users: Arc<UserLifecycle>,
     pub retention: Arc<RetentionService>,
+    pub usage: Arc<UsageService>,
     pub events: Arc<EventBus>,
     pub audit: Arc<AuditLogger>,
     pub limits: Arc<FleetLimiter>,
@@ -159,9 +160,7 @@ impl ControlPlane {
         ));
         limits.start_cleanup_task();
 
-        // Analytics collector
-        let analytics = AnalyticsCollector::new(pool.clone());
-        analytics.start();
+        let usage = Arc::new(UsageService::new(config.usage.clone(), pool.clone()));
 
         // Cross-node event replication (origin-tagged, loop-free)
         if let Some(ref redis_store) = redis {
@@ -193,12 +192,15 @@ impl ControlPlane {
             events.clone(),
         )?);
         safety.start();
-        let chat = Arc::new(ChatService::new(
-            config.chat.clone(),
-            pool.clone(),
-            events.clone(),
-            safety.text_filter(),
-        ));
+        let chat = Arc::new(
+            ChatService::new(
+                config.chat.clone(),
+                pool.clone(),
+                events.clone(),
+                safety.text_filter(),
+            )
+            .with_usage(usage.meter()),
+        );
         chat.start_retention_sweep();
         let speech = Arc::new(SpeechService::new(
             config.tts.clone(),
@@ -206,6 +208,9 @@ impl ControlPlane {
             events.clone(),
             chat.clone(),
         ));
+        if let Some(engine) = speech.engine() {
+            engine.set_usage_meter(usage.meter());
+        }
         let webhooks = Arc::new(WebhookService::new(
             config.webhooks.clone(),
             config.is_production(),
@@ -254,6 +259,7 @@ impl ControlPlane {
             webhooks,
             users,
             retention,
+            usage,
             blocks,
             events,
             audit,
@@ -282,9 +288,22 @@ impl ControlPlane {
     /// fleet does not show ghosts until the 24 h registry prune. Exactly one node does this per
     /// lost node (Redis `SET NX`); the mirrors stay, so a client of the lost node that shows up
     /// here within the mirror TTL still gets its session back (`migrate_session` reopens it).
+    /// Sessions whose node has no registry row at all (pruned before anyone reaped it) are
+    /// closed the same way, as of now, so they stop accruing usage.
     pub async fn reap_lost_nodes(&self) {
         let after = self.config.cluster.node_lost_after_secs;
-        let lost = self.nodes.lost_nodes(self.node_id, after);
+        let mut lost = self.nodes.lost_nodes(self.node_id, after);
+        match aurix_db::queries::orphaned_session_nodes(&self.pool).await {
+            Ok(orphans) => {
+                for node in orphans {
+                    let node = MediaNodeId::from_uuid(node);
+                    if node != self.node_id && !lost.contains(&node) {
+                        lost.push(node);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("orphaned-session scan skipped: {e}"),
+        }
         self.reaped_nodes.retain(|id| lost.contains(id));
         for node in lost {
             if self.reaped_nodes.contains(&node) {

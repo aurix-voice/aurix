@@ -14,6 +14,7 @@ use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{channel_id_hash, TtsState};
 use aurix_common::tts_stt::{PcmAudio, TtsProvider};
 use aurix_common::types::{AppId, ChannelId, SessionId, UserId};
+use aurix_common::usage::{UsageMeter, UsageMetric};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
@@ -128,6 +129,7 @@ pub struct TtsEngine {
     queued_per_channel: DashMap<ChannelId, u32>,
     streams: DashMap<u32, Arc<Mutex<StreamClock>>>,
     events: broadcast::Sender<TtsStatusEvent>,
+    usage: OnceLock<Arc<UsageMeter>>,
 }
 
 impl TtsEngine {
@@ -143,7 +145,13 @@ impl TtsEngine {
             queued_per_channel: DashMap::new(),
             streams: DashMap::new(),
             events,
+            usage: OnceLock::new(),
         }
+    }
+
+    /// Counts accepted requests and their characters into the usage meter.
+    pub fn set_usage_meter(&self, meter: Arc<UsageMeter>) {
+        let _ = self.usage.set(meter);
     }
 
     /// Bind the router once the SFU has started; requests fail until then.
@@ -197,6 +205,16 @@ impl TtsEngine {
             *count += 1;
         }
 
+        if let Some(meter) = self.usage.get() {
+            let channel = Some(request.channel_id);
+            meter.record(request.app_id, channel, UsageMetric::TtsRequests, 1);
+            meter.record(
+                request.app_id,
+                channel,
+                UsageMetric::TtsCharacters,
+                request.text.chars().count() as u64,
+            );
+        }
         let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
         let cancel = CancellationToken::new();
         self.jobs.insert(

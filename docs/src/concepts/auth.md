@@ -42,7 +42,7 @@ enforced on top of the per-IP limit — see
 | `chat:read` / `chat:write` | stored message history — system / directed messages |
 | `tts:write` | `POST /v1/channels/:id/tts` |
 | `keys:manage` | API key CRUD |
-| `analytics:read` | `GET /v1/analytics` |
+| `analytics:read` | `GET /v1/analytics*` — series, channel usage, quota state, export ([Usage analytics](../operations/usage-analytics.md)) |
 | `audit:read` | `GET /v1/audit-log` |
 | `webhooks:read` / `webhooks:write` | subscriptions, deliveries, event catalogue — create, update, rotate, test, resync, retry |
 | `events:read` | `GET /v1/events`, `GET /v1/events/snapshot` (and the event catalogue) |
@@ -63,7 +63,7 @@ FORBIDDEN` otherwise).
 | --- | --- | :-: | :-: | :-: | :-: |
 | `apps:read` | `GET /v1/apps`, `GET /v1/apps/{id}` | ✓ | ✓ | ✓ | ✓ |
 | `nodes:read` | `GET /v1/nodes` | ✓ | ✓ | ✓ | ✓ |
-| `analytics:read` | reserved for fleet analytics | ✓ | ✓ | ✓ | ✓ |
+| `analytics:read` | `GET /admin/analytics/usage`, `GET /admin/analytics/apps/{id}`, `GET /admin/analytics/export` | ✓ | ✓ | ✓ | ✓ |
 | `audit:read` | `GET /admin/audit-log` | | ✓ | ✓ | ✓ |
 | `moderation:read` | reserved for cross-app moderation views | | ✓ | ✓ | ✓ |
 | `apps:write` | `POST /v1/apps`, `PATCH /v1/apps/{id}` | | | ✓ | ✓ |

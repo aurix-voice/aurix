@@ -1,6 +1,7 @@
 pub mod migrations;
 pub mod models;
 pub mod queries;
+pub mod usage;
 
 use aurix_common::config::DatabaseConfig;
 use sqlx::postgres::{PgPool, PgPoolOptions};

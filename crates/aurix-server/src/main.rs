@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         options.max_concurrent_stt = config.stt.max_concurrent_requests as usize;
         let mut pipeline =
             aurix_media::audio_pipeline::AudioAnalysisPipeline::new(options, Some(stt), Vec::new());
+        pipeline.set_usage_meter(control.usage.meter());
         let safety = control.safety.clone();
         if safety.voice_enabled() {
             pipeline.set_safety_enabled(true);
@@ -238,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
 
     let media_bind = aurix_common::net::parse_bind_addr(&config.media.host, config.media.port)
         .map_err(|e| anyhow::anyhow!("media.host: {e}"))?;
+    sfu.set_usage_meter(control.usage.meter());
     sfu.start(media_bind).await?;
     info!(
         "SFU node started on {} ({:?})",
@@ -246,6 +248,12 @@ async fn main() -> anyhow::Result<()> {
     );
     control.speech.start(&sfu);
     let sfu = Arc::new(RwLock::new(sfu));
+    {
+        let sfu = sfu.clone();
+        control
+            .usage
+            .set_pre_flush(move || sfu.read().meter_usage());
+    }
     if control.safety.enabled() {
         control
             .safety
@@ -472,6 +480,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    control.usage.start(shutdown.clone());
+    if control.usage.config().enabled {
+        info!(
+            "Usage accounting enabled (flush {}s, aggregate {}s, retention {}d / channels {}d)",
+            config.usage.flush_interval_secs,
+            config.usage.aggregate_interval_secs,
+            config.usage.retention_days,
+            config.usage.channel_retention_days
+        );
     }
 
     if control.retention.enabled() {

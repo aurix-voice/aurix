@@ -306,7 +306,8 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/channels/:id/tts`, `GET /v1/tts/voices` | speak a server announcement into a channel with the configured TTS provider (`tts:write`; `{"text":…,"voice":…}` → `request_id`, progress as `tts.status` events) / list voices and limits (see [Transcripts and text-to-speech](#transcripts-and-text-to-speech)) |
 | API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id`, `POST /v1/recordings/mixdown`, `POST …/:id/transcribe`, `GET …/:id/transcript[?format=srt\|vtt]` | per-participant recording, channel mixdown (Ogg/Opus or WAV) and post-hoc transcript with speakers |
 | API key | `GET /v1/channels/:id/audio/streams/pull` (WebSocket), `POST|GET /v1/channels/:id/audio/streams`, `GET|DELETE …/audio/streams/:sid`, `GET /v1/audio/streams` | real-time audio out of the node — pull it over a WebSocket or have the node push it to yours (`audio_streams:read|write`; see [Live audio streams](#live-audio-streams)) |
-| API key | `POST|GET /v1/api-keys`, `PATCH|DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
+| API key | `POST|GET /v1/api-keys`, `PATCH|DELETE /v1/api-keys/:id`, `GET /v1/audit-log` | account |
+| API key | `GET /v1/analytics[?from&to&step]`, `GET /v1/analytics/channels[/:id]`, `GET /v1/analytics/quota`, `GET /v1/analytics/export[?scope=app\|channels&format=json\|csv]` | usage time series — CCU, session/participant minutes, unique users, media bytes, chat/TTS/STT — per application (5-minute buckets) and per channel (hourly), quota state, raw bucket export for billing (`analytics:read`; see [Usage analytics and quotas](#usage-analytics-and-quotas)) |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
 | API key | `GET /v1/events` (SSE), `GET /v1/events/snapshot` | live server event stream for game servers (`events:read`) |
 | player JWT | `GET /v1/me/turn-credentials`, `GET /v1/me/regions`, `POST /v1/me/reports`, `POST /v1/me/recordings/:id/consent`, `POST /v1/webrtc/offer` | end users (`/me/regions` is the same discovery list for the SDKs' RTT probing) |
@@ -407,7 +408,8 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__RECORDING__*` | `ENABLED`, `STORAGE_PATH`, `RETENTION_DAYS`, `REQUIRE_CONSENT`, `ENCRYPTION_ENABLED` + `ENCRYPTION_KEY` (≥ 32 chars), S3 settings |
 | `AURIX__RATE_LIMITING__*` | `REQUESTS_PER_SECOND` / `BURST_SIZE` per client IP, `PER_KEY` (each API key's own requests/minute), `CONNECTS_PER_MINUTE`, `CHANNEL_JOINS_PER_MINUTE`, `BLOCK_CHANGES_PER_MINUTE`, `REPORTS_PER_MINUTE`, `ADMIN_LOGIN_PER_MINUTE`; `FLEET` shares the buckets through Redis so limits hold across the whole fleet, `FAIL_CLOSED` refuses instead of falling back to per-node buckets when Redis is down |
 | `AURIX__CHAT__*` | `ENABLED` (default `true`), `MAX_MESSAGE_BYTES` (1024, text + metadata, ≤ 16384), `MESSAGES_PER_SECOND`/`MESSAGE_BURST` (2 / 10 per session), `TYPING_INTERVAL_MS` (1500), `SERVER_MUTE_BLOCKS_TEXT` (`true`), `FILTER_WEBHOOK` + `FILTER_TIMEOUT_MS` (1500) + `FILTER_FAIL_OPEN` (`false`), `PERSIST` (`false`) + `RETENTION_DAYS` (30) |
-| `AURIX__RETENTION__*` | `ENABLED` (`true`), `SESSIONS_DAYS` (90), `MODERATION_EVENTS_DAYS` (365, resolved cases only), `AUDIT_LOG_DAYS` (0 = keep), `ANALYTICS_DAYS` (400), `TOMBSTONES_DAYS` (30, must cover the longest token lifetime), `INACTIVE_USERS_DAYS` (0 = never auto-erase), `BATCH_SIZE` (5000), `INTERVAL_SECS` (3600, ≥ 60) — see [User erasure, export and retention](#user-erasure-export-and-retention) |
+| `AURIX__RETENTION__*` | `ENABLED` (`true`), `SESSIONS_DAYS` (90), `MODERATION_EVENTS_DAYS` (365, resolved cases only), `AUDIT_LOG_DAYS` (0 = keep), `ANALYTICS_DAYS` (400, legacy snapshot rows), `TOMBSTONES_DAYS` (30, must cover the longest token lifetime), `INACTIVE_USERS_DAYS` (0 = never auto-erase), `BATCH_SIZE` (5000), `INTERVAL_SECS` (3600, ≥ 60) — see [User erasure, export and retention](#user-erasure-export-and-retention) |
+| `AURIX__USAGE__*` | `ENABLED` (`true`), `FLUSH_INTERVAL_SECS` (15), `AGGREGATE_INTERVAL_SECS` (60), `RETENTION_DAYS` (400, application buckets), `CHANNEL_RETENTION_DAYS` (90), `QUOTA_CACHE_SECS` (30) — see [Usage analytics and quotas](#usage-analytics-and-quotas) |
 | `AURIX__WEBHOOKS__*` | `ENABLED` (`true`), `TIMEOUT_MS` (5000), `RETRY_DELAYS_SECS` (`5,30,120,600,1800,3600,7200`), `CONCURRENCY` (16), `BATCH_SIZE` (100), `MAX_PENDING_PER_SUBSCRIPTION` (10000 — older events are dropped for a dead endpoint), `RETENTION_HOURS` (72, delivery log), `MAX_SUBSCRIPTIONS_PER_APP` (20), `REQUIRE_HTTPS` / `ALLOW_PRIVATE_URLS` (default: strict in production), `SSE_KEEPALIVE_SECS` (15) |
 | `AURIX__STT__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/transcriptions`), `API_KEY`, `MODEL`, `LANGUAGE` (unset = auto-detect), `SEGMENT_SECS` (3.0), `SILENCE_FLUSH_MS` (700), `MIN_SEGMENT_MS` (400), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (8), `INCLUDE_WORDS` (`false`) — see [Transcripts and text-to-speech](#transcripts-and-text-to-speech) |
 | `AURIX__TTS__*` | `ENABLED` (`false`), `ENDPOINT` (OpenAI-compatible `/v1/audio/speech`, WAV), `API_KEY`, `MODEL`, `VOICES` (`alloy`), `DEFAULT_VOICE`, `ALLOW_CLIENT_REQUESTS` (`true`), `MAX_TEXT_CHARS` (500), `MAX_AUDIO_SECS` (30), `TIMEOUT_MS` (15000), `MAX_CONCURRENT_REQUESTS` (4), `MAX_QUEUED_PER_SESSION` (3), `MAX_QUEUED_PER_CHANNEL` (8), `REQUESTS_PER_MINUTE_PER_SESSION` (10) |
@@ -473,7 +475,7 @@ path. Rules with `0` days are skipped:
 | `sessions_days` | sessions **disconnected** longer ago than this, with their memberships (open sessions are never touched) |
 | `moderation_events_days` | **resolved** events older than this; open cases are kept indefinitely |
 | `audit_log_days` | audit entries (default `0`: keep forever — most compliance regimes want them) |
-| `analytics_days` | analytics snapshots |
+| `analytics_days` | legacy `analytics_snapshots` rows (usage buckets follow `[usage]`, see below) |
 | `tombstones_days` | deletion tombstones (after which old tokens can no longer be recognised — hence the validator) |
 | `inactive_users_days` | full erasure (as above, `purge_moderation=false`) of users not seen for this long who are not banned and have no open session; default `0` = off |
 
@@ -484,6 +486,35 @@ returns the per-rule counts. Sweeps that removed anything are audited as `retent
 before the request still contains the data — set your backup retention accordingly. Webhook
 deliveries already queued that mention the user are delivered as-is (the events happened), and
 nothing is recalled from game servers that consumed the event stream.
+
+### Usage analytics and quotas
+
+Every application's consumption is metered into 5-minute buckets (and hourly per-channel
+buckets): CCU (`peak_sessions`), session and participant minutes, sessions started, unique
+users, active channels, recording seconds, media bytes in/out, chat messages, TTS requests and
+characters, STT audio. CCU and minutes are **derived from the session/membership intervals in
+PostgreSQL** by one node at a time (advisory lock) — reconnects, resumes and cross-node
+failover keep the same session and count once, a node that dies is closed at its last
+heartbeat by the fleet reaper and the buckets are re-derived — while the metered counters
+(bytes, chat, TTS, STT) are accumulated on each node and flushed every
+`usage.flush_interval_secs`. Buckets before `range.finalized_through` are final; the current
+one is still accruing.
+
+`GET /v1/analytics?from&to[&step]` returns live counters, range totals and the series (step
+auto-picked among 5 min / 1 h / 1 day, or an explicit multiple of 300 s), `GET
+/v1/analytics/channels[/:id]` the busiest channels and one channel's hourly series, `GET
+/v1/analytics/export?scope=app|channels&format=json|csv` every raw bucket for your billing or BI
+(200 000 rows per call, `truncated` / `X-Aurix-Truncated` when cut), `GET /v1/analytics/quota`
+the limits below. Administrators (`analytics:read`) see the fleet under `/admin/analytics/*`.
+
+Two per-application limits complement `max_channels` / `max_participants_per_channel`
+(`POST|PATCH /v1/apps`, `0` = unlimited): **`max_concurrent_sessions`** — fleet-wide CCU,
+admitted atomically under a per-application advisory lock, the session beyond it is refused with
+`QUOTA_EXCEEDED`; **`monthly_participant_minutes`** — channel minutes per UTC month, checked at
+every channel join as finalized minutes + the live overlap of open memberships, joins are
+refused with `QUOTA_EXCEEDED` until the month rolls over (sessions may still connect, members
+already present stay). Rejections count in `aurix_quota_rejections_total{quota}`. Details,
+retention and the billing recipe: [Usage analytics and quotas](docs/src/operations/usage-analytics.md).
 
 ### Transcripts and text-to-speech
 

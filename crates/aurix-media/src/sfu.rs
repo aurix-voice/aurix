@@ -12,6 +12,7 @@ use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::channel_id_hash;
 use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
+use aurix_common::usage::{UsageMeter, UsageMetric};
 use chrono::Utc;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -121,6 +122,7 @@ pub struct SfuNode {
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
+    usage: Option<Arc<UsageMeter>>,
     events: broadcast::Sender<MediaEvent>,
     local_addr: Option<SocketAddr>,
     family: Option<aurix_common::net::BoundFamily>,
@@ -147,6 +149,7 @@ impl SfuNode {
             cascade: None,
             audio_pipeline: None,
             audio_sink: None,
+            usage: None,
             events,
             local_addr: None,
             family: None,
@@ -162,6 +165,28 @@ impl SfuNode {
     /// Attach a recording/analysis tap. Must be called before `start`.
     pub fn set_audio_sink(&mut self, sink: Arc<dyn AudioSink>) {
         self.audio_sink = Some(sink);
+    }
+
+    /// Meters media bytes per application into `meter` (see [`Self::meter_usage`]).
+    pub fn set_usage_meter(&mut self, meter: Arc<UsageMeter>) {
+        self.usage = Some(meter);
+    }
+
+    /// Hands the bytes every live session moved since the previous call to the usage meter.
+    /// Called periodically; sessions being torn down are metered a last time in place.
+    pub fn meter_usage(&self) {
+        let Some(meter) = self.usage.as_ref() else {
+            return;
+        };
+        for entry in self.sessions_by_id.iter() {
+            Self::meter_session(meter, entry.value());
+        }
+    }
+
+    fn meter_session(meter: &UsageMeter, session: &MediaSession) {
+        let (rx, tx) = session.take_unmetered_bytes();
+        meter.record(session.app_id, None, UsageMetric::MediaBytesIn, rx);
+        meter.record(session.app_id, None, UsageMetric::MediaBytesOut, tx);
     }
 
     pub fn webrtc_manager(&self) -> Option<&Arc<WebRtcManager>> {
@@ -525,6 +550,9 @@ impl SfuNode {
 
     fn teardown_session(&self, session: &Arc<MediaSession>) {
         session.deactivate();
+        if let Some(meter) = self.usage.as_ref() {
+            Self::meter_session(meter, session);
+        }
         self.sessions_by_id.remove(&session.session_id);
         if let Some(addr) = session.clear_endpoint() {
             self.sessions_by_addr.remove(&addr);

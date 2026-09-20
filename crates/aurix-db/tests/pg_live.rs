@@ -35,6 +35,8 @@ async fn app(pool: &DbPool, name: &str) -> Uuid {
         active: true,
         max_channels: 10,
         max_participants_per_channel: 10,
+        max_concurrent_sessions: 0,
+        monthly_participant_minutes: 0,
         created_at: now,
         updated_at: now,
     };

@@ -68,7 +68,7 @@
     },
     {
       "name": "Analytics",
-      "description": "Usage counters and historical snapshots of the application."
+      "description": "Usage time series (CCU, minutes per application and channel), exports and quota state."
     },
     {
       "name": "API keys",
@@ -964,6 +964,234 @@
         "x-aurix-admin-permission": "retention:run"
       }
     },
+    "/admin/analytics/usage": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Usage totals of every application",
+        "operationId": "adminUsage",
+        "description": "Range totals per application across the fleet (applications without usage in the range are omitted). Default range: the last 30 days.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 30 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetUsage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "analytics:read"
+      }
+    },
+    "/admin/analytics/apps/{app_id}": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "One application's series, totals and quota state",
+        "operationId": "adminAppUsage",
+        "description": "The same body as `GET /v1/analytics` for the given application, plus `app_id`, `active` and its `quota`. Deactivated (deleted) applications are still returned so their last invoice can be produced; `404` only for an unknown id.",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          },
+          {
+            "name": "step",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 300,
+              "multipleOf": 300
+            },
+            "description": "Series resolution in seconds, a multiple of 300. Default: the finest of 300/3600/86400 that keeps the series under 5 000 points; an explicit step producing more than 10 000 points is `400`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAppUsage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "analytics:read"
+      }
+    },
+    "/admin/analytics/export": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "5-minute buckets of every application (JSON or CSV)",
+        "operationId": "adminExportUsage",
+        "description": "Fleet-wide export of application buckets (`scope=fleet`), same row shape and cap as `GET /v1/analytics/export`. Default range: the last 30 days.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 30 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "default": "json"
+            },
+            "description": "`csv` returns `text/csv` (see `UsageExport`)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "Content-Disposition": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`attachment; filename=\"usage-….csv\"` for CSV"
+              },
+              "X-Aurix-Truncated": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "true"
+                  ]
+                },
+                "description": "Present on CSV responses when the 200 000-row cap cut the range"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageExport"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "analytics:read"
+      }
+    },
     "/v1/apps": {
       "post": {
         "tags": [
@@ -1127,7 +1355,7 @@
         ],
         "summary": "Edit an application's name, description or quotas",
         "operationId": "updateApp",
-        "description": "Fields left out are unchanged; `description: null` clears it. Raising `max_participants_per_channel` is how an existing application gets large (audience) channels — `POST /v1/channels` clamps `config.max_participants` to this quota. Lowering it affects channels created or reconfigured afterwards.",
+        "description": "Fields left out are unchanged; `description: null` clears it. Raising `max_participants_per_channel` is how an existing application gets large (audience) channels — `POST /v1/channels` clamps `config.max_participants` to this quota. Lowering it affects channels created or reconfigured afterwards. `max_concurrent_sessions` and `monthly_participant_minutes` (0 = unlimited) take effect on new sessions/joins within `usage.quota_cache_secs`; existing sessions are not cut.",
         "parameters": [
           {
             "name": "app_id",
@@ -1183,7 +1411,7 @@
         ],
         "summary": "Deactivate an application",
         "operationId": "deleteApp",
-        "description": "Soft-deletes the app: its API keys stop working and its sessions are closed.",
+        "description": "Soft-deletes the app: its API keys stop authenticating at once, every live session is closed on every node, and its usage history stays readable through `/admin/analytics`. Deleting an already deactivated or unknown application returns 404.",
         "parameters": [
           {
             "name": "app_id",
@@ -3962,8 +4190,9 @@
         "tags": [
           "Analytics"
         ],
-        "summary": "Current counters and historical snapshots",
+        "summary": "Current counters, range totals and the application time series",
         "operationId": "getAnalytics",
+        "description": "CCU (`peak_sessions`), session and participant minutes, unique users, active channels and metered counters per bucket. Lifecycle metrics (CCU, minutes, unique users) are derived from session and membership intervals by a fleet-wide aggregator that runs every `usage.aggregate_interval_secs`; metered counters (media bytes, chat, TTS, STT) are flushed by every node every `usage.flush_interval_secs`. Buckets before `range.finalized_through` are final; the current one is still accruing. Clock-time is UTC; buckets are aligned to epoch multiples of the step.",
         "parameters": [
           {
             "name": "from",
@@ -3971,7 +4200,8 @@
             "schema": {
               "type": "string",
               "format": "date-time"
-            }
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400 days."
           },
           {
             "name": "to",
@@ -3979,7 +4209,18 @@
             "schema": {
               "type": "string",
               "format": "date-time"
-            }
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          },
+          {
+            "name": "step",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 300,
+              "multipleOf": 300
+            },
+            "description": "Series resolution in seconds, a multiple of 300. Default: the finest of 300/3600/86400 that keeps the series under 5 000 points; an explicit step producing more than 10 000 points is `400`."
           }
         ],
         "responses": {
@@ -3988,10 +4229,325 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Analytics"
+                  "$ref": "#/components/schemas/AppUsage"
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "analytics:read"
+        ]
+      }
+    },
+    "/v1/analytics/quota": {
+      "get": {
+        "tags": [
+          "Analytics"
+        ],
+        "summary": "Limits of the application and how much of them is used",
+        "operationId": "getQuota",
+        "description": "`max_concurrent_sessions` and `monthly_participant_minutes` are set by the operator (`PATCH /v1/apps/{app_id}`); `0` means unlimited. Consumption is fleet-wide.",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaState"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "analytics:read"
+        ]
+      }
+    },
+    "/v1/analytics/channels": {
+      "get": {
+        "tags": [
+          "Analytics"
+        ],
+        "summary": "Per-channel totals over a range, busiest first",
+        "operationId": "listChannelUsage",
+        "description": "Channels that had any usage in the range (including deleted ones — usage outlives the channel), ordered by participant minutes.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            },
+            "description": "Maximum number of channels returned."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelUsageList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "analytics:read"
+        ]
+      }
+    },
+    "/v1/analytics/channels/{channel_id}": {
+      "get": {
+        "tags": [
+          "Analytics"
+        ],
+        "summary": "Hourly series of one channel",
+        "operationId": "getChannelUsage",
+        "description": "Peak participants, participant minutes, joins, unique users and metered counters per hour. A channel that neither exists in the application nor has usage there is `404`.",
+        "parameters": [
+          {
+            "name": "channel_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelUsage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "analytics:read"
+        ]
+      }
+    },
+    "/v1/analytics/export": {
+      "get": {
+        "tags": [
+          "Analytics"
+        ],
+        "summary": "Raw usage buckets for billing or BI (JSON or CSV)",
+        "operationId": "exportUsage",
+        "description": "Every bucket of the application in the range: 5-minute application rows (`scope=app`, default) or hourly per-channel rows (`scope=channels`). At most 200 000 rows per call — `truncated` (JSON) / `X-Aurix-Truncated` (CSV) signals a cut; page by narrowing `from`/`to`. Default range: the last 30 days.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 30 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "app",
+                "channels"
+              ],
+              "default": "app"
+            },
+            "description": "`app`: 5-minute application buckets; `channels`: hourly per-channel buckets."
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "default": "json"
+            },
+            "description": "`csv` returns `text/csv` (see `UsageExport`)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "Content-Disposition": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`attachment; filename=\"usage-….csv\"` for CSV"
+              },
+              "X-Aurix-Truncated": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "true"
+                  ]
+                },
+                "description": "Present on CSV responses when the 200 000-row cap cut the range"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageExport"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -7101,83 +7657,6 @@
           "admin"
         ]
       },
-      "Analytics": {
-        "type": "object",
-        "properties": {
-          "current": {
-            "type": "object",
-            "properties": {
-              "active_sessions": {
-                "type": "integer",
-                "format": "int64"
-              },
-              "active_channels": {
-                "type": "integer",
-                "format": "int64"
-              },
-              "users": {
-                "type": "integer",
-                "format": "int64"
-              }
-            }
-          },
-          "history": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AnalyticsSnapshot"
-            }
-          }
-        },
-        "required": [
-          "current",
-          "history"
-        ]
-      },
-      "AnalyticsSnapshot": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "app_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "timestamp": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "active_users": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "active_channels": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "peak_concurrent": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "total_minutes": {
-            "type": "number"
-          },
-          "bandwidth_gb": {
-            "type": "number"
-          },
-          "avg_latency_ms": {
-            "type": "number"
-          },
-          "avg_packet_loss": {
-            "type": "number"
-          },
-          "error_count": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
       "AnnounceRequest": {
         "type": "object",
         "properties": {
@@ -7293,6 +7772,15 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "max_concurrent_sessions": {
+            "type": "integer",
+            "description": "Concurrent sessions (CCU) allowed fleet-wide; the next `SessionInit` beyond it fails with `QUOTA_EXCEEDED`. `0` = unlimited."
+          },
+          "monthly_participant_minutes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Channel participant minutes allowed per UTC calendar month; once reached, channel joins fail with `QUOTA_EXCEEDED` until the month rolls over (sessions may still connect). `0` = unlimited."
           }
         },
         "required": [
@@ -8166,6 +8654,23 @@
               "integer",
               "null"
             ]
+          },
+          "max_concurrent_sessions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Concurrent sessions (CCU) allowed fleet-wide; the next `SessionInit` beyond it fails with `QUOTA_EXCEEDED`. `0` = unlimited."
+          },
+          "monthly_participant_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "description": "Channel participant minutes allowed per UTC calendar month; once reached, channel joins fail with `QUOTA_EXCEEDED` until the month rolls over (sessions may still connect). `0` = unlimited."
           }
         },
         "required": [
@@ -10573,6 +11078,17 @@
             "minimum": 1,
             "maximum": 100000,
             "description": "Upper bound for `ChannelConfig.max_participants` of this app's channels."
+          },
+          "max_concurrent_sessions": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Concurrent sessions (CCU) allowed fleet-wide; the next `SessionInit` beyond it fails with `QUOTA_EXCEEDED`. `0` = unlimited."
+          },
+          "monthly_participant_minutes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Channel participant minutes allowed per UTC calendar month; once reached, channel joins fail with `QUOTA_EXCEEDED` until the month rolls over (sessions may still connect). `0` = unlimited."
           }
         }
       },
@@ -10958,6 +11474,656 @@
         },
         "required": [
           "tokens_revoked"
+        ]
+      },
+      "UsageTotals": {
+        "type": "object",
+        "description": "Sums of additive counters and maxima of peaks over a range.",
+        "properties": {
+          "peak_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Highest number of concurrently connected sessions (CCU) in any bucket"
+          },
+          "session_minutes": {
+            "type": "number",
+            "format": "double",
+            "description": "Connected session time, clipped to the range"
+          },
+          "sessions_started": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "peak_participants": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Highest number of concurrent channel memberships"
+          },
+          "participant_minutes": {
+            "type": "number",
+            "format": "double",
+            "description": "Channel membership time (a user in two channels counts twice); this is what the monthly quota meters"
+          },
+          "recording_seconds": {
+            "type": "number",
+            "format": "double"
+          },
+          "media_bytes_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "AURX/WebRTC media bytes received from the application's players"
+          },
+          "media_bytes_out": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Media bytes sent to the application's players"
+          },
+          "chat_messages": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_characters": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stt_audio_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Audio milliseconds submitted to the STT provider"
+          }
+        },
+        "required": [
+          "peak_sessions",
+          "session_minutes",
+          "sessions_started",
+          "peak_participants",
+          "participant_minutes",
+          "recording_seconds",
+          "media_bytes_in",
+          "media_bytes_out",
+          "chat_messages",
+          "tts_requests",
+          "tts_characters",
+          "stt_audio_ms"
+        ]
+      },
+      "UsageAppBucket": {
+        "type": "object",
+        "description": "One application bucket (5 minutes, or the requested `step` when rolled up). Buckets are aligned to UTC epoch multiples; a bucket at or after `range.finalized_through` is still accruing.",
+        "properties": {
+          "app_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "bucket": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "peak_sessions": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "session_minutes": {
+            "type": "number",
+            "format": "double"
+          },
+          "sessions_started": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unique_users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Distinct users with a session in the bucket"
+          },
+          "peak_participants": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "participant_minutes": {
+            "type": "number",
+            "format": "double"
+          },
+          "active_channels": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Channels with at least one member during the bucket"
+          },
+          "recording_seconds": {
+            "type": "number",
+            "format": "double"
+          },
+          "media_bytes_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "AURX/WebRTC media bytes received from the application's players"
+          },
+          "media_bytes_out": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Media bytes sent to the application's players"
+          },
+          "chat_messages": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_characters": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stt_audio_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Audio milliseconds submitted to the STT provider"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "app_id",
+          "bucket",
+          "peak_sessions",
+          "session_minutes",
+          "sessions_started",
+          "unique_users",
+          "peak_participants",
+          "participant_minutes",
+          "active_channels",
+          "recording_seconds",
+          "media_bytes_in",
+          "media_bytes_out",
+          "chat_messages",
+          "tts_requests",
+          "tts_characters",
+          "stt_audio_ms",
+          "updated_at"
+        ]
+      },
+      "UsageChannelBucket": {
+        "type": "object",
+        "description": "One hourly channel bucket.",
+        "properties": {
+          "app_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "channel_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "bucket": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "peak_participants": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "participant_minutes": {
+            "type": "number",
+            "format": "double"
+          },
+          "joins": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unique_users": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chat_messages": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_characters": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stt_audio_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "app_id",
+          "channel_id",
+          "bucket",
+          "peak_participants",
+          "participant_minutes",
+          "joins",
+          "unique_users",
+          "chat_messages",
+          "tts_requests",
+          "tts_characters",
+          "stt_audio_ms",
+          "updated_at"
+        ]
+      },
+      "UsageRange": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "step_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Resolution of `series`"
+          },
+          "finalized_through": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Buckets before this instant are final; later ones (and the current one) are still being aggregated. `null` until the first aggregation pass."
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "step_secs",
+          "finalized_through"
+        ]
+      },
+      "AppUsage": {
+        "type": "object",
+        "properties": {
+          "current": {
+            "type": "object",
+            "properties": {
+              "active_sessions": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Open sessions right now, fleet-wide"
+              },
+              "active_channels": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "users": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Users known to the application"
+              }
+            },
+            "required": [
+              "active_sessions",
+              "active_channels",
+              "users"
+            ]
+          },
+          "range": {
+            "$ref": "#/components/schemas/UsageRange"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/UsageTotals"
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageAppBucket"
+            }
+          }
+        },
+        "required": [
+          "current",
+          "range",
+          "totals",
+          "series"
+        ]
+      },
+      "AdminAppUsage": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AppUsage"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "app_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "quota": {
+                "$ref": "#/components/schemas/QuotaState"
+              },
+              "active": {
+                "type": "boolean",
+                "description": "`false` once the application was deleted (deactivated); its buckets stay readable for billing."
+              }
+            },
+            "required": [
+              "app_id",
+              "active",
+              "quota"
+            ]
+          }
+        ]
+      },
+      "ChannelUsageTotals": {
+        "type": "object",
+        "properties": {
+          "channel_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "peak_participants": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "participant_minutes": {
+            "type": "number",
+            "format": "double"
+          },
+          "joins": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unique_users": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chat_messages": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tts_characters": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stt_audio_ms": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "channel_id",
+          "peak_participants",
+          "participant_minutes",
+          "joins",
+          "unique_users",
+          "chat_messages",
+          "tts_requests",
+          "tts_characters",
+          "stt_audio_ms"
+        ]
+      },
+      "ChannelUsageList": {
+        "type": "object",
+        "properties": {
+          "range": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          },
+          "channels": {
+            "type": "array",
+            "description": "Busiest channels first (by participant minutes).",
+            "items": {
+              "$ref": "#/components/schemas/ChannelUsageTotals"
+            }
+          }
+        },
+        "required": [
+          "range",
+          "channels"
+        ]
+      },
+      "ChannelUsage": {
+        "type": "object",
+        "properties": {
+          "channel_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "range": {
+            "$ref": "#/components/schemas/UsageRange"
+          },
+          "totals": {
+            "type": "object",
+            "properties": {
+              "peak_participants": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "participant_minutes": {
+                "type": "number",
+                "format": "double"
+              },
+              "joins": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "chat_messages": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "tts_requests": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "tts_characters": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "stt_audio_ms": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "required": [
+              "peak_participants",
+              "participant_minutes",
+              "joins",
+              "chat_messages",
+              "tts_requests",
+              "tts_characters",
+              "stt_audio_ms"
+            ]
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageChannelBucket"
+            }
+          }
+        },
+        "required": [
+          "channel_id",
+          "range",
+          "totals",
+          "series"
+        ]
+      },
+      "QuotaState": {
+        "type": "object",
+        "description": "Per-application limits and their current consumption. `0` means unlimited.",
+        "properties": {
+          "max_concurrent_sessions": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "active_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Open sessions fleet-wide"
+          },
+          "monthly_participant_minutes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "participant_minutes_this_month": {
+            "type": "number",
+            "format": "double",
+            "description": "Finalized buckets since `month_start` plus the live overlap of open memberships"
+          },
+          "month_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the current UTC calendar month; the monthly quota resets here."
+          }
+        },
+        "required": [
+          "max_concurrent_sessions",
+          "active_sessions",
+          "monthly_participant_minutes",
+          "participant_minutes_this_month",
+          "month_start"
+        ]
+      },
+      "UsageExport": {
+        "type": "object",
+        "description": "JSON form of an export. With `format=csv` the same rows are returned as `text/csv` (header row first, RFC 3339 buckets) with `Content-Disposition: attachment` and `X-Aurix-Truncated: true` when the row cap cut the range.",
+        "properties": {
+          "range": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "app",
+              "channels",
+              "fleet"
+            ]
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "More than 200 000 rows matched; narrow the range."
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/UsageAppBucket"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageChannelBucket"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "range",
+          "scope",
+          "count",
+          "truncated",
+          "rows"
+        ]
+      },
+      "FleetUsage": {
+        "type": "object",
+        "properties": {
+          "range": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "finalized_through": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "from",
+              "to",
+              "finalized_through"
+            ]
+          },
+          "apps": {
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/UsageTotals"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "app_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  },
+                  "required": [
+                    "app_id"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "range",
+          "apps"
         ]
       }
     }

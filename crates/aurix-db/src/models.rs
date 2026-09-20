@@ -14,6 +14,10 @@ pub struct AppRow {
     pub active: bool,
     pub max_channels: i32,
     pub max_participants_per_channel: i32,
+    /// Fleet-wide cap on simultaneously connected sessions; `0` = unlimited.
+    pub max_concurrent_sessions: i32,
+    /// Cap on channel participant-minutes per calendar month (UTC); `0` = unlimited.
+    pub monthly_participant_minutes: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -378,21 +382,6 @@ pub struct ApiKeyRow {
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct AnalyticsSnapshotRow {
-    pub id: Uuid,
-    pub app_id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    pub active_users: i64,
-    pub active_channels: i64,
-    pub peak_concurrent: i64,
-    pub total_minutes: f64,
-    pub bandwidth_gb: f64,
-    pub avg_latency_ms: f64,
-    pub avg_packet_loss: f64,
-    pub error_count: i64,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

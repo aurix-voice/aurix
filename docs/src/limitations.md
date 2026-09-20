@@ -73,6 +73,13 @@ the chapter that explains the boundary.
   stream on the old node is finalised at that point and continues on the new node only if
   that node records/streams the channel. Failover needs Redis — without it a resume elsewhere
   is a fresh session ([High availability](operations/high-availability.md)).
+* **Usage metering is exact for CCU and minutes, eventual for counters.** CCU, session and
+  participant minutes are derived from lifecycle intervals in PostgreSQL and survive node loss;
+  media-byte, chat, TTS and STT counters are flushed per node every `usage.flush_interval_secs`
+  and a crashed node loses its last interval. Series are 5-minute (application) / hourly
+  (channel) buckets, UTC only, with no per-user breakdown; the monthly minute quota is admission
+  control at channel join, not a kill switch for members already present
+  ([Usage analytics and quotas](operations/usage-analytics.md)).
 * **Redis Sentinel yes, Redis Cluster no.** The ownership claim is a multi-key Lua script
   without hash tags and the event bus is classic Pub/Sub; point the fleet at a Sentinel set or
   a managed endpoint with a stable address.

@@ -1,3 +1,4 @@
+use crate::analytics;
 use crate::handlers;
 use crate::middleware;
 use crate::state::AppState;
@@ -104,6 +105,15 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::admin_rotate_app_key),
         )
         .route("/v1/nodes", get(handlers::list_media_nodes))
+        .route("/admin/analytics/usage", get(analytics::admin_usage))
+        .route(
+            "/admin/analytics/export",
+            get(analytics::admin_export_usage),
+        )
+        .route(
+            "/admin/analytics/apps/:app_id",
+            get(analytics::admin_app_usage),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::admin_auth_middleware,
@@ -204,7 +214,14 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/safety/users/:user_id/risk",
             get(handlers::get_safety_user_risk),
         )
-        .route("/v1/analytics", get(handlers::get_analytics))
+        .route("/v1/analytics", get(analytics::get_analytics))
+        .route("/v1/analytics/quota", get(analytics::get_quota))
+        .route("/v1/analytics/export", get(analytics::export_usage))
+        .route("/v1/analytics/channels", get(analytics::list_channel_usage))
+        .route(
+            "/v1/analytics/channels/:channel_id",
+            get(analytics::get_channel_usage),
+        )
         .route(
             "/v1/api-keys",
             post(handlers::create_api_key).get(handlers::list_api_keys),

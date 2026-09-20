@@ -31,6 +31,7 @@ use aurix_common::protocol::{
 use aurix_common::types::*;
 use aurix_control::chat::{Conversation, OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
+use aurix_control::session_manager::ClientInfo;
 use aurix_control::{
     ActionTokenService, ControlPlane, LimitScope, MirroredChannel, MirroredPrefs, ParticipantSpeak,
     ServerEvent, SessionMirror, TakeoverRefused, MIGRATION_SEQUENCE_GAP,
@@ -308,6 +309,14 @@ impl WsState {
                 let _ = conn.tx.try_send(json.clone());
             }
         }
+    }
+
+    fn sessions_of_app(&self, app_id: AppId) -> Vec<SessionId> {
+        self.connections
+            .iter()
+            .filter(|e| e.value().app_id == app_id)
+            .map(|e| *e.key())
+            .collect()
     }
 
     fn sessions_of_user(&self, app_id: AppId, user_id: UserId) -> Vec<SessionId> {
@@ -1104,6 +1113,11 @@ impl WsState {
                 } => {
                     for sid in self.sessions_of_user(app_id, user_id) {
                         self.request_close(sid, "user deleted");
+                    }
+                }
+                ServerEvent::AppDeactivated { app_id, .. } => {
+                    for sid in self.sessions_of_app(app_id) {
+                        self.request_close(sid, "application deactivated");
                     }
                 }
                 ServerEvent::RecordingStarted {
@@ -1989,8 +2003,11 @@ async fn adopt_mirrored_session(
                     token.user_id,
                     token.app_id,
                     node_id,
-                    &ip.to_string(),
-                    user_agent,
+                    ClientInfo {
+                        ip_address: &ip.to_string(),
+                        user_agent,
+                    },
+                    0,
                 )
                 .await;
             if let Err(e) = created {
@@ -2248,6 +2265,9 @@ async fn open_session(
         }
     }
 
+    // The application's quotas apply before any node resource is taken.
+    let limits = state.control.usage.app_limits(token.app_id).await?;
+
     let session_id = SessionId::new();
     // Media session first: node capacity is the hard limit.
     let created = {
@@ -2281,16 +2301,22 @@ async fn open_session(
             token.user_id,
             token.app_id,
             state.control.node_id,
-            &ip.to_string(),
-            user_agent,
+            ClientInfo {
+                ip_address: &ip.to_string(),
+                user_agent,
+            },
+            limits.max_concurrent_sessions,
         )
         .await
     {
-        warn!("session persistence failed: {e}");
         {
             let sfu = state.sfu.read();
             let _ = sfu.destroy_session(&session_id);
         }
+        if matches!(e, AurixError::QuotaExceeded(_)) {
+            return Err(e);
+        }
+        warn!("session persistence failed: {e}");
         return Err(AurixError::Internal("Session could not be created".into()));
     }
 
@@ -3221,6 +3247,20 @@ async fn handle_control_message(
                 (token.channels.clone(), None)
             };
             if let Err(e) = state.control.rbac.check_channel_join(&channel_id, &perms) {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+            // Monthly participant-minutes quota: a join is what starts charging.
+            let quota = match state.control.usage.app_limits(token.app_id).await {
+                Ok(limits) => {
+                    state
+                        .control
+                        .usage
+                        .check_minutes_quota(token.app_id, limits.monthly_participant_minutes)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = quota {
                 return send_error(tx, e.error_code(), &e.public_message()).await;
             }
             // Tenant check + persisted configuration (limits, spatial settings, codec). An

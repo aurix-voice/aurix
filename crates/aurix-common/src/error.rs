@@ -48,6 +48,10 @@ pub enum AurixError {
     #[error("Rate limit exceeded: {0}")]
     RateLimitExceeded(String),
 
+    /// A per-application usage quota (concurrent sessions, monthly minutes) is exhausted.
+    #[error("Quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
 
@@ -176,6 +180,7 @@ impl AurixError {
             Self::UserBanned(_) => 403,
             Self::UserMuted(_) => 403,
             Self::RateLimitExceeded(_) => 429,
+            Self::QuotaExceeded(_) => 429,
             Self::InvalidConfiguration(_) => 400,
             Self::Validation(_) => 400,
             Self::Conflict(_) => 409,
@@ -211,6 +216,7 @@ impl AurixError {
             Self::SessionNotFound(_) => "SESSION_NOT_FOUND",
             Self::MediaNodeUnavailable(_) => "MEDIA_NODE_UNAVAILABLE",
             Self::RateLimitExceeded(_) => "RATE_LIMIT_EXCEEDED",
+            Self::QuotaExceeded(_) => "QUOTA_EXCEEDED",
             Self::InvalidConfiguration(_) => "INVALID_CONFIG",
             Self::Database(_) => "DB_ERROR",
             Self::Redis(_) => "REDIS_ERROR",

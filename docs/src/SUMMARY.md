@@ -41,6 +41,7 @@
 
 - [Deployment and configuration](operations/deployment.md)
 - [Administrator accounts and SSO](operations/admin-sso.md)
+- [Usage analytics and quotas](operations/usage-analytics.md)
 - [Scaling out](operations/scaling.md)
 - [High availability](operations/high-availability.md)
 - [Backups and observability](operations/observability.md)

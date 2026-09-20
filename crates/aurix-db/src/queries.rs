@@ -7,19 +7,29 @@ use uuid::Uuid;
 
 pub async fn create_app(pool: &DbPool, app: &AppRow) -> Result<AppRow, sqlx::Error> {
     sqlx::query_as::<_, AppRow>(
-        r#"INSERT INTO apps (id, name, description, owner_id, api_key_hash, api_secret_hash, active, max_channels, max_participants_per_channel, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        r#"INSERT INTO apps (id, name, description, owner_id, api_key_hash, api_secret_hash, active, max_channels, max_participants_per_channel, max_concurrent_sessions, monthly_participant_minutes, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
            RETURNING *"#
     )
     .bind(app.id).bind(&app.name).bind(&app.description).bind(app.owner_id)
     .bind(&app.api_key_hash).bind(&app.api_secret_hash).bind(app.active)
     .bind(app.max_channels).bind(app.max_participants_per_channel)
+    .bind(app.max_concurrent_sessions).bind(app.monthly_participant_minutes)
     .bind(app.created_at).bind(app.updated_at)
     .fetch_one(pool).await
 }
 
 pub async fn get_app(pool: &DbPool, id: Uuid) -> Result<Option<AppRow>, sqlx::Error> {
     sqlx::query_as::<_, AppRow>("SELECT * FROM apps WHERE id = $1 AND active = true")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Like [`get_app`] but also returns deactivated applications (their usage history stays
+/// readable for billing).
+pub async fn get_app_any(pool: &DbPool, id: Uuid) -> Result<Option<AppRow>, sqlx::Error> {
+    sqlx::query_as::<_, AppRow>("SELECT * FROM apps WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -55,14 +65,22 @@ pub async fn update_app_key_hash(
     Ok(())
 }
 
-/// Updates an app's editable settings; `None` keeps the current value.
+/// Editable application settings for [`update_app`]; `None` keeps the current value.
+#[derive(Debug, Clone, Default)]
+pub struct AppUpdate<'a> {
+    pub name: Option<&'a str>,
+    pub description: Option<Option<&'a str>>,
+    pub max_channels: Option<i32>,
+    pub max_participants_per_channel: Option<i32>,
+    pub max_concurrent_sessions: Option<i32>,
+    pub monthly_participant_minutes: Option<i64>,
+}
+
+/// Updates an app's editable settings.
 pub async fn update_app(
     pool: &DbPool,
     app_id: uuid::Uuid,
-    name: Option<&str>,
-    description: Option<Option<&str>>,
-    max_channels: Option<i32>,
-    max_participants_per_channel: Option<i32>,
+    update: AppUpdate<'_>,
 ) -> Result<Option<AppRow>, sqlx::Error> {
     sqlx::query_as::<_, AppRow>(
         r#"UPDATE apps SET
@@ -70,16 +88,20 @@ pub async fn update_app(
                description = CASE WHEN $3 THEN $4 ELSE description END,
                max_channels = COALESCE($5, max_channels),
                max_participants_per_channel = COALESCE($6, max_participants_per_channel),
+               max_concurrent_sessions = COALESCE($7, max_concurrent_sessions),
+               monthly_participant_minutes = COALESCE($8, monthly_participant_minutes),
                updated_at = NOW()
            WHERE id = $1 AND active = true
            RETURNING *"#,
     )
     .bind(app_id)
-    .bind(name)
-    .bind(description.is_some())
-    .bind(description.flatten())
-    .bind(max_channels)
-    .bind(max_participants_per_channel)
+    .bind(update.name)
+    .bind(update.description.is_some())
+    .bind(update.description.flatten())
+    .bind(update.max_channels)
+    .bind(update.max_participants_per_channel)
+    .bind(update.max_concurrent_sessions)
+    .bind(update.monthly_participant_minutes)
     .fetch_optional(pool)
     .await
 }
@@ -833,6 +855,52 @@ pub async fn create_session(pool: &DbPool, s: &SessionRow) -> Result<SessionRow,
     .fetch_one(pool).await
 }
 
+/// Inserts the session unless the application already has `max_concurrent` open sessions
+/// (`Ok(None)`). Count and insert run under a per-application transaction-scoped advisory
+/// lock, so concurrent admissions on any node serialize and the limit holds fleet-wide.
+pub async fn create_session_within_limit(
+    pool: &DbPool,
+    s: &SessionRow,
+    max_concurrent: i64,
+) -> Result<Option<SessionRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('aurix_sessions'), hashtext($1::text))")
+        .bind(s.app_id)
+        .execute(&mut *tx)
+        .await?;
+    // A user reconnecting to the same node replaces their previous session there, which may
+    // still be closing; it must not hold a slot against them.
+    let (active,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM sessions
+           WHERE app_id = $1 AND disconnected_at IS NULL
+             AND NOT (user_id = $2 AND media_node_id = $3)"#,
+    )
+    .bind(s.app_id)
+    .bind(s.user_id)
+    .bind(s.media_node_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active >= max_concurrent {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, SessionRow>(
+        r#"INSERT INTO sessions (id, user_id, app_id, media_node_id, ip_address, user_agent, connected_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *"#,
+    )
+    .bind(s.id)
+    .bind(s.user_id)
+    .bind(s.app_id)
+    .bind(s.media_node_id)
+    .bind(&s.ip_address)
+    .bind(&s.user_agent)
+    .bind(s.connected_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
 pub async fn close_session(
     pool: &DbPool,
     session_id: Uuid,
@@ -867,14 +935,38 @@ pub async fn get_session(
 
 /// Close every session that is still marked open for a media node (used on node startup
 /// so that a crash does not leave phantom active sessions).
+/// Sessions and memberships a node left open are closed as of its last registry heartbeat
+/// (never before they started), so the time between the node dying and the cleanup is not
+/// billed as usage. A node with no registry row is closed as of now.
+const STALE_CUTOFF_SQL: &str =
+    "COALESCE((SELECT n.last_heartbeat FROM media_nodes n WHERE n.id = $1), NOW())";
+
 pub async fn close_stale_sessions_for_node(
     pool: &DbPool,
     media_node_id: Uuid,
     reason: &str,
 ) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query("UPDATE sessions SET disconnected_at = NOW(), disconnect_reason = $2 WHERE media_node_id = $1 AND disconnected_at IS NULL")
-        .bind(media_node_id).bind(reason).execute(pool).await?;
+    let r = sqlx::query(&format!(
+        "UPDATE sessions SET disconnected_at = GREATEST(connected_at, LEAST(NOW(), {STALE_CUTOFF_SQL})), disconnect_reason = $2 \
+         WHERE media_node_id = $1 AND disconnected_at IS NULL"
+    ))
+    .bind(media_node_id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
     Ok(r.rows_affected())
+}
+
+/// Media nodes that still own open sessions but have no registry row any more (pruned after
+/// the 24 h retention, or never registered). Their sessions can only be closed as of now.
+pub async fn orphaned_session_nodes(pool: &DbPool) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT DISTINCT s.media_node_id FROM sessions s
+           WHERE s.disconnected_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM media_nodes n WHERE n.id = s.media_node_id)"#,
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// Closes memberships left open by a previous crash of this node; returns the channel of every
@@ -883,9 +975,13 @@ pub async fn close_stale_memberships_for_node(
     pool: &DbPool,
     media_node_id: Uuid,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(
-        "UPDATE channel_memberships SET left_at = NOW() WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1) RETURNING channel_id"
-    ).bind(media_node_id).fetch_all(pool).await
+    sqlx::query_scalar::<_, Uuid>(&format!(
+        "UPDATE channel_memberships SET left_at = GREATEST(joined_at, LEAST(NOW(), {STALE_CUTOFF_SQL})) \
+         WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1) RETURNING channel_id"
+    ))
+    .bind(media_node_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Closes the open memberships of every session still marked live on a node that stopped
@@ -895,13 +991,13 @@ pub async fn close_memberships_for_lost_node(
     pool: &DbPool,
     media_node_id: Uuid,
 ) -> Result<Vec<LostMembershipRow>, sqlx::Error> {
-    sqlx::query_as::<_, LostMembershipRow>(
-        r#"UPDATE channel_memberships m SET left_at = NOW()
+    sqlx::query_as::<_, LostMembershipRow>(&format!(
+        r#"UPDATE channel_memberships m SET left_at = GREATEST(m.joined_at, LEAST(NOW(), {STALE_CUTOFF_SQL}))
            FROM sessions s, channels c
            WHERE s.id = m.session_id AND c.id = m.channel_id
              AND m.left_at IS NULL AND s.media_node_id = $1 AND s.disconnected_at IS NULL
            RETURNING c.app_id, m.channel_id, m.user_id, m.session_id, m.role"#,
-    )
+    ))
     .bind(media_node_id)
     .fetch_all(pool)
     .await
@@ -2439,15 +2535,20 @@ pub async fn create_api_key(pool: &DbPool, key: &ApiKeyRow) -> Result<ApiKeyRow,
     .fetch_one(pool).await
 }
 
-/// Fetch by prefix regardless of state; the caller decides how to treat inactive/expired keys.
+/// Fetch by prefix regardless of the key's state — the caller decides how to treat
+/// inactive/expired keys — but never a key of a deactivated (deleted) application.
 pub async fn get_api_key_by_prefix(
     pool: &DbPool,
     prefix: &str,
 ) -> Result<Option<ApiKeyRow>, sqlx::Error> {
     sqlx::query_as::<_, ApiKeyRow>(
-        "SELECT * FROM api_keys WHERE key_prefix = $1 ORDER BY active DESC, created_at DESC LIMIT 1"
+        r#"SELECT k.* FROM api_keys k JOIN apps a ON a.id = k.app_id
+           WHERE k.key_prefix = $1 AND a.active = true
+           ORDER BY k.active DESC, k.created_at DESC LIMIT 1"#,
     )
-        .bind(prefix).fetch_optional(pool).await
+    .bind(prefix)
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn revoke_api_key(pool: &DbPool, app_id: Uuid, key_id: Uuid) -> Result<u64, sqlx::Error> {
@@ -2487,36 +2588,6 @@ pub async fn touch_api_key(pool: &DbPool, key_id: Uuid) -> Result<(), sqlx::Erro
         .execute(pool)
         .await?;
     Ok(())
-}
-
-// ── Analytics Queries ──
-
-pub async fn insert_analytics_snapshot(
-    pool: &DbPool,
-    snap: &AnalyticsSnapshotRow,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"INSERT INTO analytics_snapshots (id, app_id, timestamp, active_users, active_channels, peak_concurrent, total_minutes, bandwidth_gb, avg_latency_ms, avg_packet_loss, error_count)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#
-    )
-    .bind(snap.id).bind(snap.app_id).bind(snap.timestamp)
-    .bind(snap.active_users).bind(snap.active_channels).bind(snap.peak_concurrent)
-    .bind(snap.total_minutes).bind(snap.bandwidth_gb)
-    .bind(snap.avg_latency_ms).bind(snap.avg_packet_loss).bind(snap.error_count)
-    .execute(pool).await?;
-    Ok(())
-}
-
-pub async fn get_analytics(
-    pool: &DbPool,
-    app_id: Uuid,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> Result<Vec<AnalyticsSnapshotRow>, sqlx::Error> {
-    sqlx::query_as::<_, AnalyticsSnapshotRow>(
-        "SELECT * FROM analytics_snapshots WHERE app_id = $1 AND timestamp >= $2 AND timestamp <= $3 ORDER BY timestamp ASC"
-    )
-    .bind(app_id).bind(from).bind(to).fetch_all(pool).await
 }
 
 // ── Admin User Queries ──

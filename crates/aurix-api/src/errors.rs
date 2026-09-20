@@ -5,6 +5,7 @@ use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+#[derive(Debug)]
 pub struct ApiError {
     pub error: AurixError,
     /// `Retry-After` (seconds) for throttled requests.

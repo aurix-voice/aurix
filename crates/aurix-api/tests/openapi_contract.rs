@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const ROUTES_RS: &str = include_str!("../src/routes.rs");
 const HANDLER_SOURCES: &[&str] = &[
+    include_str!("../src/analytics.rs"),
     include_str!("../src/handlers.rs"),
     include_str!("../src/streams.rs"),
     include_str!("../src/webhooks.rs"),

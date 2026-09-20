@@ -11472,3 +11472,675 @@ async fn admin_sso_login_roles_and_lifecycle() {
         "every code exchange carried the right PKCE verifier, redirect and client secret"
     );
 }
+
+// ── Usage analytics, export and per-application quotas ──
+
+/// Opens a WebSocket and returns the error code the server refuses the session with, or
+/// `None` when a `SessionInitAck` arrives (the socket is dropped either way).
+async fn connect_refused(env: &Env, token: &str) -> Option<String> {
+    let mut req = format!("{}/ws", env.ws).into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("first control message")
+            .expect("ws closed before the first control message")
+            .expect("ws error");
+        match m {
+            Message::Text(t) => {
+                return match serde_json::from_str::<ControlMessage>(&t).unwrap() {
+                    ControlMessage::SessionInitAck { .. } => None,
+                    ControlMessage::Error { code, .. } => Some(code),
+                    other => panic!("unexpected first message {other:?}"),
+                }
+            }
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+}
+
+async fn admin_json(
+    http: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let mut req = http.request(method, url).bearer_auth(token);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+async fn tenant_get(env: &Env, http: &reqwest::Client, path: &str) -> (u16, serde_json::Value) {
+    let resp = http
+        .get(format!("{}{path}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+async fn quota_of(env: &Env, http: &reqwest::Client) -> serde_json::Value {
+    let (status, q) = tenant_get(env, http, "/v1/analytics/quota").await;
+    assert_eq!(status, 200, "quota: {q}");
+    q
+}
+
+/// Polls `f` every two seconds until it returns `Some`, or panics after `wait`.
+async fn eventually<T, F, Fut>(wait: Duration, what: &str, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if let Some(v) = f().await {
+            return v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Usage accounting end to end. An administrator creates a throwaway application capped at two
+/// concurrent sessions; two players (on two nodes when `AURIX_E2E_WS2` is set) talk and chat in a
+/// channel, a third is refused with `QUOTA_EXCEEDED` while a reconnect of an admitted player is
+/// not, raising the cap admits the third. After the aggregator ran, `GET /v1/analytics*` shows
+/// the CCU, minutes, media bytes and chat of the application and the channel (derived across
+/// both nodes), the JSON/CSV exports carry the raw buckets, another tenant and a key without
+/// `analytics:read` see nothing, and the fleet views require an administrator. Finally a
+/// one-minute monthly quota refuses a new channel join once the live members have used it,
+/// and deleting the application takes its usage with it.
+#[tokio::test]
+#[ignore = "requires a running Aurix server and AURIX_E2E_ADMIN_TOKEN; see the e2e job in .github/workflows/ci.yml"]
+async fn usage_analytics_export_and_per_app_quotas() {
+    let Some(base) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Ok(admin) = std::env::var("AURIX_E2E_ADMIN_TOKEN") else {
+        eprintln!("AURIX_E2E_ADMIN_TOKEN not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let started = chrono::Utc::now();
+
+    // ── A dedicated application with a CCU cap of 2 ──
+    let (status, bad) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/apps", base.api),
+        &admin,
+        Some(serde_json::json!({"name": "usage-e2e", "max_concurrent_sessions": -1})),
+    )
+    .await;
+    assert_eq!(status, 400, "negative quota is rejected: {bad}");
+    let (status, app) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/apps", base.api),
+        &admin,
+        Some(serde_json::json!({
+            "name": format!("usage-e2e-{}", uuid::Uuid::now_v7()),
+            "max_concurrent_sessions": 2,
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "create app: {app}");
+    let app_id = app["id"].as_str().unwrap().to_string();
+    let (status, shown) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/v1/apps/{app_id}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "get app: {shown}");
+    assert_eq!(shown["max_concurrent_sessions"], 2);
+    assert_eq!(shown["monthly_participant_minutes"], 0);
+    let env = Env {
+        api_key: app["api_key"].as_str().unwrap().to_string(),
+        ..base.clone()
+    };
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let far = env2.as_ref().unwrap_or(&env);
+    eprintln!(
+        "app {app_id}; Bob on {}",
+        if env2.is_some() { "node 2" } else { "node 1" }
+    );
+
+    let channel = create_channel(&env, &http).await;
+    let (tok_a, _) = issue_token(&env, &http, "usage:alice", "Alice", channel).await;
+    let (tok_b, _) = issue_token(&env, &http, "usage:bob", "Bob", channel).await;
+    let (tok_c, _) = issue_token(&env, &http, "usage:carol", "Carol", channel).await;
+    let (tok_d, _) = issue_token(&env, &http, "usage:dave", "Dave", channel).await;
+
+    let mut alice = connect(&env, "Alice", tok_a.clone()).await;
+    let mut bob = connect(far, "Bob", tok_b).await;
+    join(&mut alice, channel).await;
+    join(&mut bob, channel).await;
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    // Bob's join ack carried Alice in the roster; give the fleet a moment to fan the join out.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Media (metered bytes) and chat (metered count) in the channel.
+    let payload = Bytes::from_static(&[0x77u8; 120]);
+    let mut heard = 0;
+    for round in 0..3u32 {
+        send_audio(&alice, channel, 1 + round * 10, &payload).await;
+        heard += count_audio_from(&bob, alice.ssrc, &payload).await;
+        if heard >= 5 {
+            break;
+        }
+    }
+    assert!(heard >= 5, "Bob hears Alice ({heard} packets)");
+    for i in 0..3 {
+        alice
+            .send(&ControlMessage::ChatSend {
+                channel_id: channel,
+                text: format!("usage {i}"),
+                metadata: None,
+                client_ref: None,
+            })
+            .await;
+        expect_chat(&mut bob, "chat").await;
+    }
+
+    // ── Concurrent-session quota ──
+    let q = quota_of(&env, &http).await;
+    assert_eq!(q["max_concurrent_sessions"], 2, "{q}");
+    assert_eq!(q["active_sessions"], 2, "{q}");
+    assert_eq!(
+        connect_refused(&env, &tok_c).await.as_deref(),
+        Some("QUOTA_EXCEEDED"),
+        "a third session is refused at the cap"
+    );
+    if let Some(far) = &env2 {
+        assert_eq!(
+            connect_refused(far, &tok_c).await.as_deref(),
+            Some("QUOTA_EXCEEDED"),
+            "the cap is fleet-wide, not per node"
+        );
+    }
+    // Alice reconnecting (same user, same node) replaces her session and is not counted twice.
+    let mut alice2 = connect(&env, "Alice", tok_a).await;
+    assert_ne!(alice2.session_id, alice.session_id);
+    join(&mut alice2, channel).await;
+    let _ = alice.try_recv(Duration::from_secs(3)).await; // old socket is closed by the server
+    eventually(Duration::from_secs(10), "old session closed", || async {
+        (quota_of(&env, &http).await["active_sessions"] == 2).then_some(())
+    })
+    .await;
+    assert_eq!(
+        connect_refused(&env, &tok_c).await.as_deref(),
+        Some("QUOTA_EXCEEDED"),
+        "still full after the replacement"
+    );
+    let (status, patched) = admin_json(
+        &http,
+        reqwest::Method::PATCH,
+        format!("{}/v1/apps/{app_id}", base.api),
+        &admin,
+        Some(serde_json::json!({"max_concurrent_sessions": 3})),
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["max_concurrent_sessions"], 3);
+    let mut carol = connect(&env, "Carol", tok_c.clone()).await;
+    let q = quota_of(&env, &http).await;
+    assert_eq!(q["active_sessions"], 3, "{q}");
+    assert_eq!(q["max_concurrent_sessions"], 3, "{q}");
+
+    // ── Isolation: other tenant, key without analytics:read, no admin token ──
+    let (status, _) = tenant_get(&base, &http, &format!("/v1/analytics/channels/{channel}")).await;
+    assert_eq!(
+        status, 404,
+        "another tenant cannot read the channel's usage"
+    );
+    let restricted: serde_json::Value = http
+        .post(format!("{}/v1/api-keys", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"name": "no-analytics", "permissions": ["channels:read"]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let restricted = Env {
+        api_key: restricted["key"].as_str().unwrap().to_string(),
+        ..env.clone()
+    };
+    for path in [
+        "/v1/analytics",
+        "/v1/analytics/quota",
+        "/v1/analytics/channels",
+        "/v1/analytics/export",
+    ] {
+        let (status, _) = tenant_get(&restricted, &http, path).await;
+        assert_eq!(status, 403, "{path} needs analytics:read");
+    }
+    for path in ["/admin/analytics/usage", "/admin/analytics/export"] {
+        let (status, _) = tenant_get(&env, &http, path).await;
+        assert_eq!(status, 401, "{path} is an administrator view");
+        let status = http
+            .get(format!("{}{path}", env.api))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 401, "{path} without credentials");
+    }
+    for bad in [
+        "/v1/analytics?from=yesterday",
+        "/v1/analytics?from=2024-01-02T00:00:00Z&to=2024-01-01T00:00:00Z",
+        "/v1/analytics?step=299",
+        "/v1/analytics?from=2020-01-01T00:00:00Z&to=2024-01-01T00:00:00Z",
+        "/v1/analytics?from=2024-01-01T00:00:00Z&to=2024-12-31T00:00:00Z&step=300",
+        "/v1/analytics/export?scope=fleet",
+        "/v1/analytics/export?format=xml",
+    ] {
+        let (status, body) = tenant_get(&env, &http, bad).await;
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
+
+    // ── The aggregator derives CCU/minutes from both nodes' intervals ──
+    let from = (started - chrono::Duration::minutes(10))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let range = format!("from={from}");
+    let usage = eventually(Duration::from_secs(150), "usage aggregation", || async {
+        let (status, u) = tenant_get(&env, &http, &format!("/v1/analytics?{range}")).await;
+        assert_eq!(status, 200, "{u}");
+        let t = &u["totals"];
+        let ready = t["peak_sessions"].as_i64().unwrap_or(0) >= 2
+            && t["participant_minutes"].as_f64().unwrap_or(0.0) > 0.0
+            && t["media_bytes_in"].as_i64().unwrap_or(0) > 0
+            && t["chat_messages"].as_i64().unwrap_or(0) >= 3;
+        ready.then_some(u)
+    })
+    .await;
+    eprintln!("usage totals: {}", usage["totals"]);
+    assert_eq!(usage["current"]["active_sessions"], 3, "{usage}");
+    assert_eq!(usage["current"]["active_channels"], 1, "{usage}");
+    assert_eq!(usage["range"]["step_secs"], 300, "{usage}");
+    assert!(usage["range"]["finalized_through"].is_string(), "{usage}");
+    let totals = &usage["totals"];
+    assert!(totals["peak_sessions"].as_i64().unwrap() <= 3, "{totals}");
+    assert!(
+        totals["sessions_started"].as_i64().unwrap() >= 3,
+        "{totals}"
+    );
+    assert!(
+        totals["peak_participants"].as_i64().unwrap() >= 2,
+        "{totals}"
+    );
+    assert!(
+        totals["session_minutes"].as_f64().unwrap() > 0.0,
+        "{totals}"
+    );
+    assert!(totals["media_bytes_out"].as_i64().unwrap() > 0, "{totals}");
+    let series = usage["series"].as_array().unwrap();
+    assert!(!series.is_empty(), "{usage}");
+    assert!(
+        series
+            .iter()
+            .any(|b| b["peak_sessions"].as_i64().unwrap() >= 2
+                && b["active_channels"].as_i64().unwrap() >= 1
+                && b["unique_users"].as_i64().unwrap() >= 2),
+        "a 5-minute bucket holds both players: {series:?}"
+    );
+    let (status, hourly) =
+        tenant_get(&env, &http, &format!("/v1/analytics?{range}&step=3600")).await;
+    assert_eq!(status, 200, "{hourly}");
+    assert_eq!(hourly["range"]["step_secs"], 3600);
+    assert_eq!(hourly["totals"]["peak_sessions"], totals["peak_sessions"]);
+    assert!(
+        hourly["series"].as_array().unwrap().len() <= 2,
+        "hourly rollup: {}",
+        hourly["series"]
+    );
+
+    let (status, channels) =
+        tenant_get(&env, &http, &format!("/v1/analytics/channels?{range}")).await;
+    assert_eq!(status, 200, "{channels}");
+    let mine = channels["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["channel_id"] == channel.to_string())
+        .unwrap_or_else(|| panic!("channel listed: {channels}"))
+        .clone();
+    assert!(mine["peak_participants"].as_i64().unwrap() >= 2, "{mine}");
+    assert!(
+        mine["participant_minutes"].as_f64().unwrap() > 0.0,
+        "{mine}"
+    );
+    assert!(mine["joins"].as_i64().unwrap() >= 3, "{mine}");
+    assert_eq!(mine["unique_users"], 2, "{mine}");
+    assert!(mine["chat_messages"].as_i64().unwrap() >= 3, "{mine}");
+    let (status, one) = tenant_get(
+        &env,
+        &http,
+        &format!("/v1/analytics/channels/{channel}?{range}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(one["range"]["step_secs"], 3600);
+    assert_eq!(
+        one["totals"]["peak_participants"],
+        mine["peak_participants"]
+    );
+    assert!(!one["series"].as_array().unwrap().is_empty(), "{one}");
+
+    // ── Exports ──
+    let (status, export) = tenant_get(&env, &http, &format!("/v1/analytics/export?{range}")).await;
+    assert_eq!(status, 200, "{export}");
+    assert_eq!(export["scope"], "app");
+    assert_eq!(export["truncated"], false);
+    let rows = export["rows"].as_array().unwrap();
+    assert_eq!(export["count"], rows.len());
+    assert!(
+        !rows.is_empty() && rows.iter().all(|r| r["app_id"] == app_id),
+        "{export}"
+    );
+    let csv = http
+        .get(format!(
+            "{}/v1/analytics/export?{range}&scope=channels&format=csv",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csv.status(), 200);
+    assert_eq!(
+        csv.headers()["content-type"].to_str().unwrap(),
+        "text/csv; charset=utf-8"
+    );
+    assert!(csv.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment; filename=\"usage-channels-"));
+    assert!(csv.headers().get("x-aurix-truncated").is_none());
+    let body = csv.text().await.unwrap();
+    let mut lines = body.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "app_id,channel_id,bucket,peak_participants,participant_minutes,joins,unique_users,chat_messages,tts_requests,tts_characters,stt_audio_ms"
+    );
+    let data: Vec<&str> = lines.collect();
+    assert!(
+        data.iter()
+            .all(|l| l.starts_with(&format!("{app_id},{channel},"))),
+        "{body}"
+    );
+    assert!(!data.is_empty(), "{body}");
+    let (status, other) = tenant_get(
+        &base,
+        &http,
+        &format!("/v1/analytics/export?{range}&scope=channels"),
+    )
+    .await;
+    assert_eq!(status, 200, "{other}");
+    assert!(
+        other["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["app_id"] != app_id),
+        "another tenant's export never carries this application"
+    );
+
+    // ── Fleet views ──
+    let (status, fleet) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/admin/analytics/usage?{range}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{fleet}");
+    let fleet_app = fleet["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["app_id"] == app_id)
+        .unwrap_or_else(|| panic!("application in the fleet view: {fleet}"));
+    assert_eq!(fleet_app["peak_sessions"], totals["peak_sessions"]);
+    assert_eq!(fleet_app["chat_messages"], totals["chat_messages"]);
+    let (status, admin_app) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/admin/analytics/apps/{app_id}?{range}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{admin_app}");
+    assert_eq!(admin_app["app_id"], app_id);
+    assert_eq!(
+        admin_app["totals"]["peak_sessions"],
+        totals["peak_sessions"]
+    );
+    assert_eq!(admin_app["quota"]["max_concurrent_sessions"], 3);
+    assert_eq!(admin_app["quota"]["active_sessions"], 3);
+    let fleet_csv = http
+        .get(format!(
+            "{}/admin/analytics/export?{range}&format=csv",
+            base.api
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fleet_csv.status(), 200);
+    let fleet_csv = fleet_csv.text().await.unwrap();
+    assert!(
+        fleet_csv.starts_with("app_id,bucket,peak_sessions,"),
+        "{fleet_csv}"
+    );
+    assert!(
+        fleet_csv
+            .lines()
+            .any(|l| l.starts_with(&format!("{app_id},"))),
+        "fleet export carries the application"
+    );
+
+    // ── Monthly participant-minutes quota ──
+    let (status, patched) = admin_json(
+        &http,
+        reqwest::Method::PATCH,
+        format!("{}/v1/apps/{app_id}", base.api),
+        &admin,
+        Some(serde_json::json!({"max_concurrent_sessions": 0, "monthly_participant_minutes": 1})),
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["monthly_participant_minutes"], 1);
+    // Alice and Bob have been in the channel for a while: their open memberships count live.
+    let q = eventually(
+        Duration::from_secs(90),
+        "a participant-minute used",
+        || async {
+            let q = quota_of(&env, &http).await;
+            (q["participant_minutes_this_month"].as_f64().unwrap() >= 1.0).then_some(q)
+        },
+    )
+    .await;
+    assert_eq!(q["monthly_participant_minutes"], 1, "{q}");
+    assert_eq!(q["max_concurrent_sessions"], 0, "{q}");
+    let mut dave = connect(&env, "Dave", tok_d).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        dave.send(&ControlMessage::ChannelJoin {
+            channel_id: channel,
+            token: dave.token.clone(),
+        })
+        .await;
+        let m = dave
+            .expect("join outcome", |m| {
+                matches!(
+                    m,
+                    ControlMessage::ChannelJoinAck { .. } | ControlMessage::Error { .. }
+                )
+            })
+            .await;
+        match m {
+            ControlMessage::Error { code, .. } => {
+                assert_eq!(code, "QUOTA_EXCEEDED");
+                break;
+            }
+            // Another node's quota cache may still hold the old limit for a moment.
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "join is refused once the monthly minutes are used"
+                );
+                dave.send(&ControlMessage::ChannelLeave {
+                    channel_id: channel,
+                })
+                .await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                drain_ws(&mut dave).await;
+            }
+        }
+    }
+    // Members already present are not evicted, and sessions still connect.
+    assert_eq!(membership_count(&env, &http, channel).await, 2);
+    carol
+        .send(&ControlMessage::ChannelJoin {
+            channel_id: channel,
+            token: carol.token.clone(),
+        })
+        .await;
+    expect_error(&mut carol, "Carol's join", "QUOTA_EXCEEDED").await;
+
+    // ── Teardown: deleting (deactivating) the application kills its API keys and every
+    // live session on every node, but keeps its usage readable for administrators ──
+    for p in [&mut alice2, &mut carol] {
+        p.ws.close(None).await.unwrap();
+    }
+    eventually(Duration::from_secs(15), "two sessions left", || async {
+        (quota_of(&env, &http).await["active_sessions"] == 2).then_some(())
+    })
+    .await;
+    let (status, deleted) = admin_json(
+        &http,
+        reqwest::Method::DELETE,
+        format!("{}/v1/apps/{app_id}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{deleted}");
+    // Bob (second node when configured) and Dave are evicted fleet-wide.
+    for p in [&mut bob, &mut dave] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, p.ws.next()).await {
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(_))) => continue,
+                Err(_) => panic!("{}: session survived the deactivation", p.name),
+            }
+        }
+    }
+    let (status, gone) = tenant_get(&env, &http, "/v1/analytics").await;
+    assert_eq!(status, 401, "deactivated app's key is dead: {gone}");
+    let (status, deleted_again) = admin_json(
+        &http,
+        reqwest::Method::DELETE,
+        format!("{}/v1/apps/{app_id}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "{deleted_again}");
+    let (status, kept) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/admin/analytics/apps/{app_id}?{range}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept["active"], false);
+    eventually(
+        Duration::from_secs(15),
+        "evicted sessions closed",
+        || async {
+            let (_, k) = admin_json(
+                &http,
+                reqwest::Method::GET,
+                format!("{}/admin/analytics/apps/{app_id}", base.api),
+                &admin,
+                None,
+            )
+            .await;
+            (k["quota"]["active_sessions"] == 0).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        kept["totals"]["chat_messages"], 3,
+        "history survives deactivation"
+    );
+    let (status, fleet) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/admin/analytics/usage?{range}", base.api),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        fleet["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["app_id"] == app_id),
+        "the fleet listing still bills the deactivated application"
+    );
+    let (status, unknown) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/admin/analytics/apps/{}", base.api, uuid::Uuid::now_v7()),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "{unknown}");
+}

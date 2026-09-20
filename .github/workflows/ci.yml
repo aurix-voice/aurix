@@ -107,6 +107,10 @@ jobs:
           AURIX_E2E_MAX_CHANNELS: "4"
           AURIX_E2E_REPORTS_PER_MINUTE: "3"
         run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture
+      - name: PostgreSQL integration (chat history, usage aggregation)
+        env:
+          AURIX_E2E_DATABASE_URL: postgres://aurix:aurix@127.0.0.1:5432/aurix
+        run: cargo test --locked -p aurix-db -- --ignored --nocapture
       - name: E2E (native client core)
         env:
           AURIX_E2E_API: http://127.0.0.1:8080

@@ -221,6 +221,26 @@ pub static RATE_LIMIT_BACKEND_ERRORS: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Connects / channel joins refused by a per-application quota (`max_concurrent_sessions`,
+/// `monthly_participant_minutes`).
+pub static QUOTA_REJECTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_quota_rejections_total",
+        "Requests refused by a per-application quota",
+        &["quota"]
+    )
+    .unwrap()
+});
+
+/// Metered usage deltas flushed to Postgres.
+pub static USAGE_FLUSHED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_usage_deltas_flushed_total",
+        "Usage counter deltas written to the database"
+    )
+    .unwrap()
+});
+
 // ── Webhook / event stream Metrics ──
 
 /// `result` is `delivered`, `retry` (attempt failed, rescheduled), `failed` (gave up),

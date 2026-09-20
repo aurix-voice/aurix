@@ -119,6 +119,13 @@ pub enum ServerEvent {
         healthy: bool,
         timestamp: DateTime<Utc>,
     },
+    /// An administrator deleted (deactivated) an application: every node closes its live
+    /// sessions. Node-scoped — the tenant that could subscribe to it no longer exists.
+    AppDeactivated {
+        app_id: AppId,
+        deleted_by: UserId,
+        timestamp: DateTime<Utc>,
+    },
     /// A client resumed its session on `to` after losing `from` (cross-node failover). `from`
     /// drops its copy of the session without touching the database or the rosters; every
     /// other node re-points the participant's cascade source. Node-scoped.
@@ -356,7 +363,8 @@ impl ServerEvent {
             | Self::TtsStatus { app_id, .. }
             | Self::SafetyIncident { app_id, .. }
             | Self::SafetyRiskChanged { app_id, .. }
-            | Self::SessionMigrated { app_id, .. } => Some(*app_id),
+            | Self::SessionMigrated { app_id, .. }
+            | Self::AppDeactivated { app_id, .. } => Some(*app_id),
             Self::NodeHealthChanged { .. } | Self::WebhooksChanged { .. } => None,
         }
     }
@@ -409,6 +417,7 @@ impl ServerEvent {
             Self::NodeHealthChanged { .. }
             | Self::WebhooksChanged { .. }
             | Self::SessionMigrated { .. }
+            | Self::AppDeactivated { .. }
             | Self::RecordingConsentGiven { .. }
             | Self::ParticipantPositions { .. }
             | Self::TtsAnnouncement { .. } => return None,

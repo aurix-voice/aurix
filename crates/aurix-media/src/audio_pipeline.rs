@@ -1,6 +1,7 @@
 use aurix_common::error::{AurixError, Result};
 use aurix_common::tts_stt::{ContentAnalyzer, ContentViolation, SttProvider, TranscriptResult};
 use aurix_common::types::{AppId, ChannelId, UserId};
+use aurix_common::usage::{UsageMeter, UsageMetric};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -88,6 +89,7 @@ pub struct AudioAnalysisPipeline {
     violation_callback: Option<ViolationCallback>,
     /// Without a safety consumer, `safety_voice` alone does not trigger transcription.
     safety_enabled: bool,
+    usage: Option<Arc<UsageMeter>>,
 }
 
 pub type TranscriptCallback = Arc<dyn Fn(TranscriptSegment) + Send + Sync>;
@@ -113,7 +115,13 @@ impl AudioAnalysisPipeline {
             stt_callback: None,
             violation_callback: None,
             safety_enabled: false,
+            usage: None,
         }
+    }
+
+    /// Counts audio milliseconds sent to the STT provider into the usage meter.
+    pub fn set_usage_meter(&mut self, meter: Arc<UsageMeter>) {
+        self.usage = Some(meter);
     }
 
     /// Transcribe channels with `safety_voice: true` too (the transcript callback receives
@@ -268,8 +276,17 @@ impl AudioAnalysisPipeline {
                     let cb = self.stt_callback.clone();
                     let app_id = channel.app_id;
                     let pcm = Arc::clone(&pcm);
+                    let usage = self.usage.clone();
                     tokio::spawn(async move {
                         let audio_ms = pcm.len() as u64 * 1000 / u64::from(sr.max(1));
+                        if let Some(meter) = usage {
+                            meter.record(
+                                app_id,
+                                Some(channel_id),
+                                UsageMetric::SttAudioMs,
+                                audio_ms,
+                            );
+                        }
                         let outcome = stt.transcribe(&pcm, sr).await;
                         drop(permit);
                         match outcome {

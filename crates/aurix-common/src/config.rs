@@ -29,6 +29,8 @@ pub struct AurixConfig {
     pub safety: SafetyConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub usage: UsageConfig,
 }
 
 impl AurixConfig {
@@ -177,6 +179,23 @@ impl AurixConfig {
         }
         if self.cluster.failover_endpoints > 16 {
             anyhow::bail!("cluster.failover_endpoints must be <= 16");
+        }
+        if self.usage.enabled {
+            if !(5..=300).contains(&self.usage.flush_interval_secs) {
+                anyhow::bail!("usage.flush_interval_secs must be within 5..=300");
+            }
+            if !(30..=3600).contains(&self.usage.aggregate_interval_secs) {
+                anyhow::bail!("usage.aggregate_interval_secs must be within 30..=3600");
+            }
+            if self.usage.retention_days == 0 || self.usage.retention_days > 3660 {
+                anyhow::bail!("usage.retention_days must be within 1..=3660");
+            }
+            if self.usage.channel_retention_days > self.usage.retention_days {
+                anyhow::bail!("usage.channel_retention_days must not exceed usage.retention_days");
+            }
+            if self.usage.quota_cache_secs > 300 {
+                anyhow::bail!("usage.quota_cache_secs must be at most 300");
+            }
         }
         if !(0.0..=1.0).contains(&self.media.unfocused_channel_gain) {
             anyhow::bail!("media.unfocused_channel_gain must be within 0.0..=1.0");
@@ -828,6 +847,64 @@ impl Default for ClusterConfig {
             session_mirror_ttl_secs: default_session_mirror_ttl_secs(),
             node_lost_after_secs: default_node_lost_after_secs(),
             failover_endpoints: default_failover_endpoints(),
+        }
+    }
+}
+
+/// Tenant usage accounting (`GET /v1/analytics*`, usage export, per-application quotas).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UsageConfig {
+    /// Meter usage and aggregate it into time series. Off: series and exports stop
+    /// growing and `monthly_participant_minutes` is not enforced (`max_concurrent_sessions`
+    /// still is — it only needs the live session table).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often a node writes its metered counters (media bytes, chat, TTS, STT) to the
+    /// database (seconds).
+    #[serde(default = "default_usage_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    /// How often one node (advisory lock) turns closed sessions/memberships into CCU and
+    /// minute buckets (seconds). Buckets are final once the aggregator has passed them;
+    /// the current bucket is always partial.
+    #[serde(default = "default_usage_aggregate_interval_secs")]
+    pub aggregate_interval_secs: u64,
+    /// Days of application-level 5-minute buckets to keep.
+    #[serde(default = "default_usage_retention_days")]
+    pub retention_days: u32,
+    /// Days of per-channel hourly buckets to keep (they are far more numerous).
+    #[serde(default = "default_usage_channel_retention_days")]
+    pub channel_retention_days: u32,
+    /// How long a node may trust a cached monthly minute total when admitting channel joins
+    /// (seconds). `0` queries the database on every join.
+    #[serde(default = "default_usage_quota_cache_secs")]
+    pub quota_cache_secs: u64,
+}
+
+fn default_usage_flush_interval_secs() -> u64 {
+    15
+}
+fn default_usage_aggregate_interval_secs() -> u64 {
+    60
+}
+fn default_usage_retention_days() -> u32 {
+    400
+}
+fn default_usage_channel_retention_days() -> u32 {
+    90
+}
+fn default_usage_quota_cache_secs() -> u64 {
+    30
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            flush_interval_secs: default_usage_flush_interval_secs(),
+            aggregate_interval_secs: default_usage_aggregate_interval_secs(),
+            retention_days: default_usage_retention_days(),
+            channel_retention_days: default_usage_channel_retention_days(),
+            quota_cache_secs: default_usage_quota_cache_secs(),
         }
     }
 }

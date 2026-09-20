@@ -285,6 +285,9 @@ pub struct MediaSession {
     packets_received: AtomicU64,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
+    /// Byte totals already handed to the usage meter.
+    metered_sent: AtomicU64,
+    metered_received: AtomicU64,
 }
 
 impl MediaSession {
@@ -344,6 +347,8 @@ impl MediaSession {
             packets_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            metered_sent: AtomicU64::new(0),
+            metered_received: AtomicU64::new(0),
         })
     }
 
@@ -615,6 +620,15 @@ impl MediaSession {
     pub fn record_packet_received(&self, bytes: u64) {
         self.packets_received.fetch_add(1, Ordering::Relaxed);
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes (received, sent) since the previous call; each byte is returned exactly once.
+    pub fn take_unmetered_bytes(&self) -> (u64, u64) {
+        let rx = self.bytes_received.load(Ordering::Relaxed);
+        let tx = self.bytes_sent.load(Ordering::Relaxed);
+        let rx_prev = self.metered_received.swap(rx, Ordering::Relaxed);
+        let tx_prev = self.metered_sent.swap(tx, Ordering::Relaxed);
+        (rx.saturating_sub(rx_prev), tx.saturating_sub(tx_prev))
     }
 
     /// Anti-replay check for an authenticated packet's sequence number.

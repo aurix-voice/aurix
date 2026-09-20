@@ -35,36 +35,67 @@ pub struct MigratedSession {
     pub open_channels: Vec<ChannelId>,
 }
 
+/// Where a session connects from, as recorded on its row.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientInfo<'a> {
+    pub ip_address: &'a str,
+    pub user_agent: Option<&'a str>,
+}
+
 impl SessionManager {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
     }
 
+    /// Insert the session row; a positive `max_concurrent` makes the insert conditional on the
+    /// application's open-session count (`QuotaExceeded` otherwise).
     pub async fn create_session(
         &self,
         session_id: SessionId,
         user_id: UserId,
         app_id: AppId,
         media_node_id: MediaNodeId,
-        ip_address: &str,
-        user_agent: Option<&str>,
+        client: ClientInfo<'_>,
+        max_concurrent: i32,
     ) -> Result<SessionRow> {
         let row = SessionRow {
             id: session_id.0,
             user_id: user_id.0,
             app_id: app_id.0,
             media_node_id: media_node_id.0,
-            ip_address: ip_address.to_string(),
-            user_agent: user_agent.map(|s| s.to_string()),
+            ip_address: client.ip_address.to_string(),
+            user_agent: client.user_agent.map(|s| s.to_string()),
             connected_at: Utc::now(),
             disconnected_at: None,
             disconnect_reason: None,
             quality_stats: None,
         };
 
-        aurix_db::queries::create_session(&self.pool, &row)
-            .await
-            .map_err(|e| AurixError::Database(format!("Session creation failed: {e}")))
+        let db =
+            |e: aurix_db::DbError| AurixError::Database(format!("Session creation failed: {e}"));
+        if max_concurrent <= 0 {
+            return aurix_db::queries::create_session(&self.pool, &row)
+                .await
+                .map_err(db);
+        }
+        match aurix_db::queries::create_session_within_limit(
+            &self.pool,
+            &row,
+            i64::from(max_concurrent),
+        )
+        .await
+        .map_err(db)?
+        {
+            Some(row) => Ok(row),
+            None => {
+                aurix_metrics::QUOTA_REJECTIONS
+                    .with_label_values(&["concurrent_sessions"])
+                    .inc();
+                Err(AurixError::QuotaExceeded(format!(
+                    "application is at its concurrent session limit ({max_concurrent})"
+                )))
+            }
+        }
     }
 
     /// Closes the session row if it is still hosted by `node`. A row re-homed by a cross-node
