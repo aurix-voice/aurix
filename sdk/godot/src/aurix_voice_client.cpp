@@ -395,6 +395,35 @@ Dictionary AurixVoiceClient::get_audio_policy() const {
     return audio_policy_to_dict(p);
 }
 
+int AurixVoiceClient::set_loss_adaptation(LossAdaptation adaptation) {
+    config_.loss_adaptation = static_cast<AurixLossAdaptation>(adaptation);
+    return client_ ? client_.set_loss_adaptation(config_.loss_adaptation) : AURIX_OK;
+}
+
+AurixVoiceClient::LossAdaptation AurixVoiceClient::get_loss_adaptation() const {
+    return static_cast<LossAdaptation>(client_ ? client_.loss_adaptation() : config_.loss_adaptation);
+}
+
+AurixVoiceClient::LossProfile AurixVoiceClient::get_loss_profile() const {
+    return static_cast<LossProfile>(client_ ? client_.loss_profile() : AURIX_LOSS_PROFILE_LOW);
+}
+
+int AurixVoiceClient::set_decoder_settings(const Dictionary& settings) {
+    AurixDecoderSettings d = config_.decoder;
+    if (client_) client_.decoder_settings(d);
+    decoder_from_dict(settings, d);
+    config_.decoder = d;
+    return client_ ? client_.set_decoder_settings(d) : AURIX_OK;
+}
+
+Dictionary AurixVoiceClient::get_decoder_settings() const {
+    AurixDecoderSettings d = config_.decoder;
+    if (client_) client_.decoder_settings(d);
+    return decoder_to_dict(d);
+}
+
+bool AurixVoiceClient::is_dred_supported() { return aurix::Client::dred_supported(); }
+
 int AurixVoiceClient::set_dsp(const Dictionary& config) {
     AurixDspConfig c = config_.dsp;
     if (client_) client_.dsp(c);
@@ -987,6 +1016,9 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     case AURIX_EVENT_AUDIO_CODEC_CHANGED:
         emit_signal("audio_codec_changed", static_cast<int>(ev.audio_codec()));
         break;
+    case AURIX_EVENT_LOSS_PROFILE_CHANGED:
+        emit_signal("loss_profile_changed", static_cast<int>(ev.loss_profile()), static_cast<int>(ev.number2()));
+        break;
     case AURIX_EVENT_MEDIA_PATH_CHANGED:
         emit_signal("media_path_changed", static_cast<int>(ev.media_path()), gstr(ev.message()));
         break;
@@ -1122,6 +1154,12 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_encoder_settings", "settings"), &AurixVoiceClient::set_encoder_settings);
     ClassDB::bind_method(D_METHOD("get_encoder_settings"), &AurixVoiceClient::get_encoder_settings);
     ClassDB::bind_method(D_METHOD("get_audio_policy"), &AurixVoiceClient::get_audio_policy);
+    ClassDB::bind_method(D_METHOD("set_loss_adaptation", "adaptation"), &AurixVoiceClient::set_loss_adaptation);
+    ClassDB::bind_method(D_METHOD("get_loss_adaptation"), &AurixVoiceClient::get_loss_adaptation);
+    ClassDB::bind_method(D_METHOD("get_loss_profile"), &AurixVoiceClient::get_loss_profile);
+    ClassDB::bind_method(D_METHOD("set_decoder_settings", "settings"), &AurixVoiceClient::set_decoder_settings);
+    ClassDB::bind_method(D_METHOD("get_decoder_settings"), &AurixVoiceClient::get_decoder_settings);
+    ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("is_dred_supported"), &AurixVoiceClient::is_dred_supported);
     ClassDB::bind_method(D_METHOD("set_dsp", "config"), &AurixVoiceClient::set_dsp);
     ClassDB::bind_method(D_METHOD("get_dsp"), &AurixVoiceClient::get_dsp);
     ClassDB::bind_method(D_METHOD("get_dsp_stats"), &AurixVoiceClient::get_dsp_stats);
@@ -1229,6 +1267,7 @@ void AurixVoiceClient::_bind_methods() {
     ADD_SIGNAL(MethodInfo("network_quality", PropertyInfo(Variant::DICTIONARY, "quality")));
     ADD_SIGNAL(MethodInfo("audio_policy_changed", PropertyInfo(Variant::DICTIONARY, "policy")));
     ADD_SIGNAL(MethodInfo("audio_codec_changed", PropertyInfo(Variant::INT, "codec")));
+    ADD_SIGNAL(MethodInfo("loss_profile_changed", PropertyInfo(Variant::INT, "profile"), PropertyInfo(Variant::INT, "uplink_loss_percent")));
     ADD_SIGNAL(MethodInfo("media_path_changed", PropertyInfo(Variant::INT, "path"), PropertyInfo(Variant::STRING, "reason")));
     ADD_SIGNAL(MethodInfo("downlink_mode_changed", PropertyInfo(Variant::INT, "mode")));
     ADD_SIGNAL(MethodInfo("endpoint_changed", PropertyInfo(Variant::STRING, "ws_url")));
@@ -1287,6 +1326,13 @@ void AurixVoiceClient::_bind_methods() {
     BIND_ENUM_CONSTANT(TTS_FINISHED);
     BIND_ENUM_CONSTANT(TTS_CANCELLED);
     BIND_ENUM_CONSTANT(TTS_FAILED);
+    BIND_ENUM_CONSTANT(LOSS_PROFILE_LOW);
+    BIND_ENUM_CONSTANT(LOSS_PROFILE_MODERATE);
+    BIND_ENUM_CONSTANT(LOSS_PROFILE_HIGH);
+    BIND_ENUM_CONSTANT(LOSS_ADAPTATION_AUTO);
+    BIND_ENUM_CONSTANT(LOSS_ADAPTATION_FIXED_LOW);
+    BIND_ENUM_CONSTANT(LOSS_ADAPTATION_FIXED_MODERATE);
+    BIND_ENUM_CONSTANT(LOSS_ADAPTATION_FIXED_HIGH);
     BIND_ENUM_CONSTANT(NOISE_SUPPRESSION_OFF);
     BIND_ENUM_CONSTANT(NOISE_SUPPRESSION_LOW);
     BIND_ENUM_CONSTANT(NOISE_SUPPRESSION_MODERATE);

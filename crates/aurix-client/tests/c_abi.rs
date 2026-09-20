@@ -128,6 +128,10 @@ fn build_and_run_sample(compiler: &str, std_flag: &str, source: &str, exe_name: 
             stdout.contains("region eu_west node=11111111-1111-1111-1111-111111111111 ws=wss://eu1.example/ws nodes=2"),
             "{stdout}"
         );
+        assert!(
+            stdout.contains("bare codec: lost frame -> fec 960 samples (dred supported)"),
+            "{stdout}"
+        );
     }
     assert!(stderr.contains("connect failed:"), "{stderr}");
 }

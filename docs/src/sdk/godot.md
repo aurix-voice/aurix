@@ -62,6 +62,14 @@ func join(channel_id: String) -> void:
 * **Server-side directional audio:** `update_transforms(channel_id, {user_id: Transform3D})`
   (Godot's `-Z` forward is converted).
 * **AEC reference:** `push_render(PackedVector2Array)` when you mix game audio yourself.
+* **Packet loss:** the core rebuilds lost frames from FEC / DRED and conceals the rest with
+  libopus' neural PLC; `get_encoder_settings()["dred_duration_ms"]`,
+  `set_decoder_settings({"complexity": 5, "osce_bwe": false})` / `get_decoder_settings()`,
+  `set_loss_adaptation(LOSS_ADAPTATION_AUTO | LOSS_ADAPTATION_FIXED_LOW | …)`,
+  `get_loss_adaptation()`, `get_loss_profile()` (`LOSS_PROFILE_LOW | MODERATE | HIGH`), the
+  `loss_profile_changed(profile, uplink_loss_percent)` signal and the static
+  `AurixVoiceClient.is_dred_supported()` — semantics in
+  [Packet loss](native.md#packet-loss-fec-dred-and-the-neural-plc).
 * **End-to-end encryption:** the core announces the capability and seals/opens frames of
   [`e2ee` channels](../features/e2ee.md) on its own, so a Godot client joins them like any other
   channel; the fingerprint / identity-persistence API and the `E2EE_*` events are not bound to

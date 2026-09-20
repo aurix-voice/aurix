@@ -31,6 +31,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > spatialization, per-participant WebRTC tracks with Web Audio HRTF for browsers / Unity WebGL,
 > group end-to-end encrypted channels (native + browser), priority speakers with
 > attack/hold/release ducking, lip-sync visemes and a voice-effects library in every SDK,
+> libopus 1.6 with DRED / neural PLC / OSCE and a loss-adaptive FEC profile,
 > fleet-wide rate limits, recording mixdown + post-hoc STT, live translation,
 > chat history/offline delivery/read markers, IPv6 dual-stack, admin SSO + roles, usage
 > analytics/quotas, and Web / Unity (incl. WebGL) / native (C ABI) / Unreal / Godot SDKs.
@@ -615,6 +616,21 @@ Unity `AurixGameAudioDucker` let the game duck its own music/SFX
 ([docs](docs/src/features/speech.md#voice-effects),
 [ducking](docs/src/features/channels.md#priority-speakers-and-ducking)).
 
+**Packet loss: FEC, DRED, neural PLC.** The native core and the server link a **bundled, static
+libopus 1.6** (no system `libopus`; CMake at build time) and use its three loss tools: in-band
+FEC for the frame just before a packet, **Deep REDundancy** (`dred_duration_ms`, up to 1040 ms of
+history a later packet carries — actual coverage is what the bitrate fits) for bursts, and the
+neural PLC / OSCE speech enhancer (`DecoderSettings { complexity, osce_bwe }`, `>= 5` deep PLC,
+`>= 6` OSCE). Receivers repair gaps FEC → DRED → PLC when the packet that ends them arrives, keep
+reordered packets and count `frames_fec_recovered` / `frames_dred_recovered` / `frames_late`; the
+server mixers do the same per sender (`media.mixer_decoder_complexity`,
+`aurix_mixer_lost_frames_total{method}`) and the per-sender forwarded sequence keeps short uplink
+gaps visible so downstream repair can act. The encoder follows the server-measured uplink loss
+with a **loss profile** — `Low` / `Moderate` (≥ 3 %: FEC on, expected loss ≥ 10 %) / `High`
+(≥ 10 %: expected loss ≥ 20 %, DRED ≥ 400 ms, 28 kbit/s floor), hysteresis and a 6 s dwell,
+pinnable per client — in native / C ABI / C++ / Unity / Unreal / Godot; browsers keep FEC and
+their own PLC ([docs](docs/src/sdk/native.md#packet-loss-fec-dred-and-the-neural-plc)).
+
 ### Content safety
 
 `[safety]` (off by default) turns what a node already sees into moderation data: transcripts of
@@ -1013,7 +1029,8 @@ The live E2E test drives two players through WebSocket + UDP: session bind, chan
 authenticated audio Alice→Bob, forged-packet rejection, recording of real Opus packets, TURN
 allocation with API-issued credentials, and clean-up on disconnect.
 
-System dependencies for building: `pkg-config`, `libssl-dev`, `cmake`, `libopus-dev` (Debian names).
+System dependencies for building: `pkg-config`, `libssl-dev`, `cmake` (Debian names); libopus 1.6
+is compiled from bundled sources and linked statically, no system `libopus` is used.
 
 ### Load testing
 

@@ -106,6 +106,10 @@ tunnel_queue_packets = 128
 # channel (one decode per speaker + one encode per channel); receivers with local mutes /
 # volumes / positional or ambient gains get a private mixer (one encode each).
 downlink_mix = true
+# libopus decoder complexity (0..=10) of the server mixers: >= 5 conceals lost uplink frames
+# with the neural PLC, >= 6 adds OSCE speech enhancement. Frames are first rebuilt from the next
+# packet's in-band FEC / DRED regardless; this tunes what remains. CPU per concealed frame.
+mixer_decoder_complexity = 5
 # Per-participant WebRTC downlink tracks a browser may negotiate on top of the mixed track
 # (`SessionInitAck.webrtc_participant_streams`, at most 64). Each carries one speaker's own
 # Opus frames, forwarded as-is (no transcoding), so the browser can spatialize (Web Audio HRTF)

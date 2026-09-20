@@ -59,8 +59,9 @@ cargo build -p aurix-client --release --target <console-target> \
 * Prefer the **static library**. `crates/aurix-client/include/aurix_client.h` is the ABI; it
   is generated with cbindgen and drift-checked in CI, so a header from the same commit matches
   the library byte for byte.
-* libopus is compiled from source by `audiopus_sys` with the target's C compiler — point
-  `CC`/`CFLAGS` (or `CMAKE_TOOLCHAIN_FILE`) at the platform toolchain.
+* libopus 1.6 is compiled from the sources bundled with `opusic-sys` (cmake) with the target's C
+  compiler — point `CC`/`CFLAGS` (or `CMAKE_TOOLCHAIN_FILE`) at the platform toolchain. The
+  neural DRED / OSCE / deep-PLC models add roughly 1 MB of weights to the library.
 * `worker_threads`: start at 1. It is enough for a voice session; raise it only if the platform
   profiler shows the runtime thread saturating.
 * Thread affinity and priorities are set by the host after `aurix_client_create` returns if

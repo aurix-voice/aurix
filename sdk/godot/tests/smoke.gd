@@ -133,6 +133,20 @@ func _init() -> void:
 	_check(client.set_dsp(dsp) == AurixVoiceClient.RESULT_OK, "set_dsp ok")
 	_check(int(client.get_dsp()["noise_suppression"]) == AurixVoiceClient.NOISE_SUPPRESSION_OFF, "dsp round-trips")
 	_check(client.get_dsp()["agc"] == false, "dsp agc round-trips")
+	_check(enc.has("dred_duration_ms"), "encoder settings carry dred_duration_ms")
+	_check(AurixVoiceClient.is_dred_supported(), "bundled libopus has DRED")
+	enc["dred_duration_ms"] = 200
+	_check(client.set_encoder_settings(enc) == AurixVoiceClient.RESULT_OK, "set dred duration ok")
+	_check(int(client.get_encoder_settings()["dred_duration_ms"]) == 200, "dred duration round-trips")
+	_check(client.get_loss_adaptation() == AurixVoiceClient.LOSS_ADAPTATION_AUTO, "default loss adaptation auto")
+	_check(client.get_loss_profile() == AurixVoiceClient.LOSS_PROFILE_LOW, "default loss profile low")
+	_check(client.set_loss_adaptation(AurixVoiceClient.LOSS_ADAPTATION_FIXED_HIGH) == AurixVoiceClient.RESULT_OK, "pin loss profile ok")
+	_check(client.get_loss_adaptation() == AurixVoiceClient.LOSS_ADAPTATION_FIXED_HIGH, "loss adaptation round-trips")
+	var dec: Dictionary = client.get_decoder_settings()
+	_check(dec.has("complexity") and dec.has("osce_bwe"), "decoder settings dictionary: %s" % dec)
+	dec["complexity"] = 7
+	_check(client.set_decoder_settings(dec) == AurixVoiceClient.RESULT_OK, "set_decoder_settings ok")
+	_check(int(client.get_decoder_settings()["complexity"]) == 7, "decoder complexity round-trips")
 	_check(client.get_audio_codec() == AurixVoiceClient.CODEC_OPUS, "default codec opus")
 	_check(client.get_downlink_mode() == AurixVoiceClient.DOWNLINK_STREAMS, "default downlink streams")
 
@@ -149,7 +163,7 @@ func _init() -> void:
 			"chat_inbox_synced", "translation_changed", "raw_event", "request_failed", "kicked",
 			"recording", "audio_policy_changed", "audio_codec_changed", "disconnected", "server_error",
 			"transmission_changed", "channel_focus_changed", "user_block_changed", "moderation_applied",
-			"positions", "rejoin_failed", "bitrate_changed", "chat_read_markers"]:
+			"positions", "rejoin_failed", "bitrate_changed", "chat_read_markers", "loss_profile_changed"]:
 		_check(client.has_signal(sig), "signal %s" % sig)
 
 	# Region discovery helper.

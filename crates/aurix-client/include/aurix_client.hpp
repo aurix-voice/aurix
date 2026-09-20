@@ -157,6 +157,9 @@ public:
     /// `AURIX_EVENT_DUCKING_CHANGED` only: depth and timings for the game's own audio bus
     /// (`flag()` says whether ducking just started or stopped).
     AurixDucking ducking() const { return aurix_event_ducking(ev_); }
+    /// Tier of `AURIX_EVENT_LOSS_PROFILE_CHANGED` (`number2()` = the uplink loss in whole
+    /// percent that triggered it); `AURIX_LOSS_PROFILE_LOW` for other events.
+    AurixLossProfile loss_profile() const { return aurix_event_loss_profile(ev_); }
 
     std::vector<AurixParticipant> participants() const {
         std::vector<AurixParticipant> out(aurix_event_participant_count(ev_));
@@ -407,6 +410,22 @@ public:
     bool encoder_settings(AurixEncoderSettings& out) const { return aurix_client_encoder_settings(c_, &out); }
     /// Pin complexity 0..=10 over channel hints; a negative value unpins.
     AurixResult set_complexity(std::int8_t complexity) { return aurix_client_set_complexity(c_, complexity); }
+    /// Uplink redundancy: adapt FEC / DRED to the server's loss reports (default) or pin a
+    /// tier; a change fires `AURIX_EVENT_LOSS_PROFILE_CHANGED`.
+    AurixResult set_loss_adaptation(AurixLossAdaptation adaptation) {
+        return aurix_client_set_loss_adaptation(c_, adaptation);
+    }
+    AurixLossAdaptation loss_adaptation() const { return aurix_client_loss_adaptation(c_); }
+    /// Redundancy tier the encoder runs with right now.
+    AurixLossProfile loss_profile() const { return aurix_client_loss_profile(c_); }
+    /// Downlink decoder tuning shared by every remote stream: complexity >= 5 neural PLC,
+    /// >= 6 OSCE speech enhancement; optional OSCE bandwidth extension.
+    AurixResult set_decoder_settings(const AurixDecoderSettings& settings) {
+        return aurix_client_set_decoder_settings(c_, &settings);
+    }
+    bool decoder_settings(AurixDecoderSettings& out) const { return aurix_client_decoder_settings(c_, &out); }
+    /// This build's libopus codes / decodes Deep REDundancy.
+    static bool dred_supported() { return aurix_dred_supported(); }
     /// Merged policy of the joined channels; `false` before the first join.
     bool audio_policy(AurixAudioPolicy& out) const { return aurix_client_audio_policy(c_, &out); }
     void set_output_volume(float volume) { aurix_client_set_output_volume(c_, volume); }
@@ -642,6 +661,27 @@ public:
     int decode(const std::uint8_t* packet, std::size_t packet_len, std::int16_t* pcm,
                std::size_t max_frame_samples_per_channel, bool fec = false) {
         return aurix_opus_decoder_decode_i16(d_, packet, packet_len, pcm, max_frame_samples_per_channel, fec);
+    }
+    /// Neural PLC / OSCE tuning (complexity >= 5 deep PLC, >= 6 OSCE; optional bandwidth extension).
+    AurixResult apply(const AurixDecoderSettings& settings) { return aurix_opus_decoder_apply(d_, &settings); }
+    bool settings(AurixDecoderSettings& out) const { return aurix_opus_decoder_settings(d_, &out); }
+    /// Rebuild the frame `frames_before` frames before `later_packet` from its Deep REDundancy
+    /// (1 = the frame right before it; use `decode(..., fec = true)` for that one when the packet
+    /// has in-band FEC — see `packet_has_fec`). Samples per channel written, 0 when the packet's
+    /// DRED does not reach that far (or this libopus has none), negative `AurixResult` on error.
+    int decode_dred(const std::uint8_t* later_packet, std::size_t packet_len, std::uint32_t frames_before, float* pcm,
+                    std::size_t frame_samples_per_channel) {
+        return aurix_opus_decoder_dred_decode_f32(d_, later_packet, packet_len, frames_before, pcm,
+                                                  frame_samples_per_channel);
+    }
+    int decode_dred(const std::uint8_t* later_packet, std::size_t packet_len, std::uint32_t frames_before,
+                    std::int16_t* pcm, std::size_t frame_samples_per_channel) {
+        return aurix_opus_decoder_dred_decode_i16(d_, later_packet, packet_len, frames_before, pcm,
+                                                  frame_samples_per_channel);
+    }
+    /// Whether an Opus packet carries in-band FEC (LBRR) for the frame before it.
+    static bool packet_has_fec(const std::uint8_t* packet, std::size_t packet_len) {
+        return aurix_opus_packet_has_fec(packet, packet_len);
     }
 
 private:

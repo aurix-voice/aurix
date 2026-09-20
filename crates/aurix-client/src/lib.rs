@@ -33,9 +33,10 @@ pub mod ffi;
 
 pub mod media;
 pub mod regions;
+pub mod resilience;
 pub mod visemes;
 
-pub use audio::EncoderSettings;
+pub use audio::{DecoderSettings, EncoderSettings};
 pub use aurix_common::protocol::{
     decode_chat_cursor, encode_chat_cursor, ChatMessage, ChatReadMarker, ParticipantEnergy,
     Transcript, TransmissionMode, TtsDestination, TtsState, UserPosition,
@@ -54,6 +55,7 @@ pub use events::{
 };
 pub use media::{IncomingAudio, MediaPath, MediaPathPolicy, MediaStats};
 pub use regions::{GeoLocation, ProbedRegion, Region, RegionEndpoint, RegionsResponse};
+pub use resilience::{LossAdaptation, LossController, LossProfile, LossProfilePolicy};
 pub use visemes::{Viseme, VisemeAnalyzer, VisemeFrame, VISEME_COUNT};
 
 /// Top bit of a synthesized (TTS / announcement) stream SSRC; session SSRCs never have it.

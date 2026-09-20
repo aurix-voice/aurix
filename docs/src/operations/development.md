@@ -18,8 +18,9 @@
 ## Toolchain
 
 Rust stable (`rust-version = "1.88"` in `Cargo.toml`), PostgreSQL 15+, Redis 7+, and the native build
-dependencies `pkg-config libssl-dev cmake libopus-dev` (Debian names — `libssl-dev` is only needed
-because the WebRTC stack pulls OpenSSL transitively; everything else uses rustls). For the SDKs:
+dependencies `pkg-config libssl-dev cmake` (Debian names — `libssl-dev` is only needed because the
+WebRTC stack pulls OpenSSL transitively; everything else uses rustls; `cmake` builds the bundled
+libopus 1.6 — no system `libopus` is used). For the SDKs:
 Node 20 (`sdk/web`), .NET 8 SDK (`sdk/unity/DotNet`), mdBook 0.5 for the book.
 
 ```bash

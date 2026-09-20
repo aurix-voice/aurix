@@ -21,6 +21,19 @@ pub const MAX_PARTICIPANT_GAIN: f32 = 2.0;
 /// `media.unfocused_channel_gain`.
 pub const DEFAULT_UNFOCUSED_GAIN: f32 = 0.5;
 
+/// RTP timestamp step of one 20 ms frame on the 48 kHz media clock.
+const AUDIO_FRAME_TS: i32 = 960;
+/// Longest run of missing uplink frames kept as a gap in the forwarded sequence (1 s, the
+/// most DRED can carry); anything longer is treated as a pause.
+pub const MAX_FORWARDED_GAP_FRAMES: u32 = 50;
+
+#[derive(Debug, Clone, Copy)]
+struct AudioClock {
+    uplink_seq: u32,
+    rtp_ts: u32,
+    seq: u32,
+}
+
 /// What this participant wants to hear: local ("for me") mutes, per-sender gain and the
 /// persistent cross-mute list, plus the focused channel (every other channel is attenuated by
 /// `unfocused_gain`). Evaluated per packet on the receiver side of the fan-out, so a muted or
@@ -253,7 +266,11 @@ pub struct MediaSession {
     /// keyed by stream SSRC; same sticky ranking as `ambient`, but losers are withheld
     /// instead of attenuated.
     pub stream_cap: Mutex<crate::ambient::AmbientState>,
+    /// Per-sender audio sequence handed out to receivers (see [`Self::next_audio_sequence`]).
     pub sequence: AtomicU32,
+    /// Uplink packet sequence, RTP timestamp and forwarded sequence of the last audio
+    /// frame renumbered.
+    audio_clock: Mutex<Option<AudioClock>>,
     /// Sequence counter for server-originated packets addressed to this session
     /// (acks, commands); keeps their encryption IVs unique under the session key.
     pub downlink_sequence: AtomicU32,
@@ -325,6 +342,7 @@ impl MediaSession {
             ambient: Mutex::new(crate::ambient::AmbientState::default()),
             stream_cap: Mutex::new(crate::ambient::AmbientState::default()),
             sequence: AtomicU32::new(0),
+            audio_clock: Mutex::new(None),
             downlink_sequence: AtomicU32::new(0),
             last_audio_timestamp: AtomicU64::new(0),
             last_audio_at_ms: AtomicI64::new(0),
@@ -820,8 +838,53 @@ impl MediaSession {
         self.quality_track.lock().mos_alert.is_alerting()
     }
 
+    /// Forwarded sequence for an uplink audio frame: the uplink sequence is shared with
+    /// heartbeats and reports, so receivers get a per-sender audio-only numbering. A short
+    /// run of frames missing on the uplink — both the packet sequence and the 20 ms
+    /// timestamp clock jumped by the same count — keeps its numbers, so receivers' jitter
+    /// buffers see the loss and rebuild it from FEC/DRED or conceal it instead of playing
+    /// the stream fast. A pause (DTX, VAD gate, only heartbeats in between) or a longer jump
+    /// counts as one frame; a frame arriving late for a slot skipped this way takes that slot.
+    pub fn next_audio_sequence(&self, uplink_seq: u32, rtp_ts: u32) -> u32 {
+        let mut clock = self.audio_clock.lock();
+        let step = match *clock {
+            Some(last) => {
+                let ts = rtp_ts.wrapping_sub(last.rtp_ts) as i32;
+                let packets = uplink_seq.wrapping_sub(last.uplink_seq) as i32;
+                let frames = ts / AUDIO_FRAME_TS;
+                if ts % AUDIO_FRAME_TS != 0 || frames == 0 {
+                    1
+                } else if frames < 0 {
+                    if packets < 0 && frames >= -(MAX_FORWARDED_GAP_FRAMES as i32) {
+                        return last.seq.wrapping_sub(frames.unsigned_abs());
+                    }
+                    1
+                } else if frames > MAX_FORWARDED_GAP_FRAMES as i32 {
+                    1
+                } else {
+                    frames.min(packets.max(1)) as u32
+                }
+            }
+            None => 1,
+        };
+        let seq = self
+            .sequence
+            .fetch_add(step, Ordering::Relaxed)
+            .wrapping_add(step - 1);
+        *clock = Some(AudioClock {
+            uplink_seq,
+            rtp_ts,
+            seq,
+        });
+        seq
+    }
+
+    /// Next forwarded audio sequence with no gap accounting (server-originated frames on
+    /// this sender's SSRC, browser uplinks without a packet sequence).
     pub fn next_sequence(&self) -> u32 {
-        self.sequence.fetch_add(1, Ordering::Relaxed)
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        *self.audio_clock.lock() = None;
+        seq
     }
 
     /// Next per-sender downlink audio sequence this session will hand out.
@@ -1122,5 +1185,37 @@ mod tests {
             adopted.quality_summary().unwrap().samples,
             continued.samples
         );
+    }
+
+    #[test]
+    fn forwarded_audio_sequence_keeps_short_losses_and_collapses_pauses() {
+        let s = session();
+        let ts = |frame: u32| frame * AUDIO_FRAME_TS as u32;
+        // Consecutive uplink frames: consecutive forwarded numbers.
+        assert_eq!(s.next_audio_sequence(10, ts(0)), 0);
+        assert_eq!(s.next_audio_sequence(11, ts(1)), 1);
+        // Two frames lost on the uplink (both clocks jumped by 3): the gap stays.
+        assert_eq!(s.next_audio_sequence(14, ts(4)), 4);
+        // A heartbeat between two frames advances the packet sequence but not the clock.
+        assert_eq!(s.next_audio_sequence(16, ts(5)), 5);
+        // A pause (packets consecutive, clock jumped) is one frame, not a loss.
+        assert_eq!(s.next_audio_sequence(17, ts(45)), 6);
+        // Loss beyond the cap counts as a pause too.
+        assert_eq!(
+            s.next_audio_sequence(17 + 80, ts(45 + 80)),
+            7,
+            "80 frames > MAX_FORWARDED_GAP_FRAMES"
+        );
+        // Loss plus heartbeats: never more slots than frames the clock accounts for.
+        assert_eq!(s.next_audio_sequence(17 + 80 + 6, ts(45 + 80 + 3)), 10);
+        // A frame arriving late for a skipped slot takes that slot and leaves the clock alone.
+        assert_eq!(s.next_audio_sequence(17 + 80 + 4, ts(45 + 80 + 1)), 8);
+        assert_eq!(s.next_audio_sequence(17 + 80 + 7, ts(45 + 80 + 4)), 11);
+        // A clock step that is not whole frames is a fresh frame.
+        assert_eq!(
+            s.next_audio_sequence(17 + 80 + 8, ts(45 + 80 + 4) + 100),
+            12
+        );
+        assert_eq!(s.audio_sequence(), 13);
     }
 }

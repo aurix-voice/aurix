@@ -137,6 +137,18 @@ pub static QUALITY_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Uplink frames a server mixer found missing when a sender's next packet arrived, by how
+/// the gap was filled: `fec` (in-band redundancy of the next packet), `dred` (Deep
+/// REDundancy), `plc` (concealment) or `skipped` (gap too long or already played out).
+pub static MIXER_LOST_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_mixer_lost_frames_total",
+        "Lost uplink frames seen by server mixers, by recovery method",
+        &["method"]
+    )
+    .unwrap()
+});
+
 // ── API Metrics ──
 
 pub static API_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {

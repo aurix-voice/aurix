@@ -2,6 +2,7 @@ use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::MediaChannel;
 use crate::mix::MixHub;
+use crate::mixer::MixerConfig;
 use crate::quality::{MosAlertPolicy, QualityTick};
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
@@ -73,6 +74,8 @@ pub struct SfuOptions {
     /// address itself (single-host development).
     pub advertised_addrs: Vec<SocketAddr>,
     pub downlink_bitrate: u32,
+    /// libopus decoder complexity of the server mixers (see `MediaConfig::mixer_decoder_complexity`).
+    pub mixer_decoder_complexity: u8,
     /// Number of concurrent UDP receive workers (0 = derive from available CPUs).
     pub rx_workers: usize,
     /// Accept AURX media over the control WebSocket (see `MediaConfig::media_tunnel`).
@@ -106,6 +109,7 @@ impl Default for SfuOptions {
             cascade_peers: Vec::new(),
             advertised_addrs: Vec::new(),
             downlink_bitrate: 32_000,
+            mixer_decoder_complexity: 5,
             rx_workers: 0,
             media_tunnel: true,
             tunnel_queue_packets: 128,
@@ -140,6 +144,13 @@ pub struct SfuNode {
 }
 
 impl SfuNode {
+    fn mixer_config(&self) -> MixerConfig {
+        MixerConfig {
+            bitrate_bps: self.options.downlink_bitrate as i32,
+            decoder_complexity: self.options.mixer_decoder_complexity,
+        }
+    }
+
     pub fn new(node_id: MediaNodeId, region: Region, options: SfuOptions) -> Self {
         let (events, _) = broadcast::channel(4096);
         Self {
@@ -301,7 +312,7 @@ impl SfuNode {
             socket.clone(),
             advertised.clone(),
             webrtc_event_tx,
-            self.options.downlink_bitrate,
+            self.mixer_config(),
             self.options.webrtc_participant_streams,
         ));
         self.webrtc_manager = Some(webrtc_mgr.clone());
@@ -346,7 +357,7 @@ impl SfuNode {
             self.events.clone(),
             self.options
                 .downlink_mix
-                .then(|| MixHub::new(socket.clone(), self.options.downlink_bitrate as i32)),
+                .then(|| MixHub::new(socket.clone(), self.mixer_config())),
         ));
 
         // WebRTC media events -> router
@@ -376,7 +387,13 @@ impl SfuNode {
                             }
                             session.record_uplink(seq, Some(rtp_time), payload.len());
                             if let Err(e) = router
-                                .route_webrtc_audio(&session, rtp_time, payload, level)
+                                .route_webrtc_audio(
+                                    &session,
+                                    Some(seq as u32),
+                                    rtp_time,
+                                    payload,
+                                    level,
+                                )
                                 .await
                             {
                                 warn!("WebRTC audio route error: {}", e);
@@ -991,7 +1008,7 @@ impl SfuNode {
             .get_session(session_id)
             .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
         router
-            .route_webrtc_audio(&session, rtp_time, payload, level)
+            .route_webrtc_audio(&session, None, rtp_time, payload, level)
             .await
     }
     /// Every live session of a user on this node (a user may hold a session per device).

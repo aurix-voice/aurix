@@ -25,16 +25,12 @@ if ($Target -notlike "*-pc-windows-msvc") {
 
 $CargoArgs = @("build", "-p", "aurix-client", "--lib", "--target", $Target)
 if (-not $Debug) { $CargoArgs += "--release" }
-$CleanArgs = @("clean", "-p", "audiopus_sys", "--target", $Target)
-if (-not $Debug) { $CleanArgs += "--release" }
 
 Write-Host "building aurix-client for $Target ($Profile)"
 Push-Location $Root
 try {
-    # libopus is built from the bundled source (needs cmake) and linked statically into the DLL.
-    & cargo @CleanArgs 2>$null | Out-Null
-    $env:LIBOPUS_STATIC = "1"
-    $env:LIBOPUS_NO_PKG = "1"
+    # libopus 1.6 (DRED/OSCE) is built from the sources bundled with opusic-sys (needs cmake) and
+    # linked statically into the DLL.
     & cargo @CargoArgs
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 } finally {

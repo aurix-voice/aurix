@@ -163,6 +163,52 @@ struct AURIXVOICE_API FAurixEncoderSettings
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
 	bool bStereo = false;
+
+	/**
+	 * Deep REDundancy (libopus 1.5+): how much recent speech, 0..1040 ms in 10 ms steps, each
+	 * packet carries in compressed form so a receiver can rebuild several lost frames from the
+	 * next packet that arrives. 0 = off. Reads back 0 when the library has no DRED.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	int32 DredDurationMs = 0;
+};
+
+/** Redundancy tier of the uplink encoder. */
+UENUM(BlueprintType)
+enum class EAurixLossProfile : uint8
+{
+	/** Baseline settings. */
+	Low,
+	/** In-band FEC on, tuned for >= 10 % loss. */
+	Moderate,
+	/** FEC tuned for >= 20 % loss, 400 ms of DRED, bitrate floor 28 kbit/s. */
+	High,
+};
+
+/** How the uplink loss profile is chosen. */
+UENUM(BlueprintType)
+enum class EAurixLossAdaptation : uint8
+{
+	/** From the server's uplink-loss reports: → Moderate at 3 %, → High at 10 %; back below 1 % / 5 % after 6 s. */
+	Auto,
+	FixedLow,
+	FixedModerate,
+	FixedHigh,
+};
+
+/** Downlink Opus decoder tuning shared by every remote stream. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixDecoderSettings
+{
+	GENERATED_BODY()
+
+	/** 0..10: >= 5 neural packet loss concealment, >= 6 OSCE speech enhancement (more CPU per stream). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	int32 Complexity = 5;
+
+	/** OSCE bandwidth extension of narrow speech; ignored by libopus builds without it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
+	bool bOsceBwe = false;
 };
 
 /** A channel's audio policy (operator-set ChannelConfig), merged over the joined channels. */
@@ -434,6 +480,14 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	/** Microphone processing (high-pass, echo cancellation, noise suppression, AGC). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	FAurixDspSettings Dsp;
+
+	/** Downlink decoder tuning (neural PLC / OSCE); SetDecoderSettings changes it later. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	FAurixDecoderSettings Decoder;
+
+	/** Uplink redundancy: follow the server's loss reports or pin a tier; SetLossAdaptation changes it later. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	EAurixLossAdaptation LossAdaptation = EAurixLossAdaptation::Auto;
 
 	/**
 	 * Adopt each joined channel's audio policy (bitrate, FEC/DTX, bandwidth, signal and the

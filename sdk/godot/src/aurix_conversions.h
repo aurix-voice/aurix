@@ -10,6 +10,8 @@
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include <algorithm>
+
 namespace aurix_godot {
 
 using godot::Array;
@@ -221,6 +223,7 @@ inline Dictionary encoder_to_dict(const AurixEncoderSettings& e) {
     d["expected_loss_percent"] = static_cast<int>(e.expected_loss_percent);
     d["dtx"] = e.dtx;
     d["channels"] = static_cast<int>(e.channels);
+    d["dred_duration_ms"] = static_cast<int>(e.dred_duration_ms);
     return d;
 }
 
@@ -236,6 +239,19 @@ inline void encoder_from_dict(const Dictionary& d, AurixEncoderSettings& e) {
     if (d.has("expected_loss_percent")) e.expected_loss_percent = static_cast<uint8_t>(static_cast<int64_t>(d["expected_loss_percent"]));
     if (d.has("dtx")) e.dtx = static_cast<bool>(d["dtx"]);
     if (d.has("channels")) e.channels = static_cast<uint8_t>(static_cast<int64_t>(d["channels"]));
+    if (d.has("dred_duration_ms")) e.dred_duration_ms = static_cast<uint16_t>(std::clamp<int64_t>(static_cast<int64_t>(d["dred_duration_ms"]), 0, 1040));
+}
+
+inline Dictionary decoder_to_dict(const AurixDecoderSettings& s) {
+    Dictionary d;
+    d["complexity"] = static_cast<int>(s.complexity);
+    d["osce_bwe"] = s.osce_bwe;
+    return d;
+}
+
+inline void decoder_from_dict(const Dictionary& d, AurixDecoderSettings& s) {
+    if (d.has("complexity")) s.complexity = static_cast<uint8_t>(std::clamp<int64_t>(static_cast<int64_t>(d["complexity"]), 0, 10));
+    if (d.has("osce_bwe")) s.osce_bwe = static_cast<bool>(d["osce_bwe"]);
 }
 
 inline Dictionary dsp_to_dict(const AurixDspConfig& c) {

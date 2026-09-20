@@ -96,6 +96,8 @@ namespace Aurix.Audio
         /// <summary>Ceiling for a stereo encoder.</summary>
         public const int MaxStereoBitrate = 510000;
         public const int MaxComplexity = 10;
+        /// <summary>Longest Deep REDundancy history libopus codes per packet (10 ms steps).</summary>
+        public const int MaxDredDurationMs = 1040;
 
         /// <summary>Target bitrate, bits per second.</summary>
         public int BitrateBps;
@@ -118,6 +120,12 @@ namespace Aurix.Audio
         /// Only honoured when the channel policy allows stereo (<see cref="AudioPolicy.Stereo"/>); PCMU is always mono.
         /// </summary>
         public int Channels;
+        /// <summary>
+        /// Deep REDundancy (libopus 1.5+): history each packet carries a neural low-rate copy of, 0 (off)..1040 ms
+        /// in 10 ms steps. Lets receivers rebuild bursts of lost frames; costs bitrate (an encoder at 28–40 kbit/s
+        /// only codes part of the requested history). Only <see cref="NativeOpusCodec"/> honours it (Concentus has no DRED).
+        /// </summary>
+        public int DredDurationMs;
 
         public bool Stereo => Channels == 2;
 
@@ -133,6 +141,7 @@ namespace Aurix.Audio
             ExpectedLossPercent = 5,
             Dtx = false,
             Channels = 1,
+            DredDurationMs = 0,
         };
 
         /// <summary>Copy with every numeric field pulled into the range libopus accepts.</summary>
@@ -143,6 +152,7 @@ namespace Aurix.Audio
             s.BitrateBps = Math.Clamp(s.BitrateBps, MinBitrate, s.Channels == 2 ? MaxStereoBitrate : MaxBitrate);
             s.Complexity = Math.Clamp(s.Complexity, 0, MaxComplexity);
             s.ExpectedLossPercent = Math.Clamp(s.ExpectedLossPercent, 0, 100);
+            s.DredDurationMs = Math.Clamp(s.DredDurationMs, 0, MaxDredDurationMs) / 10 * 10;
             return s;
         }
 
@@ -169,17 +179,52 @@ namespace Aurix.Audio
         public bool Equals(OpusEncoderSettings o) =>
             BitrateBps == o.BitrateBps && Complexity == o.Complexity && MaxBandwidth == o.MaxBandwidth &&
             Signal == o.Signal && Vbr == o.Vbr && ConstrainedVbr == o.ConstrainedVbr && Fec == o.Fec &&
-            ExpectedLossPercent == o.ExpectedLossPercent && Dtx == o.Dtx && Channels == o.Channels;
+            ExpectedLossPercent == o.ExpectedLossPercent && Dtx == o.Dtx && Channels == o.Channels &&
+            DredDurationMs == o.DredDurationMs;
 
         public override bool Equals(object obj) => obj is OpusEncoderSettings o && Equals(o);
 
         public override int GetHashCode() =>
             HashCode.Combine(BitrateBps, Complexity, (int)MaxBandwidth, (int)Signal,
-                (Vbr ? 1 : 0) | (ConstrainedVbr ? 2 : 0) | (Fec ? 4 : 0) | (Dtx ? 8 : 0), ExpectedLossPercent, Channels);
+                (Vbr ? 1 : 0) | (ConstrainedVbr ? 2 : 0) | (Fec ? 4 : 0) | (Dtx ? 8 : 0), ExpectedLossPercent, Channels,
+                DredDurationMs);
 
         public override string ToString() =>
             $"{BitrateBps} bps c{Complexity} {MaxBandwidth} {Signal}{(Channels == 2 ? " stereo" : "")}" +
-            $"{(Vbr ? (ConstrainedVbr ? " cvbr" : " vbr") : " cbr")}{(Fec ? $" fec({ExpectedLossPercent}%)" : "")}{(Dtx ? " dtx" : "")}";
+            $"{(Vbr ? (ConstrainedVbr ? " cvbr" : " vbr") : " cbr")}{(Fec ? $" fec({ExpectedLossPercent}%)" : "")}{(Dtx ? " dtx" : "")}" +
+            $"{(DredDurationMs > 0 ? $" dred({DredDurationMs}ms)" : "")}";
+    }
+
+    /// <summary>
+    /// Tuning of an Opus decoder's libopus 1.5+ neural paths. Mirrors the native core's <c>DecoderSettings</c>;
+    /// only <see cref="NativeOpusCodec"/> honours it (see <see cref="IOpusDecoderControls"/>).
+    /// </summary>
+    public struct OpusDecoderSettings : IEquatable<OpusDecoderSettings>
+    {
+        /// <summary>Neural PLC without OSCE — the default balance for many concurrent streams.</summary>
+        public const int DefaultComplexity = 5;
+
+        /// <summary>
+        /// 0..10. &gt;= 5 conceals lost frames with the neural PLC instead of the classic one; &gt;= 6 also runs OSCE LACE
+        /// speech enhancement on SILK frames, &gt;= 7 NoLACE (best quality, several times the CPU of LACE).
+        /// </summary>
+        public int Complexity;
+        /// <summary>OSCE bandwidth extension: wideband SILK speech is widened to fullband (needs complexity &gt;= 4).</summary>
+        public bool OsceBwe;
+
+        public static OpusDecoderSettings Default => new OpusDecoderSettings { Complexity = DefaultComplexity, OsceBwe = false };
+
+        public OpusDecoderSettings Clamped()
+        {
+            var s = this;
+            s.Complexity = Math.Clamp(s.Complexity, 0, OpusEncoderSettings.MaxComplexity);
+            return s;
+        }
+
+        public bool Equals(OpusDecoderSettings o) => Complexity == o.Complexity && OsceBwe == o.OsceBwe;
+        public override bool Equals(object obj) => obj is OpusDecoderSettings o && Equals(o);
+        public override int GetHashCode() => HashCode.Combine(Complexity, OsceBwe);
+        public override string ToString() => $"decoder c{Complexity}{(OsceBwe ? " osce-bwe" : "")}";
     }
 
     /// <summary>

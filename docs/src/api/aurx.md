@@ -148,6 +148,15 @@ Metrics: `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}
 * Feeds the decoded frame to recording, live streams and transcription **only** when the
   channel/consent rules allow and the frame is not `E2ee`.
 * Estimates uplink quality from sequence gaps/jitter for [network quality](../features/quality.md).
+* Renumbers audio per sender: the uplink sequence is shared with heartbeats and reports, so
+  receivers get a per-sender audio-only sequence. A short run of frames missing on the uplink
+  (packet sequence and the 20 ms timestamp clock jumped by the same count, up to 50 frames)
+  stays a **gap** in that numbering, so receivers' jitter buffers see the loss and rebuild it
+  from the next packet's in-band FEC / DRED or conceal it; a pause (DTX, VAD gate, heartbeats
+  only) or a longer jump does not. A frame arriving late for such a slot keeps that slot.
+  Timestamps are forwarded unchanged. The server mixers do the same repair on their own
+  decoders (`media.mixer_decoder_complexity`, `aurix_mixer_lost_frames_total{method}`) —
+  see [Packet loss](../sdk/native.md#packet-loss-fec-dred-and-the-neural-plc).
 * On a session that negotiated PCMU: decodes the μ-law uplink and re-encodes it as narrowband
   Opus before any of the above, so the rest of the channel is unaffected; encodes the Opus it
   would have sent to that session as μ-law after the per-receiver step (gain/direction bytes and

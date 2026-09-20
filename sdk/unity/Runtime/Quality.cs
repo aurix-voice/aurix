@@ -172,6 +172,11 @@ namespace Aurix
         public long FramesLost;
         /// <summary>Lost frames rebuilt from in-band FEC instead of PLC (subset of <see cref="FramesLost"/>).</summary>
         public long FramesFecRecovered;
+        /// <summary>
+        /// Lost frames rebuilt from a later packet's Deep REDundancy (libopus 1.5+, native codec only; subset of
+        /// <see cref="FramesLost"/>). Frames neither FEC nor DRED covered were concealed with PLC.
+        /// </summary>
+        public long FramesDredRecovered;
         public long FramesLate;
         public long Underruns;
         public int ActiveStreams;

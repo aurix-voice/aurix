@@ -1,7 +1,7 @@
 # Quick start (development)
 
 Prerequisites: a Rust toolchain (1.88+), Docker, and the build dependencies `pkg-config`,
-`libssl-dev`, `cmake`, `libopus-dev` (Debian names).
+`libssl-dev`, `cmake` (Debian names; libopus is built from bundled sources).
 
 ## 1. Start the dependencies and the server
 

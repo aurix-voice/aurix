@@ -10,14 +10,15 @@ namespace Aurix.Audio
     /// Drop the binary for each target into <c>Plugins/&lt;platform&gt;/</c>; on iOS link the static library
     /// (<c>libaurix_client.a</c>) and the symbols resolve through <c>__Internal</c>.
     /// <para>
-    /// Supports every control in <see cref="OpusEncoderSettings"/> and FEC recovery of lost frames
-    /// (<see cref="IOpusFecDecoder"/>). Nothing here is variadic, so the P/Invoke signatures are
+    /// Supports every control in <see cref="OpusEncoderSettings"/> (including DRED), FEC and DRED
+    /// recovery of lost frames (<see cref="IOpusFecDecoder"/>, <see cref="IOpusDredDecoder"/>) and the
+    /// libopus 1.5+ neural PLC / OSCE tuning (<see cref="IOpusDecoderControls"/>). Nothing here is variadic, so the P/Invoke signatures are
     /// valid on every ABI (a direct <c>opus_encoder_ctl</c> import is not, e.g. on Apple arm64).
     /// Projects that do not ship native binaries keep using Concentus; check
     /// <see cref="IsAvailable"/> to pick at runtime.
     /// </para>
     /// </summary>
-    public sealed class NativeOpusCodec : IOpusCodec, IOpusEncoderControls, IOpusFecDecoder
+    public sealed class NativeOpusCodec : IOpusCodec, IOpusEncoderControls, IOpusFecDecoder, IOpusDredDecoder, IOpusDecoderControls
     {
 #if UNITY_IOS && !UNITY_EDITOR
         private const string Lib = "__Internal";
@@ -41,6 +42,7 @@ namespace Aurix.Audio
             public byte ExpectedLossPercent;
             public byte Dtx;
             public byte Channels;
+            public ushort DredDurationMs;
 
             public static NativeSettings From(OpusEncoderSettings s)
             {
@@ -57,6 +59,7 @@ namespace Aurix.Audio
                     ExpectedLossPercent = (byte)s.ExpectedLossPercent,
                     Dtx = (byte)(s.Dtx ? 1 : 0),
                     Channels = (byte)s.Channels,
+                    DredDurationMs = (ushort)s.DredDurationMs,
                 };
             }
 
@@ -72,7 +75,24 @@ namespace Aurix.Audio
                 ExpectedLossPercent = ExpectedLossPercent,
                 Dtx = Dtx != 0,
                 Channels = Channels,
+                DredDurationMs = DredDurationMs,
             };
+        }
+
+        /// <summary>Blittable mirror of the C <c>AurixDecoderSettings</c>.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeDecoderSettings
+        {
+            public byte Complexity;
+            public byte OsceBwe;
+
+            public static NativeDecoderSettings From(OpusDecoderSettings s)
+            {
+                s = s.Clamped();
+                return new NativeDecoderSettings { Complexity = (byte)s.Complexity, OsceBwe = (byte)(s.OsceBwe ? 1 : 0) };
+            }
+
+            public OpusDecoderSettings ToManaged() => new OpusDecoderSettings { Complexity = Complexity, OsceBwe = OsceBwe != 0 };
         }
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -92,6 +112,19 @@ namespace Aurix.Audio
         private static extern void aurix_opus_decoder_destroy(IntPtr decoder);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         private static extern int aurix_opus_decoder_decode_f32(IntPtr decoder, ref byte packet, UIntPtr packetLen, ref float pcm, UIntPtr maxFrameSamplesPerChannel, [MarshalAs(UnmanagedType.U1)] bool fec);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int aurix_opus_decoder_apply(IntPtr decoder, ref NativeDecoderSettings settings);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool aurix_opus_decoder_settings(IntPtr decoder, out NativeDecoderSettings settings);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int aurix_opus_decoder_dred_decode_f32(IntPtr decoder, ref byte packet, UIntPtr packetLen, uint framesBefore, ref float pcm, UIntPtr frameSamplesPerChannel);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool aurix_opus_packet_has_fec(ref byte packet, UIntPtr packetLen);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool aurix_dred_supported();
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr aurix_last_error();
 
@@ -126,11 +159,34 @@ namespace Aurix.Audio
             return true;
         }
 
+        /// <summary>
+        /// Whether the native library's libopus codes and decodes Deep REDundancy (the bundled 1.6 does).
+        /// Without it <see cref="OpusEncoderSettings.DredDurationMs"/> reads back 0 and <see cref="DecodeDred"/>
+        /// returns 0 (the jitter buffer falls back to FEC + PLC). Requires <see cref="IsAvailable"/>.
+        /// </summary>
+        public static bool DredSupported
+        {
+            get
+            {
+                if (!IsAvailable) return false;
+                try { return aurix_dred_supported(); }
+                catch (EntryPointNotFoundException) { return false; }
+            }
+        }
+
+        /// <summary>Whether <paramref name="packet"/> carries in-band FEC (LBRR) for the frame before it.</summary>
+        public static bool PacketHasFec(ReadOnlySpan<byte> packet)
+        {
+            if (packet.IsEmpty) return false;
+            return aurix_opus_packet_has_fec(ref MemoryMarshal.GetReference(packet), (UIntPtr)(uint)packet.Length);
+        }
+
         private IntPtr _encoder;
         private IntPtr _decoder;
         private readonly object _encLock = new object();
         private readonly object _decLock = new object();
         private OpusEncoderSettings _settings;
+        private OpusDecoderSettings _decoderSettings = OpusDecoderSettings.Default;
 
         public int SampleRate { get; }
         public int Channels { get; }
@@ -154,6 +210,7 @@ namespace Aurix.Audio
                 throw new InvalidOperationException("aurix_opus_decoder_create: " + err);
             }
             _settings = ReadSettings();
+            _decoderSettings = ReadDecoderSettings();
         }
 
         private static string LastError()
@@ -167,8 +224,28 @@ namespace Aurix.Audio
             return aurix_opus_encoder_settings(_encoder, out var s) ? s.ToManaged() : _settings;
         }
 
+        private OpusDecoderSettings ReadDecoderSettings()
+        {
+            return aurix_opus_decoder_settings(_decoder, out var s) ? s.ToManaged() : _decoderSettings;
+        }
+
         /// <summary>Settings libopus is running with (after clamping).</summary>
         public OpusEncoderSettings Settings { get { lock (_encLock) return _settings; } }
+
+        /// <summary>Decoder tuning libopus is running with (after clamping).</summary>
+        public OpusDecoderSettings DecoderSettings { get { lock (_decLock) return _decoderSettings; } }
+
+        public void ApplyDecoder(OpusDecoderSettings settings)
+        {
+            lock (_decLock)
+            {
+                ThrowIfDisposed();
+                var s = NativeDecoderSettings.From(settings);
+                int rc = aurix_opus_decoder_apply(_decoder, ref s);
+                if (rc != 0) throw new InvalidOperationException("aurix_opus_decoder_apply: " + LastError());
+                _decoderSettings = ReadDecoderSettings();
+            }
+        }
 
         public void Apply(OpusEncoderSettings settings)
         {
@@ -212,6 +289,20 @@ namespace Aurix.Audio
 
         public int DecodeFec(ReadOnlySpan<byte> nextPacket, Span<float> pcm, int frameSamplesPerChannel) =>
             nextPacket.IsEmpty ? DecodeLost(pcm, frameSamplesPerChannel) : DecodeInternal(nextPacket, pcm, frameSamplesPerChannel, true);
+
+        public int DecodeDred(ReadOnlySpan<byte> laterPacket, int framesBefore, Span<float> pcm, int frameSamplesPerChannel)
+        {
+            if (laterPacket.IsEmpty || framesBefore <= 0) return 0;
+            if (frameSamplesPerChannel <= 0 || pcm.Length < frameSamplesPerChannel * Channels)
+                throw new ArgumentException("pcm buffer too small", nameof(pcm));
+            lock (_decLock)
+            {
+                ThrowIfDisposed();
+                int n = aurix_opus_decoder_dred_decode_f32(_decoder, ref MemoryMarshal.GetReference(laterPacket),
+                    (UIntPtr)(uint)laterPacket.Length, (uint)framesBefore, ref MemoryMarshal.GetReference(pcm), (UIntPtr)(uint)frameSamplesPerChannel);
+                return Math.Max(0, n);
+            }
+        }
 
         private static byte _noPacket;
 

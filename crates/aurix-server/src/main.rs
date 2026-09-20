@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             cascade_peers: config.media.cascade_peers.clone(),
             advertised_addrs,
             downlink_bitrate: config.media.default_bitrate,
+            mixer_decoder_complexity: config.media.mixer_decoder_complexity,
             rx_workers: config.media.rx_workers,
             media_tunnel: config.media.media_tunnel,
             tunnel_queue_packets: config.media.tunnel_queue_packets,

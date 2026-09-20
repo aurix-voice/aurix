@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::channel::{MediaChannel, Mix};
-use crate::mixer::{OpusMixer, FRAME_SAMPLES};
+use crate::mixer::{MixerConfig, OpusMixer, FRAME_SAMPLES};
 use crate::session::{MediaEndpoint, MediaSession};
 use crate::transcode::PcmuDownlink;
 use crate::tts::SYNTH_SSRC_FLAG;
@@ -111,12 +111,12 @@ impl MixNode {
         self.subscribers.lock().remove(session_id);
     }
 
-    fn push(&self, sender_ssrc: u32, mix: &Mix, payload: &[u8]) {
+    fn push(&self, sender_ssrc: u32, timestamp: u32, mix: &Mix, payload: &[u8]) {
         *self.last_fed.lock() = Instant::now();
-        if let Err(e) = self
-            .mixer
-            .lock()
-            .push_opus(sender_ssrc, mix.volume, mix.direction, payload)
+        if let Err(e) =
+            self.mixer
+                .lock()
+                .push_opus(sender_ssrc, timestamp, mix.volume, mix.direction, payload)
         {
             aurix_metrics::DOWNLINK_MIX_FRAMES
                 .with_label_values(&["failed"])
@@ -252,7 +252,7 @@ impl MixNode {
 
 pub struct MixHub {
     socket: Arc<MediaSocket>,
-    bitrate_bps: i32,
+    mixer: MixerConfig,
     nodes: DashMap<Slot, Arc<MixNode>>,
     /// Which mixer currently serves each (receiver, channel).
     assignments: DashMap<(SessionId, ChannelId), Slot>,
@@ -262,10 +262,10 @@ pub struct MixHub {
 }
 
 impl MixHub {
-    pub fn new(socket: Arc<MediaSocket>, bitrate_bps: i32) -> Arc<Self> {
+    pub fn new(socket: Arc<MediaSocket>, mixer: MixerConfig) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             socket,
-            bitrate_bps,
+            mixer,
             nodes: DashMap::new(),
             assignments: DashMap::new(),
             sequences: DashMap::new(),
@@ -324,11 +324,21 @@ impl MixHub {
                     if !shared_fed {
                         // Uniform receivers of a Team/Command channel all hear the sender at
                         // unity; their focus gain is applied per packet on emit.
-                        node.push(packet.header.ssrc, &Mix::UNITY, &packet.payload);
+                        node.push(
+                            packet.header.ssrc,
+                            packet.header.timestamp,
+                            &Mix::UNITY,
+                            &packet.payload,
+                        );
                         shared_fed = true;
                     }
                 }
-                Slot::Private(..) => node.push(packet.header.ssrc, &mix, &packet.payload),
+                Slot::Private(..) => node.push(
+                    packet.header.ssrc,
+                    packet.header.timestamp,
+                    &mix,
+                    &packet.payload,
+                ),
             }
         }
         leftovers
@@ -344,7 +354,7 @@ impl MixHub {
                 .inc();
             return None;
         }
-        let mixer = match OpusMixer::new(self.bitrate_bps) {
+        let mixer = match OpusMixer::new(self.mixer) {
             Ok(m) => m,
             Err(e) => {
                 warn!("downlink mixer: {e}");

@@ -229,6 +229,7 @@ namespace Aurix
         private int? _complexityPin;
         private bool _followChannelPolicy = true;
         private BitrateCommand? _bitrateCommand;
+        private readonly LossController _loss = new LossController();
         private IOpusCodec _encoder;
         private OpusEncoderSettings? _appliedEncoderSettings;
         private byte[] _mediaKey;
@@ -581,6 +582,34 @@ namespace Aurix
         }
 
         /// <summary>
+        /// Loss profile the uplink encoder runs with right now (mirrors <c>aurix_client_loss_profile</c>): chosen from the
+        /// server's uplink loss reports with hysteresis and a dwell time, or pinned via <see cref="SetLossProfile"/>.
+        /// </summary>
+        public LossProfile LossProfile { get { lock (_channels) return _loss.Profile; } }
+
+        /// <summary>The pinned loss profile, or null while it follows the server's reports.</summary>
+        public LossProfile? PinnedLossProfile { get { lock (_channels) return _loss.Pinned; } }
+
+        /// <summary>
+        /// Pin the uplink redundancy tier (FEC / expected loss / DRED) or <c>null</c> to choose it from the server's
+        /// uplink loss reports (the default). Applied to the encoder at once.
+        /// </summary>
+        public void SetLossProfile(LossProfile? profile)
+        {
+            bool changed;
+            LossProfile now;
+            float loss;
+            lock (_channels)
+            {
+                changed = _loss.SetPinned(profile, DateTime.UtcNow);
+                now = _loss.Profile;
+                loss = _loss.UplinkLossPercent;
+            }
+            ReapplyEncoder();
+            if (changed) OnLossProfileChanged?.Invoke(now, loss);
+        }
+
+        /// <summary>
         /// The uplink codec this client keeps tuned. Set it once after constructing the codec; every
         /// policy/bitrate change is pushed through <see cref="IOpusEncoderControls.Apply"/> (or
         /// <see cref="IOpusCodec.SetBitrate"/> for codecs without full controls).
@@ -600,13 +629,51 @@ namespace Aurix
             bool followed = _followChannelPolicy && _audioPolicy.HasValue;
             var s = followed ? _encoderSettings.WithPolicy(_audioPolicy.Value, _complexityPin) : _encoderSettings;
             if (!followed && _complexityPin.HasValue) s.Complexity = _complexityPin.Value;
+            int? ceiling = followed ? _audioPolicy.Value.BitrateBps : (int?)null;
             if (_bitrateCommand.HasValue)
             {
                 var cmd = _bitrateCommand.Value;
                 s.BitrateBps = cmd.TargetBitrateBps;
                 s.ExpectedLossPercent = Math.Max(s.ExpectedLossPercent, cmd.ExpectedLossPercent);
+                ceiling = cmd.TargetBitrateBps;
             }
-            return s.Clamped();
+            return _loss.Shape(s.Clamped(), ceiling);
+        }
+
+        /// <summary>Feed a server uplink-loss report to the loss profile; on a tier change retune the encoder and tell the app.</summary>
+        private void ObserveUplinkLoss(float uplinkLossPercent)
+        {
+            bool changed;
+            LossProfile now;
+            lock (_channels)
+            {
+                changed = _loss.Observe(uplinkLossPercent, DateTime.UtcNow);
+                now = _loss.Profile;
+            }
+            if (!changed) return;
+            ReapplyEncoder();
+            OnLossProfileChanged?.Invoke(now, uplinkLossPercent);
+        }
+
+        /// <summary>A session ended: forget the server's bitrate command and the measured loss.</summary>
+        private void ResetLinkAdaptation()
+        {
+            bool changed;
+            LossProfile now;
+            bool hadCommand;
+            lock (_channels)
+            {
+                var before = _loss.Profile;
+                hadCommand = _bitrateCommand.HasValue;
+                _bitrateCommand = null;
+                _loss.Reset();
+                now = _loss.Profile;
+                changed = before != now;
+            }
+            if (!changed && !hadCommand) return;
+            try { ReapplyEncoder(); }
+            catch (ObjectDisposedException) { }
+            if (changed) OnLossProfileChanged?.Invoke(now, 0f);
         }
 
         /// <summary>Push the effective settings to the bound codec and notify, if they changed.</summary>
@@ -677,6 +744,11 @@ namespace Aurix
         /// bitrate command). Applied to <see cref="Encoder"/> automatically when one is bound.
         /// </summary>
         public event Action<OpusEncoderSettings> OnEncoderSettingsChanged;
+        /// <summary>
+        /// The uplink loss profile changed (escalated at once on the server's uplink loss, relaxed after the dwell time,
+        /// or pinned); with the uplink loss percent that drove it.
+        /// </summary>
+        public event Action<LossProfile, float> OnLossProfileChanged;
         /// <summary>
         /// Server-side view of this connection (downlink from our reports + uplink as measured by the SFU),
         /// sent when the 1–5 bars change and periodically as a summary.
@@ -2222,6 +2294,7 @@ namespace Aurix
                 var t = mixer.Totals;
                 s.FramesLost = t.Lost;
                 s.FramesFecRecovered = t.FecRecovered;
+                s.FramesDredRecovered = t.DredRecovered;
                 s.FramesLate = t.Late;
                 s.Underruns = t.Underruns;
                 s.ActiveStreams = mixer.ActiveStreams;
@@ -2393,6 +2466,7 @@ namespace Aurix
             _media?.Dispose();
             _media = null;
             _serverQuality = null;
+            ResetLinkAdaptation();
             _control?.Dispose();
             _control = null;
             _resumeToken = null;
@@ -2723,6 +2797,7 @@ namespace Aurix
                     if (q.HasValue)
                     {
                         _serverQuality = q;
+                        ObserveUplinkLoss(q.Value.UplinkLossPercent);
                         OnNetworkQuality?.Invoke(q.Value);
                     }
                     break;

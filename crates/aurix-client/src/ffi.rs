@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::audio::EncoderSettings;
+use crate::audio::{DecoderSettings, EncoderSettings};
 use crate::client::Client;
 use crate::config::ClientConfig;
 use crate::dsp::{DspConfig, DspStats, NoiseSuppression};
@@ -53,6 +53,7 @@ use crate::effects::{
 use crate::error::ClientError;
 use crate::events::{ChannelScope, ChatScope, ConnectionState, Event};
 use crate::media::{MediaPath, MediaPathPolicy};
+use crate::resilience::{LossAdaptation, LossProfile};
 use crate::visemes::{Viseme, VisemeAnalyzer, VisemeFrame, VISEME_COUNT};
 
 // ------------------------------------------------------------------------------- results
@@ -500,6 +501,11 @@ pub struct AurixEncoderSettings {
     /// 1 (mono voice, default) or 2 (stereo music / broadcast). Only honoured in channels
     /// whose policy allows `stereo`; PCMU is always mono. Other values are read as 1.
     pub channels: u8,
+    /// Deep REDundancy (libopus 1.5+): history each packet carries a neural low-rate copy
+    /// of, 0 (off) ..= 1040 ms in 10 ms steps. Lets receivers rebuild bursts of lost
+    /// frames; the automatic loss profile turns it on under heavy loss. Reads back 0 on a
+    /// libopus without DRED.
+    pub dred_duration_ms: u16,
 }
 
 impl From<EncoderSettings> for AurixEncoderSettings {
@@ -515,6 +521,7 @@ impl From<EncoderSettings> for AurixEncoderSettings {
             expected_loss_percent: s.expected_loss_percent,
             dtx: s.dtx,
             channels: s.channels,
+            dred_duration_ms: s.dred_duration_ms,
         }
     }
 }
@@ -532,8 +539,109 @@ impl From<AurixEncoderSettings> for EncoderSettings {
             expected_loss_percent: s.expected_loss_percent,
             dtx: s.dtx,
             channels: s.channels,
+            dred_duration_ms: s.dred_duration_ms,
         }
         .clamped()
+    }
+}
+
+/// Downlink Opus decoder tuning (libopus 1.5+ neural paths), shared by every remote stream.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurixDecoderSettings {
+    /// 0..=10. >= 5 conceals lost frames with the neural PLC (default), >= 6 adds OSCE LACE
+    /// speech enhancement of SILK frames, >= 7 NoLACE (best, several times LACE's CPU).
+    pub complexity: u8,
+    /// OSCE bandwidth extension of wideband speech to fullband (needs complexity >= 4).
+    pub osce_bwe: bool,
+}
+
+impl From<DecoderSettings> for AurixDecoderSettings {
+    fn from(s: DecoderSettings) -> Self {
+        Self {
+            complexity: s.complexity,
+            osce_bwe: s.osce_bwe,
+        }
+    }
+}
+
+impl From<AurixDecoderSettings> for DecoderSettings {
+    fn from(s: AurixDecoderSettings) -> Self {
+        DecoderSettings {
+            complexity: s.complexity,
+            osce_bwe: s.osce_bwe,
+        }
+        .clamped()
+    }
+}
+
+/// Redundancy tier of the uplink encoder (see `aurix_client_set_loss_adaptation`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AurixLossProfile {
+    /// Clean link: the baseline settings as they are.
+    #[default]
+    AurixLossProfileLow = 0,
+    /// In-band FEC on, tuned for >= 10 % (or the measured loss).
+    AurixLossProfileModerate = 1,
+    /// FEC tuned for >= 20 %, DRED covering 400 ms, bitrate lifted to 28 kbit/s where the
+    /// channel target / server command allows.
+    AurixLossProfileHigh = 2,
+}
+
+impl From<LossProfile> for AurixLossProfile {
+    fn from(p: LossProfile) -> Self {
+        match p {
+            LossProfile::Low => Self::AurixLossProfileLow,
+            LossProfile::Moderate => Self::AurixLossProfileModerate,
+            LossProfile::High => Self::AurixLossProfileHigh,
+        }
+    }
+}
+
+impl From<AurixLossProfile> for LossProfile {
+    fn from(p: AurixLossProfile) -> Self {
+        match p {
+            AurixLossProfile::AurixLossProfileLow => Self::Low,
+            AurixLossProfile::AurixLossProfileModerate => Self::Moderate,
+            AurixLossProfile::AurixLossProfileHigh => Self::High,
+        }
+    }
+}
+
+/// How the uplink loss profile is chosen.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AurixLossAdaptation {
+    /// From the server's uplink-loss reports: low → moderate at 3 %, → high at 10 %; back
+    /// below 1 % / 5 % after a 6 s dwell (default).
+    AurixLossAdaptationAuto = 0,
+    AurixLossAdaptationFixedLow = 1,
+    AurixLossAdaptationFixedModerate = 2,
+    AurixLossAdaptationFixedHigh = 3,
+}
+
+impl From<LossAdaptation> for AurixLossAdaptation {
+    fn from(a: LossAdaptation) -> Self {
+        match a {
+            LossAdaptation::Auto => Self::AurixLossAdaptationAuto,
+            LossAdaptation::Fixed(LossProfile::Low) => Self::AurixLossAdaptationFixedLow,
+            LossAdaptation::Fixed(LossProfile::Moderate) => Self::AurixLossAdaptationFixedModerate,
+            LossAdaptation::Fixed(LossProfile::High) => Self::AurixLossAdaptationFixedHigh,
+        }
+    }
+}
+
+impl From<AurixLossAdaptation> for LossAdaptation {
+    fn from(a: AurixLossAdaptation) -> Self {
+        match a {
+            AurixLossAdaptation::AurixLossAdaptationAuto => Self::Auto,
+            AurixLossAdaptation::AurixLossAdaptationFixedLow => Self::Fixed(LossProfile::Low),
+            AurixLossAdaptation::AurixLossAdaptationFixedModerate => {
+                Self::Fixed(LossProfile::Moderate)
+            }
+            AurixLossAdaptation::AurixLossAdaptationFixedHigh => Self::Fixed(LossProfile::High),
+        }
     }
 }
 
@@ -619,6 +727,12 @@ pub struct AurixClientConfig {
     /// across runs); `false`: a fresh identity per client.
     pub has_e2ee_identity: bool,
     pub e2ee_identity: [u8; 32],
+    /// Downlink decoder tuning (neural PLC / OSCE); `aurix_client_set_decoder_settings`
+    /// changes it later.
+    pub decoder: AurixDecoderSettings,
+    /// Uplink redundancy: adapt FEC / DRED to the server's loss reports (default) or pin a
+    /// tier; `aurix_client_set_loss_adaptation` changes it later.
+    pub loss_adaptation: AurixLossAdaptation,
 }
 
 #[no_mangle]
@@ -650,6 +764,8 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         e2ee: d.e2ee,
         has_e2ee_identity: false,
         e2ee_identity: [0; 32],
+        decoder: d.decoder.into(),
+        loss_adaptation: d.loss_adaptation.into(),
     };
 }
 
@@ -910,6 +1026,8 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.udp_reprobe_interval = Duration::from_millis(c.udp_reprobe_interval_ms as u64);
     cfg.e2ee = c.e2ee;
     cfg.e2ee_identity = c.has_e2ee_identity.then_some(c.e2ee_identity);
+    cfg.decoder = c.decoder.into();
+    cfg.loss_adaptation = c.loss_adaptation.into();
     Ok(cfg)
 }
 
@@ -1418,6 +1536,10 @@ pub enum AurixEventType {
     /// ducking the channel; `aurix_event_ducking` = the depth and timing to apply to the
     /// game's own music/SFX bus (the voice mix is ducked server-side already).
     AurixEventDuckingChanged = 45,
+    /// `aurix_event_loss_profile` = the uplink redundancy tier now in force (`number` = its
+    /// value, `number2` = the server-measured uplink loss in whole percent that triggered
+    /// it); FEC tuning / DRED already applied to the encoder.
+    AurixEventLossProfileChanged = 46,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1759,6 +1881,7 @@ impl AurixEvent {
             Event::UserBlockChanged { .. } => T::AurixEventUserBlockChanged,
             Event::Recording { .. } => T::AurixEventRecording,
             Event::BitrateChanged { .. } => T::AurixEventBitrateChanged,
+            Event::LossProfileChanged { .. } => T::AurixEventLossProfileChanged,
             Event::Kicked { .. } => T::AurixEventKicked,
             Event::ModerationApplied { .. } => T::AurixEventModerationApplied,
             Event::ChatMessage { .. } => T::AurixEventChatMessage,
@@ -2021,6 +2144,7 @@ pub unsafe extern "C" fn aurix_event_flag2(event: *const AurixEvent) -> bool {
 pub unsafe extern "C" fn aurix_event_number(event: *const AurixEvent) -> u64 {
     match self::event(event).map(|e| &e.event) {
         Some(Event::BitrateChanged { bitrate_bps, .. }) => *bitrate_bps as u64,
+        Some(Event::LossProfileChanged { profile, .. }) => AurixLossProfile::from(*profile) as u64,
         Some(Event::Recovering { attempt, .. }) => *attempt as u64,
         Some(Event::ChatReadMarkers { unread_count, .. }) => u64::from(*unread_count),
         Some(Event::ChatInboxSynced { delivered, .. }) => u64::from(*delivered),
@@ -2036,7 +2160,20 @@ pub unsafe extern "C" fn aurix_event_number2(event: *const AurixEvent) -> u64 {
     match self::event(event).map(|e| &e.event) {
         Some(Event::Recovering { delay, .. }) => delay.as_millis() as u64,
         Some(Event::ChatReadMarkers { markers, .. }) => markers.len() as u64,
+        Some(Event::LossProfileChanged {
+            uplink_loss_percent,
+            ..
+        }) => uplink_loss_percent.clamp(0.0, 100.0).round() as u64,
         _ => 0,
+    }
+}
+
+/// Redundancy tier of a `LossProfileChanged` event (`Low` for other events).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_loss_profile(event: *const AurixEvent) -> AurixLossProfile {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::LossProfileChanged { profile, .. }) => (*profile).into(),
+        _ => AurixLossProfile::AurixLossProfileLow,
     }
 }
 
@@ -3438,6 +3575,77 @@ pub unsafe extern "C" fn aurix_client_audio_policy(
     }
 }
 
+/// Choose the uplink redundancy tier from the server's loss reports (`Auto`, default) or
+/// pin one; FEC tuning / DRED are applied to the encoder at once and
+/// `AurixEventLossProfileChanged` reports later moves.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_loss_adaptation(
+    client: *mut AurixClient,
+    adaptation: AurixLossAdaptation,
+) -> AurixResult {
+    match self::client(client) {
+        Ok(c) => ok(c.set_loss_adaptation(adaptation.into())),
+        Err(r) => r,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_loss_adaptation(
+    client: *const AurixClient,
+) -> AurixLossAdaptation {
+    match self::client(client) {
+        Ok(c) => c.loss_adaptation().into(),
+        Err(_) => AurixLossAdaptation::AurixLossAdaptationAuto,
+    }
+}
+
+/// Redundancy tier the encoder runs with right now.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_loss_profile(client: *const AurixClient) -> AurixLossProfile {
+    match self::client(client) {
+        Ok(c) => c.loss_profile().into(),
+        Err(_) => AurixLossProfile::AurixLossProfileLow,
+    }
+}
+
+/// Retune every downlink decoder (complexity → neural PLC / OSCE, OSCE bandwidth extension);
+/// streams already playing switch immediately. Out-of-range values are clamped.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_decoder_settings(
+    client: *mut AurixClient,
+    settings: *const AurixDecoderSettings,
+) -> AurixResult {
+    if settings.is_null() {
+        return AurixResult::AurixInvalidArgument;
+    }
+    match self::client(client) {
+        Ok(c) => ok(c.set_decoder_settings((*settings).into())),
+        Err(r) => r,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_decoder_settings(
+    client: *const AurixClient,
+    out: *mut AurixDecoderSettings,
+) -> bool {
+    let Ok(c) = self::client(client) else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    *out = c.decoder_settings().into();
+    true
+}
+
+/// Whether this library's libopus codes and decodes Deep REDundancy (the bundled libopus
+/// 1.6 does; without it lost frames get FEC + PLC only and `dred_duration_ms` reads back 0).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_dred_supported() -> bool {
+    crate::audio::dred_supported()
+}
+
 /// Payload of `AurixEventAudioPolicyChanged`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_audio_policy(
@@ -4154,6 +4362,11 @@ pub struct AurixStats {
     pub frames_e2ee: u64,
     /// Encrypted downlink frames dropped: unknown sender, key not yet received, or replay.
     pub e2ee_undecryptable: u64,
+    /// Of `frames_lost`, frames rebuilt from the next packet's in-band FEC / from DRED.
+    pub frames_fec_recovered: u64,
+    pub frames_dred_recovered: u64,
+    /// Uplink redundancy tier in force.
+    pub loss_profile: AurixLossProfile,
 }
 
 #[no_mangle]
@@ -4201,6 +4414,9 @@ pub unsafe extern "C" fn aurix_client_stats(
         heartbeats_lost_consecutive: s.media.heartbeats_lost_consecutive,
         frames_e2ee: s.transmit.frames_e2ee,
         e2ee_undecryptable: s.transmit.e2ee_undecryptable,
+        frames_fec_recovered: s.frames_fec_recovered,
+        frames_dred_recovered: s.frames_dred_recovered,
+        loss_profile: s.loss_profile.into(),
     };
     AurixResult::AurixOk
 }
@@ -4698,6 +4914,100 @@ pub unsafe extern "C" fn aurix_opus_decoder_decode_i16(
         Ok(len) => len as i32,
         Err(e) => codec_err_i32(e),
     }
+}
+
+/// Retune a bare decoder (complexity → neural PLC / OSCE, OSCE bandwidth extension); takes
+/// effect from the next frame. Out-of-range values are clamped.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_apply(
+    decoder: *mut AurixOpusDecoder,
+    settings: *const AurixDecoderSettings,
+) -> AurixResult {
+    if decoder.is_null() {
+        return null_ptr("decoder");
+    }
+    if settings.is_null() {
+        return null_ptr("settings");
+    }
+    match (*decoder).inner.apply((*settings).into()) {
+        Ok(()) => AurixResult::AurixOk,
+        Err(e) => codec_fail(e),
+    }
+}
+
+/// The settings a bare decoder is running with.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_settings(
+    decoder: *mut AurixOpusDecoder,
+    out: *mut AurixDecoderSettings,
+) -> bool {
+    if decoder.is_null() || out.is_null() {
+        return false;
+    }
+    *out = (*decoder).inner.settings().into();
+    true
+}
+
+/// Rebuild the frame `frames_before` frames before `packet` (1 = the one right before it, 2
+/// = the one before that, …) from the Deep REDundancy the packet carries, into one frame of
+/// `frame_samples_per_channel` samples per channel. Use it for the frames of a gap that the
+/// next packet's in-band FEC does not cover, before falling back to PLC. Returns samples per
+/// channel written, `0` when the packet's DRED does not reach that far (or this libopus has
+/// none — see `aurix_dred_supported`), or a negative `AurixResult` code.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_dred_decode_f32(
+    decoder: *mut AurixOpusDecoder,
+    packet: *const u8,
+    packet_len: usize,
+    frames_before: u32,
+    pcm: *mut f32,
+    frame_samples_per_channel: usize,
+) -> i32 {
+    if decoder.is_null() || packet.is_null() || pcm.is_null() {
+        return -(null_ptr("decoder/packet/pcm") as i32);
+    }
+    let dec = &mut (*decoder).inner;
+    let packet = std::slice::from_raw_parts(packet, packet_len);
+    let n = frame_samples_per_channel.saturating_mul(dec.channels());
+    let pcm = std::slice::from_raw_parts_mut(pcm, n);
+    match dec.dred_decode_f32(packet, frames_before as usize, pcm) {
+        Ok(len) => len as i32,
+        Err(e) => codec_err_i32(e),
+    }
+}
+
+/// `aurix_opus_decoder_dred_decode_f32` for interleaved i16 PCM.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_decoder_dred_decode_i16(
+    decoder: *mut AurixOpusDecoder,
+    packet: *const u8,
+    packet_len: usize,
+    frames_before: u32,
+    pcm: *mut i16,
+    frame_samples_per_channel: usize,
+) -> i32 {
+    if decoder.is_null() || packet.is_null() || pcm.is_null() {
+        return -(null_ptr("decoder/packet/pcm") as i32);
+    }
+    let dec = &mut (*decoder).inner;
+    let packet = std::slice::from_raw_parts(packet, packet_len);
+    let n = frame_samples_per_channel.saturating_mul(dec.channels());
+    let pcm = std::slice::from_raw_parts_mut(pcm, n);
+    match dec.dred_decode_i16(packet, frames_before as usize, pcm) {
+        Ok(len) => len as i32,
+        Err(e) => codec_err_i32(e),
+    }
+}
+
+/// Whether an Opus packet carries in-band FEC (LBRR) for the frame before it — the cheap
+/// check before `aurix_opus_decoder_decode_*` with `fec = true`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_opus_packet_has_fec(packet: *const u8, packet_len: usize) -> bool {
+    if packet.is_null() || packet_len == 0 {
+        return false;
+    }
+    let packet = std::slice::from_raw_parts(packet, packet_len);
+    opus::packet::has_lbrr(packet).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------- standalone DSP
@@ -5295,6 +5605,208 @@ mod tests {
             aurix_opus_decoder_destroy(dec);
             aurix_opus_encoder_destroy(ptr::null_mut());
             aurix_opus_decoder_destroy(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn loss_adaptation_and_decoder_settings_round_trip_through_the_abi() {
+        unsafe {
+            let mut cfg = std::mem::MaybeUninit::<AurixClientConfig>::uninit();
+            aurix_client_config_default(cfg.as_mut_ptr());
+            let mut cfg = cfg.assume_init();
+            assert_eq!(
+                cfg.decoder,
+                AurixDecoderSettings::from(DecoderSettings::default())
+            );
+            assert_eq!(
+                cfg.loss_adaptation,
+                AurixLossAdaptation::AurixLossAdaptationAuto
+            );
+            let url = CString::new("http://not-a-websocket").unwrap();
+            let token = CString::new("t").unwrap();
+            cfg.ws_url = url.as_ptr();
+            cfg.token = token.as_ptr();
+            cfg.loss_adaptation = AurixLossAdaptation::AurixLossAdaptationFixedHigh;
+            let client = aurix_client_create(&cfg);
+            assert!(!client.is_null());
+            assert_eq!(
+                aurix_client_loss_adaptation(client),
+                AurixLossAdaptation::AurixLossAdaptationFixedHigh
+            );
+            assert_eq!(
+                aurix_client_loss_profile(client),
+                AurixLossProfile::AurixLossProfileHigh
+            );
+            assert_eq!(
+                aurix_client_set_loss_adaptation(
+                    client,
+                    AurixLossAdaptation::AurixLossAdaptationAuto
+                ),
+                AurixResult::AurixOk
+            );
+            assert_eq!(
+                aurix_client_loss_profile(client),
+                AurixLossProfile::AurixLossProfileLow
+            );
+            let ds = AurixDecoderSettings {
+                complexity: 42,
+                osce_bwe: true,
+            };
+            assert_eq!(
+                aurix_client_set_decoder_settings(client, &ds),
+                AurixResult::AurixOk
+            );
+            assert_eq!(
+                aurix_client_set_decoder_settings(client, ptr::null()),
+                AurixResult::AurixInvalidArgument
+            );
+            let mut back = AurixDecoderSettings::from(DecoderSettings::default());
+            assert!(aurix_client_decoder_settings(client, &mut back));
+            assert_eq!((back.complexity, back.osce_bwe), (10, true));
+            assert!(!aurix_client_decoder_settings(ptr::null(), &mut back));
+            assert_eq!(
+                aurix_client_loss_profile(ptr::null()),
+                AurixLossProfile::AurixLossProfileLow
+            );
+            aurix_client_destroy(client);
+        }
+    }
+
+    #[test]
+    fn bare_decoder_rebuilds_a_burst_from_dred_through_the_abi() {
+        unsafe {
+            assert!(aurix_dred_supported());
+            let mut settings = AurixEncoderSettings::from(EncoderSettings::default());
+            settings.bitrate_bps = 40_000;
+            settings.complexity = 10;
+            settings.fec = true;
+            settings.expected_loss_percent = 30;
+            settings.dtx = false;
+            settings.dred_duration_ms = 400;
+            let enc = aurix_opus_encoder_create(48_000, 1, &settings);
+            assert!(!enc.is_null());
+            let mut got = settings;
+            assert!(aurix_opus_encoder_settings(enc, &mut got));
+            assert_eq!(got.dred_duration_ms, 400);
+
+            let frame = 960usize;
+            let n = 50;
+            let pcm = opus::testing::speech_like_f32(n);
+            let mut packets = Vec::with_capacity(n);
+            let mut buf = vec![0u8; 1275];
+            for i in 0..n {
+                let len = aurix_opus_encoder_encode_f32(
+                    enc,
+                    pcm[i * frame..].as_ptr(),
+                    frame,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+                assert!(len > 0, "encode {i}: {len}");
+                packets.push(buf[..len as usize].to_vec());
+            }
+
+            let dec = aurix_opus_decoder_create(48_000, 1);
+            assert!(!dec.is_null());
+            let ds = AurixDecoderSettings {
+                complexity: 6,
+                osce_bwe: false,
+            };
+            assert_eq!(aurix_opus_decoder_apply(dec, &ds), AurixResult::AurixOk);
+            assert_eq!(
+                aurix_opus_decoder_apply(dec, ptr::null()),
+                AurixResult::AurixNullPointer
+            );
+            let mut back = AurixDecoderSettings::from(DecoderSettings::default());
+            assert!(aurix_opus_decoder_settings(dec, &mut back));
+            assert_eq!(back.complexity, 6);
+            let mut out = vec![0f32; frame];
+            for p in &packets[..30] {
+                let n = aurix_opus_decoder_decode_f32(
+                    dec,
+                    p.as_ptr(),
+                    p.len(),
+                    out.as_mut_ptr(),
+                    frame,
+                    false,
+                );
+                assert_eq!(n as usize, frame);
+            }
+            // Frames 30..33 lost: 30..32 from packet 34's DRED, 33 from its FEC (or PLC).
+            let later = &packets[34];
+            let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+            let mut rebuilt = Vec::new();
+            for back in (2..=4u32).rev() {
+                let n = aurix_opus_decoder_dred_decode_f32(
+                    dec,
+                    later.as_ptr(),
+                    later.len(),
+                    back,
+                    out.as_mut_ptr(),
+                    frame,
+                );
+                assert_eq!(n as usize, frame, "{back} frames back");
+                rebuilt.extend_from_slice(&out);
+            }
+            let reference = rms(&pcm[30 * frame..33 * frame]);
+            let got = rms(&rebuilt);
+            assert!(
+                got > reference * 0.3 && got < reference * 3.0,
+                "DRED rms {got} vs {reference}"
+            );
+            let mut out16 = vec![0i16; frame];
+            assert_eq!(
+                aurix_opus_decoder_dred_decode_i16(
+                    dec,
+                    later.as_ptr(),
+                    later.len(),
+                    2,
+                    out16.as_mut_ptr(),
+                    frame,
+                ) as usize,
+                frame
+            );
+            assert!(out16.iter().any(|&v| v != 0));
+            let fec = aurix_opus_packet_has_fec(later.as_ptr(), later.len());
+            let n = aurix_opus_decoder_decode_f32(
+                dec,
+                later.as_ptr(),
+                later.len(),
+                out.as_mut_ptr(),
+                frame,
+                fec,
+            );
+            assert_eq!(n as usize, frame);
+            // Beyond the packet's history → 0; bad arguments → negative codes.
+            assert_eq!(
+                aurix_opus_decoder_dred_decode_f32(
+                    dec,
+                    later.as_ptr(),
+                    later.len(),
+                    60,
+                    out.as_mut_ptr(),
+                    frame,
+                ),
+                0
+            );
+            assert_eq!(
+                aurix_opus_decoder_dred_decode_f32(
+                    dec,
+                    later.as_ptr(),
+                    later.len(),
+                    0,
+                    out.as_mut_ptr(),
+                    frame,
+                ),
+                -(AurixResult::AurixInvalidArgument as i32)
+            );
+            assert_eq!(
+                aurix_opus_decoder_dred_decode_f32(dec, ptr::null(), 0, 2, out.as_mut_ptr(), frame),
+                -(AurixResult::AurixNullPointer as i32)
+            );
+            assert!(!aurix_opus_packet_has_fec(ptr::null(), 0));
+            aurix_opus_encoder_destroy(enc);
+            aurix_opus_decoder_destroy(dec);
         }
     }
 

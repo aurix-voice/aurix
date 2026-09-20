@@ -1,6 +1,7 @@
-use crate::audio::EncoderSettings;
+use crate::audio::{DecoderSettings, EncoderSettings};
 use crate::dsp::DspConfig;
 use crate::media::MediaPathPolicy;
+use crate::resilience::{LossAdaptation, LossProfilePolicy};
 use std::time::Duration;
 
 /// Exponential backoff for automatic reconnects.
@@ -63,6 +64,14 @@ pub struct ClientConfig {
     /// Uplink Opus encoder before any channel policy applies (bitrate, complexity, bandwidth,
     /// VBR/FEC/DTX).
     pub encoder: EncoderSettings,
+    /// Downlink Opus decoders: complexity (neural PLC from 5, OSCE speech enhancement from
+    /// 6) and OSCE bandwidth extension. Changeable at runtime with
+    /// `Client::set_decoder_settings`.
+    pub decoder: DecoderSettings,
+    /// How the uplink's redundancy (FEC tuning, DRED) follows the loss the server measures:
+    /// automatically by [`LossProfilePolicy`] thresholds, or pinned to one profile.
+    pub loss_adaptation: LossAdaptation,
+    pub loss_profile_policy: LossProfilePolicy,
     /// Capture DSP (high-pass, echo cancellation, noise suppression, AGC) applied before the
     /// VAD and encoder; everything on by default, `DspConfig::BYPASS` for hosts with their own
     /// processing. Changeable at runtime with `Client::set_dsp`.
@@ -104,6 +113,9 @@ impl ClientConfig {
             udp_fallback_lost_heartbeats: 3,
             udp_reprobe_interval: Duration::from_secs(30),
             encoder: EncoderSettings::default(),
+            decoder: DecoderSettings::default(),
+            loss_adaptation: LossAdaptation::Auto,
+            loss_profile_policy: LossProfilePolicy::default(),
             dsp: DspConfig::default(),
             follow_channel_policy: true,
             jitter_target_frames: 2,

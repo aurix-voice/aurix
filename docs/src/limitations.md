@@ -108,6 +108,16 @@ the chapter that explains the boundary.
   and expected loss are only controllable in the native, Unity and Unreal SDKs
   ([Web SDK](sdk/web.md#opus-in-the-browser)). Native mono encoders are capped at 300 kbit/s
   (libopus), channel configs at `media.max_bitrate`.
+* **Loss repair is bounded by what the wire carries.** In-band FEC covers one frame back and
+  only when the sender's encoder had it on; DRED covers as much history as libopus fits into
+  the bitrate (none below ≈ 28 kbit/s, ≈ 100–150 ms at 28–40 kbit/s — a requested
+  `dred_duration_ms` is a ceiling, not a guarantee), the receiver sees at most 52 frames back
+  and the server mixers 4; everything else is neural PLC, which fades to silence over a long
+  gap. Browsers get FEC and their own PLC only — no DRED, no loss profile
+  (the browser owns its codec). The forwarded per-sender sequence keeps uplink gaps of up to
+  50 frames when the packet sequence and the timestamp clock agree; a loss that coincides with a
+  pause or with heartbeats is under-counted, never over-counted
+  ([Packet loss](sdk/native.md#packet-loss-fec-dred-and-the-neural-plc)).
 * **The native server mix is per hop, not end-to-end.** `E2ee` frames cannot enter a mix and
   keep arriving as separate streams even in `mixed` downlink mode; a mix costs the node one Opus
   decode per selected speaker plus one stereo encode per mixer, capped at `MAX_MIXERS` (8192)
@@ -223,6 +233,12 @@ the chapter that explains the boundary.
   samples linked against the freshly built library and the Unreal `ThirdParty` staging scripts —
   and uploaded as workflow artifacts. What CI does not do is load them from Unity `Plugins/` or
   compile the Unreal module on those hosts, and there is no 32-bit or ARM64 Windows build.
+* **Loss repair is measured, not listened to.** FEC / DRED / PLC recovery is verified with
+  synthetic speech-like signals (sample-domain correlation against the original, frame counts
+  by method, stereo, reordering, partial DRED coverage, PCMU bypass) on Linux and in the
+  server-mixer loss simulation; no listening test, no real lossy network and no measurement of
+  OSCE's effect on perceived quality has been run from this repository. `osce_bwe` depends on
+  the libopus build and reads back `false` where it is not compiled in.
 * **Admin SSO against real identity providers.** The OIDC relying party is exercised end to end
   against the repository's mock provider (discovery, PKCE, nonce, JWKS rotation, userinfo,
   role mapping) and follows the OpenID Connect Core rules, but no Keycloak / Entra ID / Okta /

@@ -16,6 +16,7 @@ members = [
     "crates/aurix-cli",
     "crates/aurix-loadtest",
     "crates/aurix-client",
+    "crates/aurix-opus",
 ]
 
 [workspace.package]
@@ -88,5 +89,5 @@ md-5 = "0.10"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
 str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-opus = "0.3"
+opus = { package = "aurix-opus", path = "crates/aurix-opus" }
 hex = "0.4"

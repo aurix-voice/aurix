@@ -100,6 +100,17 @@ public:
         NOISE_SUPPRESSION_MODERATE = AURIX_NOISE_SUPPRESSION_MODERATE,
         NOISE_SUPPRESSION_HIGH = AURIX_NOISE_SUPPRESSION_HIGH,
     };
+    enum LossProfile {
+        LOSS_PROFILE_LOW = AURIX_LOSS_PROFILE_LOW,
+        LOSS_PROFILE_MODERATE = AURIX_LOSS_PROFILE_MODERATE,
+        LOSS_PROFILE_HIGH = AURIX_LOSS_PROFILE_HIGH,
+    };
+    enum LossAdaptation {
+        LOSS_ADAPTATION_AUTO = AURIX_LOSS_ADAPTATION_AUTO,
+        LOSS_ADAPTATION_FIXED_LOW = AURIX_LOSS_ADAPTATION_FIXED_LOW,
+        LOSS_ADAPTATION_FIXED_MODERATE = AURIX_LOSS_ADAPTATION_FIXED_MODERATE,
+        LOSS_ADAPTATION_FIXED_HIGH = AURIX_LOSS_ADAPTATION_FIXED_HIGH,
+    };
     enum OpusBandwidth {
         BANDWIDTH_NARROWBAND = AURIX_BANDWIDTH_NARROWBAND,
         BANDWIDTH_MEDIUMBAND = AURIX_BANDWIDTH_MEDIUMBAND,
@@ -224,6 +235,12 @@ public:
     int set_encoder_settings(const Dictionary& settings);
     Dictionary get_encoder_settings() const;
     Dictionary get_audio_policy() const;
+    int set_loss_adaptation(LossAdaptation adaptation);
+    LossAdaptation get_loss_adaptation() const;
+    LossProfile get_loss_profile() const;
+    int set_decoder_settings(const Dictionary& settings);
+    Dictionary get_decoder_settings() const;
+    static bool is_dred_supported();
     int set_dsp(const Dictionary& config);
     Dictionary get_dsp() const;
     Dictionary get_dsp_stats() const;
@@ -330,6 +347,8 @@ private:
 }  // namespace godot
 
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::Result);
+VARIANT_ENUM_CAST(godot::AurixVoiceClient::LossProfile);
+VARIANT_ENUM_CAST(godot::AurixVoiceClient::LossAdaptation);
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::ConnectionState);
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::TransmissionMode);
 VARIANT_ENUM_CAST(godot::AurixVoiceClient::AudioCodec);

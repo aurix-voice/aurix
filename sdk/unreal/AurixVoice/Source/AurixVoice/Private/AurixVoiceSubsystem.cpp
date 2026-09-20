@@ -402,6 +402,7 @@ AurixEncoderSettings ToNativeEncoderSettings(const FAurixEncoderSettings& S)
 	Out.expected_loss_percent = static_cast<uint8_t>(FMath::Clamp(S.ExpectedLossPercent, 0, 100));
 	Out.dtx = S.bDtx;
 	Out.channels = S.bStereo ? 2 : 1;
+	Out.dred_duration_ms = static_cast<uint16_t>(FMath::Clamp(S.DredDurationMs, 0, 1040));
 	return Out;
 }
 
@@ -418,6 +419,55 @@ FAurixEncoderSettings FromNativeEncoderSettings(const AurixEncoderSettings& S)
 	Out.ExpectedLossPercent = static_cast<int32>(S.expected_loss_percent);
 	Out.bDtx = S.dtx;
 	Out.bStereo = S.channels == 2;
+	Out.DredDurationMs = static_cast<int32>(S.dred_duration_ms);
+	return Out;
+}
+
+AurixLossAdaptation ToNativeLossAdaptation(EAurixLossAdaptation A)
+{
+	switch (A)
+	{
+	case EAurixLossAdaptation::FixedLow: return AURIX_LOSS_ADAPTATION_FIXED_LOW;
+	case EAurixLossAdaptation::FixedModerate: return AURIX_LOSS_ADAPTATION_FIXED_MODERATE;
+	case EAurixLossAdaptation::FixedHigh: return AURIX_LOSS_ADAPTATION_FIXED_HIGH;
+	default: return AURIX_LOSS_ADAPTATION_AUTO;
+	}
+}
+
+EAurixLossAdaptation FromNativeLossAdaptation(AurixLossAdaptation A)
+{
+	switch (A)
+	{
+	case AURIX_LOSS_ADAPTATION_FIXED_LOW: return EAurixLossAdaptation::FixedLow;
+	case AURIX_LOSS_ADAPTATION_FIXED_MODERATE: return EAurixLossAdaptation::FixedModerate;
+	case AURIX_LOSS_ADAPTATION_FIXED_HIGH: return EAurixLossAdaptation::FixedHigh;
+	default: return EAurixLossAdaptation::Auto;
+	}
+}
+
+EAurixLossProfile FromNativeLossProfile(AurixLossProfile P)
+{
+	switch (P)
+	{
+	case AURIX_LOSS_PROFILE_MODERATE: return EAurixLossProfile::Moderate;
+	case AURIX_LOSS_PROFILE_HIGH: return EAurixLossProfile::High;
+	default: return EAurixLossProfile::Low;
+	}
+}
+
+AurixDecoderSettings ToNativeDecoderSettings(const FAurixDecoderSettings& S)
+{
+	AurixDecoderSettings Out;
+	Out.complexity = static_cast<uint8_t>(FMath::Clamp(S.Complexity, 0, 10));
+	Out.osce_bwe = S.bOsceBwe;
+	return Out;
+}
+
+FAurixDecoderSettings FromNativeDecoderSettings(const AurixDecoderSettings& S)
+{
+	FAurixDecoderSettings Out;
+	Out.Complexity = static_cast<int32>(S.complexity);
+	Out.bOsceBwe = S.osce_bwe;
 	return Out;
 }
 
@@ -608,6 +658,8 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.request_timeout_ms = static_cast<uint32_t>(FMath::Max(1, Settings.RequestTimeoutMs));
 	Cfg.raw.encoder = ToNativeEncoderSettings(Settings.Encoder);
 	Cfg.raw.dsp = ToNativeDspConfig(Settings.Dsp);
+	Cfg.raw.decoder = ToNativeDecoderSettings(Settings.Decoder);
+	Cfg.raw.loss_adaptation = ToNativeLossAdaptation(Settings.LossAdaptation);
 	Cfg.raw.follow_channel_policy = Settings.bFollowChannelPolicy;
 	Cfg.raw.jitter_target_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterTargetFrames));
 	Cfg.raw.jitter_max_frames = static_cast<uint32_t>(FMath::Max(1, Settings.JitterMaxFrames));
@@ -943,6 +995,43 @@ bool UAurixVoiceSubsystem::GetEncoderSettings(FAurixEncoderSettings& OutSettings
 	}
 	OutSettings = FromNativeEncoderSettings(Raw);
 	return true;
+}
+
+bool UAurixVoiceSubsystem::SetLossAdaptation(EAurixLossAdaptation Adaptation)
+{
+	return Native && Check(Native->Client.set_loss_adaptation(ToNativeLossAdaptation(Adaptation)), TEXT("set_loss_adaptation"));
+}
+
+EAurixLossAdaptation UAurixVoiceSubsystem::GetLossAdaptation() const
+{
+	return Native ? FromNativeLossAdaptation(Native->Client.loss_adaptation()) : EAurixLossAdaptation::Auto;
+}
+
+EAurixLossProfile UAurixVoiceSubsystem::GetLossProfile() const
+{
+	return Native ? FromNativeLossProfile(Native->Client.loss_profile()) : EAurixLossProfile::Low;
+}
+
+bool UAurixVoiceSubsystem::SetDecoderSettings(const FAurixDecoderSettings& Settings)
+{
+	return Native && Check(Native->Client.set_decoder_settings(ToNativeDecoderSettings(Settings)), TEXT("set_decoder_settings"));
+}
+
+bool UAurixVoiceSubsystem::GetDecoderSettings(FAurixDecoderSettings& OutSettings) const
+{
+	AurixDecoderSettings Raw;
+	if (!Native || !Native->Client.decoder_settings(Raw))
+	{
+		OutSettings = FAurixDecoderSettings();
+		return false;
+	}
+	OutSettings = FromNativeDecoderSettings(Raw);
+	return true;
+}
+
+bool UAurixVoiceSubsystem::IsDredSupported()
+{
+	return aurix::Client::dred_supported();
 }
 
 bool UAurixVoiceSubsystem::SetComplexity(int32 Complexity)
@@ -2021,6 +2110,10 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		}
 		break;
 	}
+
+	case AURIX_EVENT_LOSS_PROFILE_CHANGED:
+		OnLossProfileChanged.Broadcast(FromNativeLossProfile(aurix_event_loss_profile(Raw)), static_cast<int32>(aurix_event_number2(Raw)));
+		break;
 
 	default:
 		UE_LOG(LogAurixVoice, Verbose, TEXT("unhandled native event %d"), static_cast<int32>(Type));

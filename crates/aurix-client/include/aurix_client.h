@@ -29,6 +29,16 @@
 #define EncoderSettings_DEFAULT_COMPLEXITY 9
 
 /**
+ * Longest DRED history libopus can code (104 × 10 ms).
+ */
+#define EncoderSettings_MAX_DRED_DURATION_MS 1040
+
+/**
+ * Neural PLC without OSCE — the default balance for many concurrent streams.
+ */
+#define DecoderSettings_DEFAULT_COMPLEXITY 5
+
+/**
  * Bytes needed for `aurix_uuid_format` (36 characters + NUL).
  */
 #define AURIX_UUID_STRING_LEN 37
@@ -104,6 +114,29 @@
 #define DEFAULT_RTT_TOLERANCE_MS 15.0
 
 /**
+ * Expected-loss floor the `Moderate` profile tunes in-band FEC for, percent.
+ */
+#define LossProfilePolicy_MODERATE_EXPECTED_LOSS 10
+
+/**
+ * Expected-loss floor the `High` profile tunes in-band FEC for, percent.
+ */
+#define LossProfilePolicy_HIGH_EXPECTED_LOSS 20
+
+/**
+ * DRED history the `High` profile asks the encoder for. libopus codes as much of it
+ * as the bitrate affords (about 100-150 ms at 28-40 kbit/s, the full span only well
+ * above); bursts within what a packet carries are rebuilt, older frames concealed.
+ */
+#define LossProfilePolicy_HIGH_DRED_DURATION_MS 400
+
+/**
+ * libopus gives DRED a share of `bitrate - 20 kbit/s` (with FEC on); below this it
+ * codes none, so the `High` profile lifts the bitrate to it when the channel allows.
+ */
+#define LossProfilePolicy_DRED_MIN_BITRATE_BPS 28000
+
+/**
  * Return code of fallible calls; details via `aurix_last_error`.
  */
 typedef enum AurixResult {
@@ -176,6 +209,20 @@ typedef enum AurixMediaPathPolicy {
   AURIX_MEDIA_PATH_UDP_ONLY = 1,
   AURIX_MEDIA_PATH_TUNNEL_ONLY = 2,
 } AurixMediaPathPolicy;
+
+/**
+ * How the uplink loss profile is chosen.
+ */
+typedef enum AurixLossAdaptation {
+  /**
+   * From the server's uplink-loss reports: low → moderate at 3 %, → high at 10 %; back
+   * below 1 % / 5 % after a 6 s dwell (default).
+   */
+  AURIX_LOSS_ADAPTATION_AUTO = 0,
+  AURIX_LOSS_ADAPTATION_FIXED_LOW = 1,
+  AURIX_LOSS_ADAPTATION_FIXED_MODERATE = 2,
+  AURIX_LOSS_ADAPTATION_FIXED_HIGH = 3,
+} AurixLossAdaptation;
 
 typedef enum AurixConnectionState {
   AURIX_STATE_DISCONNECTED = 0,
@@ -403,7 +450,32 @@ typedef enum AurixEventType {
    * game's own music/SFX bus (the voice mix is ducked server-side already).
    */
   AURIX_EVENT_DUCKING_CHANGED = 45,
+  /**
+   * `aurix_event_loss_profile` = the uplink redundancy tier now in force (`number` = its
+   * value, `number2` = the server-measured uplink loss in whole percent that triggered
+   * it); FEC tuning / DRED already applied to the encoder.
+   */
+  AURIX_EVENT_LOSS_PROFILE_CHANGED = 46,
 } AurixEventType;
+
+/**
+ * Redundancy tier of the uplink encoder (see `aurix_client_set_loss_adaptation`).
+ */
+typedef enum AurixLossProfile {
+  /**
+   * Clean link: the baseline settings as they are.
+   */
+  AURIX_LOSS_PROFILE_LOW = 0,
+  /**
+   * In-band FEC on, tuned for >= 10 % (or the measured loss).
+   */
+  AURIX_LOSS_PROFILE_MODERATE = 1,
+  /**
+   * FEC tuned for >= 20 %, DRED covering 400 ms, bitrate lifted to 28 kbit/s where the
+   * channel target / server command allows.
+   */
+  AURIX_LOSS_PROFILE_HIGH = 2,
+} AurixLossProfile;
 
 typedef enum AurixTransmissionMode {
   /**
@@ -613,6 +685,13 @@ typedef struct AurixEncoderSettings {
    * whose policy allows `stereo`; PCMU is always mono. Other values are read as 1.
    */
   uint8_t channels;
+  /**
+   * Deep REDundancy (libopus 1.5+): history each packet carries a neural low-rate copy
+   * of, 0 (off) ..= 1040 ms in 10 ms steps. Lets receivers rebuild bursts of lost
+   * frames; the automatic loss profile turns it on under heavy loss. Reads back 0 on a
+   * libopus without DRED.
+   */
+  uint16_t dred_duration_ms;
 } AurixEncoderSettings;
 
 /**
@@ -652,6 +731,21 @@ typedef struct AurixDspConfig {
    */
   float agc_max_gain_db;
 } AurixDspConfig;
+
+/**
+ * Downlink Opus decoder tuning (libopus 1.5+ neural paths), shared by every remote stream.
+ */
+typedef struct AurixDecoderSettings {
+  /**
+   * 0..=10. >= 5 conceals lost frames with the neural PLC (default), >= 6 adds OSCE LACE
+   * speech enhancement of SILK frames, >= 7 NoLACE (best, several times LACE's CPU).
+   */
+  uint8_t complexity;
+  /**
+   * OSCE bandwidth extension of wideband speech to fullband (needs complexity >= 4).
+   */
+  bool osce_bwe;
+} AurixDecoderSettings;
 
 /**
  * Connection parameters. Fill with `aurix_client_config_default`, then set `ws_url`/`token`.
@@ -730,6 +824,16 @@ typedef struct AurixClientConfig {
    */
   bool has_e2ee_identity;
   uint8_t e2ee_identity[32];
+  /**
+   * Downlink decoder tuning (neural PLC / OSCE); `aurix_client_set_decoder_settings`
+   * changes it later.
+   */
+  struct AurixDecoderSettings decoder;
+  /**
+   * Uplink redundancy: adapt FEC / DRED to the server's loss reports (default) or pin a
+   * tier; `aurix_client_set_loss_adaptation` changes it later.
+   */
+  enum AurixLossAdaptation loss_adaptation;
 } AurixClientConfig;
 
 /**
@@ -1301,6 +1405,15 @@ typedef struct AurixStats {
    * Encrypted downlink frames dropped: unknown sender, key not yet received, or replay.
    */
   uint64_t e2ee_undecryptable;
+  /**
+   * Of `frames_lost`, frames rebuilt from the next packet's in-band FEC / from DRED.
+   */
+  uint64_t frames_fec_recovered;
+  uint64_t frames_dred_recovered;
+  /**
+   * Uplink redundancy tier in force.
+   */
+  enum AurixLossProfile loss_profile;
 } AurixStats;
 
 /**
@@ -1347,6 +1460,8 @@ typedef struct AurixRegionEndpoint {
    */
   bool probe_failed;
 } AurixRegionEndpoint;
+
+
 
 
 
@@ -1534,6 +1649,11 @@ uint64_t aurix_event_number(const struct AurixEvent *event);
  * `ChatReadMarkers`.
  */
 uint64_t aurix_event_number2(const struct AurixEvent *event);
+
+/**
+ * Redundancy tier of a `LossProfileChanged` event (`Low` for other events).
+ */
+enum AurixLossProfile aurix_event_loss_profile(const struct AurixEvent *event);
 
 /**
  * Machine-readable code for failures (`RequestFailed`, `ServerError`, `RejoinFailed`);
@@ -1944,6 +2064,37 @@ enum AurixResult aurix_client_set_complexity(struct AurixClient *client, int8_t 
 bool aurix_client_audio_policy(const struct AurixClient *client, struct AurixAudioPolicy *out);
 
 /**
+ * Choose the uplink redundancy tier from the server's loss reports (`Auto`, default) or
+ * pin one; FEC tuning / DRED are applied to the encoder at once and
+ * `AurixEventLossProfileChanged` reports later moves.
+ */
+enum AurixResult aurix_client_set_loss_adaptation(struct AurixClient *client,
+                                                  enum AurixLossAdaptation adaptation);
+
+enum AurixLossAdaptation aurix_client_loss_adaptation(const struct AurixClient *client);
+
+/**
+ * Redundancy tier the encoder runs with right now.
+ */
+enum AurixLossProfile aurix_client_loss_profile(const struct AurixClient *client);
+
+/**
+ * Retune every downlink decoder (complexity → neural PLC / OSCE, OSCE bandwidth extension);
+ * streams already playing switch immediately. Out-of-range values are clamped.
+ */
+enum AurixResult aurix_client_set_decoder_settings(struct AurixClient *client,
+                                                   const struct AurixDecoderSettings *settings);
+
+bool aurix_client_decoder_settings(const struct AurixClient *client,
+                                   struct AurixDecoderSettings *out);
+
+/**
+ * Whether this library's libopus codes and decodes Deep REDundancy (the bundled libopus
+ * 1.6 does; without it lost frames get FEC + PLC only and `dred_duration_ms` reads back 0).
+ */
+bool aurix_dred_supported(void);
+
+/**
  * Payload of `AurixEventAudioPolicyChanged`.
  */
 bool aurix_event_audio_policy(const struct AurixEvent *event, struct AurixAudioPolicy *out);
@@ -2279,6 +2430,50 @@ int32_t aurix_opus_decoder_decode_i16(struct AurixOpusDecoder *decoder,
                                       int16_t *pcm,
                                       size_t max_frame_samples_per_channel,
                                       bool fec);
+
+/**
+ * Retune a bare decoder (complexity → neural PLC / OSCE, OSCE bandwidth extension); takes
+ * effect from the next frame. Out-of-range values are clamped.
+ */
+enum AurixResult aurix_opus_decoder_apply(struct AurixOpusDecoder *decoder,
+                                          const struct AurixDecoderSettings *settings);
+
+/**
+ * The settings a bare decoder is running with.
+ */
+bool aurix_opus_decoder_settings(struct AurixOpusDecoder *decoder,
+                                 struct AurixDecoderSettings *out);
+
+/**
+ * Rebuild the frame `frames_before` frames before `packet` (1 = the one right before it, 2
+ * = the one before that, …) from the Deep REDundancy the packet carries, into one frame of
+ * `frame_samples_per_channel` samples per channel. Use it for the frames of a gap that the
+ * next packet's in-band FEC does not cover, before falling back to PLC. Returns samples per
+ * channel written, `0` when the packet's DRED does not reach that far (or this libopus has
+ * none — see `aurix_dred_supported`), or a negative `AurixResult` code.
+ */
+int32_t aurix_opus_decoder_dred_decode_f32(struct AurixOpusDecoder *decoder,
+                                           const uint8_t *packet,
+                                           size_t packet_len,
+                                           uint32_t frames_before,
+                                           float *pcm,
+                                           size_t frame_samples_per_channel);
+
+/**
+ * `aurix_opus_decoder_dred_decode_f32` for interleaved i16 PCM.
+ */
+int32_t aurix_opus_decoder_dred_decode_i16(struct AurixOpusDecoder *decoder,
+                                           const uint8_t *packet,
+                                           size_t packet_len,
+                                           uint32_t frames_before,
+                                           int16_t *pcm,
+                                           size_t frame_samples_per_channel);
+
+/**
+ * Whether an Opus packet carries in-band FEC (LBRR) for the frame before it — the cheap
+ * check before `aurix_opus_decoder_decode_*` with `fec = true`.
+ */
+bool aurix_opus_packet_has_fec(const uint8_t *packet, size_t packet_len);
 
 /**
  * Create a standalone DSP processor with `config` (NULL = `aurix_dsp_config_default`).

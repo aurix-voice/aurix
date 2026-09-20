@@ -169,6 +169,75 @@ recover the previous lost frame from this packet's FEC data). None of these is v
 are safe P/Invoke targets — this is how the Unity SDK's `NativeOpusCodec` gets libopus. C++:
 `aurix::OpusEncoder` / `aurix::OpusDecoder` in `aurix_client.hpp`.
 
+## Packet loss: FEC, DRED and the neural PLC
+
+The core links **libopus 1.6** (bundled sources, static; `aurix_dred_supported()` reports whether
+the build has the neural DRED decoder — the shipped one does) and uses its three loss tools:
+
+* **In-band FEC (LBRR)** — every packet may carry a low-rate copy of the *previous* frame;
+  `fec` / `expected_loss_percent` tune how much bitrate goes to it.
+* **DRED (Deep REDundancy)** — a neural, very low-rate copy of up to `dred_duration_ms`
+  (0 … 1040 ms, 10 ms steps) of *history* in every packet, so a burst of lost frames is
+  rebuilt from the first packet that arrives after it. libopus codes as much of the requested
+  history as the bitrate affords (nothing below ≈ 28 kbit/s with FEC on, about 100–150 ms at
+  28–40 kbit/s, the full span only well above); the wire coverage, not the request, decides
+  how far back a receiver can rebuild — older frames fall through to PLC.
+* **PLC** — what remains is concealed by the decoder; at decoder `complexity >= 5` libopus uses
+  its neural (deep) PLC, `>= 6` adds OSCE (LACE) speech enhancement, `>= 7` the larger NoLACE
+  model. `osce_bwe` (bandwidth extension of narrowband/wideband speech) is honoured only by a
+  libopus built with it and otherwise silently ignored.
+
+**Receive side.** Every jitter buffer in `RemoteMixer` hands a missing frame to the codec in
+that order — FEC when exactly the previous frame is missing and the next packet carries LBRR,
+DRED for any frame within the next packet's coverage, PLC for the rest — before decoding the
+packet itself, so no extra buffering latency is added: recovery happens when the packet that
+ends the gap is played, from bytes that already arrived. Reordered packets that still fit the
+buffer are played in order; packets for a slot already played are dropped (`frames_late`). A
+stream that ran dry mid-spurt keeps its sequence instead of restarting when the packet that
+ends the gap can rebuild it. PCMU streams have none of this (μ-law has no redundancy).
+`ClientStats.frames_lost` / `frames_fec_recovered` / `frames_dred_recovered` tell the three
+apart; `ClientConfig.decoder` (`DecoderSettings { complexity: 5, osce_bwe: false }`) and
+`set_decoder_settings` / `decoder_settings` tune the decoders of every stream at once.
+
+**Send side — the loss profile.** The server measures the loss on *our* packets and reports it
+in every `NetworkQuality` (`uplink_loss_percent`). A `LossController` maps it to a tier and
+re-shapes the effective encoder settings on top of baseline, channel policy and
+`BitrateCommand`:
+
+| Profile | Enter | Leave (after 6 s dwell) | Effect on the encoder |
+|---|---|---|---|
+| `Low` | — | — | baseline / policy as is |
+| `Moderate` | uplink loss ≥ 3 % | < 1 % | FEC on, `expected_loss_percent` ≥ 10 (or the measured loss) |
+| `High` | ≥ 10 % | < 5 % | FEC on, `expected_loss_percent` ≥ 20, DRED ≥ 400 ms, bitrate raised to 28 kbit/s where the policy/command ceiling allows |
+
+Escalation is immediate, relaxation waits for the dwell (hysteresis keeps a flapping link from
+toggling redundancy every report). `LossAdaptation::Auto` is the default;
+`Fixed(LossProfile)` pins a tier (a LAN game may want `Low`, a mobile title may start `High`);
+`set_loss_adaptation` / `loss_adaptation` / `loss_profile` and `Event::LossProfileChanged
+{ profile, uplink_loss_percent }` (also when a session ends and the tier resets) expose it;
+`ClientStats.loss_profile` mirrors the current tier. A `dred_duration_ms` in the baseline is
+kept as a floor — the profile only ever raises redundancy. Everything applies equally to E2EE
+frames (redundancy is inside the Opus payload the core seals).
+
+C: `AurixEncoderSettings.dred_duration_ms`, `AurixDecoderSettings` +
+`aurix_client_set_decoder_settings` / `aurix_client_decoder_settings`, `AurixLossAdaptation` +
+`aurix_client_set_loss_adaptation` / `aurix_client_loss_adaptation` /
+`aurix_client_loss_profile`, `AURIX_EVENT_LOSS_PROFILE_CHANGED` + `aurix_event_loss_profile`,
+`AurixStats.frames_fec_recovered` / `frames_dred_recovered` / `loss_profile`,
+`aurix_dred_supported`. Standalone codec: `aurix_opus_decoder_apply` / `_settings`,
+`aurix_opus_decoder_dred_decode_f32/_i16(decoder, later_packet, len, frames_before, pcm,
+frame_samples)` (returns samples per channel, `0` when the packet's DRED does not reach that
+frame or the build has none) and `aurix_opus_packet_has_fec`. C++: `aurix::OpusDecoder::apply`
+/ `decode_dred` / `packet_has_fec`, `aurix::Client::set_loss_adaptation` / `loss_profile` /
+`set_decoder_settings` / `dred_supported`.
+
+On the node the same recovery runs in the server mixers (`media.mixer_decoder_complexity`,
+`aurix_mixer_lost_frames_total{method}`) and the forwarded per-sender sequence keeps short
+uplink losses as gaps so receivers can see and repair them
+([AURX](../api/aurx.md#what-the-server-does-with-your-packets)). Cost: DRED adds encoder CPU
+and ≈ 1 MB of model weights to the library; the neural PLC/OSCE cost decoder CPU per concealed
+or enhanced frame — lower `complexity` on constrained devices.
+
 ## Capture DSP: echo cancellation, noise suppression, AGC
 
 The core cleans the microphone before anything else sees it, on 48 kHz mono after
@@ -509,10 +578,13 @@ sound wave play; call `PushRenderAudio` with any other speaker audio (game mix, 
 can cancel that too.
 
 Opus: `FAurixVoiceSettings.Encoder` (`FAurixEncoderSettings`: bitrate, complexity, max
-bandwidth, signal, VBR/constrained VBR, FEC, expected loss, DTX, `bStereo`) and
-`bFollowChannelPolicy`;
+bandwidth, signal, VBR/constrained VBR, FEC, expected loss, DTX, `bStereo`, `DredDurationMs`),
+`Decoder` (`FAurixDecoderSettings`: `Complexity`, `bOsceBwe`), `LossAdaptation`
+(`EAurixLossAdaptation`) and `bFollowChannelPolicy`;
 at runtime `SetEncoderSettings`, `GetEncoderSettings`, `SetComplexity` (pin, `-1` un-pins),
-`GetAudioPolicy` (`FAurixAudioPolicy`, with `bStereo`) and the `OnAudioPolicyChanged` / `OnBitrateChanged`
+`GetAudioPolicy` (`FAurixAudioPolicy`, with `bStereo`), `SetLossAdaptation` / `GetLossAdaptation`
+/ `GetLossProfile` (`EAurixLossProfile`), `SetDecoderSettings` / `GetDecoderSettings`,
+`IsDredSupported` and the `OnAudioPolicyChanged` / `OnBitrateChanged` / `OnLossProfileChanged`
 delegates — the same layering as the Rust API above.
 
 `GetStats(FAurixStats&)`, `GetNetworkQuality(FAurixNetworkQuality&)` and `OnNetworkQuality`

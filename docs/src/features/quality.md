@@ -63,6 +63,12 @@ on resume); loss, R-factor, MOS and bars describe the latest period.
 5. Uplink loss above `quality.loss_alert_percent` (20 %) over a period raises `quality.alert`
    with `metric: "uplink_packet_loss"` (webhooks/SSE) even if the client reports nothing; the
    same threshold applies to the client-reported loss (`metric: "packet_loss"`).
+6. Native, Unity and Unreal/Godot clients also feed `uplink_loss_percent` to their **loss
+   profile**: ≥ 3 % turns in-band FEC on and tunes it for ≥ 10 % loss, ≥ 10 % adds Opus DRED
+   history and a 28 kbit/s floor; tiers relax after a 6 s dwell below 1 % / 5 %. Lost frames
+   are rebuilt on receivers and in the server mixers from FEC → DRED → neural PLC
+   ([Packet loss](../sdk/native.md#packet-loss-fec-dred-and-the-neural-plc);
+   `aurix_mixer_lost_frames_total{method}`).
 
 ## MOS alerts
 

@@ -48,13 +48,9 @@ CARGO_ARGS=(build -p aurix-client --lib --target "$TARGET")
 [ "$PROFILE" = "release" ] && CARGO_ARGS+=(--release)
 
 echo "building aurix-client for $TARGET ($PROFILE)"
-# libopus is compiled from the bundled source and linked statically (needs cmake) so the shipped
-# library has no dependency on a system libopus. audiopus_sys does not re-run its build script
-# when these variables change, so its output is cleaned first.
-CLEAN_ARGS=(clean -p audiopus_sys --target "$TARGET")
-[ "$PROFILE" = "release" ] && CLEAN_ARGS+=(--release)
-( cd "$ROOT" && cargo "${CLEAN_ARGS[@]}" >/dev/null 2>&1 || true )
-( cd "$ROOT" && LIBOPUS_STATIC=1 LIBOPUS_NO_PKG=1 RUSTFLAGS="${RUSTFLAGS:-} $LINK_ARGS" cargo "${CARGO_ARGS[@]}" )
+# libopus 1.6 (DRED/OSCE) is compiled from the sources bundled with opusic-sys (needs cmake) and
+# linked statically, so the shipped library has no dependency on a system libopus.
+( cd "$ROOT" && RUSTFLAGS="${RUSTFLAGS:-} $LINK_ARGS" cargo "${CARGO_ARGS[@]}" )
 
 OUT="$ROOT/target/$TARGET/$PROFILE"
 DEST="$SDK/addons/aurix_voice/bin/$GODOT_PLATFORM.$GODOT_ARCH"

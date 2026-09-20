@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::audio::{
-    CaptureEncoder, EncoderSettings, MixerTotals, RemoteMixer, StreamStats, FRAME_SAMPLES,
+    CaptureEncoder, DecoderSettings, EncoderSettings, MixerTotals, RemoteMixer, StreamStats,
+    FRAME_SAMPLES,
 };
 use crate::config::ClientConfig;
 use crate::control::{
@@ -50,6 +51,7 @@ use crate::media::{
     resolve_media_candidates, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
     MediaTransport, SequenceCounter, TUNNEL_UPLINK_QUEUE,
 };
+use crate::resilience::{LossAdaptation, LossController, LossProfile};
 use crate::visemes::VisemeFrame;
 
 const MAX_QUEUED_EVENTS: usize = 4096;
@@ -107,6 +109,12 @@ pub struct ClientStats {
     pub frames_lost: u64,
     pub frames_late: u64,
     pub underruns: u64,
+    /// Of `frames_lost`, frames rebuilt from the next packet's in-band FEC / from DRED
+    /// rather than concealed.
+    pub frames_fec_recovered: u64,
+    pub frames_dred_recovered: u64,
+    /// Uplink loss profile in force (FEC tuning / DRED tier).
+    pub loss_profile: LossProfile,
     /// Local downlink quality (client-measured RTT/jitter/loss), simplified E-model.
     pub r_factor: f32,
     pub mos: f32,
@@ -263,6 +271,11 @@ struct Inner {
     audio_policy: Mutex<Option<AudioPolicy>>,
     /// App-pinned complexity, taking precedence over the channel hint.
     complexity_pin: Mutex<Option<u8>>,
+    /// Uplink loss profile from the server's `NetworkQuality` reports.
+    loss: Mutex<LossController>,
+    /// Last server `BitrateCommand` (bit/s, expected loss %), laid over the baseline until
+    /// the channel policy changes or the session ends.
+    bitrate_command: Mutex<Option<(u32, u8)>>,
     muted: AtomicBool,
     local_speaking: AtomicBool,
     channels: Mutex<HashMap<ChannelId, ChannelState>>,
@@ -606,6 +619,8 @@ impl Client {
         let mut encoder = CaptureEncoder::new(cfg.encoder)?;
         encoder.dsp.set_config(cfg.dsp);
         let far_end = encoder.dsp.far_end();
+        let mut mixer = RemoteMixer::new(cfg.jitter_target_frames, cfg.jitter_max_frames);
+        mixer.set_decoder_settings(cfg.decoder)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(cfg.worker_threads.max(1))
             .thread_name("aurix-client")
@@ -622,14 +637,16 @@ impl Client {
             None => e2ee::IdentityKey::generate(),
         };
         let inner = Arc::new(Inner {
-            mixer: Mutex::new(RemoteMixer::new(
-                cfg.jitter_target_frames,
-                cfg.jitter_max_frames,
-            )),
+            mixer: Mutex::new(mixer),
             encoder: Mutex::new(encoder),
             far_end,
             audio_policy: Mutex::new(None),
             complexity_pin: Mutex::new(None),
+            loss: Mutex::new(LossController::new(
+                cfg.loss_adaptation,
+                cfg.loss_profile_policy,
+            )),
+            bitrate_command: Mutex::new(None),
             cfg: RwLock::new(cfg),
             state: AtomicU8::new(0),
             events: Mutex::new(VecDeque::new()),
@@ -715,6 +732,7 @@ impl Client {
         self.inner.channels.lock().clear();
         *self.inner.session.lock() = None;
         *self.inner.server_quality.lock() = None;
+        reset_link_adaptation(&self.inner);
         if self.inner.state() != ConnectionState::Failed {
             self.inner.set_state(ConnectionState::Disconnected);
         }
@@ -1225,6 +1243,53 @@ impl Client {
         *self.inner.audio_policy.lock()
     }
 
+    /// Choose the uplink loss profile automatically from the server's loss reports (the
+    /// default) or pin one tier. Applied to the encoder at once.
+    pub fn set_loss_adaptation(&self, adaptation: LossAdaptation) -> Result<()> {
+        let changed = self
+            .inner
+            .loss
+            .lock()
+            .set_adaptation(adaptation, Instant::now());
+        self.inner.cfg.write().loss_adaptation = adaptation;
+        reapply_encoder(&self.inner)?;
+        if let Some(profile) = changed {
+            let loss = self.inner.loss.lock().uplink_loss_percent();
+            self.inner.emit(Event::LossProfileChanged {
+                profile,
+                uplink_loss_percent: loss,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn loss_adaptation(&self) -> LossAdaptation {
+        self.inner.loss.lock().adaptation()
+    }
+
+    /// Loss profile the encoder runs with right now.
+    pub fn loss_profile(&self) -> LossProfile {
+        self.inner.loss.lock().profile()
+    }
+
+    /// Retune every downlink decoder (complexity → neural PLC / OSCE, OSCE bandwidth
+    /// extension); existing streams switch immediately.
+    pub fn set_decoder_settings(&self, settings: DecoderSettings) -> Result<()> {
+        self.inner.mixer.lock().set_decoder_settings(settings)?;
+        self.inner.cfg.write().decoder = settings.clamped();
+        Ok(())
+    }
+
+    pub fn decoder_settings(&self) -> DecoderSettings {
+        self.inner.mixer.lock().decoder_settings()
+    }
+
+    /// Whether this build's libopus codes / decodes Deep REDundancy (bundled libopus 1.6:
+    /// always `true`; a build against an older system libopus falls back to FEC + PLC).
+    pub fn dred_supported(&self) -> bool {
+        self.inner.mixer.lock().dred_supported()
+    }
+
     /// Master playback volume `0..=2`.
     pub fn set_output_volume(&self, volume: f32) {
         self.inner.mixer.lock().set_output_volume(volume);
@@ -1689,6 +1754,9 @@ impl Client {
             frames_lost: totals.lost,
             frames_late: totals.late,
             underruns: totals.underruns,
+            frames_fec_recovered: totals.fec_recovered,
+            frames_dred_recovered: totals.dred_recovered,
+            loss_profile: self.inner.loss.lock().profile(),
             r_factor: r,
             mos: quality::mos_from_r(r),
             bars: quality::bars_from_r(r),
@@ -1946,6 +2014,7 @@ fn finish(inner: &Inner, pending: &mut Pending, reason: &str, state: ConnectionS
     inner.mixer.lock().clear();
     *inner.session.lock() = None;
     *inner.server_quality.lock() = None;
+    reset_link_adaptation(inner);
     if inner.local_speaking.swap(false, Ordering::AcqRel) {
         inner.emit(Event::LocalSpeaking(false));
     }
@@ -2998,12 +3067,13 @@ async fn e2ee_rotate(inner: &Inner, conn: &mut ControlConnection) -> std::result
     }
 }
 
-/// Settings for the encoder given the baseline, the pinned complexity and the channel policy.
+/// Settings for the encoder given the baseline, the pinned complexity, the channel policy,
+/// the server's last bitrate command and the uplink loss profile.
 fn effective_encoder_settings(inner: &Inner) -> EncoderSettings {
     let cfg = inner.cfg.read();
     let pin = *inner.complexity_pin.lock();
     let policy = *inner.audio_policy.lock();
-    match policy {
+    let mut base = match policy {
         Some(p) if cfg.follow_channel_policy => cfg.encoder.with_policy(&p, pin),
         _ => {
             let mut s = cfg.encoder;
@@ -3012,6 +3082,30 @@ fn effective_encoder_settings(inner: &Inner) -> EncoderSettings {
             }
             s.clamped()
         }
+    };
+    let mut ceiling = policy.map(|p| p.bitrate_bps);
+    if let Some((bps, loss)) = *inner.bitrate_command.lock() {
+        base.bitrate_bps = bps;
+        base.expected_loss_percent = loss.max(base.expected_loss_percent);
+        ceiling = Some(bps);
+    }
+    inner.loss.lock().shape(base, ceiling)
+}
+
+/// A session ended: forget the server's bitrate command and the measured loss.
+fn reset_link_adaptation(inner: &Inner) {
+    *inner.bitrate_command.lock() = None;
+    let before = inner.loss.lock().profile();
+    inner.loss.lock().reset();
+    let after = inner.loss.lock().profile();
+    if let Err(e) = reapply_encoder(inner) {
+        tracing::warn!("restoring baseline encoder settings failed: {e}");
+    }
+    if before != after {
+        inner.emit(Event::LossProfileChanged {
+            profile: after,
+            uplink_loss_percent: 0.0,
+        });
     }
 }
 
@@ -3019,6 +3113,24 @@ fn reapply_encoder(inner: &Inner) -> Result<()> {
     let settings = effective_encoder_settings(inner);
     inner.encoder.lock().apply(settings)?;
     Ok(())
+}
+
+/// Feed a server uplink-loss report to the loss profile; on a tier change retune the encoder
+/// and tell the app.
+fn observe_uplink_loss(inner: &Inner, uplink_loss_percent: f32) {
+    let changed = inner
+        .loss
+        .lock()
+        .observe(uplink_loss_percent, Instant::now());
+    if let Some(profile) = changed {
+        if let Err(e) = reapply_encoder(inner) {
+            tracing::warn!("applying loss profile {} failed: {e}", profile.as_str());
+        }
+        inner.emit(Event::LossProfileChanged {
+            profile,
+            uplink_loss_percent,
+        });
+    }
 }
 
 /// Recompute the merged policy over the joined channels; on change, retune the encoder and
@@ -3034,6 +3146,7 @@ fn refresh_audio_policy(inner: &Inner) {
     if inner.audio_policy.lock().replace(merged) == Some(merged) {
         return;
     }
+    *inner.bitrate_command.lock() = None;
     if inner.cfg.read().follow_channel_policy {
         if let Err(e) = reapply_encoder(inner) {
             tracing::warn!("applying channel audio policy failed: {e}");
@@ -3410,15 +3523,12 @@ async fn handle_message(
             expected_loss_percent,
         } => {
             let bps = target_bitrate_kbps.saturating_mul(1000);
-            {
-                let mut enc = inner.encoder.lock();
-                let current = enc.settings();
-                let _ = enc.apply(EncoderSettings {
-                    bitrate_bps: bps,
-                    expected_loss_percent: expected_loss_percent
-                        .max(EncoderSettings::default().expected_loss_percent),
-                    ..current
-                });
+            *inner.bitrate_command.lock() = Some((
+                bps,
+                expected_loss_percent.max(EncoderSettings::default().expected_loss_percent),
+            ));
+            if let Err(e) = reapply_encoder(inner) {
+                tracing::warn!("applying bitrate command failed: {e}");
             }
             inner.emit(Event::BitrateChanged {
                 bitrate_bps: bps,
@@ -3427,6 +3537,7 @@ async fn handle_message(
         }
         ControlMessage::NetworkQuality { quality } => {
             *inner.server_quality.lock() = Some(quality);
+            observe_uplink_loss(inner, quality.uplink_loss_percent);
             inner.emit(Event::NetworkQuality(quality));
         }
         ControlMessage::RecordingNotification {

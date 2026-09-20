@@ -3,7 +3,7 @@
 FROM rust:1.90-bookworm AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev cmake clang libopus-dev \
+        pkg-config libssl-dev cmake clang \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---------- runtime ----------
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 libopus0 curl tini \
+        ca-certificates libssl3 curl tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 aurix \
     && useradd --system --uid 10001 --gid aurix --home /var/lib/aurix --shell /usr/sbin/nologin aurix \

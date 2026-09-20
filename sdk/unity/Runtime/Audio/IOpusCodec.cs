@@ -14,7 +14,9 @@ namespace Aurix.Audio
     /// The server expects 48 kHz Opus frames; mono or stereo, 20 ms (960 samples) frames recommended.
     /// Implement <see cref="IOpusEncoderControls"/> as well to receive the full channel policy
     /// (complexity, bandwidth, FEC, DTX, …) instead of just the bitrate, and
-    /// <see cref="IOpusFecDecoder"/> to let the jitter buffer recover lost frames from in-band FEC.
+    /// <see cref="IOpusFecDecoder"/> to let the jitter buffer recover lost frames from in-band FEC,
+    /// <see cref="IOpusDredDecoder"/> to rebuild bursts from Deep REDundancy and
+    /// <see cref="IOpusDecoderControls"/> for the neural PLC / OSCE tuning.
     /// </summary>
     public interface IOpusCodec : IDisposable
     {
@@ -59,6 +61,28 @@ namespace Aurix.Audio
         /// <paramref name="frameSamplesPerChannel"/> must match the stream's frame duration).
         /// </summary>
         int DecodeFec(ReadOnlySpan<byte> nextPacket, Span<float> pcm, int frameSamplesPerChannel);
+    }
+
+    /// <summary>
+    /// Optional: a decoder that can rebuild frames further back than the previous one from the Deep
+    /// REDundancy (libopus 1.5+) a later packet carries. The jitter buffer asks for it for the frames
+    /// of a gap that <see cref="IOpusFecDecoder"/> does not cover, before falling back to PLC.
+    /// </summary>
+    public interface IOpusDredDecoder
+    {
+        /// <summary>
+        /// Rebuild the frame <paramref name="framesBefore"/> frames before <paramref name="laterPacket"/>
+        /// (1 = the one right before it) into <paramref name="pcm"/>. Returns samples-per-channel written,
+        /// or 0 when the packet's redundancy does not reach that far.
+        /// </summary>
+        int DecodeDred(ReadOnlySpan<byte> laterPacket, int framesBefore, Span<float> pcm, int frameSamplesPerChannel);
+    }
+
+    /// <summary>Optional: a decoder whose libopus 1.5+ neural paths (deep PLC, OSCE) can be tuned.</summary>
+    public interface IOpusDecoderControls
+    {
+        OpusDecoderSettings DecoderSettings { get; }
+        void ApplyDecoder(OpusDecoderSettings settings);
     }
 
     /// <summary>Opus packet inspection (RFC 6716 table of contents byte).</summary>

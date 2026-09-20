@@ -211,9 +211,10 @@ impl PacketRouter {
             PacketType::Audio | PacketType::AudioFec => {
                 let level = packet.take_audio_level();
                 // The uplink sequence is shared with heartbeats and reports (one anti-replay
-                // window per session); receivers' jitter buffers need a gapless audio-only
-                // sequence, so the forwarded stream is renumbered per sender.
-                packet.header.sequence = session.next_sequence();
+                // window per session); receivers get a per-sender audio-only numbering that
+                // keeps short runs of lost frames as gaps.
+                packet.header.sequence =
+                    session.next_audio_sequence(packet.header.sequence, packet.header.timestamp);
                 self.route_audio_packet(&packet, &session, level).await
             }
             PacketType::Heartbeat => self.handle_heartbeat(&packet, &session, source).await,
@@ -492,11 +493,14 @@ impl PacketRouter {
         Ok(())
     }
 
-    /// Route depayloaded Opus audio received from a WebRTC session; `level` is the RTP
-    /// audio-level extension (`-dBov`) when the browser sent one.
+    /// Route depayloaded Opus audio received from a WebRTC session; `rtp_seq` is the RTP
+    /// sequence (lets short uplink losses stay gaps for native receivers, see
+    /// [`MediaSession::next_audio_sequence`]), `level` the RTP audio-level extension
+    /// (`-dBov`) when the browser sent one.
     pub async fn route_webrtc_audio(
         &self,
         sender: &Arc<MediaSession>,
+        rtp_seq: Option<u32>,
         rtp_time: u32,
         payload: Vec<u8>,
         level: Option<u8>,
@@ -524,9 +528,10 @@ impl PacketRouter {
                 speaking: true,
             });
         }
-        let seq = sender
-            .sequence
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = match rtp_seq {
+            Some(rtp_seq) => sender.next_audio_sequence(rtp_seq, rtp_time),
+            None => sender.next_sequence(),
+        };
         // A browser sends one frame for all its channels, so a receiver sharing several of them
         // with the sender must get it exactly once — through the channel where it hears the
         // sender loudest (focus / positional attenuation) — or the mixers would double the audio.

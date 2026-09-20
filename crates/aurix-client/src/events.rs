@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::time::Duration;
 
 use crate::media::MediaPath;
+use crate::resilience::LossProfile;
 
 /// Lifecycle of the control connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -225,6 +226,13 @@ pub enum Event {
     BitrateChanged {
         bitrate_bps: u32,
         reason: String,
+    },
+    /// The uplink loss profile (FEC tuning / DRED tier chosen from the loss the server
+    /// measures on our packets) moved to another tier; already applied to the encoder.
+    LossProfileChanged {
+        profile: LossProfile,
+        /// The report that triggered the change (`0` when a session ended).
+        uplink_loss_percent: f32,
     },
     /// The merged audio policy of the joined channels changed (join/leave or an operator
     /// edited a channel). Already applied to the encoder when

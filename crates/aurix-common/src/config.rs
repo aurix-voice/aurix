@@ -200,6 +200,9 @@ impl AurixConfig {
                 "media.webrtc_participant_streams must be at most {MAX_WEBRTC_PARTICIPANT_STREAMS}"
             );
         }
+        if self.media.mixer_decoder_complexity > 10 {
+            anyhow::bail!("media.mixer_decoder_complexity must be within 0..=10");
+        }
         if self.redis.sentinels.is_empty() != self.redis.sentinel_master.is_none() {
             anyhow::bail!("redis.sentinels and redis.sentinel_master must be set together");
         }
@@ -1380,6 +1383,13 @@ pub struct MediaConfig {
     /// mixer (one encode each). Disable on CPU-bound nodes to force per-speaker streams.
     #[serde(default = "default_true")]
     pub downlink_mix: bool,
+    /// libopus decoder complexity (`0..=10`) of the server mixers (native downlink mix,
+    /// browser mixed track): `>= 5` conceals lost uplink frames with the neural PLC, `>= 6`
+    /// adds OSCE enhancement of speech frames. Missing frames are first rebuilt from the next
+    /// packet's in-band FEC / DRED at any complexity; this only tunes what remains.
+    /// Costs CPU per concealed / enhanced frame — lower on CPU-bound nodes.
+    #[serde(default = "default_mixer_decoder_complexity")]
+    pub mixer_decoder_complexity: u8,
     /// Per-participant WebRTC downlink tracks a browser may negotiate on top of the mixed
     /// track (`SessionInitAck.webrtc_participant_streams`): each carries one speaker's own
     /// Opus frames so the browser can spatialize (Web Audio HRTF) and mix them itself; speakers
@@ -1466,6 +1476,10 @@ fn default_webrtc_participant_streams() -> u32 {
     16
 }
 
+fn default_mixer_decoder_complexity() -> u8 {
+    5
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
@@ -1497,6 +1511,7 @@ impl Default for MediaConfig {
             pcmu_fallback: true,
             media_tunnel: true,
             downlink_mix: true,
+            mixer_decoder_complexity: default_mixer_decoder_complexity(),
             webrtc_participant_streams: default_webrtc_participant_streams(),
             tunnel_queue_packets: default_tunnel_queue_packets(),
             rx_workers: 0,

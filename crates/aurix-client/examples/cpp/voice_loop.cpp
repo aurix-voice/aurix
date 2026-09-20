@@ -143,6 +143,41 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::printf("bare codec: 20 ms frame -> %d bytes\n", len);
+
+        // Loss resilience: the decoder's neural PLC tier, and a lost frame rebuilt from the next
+        // packet's redundancy (in-band FEC when present, DRED for frames further back).
+        AurixDecoderSettings ds = defaults.decoder;
+        ds.complexity = 6;
+        if (dec.apply(ds) != AURIX_OK || !dec.settings(ds) || ds.complexity != 6) {
+            std::fprintf(stderr, "decoder settings failed: %s\n", aurix::last_error().c_str());
+            return 2;
+        }
+        s.fec = true;
+        s.expected_loss_percent = 20;
+        s.dred_duration_ms = aurix::Client::dred_supported() ? 200 : 0;
+        if (enc.apply(s) != AURIX_OK) {
+            std::fprintf(stderr, "encoder settings failed: %s\n", aurix::last_error().c_str());
+            return 2;
+        }
+        int next_len = 0;
+        for (int i = 0; i < 20; ++i) {
+            next_len = enc.encode(tone.data(), tone.size(), packet, sizeof packet);
+        }
+        if (next_len <= 0) {
+            std::fprintf(stderr, "encode failed: %s\n", aurix::last_error().c_str());
+            return 2;
+        }
+        const std::size_t next_size = static_cast<std::size_t>(next_len);
+        const bool has_fec = aurix::OpusDecoder::packet_has_fec(packet, next_size);
+        const int rebuilt = has_fec ? dec.decode(packet, next_size, pcm.data(), pcm.size(), true)
+                                    : dec.decode_dred(packet, next_size, 1, pcm.data(), pcm.size());
+        if (rebuilt < 0) {
+            std::fprintf(stderr, "loss recovery failed (%d): %s\n", rebuilt, aurix::last_error().c_str());
+            return 2;
+        }
+        std::printf("bare codec: lost frame -> %s %d samples (dred %s)\n",
+                    has_fec ? "fec" : (rebuilt > 0 ? "dred" : "plc"), rebuilt > 0 ? rebuilt : dec.decode(nullptr, 0, pcm.data(), pcm.size()),
+                    aurix::Client::dred_supported() ? "supported" : "unavailable");
     }
 
     aurix::Uuid channel;

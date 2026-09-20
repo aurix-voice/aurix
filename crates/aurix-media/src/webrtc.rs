@@ -27,7 +27,7 @@ use str0m::media::{Direction as RtcDirection, Frequency, MediaKind, MediaTime, M
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
-use crate::mixer::{OpusMixer, FRAME_SAMPLES};
+use crate::mixer::{MixerConfig, OpusMixer, FRAME_SAMPLES};
 
 /// Dynamic payload type offered for Opus (the same one browsers use by default).
 const OPUS_PT: Pt = Pt::new_with_value(111);
@@ -111,7 +111,7 @@ pub struct WebRtcManager {
     /// the media port); all of them lead to `socket`.
     advertised_addrs: Vec<SocketAddr>,
     event_tx: mpsc::Sender<WebRtcMediaEvent>,
-    downlink_bitrate: i32,
+    mixer: MixerConfig,
     max_participant_streams: usize,
 }
 
@@ -133,7 +133,7 @@ impl WebRtcManager {
         socket: Arc<MediaSocket>,
         advertised_addrs: Vec<SocketAddr>,
         event_tx: mpsc::Sender<WebRtcMediaEvent>,
-        downlink_bitrate: u32,
+        mixer: MixerConfig,
         max_participant_streams: u32,
     ) -> Self {
         let advertised_addrs: Vec<SocketAddr> = advertised_addrs
@@ -147,7 +147,7 @@ impl WebRtcManager {
             socket,
             advertised_addrs,
             event_tx,
-            downlink_bitrate: downlink_bitrate as i32,
+            mixer,
             max_participant_streams: max_participant_streams as usize,
         }
     }
@@ -209,7 +209,7 @@ impl WebRtcManager {
             return Err(AurixError::Transport("ICE credentials unavailable".into()));
         }
 
-        let mixer = OpusMixer::new(self.downlink_bitrate)?;
+        let mixer = OpusMixer::new(self.mixer)?;
 
         let (net_tx, net_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr)>(512);
         let (media_tx, media_rx) = mpsc::channel::<SessionInput>(512);
@@ -624,6 +624,7 @@ async fn session_task(
                                 }
                                 if let Err(e) = mixer.push_opus(
                                     media.sender_ssrc,
+                                    media.sender_ts,
                                     media.volume,
                                     media.direction,
                                     &media.payload,

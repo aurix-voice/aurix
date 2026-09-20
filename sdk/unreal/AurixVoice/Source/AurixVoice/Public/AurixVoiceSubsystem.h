@@ -37,6 +37,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixRecording, FGuid, ChannelId,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixBitrateChanged, int32, BitrateBps, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixNetworkQualityChanged, const FAurixNetworkQuality&, Quality);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioPolicyChanged, const FAurixAudioPolicy&, Policy);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixLossProfileChanged, EAurixLossProfile, Profile, int32, UplinkLossPercent);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixKicked, FGuid, ChannelId, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixModerationApplied, int64, RequestId, FGuid, ChannelId, FGuid, UserId, EAurixModerationAction, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatMessageReceived, const FAurixChatMessage&, Message);
@@ -223,6 +224,31 @@ public:
 	/** Pin Opus complexity 0..10 regardless of channel hints (e.g. lower on a weak CPU); -1 unpins. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	bool SetComplexity(int32 Complexity);
+
+	/**
+	 * Choose the uplink redundancy tier from the server's loss reports (Auto, default) or pin one.
+	 * FEC tuning / DRED apply to the encoder at once; OnLossProfileChanged reports later moves.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	bool SetLossAdaptation(EAurixLossAdaptation Adaptation);
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	EAurixLossAdaptation GetLossAdaptation() const;
+
+	/** Redundancy tier the encoder runs with right now. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	EAurixLossProfile GetLossProfile() const;
+
+	/** Retune every downlink decoder (complexity → neural PLC / OSCE); streams already playing switch at once. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Playback")
+	bool SetDecoderSettings(const FAurixDecoderSettings& Settings);
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Playback")
+	bool GetDecoderSettings(FAurixDecoderSettings& OutSettings) const;
+
+	/** Whether this build's libopus codes / decodes Deep REDundancy (else lost frames get FEC + PLC only). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Playback")
+	static bool IsDredSupported();
 
 	/** Replace the capture processing (high-pass / AEC / NS / AGC) at runtime, e.g. from a settings menu. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
@@ -599,6 +625,8 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixBitrateChanged OnBitrateChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixNetworkQualityChanged OnNetworkQuality;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioPolicyChanged OnAudioPolicyChanged;
+	/** The uplink redundancy tier moved (with the server-measured uplink loss that triggered it). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixLossProfileChanged OnLossProfileChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixKicked OnKicked;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixModerationApplied OnModerationApplied;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatMessageReceived OnChatMessage;

@@ -186,9 +186,26 @@ The SDK does not bundle Opus; two codecs are provided and the client is codec-ag
 Both expose every libopus encoder control through `OpusEncoderSettings` (`BitrateBps`
 6 000..300 000 mono / ..510 000 stereo, `Complexity` 0..10, `MaxBandwidth`, `Signal`
 Auto/Voice/Music, `Vbr`, `ConstrainedVbr`, `Fec`, `ExpectedLossPercent`, `Dtx`, `Channels`
-1|2) and recover lost frames from the next
-packet's FEC data (`IOpusFecDecoder`; `RemoteMixer` uses it before falling back to PLC,
+1|2, `DredDurationMs` 0..1040) and recover lost frames from the next packet's FEC data
+(`IOpusFecDecoder`; `RemoteMixer` uses it before falling back to PLC,
 `VoiceStats.FramesFecRecovered`).
+
+**Packet loss (libopus 1.6 in `NativeOpusCodec`).** The native codec also implements
+`IOpusDredDecoder` (`DecodeDred(laterPacket, framesBefore, pcm, n)` rebuilds a frame from the
+Deep REDundancy a later packet carries; `NativeOpusCodec.DredSupported`) and
+`IOpusDecoderControls` (`OpusDecoderSettings { Complexity, OsceBwe }`: `>= 5` neural PLC,
+`>= 6` OSCE; `RemoteMixer.DecoderSettings` applies it to every stream). `RemoteMixer` repairs a
+gap in the order FEC (one frame) → DRED (bursts, as far as the packet's coverage reaches) → PLC
+when the packet that ends it arrives, keeps reordered packets, drops ones for slots already
+played (`VoiceStats.FramesLate`) and counts `FramesFecRecovered` / `FramesDredRecovered`;
+Concentus has FEC and classic PLC only. The client's **loss profile** follows the server's
+`NetworkQuality.UplinkLossPercent` — `LossProfile.Low / Moderate / High` at ≥ 3 % / ≥ 10 %
+(FEC on, `ExpectedLossPercent` ≥ 10 / 20, DRED ≥ 400 ms and a 28 kbit/s floor in `High`),
+relaxing after a 6 s dwell below 1 % / 5 % — `client.LossProfile`, `SetLossProfile(profile)`
+to pin / `SetLossProfile(null)` for automatic, `OnLossProfileChanged(profile, lossPercent)`,
+`VoiceStats.LossProfile`; same thresholds and shaping as the native core
+([Packet loss](native.md#packet-loss-fec-dred-and-the-neural-plc)). Not available in WebGL
+players (the browser owns its codec).
 
 The encoder the client drives (`client.Encoder = codec`) runs the **baseline** you set
 (`SetEncoderSettings`, the *Opus encoder* inspector block of `AurixVoiceBehaviour`) with the

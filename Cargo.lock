@@ -273,17 +273,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "audiopus_sys"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
-dependencies = [
- "cmake",
- "log",
- "pkg-config",
-]
-
-[[package]]
 name = "aurix-api"
 version = "1.2.0"
 dependencies = [
@@ -365,13 +354,13 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "aurix-common",
+ "aurix-opus",
  "base64 0.22.1",
  "bytes",
  "cbindgen",
  "chrono",
  "futures-util",
  "nnnoiseless",
- "opus",
  "parking_lot",
  "rand 0.8.8",
  "realfft",
@@ -505,6 +494,7 @@ dependencies = [
  "async-trait",
  "aurix-common",
  "aurix-metrics",
+ "aurix-opus",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -513,7 +503,6 @@ dependencies = [
  "dashmap",
  "flume",
  "libc",
- "opus",
  "parking_lot",
  "prometheus",
  "rand 0.8.8",
@@ -557,6 +546,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurix-opus"
+version = "1.2.0"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
 name = "aurix-recording"
 version = "1.2.0"
 dependencies = [
@@ -564,6 +560,7 @@ dependencies = [
  "async-trait",
  "aurix-common",
  "aurix-db",
+ "aurix-opus",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -571,7 +568,6 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
- "opus",
  "parking_lot",
  "rand 0.8.8",
  "reqwest",
@@ -599,6 +595,7 @@ dependencies = [
  "aurix-media",
  "aurix-metrics",
  "aurix-moderation",
+ "aurix-opus",
  "aurix-recording",
  "aurix-turn",
  "aurix-ws",
@@ -613,7 +610,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "opus",
  "parking_lot",
  "rand 0.8.8",
  "reqwest",
@@ -2692,12 +2688,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "opus"
-version = "0.3.1"
+name = "opusic-sys"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3809943dff6fbad5f0484449ea26bdb9cb7d8efdf26ed50d3c7f227f69eb5c"
+checksum = "c9d1ecdf206421bc74343ab3bb2f30ad2abbfee41fa341f7181fecbaf957769a"
 dependencies = [
- "audiopus_sys",
+ "cmake",
 ]
 
 [[package]]

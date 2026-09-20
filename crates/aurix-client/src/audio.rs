@@ -365,6 +365,12 @@ pub struct EncoderSettings {
     /// Channels the uplink is encoded with: `1` (voice, the default) or `2` (stereo music /
     /// broadcast). A channel policy without `stereo` forces `1`; PCMU is always mono.
     pub channels: u8,
+    /// Deep REDundancy (Opus 1.5 DRED): every packet carries a neural low-rate summary of up
+    /// to this much preceding audio (`0` = off, `..=1040` ms in 10 ms steps), so a receiver
+    /// rebuilds bursts of several lost frames instead of concealing them. Costs a share of
+    /// `bitrate_bps` (nothing below ~28 kbit/s with FEC on); the adaptive loss profile
+    /// turns it on under heavy loss.
+    pub dred_duration_ms: u16,
 }
 
 impl EncoderSettings {
@@ -375,6 +381,8 @@ impl EncoderSettings {
     pub const MAX_STEREO_BITRATE: u32 = 510_000;
     /// libopus' own default.
     pub const DEFAULT_COMPLEXITY: u8 = 9;
+    /// Longest DRED history libopus can code (104 × 10 ms).
+    pub const MAX_DRED_DURATION_MS: u16 = 1_040;
 
     pub fn clamped(mut self) -> Self {
         self.channels = if self.channels == 2 { 2 } else { 1 };
@@ -386,6 +394,7 @@ impl EncoderSettings {
         self.bitrate_bps = self.bitrate_bps.clamp(Self::MIN_BITRATE, max);
         self.complexity = self.complexity.min(10);
         self.expected_loss_percent = self.expected_loss_percent.min(100);
+        self.dred_duration_ms = self.dred_duration_ms.min(Self::MAX_DRED_DURATION_MS) / 10 * 10;
         self
     }
 
@@ -429,6 +438,7 @@ impl Default for EncoderSettings {
             expected_loss_percent: 5,
             dtx: false,
             channels: 1,
+            dred_duration_ms: 0,
         }
     }
 }
@@ -468,7 +478,24 @@ pub fn apply_encoder_settings(
     e.set_packet_loss_perc(i32::from(s.expected_loss_percent))?;
     e.set_dtx(s.dtx)?;
     e.set_bitrate(opus::Bitrate::Bits(s.bitrate_bps as i32))?;
-    Ok(s)
+    let dred_duration_ms = match e.set_dred_duration(u32::from(s.dred_duration_ms / 10)) {
+        Ok(()) => s.dred_duration_ms,
+        // A libopus without DRED: plain FEC/PLC, the setting reads back as off.
+        Err(err) if err.code() == opus::ErrorCode::Unimplemented => 0,
+        Err(err) => return Err(err),
+    };
+    Ok(EncoderSettings {
+        dred_duration_ms,
+        ..s
+    })
+}
+
+/// Whether this libopus build codes DRED (`false`: [`EncoderSettings::dred_duration_ms`] is
+/// accepted but stays off and receivers fall back to FEC/PLC).
+pub fn dred_supported() -> bool {
+    opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+        .and_then(|mut e| e.set_dred_duration(1))
+        .is_ok()
 }
 
 /// What libopus reports back, for tests and diagnostics.
@@ -500,6 +527,12 @@ pub fn probe_encoder_settings(e: &mut opus::Encoder) -> Result<EncoderSettings, 
         expected_loss_percent: e.get_packet_loss_perc()?.clamp(0, 100) as u8,
         dtx: e.get_dtx()?,
         channels: 1,
+        dred_duration_ms: e
+            .get_dred_duration()
+            .map(|frames| {
+                (frames * 10).min(u32::from(EncoderSettings::MAX_DRED_DURATION_MS)) as u16
+            })
+            .unwrap_or(0),
     })
 }
 
@@ -623,6 +656,22 @@ impl OpusEncoder {
 pub struct OpusDecoder {
     decoder: opus::Decoder,
     channels: usize,
+    sample_rate: u32,
+    /// DRED state, created on the first `dred_decode_*` call; `None` when the build has no DRED.
+    dred: Option<Box<DecoderDred>>,
+}
+
+struct DecoderDred {
+    decoder: opus::DredDecoder,
+    data: opus::Dred,
+    /// FNV-1a of the packet the redundancy was parsed from, and the history it can rebuild.
+    parsed: Option<(u64, usize)>,
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 impl OpusDecoder {
@@ -631,11 +680,92 @@ impl OpusDecoder {
         Ok(Self {
             decoder: opus::Decoder::new(sample_rate_hz, ch)?,
             channels: usize::from(channels),
+            sample_rate: sample_rate_hz,
+            dred: None,
         })
     }
 
     pub fn channels(&self) -> usize {
         self.channels
+    }
+
+    /// Retune the decoder: complexity `>= 5` conceals lost frames with the neural PLC, `>= 6`
+    /// enhances decoded speech (OSCE); `osce_bwe` extends 16 kHz speech to full band.
+    pub fn apply(&mut self, settings: DecoderSettings) -> Result<(), CodecError> {
+        Ok(settings.clamped().apply(&mut self.decoder)?)
+    }
+
+    pub fn settings(&mut self) -> DecoderSettings {
+        DecoderSettings {
+            complexity: self.decoder.get_complexity().unwrap_or(0).clamp(0, 10) as u8,
+            osce_bwe: self.decoder.get_osce_bwe().unwrap_or(false),
+        }
+    }
+
+    /// Rebuild the frame `frames_before` frames before `packet` (1 = the one right before it)
+    /// from the packet's Deep REDundancy into one frame of `pcm.len() / channels` samples.
+    /// Returns samples per channel, `Ok(0)` when the packet's DRED does not reach that far (or
+    /// this build has no DRED) — run PLC then.
+    pub fn dred_decode_f32(
+        &mut self,
+        packet: &[u8],
+        frames_before: usize,
+        pcm: &mut [f32],
+    ) -> Result<usize, CodecError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(self.channels) || frames_before == 0 {
+            return Err(CodecError::BadFrame);
+        }
+        let frame = pcm.len() / self.channels;
+        let offset = frames_before * frame;
+        if self.dred.is_none() {
+            self.dred = opus::DredDecoder::new()
+                .and_then(|decoder| {
+                    Ok(Box::new(DecoderDred {
+                        decoder,
+                        data: opus::Dred::new()?,
+                        parsed: None,
+                    }))
+                })
+                .ok();
+        }
+        let Some(st) = self.dred.as_deref_mut() else {
+            return Ok(0);
+        };
+        let key = fnv1a(packet);
+        let available = match st.parsed {
+            Some((k, n)) if k == key => n,
+            _ => {
+                let max = (offset + 4 * frame).min(self.sample_rate as usize);
+                let n = st
+                    .decoder
+                    .parse(&mut st.data, packet, max, self.sample_rate)
+                    .unwrap_or(0);
+                st.parsed = Some((key, n));
+                n
+            }
+        };
+        if available < offset {
+            return Ok(0);
+        }
+        Ok(self.decoder.dred_decode_float(&st.data, offset, pcm)?)
+    }
+
+    /// [`Self::dred_decode_f32`] with 16-bit output.
+    pub fn dred_decode_i16(
+        &mut self,
+        packet: &[u8],
+        frames_before: usize,
+        pcm: &mut [i16],
+    ) -> Result<usize, CodecError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(self.channels) || frames_before == 0 {
+            return Err(CodecError::BadFrame);
+        }
+        let mut tmp = vec![0f32; pcm.len()];
+        let n = self.dred_decode_f32(packet, frames_before, &mut tmp)?;
+        for (o, s) in pcm.iter_mut().zip(&tmp[..n * self.channels]) {
+            *o = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        }
+        Ok(n)
     }
 
     /// Decodes `packet` into interleaved f32 PCM; an empty packet runs PLC for one frame of
@@ -1033,6 +1163,18 @@ impl<F> JitterBuffer<F> {
         self.frames.is_empty()
     }
 
+    /// Sequence of the slot the next [`Self::pop`] serves (the slot just returned is one
+    /// below).
+    pub fn next_seq(&self) -> u32 {
+        self.next_seq
+    }
+
+    /// Oldest buffered frame and its sequence — after a [`JitterSlot::Lost`], the packet
+    /// whose in-band FEC / DRED may rebuild the missing slot.
+    pub fn peek(&self) -> Option<(u32, &F)> {
+        self.frames.iter().next().map(|(&seq, f)| (seq, f))
+    }
+
     fn seq_before(a: u32, b: u32) -> bool {
         (a.wrapping_sub(b) as i32) < 0
     }
@@ -1097,6 +1239,11 @@ struct Stream {
     jitter: JitterBuffer<WireFrame>,
     decoder: opus::Decoder,
     pcmu: PcmuDecoder,
+    /// DRED parsed from the packet that closes the current gap, reused for each lost frame
+    /// of that gap.
+    dred: Option<Box<StreamDred>>,
+    fec_recovered: u64,
+    dred_recovered: u64,
     /// Codec of the last frame decoded; the concealment path follows it.
     codec: AudioCodec,
     /// The Opus decoder is stereo and `frame` holds interleaved L/R: a server-mixed stream,
@@ -1122,6 +1269,95 @@ struct Stream {
     viseme_fed_at: Instant,
 }
 
+struct StreamDred {
+    data: opus::Dred,
+    /// Packet the redundancy was parsed from.
+    packet_seq: u32,
+    /// Samples before that packet the redundancy can rebuild.
+    samples: usize,
+}
+
+impl StreamDred {
+    /// The redundancy of `packet` (sequence `seq`), parsed once per packet for up to
+    /// `max_samples` of history; `None` when this build has no DRED state.
+    fn parse_once<'a>(
+        slot: &'a mut Option<Box<StreamDred>>,
+        dec: &mut opus::DredDecoder,
+        seq: u32,
+        packet: &[u8],
+        max_samples: usize,
+    ) -> Option<&'a mut StreamDred> {
+        if slot.is_none() {
+            *slot = opus::Dred::new().ok().map(|data| {
+                Box::new(StreamDred {
+                    data,
+                    packet_seq: seq.wrapping_sub(1),
+                    samples: 0,
+                })
+            });
+        }
+        let st = slot.as_deref_mut()?;
+        if st.packet_seq != seq {
+            st.samples = dec
+                .parse(&mut st.data, packet, max_samples, SAMPLE_RATE)
+                .unwrap_or(0);
+            st.packet_seq = seq;
+        }
+        Some(st)
+    }
+}
+
+/// Longest gap DRED is asked to bridge, in 20 ms frames (libopus codes up to ~1 s).
+const MAX_DRED_GAP_FRAMES: usize = 52;
+
+/// History to request from a packet's DRED for a gap of `gap` frames: the redundancy is
+/// coded with an encoder-side offset of a few frames, so asking for exactly the gap decodes
+/// too few latents; asking for a little more costs only decoder time.
+fn dred_history_samples(gap: usize) -> usize {
+    ((gap + 4) * FRAME_SAMPLES).min(SAMPLE_RATE as usize)
+}
+
+/// Tuning of every remote stream's Opus decoder (libopus 1.5+ neural paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderSettings {
+    /// `0..=10`. `>= 5` conceals lost frames with the neural PLC instead of the classic
+    /// one; `>= 6` also runs OSCE LACE speech enhancement on SILK frames, `>= 7` NoLACE
+    /// (best quality, several times the CPU of LACE).
+    pub complexity: u8,
+    /// OSCE bandwidth extension: wideband SILK speech is widened to fullband (needs
+    /// `complexity >= 4`).
+    pub osce_bwe: bool,
+}
+
+impl DecoderSettings {
+    /// Neural PLC without OSCE — the default balance for many concurrent streams.
+    pub const DEFAULT_COMPLEXITY: u8 = 5;
+
+    pub fn clamped(mut self) -> Self {
+        self.complexity = self.complexity.min(10);
+        self
+    }
+
+    /// Configures one libopus decoder; a build without OSCE keeps `osce_bwe` off.
+    fn apply(self, d: &mut opus::Decoder) -> Result<(), opus::Error> {
+        d.set_complexity(i32::from(self.complexity))?;
+        match d.set_osce_bwe(self.osce_bwe) {
+            Ok(()) => Ok(()),
+            Err(err) if err.code() == opus::ErrorCode::Unimplemented => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Default for DecoderSettings {
+    fn default() -> Self {
+        Self {
+            complexity: Self::DEFAULT_COMPLEXITY,
+            osce_bwe: false,
+        }
+    }
+}
+
 /// Statistics of one decoded sender stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StreamStats {
@@ -1129,6 +1365,10 @@ pub struct StreamStats {
     pub buffered_frames: usize,
     pub lost: u64,
     pub late: u64,
+    /// Lost frames rebuilt from the following packet's in-band FEC / DRED (subsets of
+    /// `lost`); the rest were concealed.
+    pub fec_recovered: u64,
+    pub dred_recovered: u64,
     /// Decoded two-wide (a stereo uplink or a server mix).
     pub stereo: bool,
     /// Server-mixed channel stream (`PacketFlags::Mixed`), never a single participant.
@@ -1140,13 +1380,26 @@ pub struct StreamStats {
 /// Downlink counters accumulated over every stream the mixer has ever seen.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MixerTotals {
-    /// Frames the jitter buffers declared lost and concealed with PLC.
+    /// Frames the jitter buffers declared lost (rebuilt from FEC / DRED or concealed).
     pub lost: u64,
     /// Frames that arrived after their play-out time and were discarded.
     pub late: u64,
     /// Times a stream ran dry mid-talk-spurt (a packet followed within
     /// [`UNDERRUN_RESUME_WINDOW`]); the natural end of a spurt is not counted.
     pub underruns: u64,
+    /// Lost frames rebuilt from the next packet's in-band FEC (subset of `lost`).
+    pub fec_recovered: u64,
+    /// Lost frames rebuilt from Deep REDundancy (subset of `lost`).
+    pub dred_recovered: u64,
+}
+
+impl MixerTotals {
+    fn absorb(&mut self, s: &Stream) {
+        self.lost += s.jitter.lost;
+        self.late += s.jitter.late;
+        self.fec_recovered += s.fec_recovered;
+        self.dred_recovered += s.dred_recovered;
+    }
 }
 
 /// A stream that starves and receives its next frame within this window ran dry because
@@ -1172,6 +1425,9 @@ pub struct RemoteMixer {
     underruns: u64,
     /// Every stream gets a [`VisemeAnalyzer`] fed from its decoded frames.
     visemes: bool,
+    decoder: DecoderSettings,
+    /// Shared DRED extractor; `None` when this libopus has no DRED (gaps get FEC/PLC only).
+    dred: Option<opus::DredDecoder>,
 }
 
 impl RemoteMixer {
@@ -1187,7 +1443,33 @@ impl RemoteMixer {
             retired: MixerTotals::default(),
             underruns: 0,
             visemes: false,
+            decoder: DecoderSettings::default(),
+            dred: opus::DredDecoder::new().ok(),
         }
+    }
+
+    /// Retune every stream's decoder (existing and future ones).
+    pub fn set_decoder_settings(&mut self, settings: DecoderSettings) -> Result<(), opus::Error> {
+        self.decoder = settings.clamped();
+        for s in self.streams.values_mut() {
+            self.decoder.apply(&mut s.decoder)?;
+        }
+        Ok(())
+    }
+
+    pub fn decoder_settings(&self) -> DecoderSettings {
+        self.decoder
+    }
+
+    /// Whether lost frames can be rebuilt from DRED with this libopus build.
+    pub fn dred_supported(&self) -> bool {
+        self.dred.is_some()
+    }
+
+    fn new_decoder(&self, stereo: bool) -> Result<opus::Decoder, opus::Error> {
+        let mut d = opus::Decoder::new(SAMPLE_RATE, opus_width(stereo))?;
+        self.decoder.apply(&mut d)?;
+        Ok(d)
     }
 
     /// Analyse every stream's decoded audio for lip-sync (see [`Self::visemes`]). Streams
@@ -1297,7 +1579,9 @@ impl RemoteMixer {
                 s.stereo || stereo
             };
             if s.mixed != mixed || s.stereo != want_stereo {
-                s.decoder = opus::Decoder::new(SAMPLE_RATE, opus_width(want_stereo))?;
+                let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus_width(want_stereo))?;
+                self.decoder.apply(&mut decoder)?;
+                s.decoder = decoder;
                 s.stereo = want_stereo;
                 s.mixed = mixed;
                 s.pos = 0;
@@ -1308,11 +1592,14 @@ impl RemoteMixer {
         let stream = match self.streams.get_mut(&ssrc) {
             Some(s) => s,
             None => {
-                let decoder = opus::Decoder::new(SAMPLE_RATE, opus_width(stereo))?;
+                let decoder = self.new_decoder(stereo)?;
                 self.streams.entry(ssrc).or_insert(Stream {
                     jitter: JitterBuffer::new(self.target_depth, self.max_depth),
                     decoder,
                     pcmu: PcmuDecoder::new(),
+                    dred: None,
+                    fec_recovered: 0,
+                    dred_recovered: 0,
                     codec,
                     stereo,
                     mixed,
@@ -1345,18 +1632,53 @@ impl RemoteMixer {
         let now = Instant::now();
         stream.last_activity = now;
         if stream.starved {
-            // A talk spurt after silence: refill the target depth before playing again.
-            stream.jitter.reset();
+            let resumed = now.duration_since(stream.starved_at) < UNDERRUN_RESUME_WINDOW;
+            let bridged = resumed
+                && codec == AudioCodec::Opus
+                && stream.codec == AudioCodec::Opus
+                && Self::packet_bridges_gap(stream, self.dred.as_mut(), seq, &data);
+            if !bridged {
+                // A talk spurt after silence: refill the target depth before playing again.
+                stream.jitter.reset();
+            }
             stream.starved = false;
             if let Some(v) = &mut stream.visemes {
                 v.reset();
             }
-            if now.duration_since(stream.starved_at) < UNDERRUN_RESUME_WINDOW {
+            if resumed {
                 self.underruns += 1;
             }
         }
         stream.jitter.push(seq, WireFrame { codec, data });
         Ok(())
+    }
+
+    /// After the buffer ran dry mid-spurt, whether the packet that ends the gap can rebuild
+    /// the frames missed meanwhile (in-band FEC for a single one, DRED for a burst). Then the
+    /// stream keeps its sequence — the gap plays late, rebuilt, until the next pause re-syncs
+    /// it — instead of restarting and dropping the frames for good. A packet that cannot
+    /// (no redundancy, gap too long or out of order) restarts the stream as before.
+    fn packet_bridges_gap(
+        s: &mut Stream,
+        dred_dec: Option<&mut opus::DredDecoder>,
+        seq: u32,
+        packet: &[u8],
+    ) -> bool {
+        if !s.jitter.is_empty() {
+            return true;
+        }
+        let gap = seq.wrapping_sub(s.jitter.next_seq()) as usize;
+        if gap == 0 || gap > MAX_DRED_GAP_FRAMES {
+            return false;
+        }
+        if gap == 1 && opus::packet::has_lbrr(packet).unwrap_or(false) {
+            return true;
+        }
+        let Some(dd) = dred_dec else {
+            return false;
+        };
+        StreamDred::parse_once(&mut s.dred, dd, seq, packet, dred_history_samples(gap))
+            .is_some_and(|st| st.samples >= FRAME_SAMPLES)
     }
 
     pub fn remove(&mut self, ssrc: u32) {
@@ -1367,8 +1689,7 @@ impl RemoteMixer {
 
     pub fn clear(&mut self) {
         for (_, s) in self.streams.drain() {
-            self.retired.lost += s.jitter.lost;
-            self.retired.late += s.jitter.late;
+            self.retired.absorb(&s);
         }
         self.claimed.clear();
     }
@@ -1384,8 +1705,7 @@ impl RemoteMixer {
     }
 
     fn retire(&mut self, s: &Stream) {
-        self.retired.lost += s.jitter.lost;
-        self.retired.late += s.jitter.late;
+        self.retired.absorb(s);
     }
 
     pub fn stream_stats(&self) -> Vec<StreamStats> {
@@ -1396,6 +1716,8 @@ impl RemoteMixer {
                 buffered_frames: s.jitter.len(),
                 lost: s.jitter.lost,
                 late: s.jitter.late,
+                fec_recovered: s.fec_recovered,
+                dred_recovered: s.dred_recovered,
                 stereo: s.stereo,
                 mixed: s.mixed,
                 starved: s.starved,
@@ -1407,8 +1729,7 @@ impl RemoteMixer {
     pub fn totals(&self) -> MixerTotals {
         let mut t = self.retired;
         for s in self.streams.values() {
-            t.lost += s.jitter.lost;
-            t.late += s.jitter.late;
+            t.absorb(s);
         }
         t.underruns = self.underruns;
         t
@@ -1427,12 +1748,50 @@ impl RemoteMixer {
         self.streams.retain(|_, s| {
             let keep = now.duration_since(s.last_activity) < STREAM_IDLE_TIMEOUT;
             if !keep {
-                retired.lost += s.jitter.lost;
-                retired.late += s.jitter.late;
+                retired.absorb(s);
             }
             keep
         });
         self.retired = retired;
+    }
+
+    /// Fill a lost Opus slot: the packet closing the gap rebuilds it from in-band FEC (the
+    /// slot right before that packet) or DRED (any slot within the redundancy it carries);
+    /// otherwise the decoder conceals. Returns samples per channel.
+    fn conceal_opus(
+        s: &mut Stream,
+        dred_dec: Option<&mut opus::DredDecoder>,
+    ) -> Result<usize, opus::Error> {
+        let width = if s.stereo { 2 } else { 1 };
+        let out = &mut s.frame[..FRAME_SAMPLES * width];
+        let lost_seq = s.jitter.next_seq().wrapping_sub(1);
+        if let Some((next_seq, next)) = s.jitter.peek() {
+            let gap = next_seq.wrapping_sub(lost_seq) as usize;
+            if next.codec == AudioCodec::Opus && gap >= 1 {
+                if gap == 1 && opus::packet::has_lbrr(&next.data).unwrap_or(false) {
+                    let n = s.decoder.decode_float(&next.data, out, true)?;
+                    s.fec_recovered += 1;
+                    return Ok(n);
+                }
+                if let Some(dd) = dred_dec.filter(|_| gap <= MAX_DRED_GAP_FRAMES) {
+                    let offset = gap * FRAME_SAMPLES;
+                    if let Some(st) = StreamDred::parse_once(
+                        &mut s.dred,
+                        dd,
+                        next_seq,
+                        &next.data,
+                        dred_history_samples(gap),
+                    )
+                    .filter(|st| st.samples >= offset)
+                    {
+                        let n = s.decoder.dred_decode_float(&st.data, offset, out)?;
+                        s.dred_recovered += 1;
+                        return Ok(n);
+                    }
+                }
+            }
+        }
+        s.decoder.decode_float(&[], out, false)
     }
 
     /// Render one stream **into** `output` (added). With `pan` a directional stream is panned
@@ -1440,6 +1799,7 @@ impl RemoteMixer {
     /// caller spatializes). Returns `(frames written, contributed audible samples)`.
     fn render_stream(
         s: &mut Stream,
+        dred: Option<&mut opus::DredDecoder>,
         output: &mut [f32],
         channels: usize,
         master: f32,
@@ -1449,6 +1809,7 @@ impl RemoteMixer {
         let frames_needed = output.len() / channels;
         let mut written = 0;
         let mut contributed = false;
+        let mut dred = dred;
         while written < frames_needed {
             if s.pos >= s.len {
                 let slot = s.jitter.pop();
@@ -1468,14 +1829,7 @@ impl RemoteMixer {
                         }
                     }
                     JitterSlot::Lost => match s.codec {
-                        AudioCodec::Opus => {
-                            let width = if s.stereo { 2 } else { 1 };
-                            s.decoder.decode_float(
-                                &[],
-                                &mut s.frame[..FRAME_SAMPLES * width],
-                                false,
-                            )
-                        }
+                        AudioCodec::Opus => Self::conceal_opus(s, dred.as_deref_mut()),
                         AudioCodec::Pcmu => Ok(s.pcmu.conceal(&mut s.frame)),
                     },
                 };
@@ -1560,11 +1914,12 @@ impl RemoteMixer {
         self.expire_idle(now);
         let mut active = 0;
         let claimed = &self.claimed;
+        let mut dred = self.dred.as_mut();
         for (ssrc, s) in self.streams.iter_mut() {
             if claimed.contains(ssrc) {
                 continue;
             }
-            if Self::render_stream(s, output, channels, master, true, now).1 {
+            if Self::render_stream(s, dred.as_deref_mut(), output, channels, master, true, now).1 {
                 active += 1;
             }
         }
@@ -1603,9 +1958,18 @@ impl RemoteMixer {
         let now = Instant::now();
         self.expire_idle(now);
         let mut frames = 0;
+        let mut dred = self.dred.as_mut();
         for ssrc in ssrcs {
             if let Some(s) = self.streams.get_mut(ssrc) {
-                let (written, _) = Self::render_stream(s, output, channels, master, false, now);
+                let (written, _) = Self::render_stream(
+                    s,
+                    dred.as_deref_mut(),
+                    output,
+                    channels,
+                    master,
+                    false,
+                    now,
+                );
                 frames = frames.max(written);
             }
         }
@@ -1855,6 +2219,7 @@ mod tests {
             expected_loss_percent: 20,
             dtx: true,
             channels: 1,
+            dred_duration_ms: 200,
         };
         let mut enc = CaptureEncoder::new(wanted).unwrap();
         assert_eq!(enc.settings(), wanted);
@@ -2571,5 +2936,395 @@ mod tests {
         );
         enc.set_visemes(false);
         assert_eq!(enc.visemes(), None);
+    }
+
+    /// Syllable-like bursts (glottal-pulse harmonics with moving formant emphasis) separated
+    /// by short pauses; SILK keeps classifying it as speech, so LBRR and DRED are produced.
+    fn speech_like(frames: usize) -> Vec<f32> {
+        let mut seed = 0x1234_5678u32;
+        (0..frames * FRAME_SAMPLES)
+            .map(|i| {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                let syllable = (t / 0.18).floor();
+                let phase = (t % 0.18) / 0.18;
+                let voiced = phase < 0.7;
+                let f0 = 110.0 + 25.0 * (syllable * 0.9).sin() + 15.0 * (t * 4.0).sin();
+                let formant = 500.0 + 400.0 * ((syllable * 1.7).sin() + 1.0);
+                let env = if voiced {
+                    (phase / 0.1).min(1.0) * ((0.7 - phase) / 0.1).min(1.0)
+                } else {
+                    0.0
+                };
+                let mut s = 0.0;
+                for h in 1..=12 {
+                    let f = f0 * h as f32;
+                    let weight = 1.0 / (1.0 + ((f - formant) / 300.0).powi(2));
+                    s += (2.0 * std::f32::consts::PI * f * t).sin() * weight;
+                }
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((seed >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.02;
+                (s * 0.4 * env + noise) * 0.27
+            })
+            .collect()
+    }
+
+    fn rms(pcm: &[f32]) -> f32 {
+        (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len().max(1) as f32).sqrt()
+    }
+
+    /// Best normalized cross-correlation of `a` against `b` over lags `0..400`.
+    fn similarity(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len()) - 400;
+        (0..400)
+            .map(|lag| {
+                let (mut xy, mut xx, mut yy) = (0.0f64, 0.0f64, 0.0f64);
+                for i in 0..n {
+                    let (x, y) = (a[i] as f64, b[i + lag] as f64);
+                    xy += x * y;
+                    xx += x * x;
+                    yy += y * y;
+                }
+                (xy / (xx * yy).sqrt().max(1e-12)) as f32
+            })
+            .fold(f32::MIN, f32::max)
+    }
+
+    fn resilient_encoder(channels: u8) -> CaptureEncoder {
+        CaptureEncoder::new(EncoderSettings {
+            bitrate_bps: if channels == 2 { 64_000 } else { 40_000 },
+            fec: true,
+            expected_loss_percent: 30,
+            dtx: false,
+            channels,
+            dred_duration_ms: 400,
+            ..EncoderSettings::default()
+        })
+        .unwrap()
+    }
+
+    /// Reference decode of every packet, and the mixer's output for `frames` with `lost`
+    /// dropped (all packets are buffered up front so the gap is declared lost, not starved).
+    fn mix_with_loss(
+        frames: &[EncodedFrame],
+        lost: &[u32],
+        channels: usize,
+        settings: DecoderSettings,
+    ) -> (RemoteMixer, Vec<f32>) {
+        let mut mixer = RemoteMixer::new(1, frames.len() + 4);
+        mixer.set_decoder_settings(settings).unwrap();
+        for (seq, f) in frames.iter().enumerate() {
+            if !lost.contains(&(seq as u32)) {
+                mixer
+                    .push(7, seq as u32, 1.0, None, f.payload.clone())
+                    .unwrap();
+            }
+        }
+        let mut out = Vec::with_capacity(frames.len() * FRAME_SAMPLES * channels);
+        let mut frame = vec![0f32; FRAME_SAMPLES * channels];
+        for _ in 0..frames.len() {
+            frame.fill(0.0);
+            mixer.mix(&mut frame, channels as u8);
+            out.extend_from_slice(&frame);
+        }
+        (mixer, out)
+    }
+
+    #[test]
+    fn mixer_rebuilds_one_lost_frame_from_fec_and_conceals_without_it() {
+        let mut enc = resilient_encoder(1);
+        let pcm = speech_like(60);
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| frames.push(f));
+        assert_eq!(frames.len(), 60);
+        // A lost frame whose successor carries LBRR (SILK omits it from some packets).
+        let lost = (20..50u32)
+            .find(|&s| opus::packet::has_lbrr(&frames[s as usize + 1].payload).unwrap())
+            .expect("steady-state speech packets carry LBRR");
+        let (_, reference) = mix_with_loss(&frames, &[], 1, DecoderSettings::default());
+        let (mixer, fec) = mix_with_loss(&frames, &[lost], 1, DecoderSettings::default());
+        let t = mixer.totals();
+        assert_eq!(
+            (t.lost, t.fec_recovered, t.dred_recovered),
+            (1, 1, 0),
+            "{t:?}"
+        );
+
+        // Without in-band FEC the same gap is concealed (deep PLC still fills it).
+        let mut plain = CaptureEncoder::new(EncoderSettings {
+            fec: false,
+            dtx: false,
+            dred_duration_ms: 0,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let mut plain_frames = Vec::new();
+        plain.push_f32(&pcm, SAMPLE_RATE, 1, |f| plain_frames.push(f));
+        let (mixer, plc) = mix_with_loss(&plain_frames, &[lost], 1, DecoderSettings::default());
+        let t = mixer.totals();
+        assert_eq!(
+            (t.lost, t.fec_recovered, t.dred_recovered),
+            (1, 0, 0),
+            "{t:?}"
+        );
+
+        // Jitter target 1 delays play-out by one frame: slot `lost + 1` of the output.
+        let win = (lost as usize + 1) * FRAME_SAMPLES..(lost as usize + 3) * FRAME_SAMPLES;
+        let (fec_sim, plc_sim) = (
+            similarity(&fec[win.clone()], &reference[win.clone()]),
+            similarity(&plc[win.clone()], &reference[win.clone()]),
+        );
+        assert!(fec_sim > 0.9, "FEC similarity {fec_sim}");
+        assert!(rms(&plc[win.clone()]) > 0.01, "PLC went silent");
+        assert!(fec_sim > plc_sim, "FEC {fec_sim} should beat PLC {plc_sim}");
+    }
+
+    #[test]
+    fn mixer_rebuilds_a_burst_from_dred_and_falls_back_to_plc_without_it() {
+        let mut enc = resilient_encoder(1);
+        let pcm = speech_like(60);
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| frames.push(f));
+        // 40 kb/s with 30 % expected loss buys ~135 ms of DRED history per packet (the
+        // encoder trades duration for bits): a 120 ms burst is fully covered, a 160 ms one
+        // has its oldest frames concealed instead.
+        let lost: Vec<u32> = (30..36).collect();
+        let (_, reference) = mix_with_loss(&frames, &[], 1, DecoderSettings::default());
+        let (mixer, dred) = mix_with_loss(&frames, &lost, 1, DecoderSettings::default());
+        let t = mixer.totals();
+        assert_eq!(t.lost, 6, "{t:?}");
+        assert_eq!(t.fec_recovered + t.dred_recovered, 6, "{t:?}");
+        assert!(t.dred_recovered >= 5, "{t:?}");
+        let win = 31 * FRAME_SAMPLES..37 * FRAME_SAMPLES;
+        let (r_ref, r_dred) = (rms(&reference[win.clone()]), rms(&dred[win.clone()]));
+        assert!(
+            r_dred > r_ref * 0.3 && r_dred < r_ref * 3.0,
+            "DRED rms {r_dred} vs {r_ref}"
+        );
+        let longer: Vec<u32> = (30..38).collect();
+        let (mixer, _) = mix_with_loss(&frames, &longer, 1, DecoderSettings::default());
+        let t = mixer.totals();
+        assert_eq!(t.lost, 8, "{t:?}");
+        assert!(t.fec_recovered + t.dred_recovered >= 5, "{t:?}");
+        assert!(t.fec_recovered + t.dred_recovered < 8, "{t:?}");
+
+        // A mixer without a DRED decoder conceals the whole burst.
+        let mut mixer = RemoteMixer::new(1, 64);
+        mixer.dred = None;
+        for (seq, f) in frames.iter().enumerate() {
+            if !lost.contains(&(seq as u32)) {
+                mixer
+                    .push(7, seq as u32, 1.0, None, f.payload.clone())
+                    .unwrap();
+            }
+        }
+        let mut frame = vec![0f32; FRAME_SAMPLES];
+        for _ in 0..frames.len() {
+            mixer.mix(&mut frame, 1);
+        }
+        let t = mixer.totals();
+        assert_eq!(t.lost, 6, "{t:?}");
+        assert_eq!(t.dred_recovered, 0, "{t:?}");
+        assert!(t.fec_recovered <= 1, "{t:?}");
+
+        // Packets without DRED: the burst is concealed, nothing is mis-attributed.
+        let mut plain = CaptureEncoder::new(EncoderSettings {
+            fec: false,
+            dtx: false,
+            dred_duration_ms: 0,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let mut plain_frames = Vec::new();
+        plain.push_f32(&pcm, SAMPLE_RATE, 1, |f| plain_frames.push(f));
+        let (mixer, _) = mix_with_loss(&plain_frames, &lost, 1, DecoderSettings::default());
+        let t = mixer.totals();
+        assert_eq!(
+            (t.lost, t.fec_recovered, t.dred_recovered),
+            (6, 0, 0),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn bare_decoder_rebuilds_a_gap_from_dred_and_reports_zero_beyond_it() {
+        let mut enc = resilient_encoder(1);
+        let pcm = speech_like(50);
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| frames.push(f));
+        let mut dec = OpusDecoder::new(SAMPLE_RATE, 1).unwrap();
+        dec.apply(DecoderSettings {
+            complexity: 6,
+            osce_bwe: false,
+        })
+        .unwrap();
+        assert_eq!(dec.settings().complexity, 6);
+        let mut out = vec![0f32; FRAME_SAMPLES];
+        for f in &frames[..30] {
+            dec.decode_f32(&f.payload, &mut out, false).unwrap();
+        }
+        // Frames 30..34 lost; packet 34 rebuilds 33 (FEC) and 30..32 (DRED, 2..4 frames back).
+        let next = &frames[34].payload;
+        let mut rebuilt = Vec::new();
+        for back in (2..=4).rev() {
+            let n = dec.dred_decode_f32(next, back, &mut out).unwrap();
+            assert_eq!(n, FRAME_SAMPLES, "{back} frames back");
+            rebuilt.extend_from_slice(&out);
+        }
+        let reference = &pcm[30 * FRAME_SAMPLES..33 * FRAME_SAMPLES];
+        let (r_ref, r_dred) = (rms(reference), rms(&rebuilt));
+        assert!(
+            r_dred > r_ref * 0.3 && r_dred < r_ref * 3.0,
+            "DRED rms {r_dred} vs {r_ref}"
+        );
+        // Beyond what the packet carries (~1 s cap, and nothing at all for a DRED-less packet).
+        assert_eq!(dec.dred_decode_f32(next, 60, &mut out).unwrap(), 0);
+        let mut plain = CaptureEncoder::new(EncoderSettings {
+            dred_duration_ms: 0,
+            dtx: false,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let mut plain_frames = Vec::new();
+        plain.push_f32(&pcm, SAMPLE_RATE, 1, |f| plain_frames.push(f));
+        assert_eq!(
+            dec.dred_decode_f32(&plain_frames[34].payload, 2, &mut out)
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            dec.dred_decode_f32(next, 0, &mut out),
+            Err(CodecError::BadFrame)
+        ));
+    }
+
+    #[test]
+    fn mixer_recovers_a_stereo_burst_and_survives_reordering() {
+        let mut enc = resilient_encoder(2);
+        let mono = speech_like(60);
+        let pcm: Vec<f32> = mono.iter().flat_map(|&s| [s, s * 0.5]).collect();
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, SAMPLE_RATE, 2, |f| frames.push(f));
+        assert_eq!(frames.len(), 60);
+        let lost: Vec<u32> = (30..35).collect();
+        let (mixer, out) = mix_with_loss(&frames, &lost, 2, DecoderSettings::default());
+        let t = mixer.totals();
+        assert_eq!(t.lost, 5, "{t:?}");
+        assert_eq!(t.fec_recovered + t.dred_recovered, 5, "{t:?}");
+        assert!(mixer.stream_stats()[0].stereo);
+        let win = 31 * FRAME_SAMPLES * 2..36 * FRAME_SAMPLES * 2;
+        let (l, r): (Vec<f32>, Vec<f32>) = out[win].chunks(2).map(|c| (c[0], c[1])).unzip();
+        let (rl, rr) = (rms(&l), rms(&r));
+        assert!(rl > 0.01 && rr > 0.5 * rl && rr < 0.8 * rl, "L {rl} R {rr}");
+
+        // Reordered arrival within the buffer is plain decoding — nothing is "recovered".
+        let mut mixer = RemoteMixer::new(4, 64);
+        let order = [0u32, 1, 2, 3, 5, 4, 6, 8, 7, 9, 10, 11];
+        for &seq in &order {
+            mixer
+                .push(7, seq, 1.0, None, frames[seq as usize].payload.clone())
+                .unwrap();
+        }
+        let mut frame = vec![0f32; FRAME_SAMPLES * 2];
+        for _ in 0..12 {
+            mixer.mix(&mut frame, 2);
+        }
+        let t = mixer.totals();
+        assert_eq!(
+            (t.lost, t.late, t.fec_recovered, t.dred_recovered),
+            (0, 0, 0, 0),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn starved_stream_keeps_its_sequence_when_the_next_packet_can_rebuild_the_gap() {
+        let mut enc = resilient_encoder(1);
+        let pcm = speech_like(60);
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| frames.push(f));
+        let mut mixer = RemoteMixer::new(2, 12);
+        let mut out = vec![0f32; FRAME_SAMPLES];
+        let feed = |m: &mut RemoteMixer, seq: u32| {
+            m.push(7, seq, 1.0, None, frames[seq as usize].payload.clone())
+                .unwrap()
+        };
+        // Real-time cadence: one packet in, one frame out; frames 30..=35 never arrive.
+        for seq in 0..30 {
+            feed(&mut mixer, seq);
+            mixer.mix(&mut out, 1);
+        }
+        for _ in 30..36 {
+            mixer.mix(&mut out, 1);
+        }
+        assert!(mixer.stream_stats()[0].starved);
+        for seq in 36..60 {
+            feed(&mut mixer, seq);
+            mixer.mix(&mut out, 1);
+        }
+        let t = mixer.totals();
+        assert_eq!((t.underruns, t.lost), (1, 6), "{t:?}");
+        assert_eq!(t.fec_recovered + t.dred_recovered, 6, "{t:?}");
+        assert!(t.dred_recovered >= 5, "{t:?}");
+
+        // Without redundancy the same starvation restarts the stream: no phantom losses.
+        let mut plain = CaptureEncoder::new(EncoderSettings {
+            fec: false,
+            dtx: false,
+            dred_duration_ms: 0,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let mut plain_frames = Vec::new();
+        plain.push_f32(&pcm, SAMPLE_RATE, 1, |f| plain_frames.push(f));
+        let mut mixer = RemoteMixer::new(2, 12);
+        for (seq, frame) in plain_frames.iter().enumerate().take(30) {
+            mixer
+                .push(7, seq as u32, 1.0, None, frame.payload.clone())
+                .unwrap();
+            mixer.mix(&mut out, 1);
+        }
+        for _ in 30..36 {
+            mixer.mix(&mut out, 1);
+        }
+        for (seq, frame) in plain_frames.iter().enumerate().take(60).skip(36) {
+            mixer
+                .push(7, seq as u32, 1.0, None, frame.payload.clone())
+                .unwrap();
+            mixer.mix(&mut out, 1);
+        }
+        let t = mixer.totals();
+        assert_eq!(
+            (t.underruns, t.lost, t.fec_recovered, t.dred_recovered),
+            (1, 0, 0, 0),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn pcmu_streams_ignore_the_opus_recovery_path() {
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        enc.set_codec(AudioCodec::Pcmu);
+        let pcm = sine(FRAME_SAMPLES * 12, SAMPLE_RATE, 440.0, 0.5);
+        let mut frames = Vec::new();
+        enc.push_f32(&pcm, SAMPLE_RATE, 1, |f| frames.push(f));
+        assert!(frames.iter().all(|f| f.codec == AudioCodec::Pcmu));
+        let mut mixer = RemoteMixer::new(1, 16);
+        for (seq, f) in frames.iter().enumerate() {
+            if seq != 5 {
+                mixer
+                    .push_frame(7, seq as u32, 1.0, None, f.codec, f.payload.clone())
+                    .unwrap();
+            }
+        }
+        let mut out = vec![0f32; FRAME_SAMPLES];
+        for _ in 0..12 {
+            mixer.mix(&mut out, 1);
+        }
+        let t = mixer.totals();
+        assert_eq!(
+            (t.lost, t.fec_recovered, t.dred_recovered),
+            (1, 0, 0),
+            "{t:?}"
+        );
     }
 }
