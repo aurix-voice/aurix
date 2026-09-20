@@ -126,7 +126,7 @@ async fn start_sfu_with(options: SfuOptions) -> (SfuNode, SocketAddr) {
             ..options
         },
     );
-    sfu.start("127.0.0.1:0").await.unwrap();
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = sfu.local_addr().unwrap();
     (sfu, addr)
 }
@@ -943,7 +943,7 @@ async fn transmission_mode_focus_and_session_channel_limits() {
             ..SfuOptions::default()
         },
     );
-    sfu.start("127.0.0.1:0").await.unwrap();
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = sfu.local_addr().unwrap();
     let app = AppId::new();
     let team = ChannelId::new();
@@ -1244,7 +1244,7 @@ async fn webrtc_frame_reaches_shared_receiver_once_via_loudest_channel() {
             ..SfuOptions::default()
         },
     );
-    sfu.start("127.0.0.1:0").await.unwrap();
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = sfu.local_addr().unwrap();
     let app = AppId::new();
     let team = ChannelId::new();
@@ -1347,7 +1347,7 @@ async fn audio_levels_drive_speaking_and_energy_reports() {
             ..SfuOptions::default()
         },
     );
-    sfu.start("127.0.0.1:0").await.unwrap();
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = sfu.local_addr().unwrap();
     let app = AppId::new();
     let channel = ChannelId::new();
@@ -1943,7 +1943,7 @@ async fn listeners_get_one_server_mixed_stream_per_channel() {
             ..SfuOptions::default()
         },
     );
-    sfu.start("127.0.0.1:0").await.unwrap();
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = sfu.local_addr().unwrap();
     assert!(sfu.downlink_mix_enabled());
     let app = AppId::new();
@@ -2235,4 +2235,108 @@ async fn adopted_session_downlink_sequence_continues_above_the_mirrored_one() {
 
     // Restarting at zero (what a plain re-creation would do) is exactly what the window rejects.
     assert!(!window.check_and_update(0));
+}
+
+/// One `[::]` socket serves IPv4 and IPv6 players at once: the IPv4 peer is recorded with its
+/// real IPv4 address (not `::ffff:…`), audio crosses families both ways, and only advertised
+/// addresses the socket can actually serve survive.
+#[tokio::test]
+async fn dual_stack_sfu_routes_between_ipv4_and_ipv6_clients() {
+    let v6 = match UdpSocket::bind("[::1]:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skipping: no IPv6 loopback ({e})");
+            return;
+        }
+    };
+    let mut sfu = SfuNode::new(
+        MediaNodeId::new(),
+        Region::EuWest,
+        SfuOptions {
+            max_participants: 3,
+            advertised_addrs: vec![
+                "203.0.113.7:10000".parse().unwrap(),
+                "[2001:db8::7]:10000".parse().unwrap(),
+            ],
+            ..SfuOptions::default()
+        },
+    );
+    if let Err(e) = sfu.start("[::]:0".parse().unwrap()).await {
+        eprintln!("skipping: dual-stack bind unavailable ({e})");
+        return;
+    }
+    assert_eq!(
+        sfu.family(),
+        Some(aurix_common::net::BoundFamily::DualStack)
+    );
+    assert_eq!(sfu.advertised_addrs().len(), 2, "both families advertised");
+    let port = sfu.local_addr().unwrap().port();
+    let via_v4: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let via_v6: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    for s in [&s_a, &s_b] {
+        sfu.join_channel(
+            &s.session_id,
+            channel,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client {
+        sock: v6,
+        session: s_b.clone(),
+        seq: 1,
+    };
+    a.bind(via_v4).await;
+    b.bind(via_v6).await;
+
+    match s_a.endpoint() {
+        Some(aurix_media::session::MediaEndpoint::Udp(ep)) => {
+            assert!(ep.is_ipv4(), "IPv4 peer must be canonical, got {ep}");
+            assert_eq!(ep, a.sock.local_addr().unwrap());
+        }
+        other => panic!("unexpected endpoint {other:?}"),
+    }
+    match s_b.endpoint() {
+        Some(aurix_media::session::MediaEndpoint::Udp(ep)) => {
+            assert!(ep.is_ipv6());
+            assert_eq!(ep, b.sock.local_addr().unwrap());
+        }
+        other => panic!("unexpected endpoint {other:?}"),
+    }
+
+    a.send_audio(via_v4, &channel, b"from-v4").await;
+    let got = b.recv().await.expect("IPv6 client hears the IPv4 client");
+    assert_eq!(got.header.ssrc, s_a.ssrc);
+    b.send_audio(via_v6, &channel, b"from-v6").await;
+    let got = a.recv().await.expect("IPv4 client hears the IPv6 client");
+    assert_eq!(got.header.ssrc, s_b.ssrc);
+}
+
+/// An IPv4-only bind drops IPv6 advertisements instead of handing clients a dead candidate.
+#[tokio::test]
+async fn ipv4_only_sfu_advertises_ipv4_only() {
+    let (sfu, _addr) = start_sfu_with(SfuOptions {
+        advertised_addrs: vec![
+            "203.0.113.7:10000".parse().unwrap(),
+            "[2001:db8::7]:10000".parse().unwrap(),
+        ],
+        ..SfuOptions::default()
+    })
+    .await;
+    assert_eq!(sfu.family(), Some(aurix_common::net::BoundFamily::V4));
+    assert_eq!(
+        sfu.advertised_addrs(),
+        &["203.0.113.7:10000".parse::<SocketAddr>().unwrap()]
+    );
 }

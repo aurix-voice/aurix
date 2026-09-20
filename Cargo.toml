@@ -85,6 +85,7 @@ sha1 = "0.10"
 subtle = "2.6"
 md-5 = "0.10"
 libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 opus = "0.3"
 hex = "0.4"

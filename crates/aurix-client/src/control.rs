@@ -30,7 +30,10 @@ const RESUME_HEADER: &str = "x-aurix-resume";
 pub struct SessionAck {
     pub session_id: SessionId,
     pub ssrc: u32,
+    /// Primary media endpoint (`host:port`; IPv6 hosts bracketed).
     pub media_addr: String,
+    /// Every public media endpoint of the node, IPv4 first then IPv6; empty from older nodes.
+    pub media_addrs: Vec<String>,
     pub media_key: Vec<u8>,
     pub resume_token: String,
     pub resume_grace: Duration,
@@ -184,6 +187,7 @@ impl ControlConnection {
                     session_id,
                     ssrc,
                     media_addr,
+                    media_addrs,
                     media_key,
                     resume_token,
                     resume_grace_ms,
@@ -203,6 +207,7 @@ impl ControlConnection {
                         session_id,
                         ssrc,
                         media_addr,
+                        media_addrs,
                         media_key,
                         resume_token,
                         resume_grace: Duration::from_millis(resume_grace_ms),

@@ -8183,7 +8183,15 @@
             "type": "string"
           },
           "address": {
-            "type": "string"
+            "type": "string",
+            "description": "Public IPv4 (or host name) of the node's media socket (`media.external_ip`)."
+          },
+          "address_ipv6": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public IPv6 of the media socket when the node is dual-stack or IPv6-only (`media.external_ipv6`); `null` on IPv4-only nodes and nodes older than this schema."
           },
           "media_port": {
             "type": "integer"
@@ -9137,6 +9145,7 @@
           },
           "uris": {
             "type": "array",
+            "description": "`turn:` (UDP and TCP) and `stun:` URIs for every public address family of the node — IPv4 first, then IPv6 with the host bracketed (`turn:[2001:db8::10]:3478?transport=udp`). Pass them all to the ICE agent.",
             "items": {
               "type": "string",
               "example": "turn:voice.example.com:3478?transport=udp"

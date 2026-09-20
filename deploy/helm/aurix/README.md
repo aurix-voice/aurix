@@ -39,6 +39,7 @@ Required one-pod-per-node anti-affinity is always rendered.
 | `config.externalUrl` (or `perNode.*`) | public https URL; `wss://<host>/ws` is derived from it |
 | `config.corsOrigins` | allowed browser origins (no wildcard in production) |
 | `config.externalIpSource` + `externalIp`/`externalIps`/`externalIpScript` | public media IP per pod |
+| `config.externalIpv6`/`externalIpv6s`, `config.dualStack` | optional public IPv6 per pod → media/TURN bind `::` and advertise IPv4 + IPv6 |
 | `config.region`, `config.location` | region label and coordinates for [region discovery](../../../docs/src/operations/scaling.md#regions) |
 | `existingSecret` **or** `secrets.*` | see below |
 

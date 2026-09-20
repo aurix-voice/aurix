@@ -57,6 +57,7 @@ struct Player {
     ssrc: u32,
     keys: MediaKeys,
     media_addr: SocketAddr,
+    media_addrs: Vec<String>,
     udp: UdpSocket,
     media_key: Vec<u8>,
     resume_token: String,
@@ -232,6 +233,7 @@ async fn connect_with(
         session_id,
         ssrc,
         media_addr,
+        media_addrs,
         media_key,
         resume_token,
         resume_grace_ms,
@@ -247,6 +249,10 @@ async fn connect_with(
     assert!(
         downlink_mix,
         "{name}: dev nodes run with media.downlink_mix enabled"
+    );
+    assert!(
+        media_addrs.is_empty() || media_addrs[0] == media_addr,
+        "{name}: media_addrs must start with the legacy media_addr ({media_addr} vs {media_addrs:?})"
     );
     let media_key = base64::engine::general_purpose::STANDARD
         .decode(media_key)
@@ -265,6 +271,7 @@ async fn connect_with(
         ssrc,
         keys: MediaKeys::derive(&media_key),
         media_addr: media_addr.parse().unwrap(),
+        media_addrs,
         udp,
         media_key,
         resume_token,
@@ -680,6 +687,201 @@ async fn full_stack_two_players_udp_audio_and_turn() {
         Some(0),
         "session must be closed in the database after WS disconnect: {user}"
     );
+}
+
+/// One TURN allocation over `sock`, asking for `family` (`0x01` IPv4, `0x02` IPv6); returns
+/// the relayed address, or the error code the server answered with.
+async fn turn_allocate(
+    sock: &UdpSocket,
+    turn_addr: SocketAddr,
+    username: &str,
+    password: &str,
+    family: u8,
+) -> Result<SocketAddr, u16> {
+    let mut buf = vec![0u8; 2048];
+    let mut req = StunMessage::new(StunMessageType::AllocateRequest, rand::random());
+    req.add_attribute(StunAttributeType::RequestedTransport, vec![17, 0, 0, 0]);
+    sock.send_to(&req.encode(), turn_addr).await.unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+        .await
+        .expect("TURN did not answer")
+        .unwrap();
+    let challenge = StunMessage::decode(&buf[..n]).unwrap();
+    assert_eq!(challenge.msg_type, StunMessageType::AllocateErrorResponse);
+    let realm = challenge.get_string(StunAttributeType::Realm).unwrap();
+    let nonce = challenge.get_string(StunAttributeType::Nonce).unwrap();
+    let key = aurix_common::crypto::stun_long_term_key(username, &realm, password);
+    let mut req = StunMessage::new(StunMessageType::AllocateRequest, rand::random());
+    req.add_attribute(StunAttributeType::Username, username.as_bytes().to_vec());
+    req.add_attribute(StunAttributeType::Realm, realm.into_bytes());
+    req.add_attribute(StunAttributeType::Nonce, nonce.into_bytes());
+    req.add_attribute(StunAttributeType::RequestedTransport, vec![17, 0, 0, 0]);
+    req.add_attribute(
+        StunAttributeType::RequestedAddressFamily,
+        vec![family, 0, 0, 0],
+    );
+    sock.send_to(&req.encode_with_integrity(&key), turn_addr)
+        .await
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+        .await
+        .expect("TURN did not answer allocate")
+        .unwrap();
+    let resp = StunMessage::decode(&buf[..n]).unwrap();
+    assert!(StunMessage::verify_integrity(&buf[..n], &key));
+    match resp.msg_type {
+        StunMessageType::AllocateResponse => Ok(resp
+            .get_xor_address(StunAttributeType::XorRelayedAddress)
+            .expect("relayed address")),
+        StunMessageType::AllocateErrorResponse => Err(resp
+            .get_attribute(StunAttributeType::ErrorCode)
+            .map(|a| a.value[2] as u16 * 100 + a.value[3] as u16)
+            .expect("error code")),
+        other => panic!("unexpected TURN answer {other:?}"),
+    }
+}
+
+/// A node started with `media.host = turn.host = "::"`, `media.external_ip = 127.0.0.1` and
+/// `media.external_ipv6 = ::1` serves IPv4 and IPv6 players on the same sockets: the ack lists
+/// both endpoints (IPv4 first), an IPv4 player and an IPv6 player hear each other, the TURN
+/// credentials carry bracketed IPv6 URIs, and TURN relays in whichever family the client asks
+/// for. Loopback only — this proves the plumbing, not public IPv6 reachability. Needs
+/// `AURIX_E2E_IPV6=1`.
+#[tokio::test]
+#[ignore = "requires a dual-stack Aurix server (AURIX_E2E_IPV6=1); see docs/operations/deployment.md"]
+async fn dual_stack_node_serves_ipv4_and_ipv6_players_and_turn() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    if std::env::var("AURIX_E2E_IPV6").ok().as_deref() != Some("1") {
+        eprintln!("AURIX_E2E_IPV6 not set; skipping");
+        return;
+    }
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, _) = issue_token(&env, &http, "e2e:v6-alice", "Alice", channel_id).await;
+    let (tok_b, _) = issue_token(&env, &http, "e2e:v6-bob", "Bob", channel_id).await;
+
+    // Alice stays on the legacy IPv4 endpoint; Bob binds the IPv6 candidate.
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let ack_addrs = alice.media_addrs.clone();
+    assert_eq!(
+        ack_addrs.len(),
+        2,
+        "dual-stack node advertises both families: {ack_addrs:?}"
+    );
+    let v4: SocketAddr = ack_addrs[0].parse().unwrap();
+    let v6: SocketAddr = ack_addrs[1].parse().unwrap();
+    assert!(v4.is_ipv4() && v6.is_ipv6(), "{ack_addrs:?}");
+    assert!(
+        ack_addrs[1].starts_with('['),
+        "IPv6 endpoint must be bracketed: {ack_addrs:?}"
+    );
+    assert_eq!(alice.media_addr, v4);
+    bob.media_addr = v6;
+    bob.udp = UdpSocket::bind("[::]:0").await.unwrap();
+
+    bind_media(&mut alice).await;
+    bind_media(&mut bob).await;
+    join(&mut alice, channel_id).await;
+    join(&mut bob, channel_id).await;
+    alice
+        .expect("ParticipantJoined(bob)", |m| {
+            matches!(m, ControlMessage::ParticipantJoined { .. })
+        })
+        .await;
+
+    let payload = Bytes::from_static(b"dual-stack-opus");
+    send_audio(&alice, channel_id, 1, &payload).await;
+    assert!(
+        count_audio_from(&bob, alice.ssrc, &payload).await >= 5,
+        "IPv6 Bob must hear IPv4 Alice"
+    );
+    send_audio(&bob, channel_id, 1, &payload).await;
+    assert!(
+        count_audio_from(&alice, bob.ssrc, &payload).await >= 5,
+        "IPv4 Alice must hear IPv6 Bob"
+    );
+
+    // TURN credentials: URIs for both families, IPv6 bracketed.
+    let turn: serde_json::Value = http
+        .get(format!("{}/v1/me/turn-credentials", env.api))
+        .bearer_auth(&alice.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uris: Vec<&str> = turn["uris"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    let udp_v4 = uris
+        .iter()
+        .find(|u| u.starts_with("turn:127.0.0.1:") && u.ends_with("transport=udp"))
+        .unwrap_or_else(|| panic!("no IPv4 TURN UDP URI in {uris:?}"));
+    let udp_v6 = uris
+        .iter()
+        .find(|u| u.starts_with("turn:[::1]:") && u.ends_with("transport=udp"))
+        .unwrap_or_else(|| panic!("no bracketed IPv6 TURN UDP URI in {uris:?}"));
+    assert!(
+        uris.iter().any(|u| u.starts_with("stun:[::1]:")),
+        "{uris:?}"
+    );
+    let addr_of = |uri: &str| -> SocketAddr {
+        uri.trim_start_matches("turn:")
+            .split('?')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let (turn_v4, turn_v6) = (addr_of(udp_v4), addr_of(udp_v6));
+    assert_eq!(turn_v4.port(), turn_v6.port());
+    let username = turn["username"].as_str().unwrap();
+    let password = turn["password"].as_str().unwrap();
+
+    // IPv4 client → IPv4 relay (default) and IPv6 relay on request; IPv6 client likewise.
+    let sock4 = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let relay = turn_allocate(&sock4, turn_v4, username, password, 0x01)
+        .await
+        .expect("IPv4 relay for IPv4 client");
+    assert_eq!(
+        relay.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    let sock4b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let relay = turn_allocate(&sock4b, turn_v4, username, password, 0x02)
+        .await
+        .expect("IPv6 relay for IPv4 client");
+    assert_eq!(
+        relay.ip(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    );
+    let sock6 = UdpSocket::bind("[::]:0").await.unwrap();
+    let relay = turn_allocate(&sock6, turn_v6, username, password, 0x02)
+        .await
+        .expect("IPv6 relay for IPv6 client");
+    assert_eq!(
+        relay.ip(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    );
+    let sock6b = UdpSocket::bind("[::]:0").await.unwrap();
+    assert_eq!(
+        turn_allocate(&sock6b, turn_v6, username, password, 0x07).await,
+        Err(440),
+        "unknown address family is refused"
+    );
+
+    bob.ws.close(None).await.unwrap();
+    alice.ws.close(None).await.unwrap();
 }
 
 async fn create_channel(env: &Env, http: &reqwest::Client) -> ChannelId {

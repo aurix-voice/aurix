@@ -91,7 +91,13 @@ namespace Aurix
     {
         public Guid SessionId;
         public uint Ssrc;
+        /// <summary>Primary native media endpoint (<c>host:port</c>, IPv6 hosts bracketed).</summary>
         public string MediaAddr;
+        /// <summary>
+        /// Every public media endpoint of the node, IPv4 first then IPv6 (contains at least <see cref="MediaAddr"/>).
+        /// The SDK tries them in order when binding UDP and sticks with the family that answered.
+        /// </summary>
+        public IReadOnlyList<string> MediaAddrs = Array.Empty<string>();
         /// <summary>True when this is the same session as before a connection loss (same SSRC, channels kept).</summary>
         public bool Resumed;
         /// <summary>
@@ -206,6 +212,8 @@ namespace Aurix
         private uint _lastMediaSequence;
         /// <summary>UDP failed to bind or its heartbeats died at least until here: Auto sessions opened before go straight to the tunnel.</summary>
         private DateTime? _udpBlockedUntil;
+        /// <summary>Address family of the last UDP candidate that answered a <c>SessionBind</c>; tried first next time.</summary>
+        private System.Net.Sockets.AddressFamily? _udpFamilyHint;
         private DateTime _nextUdpProbe = DateTime.MaxValue;
         private int _pathSwitchActive;
         private bool _closedByUser;
@@ -617,11 +625,19 @@ namespace Aurix
                 if (advertised != null)
                     foreach (var item in advertised)
                         if (item is string s && s != url) failover.Add(s);
+                var mediaAddr = ack.Str("media_addr");
+                var mediaAddrs = new List<string>();
+                var advertisedMedia = MiniJson.AsArray(ack.Data != null && ack.Data.TryGetValue("media_addrs", out var ma) ? ma : null);
+                if (advertisedMedia != null)
+                    foreach (var item in advertisedMedia)
+                        if (item is string s && !string.IsNullOrEmpty(s) && !mediaAddrs.Contains(s)) mediaAddrs.Add(s);
+                if (mediaAddrs.Count == 0 && !string.IsNullOrEmpty(mediaAddr)) mediaAddrs.Add(mediaAddr);
                 var info = new SessionInfo
                 {
                     SessionId = ack.Id("session_id"),
                     Ssrc = ack.U32("ssrc"),
-                    MediaAddr = ack.Str("media_addr"),
+                    MediaAddr = mediaAddr,
+                    MediaAddrs = mediaAddrs,
                     Resumed = ack.Bool("resumed"),
                     Migrated = ack.Bool("migrated"),
                     Endpoint = url,
@@ -716,20 +732,34 @@ namespace Aurix
             Post(() => OnMediaPathChanged?.Invoke(path, reason));
         }
 
+        /// <summary>
+        /// Bind UDP against the node's media candidates one after another (the address family that answered last
+        /// time first). Candidates are not raced in parallel: the server binds the session to the last
+        /// <c>SessionBind</c> it sees, so two winners would fight over the downlink endpoint.
+        /// </summary>
         private async Task<MediaTransport> BindUdpAsync(SessionInfo info, SequenceCounter seq, int attempts, int timeoutMs, CancellationToken ct)
         {
-            var endpoint = await MediaTransport.ResolveAsync(info.MediaAddr).ConfigureAwait(false);
-            var media = new MediaTransport(endpoint, info.SessionId, info.Ssrc, _mediaKey, seq) { HeartbeatInterval = MediaHeartbeatInterval };
-            try
+            var candidates = await MediaTransport.ResolveCandidatesAsync(info.MediaAddr, info.MediaAddrs).ConfigureAwait(false);
+            if (_udpFamilyHint is System.Net.Sockets.AddressFamily preferred)
+                candidates.Sort((a, b) => (a.AddressFamily == preferred ? 0 : 1).CompareTo(b.AddressFamily == preferred ? 0 : 1));
+            Exception last = null;
+            foreach (var endpoint in candidates)
             {
-                await media.BindAsync(ct, attempts, timeoutMs).ConfigureAwait(false);
-                return media;
+                ct.ThrowIfCancellationRequested();
+                var media = new MediaTransport(endpoint, info.SessionId, info.Ssrc, _mediaKey, seq) { HeartbeatInterval = MediaHeartbeatInterval };
+                try
+                {
+                    await media.BindAsync(ct, attempts, timeoutMs).ConfigureAwait(false);
+                    _udpFamilyHint = endpoint.AddressFamily;
+                    return media;
+                }
+                catch (Exception e) when (!(e is OperationCanceledException))
+                {
+                    media.Dispose();
+                    last = e;
+                }
             }
-            catch
-            {
-                media.Dispose();
-                throw;
-            }
+            throw last ?? new InvalidOperationException("no media endpoint advertised");
         }
 
         private async Task<MediaTransport> BindTunnelAsync(ControlChannel control, SessionInfo info, SequenceCounter seq, CancellationToken ct)

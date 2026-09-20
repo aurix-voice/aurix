@@ -70,7 +70,7 @@ Validation runs at start-up and refuses to boot on an invalid combination; with
   `auth.jwt_public_key_path` (RS256) is set;
 * `turn.auth_secret` shorter than 32 bytes / placeholder, or TURN enabled without an external IP;
 * `*` in `server.cors_origins`;
-* a missing `media.external_ip`;
+* neither `media.external_ip` nor `media.external_ipv6` set;
 * the development database credentials.
 
 Secrets (`AURIX__AUTH__JWT_SECRET`, `AURIX__TURN__AUTH_SECRET`, `AURIX__MEDIA__CASCADE_SECRET`,
@@ -86,10 +86,10 @@ are never echoed back by the API or logs.
 | `redis` | `url`, `pool_size`, `sentinels` + `sentinel_master` for [Redis Sentinel](high-availability.md#sentinel-mode) |
 | `cluster` | `session_mirror` (`true`; needs Redis), `session_mirror_ttl_secs` (180), `node_lost_after_secs` (30), `failover_endpoints` (3) — [cross-node failover](high-availability.md#cross-node-session-failover) |
 | `auth` | `jwt_secret` or `jwt_public_key_path`, `token_ttl_secs` (3600), `action_token_ttl_secs` (90) / `action_token_max_ttl_secs` (600), `require_action_tokens`, `admin_bootstrap_token` |
-| `media` | `external_ip`, `port` (10000; cascade uses `port + 1`), `require_packet_auth` (`true`), `rx_workers` (`0` = CPUs clamped 2–8), `session_timeout_secs` (60), `speaking_timeout_ms` (400), `speaking_energy_threshold` (0.01), `energy_interval_ms` (200), `quality_interval_ms` (2000), `unfocused_channel_gain` (0.5), `max_channels_per_session` (10), `max_positional_channels_per_session` (1), `pcmu_fallback` (`true`; [G.711 sessions](../features/channels.md#codecs-opus-and-the-pcmu-fallback) cost the node an Opus encoder + a decoder per speaker heard), `media_tunnel` (`true`; native media as binary frames on the control WebSocket when UDP is blocked — [tunnel](../api/aurx.md#tunnel-aurx-over-the-control-websocket)), `tunnel_queue_packets` (128, 8–4096; per-session downlink queue, drops when the client's TCP stalls), `cascade_secret`, `cascade_discovery` (`true`), `cascade_discovery_interval_ms` (3000), `cascade_peers` |
-| `turn` | `enabled`, `external_ip`, `realm`, `auth_secret`, `udp_port` / `tcp_port` (3478), `min_port` / `max_port` relay range, `allocation_lifetime_secs`, `max_allocations` |
+| `media` | `host` (`0.0.0.0` IPv4-only, `::` dual-stack, an IPv6 literal IPv6-only — [IPv6](#ipv6-and-dual-stack)), `external_ip` (public IPv4), `external_ipv6` (public IPv6, advertised after IPv4), `port` (10000; cascade uses `port + 1`), `require_packet_auth` (`true`), `rx_workers` (`0` = CPUs clamped 2–8), `session_timeout_secs` (60), `speaking_timeout_ms` (400), `speaking_energy_threshold` (0.01), `energy_interval_ms` (200), `quality_interval_ms` (2000), `unfocused_channel_gain` (0.5), `max_channels_per_session` (10), `max_positional_channels_per_session` (1), `pcmu_fallback` (`true`; [G.711 sessions](../features/channels.md#codecs-opus-and-the-pcmu-fallback) cost the node an Opus encoder + a decoder per speaker heard), `media_tunnel` (`true`; native media as binary frames on the control WebSocket when UDP is blocked — [tunnel](../api/aurx.md#tunnel-aurx-over-the-control-websocket)), `tunnel_queue_packets` (128, 8–4096; per-session downlink queue, drops when the client's TCP stalls), `cascade_secret`, `cascade_discovery` (`true`), `cascade_discovery_interval_ms` (3000), `cascade_peers` |
+| `turn` | `enabled`, `host` (same semantics as `media.host`), `external_ip`, `external_ipv6` (default to the media addresses), `realm`, `auth_secret`, `udp_port` / `tcp_port` (3478), `min_port` / `max_port` relay range, `allocation_lifetime_secs`, `max_allocations` |
 | `recording` | `enabled`, `storage_path`, `max_recording_duration_secs` (7200), `retention_days` (90), `require_consent` (`true`), `encryption_enabled` + `encryption_key` (≥ 32 chars), `s3.*`; `recording.live.*` for [live streams](../features/recordings.md#live-audio-streams); `recording.processing.*` (`max_concurrent` 2, `max_queued` 64, `max_sources` 64, `mixdown_bitrate` 64000, `stt_chunk_secs` 30, `stt_sample_rate` 16000) for [mixdowns and transcripts](../features/recordings.md#mixdowns-and-transcripts-of-stored-recordings) |
-| `rate_limiting` | `enabled`, `requests_per_second` / `burst_size` (per client IP), `per_key` (each API key's own requests/minute), `channel_joins_per_minute`, `connects_per_minute`, `block_changes_per_minute`, `reports_per_minute`, `admin_login_per_minute`, `fleet` (share buckets through Redis), `fail_closed` — [Rate limits](scaling.md#fleet-wide-rate-limits) |
+| `rate_limiting` | `enabled`, `requests_per_second` / `burst_size` (per client IP; IPv6 by `ipv6_prefix`, default 64), `per_key` (each API key's own requests/minute), `channel_joins_per_minute`, `connects_per_minute`, `block_changes_per_minute`, `reports_per_minute`, `admin_login_per_minute`, `fleet` (share buckets through Redis), `fail_closed` — [Rate limits](scaling.md#fleet-wide-rate-limits) |
 | `chat` | see [Text chat](../features/chat.md) — `enabled`, `max_message_bytes`, flood limits, `filter_webhook`, `persist` |
 | `webhooks` | `enabled`, `timeout_ms`, `retry_delays_secs`, `concurrency`, `batch_size`, `max_pending_per_subscription`, `retention_hours`, `max_subscriptions_per_app`, `require_https` / `allow_private_urls` (strict in production), `sse_keepalive_secs` |
 | `retention` | see [Moderation and lifecycle](../features/moderation.md#retention-sweep) |
@@ -116,6 +116,47 @@ For large TURN ranges run the container with `network_mode: host` instead of pub
 thousands of ports. Clients must reach `media.external_ip:media.port` directly; when they
 cannot (symmetric NAT, corporate networks) browsers fall back to TURN, native clients need the
 UDP path.
+
+### IPv6 and dual-stack
+
+Media, cascade and TURN are IPv4-only by default (`media.host = "0.0.0.0"`). Three layouts:
+
+| `media.host` / `turn.host` | listens on | advertise |
+|---|---|---|
+| `0.0.0.0` (default) | IPv4 | `external_ip` |
+| `::` | IPv4 **and** IPv6 on one socket (`IPV6_V6ONLY` off; IPv4 peers show up canonicalised, never as `::ffff:…`) | `external_ip` and/or `external_ipv6` |
+| an IPv6 literal (`2001:db8::10`) | IPv6 only | `external_ipv6` |
+
+`external_ip` must be IPv4 (or a host name), `external_ipv6` an IPv6 literal, and each must
+match a family the bind accepts — the validator refuses `external_ipv6` on an IPv4-only bind and
+vice versa. Everything derived follows the families you configure:
+
+* `SessionInitAck.media_addrs` lists `external_ip:port` then `[external_ipv6]:port`; the native
+  and Unity SDKs try them in order and remember which family answered. `media_addr` stays the
+  first entry for older clients.
+* WebRTC offers one host candidate per family; ICE picks.
+* TURN allocates a relay in the family the client asks for (`REQUESTED-ADDRESS-FAMILY`, RFC
+  6156: `0x01` IPv4, `0x02` IPv6; `440` when that family is not bound, `443` when a permission or
+  send names a peer of the other family) and advertises the matching external address.
+  `turn.external_ip` / `external_ipv6` default to the media addresses, so a TURN node sharing the
+  media node's IPs needs no extra settings; on a wildcard bind without any external address the
+  relay would be advertised as `0.0.0.0`/`::` (logged as a warning) — set one of them.
+  `POST /v1/turn/credentials` returns `turn:`/`stun:` URIs for every configured family, IPv6
+  hosts bracketed (`turn:[2001:db8::10]:3478?transport=udp`).
+* The node registry (`GET /v1/nodes`, cascade discovery) carries `address` and `address_ipv6`;
+  nodes relay to each other over whichever family both bind (IPv4 preferred when both are usable).
+* Rate limits key IPv6 clients by `rate_limiting.ipv6_prefix` (default `/64`, one bucket per
+  customer prefix) and IPv4 clients by full address.
+
+Docker Compose: set `AURIX_PUBLIC_IPV6` and `AURIX_MEDIA_BIND=::` (Docker needs `enable_ipv6` on
+the network, or run with host networking). Helm: `config.externalIpv6` / `externalIpv6s` (or
+`config.dualStack` alone) — the entrypoint switches the binds to `::` and exports both externals.
+Kernels or containers without IPv6 fail the `::` bind at start-up with an explicit error; keep
+the IPv4 defaults there.
+CI runs the server E2E suite once more against a `::` node with both externals set to loopback
+(`dual_stack_node_serves_ipv4_and_ipv6_players_and_turn`, gated by `AURIX_E2E_IPV6=1`): an IPv4 and
+an IPv6 player exchanging audio plus IPv4/IPv6 TURN relays. That proves the plumbing on one host,
+not public IPv6 reachability of a deployment.
 
 ## TLS
 

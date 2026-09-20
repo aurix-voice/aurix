@@ -136,7 +136,7 @@ async fn browser_and_aurx_client_hear_each_other() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
     let mut sfu = SfuNode::new(MediaNodeId::new(), Region::EuWest, SfuOptions::default());
-    sfu.start("127.0.0.1:0").await.unwrap();
+    sfu.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let sfu_addr = sfu.local_addr().unwrap();
     let app = AppId::new();
     let channel = ChannelId::new();

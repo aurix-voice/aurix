@@ -136,6 +136,11 @@ impl FleetLimiter {
         &self.cfg
     }
 
+    /// Bucket subject for a client IP: IPv4 as-is, IPv6 aggregated to `rate_limiting.ipv6_prefix`.
+    pub fn ip_subject(&self, ip: std::net::IpAddr) -> String {
+        aurix_common::addr::client_key(ip, self.cfg.ipv6_prefix)
+    }
+
     /// The configured limit for a scope; `ApiKey` is per key and passed by the caller.
     pub fn limit(&self, scope: Scope) -> Limit {
         let c = &self.cfg;

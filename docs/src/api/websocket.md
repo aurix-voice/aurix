@@ -18,13 +18,17 @@ Immediately after the upgrade the server sends
 
 ```json
 {"type":"SessionInitAck","data":{"session_id":"…","ssrc":123456,"media_addr":"203.0.113.10:10000",
+  "media_addrs":["203.0.113.10:10000","[2001:db8::10]:10000"],
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
   "migrated":false,"failover":["wss://eu2.voice.example.com/ws","wss://eu3.voice.example.com/ws"],
   "media_tunnel":true,"downlink_mix":true}}
 ```
 
 `media_key` is the master secret for the [AURX media path](aurx.md); `media_addr` is the UDP
-endpoint of *this* node; `media_tunnel` says the node also accepts AURX packets as **binary
+endpoint of *this* node and `media_addrs` every public endpoint of it in preference order (IPv4
+first, IPv6 bracketed; the first entry equals `media_addr`; absent from older nodes —
+clients try the candidates in order and stick with the family that answers `SessionBind`);
+`media_tunnel` says the node also accepts AURX packets as **binary
 frames on this very connection** when UDP is blocked
 ([tunnel](aurx.md#tunnel-aurx-over-the-control-websocket)) — text frames are always control
 messages, binary frames are always media; `downlink_mix` says native sessions may ask for a

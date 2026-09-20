@@ -197,7 +197,10 @@ export type ServerMessage =
       data: {
         session_id: string;
         ssrc: number;
+        /** Primary native media endpoint (`host:port`, IPv6 hosts bracketed); informational for WebRTC clients. */
         media_addr: string;
+        /** Every public media endpoint of the node (IPv4 first, then IPv6); absent from older nodes. */
+        media_addrs?: string[];
         media_key: string;
         /** One-time credential for reattaching to this session after a dropped connection. */
         resume_token?: string;

@@ -134,6 +134,17 @@ pub fn resolve_media_addr(
     media_addr: &str,
     fallback_host: &str,
 ) -> Result<SocketAddr, ClientError> {
+    resolve_media_addr_all(media_addr, fallback_host)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ClientError::Transport(format!("no address for `{media_addr}`")))
+}
+
+/// Every socket address one `host:port` endpoint resolves to, IPv4 first.
+fn resolve_media_addr_all(
+    media_addr: &str,
+    fallback_host: &str,
+) -> Result<Vec<SocketAddr>, ClientError> {
     let (host, port) = split_host_port(media_addr)
         .ok_or_else(|| ClientError::Transport(format!("invalid media_addr `{media_addr}`")))?;
     let host = if host.is_empty() || host == "0.0.0.0" || host == "::" {
@@ -146,10 +157,41 @@ pub fn resolve_media_addr(
         .map_err(|e| ClientError::Transport(format!("resolve {host}: {e}")))?
         .collect();
     addrs.sort_by_key(|a| !a.is_ipv4());
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| ClientError::Transport(format!("no address for {host}")))
+    Ok(addrs)
+}
+
+/// UDP candidates of a session in bind order: every endpoint of `media_addrs` (the node's
+/// IPv4 and IPv6 addresses) or, from an older node, just `media_addr`; duplicates removed,
+/// order preserved (IPv4 first as advertised). Fails only when no endpoint resolves at all.
+pub fn resolve_media_candidates(
+    media_addr: &str,
+    media_addrs: &[String],
+    fallback_host: &str,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    let endpoints: Vec<&str> = if media_addrs.is_empty() {
+        vec![media_addr]
+    } else {
+        media_addrs.iter().map(String::as_str).collect()
+    };
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut last_err = None;
+    for ep in endpoints {
+        match resolve_media_addr_all(ep, fallback_host) {
+            Ok(addrs) => {
+                for a in addrs {
+                    if !out.contains(&a) {
+                        out.push(a);
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if out.is_empty() {
+        return Err(last_err
+            .unwrap_or_else(|| ClientError::Transport("no media endpoint advertised".into())));
+    }
+    Ok(out)
 }
 
 fn split_host_port(s: &str) -> Option<(&str, u16)> {
@@ -890,5 +932,43 @@ mod tests {
             "[::1]:9001".parse().unwrap()
         );
         assert!(resolve_media_addr("nonsense", "x").is_err());
+    }
+
+    #[test]
+    fn media_candidates_keep_server_order_and_fall_back_to_the_legacy_field() {
+        let both = resolve_media_candidates(
+            "203.0.113.7:9000",
+            &["203.0.113.7:9000".into(), "[2001:db8::7]:9000".into()],
+            "x",
+        )
+        .unwrap();
+        assert_eq!(
+            both,
+            vec![
+                "203.0.113.7:9000".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::7]:9000".parse().unwrap()
+            ]
+        );
+        // Older node: only media_addr.
+        assert_eq!(
+            resolve_media_candidates("[::1]:9001", &[], "x").unwrap(),
+            vec!["[::1]:9001".parse::<SocketAddr>().unwrap()]
+        );
+        // A garbage entry is skipped as long as one candidate resolves; duplicates collapse.
+        assert_eq!(
+            resolve_media_candidates(
+                "127.0.0.1:1",
+                &[
+                    "nonsense".into(),
+                    "127.0.0.1:1".into(),
+                    "127.0.0.1:1".into()
+                ],
+                "x"
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(resolve_media_candidates("nonsense", &["nonsense".into()], "x").is_err());
     }
 }

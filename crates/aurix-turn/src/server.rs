@@ -1,12 +1,13 @@
 use crate::allocation::ClientProtocol;
 use crate::stun::{StunMessage, STUN_HEADER_SIZE};
-use crate::turn::{ClientSink, TurnHandler};
-use aurix_common::config::TurnConfig;
+use crate::turn::{ClientSink, RelayAddressing, TurnHandler};
+use aurix_common::addr::canonical;
+use aurix_common::config::{MediaConfig, TurnConfig};
 use aurix_common::error::{AurixError, Result};
+use aurix_common::net::{bind_tcp, parse_bind_addr, FamilyUdpSocket};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -19,27 +20,20 @@ pub struct TurnServer {
 }
 
 impl TurnServer {
-    pub fn new(config: &TurnConfig) -> Self {
-        let external_ip = config
-            .external_ip
-            .as_deref()
-            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-            .or_else(|| config.host.parse::<std::net::IpAddr>().ok())
-            .filter(|ip| !ip.is_unspecified());
-        let mut handler = TurnHandler::new(
+    /// `media` supplies the fallback public addresses when `turn.external_ip*` is unset
+    /// (the TURN node normally shares the media node's addresses).
+    pub fn new(config: &TurnConfig, media: &MediaConfig) -> Self {
+        let (external_ip, external_ipv6) = config.relay_ips(media);
+        let relay = RelayAddressing::from_config(&config.host, external_ip, external_ipv6);
+        let handler = TurnHandler::new(
             config.realm.clone(),
             config.auth_secret.clone(),
             config.min_port,
             config.max_port,
             config.max_allocations,
             config.allocation_lifetime_secs as i64,
-            external_ip,
+            relay,
         );
-        if let Ok(ip) = config.host.parse::<std::net::IpAddr>() {
-            if ip.is_loopback() {
-                handler.set_relay_bind_ip(ip);
-            }
-        }
         Self {
             handler: Arc::new(handler),
             config: config.clone(),
@@ -50,43 +44,47 @@ impl TurnServer {
         &self.handler
     }
 
-    /// Bind the UDP and TCP listeners and return the bound UDP address; the receive loops run
-    /// in background tasks until `run` completes.
+    /// Bind the UDP and TCP listeners and serve until the UDP loop ends.
     pub async fn run(&self) -> Result<()> {
         let (socket, _tcp) = self.bind().await?;
         self.serve_udp(socket).await
     }
 
-    /// Bind sockets without entering the receive loop (used by tests and by `run`).
-    pub async fn bind(&self) -> Result<(Arc<UdpSocket>, SocketAddr)> {
-        let udp_addr = format!("{}:{}", self.config.host, self.config.udp_port);
-        let socket = UdpSocket::bind(&udp_addr).await.map_err(|e| {
+    /// Bind sockets without entering the receive loop (used by tests and by `run`). The
+    /// listeners follow `turn.host`: `0.0.0.0` IPv4-only, `::` dual-stack, a specific IPv6
+    /// literal IPv6-only. Returns the UDP socket and the bound TCP address.
+    pub async fn bind(&self) -> Result<(Arc<FamilyUdpSocket>, SocketAddr)> {
+        let udp_addr = parse_bind_addr(&self.config.host, self.config.udp_port)
+            .map_err(|e| AurixError::StunTurn(format!("turn.host: {e}")))?;
+        let socket = FamilyUdpSocket::bind(udp_addr, true, 0).map_err(|e| {
             AurixError::StunTurn(format!("Failed to bind TURN UDP {udp_addr}: {e}"))
         })?;
-        let socket = Arc::new(socket);
         info!(
-            "TURN server listening on UDP {}",
-            socket
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or(udp_addr)
+            "TURN server listening on UDP {} ({:?}, relays {:?})",
+            socket.local_addr(),
+            socket.family(),
+            self.handler.relay_addressing()
         );
 
-        let tcp_addr = format!("{}:{}", self.config.host, self.config.tcp_port);
-        let listener = TcpListener::bind(&tcp_addr).await.map_err(|e| {
+        let tcp_addr = parse_bind_addr(&self.config.host, self.config.tcp_port)
+            .map_err(|e| AurixError::StunTurn(format!("turn.host: {e}")))?;
+        let (listener, tcp_family) = bind_tcp(tcp_addr, true).map_err(|e| {
             AurixError::StunTurn(format!("Failed to bind TURN TCP {tcp_addr}: {e}"))
         })?;
         let tcp_local = listener
             .local_addr()
             .map_err(|e| AurixError::StunTurn(e.to_string()))?;
-        info!("TURN server listening on TCP {}", tcp_local);
+        info!(
+            "TURN server listening on TCP {} ({:?})",
+            tcp_local, tcp_family
+        );
         let handler_tcp = self.handler.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         let h = handler_tcp.clone();
-                        tokio::spawn(Self::handle_tcp_client(stream, peer, h));
+                        tokio::spawn(Self::handle_tcp_client(stream, canonical(peer), h));
                     }
                     Err(e) => {
                         error!("TURN TCP accept error: {e}");
@@ -107,7 +105,7 @@ impl TurnServer {
         Ok((socket, tcp_local))
     }
 
-    pub async fn serve_udp(&self, socket: Arc<UdpSocket>) -> Result<()> {
+    pub async fn serve_udp(&self, socket: Arc<FamilyUdpSocket>) -> Result<()> {
         let sink = ClientSink::Udp(socket.clone());
         let mut buf = vec![0u8; 4096];
         loop {

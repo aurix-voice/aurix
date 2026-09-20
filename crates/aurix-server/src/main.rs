@@ -78,12 +78,12 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => error!("Stale session recovery failed: {e}"),
     }
 
-    let advertised_addr = config
-        .media
-        .external_ip
-        .as_deref()
-        .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
-        .map(|ip| std::net::SocketAddr::new(ip, config.media.port));
+    let (media_v4, media_v6) = config.media.advertised_ips();
+    let advertised_addrs: Vec<std::net::SocketAddr> = media_v4
+        .map(|ip| std::net::SocketAddr::new(ip.into(), config.media.port))
+        .into_iter()
+        .chain(media_v6.map(|ip| std::net::SocketAddr::new(ip.into(), config.media.port)))
+        .collect();
     let mut sfu = SfuNode::new(
         node_id,
         config.server.region,
@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
             session_timeout_secs: config.media.session_timeout_secs,
             cascade_secret: config.media.cascade_secret.clone(),
             cascade_peers: config.media.cascade_peers.clone(),
-            advertised_addr,
+            advertised_addrs,
             downlink_bitrate: config.media.default_bitrate,
             rx_workers: config.media.rx_workers,
             media_tunnel: config.media.media_tunnel,
@@ -236,9 +236,14 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let media_bind = format!("{}:{}", config.media.host, config.media.port);
-    sfu.start(&media_bind).await?;
-    info!("SFU node started on {}", media_bind);
+    let media_bind = aurix_common::net::parse_bind_addr(&config.media.host, config.media.port)
+        .map_err(|e| anyhow::anyhow!("media.host: {e}"))?;
+    sfu.start(media_bind).await?;
+    info!(
+        "SFU node started on {} ({:?})",
+        media_bind,
+        sfu.family().expect("started")
+    );
     control.speech.start(&sfu);
     let sfu = Arc::new(RwLock::new(sfu));
     if control.safety.enabled() {
@@ -254,7 +259,9 @@ async fn main() -> anyhow::Result<()> {
         .media
         .external_ip
         .clone()
+        .or_else(|| config.media.external_ipv6.clone())
         .unwrap_or_else(|| config.server.host.clone());
+    let node_address_ipv6 = config.media.external_ipv6.clone();
     let advertised_ws_url = config.server.advertised_ws_url(config.is_production());
     let advertised_api_url = config.server.advertised_api_url();
     match &advertised_ws_url {
@@ -268,10 +275,12 @@ async fn main() -> anyhow::Result<()> {
         let ws_url = advertised_ws_url.clone();
         let api_url = advertised_api_url.clone();
         let location = config.server.location;
+        let address_ipv6 = node_address_ipv6.clone();
         move |mut info: aurix_common::types::MediaNodeInfo| {
             info.ws_url = ws_url.clone();
             info.api_url = api_url.clone();
             info.location = location;
+            info.address_ipv6 = address_ipv6.clone();
             info
         }
     };
@@ -327,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.turn.enabled {
-        let turn_server = Arc::new(TurnServer::new(&config.turn));
+        let turn_server = Arc::new(TurnServer::new(&config.turn, &config.media));
         let cancel = shutdown.clone();
         tasks.spawn(async move {
             tokio::select! {
@@ -336,8 +345,9 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         info!(
-            "TURN server started on {}:{} (udp) / {} (tcp)",
-            config.turn.host, config.turn.udp_port, config.turn.tcp_port
+            "TURN server started on {} (udp) / {} (tcp)",
+            aurix_common::addr::host_port(&config.turn.host, config.turn.udp_port),
+            aurix_common::addr::host_port(&config.turn.host, config.turn.tcp_port)
         );
     }
 

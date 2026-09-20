@@ -6,6 +6,7 @@
 //! (`OpusMixer`) into the single negotiated audio track. The `WebRtcManager` demuxes
 //! incoming UDP packets to the correct session based on source address or ICE ufrag.
 
+use crate::transport::MediaSocket;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::types::*;
 use dashmap::DashMap;
@@ -13,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -73,9 +73,10 @@ pub struct WebRtcManager {
     sessions: Arc<DashMap<SessionId, SessionHandle>>,
     addr_map: Arc<DashMap<SocketAddr, SessionId>>,
     ufrag_map: Arc<DashMap<String, SessionId>>,
-    socket: Arc<UdpSocket>,
-    /// Address advertised to browsers as the ICE host candidate (external IP + media port).
-    advertised_addr: SocketAddr,
+    socket: Arc<MediaSocket>,
+    /// Addresses advertised to browsers as ICE host candidates (public IPv4 and/or IPv6 with
+    /// the media port); all of them lead to `socket`.
+    advertised_addrs: Vec<SocketAddr>,
     event_tx: mpsc::Sender<WebRtcMediaEvent>,
     downlink_bitrate: i32,
 }
@@ -95,17 +96,21 @@ pub struct WebRtcOfferResponse {
 
 impl WebRtcManager {
     pub fn new(
-        socket: Arc<UdpSocket>,
-        advertised_addr: SocketAddr,
+        socket: Arc<MediaSocket>,
+        advertised_addrs: Vec<SocketAddr>,
         event_tx: mpsc::Sender<WebRtcMediaEvent>,
         downlink_bitrate: u32,
     ) -> Self {
+        let advertised_addrs: Vec<SocketAddr> = advertised_addrs
+            .into_iter()
+            .filter(|a| socket.can_reach(*a))
+            .collect();
         Self {
             sessions: Arc::new(DashMap::new()),
             addr_map: Arc::new(DashMap::new()),
             ufrag_map: Arc::new(DashMap::new()),
             socket,
-            advertised_addr,
+            advertised_addrs,
             event_tx,
             downlink_bitrate: downlink_bitrate as i32,
         }
@@ -144,9 +149,11 @@ impl WebRtcManager {
         );
         let mut rtc = config.build(Instant::now());
 
-        let candidate = Candidate::host(self.advertised_addr, "udp")
-            .map_err(|e| AurixError::Transport(format!("ICE candidate: {e}")))?;
-        rtc.add_local_candidate(candidate);
+        for addr in &self.advertised_addrs {
+            let candidate = Candidate::host(*addr, "udp")
+                .map_err(|e| AurixError::Transport(format!("ICE candidate: {e}")))?;
+            rtc.add_local_candidate(candidate);
+        }
 
         let offer = SdpOffer::from_sdp_string(offer_sdp)
             .map_err(|e| AurixError::Transport(format!("SDP parse error: {e}")))?;
@@ -191,6 +198,16 @@ impl WebRtcManager {
         Ok(answer_sdp)
     }
 
+    /// The advertised host candidate a packet from `src` was sent to (same address family).
+    fn candidate_for(&self, src: SocketAddr) -> SocketAddr {
+        self.advertised_addrs
+            .iter()
+            .find(|a| a.is_ipv4() == src.is_ipv4())
+            .or_else(|| self.advertised_addrs.first())
+            .copied()
+            .unwrap_or_else(|| self.socket.local_addr())
+    }
+
     /// RFC 7983 demux: STUN (0-3), DTLS (20-63), RTP/RTCP (128-191).
     pub fn is_webrtc_packet(data: &[u8]) -> bool {
         match data.first() {
@@ -202,8 +219,9 @@ impl WebRtcManager {
     /// Route an incoming packet to the correct WebRTC session.
     pub async fn handle_packet(&self, data: &[u8], src: SocketAddr) {
         // str0m matches the destination against the advertised host candidate; the socket
-        // itself is usually bound to a wildcard address, so report the candidate address.
-        let dst = self.advertised_addr;
+        // itself is usually bound to a wildcard address, so report the candidate address of
+        // the family the packet arrived on.
+        let dst = self.candidate_for(src);
         let sid = self.addr_map.get(&src).map(|s| *s);
         if let Some(sid) = sid {
             let tx = self.sessions.get(&sid).map(|h| h.net_tx.clone());
@@ -281,7 +299,7 @@ impl WebRtcManager {
 struct SessionTaskCtx {
     session_id: SessionId,
     user_id: UserId,
-    socket: Arc<UdpSocket>,
+    socket: Arc<MediaSocket>,
     event_tx: mpsc::Sender<WebRtcMediaEvent>,
     addr_map: Arc<DashMap<SocketAddr, SessionId>>,
     sessions: Arc<DashMap<SessionId, SessionHandle>>,

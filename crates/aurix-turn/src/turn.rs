@@ -8,11 +8,12 @@ use aurix_common::crypto::{
     turn_password_for_username,
 };
 use aurix_common::error::Result;
+use aurix_common::net::{bind_udp, FamilyUdpSocket};
 use base64::Engine;
 use bytes::{BufMut, BytesMut};
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -30,7 +31,7 @@ const MAX_RELAY_PAYLOAD: usize = 1500;
 /// per-connection writer task for TCP clients.
 #[derive(Clone)]
 pub enum ClientSink {
-    Udp(Arc<UdpSocket>),
+    Udp(Arc<FamilyUdpSocket>),
     Tcp(mpsc::Sender<Vec<u8>>),
 }
 
@@ -59,6 +60,100 @@ struct Authenticated {
     key: [u8; 16],
 }
 
+/// Relay addressing for one address family (RFC 8656 §7.2: the relayed transport address is
+/// of the family the client asked for with REQUESTED-ADDRESS-FAMILY).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayFamily {
+    /// IP the relay sockets of this family bind to: the wildcard in production, loopback in
+    /// single-host setups and tests.
+    pub bind: IpAddr,
+    /// Public IP written into XOR-RELAYED-ADDRESS. `None`: the bind IP when it is specific,
+    /// otherwise the address the client reached the server on.
+    pub external: Option<IpAddr>,
+}
+
+impl RelayFamily {
+    pub fn v4(external: Option<Ipv4Addr>) -> Self {
+        Self {
+            bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            external: external.map(IpAddr::V4),
+        }
+    }
+
+    pub fn v6(external: Option<Ipv6Addr>) -> Self {
+        Self {
+            bind: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            external: external.map(IpAddr::V6),
+        }
+    }
+
+    pub fn loopback(v6: bool) -> Self {
+        Self {
+            bind: if v6 {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            },
+            external: None,
+        }
+    }
+}
+
+/// Which relay families a TURN node offers. A dual-stack node offers both; an IPv4-only
+/// listener offers IPv4 relays only (an IPv6 REQUESTED-ADDRESS-FAMILY gets 440).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayAddressing {
+    pub v4: Option<RelayFamily>,
+    pub v6: Option<RelayFamily>,
+}
+
+impl RelayAddressing {
+    /// Derive relay families from the listener bind host and the configured external
+    /// addresses: `0.0.0.0` → IPv4 only, `::` → both, a specific IPv6 literal → IPv6 only.
+    /// A loopback bind host keeps relays on loopback too (single-host development, tests).
+    pub fn from_config(
+        host: &str,
+        external_ip: Option<Ipv4Addr>,
+        external_ipv6: Option<Ipv6Addr>,
+    ) -> Self {
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        let bind_ip = host.parse::<IpAddr>().ok();
+        let (want_v4, want_v6) = match bind_ip {
+            Some(IpAddr::V4(_)) => (true, false),
+            Some(IpAddr::V6(v6)) if v6.is_unspecified() => (true, true),
+            Some(IpAddr::V6(_)) => (false, true),
+            // `localhost` / host names: the listener binds with parse_bind_addr's rules; offer
+            // both families and let per-allocation binds fail over.
+            None => (true, true),
+        };
+        let v4 = want_v4.then(|| match bind_ip {
+            Some(IpAddr::V4(ip)) if ip.is_loopback() => RelayFamily::loopback(false),
+            Some(IpAddr::V4(ip)) if !ip.is_unspecified() => RelayFamily {
+                bind: IpAddr::V4(ip),
+                external: external_ip.map(IpAddr::V4).or(Some(IpAddr::V4(ip))),
+            },
+            _ => RelayFamily::v4(external_ip),
+        });
+        let v6 = want_v6.then(|| match bind_ip {
+            Some(IpAddr::V6(ip)) if ip.is_loopback() => RelayFamily::loopback(true),
+            Some(IpAddr::V6(ip)) if !ip.is_unspecified() => RelayFamily {
+                bind: IpAddr::V6(ip),
+                external: external_ipv6.map(IpAddr::V6).or(Some(IpAddr::V6(ip))),
+            },
+            _ => RelayFamily::v6(external_ipv6),
+        });
+        Self { v4, v6 }
+    }
+
+    pub fn family(&self, v6: bool) -> Option<RelayFamily> {
+        if v6 {
+            self.v6
+        } else {
+            self.v4
+        }
+    }
+}
+
 enum AuthFailure {
     /// 401 with fresh REALM/NONCE.
     Unauthorized,
@@ -78,8 +173,7 @@ pub struct TurnHandler {
     next_port: AtomicU16,
     max_allocations: u32,
     allocation_lifetime: i64,
-    external_ip: Option<IpAddr>,
-    relay_bind_ip: IpAddr,
+    relay: RelayAddressing,
 }
 
 impl TurnHandler {
@@ -90,7 +184,7 @@ impl TurnHandler {
         max_port: u16,
         max_allocations: u32,
         allocation_lifetime: i64,
-        external_ip: Option<IpAddr>,
+        relay: RelayAddressing,
     ) -> Self {
         Self {
             realm,
@@ -102,14 +196,13 @@ impl TurnHandler {
             next_port: AtomicU16::new(min_port),
             max_allocations,
             allocation_lifetime: allocation_lifetime.clamp(60, MAX_LIFETIME_SECS as i64),
-            external_ip,
-            relay_bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            relay,
         }
     }
 
-    /// IP the relay sockets bind to (defaults to 0.0.0.0; tests use loopback).
-    pub fn set_relay_bind_ip(&mut self, ip: IpAddr) {
-        self.relay_bind_ip = ip;
+    /// Relay families this node offers.
+    pub fn relay_addressing(&self) -> RelayAddressing {
+        self.relay
     }
 
     pub fn allocations(&self) -> &Arc<DashMap<ClientKey, Allocation>> {
@@ -399,10 +492,7 @@ impl TurnHandler {
                 return Ok(());
             }
         };
-        if relay_ip_family_v6
-            && !self.relay_bind_ip.is_ipv6()
-            && self.external_ip.map(|ip| !ip.is_ipv6()).unwrap_or(true)
-        {
+        let Some(relay_family) = self.relay.family(relay_ip_family_v6) else {
             self.send_error(
                 msg,
                 client,
@@ -413,7 +503,7 @@ impl TurnHandler {
             )
             .await;
             return Ok(());
-        }
+        };
 
         if self.allocations.len() as u32 >= self.max_allocations {
             self.send_error(msg, client, sink, &auth.key, 508, "Insufficient Capacity")
@@ -448,20 +538,33 @@ impl TurnHandler {
             )
             .max(1);
 
-        let Some((relay_socket, relay_port)) = self.bind_relay_socket().await else {
+        let Some((relay_socket, relay_port)) = self.bind_relay_socket(relay_family.bind).await
+        else {
             self.send_error(msg, client, sink, &auth.key, 508, "Insufficient Capacity")
                 .await;
             return Ok(());
         };
-        let relay_ip = self.external_ip.unwrap_or(match self.relay_bind_ip {
-            IpAddr::V4(ip) if ip.is_unspecified() => match sink {
-                ClientSink::Udp(s) => s
-                    .local_addr()
-                    .map(|a| a.ip())
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-                ClientSink::Tcp(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            },
-            ip => ip,
+        let relay_ip = relay_family.external.unwrap_or_else(|| {
+            if !relay_family.bind.is_unspecified() {
+                return relay_family.bind;
+            }
+            // No public address configured (development): advertise the address the client
+            // reached us on, when the listener is bound to a specific one of this family.
+            let reached = match sink {
+                ClientSink::Udp(s) => Some(s.local_addr().ip()),
+                ClientSink::Tcp(_) => None,
+            }
+            .filter(|ip| !ip.is_unspecified() && ip.is_ipv6() == relay_ip_family_v6);
+            reached.unwrap_or_else(|| {
+                warn!(
+                    "TURN relay for {} has no public {} address (set turn.external_ip{}); \
+                     advertising the unspecified address",
+                    client.addr,
+                    if relay_ip_family_v6 { "IPv6" } else { "IPv4" },
+                    if relay_ip_family_v6 { "v6" } else { "" }
+                );
+                relay_family.bind
+            })
         });
         let relay_addr = SocketAddr::new(relay_ip, relay_port);
 
@@ -564,7 +667,10 @@ impl TurnHandler {
         });
     }
 
-    async fn bind_relay_socket(&self) -> Option<(Arc<UdpSocket>, u16)> {
+    /// Bind a relay socket of one family on a free port of the configured range. IPv6 relay
+    /// sockets are IPv6-only so peers of the other family are rejected by the kernel too, not
+    /// only by the permission check (RFC 8656 §7.2).
+    async fn bind_relay_socket(&self, bind_ip: IpAddr) -> Option<(Arc<UdpSocket>, u16)> {
         let span = (self.max_port - self.min_port) as usize + 1;
         for _ in 0..span.min(256) {
             let port = {
@@ -579,9 +685,10 @@ impl TurnHandler {
             if !self.ports_in_use.lock().insert(port) {
                 continue;
             }
-            match UdpSocket::bind(SocketAddr::new(self.relay_bind_ip, port)).await {
-                Ok(sock) => return Some((Arc::new(sock), port)),
-                Err(_) => {
+            match bind_udp(SocketAddr::new(bind_ip, port), false, 0) {
+                Ok((sock, _family)) => return Some((Arc::new(sock), port)),
+                Err(e) => {
+                    debug!("TURN relay bind {}:{} failed: {}", bind_ip, port, e);
                     self.ports_in_use.lock().remove(&port);
                 }
             }
@@ -833,10 +940,5 @@ impl TurnHandler {
 
     pub fn realm(&self) -> &str {
         &self.realm
-    }
-
-    /// Whether a loopback/unspecified relay IP is in use (only sensible for tests).
-    pub fn relay_bind_ip(&self) -> IpAddr {
-        self.relay_bind_ip
     }
 }

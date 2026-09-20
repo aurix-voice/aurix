@@ -71,7 +71,9 @@ impl AurixConfig {
         for opt in [
             &mut self.server.external_ws_url,
             &mut self.media.external_ip,
+            &mut self.media.external_ipv6,
             &mut self.turn.external_ip,
+            &mut self.turn.external_ipv6,
             &mut self.media.cascade_secret,
             &mut self.auth.admin_bootstrap_token,
             &mut self.recording.encryption_key,
@@ -127,6 +129,23 @@ impl AurixConfig {
         }
         if self.media.max_participants_per_node == 0 {
             anyhow::bail!("max_participants_per_node must be > 0");
+        }
+        validate_families(
+            "media",
+            &self.media.host,
+            &self.media.external_ip,
+            &self.media.external_ipv6,
+        )?;
+        if self.turn.enabled {
+            validate_families(
+                "turn",
+                &self.turn.host,
+                &self.turn.external_ip,
+                &self.turn.external_ipv6,
+            )?;
+        }
+        if self.rate_limiting.ipv6_prefix > 128 {
+            anyhow::bail!("rate_limiting.ipv6_prefix must be within 0..=128");
         }
         if !(0.0..=1.0).contains(&self.media.speaking_energy_threshold) {
             anyhow::bail!("media.speaking_energy_threshold must be within 0.0..=1.0");
@@ -414,17 +433,21 @@ impl AurixConfig {
                         "turn.auth_secret is a placeholder value; set a real secret in production"
                     );
                 }
-                if self.turn.external_ip.is_none() && self.media.external_ip.is_none() {
+                if self.turn.external_ip.is_none()
+                    && self.media.external_ip.is_none()
+                    && self.turn.external_ipv6.is_none()
+                    && self.media.external_ipv6.is_none()
+                {
                     anyhow::bail!(
-                        "turn.external_ip (or media.external_ip) must be set in production so TURN URIs are routable"
+                        "turn.external_ip / turn.external_ipv6 (or the media equivalents) must be set in production so TURN URIs are routable"
                     );
                 }
             }
             if self.server.cors_origins.iter().any(|o| o == "*") {
                 anyhow::bail!("server.cors_origins must not contain '*' in production");
             }
-            if self.media.external_ip.is_none() {
-                anyhow::bail!("media.external_ip must be set in production so clients receive a routable media address");
+            if self.media.external_ip.is_none() && self.media.external_ipv6.is_none() {
+                anyhow::bail!("media.external_ip and/or media.external_ipv6 must be set in production so clients receive a routable media address");
             }
             if self.database.url.contains("aurix:aurix@") {
                 anyhow::bail!("database.url uses the development default credentials; set real credentials in production");
@@ -513,6 +536,135 @@ fn default_request_timeout_secs() -> u64 {
 }
 fn default_session_resume_grace_secs() -> u64 {
     30
+}
+
+/// `external_ip` must be IPv4 (or a host name), `external_ipv6` an IPv6 literal, and each
+/// advertised family must be reachable through the bind address (`0.0.0.0` never carries IPv6,
+/// a specific IPv6 literal never carries IPv4).
+fn validate_families(
+    section: &str,
+    host: &str,
+    external_ip: &Option<String>,
+    external_ipv6: &Option<String>,
+) -> anyhow::Result<()> {
+    use std::net::IpAddr;
+    let bind =
+        crate::net::parse_bind_addr(host, 1).map_err(|e| anyhow::anyhow!("{section}.host: {e}"))?;
+    let bind_v4 = bind.is_ipv4() || bind.ip().is_unspecified();
+    let bind_v6 = bind.is_ipv6();
+    if let Some(v4) = external_ip.as_deref() {
+        let trimmed = v4.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(IpAddr::V6(_)) = trimmed.parse::<IpAddr>() {
+            anyhow::bail!(
+                "{section}.external_ip `{v4}` is an IPv6 address; put it in {section}.external_ipv6"
+            );
+        }
+        if !bind_v4 {
+            anyhow::bail!(
+                "{section}.external_ip is set but {section}.host = `{host}` never accepts IPv4 (use `::` for dual-stack)"
+            );
+        }
+    }
+    if let Some(v6) = external_ipv6.as_deref() {
+        let trimmed = v6.trim_start_matches('[').trim_end_matches(']');
+        match trimmed.parse::<IpAddr>() {
+            Ok(IpAddr::V6(ip)) if !ip.is_unspecified() => {}
+            _ => anyhow::bail!(
+                "{section}.external_ipv6 `{v6}` must be a routable IPv6 literal (e.g. 2001:db8::10)"
+            ),
+        }
+        if !bind_v6 {
+            anyhow::bail!(
+                "{section}.external_ipv6 is set but {section}.host = `{host}` is IPv4-only (use `::` for dual-stack)"
+            );
+        }
+    }
+    Ok(())
+}
+
+impl MediaConfig {
+    /// Public `host:port` media endpoints in advertisement order: IPv4 first (when configured),
+    /// then IPv6. Empty when neither external address is set (callers fall back to the bind
+    /// host so single-host deployments still work).
+    pub fn advertised_endpoints(&self) -> Vec<String> {
+        [self.external_ip.as_deref(), self.external_ipv6.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|h| !h.is_empty())
+            .map(|h| crate::addr::host_port(h, self.port))
+            .collect()
+    }
+
+    /// Parsed public IPs (IPv4, IPv6) for ICE candidates and node registration.
+    pub fn advertised_ips(&self) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+        let v4 = self
+            .external_ip
+            .as_deref()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
+        let v6 = self.external_ipv6.as_deref().and_then(|s| {
+            s.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::Ipv6Addr>()
+                .ok()
+        });
+        (v4, v6)
+    }
+}
+
+impl TurnConfig {
+    /// Public TURN hosts (IPv4 then IPv6) for URIs and relay addresses, falling back to the
+    /// media node's addresses and finally to a non-wildcard bind host.
+    pub fn advertised_hosts(&self, media: &MediaConfig) -> Vec<String> {
+        let v4 = self
+            .external_ip
+            .clone()
+            .or_else(|| media.external_ip.clone())
+            .filter(|h| !h.is_empty());
+        let v6 = self
+            .external_ipv6
+            .clone()
+            .or_else(|| media.external_ipv6.clone())
+            .filter(|h| !h.is_empty())
+            .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_string());
+        let mut hosts: Vec<String> = v4.into_iter().chain(v6).collect();
+        if hosts.is_empty() {
+            hosts.push(if crate::addr::is_unspecified_host(&self.host) {
+                "127.0.0.1".to_string()
+            } else {
+                self.host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string()
+            });
+        }
+        hosts
+    }
+
+    /// Public relay IPs (IPv4, IPv6) written into XOR-RELAYED-ADDRESS: `turn.external_ip*`,
+    /// falling back to the media node's external addresses. Host names are not usable here.
+    pub fn relay_ips(
+        &self,
+        media: &MediaConfig,
+    ) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+        let (media_v4, media_v6) = media.advertised_ips();
+        let v4 = self
+            .external_ip
+            .as_deref()
+            .and_then(|s| s.trim().parse::<std::net::Ipv4Addr>().ok())
+            .or(media_v4);
+        let v6 = self
+            .external_ipv6
+            .as_deref()
+            .and_then(|s| {
+                s.trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::Ipv6Addr>()
+                    .ok()
+            })
+            .or(media_v6);
+        (v4, v6)
+    }
 }
 
 impl ServerConfig {
@@ -739,9 +891,17 @@ impl Default for AuthConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MediaConfig {
+    /// UDP bind address of the media socket. `0.0.0.0` is IPv4-only, `::` is dual-stack (IPv4
+    /// and IPv6 on one socket), a specific IPv6 literal is IPv6-only.
     pub host: String,
     pub port: u16,
+    /// Public IPv4 address clients reach the media socket at. Required in production for any
+    /// node that serves IPv4 clients.
     pub external_ip: Option<String>,
+    /// Public IPv6 address of the media socket (advertised next to `external_ip`; the client
+    /// picks whichever family works for it). Requires `host = "::"` or an IPv6 bind.
+    #[serde(default)]
+    pub external_ipv6: Option<String>,
     pub max_participants_per_node: u32,
     pub max_channels_per_node: u32,
     pub default_bitrate: u32,
@@ -863,6 +1023,7 @@ impl Default for MediaConfig {
             host: "0.0.0.0".into(),
             port: 10000,
             external_ip: None,
+            external_ipv6: None,
             max_participants_per_node: 5000,
             max_channels_per_node: 2000,
             default_bitrate: 48000,
@@ -900,6 +1061,7 @@ impl Default for MediaConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TurnConfig {
     pub enabled: bool,
+    /// Bind address of the TURN listeners (`0.0.0.0` IPv4-only, `::` dual-stack).
     pub host: String,
     pub udp_port: u16,
     pub tcp_port: u16,
@@ -909,9 +1071,14 @@ pub struct TurnConfig {
     pub max_port: u16,
     pub allocation_lifetime_secs: u64,
     pub max_allocations: u32,
-    /// Public IP advertised to clients as the relay address (defaults to `host`).
+    /// Public IPv4 address advertised in TURN URIs and as the IPv4 relay address (defaults to
+    /// `media.external_ip`, then `host`).
     #[serde(default)]
     pub external_ip: Option<String>,
+    /// Public IPv6 address for IPv6 TURN URIs and RFC 6156 IPv6 relay allocations (defaults to
+    /// `media.external_ipv6`). Requires a dual-stack or IPv6 bind.
+    #[serde(default)]
+    pub external_ipv6: Option<String>,
     /// Lifetime of TURN credentials handed out by `POST /v1/turn/credentials`.
     #[serde(default = "default_turn_credential_ttl_secs")]
     pub credential_ttl_secs: i64,
@@ -935,6 +1102,7 @@ impl Default for TurnConfig {
             allocation_lifetime_secs: 600,
             max_allocations: 10000,
             external_ip: None,
+            external_ipv6: None,
             credential_ttl_secs: default_turn_credential_ttl_secs(),
         }
     }
@@ -1224,6 +1392,10 @@ pub struct RateLimitConfig {
     /// Operator login / setup attempts per client IP.
     #[serde(default = "default_admin_login_per_minute")]
     pub admin_login_per_minute: u32,
+    /// Per-IP buckets aggregate IPv6 clients at this prefix length (a host can rotate through
+    /// its whole delegated /64 for free otherwise). `0` or `128` keys on the full address.
+    #[serde(default = "default_ipv6_prefix")]
+    pub ipv6_prefix: u8,
 }
 
 fn default_connects_per_minute() -> u32 {
@@ -1242,6 +1414,10 @@ fn default_admin_login_per_minute() -> u32 {
     10
 }
 
+fn default_ipv6_prefix() -> u8 {
+    64
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -1257,6 +1433,7 @@ impl Default for RateLimitConfig {
             block_changes_per_minute: default_block_changes_per_minute(),
             reports_per_minute: default_reports_per_minute(),
             admin_login_per_minute: default_admin_login_per_minute(),
+            ipv6_prefix: default_ipv6_prefix(),
         }
     }
 }
@@ -1888,6 +2065,60 @@ mod tests {
 
         cfg.server.cors_origins = vec!["https://game.example.com".into()];
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn address_families_are_validated() {
+        let mut cfg = dev_config();
+        cfg.media.host = "0.0.0.0".into();
+        cfg.media.external_ipv6 = Some("2001:db8::10".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("IPv4-only"), "{err}");
+
+        cfg.media.host = "::".into();
+        cfg.media.external_ip = Some("203.0.113.10".into());
+        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            cfg.media.advertised_endpoints(),
+            vec!["203.0.113.10:10000", "[2001:db8::10]:10000"]
+        );
+        assert_eq!(
+            cfg.turn.advertised_hosts(&cfg.media),
+            vec!["203.0.113.10", "2001:db8::10"]
+        );
+
+        cfg.media.external_ip = Some("2001:db8::10".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("external_ipv6"), "{err}");
+        cfg.media.external_ip = None;
+
+        cfg.media.external_ipv6 = Some("not-an-ip".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("IPv6 literal"), "{err}");
+
+        // A specific IPv6 bind never carries IPv4.
+        cfg.media.host = "2001:db8::10".into();
+        cfg.media.external_ipv6 = Some("2001:db8::10".into());
+        cfg.media.external_ip = Some("203.0.113.10".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("never accepts IPv4"), "{err}");
+        cfg.media.external_ip = None;
+        assert!(cfg.validate().is_ok());
+
+        // Production accepts an IPv6-only media node.
+        cfg.server.environment = "production".into();
+        cfg.turn.enabled = false;
+        cfg.database.url = "postgres://prod:s3cret@db/aurix".into();
+        cfg.auth.jwt_secret = "a".repeat(48);
+        cfg.server.cors_origins = vec!["https://game.example.com".into()];
+        assert!(cfg.validate().is_ok());
+
+        // TURN with no external address at all falls back to loopback in development only.
+        cfg.server.environment = "development".into();
+        cfg.turn.enabled = true;
+        cfg.media.external_ipv6 = None;
+        cfg.media.host = "::".into();
+        assert_eq!(cfg.turn.advertised_hosts(&cfg.media), vec!["127.0.0.1"]);
     }
 
     #[test]

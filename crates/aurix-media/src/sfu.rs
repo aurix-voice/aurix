@@ -4,6 +4,7 @@ use crate::channel::MediaChannel;
 use crate::mix::MixHub;
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
+use crate::transport::bind_media_socket;
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
 use aurix_common::crypto::CryptoProvider;
@@ -17,7 +18,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
@@ -63,8 +63,10 @@ pub struct SfuOptions {
     pub session_timeout_secs: u64,
     pub cascade_secret: Option<String>,
     pub cascade_peers: Vec<String>,
-    /// Address advertised to WebRTC clients (external IP + media port).
-    pub advertised_addr: Option<SocketAddr>,
+    /// Public addresses of the media socket (IPv4 and/or IPv6 with the media port), used as
+    /// WebRTC ICE host candidates and for `SessionInitAck.media_addrs`. Empty: the bound
+    /// address itself (single-host development).
+    pub advertised_addrs: Vec<SocketAddr>,
     pub downlink_bitrate: u32,
     /// Number of concurrent UDP receive workers (0 = derive from available CPUs).
     pub rx_workers: usize,
@@ -93,7 +95,7 @@ impl Default for SfuOptions {
             session_timeout_secs: 60,
             cascade_secret: None,
             cascade_peers: Vec::new(),
-            advertised_addr: None,
+            advertised_addrs: Vec::new(),
             downlink_bitrate: 32_000,
             rx_workers: 0,
             media_tunnel: true,
@@ -121,6 +123,8 @@ pub struct SfuNode {
     audio_sink: Option<Arc<dyn AudioSink>>,
     events: broadcast::Sender<MediaEvent>,
     local_addr: Option<SocketAddr>,
+    family: Option<aurix_common::net::BoundFamily>,
+    advertised: Vec<SocketAddr>,
     started: bool,
 }
 
@@ -145,6 +149,8 @@ impl SfuNode {
             audio_sink: None,
             events,
             local_addr: None,
+            family: None,
+            advertised: Vec::new(),
             started: false,
         }
     }
@@ -181,6 +187,17 @@ impl SfuNode {
         self.local_addr
     }
 
+    /// Address families the media socket serves (`None` until started).
+    pub fn family(&self) -> Option<aurix_common::net::BoundFamily> {
+        self.family
+    }
+
+    /// Public media endpoints in advertisement order (IPv4 first, then IPv6); the bound
+    /// address when nothing public is configured.
+    pub fn advertised_addrs(&self) -> &[SocketAddr] {
+        &self.advertised
+    }
+
     pub fn options(&self) -> &SfuOptions {
         &self.options
     }
@@ -195,57 +212,40 @@ impl SfuNode {
             .clamp(2, 8)
     }
 
-    pub async fn start(&mut self, bind_addr: &str) -> Result<()> {
+    /// Bind the media socket and start every worker. `bind_addr` `[::]:port` is dual-stack
+    /// (IPv4 peers show up with their real IPv4 address), `0.0.0.0:port` IPv4-only, a specific
+    /// IPv6 literal IPv6-only.
+    pub async fn start(&mut self, bind_addr: SocketAddr) -> Result<()> {
         if self.started {
             return Err(AurixError::Internal("SFU already started".into()));
         }
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|e| AurixError::Transport(format!("Failed to bind UDP: {e}")))?;
+        let socket = bind_media_socket(bind_addr)
+            .map_err(|e| AurixError::Transport(format!("Failed to bind UDP {bind_addr}: {e}")))?;
+        let local_addr = socket.local_addr();
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-            let buf_size: libc::c_int = 4 * 1024 * 1024;
-            // SAFETY: fd is a valid open socket; the pointer/len describe a live c_int.
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+        let mut advertised: Vec<SocketAddr> = self
+            .options
+            .advertised_addrs
+            .iter()
+            .copied()
+            .filter(|a| socket.can_reach(*a))
+            .collect();
+        if advertised.is_empty() {
+            advertised.push(local_addr);
         }
-
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| AurixError::Transport(format!("local_addr: {e}")))?;
-        let socket = Arc::new(socket);
-
-        let advertised = self.options.advertised_addr.unwrap_or(local_addr);
         let (webrtc_event_tx, mut webrtc_event_rx) = mpsc::channel::<WebRtcMediaEvent>(4096);
         let webrtc_mgr = Arc::new(WebRtcManager::new(
             socket.clone(),
-            advertised,
+            advertised.clone(),
             webrtc_event_tx,
             self.options.downlink_bitrate,
         ));
         self.webrtc_manager = Some(webrtc_mgr.clone());
 
         if let Some(secret) = self.options.cascade_secret.clone() {
-            let cascade_addr = format!("{}:{}", local_addr.ip(), local_addr.port().wrapping_add(1));
+            let cascade_addr = SocketAddr::new(local_addr.ip(), local_addr.port().wrapping_add(1));
             match CascadeRelay::new(
-                &cascade_addr,
+                cascade_addr,
                 self.node_id,
                 &secret,
                 &self.options.cascade_peers,
@@ -401,11 +401,17 @@ impl SfuNode {
             pipeline.spawn_idle_flusher(self.channels.clone());
         }
         self.local_addr = Some(local_addr);
+        self.family = Some(socket.family());
+        self.advertised = advertised.clone();
         self.router = Some(router);
         self.started = true;
         info!(
-            "SFU node {} started in region {:?}, listening on {} (advertised {})",
-            self.node_id, self.region, local_addr, advertised
+            "SFU node {} started in region {:?}, listening on {} ({:?}, advertised {:?})",
+            self.node_id,
+            self.region,
+            local_addr,
+            socket.family(),
+            advertised
         );
         Ok(())
     }
@@ -903,6 +909,7 @@ impl SfuNode {
             id: self.node_id,
             region: self.region,
             address: address.to_string(),
+            address_ipv6: None,
             media_port,
             api_port,
             cascade_port: self.cascade.as_ref().map(|c| c.local_addr().port()),

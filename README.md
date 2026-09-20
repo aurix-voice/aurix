@@ -153,8 +153,9 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
 1. Connect to `ws://host:8081/ws` with the player JWT (`Authorization: Bearer`, the
    `Sec-WebSocket-Protocol: aurix, bearer.<jwt>` sub-protocol for browsers, or `?token=` as last
    resort) or with a one-time `login` action token. The server replies
-   `SessionInitAck { session_id, ssrc, media_addr, media_key, resume_token, resume_grace_ms }`.
-2. **Native clients**: send an authenticated `SessionBind` datagram to `media_addr`
+   `SessionInitAck { session_id, ssrc, media_addr, media_addrs, media_key, resume_token, resume_grace_ms }`.
+2. **Native clients**: send an authenticated `SessionBind` datagram to `media_addr` (or try the
+   `media_addrs` candidates in order — IPv4 first, then IPv6 on dual-stack nodes)
    (`AurixPacket::session_bind(...).encode_authenticated(media_key)`), wait for
    `SessionBindAck` / `MediaBound`, then `ChannelJoin { channel_id, token }` over WebSocket and
    start sending `Audio` packets (Opus, 20 ms, `encode_authenticated`). `token` is either the
@@ -389,12 +390,13 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 | `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN` | allows `/admin/setup` after the first admin exists; unset after use |
 | `AURIX__AUTH__ACTION_TOKEN_TTL_SECS`, `AURIX__AUTH__ACTION_TOKEN_MAX_TTL_SECS` | default (90) and maximum (600) lifetime of one-time action tokens |
 | `AURIX__AUTH__REQUIRE_ACTION_TOKENS` | `true` — WebSocket login and `ChannelJoin` accept only one-time action tokens (player JWTs stay valid for REST) |
-| `AURIX__MEDIA__EXTERNAL_IP` | public IP advertised to clients for UDP media |
+| `AURIX__MEDIA__EXTERNAL_IP` | public IPv4 advertised to clients for UDP media |
+| `AURIX__MEDIA__HOST`, `AURIX__MEDIA__EXTERNAL_IPV6` | `0.0.0.0` (IPv4 only, default), `::` (dual-stack) or an IPv6 literal (IPv6 only); public IPv6 advertised as an additional media candidate — [IPv6](docs/src/operations/deployment.md#ipv6-and-dual-stack) |
 | `AURIX__MEDIA__REQUIRE_PACKET_AUTH` | `true` (default) — drop unauthenticated media |
 | `AURIX__MEDIA__RX_WORKERS` | concurrent UDP receive workers on the SFU socket; `0` (default) = CPU count clamped to 2–8 |
 | `AURIX__MEDIA__SPEAKING_TIMEOUT_MS`, `AURIX__MEDIA__SPEAKING_ENERGY_THRESHOLD`, `AURIX__MEDIA__ENERGY_INTERVAL_MS` | speaking indicator hangover (400), linear RMS level a labelled frame must reach to count as speech (0.01 ≈ −40 dBov), period of `ChannelEnergy` reports (200; `0` disables them) |
 | `AURIX__MEDIA__CASCADE_SECRET`, `AURIX__MEDIA__CASCADE_PEERS` | shared secret + allow-list for SFU↔SFU relay |
-| `AURIX__TURN__*` | `ENABLED`, `EXTERNAL_IP`, `REALM`, `AUTH_SECRET` (≥ 32 bytes), `MIN_PORT`/`MAX_PORT` relay range |
+| `AURIX__TURN__*` | `ENABLED`, `HOST`, `EXTERNAL_IP`, `EXTERNAL_IPV6`, `REALM`, `AUTH_SECRET` (≥ 32 bytes), `MIN_PORT`/`MAX_PORT` relay range |
 | `AURIX__SERVER__CORS_ORIGINS` | explicit origins; `*` is rejected in production |
 | `AURIX__SERVER__TRUSTED_PROXIES` | CIDRs whose `X-Forwarded-For` is trusted for rate limiting / audit |
 | `AURIX__SERVER__SESSION_RESUME_GRACE_SECS` | how long a dropped session waits for a resume (default 30, `0` disables; must be ≤ `AURIX__MEDIA__SESSION_TIMEOUT_SECS`) |

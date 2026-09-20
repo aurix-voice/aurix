@@ -173,7 +173,7 @@ pub async fn rate_limit_middleware(
     state
         .control
         .limits
-        .check(LimitScope::ApiIp, &ip.to_string())
+        .check(LimitScope::ApiIp, &state.control.limits.ip_subject(ip))
         .await?;
     Ok(next.run(request).await)
 }

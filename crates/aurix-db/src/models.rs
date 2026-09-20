@@ -313,6 +313,8 @@ pub struct MediaNodeRow {
     pub id: Uuid,
     pub region: String,
     pub address: String,
+    #[sqlx(default)]
+    pub address_ipv6: Option<String>,
     pub media_port: i32,
     pub api_port: i32,
     pub cascade_port: Option<i32>,

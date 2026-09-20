@@ -7,6 +7,9 @@
 {{- if and (eq .Values.config.externalIpSource "static") .Values.config.externalIps (lt (len .Values.config.externalIps) (int .Values.replicaCount)) }}
 {{- fail "config.externalIps must list one IP per replica" }}
 {{- end }}
+{{- if and .Values.config.externalIpv6s (lt (len .Values.config.externalIpv6s) (int .Values.replicaCount)) }}
+{{- fail "config.externalIpv6s must list one IPv6 per replica" }}
+{{- end }}
 {{- if not (has .Values.config.externalIpSource (list "static" "hostIP" "script")) }}
 {{- fail "config.externalIpSource must be static, hostIP or script" }}
 {{- end }}
@@ -92,6 +95,12 @@ spec:
               value: {{ .Values.config.externalIp | quote }}
             - name: AURIX_EXTERNAL_IPS
               value: {{ join "," .Values.config.externalIps | quote }}
+            - name: AURIX_EXTERNAL_IPV6
+              value: {{ .Values.config.externalIpv6 | quote }}
+            - name: AURIX_EXTERNAL_IPV6S
+              value: {{ join "," .Values.config.externalIpv6s | quote }}
+            - name: AURIX_DUAL_STACK
+              value: {{ .Values.config.dualStack | quote }}
             - name: HOST_IP
               valueFrom:
                 fieldRef:

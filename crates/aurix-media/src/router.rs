@@ -11,6 +11,7 @@
 //!   same tag/replay checks as UDP packets; the bind/ack handshake is identical.
 //! * The SSRC in the header is never used to look up a sender.
 
+use crate::transport::MediaSocket;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::*;
 use aurix_common::sink::AudioSink;
@@ -22,7 +23,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -121,7 +121,7 @@ pub struct RouterShared {
 
 pub struct PacketRouter {
     shared: RouterShared,
-    socket: Arc<UdpSocket>,
+    socket: Arc<MediaSocket>,
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
     webrtc: Option<Arc<WebRtcManager>>,
@@ -140,7 +140,7 @@ impl PacketRouter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared: RouterShared,
-        socket: Arc<UdpSocket>,
+        socket: Arc<MediaSocket>,
         cascade: Option<Arc<CascadeRelay>>,
         audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
         webrtc: Option<Arc<WebRtcManager>>,

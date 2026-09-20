@@ -786,7 +786,14 @@ pub enum ControlMessage {
     SessionInitAck {
         session_id: SessionId,
         ssrc: u32,
+        /// Primary UDP media endpoint (`host:port`, IPv6 in brackets) — the first entry of
+        /// `media_addrs`, kept for clients that only understand one address.
         media_addr: String,
+        /// Every public UDP media endpoint of this node, IPv4 first, then IPv6. A dual-stack
+        /// client tries them in parallel and keeps the first that answers its `SessionBind`;
+        /// all entries lead to the same socket, so the session and its key are identical.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media_addrs: Vec<String>,
         media_key: String,
         #[serde(default)]
         resume_token: String,

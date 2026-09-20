@@ -2820,23 +2820,28 @@ fn issue_turn_credentials(
         ttl,
         Utc::now().timestamp(),
     );
-    let host = turn
-        .external_ip
-        .clone()
-        .or_else(|| state.control.config.media.external_ip.clone())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| {
-            if turn.host == "0.0.0.0" || turn.host == "::" {
-                "127.0.0.1".to_string()
-            } else {
-                turn.host.clone()
-            }
-        });
-    let uris = vec![
-        format!("turn:{}:{}?transport=udp", host, turn.udp_port),
-        format!("turn:{}:{}?transport=tcp", host, turn.tcp_port),
-        format!("stun:{}:{}", host, turn.udp_port),
-    ];
+    // One turn/turn?tcp/stun triple per advertised host, IPv4 first then IPv6 (bracketed), so
+    // an IPv6-only client still finds a usable server and dual-stack clients can pick either.
+    let uris: Vec<String> = turn
+        .advertised_hosts(&state.control.config.media)
+        .iter()
+        .flat_map(|host| {
+            [
+                format!(
+                    "turn:{}?transport=udp",
+                    aurix_common::addr::host_port(host, turn.udp_port)
+                ),
+                format!(
+                    "turn:{}?transport=tcp",
+                    aurix_common::addr::host_port(host, turn.tcp_port)
+                ),
+                format!(
+                    "stun:{}",
+                    aurix_common::addr::host_port(host, turn.udp_port)
+                ),
+            ]
+        })
+        .collect();
     Ok(TurnCredentialsResponse {
         username: creds.username,
         password: creds.password,
@@ -2883,7 +2888,9 @@ pub async fn admin_login(
     ip: Option<Extension<ClientIp>>,
     Json(req): Json<AdminLoginRequest>,
 ) -> JsonResult {
-    let ip_key = client_ip_string(ip).unwrap_or_else(|| "unknown".into());
+    let ip_key = ip
+        .map(|Extension(c)| state.control.limits.ip_subject(c.0))
+        .unwrap_or_else(|| "unknown".into());
     state
         .control
         .limits
@@ -2925,7 +2932,9 @@ pub async fn admin_setup(
     ip: Option<Extension<ClientIp>>,
     Json(req): Json<BootstrapAdminRequest>,
 ) -> JsonResult {
-    let ip_key = client_ip_string(ip).unwrap_or_else(|| "unknown".into());
+    let ip_key = ip
+        .map(|Extension(c)| state.control.limits.ip_subject(c.0))
+        .unwrap_or_else(|| "unknown".into());
     state
         .control
         .limits

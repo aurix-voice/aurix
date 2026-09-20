@@ -37,6 +37,22 @@ data:
     echo "advertising media IP ${ip}"
     export AURIX__MEDIA__EXTERNAL_IP="$ip"
     export AURIX__TURN__EXTERNAL_IP="$ip"
+    ip6=""
+    if [ -n "${AURIX_EXTERNAL_IPV6S:-}" ]; then
+      ordinal="${POD_NAME##*-}"
+      ip6=$(printf '%s' "$AURIX_EXTERNAL_IPV6S" | tr ',' '\n' | sed -n "$((ordinal + 1))p")
+    else
+      ip6="${AURIX_EXTERNAL_IPV6:-}"
+    fi
+    if [ -n "$ip6" ]; then
+      echo "advertising media IPv6 ${ip6}"
+      export AURIX__MEDIA__EXTERNAL_IPV6="$ip6"
+      export AURIX__TURN__EXTERNAL_IPV6="$ip6"
+    fi
+    if [ -n "$ip6" ] || [ "${AURIX_DUAL_STACK:-false}" = "true" ]; then
+      export AURIX__MEDIA__HOST="${AURIX__MEDIA__HOST:-::}"
+      export AURIX__TURN__HOST="${AURIX__TURN__HOST:-::}"
+    fi
     exec /usr/bin/tini -- /usr/local/bin/aurix-server "$@"
   {{- if eq .Values.config.externalIpSource "script" }}
   resolve-ip.sh: |

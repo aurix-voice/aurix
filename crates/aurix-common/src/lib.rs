@@ -1,3 +1,4 @@
+pub mod addr;
 #[cfg(feature = "server")]
 pub mod audit;
 #[cfg(feature = "server")]

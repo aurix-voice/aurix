@@ -85,7 +85,11 @@ pub struct ChannelScope {
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub ssrc: u32,
+    /// Primary media endpoint (`host:port`; IPv6 hosts bracketed).
     pub media_addr: String,
+    /// Every public media endpoint of the node (IPv4 first, then IPv6). Contains at least
+    /// `media_addr`; the client races them when binding UDP.
+    pub media_addrs: Vec<String>,
     pub resume_grace: Duration,
     pub resumed: bool,
     /// The node accepts AURX media as binary frames on the control WebSocket.

@@ -913,7 +913,12 @@ pub struct ParticipantInfo {
 pub struct MediaNodeInfo {
     pub id: MediaNodeId,
     pub region: Region,
+    /// Primary address other nodes reach this node at (public IPv4 when configured, else the
+    /// IPv6 address or the bind host).
     pub address: String,
+    /// Public IPv6 address, when the node is reachable over IPv6 as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_ipv6: Option<String>,
     pub media_port: u16,
     pub api_port: u16,
     /// UDP port of the node-to-node relay (None when cascade is disabled on that node).

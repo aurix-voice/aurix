@@ -45,7 +45,7 @@ use crate::events::{
     ChannelScope, ChatScope, ConnectionState, Event, Participant, RequestId, SessionInfo,
 };
 use crate::media::{
-    resolve_media_addr, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
+    resolve_media_candidates, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
     MediaTransport, SequenceCounter, TUNNEL_UPLINK_QUEUE,
 };
 
@@ -241,6 +241,9 @@ struct Inner {
     /// A UDP bind failed or UDP heartbeats died at least until this instant: `Auto` sessions
     /// opened before it go straight to the tunnel and let the re-probe find UDP again.
     udp_blocked_until: Mutex<Option<Instant>>,
+    /// Address family of the last UDP endpoint that answered a `SessionBind` (`true` = IPv6);
+    /// tried first on the next bind so a dual-stack client sticks with the family that works.
+    udp_family_hint: Arc<Mutex<Option<bool>>>,
     endpoints: Mutex<Endpoints>,
 }
 
@@ -513,6 +516,7 @@ impl Client {
             closing: AtomicBool::new(false),
             resume_seq: Mutex::new(None),
             udp_blocked_until: Mutex::new(None),
+            udp_family_hint: Arc::new(Mutex::new(None)),
             endpoints: Mutex::new(endpoints),
         });
         Ok(Self {
@@ -1734,6 +1738,11 @@ async fn session(
         session_id: ack.session_id,
         ssrc: ack.ssrc,
         media_addr: ack.media_addr.clone(),
+        media_addrs: if ack.media_addrs.is_empty() {
+            vec![ack.media_addr.clone()]
+        } else {
+            ack.media_addrs.clone()
+        },
         resume_grace: ack.resume_grace,
         resumed: ack.resumed,
         media_tunnel: ack.media_tunnel,
@@ -1765,10 +1774,12 @@ async fn session(
         ssrc: ack.ssrc,
         key: ack.media_key.clone(),
         seq: Arc::new(AtomicU32::new(take_pending_sequence(inner))),
-        udp_addr: resolve_media_addr(
+        udp_addrs: resolve_media_candidates(
             &ack.media_addr,
+            &ack.media_addrs,
             &ws_host(url).unwrap_or_else(|| "127.0.0.1".into()),
         ),
+        family_hint: Arc::clone(&inner.udp_family_hint),
         tunnel_offered: ack.media_tunnel,
     };
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Vec<u8>>(TUNNEL_UPLINK_QUEUE);
@@ -1852,7 +1863,7 @@ async fn session(
     let reprobe_enabled = cfg.media_path == MediaPathPolicy::Auto
         && links.tunnel_offered
         && !cfg.udp_reprobe_interval.is_zero()
-        && links.udp_addr.is_ok();
+        && links.udp_addrs.is_ok();
     let mut reprobe = tokio::time::interval(if reprobe_enabled {
         cfg.udp_reprobe_interval
     } else {
@@ -1958,12 +1969,7 @@ async fn session(
                 }
             }
             _ = reprobe.tick(), if reprobe_enabled && probe.is_none() && media.path() == MediaPath::Tunnel => {
-                probe = links.udp_addr.as_ref().ok().map(|&addr| {
-                    let (sid, ssrc, key, seq) = (links.sid, links.ssrc, links.key.clone(), Arc::clone(&links.seq));
-                    tokio::task::spawn_blocking(move || {
-                        MediaTransport::bind_udp(addr, sid, ssrc, &key, seq, 1, PROBE_TIMEOUT)
-                    })
-                });
+                probe = links.udp_attempt(1, PROBE_TIMEOUT).ok().map(tokio::spawn);
             }
             probed = async { probe.as_mut().expect("guarded by the branch condition").await }, if probe.is_some() => {
                 probe = None;
@@ -2017,7 +2023,10 @@ struct MediaLinks {
     /// Shared by every link of the session so the server's replay window keeps accepting
     /// packets across UDP ↔ tunnel switches.
     seq: SequenceCounter,
-    udp_addr: Result<std::net::SocketAddr>,
+    /// UDP candidates (IPv4 first as advertised, then IPv6); `Err` when nothing resolved.
+    udp_addrs: Result<Vec<std::net::SocketAddr>>,
+    /// Shared with `Inner::udp_family_hint`.
+    family_hint: Arc<Mutex<Option<bool>>>,
     tunnel_offered: bool,
 }
 
@@ -2034,13 +2043,50 @@ impl MediaLinks {
 
     /// UDP bind off the async threads (blocking socket I/O with retries).
     async fn bind_udp(&self, attempts: u32, timeout: Duration) -> Result<MediaTransport> {
-        let addr = self.udp_addr.clone()?;
+        match self.udp_attempt(attempts, timeout) {
+            Ok(fut) => fut.await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A future that tries the UDP candidates one after another (the family that answered
+    /// last time first) with `attempts × timeout` each and returns the first transport whose
+    /// `SessionBind` was acknowledged. Candidates are not raced in parallel: the server binds
+    /// the session to the *last* `SessionBind` it sees, so two simultaneous winners would fight
+    /// over the downlink endpoint.
+    fn udp_attempt(
+        &self,
+        attempts: u32,
+        timeout: Duration,
+    ) -> Result<impl std::future::Future<Output = Result<MediaTransport>> + Send + 'static> {
+        let mut addrs = self.udp_addrs.clone()?;
+        if let Some(v6_first) = *self.family_hint.lock() {
+            addrs.sort_by_key(|a| a.is_ipv6() != v6_first);
+        }
         let (sid, ssrc, key, seq) = (self.sid, self.ssrc, self.key.clone(), Arc::clone(&self.seq));
-        tokio::task::spawn_blocking(move || {
-            MediaTransport::bind_udp(addr, sid, ssrc, &key, seq, attempts, timeout)
+        let hint = Arc::clone(&self.family_hint);
+        Ok(async move {
+            let mut last_err = ClientError::Transport("no UDP candidate".into());
+            for addr in addrs {
+                let (key, seq) = (key.clone(), Arc::clone(&seq));
+                let bound = tokio::task::spawn_blocking(move || {
+                    MediaTransport::bind_udp(addr, sid, ssrc, &key, seq, attempts, timeout)
+                })
+                .await
+                .map_err(|e| ClientError::Transport(format!("bind task: {e}")))?;
+                match bound {
+                    Ok(t) => {
+                        *hint.lock() = Some(addr.is_ipv6());
+                        return Ok(t);
+                    }
+                    Err(e) => {
+                        tracing::debug!("UDP candidate {addr} did not answer: {e}");
+                        last_err = e;
+                    }
+                }
+            }
+            Err(last_err)
         })
-        .await
-        .map_err(|e| ClientError::Transport(format!("bind task: {e}")))?
     }
 }
 

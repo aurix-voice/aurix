@@ -1,74 +1,58 @@
-// This module is kept for potential future use (e.g., WebRTC transport).
-// The primary UDP receive loop is in sfu.rs.
-// This provides the bind-and-run abstraction.
+//! The media UDP socket. One socket carries native AURX, WebRTC (ICE/DTLS/SRTP) and, on a
+//! dual-stack node, both address families: peers are reported in canonical form (real IPv4 for
+//! IPv4-mapped addresses) and destinations are converted back to the socket's own family on send,
+//! so the rest of the SFU never sees `::ffff:` addresses.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tracing::{error, info, warn};
 
-use crate::router::PacketRouter;
+use aurix_common::net::FamilyUdpSocket;
 
-pub struct UdpTransport {
-    socket: Arc<UdpSocket>,
-    router: Arc<PacketRouter>,
+pub const MEDIA_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// The media socket: [`FamilyUdpSocket`] with the SFU's socket buffers and dual-stack wildcard
+/// binds.
+pub type MediaSocket = FamilyUdpSocket;
+
+/// Bind the media socket. A wildcard IPv6 `bind_addr` (`[::]:port`) becomes dual-stack.
+pub fn bind_media_socket(bind_addr: SocketAddr) -> std::io::Result<Arc<MediaSocket>> {
+    FamilyUdpSocket::bind(bind_addr, true, MEDIA_SOCKET_BUFFER_BYTES)
 }
 
-impl UdpTransport {
-    pub async fn bind(addr: &str, router: Arc<PacketRouter>) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(addr).await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aurix_common::net::BoundFamily;
+    use tokio::net::UdpSocket;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-            let buf_size: libc::c_int = 4 * 1024 * 1024;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
+    #[tokio::test]
+    async fn dual_stack_socket_hides_mapped_addresses() {
+        let sock = match bind_media_socket("[::]:0".parse().unwrap()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: no IPv6 ({e})");
+                return;
             }
-        }
-
-        info!("UDP transport bound to {}", addr);
-
-        Ok(Self {
-            socket: Arc::new(socket),
-            router,
-        })
+        };
+        assert_eq!(sock.family(), BoundFamily::DualStack);
+        let port = sock.local_addr().port();
+        let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        v4.send_to(b"ping", ("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        assert!(from.is_ipv4(), "peer must be canonical IPv4, got {from}");
+        assert!(sock.can_reach(from));
+        sock.send_to(b"pong", from).await.unwrap();
+        let (n, _) = v4.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
     }
 
-    pub fn socket(&self) -> Arc<UdpSocket> {
-        self.socket.clone()
-    }
-
-    pub async fn run(&self) {
-        let mut buf = vec![0u8; 2048];
-        loop {
-            match self.socket.recv_from(&mut buf).await {
-                Ok((len, src_addr)) => {
-                    if len < aurix_common::protocol::HEADER_SIZE {
-                        continue;
-                    }
-                    if let Err(e) = self.router.route_packet(&buf[..len], src_addr).await {
-                        warn!("Packet routing error from {}: {}", src_addr, e);
-                    }
-                }
-                Err(e) => {
-                    error!("UDP recv error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            }
-        }
+    #[tokio::test]
+    async fn ipv4_socket_cannot_reach_ipv6() {
+        let sock = bind_media_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(sock.family(), BoundFamily::V4);
+        assert!(!sock.can_reach("[::1]:1".parse().unwrap()));
+        assert!(sock.can_reach("127.0.0.1:1".parse().unwrap()));
     }
 }

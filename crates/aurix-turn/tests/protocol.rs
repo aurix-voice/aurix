@@ -1,6 +1,6 @@
 //! End-to-end TURN protocol tests over real loopback sockets (UDP and TCP clients).
 
-use aurix_common::config::TurnConfig;
+use aurix_common::config::{MediaConfig, TurnConfig};
 use aurix_common::crypto::{generate_turn_credentials, stun_long_term_key};
 use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use aurix_turn::TurnServer;
@@ -14,9 +14,15 @@ const SECRET: &str = "integration-turn-secret-0123456789";
 const REALM: &str = "test.aurix";
 
 async fn start_server() -> (Arc<TurnServer>, SocketAddr, SocketAddr) {
+    start_server_on("127.0.0.1").await
+}
+
+/// Starts a TURN node bound to `host` (`127.0.0.1` IPv4-only, `::1` IPv6-only, `::`
+/// dual-stack) and returns the UDP and TCP listener addresses as bound.
+async fn start_server_on(host: &str) -> (Arc<TurnServer>, SocketAddr, SocketAddr) {
     let cfg = TurnConfig {
         enabled: true,
-        host: "127.0.0.1".into(),
+        host: host.into(),
         udp_port: 0,
         tcp_port: 0,
         realm: REALM.into(),
@@ -26,11 +32,12 @@ async fn start_server() -> (Arc<TurnServer>, SocketAddr, SocketAddr) {
         allocation_lifetime_secs: 600,
         max_allocations: 100,
         external_ip: None,
+        external_ipv6: None,
         credential_ttl_secs: 3600,
     };
-    let server = Arc::new(TurnServer::new(&cfg));
+    let server = Arc::new(TurnServer::new(&cfg, &MediaConfig::default()));
     let (udp, tcp_addr) = server.bind().await.unwrap();
-    let udp_addr = udp.local_addr().unwrap();
+    let udp_addr = udp.local_addr();
     let s = server.clone();
     tokio::spawn(async move {
         let _ = s.serve_udp(udp).await;
@@ -65,7 +72,11 @@ struct UdpClient {
 
 impl UdpClient {
     async fn new(server: SocketAddr) -> Self {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Self::bound("127.0.0.1:0", server).await
+    }
+
+    async fn bound(local: &str, server: SocketAddr) -> Self {
+        let sock = UdpSocket::bind(local).await.unwrap();
         Self {
             sock,
             server,
@@ -122,6 +133,59 @@ impl UdpClient {
         req.add_attribute(StunAttributeType::RequestedTransport, vec![17, 0, 0, 0]);
         self.roundtrip(&req.encode_with_integrity(&c.key)).await
     }
+
+    /// Allocate with REQUESTED-ADDRESS-FAMILY (RFC 8656 §7.1: 0x01 IPv4, 0x02 IPv6).
+    async fn allocate_family(&self, c: &Creds, family: u8) -> StunMessage {
+        let mut req = self.authed(StunMessageType::AllocateRequest, c);
+        req.add_attribute(StunAttributeType::RequestedTransport, vec![17, 0, 0, 0]);
+        req.add_attribute(
+            StunAttributeType::RequestedAddressFamily,
+            vec![family, 0, 0, 0],
+        );
+        self.roundtrip(&req.encode_with_integrity(&c.key)).await
+    }
+
+    /// CreatePermission + Send indication to `peer`, then a peer → client Data indication.
+    /// Returns the address the peer saw the relayed datagram come from.
+    async fn relay_roundtrip(&self, c: &Creds, peer: &UdpSocket, relay: SocketAddr) -> SocketAddr {
+        let peer_addr = peer.local_addr().unwrap();
+        let mut req = self.authed(StunMessageType::CreatePermissionRequest, c);
+        req.add_xor_address(StunAttributeType::XorPeerAddress, peer_addr);
+        let resp = self.roundtrip(&req.encode_with_integrity(&c.key)).await;
+        assert_eq!(
+            resp.msg_type,
+            StunMessageType::CreatePermissionResponse,
+            "{:?}",
+            error_code(&resp)
+        );
+        let mut ind = StunMessage::new(StunMessageType::SendIndication, txid());
+        ind.add_xor_address(StunAttributeType::XorPeerAddress, peer_addr);
+        ind.add_attribute(StunAttributeType::Data, b"to peer".to_vec());
+        self.send_raw(&ind.encode()).await;
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
+            .await
+            .expect("peer did not receive relayed data")
+            .unwrap();
+        assert_eq!(&buf[..n], b"to peer");
+        peer.send_to(b"to client", relay).await.unwrap();
+        let raw = self.recv().await.expect("data indication");
+        let m = StunMessage::decode(&raw).unwrap();
+        assert_eq!(m.msg_type, StunMessageType::DataIndication);
+        assert_eq!(
+            m.get_attribute(StunAttributeType::Data).unwrap().value,
+            b"to client"
+        );
+        assert_eq!(
+            m.get_xor_address(StunAttributeType::XorPeerAddress),
+            Some(peer_addr)
+        );
+        from
+    }
+}
+
+fn ipv6_loopback_available() -> bool {
+    std::net::UdpSocket::bind("[::1]:0").is_ok()
 }
 
 fn error_code(m: &StunMessage) -> Option<u16> {
@@ -522,4 +586,215 @@ async fn tcp_client_allocates_and_relays_udp() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(server.handler().allocation_count(), 0);
+}
+
+#[tokio::test]
+async fn ipv4_only_listener_offers_ipv4_relays_only() {
+    let (_server, udp_addr, _) = start_server().await;
+    let c = creds("v4only", 600);
+    let mut client = UdpClient::new(udp_addr).await;
+    client.challenge().await;
+    // An explicit IPv6 request on an IPv4-only node: 440 Address Family not Supported.
+    let resp = client.allocate_family(&c, 0x02).await;
+    assert_eq!(resp.msg_type, StunMessageType::AllocateErrorResponse);
+    assert_eq!(error_code(&resp), Some(440));
+    // Explicit IPv4 works and the relay is IPv4.
+    let resp = client.allocate_family(&c, 0x01).await;
+    assert_eq!(
+        resp.msg_type,
+        StunMessageType::AllocateResponse,
+        "{:?}",
+        error_code(&resp)
+    );
+    let relay = resp
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert!(relay.is_ipv4(), "{relay}");
+    assert_eq!(relay.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+}
+
+#[tokio::test]
+async fn ipv6_only_listener_relays_ipv6_and_rejects_ipv4_family() {
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: no IPv6 loopback");
+        return;
+    }
+    let (server, udp_addr, tcp_addr) = start_server_on("::1").await;
+    assert!(udp_addr.is_ipv6() && tcp_addr.is_ipv6());
+    let c = creds("v6only", 600);
+    let mut client = UdpClient::bound("[::1]:0", udp_addr).await;
+    client.challenge().await;
+    // The RFC default family (IPv4) is not offered by an IPv6-only node.
+    let resp = client.allocate(&c).await;
+    assert_eq!(error_code(&resp), Some(440));
+    let resp = client.allocate_family(&c, 0x02).await;
+    assert_eq!(
+        resp.msg_type,
+        StunMessageType::AllocateResponse,
+        "{:?}",
+        error_code(&resp)
+    );
+    let relay = resp
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert_eq!(relay.ip(), "::1".parse::<std::net::IpAddr>().unwrap());
+    assert!((40000..=40100).contains(&relay.port()));
+    let mapped = resp
+        .get_xor_address(StunAttributeType::XorMappedAddress)
+        .unwrap();
+    assert_eq!(mapped, client.sock.local_addr().unwrap());
+    // An IPv4 peer on an IPv6 relay: 443 Peer Address Family Mismatch.
+    {
+        let mut req = client.authed(StunMessageType::CreatePermissionRequest, &c);
+        req.add_xor_address(
+            StunAttributeType::XorPeerAddress,
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let resp = client.roundtrip(&req.encode_with_integrity(&c.key)).await;
+        assert_eq!(error_code(&resp), Some(443));
+    }
+    let peer = UdpSocket::bind("[::1]:0").await.unwrap();
+    let from = client.relay_roundtrip(&c, &peer, relay).await;
+    assert_eq!(from, relay);
+    assert_eq!(server.handler().allocation_count(), 1);
+}
+
+#[tokio::test]
+async fn dual_stack_listener_serves_both_families_with_canonical_addresses() {
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: no IPv6 loopback");
+        return;
+    }
+    let (server, udp_addr, _) = start_server_on("::").await;
+    let port = udp_addr.port();
+    let v4_server = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
+    let v6_server = SocketAddr::new("::1".parse().unwrap(), port);
+
+    // IPv4 client through the dual-stack socket: XOR-MAPPED-ADDRESS is plain IPv4 (not
+    // ::ffff:127.0.0.1) and the default relay family is IPv4.
+    let c4 = creds("dual-v4", 600);
+    let mut v4 = UdpClient::new(v4_server).await;
+    v4.challenge().await;
+    let resp = v4.allocate(&c4).await;
+    assert_eq!(
+        resp.msg_type,
+        StunMessageType::AllocateResponse,
+        "{:?}",
+        error_code(&resp)
+    );
+    let mapped = resp
+        .get_xor_address(StunAttributeType::XorMappedAddress)
+        .unwrap();
+    assert_eq!(mapped, v4.sock.local_addr().unwrap());
+    let relay4 = resp
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert!(relay4.is_ipv4(), "{relay4}");
+    // No external address configured and a wildcard bind: the node advertises the wildcard
+    // and the client reaches the relay on the address it reached the server on.
+    let relay4 = SocketAddr::new("127.0.0.1".parse().unwrap(), relay4.port());
+    let peer4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(v4.relay_roundtrip(&c4, &peer4, relay4).await, relay4);
+
+    // IPv6 client asks for an IPv6 relay.
+    let c6 = creds("dual-v6", 600);
+    let mut v6 = UdpClient::bound("[::1]:0", v6_server).await;
+    v6.challenge().await;
+    let resp = v6.allocate_family(&c6, 0x02).await;
+    assert_eq!(
+        resp.msg_type,
+        StunMessageType::AllocateResponse,
+        "{:?}",
+        error_code(&resp)
+    );
+    assert_eq!(
+        resp.get_xor_address(StunAttributeType::XorMappedAddress),
+        Some(v6.sock.local_addr().unwrap())
+    );
+    let relay6 = resp
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert!(relay6.is_ipv6(), "{relay6}");
+    let relay6 = SocketAddr::new("::1".parse().unwrap(), relay6.port());
+    let peer6 = UdpSocket::bind("[::1]:0").await.unwrap();
+    assert_eq!(v6.relay_roundtrip(&c6, &peer6, relay6).await, relay6);
+
+    // An IPv6 client may also ask for an IPv4 relay on a dual-stack node (RFC 8656 §7.2 lets
+    // the families differ).
+    let c6b = creds("dual-v6-to-v4", 600);
+    let mut v6b = UdpClient::bound("[::1]:0", v6_server).await;
+    v6b.challenge().await;
+    let resp = v6b.allocate_family(&c6b, 0x01).await;
+    assert_eq!(
+        resp.msg_type,
+        StunMessageType::AllocateResponse,
+        "{:?}",
+        error_code(&resp)
+    );
+    let relay = resp
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert!(relay.is_ipv4(), "{relay}");
+    let relay = SocketAddr::new("127.0.0.1".parse().unwrap(), relay.port());
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(v6b.relay_roundtrip(&c6b, &peer, relay).await, relay);
+
+    assert_eq!(server.handler().allocation_count(), 3);
+}
+
+#[tokio::test]
+async fn configured_external_addresses_are_advertised_per_family() {
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: no IPv6 loopback");
+        return;
+    }
+    let cfg = TurnConfig {
+        enabled: true,
+        host: "::".into(),
+        udp_port: 0,
+        tcp_port: 0,
+        realm: REALM.into(),
+        auth_secret: SECRET.into(),
+        min_port: 40000,
+        max_port: 40100,
+        allocation_lifetime_secs: 600,
+        max_allocations: 100,
+        external_ip: Some("203.0.113.7".into()),
+        external_ipv6: Some("2001:db8::7".into()),
+        credential_ttl_secs: 3600,
+    };
+    let server = Arc::new(TurnServer::new(&cfg, &MediaConfig::default()));
+    let (udp, _tcp) = server.bind().await.unwrap();
+    let port = udp.local_addr().port();
+    let s = server.clone();
+    tokio::spawn(async move {
+        let _ = s.serve_udp(udp).await;
+    });
+
+    let c = creds("ext", 600);
+    let mut client = UdpClient::new(SocketAddr::new("127.0.0.1".parse().unwrap(), port)).await;
+    client.challenge().await;
+    let relay4 = client
+        .allocate_family(&c, 0x01)
+        .await
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert_eq!(
+        relay4.ip(),
+        "203.0.113.7".parse::<std::net::IpAddr>().unwrap()
+    );
+
+    let c6 = creds("ext6", 600);
+    let mut client6 =
+        UdpClient::bound("[::1]:0", SocketAddr::new("::1".parse().unwrap(), port)).await;
+    client6.challenge().await;
+    let relay6 = client6
+        .allocate_family(&c6, 0x02)
+        .await
+        .get_xor_address(StunAttributeType::XorRelayedAddress)
+        .unwrap();
+    assert_eq!(
+        relay6.ip(),
+        "2001:db8::7".parse::<std::net::IpAddr>().unwrap()
+    );
 }

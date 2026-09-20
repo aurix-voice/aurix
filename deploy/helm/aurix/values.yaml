@@ -71,6 +71,14 @@ config:
   externalIpScript: |
     TOKEN=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
     curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4
+  # Optional public IPv6 of each pod (dual-stack). When set, media and TURN bind `::` (dual-stack)
+  # and advertise both families: IPv4 stays first in every endpoint list, IPv6 is an additional
+  # candidate. Same shape as the IPv4 settings: one value or a per-ordinal list.
+  externalIpv6: ""
+  externalIpv6s: []
+  # Bind media and TURN on `::` (dual-stack) even without a public IPv6 - lets IPv6-only
+  # clients reach the node through NAT64/other means you control. Implied by externalIpv6*.
+  dualStack: false
   logLevel: info
   turn:
     enabled: true

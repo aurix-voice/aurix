@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -206,18 +207,50 @@ namespace Aurix.Transport
         public static MediaTransport OverTunnel(IMediaTunnel tunnel, Guid sessionId, uint ssrc, byte[] mediaKey, SequenceCounter sequence = null) =>
             new MediaTransport(tunnel, sessionId, ssrc, mediaKey, sequence ?? new SequenceCounter());
 
-        /// <summary>Resolve <c>host:port</c> as delivered in <c>SessionInitAck.media_addr</c>.</summary>
+        /// <summary>Resolve <c>host:port</c> as delivered in <c>SessionInitAck.media_addr</c> (IPv4 preferred for host names).</summary>
         public static async Task<IPEndPoint> ResolveAsync(string mediaAddr)
+        {
+            var all = await ResolveAllAsync(mediaAddr).ConfigureAwait(false);
+            if (all.Count == 0) throw new SocketException((int)SocketError.HostNotFound);
+            return all[0];
+        }
+
+        /// <summary>
+        /// Resolve every media endpoint the node advertised (<c>SessionInitAck.media_addrs</c>: IPv4 first, then
+        /// IPv6; older nodes send only <c>media_addr</c>) into distinct UDP candidates in bind order. Entries that
+        /// fail to parse or resolve are skipped as long as at least one candidate remains.
+        /// </summary>
+        public static async Task<List<IPEndPoint>> ResolveCandidatesAsync(string mediaAddr, IReadOnlyList<string> mediaAddrs)
+        {
+            var endpoints = mediaAddrs != null && mediaAddrs.Count > 0 ? mediaAddrs : new[] { mediaAddr };
+            var result = new List<IPEndPoint>();
+            Exception last = null;
+            foreach (var ep in endpoints)
+            {
+                if (string.IsNullOrEmpty(ep)) continue;
+                try
+                {
+                    foreach (var candidate in await ResolveAllAsync(ep).ConfigureAwait(false))
+                        if (!result.Contains(candidate)) result.Add(candidate);
+                }
+                catch (Exception e) { last = e; }
+            }
+            if (result.Count == 0) throw last ?? new SocketException((int)SocketError.HostNotFound);
+            return result;
+        }
+
+        private static async Task<List<IPEndPoint>> ResolveAllAsync(string mediaAddr)
         {
             int colon = mediaAddr.LastIndexOf(':');
             if (colon <= 0) throw new FormatException("media_addr must be host:port");
             var host = mediaAddr.Substring(0, colon).Trim('[', ']');
             var port = int.Parse(mediaAddr.Substring(colon + 1));
-            if (IPAddress.TryParse(host, out var ip)) return new IPEndPoint(ip, port);
+            var result = new List<IPEndPoint>();
+            if (IPAddress.TryParse(host, out var ip)) { result.Add(new IPEndPoint(ip, port)); return result; }
             var addrs = await Dns.GetHostAddressesAsync(host).ConfigureAwait(false);
-            foreach (var a in addrs) if (a.AddressFamily == AddressFamily.InterNetwork) return new IPEndPoint(a, port);
-            if (addrs.Length == 0) throw new SocketException((int)SocketError.HostNotFound);
-            return new IPEndPoint(addrs[0], port);
+            foreach (var a in addrs) if (a.AddressFamily == AddressFamily.InterNetwork) result.Add(new IPEndPoint(a, port));
+            foreach (var a in addrs) if (a.AddressFamily == AddressFamily.InterNetworkV6) result.Add(new IPEndPoint(a, port));
+            return result;
         }
 
         /// <summary>

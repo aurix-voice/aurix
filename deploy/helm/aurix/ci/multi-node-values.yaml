@@ -9,6 +9,7 @@ config:
     latitude: "38.9"
     longitude: "-77.0"
   externalIpSource: script
+  externalIpv6s: ["2001:db8::10", "2001:db8::11", "2001:db8::12"]
   turn:
     enabled: true
     realm: voice.example.com

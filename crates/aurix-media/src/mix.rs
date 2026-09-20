@@ -22,6 +22,7 @@
 //! streams); recording, transcription, safety and the cascade tap the sender's frame before
 //! delivery, so mixing is a pure downlink optimisation.
 
+use crate::transport::MediaSocket;
 use aurix_common::protocol::{channel_id_hash, AurixPacket, PacketFlags, PacketHeader, PacketType};
 use aurix_common::types::{AudioCodec, ChannelId, SessionId};
 use bytes::Bytes;
@@ -31,7 +32,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
 use crate::channel::{MediaChannel, Mix};
@@ -130,7 +130,7 @@ impl MixNode {
     }
 
     /// Seals and sends one mixed frame to every subscriber.
-    async fn emit(&self, frame: &[u8], socket: &UdpSocket) {
+    async fn emit(&self, frame: &[u8], socket: &MediaSocket) {
         let subs: Vec<(Arc<MediaSession>, Arc<AtomicU32>)> = self
             .subscribers
             .lock()
@@ -251,7 +251,7 @@ impl MixNode {
 }
 
 pub struct MixHub {
-    socket: Arc<UdpSocket>,
+    socket: Arc<MediaSocket>,
     bitrate_bps: i32,
     nodes: DashMap<Slot, Arc<MixNode>>,
     /// Which mixer currently serves each (receiver, channel).
@@ -262,7 +262,7 @@ pub struct MixHub {
 }
 
 impl MixHub {
-    pub fn new(socket: Arc<UdpSocket>, bitrate_bps: i32) -> Arc<Self> {
+    pub fn new(socket: Arc<MediaSocket>, bitrate_bps: i32) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             socket,
             bitrate_bps,

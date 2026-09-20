@@ -2294,10 +2294,11 @@ pub async fn upsert_media_node(
     node: &MediaNodeRow,
 ) -> Result<MediaNodeRow, sqlx::Error> {
     sqlx::query_as::<_, MediaNodeRow>(
-        r#"INSERT INTO media_nodes (id, region, address, media_port, api_port, capacity, active_channels, active_participants, cpu_usage, memory_usage, bandwidth_in_mbps, bandwidth_out_mbps, healthy, version, last_heartbeat, registered_at, cascade_port, ws_url, api_url, latitude, longitude)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        r#"INSERT INTO media_nodes (id, region, address, media_port, api_port, capacity, active_channels, active_participants, cpu_usage, memory_usage, bandwidth_in_mbps, bandwidth_out_mbps, healthy, version, last_heartbeat, registered_at, cascade_port, ws_url, api_url, latitude, longitude, address_ipv6)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
            ON CONFLICT (id) DO UPDATE SET
              region = EXCLUDED.region, address = EXCLUDED.address, media_port = EXCLUDED.media_port,
+             address_ipv6 = EXCLUDED.address_ipv6,
              api_port = EXCLUDED.api_port, cascade_port = EXCLUDED.cascade_port, version = EXCLUDED.version,
              ws_url = EXCLUDED.ws_url, api_url = EXCLUDED.api_url,
              latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude,
@@ -2314,6 +2315,7 @@ pub async fn upsert_media_node(
     .bind(node.healthy).bind(&node.version).bind(node.last_heartbeat).bind(node.registered_at)
     .bind(node.cascade_port)
     .bind(&node.ws_url).bind(&node.api_url).bind(node.latitude).bind(node.longitude)
+    .bind(&node.address_ipv6)
     .fetch_one(pool).await
 }
 

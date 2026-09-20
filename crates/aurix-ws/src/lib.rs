@@ -2521,21 +2521,19 @@ async fn handle_ws_connection(
             Err(_) => (None, mpsc::channel(1).1),
         };
 
-    let media_addr = format!(
-        "{}:{}",
-        state
-            .control
-            .config
-            .media
-            .external_ip
-            .as_deref()
-            .unwrap_or(&state.control.config.server.host),
-        state.control.config.media.port
-    );
+    let mut media_addrs = state.control.config.media.advertised_endpoints();
+    if media_addrs.is_empty() {
+        media_addrs.push(aurix_common::addr::host_port(
+            &state.control.config.server.host,
+            state.control.config.media.port,
+        ));
+    }
+    let media_addr = media_addrs[0].clone();
     let init_ack = ControlMessage::SessionInitAck {
         session_id,
         ssrc: attached.ssrc,
         media_addr,
+        media_addrs,
         media_key: base64::engine::general_purpose::STANDARD.encode(attached.media_key),
         resume_token: resume_token.token,
         resume_grace_ms: grace.as_millis() as u64,

@@ -14,6 +14,7 @@
 //! Topology is per channel: a packet is forwarded only to the nodes that currently host
 //! participants of that channel (see `set_channel_peers`, driven by `CascadeTopology`).
 
+use crate::transport::{bind_media_socket, MediaSocket};
 use aurix_common::crypto::MediaKeys;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{
@@ -27,7 +28,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
 pub struct CascadeRelay {
@@ -39,7 +39,7 @@ pub struct CascadeRelay {
     static_peers: HashSet<SocketAddr>,
     /// Peers currently known through discovery (healthy nodes from the registry).
     dynamic_peers: Mutex<HashSet<SocketAddr>>,
-    socket: Arc<UdpSocket>,
+    socket: Arc<MediaSocket>,
     local_addr: SocketAddr,
     keys: MediaKeys,
     relay_ssrc: u32,
@@ -49,7 +49,7 @@ pub struct CascadeRelay {
 
 impl CascadeRelay {
     pub async fn new(
-        bind_addr: &str,
+        bind_addr: SocketAddr,
         local_node_id: MediaNodeId,
         secret: &str,
         peers: &[String],
@@ -59,18 +59,20 @@ impl CascadeRelay {
                 "media.cascade_secret must be at least 16 characters".into(),
             ));
         }
-        let socket = UdpSocket::bind(bind_addr)
-            .await
+        let socket = bind_media_socket(bind_addr)
             .map_err(|e| AurixError::Transport(format!("Cascade bind failed: {e}")))?;
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| AurixError::Transport(format!("Cascade local_addr failed: {e}")))?;
+        let local_addr = socket.local_addr();
         let allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>> = Arc::new(DashMap::new());
         let mut static_peers = HashSet::new();
         for p in peers {
-            let addr: SocketAddr = p.parse().map_err(|_| {
+            let addr: SocketAddr = p.parse().map(aurix_common::addr::canonical).map_err(|_| {
                 AurixError::InvalidConfiguration(format!("Invalid cascade peer address: {p}"))
             })?;
+            if !socket.can_reach(addr) {
+                return Err(AurixError::InvalidConfiguration(format!(
+                    "cascade peer {p} is not reachable from the cascade socket bound to {local_addr}"
+                )));
+            }
             allowed_peers.insert(addr, Mutex::new(ReplayWindow::default()));
             static_peers.insert(addr);
         }
@@ -84,7 +86,7 @@ impl CascadeRelay {
             allowed_peers,
             static_peers,
             dynamic_peers: Mutex::new(HashSet::new()),
-            socket: Arc::new(socket),
+            socket,
             local_addr,
             keys: MediaKeys::derive(secret.as_bytes()),
             relay_ssrc: rand::random(),
@@ -111,6 +113,11 @@ impl CascadeRelay {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Which address families this relay can exchange datagrams with.
+    pub fn family(&self) -> aurix_common::net::BoundFamily {
+        self.socket.family()
     }
 
     pub fn allowed_peers(&self) -> Vec<SocketAddr> {
@@ -316,7 +323,7 @@ mod tests {
     async fn rejects_unknown_peer_and_bad_tag() {
         let peer: SocketAddr = "127.0.0.1:45001".parse().unwrap();
         let relay = CascadeRelay::new(
-            "127.0.0.1:0",
+            "127.0.0.1:0".parse().unwrap(),
             MediaNodeId::new(),
             "0123456789abcdef",
             &[peer.to_string()],
@@ -360,7 +367,7 @@ mod tests {
         let dyn_a: SocketAddr = "127.0.0.1:45010".parse().unwrap();
         let dyn_b: SocketAddr = "127.0.0.1:45011".parse().unwrap();
         let relay = CascadeRelay::new(
-            "127.0.0.1:0",
+            "127.0.0.1:0".parse().unwrap(),
             MediaNodeId::new(),
             "0123456789abcdef",
             &[static_peer.to_string()],
@@ -405,7 +412,7 @@ mod tests {
     async fn restarted_peer_continues_above_its_previous_counters() {
         let peer: SocketAddr = "127.0.0.1:45020".parse().unwrap();
         let relay = CascadeRelay::new(
-            "127.0.0.1:0",
+            "127.0.0.1:0".parse().unwrap(),
             MediaNodeId::new(),
             "0123456789abcdef",
             &[peer.to_string()],

@@ -133,6 +133,33 @@ jobs:
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8090/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8090/ready
           cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture strict_mode
+      - name: E2E (dual-stack media and TURN on ::)
+        env:
+          AURIX__TURN__ENABLED: "true"
+          AURIX__TURN__AUTH_SECRET: ci-only-turn-secret-0123456789abcdefghijklmno
+          AURIX__TURN__HOST: "::"
+          AURIX__TURN__UDP_PORT: "3479"
+          AURIX__TURN__TCP_PORT: "3479"
+          AURIX__TURN__MIN_PORT: "41000"
+          AURIX__TURN__MAX_PORT: "41100"
+          AURIX__RECORDING__ENABLED: "false"
+          AURIX__MEDIA__HOST: "::"
+          AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          AURIX__MEDIA__EXTERNAL_IPV6: "::1"
+          AURIX__SERVER__API_PORT: "8070"
+          AURIX__SERVER__WS_PORT: "8071"
+          AURIX__MEDIA__PORT: "10006"
+          AURIX__METRICS__PORT: "9096"
+          AURIX__TRACING__LOG_FORMAT: text
+          AURIX_E2E_IPV6: "1"
+          AURIX_E2E_API: http://127.0.0.1:8070
+          AURIX_E2E_WS: ws://127.0.0.1:8071
+          AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
+        run: |
+          nohup ./target/debug/aurix-server > server-dual-stack.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8070/ready && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8070/ready
+          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture dual_stack_node
       - name: E2E (speech, content safety and recording post-processing against the mock provider)
         env:
           AURIX__TURN__ENABLED: "false"
