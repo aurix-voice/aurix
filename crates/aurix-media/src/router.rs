@@ -675,6 +675,30 @@ impl PacketRouter {
         Ok(())
     }
 
+    /// Inject a synthesized Opus frame meant for `listener` alone (a spoken translation):
+    /// sealed for that receiver only, never mixed with or relayed to anyone else, not recorded
+    /// or transcribed. `listener` must be a participant of `channel_id`.
+    pub async fn inject_listener_audio(
+        &self,
+        listener: &Arc<MediaSession>,
+        channel_id: &ChannelId,
+        frame: InjectedFrame,
+    ) -> Result<()> {
+        if !listener.is_active() {
+            return Err(AurixError::SessionNotFound(listener.session_id.to_string()));
+        }
+        let channel = self.channel_for_sender(channel_id, listener)?;
+        let packet = frame.into_packet(channel_id);
+        self.deliver_scoped(
+            &channel,
+            vec![(listener.clone(), Mix::UNITY)],
+            &packet,
+            false,
+        )
+        .await;
+        Ok(())
+    }
+
     fn channel_for_sender(
         &self,
         channel_id: &ChannelId,

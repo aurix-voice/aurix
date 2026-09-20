@@ -99,3 +99,80 @@ channel plays the announcement to its participants on a per-channel system SSRC 
 attached), and progress is published as `tts.status` events. `GET /v1/tts/voices` returns
 `{enabled, client_requests, voices, max_text_chars, max_audio_secs}` so a client can build its
 voice picker from the server's configuration.
+
+## Live translation
+
+With `[translation]` enabled each listener picks the language they want captions in and the
+node translates every captioned segment **once per requested language** through a
+machine-translation server you run yourself — LibreTranslate-compatible `POST /translate`
+(`provider = "libretranslate"`) or an OpenAI-compatible `POST /v1/chat/completions` with a
+translation prompt (`provider = "openai_chat"`: vLLM, Ollama, llama.cpp, hosted LLMs). STT stays
+the input, so `[stt]` must be on; the mock speech server also answers `/translate`.
+
+```toml
+[translation]
+enabled = true
+provider = "libretranslate"
+endpoint = "http://libretranslate:5000"
+# api_key, model (openai_chat)
+timeout_ms = 10000
+max_concurrent_requests = 8
+max_text_chars = 2000
+languages = ["en", "de", "fr", "pt-BR"]   # offer; empty = any BCP-47 tag
+max_languages_per_channel = 8
+cache_entries = 2048
+speech = true                             # spoken translations through [tts]
+[translation.voices]
+de = "thorsten"
+```
+
+`SessionInitAck.translation` (`{speech, languages}`) tells a client what the node offers; it is
+absent on nodes without translation. A listener then sends
+
+```json
+{"type":"SetTranslation","data":{"language":"de","spoken_language":"en","speech":true}}
+```
+
+(Web `setTranslation("de", {spokenLanguage, speech})`, Unity `SetTranslationAsync`, native
+`aurix_client_set_translation`, Unreal `SetTranslation`). Tags are normalised (`DE_de` →
+`de-de`), checked against the offer (`VALIDATION_ERROR` otherwise) and echoed back as
+`TranslationChanged`; `language: null` stops translating, and `speech` without a target is
+dropped. `spoken_language` is a hint for the transcriber when the provider cannot detect the
+speaker's language. Preferences survive a resume, including on another node.
+
+What each participant receives for a segment:
+
+* the **speaker** and listeners without a target — or whose target is the segment's language —
+  get the original `Transcript` immediately, before any translation starts;
+* a listener with another target gets the same segment (same `id`, `user_id`, `started_at`,
+  `duration_ms`) with `text` and `language` replaced and the source attached as
+  `"original": {"text": "…", "language": "en"}`; word timings do not survive translation;
+* a listener with `speech: true` additionally hears the translation spoken **privately** on the
+  channel's translator SSRC (a synthetic SSRC distinct from the announcement voice), through the
+  same `[tts]` provider, voice per language from `translation.voices`. Nobody else — not the
+  speaker, not listeners of other languages — gets a frame, and no `TtsStatus` is emitted for it.
+
+Translation never widens who hears whom: tenant, channel membership, transcript opt-in, local
+mutes, blocks, zero gain, text reachability and radius / ambient visibility are evaluated
+exactly as for the original caption, and re-checked after the provider round trip, so a listener
+who muted the speaker meanwhile gets nothing. When the provider fails, times out, the segment is
+longer than `max_text_chars` or the node's `max_concurrent_requests` are busy, the listener gets
+the **original** transcript instead (never marked as translated); results are cached per node
+(`cache_entries`), failures are not. With more distinct targets than
+`max_languages_per_channel` in one channel the most-requested languages win and the rest fall
+back to the original. `aurix_translations_total{outcome="ok"|"cached"|"error"|"busy"|"skipped"}`
+and `aurix_translation_latency_seconds` count it all. Provider keys stay on the node; translated
+text is as ephemeral as the transcripts it comes from.
+
+## Voice effects (native SDK)
+
+The native core (and thus Unreal) can run a chain of **voice effects** on the microphone uplink,
+after noise suppression / AEC / AGC and input gain and before the VAD meter and the encoder, so
+what peers hear, the level bars and the transcripts all reflect the effected voice. Built in:
+`PitchShift` (±24 semitones), `RingModulator` (robot voice, up to 2 kHz) and `CallbackEffect`
+for the host's own DSP (`aurix_client_set_voice_effect_callback`: called on the capture thread
+with a 20 ms 48 kHz frame, mono or interleaved stereo — no blocking, no allocation). Effects
+touch only the microphone: injected audio, TTS and the downlink are untouched, and the mono /
+stereo / PCMU paths all see the processed frame. Rust `Client::set_voice_effects(EffectChain)`,
+C `aurix_client_set_voice_effects(&AurixVoiceEffects)`, Unreal `SetVoiceEffects`. Unity and the
+Web SDK run the engine's / browser's own audio graph and have no effect chain.

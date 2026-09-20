@@ -288,6 +288,37 @@ max_queued_per_session = 3
 max_queued_per_channel = 8
 requests_per_minute_per_session = 10
 
+[translation]
+# Live translation of transcripts: each listener names the language they want
+# (`SetTranslation`), the node translates every captioned segment once per requested language
+# through a self-hosted machine-translation server and delivers the translated caption (with
+# the original attached) only to the listeners who asked for it; optionally the translation is
+# also spoken privately to them through `[tts]`. Off by default; needs `[stt]`.
+enabled = false
+# "libretranslate" (POST /translate; LibreTranslate, Argos servers) or "openai_chat"
+# (POST /v1/chat/completions with a translation prompt; vLLM, Ollama, llama.cpp, hosted LLMs).
+provider = "libretranslate"
+# endpoint = "http://libretranslate:5000"
+# api_key = "…"            # AURIX__TRANSLATION__API_KEY
+# model = "…"              # openai_chat only
+timeout_ms = 10000
+# Provider requests in flight per node; further segments fall back to the original text.
+max_concurrent_requests = 8
+# Segments longer than this are delivered untranslated.
+max_text_chars = 2000
+# Target languages listeners may request (BCP-47 tags, empty = any); AURIX__TRANSLATION__LANGUAGES=de,fr
+languages = []
+# Distinct target languages translated per segment and channel (most-requested win).
+max_languages_per_channel = 8
+# Identical (source, target, text) translations remembered per node.
+cache_entries = 2048
+# Offer spoken translations (`SetTranslation { speech: true }`); requires `[tts]`.
+speech = true
+# TTS voice per target language; others use `tts.default_voice`.
+# [translation.voices]
+# de = "thorsten"
+# fr = "siwis"
+
 [safety]
 # Content safety: chat messages (and TTS text) and — for channels created with
 # `safety_voice = true` — speech transcripts go through a normalized lexicon and/or an HTTP

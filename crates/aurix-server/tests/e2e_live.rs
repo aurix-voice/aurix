@@ -25,6 +25,7 @@ use aurix_turn::stun::{StunAttributeType, StunMessage, StunMessageType};
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -97,6 +98,7 @@ struct Player {
     media_tunnel: bool,
     migrated: bool,
     failover: Vec<String>,
+    translation: Option<aurix_common::protocol::TranslationInfo>,
 }
 
 impl Player {
@@ -273,6 +275,7 @@ async fn connect_with(
         downlink_mix,
         migrated,
         failover,
+        translation,
     } = msg
     else {
         panic!("{name}: expected SessionInitAck, got {t}");
@@ -311,6 +314,7 @@ async fn connect_with(
         media_tunnel,
         migrated,
         failover,
+        translation,
     }
 }
 
@@ -12167,4 +12171,362 @@ async fn usage_analytics_export_and_per_app_quotas() {
     )
     .await;
     assert_eq!(status, 404, "{unknown}");
+}
+
+async fn set_translation(
+    p: &mut Player,
+    language: Option<&str>,
+    spoken_language: Option<&str>,
+    speech: bool,
+) -> (Option<String>, Option<String>, bool) {
+    p.send(&ControlMessage::SetTranslation {
+        language: language.map(str::to_string),
+        spoken_language: spoken_language.map(str::to_string),
+        speech,
+    })
+    .await;
+    let m = p
+        .expect("TranslationChanged", |m| {
+            matches!(m, ControlMessage::TranslationChanged { .. })
+        })
+        .await;
+    match m {
+        ControlMessage::TranslationChanged {
+            language,
+            spoken_language,
+            speech,
+        } => (language, spoken_language, speech),
+        _ => unreachable!(),
+    }
+}
+
+/// Live translation against the mock provider (`examples/mock_speech.rs`, `POST /translate`):
+/// listeners who asked for another language get the segment translated (with the original
+/// attached) while everyone else — including the speaker, whatever they asked for — gets the
+/// untranslated text at once; a failing or too slow provider degrades to the original text;
+/// spoken translations reach the requesting listener alone on the channel's translation SSRC;
+/// eligibility (local mute) and the node's language offer are enforced; clearing the
+/// preference restores originals. Needs `translation.*` enabled on the node(s).
+#[tokio::test]
+#[ignore = "requires a running Aurix server with STT/TTS/translation pointed at examples/mock_speech.rs"]
+async fn live_translation_per_listener_language() {
+    use aurix_media::tts::translation_voice_ssrc;
+
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let same_node = std::env::var("AURIX_E2E_WS2").is_err();
+    let env2 = match std::env::var("AURIX_E2E_WS2") {
+        Ok(ws) => Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+            ws,
+            api_key: env.api_key.clone(),
+        },
+        Err(_) => {
+            eprintln!(
+                "AURIX_E2E_WS2 not set; running the spoken-translation listener on the same node"
+            );
+            env.clone()
+        }
+    };
+
+    let spoken = create_channel_with(&env, &http, serde_json::json!({"transcription": true})).await;
+    let mut players = Vec::new();
+    for (ext, name, e) in [
+        ("mt:alice", "alice", &env),
+        ("mt:bob", "bob", &env),
+        ("mt:carol", "carol", &env2),
+        ("mt:dave", "dave", &env),
+        ("mt:erin", "erin", &env),
+        ("mt:frank", "frank", &env),
+    ] {
+        let (tok, uid) = issue_token(e, &http, ext, name, spoken).await;
+        let mut p = connect(e, name, tok).await;
+        bind_media(&mut p).await;
+        players.push((p, UserId::from_uuid(uid.parse().unwrap())));
+    }
+    let [(mut alice, uid_a), (mut bob, _), (mut carol, _), (mut dave, _), (mut erin, _), (mut frank, _)] =
+        <[_; 6]>::try_from(players).ok().unwrap();
+
+    let Some(info) = alice.translation.clone() else {
+        eprintln!("translation not enabled on the node; skipping (set AURIX__TRANSLATION__*)");
+        return;
+    };
+    assert!(
+        info.speech,
+        "the E2E node runs with TTS, so spoken translations are offered: {info:?}"
+    );
+    for lang in ["de", "fr", "it", "nl"] {
+        assert!(
+            info.languages.iter().any(|l| l == lang),
+            "the E2E node offers {lang}: {info:?}"
+        );
+    }
+    assert_eq!(carol.translation.as_ref().map(|i| i.speech), Some(true));
+
+    for p in [
+        &mut alice, &mut bob, &mut carol, &mut dave, &mut erin, &mut frank,
+    ] {
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id: spoken,
+            token: tok,
+        })
+        .await;
+        p.expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { channel_id, .. } if *channel_id == spoken)
+        })
+        .await;
+    }
+
+    // ── preference validation ──
+    bob.send(&ControlMessage::SetTranslation {
+        language: Some("not a tag!".into()),
+        spoken_language: None,
+        speech: false,
+    })
+    .await;
+    expect_error(&mut bob, "garbage language tag", "VALIDATION_ERROR").await;
+    bob.send(&ControlMessage::SetTranslation {
+        language: Some("ja".into()),
+        spoken_language: None,
+        speech: false,
+    })
+    .await;
+    expect_error(
+        &mut bob,
+        "language outside the node's offer",
+        "VALIDATION_ERROR",
+    )
+    .await;
+    assert_eq!(
+        set_translation(&mut bob, None, Some("EN_us"), true).await,
+        (None, Some("en-us".into()), false),
+        "speech without a target is meaningless and normalisation is the server's"
+    );
+    assert_eq!(
+        set_translation(&mut bob, Some(" DE "), Some("en"), false).await,
+        (Some("de".into()), Some("en".into()), false)
+    );
+    assert_eq!(
+        set_translation(&mut carol, Some("fr"), None, true).await,
+        (Some("fr".into()), None, true)
+    );
+    assert_eq!(
+        set_translation(&mut erin, Some("it"), None, false).await.0,
+        Some("it".into())
+    );
+    assert!(set_translation(&mut frank, Some("nl"), None, true).await.2);
+    for p in [
+        &mut alice, &mut bob, &mut carol, &mut dave, &mut erin, &mut frank,
+    ] {
+        drain_ws(p).await;
+    }
+    for p in [&alice, &bob, &carol, &dave, &erin, &frank] {
+        drain_udp(p).await;
+    }
+
+    let before = translation_counters(&http).await;
+    if before.is_none() {
+        eprintln!("AURIX_E2E_METRICS not set; skipping translation counters");
+    }
+
+    // ── one segment, five listeners, four languages ──
+    let carol_voice = translation_voice_ssrc(&spoken);
+    let started = tokio::time::Instant::now();
+    stream_frames(&alice, spoken, 1, &opus_tone(440.0, 1_600), false).await;
+    let original = expect_transcript(&mut alice, spoken, uid_a).await;
+    assert!(
+        tone_hz(&original.text).is_some_and(|hz| (hz - 440.0).abs() < 10.0),
+        "speaker captions stay in the spoken language: {original:?}"
+    );
+    assert_eq!(original.language.as_deref(), Some("en"));
+    assert!(original.original.is_none());
+
+    let td = expect_transcript(&mut dave, spoken, uid_a).await;
+    assert_eq!(
+        (td.id, &td.text, td.original.is_none()),
+        (original.id, &original.text, true)
+    );
+
+    let tb = expect_transcript(&mut bob, spoken, uid_a).await;
+    assert_eq!(tb.id, original.id, "the translation is the same segment");
+    assert_eq!(tb.text, format!("[de] {}", original.text));
+    assert_eq!(tb.language.as_deref(), Some("de"));
+    let orig = tb
+        .original
+        .clone()
+        .expect("translated transcripts carry the original");
+    assert_eq!(
+        (orig.text.as_str(), orig.language.as_deref()),
+        (original.text.as_str(), Some("en"))
+    );
+    assert!(
+        tb.words.is_empty(),
+        "word timings do not survive translation: {tb:?}"
+    );
+
+    let tc = expect_transcript(&mut carol, spoken, uid_a).await;
+    assert_eq!(tc.text, format!("[fr] {}", original.text));
+    assert_eq!(tc.language.as_deref(), Some("fr"));
+
+    // Provider failure (it) and timeout (nl, 3 s against a 1.5 s budget) fall back to the original.
+    let te = expect_transcript(&mut erin, spoken, uid_a).await;
+    assert_eq!(
+        (te.id, &te.text, te.language.as_deref()),
+        (original.id, &original.text, Some("en"))
+    );
+    assert!(
+        te.original.is_none(),
+        "a fallback is not marked as translated: {te:?}"
+    );
+    let tf = expect_transcript(&mut frank, spoken, uid_a).await;
+    assert_eq!((tf.id, &tf.text), (original.id, &original.text));
+    assert!(tf.original.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "the timeout fallback must not wait for the slow provider"
+    );
+
+    // Spoken translation: Carol alone hears it (mock TTS: 1 s of 24 kHz sine → 50 Opus frames).
+    let ((got_c, ok_c), got_b, got_d, got_f) = tokio::join!(
+        synth_audio_from(&carol, carol_voice, Duration::from_millis(2_500)),
+        synth_audio_from(&bob, carol_voice, Duration::from_millis(2_500)),
+        synth_audio_from(&dave, carol_voice, Duration::from_millis(2_500)),
+        synth_audio_from(&frank, carol_voice, Duration::from_millis(2_500)),
+    );
+    assert!(
+        (45..=55).contains(&got_c) && ok_c,
+        "carol hears her translation spoken: {got_c} ok={ok_c}"
+    );
+    assert_eq!(
+        (got_b.0, got_d.0, got_f.0),
+        (0, 0, 0),
+        "spoken translations never leak to other listeners (bob/dave/frank)"
+    );
+    assert_eq!(
+        synth_audio_from(&alice, carol_voice, Duration::from_millis(300))
+            .await
+            .0,
+        0,
+        "nor to the speaker"
+    );
+    for p in [
+        &mut alice, &mut bob, &mut carol, &mut dave, &mut erin, &mut frank,
+    ] {
+        drain_ws(p).await;
+    }
+
+    // ── speaker preference does not translate their own captions; local mute suppresses
+    // the translated copy exactly like the original ──
+    assert_eq!(
+        set_translation(&mut alice, Some("de"), None, false).await.0,
+        Some("de".into())
+    );
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: uid_a,
+        channel_id: Some(spoken),
+        muted: true,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_ws(&mut bob).await;
+    stream_frames(&alice, spoken, 1_000, &opus_tone(880.0, 1_600), false).await;
+    let ta = expect_transcript(&mut alice, spoken, uid_a).await;
+    assert!(
+        tone_hz(&ta.text).is_some_and(|hz| (hz - 880.0).abs() < 15.0) && ta.original.is_none(),
+        "speaker keeps original captions: {ta:?}"
+    );
+    assert_eq!(ta.language.as_deref(), Some("en"));
+    let tc = expect_transcript(&mut carol, spoken, uid_a).await;
+    assert_eq!(tc.text, format!("[fr] {}", ta.text));
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_no_transcript(
+        &mut bob,
+        Duration::from_millis(500),
+        "locally muted the speaker",
+    )
+    .await;
+    bob.send(&ControlMessage::SetParticipantMute {
+        user_id: uid_a,
+        channel_id: Some(spoken),
+        muted: false,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for p in [
+        &mut alice, &mut bob, &mut carol, &mut dave, &mut erin, &mut frank,
+    ] {
+        drain_ws(p).await;
+    }
+    for p in [&alice, &bob, &carol, &dave, &erin, &frank] {
+        drain_udp(p).await;
+    }
+
+    // ── clearing the preference restores the original; speech off stops the audio ──
+    assert_eq!(
+        set_translation(&mut bob, None, None, false).await,
+        (None, None, false)
+    );
+    assert_eq!(
+        set_translation(&mut carol, Some("fr"), None, false).await,
+        (Some("fr".into()), None, false)
+    );
+    drain_ws(&mut bob).await;
+    drain_ws(&mut carol).await;
+    stream_frames(&alice, spoken, 2_000, &opus_tone(660.0, 1_600), false).await;
+    let ta = expect_transcript(&mut alice, spoken, uid_a).await;
+    let tb = expect_transcript(&mut bob, spoken, uid_a).await;
+    assert_eq!(
+        (tb.id, &tb.text, tb.original.is_none()),
+        (ta.id, &ta.text, true)
+    );
+    let tc = expect_transcript(&mut carol, spoken, uid_a).await;
+    assert_eq!(tc.text, format!("[fr] {}", ta.text));
+    assert_eq!(
+        synth_audio_from(&carol, carol_voice, Duration::from_millis(1_500))
+            .await
+            .0,
+        0,
+        "no spoken translation once speech is off"
+    );
+
+    if let Some(before) = before {
+        let after = translation_counters(&http).await.unwrap();
+        let delta = |outcome: &str| {
+            after.get(outcome).copied().unwrap_or(0.0) - before.get(outcome).copied().unwrap_or(0.0)
+        };
+        // Only Bob's German is translated by the speaker's node (Carol's French happens where she
+        // is connected) and only for the first segment: he is locally deaf to Alice for the second
+        // and has no target for the third. Italian fails and Dutch times out on all three.
+        let expected_ok = if same_node { 4.0 } else { 1.0 };
+        assert_eq!(
+            delta("ok") + delta("cached"),
+            expected_ok,
+            "German once (plus Carol's French per segment when she shares the node): {after:?} vs {before:?}"
+        );
+        assert_eq!(
+            delta("error"),
+            6.0,
+            "failed and timed-out translations are counted and never cached: {after:?} vs {before:?}"
+        );
+        assert_eq!(delta("busy") + delta("skipped"), 0.0);
+    }
+}
+
+/// `aurix_translations_total{outcome}` of the node behind `AURIX_E2E_METRICS`, if set.
+async fn translation_counters(http: &reqwest::Client) -> Option<HashMap<String, f64>> {
+    let url = std::env::var("AURIX_E2E_METRICS").ok()?;
+    let body = http.get(&url).send().await.ok()?.text().await.ok()?;
+    Some(
+        body.lines()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("aurix_translations_total{outcome=\"")?;
+                let (outcome, value) = rest.split_once("\"}")?;
+                Some((outcome.to_string(), value.trim().parse().ok()?))
+            })
+            .collect(),
+    )
 }

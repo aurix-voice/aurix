@@ -20,6 +20,8 @@ pub mod safety;
 #[cfg(feature = "server")]
 pub mod sink;
 #[cfg(feature = "server")]
+pub mod translate;
+#[cfg(feature = "server")]
 pub mod tts_stt;
 pub mod types;
 #[cfg(feature = "server")]

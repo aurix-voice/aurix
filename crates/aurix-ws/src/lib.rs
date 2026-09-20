@@ -26,15 +26,17 @@ use aurix_common::crypto::{constant_time_eq, ResumeToken};
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
     decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
-    ParticipantEnergy, ParticipantVolume, TransmissionMode, TtsDestination, UserPosition,
+    ParticipantEnergy, ParticipantVolume, Transcript, TranscriptOriginal, TransmissionMode,
+    TtsDestination, UserPosition,
 };
 use aurix_common::types::*;
 use aurix_control::chat::{Conversation, OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::session_manager::ClientInfo;
 use aurix_control::{
-    ActionTokenService, ControlPlane, LimitScope, MirroredChannel, MirroredPrefs, ParticipantSpeak,
-    ServerEvent, SessionMirror, TakeoverRefused, MIGRATION_SEQUENCE_GAP,
+    ActionTokenService, ControlPlane, LimitScope, ListenerTranslation, MirroredChannel,
+    MirroredPrefs, ParticipantSpeak, ServerEvent, SessionMirror, TakeoverRefused,
+    TranslationService, MIGRATION_SEQUENCE_GAP,
 };
 use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
 use aurix_media::session::MAX_PARTICIPANT_GAIN;
@@ -106,6 +108,15 @@ pub struct ConnectionInfo {
     closing: Option<String>,
     /// Delivers `Transcript` events for the session's channels (`SetTranscripts`).
     transcripts: bool,
+    /// Target language for translated transcripts / speech (`SetTranslation`).
+    translation: ListenerTranslation,
+}
+
+/// A transcript recipient who wants it in another language.
+struct TranslationListener {
+    session_id: SessionId,
+    target: String,
+    speech: bool,
 }
 
 impl ConnectionInfo {
@@ -638,6 +649,9 @@ impl WsState {
             downlink: session.downlink_mode(),
             muted: session.is_muted.load(Ordering::Relaxed),
             transcripts: conn.transcripts,
+            translation: conn.translation.language.clone(),
+            spoken_language: conn.translation.spoken_language.clone(),
+            translation_speech: conn.translation.speech,
         };
         Some(SessionMirror {
             session_id,
@@ -1458,17 +1472,19 @@ impl WsState {
 
     /// A transcript goes to the channel's local members of the same tenant that did not opt
     /// out; the speaker gets their own (captions), a receiver who blocked or locally muted the
-    /// speaker does not (they would not hear them either).
-    fn deliver_transcript(&self, app_id: AppId, transcript: aurix_common::protocol::Transcript) {
+    /// speaker does not (they would not hear them either). Members who asked for another
+    /// language (`SetTranslation`) get a translated copy instead, produced off this path so
+    /// the original never waits for the translator.
+    fn deliver_transcript(&self, app_id: AppId, transcript: Transcript) {
         let channel_id = transcript.channel_id;
         let speaker = transcript.user_id;
-        let Ok(json) = serde_json::to_string(&ControlMessage::Transcript { transcript }) else {
-            return;
-        };
         let Some(members) = self.channel_members.get(&channel_id) else {
             return;
         };
         let channel = self.sfu.read().get_channel(&channel_id);
+        let translator = &self.control.translation;
+        let mut originals: Vec<mpsc::Sender<String>> = Vec::new();
+        let mut translated: Vec<TranslationListener> = Vec::new();
         for sid in members.iter() {
             let Some(conn) = self.connections.get(&sid) else {
                 continue;
@@ -1485,7 +1501,159 @@ impl WsState {
             {
                 continue;
             }
-            let _ = conn.tx.try_send(json.clone());
+            match conn.translation.language.as_deref() {
+                Some(target)
+                    if translator.enabled()
+                        && conn.user_id != speaker
+                        && TranslationService::needs_translation(
+                            transcript.language.as_deref(),
+                            target,
+                        ) =>
+                {
+                    translated.push(TranslationListener {
+                        session_id: *sid,
+                        target: target.to_string(),
+                        speech: conn.translation.speech,
+                    });
+                }
+                _ => originals.push(conn.tx.clone()),
+            }
+        }
+        drop(members);
+        let targets = translator.select_targets(translated.iter().map(|l| l.target.as_str()));
+        // Listeners whose language lost the per-channel fan-out cap fall back to the original.
+        let (translated, capped): (Vec<_>, Vec<_>) = translated
+            .into_iter()
+            .partition(|l| targets.contains(&l.target));
+        for listener in capped {
+            aurix_metrics::TRANSLATIONS
+                .with_label_values(&["skipped"])
+                .inc();
+            if let Some(conn) = self.connections.get(&listener.session_id) {
+                originals.push(conn.tx.clone());
+            }
+        }
+        if !originals.is_empty() {
+            if let Ok(json) = serde_json::to_string(&ControlMessage::Transcript {
+                transcript: transcript.clone(),
+            }) {
+                for tx in &originals {
+                    let _ = tx.try_send(json.clone());
+                }
+            }
+        }
+        if translated.is_empty() {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            state
+                .deliver_translations(app_id, transcript, targets, translated)
+                .await;
+        });
+    }
+
+    /// One machine translation per target language, then per-listener delivery: the text as a
+    /// `Transcript` carrying `original`, and — for listeners who asked — spoken through the TTS
+    /// engine into their downlink alone. A failed translation degrades to the original text
+    /// (never to silence). Eligibility is re-checked after the round trip.
+    async fn deliver_translations(
+        &self,
+        app_id: AppId,
+        transcript: Transcript,
+        targets: Vec<String>,
+        listeners: Vec<TranslationListener>,
+    ) {
+        let channel_id = transcript.channel_id;
+        let speaker = transcript.user_id;
+        let translator = &self.control.translation;
+        let results = futures_util::future::join_all(targets.iter().map(|target| {
+            translator.translate(&transcript.text, transcript.language.as_deref(), target)
+        }))
+        .await;
+        for (target, result) in targets.iter().zip(results) {
+            let translation = match result {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    debug!(
+                        "Translation of {}'s transcript into {} failed: {}",
+                        speaker, target, e
+                    );
+                    None
+                }
+            };
+            let mut payload = transcript.clone();
+            let mut speak = false;
+            if let Some(translation) = translation {
+                let detected = transcript
+                    .language
+                    .clone()
+                    .or_else(|| translation.source_language.clone());
+                // The provider found the speaker already talks the listener's language.
+                let same_language = transcript.language.is_none()
+                    && translation
+                        .source_language
+                        .as_deref()
+                        .is_some_and(|s| aurix_common::translate::same_language(s, target));
+                if same_language {
+                    payload.language = detected;
+                } else {
+                    payload.original = Some(TranscriptOriginal {
+                        text: transcript.text.clone(),
+                        language: detected,
+                    });
+                    payload.text = translation.text;
+                    payload.language = Some(target.clone());
+                    payload.words = Vec::new();
+                    speak = true;
+                }
+            }
+            let Ok(json) = serde_json::to_string(&ControlMessage::Transcript {
+                transcript: payload.clone(),
+            }) else {
+                continue;
+            };
+            for listener in listeners.iter().filter(|l| &l.target == target) {
+                let tx = self.connections.get(&listener.session_id).and_then(|conn| {
+                    (conn.app_id == app_id
+                        && conn.transcripts
+                        && conn.channels.contains(&channel_id)
+                        && conn.translation.language.as_deref() == Some(target.as_str()))
+                    .then(|| conn.tx.clone())
+                });
+                let Some(tx) = tx else {
+                    continue;
+                };
+                if !self.hears(&listener.session_id, &channel_id, &speaker) {
+                    continue;
+                }
+                let _ = tx.try_send(json.clone());
+                if !speak || !listener.speech {
+                    continue;
+                }
+                let session = self
+                    .sfu
+                    .read()
+                    .get_session(&listener.session_id)
+                    .filter(|s| s.is_active());
+                let Some(session) = session else {
+                    continue;
+                };
+                let voice =
+                    translator.voice_for(target, &self.control.speech.config().default_voice);
+                if let Err(e) = self.control.speech.speak_to_listener(
+                    app_id,
+                    channel_id,
+                    session,
+                    payload.text.clone(),
+                    voice,
+                ) {
+                    debug!(
+                        "Spoken translation for {} skipped: {}",
+                        listener.session_id, e
+                    );
+                }
+            }
         }
     }
 
@@ -2057,6 +2225,18 @@ async fn adopt_mirrored_session(
     if mirror.prefs.codec == AudioCodec::Pcmu && state.control.config.media.pcmu_fallback {
         let _ = media_session.set_codec(AudioCodec::Pcmu);
     }
+    let translation = state
+        .control
+        .translation
+        .listener_preferences(
+            mirror.prefs.translation.as_deref(),
+            mirror.prefs.spoken_language.as_deref(),
+            mirror.prefs.translation_speech,
+        )
+        .unwrap_or_default();
+    if let Some(pipeline) = state.sfu.read().audio_pipeline() {
+        pipeline.set_spoken_language(token.user_id, translation.spoken_language.clone());
+    }
     state.connections.insert(
         session_id,
         ConnectionInfo {
@@ -2073,6 +2253,7 @@ async fn adopt_mirrored_session(
             generation: 0,
             closing: None,
             transcripts: mirror.prefs.transcripts,
+            translation,
         },
     );
 
@@ -2336,6 +2517,7 @@ async fn open_session(
             generation: 0,
             closing: None,
             transcripts: true,
+            translation: ListenerTranslation::default(),
         },
     );
     Ok(Attached {
@@ -2371,6 +2553,24 @@ fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<Contr
         codec: session.codec(),
         downlink: session.downlink_mode(),
     })
+}
+
+/// `TranslationChanged` for a resumed/migrated session that had preferences; a fresh session
+/// (nothing set) gets none.
+fn translation_preferences(state: &WsState, session_id: &SessionId) -> Option<ControlMessage> {
+    let conn = state.connections.get(session_id)?;
+    if conn.translation == ListenerTranslation::default() {
+        return None;
+    }
+    Some(translation_changed(&conn.translation))
+}
+
+fn translation_changed(prefs: &ListenerTranslation) -> ControlMessage {
+    ControlMessage::TranslationChanged {
+        language: prefs.language.clone(),
+        spoken_language: prefs.spoken_language.clone(),
+        speech: prefs.speech,
+    }
 }
 
 fn channel_snapshot(
@@ -2568,6 +2768,7 @@ async fn handle_ws_connection(
         downlink_mix: state.sfu.read().downlink_mix_enabled(),
         migrated: attached.migrated,
         failover: state.failover_endpoints(),
+        translation: state.control.translation.info(),
     };
     if tx
         .send(serde_json::to_string(&init_ack).unwrap_or_default())
@@ -2579,6 +2780,9 @@ async fn handle_ws_connection(
     }
     if let Some(prefs) = receiver_preferences(&state, &session_id) {
         send_msg(&tx, &prefs).await;
+    }
+    if let Some(msg) = translation_preferences(&state, &session_id) {
+        send_msg(&tx, &msg).await;
     }
     // A resumed client reconciles its channel state from one ChannelJoinAck per channel.
     for channel_id in attached.resumed_channels.iter().flatten() {
@@ -2770,6 +2974,7 @@ fn touches_mirror(msg: &ControlMessage) -> bool {
             | ControlMessage::SetDownlinkMode { .. }
             | ControlMessage::MuteStateChanged { .. }
             | ControlMessage::SetTranscripts { .. }
+            | ControlMessage::SetTranslation { .. }
     )
 }
 
@@ -4033,6 +4238,32 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetTranslation {
+            language,
+            spoken_language,
+            speech,
+        } => {
+            let prefs = match state.control.translation.listener_preferences(
+                language.as_deref(),
+                spoken_language.as_deref(),
+                speech,
+            ) {
+                Ok(prefs) => prefs,
+                Err(e) => {
+                    send_error(tx, e.error_code(), &e.public_message()).await;
+                    return;
+                }
+            };
+            if let Some(pipeline) = state.sfu.read().audio_pipeline() {
+                pipeline.set_spoken_language(token.user_id, prefs.spoken_language.clone());
+            }
+            let reply = translation_changed(&prefs);
+            if let Some(mut conn) = state.connections.get_mut(&session_id) {
+                conn.translation = prefs;
+            }
+            send_msg(tx, &reply).await;
+        }
+
         ControlMessage::TtsSpeak {
             channel_id,
             text,
@@ -4091,6 +4322,7 @@ async fn handle_control_message(
         | ControlMessage::ChannelFocusChanged { .. }
         | ControlMessage::AudioCodecChanged { .. }
         | ControlMessage::DownlinkModeChanged { .. }
+        | ControlMessage::TranslationChanged { .. }
         | ControlMessage::BitrateCommand { .. }
         | ControlMessage::NetworkQuality { .. }
         | ControlMessage::RecordingNotification { .. }
@@ -4271,6 +4503,7 @@ mod tests {
             generation: 1,
             closing: None,
             transcripts: true,
+            translation: ListenerTranslation::default(),
         }
     }
 

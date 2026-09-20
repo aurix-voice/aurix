@@ -210,6 +210,52 @@ place, whole 480-sample blocks) and `aurix_dsp_push_render_f32` — the Unity SD
 Out-of-range values are clamped rather than rejected. Everything is enabled by default; the
 browser SDK relies on the browser's own AEC/NS/AGC instead (`getUserMedia` constraints).
 
+## Voice effects
+
+After the DSP and the input gain — and before the VAD meter and the encoder, so peers, level
+bars and transcripts all get the effected voice — the capture path runs an
+`EffectChain` (`aurix_client::effects`) of `VoiceEffect` stages on each 20 ms 48 kHz frame
+(mono or interleaved stereo, output clamped to ±1). Built in: `PitchShift::new(semitones)`
+(±24), `RingModulator::new(hz)` (robot voice, ≤ 2 kHz) and `CallbackEffect::new(|frame, channels| …)`
+for the host's own processing. Effects touch only the microphone uplink — injected audio, TTS
+and the downlink are untouched — and the mono, stereo and PCMU encoders all see the processed
+frame. The chain runs on the capture thread: no blocking, no allocation.
+
+```rust
+use aurix_client::effects::{EffectChain, PitchShift, RingModulator, CallbackEffect};
+client.set_voice_effects(EffectChain::new(vec![
+    Box::new(PitchShift::new(-5.0)),
+    Box::new(RingModulator::new(60.0)),
+    Box::new(CallbackEffect::new(|frame: &mut [f32], channels: u8| my_dsp(frame, channels))),
+]));
+client.set_voice_effects(EffectChain::default()); // bypass
+```
+
+C: `aurix_client_set_voice_effects(&AurixVoiceEffects { pitch_semitones, ring_mod_hz })` (zero =
+stage off, clamped to `AURIX_MAX_PITCH_SEMITONES` / `AURIX_MAX_RING_MOD_HZ`),
+`aurix_client_voice_effects`, and `aurix_client_set_voice_effect_callback(client, fn, user_data)`
+for a host stage `void fn(void* user_data, float* frame, uint32_t samples_per_channel, uint8_t channels)`
+run after the built-ins (`NULL` removes it). Unreal: `SetVoiceEffects` / `GetVoiceEffects` /
+`SetVoiceEffectCallback`.
+
+## Live translation
+
+`SessionInfo.translation` (`Some { speech, languages }` on nodes with `[translation]`) says
+whether the node translates transcripts; `client.set_translation(Some("de"), Some("en"), speech)`
+asks for the captions this session receives in German while declaring English as the language
+it speaks, and the server confirms with `Event::TranslationChanged` (normalised tags) or
+`ServerError` (`VALIDATION_ERROR` unknown / unoffered tag, `TRANSLATION_DISABLED`). Translated
+`Transcript`s carry `original: Some { text, language }`; segments already in the target language
+or that the provider could not translate arrive as the original. With `speech` the translation
+is also spoken privately to this session on the channel's translator SSRC (synthetic, no
+participant behind it). The preference is replayed after reconnect and failover. C:
+`AurixSessionInfo.translation` / `translation_speech`, `aurix_client_set_translation(client,
+language, spoken_language, speech)`, `AURIX_EVENT_TRANSLATION_CHANGED` + `aurix_event_translation`,
+`AurixTranscript.original_text` / `original_language` (`NULL` when untranslated). Unreal:
+`SetTranslation`, `OnTranslationChanged`, `FAurixSessionInfo.bTranslation` /
+`bTranslationSpeech`, `FAurixTranscript.OriginalText` / `OriginalLanguage`. See
+[live translation](../features/speech.md#live-translation).
+
 ## PCMU (G.711) fallback
 
 `client.set_audio_codec(AudioCodec::Pcmu)` asks the server to run the session on G.711 μ-law

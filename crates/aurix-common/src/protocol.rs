@@ -817,6 +817,10 @@ pub enum ControlMessage {
         /// stops answering, reconnect with the same resume credential to one of them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failover: Vec<String>,
+        /// The node translates transcripts on request (`SetTranslation`); absent when the
+        /// operator has not configured `[translation]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        translation: Option<TranslationInfo>,
     },
     /// Sent by the server once a media path has been authenticated via `SessionBind`:
     /// `transport` is `udp`, `tunnel` (AURX over this WebSocket) or `webrtc`.
@@ -1190,6 +1194,29 @@ pub enum ControlMessage {
     SetTranscripts {
         enabled: bool,
     },
+    /// Client → server: translate the transcripts this session receives into `language`
+    /// (`None` = stop translating). Segments already in that language arrive untranslated;
+    /// translated ones carry `Transcript.original`. `speech` additionally asks for the
+    /// translation to be spoken to this session alone on the channel's translator SSRC
+    /// (needs `SessionInitAck.translation.speech`). `spoken_language` tells peers' translators
+    /// which language this participant speaks when the transcriber cannot tell.
+    SetTranslation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spoken_language: Option<String>,
+        #[serde(default)]
+        speech: bool,
+    },
+    /// Server → client: the session's translation preferences as applied (normalised tags).
+    TranslationChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spoken_language: Option<String>,
+        #[serde(default)]
+        speech: bool,
+    },
     /// Client → server: synthesize `text` server-side and play it as this participant's
     /// voice. `channel_id` = `None` plays into every channel the session transmits to;
     /// `destination` selects who hears it. `client_ref` is echoed in `TtsStatus`.
@@ -1256,6 +1283,29 @@ pub struct Transcript {
     /// Word timings relative to `started_at` (only when the node has `stt.include_words`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<TranscriptWordTiming>,
+    /// Present when `text` is a translation: the segment as transcribed. Shares `id` with the
+    /// untranslated event so clients can replace captions in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<TranscriptOriginal>,
+}
+
+/// The untranslated form of a translated [`Transcript`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptOriginal {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Live-translation capability of the node (`SessionInitAck.translation`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TranslationInfo {
+    /// Translations can also be spoken to the listener (`SetTranslation { speech: true }`).
+    #[serde(default)]
+    pub speech: bool,
+    /// Target languages listeners may request; empty = any language tag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1895,10 +1945,12 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 duration_ms: 900,
                 words: Vec::new(),
+                original: None,
             },
         };
         let json = serde_json::to_string(&transcript).unwrap();
         assert!(!json.contains("\"words\""));
+        assert!(!json.contains("\"original\""));
         assert!(json.contains(r#""type":"Transcript""#));
     }
 

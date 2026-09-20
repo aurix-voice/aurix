@@ -45,6 +45,9 @@ use crate::audio::EncoderSettings;
 use crate::client::Client;
 use crate::config::ClientConfig;
 use crate::dsp::{DspConfig, DspStats, NoiseSuppression};
+use crate::effects::{
+    CallbackEffect, EffectChain, PitchShift, RingModulator, MAX_PITCH_SEMITONES, MAX_RING_MOD_HZ,
+};
 use crate::error::ClientError;
 use crate::events::{ChannelScope, ChatScope, ConnectionState, Event};
 use crate::media::{MediaPath, MediaPathPolicy};
@@ -900,6 +903,91 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
 /// Opaque voice client. One per player/session.
 pub struct AurixClient {
     client: Client,
+    effects: parking_lot::Mutex<VoiceEffectsState>,
+}
+
+/// Host-provided voice effect: `frame` is one 20 ms 48 kHz interleaved frame
+/// (`samples_per_channel * channels` floats in `-1..=1`) to modify in place. Called on the
+/// thread that feeds `aurix_client_push_capture_*` — no blocking, no allocation.
+pub type AurixVoiceEffectFn = Option<
+    unsafe extern "C" fn(
+        user_data: *mut c_void,
+        frame: *mut f32,
+        samples_per_channel: u32,
+        channels: u8,
+    ),
+>;
+
+/// Built-in voice effects (`aurix_client_set_voice_effects`); zero = that stage is off.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AurixVoiceEffects {
+    /// Pitch shift in semitones, clamped to ±`AURIX_MAX_PITCH_SEMITONES`.
+    pub pitch_semitones: f32,
+    /// Ring-modulator ("robot") carrier in Hz, clamped to `0..=AURIX_MAX_RING_MOD_HZ`.
+    pub ring_mod_hz: f32,
+}
+
+/// Largest built-in pitch shift either way, in semitones.
+pub const AURIX_MAX_PITCH_SEMITONES: f32 = 24.0;
+/// Highest built-in ring-modulator carrier, in Hz.
+pub const AURIX_MAX_RING_MOD_HZ: f32 = 2000.0;
+
+const _: () = assert!(AURIX_MAX_PITCH_SEMITONES == MAX_PITCH_SEMITONES);
+const _: () = assert!(AURIX_MAX_RING_MOD_HZ == MAX_RING_MOD_HZ);
+
+struct HostEffect {
+    f: unsafe extern "C" fn(*mut c_void, *mut f32, u32, u8),
+    user_data: *mut c_void,
+}
+
+// The host promises `user_data` may be used from the capture thread (as with every other
+// callback in this ABI).
+unsafe impl Send for HostEffect {}
+
+impl HostEffect {
+    fn process(&self, frame: &mut [f32], channels: u8) {
+        let per_channel = frame.len() / channels.max(1) as usize;
+        // SAFETY: `frame` is a live, exclusively borrowed slice for the duration of the
+        // call; the host contract is to touch only that many samples.
+        unsafe {
+            (self.f)(
+                self.user_data,
+                frame.as_mut_ptr(),
+                per_channel as u32,
+                channels,
+            )
+        }
+    }
+}
+
+#[derive(Default)]
+struct VoiceEffectsState {
+    builtin: AurixVoiceEffects,
+    host: Option<HostEffect>,
+}
+
+impl VoiceEffectsState {
+    /// Built-in stages first (pitch, then ring modulator), the host callback last.
+    fn chain(&self) -> EffectChain {
+        let mut chain = EffectChain::default();
+        if self.builtin.pitch_semitones != 0.0 {
+            chain.push(Box::new(PitchShift::new(self.builtin.pitch_semitones)));
+        }
+        if self.builtin.ring_mod_hz > 0.0 {
+            chain.push(Box::new(RingModulator::new(self.builtin.ring_mod_hz)));
+        }
+        if let Some(host) = &self.host {
+            let holder = HostEffect {
+                f: host.f,
+                user_data: host.user_data,
+            };
+            chain.push(Box::new(CallbackEffect::new(
+                move |frame: &mut [f32], channels| holder.process(frame, channels),
+            )));
+        }
+        chain
+    }
 }
 
 unsafe fn client<'a>(h: *const AurixClient) -> Result<&'a Client, AurixResult> {
@@ -923,7 +1011,10 @@ pub unsafe extern "C" fn aurix_client_create(config: *const AurixClientConfig) -
         Err(_) => return ptr::null_mut(),
     };
     match Client::new(cfg) {
-        Ok(client) => Box::into_raw(Box::new(AurixClient { client })),
+        Ok(client) => Box::into_raw(Box::new(AurixClient {
+            client,
+            effects: parking_lot::Mutex::new(VoiceEffectsState::default()),
+        })),
         Err(e) => {
             fail(e);
             ptr::null_mut()
@@ -1001,6 +1092,10 @@ pub struct AurixSessionInfo {
     /// The latest (re)connect resumed the session on a *different* node (same session id
     /// and SSRC, new media key/endpoint). See `aurix_client_endpoint`.
     pub migrated: bool,
+    /// The node translates transcripts for listeners (`aurix_client_set_translation`).
+    pub translation: bool,
+    /// Translations can also be spoken into this session's downlink.
+    pub translation_speech: bool,
 }
 
 /// `false` when no session is open.
@@ -1026,6 +1121,8 @@ pub unsafe extern "C" fn aurix_client_session(
                 media_tunnel: s.media_tunnel,
                 downlink_mix: s.downlink_mix,
                 migrated: s.migrated,
+                translation: s.translation.is_some(),
+                translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
             };
             true
         }
@@ -1189,6 +1286,9 @@ pub enum AurixEventType {
     /// `number` = directed messages replayed (each arrived as `ChatMessage` with `offline`)
     /// since connecting, `flag` = older unread ones were left out (page with history).
     AurixEventChatInboxSynced = 39,
+    /// `aurix_event_translation`: the server applied `aurix_client_set_translation`
+    /// (tags normalised). A fresh session starts untranslated; the request is re-applied.
+    AurixEventTranslationChanged = 40,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1343,6 +1443,23 @@ pub struct AurixTranscript {
     pub duration_ms: u32,
     /// Word timings are available through `aurix_event_json`.
     pub word_count: u32,
+    /// Speaker's words before translation, or `NULL` for an untranslated transcript (then
+    /// `text` / `language` are the speaker's own).
+    pub original_text: *const c_char,
+    /// Language of `original_text` (BCP-47) or `NULL`.
+    pub original_language: *const c_char,
+}
+
+/// Translation preferences as applied by the server (`AurixEventTranslationChanged`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AurixTranslation {
+    /// Target language of translated transcripts, `NULL` = original language only.
+    pub language: *const c_char,
+    /// Language this participant declared to speak, or `NULL`.
+    pub spoken_language: *const c_char,
+    /// Translations are also spoken into this session's downlink.
+    pub speech: bool,
 }
 
 #[repr(C)]
@@ -1445,6 +1562,18 @@ impl AurixEvent {
             Event::Transcript(t) => {
                 extra.push(cstring(&t.text));
                 extra.push(cstring(t.language.as_deref().unwrap_or_default()));
+                if let Some(o) = &t.original {
+                    extra.push(cstring(&o.text));
+                    extra.push(cstring(o.language.as_deref().unwrap_or_default()));
+                }
+            }
+            Event::TranslationChanged {
+                language,
+                spoken_language,
+                ..
+            } => {
+                extra.push(cstring(language.as_deref().unwrap_or_default()));
+                extra.push(cstring(spoken_language.as_deref().unwrap_or_default()));
             }
             Event::TtsStatus { message: m, .. } => {
                 extra.push(cstring(m.as_deref().unwrap_or_default()));
@@ -1482,6 +1611,7 @@ impl AurixEvent {
             Event::ChannelFocusChanged(_) => T::AurixEventChannelFocusChanged,
             Event::AudioCodecChanged(_) => T::AurixEventAudioCodecChanged,
             Event::DownlinkModeChanged(_) => T::AurixEventDownlinkModeChanged,
+            Event::TranslationChanged { .. } => T::AurixEventTranslationChanged,
             Event::EndpointChanged { .. } => T::AurixEventEndpointChanged,
             Event::UserBlockChanged { .. } => T::AurixEventUserBlockChanged,
             Event::Recording { .. } => T::AurixEventRecording,
@@ -1845,6 +1975,8 @@ pub unsafe extern "C" fn aurix_event_session(
                 media_tunnel: s.media_tunnel,
                 downlink_mix: s.downlink_mix,
                 migrated: s.migrated,
+                translation: s.translation.is_some(),
+                translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
             };
             true
         }
@@ -2031,6 +2163,51 @@ pub unsafe extern "C" fn aurix_event_transcript(
         started_at_ms: t.started_at.timestamp_millis(),
         duration_ms: t.duration_ms.min(u32::MAX as u64) as u32,
         word_count: t.words.len() as u32,
+        original_text: match &t.original {
+            Some(_) => s[2].as_ptr(),
+            None => ptr::null(),
+        },
+        original_language: match &t.original {
+            Some(o) if o.language.is_some() => s[3].as_ptr(),
+            _ => ptr::null(),
+        },
+    };
+    true
+}
+
+/// Preferences of a `TranslationChanged` event.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_translation(
+    event: *const AurixEvent,
+    out: *mut AurixTranslation,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(e) = self::event(event) else {
+        return false;
+    };
+    let Event::TranslationChanged {
+        language,
+        spoken_language,
+        speech,
+    } = &e.event
+    else {
+        return false;
+    };
+    let s = &e.strings.extra;
+    *out = AurixTranslation {
+        language: if language.is_some() {
+            s[0].as_ptr()
+        } else {
+            ptr::null()
+        },
+        spoken_language: if spoken_language.is_some() {
+            s[1].as_ptr()
+        } else {
+            ptr::null()
+        },
+        speech: *speech,
     };
     true
 }
@@ -2676,6 +2853,68 @@ pub unsafe extern "C" fn aurix_client_dsp_stats(
     AurixResult::AurixOk
 }
 
+/// Built-in voice effects on the microphone (after the DSP and input gain, before VAD and
+/// encoding; injected audio and the downlink are untouched). `NULL` or all-zero = off.
+/// Read back (clamped) with `aurix_client_voice_effects`. Runs before the host callback.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_voice_effects(
+    client: *mut AurixClient,
+    effects: *const AurixVoiceEffects,
+) -> AurixResult {
+    if client.is_null() {
+        return null_ptr("client");
+    }
+    let requested = if effects.is_null() {
+        AurixVoiceEffects::default()
+    } else {
+        *effects
+    };
+    let handle = &*client;
+    let mut state = handle.effects.lock();
+    state.builtin = AurixVoiceEffects {
+        pitch_semitones: requested
+            .pitch_semitones
+            .clamp(-MAX_PITCH_SEMITONES, MAX_PITCH_SEMITONES),
+        ring_mod_hz: requested.ring_mod_hz.clamp(0.0, MAX_RING_MOD_HZ),
+    };
+    handle.client.set_voice_effects(state.chain());
+    AurixResult::AurixOk
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_voice_effects(
+    client: *const AurixClient,
+    out: *mut AurixVoiceEffects,
+) -> AurixResult {
+    if client.is_null() {
+        return null_ptr("client");
+    }
+    if out.is_null() {
+        return null_ptr("out");
+    }
+    *out = (*client).effects.lock().builtin;
+    AurixResult::AurixOk
+}
+
+/// Install (or, with `NULL`, remove) a host voice effect that runs on every microphone frame
+/// after the built-in stages. `user_data` is handed back verbatim on the capture thread and
+/// must stay valid until the callback is removed or the client destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_voice_effect_callback(
+    client: *mut AurixClient,
+    callback: AurixVoiceEffectFn,
+    user_data: *mut c_void,
+) -> AurixResult {
+    if client.is_null() {
+        return null_ptr("client");
+    }
+    let handle = &*client;
+    let mut state = handle.effects.lock();
+    state.host = callback.map(|f| HostEffect { f, user_data });
+    handle.client.set_voice_effects(state.chain());
+    AurixResult::AurixOk
+}
+
 /// Feed the echo canceller with audio the host plays through its own path (48 kHz,
 /// interleaved, `sample_count` total samples). Audio the host obtains from
 /// `aurix_client_mix_output_*` is fed automatically — do not push it again. Audio-thread safe.
@@ -2979,6 +3218,33 @@ pub unsafe extern "C" fn aurix_client_set_transcripts(
         Ok(c) => ok(c.set_transcripts(enabled)),
         Err(r) => r,
     }
+}
+
+/// Receive peers' transcripts translated into `language` (BCP-47, `NULL` = original only);
+/// `speech` also has them spoken into this session's downlink
+/// (`AurixSessionInfo.translation_speech`). `spoken_language` (may be `NULL`) declares the
+/// language this participant speaks. Applied on `AurixEventTranslationChanged`; unsupported
+/// tags come back as `AurixEventServerError`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_translation(
+    client: *mut AurixClient,
+    language: *const c_char,
+    spoken_language: *const c_char,
+    speech: bool,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let language = match opt_cstr_arg(language, "language") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let spoken_language = match opt_cstr_arg(spoken_language, "spoken_language") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    ok(c.set_translation(language.as_deref(), spoken_language.as_deref(), speech))
 }
 
 /// Pose of one user for positional channels (engine coordinates; the channel config decides

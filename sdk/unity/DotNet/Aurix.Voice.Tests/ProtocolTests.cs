@@ -620,6 +620,53 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void TranslationMessagesMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b821-4856-71ab-9f6c-8907f61da4c2");
+            var alice = Guid.Parse("01a0b821-4862-73cd-81a3-dbe148edea9b");
+
+            Assert.Equal(
+                "{\"type\":\"SetTranslation\",\"data\":{\"language\":\"de\",\"spoken_language\":\"en\",\"speech\":true}}",
+                ControlMessage.SetTranslation(new TranslationPrefs { Language = "de", SpokenLanguage = "en", Speech = true }));
+            Assert.Equal(
+                "{\"type\":\"SetTranslation\",\"data\":{\"language\":null,\"spoken_language\":null,\"speech\":false}}",
+                ControlMessage.SetTranslation(new TranslationPrefs()));
+
+            Assert.Equal("de-de", TranslationPrefs.NormalizeTag(" DE_de "));
+            Assert.Null(TranslationPrefs.NormalizeTag("  "));
+            Assert.Null(TranslationPrefs.NormalizeTag(null));
+
+            // Capability in SessionInitAck; absent on nodes without translation.
+            var ack = ControlMessage.Parse("{\"type\":\"SessionInitAck\",\"data\":{\"session_id\":\"5855c240-f790-4303-8101-20f036ea25b1\",\"ssrc\":7," +
+                "\"media_addr\":\"10.0.0.2:40000\",\"media_key\":\"AAAA\",\"translation\":{\"speech\":true,\"languages\":[\"en\",\"de\"]}}}");
+            var cap = ack.Translation();
+            Assert.True(cap.Speech);
+            Assert.Equal(new[] { "en", "de" }, cap.Languages);
+            Assert.Null(ControlMessage.Parse("{\"type\":\"SessionInitAck\",\"data\":{\"session_id\":\"5855c240-f790-4303-8101-20f036ea25b1\",\"ssrc\":7," +
+                "\"media_addr\":\"10.0.0.2:40000\",\"media_key\":\"AAAA\"}}").Translation());
+
+            var changed = ControlMessage.Parse("{\"type\":\"TranslationChanged\",\"data\":{\"language\":\"fr\",\"spoken_language\":null,\"speech\":false}}").TranslationPrefs();
+            Assert.Equal("fr", changed.Language);
+            Assert.Null(changed.SpokenLanguage);
+            Assert.False(changed.Speech);
+
+            // Translated transcript keeps the original; untranslated ones have no `original`.
+            var t = ControlMessage.Parse("{\"type\":\"Transcript\",\"data\":{\"transcript\":{\"id\":\"5855c240-f790-4303-8101-20f036ea25b1\"," +
+                "\"channel_id\":\"" + team + "\",\"user_id\":\"" + alice + "\",\"text\":\"Hallo Welt\",\"language\":\"de\"," +
+                "\"started_at\":\"2026-09-19T05:26:24Z\",\"duration_ms\":900,\"original\":{\"text\":\"hello world\",\"language\":\"en\"}}}}").Transcript();
+            Assert.True(t.Translated);
+            Assert.Equal("Hallo Welt", t.Text);
+            Assert.Equal("de", t.Language);
+            Assert.Equal("hello world", t.OriginalText);
+            Assert.Equal("en", t.OriginalLanguage);
+            var plain = ControlMessage.Parse("{\"type\":\"Transcript\",\"data\":{\"transcript\":{\"id\":\"5855c240-f790-4303-8101-20f036ea25b2\"," +
+                "\"channel_id\":\"" + team + "\",\"user_id\":\"" + alice + "\",\"text\":\"hi\",\"started_at\":\"2026-09-19T05:26:24Z\",\"duration_ms\":400}}}").Transcript();
+            Assert.False(plain.Translated);
+            Assert.Null(plain.OriginalText);
+            Assert.Null(plain.OriginalLanguage);
+        }
+
+        [Fact]
         public void ChannelEnergyMessageParses()
         {
             var team = Guid.Parse("aaaaaaaa-0000-0000-0000-000000000001");

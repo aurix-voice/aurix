@@ -240,6 +240,29 @@ impl SpeechService {
         })
     }
 
+    /// Speech heard by one listener only (translated transcripts). Bypasses the client
+    /// request policy — the text is server-produced — but keeps the engine's queue caps.
+    pub fn speak_to_listener(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        listener: Arc<MediaSession>,
+        text: String,
+        voice: String,
+    ) -> Result<Uuid> {
+        let engine = self.engine_or_disabled()?;
+        self.validate_text(&text)?;
+        engine.submit(TtsRequest {
+            app_id,
+            channel_id,
+            text,
+            voice,
+            source: TtsSource::Listener { listener },
+            client_ref: None,
+            request_id: None,
+        })
+    }
+
     /// Cancel a player's request (`request_id`) or everything they queued (`None`).
     /// Returns how many requests were cancelled.
     pub fn cancel_for_session(&self, session_id: SessionId, request_id: Option<Uuid>) -> usize {

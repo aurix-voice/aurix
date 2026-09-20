@@ -304,6 +304,28 @@ pub static PCMU_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// ── Live translation Metrics ──
+
+/// `outcome` is `ok` (provider answered), `cached`, `error` (provider failed or timed out),
+/// `busy` (concurrency cap) or `skipped` (segment too long / too many languages).
+pub static TRANSLATIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_translations_total",
+        "Transcript segments translated for listeners, by outcome",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+pub static TRANSLATION_LATENCY: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "aurix_translation_latency_seconds",
+        "Round trip of one machine-translation request",
+        vec![0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0]
+    )
+    .unwrap()
+});
+
 pub static PCMU_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
         "aurix_pcmu_sessions",

@@ -146,6 +146,8 @@ public:
         return out;
     }
     bool transcript(AurixTranscript& out) const { return aurix_event_transcript(ev_, &out); }
+    /// Payload of `AURIX_EVENT_TRANSLATION_CHANGED` (the server-acked listener preference).
+    bool translation(AurixTranslation& out) const { return aurix_event_translation(ev_, &out); }
     bool tts(AurixTtsStatus& out) const { return aurix_event_tts(ev_, &out); }
     /// Payload of `AURIX_EVENT_AUDIO_POLICY_CHANGED`.
     bool audio_policy(AurixAudioPolicy& out) const { return aurix_event_audio_policy(ev_, &out); }
@@ -350,6 +352,13 @@ public:
     AurixResult set_dsp(const AurixDspConfig& config) { return aurix_client_set_dsp(c_, &config); }
     bool dsp(AurixDspConfig& out) const { return aurix_client_dsp(c_, &out) == AURIX_OK; }
     bool dsp_stats(AurixDspStats& out) const { return aurix_client_dsp_stats(c_, &out) == AURIX_OK; }
+    /// Built-in microphone voice effects (pitch shift / ring modulator); all-zero = off.
+    AurixResult set_voice_effects(const AurixVoiceEffects& effects) { return aurix_client_set_voice_effects(c_, &effects); }
+    bool voice_effects(AurixVoiceEffects& out) const { return aurix_client_voice_effects(c_, &out) == AURIX_OK; }
+    /// Host effect run on every 20 ms 48 kHz capture frame after the built-ins (`nullptr` removes it).
+    AurixResult set_voice_effect_callback(AurixVoiceEffectFn callback, void* user_data) {
+        return aurix_client_set_voice_effect_callback(c_, callback, user_data);
+    }
     void set_muted(bool muted) { aurix_client_set_muted(c_, muted); }
     bool is_muted() const { return aurix_client_is_muted(c_); }
     bool is_speaking() const { return aurix_client_is_speaking(c_); }
@@ -398,6 +407,11 @@ public:
     /// Link the media currently uses (UDP or the WebSocket tunnel); `AURIX_MEDIA_NONE` before bind.
     AurixMediaPath media_path() const { return aurix_client_media_path(c_); }
     AurixResult set_transcripts(bool enabled) { return aurix_client_set_transcripts(c_, enabled); }
+    /// Ask for transcripts translated into `language` (BCP-47, `nullptr` = off), optionally
+    /// declaring the language you speak and requesting private TTS of the translation.
+    AurixResult set_translation(const char* language, const char* spoken_language, bool speech) {
+        return aurix_client_set_translation(c_, language, spoken_language, speech);
+    }
     AurixResult update_positions(const Uuid& channel, const AurixPosition* positions, std::size_t count) {
         return aurix_client_update_positions(c_, &channel.raw, positions, count);
     }

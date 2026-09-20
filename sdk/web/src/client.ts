@@ -168,6 +168,36 @@ export interface SessionInfo {
   endpoint: string;
   /** Other nodes advertised for failover, tried in order after `endpoint` on a reconnect. */
   failover: string[];
+  /**
+   * The node translates transcripts on request (`setTranslation`); `undefined` when the
+   * operator has not configured translation.
+   */
+  translation?: TranslationInfo;
+}
+
+/** Live-translation capability of the node. */
+export interface TranslationInfo {
+  /** Translations can also be spoken privately to the listener (`setTranslation(..., { speech: true })`). */
+  speech: boolean;
+  /** Target languages listeners may request; empty = any BCP-47 tag. */
+  languages: string[];
+}
+
+/** This client's translation preference as the server applied it (normalised tags). */
+export interface TranslationPrefs {
+  /** Target language, or `undefined` when receiving originals only. */
+  language?: string;
+  /** Language this participant declared it speaks. */
+  spokenLanguage?: string;
+  /** Translations are also spoken privately to this client. */
+  speech: boolean;
+}
+
+export interface SetTranslationOptions {
+  /** Tell peers' translators which language you speak when the recogniser cannot tell. */
+  spokenLanguage?: string;
+  /** Also have the translation spoken to you alone, on the channel's translator voice (needs `SessionInfo.translation.speech`). */
+  speech?: boolean;
 }
 
 /**
@@ -335,6 +365,8 @@ export interface Transcript {
   durationMs: number;
   /** Word timings relative to `startedAt`; empty unless the server enables them. */
   words: TranscriptWord[];
+  /** Present when `text` is a translation: the speaker's words as transcribed. */
+  original?: { text: string; language?: string };
 }
 
 export interface TranscriptWord {
@@ -506,6 +538,8 @@ export interface AurixEvents {
    * transcribed for it either.
    */
   transcript: (transcript: Transcript) => void;
+  /** The server applied (or a resumed session restored) this client's translation preference. */
+  translationChanged: (prefs: TranslationPrefs) => void;
   /** Progress of a `speak()` request (queued → playing → finished/cancelled/failed). */
   ttsStatus: (status: TtsStatus) => void;
   serverError: (code: string, message: string) => void;
@@ -567,6 +601,13 @@ interface Pending<T> {
   timer: ReturnType<typeof setTimeout> | undefined;
 }
 
+/** Lower-case, `_` → `-`, trimmed tag (the server validates further); `undefined` for empty input. */
+function normalizeLanguageTag(tag: string | undefined): string | undefined {
+  if (tag === undefined) return undefined;
+  const t = tag.trim().toLowerCase().replace(/_/g, '-');
+  return t === '' ? undefined : t;
+}
+
 function transcriptFromWire(t: TranscriptWire): Transcript {
   return {
     id: t.id,
@@ -577,6 +618,14 @@ function transcriptFromWire(t: TranscriptWire): Transcript {
     startedAt: new Date(t.started_at),
     durationMs: t.duration_ms,
     words: (t.words ?? []).map((w) => ({ word: w.word, startMs: w.start_ms, endMs: w.end_ms })),
+    ...(t.original
+      ? {
+          original: {
+            text: t.original.text,
+            ...(t.original.language ? { language: t.original.language } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -701,6 +750,7 @@ export class AurixClient {
   private speechDone = new Map<string, Pending<TtsStatus>>();
   private speakRefCounter = 0;
   private wantTranscripts = true;
+  private translation: TranslationPrefs = { speech: false };
   /** Channels the server transcribes (from `ChannelJoinAck`). */
   private transcribedChannels = new Set<string>();
   private monitoredChannels = new Set<string>();
@@ -1208,6 +1258,9 @@ export class AurixClient {
     if (!this.wantTranscripts) {
       this.trySend({ type: 'SetTranscripts', data: { enabled: false } });
     }
+    if (this.translation.language !== undefined || this.translation.spokenLanguage !== undefined) {
+      this.trySend({ type: 'SetTranslation', data: this.translationWire() });
+    }
   }
 
   /**
@@ -1487,6 +1540,37 @@ export class AurixClient {
     this.trySend({ type: 'SetTranscripts', data: { enabled } });
   }
 
+  /** Translation preference this client asked for (client-held; the server acks with `translationChanged`). */
+  get translationPrefs(): TranslationPrefs {
+    return { ...this.translation };
+  }
+
+  /**
+   * Receive transcripts translated into `language` (BCP-47; `undefined` = originals only).
+   * Segments already in that language arrive untranslated; translated ones carry
+   * `Transcript.original`. Requires transcripts to be enabled and `SessionInfo.translation`.
+   * Client-held: replayed on reconnect.
+   */
+  setTranslation(language: string | undefined, options: SetTranslationOptions = {}): void {
+    const target = normalizeLanguageTag(language);
+    const spoken = normalizeLanguageTag(options.spokenLanguage);
+    this.translation = {
+      ...(target !== undefined ? { language: target } : {}),
+      ...(spoken !== undefined ? { spokenLanguage: spoken } : {}),
+      speech: options.speech === true && target !== undefined,
+    };
+    this.trySend({ type: 'SetTranslation', data: this.translationWire() });
+  }
+
+  private translationWire(): { language?: string; spoken_language?: string; speech: boolean } {
+    return {
+      ...(this.translation.language !== undefined ? { language: this.translation.language } : {}),
+      ...(this.translation.spokenLanguage !== undefined
+        ? { spoken_language: this.translation.spokenLanguage }
+        : {}),
+      speech: this.translation.speech,
+    };
+  }
   /**
    * Have the server synthesize `text` and play it as this user's voice. Resolves once the
    * request is queued; `done` (and `ttsStatus` events) track playback. Rejects with
@@ -2057,6 +2141,14 @@ export class AurixClient {
           migrated: d.migrated === true,
           endpoint,
           failover: [...this.failoverEndpoints],
+          ...(d.translation
+            ? {
+                translation: {
+                  speech: d.translation.speech === true,
+                  languages: [...(d.translation.languages ?? [])],
+                },
+              }
+            : {}),
         };
         this.resumeToken = d.resume_token || undefined;
         this.resumeGraceMs = d.resume_grace_ms ?? 0;
@@ -2210,6 +2302,16 @@ export class AurixClient {
         const d = (msg as Extract<ServerMessage, { type: 'TransmissionChanged' }>).data;
         this.transmission = transmissionFromWire(d.mode);
         this.emit('transmissionChanged', this.transmission);
+        return;
+      }
+      case 'TranslationChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'TranslationChanged' }>).data;
+        this.translation = {
+          ...(d.language ? { language: d.language } : {}),
+          ...(d.spoken_language ? { spokenLanguage: d.spoken_language } : {}),
+          speech: d.speech === true,
+        };
+        this.emit('translationChanged', { ...this.translation });
         return;
       }
       case 'ChannelFocusChanged': {

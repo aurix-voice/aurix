@@ -46,6 +46,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixChatReadMarkersReceived, FGu
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatInboxSynced, int32, Delivered, bool, bTruncated);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantTyping, FGuid, ChannelId, FGuid, UserId, bool, bTyping);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixTranscriptReceived, const FAurixTranscript&, Transcript);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixTranslationChanged, const FString&, Language, const FString&, SpokenLanguage, bool, bSpeech);
+
+/** Custom capture effect: one 20 ms 48 kHz interleaved frame (SamplesPerChannel * Channels floats) to modify in place. */
+typedef void (*FAurixVoiceEffectFn)(void* UserData, float* Frame, uint32 SamplesPerChannel, uint8 Channels);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixTtsStatusChanged, const FAurixTtsStatus&, Status);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRequestFailed, int64, RequestId, const FString&, Code, const FString&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixServerError, const FString&, Code, const FString&, Message);
@@ -228,6 +232,23 @@ public:
 	bool GetDspStats(FAurixDspStats& OutStats) const;
 
 	/**
+	 * Built-in voice effects on the microphone (pitch shift / ring modulator), after the DSP
+	 * and input gain and before VAD / encoding. Only your uplink is affected. Values are
+	 * clamped by the core; read back with GetVoiceEffects.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	bool SetVoiceEffects(const FAurixVoiceEffects& Effects);
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool GetVoiceEffects(FAurixVoiceEffects& OutEffects) const;
+
+	/**
+	 * Native-only: install a custom effect run on every 20 ms 48 kHz capture frame after the
+	 * built-ins (nullptr removes it). Runs on the capture thread — no blocking or allocation.
+	 */
+	bool SetVoiceEffectCallback(FAurixVoiceEffectFn Callback, void* UserData);
+
+	/**
 	 * Give the echo canceller speaker audio the core did not render itself (game audio, music):
 	 * interleaved 48 kHz float PCM, 1..2 channels, in playout order. Not needed for the remote
 	 * voice mix — MixOutputAudio and the plugin's sound wave feed it automatically.
@@ -381,6 +402,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetTranscripts(bool bEnabled);
 
+	/**
+	 * Receive transcripts translated into Language (BCP-47; empty = originals only), optionally
+	 * declaring the language you speak (helps the recogniser) and asking for the translation
+	 * to be spoken privately to you (bSpeech; needs FAurixSessionInfo::bTranslationSpeech).
+	 * Requires SetTranscripts(true). Acked by OnTranslationChanged; replayed on reconnect.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
+	bool SetTranslation(const FString& Language, const FString& SpokenLanguage, bool bSpeech);
+
 	// ---- positional audio ------------------------------------------------------------------
 
 	/** Report 1..64 poses (metres, engine axes) for a positional channel. */
@@ -508,6 +538,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatInboxSynced OnChatInboxSynced;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantTyping OnParticipantTyping;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTranscriptReceived OnTranscript;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTranslationChanged OnTranslationChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTtsStatusChanged OnTtsStatus;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRequestFailed OnRequestFailed;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixServerError OnServerError;

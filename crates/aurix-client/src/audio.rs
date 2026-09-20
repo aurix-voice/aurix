@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::dsp::{Dsp, DspConfig};
+use crate::effects::EffectChain;
 
 /// Opus on the wire runs at 48 kHz; the mixer and the capture path work at this rate and
 /// PCMU frames are resampled to/from it at the edge.
@@ -691,6 +692,8 @@ pub struct CaptureEncoder {
     pub vad: VoiceActivityDetector,
     /// Capture DSP (high-pass / AEC / NS / AGC), bypassed until configured.
     pub dsp: Dsp,
+    /// Voice effects applied after the DSP and gain, before VAD metering and encoding.
+    pub effects: EffectChain,
     settings: EncoderSettings,
     out: [u8; 1275],
     ulaw: Vec<u8>,
@@ -714,6 +717,7 @@ impl CaptureEncoder {
             gain: 1.0,
             vad: VoiceActivityDetector::default(),
             dsp: Dsp::new(DspConfig::BYPASS),
+            effects: EffectChain::default(),
             settings,
             out: [0u8; 1275],
             ulaw: Vec::with_capacity(PCMU_FRAME_SAMPLES),
@@ -869,6 +873,7 @@ impl CaptureEncoder {
                         *s = (*s * self.gain).clamp(-1.0, 1.0);
                     }
                 }
+                self.effects.process(frame, 1);
                 self.vad.process(frame);
                 let energy = rms(frame);
                 match self.codec {
@@ -908,6 +913,9 @@ impl CaptureEncoder {
                     };
                     self.interleaved[n * 2] = l;
                     self.interleaved[n * 2 + 1] = r;
+                }
+                self.effects.process(&mut self.interleaved, 2);
+                for (n, [l, r]) in self.interleaved.as_chunks::<2>().0.iter().enumerate() {
                     self.meter[n] = 0.5 * (l + r);
                 }
                 self.vad.process(&self.meter);
@@ -947,6 +955,7 @@ impl CaptureEncoder {
         self.pending.clear();
         self.resamplers.clear();
         self.vad.reset();
+        self.effects.reset();
         let _ = self.encoder.reset_state();
         self.pcmu.reset();
     }
@@ -2030,6 +2039,106 @@ mod tests {
         assert!(ulaw
             .iter()
             .all(|f| f.codec == AudioCodec::Pcmu && f.payload.len() == PCMU_FRAME_SAMPLES));
+    }
+
+    #[test]
+    fn voice_effects_run_after_gain_and_before_vad_and_encoding() {
+        use crate::effects::CallbackEffect;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let seen_channels = Arc::new(AtomicUsize::new(0));
+        let frames_seen = Arc::new(AtomicUsize::new(0));
+        let capture = |enc: &mut CaptureEncoder| {
+            let pcm = sine(48_000, 48_000, 440.0, 0.5);
+            let mut frames = Vec::new();
+            for chunk in pcm.chunks(480) {
+                enc.push_f32(chunk, 48_000, 1, |f| frames.push(f));
+            }
+            frames
+        };
+
+        let mut enc = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        let loud = capture(&mut enc);
+        assert!(loud.iter().all(|f| f.speech));
+
+        // A stage that silences the frame is seen by the VAD / level meter and the encoder.
+        let mut chain = EffectChain::default();
+        let (sc, fs) = (seen_channels.clone(), frames_seen.clone());
+        chain.push(Box::new(CallbackEffect::new(
+            move |frame: &mut [f32], ch| {
+                sc.store(ch as usize, Ordering::Relaxed);
+                fs.fetch_add(1, Ordering::Relaxed);
+                frame.fill(0.0);
+            },
+        )));
+        enc.effects = chain;
+        let muted = capture(&mut enc);
+        assert_eq!(seen_channels.load(Ordering::Relaxed), 1);
+        assert_eq!(frames_seen.load(Ordering::Relaxed), 50);
+        assert!(muted.iter().all(|f| f.level == AUDIO_LEVEL_SILENCE));
+        // VAD hangover / energy smoothing from the loud run decay, then it is plain silence.
+        assert!(muted[20..].iter().all(|f| !f.speech && f.energy < 1e-4));
+
+        // Empty chain is a bypass again.
+        enc.effects = EffectChain::default();
+        assert!(capture(&mut enc).iter().all(|f| f.speech));
+
+        // Stereo frames arrive interleaved with `channels == 2`, and the effect output is
+        // what gets metered: silencing the right half only still leaves speech.
+        let mut stereo = CaptureEncoder::new(EncoderSettings {
+            channels: 2,
+            signal: OpusSignal::Music,
+            bitrate_bps: 96_000,
+            ..EncoderSettings::default()
+        })
+        .unwrap();
+        let mut chain = EffectChain::default();
+        let sc = seen_channels.clone();
+        chain.push(Box::new(CallbackEffect::new(
+            move |frame: &mut [f32], ch| {
+                sc.store(ch as usize, Ordering::Relaxed);
+                for [l, r] in frame.as_chunks_mut::<2>().0 {
+                    *r = *l;
+                    *l = 0.0;
+                }
+            },
+        )));
+        stereo.effects = chain;
+        let frames = left_only_capture(&mut stereo);
+        assert_eq!(seen_channels.load(Ordering::Relaxed), 2);
+        assert!(frames
+            .iter()
+            .all(|f| f.speech && opus_packet_is_stereo(&f.payload)));
+        let mut mixer = RemoteMixer::new(1, 12);
+        let out = play(&mut mixer, 1, 0, &frames, None, 2);
+        let (l, r) = split_lr(&out, 4);
+        assert!(rms(&l) < 0.02, "{}", rms(&l));
+        assert!((rms(&r) - 0.3535).abs() < 0.05, "{}", rms(&r));
+
+        // The PCMU edge gets the same processed frame: a built-in pitch shift up an octave is
+        // audible in the μ-law payload, and `reset()` clears the effect state too.
+        use crate::effects::PitchShift;
+        let mut pcmu = CaptureEncoder::new(EncoderSettings::default()).unwrap();
+        pcmu.set_codec(AudioCodec::Pcmu);
+        pcmu.effects = EffectChain::new(vec![Box::new(PitchShift::new(12.0))]);
+        let frames = capture(&mut pcmu);
+        assert!(frames
+            .iter()
+            .all(|f| f.codec == AudioCodec::Pcmu && f.payload.len() == PCMU_FRAME_SAMPLES));
+        let mut decoded = Vec::new();
+        for f in &frames[10..] {
+            g711::decode_f32(&f.payload, &mut decoded);
+        }
+        let crossings = decoded
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count() as f32;
+        let hz = crossings / 2.0 / (decoded.len() as f32 / PCMU_SAMPLE_RATE as f32);
+        assert!((hz - 880.0).abs() < 60.0, "pitched μ-law at {hz} Hz");
+        assert!(frames[10..].iter().all(|f| f.speech));
+        pcmu.reset();
+        assert_eq!(pcmu.effects.len(), 1);
     }
 
     #[test]

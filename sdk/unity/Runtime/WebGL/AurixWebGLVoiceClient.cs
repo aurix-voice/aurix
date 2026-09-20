@@ -39,6 +39,7 @@ namespace Aurix.WebGL
         private bool _disposed;
         private bool _muted;
         private bool _wantTranscripts;
+        private TranslationPrefs _translation = new TranslationPrefs();
         private TransmissionMode _transmission = TransmissionMode.All;
         private Guid? _focus;
         private Guid _userId;
@@ -93,6 +94,7 @@ namespace Aurix.WebGL
         public TransmissionMode Transmission { get { lock (_channels) return _transmission; } }
         public Guid? FocusChannel { get { lock (_channels) return _focus; } }
         public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
+        public TranslationPrefs TranslationPrefs { get { lock (_channels) return _translation.Clone(); } }
         public NetworkQuality? LastNetworkQuality => _quality;
         /// <summary>Whether the browser client exists (created by the first connect, destroyed by <see cref="Dispose"/>).</summary>
         public bool IsCreated => _handle > 0;
@@ -124,6 +126,7 @@ namespace Aurix.WebGL
         public event Action<int, bool> OnChatInboxSynced;
         public event Action<Guid, Guid, bool> OnParticipantTyping;
         public event Action<Transcript> OnTranscript;
+        public event Action<TranslationPrefs> OnTranslationChanged;
         public event Action<TtsStatus> OnTtsStatus;
         public event Action<string, string> OnServerError;
         public event Action<string> OnDisconnected;
@@ -301,6 +304,24 @@ namespace Aurix.WebGL
         {
             lock (_channels) _wantTranscripts = enabled;
             return Sync("setTranscripts", new Dictionary<string, object> { { "enabled", enabled } });
+        }
+
+        public Task SetTranslationAsync(string language, string spokenLanguage = null, bool speech = false, CancellationToken ct = default)
+        {
+            var target = Protocol.TranslationPrefs.NormalizeTag(language);
+            var prefs = new TranslationPrefs
+            {
+                Language = target,
+                SpokenLanguage = Protocol.TranslationPrefs.NormalizeTag(spokenLanguage),
+                Speech = speech && target != null,
+            };
+            lock (_channels) _translation = prefs;
+            return Sync("setTranslation", new Dictionary<string, object>
+            {
+                { "language", prefs.Language },
+                { "spokenLanguage", prefs.SpokenLanguage },
+                { "speech", prefs.Speech },
+            });
         }
 
         private static Dictionary<string, object> Channel(Guid channelId) => new Dictionary<string, object> { { "channelId", channelId } };
@@ -853,6 +874,13 @@ namespace Aurix.WebGL
                 {
                     var t = BridgeJson.Transcript(BridgeJson.Obj(e, "transcript"));
                     if (t != null) OnTranscript?.Invoke(t);
+                    return;
+                }
+                case "translationChanged":
+                {
+                    var prefs = BridgeJson.TranslationPrefs(BridgeJson.Obj(e, "prefs"));
+                    lock (_channels) _translation = prefs.Clone();
+                    OnTranslationChanged?.Invoke(prefs);
                     return;
                 }
                 case "ttsStatus":

@@ -4,7 +4,7 @@
 //! tunnelled (see [`crate::media`]). Connection policy (reconnects, re-joins) lives in
 //! [`crate::client`].
 
-use aurix_common::protocol::ControlMessage;
+use aurix_common::protocol::{ControlMessage, TranslationInfo};
 use aurix_common::types::{SessionId, UserId};
 use base64::Engine;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -46,6 +46,9 @@ pub struct SessionAck {
     pub migrated: bool,
     /// Public WebSocket URLs of other healthy nodes to try when this one stops answering.
     pub failover: Vec<String>,
+    /// The node translates transcripts for listeners (`Client::set_translation`); `None` when
+    /// translation is not configured there.
+    pub translation: Option<TranslationInfo>,
 }
 
 /// Informational (unverified) claims of the session JWT; lets the client recognise itself in
@@ -196,6 +199,7 @@ impl ControlConnection {
                     downlink_mix,
                     migrated,
                     failover,
+                    translation,
                 }) => {
                     let media_key = base64::engine::general_purpose::STANDARD
                         .decode(media_key.as_bytes())
@@ -216,6 +220,7 @@ impl ControlConnection {
                         downlink_mix,
                         migrated,
                         failover,
+                        translation,
                     });
                 }
                 Some(ControlMessage::Error { code, message, .. }) => {

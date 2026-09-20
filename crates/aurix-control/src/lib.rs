@@ -13,6 +13,7 @@ pub mod safety;
 pub mod session_manager;
 pub mod session_mirror;
 pub mod speech;
+pub mod translation;
 pub mod usage;
 pub mod user_lifecycle;
 pub mod webhooks;
@@ -30,6 +31,7 @@ pub use session_mirror::{
     MirroredChannel, MirroredPrefs, SessionMirror, TakeoverRefused, MIGRATION_SEQUENCE_GAP,
 };
 pub use speech::{ParticipantSpeak, SpeechService};
+pub use translation::{ListenerTranslation, TranslationService};
 pub use usage::{AppLimits, QuotaState, UsageService};
 pub use user_lifecycle::{DeleteUserRequest, RetentionService, UserLifecycle};
 pub use webhooks::{PublicEvent, WebhookService};

@@ -186,6 +186,11 @@ jobs:
           AURIX__TTS__MAX_AUDIO_SECS: "4"
           AURIX__TTS__REQUESTS_PER_MINUTE_PER_SESSION: "6"
           AURIX__TTS__MAX_QUEUED_PER_SESSION: "2"
+          AURIX__TRANSLATION__ENABLED: "true"
+          AURIX__TRANSLATION__ENDPOINT: http://127.0.0.1:18790
+          AURIX__TRANSLATION__API_KEY: ci-only-speech-token
+          AURIX__TRANSLATION__TIMEOUT_MS: "1500"
+          AURIX__TRANSLATION__LANGUAGES: en,de,fr,it,nl
           AURIX__SAFETY__ENABLED: "true"
           AURIX__SAFETY__CLASSIFIER__ENDPOINT: http://127.0.0.1:18790/v1/moderations
           AURIX__SAFETY__CLASSIFIER__API_KEY: ci-only-speech-token
@@ -196,6 +201,7 @@ jobs:
           AURIX_E2E_SAFETY: "1"
           AURIX_E2E_API: http://127.0.0.1:8100
           AURIX_E2E_WS: ws://127.0.0.1:8101
+          AURIX_E2E_METRICS: http://127.0.0.1:9092/metrics
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
           AURIX_E2E_API_KEY2: ${{ steps.bootstrap.outputs.key2 }}
         run: |
@@ -204,7 +210,7 @@ jobs:
           nohup ./target/debug/aurix-server > server-speech.log 2>&1 &
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8100/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8100/ready
-          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture speech_transcripts content_safety recording_mixdown
+          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture speech_transcripts content_safety recording_mixdown live_translation
       - name: E2E (admin SSO against the mock OIDC provider + administrator lifecycle)
         env:
           AURIX__TURN__ENABLED: "false"

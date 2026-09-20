@@ -478,6 +478,14 @@ struct AURIXVOICE_API FAurixSessionInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bDownlinkMix = false;
 
+	/** The node translates transcripts on request (SetTranslation). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bTranslation = false;
+
+	/** Translated transcripts can also be spoken privately to the listener (SetTranslation bSpeech). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bTranslationSpeech = false;
+
 	/**
 	 * The latest (re)connect resumed the session on a different node (same session id and
 	 * SSRC, new media key/endpoint). GetEndpoint names it.
@@ -639,6 +647,32 @@ struct AURIXVOICE_API FAurixTranscript
 
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int32 DurationMs = 0;
+
+	/** Set when Text is a translation: the speaker's words as transcribed. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bTranslated = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString OriginalText;
+
+	/** Detected / declared language of OriginalText (BCP-47 or empty). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString OriginalLanguage;
+};
+
+/** Built-in microphone voice effects; zero disables a stage. Applied after the DSP, before encoding. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixVoiceEffects
+{
+	GENERATED_BODY()
+
+	/** Pitch shift in semitones, -24..24 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "-24", ClampMax = "24"))
+	float PitchSemitones = 0.f;
+
+	/** Ring-modulator ("robot") carrier in Hz, 0..2000 (0 = off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix", meta = (ClampMin = "0", ClampMax = "2000"))
+	float RingModHz = 0.f;
 };
 
 USTRUCT(BlueprintType)

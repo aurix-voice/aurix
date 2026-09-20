@@ -1685,6 +1685,90 @@ async fn tts_injection_follows_channel_routing() {
         }
     }
 
+    // Spoken translation: private to the requesting listener on the channel's translator SSRC
+    // (never a participant's or the announcement SSRC), no `TtsStatus` for anyone, and its
+    // sequence clock is per listener so two listeners' translations do not share one stream.
+    // Carol's local mute of Alice is irrelevant: the voice is the server's, not Alice's.
+    let translator = translation_voice_ssrc(&channel);
+    assert_ne!(translator, sys);
+    for listener in [&carol, &bob] {
+        engine
+            .submit(TtsRequest {
+                app_id: app,
+                channel_id: channel,
+                text: "x".into(), // 5 frames
+                voice: "nova".into(),
+                source: TtsSource::Listener {
+                    listener: listener.session.clone(),
+                },
+                client_ref: None,
+                request_id: None,
+            })
+            .unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(600), status.recv())
+            .await
+            .is_err(),
+        "listener-scoped speech emits no status events"
+    );
+    for _ in 0..20 {
+        if engine.pending() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(engine.pending(), 0);
+    for c in [&carol, &bob] {
+        let mut seqs = Vec::new();
+        while let Some(p) = c.recv().await {
+            assert_eq!(p.header.ssrc, translator);
+            assert_eq!(p.header.channel_id_hash, channel_id_hash(&channel));
+            seqs.push(p.header.sequence);
+        }
+        assert_eq!(
+            seqs,
+            (0..5).collect::<Vec<_>>(),
+            "{} hears only her own translation",
+            c.session.user_id
+        );
+    }
+    assert!(
+        alice.recv().await.is_none(),
+        "the speaker never hears listeners' translations"
+    );
+    // A listener who left the channel (or belongs to another tenant) gets nothing.
+    sfu.leave_channel(&carol.session.session_id, &channel)
+        .unwrap();
+    engine
+        .submit(TtsRequest {
+            app_id: app,
+            channel_id: channel,
+            text: "x".into(),
+            voice: "nova".into(),
+            source: TtsSource::Listener {
+                listener: carol.session.clone(),
+            },
+            client_ref: None,
+            request_id: None,
+        })
+        .unwrap();
+    for _ in 0..20 {
+        if engine.pending() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(carol.recv().await.is_none());
+    assert!(bob.recv().await.is_none());
+    sfu.join_channel(
+        &carol.session.session_id,
+        channel,
+        cfg.clone(),
+        ChannelRole::Speaker,
+    )
+    .unwrap();
+
     // Cancellation mid-playout stops the stream; only the owner may cancel.
     let id = engine
         .submit(TtsRequest {

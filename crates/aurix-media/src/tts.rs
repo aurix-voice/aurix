@@ -4,11 +4,13 @@
 //!
 //! Synthesized streams carry their own SSRC with the top bit set ([`SYNTH_SSRC_FLAG`]): a
 //! participant's voice is `session_ssrc | FLAG`, a server announcement is derived from the
-//! channel id. Receivers therefore never mix TTS frames into a microphone jitter buffer, and
-//! SDKs can attribute the stream (`ssrc & !FLAG` is the participant's SSRC or nobody's).
+//! channel id, a listener's private translator voice from the channel id as well (distinct
+//! from the announcement). Receivers therefore never mix TTS frames into a microphone jitter
+//! buffer, and SDKs can attribute the stream (`ssrc & !FLAG` is the participant's SSRC or
+//! nobody's).
 //!
-//! Synthesis runs concurrently (bounded); playout is serialised per synthesized stream so two
-//! requests for the same voice never interleave.
+//! Synthesis runs concurrently (bounded); playout is serialised per synthesized stream (per
+//! receiver for private streams) so two requests for the same voice never interleave.
 
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{channel_id_hash, TtsState};
@@ -41,6 +43,12 @@ pub fn participant_voice_ssrc(session_ssrc: u32) -> u32 {
 /// listener in several channels keeps the streams apart).
 pub fn system_voice_ssrc(channel_id: &ChannelId) -> u32 {
     (channel_id_hash(channel_id) & !SYNTH_SSRC_FLAG) | SYNTH_SSRC_FLAG
+}
+
+/// SSRC of the translator voice a listener hears privately in `channel_id` (live translation
+/// of other participants' speech). Stable per channel, never equal to the announcement SSRC.
+pub fn translation_voice_ssrc(channel_id: &ChannelId) -> u32 {
+    ((channel_id_hash(channel_id) ^ 0x5A5A_5A5A) & !SYNTH_SSRC_FLAG) | SYNTH_SSRC_FLAG
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +87,9 @@ pub enum TtsSource {
     },
     /// Server announcement to every local participant of the channel.
     System,
+    /// Private to `listener`: nobody else receives a frame. Used for spoken translations; the
+    /// stream is [`translation_voice_ssrc`] and no `TtsStatus` is emitted for it.
+    Listener { listener: Arc<MediaSession> },
 }
 
 pub struct TtsRequest {
@@ -112,6 +123,9 @@ struct Job {
     session_id: Option<SessionId>,
 }
 
+/// One synthesized stream: its SSRC and, for private streams, the receiver.
+type StreamKey = (u32, Option<SessionId>);
+
 /// Sequence/timestamp clock of one synthesized stream; holding its lock is the playout slot.
 #[derive(Default)]
 struct StreamClock {
@@ -127,7 +141,7 @@ pub struct TtsEngine {
     jobs: DashMap<Uuid, Job>,
     queued_per_session: DashMap<SessionId, u32>,
     queued_per_channel: DashMap<ChannelId, u32>,
-    streams: DashMap<u32, Arc<Mutex<StreamClock>>>,
+    streams: DashMap<StreamKey, Arc<Mutex<StreamClock>>>,
     events: broadcast::Sender<TtsStatusEvent>,
     usage: OnceLock<Arc<UsageMeter>>,
 }
@@ -174,11 +188,15 @@ impl TtsEngine {
             .get()
             .cloned()
             .ok_or_else(|| AurixError::Internal("media plane not started".into()))?;
-        let (session_id, user_id) = match &request.source {
+        // Whose queue slot the request takes / who is told about its progress.
+        let (session_id, user_id, notify) = match &request.source {
             TtsSource::Participant { session, .. } => {
-                (Some(session.session_id), Some(session.user_id))
+                (Some(session.session_id), Some(session.user_id), true)
             }
-            TtsSource::System => (None, None),
+            TtsSource::System => (None, None, true),
+            TtsSource::Listener { listener } => {
+                (Some(listener.session_id), Some(listener.user_id), false)
+            }
         };
         if let Some(session_id) = session_id {
             let mut count = self.queued_per_session.entry(session_id).or_insert(0);
@@ -235,11 +253,13 @@ impl TtsEngine {
             duration_ms: None,
             message: None,
         };
-        let _ = self.events.send(base.clone());
+        if notify {
+            let _ = self.events.send(base.clone());
+        }
 
         let engine = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = engine.run(&router, request, &base, cancel).await;
+            let outcome = engine.run(&router, request, &base, notify, cancel).await;
             let mut status = base;
             match outcome {
                 Ok(Some(duration_ms)) => {
@@ -248,7 +268,11 @@ impl TtsEngine {
                 }
                 Ok(None) => status.state = TtsState::Cancelled,
                 Err(e) => {
-                    warn!("TTS request {} failed: {}", request_id, e);
+                    if notify {
+                        warn!("TTS request {} failed: {}", request_id, e);
+                    } else {
+                        debug!("private TTS request {} failed: {}", request_id, e);
+                    }
                     status.state = TtsState::Failed;
                     status.message = Some(e.public_message());
                 }
@@ -258,7 +282,9 @@ impl TtsEngine {
                 engine.release_session_slot(session_id);
             }
             engine.release_channel_slot(status.channel_id);
-            let _ = engine.events.send(status);
+            if notify {
+                let _ = engine.events.send(status);
+            }
         });
         Ok(request_id)
     }
@@ -319,6 +345,7 @@ impl TtsEngine {
         router: &PacketRouter,
         request: TtsRequest,
         base: &TtsStatusEvent,
+        notify: bool,
         cancel: CancellationToken,
     ) -> Result<Option<u64>> {
         let permit = tokio::select! {
@@ -336,13 +363,17 @@ impl TtsEngine {
         }
         let duration_ms = frames.len() as u64 * FRAME_DURATION.as_millis() as u64;
 
-        let ssrc = match &request.source {
-            TtsSource::Participant { session, .. } => participant_voice_ssrc(session.ssrc),
-            TtsSource::System => system_voice_ssrc(&request.channel_id),
+        let (ssrc, receiver) = match &request.source {
+            TtsSource::Participant { session, .. } => (participant_voice_ssrc(session.ssrc), None),
+            TtsSource::System => (system_voice_ssrc(&request.channel_id), None),
+            TtsSource::Listener { listener } => (
+                translation_voice_ssrc(&request.channel_id),
+                Some(listener.session_id),
+            ),
         };
         let clock = self
             .streams
-            .entry(ssrc)
+            .entry((ssrc, receiver))
             .or_insert_with(|| Arc::new(Mutex::new(StreamClock::default())))
             .value()
             .clone();
@@ -351,12 +382,14 @@ impl TtsEngine {
             guard = clock.lock() => guard,
         };
 
-        let _ = self.events.send(TtsStatusEvent {
-            state: TtsState::Playing,
-            duration_ms: Some(duration_ms),
-            message: truncated.then(|| "audio truncated to the configured maximum".to_string()),
-            ..base.clone()
-        });
+        if notify {
+            let _ = self.events.send(TtsStatusEvent {
+                state: TtsState::Playing,
+                duration_ms: Some(duration_ms),
+                message: truncated.then(|| "audio truncated to the configured maximum".to_string()),
+                ..base.clone()
+            });
+        }
         debug!(
             "TTS {} playing {} frames ({} ms) on ssrc {:#x} in {}",
             base.request_id,
@@ -400,6 +433,11 @@ impl TtsEngine {
                 TtsSource::System => {
                     router
                         .inject_system_audio(&request.app_id, &request.channel_id, frame)
+                        .await?
+                }
+                TtsSource::Listener { listener } => {
+                    router
+                        .inject_listener_audio(listener, &request.channel_id, frame)
                         .await?
                 }
             }
@@ -505,6 +543,9 @@ mod tests {
         let ch = ChannelId::new();
         assert_ne!(system_voice_ssrc(&ch) & SYNTH_SSRC_FLAG, 0);
         assert_eq!(system_voice_ssrc(&ch), system_voice_ssrc(&ch));
+        assert_ne!(translation_voice_ssrc(&ch) & SYNTH_SSRC_FLAG, 0);
+        assert_ne!(translation_voice_ssrc(&ch), system_voice_ssrc(&ch));
+        assert_eq!(translation_voice_ssrc(&ch), translation_voice_ssrc(&ch));
     }
 
     #[test]

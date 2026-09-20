@@ -209,6 +209,24 @@ stops capture, unbinds the sound waves and only then destroys the client.
   `HeartbeatsLostConsecutive` / `UplinkDropped`. The tunnel is TCP — expect latency bursts under
   loss; it keeps the player in the call, UDP remains the path to be on.
 
+* **Voice effects:** `SetVoiceEffects(FAurixVoiceEffects { PitchSemitones (±24), RingModHz
+  (0–2000) })` runs the core's built-in pitch shifter / ring modulator on the microphone after
+  the DSP and input gain and before VAD / encoding (zero = stage off, values clamped;
+  `GetVoiceEffects` reads back). `SetVoiceEffectCallback(Fn, UserData)` (C++ only) adds your own
+  stage after the built-ins: called on the capture thread with a 20 ms 48 kHz float frame and
+  its channel count — no blocking, no allocation; `nullptr` removes it. Only the uplink is
+  affected; playback, injected audio and TTS are untouched.
+
+* **Live translation:** `FAurixSessionInfo.bTranslation` / `bTranslationSpeech` say what the
+  node offers; `SetTranslation(Language, SpokenLanguage, bSpeech)` asks for the transcripts you
+  receive in `Language` (BCP-47; empty = originals only) while declaring the language you speak,
+  and `OnTranslationChanged(Language, SpokenLanguage, bSpeech)` confirms the normalised
+  preference (rejections arrive on `OnServerError`: `VALIDATION_ERROR` unknown / unoffered tag,
+  `TRANSLATION_DISABLED`). Translated `FAurixTranscript`s fill `OriginalText` /
+  `OriginalLanguage`; segments already in your language or that the provider could not
+  translate arrive as the original. With `bSpeech` the translation is also spoken to you alone
+  on the channel's translator SSRC. Replayed after reconnect and failover.
+
 ### Statistics and network quality bars
 
 `GetStats(FAurixStats&)` returns the native snapshot (packets/bytes both ways, `BadAuth`,

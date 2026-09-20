@@ -21,7 +21,7 @@ Immediately after the upgrade the server sends
   "media_addrs":["203.0.113.10:10000","[2001:db8::10]:10000"],
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
   "migrated":false,"failover":["wss://eu2.voice.example.com/ws","wss://eu3.voice.example.com/ws"],
-  "media_tunnel":true,"downlink_mix":true}}
+  "media_tunnel":true,"downlink_mix":true,"translation":{"speech":true,"languages":["en","de","fr"]}}}
 ```
 
 `media_key` is the master secret for the [AURX media path](aurx.md); `media_addr` is the UDP
@@ -32,7 +32,10 @@ clients try the candidates in order and stick with the family that answers `Sess
 frames on this very connection** when UDP is blocked
 ([tunnel](aurx.md#tunnel-aurx-over-the-control-websocket)) — text frames are always control
 messages, binary frames are always media; `downlink_mix` says native sessions may ask for a
-[server-mixed downlink](../features/channels.md#server-mix-for-native-clients). With
+[server-mixed downlink](../features/channels.md#server-mix-for-native-clients); `translation`
+(absent when the node does not translate) lists the target languages listeners may request with
+`SetTranslation` and whether translations can also be spoken to them
+([live translation](../features/speech.md#live-translation)). With
 `AURIX__AUTH__REQUIRE_ACTION_TOKENS=true` a
 plain player JWT is refused for the handshake (`ACTION_TOKEN_REQUIRED`).
 `failover` lists other healthy nodes (same region first, least loaded first; up to
@@ -96,6 +99,7 @@ See [High availability](../operations/high-availability.md#cross-node-session-fa
 | `ChatHistory { channel_id \| user_id, before?, after?, limit?, client_ref? }` | `ChatHistoryResult { …, messages, next_before?, next_after? }` | stored chat only; opaque `(sent_at, id)` cursors ([history pages](../features/chat.md#history-pages)) |
 | `ChatMarkRead { channel_id \| user_id, message_id }`, `ChatReadMarkers { channel_id \| user_id }` | `ChatReadMarker { marker }`, `ChatReadMarkersResult { …, markers, unread_count }`, `ChatInboxSynced { delivered, truncated }` after `SessionInitAck` | stored chat only; see [read markers](../features/chat.md#read-markers-and-unread-counts) and [offline delivery](../features/chat.md#offline-delivery-of-directed-messages) |
 | `SetTranscripts { enabled }` | `Transcript { transcript }` | opt-out of transcript delivery |
+| `SetTranslation { language?, spoken_language?, speech }` | `TranslationChanged { language?, spoken_language?, speech }` | receive transcripts translated into `language` (normalised BCP-47 tag, `null` = stop); translated `Transcript`s carry `original {text, language?}`; `speech` = also spoken privately to this session; `VALIDATION_ERROR` for unknown / unoffered tags, `TRANSLATION_DISABLED` when the node does not translate — see [live translation](../features/speech.md#live-translation) |
 | `TtsSpeak { channel_id?, text, voice?, destination, client_ref? }`, `TtsCancel` | `TtsStatus { request_id, client_ref, state, duration_ms?, message? }` | see [Transcripts and TTS](../features/speech.md) |
 | `WebRtcOffer { sdp }` | `WebRtcAnswer { sdp }` | browsers; alternative to `POST /v1/webrtc/offer` |
 | `Ping { nonce }` | `Pong { nonce }`, `Error { code, message, client_ref? }` | errors reuse the REST codes; `client_ref` echoes the request that failed when it had one |

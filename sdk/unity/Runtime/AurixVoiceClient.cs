@@ -117,6 +117,11 @@ namespace Aurix
         /// (<see cref="AurixVoiceClient.SetDownlinkModeAsync"/> with <see cref="DownlinkMode.Mixed"/>).
         /// </summary>
         public bool DownlinkMix;
+        /// <summary>
+        /// The node translates transcripts on request (<see cref="AurixVoiceClient.SetTranslationAsync"/>);
+        /// null when the operator has not configured translation.
+        /// </summary>
+        public TranslationInfo Translation;
     }
 
     public sealed class RecordingNotice
@@ -192,6 +197,7 @@ namespace Aurix
         private readonly Dictionary<string, TaskCompletionSource<TtsStatus>> _speechDone = new Dictionary<string, TaskCompletionSource<TtsStatus>>();
         private int _speakRefCounter;
         private bool _wantTranscripts = true;
+        private TranslationPrefs _translation = new TranslationPrefs();
         private AudioCodec _preferredCodec = AudioCodec.Opus;
         private AudioCodec _activeCodec = AudioCodec.Opus;
         private DownlinkMode _preferredDownlink = DownlinkMode.Streams;
@@ -478,6 +484,8 @@ namespace Aurix
         /// blocked or locally muted are not transcribed for it either.
         /// </summary>
         public event Action<Transcript> OnTranscript;
+        /// <summary>The server applied (or a resumed session restored) this client's translation preference.</summary>
+        public event Action<TranslationPrefs> OnTranslationChanged;
         /// <summary>Progress of a <see cref="SpeakAsync"/> request (queued → playing → finished/cancelled/failed).</summary>
         public event Action<TtsStatus> OnTtsStatus;
         /// <summary>
@@ -650,6 +658,7 @@ namespace Aurix
                     Failover = failover,
                     MediaTunnel = ack.Bool("media_tunnel"),
                     DownlinkMix = ack.Bool("downlink_mix"),
+                    Translation = ack.Translation(),
                 };
                 _mediaKey = Convert.FromBase64String(ack.Str("media_key") ?? throw new InvalidOperationException("SessionInitAck without media_key"));
                 var token = ack.Str("resume_token");
@@ -1299,6 +1308,32 @@ namespace Aurix
             return control.SendAsync(ControlMessage.SetTranscripts(enabled), ct);
         }
 
+        /// <summary>Translation preference this client asked for (client-held; the server acks with <see cref="OnTranslationChanged"/>).</summary>
+        public TranslationPrefs TranslationPrefs { get { lock (_channels) return _translation.Clone(); } }
+
+        /// <summary>
+        /// Receive transcripts translated into <paramref name="language"/> (BCP-47; null = originals only).
+        /// Segments already in that language arrive untranslated; translated ones carry
+        /// <see cref="Transcript.OriginalText"/>. <paramref name="spokenLanguage"/> tells peers' translators which
+        /// language this participant speaks when the recogniser cannot tell; <paramref name="speech"/> also has the
+        /// translation spoken privately to this client (needs <see cref="SessionInfo.Translation"/>.Speech). Requires
+        /// transcripts to be enabled. Client-held: replayed after a fresh session.
+        /// </summary>
+        public Task SetTranslationAsync(string language, string spokenLanguage = null, bool speech = false, CancellationToken ct = default)
+        {
+            var target = Protocol.TranslationPrefs.NormalizeTag(language);
+            var prefs = new TranslationPrefs
+            {
+                Language = target,
+                SpokenLanguage = Protocol.TranslationPrefs.NormalizeTag(spokenLanguage),
+                Speech = speech && target != null,
+            };
+            lock (_channels) _translation = prefs;
+            var control = _control;
+            if (control == null || !control.IsOpen) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetTranslation(prefs), ct);
+        }
+
         /// <summary>
         /// Codec currently negotiated for this session's native media path (what to encode with and what
         /// <see cref="TryDequeueAudio"/> delivers). Opus until the server acknowledges a PCMU request.
@@ -1477,9 +1512,12 @@ namespace Aurix
             bool wantTranscripts;
             AudioCodec codec;
             DownlinkMode downlink;
-            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; downlink = _preferredDownlink; }
+            TranslationPrefs translation;
+            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; downlink = _preferredDownlink; translation = _translation; }
             if (!wantTranscripts)
                 await control.SendAsync(ControlMessage.SetTranscripts(false), ct).ConfigureAwait(false);
+            if (translation.Language != null || translation.SpokenLanguage != null)
+                await control.SendAsync(ControlMessage.SetTranslation(translation), ct).ConfigureAwait(false);
             // A fresh session is Opus; the server confirms the switch with AudioCodecChanged.
             if (codec != AudioCodec.Opus)
                 await control.SendAsync(ControlMessage.SetAudioCodec(codec), ct).ConfigureAwait(false);
@@ -2178,6 +2216,13 @@ namespace Aurix
                 {
                     var t = m.Transcript();
                     if (t != null) OnTranscript?.Invoke(t);
+                    break;
+                }
+                case "TranslationChanged":
+                {
+                    var prefs = m.TranslationPrefs();
+                    lock (_channels) _translation = prefs.Clone();
+                    OnTranslationChanged?.Invoke(prefs);
                     break;
                 }
                 case "TtsStatus":

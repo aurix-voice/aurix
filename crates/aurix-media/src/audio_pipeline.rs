@@ -79,6 +79,9 @@ pub struct TranscriptSegment {
 pub struct AudioAnalysisPipeline {
     buffers: Mutex<HashMap<(UserId, ChannelId), UserAudioBuffer>>,
     decoders: Mutex<HashMap<(UserId, ChannelId), opus::Decoder>>,
+    /// Language a speaker declared for their own speech; fills `TranscriptResult.language`
+    /// when the provider does not detect one.
+    spoken_languages: Mutex<HashMap<UserId, String>>,
     stt_provider: Option<Arc<dyn SttProvider>>,
     content_analyzers: Vec<Arc<dyn ContentAnalyzer>>,
     options: PipelineOptions,
@@ -106,6 +109,7 @@ impl AudioAnalysisPipeline {
         Self {
             buffers: Mutex::new(HashMap::new()),
             decoders: Mutex::new(HashMap::new()),
+            spoken_languages: Mutex::new(HashMap::new()),
             stt_provider,
             content_analyzers,
             stt_permits: Arc::new(Semaphore::new(options.max_concurrent_stt.max(1))),
@@ -128,6 +132,18 @@ impl AudioAnalysisPipeline {
     /// segments with `safety = true`).
     pub fn set_safety_enabled(&mut self, enabled: bool) {
         self.safety_enabled = enabled;
+    }
+
+    pub fn set_spoken_language(&self, user_id: UserId, language: Option<String>) {
+        let mut langs = self.spoken_languages.lock();
+        match language {
+            Some(lang) => {
+                langs.insert(user_id, lang);
+            }
+            None => {
+                langs.remove(&user_id);
+            }
+        }
     }
 
     fn transcribes(&self, channel: &MediaChannel) -> bool {
@@ -270,6 +286,7 @@ impl AudioAnalysisPipeline {
         {
             let deliver = channel.config().transcription;
             let safety = self.safety_enabled && channel.config().safety_voice;
+            let spoken = self.spoken_languages.lock().get(&user_id).cloned();
             match Arc::clone(&self.stt_permits).try_acquire_owned() {
                 Ok(permit) => {
                     let stt = stt.clone();
@@ -290,7 +307,12 @@ impl AudioAnalysisPipeline {
                         let outcome = stt.transcribe(&pcm, sr).await;
                         drop(permit);
                         match outcome {
-                            Ok(result) => {
+                            Ok(mut result) => {
+                                if result.language.is_empty() {
+                                    if let Some(lang) = spoken {
+                                        result.language = lang;
+                                    }
+                                }
                                 if !result.text.trim().is_empty() {
                                     if let Some(ref cb) = cb {
                                         cb(TranscriptSegment {
@@ -389,6 +411,7 @@ impl AudioAnalysisPipeline {
         buffers.retain(|(uid, _), _| *uid != user_id);
         drop(buffers);
         self.decoders.lock().retain(|(uid, _), _| *uid != user_id);
+        self.spoken_languages.lock().remove(&user_id);
     }
 
     pub fn is_enabled(&self) -> bool {

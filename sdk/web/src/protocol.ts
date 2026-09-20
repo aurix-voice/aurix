@@ -172,6 +172,10 @@ export type ClientMessage =
   | { type: 'ChatReadMarkers'; data: { channel_id?: string; user_id?: string } }
   | { type: 'SetTranscripts'; data: { enabled: boolean } }
   | {
+      type: 'SetTranslation';
+      data: { language?: string | null; spoken_language?: string | null; speech: boolean };
+    }
+  | {
       type: 'TtsSpeak';
       data: {
         channel_id?: string;
@@ -215,6 +219,8 @@ export type ServerMessage =
         migrated?: boolean;
         /** WebSocket URLs of other nodes to try when this one stops answering. */
         failover?: string[];
+        /** The node translates transcripts on request; absent when translation is not configured. */
+        translation?: TranslationInfoWire;
       };
     }
   | { type: 'MediaBound'; data: { session_id: string } }
@@ -293,6 +299,10 @@ export type ServerMessage =
   | { type: 'ChannelEnergy'; data: { channel_id: string; levels: ParticipantEnergy[] } }
   | { type: 'Transcript'; data: { transcript: TranscriptWire } }
   | {
+      type: 'TranslationChanged';
+      data: { language?: string | null; spoken_language?: string | null; speech?: boolean };
+    }
+  | {
       type: 'TtsStatus';
       data: {
         request_id: string;
@@ -349,6 +359,14 @@ export interface TranscriptWire {
   started_at: string;
   duration_ms: number;
   words?: TranscriptWordWire[];
+  /** Present when `text` is a translation: the segment as transcribed. */
+  original?: { text: string; language?: string | null } | null;
+}
+
+export interface TranslationInfoWire {
+  speech?: boolean;
+  /** Target languages listeners may request; empty/absent = any tag. */
+  languages?: string[];
 }
 
 /**

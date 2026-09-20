@@ -5,6 +5,8 @@
 //!   stereo mixer (`RemoteMixer`), pure CPU code with no I/O;
 //! * [`dsp`] — capture DSP: high-pass, acoustic echo cancellation, RNNoise-based noise
 //!   suppression and AGC, pure Rust;
+//! * [`effects`] — voice effects hook between the DSP and the encoder (reference pitch shift /
+//!   ring modulator, host-provided stages);
 //! * [`media`] — AURX v2 over UDP or tunnelled through the control WebSocket when UDP is
 //!   blocked: authenticated `SessionBind`, AES-256-CTR + HMAC per packet, replay windows,
 //!   heartbeats, quality reports;
@@ -23,6 +25,7 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod dsp;
+pub mod effects;
 
 pub mod error;
 pub mod events;

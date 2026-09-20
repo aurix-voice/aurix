@@ -188,6 +188,8 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	Out.bResumed = S.resumed;
 	Out.bMediaTunnel = S.media_tunnel;
 	Out.bDownlinkMix = S.downlink_mix;
+	Out.bTranslation = S.translation;
+	Out.bTranslationSpeech = S.translation_speech;
 	Out.bMigrated = S.migrated;
 	return Out;
 }
@@ -881,6 +883,32 @@ bool UAurixVoiceSubsystem::GetDspStats(FAurixDspStats& OutStats) const
 	return true;
 }
 
+bool UAurixVoiceSubsystem::SetVoiceEffects(const FAurixVoiceEffects& Effects)
+{
+	AurixVoiceEffects Raw;
+	Raw.pitch_semitones = Effects.PitchSemitones;
+	Raw.ring_mod_hz = Effects.RingModHz;
+	return Native && Check(Native->Client.set_voice_effects(Raw), TEXT("set_voice_effects"));
+}
+
+bool UAurixVoiceSubsystem::GetVoiceEffects(FAurixVoiceEffects& OutEffects) const
+{
+	AurixVoiceEffects Raw;
+	if (!Native || !Native->Client.voice_effects(Raw))
+	{
+		OutEffects = FAurixVoiceEffects();
+		return false;
+	}
+	OutEffects.PitchSemitones = Raw.pitch_semitones;
+	OutEffects.RingModHz = Raw.ring_mod_hz;
+	return true;
+}
+
+bool UAurixVoiceSubsystem::SetVoiceEffectCallback(FAurixVoiceEffectFn Callback, void* UserData)
+{
+	return Native && Check(Native->Client.set_voice_effect_callback(reinterpret_cast<AurixVoiceEffectFn>(Callback), UserData), TEXT("set_voice_effect_callback"));
+}
+
 void UAurixVoiceSubsystem::PushRenderAudio(const TArray<float>& InterleavedPcm, int32 Channels)
 {
 	if (!Native || Channels < 1 || Channels > 2 || InterleavedPcm.Num() == 0)
@@ -1200,6 +1228,19 @@ TArray<FString> UAurixVoiceSubsystem::GetFailoverEndpoints() const
 bool UAurixVoiceSubsystem::SetTranscripts(bool bEnabled)
 {
 	return Native && Check(Native->Client.set_transcripts(bEnabled), TEXT("set_transcripts"));
+}
+
+bool UAurixVoiceSubsystem::SetTranslation(const FString& Language, const FString& SpokenLanguage, bool bSpeech)
+{
+	if (!Native)
+	{
+		return false;
+	}
+	const std::string LanguageUtf8 = ToUtf8(Language);
+	const std::string SpokenUtf8 = ToUtf8(SpokenLanguage);
+	return Check(
+		Native->Client.set_translation(Language.IsEmpty() ? nullptr : LanguageUtf8.c_str(), SpokenLanguage.IsEmpty() ? nullptr : SpokenUtf8.c_str(), bSpeech),
+		TEXT("set_translation"));
 }
 
 // ---- positional audio ----------------------------------------------------------------------
@@ -1703,7 +1744,20 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 			Out.Language = FromUtf8(T.language);
 			Out.StartedAt = FromUnixMs(T.started_at_ms);
 			Out.DurationMs = static_cast<int32>(T.duration_ms);
+			Out.bTranslated = T.original_text != nullptr;
+			Out.OriginalText = FromUtf8(T.original_text);
+			Out.OriginalLanguage = FromUtf8(T.original_language);
 			OnTranscript.Broadcast(Out);
+		}
+		break;
+	}
+
+	case AURIX_EVENT_TRANSLATION_CHANGED:
+	{
+		AurixTranslation T;
+		if (aurix_event_translation(Raw, &T))
+		{
+			OnTranslationChanged.Broadcast(FromUtf8(T.language), FromUtf8(T.spoken_language), T.speech);
 		}
 		break;
 	}

@@ -43,6 +43,13 @@ pub struct MirroredPrefs {
     pub muted: bool,
     #[serde(default = "default_true")]
     pub transcripts: bool,
+    /// Listener translation target (`SetTranslation.language`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken_language: Option<String>,
+    #[serde(default)]
+    pub translation_speech: bool,
 }
 
 fn default_true() -> bool {
@@ -60,6 +67,9 @@ impl Default for MirroredPrefs {
             downlink: DownlinkMode::default(),
             muted: false,
             transcripts: true,
+            translation: None,
+            spoken_language: None,
+            translation_speech: false,
         }
     }
 }

@@ -21,8 +21,17 @@ the chapter that explains the boundary.
   the built-in capture DSP ([Native core](sdk/native.md#capture-dsp-echo-cancellation-noise-suppression-agc)).
   The DSP is a pure-Rust implementation (frequency-domain AEC, RNNoise-derived NS); it has unit
   and ABI coverage but no field tuning on a fleet of real devices yet.
-* **No speech models ship with Aurix.** STT/TTS talk to OpenAI-compatible HTTP endpoints you
-  host; transcripts are delivered live and never stored server-side ([Speech](features/speech.md)).
+* **No speech or translation models ship with Aurix.** STT/TTS talk to OpenAI-compatible HTTP
+  endpoints you host, live translation to a LibreTranslate- or OpenAI-chat-compatible server;
+  transcripts and translations are delivered live and never stored server-side
+  ([Speech](features/speech.md)). Translation is **caption-first**: the translated text follows
+  the original by the STT segment plus the provider's latency (seconds, not milliseconds), the
+  spoken translation is a synthesized voice on a channel-level translator SSRC — not the
+  speaker's voice — and word timings are dropped from translated segments. Each node
+  translates once per (segment, target language); there is no fleet-wide translation cache.
+* **Voice effects are native-only.** The pitch shifter / ring modulator / host callback chain
+  runs in the native core (Unreal, C ABI); Unity and the Web SDK use the engine's / browser's
+  own audio graph for effects.
 
 ## Protocol and media
 

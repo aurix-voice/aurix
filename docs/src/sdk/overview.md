@@ -20,6 +20,8 @@ where they differ.
 | Echo channel / audio injection | yes | yes | capture push API | capture push API |
 | Text chat lite | yes | yes | yes | yes |
 | Transcripts / TTS | yes | yes | yes | yes |
+| Live translation (`setTranslation`, `original` on transcripts, private translated speech) | yes | yes (native + WebGL) | yes | yes |
+| Voice effects on the uplink | browser audio graph (bring your own) | Unity audio graph (bring your own) | `EffectChain` (pitch, ring mod, callback) | `SetVoiceEffects` / callback |
 | Stats / quality bars | `getStats()` | `GetStats()` | `aurix_client_stats` | `GetStats` |
 | Devices / input gain / speaker mute | yes | yes | host-provided capture | engine `AudioCapture` |
 | Action tokens (`refreshToken`/`joinToken`) | yes | yes | yes | yes |

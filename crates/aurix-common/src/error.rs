@@ -120,6 +120,14 @@ pub enum AurixError {
     #[error("Speech-to-text failed: {0}")]
     Stt(String),
 
+    /// Live translation is not configured on this node.
+    #[error("Translation disabled")]
+    TranslationDisabled,
+
+    /// The machine-translation provider failed.
+    #[error("Translation failed: {0}")]
+    Translation(String),
+
     /// The content-safety classifier failed.
     #[error("Safety classifier failed: {0}")]
     Safety(String),
@@ -143,6 +151,7 @@ impl AurixError {
                 | Self::MediaNodeUnavailable(_)
                 | Self::Tts(_)
                 | Self::Stt(_)
+                | Self::Translation(_)
                 | Self::Safety(_)
         )
     }
@@ -156,6 +165,7 @@ impl AurixError {
                 Self::Moderation(_) => "Moderation operation failed".to_string(),
                 Self::Tts(_) => "Text-to-speech failed".to_string(),
                 Self::Stt(_) => "Speech-to-text failed".to_string(),
+                Self::Translation(_) => "Translation failed".to_string(),
                 Self::Safety(_) => "Safety classifier failed".to_string(),
                 _ => "Internal server error".to_string(),
             }
@@ -194,6 +204,8 @@ impl AurixError {
             Self::TtsDisabled => 404,
             Self::Tts(_) => 502,
             Self::Stt(_) => 502,
+            Self::TranslationDisabled => 404,
+            Self::Translation(_) => 502,
             Self::Safety(_) => 502,
             _ => 500,
         }
@@ -238,6 +250,8 @@ impl AurixError {
             Self::TtsDisabled => "TTS_DISABLED",
             Self::Tts(_) => "TTS_ERROR",
             Self::Stt(_) => "STT_ERROR",
+            Self::TranslationDisabled => "TRANSLATION_DISABLED",
+            Self::Translation(_) => "TRANSLATION_ERROR",
             Self::Safety(_) => "SAFETY_ERROR",
         }
     }

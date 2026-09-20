@@ -18,22 +18,29 @@
 //!   `hate` or a `880hz` tone → `harassment` 0.95 (flagged); `rude` or a `660hz` tone →
 //!   `harassment` 0.75 (flagged); `[classifier-fail]` → HTTP 500; anything else 0.01. The
 //!   E2E test drives voice incidents with tones and chat incidents with those words.
+//! * `POST /translate` (LibreTranslate shape) answers `translatedText: "[<target>] <q>"` with
+//!   `detectedLanguage` `en` (or the given `source`). Target `it` → HTTP 500, `nl` → 3 s
+//!   delay (longer than the E2E node's `translation.timeout_ms`); `GET /translate/count`
+//!   reports how many translation requests were served, so tests can see cache hits.
 //!
 //! An `Authorization` header, when the server is started with a bearer token as the second
-//! argument, must match or the request is refused with 401.
+//! argument, must match or the request is refused with 401 (`/translate` takes the token as
+//! LibreTranslate's `api_key` body field instead).
 
 use aurix_common::tts_stt::{parse_wav, pcm_to_wav};
 use axum::extract::{Multipart, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone)]
 struct Shared {
     bearer: Option<Arc<str>>,
+    translations: Arc<AtomicU64>,
 }
 
 #[tokio::main]
@@ -46,7 +53,12 @@ async fn main() {
         .route("/v1/audio/transcriptions", post(transcribe))
         .route("/v1/audio/speech", post(speak))
         .route("/v1/moderations", post(moderate))
-        .with_state(Shared { bearer });
+        .route("/translate", post(translate))
+        .route("/translate/count", get(translate_count))
+        .with_state(Shared {
+            bearer,
+            translations: Arc::new(AtomicU64::new(0)),
+        });
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("mock speech server on http://{bind}");
     axum::serve(listener, app).await.expect("serve");
@@ -117,6 +129,58 @@ async fn transcribe(
         ]
     }))
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TranslateRequest {
+    q: String,
+    #[serde(default)]
+    source: Option<String>,
+    target: String,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+async fn translate(
+    State(shared): State<Shared>,
+    Json(req): Json<TranslateRequest>,
+) -> axum::response::Response {
+    if let Some(expected) = &shared.bearer {
+        if req.api_key.as_deref() != Some(expected.as_ref()) {
+            return (StatusCode::UNAUTHORIZED, "bad api_key").into_response();
+        }
+    }
+    shared.translations.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "mt: {:?} {:?} -> {}",
+        req.q,
+        req.source.as_deref().unwrap_or("auto"),
+        req.target
+    );
+    match req.target.as_str() {
+        "it" => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "synthetic translation failure"})),
+            )
+                .into_response();
+        }
+        "nl" => tokio::time::sleep(Duration::from_secs(3)).await,
+        _ => {}
+    }
+    let detected = match req.source.as_deref() {
+        None | Some("auto") => "en".to_string(),
+        Some(s) => s.to_string(),
+    };
+    Json(serde_json::json!({
+        "translatedText": format!("[{}] {}", req.target, req.q),
+        "detectedLanguage": {"confidence": 92.0, "language": detected}
+    }))
+    .into_response()
+}
+
+async fn translate_count(State(shared): State<Shared>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"count": shared.translations.load(Ordering::Relaxed)}))
 }
 
 /// Zero-crossing estimate of the fundamental — enough to tell test tones apart.

@@ -313,6 +313,16 @@ export class AurixBridge {
         return null;
       case 'transcriptsEnabled':
         return c.transcriptsEnabled;
+      case 'setTranslation': {
+        const spokenLanguage = optString(a, 'spokenLanguage');
+        c.setTranslation(optString(a, 'language'), {
+          ...(spokenLanguage !== undefined ? { spokenLanguage } : {}),
+          speech: a['speech'] === true,
+        });
+        return null;
+      }
+      case 'translationPrefs':
+        return c.translationPrefs;
 
       // Text
       case 'sendMessage':
@@ -457,6 +467,7 @@ export class AurixBridge {
     on('chatInboxSynced', (delivered, truncated) => q({ type: 'chatInboxSynced', delivered, truncated }));
     on('participantTyping', (channelId, userId, typing) => q({ type: 'participantTyping', channelId, userId, typing }));
     on('transcript', (transcript) => q({ type: 'transcript', transcript }));
+    on('translationChanged', (prefs) => q({ type: 'translationChanged', prefs }));
     on('ttsStatus', (status) => q({ type: 'ttsStatus', status }));
     on('serverError', (code, message) => q({ type: 'serverError', code, message }));
     on('error', (error) => q({ type: 'error', error: errorInfo(error) }));

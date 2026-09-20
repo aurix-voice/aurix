@@ -162,6 +162,10 @@ impl SfuNode {
         self.audio_pipeline = Some(pipeline);
     }
 
+    pub fn audio_pipeline(&self) -> Option<&Arc<AudioAnalysisPipeline>> {
+        self.audio_pipeline.as_ref()
+    }
+
     /// Attach a recording/analysis tap. Must be called before `start`.
     pub fn set_audio_sink(&mut self, sink: Arc<dyn AudioSink>) {
         self.audio_sink = Some(sink);

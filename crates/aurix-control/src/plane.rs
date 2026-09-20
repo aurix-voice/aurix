@@ -9,6 +9,7 @@ use crate::redis_store::RedisStore;
 use crate::safety::SafetyService;
 use crate::session_manager::SessionManager;
 use crate::speech::SpeechService;
+use crate::translation::TranslationService;
 use crate::usage::UsageService;
 use crate::user_lifecycle::{RetentionService, UserLifecycle};
 use crate::webhooks::WebhookService;
@@ -40,6 +41,7 @@ pub struct ControlPlane {
     pub chat: Arc<ChatService>,
     pub safety: Arc<SafetyService>,
     pub speech: Arc<SpeechService>,
+    pub translation: Arc<TranslationService>,
     pub webhooks: Arc<WebhookService>,
     pub users: Arc<UserLifecycle>,
     pub retention: Arc<RetentionService>,
@@ -211,6 +213,10 @@ impl ControlPlane {
         if let Some(engine) = speech.engine() {
             engine.set_usage_meter(usage.meter());
         }
+        let translation = Arc::new(TranslationService::new(
+            config.translation.clone(),
+            speech.enabled(),
+        ));
         let webhooks = Arc::new(WebhookService::new(
             config.webhooks.clone(),
             config.is_production(),
@@ -256,6 +262,7 @@ impl ControlPlane {
             chat,
             safety,
             speech,
+            translation,
             webhooks,
             users,
             retention,

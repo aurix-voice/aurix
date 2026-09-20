@@ -70,6 +70,23 @@ namespace Aurix.WebGL
                 Failover = failover,
                 MediaTunnel = false,
                 DownlinkMix = false,
+                Translation = Translation(Obj(o, "translation")),
+            };
+        }
+
+        internal static TranslationInfo Translation(Dictionary<string, object> o)
+        {
+            if (o == null) return null;
+            return new TranslationInfo { Speech = MiniJson.GetBool(o, "speech"), Languages = Strings(o, "languages") };
+        }
+
+        internal static TranslationPrefs TranslationPrefs(Dictionary<string, object> o)
+        {
+            return new TranslationPrefs
+            {
+                Language = MiniJson.GetString(o, "language"),
+                SpokenLanguage = MiniJson.GetString(o, "spokenLanguage"),
+                Speech = MiniJson.GetBool(o, "speech"),
             };
         }
 
@@ -270,6 +287,12 @@ namespace Aurix.WebGL
                 StartedAt = Time(o, "startedAt"),
                 DurationMs = (ulong)Math.Max(0, MiniJson.GetNumber(o, "durationMs")),
             };
+            var original = Obj(o, "original");
+            if (original != null)
+            {
+                t.OriginalText = MiniJson.GetString(original, "text") ?? string.Empty;
+                t.OriginalLanguage = MiniJson.GetString(original, "language");
+            }
             var words = Arr(o, "words");
             if (words != null)
                 foreach (var item in words)

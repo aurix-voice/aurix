@@ -258,6 +258,12 @@ namespace Aurix.Protocol
         public ulong DurationMs;
         /// <summary>Word timings relative to <see cref="StartedAt"/>; empty unless the server enables them.</summary>
         public List<TranscriptWord> Words = new List<TranscriptWord>();
+        /// <summary>True when <see cref="Text"/> is a translation into this client's requested language.</summary>
+        public bool Translated => OriginalText != null;
+        /// <summary>The speaker's words as transcribed, when <see cref="Text"/> is a translation; otherwise null.</summary>
+        public string OriginalText;
+        /// <summary>Language of <see cref="OriginalText"/> as detected/declared, or null.</summary>
+        public string OriginalLanguage;
     }
 
     public struct TranscriptWord
@@ -265,6 +271,36 @@ namespace Aurix.Protocol
         public string Word;
         public ulong StartMs;
         public ulong EndMs;
+    }
+
+    /// <summary>Live-translation capability advertised in <c>SessionInitAck</c>.</summary>
+    public sealed class TranslationInfo
+    {
+        /// <summary>Translations can also be spoken privately to the listener.</summary>
+        public bool Speech;
+        /// <summary>Target languages listeners may request; empty = any BCP-47 tag.</summary>
+        public IReadOnlyList<string> Languages = Array.Empty<string>();
+    }
+
+    /// <summary>This client's translation preference as the server applied it (normalised tags).</summary>
+    public sealed class TranslationPrefs
+    {
+        /// <summary>Target language, or null when receiving originals only.</summary>
+        public string Language;
+        /// <summary>Language this participant declared it speaks, or null.</summary>
+        public string SpokenLanguage;
+        /// <summary>Translations are also spoken privately to this client.</summary>
+        public bool Speech;
+
+        public TranslationPrefs Clone() => new TranslationPrefs { Language = Language, SpokenLanguage = SpokenLanguage, Speech = Speech };
+
+        /// <summary>Lower-case, <c>_</c> → <c>-</c>, trimmed tag (the server validates further); null for empty input.</summary>
+        public static string NormalizeTag(string tag)
+        {
+            if (tag == null) return null;
+            var t = tag.Trim().ToLowerInvariant().Replace('_', '-');
+            return t.Length == 0 ? null : t;
+        }
     }
 
     /// <summary>Who hears a synthesized utterance requested by this client.</summary>
@@ -466,6 +502,12 @@ namespace Aurix.Protocol
                     System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTimeOffset.MinValue,
                 DurationMs = (ulong)Math.Max(0, MiniJson.GetNumber(o, "duration_ms", 0)),
             };
+            var original = MiniJson.AsObject(o.TryGetValue("original", out var ov) ? ov : null);
+            if (original != null)
+            {
+                t.OriginalText = MiniJson.GetString(original, "text") ?? string.Empty;
+                t.OriginalLanguage = MiniJson.GetString(original, "language");
+            }
             if (o.TryGetValue("words", out var wv) && MiniJson.AsArray(wv) is List<object> words)
                 foreach (var item in words)
                 {
@@ -479,6 +521,30 @@ namespace Aurix.Protocol
                     });
                 }
             return t;
+        }
+
+        /// <summary>Typed view of <c>SessionInitAck.translation</c>; null when the node does not translate.</summary>
+        public TranslationInfo Translation()
+        {
+            var o = MiniJson.AsObject(Data != null && Data.TryGetValue("translation", out var v) ? v : null);
+            if (o == null) return null;
+            var languages = new List<string>();
+            if (o.TryGetValue("languages", out var lv) && MiniJson.AsArray(lv) is List<object> arr)
+                foreach (var item in arr)
+                    if (item is string s && s.Length > 0) languages.Add(s);
+            return new TranslationInfo { Speech = MiniJson.GetBool(o, "speech", false), Languages = languages };
+        }
+
+        /// <summary>Typed view of a <c>TranslationChanged</c> payload.</summary>
+        public TranslationPrefs TranslationPrefs()
+        {
+            var d = Data ?? new Dictionary<string, object>();
+            return new TranslationPrefs
+            {
+                Language = MiniJson.GetString(d, "language"),
+                SpokenLanguage = MiniJson.GetString(d, "spoken_language"),
+                Speech = MiniJson.GetBool(d, "speech", false),
+            };
         }
 
         /// <summary>Typed view of a <c>TtsStatus</c> payload.</summary>
@@ -754,6 +820,14 @@ namespace Aurix.Protocol
 
         public static string SetTranscripts(bool enabled) =>
             Serialize("SetTranscripts", new Dictionary<string, object> { { "enabled", enabled } });
+
+        public static string SetTranslation(TranslationPrefs prefs) =>
+            Serialize("SetTranslation", new Dictionary<string, object>
+            {
+                { "language", prefs.Language },
+                { "spoken_language", prefs.SpokenLanguage },
+                { "speech", prefs.Speech },
+            });
 
         public static string SetAudioCodec(Aurix.Audio.AudioCodec codec) =>
             Serialize("SetAudioCodec", new Dictionary<string, object> { { "codec", AudioCodecToWire(codec) } });

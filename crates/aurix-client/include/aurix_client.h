@@ -54,6 +54,16 @@
 #define AURIX_FRAME_SAMPLES 960
 
 /**
+ * Largest built-in pitch shift either way, in semitones.
+ */
+#define AURIX_MAX_PITCH_SEMITONES 24.0
+
+/**
+ * Highest built-in ring-modulator carrier, in Hz.
+ */
+#define AURIX_MAX_RING_MOD_HZ 2000.0
+
+/**
  * Capacity of fixed-size URL buffers in this ABI (including the NUL).
  */
 #define AURIX_URL_LEN 512
@@ -333,6 +343,11 @@ typedef enum AurixEventType {
    * since connecting, `flag` = older unread ones were left out (page with history).
    */
   AURIX_EVENT_CHAT_INBOX_SYNCED = 39,
+  /**
+   * `aurix_event_translation`: the server applied `aurix_client_set_translation`
+   * (tags normalised). A fresh session starts untranslated; the request is re-applied.
+   */
+  AURIX_EVENT_TRANSLATION_CHANGED = 40,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -634,6 +649,14 @@ typedef struct AurixSessionInfo {
    * and SSRC, new media key/endpoint). See `aurix_client_endpoint`.
    */
   bool migrated;
+  /**
+   * The node translates transcripts for listeners (`aurix_client_set_translation`).
+   */
+  bool translation;
+  /**
+   * Translations can also be spoken into this session's downlink.
+   */
+  bool translation_speech;
 } AurixSessionInfo;
 
 /**
@@ -751,7 +774,34 @@ typedef struct AurixTranscript {
    * Word timings are available through `aurix_event_json`.
    */
   uint32_t word_count;
+  /**
+   * Speaker's words before translation, or `NULL` for an untranslated transcript (then
+   * `text` / `language` are the speaker's own).
+   */
+  const char *original_text;
+  /**
+   * Language of `original_text` (BCP-47) or `NULL`.
+   */
+  const char *original_language;
 } AurixTranscript;
+
+/**
+ * Translation preferences as applied by the server (`AurixEventTranslationChanged`).
+ */
+typedef struct AurixTranslation {
+  /**
+   * Target language of translated transcripts, `NULL` = original language only.
+   */
+  const char *language;
+  /**
+   * Language this participant declared to speak, or `NULL`.
+   */
+  const char *spoken_language;
+  /**
+   * Translations are also spoken into this session's downlink.
+   */
+  bool speech;
+} AurixTranslation;
 
 typedef struct AurixTtsStatus {
   /**
@@ -871,6 +921,30 @@ typedef struct AurixDspStats {
    */
   uint64_t far_end_underruns;
 } AurixDspStats;
+
+/**
+ * Built-in voice effects (`aurix_client_set_voice_effects`); zero = that stage is off.
+ */
+typedef struct AurixVoiceEffects {
+  /**
+   * Pitch shift in semitones, clamped to ±`AURIX_MAX_PITCH_SEMITONES`.
+   */
+  float pitch_semitones;
+  /**
+   * Ring-modulator ("robot") carrier in Hz, clamped to `0..=AURIX_MAX_RING_MOD_HZ`.
+   */
+  float ring_mod_hz;
+} AurixVoiceEffects;
+
+/**
+ * Host-provided voice effect: `frame` is one 20 ms 48 kHz interleaved frame
+ * (`samples_per_channel * channels` floats in `-1..=1`) to modify in place. Called on the
+ * thread that feeds `aurix_client_push_capture_*` — no blocking, no allocation.
+ */
+typedef void (*AurixVoiceEffectFn)(void *user_data,
+                                   float *frame,
+                                   uint32_t samples_per_channel,
+                                   uint8_t channels);
 
 /**
  * A channel's audio policy as set by the operator (`ChannelConfig`), merged across the
@@ -1298,6 +1372,11 @@ bool aurix_event_read_marker_at(const struct AurixEvent *event,
 
 bool aurix_event_transcript(const struct AurixEvent *event, struct AurixTranscript *out);
 
+/**
+ * Preferences of a `TranslationChanged` event.
+ */
+bool aurix_event_translation(const struct AurixEvent *event, struct AurixTranslation *out);
+
 bool aurix_event_tts(const struct AurixEvent *event, struct AurixTtsStatus *out);
 
 /**
@@ -1498,6 +1577,26 @@ enum AurixResult aurix_client_dsp_stats(const struct AurixClient *client,
                                         struct AurixDspStats *out);
 
 /**
+ * Built-in voice effects on the microphone (after the DSP and input gain, before VAD and
+ * encoding; injected audio and the downlink are untouched). `NULL` or all-zero = off.
+ * Read back (clamped) with `aurix_client_voice_effects`. Runs before the host callback.
+ */
+enum AurixResult aurix_client_set_voice_effects(struct AurixClient *client,
+                                                const struct AurixVoiceEffects *effects);
+
+enum AurixResult aurix_client_voice_effects(const struct AurixClient *client,
+                                            struct AurixVoiceEffects *out);
+
+/**
+ * Install (or, with `NULL`, remove) a host voice effect that runs on every microphone frame
+ * after the built-in stages. `user_data` is handed back verbatim on the capture thread and
+ * must stay valid until the callback is removed or the client destroyed.
+ */
+enum AurixResult aurix_client_set_voice_effect_callback(struct AurixClient *client,
+                                                        AurixVoiceEffectFn callback,
+                                                        void *user_data);
+
+/**
  * Feed the echo canceller with audio the host plays through its own path (48 kHz,
  * interleaved, `sample_count` total samples). Audio the host obtains from
  * `aurix_client_mix_output_*` is fed automatically — do not push it again. Audio-thread safe.
@@ -1621,6 +1720,18 @@ enum AurixResult aurix_client_set_downlink_mode(struct AurixClient *client,
 enum AurixDownlinkMode aurix_client_downlink_mode(const struct AurixClient *client);
 
 enum AurixResult aurix_client_set_transcripts(struct AurixClient *client, bool enabled);
+
+/**
+ * Receive peers' transcripts translated into `language` (BCP-47, `NULL` = original only);
+ * `speech` also has them spoken into this session's downlink
+ * (`AurixSessionInfo.translation_speech`). `spoken_language` (may be `NULL`) declares the
+ * language this participant speaks. Applied on `AurixEventTranslationChanged`; unsupported
+ * tags come back as `AurixEventServerError`.
+ */
+enum AurixResult aurix_client_set_translation(struct AurixClient *client,
+                                              const char *language,
+                                              const char *spoken_language,
+                                              bool speech);
 
 /**
  * Report 1..=64 poses for a positional channel.

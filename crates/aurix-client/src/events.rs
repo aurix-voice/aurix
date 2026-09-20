@@ -1,6 +1,6 @@
 use aurix_common::protocol::{
-    ChatMessage, ChatReadMarker, ParticipantEnergy, Transcript, TransmissionMode, TtsState,
-    UserPosition,
+    ChatMessage, ChatReadMarker, ParticipantEnergy, Transcript, TranslationInfo, TransmissionMode,
+    TtsState, UserPosition,
 };
 use aurix_common::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
@@ -105,6 +105,9 @@ pub struct SessionInfo {
     pub endpoint: String,
     /// Other healthy nodes the client will try, in order, when this one stops answering.
     pub failover: Vec<String>,
+    /// The node translates transcripts into a listener's language (`Client::set_translation`);
+    /// `None` when the operator has not configured translation.
+    pub translation: Option<TranslationInfo>,
 }
 
 /// Everything the integration observes. Poll with `Client::poll_event`.
@@ -179,6 +182,13 @@ pub enum Event {
     /// The server acknowledged a downlink mode (`Client::set_downlink_mode`); a fresh
     /// session starts in `Streams` and the requested mode is re-applied automatically.
     DownlinkModeChanged(DownlinkMode),
+    /// The server applied `Client::set_translation` (tags normalised); a fresh session starts
+    /// without translation and the requested preferences are re-applied automatically.
+    TranslationChanged {
+        language: Option<String>,
+        spoken_language: Option<String>,
+        speech: bool,
+    },
     UserBlockChanged {
         user_id: UserId,
         blocked: bool,

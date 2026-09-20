@@ -334,6 +334,31 @@ transmits to exactly one channel. Synthesized speech is routed exactly like your
 (transmission mode, mutes, blocks, focus, other nodes) and reaches browsers inside the mixed
 downlink; statuses go to the requesting session only. Disconnecting cancels pending requests.
 
+### Live translation
+
+```ts
+// server: [translation] configured; the node advertises what it offers
+const t = client.sessionInfo?.translation;         // { speech, languages } or undefined
+if (t && (t.languages.length === 0 || t.languages.includes('de'))) {
+  client.setTranslation('de', { spokenLanguage: 'en', speech: t.speech });
+}
+client.on('translationChanged', (p) => console.log(p.language, p.spokenLanguage, p.speech));
+client.on('transcript', (t) => {
+  if (t.original) captions.append(t.userId, t.text, t.language, `(${t.original.language}: ${t.original.text})`);
+  else captions.append(t.userId, t.text, t.language);
+});
+client.translationPrefs;                           // as applied by the server (normalised tags)
+client.setTranslation(undefined);                  // back to originals only
+```
+
+`setTranslation` translates the captions *you* receive; the speaker and listeners of other
+languages keep getting theirs. A segment already in your language, one the provider could not
+translate in time, or one longer than the node's limit arrives as the original (no `original`
+field). With `speech: true` the translation is also spoken to you alone inside your WebRTC
+downlink. Tags are BCP-47 (`DE_de` → `de-de`); the server answers `VALIDATION_ERROR` for a
+language it does not offer and `TRANSLATION_DISABLED` when translation is off. The preference
+survives reconnects and failover.
+
 ### Statistics & network quality
 
 ```ts

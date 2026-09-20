@@ -40,6 +40,7 @@ use crate::control::{
     token_identity, ws_host, ControlConnection, Inbound, SessionAck, TokenIdentity,
 };
 use crate::dsp::{DspConfig, DspStats, FarEndHandle};
+use crate::effects::EffectChain;
 use crate::error::{ClientError, Result};
 use crate::events::{
     ChannelScope, ChatScope, ConnectionState, Event, Participant, RequestId, SessionInfo,
@@ -169,6 +170,15 @@ struct Prefs {
     local_mutes: HashMap<(UserId, Option<ChannelId>), bool>,
     volumes: HashMap<UserId, f32>,
     transcripts_enabled: bool,
+    /// Translation the app asked for; replayed on a fresh session.
+    translation: TranslationPrefs,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TranslationPrefs {
+    language: Option<String>,
+    spoken_language: Option<String>,
+    speech: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -939,6 +949,18 @@ impl Client {
         self.inner.encoder.lock().dsp.config()
     }
 
+    /// Replace the voice effect chain applied to microphone frames after the DSP and input
+    /// gain (before VAD metering / encoding); an empty chain bypasses. Effects run on the
+    /// capture thread. See [`crate::effects`].
+    pub fn set_voice_effects(&self, chain: EffectChain) {
+        self.inner.encoder.lock().effects = chain;
+    }
+
+    /// Number of stages in the active voice effect chain.
+    pub fn voice_effect_count(&self) -> usize {
+        self.inner.encoder.lock().effects.len()
+    }
+
     /// Runtime DSP diagnostics (ERLE, echo delay, speech probability, AGC gain).
     pub fn dsp_stats(&self) -> DspStats {
         self.inner.encoder.lock().dsp.stats()
@@ -1159,6 +1181,32 @@ impl Client {
     pub fn set_transcripts(&self, enabled: bool) -> Result<()> {
         self.inner.prefs.lock().transcripts_enabled = enabled;
         self.send_cmd(Command::Send(ControlMessage::SetTranscripts { enabled }))
+    }
+
+    /// Receive other participants' transcripts translated into `language` (BCP 47 tag,
+    /// `None` = original language only); `speech` also has each translation spoken into this
+    /// session's downlink (needs `SessionInfo.translation.speech`). `spoken_language` tells
+    /// the server which language this participant speaks when the transcriber cannot detect
+    /// it. Applied on `TranslationChanged`; the server rejects unsupported tags with
+    /// `ServerError`.
+    pub fn set_translation(
+        &self,
+        language: Option<&str>,
+        spoken_language: Option<&str>,
+        speech: bool,
+    ) -> Result<()> {
+        let prefs = TranslationPrefs {
+            language: language.map(str::to_string),
+            spoken_language: spoken_language.map(str::to_string),
+            speech,
+        };
+        let msg = ControlMessage::SetTranslation {
+            language: prefs.language.clone(),
+            spoken_language: prefs.spoken_language.clone(),
+            speech: prefs.speech,
+        };
+        self.inner.prefs.lock().translation = prefs;
+        self.send_cmd(Command::Send(msg))
     }
 
     /// Positional channels: this player's (and, for hosts, other players') poses.
@@ -1750,6 +1798,7 @@ async fn session(
         migrated: ack.migrated,
         endpoint: url.to_string(),
         failover: ack.failover.clone(),
+        translation: ack.translation.clone(),
     };
     *inner.session.lock() = Some(info.clone());
     *resume = Some((ack.session_id, ack.resume_token.clone()));
@@ -1830,7 +1879,7 @@ async fn session(
             inner.emit(Event::DownlinkModeChanged(DownlinkMode::Streams));
         }
         // Global preferences first; channel-scoped ones follow each re-join ack.
-        let msgs = replay_global_prefs(inner);
+        let msgs = replay_global_prefs(&inner.prefs.lock());
         for m in msgs {
             if conn.send(&m).await.is_err() {
                 return Exit::Dropped("send failed".into());
@@ -2206,11 +2255,17 @@ fn install_media(inner: &Arc<Inner>, new: &Arc<MediaTransport>, old: Option<&Arc
     }
 }
 
-fn replay_global_prefs(inner: &Inner) -> Vec<ControlMessage> {
-    let prefs = inner.prefs.lock();
+fn replay_global_prefs(prefs: &Prefs) -> Vec<ControlMessage> {
     let mut msgs = Vec::new();
     if !prefs.transcripts_enabled {
         msgs.push(ControlMessage::SetTranscripts { enabled: false });
+    }
+    if prefs.translation != TranslationPrefs::default() {
+        msgs.push(ControlMessage::SetTranslation {
+            language: prefs.translation.language.clone(),
+            spoken_language: prefs.translation.spoken_language.clone(),
+            speech: prefs.translation.speech,
+        });
     }
     for (&(user_id, channel_id), &muted) in &prefs.local_mutes {
         if channel_id.is_none() && muted {
@@ -2807,6 +2862,17 @@ async fn handle_message(
             inner.prefs.lock().focus = channel_id;
             inner.emit(Event::ChannelFocusChanged(channel_id));
         }
+        ControlMessage::TranslationChanged {
+            language,
+            spoken_language,
+            speech,
+        } => {
+            inner.emit(Event::TranslationChanged {
+                language,
+                spoken_language,
+                speech,
+            });
+        }
         ControlMessage::ChannelAudioPolicy { channel_id, audio } => {
             if let Some(ch) = inner.channels.lock().get_mut(&channel_id) {
                 ch.audio = audio;
@@ -3055,6 +3121,7 @@ async fn handle_message(
         | ControlMessage::ChatMarkRead { .. }
         | ControlMessage::ChatReadMarkers { .. }
         | ControlMessage::SetTranscripts { .. }
+        | ControlMessage::SetTranslation { .. }
         | ControlMessage::TtsSpeak { .. }
         | ControlMessage::TtsCancel
         | ControlMessage::WebRtcOffer { .. }
@@ -3068,6 +3135,36 @@ mod tests {
     use super::*;
     use aurix_common::types::{OpusBandwidth, OpusSignal};
     use uuid::Uuid;
+
+    #[test]
+    fn translation_preference_is_replayed_on_a_fresh_session_only_when_set() {
+        let mut prefs = Prefs {
+            transcripts_enabled: true,
+            ..Prefs::default()
+        };
+        assert!(replay_global_prefs(&prefs).is_empty());
+
+        prefs.translation = TranslationPrefs {
+            language: Some("de".into()),
+            spoken_language: Some("en".into()),
+            speech: true,
+        };
+        let msgs = replay_global_prefs(&prefs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0],
+            ControlMessage::SetTranslation { language: Some(l), spoken_language: Some(s), speech: true }
+                if l == "de" && s == "en"
+        ));
+
+        prefs.translation = TranslationPrefs::default();
+        prefs.transcripts_enabled = false;
+        let msgs = replay_global_prefs(&prefs);
+        assert!(matches!(
+            msgs.as_slice(),
+            [ControlMessage::SetTranscripts { enabled: false }]
+        ));
+    }
 
     #[test]
     fn reconnects_try_the_session_node_first_then_rotate_through_failover() {

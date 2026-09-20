@@ -26,6 +26,8 @@ pub struct AurixConfig {
     #[serde(default)]
     pub tts: TtsConfig,
     #[serde(default)]
+    pub translation: TranslationConfig,
+    #[serde(default)]
     pub safety: SafetyConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
@@ -51,6 +53,7 @@ impl AurixConfig {
                 .with_list_parse_key("redis.sentinels")
                 .with_list_parse_key("webhooks.retry_delays_secs")
                 .with_list_parse_key("tts.voices")
+                .with_list_parse_key("translation.languages")
                 .with_list_parse_key("safety.categories")
                 .with_list_parse_key("auth.oidc.scopes")
                 .with_list_parse_key("auth.oidc.superadmin_emails")
@@ -90,6 +93,9 @@ impl AurixConfig {
             &mut self.tts.endpoint,
             &mut self.tts.api_key,
             &mut self.tts.model,
+            &mut self.translation.endpoint,
+            &mut self.translation.api_key,
+            &mut self.translation.model,
             &mut self.safety.classifier.endpoint,
             &mut self.safety.classifier.api_key,
             &mut self.safety.classifier.model,
@@ -100,6 +106,7 @@ impl AurixConfig {
             }
         }
         clean(&mut self.tts.voices);
+        clean(&mut self.translation.languages);
         clean(&mut self.safety.categories);
         for entry in &mut self.safety.text.lexicon {
             entry.pattern = entry.pattern.trim().to_string();
@@ -337,6 +344,49 @@ impl AurixConfig {
             }
             if !self.tts.voices.contains(&self.tts.default_voice) {
                 anyhow::bail!("tts.default_voice must be one of tts.voices");
+            }
+        }
+        if self.translation.enabled {
+            let t = &self.translation;
+            match &t.endpoint {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {}
+                Some(_) => anyhow::bail!("translation.endpoint must be an http(s) URL"),
+                None => anyhow::bail!("translation.enabled requires translation.endpoint"),
+            }
+            if !self.stt.enabled {
+                anyhow::bail!(
+                    "translation.enabled requires stt.enabled (transcripts are its input)"
+                );
+            }
+            if t.timeout_ms < 500 || t.timeout_ms > 120_000 {
+                anyhow::bail!("translation.timeout_ms must be within 500..=120000");
+            }
+            if t.max_concurrent_requests == 0 {
+                anyhow::bail!("translation.max_concurrent_requests must be > 0");
+            }
+            if t.max_text_chars == 0 || t.max_text_chars > 20_000 {
+                anyhow::bail!("translation.max_text_chars must be within 1..=20000");
+            }
+            if t.max_languages_per_channel == 0 {
+                anyhow::bail!("translation.max_languages_per_channel must be > 0");
+            }
+            for lang in &t.languages {
+                if crate::translate::normalize_language(lang).is_none() {
+                    anyhow::bail!("translation.languages: `{lang}` is not a language tag");
+                }
+            }
+            for (lang, voice) in &t.voices {
+                if crate::translate::normalize_language(lang).is_none() {
+                    anyhow::bail!("translation.voices: `{lang}` is not a language tag");
+                }
+                if self.tts.enabled && !self.tts.voices.contains(voice) {
+                    anyhow::bail!("translation.voices.{lang} = `{voice}` is not one of tts.voices");
+                }
+            }
+            if t.speech && !self.tts.enabled {
+                tracing::warn!(
+                    "translation.speech is set but [tts] is disabled: translated transcripts only"
+                );
             }
         }
         if self.safety.enabled {
@@ -2105,6 +2155,70 @@ impl Default for TtsConfig {
     }
 }
 
+/// Machine-translation backend for live transcripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MtProviderKind {
+    /// LibreTranslate-compatible `POST /translate` (LibreTranslate, Argos-based servers).
+    #[default]
+    Libretranslate,
+    /// OpenAI-compatible `POST /v1/chat/completions` with a translation prompt (vLLM, Ollama,
+    /// llama.cpp server, hosted LLM APIs).
+    OpenaiChat,
+}
+
+/// Real-time translation: transcripts of channels with `transcription: true` are translated
+/// into the language each listener asked for (`SetTranslation`) and delivered as additional
+/// `Transcript` events carrying the original; with `[tts]` enabled and `speech = true` the
+/// translation can also be spoken to that listener alone. Requires `[stt]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TranslationConfig {
+    pub enabled: bool,
+    pub provider: MtProviderKind,
+    /// Base URL of the translation server, e.g. `http://libretranslate:5000`.
+    pub endpoint: Option<String>,
+    pub api_key: Option<String>,
+    /// Model name for `openai_chat`.
+    pub model: Option<String>,
+    pub timeout_ms: u64,
+    /// Provider requests in flight per node; segments beyond that are not translated.
+    pub max_concurrent_requests: u32,
+    /// Transcript segments longer than this are not translated.
+    pub max_text_chars: usize,
+    /// Target languages listeners may request (normalised tags); empty = any.
+    pub languages: Vec<String>,
+    /// Distinct target languages translated per channel segment on this node; the languages
+    /// requested by the most listeners win.
+    pub max_languages_per_channel: u32,
+    /// Identical `(source, target, text)` translations remembered per node.
+    pub cache_entries: usize,
+    /// Allow listeners to receive translations as synthesized speech (`[tts]` must be on).
+    pub speech: bool,
+    /// TTS voice per target language (`tts.default_voice` for the rest).
+    pub voices: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for TranslationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: MtProviderKind::default(),
+            endpoint: None,
+            api_key: None,
+            model: None,
+            timeout_ms: 10_000,
+            max_concurrent_requests: 8,
+            max_text_chars: 2_000,
+            languages: Vec::new(),
+            max_languages_per_channel: 8,
+            cache_entries: 2_048,
+            speech: true,
+            voices: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 /// Content safety: toxicity classification of transcripts and chat, lexicon filtering,
 /// per-user risk scoring, incident records with evidence, and optional automatic moderation.
 ///
@@ -2475,14 +2589,17 @@ mod tests {
             "AURIX__SERVER__TRUSTED_PROXIES",
             "10.0.0.0/8, 192.168.0.0/16",
         );
+        std::env::set_var("AURIX__TRANSLATION__LANGUAGES", "de, fr,pt-BR");
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default");
         let cfg = AurixConfig::load(Some(path)).expect("load with env overrides");
         std::env::remove_var("AURIX__SERVER__CORS_ORIGINS");
         std::env::remove_var("AURIX__SERVER__TRUSTED_PROXIES");
+        std::env::remove_var("AURIX__TRANSLATION__LANGUAGES");
         assert_eq!(
             cfg.server.cors_origins,
             vec!["https://a.example", "https://b.example"]
         );
         assert_eq!(cfg.server.trusted_proxies.len(), 2);
+        assert_eq!(cfg.translation.languages, vec!["de", "fr", "pt-BR"]);
     }
 }

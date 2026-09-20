@@ -557,6 +557,23 @@ channel plays the announcement to its participants on a per-channel system SSRC 
 participant attached), and progress is published as `tts.status` events. `GET /v1/tts/voices`
 lists the configured voices and limits.
 
+**Live translation.** With `[translation]` (off by default; LibreTranslate-compatible
+`POST /translate` or an OpenAI-compatible chat endpoint you host — vLLM, Ollama, llama.cpp) a
+listener asks with `SetTranslation {language, spoken_language?, speech}` (Web `setTranslation()`,
+Unity `SetTranslationAsync()`, native `aurix_client_set_translation`, Unreal `SetTranslation`)
+to receive the captions of the channels they hear in their own language: the node translates
+each segment once per requested language and delivers the translated `Transcript` — same id,
+speaker and timing, the source attached as `original {text, language}` — only to the listeners
+who asked for that language, while the speaker and everyone else keep the original, which is
+delivered immediately and never waits for the translator. `speech: true` additionally has the
+translation synthesized through `[tts]` and played **privately** to that listener on a
+per-channel translator SSRC — no other participant receives a frame. Tenant, membership,
+transcript opt-in, mutes, blocks, radius and ambient rules are those of the original caption
+and are re-checked after the provider round trip; provider failures, timeouts, over-long
+segments or a busy node fall back to the original text; `SessionInitAck.translation`
+advertises the offered languages, `max_languages_per_channel`, `max_concurrent_requests`,
+`cache_entries` and `timeout_ms` bound the cost, `aurix_translations_total{outcome}` counts it.
+
 ### Content safety
 
 `[safety]` (off by default) turns what a node already sees into moderation data: transcripts of
@@ -956,7 +973,7 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 |-----|------|-----------|-------------|
 | Web (TypeScript) | [`sdk/web`](sdk/web) | WebRTC/Opus via the SFU, WS control plane, demo page | two-browser smoke test (ICE/DTLS, RTP both ways, decoded audio) |
 | Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane; capture DSP via the native core (AEC/NS/AGC) with a managed high-pass + AGC fallback; Unity WebGL players get the same C# API over the Web SDK (browser WebRTC) through `AurixWebGL.jslib` | `dotnet test` (incl. a scripted WebGL bridge) + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus); Unity compile check with `UNITY_WEBGL` |
-| Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, capture DSP (high-pass, acoustic echo cancellation, RNNoise-derived noise suppression, AGC), reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
+| Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, capture DSP (high-pass, acoustic echo cancellation, RNNoise-derived noise suppression, AGC) and a voice-effects chain (pitch shift, ring modulator, host callback) on the uplink, reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
 | Unreal Engine 5.3+ (C++/Blueprint) | [`sdk/unreal`](sdk/unreal) | `AurixVoice` plugin over the `aurix-client` C ABI: `UAurixVoiceSubsystem` with typed Blueprint events, `AudioCapture` microphone bridge, procedural playback wave + per-participant sound waves for engine spatialization; static-Opus native library staged by `sdk/unreal/scripts/build_native.*` | native library build for Linux + ABI-reference test in CI; UHT/engine compile **not** run here (no Unreal in the dev environment — see the [README](sdk/unreal/README.md)) |
 
 All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
@@ -967,8 +984,11 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 * No SIP/PSTN gateway, no server-side noise suppression (the native core / SDKs do it on the client).
 * Text chat is deliberately "lite": live channel/directed messages and typing only — no offline
   delivery, conversations, read markers or attachments; history is an opt-in per deployment.
-* STT/TTS and the content-safety classifier talk to OpenAI-compatible HTTP servers you host; no
-  speech or moderation model ships with Aurix, and transcripts are not stored server-side.
+* STT/TTS, live translation and the content-safety classifier talk to HTTP servers you host
+  (OpenAI-compatible, LibreTranslate-compatible); no speech, translation or moderation model
+  ships with Aurix, transcripts and translations are not stored server-side, and translation is
+  caption-first (seconds of provider latency; the spoken translation is a synthesized
+  translator voice, not the speaker's).
 * Live audio streams are per participant (no server-side mix) and node-local; the node does not
   buffer them across a consumer outage beyond `recording.live.queue_frames`.
 * Cascade is a one-hop mesh between the nodes that host a channel (no hierarchical relay trees);

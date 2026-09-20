@@ -187,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
                     started_at: seg.started_at,
                     duration_ms: seg.audio_ms,
                     words,
+                    original: None,
                 },
             });
         });
