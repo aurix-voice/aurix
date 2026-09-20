@@ -161,6 +161,9 @@ namespace Aurix.Audio
             public IOpusFecDecoder Fec;
             public AudioCodec Codec;
             public bool Mixed;
+            /// <summary>Decoded two-wide: a server mix or a sender that has sent at least one stereo packet.</summary>
+            public bool Stereo;
+            public bool Panned;
             public long FecRecovered;
             public float Volume = 1f;
             public float LeftGain = 1f;
@@ -185,9 +188,10 @@ namespace Aurix.Audio
 
         /// <summary>
         /// <paramref name="stereoDecoderFactory"/> creates 2-channel decoders for server-mixed channel streams
-        /// (<see cref="Transport.IncomingAudio.Mixed"/>, stereo Opus). Without one such frames go through
-        /// <paramref name="decoderFactory"/>, which — if it is mono — downmixes them: the server's panning is lost but
-        /// playback still works.
+        /// (<see cref="Transport.IncomingAudio.Mixed"/>) and for senders whose Opus packets are stereo (music /
+        /// broadcast uplinks, detected per packet). Without one such frames go through
+        /// <paramref name="decoderFactory"/>, which — if it is mono — downmixes them: the image / server panning is
+        /// lost but playback still works.
         /// </summary>
         public RemoteMixer(Func<IOpusCodec> decoderFactory, Func<IOpusCodec> stereoDecoderFactory)
         {
@@ -240,17 +244,20 @@ namespace Aurix.Audio
 
         /// <summary>
         /// Queue a verified frame; <paramref name="mixed"/> marks a server-mixed channel stream
-        /// (<see cref="Transport.IncomingAudio.Mixed"/>), decoded as stereo when a stereo decoder factory was given.
+        /// (<see cref="Transport.IncomingAudio.Mixed"/>). Mixed streams and streams whose Opus packets are
+        /// stereo are decoded as stereo when a stereo decoder factory was given; a stream is upgraded on its
+        /// first stereo packet and stays stereo (a stereo decoder upmixes later mono packets).
         /// </summary>
         public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, AudioCodec codec, bool mixed, byte[] payload)
         {
+            bool stereo = mixed || (codec == AudioCodec.Opus && OpusPacket.IsStereo(payload));
             Stream s;
             lock (_streams)
             {
                 if (!_streams.TryGetValue(ssrc, out s))
                 {
                     s = new Stream();
-                    Attach(s, codec, mixed);
+                    Attach(s, codec, mixed, stereo);
                     _streams[ssrc] = s;
                 }
                 else if (s.Codec != codec || s.Mixed != mixed)
@@ -259,10 +266,18 @@ namespace Aurix.Audio
                     s.Jitter = new JitterBuffer();
                     s.FecRecovered = 0;
                     s.FramePos = s.FrameLen = 0;
-                    Attach(s, codec, mixed);
+                    Attach(s, codec, mixed, stereo);
+                }
+                else if (stereo && !s.Stereo)
+                {
+                    // Mono → stereo mid-stream: swap the decoder, keep the jitter buffer and counters.
+                    s.Decoder.Dispose();
+                    s.FramePos = s.FrameLen = 0;
+                    Attach(s, codec, mixed, true);
                 }
                 s.Volume = volume;
-                if (direction.HasValue) (s.LeftGain, s.RightGain) = direction.Value.StereoGains();
+                s.Panned = direction.HasValue && !mixed; // a server mix is already panned per listener
+                if (s.Panned) (s.LeftGain, s.RightGain) = direction.Value.StereoGains();
                 else { s.LeftGain = 1f; s.RightGain = 1f; }
                 long now = DateTime.UtcNow.Ticks;
                 s.LastActivityTicks = now;
@@ -277,15 +292,16 @@ namespace Aurix.Audio
             s.Jitter.Push(seq, payload);
         }
 
-        private void Attach(Stream s, AudioCodec codec, bool mixed)
+        private void Attach(Stream s, AudioCodec codec, bool mixed, bool stereo)
         {
             var decoder = codec == AudioCodec.Pcmu ? new PcmuCodec()
-                : mixed && _stereoDecoderFactory != null ? _stereoDecoderFactory()
+                : stereo && _stereoDecoderFactory != null ? _stereoDecoderFactory()
                 : _decoderFactory();
             s.Decoder = decoder;
             s.Fec = decoder as IOpusFecDecoder;
             s.Codec = codec;
             s.Mixed = mixed;
+            s.Stereo = codec == AudioCodec.Opus && stereo;
         }
 
         public void Remove(uint ssrc)
@@ -346,8 +362,10 @@ namespace Aurix.Audio
 
         /// <summary>
         /// Mix into <paramref name="output"/> (interleaved, <c>outputChannels</c> wide). Adds to
-        /// existing contents. Mono streams with a direction are panned between the first two output
-        /// channels (left, right); further channels get the centred signal.
+        /// existing contents. Streams with a direction are panned between the first two output
+        /// channels (left, right) — a stereo stream is downmixed first, positional audio has one
+        /// source point; a stereo stream without a direction keeps its image. Further channels get
+        /// the centred signal; a mono output gets the downmix.
         /// </summary>
         public void Mix(float[] output, int outputChannels) => Mix(output, 0, output.Length / outputChannels, outputChannels);
 
@@ -401,22 +419,23 @@ namespace Aurix.Audio
                         float gain = s.Volume * master;
                         if (gain != 0f)
                         {
-                            bool pan = dch == 1 && outputChannels >= 2;
-                            bool downmix = dch == 2 && outputChannels == 1;
+                            bool pan = s.Panned && outputChannels >= 2;
+                            bool downmix = dch == 2 && (outputChannels == 1 || pan);
                             for (int f = 0; f < take; f++)
                             {
-                                if (downmix)
+                                int i = s.FramePos + f * dch;
+                                if (downmix && outputChannels == 1)
                                 {
-                                    int i = s.FramePos + f * 2;
                                     output[offset + written + f] += (s.Frame[i] + s.Frame[i + 1]) * 0.5f * gain;
                                     continue;
                                 }
+                                float mono = downmix ? (s.Frame[i] + s.Frame[i + 1]) * 0.5f : 0f;
                                 for (int c = 0; c < outputChannels; c++)
                                 {
-                                    int srcC = dch == 1 ? 0 : Math.Min(c, dch - 1);
+                                    float v = downmix ? mono : s.Frame[i + (dch == 1 ? 0 : Math.Min(c, dch - 1))];
                                     float g = gain;
                                     if (pan) g *= c == 0 ? s.LeftGain : c == 1 ? s.RightGain : 1f;
-                                    output[offset + (written + f) * outputChannels + c] += s.Frame[s.FramePos + f * dch + srcC] * g;
+                                    output[offset + (written + f) * outputChannels + c] += v * g;
                                 }
                             }
                         }

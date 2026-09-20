@@ -45,6 +45,7 @@ namespace Aurix.Samples
 
         public void Apply(OpusEncoderSettings settings)
         {
+            settings.Channels = Channels; // fixed at construction
             var s = settings.Clamped();
             lock (_encLock)
             {

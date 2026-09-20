@@ -100,9 +100,10 @@ voice.CodecFactory = NativeOpusCodec.IsAvailable
     : () => new ConcentusOpusCodec();
 ```
 
-`OpusEncoderSettings` carries every libopus encoder control: `BitrateBps` (6 000..300 000), `Complexity` (0..10),
+`OpusEncoderSettings` carries every libopus encoder control: `BitrateBps` (6 000..300 000 mono, ..510 000 stereo), `Complexity` (0..10),
 `MaxBandwidth` (narrowband 4 kHz … fullband 20 kHz), `Signal` (Auto/Voice/Music → application + signal hint),
-`Vbr`, `ConstrainedVbr`, `Fec`, `ExpectedLossPercent` and `Dtx`. `AurixVoiceBehaviour` exposes them in the
+`Vbr`, `ConstrainedVbr`, `Fec`, `ExpectedLossPercent`, `Dtx` and `Channels` (1, or 2 for a stereo uplink — see
+below). `AurixVoiceBehaviour` exposes them in the
 inspector (*Opus encoder*); `ApplyEncoderSettings()` re-reads them at runtime. Three layers decide what the
 encoder actually runs (`client.EffectiveEncoderSettings`):
 
@@ -121,6 +122,29 @@ Set `client.Encoder = codec` and the client pushes every change through `IOpusEn
 (or `SetBitrate` for a codec without controls); `client.OnEncoderSettingsChanged` reports what was applied.
 `RemoteMixer` uses `IOpusFecDecoder` when a packet is missing and its successor has already arrived
 (`VoiceStats.FramesFecRecovered`), and falls back to PLC otherwise.
+
+### Stereo uplink (music / broadcast sources)
+
+Voice is mono end to end. For a music bot, DJ deck or stereo microphone pair set `Channels = 2`
+(`AurixVoiceBehaviour.Stereo`) and give the behaviour a two-channel codec:
+
+```csharp
+voice.Stereo = true;                                                  // inspector: Stereo
+voice.Signal = OpusSignal.Music;                                      // OPUS_APPLICATION_AUDIO
+voice.StereoCodecFactory = () => new ConcentusOpusCodec(48000, 2);    // or NativeOpusCodec(48000, 2)
+```
+
+* The channel must allow it: `AudioPolicy.Stereo` (`ChannelConfig.stereo`) — in a voice channel the followed
+  policy forces the encoder to one channel; `FollowChannelPolicy = false` leaves the decision to you. The
+  stereo bitrate ceiling is 510 kbit/s. PCMU is always mono.
+* The microphone's first two channels are L/R (a mono device is duplicated). The capture DSP (AEC/NS/AGC)
+  is voice-only and is bypassed for stereo frames; `InputGain`, VAD and energy still apply (on the L/R
+  average). Without a `StereoCodecFactory` the behaviour logs a warning and stays mono.
+* Receiving needs no setup: `RemoteMixer` reads each Opus packet's channel flag (`OpusPacket.IsStereo`),
+  swaps a stream to the stereo factory on its first stereo packet (a stereo decoder plays later mono
+  packets fine), keeps the L/R image for non-positional senders, downmixes before panning directional
+  ones and averages L/R for a mono output. With no stereo factory the mono factory decodes stereo packets
+  downmixed.
 
 ### PCMU (G.711) fallback for weak devices
 
