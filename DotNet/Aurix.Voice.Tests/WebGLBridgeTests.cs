@@ -383,6 +383,50 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public async Task TranslationCallsAndEventsUseTheSharedTypes()
+        {
+            var (client, bridge) = NewClient();
+            await Connect(client, bridge);
+            Assert.Null(client.Session.Translation);
+
+            await client.SetTranslationAsync(" DE_de ", "EN", speech: true);
+            var call = bridge.Last("setTranslation");
+            Assert.Equal("de-de", MiniJson.GetString(call.args, "language"));
+            Assert.Equal("en", MiniJson.GetString(call.args, "spokenLanguage"));
+            Assert.True(MiniJson.GetBool(call.args, "speech"));
+            Assert.Equal("de-de", client.TranslationPrefs.Language);
+
+            // Speech without a target is meaningless and not requested.
+            await client.SetTranslationAsync(null, null, speech: true);
+            call = bridge.Last("setTranslation");
+            Assert.Null(call.args["language"]);
+            Assert.False(MiniJson.GetBool(call.args, "speech"));
+            Assert.False(client.TranslationPrefs.Speech);
+
+            TranslationPrefs applied = null;
+            client.OnTranslationChanged += p => applied = p;
+            bridge.Emit("translationChanged", ("prefs", new Dictionary<string, object> { { "language", "fr" }, { "speech", false } }));
+            client.Update();
+            Assert.Equal("fr", applied.Language);
+            Assert.Null(applied.SpokenLanguage);
+            Assert.Equal("fr", client.TranslationPrefs.Language);
+
+            Transcript transcript = null;
+            client.OnTranscript += t => transcript = t;
+            bridge.Emit("transcript", ("transcript", new Dictionary<string, object>
+            {
+                { "id", "44444444-4444-4444-4444-444444444444" }, { "channelId", Channel.ToString() }, { "userId", Bob.ToString() },
+                { "text", "Bonjour" }, { "language", "fr" }, { "startedAt", "2024-05-01T10:00:00.000Z" }, { "durationMs", 800.0 },
+                { "original", new Dictionary<string, object> { { "text", "hello" }, { "language", "en" } } },
+            }));
+            client.Update();
+            Assert.True(transcript.Translated);
+            Assert.Equal("Bonjour", transcript.Text);
+            Assert.Equal("hello", transcript.OriginalText);
+            Assert.Equal("en", transcript.OriginalLanguage);
+        }
+
+        [Fact]
         public async Task ChatCallsAndEventsUseTheSharedTypes()
         {
             var (client, bridge) = NewClient();

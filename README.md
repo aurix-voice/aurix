@@ -758,6 +758,28 @@ transmits to exactly one channel. Synthesized speech is routed exactly like your
 mutes, blocks, focus, other nodes) and arrives on the participant's SSRC with the top bit set (`SynthSsrcFlag`),
 so the `RemoteMixer` gives it its own jitter buffer and `FindBySsrc` still returns the speaker; channel
 announcements (`POST /v1/channels/:id/tts`) use a per-channel synthetic SSRC with no participant behind it.
+
+### Live translation
+
+```csharp
+// server: [translation] configured; Session.Translation says what the node offers (null = none)
+var t = voice.Client.Session?.Translation;
+if (t != null && (t.Languages.Count == 0 || t.Languages.Contains("de")))
+    await voice.Client.SetTranslationAsync("de", spokenLanguage: "en", speech: t.Speech);
+voice.Client.OnTranslationChanged += p => Debug.Log($"{p.Language} {p.SpokenLanguage} {p.Speech}");
+voice.Client.OnTranscript += t =>
+    captions.Show(t.UserId, t.Text, t.Language, t.Translated ? $"({t.OriginalLanguage}: {t.OriginalText})" : null);
+voice.Client.TranslationPrefs;                        // as applied by the server (normalised tags)
+await voice.Client.SetTranslationAsync(null);         // originals only
+```
+
+`SetTranslationAsync` translates the captions *you* receive; the speaker and listeners of other languages keep
+theirs. A segment already in your language, or one the provider could not translate in time / that exceeds the
+node's length limit, arrives as the original (`Translated == false`). With `speech: true` the translation is also
+spoken to you alone on the channel's translator SSRC (a synthetic SSRC with no participant behind it — `FindBySsrc`
+returns null, `IsSynthesizedSsrc` is true). Tags are BCP-47 (`DE_de` → `de-de`); the task faults with
+`VALIDATION_ERROR` for a language the node does not offer and `TRANSLATION_DISABLED` when translation is off. The
+preference is replayed after reconnect and failover, and the WebGL client exposes the same members.
 Statuses go to the requesting session only; disconnecting cancels pending requests.
 
 ## .NET: build, test, end-to-end demo
