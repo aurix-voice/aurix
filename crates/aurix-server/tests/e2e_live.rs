@@ -804,10 +804,15 @@ async fn session_resume_after_ws_drop() {
     drop(dead_ws);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Bob sees nothing, the membership is still persisted.
+    // Bob sees nothing about Alice (his own periodic quality report is not a peer event),
+    // the membership is still persisted.
+    let leaked = bob
+        .try_recv(Duration::from_millis(700))
+        .await
+        .filter(|m| !matches!(m, ControlMessage::NetworkQuality { .. }));
     assert!(
-        bob.try_recv(Duration::from_millis(700)).await.is_none(),
-        "peers must not be notified while the session is detached"
+        leaked.is_none(),
+        "peers must not be notified while the session is detached: {leaked:?}"
     );
     assert_eq!(membership_count(&env, &http, channel_id).await, 2);
 
@@ -8925,4 +8930,614 @@ async fn fleet_rate_limits_hold_across_nodes() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "another reporter is not throttled");
+}
+
+/// Little-endian 16-bit PCM WAV → (sample_rate, channels, samples).
+fn parse_wav_pcm16(bytes: &[u8]) -> (u32, u16, Vec<i16>) {
+    assert!(
+        bytes.len() > 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "not a RIFF/WAVE file ({} bytes)",
+        bytes.len()
+    );
+    let mut pos = 12;
+    let mut fmt = None;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
+        match id {
+            b"fmt " => {
+                let format = u16::from_le_bytes(body[0..2].try_into().unwrap());
+                let channels = u16::from_le_bytes(body[2..4].try_into().unwrap());
+                let rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                let bits = u16::from_le_bytes(body[14..16].try_into().unwrap());
+                assert_eq!((format, bits), (1, 16), "expected 16-bit PCM");
+                fmt = Some((rate, channels));
+            }
+            b"data" => {
+                let (rate, channels) = fmt.expect("fmt chunk precedes data");
+                let samples = body
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c))
+                    .collect();
+                return (rate, channels, samples);
+            }
+            _ => {}
+        }
+        pos += 8 + len + (len & 1);
+    }
+    panic!("no data chunk");
+}
+
+fn rms_of(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples
+        .iter()
+        .map(|s| (f32::from(*s) / 32768.0).powi(2))
+        .sum::<f32>()
+        / samples.len() as f32)
+        .sqrt()
+}
+
+/// Zero-crossing estimate of a mono tone's fundamental.
+fn zero_crossing_hz(samples: &[i16], sample_rate: u32) -> f32 {
+    let crossings = samples
+        .windows(2)
+        .filter(|w| (w[0] < 0) != (w[1] < 0))
+        .count();
+    crossings as f32 / 2.0 * sample_rate as f32 / samples.len().max(1) as f32
+}
+
+/// `GET` as JSON; `GET /v1/recordings/{id}` wraps the row (`{recording, consent, download_url}`),
+/// which is unwrapped here so callers see the same shape as the list and the processing
+/// endpoints.
+async fn recording_json(env: &Env, http: &reqwest::Client, path: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = http
+        .get(format!("{}{path}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    if let Some(row) = v.get_mut("recording") {
+        return row.take();
+    }
+    v
+}
+
+/// Polls `path` until `["status"]` leaves `processing`/`queued`/`running`.
+async fn await_processed(env: &Env, http: &reqwest::Client, path: &str) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let v = recording_json(env, http, path).await;
+        let status = v["status"].as_str().unwrap_or("");
+        if !matches!(status, "processing" | "queued" | "running") {
+            return v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{path} still `{status}` after 30 s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Records Alice and Bob separately, then renders channel mixdowns (WAV and Ogg/Opus) whose
+/// timeline follows each track's first packet, and transcribes the mixdown track by track with
+/// the mock STT so every segment names its speaker; lifecycle events reach SSE, downloads carry
+/// the right content type, invalid requests are refused, and everything is tenant-scoped.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with recording enabled and STT pointed at examples/mock_speech.rs"]
+async fn recording_mixdown_and_post_hoc_transcript() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "mixdown:alice", "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "mixdown:bob", "Bob", channel_id).await;
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    for p in [&mut alice, &mut bob] {
+        bind_media(p).await;
+        join(p, channel_id).await;
+    }
+    drain_ws(&mut alice).await;
+    drain_ws(&mut bob).await;
+
+    // One track per participant; both consent.
+    async fn record(
+        env: &Env,
+        http: &reqwest::Client,
+        p: &mut Player,
+        channel_id: ChannelId,
+        uid: &str,
+    ) -> uuid::Uuid {
+        let rec: serde_json::Value = http
+            .post(format!("{}/v1/recordings/start", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&serde_json::json!({"channel_id": channel_id, "user_id": uid}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rec["kind"], "recording");
+        assert_eq!(rec["status"], "recording");
+        let recording_id: uuid::Uuid = rec["id"].as_str().unwrap().parse().unwrap();
+        p.expect("RecordingNotification", |m| {
+            matches!(m, ControlMessage::RecordingNotification { active: true, recording_id: r, .. } if *r == recording_id)
+        })
+        .await;
+        p.send(&ControlMessage::RecordingConsentResponse {
+            recording_id,
+            consent: RecordingConsent::Accepted,
+        })
+        .await;
+        recording_id
+    }
+    let rec_a = record(&env, &http, &mut alice, channel_id, &uid_a).await;
+    let rec_b = record(&env, &http, &mut bob, channel_id, &uid_b).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A mixdown of a channel whose tracks are still running is refused.
+    let r = http
+        .post(format!("{}/v1/recordings/mixdown", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel_id, "sources": [rec_a]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409, "running track must not be mixed down");
+
+    // Alice speaks first (440 Hz, 1 s); Bob starts ~1 s later (880 Hz, 1 s) — their tracks
+    // therefore start at different wall-clock instants and must be aligned in the mix.
+    let tone_a = opus_tone(440.0, 1000);
+    let tone_b = opus_tone(880.0, 1000);
+    stream_frames(&alice, channel_id, 1, &tone_a, false).await;
+    stream_frames(&bob, channel_id, 1, &tone_b, false).await;
+    drain_udp(&alice).await;
+    drain_udp(&bob).await;
+    for id in [rec_a, rec_b] {
+        http.post(format!("{}/v1/recordings/{id}/stop", env.api))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let row = recording_json(&env, &http, &format!("/v1/recordings/{id}")).await;
+        assert_eq!(row["status"], "ready", "{row}");
+        assert!(
+            row["audio_started_at"].is_string(),
+            "first-packet timestamp recorded: {row}"
+        );
+    }
+
+    let mut sse = SseClient::open(&env, &env.api_key, Some("recording.processed"))
+        .await
+        .expect("SSE stream");
+
+    // WAV mixdown of the whole channel (sources omitted → every finished track).
+    let mix: serde_json::Value = http
+        .post(format!("{}/v1/recordings/mixdown", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel_id, "format": "wav"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mix["kind"], "mixdown", "{mix}");
+    assert_eq!(mix["status"], "processing", "{mix}");
+    assert_eq!(mix["format"], "wav", "{mix}");
+    let mut sources = id_list(&mix["sources"]);
+    sources.sort();
+    let mut want = vec![rec_a.to_string(), rec_b.to_string()];
+    want.sort();
+    assert_eq!(sources, want, "{mix}");
+    let mix_id: uuid::Uuid = mix["id"].as_str().unwrap().parse().unwrap();
+    // Not downloadable while rendering.
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{mix_id}/download")).await,
+        409
+    );
+    let done = await_processed(&env, &http, &format!("/v1/recordings/{mix_id}")).await;
+    assert_eq!(done["status"], "ready", "{done}");
+    let duration = done["duration_secs"].as_f64().unwrap();
+    assert!(
+        (1.8..=3.5).contains(&duration),
+        "two 1 s tracks offset by ~1 s → ~2 s mix, got {duration}: {done}"
+    );
+    assert!(done["file_size_bytes"].as_u64().unwrap() > 44);
+    let ev = sse
+        .expect("recording.processed", Duration::from_secs(5))
+        .await;
+    assert_eq!(ev["data"]["recording_id"], mix_id.to_string(), "{ev}");
+    assert_eq!(ev["data"]["job"], "mixdown", "{ev}");
+    assert_eq!(ev["data"]["status"], "ready", "{ev}");
+
+    let resp = http
+        .get(format!("{}/v1/recordings/{mix_id}/download", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "audio/wav"
+    );
+    let disposition = resp.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(disposition.ends_with(".wav\""), "{disposition}");
+    let wav = resp.bytes().await.unwrap();
+    let (rate, channels, pcm) = parse_wav_pcm16(&wav);
+    assert_eq!((rate, channels), (48_000, 1));
+    let secs = pcm.len() as f64 / 48_000.0;
+    assert!(
+        (secs - duration).abs() < 0.1,
+        "wav {secs}s vs row {duration}s"
+    );
+    // First 0.5 s: only Alice at 440 Hz; last 0.5 s: only Bob at 880 Hz. A 0.35 amplitude sine
+    // has RMS ≈ 0.247.
+    let head = &pcm[4_800..28_800];
+    let tail = &pcm[pcm.len() - 24_000..];
+    let (rms_head, rms_tail) = (rms_of(head), rms_of(tail));
+    assert!(
+        (0.18..=0.32).contains(&rms_head) && (0.18..=0.32).contains(&rms_tail),
+        "both tracks present at their volume: head {rms_head} tail {rms_tail}"
+    );
+    let (hz_head, hz_tail) = (
+        zero_crossing_hz(head, 48_000),
+        zero_crossing_hz(tail, 48_000),
+    );
+    assert!(
+        (hz_head - 440.0).abs() < 40.0,
+        "Alice's tone leads the mix: {hz_head} Hz"
+    );
+    assert!(
+        (hz_tail - 880.0).abs() < 60.0,
+        "Bob's tone ends the mix: {hz_tail} Hz"
+    );
+    // Between Alice's end and Bob's start there is neither silence padding lost nor overlap
+    // that doubles the level.
+    let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(peak < 20_000, "no doubled/overlapping tracks: peak {peak}");
+
+    // Ogg/Opus mixdown of the same tracks, explicitly listed, downloads as audio/ogg.
+    let mix2: serde_json::Value = http
+        .post(format!("{}/v1/recordings/mixdown", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel_id, "sources": [rec_a, rec_b]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mix2["format"], "ogg_opus", "{mix2}");
+    let mix2_id: uuid::Uuid = mix2["id"].as_str().unwrap().parse().unwrap();
+    let done2 = await_processed(&env, &http, &format!("/v1/recordings/{mix2_id}")).await;
+    assert_eq!(done2["status"], "ready", "{done2}");
+    let resp = http
+        .get(format!("{}/v1/recordings/{mix2_id}/download", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "audio/ogg"
+    );
+    let ogg = resp.bytes().await.unwrap();
+    assert!(ogg.starts_with(b"OggS") && ogg.windows(8).any(|w| w == b"OpusHead"));
+    let ev = sse
+        .expect("recording.processed", Duration::from_secs(5))
+        .await;
+    assert_eq!(ev["data"]["recording_id"], mix2_id.to_string(), "{ev}");
+
+    // Listing shows tracks and mixdowns side by side.
+    let list = recording_json(
+        &env,
+        &http,
+        &format!("/v1/recordings?channel_id={channel_id}"),
+    )
+    .await;
+    let kinds: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "mixdown").count(),
+        2,
+        "{list}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "recording").count(),
+        2,
+        "{list}"
+    );
+
+    // Invalid requests: a source from another channel, an unknown source, a mixdown of a
+    // mixdown, an empty channel.
+    let other = create_channel(&env, &http).await;
+    for (body, want) in [
+        (
+            serde_json::json!({"channel_id": other, "sources": [rec_a]}),
+            400,
+        ),
+        (
+            serde_json::json!({"channel_id": channel_id, "sources": [uuid::Uuid::now_v7()]}),
+            404,
+        ),
+        (
+            serde_json::json!({"channel_id": channel_id, "sources": [mix_id]}),
+            400,
+        ),
+        (serde_json::json!({"channel_id": other}), 404),
+    ] {
+        let r = http
+            .post(format!("{}/v1/recordings/mixdown", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), want, "{body}: {}", r.text().await.unwrap());
+    }
+
+    // Post-hoc transcript of the mixdown: one segment per speaker, on the mix timeline.
+    let r = http
+        .post(format!("{}/v1/recordings/{mix_id}/transcribe", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    if r.status() == 400 {
+        let body = r.text().await.unwrap();
+        assert!(body.contains("INVALID_CONFIG"), "{body}");
+        eprintln!("no [stt] provider on the node; transcript part skipped (start examples/mock_speech.rs)");
+    } else {
+        let queued: serde_json::Value = r.error_for_status().unwrap().json().await.unwrap();
+        assert!(
+            matches!(queued["status"].as_str(), Some("queued" | "running")),
+            "{queued}"
+        );
+        assert_eq!(queued["recording_id"], mix_id.to_string());
+        let t = await_processed(&env, &http, &format!("/v1/recordings/{mix_id}/transcript")).await;
+        assert_eq!(t["status"], "ready", "{t}");
+        assert_eq!(t["language"], "en", "{t}");
+        assert!(t["provider"].is_string(), "{t}");
+        let segments = t["segments"].as_array().unwrap();
+        let seg_a = segments
+            .iter()
+            .find(|s| s["speaker"] == uid_a)
+            .unwrap_or_else(|| panic!("no segment for Alice: {t}"));
+        let seg_b = segments
+            .iter()
+            .find(|s| s["speaker"] == uid_b)
+            .unwrap_or_else(|| panic!("no segment for Bob: {t}"));
+        let hz_a = tone_hz(seg_a["text"].as_str().unwrap()).unwrap();
+        let hz_b = tone_hz(seg_b["text"].as_str().unwrap()).unwrap();
+        assert!((hz_a - 440.0).abs() < 30.0, "Alice's segment: {seg_a}");
+        assert!((hz_b - 880.0).abs() < 60.0, "Bob's segment: {seg_b}");
+        // Leading silence (Opus pre-skip) is trimmed, so the first segment starts a few ms in.
+        assert!(seg_a["start_ms"].as_u64().unwrap() < 50, "{seg_a}");
+        let b_start = seg_b["start_ms"].as_u64().unwrap();
+        assert!(
+            (800..=2_000).contains(&b_start),
+            "Bob's offset on the mix timeline: {seg_b}"
+        );
+        assert!(
+            seg_a["words"].as_array().unwrap().len() == 2
+                && seg_a["words"][1]["start_ms"].as_u64().unwrap() > 0,
+            "word timings preserved: {seg_a}"
+        );
+        let text = t["text"].as_str().unwrap();
+        assert!(
+            text.contains("440") && text.contains("880"),
+            "joined text in timeline order: {text}"
+        );
+        assert!(
+            text.find("440").unwrap() < text.find("880").unwrap(),
+            "{text}"
+        );
+        assert!(
+            t["duration_ms"].as_u64().unwrap() >= 1_800,
+            "duration of the mix: {t}"
+        );
+        let ev = sse
+            .expect("recording.processed", Duration::from_secs(5))
+            .await;
+        assert_eq!(ev["data"]["recording_id"], mix_id.to_string(), "{ev}");
+        assert_eq!(ev["data"]["job"], "transcript", "{ev}");
+        assert_eq!(ev["data"]["status"], "ready", "{ev}");
+
+        // Subtitle renderings.
+        let srt = http
+            .get(format!(
+                "{}/v1/recordings/{mix_id}/transcript?format=srt",
+                env.api
+            ))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(srt.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/x-subrip"));
+        let srt = srt.text().await.unwrap();
+        assert!(
+            srt.starts_with("1\n")
+                && srt.contains(" --> ")
+                && srt.contains(&uid_a)
+                && srt.contains(&uid_b),
+            "{srt}"
+        );
+        let vtt = http
+            .get(format!(
+                "{}/v1/recordings/{mix_id}/transcript?format=vtt",
+                env.api
+            ))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            vtt.starts_with("WEBVTT") && vtt.contains(&format!("<v {uid_b}>")),
+            "{vtt}"
+        );
+        assert_eq!(
+            status_of(
+                &env,
+                &http,
+                &format!("/v1/recordings/{mix_id}/transcript?format=doc")
+            )
+            .await,
+            400
+        );
+
+        // A single track is transcribed as one speaker.
+        http.post(format!("{}/v1/recordings/{rec_b}/transcribe", env.api))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let tb = await_processed(&env, &http, &format!("/v1/recordings/{rec_b}/transcript")).await;
+        assert_eq!(tb["status"], "ready", "{tb}");
+        let segs = tb["segments"].as_array().unwrap();
+        assert!(
+            segs.iter().all(|s| s["speaker"] == uid_b) && !segs.is_empty(),
+            "{tb}"
+        );
+        assert!(
+            segs[0]["start_ms"].as_u64().unwrap() < 50,
+            "own timeline starts at zero: {tb}"
+        );
+    }
+    // No transcript yet → 404; unknown recording → 404.
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{rec_a}/transcript")).await,
+        404
+    );
+    assert_eq!(
+        status_of(
+            &env,
+            &http,
+            &format!("/v1/recordings/{}/transcript", uuid::Uuid::now_v7())
+        )
+        .await,
+        404
+    );
+
+    // Tenant isolation: another application sees none of it.
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let env2 = Env {
+            api_key: api_key2,
+            ..env.clone()
+        };
+        for path in [
+            format!("/v1/recordings/{mix_id}"),
+            format!("/v1/recordings/{mix_id}/download"),
+            format!("/v1/recordings/{mix_id}/transcript"),
+        ] {
+            assert_eq!(
+                status_of(&env2, &http, &path).await,
+                404,
+                "foreign tenant must not read {path}"
+            );
+        }
+        for (method, path, body) in [
+            (
+                "POST",
+                "/v1/recordings/mixdown".to_string(),
+                Some(serde_json::json!({"channel_id": channel_id, "sources": [rec_a, rec_b]})),
+            ),
+            ("POST", format!("/v1/recordings/{mix_id}/transcribe"), None),
+        ] {
+            let mut req = http
+                .request(method.parse().unwrap(), format!("{}{path}", env2.api))
+                .header("x-api-key", &env2.api_key);
+            if let Some(b) = body {
+                req = req.json(&b);
+            }
+            let r = req.send().await.unwrap();
+            assert_eq!(
+                r.status(),
+                404,
+                "foreign tenant must not {method} {path}: {}",
+                r.text().await.unwrap()
+            );
+        }
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; tenant isolation of mixdowns not exercised");
+    }
+
+    // Deleting a source track leaves the mixdown; deleting the mixdown removes its transcript.
+    http.delete(format!("{}/v1/recordings/{rec_a}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{mix_id}")).await,
+        200,
+        "mixdown survives its source"
+    );
+    http.delete(format!("{}/v1/recordings/{mix_id}", env.api))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{mix_id}")).await,
+        404
+    );
+    assert_eq!(
+        status_of(&env, &http, &format!("/v1/recordings/{mix_id}/transcript")).await,
+        404,
+        "transcript goes with the recording"
+    );
+
+    let _ = alice.ws.close(None).await;
+    let _ = bob.ws.close(None).await;
 }

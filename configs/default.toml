@@ -125,6 +125,19 @@ push_enabled = true
 connect_timeout_ms = 5000
 max_reconnects = 5
 
+# Post-hoc jobs on stored recordings: channel mixdowns (`POST /v1/recordings/mixdown`, Ogg/Opus
+# or WAV) and transcripts (`POST /v1/recordings/:id/transcribe`, needs an `[stt]` provider). Jobs
+# run on the node that accepted the request, decode on the blocking pool with `max_concurrent`
+# workers, and answer 429 when more than `max_queued` are waiting.
+[recording.processing]
+enabled = true
+max_concurrent = 2
+max_queued = 64
+max_sources = 64
+mixdown_bitrate = 64000
+stt_chunk_secs = 30
+stt_sample_rate = 16000
+
 [metrics]
 enabled = true
 port = 4040

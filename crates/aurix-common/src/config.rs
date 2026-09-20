@@ -365,6 +365,25 @@ impl AurixConfig {
                 anyhow::bail!("recording.live.connect_timeout_ms must be >= 100");
             }
         }
+        if self.recording.enabled && self.recording.processing.enabled {
+            let p = &self.recording.processing;
+            if p.max_concurrent == 0 || p.max_sources < 2 {
+                anyhow::bail!(
+                    "recording.processing.max_concurrent must be >= 1 and max_sources >= 2"
+                );
+            }
+            if !(6_000..=510_000).contains(&p.mixdown_bitrate) {
+                anyhow::bail!("recording.processing.mixdown_bitrate must be within 6000..=510000");
+            }
+            if !(5..=300).contains(&p.stt_chunk_secs) {
+                anyhow::bail!("recording.processing.stt_chunk_secs must be within 5..=300");
+            }
+            if !matches!(p.stt_sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) {
+                anyhow::bail!(
+                    "recording.processing.stt_sample_rate must be 8000, 12000, 16000, 24000 or 48000"
+                );
+            }
+        }
 
         if self.is_production() {
             if self.auth.jwt_public_key_path.is_none() {
@@ -956,6 +975,9 @@ pub struct RecordingConfig {
     /// writing files.
     #[serde(default)]
     pub live: LiveStreamConfig,
+    /// Post-hoc processing of finished recordings (channel mixdowns, WAV export, transcripts).
+    #[serde(default)]
+    pub processing: RecordingProcessingConfig,
 }
 
 impl Default for RecordingConfig {
@@ -974,6 +996,69 @@ impl Default for RecordingConfig {
             s3_secret_key: None,
             require_consent: true,
             live: LiveStreamConfig::default(),
+            processing: RecordingProcessingConfig::default(),
+        }
+    }
+}
+
+/// `[recording.processing]` — mixdowns and post-hoc transcripts of stored recordings. Jobs run
+/// on the node that accepted the request, on the blocking thread pool, and never touch the
+/// media path; the node must be able to read every source track (local file or object storage).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecordingProcessingConfig {
+    /// Accept `POST /v1/recordings/mixdown` and `POST /v1/recordings/:id/transcribe`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Jobs decoded/mixed/transcribed at the same time on one node.
+    #[serde(default = "default_processing_max_concurrent")]
+    pub max_concurrent: u32,
+    /// Jobs accepted but not yet started on one node before requests are refused with 429.
+    #[serde(default = "default_processing_max_queued")]
+    pub max_queued: u32,
+    /// Tracks a single mixdown may combine.
+    #[serde(default = "default_processing_max_sources")]
+    pub max_sources: u32,
+    /// Opus bitrate of Ogg/Opus mixdowns (bits/s).
+    #[serde(default = "default_processing_mixdown_bitrate")]
+    pub mixdown_bitrate: u32,
+    /// Longest chunk of one track sent to the speech-to-text provider per request (seconds);
+    /// chunks are cut on silence where possible.
+    #[serde(default = "default_processing_stt_chunk_secs")]
+    pub stt_chunk_secs: u32,
+    /// Sample rate the audio is handed to the speech-to-text provider at (must divide 48000).
+    #[serde(default = "default_processing_stt_sample_rate")]
+    pub stt_sample_rate: u32,
+}
+
+fn default_processing_max_concurrent() -> u32 {
+    2
+}
+fn default_processing_max_queued() -> u32 {
+    64
+}
+fn default_processing_max_sources() -> u32 {
+    64
+}
+fn default_processing_mixdown_bitrate() -> u32 {
+    64_000
+}
+fn default_processing_stt_chunk_secs() -> u32 {
+    30
+}
+fn default_processing_stt_sample_rate() -> u32 {
+    16_000
+}
+
+impl Default for RecordingProcessingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent: default_processing_max_concurrent(),
+            max_queued: default_processing_max_queued(),
+            max_sources: default_processing_max_sources(),
+            mixdown_bitrate: default_processing_mixdown_bitrate(),
+            stt_chunk_secs: default_processing_stt_chunk_secs(),
+            stt_sample_rate: default_processing_stt_sample_rate(),
         }
     }
 }

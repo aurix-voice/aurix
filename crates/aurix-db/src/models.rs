@@ -152,8 +152,35 @@ pub struct RecordingRow {
     pub ended_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
-    /// `recording` for operator-started captures, `evidence` for safety clips.
+    /// `recording` for operator-started captures, `evidence` for safety clips, `mixdown` for
+    /// channel renders derived from tracks.
     pub kind: String,
+    /// `recording` (still capturing), `processing` (mixdown being rendered), `ready`, `failed`.
+    pub status: String,
+    /// When the first audio was written; consent can delay it past `started_at`.
+    pub audio_started_at: Option<DateTime<Utc>>,
+    /// Tracks a mixdown was rendered from.
+    pub sources: Option<Vec<Uuid>>,
+    /// Node holding the file (and running the job while `processing`).
+    pub node_id: Option<Uuid>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RecordingTranscriptRow {
+    pub recording_id: Uuid,
+    pub app_id: Uuid,
+    /// `queued`, `running`, `ready`, `failed`.
+    pub status: String,
+    pub provider: Option<String>,
+    pub language: Option<String>,
+    pub text: String,
+    pub segments: serde_json::Value,
+    pub duration_ms: i64,
+    pub node_id: Option<Uuid>,
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

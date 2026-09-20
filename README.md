@@ -58,7 +58,7 @@ quick start, protocols, SDK guides, operations. The REST contract is
 | `aurix-api` | REST API (axum) |
 | `aurix-ws` | WebSocket signalling |
 | `aurix-moderation` | bans, mutes, kicks, reports, STT-based content analysis hooks |
-| `aurix-recording` | Ogg/Opus writer, consent, retention, encryption, S3 |
+| `aurix-recording` | Ogg/Opus writer/reader, consent, retention, encryption, S3, mixdown + post-hoc STT jobs |
 | `aurix-metrics` | Prometheus registry |
 | `aurix-server` | the binary; wires everything together |
 | `aurix-cli` | `aurix` admin CLI |
@@ -298,7 +298,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/moderation/{mute-all,kick-all}` | channel-wide server mute / kick of everyone currently present minus `except: [user ids]`; response lists `affected`, `skipped`, `failed`; every target still gets its own `user.muted`/`user.kicked` event and audit entry plus one `channel_mute_all`/`channel_kick_all` summary |
 | API key | `GET /v1/safety/incidents[/:id]`, `GET …/:id/export`, `GET /v1/safety/users/:id/risk` | content-safety incidents (moderation events `safety.voice`/`safety.text`), self-contained evidence bundle (inline decrypted audio when the key also has `recordings:read`), decayed per-user risk (`moderation:read`; see [Content safety](#content-safety)) |
 | API key | `POST /v1/channels/:id/tts`, `GET /v1/tts/voices` | speak a server announcement into a channel with the configured TTS provider (`tts:write`; `{"text":…,"voice":…}` → `request_id`, progress as `tts.status` events) / list voices and limits (see [Transcripts and text-to-speech](#transcripts-and-text-to-speech)) |
-| API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id` | recording |
+| API key | `POST /v1/recordings/start`, `POST /v1/recordings/:id/stop`, `GET /v1/recordings[/:id]`, `GET …/:id/download`, `DELETE …/:id`, `POST /v1/recordings/mixdown`, `POST …/:id/transcribe`, `GET …/:id/transcript[?format=srt\|vtt]` | per-participant recording, channel mixdown (Ogg/Opus or WAV) and post-hoc transcript with speakers |
 | API key | `GET /v1/channels/:id/audio/streams/pull` (WebSocket), `POST|GET /v1/channels/:id/audio/streams`, `GET|DELETE …/audio/streams/:sid`, `GET /v1/audio/streams` | real-time audio out of the node — pull it over a WebSocket or have the node push it to yours (`audio_streams:read|write`; see [Live audio streams](#live-audio-streams)) |
 | API key | `POST|GET /v1/api-keys`, `PATCH|DELETE /v1/api-keys/:id`, `GET /v1/audit-log`, `GET /v1/analytics` | account |
 | API key | `POST|GET /v1/webhooks`, `GET /v1/webhooks/events`, `GET|PATCH|DELETE /v1/webhooks/:id`, `POST …/:id/{rotate-secret,test,resync}`, `GET …/:id/deliveries[/:did]`, `POST …/:id/deliveries/:did/retry` | webhook subscriptions + delivery log (`webhooks:read|write`) |
@@ -324,7 +324,7 @@ event ids, so a consumer can mix them and de-duplicate:
 Event types (`GET /v1/webhooks/events` lists them): `channel.created|destroyed|activated|deactivated`
 (activated = first participant in, deactivated = last one out — also emitted for channels a
 crashed node left behind), `participant.joined|left|muted|unmuted|kicked`, `user.banned`,
-`user.block_changed`, `moderation.event`, `recording.started|stopped|consent_required`,
+`user.block_changed`, `moderation.event`, `recording.started|stopped|consent_required|processed`,
 `audio_stream.started|stopped`, `quality.alert`, `chat.message`. `participant.typing`, `participant.speaking` and `channel.energy`
 are high-frequency UX signals: SSE delivers them only when named in `?types=`, webhooks refuse them.
 

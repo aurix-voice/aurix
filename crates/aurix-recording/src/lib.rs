@@ -1,5 +1,7 @@
 pub mod live;
+pub mod mixdown;
 pub mod ogg;
+pub mod processing;
 pub mod s3;
 
 use aes_gcm::{
@@ -9,6 +11,7 @@ use aes_gcm::{
 use aurix_common::config::RecordingConfig;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::sink::{AudioEvidence, AudioSink, EvidenceStore, StoredEvidence};
+use aurix_common::tts_stt::SttProvider;
 use aurix_common::types::*;
 use aurix_db::models::RecordingRow;
 use aurix_db::DbPool;
@@ -17,6 +20,7 @@ use chrono::{DateTime, Duration, Utc};
 use live::LiveStreams;
 use ogg::OggOpusWriter;
 use parking_lot::Mutex;
+use processing::Jobs;
 use s3::{S3Client, S3Config};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -118,6 +122,8 @@ struct ActiveRecording {
     orderer: PacketOrderer,
     consent: RecordingConsent,
     started_at: DateTime<Utc>,
+    /// When the first packet was written (consent may delay it past `started_at`).
+    audio_started_at: Option<DateTime<Utc>>,
     packets_written: u64,
 }
 
@@ -154,6 +160,9 @@ pub struct RecordingService {
     s3: Option<S3Client>,
     active: Arc<Mutex<ActiveState>>,
     live: Arc<LiveStreams>,
+    node_id: Uuid,
+    stt: Option<Arc<dyn SttProvider>>,
+    jobs: Jobs,
 }
 
 /// A capture (stored recording or live stream) active in a channel, for client disclosure.
@@ -166,7 +175,14 @@ pub struct ActiveCapture {
 }
 
 impl RecordingService {
-    pub fn new(pool: DbPool, config: RecordingConfig, production: bool) -> Result<Self> {
+    /// `stt` enables post-hoc transcripts of stored recordings (`recording.processing`).
+    pub fn new(
+        pool: DbPool,
+        config: RecordingConfig,
+        production: bool,
+        node_id: Uuid,
+        stt: Option<Arc<dyn SttProvider>>,
+    ) -> Result<Self> {
         let encryption_key = if config.encryption_enabled {
             let key_str = config.encryption_key.as_ref().ok_or_else(|| {
                 AurixError::InvalidConfiguration(
@@ -221,6 +237,10 @@ impl RecordingService {
             production,
             config.max_recording_duration_secs,
         ));
+        let jobs = Jobs::new(
+            config.processing.max_concurrent,
+            config.processing.max_queued,
+        );
 
         Ok(Self {
             pool,
@@ -230,6 +250,9 @@ impl RecordingService {
             s3,
             active: Arc::new(Mutex::new(ActiveState::default())),
             live,
+            node_id,
+            stt,
+            jobs,
         })
     }
 
@@ -303,6 +326,11 @@ impl RecordingService {
             expires_at,
             created_at: now,
             kind: RECORDING_KIND_RECORDING.to_string(),
+            status: "recording".to_string(),
+            audio_started_at: None,
+            sources: None,
+            node_id: Some(self.node_id),
+            error: None,
         };
         let created = aurix_db::queries::create_recording(&self.pool, &row)
             .await
@@ -330,6 +358,7 @@ impl RecordingService {
                 orderer: PacketOrderer::new(),
                 consent,
                 started_at: now,
+                audio_started_at: None,
                 packets_written: 0,
             },
         );
@@ -439,6 +468,9 @@ impl RecordingService {
         if rec.consent != RecordingConsent::Accepted {
             return Ok(false);
         }
+        if rec.audio_started_at.is_none() {
+            rec.audio_started_at = Some(Utc::now());
+        }
         for (samples, pkt) in rec.orderer.push(rtp_timestamp, opus_data) {
             rec.writer
                 .write_packet_with_duration(&pkt, scale_samples(samples, rec.writer.sample_rate()))
@@ -449,7 +481,7 @@ impl RecordingService {
     }
 
     pub async fn stop_recording(&self, app_id: AppId, recording_id: Uuid) -> Result<RecordingRow> {
-        let (file_path, packets, audio_secs) = {
+        let (file_path, packets, audio_secs, audio_started_at) = {
             let mut st = self.active.lock();
             let owned = st.by_id.get(&recording_id).map(|r| r.app_id == app_id.0);
             match owned {
@@ -479,7 +511,12 @@ impl RecordingService {
                 .finish()
                 .map_err(|e| AurixError::Recording(format!("Ogg finalize failed: {e}")))?;
             let secs = active.writer.granule() as f64 / active.writer.sample_rate().max(1) as f64;
-            (active.file_path.clone(), active.packets_written, secs)
+            (
+                active.file_path.clone(),
+                active.packets_written,
+                secs,
+                active.audio_started_at,
+            )
         };
 
         if let Some(ref key) = self.encryption_key {
@@ -500,6 +537,7 @@ impl RecordingService {
             recording_id,
             metadata.len() as i64,
             audio_secs,
+            audio_started_at,
         )
         .await
         .map_err(|e| AurixError::Database(format!("Recording finish failed: {e}")))?;
@@ -511,7 +549,7 @@ impl RecordingService {
         }
 
         if let Some(ref s3) = self.s3 {
-            let key = object_key(app_id, recording_id);
+            let key = object_key(app_id, recording_id, processing::FORMAT_OGG_OPUS);
             match tokio::fs::read(&file_path).await {
                 Ok(body) => match s3.put_object(&key, body, "audio/ogg").await {
                     Ok(()) => info!(
@@ -640,10 +678,16 @@ impl RecordingService {
             .get_recording(app_id, recording_id)
             .await?
             .ok_or_else(|| AurixError::NotFound("Recording not found".into()))?;
-        if row.ended_at.is_none() {
+        if row.status == "recording" || row.status == "processing" {
             return Err(AurixError::Conflict(
                 "Recording is still in progress".into(),
             ));
+        }
+        if row.status == "failed" {
+            return Err(AurixError::Conflict(format!(
+                "Recording failed: {}",
+                row.error.as_deref().unwrap_or("unknown error")
+            )));
         }
         let bytes = tokio::fs::read(&row.file_path)
             .await
@@ -668,11 +712,12 @@ impl RecordingService {
         &self,
         app_id: AppId,
         recording_id: Uuid,
+        format: &str,
         expires_secs: u64,
     ) -> Result<Option<String>> {
         match self.s3 {
             Some(ref s3) => Ok(Some(s3.presigned_get_url(
-                &object_key(app_id, recording_id),
+                &object_key(app_id, recording_id, format),
                 expires_secs,
                 Utc::now(),
             )?)),
@@ -704,7 +749,7 @@ impl RecordingService {
         }
         if let Some(ref s3) = self.s3 {
             if let Err(e) = s3
-                .delete_object(&object_key(AppId(row.app_id), row.id))
+                .delete_object(&object_key(AppId(row.app_id), row.id, &row.format))
                 .await
             {
                 warn!(
@@ -795,9 +840,9 @@ impl AudioSink for RecordingService {
                 }
                 let _ = rec.writer.finish();
                 let secs = rec.writer.granule() as f64 / rec.writer.sample_rate().max(1) as f64;
-                (id, rec.file_path, secs)
+                (id, rec.file_path, secs, rec.audio_started_at)
             };
-            let (id, path, secs) = finished;
+            let (id, path, secs, audio_started_at) = finished;
             if let Some(key) = key {
                 if let Ok(plain) = tokio::fs::read(&path).await {
                     if let Ok(enc) = encrypt_blob(&key, &plain) {
@@ -809,7 +854,8 @@ impl AudioSink for RecordingService {
                 .await
                 .map(|m| m.len() as i64)
                 .unwrap_or(0);
-            match aurix_db::queries::finish_recording(&pool, id, size, secs).await {
+            match aurix_db::queries::finish_recording(&pool, id, size, secs, audio_started_at).await
+            {
                 Ok(true) => info!("Recording {} finished: participant left", id),
                 Ok(false) => {
                     discard_file(&path).await;
@@ -851,6 +897,7 @@ impl aurix_common::sink::UserMediaPurger for RecordingService {
                 break;
             }
             for row in &rows {
+                self.remove_derived(AppId(row.app_id), &[row.id]).await?;
                 self.remove_artifacts(row).await;
                 aurix_db::queries::delete_recording(&self.pool, row.id)
                     .await
@@ -859,6 +906,23 @@ impl aurix_common::sink::UserMediaPurger for RecordingService {
             }
         }
         Ok(total)
+    }
+}
+
+impl RecordingService {
+    /// Erases mixdowns rendered from any of `source_ids` (their transcripts go with them).
+    async fn remove_derived(&self, app_id: AppId, source_ids: &[Uuid]) -> Result<()> {
+        let derived =
+            aurix_db::queries::list_recordings_derived_from(&self.pool, app_id.0, source_ids)
+                .await
+                .map_err(|e| AurixError::Database(format!("Derived lookup failed: {e}")))?;
+        for row in &derived {
+            self.remove_artifacts(row).await;
+            aurix_db::queries::delete_recording(&self.pool, row.id)
+                .await
+                .map_err(|e| AurixError::Database(format!("Recording delete failed: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -872,6 +936,7 @@ async fn discard_file(path: &str) {
 
 pub const RECORDING_KIND_RECORDING: &str = "recording";
 pub const RECORDING_KIND_EVIDENCE: &str = "evidence";
+pub const RECORDING_KIND_MIXDOWN: &str = "mixdown";
 
 /// Longest evidence clip accepted from the safety pipeline (pre-roll + flagged segment).
 const MAX_EVIDENCE_SECS: usize = 120;
@@ -962,6 +1027,11 @@ impl EvidenceStore for RecordingService {
             expires_at: now + Duration::days(retention_days.max(1) as i64),
             created_at: now,
             kind: RECORDING_KIND_EVIDENCE.to_string(),
+            status: "ready".to_string(),
+            audio_started_at: Some(started_at),
+            sources: None,
+            node_id: Some(self.node_id),
+            error: None,
         };
         if let Err(e) = aurix_db::queries::create_recording(&self.pool, &row).await {
             discard_file(&file_path).await;
@@ -971,7 +1041,7 @@ impl EvidenceStore for RecordingService {
         }
 
         if let Some(ref s3) = self.s3 {
-            let key = object_key(app_id, recording_id);
+            let key = object_key(app_id, recording_id, processing::FORMAT_OGG_OPUS);
             match s3.put_object(&key, ogg.clone(), "audio/ogg").await {
                 Ok(()) => info!(
                     "Evidence clip {} uploaded to object storage as {}",
@@ -1035,8 +1105,13 @@ fn encode_evidence_ogg(
     Ok((bytes, secs))
 }
 
-fn object_key(app_id: AppId, recording_id: Uuid) -> String {
-    format!("{}/{}.ogg", app_id.0, recording_id)
+fn object_key(app_id: AppId, recording_id: Uuid, format: &str) -> String {
+    let ext = if format == processing::FORMAT_WAV {
+        "wav"
+    } else {
+        "ogg"
+    };
+    format!("{}/{}.{ext}", app_id.0, recording_id)
 }
 
 /// RTP Opus always uses a 48 kHz clock; convert to the Ogg stream's sample rate.

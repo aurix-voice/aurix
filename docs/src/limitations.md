@@ -77,8 +77,11 @@ the chapter that explains the boundary.
 * **Live audio streams are per participant**, not mixed, and are dropped (counted) when the
   consumer falls behind `recording.live.queue_frames`; no buffering across a consumer outage
   ([Recordings and live streams](features/recordings.md)).
-* **Recordings are per participant** Ogg/Opus files; no server-side mixdown, no transcoding
-  ([Recordings](features/recordings.md)).
+* **Recordings are captured per participant** as Ogg/Opus; a channel file is a post-hoc
+  mixdown (Ogg/Opus or WAV only — no MP3/AAC/FLAC, no video containers) rendered on the node
+  that receives the request, which must reach every source track (local disk or object
+  storage). Post-hoc transcripts reuse the live `[stt]` provider and are stored in clear text
+  in PostgreSQL ([Recordings](features/recordings.md)).
 * **Webhook and SSE delivery is at-least-once** with the same event id — consumers must be
   idempotent; SSE has no replay, only `lagged` + snapshot resync
   ([Webhooks and SSE](api/webhooks-sse.md)).

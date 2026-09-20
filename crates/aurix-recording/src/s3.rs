@@ -210,6 +210,39 @@ impl S3Client {
         Ok(())
     }
 
+    /// Fetches an object; `Ok(None)` when it does not exist.
+    pub async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let (scheme, host) = self.host()?;
+        let path = self.canonical_path(key);
+        let payload_hash = sha256_hex(b"");
+        let (auth, amz_date) = self.sign("GET", &path, "", &host, Utc::now(), &payload_hash, &[]);
+        let url = format!("{scheme}://{host}{path}");
+        let resp = self
+            .http
+            .get(&url)
+            .header("Host", &host)
+            .header("Authorization", auth)
+            .header("x-amz-date", amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .send()
+            .await
+            .map_err(|e| AurixError::Recording(format!("S3 GET failed: {e}")))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(AurixError::Recording(format!(
+                "S3 GET returned {}",
+                resp.status()
+            )));
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| AurixError::Recording(format!("S3 GET body failed: {e}")))?;
+        Ok(Some(body.to_vec()))
+    }
+
     /// Build a presigned GET URL valid for `expires_secs` (max 7 days per AWS).
     pub fn presigned_get_url(
         &self,

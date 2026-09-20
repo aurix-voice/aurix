@@ -1408,14 +1408,15 @@ pub async fn create_recording(
     rec: &RecordingRow,
 ) -> Result<RecordingRow, sqlx::Error> {
     sqlx::query_as::<_, RecordingRow>(
-        r#"INSERT INTO recordings (id, app_id, channel_id, session_id, user_id, file_path, file_size_bytes, duration_secs, format, encrypted, encryption_key_id, started_at, ended_at, expires_at, created_at, kind)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *"#
+        r#"INSERT INTO recordings (id, app_id, channel_id, session_id, user_id, file_path, file_size_bytes, duration_secs, format, encrypted, encryption_key_id, started_at, ended_at, expires_at, created_at, kind, status, audio_started_at, sources, node_id, error)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *"#
     )
     .bind(rec.id).bind(rec.app_id).bind(rec.channel_id).bind(rec.session_id)
     .bind(rec.user_id).bind(&rec.file_path).bind(rec.file_size_bytes)
     .bind(rec.duration_secs).bind(&rec.format).bind(rec.encrypted)
     .bind(&rec.encryption_key_id).bind(rec.started_at).bind(rec.ended_at).bind(rec.expires_at)
-    .bind(rec.created_at).bind(&rec.kind)
+    .bind(rec.created_at).bind(&rec.kind).bind(&rec.status).bind(rec.audio_started_at)
+    .bind(&rec.sources).bind(rec.node_id).bind(&rec.error)
     .fetch_one(pool).await
 }
 
@@ -1429,6 +1430,63 @@ pub async fn get_recording(
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+/// Tenant-scoped lookup of several recordings at once (missing ids are simply absent).
+pub async fn get_recordings(
+    pool: &DbPool,
+    app_id: Uuid,
+    ids: &[Uuid],
+) -> Result<Vec<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>(
+        "SELECT * FROM recordings WHERE app_id = $1 AND id = ANY($2) ORDER BY started_at",
+    )
+    .bind(app_id)
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Finished tracks of a channel (captures only, never evidence clips or other mixdowns).
+pub async fn list_channel_tracks(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+    limit: i64,
+) -> Result<Vec<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>(
+        "SELECT * FROM recordings WHERE app_id = $1 AND channel_id = $2 AND kind = 'recording' AND status = 'ready' ORDER BY started_at LIMIT $3",
+    )
+    .bind(app_id).bind(channel_id).bind(limit)
+    .fetch_all(pool).await
+}
+
+/// Mixdowns rendered from any of the given tracks.
+pub async fn list_recordings_derived_from(
+    pool: &DbPool,
+    app_id: Uuid,
+    source_ids: &[Uuid],
+) -> Result<Vec<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>(
+        "SELECT * FROM recordings WHERE app_id = $1 AND sources && $2",
+    )
+    .bind(app_id)
+    .bind(source_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Mixdowns a node was rendering when it stopped (found at startup).
+pub async fn list_processing_recordings_on_node(
+    pool: &DbPool,
+    node_id: Uuid,
+) -> Result<Vec<RecordingRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingRow>(
+        "SELECT * FROM recordings WHERE node_id = $1 AND status = 'processing'",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn list_recordings(
@@ -1450,9 +1508,17 @@ pub async fn finish_recording(
     id: Uuid,
     size: i64,
     duration: f64,
+    audio_started_at: Option<DateTime<Utc>>,
 ) -> Result<bool, sqlx::Error> {
-    let r = sqlx::query("UPDATE recordings SET ended_at = NOW(), file_size_bytes = $2, duration_secs = $3 WHERE id = $1")
-        .bind(id).bind(size).bind(duration).execute(pool).await?;
+    let r = sqlx::query("UPDATE recordings SET ended_at = NOW(), status = 'ready', error = NULL, file_size_bytes = $2, duration_secs = $3, audio_started_at = $4 WHERE id = $1")
+        .bind(id).bind(size).bind(duration).bind(audio_started_at).execute(pool).await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Marks a mixdown as failed; returns `false` when the row was deleted meanwhile.
+pub async fn fail_recording(pool: &DbPool, id: Uuid, error: &str) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("UPDATE recordings SET ended_at = NOW(), status = 'failed', error = $2 WHERE id = $1 AND status = 'processing'")
+        .bind(id).bind(error).execute(pool).await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -1479,6 +1545,122 @@ pub async fn delete_recording(pool: &DbPool, id: uuid::Uuid) -> Result<(), sqlx:
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// ── Recording transcripts ──
+
+/// Creates or resets a transcript request (`queued`); returns `false` when the recording is
+/// unknown for that tenant or a transcript job is still running for it.
+pub async fn queue_recording_transcript(
+    pool: &DbPool,
+    app_id: Uuid,
+    recording_id: Uuid,
+    node_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"INSERT INTO recording_transcripts (recording_id, app_id, status, node_id, requested_at)
+           SELECT id, app_id, 'queued', $3, NOW() FROM recordings WHERE app_id = $1 AND id = $2
+           ON CONFLICT (recording_id) DO UPDATE
+             SET status = 'queued', node_id = EXCLUDED.node_id, requested_at = NOW(), error = NULL,
+                 text = '', segments = '[]'::jsonb, duration_ms = 0, finished_at = NULL,
+                 provider = NULL, language = NULL
+             WHERE recording_transcripts.status NOT IN ('queued', 'running')"#,
+    )
+    .bind(app_id)
+    .bind(recording_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn get_recording_transcript(
+    pool: &DbPool,
+    app_id: Uuid,
+    recording_id: Uuid,
+) -> Result<Option<RecordingTranscriptRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingTranscriptRow>(
+        "SELECT * FROM recording_transcripts WHERE app_id = $1 AND recording_id = $2",
+    )
+    .bind(app_id)
+    .bind(recording_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Transcript jobs a node accepted but did not finish (found at startup).
+pub async fn list_unfinished_transcripts_on_node(
+    pool: &DbPool,
+    node_id: Uuid,
+) -> Result<Vec<RecordingTranscriptRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecordingTranscriptRow>(
+        "SELECT * FROM recording_transcripts WHERE node_id = $1 AND status IN ('queued', 'running')",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// `queued` → `running`; returns `false` when the request was withdrawn or taken over.
+pub async fn start_recording_transcript(
+    pool: &DbPool,
+    recording_id: Uuid,
+    node_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE recording_transcripts SET status = 'running' WHERE recording_id = $1 AND node_id = $2 AND status = 'queued'",
+    )
+    .bind(recording_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_recording_transcript(
+    pool: &DbPool,
+    recording_id: Uuid,
+    node_id: Uuid,
+    provider: &str,
+    language: Option<&str>,
+    text: &str,
+    segments: &serde_json::Value,
+    duration_ms: i64,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE recording_transcripts
+           SET status = 'ready', provider = $3, language = $4, text = $5, segments = $6,
+               duration_ms = $7, error = NULL, finished_at = NOW()
+           WHERE recording_id = $1 AND node_id = $2 AND status = 'running'"#,
+    )
+    .bind(recording_id)
+    .bind(node_id)
+    .bind(provider)
+    .bind(language)
+    .bind(text)
+    .bind(segments)
+    .bind(duration_ms)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn fail_recording_transcript(
+    pool: &DbPool,
+    recording_id: Uuid,
+    node_id: Uuid,
+    error: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE recording_transcripts SET status = 'failed', error = $3, finished_at = NOW() WHERE recording_id = $1 AND node_id = $2 AND status IN ('queued', 'running')",
+    )
+    .bind(recording_id)
+    .bind(node_id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
 }
 
 // ── Chat Queries ──

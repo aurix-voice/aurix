@@ -13,7 +13,7 @@ emit:
 | channels | `channel.created`, `channel.destroyed`, `channel.config_updated`, `channel.activated`, `channel.deactivated`, `channel.energy`, `channel.transcript` |
 | participants | `participant.joined`, `participant.left`, `participant.muted`, `participant.unmuted`, `participant.kicked`, `participant.speaking`, `participant.typing` |
 | users / moderation | `user.banned`, `user.deleted`, `user.block_changed`, `moderation.event`, `safety.incident`, `safety.risk_changed` |
-| recordings / streams | `recording.started`, `recording.stopped`, `recording.consent_required`, `audio_stream.started`, `audio_stream.stopped` |
+| recordings / streams | `recording.started`, `recording.stopped`, `recording.consent_required`, `recording.processed`, `audio_stream.started`, `audio_stream.stopped` |
 | chat / speech | `chat.message`, `tts.status` |
 | quality | `quality.alert` |
 | synthetic | `webhook.test`, `webhook.resync` (produced by the webhook service itself) |

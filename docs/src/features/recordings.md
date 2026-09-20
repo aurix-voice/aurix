@@ -49,14 +49,84 @@ require_consent = true
 
 * `GET /v1/recordings?channel_id=&page=&per_page=` and `GET /v1/recordings/{recording_id}`
   (`recordings:read`) return metadata plus `download_url` — a 15-minute pre-signed S3 URL when
-  S3 is configured, `null` for local storage — and the consent state.
+  S3 is configured and the recording is `ready`, `null` for local storage — and the consent
+  state. Every row carries `kind` (`recording` — a participant track, `evidence` — a
+  [safety clip](safety.md), `mixdown` — see below) and `status` (`recording`, `processing`,
+  `ready`, `failed` + `error`).
 * `GET /v1/recordings/{recording_id}/download` streams the decrypted `audio/ogg` bytes from the
-  node's disk (`409` while the recording is still running) and writes a `recording_accessed`
-  audit row.
-* `DELETE /v1/recordings/{recording_id}` removes the row, the local file and the S3 object.
+  node's disk (`audio/wav` for WAV mixdowns; `409` while the recording is still running or
+  rendering) and writes a `recording_accessed` audit row.
+* `DELETE /v1/recordings/{recording_id}` removes the row, the local file, the S3 object and
+  the recording's transcript.
 * Expired recordings (`expires_at`) are deleted by an hourly sweep on every node that has
-  recording enabled; erasing a user deletes their recordings first (see
+  recording enabled; erasing a user deletes their tracks — and every mixdown rendered from
+  them — first (see
   [Moderation and lifecycle](moderation.md#user-erasure-delete-v1usersuser_id)).
+
+## Mixdowns and transcripts of stored recordings
+
+Tracks stay per participant on disk; a channel-level file is a **derived** recording rendered
+on demand. Both jobs below run on the node that accepts the request, off the media path (the
+blocking thread pool, `recording.processing.max_concurrent` workers, `max_queued` waiting →
+`429` beyond). State is in the database, so any node answers `GET`s; a node restart marks the
+mixdowns it was rendering `failed` (request again) and re-queues its transcripts.
+
+```toml
+[recording.processing]
+enabled = true
+max_concurrent = 2       # decoders running at once on this node
+max_queued = 64
+max_sources = 64         # tracks per mixdown
+mixdown_bitrate = 64000  # Ogg/Opus output
+stt_chunk_secs = 30      # audio sent to the STT provider per request, cut on silence
+stt_sample_rate = 16000  # 8000 | 12000 | 16000 | 24000 | 48000
+```
+
+### Mixdown
+
+`POST /v1/recordings/mixdown` `{channel_id, sources?, format?: ogg_opus | wav, stereo?}`
+(`recordings:write`) combines finished tracks (`kind = recording`, `status = ready`) of one
+channel — the listed `sources`, or every finished track of the channel when omitted — into one
+file and returns a new recording with `kind = mixdown`, `status = processing`, `sources = [...]`
+and `user_id`/`session_id` set to the nil UUID. Tracks are aligned on their `audio_started_at`
+(the moment the first packet was written, i.e. after consent), gaps inside a track stay silent
+(the Ogg granule timeline is honoured), samples are summed as floats and soft-clipped, and the
+result is written as Ogg/Opus at `mixdown_bitrate` or as 16-bit PCM WAV, mono or stereo
+(stereo tracks keep their L/R, mono tracks are centred). When done the row flips to `ready`
+(`duration_secs`, `file_size_bytes`), is encrypted and uploaded exactly like a track, expires
+after `retention_days`, and a `recording.processed {job: "mixdown", status: "ready" | "failed",
+error?}` event is published. Deleting a source track does not delete the mixdown; erasing a user
+does.
+
+The node must be able to read every source: its own file or, with S3 configured, the object.
+Without object storage a track recorded on another node yields `409` naming that node
+(`node_id` in the recording row) — send the request there.
+
+### Transcript
+
+`POST /v1/recordings/{recording_id}/transcribe` (`recordings:write`) queues speech-to-text
+with the node's `[stt]` provider (the same one used for live transcription; `400
+INVALID_CONFIG` without one). A participant track is transcribed as a single speaker; a
+**mixdown is transcribed from its source tracks one by one**, so every segment carries the
+speaker's `user_id` while offsets stay on the mixdown's timeline. Audio is decoded, resampled to
+`stt_sample_rate` and sent in `stt_chunk_secs` chunks cut on silence (speech is not split
+mid-word when a pause exists). `409` while a transcript is already `queued`/`running`; a
+`failed` one can be requested again.
+
+`GET /v1/recordings/{recording_id}/transcript` (`recordings:read`) returns
+
+```json
+{"recording_id":"…","status":"ready","provider":"whisper","language":"en",
+ "text":"hello there general kenobi","duration_ms":4120,
+ "segments":[{"speaker":"<user_id>","start_ms":0,"end_ms":1500,"text":"hello there",
+              "language":"en","confidence":0.94,"words":[{"word":"hello","start_ms":0,"end_ms":410,"confidence":0.97}]}],
+ "requested_at":"…","finished_at":"…","error":null}
+```
+
+`?format=srt` / `?format=vtt` render the segments as subtitles (speaker as a `<v uuid>` voice
+tag) once `status = ready`. The transcript row is deleted with the recording, and
+`recording.processed {job: "transcript"}` announces completion. Transcripts are stored in
+PostgreSQL in clear text — treat the database like the recordings themselves.
 
 ## Live audio streams
 

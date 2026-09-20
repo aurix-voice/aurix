@@ -3962,7 +3962,7 @@
                         "string",
                         "null"
                       ],
-                      "description": "Pre-signed URL (15 min) when the store is S3; `null` for local storage — use the `download` route."
+                      "description": "Pre-signed URL (15 min) when the store is S3 and the recording is `ready`; `null` for local storage — use the `download` route."
                     },
                     "consent": {
                       "oneOf": [
@@ -4077,7 +4077,7 @@
         ],
         "summary": "Download the recording file",
         "operationId": "downloadRecording",
-        "description": "Decrypted on the fly when recording encryption is enabled. Access is written to the audit log.",
+        "description": "Decrypted on the fly when recording encryption is enabled. Access is written to the audit log. Participant tracks and Opus mixdowns are Ogg/Opus, WAV mixdowns are 16-bit PCM. 409 while the recording is still `recording`/`processing` or has `failed`.",
         "parameters": [
           {
             "name": "recording_id",
@@ -4091,9 +4091,15 @@
         ],
         "responses": {
           "200": {
-            "description": "Ogg/Opus file",
+            "description": "Recording file (`format` of the recording)",
             "content": {
               "audio/ogg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/wav": {
                 "schema": {
                   "type": "string",
                   "format": "binary"
@@ -4109,6 +4115,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
@@ -5674,6 +5683,245 @@
           {
             "PlayerToken": []
           }
+        ]
+      }
+    },
+    "/v1/recordings/mixdown": {
+      "post": {
+        "tags": [
+          "Recordings"
+        ],
+        "summary": "Render a channel mixdown from participant tracks",
+        "operationId": "mixdownRecordings",
+        "description": "Combines finished per-participant tracks of one channel (aligned on `audio_started_at`, summed with soft clipping) into a single Ogg/Opus or WAV file. Returns the new recording with `kind = mixdown` and `status = processing`; it becomes `ready` asynchronously — poll `GET /v1/recordings/{id}` or subscribe to `recording.processed`. The job runs on the node that accepted the request, which must be able to read every source (its own files or object storage); otherwise 409 names the node holding the track. 429 when this node's processing queue (`recording.processing.max_queued`) is full.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "channel_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "description": "Tracks to combine (all `kind = recording`, `status = ready`, same channel; at most `recording.processing.max_sources`). Omitted or empty — every finished track of the channel."
+                  },
+                  "format": {
+                    "type": "string",
+                    "enum": [
+                      "ogg_opus",
+                      "wav"
+                    ],
+                    "default": "ogg_opus"
+                  },
+                  "stereo": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Render two channels (stereo tracks keep L/R; mono tracks are centred)."
+                  }
+                },
+                "required": [
+                  "channel_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Mixdown accepted (`status = processing`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Recording"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "recordings:write"
+        ]
+      }
+    },
+    "/v1/recordings/{recording_id}/transcribe": {
+      "post": {
+        "tags": [
+          "Recordings"
+        ],
+        "summary": "Queue speech-to-text of a stored recording",
+        "operationId": "transcribeRecording",
+        "description": "Requires an `[stt]` provider on the node. A participant track is transcribed as one speaker; a mixdown is transcribed from its source tracks one by one, so every segment names its speaker. Audio is decoded in `recording.processing.stt_chunk_secs` chunks cut on silence and resampled to `stt_sample_rate`. Returns the transcript row with `status = queued`; poll `GET .../transcript` or wait for `recording.processed` with `job = transcript`. 409 while a transcript of this recording is already queued/running or the recording is not `ready`; a `failed` transcript may be requested again.",
+        "parameters": [
+          {
+            "name": "recording_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transcript queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordingTranscript"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "recordings:write"
+        ]
+      }
+    },
+    "/v1/recordings/{recording_id}/transcript": {
+      "get": {
+        "tags": [
+          "Recordings"
+        ],
+        "summary": "Transcript of a recording (JSON, SRT or WebVTT)",
+        "operationId": "getRecordingTranscript",
+        "description": "`format=json` (default) returns the row in any state; `srt`/`vtt` render the segments as subtitles (speaker as a `<v uuid>` voice tag) and require `status = ready` (409 otherwise).",
+        "parameters": [
+          {
+            "name": "recording_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "srt",
+                "vtt"
+              ],
+              "default": "json"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transcript",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordingTranscript"
+                }
+              },
+              "application/x-subrip": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/vtt": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "recordings:read"
         ]
       }
     }
@@ -8104,12 +8352,13 @@
           },
           "session_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "description": "Session of the recorded participant; the nil UUID for a mixdown."
           },
           "user_id": {
             "type": "string",
             "format": "uuid",
-            "description": "Recordings are per participant (one Ogg/Opus file each)."
+            "description": "Recorded participant for `kind = recording`/`evidence`; the nil UUID for a mixdown."
           },
           "file_path": {
             "type": "string"
@@ -8123,7 +8372,11 @@
           },
           "format": {
             "type": "string",
-            "example": "ogg/opus"
+            "enum": [
+              "ogg_opus",
+              "wav"
+            ],
+            "description": "`ogg_opus` for participant tracks and Opus mixdowns, `wav` for PCM mixdowns."
           },
           "encrypted": {
             "type": "boolean"
@@ -8153,6 +8406,59 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "recording",
+              "evidence",
+              "mixdown"
+            ],
+            "description": "`recording` — per-participant track; `evidence` — safety clip; `mixdown` — channel file rendered from tracks (`sources`)."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "recording",
+              "processing",
+              "ready",
+              "failed"
+            ],
+            "description": "`recording` while audio is being captured, `processing` while a mixdown renders, `ready` when the file can be downloaded, `failed` (see `error`)."
+          },
+          "audio_started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the first audio was written (consent may delay it past `started_at`); tracks are aligned on it in mixdowns."
+          },
+          "sources": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Tracks a mixdown was rendered from."
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Node that holds the file locally (irrelevant with object storage)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Failure reason when `status = failed`."
           }
         },
         "required": [
@@ -8163,7 +8469,9 @@
           "user_id",
           "format",
           "started_at",
-          "expires_at"
+          "expires_at",
+          "kind",
+          "status"
         ]
       },
       "RecordingConsent": {
@@ -9449,6 +9757,150 @@
         },
         "required": [
           "rate_limit"
+        ]
+      },
+      "RecordingTranscript": {
+        "type": "object",
+        "description": "Post-hoc speech-to-text of a stored recording. Segments carry the speaker (`user_id` of the source track) and offsets on the recording's timeline.",
+        "properties": {
+          "recording_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "app_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "ready",
+              "failed"
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of the STT provider that produced the text."
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Dominant language across segments (provider-reported)."
+          },
+          "text": {
+            "type": "string",
+            "description": "All segments in timeline order, space-joined."
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptSegment"
+            }
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requested_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "recording_id",
+          "app_id",
+          "status",
+          "text",
+          "segments",
+          "duration_ms",
+          "requested_at"
+        ]
+      },
+      "TranscriptSegment": {
+        "type": "object",
+        "properties": {
+          "speaker": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "User whose track this segment was recognised from."
+          },
+          "start_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "end_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "text": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "words": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "word": {
+                  "type": "string"
+                },
+                "start_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "end_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "confidence": {
+                  "type": "number"
+                }
+              }
+            },
+            "description": "Word timings when the provider returns them, shifted onto the recording timeline."
+          }
+        },
+        "required": [
+          "start_ms",
+          "end_ms",
+          "text",
+          "language",
+          "confidence"
         ]
       }
     }

@@ -186,6 +186,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/audit-log", get(handlers::list_audit_logs))
         .route("/v1/recordings", get(handlers::list_recordings))
         .route("/v1/recordings/start", post(handlers::start_recording))
+        .route("/v1/recordings/mixdown", post(handlers::mixdown_recordings))
         .route(
             "/v1/recordings/:recording_id",
             get(handlers::get_recording).delete(handlers::delete_recording),
@@ -197,6 +198,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/v1/recordings/:recording_id/stop",
             post(handlers::stop_recording),
+        )
+        .route(
+            "/v1/recordings/:recording_id/transcribe",
+            post(handlers::transcribe_recording),
+        )
+        .route(
+            "/v1/recordings/:recording_id/transcript",
+            get(handlers::get_recording_transcript),
         )
         .route("/v1/audio/streams", get(streams::list_streams))
         .route(

@@ -112,17 +112,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Speech-to-text: channels with `transcription` enabled are segmented per speaker and sent
     // to the provider; results fan out as `channel.transcript` events (never stored here).
-    if let (true, Some(endpoint)) = (config.stt.enabled, config.stt.endpoint.as_ref()) {
-        let stt: Arc<dyn aurix_common::tts_stt::SttProvider> =
-            Arc::new(aurix_common::tts_stt::WhisperSttProvider::with_options(
-                endpoint,
-                aurix_common::tts_stt::HttpProviderOptions {
-                    api_key: config.stt.api_key.clone(),
-                    model: config.stt.model.clone(),
-                    timeout: Some(std::time::Duration::from_millis(config.stt.timeout_ms)),
-                },
-                config.stt.language.clone(),
-            ));
+    let stt_provider: Option<Arc<dyn aurix_common::tts_stt::SttProvider>> =
+        match (config.stt.enabled, config.stt.endpoint.as_ref()) {
+            (true, Some(endpoint)) => Some(Arc::new(
+                aurix_common::tts_stt::WhisperSttProvider::with_options(
+                    endpoint,
+                    aurix_common::tts_stt::HttpProviderOptions {
+                        api_key: config.stt.api_key.clone(),
+                        model: config.stt.model.clone(),
+                        timeout: Some(std::time::Duration::from_millis(config.stt.timeout_ms)),
+                    },
+                    config.stt.language.clone(),
+                ),
+            )),
+            _ => None,
+        };
+    if let Some(stt) = stt_provider.clone() {
         let mut options = aurix_media::audio_pipeline::PipelineOptions::new(
             config.media.default_sample_rate,
             config.stt.segment_secs,
@@ -193,11 +198,26 @@ async fn main() -> anyhow::Result<()> {
             pool.clone(),
             config.recording.clone(),
             config.is_production(),
+            node_id.0,
+            stt_provider.clone(),
         )?);
         sfu.set_audio_sink(svc.clone());
         control.users.set_media_purger(svc.clone());
         if svc.storage_enabled() {
             control.safety.set_evidence_store(svc.clone());
+            if svc.processing_enabled() {
+                if let Err(e) = svc.recover_processing().await {
+                    warn!("Recording job recovery failed: {e}");
+                }
+                info!(
+                    "Recording processing enabled (mixdowns; transcripts {})",
+                    if svc.transcripts_available() {
+                        "on"
+                    } else {
+                        "off: no [stt] provider"
+                    }
+                );
+            }
         }
         if config.recording.live.enabled {
             info!(
@@ -408,6 +428,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(rec) = recording.clone().filter(|r| r.storage_enabled()) {
+        if let Some(mut notices) = rec.take_processing_notices() {
+            let events = control.events.clone();
+            let cancel = shutdown.clone();
+            tasks.spawn(async move {
+                loop {
+                    let notice = tokio::select! {
+                        n = notices.recv() => match n { Some(n) => n, None => return },
+                        _ = cancel.cancelled() => return,
+                    };
+                    events.publish(aurix_control::ServerEvent::RecordingProcessed {
+                        app_id: notice.app_id,
+                        channel_id: notice.channel_id,
+                        recording_id: notice.recording_id,
+                        job: notice.kind.as_str().to_string(),
+                        status: notice.status.to_string(),
+                        error: notice.error,
+                        timestamp: notice.timestamp,
+                    });
+                }
+            });
+        }
         let cancel = shutdown.clone();
         tasks.spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));

@@ -161,6 +161,17 @@ pub enum ServerEvent {
         initiated_by: UserId,
         timestamp: DateTime<Utc>,
     },
+    /// A post-hoc job on a stored recording finished: `job` is `mixdown` (the recording itself
+    /// is the rendered file) or `transcript`; `status` is `ready` or `failed`.
+    RecordingProcessed {
+        app_id: AppId,
+        channel_id: ChannelId,
+        recording_id: uuid::Uuid,
+        job: String,
+        status: String,
+        error: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
     /// A live audio stream (WebSocket pull or push) of a channel was opened on a node.
     LiveStreamStarted {
         app_id: AppId,
@@ -322,6 +333,7 @@ impl ServerEvent {
             | Self::RecordingStarted { app_id, .. }
             | Self::RecordingStopped { app_id, .. }
             | Self::RecordingConsentRequired { app_id, .. }
+            | Self::RecordingProcessed { app_id, .. }
             | Self::LiveStreamStarted { app_id, .. }
             | Self::LiveStreamStopped { app_id, .. }
             | Self::RecordingConsentGiven { app_id, .. }
@@ -373,6 +385,7 @@ impl ServerEvent {
             Self::RecordingStarted { .. } => "recording.started",
             Self::RecordingStopped { .. } => "recording.stopped",
             Self::RecordingConsentRequired { .. } => "recording.consent_required",
+            Self::RecordingProcessed { .. } => "recording.processed",
             Self::LiveStreamStarted { .. } => "audio_stream.started",
             Self::LiveStreamStopped { .. } => "audio_stream.stopped",
             Self::UserBlockChanged { .. } => "user.block_changed",
@@ -412,6 +425,7 @@ impl ServerEvent {
         "recording.started",
         "recording.stopped",
         "recording.consent_required",
+        "recording.processed",
         "audio_stream.started",
         "audio_stream.stopped",
         "quality.alert",

@@ -2218,9 +2218,15 @@ pub async fn admin_list_audit_logs(
 // ── Recordings ──
 
 fn recording_service(state: &AppState) -> Result<&aurix_recording::RecordingService, ApiError> {
+    recording_service_arc(state).map(|s| s.as_ref())
+}
+
+fn recording_service_arc(
+    state: &AppState,
+) -> Result<&std::sync::Arc<aurix_recording::RecordingService>, ApiError> {
     state
         .recording
-        .as_deref()
+        .as_ref()
         .ok_or_else(|| AurixError::InvalidConfiguration("Recording not enabled".into()).into())
 }
 
@@ -2397,7 +2403,11 @@ pub async fn get_recording(
         .get_recording(ctx.app_id, recording_id)
         .await?
         .ok_or_else(|| AurixError::NotFound("Recording not found".into()))?;
-    let download_url = svc.presigned_url(ctx.app_id, recording_id, 900)?;
+    let download_url = if recording.status == "ready" {
+        svc.presigned_url(ctx.app_id, recording_id, &recording.format, 900)?
+    } else {
+        None
+    };
     let consent = svc.consent_state(&recording_id);
     Ok(Json(
         serde_json::json!({ "recording": recording, "download_url": download_url, "consent": consent }),
@@ -2422,9 +2432,11 @@ pub async fn download_recording(
         serde_json::json!({"bytes": bytes.len()}),
         client_ip_string(ip),
     );
-    let content_type = match row.format.as_str() {
-        "ogg" | "ogg_opus" => "audio/ogg",
-        _ => "application/octet-stream",
+    let content_type = aurix_recording::processing::content_type_for(&row.format);
+    let ext = if row.format == aurix_recording::processing::FORMAT_WAV {
+        "wav"
+    } else {
+        "ogg"
     };
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -2435,20 +2447,157 @@ pub async fn download_recording(
     );
     headers.insert(
         axum::http::header::CONTENT_DISPOSITION,
-        format!(
-            "attachment; filename=\"{recording_id}.{}\"",
-            if content_type == "audio/ogg" {
-                "ogg"
-            } else {
-                "bin"
-            }
-        )
-        .parse()
-        .map_err(|_| AurixError::Internal("bad disposition".into()))?,
+        format!("attachment; filename=\"{recording_id}.{ext}\"")
+            .parse()
+            .map_err(|_| AurixError::Internal("bad disposition".into()))?,
     );
     Ok(axum::response::IntoResponse::into_response((
         headers, bytes,
     )))
+}
+
+#[derive(Deserialize)]
+pub struct MixdownBody {
+    pub channel_id: String,
+    /// Finished tracks to combine; omitted = every finished track of the channel.
+    #[serde(default)]
+    pub sources: Vec<Uuid>,
+    #[serde(default)]
+    pub format: aurix_recording::processing::MixdownFormat,
+    #[serde(default)]
+    pub stereo: bool,
+}
+
+/// Renders one file out of the per-participant tracks of a channel. Returns the new
+/// recording (`kind = mixdown`, `status = processing`); it becomes `ready` asynchronously
+/// (`recording.processed` event).
+pub async fn mixdown_recordings(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Json(body): Json<MixdownBody>,
+) -> JsonResult {
+    ctx.require("recordings:write")?;
+    let svc = recording_service_arc(&state)?;
+    let channel_id = ChannelId::from_uuid(parse_uuid(&body.channel_id, "channel_id")?);
+    let rec = svc
+        .request_mixdown(
+            ctx.app_id,
+            aurix_recording::processing::MixdownRequest {
+                channel_id,
+                sources: body.sources,
+                format: body.format,
+                stereo: body.stereo,
+            },
+        )
+        .await?;
+    state.control.audit.log(
+        Some(ctx.app_id),
+        ctx.actor(),
+        AuditAction::RecordingStarted,
+        "recording",
+        &rec.id.to_string(),
+        serde_json::json!({
+            "channel_id": channel_id,
+            "kind": "mixdown",
+            "sources": rec.sources,
+            "format": rec.format,
+        }),
+        client_ip_string(ip),
+    );
+    to_json(rec)
+}
+
+/// Queues speech-to-text of a finished recording (a mixdown is transcribed track by track,
+/// so every segment names its speaker). Poll `GET .../transcript` or wait for
+/// `recording.processed` with `job = transcript`.
+pub async fn transcribe_recording(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(recording_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("recordings:write")?;
+    let svc = recording_service_arc(&state)?;
+    let transcript = svc.request_transcript(ctx.app_id, recording_id).await?;
+    state.control.audit.log(
+        Some(ctx.app_id),
+        ctx.actor(),
+        AuditAction::RecordingAccessed,
+        "recording",
+        &recording_id.to_string(),
+        serde_json::json!({"transcript": "requested"}),
+        client_ip_string(ip),
+    );
+    to_json(transcript)
+}
+
+#[derive(Deserialize)]
+pub struct TranscriptQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// Transcript of a recording as JSON (default), `?format=srt` or `?format=vtt`. Subtitle
+/// formats are only available once the transcript is `ready`.
+pub async fn get_recording_transcript(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(recording_id): Path<Uuid>,
+    Query(query): Query<TranscriptQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    ctx.require("recordings:read")?;
+    let svc = recording_service(&state)?;
+    let transcript = svc
+        .get_transcript(ctx.app_id, recording_id)
+        .await?
+        .ok_or_else(|| AurixError::NotFound("Transcript not found".into()))?;
+    let format = query.format.as_deref().unwrap_or("json");
+    if format == "json" {
+        return Ok(Json(transcript).into_response());
+    }
+    if transcript.status != "ready" {
+        return Err(AurixError::Conflict(format!(
+            "Transcript is not ready (status: {})",
+            transcript.status
+        ))
+        .into());
+    }
+    let segments: Vec<aurix_recording::processing::TranscriptSegment> =
+        serde_json::from_value(transcript.segments)
+            .map_err(|e| AurixError::Internal(format!("stored transcript is malformed: {e}")))?;
+    let (body, content_type, ext) = match format {
+        "srt" => (
+            aurix_recording::processing::render_srt(&segments),
+            "application/x-subrip; charset=utf-8",
+            "srt",
+        ),
+        "vtt" => (
+            aurix_recording::processing::render_vtt(&segments),
+            "text/vtt; charset=utf-8",
+            "vtt",
+        ),
+        other => {
+            return Err(AurixError::Validation(format!(
+                "Unknown transcript format '{other}' (json, srt, vtt)"
+            ))
+            .into())
+        }
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        content_type
+            .parse()
+            .map_err(|_| AurixError::Internal("bad content type".into()))?,
+    );
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{recording_id}.{ext}\"")
+            .parse()
+            .map_err(|_| AurixError::Internal("bad disposition".into()))?,
+    );
+    Ok((headers, body).into_response())
 }
 
 pub async fn delete_recording(
