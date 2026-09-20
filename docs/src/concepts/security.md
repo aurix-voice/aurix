@@ -17,8 +17,15 @@
 * SFU-to-SFU cascade wraps packets in a `Relay` envelope encrypted and authenticated with keys
   derived from `media.cascade_secret`, with a per-peer anti-replay window; the client's plaintext
   is never on the wire between nodes and unknown source addresses are dropped.
-* Clients may additionally end-to-end encrypt frames. The server forwards such frames untouched
-  and cannot record, transcribe, live-stream or add directional metadata to them.
+* Channels with `e2ee: true` are **end-to-end encrypted**: every member seals its Opus frames
+  with a per-sender group key (AES-256-CTR + HMAC-SHA256, keys wrapped per peer with X25519 →
+  HKDF-SHA256 and exchanged over the control plane, rotated on every join/leave) that the node
+  never holds. The node authenticates the participants, relays the wrapped keys only between
+  members of the same channel and forwards ciphertext; it cannot mix, record, transcribe,
+  translate, classify, live-stream or add directional metadata to those frames, and sessions
+  that cannot encrypt are refused (`E2EE_REQUIRED`) rather than served plaintext. Identity keys
+  are vouched for by the node — against a malicious operator, applications compare key
+  fingerprints out of band. See [End-to-end encryption](../features/e2ee.md).
 
 ## Credentials
 

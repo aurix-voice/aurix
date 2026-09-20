@@ -277,6 +277,39 @@ keeps it); rejected with `VALIDATION_ERROR` when the node runs `media.downlink_m
 (`SessionInfo.DownlinkMix`). Channels configured with `audience.mix_for_listeners` mix for
 listeners regardless of the requested mode.
 
+## End-to-end encryption
+
+`AurixVoiceClient.E2ee` (default `true`) announces the capability on connect and lets the client
+join [`e2ee` channels](../features/e2ee.md): every Opus uplink frame into such a channel is
+sealed with the client's own sender key (`MediaTransport.SendAudioE2ee`, `PacketFlags.E2ee`),
+peers' frames are opened by SSRC before they reach `RemoteMixer`, wrapped keys travel over the
+control WebSocket, and rotation on join/leave/re-key is automatic. The crypto is managed C#
+(X25519, HKDF, AES-CTR, HMAC — no native dependency) and shares test vectors with the Rust core
+and the Web SDK.
+
+```csharp
+var client = new AurixVoiceClient(options) { E2ee = true };
+if (PlayerPrefs.HasKey("aurix.e2ee")) client.SetE2eeIdentity(Convert.FromBase64String(PlayerPrefs.GetString("aurix.e2ee")));
+Debug.Log($"my fingerprint {client.E2eeFingerprint}");
+client.OnE2eePeerKey += (userId, fingerprint, previous) => { /* show it; previous != null → the peer re-keyed */ };
+client.OnE2eePeerDecryptable += (userId, ok) => { /* their voice will (not) decode */ };
+client.OnE2eeKeyRotated += generation => {};
+client.IsChannelEncrypted(channelId); client.E2eePeerFingerprint(userId);
+client.IsE2eePeerDecryptable(userId); client.GetE2eeDecryptablePeers();
+client.RotateE2eeKey();                                  // manual; returns the new generation
+var s = client.GetStats();                               // s.FramesE2ee, s.E2eeUndecryptable
+PlayerPrefs.SetString("aurix.e2ee", Convert.ToBase64String(client.ExportE2eeIdentity()));
+```
+
+With `E2ee = false` the client never joins encrypted channels (`E2EE_REQUIRED`); it never sends
+plaintext into one or plays plaintext coming out of one — such frames count as
+`E2eeUndecryptable`. Encrypted speakers always arrive as separate streams, also in `Mixed`
+downlink mode, and only Opus can be encrypted (PCMU sessions are inaudible there).
+`AurixWebGLVoiceClient` exposes the same surface (`E2ee` / `E2eeIdentity` / `E2eeTransform` /
+`E2eeWorkerUrl` in `WebGLClientOptions`, `E2eeAvailable`, `E2eeTransformApi`,
+`GetE2eeStatsAsync`, `RotateE2eeKeyAsync`) over the browser implementation — see
+[Unity WebGL](#unity-webgl) and the Web SDK's [browser matrix](../features/e2ee.md#browser-support).
+
 ## When UDP is blocked: the WebSocket tunnel
 
 Some networks drop UDP altogether. In `MediaPathPolicy.Auto` (default) the client binds media

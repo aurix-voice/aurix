@@ -43,11 +43,16 @@ the chapter that explains the boundary.
 
 ## Protocol and media
 
-* **Native AURX is not end-to-end encrypted by default.** Payloads are encrypted per hop with
-  session keys the server knows — that is what allows mixing, recording, transcripts and
-  WebRTC interop. Clients may set the `E2ee` flag on frames they encrypt themselves; such frames
-  are forwarded opaquely to native receivers only and never reach browsers, recordings, live
-  streams or STT ([Native AURX media](api/aurx.md), [Security](concepts/security.md)).
+* **End-to-end encryption is per channel and costs the server-side features.** By default
+  payloads are encrypted per hop with session keys the server knows — that is what allows
+  mixing, recording, transcripts and translation. A channel with `e2ee: true` seals frames with
+  sender keys the node never holds and therefore has no server mix, recording, live stream,
+  STT/translation/safety, TTS injection or PCMU transcoding; every listener receives one stream
+  per speaker (top-N caps still apply), browsers hear encrypted members only on dedicated
+  per-participant tracks, and one WebRTC session cannot be in encrypted and plaintext channels
+  at once. Identity keys are authenticated by the node, so protection against a *malicious
+  operator* relies on comparing fingerprints out of band ([End-to-end
+  encryption](features/e2ee.md), [Security](concepts/security.md)).
 * **Browsers get a server-side mix plus a bounded number of per-participant tracks.** The
   Web SDK always receives one mixed (stereo) downlink per session; on top of it a node hands out
   at most `media.webrtc_participant_streams` (default 16, hard cap 64) dedicated tracks, each
@@ -56,8 +61,8 @@ the chapter that explains the boundary.
   stay in the mix (stereo panning only); the mapping changes hands with a short hold, so a
   speaker you first heard in the mix may move to a dedicated track (and back) mid-sentence.
   Web Audio needs a user gesture (autoplay policy) and a running `AudioContext`; without it the
-  SDK falls back to the mixed track. Insertable-stream encryption and native AURX over UDP are
-  not available in browsers ([Web SDK](sdk/web.md#per-participant-tracks-and-spatial-audio)).
+  SDK falls back to the mixed track. Native AURX over UDP is not available in browsers
+  ([Web SDK](sdk/web.md#per-participant-tracks-and-spatial-audio)).
 * **Unity WebGL is a browser client.** `AurixWebGLVoiceClient` reuses the Web SDK through a
   JavaScript bridge, so everything above applies: WebRTC media with a server-mixed stereo
   downlink plus bounded per-participant tracks, the browser's Opus/AEC/NS/AGC, playback through a
@@ -175,6 +180,12 @@ the chapter that explains the boundary.
 * **Browser Opus negotiation.** The Web SDK's `fmtp` rewrite and `setParameters` path are unit-
   tested on SDP text and applied in the E2E browser runs; whether a given browser honours
   `useinbandfec`/`usedtx`/`maxplaybackrate` is up to that browser's WebRTC stack.
+* **Browser E2EE outside Chromium.** The WebCrypto cipher and both encoded-frame transforms
+  (`RTCRtpScriptTransform` worker, `createEncodedStreams()`) are unit-tested against a fake
+  WebRTC stack and share vectors with the Rust and C# implementations; the `'streams'` path was
+  verified live in Chrome against real nodes (browser ↔ browser, browser ↔ native). Firefox and
+  Safari — the `RTCRtpScriptTransform` path in a real engine — have not been run from this
+  repository ([End-to-end encryption](features/e2ee.md#browser-support)).
 * **Windows/macOS native builds** of `aurix-client` are built and unit-tested in CI on
   `windows-latest` (x64 MSVC), `macos-14` (arm64) and `macos-13` (x64) — including the C/C++
   samples linked against the freshly built library and the Unreal `ThirdParty` staging scripts —

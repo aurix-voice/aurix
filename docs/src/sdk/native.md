@@ -315,6 +315,43 @@ mode. C: `AurixChannelInfo` (`role`, `participant_count`, `hidden_listeners`, `t
 `downlink_mode`; Unreal `GetChannelInfo`, `CanSpeakIn`, `SetDownlinkMode`, `GetDownlinkMode`,
 `OnDownlinkModeChanged`.
 
+## End-to-end encryption
+
+`ClientConfig::e2ee` (default `true`) announces the E2EE capability on connect and makes the
+core seal every Opus frame it sends into an [`e2ee` channel](../features/e2ee.md) with its own
+sender key, exchange wrapped keys with the members over the control WebSocket and open their
+frames by SSRC before decoding — one encode and one seal per frame whatever the number of
+channels. Rotation is automatic (peer joined / left / re-keyed, `2³¹` frames), reconnect and
+failover keep identity, keys and peers; a session without the capability (`e2ee: false`, an old
+build) is refused at `join` with `E2EE_REQUIRED`, and the core never sends plaintext into or
+plays plaintext out of an encrypted channel.
+
+```rust
+let mut cfg = ClientConfig::new(ws_url, token);
+cfg.e2ee_identity = load_identity();               // Option<[u8; 32]>: stable fingerprint across runs
+let client = Client::new(cfg)?;
+println!("my fingerprint: {}", client.e2ee_fingerprint());
+match event {
+    Event::E2eePeerKey { user_id, fingerprint, previous_fingerprint } => { /* show / compare */ }
+    Event::E2eePeerDecryptable { user_id, decryptable } => {}
+    Event::E2eeKeyRotated { generation } => {}
+    _ => {}
+}
+client.e2ee_peer_fingerprint(user_id); client.e2ee_peer_decryptable(user_id);
+let s = client.stats(); (s.frames_e2ee, s.e2ee_undecryptable);
+```
+
+C: `AurixClientConfig.e2ee`, `has_e2ee_identity` + `e2ee_identity[32]`,
+`aurix_client_e2ee_fingerprint`, `aurix_client_e2ee_peer_fingerprint`,
+`aurix_client_e2ee_peer_decryptable`, events `AURIX_EVENT_E2EE_PEER_KEY` /
+`_PEER_DECRYPTABLE` / `_KEY_ROTATED`, `AurixClientStats.frames_e2ee` / `e2ee_undecryptable`;
+the C++ wrapper and the Unreal subsystem (`FAurixClientConfig.bE2ee`, `E2eeIdentityHex`,
+`GetE2eeFingerprint`, `OnE2eePeerKey`, …) mirror them. The mixed downlink and per-participant
+pull work unchanged — encrypted speakers simply always arrive as separate streams.
+`cargo run -p aurix-client --example e2ee_peer -- <ws-url> <jwt> <channel> [secs] [tone-hz]
+[identity-hex]` is a headless peer that prints fingerprints and decrypted RMS for
+interoperability tests with browsers and Unity.
+
 ## Presence and text range
 
 `Event::ChannelJoined { scope, .. }` and `client.channel_scope(channel_id)` expose the

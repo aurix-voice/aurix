@@ -3,6 +3,7 @@ import type {
   AurixClientOptions,
   AurixEvents,
   ChatScope,
+  E2eeOptions,
   ConnectionState,
   HistoryOptions,
   ParticipantStreamInfo,
@@ -12,6 +13,8 @@ import type {
   TransmissionMode,
 } from './client.js';
 import { enumerateAudioDevices } from './devices.js';
+import { base64ToBytes, bytesToBase64 } from './e2ee.js';
+import type { E2eeTransformApi } from './e2ee.js';
 import type { OpusBrowserOptions } from './opus.js';
 import type { JsonValue, ModerationAction, Orientation3D, Position3D, RecordingConsent } from './protocol.js';
 
@@ -65,6 +68,11 @@ export interface BridgeClientOptions {
   participantStreams?: number;
   /** `true` (default) HRTF, `'equalpower'`, or `false` for mixed-only style rendering by the host. */
   spatialAudio?: boolean | 'equalpower';
+  /**
+   * Group E2EE (see `AurixClientOptions.e2ee`): `true`/`false`, or an object whose `identity` is
+   * the base64 32-byte secret exported earlier by `e2eeIdentitySecret`.
+   */
+  e2ee?: boolean | { identity?: string; transform?: 'auto' | E2eeTransformApi; workerUrl?: string };
 }
 
 export interface AurixBridgeOptions {
@@ -140,6 +148,7 @@ export class AurixBridge {
     if (raw.reconnect !== undefined) options.reconnect = raw.reconnect;
     if (raw.participantStreams !== undefined) options.participantStreams = raw.participantStreams;
     if (raw.spatialAudio !== undefined) options.spatialAudio = raw.spatialAudio;
+    if (raw.e2ee !== undefined) options.e2ee = e2eeOptions(raw.e2ee);
     if (raw.refreshToken) options.refreshToken = () => this.requestToken(entry, 'refresh', undefined);
     if (raw.joinToken) options.joinToken = (channelId) => this.requestToken(entry, 'join', channelId);
 
@@ -430,6 +439,32 @@ export class AurixBridge {
         return c.renegotiateMedia();
       case 'resumeAudio':
         return this.resumeAudio(entry);
+      case 'e2eeAvailable':
+        return c.e2eeAvailable;
+      case 'e2eeTransformApi':
+        return c.e2eeTransformApi ?? null;
+      case 'e2eeFingerprint':
+        return c.e2eeFingerprint ?? null;
+      case 'e2eeIdentitySecret': {
+        const secret = c.e2eeIdentitySecret;
+        return secret ? bytesToBase64(secret) : null;
+      }
+      case 'e2eePeerFingerprint':
+        return c.e2eePeerFingerprint(str(a, 'userId')) ?? null;
+      case 'isE2eePeerDecryptable':
+        return c.isE2eePeerDecryptable(str(a, 'userId'));
+      case 'e2eeDecryptablePeers':
+        return c.e2eeDecryptablePeers();
+      case 'isChannelEncrypted':
+        return c.isChannelEncrypted(str(a, 'channelId'));
+      case 'e2eeGeneration':
+        return c.e2eeGeneration ?? null;
+      case 'e2eeStats':
+        return c.e2eeStats ?? null;
+      case 'refreshE2eeStats':
+        return c.refreshE2eeStats().then((s) => s ?? null);
+      case 'rotateE2eeKey':
+        return c.rotateE2eeKey().then((g) => g ?? null);
 
       default:
         throw new Error(`unknown method ${method}`);
@@ -476,6 +511,11 @@ export class AurixBridge {
     on('transmissionChanged', (mode) => q({ type: 'transmissionChanged', mode }));
     on('channelFocusChanged', (channelId) => q({ type: 'channelFocusChanged', channelId: channelId ?? null }));
     on('participantStreams', (streams) => q({ type: 'participantStreams', streams: participantStreamsEvent(streams) }));
+    on('e2eePeerKey', (userId, fingerprint, previousFingerprint) =>
+      q({ type: 'e2eePeerKey', userId, fingerprint, previousFingerprint: previousFingerprint ?? null }),
+    );
+    on('e2eePeerDecryptable', (userId, decryptable) => q({ type: 'e2eePeerDecryptable', userId, decryptable }));
+    on('e2eeKeyRotated', (generation) => q({ type: 'e2eeKeyRotated', generation }));
     on('recovering', (attempt, delayMs, cause) => q({ type: 'recovering', attempt, delayMs, cause }));
     on('recovered', (info) => q({ type: 'recovered', info }));
     on('endpointChanged', (url) => q({ type: 'endpointChanged', url }));
@@ -600,6 +640,19 @@ function strArray(a: Args, key: string): string[] {
 /** Wire form of the track layout: a `MediaStream` cannot cross a string bridge, its presence can. */
 function participantStreamsEvent(streams: ParticipantStreamInfo[]): Array<{ mid: string; userId: string | null; live: boolean }> {
   return streams.map((s) => ({ mid: s.mid, userId: s.userId ?? null, live: s.stream !== undefined }));
+}
+
+function e2eeOptions(raw: NonNullable<BridgeClientOptions['e2ee']>): boolean | E2eeOptions {
+  if (typeof raw === 'boolean') return raw;
+  const options: E2eeOptions = {};
+  if (raw.identity !== undefined) {
+    const secret = base64ToBytes(raw.identity);
+    if (secret.length !== 32) throw new Error('e2ee.identity must be a base64 32-byte secret');
+    options.identity = secret;
+  }
+  if (raw.transform !== undefined) options.transform = raw.transform;
+  if (raw.workerUrl !== undefined) options.workerUrl = raw.workerUrl;
+  return options;
 }
 
 function num(a: Args, key: string): number {

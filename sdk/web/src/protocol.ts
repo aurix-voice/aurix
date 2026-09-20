@@ -22,6 +22,8 @@ export interface AudioPolicyWire {
   complexity?: number | null;
   signal?: string;
   stereo?: boolean;
+  /** Frames in this channel are end-to-end encrypted (`e2ee.ts`); the server cannot process them. */
+  e2ee?: boolean;
 }
 
 export interface ParticipantBrief {
@@ -211,6 +213,9 @@ export type ClientMessage =
   | { type: 'WebRtcOffer'; data: { sdp: string } }
   /** Participants to keep on their own downlink track while audible (bounded by `webrtc_participant_streams`). */
   | { type: 'SetParticipantStreams'; data: { pinned: string[] } }
+  /** `channel_id` absent: this session can do E2EE (sent once per connection, not relayed). */
+  | { type: 'E2eeHello'; data: { channel_id?: string; public_key: string } }
+  | { type: 'E2eeSenderKey'; data: { channel_id: string; to: string; public_key: string; generation: number; key: string } }
   | { type: 'Ping'; data: { nonce: number } }
   | { type: 'SessionClose'; data: { session_id: string; reason: string } };
 
@@ -362,6 +367,11 @@ export type ServerMessage =
   | { type: 'WebRtcAnswer'; data: { sdp: string } }
   /** Current `mid → participant` layout of the per-participant downlink tracks (full snapshot). */
   | { type: 'ParticipantStreams'; data: { streams: ParticipantStreamWire[] } }
+  | { type: 'E2eeHello'; data: { channel_id?: string; user_id?: string; public_key: string } }
+  | {
+      type: 'E2eeSenderKey';
+      data: { channel_id: string; from?: string; to: string; public_key: string; generation: number; key: string };
+    }
   | { type: 'Pong'; data: { nonce: number } };
 
 export interface UnknownMessage {

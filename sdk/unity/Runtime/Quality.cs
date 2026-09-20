@@ -153,6 +153,10 @@ namespace Aurix
         public int HeartbeatsLostConsecutive;
         /// <summary>Uplink packets dropped because the tunnel's send queue was full (0 on UDP).</summary>
         public long UplinkDropped;
+        /// <summary>Uplink frames sealed end-to-end (sent into <c>e2ee</c> channels).</summary>
+        public long FramesE2ee;
+        /// <summary>Downlink frames of encrypted channels dropped: no key for the sender yet, replay, tamper, or plaintext where only E2EE is allowed.</summary>
+        public long E2eeUndecryptable;
         /// <summary>Heartbeat RTT (media path), current and session min/avg/max.</summary>
         public float RttMs;
         public float RttMinMs;

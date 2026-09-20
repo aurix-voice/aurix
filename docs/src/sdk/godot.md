@@ -62,6 +62,10 @@ func join(channel_id: String) -> void:
 * **Server-side directional audio:** `update_transforms(channel_id, {user_id: Transform3D})`
   (Godot's `-Z` forward is converted).
 * **AEC reference:** `push_render(PackedVector2Array)` when you mix game audio yourself.
+* **End-to-end encryption:** the core announces the capability and seals/opens frames of
+  [`e2ee` channels](../features/e2ee.md) on its own, so a Godot client joins them like any other
+  channel; the fingerprint / identity-persistence API and the `E2EE_*` events are not bound to
+  GDScript yet (a fresh identity per session).
 
 ## Threading, memory, lifetime
 

@@ -27,6 +27,23 @@ import {
   type UnknownMessage,
   type UserPosition,
 } from './protocol.js';
+import {
+  E2eeGroup,
+  E2eeIdentity,
+  attachEncodedStreams,
+  base64ToBytes,
+  bytesToBase64,
+  detectE2eeSupport,
+  e2eeWorkerSource,
+  type E2eeFrameStats,
+  type E2eeKeySink,
+  type E2eeMode,
+  type E2eeOutgoing,
+  type E2eeSupport,
+  type E2eeTransformApi,
+  type E2eeWorkerMessage,
+  type E2eeWorkerReply,
+} from './e2ee.js';
 import { AudioLevelMeter, type AudioLevelMeterOptions, type AudioLevelSample } from './audio.js';
 import {
   SpatialRenderer,
@@ -155,6 +172,25 @@ export interface AurixClientOptions {
   spatialAudio?: boolean | 'equalpower';
   /** Use this `AudioContext` for participant tracks instead of creating one. */
   audioContext?: AudioContext;
+  /**
+   * Group end-to-end encryption (`e2ee.ts`). `true` (default): announce the capability when
+   * the browser has WebCrypto and an encoded-frame API, so channels created with
+   * `e2ee: true` can be joined; without those the join fails with `E2EE_REQUIRED` (there is
+   * no plaintext fallback). `false`: never join encrypted channels.
+   */
+  e2ee?: boolean | E2eeOptions;
+}
+
+export interface E2eeOptions {
+  /**
+   * 32-byte X25519 identity secret; a stored one keeps this client's fingerprint stable
+   * across sessions (`e2eeIdentitySecret` exports it). Random per client when absent.
+   */
+  identity?: Uint8Array;
+  /** Encoded-frame API: `'auto'` prefers `RTCRtpScriptTransform`, falls back to `createEncodedStreams()`. */
+  transform?: 'auto' | E2eeTransformApi;
+  /** Serve the transform worker from this URL instead of a `blob:` URL (CSP without `worker-src blob:`). */
+  workerUrl?: string;
 }
 
 /** One negotiated per-participant downlink track and who is on it. */
@@ -584,6 +620,15 @@ export interface AurixEvents {
   translationChanged: (prefs: TranslationPrefs) => void;
   /** Progress of a `speak()` request (queued → playing → finished/cancelled/failed). */
   ttsStatus: (status: TtsStatus) => void;
+  /**
+   * E2EE: a peer's identity key was learned (`previousFingerprint` undefined) or changed
+   * (reconnect with a new key — or an impostor; compare fingerprints out of band).
+   */
+  e2eePeerKey: (userId: string, fingerprint: string, previousFingerprint: string | undefined) => void;
+  /** E2EE: whether this client holds a sender key of `userId` (its frames are audible). */
+  e2eePeerDecryptable: (userId: string, decryptable: boolean) => void;
+  /** E2EE: this client's sender key rotated (a peer joined or left). */
+  e2eeKeyRotated: (generation: number) => void;
   serverError: (code: string, message: string) => void;
   error: (error: Error) => void;
   message: (message: ServerMessage | UnknownMessage) => void;
@@ -638,6 +683,8 @@ export function transmissionFromWire(mode: TransmissionModeWire | undefined): Tr
 const ALL_CHANNELS = '*';
 /** `media.unfocused_channel_gain` of a node that does not advertise it. */
 const DEFAULT_UNFOCUSED_GAIN = 0.5;
+/** Join waves (a party entering together) collapse into one E2EE key rotation. */
+const E2EE_ROTATE_DEBOUNCE_MS = 50;
 
 interface Pending<T> {
   resolve: (value: T) => void;
@@ -857,6 +904,17 @@ export class AurixClient {
   private lastPongAt = 0;
   private activeEndpoint: string;
   private failoverEndpoints: string[] = [];
+  /** Group E2EE state; present once `connect()` found the browser capable (and `e2ee` not `false`). */
+  private e2eeGroup: E2eeGroup | undefined;
+  private e2eeApi: E2eeTransformApi | undefined;
+  private e2eeWorker: Worker | undefined;
+  private e2eeWorkerStats: E2eeFrameStats | undefined;
+  /** Channels the server flagged `e2ee` in their join ack. */
+  private e2eeChannels = new Set<string>();
+  /** Serialises group operations (they await WebCrypto) in arrival order. */
+  private e2eeQueue: Promise<unknown> = Promise.resolve();
+  private e2eeRotateTimer: ReturnType<typeof setTimeout> | undefined;
+  private e2eeModeValue: E2eeMode = 'plain';
 
   constructor(options: AurixClientOptions) {
     this.opts = {
@@ -1006,6 +1064,351 @@ export class AurixClient {
 
   joinedChannels(): string[] {
     return Array.from(this.channels.keys());
+  }
+
+  // ── End-to-end encryption ──
+
+  /** What this browser can do for E2EE (WebCrypto + an encoded-frame API). */
+  static e2eeSupport(prefer: 'auto' | E2eeTransformApi = 'auto'): E2eeSupport {
+    return detectE2eeSupport(prefer);
+  }
+
+  /**
+   * `true` once `connect()` set E2EE up: the session announced the capability and encrypted
+   * channels can be joined. `false` = the browser cannot (or `e2ee: false`): joining an
+   * encrypted channel fails with `E2EE_REQUIRED`.
+   */
+  get e2eeAvailable(): boolean {
+    return this.e2eeGroup !== undefined;
+  }
+
+  /** Encoded-frame API in use (`'script'` = `RTCRtpScriptTransform` in a worker, `'streams'` = `createEncodedStreams`). */
+  get e2eeTransformApi(): E2eeTransformApi | undefined {
+    return this.e2eeGroup ? this.e2eeApi : undefined;
+  }
+
+  /** Hex SHA-256 of this client's E2EE identity key — show it so peers can verify it out of band. */
+  get e2eeFingerprint(): string | undefined {
+    return this.e2eeGroup?.identity.fingerprint;
+  }
+
+  /** The identity secret to store and pass as `e2ee.identity` next time (keeps the fingerprint). */
+  get e2eeIdentitySecret(): Uint8Array | undefined {
+    return this.e2eeGroup?.identity.exportSecret();
+  }
+
+  /** Fingerprint of a peer's identity key, once it announced itself in a shared encrypted channel. */
+  e2eePeerFingerprint(userId: string): string | undefined {
+    return this.e2eeGroup?.peerFingerprint(userId);
+  }
+
+  /** Whether this client holds a sender key of `userId` (its encrypted frames are audible). */
+  isE2eePeerDecryptable(userId: string): boolean {
+    return this.e2eeGroup?.hasKeyFor(userId) ?? false;
+  }
+
+  /** Peers whose encrypted frames this client can decrypt. */
+  e2eeDecryptablePeers(): string[] {
+    return this.e2eeGroup?.decryptablePeers() ?? [];
+  }
+
+  /** The server flagged this joined channel as end-to-end encrypted. */
+  isChannelEncrypted(channelId: string): boolean {
+    return this.e2eeChannels.has(channelId);
+  }
+
+  /** Generation of this client's current sender key. */
+  get e2eeGeneration(): number | undefined {
+    return this.e2eeGroup?.generation;
+  }
+
+  /**
+   * Frame counters of the encrypted path (worker path: as of the last snapshot, refreshed
+   * with every `stats` event and by `refreshE2eeStats()`).
+   */
+  get e2eeStats(): E2eeFrameStats | undefined {
+    if (!this.e2eeGroup) return undefined;
+    return this.e2eeWorker ? this.e2eeWorkerStats ?? { framesE2ee: 0, undecryptable: 0, held: 0 } : { ...this.e2eeGroup.frames.stats };
+  }
+
+  /** Asks the transform worker for fresh frame counters (resolves with them). */
+  refreshE2eeStats(): Promise<E2eeFrameStats | undefined> {
+    const worker = this.e2eeWorker;
+    if (!worker || !this.e2eeGroup) return Promise.resolve(this.e2eeStats);
+    return new Promise((resolve) => {
+      const done = (ev: MessageEvent<E2eeWorkerReply>) => {
+        if (ev.data.type !== 'stats') return;
+        worker.removeEventListener('message', done);
+        resolve(ev.data.stats);
+      };
+      worker.addEventListener('message', done);
+      this.postToE2eeWorker({ type: 'stats' });
+    });
+  }
+
+  /** Rotates this client's sender key now (normally automatic on join/leave). */
+  async rotateE2eeKey(): Promise<number | undefined> {
+    const group = this.e2eeGroup;
+    if (!group) return undefined;
+    return this.e2eeTask(async () => {
+      const r = await group.rotate(true);
+      if (!r) return undefined;
+      this.e2eeSend(r.out);
+      this.emit('e2eeKeyRotated', r.generation);
+      return r.generation;
+    });
+  }
+
+  private e2eeEnabled(): boolean {
+    return this.opts.e2ee !== false;
+  }
+
+  private e2eeOptions(): E2eeOptions {
+    return typeof this.opts.e2ee === 'object' ? this.opts.e2ee : {};
+  }
+
+  /** Creates the group (identity + transform worker) on the first `connect()`, if the browser can. */
+  private async ensureE2ee(): Promise<void> {
+    if (this.e2eeGroup || !this.e2eeEnabled()) return;
+    const o = this.e2eeOptions();
+    const support = detectE2eeSupport(o.transform ?? 'auto');
+    if (!support.ok) {
+      if (this.opts.e2ee !== undefined) {
+        const why = !support.crypto ? 'WebCrypto is unavailable (insecure context?)' : 'no encoded-frame API (RTCRtpScriptTransform / createEncodedStreams)';
+        this.emit('error', new Error(`E2EE unavailable: ${why}; encrypted channels cannot be joined`));
+      }
+      return;
+    }
+    let api: E2eeTransformApi = support.transform ?? 'streams';
+    let sink: E2eeKeySink | undefined;
+    if (api === 'script') {
+      try {
+        const url = o.workerUrl ?? URL.createObjectURL(new Blob([e2eeWorkerSource()], { type: 'text/javascript' }));
+        const worker = new Worker(url);
+        worker.addEventListener('message', (ev: MessageEvent<E2eeWorkerReply>) => this.onE2eeWorkerMessage(ev.data));
+        worker.addEventListener('error', (ev) => this.emit('error', new Error(`E2EE worker: ${ev.message}`)));
+        this.e2eeWorker = worker;
+        sink = { post: (msg) => this.postToE2eeWorker(msg) };
+      } catch (e) {
+        const fallback = detectE2eeSupport('streams');
+        if (!fallback.ok) {
+          if (this.opts.e2ee !== undefined) {
+            this.emit('error', new Error(`E2EE unavailable: worker could not start (${e instanceof Error ? e.message : String(e)})`));
+          }
+          return;
+        }
+        api = 'streams';
+      }
+    }
+    const identity = await E2eeIdentity.create(o.identity);
+    this.e2eeGroup = await E2eeGroup.create(identity, sink);
+    this.e2eeGroup.onRotateNeeded = () => this.scheduleE2eeRotate();
+    this.e2eeApi = api;
+  }
+
+  private postToE2eeWorker(msg: E2eeWorkerMessage): void {
+    this.e2eeWorker?.postMessage(msg);
+  }
+
+  private onE2eeWorkerMessage(msg: E2eeWorkerReply): void {
+    switch (msg.type) {
+      case 'rotate':
+        void this.e2eeTask(async () => {
+          const r = await this.e2eeGroup?.rotate(true);
+          if (!r) return;
+          this.e2eeSend(r.out);
+          this.emit('e2eeKeyRotated', r.generation);
+        });
+        return;
+      case 'stats':
+        this.e2eeWorkerStats = msg.stats;
+        return;
+      default:
+        return;
+    }
+  }
+
+  private e2eeTask<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.e2eeQueue.then(task, task);
+    this.e2eeQueue = run.catch((e: unknown) => {
+      this.emit('error', e instanceof Error ? e : new Error(String(e)));
+    });
+    return run;
+  }
+
+  private e2eeSend(out: E2eeOutgoing[]): void {
+    for (const msg of out) {
+      if (msg.type === 'hello') {
+        this.sendE2eeHello(msg.channelId);
+      } else {
+        this.send({
+          type: 'E2eeSenderKey',
+          data: {
+            channel_id: msg.channelId,
+            to: msg.to,
+            public_key: bytesToBase64(this.e2eeGroup?.identity.publicKey ?? new Uint8Array(0)),
+            generation: msg.generation,
+            key: bytesToBase64(msg.wrapped),
+          },
+        });
+      }
+    }
+  }
+
+  private sendE2eeHello(channelId: string | undefined): void {
+    const group = this.e2eeGroup;
+    if (!group || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const data: { channel_id?: string; public_key: string } = { public_key: bytesToBase64(group.identity.publicKey) };
+    if (channelId !== undefined) data.channel_id = channelId;
+    this.send({ type: 'E2eeHello', data });
+  }
+
+  private setE2eeMode(mode: E2eeMode): void {
+    if (this.e2eeModeValue === mode) return;
+    this.e2eeModeValue = mode;
+    if (this.e2eeGroup) this.e2eeGroup.frames.mode = mode;
+    this.postToE2eeWorker({ type: 'mode', mode });
+  }
+
+  /** `encrypt` while an encrypted channel is joined, `hold` while a join is in flight, else `plain`. */
+  private refreshE2eeMode(): void {
+    if (!this.e2eeGroup) return;
+    if (this.e2eeChannels.size > 0) this.setE2eeMode('encrypt');
+    else if (this.pendingJoins.size > 0) this.setE2eeMode('hold');
+    else this.setE2eeMode('plain');
+  }
+
+  private pushE2eeLayout(): void {
+    if (!this.e2eeGroup) return;
+    const entries: Array<[string, string | undefined]> = [...this.participantLayout.entries()];
+    this.e2eeGroup.frames.setLayout(entries);
+    this.postToE2eeWorker({ type: 'layout', entries });
+  }
+
+  private scheduleE2eeRotate(): void {
+    if (!this.e2eeGroup || this.e2eeRotateTimer) return;
+    this.e2eeRotateTimer = setTimeout(() => {
+      this.e2eeRotateTimer = undefined;
+      void this.e2eeTask(async () => {
+        const group = this.e2eeGroup;
+        if (!group || !group.isRotationPending || !group.active) return;
+        const r = await group.rotate(false);
+        if (!r) return;
+        this.e2eeSend(r.out);
+        this.emit('e2eeKeyRotated', r.generation);
+      });
+    }, E2EE_ROTATE_DEBOUNCE_MS);
+  }
+
+  private emitE2eeGone(gone: string[]): void {
+    for (const userId of gone) this.emit('e2eePeerDecryptable', userId, false);
+  }
+
+  /** Join ack of an encrypted channel (`replayed`: a resumed session re-acknowledged it). */
+  private e2eeChannelJoined(channelId: string, replayed: boolean, members: ReadonlySet<string>): void {
+    const group = this.e2eeGroup;
+    if (!group) return;
+    this.e2eeChannels.add(channelId);
+    if (replayed) {
+      const { out, gone } = group.rejoined(channelId, members);
+      this.emitE2eeGone(gone);
+      this.e2eeSend(out);
+    } else {
+      this.e2eeSend(group.joined(channelId));
+    }
+    this.refreshE2eeMode();
+    if (this.participantStreamsToOffer() === 0) {
+      this.emit('error', new Error(`channel ${channelId} is end-to-end encrypted but no per-participant tracks are negotiated (participantStreams = 0): its members are inaudible`));
+    }
+  }
+
+  private e2eeChannelLeft(channelId: string): void {
+    if (!this.e2eeChannels.delete(channelId)) return;
+    const group = this.e2eeGroup;
+    if (group) {
+      this.emitE2eeGone(group.left(channelId));
+      this.refreshE2eeMode();
+      if (group.active) this.scheduleE2eeRotate();
+    }
+  }
+
+  private e2eePeerLeft(channelId: string, userId: string): void {
+    const group = this.e2eeGroup;
+    if (!group || !this.e2eeChannels.has(channelId)) return;
+    this.emitE2eeGone(group.peerLeft(channelId, userId));
+    this.scheduleE2eeRotate();
+  }
+
+  /** The session is gone (disconnect, fresh session after reconnect): forget channels and peers. */
+  private e2eeSessionEnded(): void {
+    this.e2eeChannels.clear();
+    if (this.e2eeRotateTimer) {
+      clearTimeout(this.e2eeRotateTimer);
+      this.e2eeRotateTimer = undefined;
+    }
+    const group = this.e2eeGroup;
+    if (group) this.emitE2eeGone(group.reset());
+    this.refreshE2eeMode();
+  }
+
+  private onE2eeHello(d: { channel_id?: string; user_id?: string; public_key: string }): void {
+    const group = this.e2eeGroup;
+    const channelId = d.channel_id;
+    const userId = d.user_id;
+    if (!group || channelId === undefined || userId === undefined || !this.e2eeChannels.has(channelId)) return;
+    if (userId === this.userId) return;
+    void this.e2eeTask(async () => {
+      const { out, change } = await group.onHello(channelId, userId, base64ToBytes(d.public_key));
+      this.e2eeSend(out);
+      if (change) {
+        this.emit('e2eePeerKey', userId, group.peerFingerprint(userId) ?? '', change.kind === 'keyChanged' ? change.previousFingerprint : undefined);
+        this.scheduleE2eeRotate();
+      }
+    });
+  }
+
+  private onE2eeSenderKey(d: { channel_id: string; from?: string; to: string; public_key: string; generation: number; key: string }): void {
+    const group = this.e2eeGroup;
+    const from = d.from;
+    if (!group || from === undefined || from === this.userId || !this.e2eeChannels.has(d.channel_id)) return;
+    void this.e2eeTask(async () => {
+      let result;
+      try {
+        result = await group.onSenderKey(d.channel_id, from, base64ToBytes(d.public_key), d.generation, base64ToBytes(d.key));
+      } catch (e) {
+        this.emit('error', new Error(`E2EE key from ${from} rejected: ${e instanceof Error ? e.message : String(e)}`));
+        return;
+      }
+      const { out, change, decryptable } = result;
+      if (change) {
+        this.emit('e2eePeerKey', from, group.peerFingerprint(from) ?? '', change.kind === 'keyChanged' ? change.previousFingerprint : undefined);
+        this.scheduleE2eeRotate();
+      }
+      this.e2eeSend(out);
+      if (decryptable) this.emit('e2eePeerDecryptable', from, true);
+    });
+  }
+
+  /** Installs the encrypted-frame transforms on every sender/receiver of `pc`. */
+  private attachE2eeTransforms(pc: RTCPeerConnection, mixed: RTCRtpTransceiver): void {
+    const group = this.e2eeGroup;
+    if (!group) return;
+    const worker = this.e2eeWorker;
+    for (const t of pc.getTransceivers()) {
+      const midOf = () => t.mid;
+      if (t === mixed) {
+        if (worker && this.e2eeApi === 'script') {
+          t.sender.transform = new RTCRtpScriptTransform(worker, { kind: 'sender', mid: t.mid });
+        } else {
+          attachEncodedStreams(t.sender, group.frames, 'sender', midOf);
+        }
+      }
+      if (worker && this.e2eeApi === 'script') {
+        t.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'receiver', mid: t.mid });
+      } else {
+        attachEncodedStreams(t.receiver, group.frames, 'receiver', midOf);
+      }
+    }
   }
 
   get localMediaStream(): MediaStream | undefined {
@@ -1427,6 +1830,7 @@ export class AurixClient {
 
   private applyParticipantLayout(streams: ParticipantStreamWire[]): void {
     this.participantLayout = new Map(streams.map((s) => [s.mid, s.user_id ?? undefined]));
+    this.pushE2eeLayout();
     this.renderParticipants();
     this.emitParticipantStreams();
   }
@@ -1504,6 +1908,7 @@ export class AurixClient {
     const had = this.participantTracks.size > 0 || this.participantLayout.size > 0;
     this.participantTracks.clear();
     this.participantLayout.clear();
+    this.pushE2eeLayout();
     this.mixedTransceiver = undefined;
     this.renderer?.clear();
     if (had) this.emitParticipantStreams();
@@ -1576,6 +1981,8 @@ export class AurixClient {
     this.statsSnapshot = undefined;
     this.setState('connecting');
 
+    await this.ensureE2ee();
+    if (this.closedByUser) throw new Error('disconnected');
     const info = await this.openControlChannel(this.opts.wsUrl);
     this.session = info;
     this.setState('connected');
@@ -1636,6 +2043,7 @@ export class AurixClient {
     this.channels.clear();
     this.channelPositional.clear();
     this.positions.clear();
+    this.e2eeSessionEnded();
     this.session = undefined;
     this.resumeToken = undefined;
     this.stopQualityTimer();
@@ -1722,9 +2130,12 @@ export class AurixClient {
     return new Promise<Participant[]>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingJoins.delete(channelId);
+        this.refreshE2eeMode();
         reject(new Error(`join ${channelId} timed out`));
       }, this.opts.requestTimeoutMs);
       this.pendingJoins.set(channelId, { resolve, reject, timer });
+      // Until the ack says whether the channel is encrypted, no plaintext may leave.
+      this.refreshE2eeMode();
       this.send({ type: 'ChannelJoin', data: { channel_id: channelId, token } });
     });
   }
@@ -1763,6 +2174,7 @@ export class AurixClient {
     this.forgetChannelSpatial(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
     if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
+    this.e2eeChannelLeft(channelId);
     this.renderParticipants();
   }
 
@@ -2245,6 +2657,7 @@ export class AurixClient {
       for (const channelId of wanted) {
         if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
       }
+      this.e2eeSessionEnded();
       this.channelPolicies.clear();
       this.channelInfos.clear();
       this.transientBitrateBps = undefined;
@@ -2446,10 +2859,28 @@ export class AurixClient {
           clearTimeout(pending.timer);
           pending.resolve(info);
         }
+        this.sendE2eeHello(undefined);
         return;
       }
       case 'ChannelJoinAck': {
         const d = (msg as Extract<ServerMessage, { type: 'ChannelJoinAck' }>).data;
+        const encrypted = d.audio?.e2ee === true;
+        if (encrypted && !this.e2eeGroup) {
+          // The server should have refused us (`E2EE_REQUIRED`); never sit in an encrypted
+          // channel we cannot take part in.
+          this.trySend({ type: 'ChannelLeave', data: { channel_id: d.channel_id } });
+          const pending = this.pendingJoins.get(d.channel_id);
+          const err = new Error(`E2EE_REQUIRED: channel ${d.channel_id} is end-to-end encrypted and this client has no E2EE`);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingJoins.delete(d.channel_id);
+            pending.reject(err);
+          }
+          this.refreshE2eeMode();
+          this.emit('error', err);
+          return;
+        }
+        const replayed = this.channels.has(d.channel_id) && !this.pendingJoins.has(d.channel_id);
         const roster = new Map<string, Participant>();
         for (const p of d.participants) {
           roster.set(p.user_id, {
@@ -2482,6 +2913,8 @@ export class AurixClient {
         if (d.positional) this.channelPositional.set(d.channel_id, d.positional);
         else this.forgetChannelSpatial(d.channel_id);
         this.renderParticipants();
+        if (encrypted) this.e2eeChannelJoined(d.channel_id, replayed, new Set(roster.keys()));
+        else this.e2eeChannelLeft(d.channel_id);
         const list = Array.from(roster.values());
         const pending = this.pendingJoins.get(d.channel_id);
         if (pending) {
@@ -2489,6 +2922,7 @@ export class AurixClient {
           this.pendingJoins.delete(d.channel_id);
           pending.resolve(list);
         }
+        this.refreshE2eeMode();
         this.emit('channelJoined', d.channel_id, list);
         if (this.muted) this.setMuted(true);
         this.replayChannelMutes(d.channel_id);
@@ -2518,6 +2952,7 @@ export class AurixClient {
         this.channels.get(d.channel_id)?.delete(d.user_id);
         this.positions.get(d.channel_id)?.delete(d.user_id);
         this.renderParticipant(d.user_id);
+        this.e2eePeerLeft(d.channel_id, d.user_id);
         this.emit('participantLeft', d.channel_id, d.user_id);
         return;
       }
@@ -2585,6 +3020,7 @@ export class AurixClient {
         this.channelScopes.delete(d.channel_id);
         this.forgetChannelSpatial(d.channel_id);
         if (this.channelPolicies.delete(d.channel_id)) this.refreshAudioPolicy();
+        this.e2eeChannelLeft(d.channel_id);
         this.renderParticipants();
         this.emit('kicked', d.channel_id, d.reason);
         return;
@@ -2657,6 +3093,14 @@ export class AurixClient {
         this.applyParticipantLayout(d.streams);
         return;
       }
+      case 'E2eeHello': {
+        this.onE2eeHello((msg as Extract<ServerMessage, { type: 'E2eeHello' }>).data);
+        return;
+      }
+      case 'E2eeSenderKey': {
+        this.onE2eeSenderKey((msg as Extract<ServerMessage, { type: 'E2eeSenderKey' }>).data);
+        return;
+      }
       case 'WebRtcAnswer': {
         const d = (msg as Extract<ServerMessage, { type: 'WebRtcAnswer' }>).data;
         const pending = this.pendingAnswer;
@@ -2715,6 +3159,7 @@ export class AurixClient {
           clearTimeout(pending.timer);
           this.pendingJoins.delete(channelId);
           pending.reject(new Error(`${d.code}: ${d.message}`));
+          this.refreshE2eeMode();
         } else if (!moderation.done) {
           const [key, pending] = moderation.value;
           clearTimeout(pending.timer);
@@ -2872,7 +3317,13 @@ export class AurixClient {
       navigator.mediaDevices?.addEventListener?.('devicechange', this.onDeviceChange);
     }
 
-    const pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' });
+    const pcConfig: RTCConfiguration & { encodedInsertableStreams?: boolean } = {
+      iceServers,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+    };
+    if (this.e2eeGroup && this.e2eeApi === 'streams') pcConfig.encodedInsertableStreams = true;
+    const pc = new RTCPeerConnection(pcConfig);
     this.pc = pc;
     this.lossWindow.reset();
     this.startQualityTimer();
@@ -2935,6 +3386,8 @@ export class AurixClient {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription({ type: 'offer', sdp: preferStereoOpus(offer.sdp ?? '') });
+    // Mids exist now and no media flows before the answer: hook the encrypted-frame path.
+    if (this.e2eeGroup) this.attachE2eeTransforms(pc, mixed);
     // The server is ICE-lite and answers with its own host candidate, so no trickle needed:
     // wait for local gathering to finish so the offer carries our candidates.
     await this.waitForIceGathering(pc);

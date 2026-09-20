@@ -84,6 +84,49 @@ class FakeClient {
     this.attached.push(el);
   }
   detachAudioOutput() {}
+  get e2eeAvailable() {
+    return this.e2ee !== undefined;
+  }
+  get e2eeTransformApi() {
+    return this.e2ee?.api;
+  }
+  get e2eeFingerprint() {
+    return this.e2ee?.fingerprint;
+  }
+  get e2eeIdentitySecret() {
+    return this.e2ee?.secret;
+  }
+  get e2eeGeneration() {
+    return this.e2ee?.generation;
+  }
+  get e2eeStats() {
+    return this.e2ee?.stats;
+  }
+  e2eePeerFingerprint(userId) {
+    this.record('e2eePeerFingerprint', userId);
+    return this.e2ee?.peers.get(userId);
+  }
+  isE2eePeerDecryptable(userId) {
+    this.record('isE2eePeerDecryptable', userId);
+    return this.e2ee?.peers.has(userId) ?? false;
+  }
+  e2eeDecryptablePeers() {
+    return [...(this.e2ee?.peers.keys() ?? [])];
+  }
+  isChannelEncrypted(channelId) {
+    this.record('isChannelEncrypted', channelId);
+    return channelId === 'secret';
+  }
+  refreshE2eeStats() {
+    this.record('refreshE2eeStats');
+    return Promise.resolve(this.e2ee?.stats);
+  }
+  rotateE2eeKey() {
+    this.record('rotateE2eeKey');
+    if (!this.e2ee) return Promise.resolve(undefined);
+    this.e2ee.generation += 1;
+    return Promise.resolve(this.e2ee.generation);
+  }
 }
 
 function make(extraOptions = {}, bridgeOptions = {}) {
@@ -113,6 +156,79 @@ test('create validates options and forwards only the ones given', () => {
   assert.equal(handle, 1);
   assert.deepEqual(client.options, { apiUrl: 'http://api', wsUrl: 'ws://ws', token: 't', useTurn: false, pingIntervalMs: 5000, opus: { stereo: true } });
   assert.equal(client.options.refreshToken, undefined);
+});
+
+test('e2ee options: booleans pass through, the base64 identity becomes the 32-byte secret', () => {
+  assert.equal(make({ e2ee: false }).client.options.e2ee, false);
+  assert.equal(make({ e2ee: true }).client.options.e2ee, true);
+  const secret = Uint8Array.from({ length: 32 }, (_, i) => i);
+  const identity = Buffer.from(secret).toString('base64');
+  const { client } = make({ e2ee: { identity, transform: 'streams', workerUrl: '/w.js' } });
+  assert.deepEqual(client.options.e2ee, { identity: secret, transform: 'streams', workerUrl: '/w.js' });
+  assert.ok(client.options.e2ee.identity instanceof Uint8Array);
+  assert.deepEqual(make({ e2ee: {} }).client.options.e2ee, {});
+  const bridge = new AurixBridge({ document: null, createClient: (o) => new FakeClient(o) });
+  assert.throws(
+    () => bridge.create(JSON.stringify({ apiUrl: 'a', wsUrl: 'w', token: 't', e2ee: { identity: 'AAEC' } })),
+    /32-byte/,
+  );
+});
+
+test('e2ee state, stats and rotation are exposed; events are queued with named fields', async () => {
+  const { bridge, handle, client } = make({ e2ee: true });
+  const v = (method, args = {}) => ok(bridge.invoke(handle, method, JSON.stringify(args))).value;
+  assert.equal(v('e2eeAvailable'), false);
+  assert.equal(v('e2eeTransformApi'), null);
+  assert.equal(v('e2eeFingerprint'), null);
+  assert.equal(v('e2eeIdentitySecret'), null);
+  assert.equal(v('e2eeGeneration'), null);
+  assert.equal(v('e2eeStats'), null);
+  assert.deepEqual(v('e2eeDecryptablePeers'), []);
+  assert.equal(v('isE2eePeerDecryptable', { userId: 'bob' }), false);
+
+  const secret = Uint8Array.from({ length: 32 }, (_, i) => 255 - i);
+  client.e2ee = {
+    api: 'script',
+    fingerprint: 'ab12',
+    secret,
+    generation: 2,
+    stats: { framesE2ee: 10, undecryptable: 1, held: 0 },
+    peers: new Map([['alice', 'cd34']]),
+  };
+  assert.equal(v('e2eeAvailable'), true);
+  assert.equal(v('e2eeTransformApi'), 'script');
+  assert.equal(v('e2eeFingerprint'), 'ab12');
+  assert.deepEqual(Uint8Array.from(Buffer.from(v('e2eeIdentitySecret'), 'base64')), secret);
+  assert.equal(v('e2eeGeneration'), 2);
+  assert.deepEqual(v('e2eeStats'), { framesE2ee: 10, undecryptable: 1, held: 0 });
+  assert.equal(v('e2eePeerFingerprint', { userId: 'alice' }), 'cd34');
+  assert.equal(v('e2eePeerFingerprint', { userId: 'bob' }), null);
+  assert.equal(v('isE2eePeerDecryptable', { userId: 'alice' }), true);
+  assert.deepEqual(v('e2eeDecryptablePeers'), ['alice']);
+  assert.equal(v('isChannelEncrypted', { channelId: 'secret' }), true);
+  assert.equal(v('isChannelEncrypted', { channelId: 'open' }), false);
+  assert.match(JSON.parse(bridge.invoke(handle, 'isChannelEncrypted', '{}')).error.message, /channelId/);
+
+  const stats = JSON.parse(bridge.invoke(handle, 'refreshE2eeStats', '{}', 11));
+  assert.equal(stats.pending, true);
+  const rotate = JSON.parse(bridge.invoke(handle, 'rotateE2eeKey', '{}', 12));
+  assert.equal(rotate.pending, true);
+  await tick();
+  assert.deepEqual(drain(bridge, handle), [
+    { type: 'result', rid: 11, ok: true, value: { framesE2ee: 10, undecryptable: 1, held: 0 } },
+    { type: 'result', rid: 12, ok: true, value: 3 },
+  ]);
+
+  client.emit('e2eePeerKey', 'alice', 'cd34', undefined);
+  client.emit('e2eePeerKey', 'alice', 'ef56', 'cd34');
+  client.emit('e2eePeerDecryptable', 'alice', true);
+  client.emit('e2eeKeyRotated', 4);
+  assert.deepEqual(drain(bridge, handle), [
+    { type: 'e2eePeerKey', userId: 'alice', fingerprint: 'cd34', previousFingerprint: null },
+    { type: 'e2eePeerKey', userId: 'alice', fingerprint: 'ef56', previousFingerprint: 'cd34' },
+    { type: 'e2eePeerDecryptable', userId: 'alice', decryptable: true },
+    { type: 'e2eeKeyRotated', generation: 4 },
+  ]);
 });
 
 test('sync methods answer inline, unknown methods and handles fail cleanly', () => {

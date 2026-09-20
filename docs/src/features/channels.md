@@ -40,6 +40,7 @@ action token decides them at join time. A grant with `speak: false` makes the me
     "recording_enabled": false,
     "transcription": false,
     "safety_voice": false,
+    "e2ee": false,
     "positional_config": {
       "near_distance": 1.0,
       "far_distance": 50.0,
@@ -67,6 +68,11 @@ action token decides them at join time. A grant with `speak: false` makes the me
 * `stereo` (default `false`) lets participants send **two-channel Opus** — music, DJ and
   broadcast sources; see [Stereo and music uplinks](#stereo-and-music-uplinks). Off, every
   SDK encodes mono whatever the app asked for.
+* `e2ee` (default `false`) makes the channel **end-to-end encrypted**: members seal their Opus
+  frames with sender keys the node never sees, only sessions that announced the capability may
+  join (`E2EE_REQUIRED`), and everything that needs the node to hear the audio (recording,
+  transcription, safety, TTS/translation, the server mix, `ambient`, `echo`) is refused for the
+  channel — see [End-to-end encryption](e2ee.md).
 * The policy is delivered to participants as `ChannelJoinAck.audio` and, when an operator edits
   the channel, as `ChannelAudioPolicy` to everyone in it on every node (`channel.config_updated`
   event for your backend). A session in several channels applies the **merge**: the highest
@@ -370,8 +376,9 @@ browser may offer extra `recvonly` audio m-lines in its SDP; the node accepts up
   are server-only state the browser cannot reproduce, so dedicated tracks are not handed out
   there;
 * recording, transcription, safety and the cascade are untouched (they tap frames before
-  fan-out); `E2ee` speakers reach no browser on either path (the node cannot decode them
-  for the mix — see [limitations](../limitations.md)).
+  fan-out); [end-to-end encrypted](e2ee.md) speakers reach browsers **only** on dedicated
+  tracks (the node cannot decode them for the mix), so a browser with `participantStreams: 0`
+  hears nothing in an encrypted channel.
 
 Cost: no transcoding, one RTP stream and one SRTP context per track per browser; a node caps the
 count, a browser can ask for fewer (`participantStreams` in the Web SDK / Unity WebGL options).

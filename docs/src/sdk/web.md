@@ -202,8 +202,39 @@ bounded (`overflow` reports drops). This is the contract the Unity WebGL client 
 
 ## End-to-end encryption
 
-The Web SDK has no end-to-end encryption mode. Native AURX clients may mark frames with the
-`E2ee` packet flag; the node forwards such frames untouched to native receivers only and never
-decodes, mixes, records, streams or transcribes them — so they **do not reach browsers**. Media
-encryption on the Web path is DTLS-SRTP to the node plus the hop-by-hop AURX/relay encryption
-behind it (see [Security model](../concepts/security.md)).
+Channels with `e2ee: true` ([End-to-end encryption](../features/e2ee.md)) work in browsers that
+have WebCrypto and an encoded-frame API: the SDK seals each Opus frame in the sender's encoded
+stream and opens it in the receivers' per-participant tracks, so the node relays ciphertext.
+
+```ts
+const support = AurixClient.e2eeSupport();      // { crypto, transform: 'script' | 'streams' | undefined, ok }
+const client = new AurixClient({
+  apiUrl, wsUrl, token,
+  participantStreams: 16,                        // encrypted members are only audible on dedicated tracks
+  e2ee: { identity: storedSecret },              // optional: keeps the fingerprint stable across sessions
+});
+await client.connect();
+client.e2eeAvailable;                            // false → encrypted channels fail with E2EE_REQUIRED
+client.e2eeFingerprint;                          // show it so peers can compare out of band
+client.on('e2eePeerKey', (userId, fingerprint, previous) => { /* new or changed peer identity */ });
+client.on('e2eePeerDecryptable', (userId, decryptable) => { /* we hold (or lost) their sender key */ });
+client.on('e2eeKeyRotated', (generation) => {});
+client.isChannelEncrypted(channelId); client.e2eePeerFingerprint(userId);
+client.isE2eePeerDecryptable(userId); client.e2eeDecryptablePeers();
+client.e2eeStats;                                // { framesE2ee, undecryptable, held } (refreshE2eeStats() on the worker path)
+await client.rotateE2eeKey();                    // normally automatic on join/leave
+localStorage.e2ee = base64(client.e2eeIdentitySecret);
+```
+
+`e2ee: true` is the default; it only means "announce the capability when the browser has it".
+`e2ee: false` never joins encrypted channels. Without the APIs `connect()` still succeeds, but
+joining an encrypted channel is refused with `E2EE_REQUIRED` — there is no plaintext fallback,
+and the SDK never plays plaintext arriving from an encrypted channel. `transform: 'auto'`
+prefers `RTCRtpScriptTransform` (a worker built from a `blob:` URL — set `workerUrl` to a
+file serving `e2eeWorkerSource` under a strict CSP) and falls back to `createEncodedStreams()`
+(Chromium). One peer connection encrypts all of its channels or none (`E2EE_MIXED_CHANNELS`),
+encrypted members are inaudible with `participantStreams: 0` (the mixed track cannot carry
+them; the SDK emits an `error` when that happens), and the browser support matrix is in the
+[feature chapter](../features/e2ee.md#browser-support). Media encryption underneath is still
+DTLS-SRTP to the node plus the hop-by-hop AURX/relay encryption behind it
+([Security model](../concepts/security.md)).

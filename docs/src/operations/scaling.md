@@ -61,6 +61,7 @@ node takes the same decision and the limit does not depend on node clocks.
 | `join` | user | `channel_joins_per_minute` (30) |
 | `block` | user | `block_changes_per_minute` (60) |
 | `report` | user | `reports_per_minute` (10) |
+| `e2ee` | user | `e2ee_messages_per_minute` (3000) `E2eeHello` / `E2eeSenderKey` relays — a rotation costs one message per peer in the channel |
 | `admin_login` | client IP | `admin_login_per_minute` (10; a setup attempt costs two) |
 
 Per-minute limits allow the whole minute as a burst and refill continuously. REST callers get

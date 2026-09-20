@@ -83,6 +83,13 @@ namespace Aurix.Transport
         /// stereo Opus (mono μ-law on a PCMU session) under the channel's mix SSRC rather than one speaker's voice.
         /// </summary>
         public bool Mixed;
+        /// <summary>
+        /// The frame travelled end-to-end encrypted (<see cref="PacketFlags.E2ee"/>), sealed with the sender's
+        /// group key. Straight from <see cref="MediaTransport.TryDequeueAudio"/> the <see cref="Payload"/> is still
+        /// sealed and needs <see cref="Protocol.E2eeGroup.Decrypt"/>; <see cref="AurixVoiceClient.TryDequeueAudio"/>
+        /// hands it out opened. Never set together with <see cref="Mixed"/>.
+        /// </summary>
+        public bool E2ee;
         /// <summary>The encoded frame (Opus, or μ-law when <see cref="Codec"/> is <see cref="AudioCodec.Pcmu"/>).</summary>
         public byte[] Payload;
         [Obsolete("Use Payload and check Codec; the frame is not Opus on a PCMU session.")]
@@ -348,6 +355,17 @@ namespace Aurix.Transport
         /// (80/160/320/480 bytes) — anything else is dropped by the server.
         /// </summary>
         public void SendAudio(uint channelHash, uint rtpTimestamp, AudioCodec codec, byte[] frame, int length = -1, byte? level = null)
+            => SendAudio(channelHash, rtpTimestamp, codec, frame, length, level, false);
+
+        /// <summary>
+        /// Send an Opus frame already sealed by <see cref="Protocol.E2eeGroup.Encrypt"/> into an end-to-end
+        /// encrypted channel: flagged <see cref="PacketFlags.E2ee"/> so the server relays it opaque (and drops
+        /// it from channels that are not encrypted).
+        /// </summary>
+        public void SendAudioE2ee(uint channelHash, uint rtpTimestamp, byte[] sealedFrame, byte? level = null)
+            => SendAudio(channelHash, rtpTimestamp, AudioCodec.Opus, sealedFrame, -1, level, true);
+
+        private void SendAudio(uint channelHash, uint rtpTimestamp, AudioCodec codec, byte[] frame, int length, byte? level, bool e2ee)
         {
             if (length < 0) length = frame.Length;
             var payload = length == frame.Length ? frame : Slice(frame, length);
@@ -358,6 +376,7 @@ namespace Aurix.Transport
                 ? AurxPacket.AudioWithLevel(NextSeq(), rtpTimestamp, _ssrc, channelHash, level.Value, payload)
                 : AurxPacket.Audio(NextSeq(), rtpTimestamp, _ssrc, channelHash, payload);
             if (codec == AudioCodec.Pcmu) pkt.Header.Flags |= PacketFlags.Pcmu;
+            if (e2ee) pkt.Header.Flags |= PacketFlags.E2ee;
             Send(pkt);
         }
 
@@ -480,6 +499,7 @@ namespace Aurix.Transport
                         Direction = direction,
                         Codec = (pkt.Header.Flags & PacketFlags.Pcmu) != 0 ? AudioCodec.Pcmu : AudioCodec.Opus,
                         Mixed = (pkt.Header.Flags & PacketFlags.Mixed) != 0,
+                        E2ee = (pkt.Header.Flags & PacketFlags.E2ee) != 0,
                         Payload = pkt.Payload,
                     });
                     break;

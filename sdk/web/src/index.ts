@@ -9,6 +9,37 @@ export {
 } from './client.js';
 export { AurixBridge, errorInfo } from './bridge.js';
 export {
+  E2EE_CONSTANTS,
+  E2eeError,
+  E2eeGroup,
+  E2eeIdentity,
+  E2eePeerKeys,
+  E2eeReplayState,
+  E2eeSenderKey,
+  FrameCrypto,
+  attachEncodedStreams,
+  base64ToBytes,
+  bytesToBase64,
+  bytesToHex,
+  detectE2eeSupport,
+  e2eeFingerprint,
+  e2eeWorkerMain,
+  e2eeWorkerSource,
+  hexToBytes,
+  hkdfSha256,
+  x25519,
+} from './e2ee.js';
+export type {
+  E2eeFrameStats,
+  E2eeMode,
+  E2eeOutgoing,
+  E2eePeerChange,
+  E2eeSupport,
+  E2eeTransformApi,
+  E2eeWorkerMessage,
+  E2eeWorkerReply,
+} from './e2ee.js';
+export {
   SpatialRenderer,
   createAudioContext,
   directionFromListener,

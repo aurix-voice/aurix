@@ -515,6 +515,34 @@ impl Group {
         vec![Outgoing::Hello { channel_id }]
     }
 
+    /// Our membership of `channel_id` was re-acknowledged (session resume): peers absent from
+    /// the server's `members` roster left while we were away and are forgotten (rotating away
+    /// from them); a fresh hello makes the remaining members re-send keys we may have missed.
+    /// Returns the forgotten peers along with the messages to send.
+    pub fn rejoined(
+        &mut self,
+        channel_id: ChannelId,
+        members: &HashSet<UserId>,
+    ) -> (Vec<Outgoing>, Vec<UserId>) {
+        if !self.channels.contains(&channel_id) {
+            return (self.joined(channel_id), Vec::new());
+        }
+        let absent: Vec<UserId> = self
+            .peers
+            .iter()
+            .filter(|(u, p)| p.channels.contains(&channel_id) && !members.contains(u))
+            .map(|(u, _)| *u)
+            .collect();
+        let mut gone = Vec::new();
+        for user in absent {
+            self.peer_left(&channel_id, &user);
+            if !self.peers.contains_key(&user) {
+                gone.push(user);
+            }
+        }
+        (vec![Outgoing::Hello { channel_id }], gone)
+    }
+
     /// We left an encrypted channel: peers we no longer share any channel with are dropped
     /// (and our key rotates away from them).
     pub fn left(&mut self, channel_id: &ChannelId) {
@@ -748,6 +776,13 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn frame_round_trip_and_tamper() {
         let key = SenderKey::derive(3, &[7u8; 32]);
@@ -784,6 +819,44 @@ mod tests {
         let frame = key.seal(0x01020304, &[0xf8, 0xff, 0xfe, 0x00, 0x01]);
         assert_eq!(hex(&frame), "0101020304eb1575b9e6b52709cbdab928367122");
         assert_eq!(key.open(&frame).unwrap(), &[0xf8, 0xff, 0xfe, 0x00, 0x01]);
+    }
+
+    /// Fixed wrap vector shared with the Web and .NET suites (identities `[1u8; 32]` / `[2u8; 32]`).
+    #[test]
+    fn wrap_test_vector() {
+        let alice = IdentityKey::from_bytes([1u8; 32]);
+        let bob = IdentityKey::from_bytes([2u8; 32]);
+        assert_eq!(
+            hex(alice.public_key()),
+            "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209"
+        );
+        assert_eq!(
+            hex(bob.public_key()),
+            "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59"
+        );
+        assert_eq!(
+            alice.fingerprint(),
+            "1a92f23852dc908d97316a3b13578281196c1dd73d9ae5e313f3fb6b8954bf55"
+        );
+        let (enc, auth) = alice
+            .wrap_keys(bob.public_key(), alice.public_key(), bob.public_key())
+            .unwrap();
+        assert_eq!(
+            hex(&enc),
+            "d769905c2b8b1019b7e9da448b11c6b59106e1f9858efe13763ff2e3a3ab5507"
+        );
+        assert_eq!(
+            hex(&auth),
+            "e56126305aeea09d0929942837301ccdca1c74954283a0895accb5a55e6253fc"
+        );
+        // Nonce 0x42*12, generation 5, secret [9u8; 32].
+        let wrapped = hex_decode(
+            "42424242424242424242424249d1a4e521c229f2380da9fe507d631f090452c1bbc07032dcda4bba6be02de573dc00012e371ae34d5fbd125518632b",
+        );
+        assert_eq!(
+            bob.unwrap(alice.public_key(), 5, &wrapped).unwrap(),
+            [9u8; 32]
+        );
     }
 
     #[test]
@@ -984,6 +1057,34 @@ mod tests {
         assert_eq!(ga.peer_fingerprint(&b), Some(bob2.fingerprint()));
         assert!(!ga.has_key_for(&b));
         let _ = a;
+    }
+
+    #[test]
+    fn resume_forgets_departed_peers_and_rehellos() {
+        let a = user(1);
+        let b = user(2);
+        let c = user(3);
+        let mut ga = Group::new(IdentityKey::generate());
+        let bob = IdentityKey::generate();
+        let carol = IdentityKey::generate();
+        ga.joined(ch(1));
+        ga.joined(ch(2));
+        ga.on_hello(ch(1), b, *bob.public_key()).unwrap();
+        ga.on_hello(ch(2), b, *bob.public_key()).unwrap();
+        ga.on_hello(ch(1), c, *carol.public_key()).unwrap();
+        ga.rotate(false).unwrap();
+        // Resume replays channel 1 with only Bob left in it: Carol is forgotten (rotation),
+        // Bob stays known through channel 2, and we re-announce ourselves.
+        let (out, gone) = ga.rejoined(ch(1), &HashSet::from([a, b]));
+        assert_eq!(out, vec![Outgoing::Hello { channel_id: ch(1) }]);
+        assert_eq!(gone, vec![c]);
+        assert!(ga.rotation_pending());
+        assert!(ga.peer_fingerprint(&b).is_some());
+        assert!(ga.peer_fingerprint(&c).is_none());
+        // Same for a channel we did not know about: behaves like a first join.
+        let (out, gone) = ga.rejoined(ch(3), &HashSet::new());
+        assert_eq!(out, vec![Outgoing::Hello { channel_id: ch(3) }]);
+        assert!(gone.is_empty());
     }
 
     #[test]

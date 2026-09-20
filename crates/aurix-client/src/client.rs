@@ -2682,14 +2682,33 @@ fn e2ee_capability(inner: &Inner) -> ControlMessage {
     }
 }
 
-/// We joined (or re-acked after a resume) an encrypted channel: announce ourselves so the
-/// members send their keys — a resume may have missed rotations while the socket was down.
+/// We joined an encrypted channel: announce ourselves so the members send their keys. A
+/// re-ack after a resume (`replayed`) re-announces regardless — rotations may have been
+/// missed while the socket was down — and forgets peers no longer in the roster.
 async fn e2ee_joined(
     inner: &Inner,
     conn: &mut ControlConnection,
     channel_id: ChannelId,
+    replayed: bool,
+    members: &HashSet<UserId>,
 ) -> std::result::Result<(), Exit> {
-    let out = inner.e2ee.lock().joined(channel_id);
+    let (out, gone) = {
+        let mut g = inner.e2ee.lock();
+        if replayed {
+            let had: Vec<UserId> = g.decryptable_peers();
+            let (out, gone) = g.rejoined(channel_id, members);
+            let lost = had.into_iter().filter(|u| gone.contains(u)).collect();
+            (out, lost)
+        } else {
+            (g.joined(channel_id), Vec::new())
+        }
+    };
+    for user_id in gone {
+        inner.emit(Event::E2eePeerDecryptable {
+            user_id,
+            decryptable: false,
+        });
+    }
     e2ee_send(inner, conn, out).await
 }
 
@@ -2945,6 +2964,7 @@ async fn handle_message(
                 .iter()
                 .map(|b| (b.user_id, participant_from_brief(b)))
                 .collect();
+            let members: HashSet<UserId> = roster.keys().copied().collect();
             let request_id = match &pending.active_join {
                 Some((j, _)) if j.channel_id == channel_id => {
                     let (j, _) = pending.active_join.take().unwrap();
@@ -2974,7 +2994,8 @@ async fn handle_message(
             refresh_audio_policy(inner);
             inner.refresh_claims();
             if encrypted {
-                if let Err(exit) = e2ee_joined(inner, conn, channel_id).await {
+                let replayed = existed && request_id == 0;
+                if let Err(exit) = e2ee_joined(inner, conn, channel_id, replayed, &members).await {
                     return Some(exit);
                 }
             }

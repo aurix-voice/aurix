@@ -199,8 +199,13 @@ namespace Aurix.Audio
         public OpusSignal Signal;
         /// <summary>Senders may encode two channels (stereo music / broadcast); false asks for mono.</summary>
         public bool Stereo;
+        /// <summary>
+        /// Frames in this channel are end-to-end encrypted with the members' sender keys (<see cref="Protocol.E2eeGroup"/>);
+        /// the server relays them opaque and cannot mix, record or transcribe them.
+        /// </summary>
+        public bool E2ee;
 
-        /// <summary>The server's default channel policy (48 kbit/s, FEC+DTX, fullband, voice, no complexity hint, mono).</summary>
+        /// <summary>The server's default channel policy (48 kbit/s, FEC+DTX, fullband, voice, no complexity hint, mono, no E2EE).</summary>
         public static AudioPolicy Default => new AudioPolicy
         {
             BitrateBps = 48000,
@@ -211,6 +216,7 @@ namespace Aurix.Audio
             Complexity = null,
             Signal = OpusSignal.Voice,
             Stereo = false,
+            E2ee = false,
         };
 
         /// <summary>
@@ -232,6 +238,7 @@ namespace Aurix.Audio
                 : Signal == OpusSignal.Voice || o.Signal == OpusSignal.Voice ? OpusSignal.Voice
                 : OpusSignal.Auto,
             Stereo = Stereo || o.Stereo,
+            E2ee = E2ee || o.E2ee,
         };
 
         /// <summary>Merge of all policies; <see cref="Default"/> when there are none.</summary>
@@ -256,6 +263,7 @@ namespace Aurix.Audio
                 MaxBandwidth = OpusEnums.ParseBandwidth(MiniJson.GetString(o, "max_bandwidth"), d.MaxBandwidth),
                 Signal = OpusEnums.ParseSignal(MiniJson.GetString(o, "signal"), d.Signal),
                 Stereo = MiniJson.GetBool(o, "stereo", d.Stereo),
+                E2ee = MiniJson.GetBool(o, "e2ee", d.E2ee),
             };
             if (o.TryGetValue("complexity", out var c) && c is double cd) p.Complexity = (int)cd;
             return p;
@@ -271,15 +279,15 @@ namespace Aurix.Audio
 
         public bool Equals(AudioPolicy o) =>
             BitrateBps == o.BitrateBps && MinBitrateBps == o.MinBitrateBps && Fec == o.Fec && Dtx == o.Dtx &&
-            MaxBandwidth == o.MaxBandwidth && Complexity == o.Complexity && Signal == o.Signal && Stereo == o.Stereo;
+            MaxBandwidth == o.MaxBandwidth && Complexity == o.Complexity && Signal == o.Signal && Stereo == o.Stereo && E2ee == o.E2ee;
 
         public override bool Equals(object obj) => obj is AudioPolicy o && Equals(o);
 
         public override int GetHashCode() =>
-            HashCode.Combine(BitrateBps, MinBitrateBps, Fec, Dtx, (int)MaxBandwidth, Complexity ?? -1, (int)Signal, Stereo);
+            HashCode.Combine(BitrateBps, MinBitrateBps, Fec, Dtx, (int)MaxBandwidth, Complexity ?? -1, (int)Signal, HashCode.Combine(Stereo, E2ee));
 
         public override string ToString() =>
-            $"{BitrateBps} bps (min {MinBitrateBps}) {MaxBandwidth} {Signal}{(Stereo ? " stereo" : "")}" +
+            $"{BitrateBps} bps (min {MinBitrateBps}) {MaxBandwidth} {Signal}{(Stereo ? " stereo" : "")}{(E2ee ? " e2ee" : "")}" +
             $"{(Fec ? " fec" : "")}{(Dtx ? " dtx" : "")}{(Complexity.HasValue ? $" c{Complexity.Value}" : "")}";
     }
 }

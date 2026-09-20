@@ -154,6 +154,98 @@ namespace Aurix.Voice.Tests
             Assert.Equal(0, bridge.Loads);
             Assert.False(o.ContainsKey("participantStreams"), "default: as many dedicated tracks as the node allows");
             Assert.False(o.ContainsKey("spatialAudio"), "default: HRTF");
+            Assert.False(o.ContainsKey("e2ee"), "default: E2EE capability announced when the browser supports it");
+        }
+
+        [Fact]
+        public void E2eeOptionsReachTheBrowserClient()
+        {
+            var (off, bridgeOff) = NewClient();
+            off.Options.E2ee = false;
+            _ = off.ConnectAsync();
+            Assert.False(MiniJson.GetBool(bridgeOff.CreateOptions, "e2ee", true));
+
+            var (client, bridge) = NewClient();
+            var secret = new byte[32];
+            for (int i = 0; i < secret.Length; i++) secret[i] = (byte)i;
+            client.Options.E2eeIdentity = secret;
+            client.Options.E2eeTransform = WebGLE2eeTransform.EncodedStreams;
+            client.Options.E2eeWorkerUrl = "/aurix-e2ee.js";
+            _ = client.ConnectAsync();
+            var e2ee = MiniJson.AsObject(bridge.CreateOptions["e2ee"]);
+            Assert.Equal(Convert.ToBase64String(secret), MiniJson.GetString(e2ee, "identity"));
+            Assert.Equal("streams", MiniJson.GetString(e2ee, "transform"));
+            Assert.Equal("/aurix-e2ee.js", MiniJson.GetString(e2ee, "workerUrl"));
+
+            var (bad, _) = NewClient();
+            bad.Options.E2eeIdentity = new byte[31];
+            Assert.Throws<ArgumentException>(() => bad.Options.ToBridge("a", "w", "t", false, false));
+        }
+
+        [Fact]
+        public async Task E2eeCallsAndEventsUseTheSharedTypes()
+        {
+            var (client, bridge) = NewClient();
+            Assert.False(client.E2eeAvailable);
+            Assert.Null(client.E2eeFingerprint);
+            Assert.Null(client.ExportE2eeIdentity());
+            Assert.Empty(client.GetE2eeDecryptablePeers());
+
+            bridge.Replies["e2eeAvailable"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            bridge.Replies["e2eeTransformApi"] = (_, __) => "{\"ok\":true,\"value\":\"script\"}";
+            bridge.Replies["e2eeFingerprint"] = (_, __) => "{\"ok\":true,\"value\":\"ab12\"}";
+            bridge.Replies["e2eeGeneration"] = (_, __) => "{\"ok\":true,\"value\":3}";
+            bridge.Replies["e2eeIdentitySecret"] = (_, __) => "{\"ok\":true,\"value\":\"" + Convert.ToBase64String(new byte[32]) + "\"}";
+            bridge.Replies["e2eePeerFingerprint"] = (a, __) =>
+                MiniJson.GetString(a, "userId") == Alice.ToString() ? "{\"ok\":true,\"value\":\"cd34\"}" : "{\"ok\":true,\"value\":null}";
+            bridge.Replies["isE2eePeerDecryptable"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            bridge.Replies["e2eeDecryptablePeers"] = (_, __) => "{\"ok\":true,\"value\":[\"" + Alice + "\",\"" + Bob + "\"]}";
+            bridge.Replies["isChannelEncrypted"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            bridge.Async.Add("refreshE2eeStats");
+            bridge.Async.Add("rotateE2eeKey");
+            await Connect(client, bridge);
+
+            Assert.True(client.E2eeAvailable);
+            Assert.Equal("script", client.E2eeTransformApi);
+            Assert.Equal("ab12", client.E2eeFingerprint);
+            Assert.Equal(3, client.E2eeGeneration);
+            Assert.Equal(new byte[32], client.ExportE2eeIdentity());
+            Assert.Equal("cd34", client.E2eePeerFingerprint(Alice));
+            Assert.Null(client.E2eePeerFingerprint(Bob));
+            Assert.True(client.IsE2eePeerDecryptable(Bob));
+            Assert.Equal(new[] { Alice, Bob }, client.GetE2eeDecryptablePeers());
+            Assert.True(client.IsChannelEncrypted(Channel));
+            Assert.Equal(Channel.ToString(), MiniJson.GetString(bridge.Last("isChannelEncrypted").args, "channelId"));
+
+            var stats = client.GetE2eeStatsAsync();
+            bridge.Resolve(bridge.Last("refreshE2eeStats").rid,
+                new Dictionary<string, object> { { "framesE2ee", 120.0 }, { "undecryptable", 2.0 }, { "held", 5.0 } });
+            client.Update();
+            var s = await stats;
+            Assert.Equal(120, s.FramesE2ee);
+            Assert.Equal(2, s.Undecryptable);
+            Assert.Equal(5, s.Held);
+
+            var rotate = client.RotateE2eeKeyAsync();
+            bridge.Resolve(bridge.Last("rotateE2eeKey").rid, 4.0);
+            client.Update();
+            Assert.Equal(4, await rotate);
+
+            var keys = new List<(Guid, string, string)>();
+            var decryptable = new List<(Guid, bool)>();
+            var generations = new List<int>();
+            client.OnE2eePeerKey += (u, fp, prev) => keys.Add((u, fp, prev));
+            client.OnE2eePeerDecryptable += (u, d) => decryptable.Add((u, d));
+            client.OnE2eeKeyRotated += g => generations.Add(g);
+            bridge.Emit("e2eePeerKey", ("userId", Alice.ToString()), ("fingerprint", "cd34"), ("previousFingerprint", null));
+            bridge.Emit("e2eePeerKey", ("userId", Alice.ToString()), ("fingerprint", "ef56"), ("previousFingerprint", "cd34"));
+            bridge.Emit("e2eePeerDecryptable", ("userId", Alice.ToString()), ("decryptable", true));
+            bridge.Emit("e2eePeerDecryptable", ("userId", Alice.ToString()), ("decryptable", false));
+            bridge.Emit("e2eeKeyRotated", ("generation", 5.0));
+            client.Update();
+            Assert.Equal(new[] { (Alice, "cd34", (string)null), (Alice, "ef56", "cd34") }, keys);
+            Assert.Equal(new[] { (Alice, true), (Alice, false) }, decryptable);
+            Assert.Equal(new[] { 5 }, generations);
         }
 
         [Fact]

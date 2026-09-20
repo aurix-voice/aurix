@@ -38,6 +38,28 @@ namespace Aurix.Demo
             int seconds = int.Parse(Get(opt, "seconds", "12"));
 
             string channel = Get(opt, "channel", null), tokenA = Get(opt, "token-a", null), tokenB = Get(opt, "token-b", null);
+            if (Get(opt, "scenario", "audio") == "e2ee-peer")
+            {
+                if (channel == null || tokenA == null) { Console.Error.WriteLine("the e2ee-peer scenario needs --channel and --token-a"); return 2; }
+                return await E2eePeerScenario(ws, Guid.Parse(channel), tokenA, seconds, double.Parse(Get(opt, "tone", "440")), Get(opt, "identity", null));
+            }
+            if (Get(opt, "scenario", "audio") == "e2ee")
+            {
+                if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the e2ee scenario needs --api-key (creates an end-to-end encrypted channel)"); return 2; }
+                using var http = new HttpClient { BaseAddress = new Uri(api) };
+                http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                var vault = MiniJson.GetString(MiniJson.AsObject(MiniJson.Parse(await PostJson(http, "/v1/channels", new Dictionary<string, object>
+                {
+                    { "name", "csharp-demo-e2ee" },
+                    { "config", new Dictionary<string, object> { { "e2ee", true } } },
+                }))), "id");
+                var vaultId = Guid.Parse(vault);
+                var (ta, ua) = await IssueTokenWithUser(http, new[] { vault }, "alice");
+                var (tb, ub) = await IssueTokenWithUser(http, new[] { vault }, "bob");
+                var (tc, _) = await IssueTokenWithUser(http, new[] { vault }, "carol");
+                var (td, ud) = await IssueTokenWithUser(http, new[] { vault }, "dave");
+                return await E2eeScenario(http, ws, vaultId, ta, Guid.Parse(ua), tb, Guid.Parse(ub), tc, td, Guid.Parse(ud));
+            }
             if (channel == null || tokenA == null || tokenB == null)
             {
                 if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("need --api-key (or AURIX_API_KEY) or --channel/--token-a/--token-b"); return 2; }
@@ -1286,8 +1308,230 @@ namespace Aurix.Demo
             public void Dispose() { Cut(); _listener.Stop(); }
         }
 
+        /// <summary>
+        /// Group E2EE between C# clients: sender keys travel wrapped through the node, a client without
+        /// E2EE and the operator's recorder are refused, plaintext never reaches the channel, join/leave and
+        /// manual rotation change the generation, a resume keeps identity and keys.
+        /// </summary>
+        private static async Task<int> E2eeScenario(HttpClient http, string ws, Guid channelId, string tokenA, Guid aliceId, string tokenB, Guid bobId, string tokenC, string tokenD, Guid daveId)
+        {
+            var upstream = new Uri(ws);
+            using var proxy = new CutProxy(upstream.Host, upstream.Port);
+            var proxied = new UriBuilder(upstream) { Host = "127.0.0.1", Port = proxy.Port }.Uri.ToString();
+            var log = new List<string>();
+            var alice = new AurixVoiceClient(proxied, tokenA) { PingInterval = TimeSpan.FromSeconds(1) };
+            alice.Reconnect.InitialDelay = TimeSpan.FromMilliseconds(300);
+            alice.Reconnect.MaxDelay = TimeSpan.FromSeconds(1);
+            alice.Reconnect.Jitter = 0;
+            var bob = new AurixVoiceClient(ws, tokenB);
+            var carol = new AurixVoiceClient(ws, tokenC) { E2ee = false };
+            var dave = new AurixVoiceClient(ws, tokenD);
+            foreach (var (c, n) in new[] { (alice, "alice"), (bob, "bob"), (carol, "carol"), (dave, "dave") }) Hook(c, n, log);
+            var aliceGenerations = new List<int>();
+            alice.OnE2eeKeyRotated += g => { lock (aliceGenerations) aliceGenerations.Add(g); };
+            alice.OnRecovered += i => Add(log, $"alice: recovered resumed={i.Resumed}");
+
+            bool ok = true;
+            void Check(bool cond, string what) { Console.WriteLine($"{(cond ? "ok  " : "FAIL")} {what} [bob drops {bob.GetStats().E2eeUndecryptable}]"); ok &= cond; }
+
+            // A pinned identity survives export/import and gives a reproducible fingerprint.
+            var secret = new byte[E2ee.SecretLen];
+            for (int i = 0; i < secret.Length; i++) secret[i] = 7;
+            alice.SetE2eeIdentity(secret);
+            var aliceFp = alice.E2eeFingerprint;
+            Check(alice.ExportE2eeIdentity().SequenceEqual(secret), $"alice identity pinned, fingerprint {aliceFp}");
+
+            var a = await alice.ConnectAsync();
+            await bob.ConnectAsync();
+            await carol.ConnectAsync();
+            await dave.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { alice.Update(); bob.Update(); carol.Update(); dave.Update(); await Task.Delay(10); } });
+            var hash = AurixVoiceClient.ChannelHash(channelId);
+
+            // --- no E2EE support → no entry; the operator cannot record either.
+            string carolError = null;
+            try { await carol.JoinChannelAsync(channelId); } catch (InvalidOperationException e) { carolError = e.Message; }
+            Check(carolError != null && carolError.StartsWith("E2EE_REQUIRED"), $"carol (no E2EE) refused: {carolError}");
+            string recError = null;
+            try { await PostJson(http, "/v1/recordings/start", new Dictionary<string, object> { { "channel_id", channelId }, { "user_id", aliceId } }); }
+            catch (InvalidOperationException e) { recError = e.Message; }
+            Check(recError != null && recError.Contains(" 400 "), $"recording an e2ee channel refused: {recError}");
+
+            // --- alice and bob join: identities and sender keys are exchanged, each side rotates for the newcomer.
+            await alice.JoinChannelAsync(channelId);
+            await bob.JoinChannelAsync(channelId);
+            Check(await Until(() => alice.IsChannelEncrypted(channelId) && bob.IsChannelEncrypted(channelId), 3000), "both see the channel as end-to-end encrypted");
+            Check(await Until(() => alice.IsE2eePeerDecryptable(bobId) && bob.IsE2eePeerDecryptable(aliceId), 5000), "alice and bob can decrypt each other");
+            Check(bob.E2eePeerFingerprint(aliceId) == aliceFp, $"bob sees alice's real fingerprint {bob.E2eePeerFingerprint(aliceId)}");
+            Check(alice.E2eePeerFingerprint(bobId) == bob.E2eeFingerprint, $"alice sees bob's fingerprint {alice.E2eePeerFingerprint(bobId)}");
+            int genTwo = alice.E2eeGeneration;
+            Check(genTwo >= 1, $"alice rotated for bob (generation {genTwo})");
+
+            // --- audio flows sealed end to end and opens on bob's side only.
+            var heard = await StreamTone(alice, bob, hash, 80);
+            Check(heard.active >= 50 && heard.rms > 0.15 && heard.rms < 0.35, $"bob hears alice through E2EE: RMS {heard.rms:F3} over {heard.active} frames");
+            Check(heard.frames > 0 && heard.e2ee == heard.frames, $"every frame bob dequeued was E2EE ({heard.e2ee}/{heard.frames})");
+            var aStats = alice.GetStats(); var bStats = bob.GetStats();
+            Check(aStats.FramesE2ee >= 60, $"alice sealed {aStats.FramesE2ee} frames");
+            Check(bStats.E2eeUndecryptable == 0, $"bob dropped {bStats.E2eeUndecryptable} frames");
+
+            // --- plaintext cannot enter the channel: μ-law is not sent by the SDK, raw Opus is dropped by the node.
+            var ulaw = new byte[G711.FrameSamples];
+            long sentBefore = alice.Media.PacketsSent;
+            int pcmuTargets = alice.TransmitAudioFrame(AudioCodec.Pcmu, ulaw);
+            Check(pcmuTargets == 0 && alice.Media.PacketsSent == sentBefore, "μ-law frame to an e2ee channel is not sent (0 targets)");
+            using (var enc = new ConcentusOpusCodec())
+            {
+                var pcm = new float[AudioFormat.FrameSamples];
+                var opus = new byte[1275];
+                int len = enc.Encode(pcm, AudioFormat.FrameSamples, opus);
+                await Task.Delay(200);
+                while (bob.TryDequeueAudio(out _)) { } // tail of the previous tone
+                int leaked = 0;
+                long dropsBefore = bob.GetStats().E2eeUndecryptable;
+                for (int i = 0; i < 20; i++)
+                {
+                    alice.Media.SendAudio(hash, (uint)(960 * i), AudioCodec.Opus, opus, len);
+                    await Task.Delay(20);
+                    while (bob.TryDequeueAudio(out var inc)) { leaked++; Console.WriteLine($"  leaked frame e2ee={inc.E2ee} len={inc.Payload.Length}"); }
+                }
+                await Task.Delay(200);
+                while (bob.TryDequeueAudio(out _)) leaked++;
+                Console.WriteLine($"  bob media packets received {bob.Media.PacketsReceived}, drops delta {bob.GetStats().E2eeUndecryptable - dropsBefore}");
+                Check(leaked == 0 && bob.GetStats().E2eeUndecryptable == 0, $"plaintext Opus bypassing the SDK never reaches bob ({leaked} frames)");
+            }
+
+            // --- dave joins: alice rotates forward, everyone decrypts everyone.
+            await dave.JoinChannelAsync(channelId);
+            Check(await Until(() => alice.IsE2eePeerDecryptable(daveId) && dave.IsE2eePeerDecryptable(aliceId) && dave.IsE2eePeerDecryptable(bobId) && bob.IsE2eePeerDecryptable(daveId), 5000), "dave keyed with alice and bob");
+            Check(await Until(() => alice.E2eeGeneration > genTwo, 3000), $"alice rotated for dave (generation {alice.E2eeGeneration})");
+            int genThree = alice.E2eeGeneration;
+            var daveHeard = await StreamTone(alice, dave, hash, 60);
+            Check(daveHeard.active >= 35 && daveHeard.rms > 0.15 && daveHeard.rms < 0.35, $"dave hears alice after the rotation: RMS {daveHeard.rms:F3}");
+            var bobAgain = await StreamTone(alice, bob, hash, 60);
+            Check(bobAgain.active >= 35 && bobAgain.rms > 0.15, $"bob still hears alice on the new generation: RMS {bobAgain.rms:F3}");
+
+            // --- dave leaves: alice rotates away from him and forgets his key.
+            await dave.LeaveChannelAsync(channelId);
+            Check(await Until(() => alice.E2eeGeneration > genThree && !alice.IsE2eePeerDecryptable(daveId), 3000), $"alice rotated away from dave (generation {alice.E2eeGeneration}) and dropped his key");
+            await Task.Delay(150); // the new sender key is in flight on the control socket
+            var afterLeave = await StreamTone(alice, bob, hash, 60);
+            Check(afterLeave.active >= 35 && afterLeave.rms > 0.15, $"bob hears alice after dave left: RMS {afterLeave.rms:F3}");
+
+            // --- manual rotation.
+            int genBefore = alice.E2eeGeneration;
+            int? rotated = alice.RotateE2eeKey();
+            Check(rotated == genBefore + 1 && alice.E2eeGeneration == rotated, $"manual rotation → generation {rotated}");
+            await Task.Delay(300);
+            long dropsBeforeRotate = bob.GetStats().E2eeUndecryptable;
+            var afterRotate = await StreamTone(alice, bob, hash, 60);
+            Check(afterRotate.active >= 35 && afterRotate.rms > 0.15 && bob.GetStats().E2eeUndecryptable == dropsBeforeRotate, $"bob follows the manual rotation: RMS {afterRotate.rms:F3}");
+
+            // --- resume within grace keeps the identity and the keys.
+            proxy.Cut();
+            Check(await WaitState(alice, VoiceConnectionState.Reconnecting, TimeSpan.FromSeconds(5)), "alice noticed the cut");
+            Check(await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(10)), "alice is back");
+            Check(alice.Session.Resumed && alice.Session.SessionId == a.SessionId && alice.E2eeFingerprint == aliceFp, "same session, same identity after resume");
+            await Task.Delay(400);
+            Check(alice.IsE2eePeerDecryptable(bobId) && bob.IsE2eePeerDecryptable(aliceId), "keys survived the resume");
+            long dropsBeforeResume = bob.GetStats().E2eeUndecryptable;
+            var afterResume = await StreamTone(alice, bob, hash, 60);
+            Check(afterResume.active >= 35 && afterResume.rms > 0.15 && bob.GetStats().E2eeUndecryptable == dropsBeforeResume, $"bob hears alice after the resume: RMS {afterResume.rms:F3}");
+            Check(alice.GetStats().FramesE2ee > aStats.FramesE2ee, "alice keeps sealing after the resume");
+
+            await alice.LeaveChannelAsync(channelId);
+            Check(await Until(() => !bob.IsE2eePeerDecryptable(aliceId), 3000), "bob forgets alice's key when she leaves");
+            cts.Cancel();
+            try { await pump; } catch (OperationCanceledException) { }
+            alice.Dispose(); bob.Dispose(); carol.Dispose(); dave.Dispose();
+            Console.WriteLine("--- log");
+            lock (log) foreach (var l in log) Console.WriteLine(l);
+            return ok ? 0 : 1;
+        }
+
+        /// <summary>
+        /// One end of a cross-implementation E2EE check (see <c>cargo run -p aurix-client --example e2ee_peer</c>):
+        /// joins an encrypted channel, streams a tone, mixes what it decrypts and prints fingerprints and counters.
+        /// </summary>
+        private static async Task<int> E2eePeerScenario(string ws, Guid channelId, string token, int seconds, double toneHz, string identityHex)
+        {
+            var client = new AurixVoiceClient(ws, token);
+            if (identityHex != null) client.SetE2eeIdentity(Convert.FromHexString(identityHex));
+            var log = new List<string>();
+            Hook(client, "me", log);
+            client.OnE2eePeerKey += (u, fp, _) => Console.WriteLine($"peer {u} fingerprint {fp}");
+            client.OnE2eePeerDecryptable += (u, d) => Console.WriteLine($"peer {u} decryptable {d}");
+            client.OnE2eeKeyRotated += g => Console.WriteLine($"rotated {g}");
+            Console.WriteLine($"fingerprint {client.E2eeFingerprint}");
+            await client.ConnectAsync();
+            using var cts = new CancellationTokenSource();
+            var pump = Task.Run(async () => { while (!cts.IsCancellationRequested) { client.Update(); await Task.Delay(10); } });
+            try { await client.JoinChannelAsync(channelId); }
+            catch (InvalidOperationException e) { Console.WriteLine($"join refused {e.Message}"); return 1; }
+            var hash = AurixVoiceClient.ChannelHash(channelId);
+            var heard = await StreamTone(client, client, hash, seconds * 50, toneHz);
+            var st = client.GetStats();
+            Console.WriteLine($"generation {client.E2eeGeneration}");
+            Console.WriteLine($"heard active_frames={heard.active} rms={heard.rms:F3} frames={heard.frames} e2ee_frames={heard.e2ee} frames_e2ee={st.FramesE2ee} undecryptable={st.E2eeUndecryptable}");
+            await client.LeaveChannelAsync(channelId);
+            await Task.Delay(200);
+            cts.Cancel();
+            try { await pump; } catch (OperationCanceledException) { }
+            client.Dispose();
+            return 0;
+        }
+
+        /// <summary><paramref name="from"/> streams a 0.3 sine for <paramref name="frames"/> × 20 ms while <paramref name="to"/> dequeues, mixes and measures.</summary>
+        private static async Task<(int active, double rms, int frames, int e2ee)> StreamTone(AurixVoiceClient from, AurixVoiceClient to, uint hash, int frames, double toneHz = 440)
+        {
+            using var enc = new ConcentusOpusCodec();
+            var mixer = new RemoteMixer(() => new ConcentusOpusCodec());
+            var pcm = new float[AudioFormat.FrameSamples];
+            var opus = new byte[1275];
+            var outBuf = new float[AudioFormat.FrameSamples * 2];
+            var vad = new VoiceActivityDetector();
+            int active = 0, received = 0, e2ee = 0; double energy = 0; long samples = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < frames; i++)
+            {
+                for (int k = 0; k < pcm.Length; k++) pcm[k] = (float)(0.3 * Math.Sin(2 * Math.PI * toneHz * (i * pcm.Length + k) / 48000.0));
+                vad.Process(pcm, AudioFormat.FrameSamples);
+                int len = enc.Encode(pcm, AudioFormat.FrameSamples, opus);
+                from.SendOpusFrame(hash, opus, len, AudioFormat.FrameSamples, vad.Level);
+                while (to.TryDequeueAudio(out var inc))
+                {
+                    received++;
+                    if (inc.E2ee) e2ee++;
+                    mixer.Push(inc);
+                }
+                Array.Clear(outBuf, 0, outBuf.Length);
+                mixer.Mix(outBuf, 2);
+                double frameEnergy = 0;
+                foreach (var v in outBuf) frameEnergy += v * v;
+                if (frameEnergy > 0)
+                {
+                    active++;
+                    if (i >= 10) { energy += frameEnergy; samples += outBuf.Length; }
+                }
+                var wait = TimeSpan.FromMilliseconds((i + 1) * AudioFormat.FrameMs) - sw.Elapsed;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait);
+            }
+            return (active, Math.Sqrt(energy / Math.Max(1, samples)), received, e2ee);
+        }
+
+        private static async Task<bool> Until(Func<bool> cond, int timeoutMs)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline) { if (cond()) return true; await Task.Delay(20); }
+            return cond();
+        }
+
         private static void Hook(AurixVoiceClient c, string name, List<string> log)
         {
+            c.OnE2eePeerKey += (u, fp, prev) => Add(log, $"{name}: e2ee key {u} {fp}{(prev != null ? " (was " + prev + ")" : "")}");
+            c.OnE2eePeerDecryptable += (u, d) => Add(log, $"{name}: e2ee decryptable {u} {d}");
+            c.OnE2eeKeyRotated += g => Add(log, $"{name}: e2ee rotated to {g}");
             c.OnStateChanged += s => Add(log, $"{name}: state {s}");
             c.OnParticipantJoined += (_, p) => Add(log, $"{name}: joined {p.DisplayName}");
             c.OnParticipantLeft += (_, p) => Add(log, $"{name}: left {p.DisplayName}");

@@ -42,6 +42,22 @@ namespace Aurix.WebGL
         public int? ParticipantStreams;
         /// <summary>How the browser renders the dedicated tracks; <see cref="WebGLSpatialAudio.Hrtf"/> by default.</summary>
         public WebGLSpatialAudio SpatialAudio = WebGLSpatialAudio.Hrtf;
+        /// <summary>
+        /// Group end-to-end encryption. true (default): announce the capability when the browser has
+        /// WebCrypto and an encoded-frame API so channels created with <c>e2ee: true</c> can be joined
+        /// (without them the join fails with <c>E2EE_REQUIRED</c>; there is no plaintext fallback).
+        /// false: never join encrypted channels.
+        /// </summary>
+        public bool E2ee = true;
+        /// <summary>
+        /// 32-byte X25519 identity secret from an earlier <see cref="AurixWebGLVoiceClient.ExportE2eeIdentity"/>;
+        /// keeps this player's E2EE fingerprint stable across sessions. null = a fresh random identity.
+        /// </summary>
+        public byte[] E2eeIdentity;
+        /// <summary>Which encoded-frame API the browser transform uses; <see cref="WebGLE2eeTransform.Auto"/> by default.</summary>
+        public WebGLE2eeTransform E2eeTransform = WebGLE2eeTransform.Auto;
+        /// <summary>Serve the E2EE transform worker from this URL instead of a <c>blob:</c> URL (CSP without <c>worker-src blob:</c>).</summary>
+        public string E2eeWorkerUrl;
 
         internal Dictionary<string, object> ToBridge(string apiUrl, string wsUrl, string token, bool refreshToken, bool joinToken)
         {
@@ -77,6 +93,26 @@ namespace Aurix.WebGL
                 case WebGLSpatialAudio.EqualPower: o["spatialAudio"] = "equalpower"; break;
                 case WebGLSpatialAudio.None: o["spatialAudio"] = false; break;
             }
+            if (!E2ee)
+            {
+                o["e2ee"] = false;
+            }
+            else if (E2eeIdentity != null || E2eeTransform != WebGLE2eeTransform.Auto || !string.IsNullOrEmpty(E2eeWorkerUrl))
+            {
+                var e2ee = new Dictionary<string, object>();
+                if (E2eeIdentity != null)
+                {
+                    if (E2eeIdentity.Length != 32) throw new ArgumentException("E2eeIdentity must be 32 bytes", nameof(E2eeIdentity));
+                    e2ee["identity"] = Convert.ToBase64String(E2eeIdentity);
+                }
+                switch (E2eeTransform)
+                {
+                    case WebGLE2eeTransform.ScriptTransform: e2ee["transform"] = "script"; break;
+                    case WebGLE2eeTransform.EncodedStreams: e2ee["transform"] = "streams"; break;
+                }
+                if (!string.IsNullOrEmpty(E2eeWorkerUrl)) e2ee["workerUrl"] = E2eeWorkerUrl;
+                o["e2ee"] = e2ee;
+            }
             if (!string.IsNullOrEmpty(IceServersJson)) o["iceServers"] = Protocol.MiniJson.Parse(IceServersJson);
             if (!string.IsNullOrEmpty(InputDeviceId)) o["inputDeviceId"] = InputDeviceId;
             if (Reconnect != null)
@@ -105,6 +141,28 @@ namespace Aurix.WebGL
         /// the dedicated speakers stay silent — prefer <see cref="Hrtf"/> unless you know why.
         /// </summary>
         None,
+    }
+
+    /// <summary>Browser API that encrypts/decrypts encoded Opus frames for E2EE channels.</summary>
+    public enum WebGLE2eeTransform
+    {
+        /// <summary>Prefer <c>RTCRtpScriptTransform</c> (worker), fall back to <c>createEncodedStreams()</c>.</summary>
+        Auto,
+        /// <summary>Only <c>RTCRtpScriptTransform</c>.</summary>
+        ScriptTransform,
+        /// <summary>Only Chromium's <c>createEncodedStreams()</c>.</summary>
+        EncodedStreams,
+    }
+
+    /// <summary>Counters of the browser's encrypted-frame path (see <see cref="AurixWebGLVoiceClient.GetE2eeStatsAsync"/>).</summary>
+    public struct WebGLE2eeStats
+    {
+        /// <summary>Frames sealed on the uplink plus frames opened on the downlink.</summary>
+        public long FramesE2ee;
+        /// <summary>Received frames dropped because no key of their sender could open them.</summary>
+        public long Undecryptable;
+        /// <summary>Uplink frames dropped while the channel's encryption state was still unknown.</summary>
+        public long Held;
     }
 
     /// <summary>One negotiated per-participant WebRTC track (<c>ParticipantStreams</c> snapshot).</summary>

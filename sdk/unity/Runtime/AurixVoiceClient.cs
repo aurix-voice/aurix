@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using Aurix.Audio;
@@ -230,6 +231,11 @@ namespace Aurix
         private readonly LossWindow _lossWindow = new LossWindow();
         private DateTime _lastQualityReport = DateTime.MinValue;
         private NetworkQuality? _serverQuality;
+        private E2eeGroup _e2ee = new E2eeGroup(E2eeIdentityKey.Generate());
+        private DateTime? _e2eeRotateDue;
+        private long _framesE2ee;
+        private long _e2eeUndecryptable;
+        private static readonly TimeSpan E2eeRotateDebounce = TimeSpan.FromMilliseconds(200);
 
         public VoiceConnectionState State { get; private set; } = VoiceConnectionState.Disconnected;
         public SessionInfo Session { get; private set; }
@@ -292,6 +298,212 @@ namespace Aurix
         public TimeSpan ResumeGrace { get; private set; }
         /// <summary>Channels currently joined (restored across reconnects).</summary>
         public IReadOnlyCollection<Guid> JoinedChannels { get { lock (_channels) return new List<Guid>(_joinedChannels); } }
+
+        // ---- end-to-end encryption ---------------------------------------------------------------
+
+        /// <summary>
+        /// Announce end-to-end encryption support and take part in the sender-key exchange of <c>e2ee</c>
+        /// channels (<see cref="E2eeGroup"/>): frames sent there are sealed with our sender key before they
+        /// enter the AURX packet, and members' frames are opened with theirs; the server relays keys and
+        /// frames opaque and cannot mix, record or transcribe them. Off, the server refuses to join such a
+        /// channel (<c>E2EE_REQUIRED</c>) — there is no plaintext fallback. Set before <see cref="ConnectAsync"/>.
+        /// </summary>
+        public bool E2ee { get; set; } = true;
+        /// <summary>Fingerprint of our X25519 identity, as peers see it in <see cref="OnE2eePeerKey"/>.</summary>
+        public string E2eeFingerprint { get { lock (_e2ee) return _e2ee.Identity.Fingerprint; } }
+        /// <summary>Generation of our current sender key (bumps on every rotation).</summary>
+        public int E2eeGeneration { get { lock (_e2ee) return _e2ee.Generation; } }
+
+        /// <summary>
+        /// The 32-byte identity secret to persist and pass to <see cref="SetE2eeIdentity"/> next run: a
+        /// stable fingerprint lets peers pin it (a fresh one per run shows up as <c>KeyChanged</c>).
+        /// </summary>
+        public byte[] ExportE2eeIdentity() { lock (_e2ee) return _e2ee.Identity.ExportSecret(); }
+
+        /// <summary>Use a previously exported identity secret; only while disconnected.</summary>
+        public void SetE2eeIdentity(byte[] secret)
+        {
+            if (State != VoiceConnectionState.Disconnected && State != VoiceConnectionState.Failed)
+                throw new InvalidOperationException("the E2EE identity can only be set while disconnected");
+            var identity = E2eeIdentityKey.FromBytes(secret);
+            lock (_e2ee) _e2ee = new E2eeGroup(identity);
+        }
+
+        /// <summary>Fingerprint of <paramref name="userId"/>'s identity key, or null before it announced itself to us.</summary>
+        public string E2eePeerFingerprint(Guid userId) { lock (_e2ee) return _e2ee.PeerFingerprint(userId); }
+        /// <summary>Whether we hold a sender key of <paramref name="userId"/>, i.e. can open their frames.</summary>
+        public bool IsE2eePeerDecryptable(Guid userId) { lock (_e2ee) return _e2ee.HasKeyFor(userId); }
+        /// <summary>Peers whose frames we can currently open.</summary>
+        public IReadOnlyList<Guid> GetE2eeDecryptablePeers() { lock (_e2ee) return _e2ee.DecryptablePeers(); }
+        /// <summary>Whether <paramref name="channelId"/> is a joined end-to-end encrypted channel.</summary>
+        public bool IsChannelEncrypted(Guid channelId)
+        {
+            lock (_channels) return _channelPolicies.TryGetValue(channelId, out var p) && p.E2ee;
+        }
+
+        /// <summary>
+        /// Rotate our sender key now (join/leave rotate automatically) and send it to every peer. Returns
+        /// the new generation, or null when the control connection is down.
+        /// </summary>
+        public int? RotateE2eeKey()
+        {
+            var control = _control;
+            if (control == null || !control.IsOpen) return null;
+            List<E2eeOutgoing> outgoing;
+            int generation;
+            lock (_e2ee)
+            {
+                outgoing = _e2ee.Rotate(true);
+                generation = _e2ee.Generation;
+            }
+            _e2eeRotateDue = null;
+            E2eeSend(control, outgoing);
+            OnE2eeKeyRotated?.Invoke(generation);
+            return generation;
+        }
+
+        private void E2eeSend(ControlChannel control, List<E2eeOutgoing> outgoing)
+        {
+            if (outgoing.Count == 0) return;
+            byte[] pk;
+            lock (_e2ee) pk = _e2ee.Identity.PublicKey;
+            foreach (var o in outgoing)
+            {
+                var json = o.Kind == E2eeOutgoingKind.Hello
+                    ? ControlMessage.E2eeHello(o.ChannelId, pk)
+                    : ControlMessage.E2eeSenderKey(o.ChannelId, o.To, pk, o.Generation, o.Wrapped);
+                _ = control.SendAsync(json);
+            }
+        }
+
+        /// <summary>
+        /// A <c>ChannelJoinAck</c> for an encrypted channel: a first join announces us, a re-ack (session
+        /// resume replays them) forgets members who left meanwhile and re-announces.
+        /// </summary>
+        private void E2eeJoined(Guid channelId, List<Guid> members)
+        {
+            var control = _control;
+            if (control == null) return;
+            List<E2eeOutgoing> outgoing;
+            var gone = new List<Guid>();
+            lock (_e2ee) outgoing = _e2ee.Rejoined(channelId, members, gone);
+            E2eeSend(control, outgoing);
+            foreach (var user in gone) { var u = user; Post(() => OnE2eePeerDecryptable?.Invoke(u, false)); }
+        }
+
+        private void E2eeLeft(Guid channelId)
+        {
+            List<Guid> before, after;
+            lock (_e2ee)
+            {
+                if (!_e2ee.IsEncrypted(channelId)) return;
+                before = _e2ee.DecryptablePeers();
+                _e2ee.Left(channelId);
+                after = _e2ee.DecryptablePeers();
+            }
+            E2eeReportLost(before, after);
+        }
+
+        private void E2eePeerLeft(Guid channelId, Guid userId)
+        {
+            bool lost;
+            lock (_e2ee)
+            {
+                bool had = _e2ee.HasKeyFor(userId);
+                _e2ee.PeerLeft(channelId, userId);
+                lost = had && !_e2ee.HasKeyFor(userId);
+            }
+            if (lost) Post(() => OnE2eePeerDecryptable?.Invoke(userId, false));
+        }
+
+        private void E2eeReset()
+        {
+            List<Guid> before;
+            lock (_e2ee)
+            {
+                before = _e2ee.DecryptablePeers();
+                _e2ee.Reset();
+            }
+            _e2eeRotateDue = null;
+            E2eeReportLost(before, new List<Guid>());
+        }
+
+        private void E2eeReportLost(List<Guid> before, List<Guid> after)
+        {
+            foreach (var user in before)
+                if (!after.Contains(user)) { var u = user; Post(() => OnE2eePeerDecryptable?.Invoke(u, false)); }
+        }
+
+        private void E2eeOnHello(Guid channelId, Guid userId, byte[] publicKey)
+        {
+            var control = _control;
+            if (control == null) return;
+            List<E2eeOutgoing> outgoing;
+            E2eePeerChange change;
+            string fingerprint;
+            bool decryptableBefore;
+            lock (_e2ee)
+            {
+                if (!_e2ee.IsEncrypted(channelId)) return;
+                decryptableBefore = _e2ee.HasKeyFor(userId);
+                outgoing = _e2ee.OnHello(channelId, userId, publicKey, out change);
+                fingerprint = _e2ee.PeerFingerprint(userId);
+            }
+            E2eeSend(control, outgoing);
+            E2eeEmitChange(userId, fingerprint, change, decryptableBefore);
+        }
+
+        private void E2eeOnSenderKey(Guid channelId, Guid userId, byte[] publicKey, byte generation, byte[] wrapped)
+        {
+            var control = _control;
+            if (control == null) return;
+            List<E2eeOutgoing> outgoing;
+            E2eePeerChange change;
+            string fingerprint;
+            bool decryptableBefore;
+            lock (_e2ee)
+            {
+                if (!_e2ee.IsEncrypted(channelId)) return;
+                decryptableBefore = _e2ee.HasKeyFor(userId);
+                try { outgoing = _e2ee.OnSenderKey(channelId, userId, publicKey, generation, wrapped, out change); }
+                catch (CryptographicException) { return; } // not wrapped for us / forged: keep what we had
+                fingerprint = _e2ee.PeerFingerprint(userId);
+            }
+            E2eeSend(control, outgoing);
+            E2eeEmitChange(userId, fingerprint, change, decryptableBefore);
+        }
+
+        private void E2eeEmitChange(Guid userId, string fingerprint, E2eePeerChange change, bool decryptableBefore)
+        {
+            if (change.Kind == E2eePeerChangeKind.New) OnE2eePeerKey?.Invoke(userId, fingerprint, null);
+            else if (change.Kind == E2eePeerChangeKind.KeyChanged) OnE2eePeerKey?.Invoke(userId, fingerprint, change.PreviousFingerprint);
+            bool decryptable;
+            lock (_e2ee) decryptable = _e2ee.HasKeyFor(userId);
+            if (decryptable != decryptableBefore) OnE2eePeerDecryptable?.Invoke(userId, decryptable);
+        }
+
+        /// <summary>Performs a due rotation a little after it was requested, so a join wave costs one rotation.</summary>
+        private void E2eeRotateTick()
+        {
+            var control = _control;
+            if (control == null || !control.IsOpen) { _e2eeRotateDue = null; return; }
+            bool pending, active;
+            lock (_e2ee) { pending = _e2ee.RotationPending; active = _e2ee.Active; }
+            if (!pending || !active) { _e2eeRotateDue = null; return; }
+            var now = DateTime.UtcNow;
+            if (!_e2eeRotateDue.HasValue) { _e2eeRotateDue = now + E2eeRotateDebounce; return; }
+            if (now < _e2eeRotateDue.Value) return;
+            List<E2eeOutgoing> outgoing;
+            int generation;
+            lock (_e2ee)
+            {
+                outgoing = _e2ee.Rotate(false);
+                generation = _e2ee.Generation;
+            }
+            _e2eeRotateDue = null;
+            E2eeSend(control, outgoing);
+            OnE2eeKeyRotated?.Invoke(generation);
+        }
 
         /// <summary>Merged audio policy of the joined channels (kept after leaving the last one); <c>null</c> before the first join.</summary>
         public AudioPolicy? AudioPolicy { get { lock (_channels) return _audioPolicy; } }
@@ -512,6 +724,15 @@ namespace Aurix
         public event Action<string> OnSessionClosed;
         /// <summary>Verified downlink frame: (participant or null if unknown SSRC, frame).</summary>
         public event Action<Participant, IncomingAudio> OnAudio;
+        /// <summary>
+        /// A peer's identity key was learnt (<c>(userId, fingerprint, null)</c>) or changed
+        /// (<c>(userId, fingerprint, previousFingerprint)</c>) — show it for out-of-band verification.
+        /// </summary>
+        public event Action<Guid, string, string> OnE2eePeerKey;
+        /// <summary>Whether we can open <c>userId</c>'s frames changed (their sender key arrived / they left every shared channel).</summary>
+        public event Action<Guid, bool> OnE2eePeerDecryptable;
+        /// <summary>Our sender key rotated to the given generation.</summary>
+        public event Action<int> OnE2eeKeyRotated;
         /// <summary>Every raw control message, for diagnostics/extensions.</summary>
         public event Action<ControlMessage> OnControlMessage;
 
@@ -677,6 +898,12 @@ namespace Aurix
                 _lastPong = _lastPing;
                 _probeDeadline = DateTime.MaxValue;
                 SetState(VoiceConnectionState.Connected);
+                if (E2ee)
+                {
+                    byte[] pk;
+                    lock (_e2ee) pk = _e2ee.Identity.PublicKey;
+                    await control.SendAsync(ControlMessage.E2eeHello(null, pk), ct).ConfigureAwait(false);
+                }
                 return info;
             }
             catch
@@ -975,6 +1202,7 @@ namespace Aurix
                     _channels.Remove(channelId);
                 }
             }
+            E2eeLeft(channelId);
             RefreshAudioPolicy();
             Post(() => OnChannelLeft?.Invoke(channelId));
         }
@@ -1568,7 +1796,8 @@ namespace Aurix
             if (_media == null || State != VoiceConnectionState.MediaBound) return;
             _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
             if (_muted || !AllowsHash(channelHash)) return;
-            _media.SendAudio(channelHash, _rtpTimestamp, codec, frame, length, level);
+            byte[] sealedFrame = null;
+            SendToTarget(_media, channelHash, IsHashEncrypted(channelHash), _rtpTimestamp, codec, frame, length, level, ref sealedFrame);
         }
 
         /// <summary>
@@ -1586,13 +1815,44 @@ namespace Aurix
             if (_media == null || State != VoiceConnectionState.MediaBound) return 0;
             _rtpTimestamp = unchecked(_rtpTimestamp + (uint)samplesPerChannel);
             if (_muted) return 0;
-            var targets = new List<Guid>();
+            var targets = new List<KeyValuePair<uint, bool>>();
             lock (_channels)
                 foreach (var ch in _joinedChannels)
-                    if (_transmission.Allows(ch)) targets.Add(ch);
-            foreach (var ch in targets)
-                _media.SendAudio(ChannelHash(ch), _rtpTimestamp, codec, frame, length, level);
-            return targets.Count;
+                    if (_transmission.Allows(ch))
+                        targets.Add(new KeyValuePair<uint, bool>(ChannelHash(ch), _channelPolicies.TryGetValue(ch, out var p) && p.E2ee));
+            int sent = 0;
+            byte[] sealedFrame = null;
+            foreach (var t in targets)
+                if (SendToTarget(_media, t.Key, t.Value, _rtpTimestamp, codec, frame, length, level, ref sealedFrame)) sent++;
+            return sent;
+        }
+
+        /// <summary>
+        /// Hand one frame to the transport for a channel, sealing it once (<paramref name="sealedFrame"/> is
+        /// reused across encrypted targets) when the channel is end-to-end encrypted. Only Opus goes to
+        /// encrypted channels: a μ-law frame would need the server to transcode it, so it is not sent.
+        /// </summary>
+        private bool SendToTarget(MediaTransport media, uint channelHash, bool encrypted, uint ts, AudioCodec codec, byte[] frame, int length, byte? level, ref byte[] sealedFrame)
+        {
+            if (!encrypted)
+            {
+                media.SendAudio(channelHash, ts, codec, frame, length, level);
+                return true;
+            }
+            if (codec != AudioCodec.Opus) return false;
+            if (sealedFrame == null)
+                lock (_e2ee) sealedFrame = _e2ee.Encrypt(frame, 0, length < 0 ? frame.Length : length);
+            media.SendAudioE2ee(channelHash, ts, sealedFrame, level);
+            Interlocked.Increment(ref _framesE2ee);
+            return true;
+        }
+
+        private bool IsHashEncrypted(uint channelHash)
+        {
+            lock (_channels)
+                foreach (var kv in _channelPolicies)
+                    if (kv.Value.E2ee && ChannelHash(kv.Key) == channelHash) return true;
+            return false;
         }
 
         private bool AllowsHash(uint channelHash)
@@ -1655,7 +1915,11 @@ namespace Aurix
         {
             var media = _media;
             var mixer = Mixer;
-            var s = new VoiceStats { State = State, ControlRttMs = ControlRttMs, Server = _serverQuality };
+            var s = new VoiceStats
+            {
+                State = State, ControlRttMs = ControlRttMs, Server = _serverQuality,
+                FramesE2ee = Interlocked.Read(ref _framesE2ee), E2eeUndecryptable = Interlocked.Read(ref _e2eeUndecryptable),
+            };
             if (media != null)
             {
                 var rtt = media.Rtt;
@@ -1721,11 +1985,38 @@ namespace Aurix
         /// <summary>True for SSRCs of server-synthesized speech (a participant's TTS voice or a channel announcement).</summary>
         public static bool IsSynthesizedSsrc(uint ssrc) => (ssrc & AurxPacket.SynthSsrcFlag) != 0;
 
-        /// <summary>Non-event alternative to <see cref="OnAudio"/> for audio-thread consumers.</summary>
+        /// <summary>
+        /// Non-event alternative to <see cref="OnAudio"/> for audio-thread consumers. Frames of end-to-end
+        /// encrypted channels come out opened (<see cref="IncomingAudio.E2ee"/> stays set); ones that cannot
+        /// be opened — sender unknown, key not yet received, replay, tamper — and plaintext frames on an
+        /// encrypted channel are dropped (<see cref="VoiceStats.E2eeUndecryptable"/>).
+        /// </summary>
         public bool TryDequeueAudio(out IncomingAudio audio)
         {
-            if (_media != null) return _media.TryDequeueAudio(out audio);
+            var media = _media;
+            if (media != null) return DequeueAudio(media, out audio);
             audio = default;
+            return false;
+        }
+
+        private bool DequeueAudio(MediaTransport media, out IncomingAudio audio)
+        {
+            while (media.TryDequeueAudio(out audio))
+            {
+                if (audio.E2ee)
+                {
+                    if (audio.Mixed) { Interlocked.Increment(ref _e2eeUndecryptable); continue; }
+                    var sender = FindBySsrc(audio.SenderSsrc);
+                    byte[] plain = null;
+                    if (sender != null) lock (_e2ee) plain = _e2ee.Decrypt(sender.UserId, audio.Payload);
+                    if (plain == null) { Interlocked.Increment(ref _e2eeUndecryptable); continue; }
+                    audio.Payload = plain;
+                    return true;
+                }
+                // Plaintext on an encrypted channel is never played: only the members' keys speak there.
+                if (IsHashEncrypted(audio.ChannelHash)) { Interlocked.Increment(ref _e2eeUndecryptable); continue; }
+                return true;
+            }
             return false;
         }
 
@@ -1742,8 +2033,10 @@ namespace Aurix
 
             if (drainAudioToEvent && _media != null)
             {
-                while (_media.TryDequeueAudio(out var a)) OnAudio?.Invoke(FindBySsrc(a.SenderSsrc), a);
+                while (DequeueAudio(_media, out var a)) OnAudio?.Invoke(FindBySsrc(a.SenderSsrc), a);
             }
+
+            E2eeRotateTick();
 
             if (_media != null && _control != null && _control.IsOpen && State == VoiceConnectionState.MediaBound)
                 DriveMediaPath(_media, _control);
@@ -1827,6 +2120,7 @@ namespace Aurix
             _joinTcs?.TrySetException(new OperationCanceledException("disconnected"));
             FailPendingChat(new OperationCanceledException("disconnected"));
             lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; _activeDownlink = DownlinkMode.Streams; }
+            E2eeReset();
         }
 
         /// <summary>Runs on the Update thread when a control channel closes or fails.</summary>
@@ -1941,6 +2235,7 @@ namespace Aurix
                     _bySsrc.Clear();
                     _channelPolicies.Clear();
                 }
+                E2eeReset();
                 foreach (var ch in rejoin) { var id = ch; Post(() => OnChannelLeft?.Invoke(id)); }
                 await ReplayReceiverPrefsAsync(ct).ConfigureAwait(false);
             }
@@ -1965,6 +2260,7 @@ namespace Aurix
                 {
                     var channelId = m.Id("channel_id");
                     var roster = new List<Participant>();
+                    bool encrypted;
                     lock (_channels)
                     {
                         var map = new Dictionary<Guid, Participant>();
@@ -1998,8 +2294,16 @@ namespace Aurix
                         };
                         var policy = Audio.AudioPolicy.FromMessage(m);
                         if (policy.HasValue) _channelPolicies[channelId] = policy.Value;
+                        encrypted = policy.HasValue && policy.Value.E2ee;
                     }
                     RefreshAudioPolicy();
+                    if (encrypted)
+                    {
+                        var members = new List<Guid>(roster.Count);
+                        foreach (var p in roster) members.Add(p.UserId);
+                        E2eeJoined(channelId, members);
+                    }
+                    else E2eeLeft(channelId);
                     OnChannelJoined?.Invoke(channelId, roster);
                     break;
                 }
@@ -2048,7 +2352,11 @@ namespace Aurix
                             _media?.ForgetSender(p.Ssrc);
                         }
                     }
-                    if (p != null) OnParticipantLeft?.Invoke(channelId, p);
+                    if (p != null)
+                    {
+                        E2eePeerLeft(channelId, p.UserId);
+                        OnParticipantLeft?.Invoke(channelId, p);
+                    }
                     break;
                 }
                 case "MuteStateChanged":
@@ -2109,8 +2417,30 @@ namespace Aurix
                 {
                     var channelId = m.Id("channel_id");
                     lock (_channels) { _channels.Remove(channelId); _joinedChannels.Remove(channelId); _channelPolicies.Remove(channelId); _channelInfos.Remove(channelId); }
+                    E2eeLeft(channelId);
                     RefreshAudioPolicy();
                     OnKicked?.Invoke(channelId, m.Str("reason") ?? string.Empty);
+                    break;
+                }
+                case "E2eeHello":
+                {
+                    // Only trustworthy with the server-authenticated sender and a channel scope.
+                    var channelId = MiniJson.GetGuid(m.Data, "channel_id");
+                    var userId = MiniJson.GetGuid(m.Data, "user_id");
+                    var pk = Protocol.E2ee.ParsePublicKey(m.Str("public_key"));
+                    if (!channelId.HasValue || !userId.HasValue || pk == null) break;
+                    E2eeOnHello(channelId.Value, userId.Value, pk);
+                    break;
+                }
+                case "E2eeSenderKey":
+                {
+                    var channelId = MiniJson.GetGuid(m.Data, "channel_id");
+                    var from = MiniJson.GetGuid(m.Data, "from");
+                    var pk = Protocol.E2ee.ParsePublicKey(m.Str("public_key"));
+                    var wrapped = Protocol.E2ee.DecodeBytes(m.Str("key"));
+                    var generation = m.Data != null && m.Data.ContainsKey("generation") ? m.Num("generation") : -1;
+                    if (!channelId.HasValue || !from.HasValue || pk == null || wrapped == null || generation < 0 || generation > 255) break;
+                    E2eeOnSenderKey(channelId.Value, from.Value, pk, (byte)generation, wrapped);
                     break;
                 }
                 case "UserBlockChanged":

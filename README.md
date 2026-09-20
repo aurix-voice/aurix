@@ -28,6 +28,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > caps, a server mix for native clients), cross-node failover with Redis session mirrors, a
 > region-aware cascade backbone, stereo/music uplinks, per-participant PCM for engine
 > spatialization, per-participant WebRTC tracks with Web Audio HRTF for browsers / Unity WebGL,
+> group end-to-end encrypted channels (native + browser),
 > fleet-wide rate limits, recording mixdown + post-hoc STT, live translation,
 > chat history/offline delivery/read markers, IPv6 dual-stack, admin SSO + roles, usage
 > analytics/quotas, and Web / Unity (incl. WebGL) / native (C ABI) / Unreal / Godot SDKs.
@@ -83,6 +84,15 @@ quick start, protocols, SDK guides, operations. The REST contract is
   the downlink individually for every receiver with that receiver's keys, so no participant can
   read another participant's packets even on a shared network.
 * WebRTC uses DTLS-SRTP; the browser's SSRCs are mapped to the authenticated session.
+* **End-to-end encrypted channels** (`"config": {"e2ee": true}`): members seal their Opus
+  frames with per-sender group keys (AES-256-CTR + HMAC-SHA256; keys wrapped per peer via
+  X25519 + HKDF and rotated on every join/leave) that the node never sees — it authenticates
+  membership, relays the wrapped keys and forwards ciphertext, and cannot mix, record,
+  transcribe, translate or classify those channels. Supported by the native core (Rust / C ABI /
+  Unreal; Godot encrypts through the core but does not bind the fingerprint API yet), Unity
+  (managed C#) and browsers via WebCrypto + encoded-frame transforms
+  (`RTCRtpScriptTransform` / `createEncodedStreams()`); sessions that cannot encrypt are refused
+  with `E2EE_REQUIRED` instead of being served plaintext ([docs](docs/src/features/e2ee.md)).
 * Tenant identity always comes from the validated API key / JWT — never from request bodies.
 * **One-time action tokens** (`POST /v1/tokens/action`): short-lived (90 s by default) JWTs with a
   unique `jti` that authorise exactly one `login`, `join`, `kick`, `mute` or `unmute`. The first

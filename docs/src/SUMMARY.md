@@ -28,6 +28,7 @@
 - [Recordings and live audio streams](features/recordings.md)
 - [Transcripts and text-to-speech](features/speech.md)
 - [Content safety](features/safety.md)
+- [End-to-end encryption](features/e2ee.md)
 - [Network quality and statistics](features/quality.md)
 
 # Client SDKs
