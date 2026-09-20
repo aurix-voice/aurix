@@ -170,11 +170,79 @@ namespace Aurix.Protocol
         public object Metadata;
         public DateTimeOffset SentAt;
         public string ClientRef;
+        /// <summary>
+        /// Directed message that waited for the recipient: replayed on connect (see
+        /// <c>OnChatInboxSynced</c>) or, on the sender's own echo, stored because the recipient is offline.
+        /// </summary>
+        public bool Offline;
 
         public bool IsSystem => FromUserId == SystemUserId;
         public bool IsDirect => ToUserId.HasValue;
         /// <summary>Echo of a message this client sent (the server returns <c>client_ref</c> only to the sender).</summary>
         public bool IsOwn => ClientRef != null;
+        /// <summary>Opaque history cursor of this message (<c>before</c>/<c>after</c> of a history request).</summary>
+        public string Cursor => ChatCursor.Encode(SentAt, Id);
+    }
+
+    /// <summary>
+    /// The server's opaque history cursor: URL-safe base64 (no padding) of the big-endian microsecond Unix
+    /// timestamp followed by the 16 UUID bytes (RFC 4122 byte order). Computed locally so any message can
+    /// anchor a history page.
+    /// </summary>
+    public static class ChatCursor
+    {
+        public static string Encode(DateTimeOffset sentAt, Guid id)
+        {
+            long micros = sentAt.UtcTicks / 10 - 62135596800000000L;
+            var bytes = new byte[24];
+            for (int i = 0; i < 8; i++) bytes[i] = (byte)(micros >> (56 - 8 * i));
+            Array.Copy(UuidBytes(id), 0, bytes, 8, 16);
+            return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        /// <summary>Wire-order (big-endian) UUID bytes; <see cref="Guid.ToByteArray"/> is little-endian for the first three groups.</summary>
+        private static byte[] UuidBytes(Guid id)
+        {
+            var b = id.ToByteArray();
+            return new[]
+            {
+                b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            };
+        }
+    }
+
+    /// <summary>One page of stored chat history, newest first.</summary>
+    public sealed class ChatHistoryPage
+    {
+        public Guid? ChannelId;
+        /// <summary>The other party of a direct conversation.</summary>
+        public Guid? PeerUserId;
+        public List<ChatMessage> Messages = new List<ChatMessage>();
+        /// <summary>Cursor for the next older page, or null when the beginning was reached.</summary>
+        public string NextBefore;
+        /// <summary>Cursor for the next newer page, or null when the page is the most recent.</summary>
+        public string NextAfter;
+    }
+
+    /// <summary>A user's reading position in a channel or a direct conversation.</summary>
+    public sealed class ChatReadMarker
+    {
+        public Guid UserId;
+        public Guid? ChannelId;
+        public Guid? PeerUserId;
+        public Guid MessageId;
+        public DateTimeOffset MessageSentAt;
+        public DateTimeOffset ReadAt;
+    }
+
+    /// <summary>Result of a read-marker query: the markers plus this user's unread count (capped by the server).</summary>
+    public sealed class ChatReadMarkers
+    {
+        public Guid? ChannelId;
+        public Guid? PeerUserId;
+        public List<ChatReadMarker> Markers = new List<ChatReadMarker>();
+        public int UnreadCount;
     }
 
     /// <summary>Server-side speech-to-text of one utterance in a channel with transcription enabled (never stored).</summary>
@@ -468,11 +536,19 @@ namespace Aurix.Protocol
         }
 
         /// <summary>Typed view of a <c>ChatMessageReceived</c> payload (<c>data.message</c>); null if absent.</summary>
-        public ChatMessage ChatMessage()
+        public ChatMessage ChatMessage() =>
+            ParseChatMessage(MiniJson.AsObject(Data != null && Data.TryGetValue("message", out var v) ? v : null));
+
+        private static DateTimeOffset ParseTime(Dictionary<string, object> o, string key)
         {
-            var o = MiniJson.AsObject(Data != null && Data.TryGetValue("message", out var v) ? v : null);
+            var s = MiniJson.GetString(o, key);
+            return s != null && DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTimeOffset.MinValue;
+        }
+
+        private static ChatMessage ParseChatMessage(Dictionary<string, object> o)
+        {
             if (o == null) return null;
-            var sentAt = MiniJson.GetString(o, "sent_at");
             return new ChatMessage
             {
                 Id = MiniJson.GetGuid(o, "id") ?? Guid.Empty,
@@ -482,10 +558,67 @@ namespace Aurix.Protocol
                 ToUserId = MiniJson.GetGuid(o, "to_user_id"),
                 Text = MiniJson.GetString(o, "text") ?? string.Empty,
                 Metadata = o.TryGetValue("metadata", out var md) ? md : null,
-                SentAt = sentAt != null && DateTimeOffset.TryParse(sentAt, System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTimeOffset.MinValue,
+                SentAt = ParseTime(o, "sent_at"),
                 ClientRef = MiniJson.GetString(o, "client_ref"),
+                Offline = MiniJson.GetBool(o, "offline"),
             };
+        }
+
+        private static ChatReadMarker ParseReadMarker(Dictionary<string, object> o)
+        {
+            if (o == null) return null;
+            return new ChatReadMarker
+            {
+                UserId = MiniJson.GetGuid(o, "user_id") ?? Guid.Empty,
+                ChannelId = MiniJson.GetGuid(o, "channel_id"),
+                PeerUserId = MiniJson.GetGuid(o, "peer_user_id"),
+                MessageId = MiniJson.GetGuid(o, "message_id") ?? Guid.Empty,
+                MessageSentAt = ParseTime(o, "message_sent_at"),
+                ReadAt = ParseTime(o, "read_at"),
+            };
+        }
+
+        /// <summary>Typed view of a <c>ChatHistoryResult</c> payload.</summary>
+        public ChatHistoryPage ChatHistory()
+        {
+            if (Data == null) return null;
+            var page = new ChatHistoryPage
+            {
+                ChannelId = MiniJson.GetGuid(Data, "channel_id"),
+                PeerUserId = MiniJson.GetGuid(Data, "user_id"),
+                NextBefore = MiniJson.GetString(Data, "next_before"),
+                NextAfter = MiniJson.GetString(Data, "next_after"),
+            };
+            if (Data.TryGetValue("messages", out var v) && MiniJson.AsArray(v) is List<object> arr)
+                foreach (var item in arr)
+                {
+                    var m = ParseChatMessage(MiniJson.AsObject(item));
+                    if (m != null) page.Messages.Add(m);
+                }
+            return page;
+        }
+
+        /// <summary>Typed view of a <c>ChatReadMarker</c> payload (<c>data.marker</c>); null if absent.</summary>
+        public ChatReadMarker ReadMarker() =>
+            ParseReadMarker(MiniJson.AsObject(Data != null && Data.TryGetValue("marker", out var v) ? v : null));
+
+        /// <summary>Typed view of a <c>ChatReadMarkersResult</c> payload.</summary>
+        public ChatReadMarkers ReadMarkers()
+        {
+            if (Data == null) return null;
+            var r = new ChatReadMarkers
+            {
+                ChannelId = MiniJson.GetGuid(Data, "channel_id"),
+                PeerUserId = MiniJson.GetGuid(Data, "user_id"),
+                UnreadCount = (int)MiniJson.GetNumber(Data, "unread_count"),
+            };
+            if (Data.TryGetValue("markers", out var v) && MiniJson.AsArray(v) is List<object> arr)
+                foreach (var item in arr)
+                {
+                    var m = ParseReadMarker(MiniJson.AsObject(item));
+                    if (m != null) r.Markers.Add(m);
+                }
+            return r;
         }
 
         public static string ConsentToWire(RecordingConsent c)
@@ -589,6 +722,35 @@ namespace Aurix.Protocol
 
         public static string ChatTyping(Guid channelId, bool typing) =>
             Serialize("ChatTyping", new Dictionary<string, object> { { "channel_id", channelId }, { "typing", typing } });
+
+        private static Dictionary<string, object> Scope(Guid? channelId, Guid? userId)
+        {
+            var d = new Dictionary<string, object>();
+            if (channelId.HasValue) d["channel_id"] = channelId.Value;
+            else if (userId.HasValue) d["user_id"] = userId.Value;
+            else throw new ArgumentException("a channel or a peer user is required");
+            return d;
+        }
+
+        public static string ChatHistory(Guid? channelId, Guid? userId, string before, string after, int? limit, string clientRef)
+        {
+            var d = Scope(channelId, userId);
+            if (before != null) d["before"] = before;
+            if (after != null) d["after"] = after;
+            if (limit.HasValue) d["limit"] = limit.Value;
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("ChatHistory", d);
+        }
+
+        public static string ChatMarkRead(Guid? channelId, Guid? userId, Guid messageId)
+        {
+            var d = Scope(channelId, userId);
+            d["message_id"] = messageId;
+            return Serialize("ChatMarkRead", d);
+        }
+
+        public static string ChatReadMarkers(Guid? channelId, Guid? userId) =>
+            Serialize("ChatReadMarkers", Scope(channelId, userId));
 
         public static string SetTranscripts(bool enabled) =>
             Serialize("SetTranscripts", new Dictionary<string, object> { { "enabled", enabled } });

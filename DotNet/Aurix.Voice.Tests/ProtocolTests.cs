@@ -433,6 +433,70 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void ChatHistoryAndReadMarkersMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b6d1-131f-7160-afd2-056622380dd3");
+            var bob = Guid.Parse("01a0b6d1-132a-7385-8e7a-9ac1eceaeb0c");
+            var msg = Guid.Parse("0192f3a4-b5c6-7d8e-9f01-23456789abcd");
+
+            // Same vector as `chat_cursor_round_trips` in crates/aurix-common/src/protocol.rs.
+            var at = new DateTimeOffset(2024, 5, 6, 7, 8, 9, TimeSpan.Zero).AddTicks(1234560);
+            Assert.Equal("AAYXw7tTSoABkvOktcZ9jp8BI0VniavN", ChatCursor.Encode(at, msg));
+            Assert.Equal("AAYXw7tTSoABkvOktcZ9jp8BI0VniavN", ChatCursor.Encode(at.ToOffset(TimeSpan.FromHours(2)), msg));
+            Assert.NotEqual(ChatCursor.Encode(at, Guid.Empty), ChatCursor.Encode(at, msg));
+
+            Assert.Equal(
+                "{\"type\":\"ChatHistory\",\"data\":{\"channel_id\":\"" + team + "\",\"client_ref\":\"h1\"}}",
+                ControlMessage.ChatHistory(team, null, null, null, null, "h1"));
+            Assert.Equal(
+                "{\"type\":\"ChatHistory\",\"data\":{\"user_id\":\"" + bob + "\",\"before\":\"AAYXw7tTSoABkvOktcZ9jp8BI0VniavN\",\"limit\":50,\"client_ref\":\"h2\"}}",
+                ControlMessage.ChatHistory(null, bob, "AAYXw7tTSoABkvOktcZ9jp8BI0VniavN", null, 50, "h2"));
+            Assert.Equal(
+                "{\"type\":\"ChatMarkRead\",\"data\":{\"channel_id\":\"" + team + "\",\"message_id\":\"" + msg + "\"}}",
+                ControlMessage.ChatMarkRead(team, null, msg));
+            Assert.Equal(
+                "{\"type\":\"ChatReadMarkers\",\"data\":{\"user_id\":\"" + bob + "\"}}",
+                ControlMessage.ChatReadMarkers(null, bob));
+            Assert.Throws<ArgumentException>(() => ControlMessage.ChatReadMarkers(null, null));
+
+            var page = ControlMessage.Parse("{\"type\":\"ChatHistoryResult\",\"data\":{\"user_id\":\"" + bob + "\",\"messages\":[" +
+                "{\"id\":\"" + msg + "\",\"from_user_id\":\"" + bob + "\",\"display_name\":\"Bob\",\"to_user_id\":\"" + team + "\"," +
+                "\"text\":\"late\",\"sent_at\":\"2024-05-06T07:08:09.123456Z\",\"offline\":true}]," +
+                "\"next_before\":\"AAA\",\"client_ref\":\"h2\"}}").ChatHistory();
+            Assert.Equal(bob, page.PeerUserId);
+            Assert.Null(page.ChannelId);
+            Assert.Single(page.Messages);
+            Assert.True(page.Messages[0].Offline);
+            Assert.Equal("AAYXw7tTSoABkvOktcZ9jp8BI0VniavN", page.Messages[0].Cursor);
+            Assert.Equal("AAA", page.NextBefore);
+            Assert.Null(page.NextAfter);
+
+            // `offline` is omitted when false.
+            Assert.False(ControlMessage.Parse("{\"type\":\"ChatMessageReceived\",\"data\":{\"message\":{\"id\":\"" + msg + "\"," +
+                "\"from_user_id\":\"" + bob + "\",\"display_name\":\"Bob\",\"to_user_id\":\"" + team + "\",\"text\":\"hi\"," +
+                "\"sent_at\":\"2024-05-06T07:08:09Z\"}}}").ChatMessage().Offline);
+
+            var marker = ControlMessage.Parse("{\"type\":\"ChatReadMarker\",\"data\":{\"marker\":{\"user_id\":\"" + bob + "\",\"channel_id\":\"" + team + "\"," +
+                "\"message_id\":\"" + msg + "\",\"message_sent_at\":\"2024-05-06T07:08:09Z\",\"read_at\":\"2024-05-06T07:08:10Z\"}}}").ReadMarker();
+            Assert.Equal(bob, marker.UserId);
+            Assert.Equal(team, marker.ChannelId);
+            Assert.Null(marker.PeerUserId);
+            Assert.Equal(msg, marker.MessageId);
+            Assert.Equal(TimeSpan.FromSeconds(1), marker.ReadAt - marker.MessageSentAt);
+
+            var markers = ControlMessage.Parse("{\"type\":\"ChatReadMarkersResult\",\"data\":{\"channel_id\":\"" + team + "\",\"markers\":[" +
+                "{\"user_id\":\"" + bob + "\",\"channel_id\":\"" + team + "\",\"message_id\":\"" + msg + "\"," +
+                "\"message_sent_at\":\"2024-05-06T07:08:09Z\",\"read_at\":\"2024-05-06T07:08:10Z\"}],\"unread_count\":7}}").ReadMarkers();
+            Assert.Equal(team, markers.ChannelId);
+            Assert.Single(markers.Markers);
+            Assert.Equal(7, markers.UnreadCount);
+
+            var synced = ControlMessage.Parse("{\"type\":\"ChatInboxSynced\",\"data\":{\"delivered\":3,\"truncated\":false}}");
+            Assert.Equal(3, (int)synced.Num("delivered"));
+            Assert.False(synced.Bool("truncated"));
+        }
+
+        [Fact]
         public void AudioLevelMatchesServerEncoding()
         {
             // Same vectors as encode_audio_level / decode_audio_level in crates/aurix-common/src/protocol.rs.

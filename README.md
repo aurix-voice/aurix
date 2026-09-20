@@ -505,10 +505,23 @@ client.OnParticipantTyping += (channelId, userId, typing) => ui.ShowTyping(userI
 var sent = await client.SendMessageAsync(channelId, "gg",
     metadata: new Dictionary<string, object> { { "ping", new Dictionary<string, object> { { "x", 12.5 }, { "y", 8.0 } } } },
     clientRef: localId);                              // optional; echoed only to you → reconcile optimistic UI
-await client.SendDirectMessageAsync(userId, "psst");  // target must be online in this app
+await client.SendDirectMessageAsync(userId, "psst");  // offline target: queued when chat.persist + offline_delivery, else USER_OFFLINE
 await client.SetTypingAsync(channelId, true);         // call on every keystroke; coalesced to one frame per 1.5 s
 await client.SetTypingAsync(channelId, false);        // always sent
+
+// Stored chat (server runs chat.persist = true): cursor-paged history and read markers.
+var page = await client.HistoryAsync(channelId, limit: 50);          // newest first
+var older = await client.HistoryAsync(channelId, before: page.NextBefore);
+var dm = await client.DirectHistoryAsync(userId, after: lastSeen.Cursor);
+await client.MarkReadAsync(channelId, page.Messages[0].Id);          // only moves forward
+var markers = await client.ReadMarkersAsync(channelId);              // markers.UnreadCount, markers.Markers
+client.OnChatReadMarker += m => ui.ShowReadUpTo(m.UserId, m.MessageId);
+client.OnChatInboxSynced += (delivered, truncated) => ui.InboxReady(); // after the offline replay on connect
 ```
+
+Directed messages that waited for you arrive after connect as ordinary `OnChatMessage` with
+`Offline = true` (oldest first), then `OnChatInboxSynced`; every device replays what is still
+unread, so dedupe by `Id` and call `MarkDirectReadAsync` once the user has seen them.
 
 The tasks complete with the server-stamped message (`Id`, `SentAt`) and otherwise throw
 `InvalidOperationException("<CODE>: <message>")`: `AUTH_DENIED` (not a member, or a block between
