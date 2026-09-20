@@ -313,6 +313,26 @@ typedef enum AurixEventType {
    * while the previous node did not. Precedes that connection's `SessionReady`.
    */
   AURIX_EVENT_ENDPOINT_CHANGED = 35,
+  /**
+   * `request_id`, `channel_id` / `user_id` = conversation, `aurix_event_chat_history` +
+   * `aurix_event_chat_history_message`: one page of stored history (newest first).
+   */
+  AURIX_EVENT_CHAT_HISTORY = 36,
+  /**
+   * `aurix_event_read_marker`: a read marker moved (this user's on any device, or another
+   * participant's when the server has read receipts on).
+   */
+  AURIX_EVENT_CHAT_READ_MARKER = 37,
+  /**
+   * `channel_id` / `user_id` = conversation, `number` = unread count, `number2` = marker
+   * count, `aurix_event_read_marker_at`: answer to `aurix_client_chat_read_markers`.
+   */
+  AURIX_EVENT_CHAT_READ_MARKERS = 38,
+  /**
+   * `number` = directed messages replayed (each arrived as `ChatMessage` with `offline`)
+   * since connecting, `flag` = older unread ones were left out (page with history).
+   */
+  AURIX_EVENT_CHAT_INBOX_SYNCED = 39,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -664,7 +684,55 @@ typedef struct AurixChatMessage {
    * Non-zero when this is the echo of a message this client sent.
    */
   uint64_t request_id;
+  /**
+   * Directed message that waited for the recipient (replayed on connect, or — on the
+   * sender's echo — queued because the recipient is offline).
+   */
+  bool offline;
+  /**
+   * History cursor of this message (`before` / `after` of `aurix_client_chat_history`).
+   */
+  const char *cursor;
 } AurixChatMessage;
+
+/**
+ * One page of chat history (`AurixEventChatHistory`). Strings owned by the event.
+ */
+typedef struct AurixChatHistory {
+  /**
+   * Messages in the page, newest first (`aurix_event_chat_history_message`).
+   */
+  size_t count;
+  /**
+   * Cursor for the next older page, or `NULL` when the beginning was reached.
+   */
+  const char *next_before;
+  /**
+   * Cursor for the next newer page, or `NULL` when the page is the most recent.
+   */
+  const char *next_after;
+} AurixChatHistory;
+
+/**
+ * A user's reading position in a channel or a direct conversation.
+ */
+typedef struct AurixReadMarker {
+  struct AurixUuid user_id;
+  /**
+   * Zero UUID for direct conversations.
+   */
+  struct AurixUuid channel_id;
+  /**
+   * The other party of a direct conversation; zero UUID for channels.
+   */
+  struct AurixUuid peer_user_id;
+  /**
+   * Last read message and its send time (Unix ms).
+   */
+  struct AurixUuid message_id;
+  int64_t message_sent_at_ms;
+  int64_t read_at_ms;
+} AurixReadMarker;
 
 typedef struct AurixTranscript {
   struct AurixUuid channel_id;
@@ -1144,12 +1212,14 @@ bool aurix_event_flag(const struct AurixEvent *event);
 bool aurix_event_flag2(const struct AurixEvent *event);
 
 /**
- * Numeric payload: bitrate (bps) for `BitrateChanged`, attempt for `Recovering`.
+ * Numeric payload: bitrate (bps) for `BitrateChanged`, attempt for `Recovering`, unread
+ * count for `ChatReadMarkers`, replayed messages for `ChatInboxSynced`.
  */
 uint64_t aurix_event_number(const struct AurixEvent *event);
 
 /**
- * Secondary number: reconnect delay in ms for `Recovering`.
+ * Secondary number: reconnect delay in ms for `Recovering`, marker count for
+ * `ChatReadMarkers`.
  */
 uint64_t aurix_event_number2(const struct AurixEvent *event);
 
@@ -1200,6 +1270,31 @@ bool aurix_event_participant(const struct AurixEvent *event,
                              struct AurixParticipant *out);
 
 bool aurix_event_chat(const struct AurixEvent *event, struct AurixChatMessage *out);
+
+/**
+ * Page summary of a `ChatHistory` event.
+ */
+bool aurix_event_chat_history(const struct AurixEvent *event, struct AurixChatHistory *out);
+
+/**
+ * Message `index` (0 = newest) of a `ChatHistory` page; `request_id` is 0 for all of them.
+ */
+bool aurix_event_chat_history_message(const struct AurixEvent *event,
+                                      size_t index,
+                                      struct AurixChatMessage *out);
+
+/**
+ * The marker of a `ChatReadMarker` event.
+ */
+bool aurix_event_read_marker(const struct AurixEvent *event, struct AurixReadMarker *out);
+
+/**
+ * Marker `index` of a `ChatReadMarkers` answer (`aurix_event_number2` = count). This
+ * user's own marker, when stored, is among them.
+ */
+bool aurix_event_read_marker_at(const struct AurixEvent *event,
+                                size_t index,
+                                struct AurixReadMarker *out);
 
 bool aurix_event_transcript(const struct AurixEvent *event, struct AurixTranscript *out);
 
@@ -1576,6 +1671,36 @@ enum AurixResult aurix_client_send_direct_chat(struct AurixClient *client,
 enum AurixResult aurix_client_set_typing(struct AurixClient *client,
                                          const struct AurixUuid *channel_id,
                                          bool typing);
+
+/**
+ * One page of stored history, newest first, answered by `AurixEventChatHistory` (or
+ * `RequestFailed`). `before` / `after` are cursors from an earlier page or from
+ * `AurixChatMessage.cursor` (`NULL` = from the present); `limit` 0 = server default.
+ */
+enum AurixResult aurix_client_chat_history(struct AurixClient *client,
+                                           const struct AurixUuid *channel_id,
+                                           const struct AurixUuid *user_id,
+                                           const char *before,
+                                           const char *after,
+                                           uint32_t limit,
+                                           uint64_t *request_id_out);
+
+/**
+ * Moves this user's read marker in the conversation to `message_id` (never backwards);
+ * every device of the user receives `AurixEventChatReadMarker`.
+ */
+enum AurixResult aurix_client_mark_chat_read(struct AurixClient *client,
+                                             const struct AurixUuid *channel_id,
+                                             const struct AurixUuid *user_id,
+                                             const struct AurixUuid *message_id);
+
+/**
+ * Asks for the read markers and unread count of a conversation; answered by
+ * `AurixEventChatReadMarkers`.
+ */
+enum AurixResult aurix_client_chat_read_markers(struct AurixClient *client,
+                                                const struct AurixUuid *channel_id,
+                                                const struct AurixUuid *user_id);
 
 /**
  * Server-side text-to-speech as this participant's voice. `channel_id` may be `NULL` for

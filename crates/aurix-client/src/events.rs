@@ -1,5 +1,6 @@
 use aurix_common::protocol::{
-    ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsState, UserPosition,
+    ChatMessage, ChatReadMarker, ParticipantEnergy, Transcript, TransmissionMode, TtsState,
+    UserPosition,
 };
 use aurix_common::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
@@ -26,6 +27,32 @@ pub enum ConnectionState {
 
 /// Correlates a request with its terminal event.
 pub type RequestId = u64;
+
+/// A stored text conversation: a channel, or the direct exchange with one user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatScope {
+    Channel(ChannelId),
+    Direct(UserId),
+}
+
+impl ChatScope {
+    pub fn split(self) -> (Option<ChannelId>, Option<UserId>) {
+        match self {
+            Self::Channel(c) => (Some(c), None),
+            Self::Direct(u) => (None, Some(u)),
+        }
+    }
+
+    /// Server payloads carry `channel_id` / `user_id`; a channel wins when both are present.
+    pub fn from_parts(channel_id: Option<ChannelId>, user_id: Option<UserId>) -> Self {
+        match (channel_id, user_id) {
+            (Some(c), _) => Self::Channel(c),
+            (None, Some(u)) => Self::Direct(u),
+            (None, None) => Self::Direct(UserId::from_uuid(uuid::Uuid::nil())),
+        }
+    }
+}
 
 /// Snapshot of a channel member.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -191,6 +218,31 @@ pub enum Event {
         channel_id: ChannelId,
         user_id: UserId,
         typing: bool,
+    },
+    /// Answer to `Client::chat_history`: one page, newest first. `next_before` pages further
+    /// into the past, `next_after` towards the present (absent when there is nothing there).
+    ChatHistory {
+        request_id: Option<RequestId>,
+        scope: ChatScope,
+        messages: Vec<ChatMessage>,
+        next_before: Option<String>,
+        next_after: Option<String>,
+    },
+    /// A read marker moved: this user's own (any device) or, with server-side read receipts,
+    /// another participant's.
+    ChatReadMarker(ChatReadMarker),
+    /// Answer to `Client::chat_read_markers`.
+    ChatReadMarkers {
+        scope: ChatScope,
+        markers: Vec<ChatReadMarker>,
+        unread_count: u32,
+    },
+    /// Sent once after connecting, after the directed messages that arrived while this user
+    /// was offline were replayed as `ChatMessage { message.offline: true }`. `truncated`: older
+    /// unread ones exist beyond the server's replay limit (page them with `chat_history`).
+    ChatInboxSynced {
+        delivered: u32,
+        truncated: bool,
     },
     Transcript(Transcript),
     TtsStatus {

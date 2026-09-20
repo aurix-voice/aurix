@@ -127,7 +127,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Devices | `InputDevices`, `SetInputDevice()`, `SetInputGain()`, `SetOutputVolume()`, `SetOutputMuted()`; `OutputResampler` for non-48 kHz mixers |
 | Capture DSP | `DspMode` (`Auto`/`Native`/`Managed`/`Off`), `HighPass`, `EchoCancellation`, `EchoTailMs`, `NoiseSuppression`, `Agc`, `AgcTargetDbfs`, `AgcMaxGainDb`, `ApplyDspSettings()`, `Dsp` (`ICaptureProcessor`: `Stats`, `PushRender`, `SupportsEchoCancellation`); `NativeCaptureDsp`, `ManagedCaptureDsp`, `CaptureDsp.Create` — [below](#capture-processing-echo-cancellation-noise-suppression-agc) |
 | Echo test / injection | echo channel + `InjectClip(clip, loop, gain, mixWithMicrophone)`, `Injector` (live PCM), `StopInjection()` |
-| Chat lite | `SendMessageAsync`, `SendDirectMessageAsync`, `SetTypingAsync`, `OnChatMessage`, `OnParticipantTyping` |
+| Chat | `SendMessageAsync`, `SendDirectMessageAsync`, `SetTypingAsync`, `OnChatMessage` (`Offline`), `OnParticipantTyping`; stored chat: `HistoryAsync` / `DirectHistoryAsync` (cursor pages), `MarkReadAsync` / `MarkDirectReadAsync`, `ReadMarkersAsync` / `DirectReadMarkersAsync`, `OnChatReadMarker`, `OnChatInboxSynced` |
 | Transcripts / TTS | `OnTranscript`, `SetTranscriptsAsync`, `IsChannelMonitored`, `SpeakAsync(text, channel?, TtsDestination, voice, clientRef)` → `SpeechRequest`, `OnTtsStatus`, `CancelSpeechAsync`, `IsSynthesizedSsrc` |
 | Recording consent | `OnRecording(RecordingNotice)`, `RespondToRecordingAsync(id, RecordingConsent)` |
 | Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand(BitrateCommand)` |

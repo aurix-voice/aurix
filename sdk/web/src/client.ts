@@ -7,6 +7,7 @@ import {
   SYSTEM_USER_ID,
   type ChannelRole,
   type ChatMessageWire,
+  type ChatReadMarkerWire,
   type ClientMessage,
   type JsonValue,
   type LocalMute,
@@ -259,6 +260,55 @@ export interface ChatMessage {
   system: boolean;
   /** The `clientRef` passed to `sendMessage`/`sendDirectMessage`; only on `own` echoes. */
   clientRef?: string;
+  /**
+   * Directed message that waited for the recipient: replayed on connect (see
+   * {@link AurixEvents.chatInboxSynced}), or — on the sender's `own` echo — accepted and
+   * stored because the recipient is offline.
+   */
+  offline: boolean;
+  /** Opaque history cursor of this message (`before` / `after` of {@link AurixClient.history}). */
+  cursor: string;
+}
+
+/** A stored text conversation: a joined channel, or the direct exchange with one user. */
+export type ChatScope = { channelId: string; userId?: undefined } | { userId: string; channelId?: undefined };
+
+export interface HistoryOptions {
+  /** Cursor: only messages older than it (`nextBefore` of a page, or `ChatMessage.cursor`). */
+  before?: string;
+  /** Cursor: only messages newer than it (`nextAfter` of a page, or `ChatMessage.cursor`). */
+  after?: string;
+  /** Page size; the server clamps it (`chat.history_page_max`, 200 by default). */
+  limit?: number;
+}
+
+/** One page of stored chat history, newest first. */
+export interface HistoryPage {
+  messages: ChatMessage[];
+  /** Cursor for the next older page; `undefined` when the beginning was reached. */
+  nextBefore?: string;
+  /** Cursor for the next newer page; `undefined` when the page is the most recent. */
+  nextAfter?: string;
+}
+
+/** A user's reading position in a channel or a direct conversation. */
+export interface ReadMarker {
+  userId: string;
+  /** Set for channel markers. */
+  channelId?: string;
+  /** The other party of a direct conversation. */
+  peerUserId?: string;
+  /** Last read message and its send time. */
+  messageId: string;
+  messageSentAt: Date;
+  readAt: Date;
+}
+
+export interface ReadMarkers {
+  /** This user's own marker (when it was ever set) and, with server-side read receipts, the other participants'. */
+  markers: ReadMarker[];
+  /** Messages after this user's marker (capped by the server, `chat.unread_count_cap`). */
+  unreadCount: number;
 }
 
 export interface SendMessageOptions {
@@ -436,6 +486,17 @@ export interface AurixEvents {
    * addressed to this user, or the echo (`own: true`) of a message this client sent.
    */
   chatMessage: (message: ChatMessage) => void;
+  /**
+   * A read marker moved: this user's own (from any device, including this one) or, when
+   * the server has read receipts on, another participant's in a shared conversation.
+   */
+  chatReadMarker: (marker: ReadMarker) => void;
+  /**
+   * Once per connection, after the directed messages that arrived while this user was
+   * offline were replayed as `chatMessage` events with `offline: true`. `truncated`: older
+   * unread ones exist beyond the server's replay limit — page them with `history`.
+   */
+  chatInboxSynced: (delivered: number, truncated: boolean) => void;
   /** Another member of `channelId` started/stopped typing (never this client's own state). */
   participantTyping: (channelId: string, userId: string, typing: boolean) => void;
   /**
@@ -629,6 +690,8 @@ export class AurixClient {
   private pendingModerations = new Map<string, Pending<void>>();
   /** client_ref → pending `sendMessage`/`sendDirectMessage`. */
   private pendingChat = new Map<string, Pending<ChatMessage>>();
+  private pendingHistory = new Map<string, Pending<HistoryPage>>();
+  private pendingReadMarkers = new Map<string, Pending<ReadMarkers>[]>();
   private chatRefCounter = 0;
   /** channel id → last `ChatTyping { typing: true }` sent (ms, `performance.now()` clock). */
   private typingSentAt = new Map<string, number>();
@@ -1277,6 +1340,18 @@ export class AurixClient {
       p.reject(new Error(reason));
     }
     this.pendingChat.clear();
+    for (const p of this.pendingHistory.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.pendingHistory.clear();
+    for (const list of this.pendingReadMarkers.values()) {
+      for (const p of list) {
+        clearTimeout(p.timer);
+        p.reject(new Error(reason));
+      }
+    }
+    this.pendingReadMarkers.clear();
     this.typingSentAt.clear();
     for (const p of this.pendingSpeak.values()) {
       clearTimeout(p.timer);
@@ -1468,8 +1543,11 @@ export class AurixClient {
   }
 
   /**
-   * Send a text message to one user of the same app. Live-only: the target must currently
-   * have a session (`USER_OFFLINE` otherwise) and neither side may have blocked the other.
+   * Send a text message to one user of the same app. Neither side may have blocked the
+   * other. When the server stores chat with offline delivery (`chat.persist` +
+   * `chat.offline_delivery`), an offline recipient gets the message on their next connect
+   * and the resolved echo carries `offline: true`; otherwise the target must currently have
+   * a session (`USER_OFFLINE`).
    */
   sendDirectMessage(userId: string, text: string, options: SendMessageOptions = {}): Promise<ChatMessage> {
     return this.sendChat((clientRef) => ({
@@ -1499,6 +1577,71 @@ export class AurixClient {
       this.typingSentAt.delete(channelId);
     }
     this.send({ type: 'ChatTyping', data: { channel_id: channelId, typing } });
+  }
+
+  /**
+   * One page of stored history (`chat.persist` on the server) of a joined channel or of the
+   * direct conversation with a user, newest first. Page into the past with
+   * `{ before: page.nextBefore }`, catch up after a gap with `{ after: lastSeen.cursor }`.
+   * Rejects with `AUTH_DENIED` for a channel this client has not joined, `NOT_FOUND` when
+   * the server does not store chat.
+   */
+  history(scope: ChatScope, options: HistoryOptions = {}): Promise<HistoryPage> {
+    this.requireOpen();
+    const clientRef = `h${++this.chatRefCounter}-${Date.now().toString(36)}`;
+    return new Promise<HistoryPage>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingHistory.delete(clientRef);
+        reject(new Error('history request timed out'));
+      }, this.opts.requestTimeoutMs);
+      this.pendingHistory.set(clientRef, { resolve, reject, timer });
+      this.send({
+        type: 'ChatHistory',
+        data: {
+          ...scopeWire(scope),
+          ...(options.before !== undefined ? { before: options.before } : {}),
+          ...(options.after !== undefined ? { after: options.after } : {}),
+          ...(options.limit !== undefined ? { limit: options.limit } : {}),
+          client_ref: clientRef,
+        },
+      });
+    });
+  }
+
+  /**
+   * Move this user's read marker in a conversation to `messageId` (the newest message the
+   * user has seen). Idempotent and never moves backwards. Every device of the user — this
+   * one included — receives the new position as `chatReadMarker`; with server-side read
+   * receipts the other participants do too.
+   */
+  markRead(scope: ChatScope, messageId: string): void {
+    this.requireOpen();
+    this.send({ type: 'ChatMarkRead', data: { ...scopeWire(scope), message_id: messageId } });
+  }
+
+  /** Read markers and unread count of a joined channel or a direct conversation. */
+  readMarkers(scope: ChatScope): Promise<ReadMarkers> {
+    this.requireOpen();
+    const key = scopeKey(scope);
+    return new Promise<ReadMarkers>((resolve, reject) => {
+      const pending: Pending<ReadMarkers> = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const list = this.pendingReadMarkers.get(key);
+          if (list) {
+            const i = list.indexOf(pending);
+            if (i >= 0) list.splice(i, 1);
+            if (list.length === 0) this.pendingReadMarkers.delete(key);
+          }
+          reject(new Error('read markers request timed out'));
+        }, this.opts.requestTimeoutMs),
+      };
+      const list = this.pendingReadMarkers.get(key);
+      if (list) list.push(pending);
+      else this.pendingReadMarkers.set(key, [pending]);
+      this.send({ type: 'ChatReadMarkers', data: scopeWire(scope) });
+    });
   }
 
   private sendChat(build: (clientRef: string) => ClientMessage, ref?: string): Promise<ChatMessage> {
@@ -2140,6 +2283,12 @@ export class AurixClient {
             this.pendingChat.delete(d.client_ref);
             pending.reject(new Error(`${d.code}: ${d.message}`));
           }
+          const history = this.pendingHistory.get(d.client_ref);
+          if (history) {
+            clearTimeout(history.timer);
+            this.pendingHistory.delete(d.client_ref);
+            history.reject(new Error(`${d.code}: ${d.message}`));
+          }
           const speak = this.pendingSpeak.get(d.client_ref);
           if (speak) {
             clearTimeout(speak.timer);
@@ -2184,6 +2333,39 @@ export class AurixClient {
           }
         }
         this.emit('chatMessage', message);
+        return;
+      }
+      case 'ChatHistoryResult': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatHistoryResult' }>).data;
+        const pending = d.client_ref != null ? this.pendingHistory.get(d.client_ref) : undefined;
+        if (!pending || d.client_ref == null) return;
+        clearTimeout(pending.timer);
+        this.pendingHistory.delete(d.client_ref);
+        const page: HistoryPage = { messages: d.messages.map((m) => this.toChatMessage(m)) };
+        if (d.next_before != null) page.nextBefore = d.next_before;
+        if (d.next_after != null) page.nextAfter = d.next_after;
+        pending.resolve(page);
+        return;
+      }
+      case 'ChatReadMarker': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatReadMarker' }>).data;
+        this.emit('chatReadMarker', readMarkerFromWire(d.marker));
+        return;
+      }
+      case 'ChatReadMarkersResult': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatReadMarkersResult' }>).data;
+        const key = d.channel_id != null ? `c:${d.channel_id}` : `u:${d.user_id ?? ''}`;
+        const list = this.pendingReadMarkers.get(key);
+        if (!list || list.length === 0) return;
+        const pending = list.shift()!;
+        if (list.length === 0) this.pendingReadMarkers.delete(key);
+        clearTimeout(pending.timer);
+        pending.resolve({ markers: d.markers.map(readMarkerFromWire), unreadCount: d.unread_count });
+        return;
+      }
+      case 'ChatInboxSynced': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatInboxSynced' }>).data;
+        this.emit('chatInboxSynced', d.delivered, d.truncated);
         return;
       }
       case 'ParticipantTyping': {
@@ -2500,6 +2682,8 @@ export class AurixClient {
       sentAt: new Date(w.sent_at),
       own,
       system: w.from_user_id === SYSTEM_USER_ID,
+      offline: w.offline === true,
+      cursor: encodeChatCursor(w.sent_at, w.id),
     };
     if (w.channel_id != null) m.channelId = w.channel_id;
     if (w.to_user_id != null) m.toUserId = w.to_user_id;
@@ -2526,4 +2710,55 @@ export class AurixClient {
     clearTimeout(p.timer);
     p.reject(new Error(reason));
   }
+}
+
+function scopeWire(scope: ChatScope): { channel_id?: string; user_id?: string } {
+  if (scope.channelId !== undefined) return { channel_id: scope.channelId };
+  if (scope.userId !== undefined) return { user_id: scope.userId };
+  throw new Error('ChatScope needs channelId or userId');
+}
+
+function scopeKey(scope: ChatScope): string {
+  return scope.channelId !== undefined ? `c:${scope.channelId}` : `u:${scope.userId}`;
+}
+
+function readMarkerFromWire(w: ChatReadMarkerWire): ReadMarker {
+  const m: ReadMarker = {
+    userId: w.user_id,
+    messageId: w.message_id,
+    messageSentAt: new Date(w.message_sent_at),
+    readAt: new Date(w.read_at),
+  };
+  if (w.channel_id != null) m.channelId = w.channel_id;
+  if (w.peer_user_id != null) m.peerUserId = w.peer_user_id;
+  return m;
+}
+
+/**
+ * The server's opaque history cursor of a message: URL-safe base64 (no padding) of the
+ * big-endian microsecond Unix timestamp followed by the 16 UUID bytes. Computed locally so
+ * any message — live or stored — can anchor a `history()` call.
+ */
+export function encodeChatCursor(sentAt: string | Date, id: string): string {
+  const micros = rfc3339Micros(sentAt);
+  const bytes = new Uint8Array(24);
+  const view = new DataView(bytes.buffer);
+  view.setBigInt64(0, micros);
+  const hex = id.replace(/-/g, '');
+  if (hex.length !== 32) throw new Error(`not a UUID: ${id}`);
+  for (let i = 0; i < 16; i++) bytes[8 + i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** Microseconds since the Unix epoch of an RFC 3339 string (sub-millisecond digits kept) or a Date. */
+function rfc3339Micros(t: string | Date): bigint {
+  if (t instanceof Date) return BigInt(t.getTime()) * 1000n;
+  const m = /^(.*?)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)$/.exec(t);
+  if (!m) return BigInt(new Date(t).getTime()) * 1000n;
+  const whole = Date.parse(`${m[1]}${m[3]}`);
+  if (Number.isNaN(whole)) throw new Error(`not an RFC 3339 timestamp: ${t}`);
+  const frac = (m[2] ?? '').padEnd(6, '0').slice(0, 6);
+  return BigInt(whole) * 1000n + BigInt(frac);
 }

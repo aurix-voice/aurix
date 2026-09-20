@@ -553,6 +553,67 @@ struct AURIXVOICE_API FAurixChatMessage
 	/** Non-zero when this is the echo of a message this client sent. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int64 RequestId = 0;
+
+	/** Directed message that waited for an offline recipient (replayed on connect, or queued on the sender's echo). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bOffline = false;
+
+	/** Opaque history cursor of this message (Before / After of ChannelHistory / DirectHistory). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString Cursor;
+};
+
+/** One page of stored chat history (newest first). */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixChatHistoryPage
+{
+	GENERATED_BODY()
+
+	/** Invalid GUID for a direct conversation. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid ChannelId;
+
+	/** The other party of a direct conversation; invalid GUID for channels. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid PeerUserId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	TArray<FAurixChatMessage> Messages;
+
+	/** Cursor of the next older page; empty when the beginning was reached. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString NextBefore;
+
+	/** Cursor of the next newer page; empty when this page is the most recent. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString NextAfter;
+};
+
+/** A user's reading position in a channel or a direct conversation. */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixReadMarker
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid UserId;
+
+	/** Invalid GUID for direct conversations. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid ChannelId;
+
+	/** The other party of a direct conversation; invalid GUID for channels. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid PeerUserId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid MessageId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FDateTime MessageSentAt;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FDateTime ReadAt;
 };
 
 USTRUCT(BlueprintType)

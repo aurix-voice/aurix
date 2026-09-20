@@ -137,6 +137,14 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::list_user_messages).post(handlers::send_user_message),
         )
         .route(
+            "/v1/users/:user_id/read-markers",
+            get(handlers::list_user_read_markers).put(handlers::put_user_read_marker),
+        )
+        .route(
+            "/v1/channels/:channel_id/read-markers",
+            get(handlers::list_channel_read_markers),
+        )
+        .route(
             "/v1/channels/:channel_id/tts",
             post(handlers::announce_in_channel),
         )

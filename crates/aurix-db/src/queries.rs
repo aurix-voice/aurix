@@ -248,6 +248,14 @@ pub async fn erase_user(
         user_id,
     )
     .await?;
+    sqlx::query(
+        "DELETE FROM chat_read_markers WHERE app_id = $1 \
+         AND (user_id = $2 OR (kind = 'direct' AND conversation_id = $2))",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     let user_blocks = delete_user_rows(
         &mut tx,
         "DELETE FROM user_blocks WHERE app_id = $1 AND (user_id = $2 OR blocked_user_id = $2)",
@@ -1667,32 +1675,84 @@ pub async fn fail_recording_transcript(
 
 pub async fn insert_chat_message(pool: &DbPool, m: &ChatMessageRow) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"INSERT INTO chat_messages (id, app_id, channel_id, from_user_id, display_name, to_user_id, text, metadata, sent_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+        r#"INSERT INTO chat_messages (id, app_id, channel_id, from_user_id, display_name, to_user_id, text, metadata, sent_at, offline)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
     )
     .bind(m.id).bind(m.app_id).bind(m.channel_id).bind(m.from_user_id)
     .bind(&m.display_name).bind(m.to_user_id).bind(&m.text).bind(&m.metadata)
-    .bind(m.sent_at)
+    .bind(m.sent_at).bind(m.offline)
     .execute(pool).await?;
     Ok(())
 }
 
-/// Newest-first page of a channel's messages, optionally strictly older than `before`.
+/// Keyset order of a history page: newest first, or oldest first when paging forward from
+/// `after` (`forward`), so the page is always contiguous with its anchor cursor.
+fn page_order(forward: bool) -> &'static str {
+    if forward {
+        "sent_at ASC, id ASC"
+    } else {
+        "sent_at DESC, id DESC"
+    }
+}
+
+/// Page of a channel's messages strictly between the cursors (`before` = older than, `after`
+/// = newer than), ordered by `(sent_at, id)` so pages never skip or repeat.
 pub async fn list_channel_messages(
     pool: &DbPool,
     app_id: Uuid,
     channel_id: Uuid,
-    before: Option<DateTime<Utc>>,
+    before: Option<MessageCursor>,
+    after: Option<MessageCursor>,
+    forward: bool,
     limit: i64,
 ) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ChatMessageRow>(
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
         r#"SELECT * FROM chat_messages
-           WHERE app_id = $1 AND channel_id = $2 AND ($3::timestamptz IS NULL OR sent_at < $3)
-           ORDER BY sent_at DESC LIMIT $4"#,
-    )
+           WHERE app_id = $1 AND channel_id = $2
+             AND ($3::timestamptz IS NULL OR (sent_at, id) < ($3, $4::uuid))
+             AND ($5::timestamptz IS NULL OR (sent_at, id) > ($5, $6::uuid))
+           ORDER BY {} LIMIT $7"#,
+        page_order(forward)
+    ))
     .bind(app_id)
     .bind(channel_id)
-    .bind(before)
+    .bind(before.map(|c| c.sent_at))
+    .bind(before.map(|c| c.id))
+    .bind(after.map(|c| c.sent_at))
+    .bind(after.map(|c| c.id))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Newest-first page of the directed messages exchanged between two users (both directions).
+#[allow(clippy::too_many_arguments)]
+pub async fn list_direct_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    peer_id: Uuid,
+    before: Option<MessageCursor>,
+    after: Option<MessageCursor>,
+    forward: bool,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
+        r#"SELECT * FROM chat_messages
+           WHERE app_id = $1
+             AND ((from_user_id = $2 AND to_user_id = $3) OR (from_user_id = $3 AND to_user_id = $2))
+             AND ($4::timestamptz IS NULL OR (sent_at, id) < ($4, $5::uuid))
+             AND ($6::timestamptz IS NULL OR (sent_at, id) > ($6, $7::uuid))
+           ORDER BY {} LIMIT $8"#,
+        page_order(forward)
+    ))
+    .bind(app_id)
+    .bind(user_id)
+    .bind(peer_id)
+    .bind(before.map(|c| c.sent_at))
+    .bind(before.map(|c| c.id))
+    .bind(after.map(|c| c.sent_at))
+    .bind(after.map(|c| c.id))
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -1704,18 +1764,197 @@ pub async fn list_user_messages(
     pool: &DbPool,
     app_id: Uuid,
     user_id: Uuid,
-    before: Option<DateTime<Utc>>,
+    before: Option<MessageCursor>,
+    after: Option<MessageCursor>,
+    forward: bool,
     limit: i64,
 ) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ChatMessageRow>(
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
         r#"SELECT * FROM chat_messages
            WHERE app_id = $1 AND (from_user_id = $2 OR to_user_id = $2)
-             AND ($3::timestamptz IS NULL OR sent_at < $3)
-           ORDER BY sent_at DESC LIMIT $4"#,
+             AND ($3::timestamptz IS NULL OR (sent_at, id) < ($3, $4::uuid))
+             AND ($5::timestamptz IS NULL OR (sent_at, id) > ($5, $6::uuid))
+           ORDER BY {} LIMIT $7"#,
+        page_order(forward)
+    ))
+    .bind(app_id)
+    .bind(user_id)
+    .bind(before.map(|c| c.sent_at))
+    .bind(before.map(|c| c.id))
+    .bind(after.map(|c| c.sent_at))
+    .bind(after.map(|c| c.id))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_chat_message(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+) -> Result<Option<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>("SELECT * FROM chat_messages WHERE app_id = $1 AND id = $2")
+        .bind(app_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Number of messages in a conversation newer than `after` that `user_id` did not send, capped
+/// at `cap` so a long-idle member cannot trigger a full scan.
+pub async fn count_unread_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    conversation: ChatConversation,
+    after: Option<MessageCursor>,
+    cap: i64,
+) -> Result<i64, sqlx::Error> {
+    let (channel_id, peer_id) = match conversation {
+        ChatConversation::Channel(c) => (Some(c), None),
+        ChatConversation::Direct(p) => (None, Some(p)),
+    };
+    let (n,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM (
+             SELECT 1 FROM chat_messages
+             WHERE app_id = $1
+               AND from_user_id <> $2
+               AND (($3::uuid IS NOT NULL AND channel_id = $3)
+                    OR ($4::uuid IS NOT NULL AND to_user_id = $2 AND from_user_id = $4))
+               AND ($5::timestamptz IS NULL OR (sent_at, id) > ($5, $6::uuid))
+             LIMIT $7
+           ) unread"#,
     )
     .bind(app_id)
     .bind(user_id)
-    .bind(before)
+    .bind(channel_id)
+    .bind(peer_id)
+    .bind(after.map(|c| c.sent_at))
+    .bind(after.map(|c| c.id))
+    .bind(cap)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+// ── Chat inbox (offline delivery of directed messages) ──
+
+/// Oldest-first directed messages to `user_id` that were accepted while the user was offline
+/// and are newer than the user's read marker for the sender (or unread entirely), not older
+/// than `min_sent_at`. The newest `limit` of them: the client pages further back via history.
+pub async fn list_unread_offline_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    min_sent_at: Option<DateTime<Utc>>,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(
+        r#"SELECT m.* FROM (
+             SELECT m.* FROM chat_messages m
+             LEFT JOIN chat_read_markers rm
+               ON rm.app_id = m.app_id AND rm.user_id = m.to_user_id
+              AND rm.kind = 'direct' AND rm.conversation_id = m.from_user_id
+             WHERE m.app_id = $1 AND m.to_user_id = $2 AND m.offline
+               AND ($3::timestamptz IS NULL OR m.sent_at >= $3)
+               AND (rm.message_id IS NULL
+                    OR (m.sent_at, m.id) > (rm.message_sent_at, rm.message_id))
+             ORDER BY m.sent_at DESC, m.id DESC LIMIT $4
+           ) m ORDER BY m.sent_at ASC, m.id ASC"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(min_sent_at)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+// ── Chat read markers ──
+
+/// Advances `user_id`'s read marker in `conversation` to `message`; returns the stored marker
+/// when it moved (`None` when the message is not newer than the current marker).
+pub async fn advance_read_marker(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    conversation: ChatConversation,
+    message: MessageCursor,
+) -> Result<Option<ChatReadMarkerRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatReadMarkerRow>(
+        r#"INSERT INTO chat_read_markers
+             (app_id, user_id, kind, conversation_id, message_id, message_sent_at, read_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())
+           ON CONFLICT (app_id, user_id, kind, conversation_id) DO UPDATE
+             SET message_id = EXCLUDED.message_id, message_sent_at = EXCLUDED.message_sent_at,
+                 read_at = NOW()
+             WHERE (chat_read_markers.message_sent_at, chat_read_markers.message_id)
+                   < (EXCLUDED.message_sent_at, EXCLUDED.message_id)
+           RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(conversation.kind())
+    .bind(conversation.id())
+    .bind(message.id)
+    .bind(message.sent_at)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_read_marker(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    conversation: ChatConversation,
+) -> Result<Option<ChatReadMarkerRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatReadMarkerRow>(
+        r#"SELECT * FROM chat_read_markers
+           WHERE app_id = $1 AND user_id = $2 AND kind = $3 AND conversation_id = $4"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(conversation.kind())
+    .bind(conversation.id())
+    .fetch_optional(pool)
+    .await
+}
+
+/// Read markers of the given users in a channel.
+pub async fn list_channel_read_markers(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+    user_ids: Option<&[Uuid]>,
+    limit: i64,
+) -> Result<Vec<ChatReadMarkerRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatReadMarkerRow>(
+        r#"SELECT * FROM chat_read_markers
+           WHERE app_id = $1 AND kind = 'channel' AND conversation_id = $2
+             AND ($3::uuid[] IS NULL OR user_id = ANY($3))
+           ORDER BY read_at DESC LIMIT $4"#,
+    )
+    .bind(app_id)
+    .bind(channel_id)
+    .bind(user_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Every read marker of a user (support tooling, data export).
+pub async fn list_user_read_markers(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ChatReadMarkerRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatReadMarkerRow>(
+        r#"SELECT * FROM chat_read_markers WHERE app_id = $1 AND user_id = $2
+           ORDER BY read_at DESC LIMIT $3"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
     .bind(limit)
     .fetch_all(pool)
     .await

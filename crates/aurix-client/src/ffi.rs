@@ -27,7 +27,9 @@
 //! not used after being destroyed/freed.
 #![allow(clippy::missing_safety_doc)]
 
-use aurix_common::protocol::{TransmissionMode, TtsDestination, TtsState, UserPosition};
+use aurix_common::protocol::{
+    ChatMessage, TransmissionMode, TtsDestination, TtsState, UserPosition,
+};
 use aurix_common::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, NetworkQuality,
     OpusBandwidth, OpusSignal, Orientation3D, Position3D, RecordingConsent, UserId,
@@ -44,7 +46,7 @@ use crate::client::Client;
 use crate::config::ClientConfig;
 use crate::dsp::{DspConfig, DspStats, NoiseSuppression};
 use crate::error::ClientError;
-use crate::events::{ChannelScope, ConnectionState, Event};
+use crate::events::{ChannelScope, ChatScope, ConnectionState, Event};
 use crate::media::{MediaPath, MediaPathPolicy};
 
 // ------------------------------------------------------------------------------- results
@@ -1175,6 +1177,18 @@ pub enum AurixEventType {
     /// `message` = the WebSocket URL the client now talks to: a failover endpoint answered
     /// while the previous node did not. Precedes that connection's `SessionReady`.
     AurixEventEndpointChanged = 35,
+    /// `request_id`, `channel_id` / `user_id` = conversation, `aurix_event_chat_history` +
+    /// `aurix_event_chat_history_message`: one page of stored history (newest first).
+    AurixEventChatHistory = 36,
+    /// `aurix_event_read_marker`: a read marker moved (this user's on any device, or another
+    /// participant's when the server has read receipts on).
+    AurixEventChatReadMarker = 37,
+    /// `channel_id` / `user_id` = conversation, `number` = unread count, `number2` = marker
+    /// count, `aurix_event_read_marker_at`: answer to `aurix_client_chat_read_markers`.
+    AurixEventChatReadMarkers = 38,
+    /// `number` = directed messages replayed (each arrived as `ChatMessage` with `offline`)
+    /// since connecting, `flag` = older unread ones were left out (page with history).
+    AurixEventChatInboxSynced = 39,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1236,6 +1250,84 @@ pub struct AurixChatMessage {
     pub sent_at_ms: i64,
     /// Non-zero when this is the echo of a message this client sent.
     pub request_id: u64,
+    /// Directed message that waited for the recipient (replayed on connect, or — on the
+    /// sender's echo — queued because the recipient is offline).
+    pub offline: bool,
+    /// History cursor of this message (`before` / `after` of `aurix_client_chat_history`).
+    pub cursor: *const c_char,
+}
+
+/// One page of chat history (`AurixEventChatHistory`). Strings owned by the event.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AurixChatHistory {
+    /// Messages in the page, newest first (`aurix_event_chat_history_message`).
+    pub count: usize,
+    /// Cursor for the next older page, or `NULL` when the beginning was reached.
+    pub next_before: *const c_char,
+    /// Cursor for the next newer page, or `NULL` when the page is the most recent.
+    pub next_after: *const c_char,
+}
+
+/// A user's reading position in a channel or a direct conversation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AurixReadMarker {
+    pub user_id: AurixUuid,
+    /// Zero UUID for direct conversations.
+    pub channel_id: AurixUuid,
+    /// The other party of a direct conversation; zero UUID for channels.
+    pub peer_user_id: AurixUuid,
+    /// Last read message and its send time (Unix ms).
+    pub message_id: AurixUuid,
+    pub message_sent_at_ms: i64,
+    pub read_at_ms: i64,
+}
+
+fn marker_to_c(m: &aurix_common::protocol::ChatReadMarker) -> AurixReadMarker {
+    AurixReadMarker {
+        user_id: m.user_id.0.into(),
+        channel_id: m.channel_id.map(|c| c.0.into()).unwrap_or_else(zero),
+        peer_user_id: m.peer_user_id.map(|u| u.0.into()).unwrap_or_else(zero),
+        message_id: m.message_id.into(),
+        message_sent_at_ms: m.message_sent_at.timestamp_millis(),
+        read_at_ms: m.read_at.timestamp_millis(),
+    }
+}
+
+/// Strings of one chat message in `OwnedStrings::extra`: name, text, metadata, cursor.
+const CHAT_STRINGS: usize = 4;
+
+fn push_chat_strings(extra: &mut Vec<CString>, m: &ChatMessage) {
+    extra.push(cstring(&m.display_name));
+    extra.push(cstring(&m.text));
+    extra.push(cstring(
+        &m.metadata
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    ));
+    extra.push(cstring(&m.cursor()));
+}
+
+fn chat_to_c(m: &ChatMessage, strings: &[CString], request_id: u64) -> AurixChatMessage {
+    AurixChatMessage {
+        message_id: m.id.into(),
+        channel_id: m.channel_id.map(|c| c.0.into()).unwrap_or_else(zero),
+        sender_id: m.from_user_id.0.into(),
+        recipient_id: m.to_user_id.map(|u| u.0.into()).unwrap_or_else(zero),
+        sender_name: strings[0].as_ptr(),
+        text: strings[1].as_ptr(),
+        metadata_json: if m.metadata.is_some() {
+            strings[2].as_ptr()
+        } else {
+            ptr::null()
+        },
+        sent_at_ms: m.sent_at.timestamp_millis(),
+        request_id,
+        offline: m.offline,
+        cursor: strings[3].as_ptr(),
+    }
 }
 
 #[repr(C)]
@@ -1337,15 +1429,18 @@ impl AurixEvent {
                 code = c.clone();
                 message = m.clone();
             }
-            Event::ChatMessage { message: m, .. } => {
-                extra.push(cstring(&m.display_name));
-                extra.push(cstring(&m.text));
-                extra.push(cstring(
-                    &m.metadata
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_default(),
-                ));
+            Event::ChatMessage { message: m, .. } => push_chat_strings(&mut extra, m),
+            Event::ChatHistory {
+                messages,
+                next_before,
+                next_after,
+                ..
+            } => {
+                extra.push(cstring(next_before.as_deref().unwrap_or_default()));
+                extra.push(cstring(next_after.as_deref().unwrap_or_default()));
+                for m in messages {
+                    push_chat_strings(&mut extra, m);
+                }
             }
             Event::Transcript(t) => {
                 extra.push(cstring(&t.text));
@@ -1394,6 +1489,10 @@ impl AurixEvent {
             Event::Kicked { .. } => T::AurixEventKicked,
             Event::ModerationApplied { .. } => T::AurixEventModerationApplied,
             Event::ChatMessage { .. } => T::AurixEventChatMessage,
+            Event::ChatHistory { .. } => T::AurixEventChatHistory,
+            Event::ChatReadMarker(_) => T::AurixEventChatReadMarker,
+            Event::ChatReadMarkers { .. } => T::AurixEventChatReadMarkers,
+            Event::ChatInboxSynced { .. } => T::AurixEventChatInboxSynced,
             Event::ParticipantTyping { .. } => T::AurixEventParticipantTyping,
             Event::Transcript(_) => T::AurixEventTranscript,
             Event::TtsStatus { .. } => T::AurixEventTtsStatus,
@@ -1517,9 +1616,9 @@ pub unsafe extern "C" fn aurix_event_request_id(event: *const AurixEvent) -> u64
         Some(Event::ChannelJoined { request_id, .. })
         | Some(Event::ModerationApplied { request_id, .. })
         | Some(Event::RequestFailed { request_id, .. }) => *request_id,
-        Some(Event::ChatMessage { request_id, .. }) | Some(Event::TtsStatus { request_id, .. }) => {
-            request_id.unwrap_or(0)
-        }
+        Some(Event::ChatMessage { request_id, .. })
+        | Some(Event::ChatHistory { request_id, .. })
+        | Some(Event::TtsStatus { request_id, .. }) => request_id.unwrap_or(0),
         _ => 0,
     }
 }
@@ -1551,6 +1650,8 @@ pub unsafe extern "C" fn aurix_event_channel_id(event: *const AurixEvent) -> Aur
         Event::ChannelFocusChanged(c) => *c,
         Event::TransmissionChanged(TransmissionMode::Single { channel_id }) => Some(*channel_id),
         Event::ChatMessage { message, .. } => message.channel_id,
+        Event::ChatHistory { scope, .. } | Event::ChatReadMarkers { scope, .. } => scope.split().0,
+        Event::ChatReadMarker(m) => m.channel_id,
         Event::Transcript(t) => Some(t.channel_id),
         _ => None,
     };
@@ -1573,6 +1674,8 @@ pub unsafe extern "C" fn aurix_event_user_id(event: *const AurixEvent) -> AurixU
         | Event::ParticipantTyping { user_id, .. } => Some(*user_id),
         Event::Recording { initiated_by, .. } => Some(*initiated_by),
         Event::ChatMessage { message, .. } => Some(message.from_user_id),
+        Event::ChatHistory { scope, .. } | Event::ChatReadMarkers { scope, .. } => scope.split().1,
+        Event::ChatReadMarker(m) => Some(m.user_id),
         Event::Transcript(t) => Some(t.user_id),
         _ => None,
     };
@@ -1591,6 +1694,7 @@ pub unsafe extern "C" fn aurix_event_object_id(event: *const AurixEvent) -> Auri
             server_request_id, ..
         } => (*server_request_id).into(),
         Event::ChatMessage { message, .. } => message.id.into(),
+        Event::ChatReadMarker(m) => m.message_id.into(),
         _ => zero(),
     }
 }
@@ -1608,6 +1712,7 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
         Some(Event::Recording { active, .. }) => *active,
         Some(Event::ParticipantTyping { typing, .. }) => *typing,
         Some(Event::Recovered { resumed, .. }) => *resumed,
+        Some(Event::ChatInboxSynced { truncated, .. }) => *truncated,
         _ => false,
     }
 }
@@ -1626,21 +1731,26 @@ pub unsafe extern "C" fn aurix_event_flag2(event: *const AurixEvent) -> bool {
     }
 }
 
-/// Numeric payload: bitrate (bps) for `BitrateChanged`, attempt for `Recovering`.
+/// Numeric payload: bitrate (bps) for `BitrateChanged`, attempt for `Recovering`, unread
+/// count for `ChatReadMarkers`, replayed messages for `ChatInboxSynced`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_number(event: *const AurixEvent) -> u64 {
     match self::event(event).map(|e| &e.event) {
         Some(Event::BitrateChanged { bitrate_bps, .. }) => *bitrate_bps as u64,
         Some(Event::Recovering { attempt, .. }) => *attempt as u64,
+        Some(Event::ChatReadMarkers { unread_count, .. }) => u64::from(*unread_count),
+        Some(Event::ChatInboxSynced { delivered, .. }) => u64::from(*delivered),
         _ => 0,
     }
 }
 
-/// Secondary number: reconnect delay in ms for `Recovering`.
+/// Secondary number: reconnect delay in ms for `Recovering`, marker count for
+/// `ChatReadMarkers`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_number2(event: *const AurixEvent) -> u64 {
     match self::event(event).map(|e| &e.event) {
         Some(Event::Recovering { delay, .. }) => delay.as_millis() as u64,
+        Some(Event::ChatReadMarkers { markers, .. }) => markers.len() as u64,
         _ => 0,
     }
 }
@@ -1787,23 +1897,111 @@ pub unsafe extern "C" fn aurix_event_chat(
     else {
         return false;
     };
+    *out = chat_to_c(message, &e.strings.extra, request_id.unwrap_or(0));
+    true
+}
+
+/// Page summary of a `ChatHistory` event.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_chat_history(
+    event: *const AurixEvent,
+    out: *mut AurixChatHistory,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(e) = self::event(event) else {
+        return false;
+    };
+    let Event::ChatHistory {
+        messages,
+        next_before,
+        next_after,
+        ..
+    } = &e.event
+    else {
+        return false;
+    };
     let s = &e.strings.extra;
-    *out = AurixChatMessage {
-        message_id: message.id.into(),
-        channel_id: message.channel_id.map(|c| c.0.into()).unwrap_or_else(zero),
-        sender_id: message.from_user_id.0.into(),
-        recipient_id: message.to_user_id.map(|u| u.0.into()).unwrap_or_else(zero),
-        sender_name: s[0].as_ptr(),
-        text: s[1].as_ptr(),
-        metadata_json: if message.metadata.is_some() {
-            s[2].as_ptr()
+    *out = AurixChatHistory {
+        count: messages.len(),
+        next_before: if next_before.is_some() {
+            s[0].as_ptr()
         } else {
             ptr::null()
         },
-        sent_at_ms: message.sent_at.timestamp_millis(),
-        request_id: request_id.unwrap_or(0),
+        next_after: if next_after.is_some() {
+            s[1].as_ptr()
+        } else {
+            ptr::null()
+        },
     };
     true
+}
+
+/// Message `index` (0 = newest) of a `ChatHistory` page; `request_id` is 0 for all of them.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_chat_history_message(
+    event: *const AurixEvent,
+    index: usize,
+    out: *mut AurixChatMessage,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(e) = self::event(event) else {
+        return false;
+    };
+    let Event::ChatHistory { messages, .. } = &e.event else {
+        return false;
+    };
+    let Some(m) = messages.get(index) else {
+        return false;
+    };
+    let start = 2 + index * CHAT_STRINGS;
+    *out = chat_to_c(m, &e.strings.extra[start..start + CHAT_STRINGS], 0);
+    true
+}
+
+/// The marker of a `ChatReadMarker` event.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_read_marker(
+    event: *const AurixEvent,
+    out: *mut AurixReadMarker,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::ChatReadMarker(m)) => {
+            *out = marker_to_c(m);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Marker `index` of a `ChatReadMarkers` answer (`aurix_event_number2` = count). This
+/// user's own marker, when stored, is among them.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_read_marker_at(
+    event: *const AurixEvent,
+    index: usize,
+    out: *mut AurixReadMarker,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::ChatReadMarkers { markers, .. }) => match markers.get(index) {
+            Some(m) => {
+                *out = marker_to_c(m);
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 #[no_mangle]
@@ -3022,6 +3220,108 @@ pub unsafe extern "C" fn aurix_client_set_typing(
     }
 }
 
+/// Exactly one of `channel_id` (a joined channel) / `user_id` (direct conversation) selects
+/// a stored conversation; the other must be `NULL`.
+unsafe fn chat_scope_arg(
+    channel_id: *const AurixUuid,
+    user_id: *const AurixUuid,
+) -> Result<ChatScope, AurixResult> {
+    match (channel_id.is_null(), user_id.is_null()) {
+        (false, true) => Ok(ChatScope::Channel(ChannelId((*channel_id).into()))),
+        (true, false) => Ok(ChatScope::Direct(UserId((*user_id).into()))),
+        _ => {
+            set_error("exactly one of channel_id / user_id must be set");
+            Err(AurixResult::AurixInvalidArgument)
+        }
+    }
+}
+
+/// One page of stored history, newest first, answered by `AurixEventChatHistory` (or
+/// `RequestFailed`). `before` / `after` are cursors from an earlier page or from
+/// `AurixChatMessage.cursor` (`NULL` = from the present); `limit` 0 = server default.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_chat_history(
+    client: *mut AurixClient,
+    channel_id: *const AurixUuid,
+    user_id: *const AurixUuid,
+    before: *const c_char,
+    after: *const c_char,
+    limit: u32,
+    request_id_out: *mut u64,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let scope = match chat_scope_arg(channel_id, user_id) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let before = match opt_cstr_arg(before, "before") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let after = match opt_cstr_arg(after, "after") {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    match c.chat_history(
+        scope,
+        before.as_deref(),
+        after.as_deref(),
+        (limit > 0).then_some(limit),
+    ) {
+        Ok(id) => {
+            if !request_id_out.is_null() {
+                *request_id_out = id;
+            }
+            AurixResult::AurixOk
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Moves this user's read marker in the conversation to `message_id` (never backwards);
+/// every device of the user receives `AurixEventChatReadMarker`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_mark_chat_read(
+    client: *mut AurixClient,
+    channel_id: *const AurixUuid,
+    user_id: *const AurixUuid,
+    message_id: *const AurixUuid,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let scope = match chat_scope_arg(channel_id, user_id) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match uuid_arg(message_id, "message_id") {
+        Ok(m) => ok(c.mark_chat_read(scope, m)),
+        Err(r) => r,
+    }
+}
+
+/// Asks for the read markers and unread count of a conversation; answered by
+/// `AurixEventChatReadMarkers`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_chat_read_markers(
+    client: *mut AurixClient,
+    channel_id: *const AurixUuid,
+    user_id: *const AurixUuid,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match chat_scope_arg(channel_id, user_id) {
+        Ok(scope) => ok(c.chat_read_markers(scope)),
+        Err(r) => r,
+    }
+}
+
 // ----------------------------------------------------------------------------------- TTS
 
 /// Server-side text-to-speech as this participant's voice. `channel_id` may be `NULL` for
@@ -3811,7 +4111,6 @@ pub unsafe extern "C" fn aurix_dsp_push_render_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aurix_common::protocol::ChatMessage;
 
     #[test]
     fn null_handles_are_rejected_not_dereferenced() {
@@ -4157,6 +4456,7 @@ mod tests {
             metadata: Some(serde_json::json!({"k": 1})),
             client_ref: None,
             sent_at: chrono::Utc::now(),
+            offline: true,
         };
         let ev = Box::into_raw(Box::new(AurixEvent::new(Event::ChatMessage {
             request_id: Some(7),
@@ -4174,6 +4474,11 @@ mod tests {
                 CStr::from_ptr(chat.metadata_json).to_str().unwrap(),
                 "{\"k\":1}"
             );
+            assert!(chat.offline);
+            let cursor = CStr::from_ptr(chat.cursor).to_str().unwrap();
+            let (sent_at, id) = aurix_common::protocol::decode_chat_cursor(cursor).unwrap();
+            assert_eq!(id.as_bytes(), &chat.message_id.bytes);
+            assert_eq!(sent_at.timestamp_millis(), chat.sent_at_ms);
             let json = CStr::from_ptr(aurix_event_json(ev)).to_str().unwrap();
             assert!(json.contains("\"type\":\"chat_message\""), "{json}");
             assert!(!aurix_event_transcript(ev, ptr::null_mut()));

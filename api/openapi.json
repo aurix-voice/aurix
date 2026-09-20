@@ -1983,7 +1983,7 @@
         ],
         "summary": "Channel message history",
         "operationId": "listChannelMessages",
-        "description": "History endpoints require `chat.persist = true` on the deployment (otherwise `404`).",
+        "description": "History endpoints require `chat.persist = true` on the deployment (otherwise `404`). Pages are newest first; follow `next_before` to older messages and `next_after` to newer ones (absent when there is nothing more in that direction).",
         "parameters": [
           {
             "name": "channel_id",
@@ -1998,17 +1998,26 @@
             "name": "before",
             "in": "query",
             "schema": {
-              "type": "string",
-              "format": "date-time"
+              "type": "string"
             },
-            "description": "Strictly before this timestamp; newest first."
+            "description": "Only messages older than this cursor. Opaque keyset cursor (`(sent_at, id)`, URL-safe base64) taken from a previous page's `next_before` / `next_after` or from a message's position; equal timestamps never skip or repeat a row. Invalid cursors are `400`."
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only messages newer than this cursor (walk forward from a known position). Opaque keyset cursor (`(sent_at, id)`, URL-safe base64) taken from a previous page's `next_before` / `next_after` or from a message's position; equal timestamps never skip or repeat a row. Invalid cursors are `400`."
           },
           {
             "name": "limit",
             "in": "query",
             "schema": {
-              "type": "integer"
-            }
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Page size; clamped to `chat.history_page_max` (default 200)."
           }
         ],
         "responses": {
@@ -2017,21 +2026,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "messages": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/ChatMessage"
-                      }
-                    }
-                  },
-                  "required": [
-                    "messages"
-                  ]
+                  "$ref": "#/components/schemas/ChatHistoryPage"
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -2133,7 +2134,7 @@
         ],
         "summary": "Directed message history of a user",
         "operationId": "listUserMessages",
-        "description": "History endpoints require `chat.persist = true` on the deployment (otherwise `404`).",
+        "description": "History endpoints require `chat.persist = true` on the deployment (otherwise `404`). Pages are newest first; follow `next_before` to older messages and `next_after` to newer ones (absent when there is nothing more in that direction).",
         "parameters": [
           {
             "name": "user_id",
@@ -2148,16 +2149,35 @@
             "name": "before",
             "in": "query",
             "schema": {
-              "type": "string",
-              "format": "date-time"
-            }
+              "type": "string"
+            },
+            "description": "Only messages older than this cursor. Opaque keyset cursor (`(sent_at, id)`, URL-safe base64) taken from a previous page's `next_before` / `next_after` or from a message's position; equal timestamps never skip or repeat a row. Invalid cursors are `400`."
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only messages newer than this cursor (walk forward from a known position). Opaque keyset cursor (`(sent_at, id)`, URL-safe base64) taken from a previous page's `next_before` / `next_after` or from a message's position; equal timestamps never skip or repeat a row. Invalid cursors are `400`."
           },
           {
             "name": "limit",
             "in": "query",
             "schema": {
-              "type": "integer"
-            }
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Page size; clamped to `chat.history_page_max` (default 200)."
+          },
+          {
+            "name": "peer",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Restrict to the conversation with this user (messages in both directions); without it every directed message the user sent or received."
           }
         ],
         "responses": {
@@ -2166,21 +2186,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "messages": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/ChatMessage"
-                      }
-                    }
-                  },
-                  "required": [
-                    "messages"
-                  ]
+                  "$ref": "#/components/schemas/ChatHistoryPage"
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -5924,6 +5936,251 @@
           "recordings:read"
         ]
       }
+    },
+    "/v1/users/{user_id}/read-markers": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Read markers of a user",
+        "operationId": "listUserReadMarkers",
+        "description": "With `channel_id` or `peer_user_id`: the user's marker in that conversation (`null` if they never read there) and how many messages from others lie after it (capped at `chat.unread_count_cap`). Without a selector: every marker of the user. Requires `chat.persist = true` (otherwise `404`).",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "channel_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Channel conversation (mutually exclusive with `peer_user_id`)."
+          },
+          {
+            "name": "peer_user_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Direct conversation with this user (mutually exclusive with `channel_id`)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadMarkerStatus"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "markers": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/ChatReadMarker"
+                          }
+                        }
+                      },
+                      "required": [
+                        "markers"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:read"
+        ]
+      },
+      "put": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Advance a user's read marker",
+        "operationId": "putUserReadMarker",
+        "description": "Marks everything in the conversation up to `message_id` as read on the user's behalf (for example after a support agent answered for them). Markers only move forward: an older or equal position is accepted but `moved` is `false`. The message must belong to the selected conversation of that user, otherwise `404`. Every device of the user receives `ChatReadMarker`; with `chat.read_receipts` so do the channel members / the peer. Requires `chat.persist = true`.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReadMarkerRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadMarkerStatus"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "moved": {
+                          "type": "boolean",
+                          "description": "Whether the marker advanced."
+                        }
+                      },
+                      "required": [
+                        "moved"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:write"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/read-markers": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Read markers in a channel",
+        "operationId": "listChannelReadMarkers",
+        "description": "Reading position of every user who marked something read in the channel (newest position first). Requires `chat.persist = true` (otherwise `404`).",
+        "parameters": [
+          {
+            "name": "channel_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "markers": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChatReadMarker"
+                      }
+                    }
+                  },
+                  "required": [
+                    "markers"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:read"
+        ]
+      }
     }
   },
   "components": {
@@ -7206,10 +7463,6 @@
             "type": "string",
             "format": "uuid"
           },
-          "app_id": {
-            "type": "string",
-            "format": "uuid"
-          },
           "channel_id": {
             "type": [
               "string",
@@ -7247,16 +7500,21 @@
           "sent_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "offline": {
+            "type": "boolean",
+            "default": false,
+            "description": "Directed message accepted while the recipient had no live session; it was stored for replay when they connect. Omitted when `false`."
           }
         },
         "required": [
           "id",
-          "app_id",
           "from_user_id",
           "display_name",
           "text",
           "sent_at"
-        ]
+        ],
+        "description": "Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history."
       },
       "CoordinateSystem": {
         "type": "string",
@@ -9901,6 +10159,111 @@
           "text",
           "language",
           "confidence"
+        ]
+      },
+      "ChatHistoryPage": {
+        "type": "object",
+        "description": "One page of chat history, newest first.",
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatMessage"
+            }
+          },
+          "next_before": {
+            "type": "string",
+            "description": "Cursor of the oldest message on the page; pass as `before` to get older ones. Absent when the page reached the oldest message."
+          },
+          "next_after": {
+            "type": "string",
+            "description": "Cursor of the newest message on the page; pass as `after` to get newer ones. Absent when the page reached the present."
+          }
+        },
+        "required": [
+          "messages"
+        ]
+      },
+      "ChatReadMarker": {
+        "type": "object",
+        "description": "A user's reading position in one conversation: everything at or before `message_id` (ordered by `(message_sent_at, message_id)`) counts as read. Exactly one of `channel_id` / `peer_user_id` is set.",
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "channel_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "peer_user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "message_sent_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "read_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "user_id",
+          "message_id",
+          "message_sent_at",
+          "read_at"
+        ]
+      },
+      "ReadMarkerStatus": {
+        "type": "object",
+        "properties": {
+          "marker": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ChatReadMarker"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`null` when the user never read in that conversation."
+          },
+          "unread_count": {
+            "type": "integer",
+            "description": "Messages from others after the marker, capped at `chat.unread_count_cap`."
+          }
+        },
+        "required": [
+          "marker",
+          "unread_count"
+        ]
+      },
+      "ReadMarkerRequest": {
+        "type": "object",
+        "properties": {
+          "channel_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Channel conversation (exactly one of `channel_id` / `peer_user_id`)."
+          },
+          "peer_user_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Direct conversation with this user."
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "message_id"
         ]
       }
     }

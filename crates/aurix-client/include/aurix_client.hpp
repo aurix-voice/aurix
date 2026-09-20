@@ -117,6 +117,34 @@ public:
 
     bool session(AurixSessionInfo& out) const { return aurix_event_session(ev_, &out); }
     bool chat(AurixChatMessage& out) const { return aurix_event_chat(ev_, &out); }
+    /// `AURIX_EVENT_CHAT_HISTORY`: page summary (cursors are owned by the event).
+    bool chat_history(AurixChatHistory& out) const { return aurix_event_chat_history(ev_, &out); }
+    /// Messages of an `AURIX_EVENT_CHAT_HISTORY` page, newest first.
+    std::vector<AurixChatMessage> chat_history_messages() const {
+        AurixChatHistory page{};
+        if (!aurix_event_chat_history(ev_, &page)) return {};
+        std::vector<AurixChatMessage> out(page.count);
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            if (!aurix_event_chat_history_message(ev_, i, &out[i])) {
+                out.resize(i);
+                break;
+            }
+        }
+        return out;
+    }
+    /// `AURIX_EVENT_CHAT_READ_MARKER`.
+    bool read_marker(AurixReadMarker& out) const { return aurix_event_read_marker(ev_, &out); }
+    /// Markers of an `AURIX_EVENT_CHAT_READ_MARKERS` answer (`number()` = unread count).
+    std::vector<AurixReadMarker> read_markers() const {
+        std::vector<AurixReadMarker> out(aurix_event_number2(ev_));
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            if (!aurix_event_read_marker_at(ev_, i, &out[i])) {
+                out.resize(i);
+                break;
+            }
+        }
+        return out;
+    }
     bool transcript(AurixTranscript& out) const { return aurix_event_transcript(ev_, &out); }
     bool tts(AurixTtsStatus& out) const { return aurix_event_tts(ev_, &out); }
     /// Payload of `AURIX_EVENT_AUDIO_POLICY_CHANGED`.
@@ -392,6 +420,24 @@ public:
         return aurix_client_send_direct_chat(c_, &user.raw, text.c_str(), metadata_json, request_id);
     }
     AurixResult set_typing(const Uuid& channel, bool typing) { return aurix_client_set_typing(c_, &channel.raw, typing); }
+    /// Stored history of a joined channel, newest first; `before` / `after` may be null.
+    AurixResult channel_history(const Uuid& channel, const char* before, const char* after, std::uint32_t limit,
+                                std::uint64_t* request_id) {
+        return aurix_client_chat_history(c_, &channel.raw, nullptr, before, after, limit, request_id);
+    }
+    /// Stored direct conversation with `user`, newest first.
+    AurixResult direct_history(const Uuid& user, const char* before, const char* after, std::uint32_t limit,
+                               std::uint64_t* request_id) {
+        return aurix_client_chat_history(c_, nullptr, &user.raw, before, after, limit, request_id);
+    }
+    AurixResult mark_channel_read(const Uuid& channel, const Uuid& message) {
+        return aurix_client_mark_chat_read(c_, &channel.raw, nullptr, &message.raw);
+    }
+    AurixResult mark_direct_read(const Uuid& user, const Uuid& message) {
+        return aurix_client_mark_chat_read(c_, nullptr, &user.raw, &message.raw);
+    }
+    AurixResult channel_read_markers(const Uuid& channel) { return aurix_client_chat_read_markers(c_, &channel.raw, nullptr); }
+    AurixResult direct_read_markers(const Uuid& user) { return aurix_client_chat_read_markers(c_, nullptr, &user.raw); }
     AurixResult speak(const std::string& text, const Uuid* channel, AurixTtsDestination destination,
                       const char* voice, std::uint64_t* request_id) {
         return aurix_client_speak(c_, text.c_str(), channel ? &channel->raw : nullptr, destination, voice, request_id);

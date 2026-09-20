@@ -192,6 +192,35 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	return Out;
 }
 
+FAurixChatMessage ToChatMessage(const AurixChatMessage& M)
+{
+	FAurixChatMessage Out;
+	Out.MessageId = ToGuid(M.message_id);
+	Out.ChannelId = ToGuid(M.channel_id);
+	Out.SenderId = ToGuid(M.sender_id);
+	Out.RecipientId = ToGuid(M.recipient_id);
+	Out.SenderName = FromUtf8(M.sender_name);
+	Out.Text = FromUtf8(M.text);
+	Out.MetadataJson = FromUtf8(M.metadata_json);
+	Out.SentAt = FromUnixMs(M.sent_at_ms);
+	Out.RequestId = static_cast<int64>(M.request_id);
+	Out.bOffline = M.offline;
+	Out.Cursor = FromUtf8(M.cursor);
+	return Out;
+}
+
+FAurixReadMarker ToReadMarker(const AurixReadMarker& M)
+{
+	FAurixReadMarker Out;
+	Out.UserId = ToGuid(M.user_id);
+	Out.ChannelId = ToGuid(M.channel_id);
+	Out.PeerUserId = ToGuid(M.peer_user_id);
+	Out.MessageId = ToGuid(M.message_id);
+	Out.MessageSentAt = FromUnixMs(M.message_sent_at_ms);
+	Out.ReadAt = FromUnixMs(M.read_at_ms);
+	return Out;
+}
+
 FAurixParticipant ToParticipant(const AurixParticipant& P)
 {
 	FAurixParticipant Out;
@@ -1279,6 +1308,56 @@ bool UAurixVoiceSubsystem::SetTyping(FGuid ChannelId, bool bTyping)
 	return Native && Check(Native->Client.set_typing(ToUuid(ChannelId), bTyping), TEXT("set_typing"));
 }
 
+bool UAurixVoiceSubsystem::ChannelHistory(FGuid ChannelId, const FString& Before, const FString& After, int32 Limit, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string BeforeUtf8 = ToUtf8(Before);
+	const std::string AfterUtf8 = ToUtf8(After);
+	const bool bOk = Check(Native->Client.channel_history(ToUuid(ChannelId), Before.IsEmpty() ? nullptr : BeforeUtf8.c_str(), After.IsEmpty() ? nullptr : AfterUtf8.c_str(), static_cast<uint32_t>(FMath::Max(0, Limit)), &Id), TEXT("channel_history"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::DirectHistory(FGuid UserId, const FString& Before, const FString& After, int32 Limit, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string BeforeUtf8 = ToUtf8(Before);
+	const std::string AfterUtf8 = ToUtf8(After);
+	const bool bOk = Check(Native->Client.direct_history(ToUuid(UserId), Before.IsEmpty() ? nullptr : BeforeUtf8.c_str(), After.IsEmpty() ? nullptr : AfterUtf8.c_str(), static_cast<uint32_t>(FMath::Max(0, Limit)), &Id), TEXT("direct_history"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::MarkChannelRead(FGuid ChannelId, FGuid MessageId)
+{
+	return Native && Check(Native->Client.mark_channel_read(ToUuid(ChannelId), ToUuid(MessageId)), TEXT("mark_channel_read"));
+}
+
+bool UAurixVoiceSubsystem::MarkDirectRead(FGuid UserId, FGuid MessageId)
+{
+	return Native && Check(Native->Client.mark_direct_read(ToUuid(UserId), ToUuid(MessageId)), TEXT("mark_direct_read"));
+}
+
+bool UAurixVoiceSubsystem::ChannelReadMarkers(FGuid ChannelId)
+{
+	return Native && Check(Native->Client.channel_read_markers(ToUuid(ChannelId)), TEXT("channel_read_markers"));
+}
+
+bool UAurixVoiceSubsystem::DirectReadMarkers(FGuid UserId)
+{
+	return Native && Check(Native->Client.direct_read_markers(ToUuid(UserId)), TEXT("direct_read_markers"));
+}
+
 bool UAurixVoiceSubsystem::Speak(const FString& Text, FGuid ChannelId, EAurixTtsDestination Destination, const FString& Voice, int64& RequestId)
 {
 	RequestId = 0;
@@ -1548,20 +1627,65 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		AurixChatMessage M;
 		if (aurix_event_chat(Raw, &M))
 		{
-			FAurixChatMessage Out;
-			Out.MessageId = ToGuid(M.message_id);
-			Out.ChannelId = ToGuid(M.channel_id);
-			Out.SenderId = ToGuid(M.sender_id);
-			Out.RecipientId = ToGuid(M.recipient_id);
-			Out.SenderName = FromUtf8(M.sender_name);
-			Out.Text = FromUtf8(M.text);
-			Out.MetadataJson = FromUtf8(M.metadata_json);
-			Out.SentAt = FromUnixMs(M.sent_at_ms);
-			Out.RequestId = static_cast<int64>(M.request_id);
-			OnChatMessage.Broadcast(Out);
+			OnChatMessage.Broadcast(ToChatMessage(M));
 		}
 		break;
 	}
+
+	case AURIX_EVENT_CHAT_HISTORY:
+	{
+		AurixChatHistory H;
+		if (aurix_event_chat_history(Raw, &H))
+		{
+			FAurixChatHistoryPage Page;
+			Page.ChannelId = ChannelId;
+			Page.PeerUserId = UserId;
+			Page.NextBefore = FromUtf8(H.next_before);
+			Page.NextAfter = FromUtf8(H.next_after);
+			Page.Messages.Reserve(static_cast<int32>(H.count));
+			for (size_t i = 0; i < H.count; ++i)
+			{
+				AurixChatMessage M;
+				if (aurix_event_chat_history_message(Raw, i, &M))
+				{
+					Page.Messages.Add(ToChatMessage(M));
+				}
+			}
+			OnChatHistory.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), Page);
+		}
+		break;
+	}
+
+	case AURIX_EVENT_CHAT_READ_MARKER:
+	{
+		AurixReadMarker M;
+		if (aurix_event_read_marker(Raw, &M))
+		{
+			OnChatReadMarker.Broadcast(ToReadMarker(M));
+		}
+		break;
+	}
+
+	case AURIX_EVENT_CHAT_READ_MARKERS:
+	{
+		TArray<FAurixReadMarker> Markers;
+		const uint64_t Count = aurix_event_number2(Raw);
+		Markers.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; i < Count; ++i)
+		{
+			AurixReadMarker M;
+			if (aurix_event_read_marker_at(Raw, i, &M))
+			{
+				Markers.Add(ToReadMarker(M));
+			}
+		}
+		OnChatReadMarkers.Broadcast(ChannelId, UserId, Markers, static_cast<int32>(aurix_event_number(Raw)));
+		break;
+	}
+
+	case AURIX_EVENT_CHAT_INBOX_SYNCED:
+		OnChatInboxSynced.Broadcast(static_cast<int32>(aurix_event_number(Raw)), aurix_event_flag(Raw));
+		break;
 
 	case AURIX_EVENT_PARTICIPANT_TYPING:
 		OnParticipantTyping.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));

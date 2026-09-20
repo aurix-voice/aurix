@@ -181,6 +181,15 @@ impl AurixConfig {
             if self.chat.messages_per_second == 0 || self.chat.message_burst == 0 {
                 anyhow::bail!("chat.messages_per_second and chat.message_burst must be > 0");
             }
+            if self.chat.history_page_max == 0 || self.chat.history_page_max > 1000 {
+                anyhow::bail!("chat.history_page_max must be within 1..=1000");
+            }
+            if self.chat.offline_max_messages == 0 || self.chat.offline_max_messages > 5000 {
+                anyhow::bail!("chat.offline_max_messages must be within 1..=5000");
+            }
+            if self.chat.unread_count_cap == 0 {
+                anyhow::bail!("chat.unread_count_cap must be > 0");
+            }
             if let Some(url) = &self.chat.filter_webhook {
                 if !url.starts_with("http://") && !url.starts_with("https://") {
                     anyhow::bail!("chat.filter_webhook must be an http(s) URL");
@@ -1253,8 +1262,9 @@ impl Default for RateLimitConfig {
 }
 
 /// Lightweight in-game text chat: real-time channel and directed messages plus typing
-/// indicators over the control WebSocket. Not a messaging product — no offline delivery, no
-/// conversations, no read markers; history is optional and off by default.
+/// indicators over the control WebSocket. With `persist = true` it also keeps cursor-paginated
+/// history, delivers directed messages to users who were offline and tracks read markers per
+/// channel / direct conversation; everything is off by default.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatConfig {
     #[serde(default = "default_true")]
@@ -1288,10 +1298,42 @@ pub struct ChatConfig {
     /// Days to keep stored messages (`0` = forever).
     #[serde(default = "default_chat_retention_days")]
     pub retention_days: u32,
+    /// Accept directed messages to users without an active session and deliver them on the
+    /// recipient's next connect (requires `persist`; otherwise `USER_OFFLINE`).
+    #[serde(default = "default_true")]
+    pub offline_delivery: bool,
+    /// Newest directed messages replayed on connect; older undelivered ones stay in history.
+    #[serde(default = "default_chat_offline_max_messages")]
+    pub offline_max_messages: u32,
+    /// Directed messages older than this are not replayed on connect (`0` = retention only).
+    #[serde(default = "default_chat_offline_max_age_hours")]
+    pub offline_max_age_hours: u32,
+    /// Largest history page a client or the REST API may request.
+    #[serde(default = "default_chat_history_page_max")]
+    pub history_page_max: u32,
+    /// Unread counters saturate at this value (`unread_count` reports `cap`, never more).
+    #[serde(default = "default_chat_unread_count_cap")]
+    pub unread_count_cap: u32,
+    /// Share read markers with the other participants of a channel / the direct peer
+    /// (`false` = a user only ever sees their own markers).
+    #[serde(default = "default_true")]
+    pub read_receipts: bool,
 }
 
 fn default_chat_max_message_bytes() -> usize {
     1024
+}
+fn default_chat_offline_max_messages() -> u32 {
+    200
+}
+fn default_chat_offline_max_age_hours() -> u32 {
+    0
+}
+fn default_chat_history_page_max() -> u32 {
+    200
+}
+fn default_chat_unread_count_cap() -> u32 {
+    1000
 }
 fn default_chat_messages_per_second() -> u32 {
     2
@@ -1323,6 +1365,12 @@ impl Default for ChatConfig {
             filter_fail_open: false,
             persist: false,
             retention_days: default_chat_retention_days(),
+            offline_delivery: true,
+            offline_max_messages: default_chat_offline_max_messages(),
+            offline_max_age_hours: default_chat_offline_max_age_hours(),
+            history_page_max: default_chat_history_page_max(),
+            unread_count_cap: default_chat_unread_count_cap(),
+            read_receipts: true,
         }
     }
 }

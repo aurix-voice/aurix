@@ -29,7 +29,7 @@ use aurix_common::protocol::{
     ParticipantEnergy, ParticipantVolume, TransmissionMode, TtsDestination, UserPosition,
 };
 use aurix_common::types::*;
-use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
+use aurix_control::chat::{Conversation, OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::{
     ActionTokenService, ControlPlane, LimitScope, MirroredChannel, MirroredPrefs, ParticipantSpeak,
@@ -973,6 +973,9 @@ impl WsState {
                 } => {
                     self.deliver_chat(app_id, message, from_session_id);
                 }
+                ServerEvent::ChatReadMarker { app_id, marker } => {
+                    self.deliver_read_marker(app_id, marker);
+                }
                 ServerEvent::ParticipantTyping {
                     app_id,
                     channel_id,
@@ -1341,6 +1344,59 @@ impl WsState {
                 continue;
             }
             let json = if is_sender { &echo_json } else { &plain_json };
+            let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    /// A moved read marker goes to every session of the reader (multi-device sync) and, with
+    /// `chat.read_receipts`, to the channel's local members who can see the reader / to the
+    /// direct peer's sessions — never to someone with a block between them and the reader.
+    fn deliver_read_marker(&self, app_id: AppId, marker: aurix_common::protocol::ChatReadMarker) {
+        let reader = marker.user_id;
+        let mut recipients = self.sessions_of_user(app_id, reader);
+        let channel = if self.control.config.chat.read_receipts {
+            match (marker.channel_id, marker.peer_user_id) {
+                (Some(channel_id), _) => {
+                    if let Some(members) = self.channel_members.get(&channel_id) {
+                        for sid in members.iter() {
+                            if !recipients.contains(&sid) {
+                                recipients.push(*sid);
+                            }
+                        }
+                    }
+                    self.sfu.read().get_channel(&channel_id)
+                }
+                (None, Some(peer)) => {
+                    for sid in self.sessions_of_user(app_id, peer) {
+                        if !recipients.contains(&sid) {
+                            recipients.push(sid);
+                        }
+                    }
+                    None
+                }
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
+        let Ok(json) = serde_json::to_string(&ControlMessage::ChatReadMarker { marker }) else {
+            return;
+        };
+        for sid in recipients {
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id {
+                continue;
+            }
+            if conn.user_id != reader
+                && (!self.text_allowed(&sid, &reader)
+                    || channel
+                        .as_ref()
+                        .is_some_and(|c| !c.sees(&conn.user_id, &reader)))
+            {
+                continue;
+            }
             let _ = conn.tx.try_send(json.clone());
         }
     }
@@ -2523,6 +2579,7 @@ async fn handle_ws_connection(
             }
         }
     }
+    replay_offline_inbox(&state, &tx, session_id, token.app_id, token.user_id).await;
     aurix_metrics::WS_CONNECTIONS.inc();
     info!(
         "WS session {} {} for user {} ({})",
@@ -2845,12 +2902,14 @@ fn channel_role(
 }
 
 /// Authorization and flow control for a client chat message, then hand-off to `ChatService`.
-/// Channel messages need active membership; directed ones an online target in the same app
-/// (live-only: no offline delivery) with no block between the two users.
+/// Channel messages need active membership; directed ones a target user of the same app with
+/// no block between the two. An offline target is refused (`USER_OFFLINE`) unless
+/// `chat.persist` + `chat.offline_delivery` are on, in which case the message is stored with
+/// `offline: true` and replayed when the user connects.
 async fn send_chat(
     state: &WsState,
     session_id: SessionId,
-    msg: OutgoingMessage,
+    mut msg: OutgoingMessage,
 ) -> Result<(), AurixError> {
     let chat = &state.control.chat;
     if !chat.enabled() {
@@ -2895,10 +2954,113 @@ async fn send_chat(
             .iter()
             .any(|s| s.app_id == msg.app_id.0);
         if !online {
-            return Err(AurixError::UserOffline);
+            if !chat.offline_delivery() {
+                return Err(AurixError::UserOffline);
+            }
+            let exists = aurix_db::queries::get_user(&state.control.pool, msg.app_id.0, to.0)
+                .await
+                .map_err(|e| AurixError::Database(e.to_string()))?
+                .is_some();
+            if !exists {
+                return Err(AurixError::NotFound("User not found".into()));
+            }
+            msg.offline = true;
         }
     }
     chat.accept(msg).await.map(|_| ())
+}
+
+/// Resolves a client's `channel_id` / `user_id` conversation selector against its
+/// memberships: a channel needs active membership on this node, a direct conversation must
+/// name another user of the app.
+fn chat_conversation(
+    state: &WsState,
+    session_id: SessionId,
+    user_id: UserId,
+    channel_id: Option<ChannelId>,
+    peer: Option<UserId>,
+) -> Result<Conversation, AurixError> {
+    match (channel_id, peer) {
+        (Some(channel_id), _) => {
+            if channel_role(state, &session_id, &channel_id).is_none() {
+                return Err(AurixError::AuthorizationDenied(
+                    "Not a member of this channel".into(),
+                ));
+            }
+            Ok(Conversation::Channel(channel_id))
+        }
+        (None, Some(p)) if p == user_id => Err(AurixError::Validation(
+            "Direct conversation needs another user".into(),
+        )),
+        (None, Some(peer)) => Ok(Conversation::Direct {
+            user: user_id,
+            peer,
+        }),
+        (None, None) => Err(AurixError::Validation(
+            "Either channel_id or user_id is required".into(),
+        )),
+    }
+}
+
+/// Channel members (local and remote) that `observer` currently sees in the roster — the
+/// users whose read receipts they may learn about.
+fn visible_participants(state: &WsState, channel_id: &ChannelId, observer: &UserId) -> Vec<UserId> {
+    state
+        .sfu
+        .read()
+        .get_channel(channel_id)
+        .map(|c| {
+            c.roster_for(observer)
+                .into_iter()
+                .map(|e| e.user_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Directed messages that arrived while the user was offline: replayed oldest-first into
+/// this connection (plain `ChatMessageReceived` with `offline: true`), followed by
+/// `ChatInboxSynced`. Read markers decide what is "new", so every device replays until the
+/// user reads (`ChatMarkRead`); duplicate `id`s are the client's dedupe key.
+async fn replay_offline_inbox(
+    state: &WsState,
+    tx: &mpsc::Sender<String>,
+    session_id: SessionId,
+    app_id: AppId,
+    user_id: UserId,
+) {
+    let chat = &state.control.chat;
+    if !chat.offline_delivery() {
+        return;
+    }
+    let (messages, truncated) = match chat.offline_backlog(app_id, user_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("offline chat backlog for {user_id}: {e}");
+            return;
+        }
+    };
+    let mut delivered = 0u32;
+    for message in messages {
+        let blocked = state
+            .sfu
+            .read()
+            .get_session(&session_id)
+            .is_some_and(|s| s.prefs.read().is_blocked_either_way(&message.from_user_id));
+        if blocked {
+            continue;
+        }
+        send_msg(tx, &ControlMessage::ChatMessageReceived { message }).await;
+        delivered += 1;
+    }
+    send_msg(
+        tx,
+        &ControlMessage::ChatInboxSynced {
+            delivered,
+            truncated,
+        },
+    )
+    .await;
 }
 
 /// A server-muted participant may not send text when `chat.server_mute_blocks_text` is set.
@@ -3680,6 +3842,7 @@ async fn handle_control_message(
                 metadata,
                 client_ref: client_ref.clone(),
                 from_session_id: Some(session_id),
+                offline: false,
             };
             if let Err(e) = send_chat(state, session_id, msg).await {
                 send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
@@ -3702,6 +3865,7 @@ async fn handle_control_message(
                 metadata,
                 client_ref: client_ref.clone(),
                 from_session_id: Some(session_id),
+                offline: false,
             };
             if let Err(e) = send_chat(state, session_id, msg).await {
                 send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
@@ -3721,6 +3885,108 @@ async fn handle_control_message(
                 return;
             }
             chat.publish_typing(token.app_id, channel_id, token.user_id, session_id, typing);
+        }
+
+        ControlMessage::ChatHistory {
+            channel_id,
+            user_id,
+            before,
+            after,
+            limit,
+            client_ref,
+        } => {
+            let result = async {
+                let conversation =
+                    chat_conversation(state, session_id, token.user_id, channel_id, user_id)?;
+                state
+                    .control
+                    .chat
+                    .history(
+                        token.app_id,
+                        conversation,
+                        before.as_deref(),
+                        after.as_deref(),
+                        limit,
+                    )
+                    .await
+            }
+            .await;
+            match result {
+                Ok(page) => {
+                    send_msg(
+                        tx,
+                        &ControlMessage::ChatHistoryResult {
+                            channel_id,
+                            user_id,
+                            messages: page.messages,
+                            next_before: page.next_before,
+                            next_after: page.next_after,
+                            client_ref,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+                }
+            }
+        }
+
+        ControlMessage::ChatMarkRead {
+            channel_id,
+            user_id,
+            message_id,
+        } => {
+            let result = async {
+                let conversation =
+                    chat_conversation(state, session_id, token.user_id, channel_id, user_id)?;
+                state
+                    .control
+                    .chat
+                    .mark_read(token.app_id, token.user_id, conversation, message_id)
+                    .await
+            }
+            .await;
+            // The marker itself arrives through the event bus (all of the user's devices).
+            if let Err(e) = result {
+                send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+        }
+
+        ControlMessage::ChatReadMarkers {
+            channel_id,
+            user_id,
+        } => {
+            let result = async {
+                let conversation =
+                    chat_conversation(state, session_id, token.user_id, channel_id, user_id)?;
+                let others = match conversation {
+                    Conversation::Channel(c) => visible_participants(state, &c, &token.user_id),
+                    Conversation::Direct { peer, .. } => vec![peer],
+                    Conversation::User(_) => Vec::new(),
+                };
+                state
+                    .control
+                    .chat
+                    .read_markers(token.app_id, token.user_id, conversation, &others)
+                    .await
+            }
+            .await;
+            match result {
+                Ok((markers, unread_count)) => {
+                    send_msg(
+                        tx,
+                        &ControlMessage::ChatReadMarkersResult {
+                            channel_id,
+                            user_id,
+                            markers,
+                            unread_count,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => send_error(tx, e.error_code(), &e.public_message()).await,
+            }
         }
 
         ControlMessage::SetTranscripts { enabled } => {
@@ -3794,6 +4060,10 @@ async fn handle_control_message(
         | ControlMessage::Kick { .. }
         | ControlMessage::ModerateParticipantAck { .. }
         | ControlMessage::ChatMessageReceived { .. }
+        | ControlMessage::ChatHistoryResult { .. }
+        | ControlMessage::ChatReadMarker { .. }
+        | ControlMessage::ChatReadMarkersResult { .. }
+        | ControlMessage::ChatInboxSynced { .. }
         | ControlMessage::ParticipantTyping { .. }
         | ControlMessage::ChannelEnergy { .. }
         | ControlMessage::Transcript { .. }

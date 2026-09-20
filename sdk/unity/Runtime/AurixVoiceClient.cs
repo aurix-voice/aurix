@@ -172,6 +172,10 @@ namespace Aurix
         /// <summary>client_ref → pending <see cref="SendMessageAsync"/>/<see cref="SendDirectMessageAsync"/>.</summary>
         private readonly Dictionary<string, TaskCompletionSource<ChatMessage>> _pendingChat = new Dictionary<string, TaskCompletionSource<ChatMessage>>();
         private int _chatRefCounter;
+        /// <summary>client_ref → pending <see cref="HistoryAsync"/>.</summary>
+        private readonly Dictionary<string, TaskCompletionSource<ChatHistoryPage>> _pendingHistory = new Dictionary<string, TaskCompletionSource<ChatHistoryPage>>();
+        /// <summary>scope key → pending <see cref="ReadMarkersAsync"/> calls, settled in request order.</summary>
+        private readonly Dictionary<string, Queue<TaskCompletionSource<ChatReadMarkers>>> _pendingReadMarkers = new Dictionary<string, Queue<TaskCompletionSource<ChatReadMarkers>>>();
         /// <summary>channel → time of the last <c>ChatTyping {typing: true}</c> sent.</summary>
         private readonly Dictionary<Guid, DateTime> _typingSentAt = new Dictionary<Guid, DateTime>();
         /// <summary>client_ref → pending <see cref="SpeakAsync"/> (settled by the <c>queued</c> status or an <c>Error</c>).</summary>
@@ -444,6 +448,18 @@ namespace Aurix
         /// this user, or the echo of a message this client sent (<see cref="ChatMessage.IsOwn"/>).
         /// </summary>
         public event Action<ChatMessage> OnChatMessage;
+        /// <summary>
+        /// A read marker moved: this user's own (from any device, this one included) or, when the server has
+        /// read receipts on, another participant's in a shared conversation.
+        /// </summary>
+        public event Action<ChatReadMarker> OnChatReadMarker;
+        /// <summary>
+        /// Once per connection, after the directed messages that arrived while this user was offline were
+        /// replayed through <see cref="OnChatMessage"/> with <see cref="ChatMessage.Offline"/>. <c>(delivered,
+        /// truncated)</c>: <c>truncated</c> means older unread ones exist beyond the server's replay limit —
+        /// page them with <see cref="HistoryAsync"/>.
+        /// </summary>
+        public event Action<int, bool> OnChatInboxSynced;
         /// <summary>Another member of the channel started/stopped typing (channel, user, typing).</summary>
         public event Action<Guid, Guid, bool> OnParticipantTyping;
         /// <summary>
@@ -584,6 +600,7 @@ namespace Aurix
             control.Received += CompletePendingJoin;
             control.Received += CompletePendingModeration;
             control.Received += CompletePendingChat;
+            control.Received += CompletePendingHistory;
             control.Received += CompletePendingSpeak;
             try
             {
@@ -1062,11 +1079,107 @@ namespace Aurix
             SendChatAsync(r => ControlMessage.ChatSend(channelId, text, metadata, r), clientRef, ct);
 
         /// <summary>
-        /// Send a text message to one user of the same app. Live-only: the target must currently have a
-        /// session (<c>USER_OFFLINE</c> otherwise) and neither side may have blocked the other.
+        /// Send a text message to one user of the same app. Neither side may have blocked the other. When the
+        /// server stores chat with offline delivery (<c>chat.persist</c> + <c>chat.offline_delivery</c>), an
+        /// offline recipient gets the message on their next connect and the echo carries
+        /// <see cref="ChatMessage.Offline"/>; otherwise the target must currently have a session (<c>USER_OFFLINE</c>).
         /// </summary>
         public Task<ChatMessage> SendDirectMessageAsync(Guid userId, string text, object metadata = null, string clientRef = null, CancellationToken ct = default) =>
             SendChatAsync(r => ControlMessage.ChatSendDirect(userId, text, metadata, r), clientRef, ct);
+
+        /// <summary>
+        /// One page of stored history of a joined channel, newest first. Page into the past with
+        /// <paramref name="before"/> = <see cref="ChatHistoryPage.NextBefore"/>, catch up after a gap with
+        /// <paramref name="after"/> = <see cref="ChatMessage.Cursor"/> of the last message seen. Faults with
+        /// <c>AUTH_DENIED</c> for a channel this client has not joined, <c>NOT_FOUND</c> when the server does not store chat.
+        /// </summary>
+        public Task<ChatHistoryPage> HistoryAsync(Guid channelId, string before = null, string after = null, int? limit = null, CancellationToken ct = default) =>
+            HistoryAsync(channelId, null, before, after, limit, ct);
+
+        /// <summary>One page of the stored direct conversation with <paramref name="userId"/>; see <see cref="HistoryAsync(Guid, string, string, int?, CancellationToken)"/>.</summary>
+        public Task<ChatHistoryPage> DirectHistoryAsync(Guid userId, string before = null, string after = null, int? limit = null, CancellationToken ct = default) =>
+            HistoryAsync(null, userId, before, after, limit, ct);
+
+        private async Task<ChatHistoryPage> HistoryAsync(Guid? channelId, Guid? userId, string before, string after, int? limit, CancellationToken ct)
+        {
+            EnsureConnected();
+            var reference = $"h{Interlocked.Increment(ref _chatRefCounter)}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
+            var tcs = new TaskCompletionSource<ChatHistoryPage>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pendingHistory) _pendingHistory[reference] = tcs;
+            try
+            {
+                await _control.SendAsync(ControlMessage.ChatHistory(channelId, userId, before, after, limit, reference), ct).ConfigureAwait(false);
+                using (var timeout = new CancellationTokenSource(RequestTimeout))
+                using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("history request timeout"))))
+                using (ct.Register(() => tcs.TrySetCanceled()))
+                    return await tcs.Task.ConfigureAwait(false);
+            }
+            finally { lock (_pendingHistory) _pendingHistory.Remove(reference); }
+        }
+
+        /// <summary>
+        /// Move this user's read marker in a channel to <paramref name="messageId"/> (the newest message the
+        /// user has seen). Idempotent and never moves backwards; every device of the user receives the new
+        /// position through <see cref="OnChatReadMarker"/>.
+        /// </summary>
+        public Task MarkReadAsync(Guid channelId, Guid messageId, CancellationToken ct = default)
+        {
+            EnsureConnected();
+            return _control.SendAsync(ControlMessage.ChatMarkRead(channelId, null, messageId), ct);
+        }
+
+        /// <summary>Move this user's read marker in the direct conversation with <paramref name="userId"/>; see <see cref="MarkReadAsync"/>.</summary>
+        public Task MarkDirectReadAsync(Guid userId, Guid messageId, CancellationToken ct = default)
+        {
+            EnsureConnected();
+            return _control.SendAsync(ControlMessage.ChatMarkRead(null, userId, messageId), ct);
+        }
+
+        /// <summary>Read markers and this user's unread count of a joined channel.</summary>
+        public Task<ChatReadMarkers> ReadMarkersAsync(Guid channelId, CancellationToken ct = default) => ReadMarkersAsync(channelId, null, ct);
+
+        /// <summary>Read markers and this user's unread count of the direct conversation with <paramref name="userId"/>.</summary>
+        public Task<ChatReadMarkers> DirectReadMarkersAsync(Guid userId, CancellationToken ct = default) => ReadMarkersAsync(null, userId, ct);
+
+        private static string ScopeKey(Guid? channelId, Guid? userId) =>
+            channelId.HasValue ? "c:" + channelId.Value.ToString("D") : "u:" + (userId?.ToString("D") ?? string.Empty);
+
+        private async Task<ChatReadMarkers> ReadMarkersAsync(Guid? channelId, Guid? userId, CancellationToken ct)
+        {
+            EnsureConnected();
+            var key = ScopeKey(channelId, userId);
+            var tcs = new TaskCompletionSource<ChatReadMarkers>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pendingReadMarkers)
+            {
+                if (!_pendingReadMarkers.TryGetValue(key, out var queue)) _pendingReadMarkers[key] = queue = new Queue<TaskCompletionSource<ChatReadMarkers>>();
+                queue.Enqueue(tcs);
+            }
+            try
+            {
+                await _control.SendAsync(ControlMessage.ChatReadMarkers(channelId, userId), ct).ConfigureAwait(false);
+                using (var timeout = new CancellationTokenSource(RequestTimeout))
+                using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("read markers request timeout"))))
+                using (ct.Register(() => tcs.TrySetCanceled()))
+                    return await tcs.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_pendingReadMarkers)
+                {
+                    if (_pendingReadMarkers.TryGetValue(key, out var queue))
+                    {
+                        // Normally already dequeued by the result; on timeout/cancel drop this entry only.
+                        if (queue.Contains(tcs))
+                        {
+                            var rest = new Queue<TaskCompletionSource<ChatReadMarkers>>();
+                            foreach (var t in queue) if (t != tcs) rest.Enqueue(t);
+                            if (rest.Count == 0) _pendingReadMarkers.Remove(key); else _pendingReadMarkers[key] = rest;
+                        }
+                        else if (queue.Count == 0) _pendingReadMarkers.Remove(key);
+                    }
+                }
+            }
+        }
 
         /// <summary>
         /// Announce that this user is (not) typing in a channel. Best-effort: <c>typing = true</c> is coalesced
@@ -1274,6 +1387,16 @@ namespace Aurix
             List<TaskCompletionSource<ChatMessage>> pending;
             lock (_pendingChat) { pending = new List<TaskCompletionSource<ChatMessage>>(_pendingChat.Values); _pendingChat.Clear(); }
             foreach (var tcs in pending) tcs.TrySetException(e);
+            List<TaskCompletionSource<ChatHistoryPage>> history;
+            lock (_pendingHistory) { history = new List<TaskCompletionSource<ChatHistoryPage>>(_pendingHistory.Values); _pendingHistory.Clear(); }
+            foreach (var tcs in history) tcs.TrySetException(e);
+            var markers = new List<TaskCompletionSource<ChatReadMarkers>>();
+            lock (_pendingReadMarkers)
+            {
+                foreach (var q in _pendingReadMarkers.Values) markers.AddRange(q);
+                _pendingReadMarkers.Clear();
+            }
+            foreach (var tcs in markers) tcs.TrySetException(e);
             lock (_typingSentAt) _typingSentAt.Clear();
             List<TaskCompletionSource<SpeechRequest>> speak;
             List<TaskCompletionSource<TtsStatus>> done;
@@ -2004,6 +2127,15 @@ namespace Aurix
                 case "ParticipantTyping":
                     OnParticipantTyping?.Invoke(m.Id("channel_id"), m.Id("user_id"), m.Bool("typing"));
                     break;
+                case "ChatReadMarker":
+                {
+                    var marker = m.ReadMarker();
+                    if (marker != null) OnChatReadMarker?.Invoke(marker);
+                    break;
+                }
+                case "ChatInboxSynced":
+                    OnChatInboxSynced?.Invoke((int)m.Num("delivered"), m.Bool("truncated"));
+                    break;
                 case "Transcript":
                 {
                     var t = m.Transcript();
@@ -2099,6 +2231,35 @@ namespace Aurix
             lock (_pendingChat) if (!_pendingChat.TryGetValue(reference, out tcs)) return;
             if (m.Type == "Error") tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
             else tcs.TrySetResult(m.ChatMessage());
+        }
+
+        /// <summary>
+        /// Runs on the network thread: a <c>ChatHistoryResult</c> (or an <c>Error</c>) tagged with our
+        /// <c>client_ref</c> settles the matching history request; a <c>ChatReadMarkersResult</c> settles the
+        /// oldest read-marker query of the same conversation (the server answers them in order).
+        /// </summary>
+        private void CompletePendingHistory(ControlMessage m)
+        {
+            if (m.Type == "ChatReadMarkersResult")
+            {
+                var key = ScopeKey(MiniJson.GetGuid(m.Data, "channel_id"), MiniJson.GetGuid(m.Data, "user_id"));
+                TaskCompletionSource<ChatReadMarkers> waiter = null;
+                lock (_pendingReadMarkers)
+                    if (_pendingReadMarkers.TryGetValue(key, out var queue) && queue.Count > 0)
+                    {
+                        waiter = queue.Dequeue();
+                        if (queue.Count == 0) _pendingReadMarkers.Remove(key);
+                    }
+                waiter?.TrySetResult(m.ReadMarkers());
+                return;
+            }
+            if (m.Type != "ChatHistoryResult" && m.Type != "Error") return;
+            var reference = m.Str("client_ref");
+            if (reference == null) return;
+            TaskCompletionSource<ChatHistoryPage> tcs;
+            lock (_pendingHistory) if (!_pendingHistory.TryGetValue(reference, out tcs)) return;
+            if (m.Type == "Error") tcs.TrySetException(new InvalidOperationException($"{m.Str("code")}: {m.Str("message")}"));
+            else tcs.TrySetResult(m.ChatHistory());
         }
 
         /// <summary>

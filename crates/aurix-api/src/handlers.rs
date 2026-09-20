@@ -4,7 +4,7 @@ use crate::state::AppState;
 use aurix_auth::ValidatedToken;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
-use aurix_control::chat::{OutgoingMessage, SYSTEM_USER};
+use aurix_control::chat::{Conversation, OutgoingMessage, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::safety::{event_type_for_source, is_safety_event, IncidentExport};
 use aurix_control::{LimitScope, SelectionHint};
@@ -1017,13 +1017,14 @@ fn publish_block_change(
 
 #[derive(Deserialize)]
 pub struct ChatHistoryQuery {
-    /// Return messages sent strictly before this timestamp (RFC 3339); newest first.
-    pub before: Option<chrono::DateTime<Utc>>,
-    pub limit: Option<i64>,
-}
-
-fn history_limit(limit: Option<i64>) -> i64 {
-    limit.unwrap_or(50).clamp(1, 200)
+    /// Page cursor from an earlier response (`next_before`): older messages only.
+    pub before: Option<String>,
+    /// Page cursor (`next_after`): newer messages only. With neither, the newest page.
+    pub after: Option<String>,
+    /// Page size, clamped to `chat.history_page_max` (default 50).
+    pub limit: Option<u32>,
+    /// `GET /v1/users/{id}/messages` only: restrict to the direct conversation with this user.
+    pub peer: Option<Uuid>,
 }
 
 pub async fn list_channel_messages(
@@ -1039,17 +1040,18 @@ pub async fn list_channel_messages(
         .channels
         .require_channel(ctx.app_id, channel_id)
         .await?;
-    let messages = state
+    let page = state
         .control
         .chat
-        .channel_history(
+        .history(
             ctx.app_id,
-            channel_id,
-            query.before,
-            history_limit(query.limit),
+            Conversation::Channel(channel_id),
+            query.before.as_deref(),
+            query.after.as_deref(),
+            query.limit,
         )
         .await?;
-    Ok(Json(serde_json::json!({ "messages": messages })))
+    to_json(page)
 }
 
 pub async fn list_user_messages(
@@ -1061,17 +1063,147 @@ pub async fn list_user_messages(
     ctx.require("chat:read")?;
     let user_id = UserId::from_uuid(user_id);
     require_user(&state, ctx.app_id, user_id).await?;
-    let messages = state
+    let conversation = match query.peer {
+        Some(peer) => Conversation::Direct {
+            user: user_id,
+            peer: UserId::from_uuid(peer),
+        },
+        None => Conversation::User(user_id),
+    };
+    let page = state
         .control
         .chat
-        .user_history(
+        .history(
             ctx.app_id,
-            user_id,
-            query.before,
-            history_limit(query.limit),
+            conversation,
+            query.before.as_deref(),
+            query.after.as_deref(),
+            query.limit,
         )
         .await?;
-    Ok(Json(serde_json::json!({ "messages": messages })))
+    to_json(page)
+}
+
+/// Selects one conversation of a user: exactly one of `channel_id` / `peer_user_id`.
+#[derive(Deserialize, Default)]
+pub struct ConversationSelector {
+    pub channel_id: Option<Uuid>,
+    pub peer_user_id: Option<Uuid>,
+}
+
+impl ConversationSelector {
+    fn resolve(&self, user_id: UserId) -> Result<Option<Conversation>, ApiError> {
+        match (self.channel_id, self.peer_user_id) {
+            (Some(_), Some(_)) => Err(AurixError::Validation(
+                "channel_id and peer_user_id are mutually exclusive".into(),
+            )
+            .into()),
+            (Some(c), None) => Ok(Some(Conversation::Channel(ChannelId::from_uuid(c)))),
+            (None, Some(p)) if p == user_id.0 => {
+                Err(AurixError::Validation("peer_user_id must be another user".into()).into())
+            }
+            (None, Some(p)) => Ok(Some(Conversation::Direct {
+                user: user_id,
+                peer: UserId::from_uuid(p),
+            })),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// `GET /v1/users/{id}/read-markers`: every stored marker of the user, or — with
+/// `?channel_id=` / `?peer_user_id=` — the marker of that conversation plus the unread count.
+pub async fn list_user_read_markers(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<ConversationSelector>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    match query.resolve(user_id)? {
+        Some(conversation) => {
+            let (markers, unread_count) = state
+                .control
+                .chat
+                .read_markers(ctx.app_id, user_id, conversation, &[])
+                .await?;
+            Ok(Json(serde_json::json!({
+                "marker": markers.into_iter().find(|m| m.user_id == user_id),
+                "unread_count": unread_count,
+            })))
+        }
+        None => {
+            let markers = state
+                .control
+                .chat
+                .user_read_markers(ctx.app_id, user_id, 1000)
+                .await?;
+            Ok(Json(serde_json::json!({ "markers": markers })))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MarkReadRequest {
+    #[serde(flatten)]
+    pub conversation: ConversationSelector,
+    pub message_id: Uuid,
+}
+
+/// `PUT /v1/users/{id}/read-markers`: moves the user's marker (never backwards) to
+/// `message_id` in the selected conversation; the user's devices receive `ChatReadMarker`.
+pub async fn put_user_read_marker(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<MarkReadRequest>,
+) -> JsonResult {
+    ctx.require("chat:write")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let conversation = req.conversation.resolve(user_id)?.ok_or_else(|| {
+        ApiError::from(AurixError::Validation(
+            "channel_id or peer_user_id is required".into(),
+        ))
+    })?;
+    let moved = state
+        .control
+        .chat
+        .mark_read(ctx.app_id, user_id, conversation, req.message_id)
+        .await?;
+    let (markers, unread_count) = state
+        .control
+        .chat
+        .read_markers(ctx.app_id, user_id, conversation, &[])
+        .await?;
+    Ok(Json(serde_json::json!({
+        "marker": markers.into_iter().find(|m| m.user_id == user_id),
+        "unread_count": unread_count,
+        "moved": moved.is_some(),
+    })))
+}
+
+/// `GET /v1/channels/{id}/read-markers`: reading positions of everyone who read in the channel.
+pub async fn list_channel_read_markers(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(channel_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let markers = state
+        .control
+        .chat
+        .channel_read_markers(ctx.app_id, channel_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "markers": markers })))
 }
 
 /// Server-originated message (announcements, match events, invites). The sender is the
@@ -1118,11 +1250,15 @@ pub async fn send_channel_message(
             metadata: req.metadata,
             client_ref: None,
             from_session_id: None,
+            offline: false,
         })
         .await?;
     to_json(message)
 }
 
+/// A directed system message to a user without an active session is queued for their next
+/// connect when offline delivery is on (`offline: true` in the response); otherwise it is
+/// only stored in history (if `chat.persist`).
 pub async fn send_user_message(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -1132,6 +1268,14 @@ pub async fn send_user_message(
     ctx.require("chat:write")?;
     let user_id = UserId::from_uuid(user_id);
     require_user(&state, ctx.app_id, user_id).await?;
+    let offline = state.control.chat.offline_delivery()
+        && !state
+            .control
+            .sessions
+            .get_active_sessions_for_user(user_id)
+            .await?
+            .iter()
+            .any(|s| s.app_id == ctx.app_id.0);
     let message = state
         .control
         .chat
@@ -1145,6 +1289,7 @@ pub async fn send_user_message(
             metadata: req.metadata,
             client_ref: None,
             from_session_id: None,
+            offline,
         })
         .await?;
     to_json(message)

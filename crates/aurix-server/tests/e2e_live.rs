@@ -2121,6 +2121,7 @@ async fn text_chat_channel_direct_typing_and_history() {
     let http = reqwest::Client::new();
     let channel_id = create_channel(&env, &http).await;
     let other_channel = create_channel(&env, &http).await;
+    let persist = chat_persists(&env, &http, channel_id).await;
     let (tok_a, uid_a) = issue_token(&env, &http, "e2e:chat-alice", "Alice", channel_id).await;
     let (tok_b, uid_b) = issue_token(&env, &http, "e2e:chat-bob", "Bob", channel_id).await;
     let (tok_c, uid_c) = issue_token(&env, &http, "e2e:chat-carol", "Carol", channel_id).await;
@@ -2225,7 +2226,14 @@ async fn text_chat_channel_direct_typing_and_history() {
         client_ref: None,
     })
     .await;
-    expect_error(&mut bob, "direct to unknown user", "USER_OFFLINE").await;
+    // With offline delivery (chat.persist) a missing user is NOT_FOUND, otherwise every
+    // target without a session is USER_OFFLINE.
+    expect_error(
+        &mut bob,
+        "direct to unknown user",
+        if persist { "NOT_FOUND" } else { "USER_OFFLINE" },
+    )
+    .await;
     bob.send(&ControlMessage::ChatSendDirect {
         user_id: uid_b,
         text: "me".into(),
@@ -2442,19 +2450,23 @@ async fn text_chat_channel_direct_typing_and_history() {
     assert_eq!(r.status(), 404);
 
     // ── history (only when the server runs with chat.persist = true) ──
-    let r = http
-        .get(format!(
-            "{}/v1/channels/{}/messages?limit=100",
-            env.api, channel_id
-        ))
-        .header("x-api-key", &env.api_key)
-        .send()
-        .await
-        .unwrap();
-    if r.status() == 404 {
+    if !persist {
         eprintln!("chat.persist is off on this server; skipping history checks");
     } else {
-        let body: serde_json::Value = r.error_for_status().unwrap().json().await.unwrap();
+        let body: serde_json::Value = http
+            .get(format!(
+                "{}/v1/channels/{}/messages?limit=100",
+                env.api, channel_id
+            ))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let msgs = body["messages"].as_array().unwrap();
         let texts: Vec<&str> = msgs.iter().map(|m| m["text"].as_str().unwrap()).collect();
         assert_eq!(texts[0], "Match starts in 10s", "newest first: {texts:?}");
@@ -2528,6 +2540,919 @@ async fn text_chat_channel_direct_typing_and_history() {
     }
 
     for p in [&mut alice, &mut bob, &mut carol, &mut dave] {
+        p.ws.close(None).await.unwrap();
+    }
+}
+
+/// Whether the server stores chat (`chat.persist`): history endpoints answer 404 otherwise.
+async fn chat_persists(env: &Env, http: &reqwest::Client, channel_id: ChannelId) -> bool {
+    let r = http
+        .get(format!("{}/v1/channels/{}/messages", env.api, channel_id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    r.status() != 404
+}
+
+struct HistoryPage {
+    messages: Vec<aurix_common::protocol::ChatMessage>,
+    next_before: Option<String>,
+    next_after: Option<String>,
+}
+
+async fn expect_history(p: &mut Player, client_ref: &str) -> HistoryPage {
+    let m = p
+        .expect("ChatHistoryResult", |m| {
+            matches!(m, ControlMessage::ChatHistoryResult { client_ref: r, .. }
+                if r.as_deref() == Some(client_ref))
+        })
+        .await;
+    let ControlMessage::ChatHistoryResult {
+        messages,
+        next_before,
+        next_after,
+        ..
+    } = m
+    else {
+        unreachable!()
+    };
+    HistoryPage {
+        messages,
+        next_before,
+        next_after,
+    }
+}
+
+async fn expect_marker(p: &mut Player, what: &str) -> aurix_common::protocol::ChatReadMarker {
+    let m = p
+        .expect(what, |m| matches!(m, ControlMessage::ChatReadMarker { .. }))
+        .await;
+    let ControlMessage::ChatReadMarker { marker } = m else {
+        unreachable!()
+    };
+    marker
+}
+
+/// Drains the offline replay after `SessionInitAck`: the queued messages (all `offline`) in
+/// arrival order, then `ChatInboxSynced`.
+async fn expect_inbox(p: &mut Player) -> (Vec<aurix_common::protocol::ChatMessage>, u32, bool) {
+    let mut messages = Vec::new();
+    loop {
+        match p.recv().await {
+            ControlMessage::ChatMessageReceived { message } => {
+                assert!(message.offline, "{}: replayed messages are flagged", p.name);
+                messages.push(message);
+            }
+            ControlMessage::ChatInboxSynced {
+                delivered,
+                truncated,
+            } => return (messages, delivered, truncated),
+            ControlMessage::NetworkQuality { .. } | ControlMessage::ReceiverPreferences { .. } => {}
+            other => panic!("{}: unexpected during inbox replay: {other:?}", p.name),
+        }
+    }
+}
+
+async fn assert_silent(p: &mut Player, why: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    while let Some(m) = p
+        .try_recv(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .await
+    {
+        assert!(
+            matches!(m, ControlMessage::NetworkQuality { .. }),
+            "{}: must stay silent while {why}: {m:?}",
+            p.name
+        );
+    }
+}
+
+/// Stored chat (`chat.persist`): keyset pagination over WS and REST that visits every
+/// message exactly once in both directions, directed messages queued for an offline user and
+/// replayed on every device (across nodes) until read, read markers that only move forward,
+/// unread counts, receipts fanned out to the peer / channel, conversation-scoped
+/// authorization, tenant isolation and the deletion cascade.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with chat.persist = true; see the e2e job in .github/workflows/ci.yml"]
+async fn chat_history_pagination_offline_delivery_and_read_markers() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    if !chat_persists(&env, &http, channel_id).await {
+        eprintln!("chat.persist is off on this server; skipping");
+        return;
+    }
+    // Carol connects to the second node when there is one: offline replay, receipts and
+    // markers then cross nodes.
+    let two_nodes = std::env::var("AURIX_E2E_WS2").is_ok();
+    let env2 = match std::env::var("AURIX_E2E_WS2") {
+        Ok(ws2) => Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+            ws: ws2,
+            api_key: env.api_key.clone(),
+        },
+        Err(_) => {
+            eprintln!("AURIX_E2E_WS2 not set; running on one node");
+            Env {
+                api: env.api.clone(),
+                ws: env.ws.clone(),
+                api_key: env.api_key.clone(),
+            }
+        }
+    };
+    let other_channel = create_channel(&env, &http).await;
+    // Fresh users per run: inboxes and markers are durable and would leak between runs.
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ext = |who: &str| format!("e2e:hist-{who}-{run}");
+    let (tok_a, uid_a) = issue_token(&env, &http, &ext("alice"), "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, &ext("bob"), "Bob", channel_id).await;
+    let (tok_c, uid_c) = issue_token(&env, &http, &ext("carol"), "Carol", channel_id).await;
+    let (tok_d, _) = issue_token(&env, &http, &ext("dave"), "Dave", other_channel).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let uid_c = UserId::from_uuid(uid_c.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut dave = connect(&env, "dave", tok_d).await;
+    for p in [&mut alice, &mut bob] {
+        let (inbox, delivered, _) = expect_inbox(p).await;
+        assert!(
+            inbox.is_empty() && delivered == 0,
+            "{}: fresh user has no inbox",
+            p.name
+        );
+        join(p, channel_id).await;
+    }
+    expect_inbox(&mut dave).await;
+    join(&mut dave, other_channel).await;
+
+    // ── 9 channel messages: alice ×7 (rate limit is 10 burst), bob ×2 in the middle ──
+    let mut ids = Vec::new();
+    for i in 0..9 {
+        let (sender, other) = if i == 3 || i == 4 {
+            (&mut bob, &mut alice)
+        } else {
+            (&mut alice, &mut bob)
+        };
+        sender
+            .send(&ControlMessage::ChatSend {
+                channel_id,
+                text: format!("msg {i}"),
+                metadata: None,
+                client_ref: Some(format!("m{i}")),
+            })
+            .await;
+        let echo = expect_chat(sender, "own echo").await;
+        assert_eq!(echo.client_ref.as_deref(), Some(format!("m{i}").as_str()));
+        assert!(!echo.offline, "live channel messages are not offline");
+        let m = expect_chat(other, "channel message").await;
+        assert_eq!(m.id, echo.id);
+        ids.push(echo.id);
+    }
+
+    // ── WS pagination backwards: 4 + 4 + 1, newest first ──
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: None,
+        limit: Some(4),
+        client_ref: Some("p1".into()),
+    })
+    .await;
+    let p1 = expect_history(&mut bob, "p1").await;
+    let texts: Vec<&str> = p1.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["msg 8", "msg 7", "msg 6", "msg 5"], "newest first");
+    assert!(p1.next_before.is_some() && p1.next_after.is_none());
+    assert_eq!(
+        p1.next_before.as_deref(),
+        Some(p1.messages.last().unwrap().cursor().as_str()),
+        "next_before is the oldest message's cursor"
+    );
+    assert!(p1
+        .messages
+        .iter()
+        .all(|m| m.client_ref.is_none() && !m.offline));
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: p1.next_before.clone(),
+        after: None,
+        limit: Some(4),
+        client_ref: Some("p2".into()),
+    })
+    .await;
+    let p2 = expect_history(&mut bob, "p2").await;
+    let texts: Vec<&str> = p2.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["msg 4", "msg 3", "msg 2", "msg 1"]);
+    assert!(p2.next_before.is_some() && p2.next_after.is_some());
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: p2.next_before.clone(),
+        after: None,
+        limit: Some(4),
+        client_ref: Some("p3".into()),
+    })
+    .await;
+    let p3 = expect_history(&mut bob, "p3").await;
+    assert_eq!(p3.messages.len(), 1);
+    assert_eq!(p3.messages[0].text, "msg 0");
+    assert!(p3.next_before.is_none(), "the oldest message ends the walk");
+    assert!(p3.next_after.is_some());
+    let mut walked: Vec<uuid::Uuid> = p1
+        .messages
+        .iter()
+        .chain(&p2.messages)
+        .chain(&p3.messages)
+        .map(|m| m.id)
+        .collect();
+    let mut expected = ids.clone();
+    expected.reverse();
+    assert_eq!(walked, expected, "every message exactly once, no gaps");
+
+    // ── forwards from the oldest with `after`: 4 + 4, still newest first inside a page ──
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: Some(p3.messages[0].cursor()),
+        limit: Some(4),
+        client_ref: Some("f1".into()),
+    })
+    .await;
+    let f1 = expect_history(&mut bob, "f1").await;
+    let texts: Vec<&str> = f1.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["msg 4", "msg 3", "msg 2", "msg 1"]);
+    assert!(f1.next_after.is_some() && f1.next_before.is_some());
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: f1.next_after.clone(),
+        limit: Some(4),
+        client_ref: Some("f2".into()),
+    })
+    .await;
+    let f2 = expect_history(&mut bob, "f2").await;
+    let texts: Vec<&str> = f2.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["msg 8", "msg 7", "msg 6", "msg 5"]);
+    assert!(f2.next_after.is_none(), "caught up with the present");
+    walked = f2
+        .messages
+        .iter()
+        .chain(&f1.messages)
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        walked,
+        expected[..8].to_vec(),
+        "forward pages tile the same set"
+    );
+
+    // ── validation and authorization of history requests ──
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: Some("not-a-cursor".into()),
+        after: None,
+        limit: None,
+        client_ref: Some("bad".into()),
+    })
+    .await;
+    let m = bob
+        .expect("invalid cursor error", |m| {
+            matches!(m, ControlMessage::Error { .. })
+        })
+        .await;
+    assert!(
+        matches!(&m, ControlMessage::Error { code, client_ref, .. }
+            if code == "VALIDATION_ERROR" && client_ref.as_deref() == Some("bad")),
+        "{m:?}"
+    );
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: None,
+        limit: Some(100_000),
+        client_ref: Some("big".into()),
+    })
+    .await;
+    let big = expect_history(&mut bob, "big").await;
+    assert_eq!(
+        big.messages.len(),
+        9,
+        "oversize limits are clamped, not refused"
+    );
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: None,
+        user_id: None,
+        before: None,
+        after: None,
+        limit: None,
+        client_ref: None,
+    })
+    .await;
+    expect_error(
+        &mut bob,
+        "history without a conversation",
+        "VALIDATION_ERROR",
+    )
+    .await;
+    dave.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: None,
+        limit: None,
+        client_ref: None,
+    })
+    .await;
+    expect_error(&mut dave, "non-member history", "AUTH_DENIED").await;
+    dave.send(&ControlMessage::ChatReadMarkers {
+        channel_id: Some(channel_id),
+        user_id: None,
+    })
+    .await;
+    expect_error(&mut dave, "non-member read markers", "AUTH_DENIED").await;
+
+    // ── REST pagination agrees with WS ──
+    let page = |query: String| {
+        let http = http.clone();
+        let url = format!("{}/v1/channels/{}/messages?{query}", env.api, channel_id);
+        let key = env.api_key.clone();
+        async move {
+            let v: serde_json::Value = http
+                .get(url)
+                .header("x-api-key", key)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v
+        }
+    };
+    let r1 = page("limit=4".into()).await;
+    let rest_texts: Vec<&str> = r1["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(rest_texts, ["msg 8", "msg 7", "msg 6", "msg 5"]);
+    assert_eq!(r1["next_before"].as_str(), p1.next_before.as_deref());
+    assert!(r1["next_after"].is_null());
+    assert!(
+        r1["messages"][0].get("offline").is_none(),
+        "false is omitted on the wire"
+    );
+    let r2 = page(format!(
+        "limit=4&before={}",
+        r1["next_before"].as_str().unwrap()
+    ))
+    .await;
+    let rest_ids: Vec<uuid::Uuid> = r2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(
+        rest_ids,
+        p2.messages.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    let r = http
+        .get(format!(
+            "{}/v1/channels/{}/messages?before=%2A%2A",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "invalid cursor over REST");
+
+    // ── channel read markers: bob reads msg 5, alice (a member) gets the receipt ──
+    bob.send(&ControlMessage::ChatMarkRead {
+        channel_id: Some(channel_id),
+        user_id: None,
+        message_id: ids[5],
+    })
+    .await;
+    let own = expect_marker(&mut bob, "own channel marker").await;
+    assert_eq!(own.user_id, uid_b);
+    assert_eq!(own.channel_id, Some(channel_id));
+    assert!(own.peer_user_id.is_none());
+    assert_eq!(own.message_id, ids[5]);
+    let receipt = expect_marker(&mut alice, "bob's receipt").await;
+    assert_eq!(receipt.message_id, ids[5]);
+    assert_eq!(receipt.user_id, uid_b);
+    assert_silent(&mut dave, "receipts stay inside the channel").await;
+    alice
+        .send(&ControlMessage::ChatReadMarkers {
+            channel_id: Some(channel_id),
+            user_id: None,
+        })
+        .await;
+    let m = alice
+        .expect("ChatReadMarkersResult", |m| {
+            matches!(m, ControlMessage::ChatReadMarkersResult { .. })
+        })
+        .await;
+    let ControlMessage::ChatReadMarkersResult {
+        markers,
+        unread_count,
+        channel_id: c,
+        ..
+    } = m
+    else {
+        unreachable!()
+    };
+    assert_eq!(c, Some(channel_id));
+    assert_eq!(markers.len(), 1, "only bob has read so far: {markers:?}");
+    assert_eq!(markers[0].user_id, uid_b);
+    assert_eq!(
+        unread_count, 2,
+        "alice never marked: bob's two messages are unread"
+    );
+    // Backwards / repeated marks do not move and produce no event.
+    for id in [ids[2], ids[5]] {
+        bob.send(&ControlMessage::ChatMarkRead {
+            channel_id: Some(channel_id),
+            user_id: None,
+            message_id: id,
+        })
+        .await;
+    }
+    assert_silent(&mut bob, "markers only move forward").await;
+    assert_silent(&mut alice, "no receipt for a marker that did not move").await;
+    bob.send(&ControlMessage::ChatMarkRead {
+        channel_id: Some(channel_id),
+        user_id: None,
+        message_id: uuid::Uuid::new_v4(),
+    })
+    .await;
+    expect_error(&mut bob, "mark an unknown message", "NOT_FOUND").await;
+    bob.send(&ControlMessage::ChatReadMarkers {
+        channel_id: Some(channel_id),
+        user_id: None,
+    })
+    .await;
+    let m = bob
+        .expect("ChatReadMarkersResult", |m| {
+            matches!(m, ControlMessage::ChatReadMarkersResult { .. })
+        })
+        .await;
+    assert!(
+        matches!(
+            m,
+            ControlMessage::ChatReadMarkersResult {
+                unread_count: 3,
+                ..
+            }
+        ),
+        "msg 6..8 from alice are after bob's marker: {m:?}"
+    );
+
+    // ── REST markers: dashboards see bob; alice is moved by the operator; tenant scoping ──
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{}/read-markers",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["markers"].as_array().unwrap().len(), 1);
+    assert_eq!(v["markers"][0]["user_id"], serde_json::json!(uid_b));
+    let v: serde_json::Value = http
+        .put(format!("{}/v1/users/{}/read-markers", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel_id, "message_id": ids[8]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["moved"], true);
+    assert_eq!(v["unread_count"], 0);
+    assert_eq!(v["marker"]["message_id"], serde_json::json!(ids[8]));
+    let pushed = expect_marker(&mut alice, "operator-set marker reaches alice's device").await;
+    assert_eq!(pushed.message_id, ids[8]);
+    let receipt = expect_marker(&mut bob, "alice's receipt").await;
+    assert_eq!(receipt.user_id, uid_a);
+    let v: serde_json::Value = http
+        .put(format!("{}/v1/users/{}/read-markers", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel_id, "message_id": ids[8]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["moved"], false, "idempotent");
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/users/{}/read-markers?channel_id={}",
+            env.api, uid_a, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["marker"]["message_id"], serde_json::json!(ids[8]));
+    assert_eq!(v["unread_count"], 0);
+    for (body, status) in [
+        (
+            serde_json::json!({"channel_id": channel_id, "peer_user_id": uid_b, "message_id": ids[8]}),
+            400,
+        ),
+        (serde_json::json!({"message_id": ids[8]}), 400),
+        (
+            serde_json::json!({"channel_id": other_channel, "message_id": ids[8]}),
+            404,
+        ),
+    ] {
+        let r = http
+            .put(format!("{}/v1/users/{}/read-markers", env.api, uid_a))
+            .header("x-api-key", &env.api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{body}");
+    }
+
+    // ── offline delivery: bob writes to carol before she ever connects ──
+    let mut queued = Vec::new();
+    for i in 0..3 {
+        bob.send(&ControlMessage::ChatSendDirect {
+            user_id: uid_c,
+            text: format!("dm {i}"),
+            metadata: None,
+            client_ref: Some(format!("dm{i}")),
+        })
+        .await;
+        let echo = expect_chat(&mut bob, "queued echo").await;
+        assert_eq!(echo.client_ref.as_deref(), Some(format!("dm{i}").as_str()));
+        assert!(
+            echo.offline,
+            "the echo says the message was queued, not delivered"
+        );
+        assert_eq!(echo.to_user_id, Some(uid_c));
+        queued.push(echo);
+    }
+    bob.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_c,
+        text: "x".repeat(4000),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    expect_error(&mut bob, "oversize offline message", "VALIDATION_ERROR").await;
+    assert_silent(&mut alice, "directed messages are private").await;
+
+    // Carol's first device (other node): the backlog replays oldest first, then the sync marker.
+    let mut carol = connect(&env2, "carol", tok_c.clone()).await;
+    let (inbox, delivered, truncated) = expect_inbox(&mut carol).await;
+    assert_eq!(
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+        queued.iter().map(|m| m.id).collect::<Vec<_>>(),
+        "oldest first, exactly the accepted ones"
+    );
+    assert!(inbox
+        .iter()
+        .all(|m| m.client_ref.is_none() && m.from_user_id == uid_b));
+    assert_eq!((delivered, truncated), (3, false));
+    // A second device replays the same unread messages (the client dedupes by id). Aurix keeps
+    // one live session per user and node, so on a single node this replaces the first device.
+    let mut carol2 = connect(&env, "carol2", tok_c.clone()).await;
+    let (inbox2, delivered2, _) = expect_inbox(&mut carol2).await;
+    assert_eq!(delivered2, 3);
+    assert_eq!(
+        inbox2.iter().map(|m| m.id).collect::<Vec<_>>(),
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    let mut second = two_nodes.then_some(carol);
+
+    // Carol reads dm 1 on one device: every device and bob learn about it.
+    carol2
+        .send(&ControlMessage::ChatMarkRead {
+            channel_id: None,
+            user_id: Some(uid_b),
+            message_id: queued[1].id,
+        })
+        .await;
+    for p in [&mut carol2, &mut bob].into_iter().chain(second.iter_mut()) {
+        let m = expect_marker(p, "carol's direct marker").await;
+        assert_eq!(m.user_id, uid_c);
+        assert_eq!(m.peer_user_id, Some(uid_b));
+        assert!(m.channel_id.is_none());
+        assert_eq!(m.message_id, queued[1].id);
+    }
+    assert_silent(&mut alice, "direct receipts go to the peer only").await;
+    // A reconnect (replacing that node's session) replays only what is still unread.
+    let mut carol = connect(&env2, "carol3", tok_c.clone()).await;
+    let (inbox3, delivered3, _) = expect_inbox(&mut carol).await;
+    assert_eq!(delivered3, 1);
+    assert_eq!(inbox3[0].id, queued[2].id);
+    second = two_nodes.then_some(carol2);
+
+    carol
+        .send(&ControlMessage::ChatReadMarkers {
+            channel_id: None,
+            user_id: Some(uid_b),
+        })
+        .await;
+    let m = carol
+        .expect("ChatReadMarkersResult", |m| {
+            matches!(m, ControlMessage::ChatReadMarkersResult { .. })
+        })
+        .await;
+    let ControlMessage::ChatReadMarkersResult {
+        markers,
+        unread_count,
+        user_id: peer,
+        ..
+    } = m
+    else {
+        unreachable!()
+    };
+    assert_eq!(peer, Some(uid_b));
+    assert_eq!(unread_count, 1);
+    assert_eq!(
+        markers.len(),
+        1,
+        "bob has not read anything from carol: {markers:?}"
+    );
+    assert_eq!(markers[0].user_id, uid_c);
+    // Wrong conversation for that message: a channel message is not part of the DM thread.
+    carol
+        .send(&ControlMessage::ChatMarkRead {
+            channel_id: None,
+            user_id: Some(uid_b),
+            message_id: ids[0],
+        })
+        .await;
+    expect_error(&mut carol, "channel message in a DM thread", "NOT_FOUND").await;
+    // Dave may not mark somebody else's conversation with that message either.
+    dave.send(&ControlMessage::ChatMarkRead {
+        channel_id: None,
+        user_id: Some(uid_b),
+        message_id: queued[0].id,
+    })
+    .await;
+    expect_error(&mut dave, "foreign DM", "NOT_FOUND").await;
+    carol
+        .send(&ControlMessage::ChatMarkRead {
+            channel_id: None,
+            user_id: Some(uid_c),
+            message_id: queued[0].id,
+        })
+        .await;
+    expect_error(&mut carol, "DM thread with myself", "VALIDATION_ERROR").await;
+
+    // Now that carol is online, bob's messages are live on both devices and not flagged.
+    bob.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_c,
+        text: "dm live".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    let live = expect_chat(&mut bob, "live echo").await;
+    assert!(!live.offline);
+    for p in [&mut carol].into_iter().chain(second.iter_mut()) {
+        let m = expect_chat(p, "live DM").await;
+        assert_eq!(m.id, live.id);
+        assert!(!m.offline);
+    }
+    // Carol answers; bob's unread count in that thread becomes 1.
+    carol
+        .send(&ControlMessage::ChatSendDirect {
+            user_id: uid_b,
+            text: "dm reply".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+    expect_chat(&mut carol, "own echo").await;
+    if let Some(p) = second.as_mut() {
+        expect_chat(p, "echo on the other device").await;
+    }
+    expect_chat(&mut bob, "carol's reply").await;
+
+    // Direct history from either side, paged; the replayed ones keep their offline flag.
+    carol
+        .send(&ControlMessage::ChatHistory {
+            channel_id: None,
+            user_id: Some(uid_b),
+            before: None,
+            after: None,
+            limit: Some(3),
+            client_ref: Some("d1".into()),
+        })
+        .await;
+    let d1 = expect_history(&mut carol, "d1").await;
+    let texts: Vec<&str> = d1.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["dm reply", "dm live", "dm 2"]);
+    assert_eq!(d1.messages[0].from_user_id, uid_c);
+    assert!(!d1.messages[1].offline && d1.messages[2].offline);
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: None,
+        user_id: Some(uid_c),
+        before: d1.next_before.clone(),
+        after: None,
+        limit: Some(3),
+        client_ref: Some("d2".into()),
+    })
+    .await;
+    let d2 = expect_history(&mut bob, "d2").await;
+    let texts: Vec<&str> = d2.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["dm 1", "dm 0"], "the same thread from bob's side");
+    assert!(d2.next_before.is_none());
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/users/{}/messages?peer={}&limit=2",
+            env.api, uid_c, uid_b
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rest: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(rest, ["dm reply", "dm live"]);
+    assert_eq!(v["messages"][1]["offline"], serde_json::Value::Null);
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/users/{}/messages?peer={}&before={}",
+            env.api,
+            uid_c,
+            uid_b,
+            v["next_before"].as_str().unwrap()
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rest: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(rest, ["dm 2", "dm 1", "dm 0"]);
+    assert_eq!(v["messages"][0]["offline"], true);
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/users/{}/read-markers?peer_user_id={}",
+            env.api, uid_b, uid_c
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v["marker"].is_null(), "bob never read carol's thread");
+    assert_eq!(v["unread_count"], 1);
+    let v: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/read-markers", env.api, uid_c))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["markers"].as_array().unwrap().len(), 1);
+    assert_eq!(v["markers"][0]["peer_user_id"], serde_json::json!(uid_b));
+
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        for url in [
+            format!("{}/v1/channels/{}/read-markers", env.api, channel_id),
+            format!("{}/v1/users/{}/read-markers", env.api, uid_c),
+            format!("{}/v1/users/{}/messages?peer={}", env.api, uid_c, uid_b),
+        ] {
+            let r = http
+                .get(&url)
+                .header("x-api-key", &api_key2)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 404, "foreign tenant: {url}");
+        }
+        let r = http
+            .put(format!("{}/v1/users/{}/read-markers", env.api, uid_a))
+            .header("x-api-key", &api_key2)
+            .json(&serde_json::json!({"channel_id": channel_id, "message_id": ids[8]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign tenant must not move markers");
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    // ── erasing carol removes her thread and markers; bob's channel history stays ──
+    http.delete(format!("{}/v1/users/{}", env.api, uid_c))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/users/{}/messages?peer={}",
+            env.api, uid_b, uid_c
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v["messages"].as_array().unwrap().is_empty(), "{v}");
+    let r = http
+        .get(format!("{}/v1/users/{}/read-markers", env.api, uid_c))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let v: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{}/read-markers",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v["markers"].as_array().unwrap().len(),
+        2,
+        "alice + bob: {v}"
+    );
+
+    // Carol's sockets were closed by the erasure.
+    for p in [&mut alice, &mut bob, &mut dave] {
         p.ws.close(None).await.unwrap();
     }
 }

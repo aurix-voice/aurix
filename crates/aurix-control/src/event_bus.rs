@@ -219,6 +219,13 @@ pub enum ServerEvent {
         /// `client_ref` and is excluded from nothing else.
         from_session_id: Option<SessionId>,
     },
+    /// A user's read marker moved (stored by the origin node). Every node forwards it to the
+    /// reader's own sessions and, with `chat.read_receipts`, to the channel members / the
+    /// direct peer.
+    ChatReadMarker {
+        app_id: AppId,
+        marker: aurix_common::protocol::ChatReadMarker,
+    },
     ParticipantTyping {
         app_id: AppId,
         channel_id: ChannelId,
@@ -339,6 +346,7 @@ impl ServerEvent {
             | Self::RecordingConsentGiven { app_id, .. }
             | Self::UserBlockChanged { app_id, .. }
             | Self::ChatMessage { app_id, .. }
+            | Self::ChatReadMarker { app_id, .. }
             | Self::ParticipantTyping { app_id, .. }
             | Self::ParticipantSpeaking { app_id, .. }
             | Self::ChannelEnergy { app_id, .. }
@@ -390,6 +398,7 @@ impl ServerEvent {
             Self::LiveStreamStopped { .. } => "audio_stream.stopped",
             Self::UserBlockChanged { .. } => "user.block_changed",
             Self::ChatMessage { .. } => "chat.message",
+            Self::ChatReadMarker { .. } => "chat.read_marker",
             Self::ParticipantTyping { .. } => "participant.typing",
             Self::ParticipantSpeaking { .. } => "participant.speaking",
             Self::ChannelEnergy { .. } => "channel.energy",
@@ -430,6 +439,7 @@ impl ServerEvent {
         "audio_stream.stopped",
         "quality.alert",
         "chat.message",
+        "chat.read_marker",
         "participant.typing",
         "participant.speaking",
         "channel.energy",

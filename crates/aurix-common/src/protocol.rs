@@ -1075,8 +1075,9 @@ pub enum ControlMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_ref: Option<String>,
     },
-    /// Text chat: directed message to one online user of the same app (party invite, whisper,
-    /// ping). Not stored for offline users.
+    /// Text chat: directed message to one user of the same app (party invite, whisper, ping).
+    /// With `chat.persist` + `chat.offline_delivery` an offline recipient gets it on the next
+    /// connect; otherwise the send fails with `USER_OFFLINE`.
     ChatSendDirect {
         user_id: UserId,
         text: String,
@@ -1087,6 +1088,79 @@ pub enum ControlMessage {
     },
     ChatMessageReceived {
         message: ChatMessage,
+    },
+    /// Client → server: a page of stored history (`chat.persist`) of a joined channel or of the
+    /// direct conversation with `user_id` (exactly one). Newest first; `before`/`after` are
+    /// opaque cursors from a previous `ChatHistoryResult`, `limit` is capped by
+    /// `chat.history_page_max`. `client_ref` is echoed in the result.
+    ChatHistory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Server → client: one history page. `next_before` pages further into the past (absent
+    /// when the oldest stored message is included), `next_after` towards the present.
+    ChatHistoryResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        messages: Vec<ChatMessage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Client → server: everything up to and including `message_id` in a joined channel or in
+    /// the direct conversation with `user_id` has been read. Markers only move forward; the
+    /// resulting `ChatReadMarker` goes to every session of the reader and (with
+    /// `chat.read_receipts`) to the channel members / the peer.
+    ChatMarkRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        message_id: uuid::Uuid,
+    },
+    /// Server → client: a read marker moved (own, multi-device sync, or another user's).
+    ChatReadMarker {
+        marker: ChatReadMarker,
+    },
+    /// Client → server: current read markers of a joined channel's participants or of the
+    /// direct conversation with `user_id`, plus this user's unread count there.
+    ChatReadMarkers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+    },
+    /// Server → client: `markers` holds the caller's own marker and, with `chat.read_receipts`,
+    /// the other participants'; `unread_count` saturates at `chat.unread_count_cap`.
+    ChatReadMarkersResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        markers: Vec<ChatReadMarker>,
+        unread_count: u32,
+    },
+    /// Server → client after `SessionInitAck`: the replay of directed messages that were
+    /// queued while the user was offline (`ChatMessageReceived` with `offline: true`) is
+    /// complete. `truncated` means older unread ones were left for `ChatHistory`.
+    ChatInboxSynced {
+        delivered: u32,
+        truncated: bool,
     },
     /// Client → server: this session is (no longer) composing a message in `channel_id`.
     ChatTyping {
@@ -1257,6 +1331,57 @@ pub struct ChatMessage {
     pub sent_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ref: Option<String>,
+    /// Directed message accepted while the recipient had no active session: the sender's echo
+    /// carries it to say "queued, not delivered live", the recipient sees it on the replay
+    /// after connecting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline: bool,
+}
+
+impl ChatMessage {
+    /// History cursor addressing this message; see [`encode_chat_cursor`].
+    pub fn cursor(&self) -> String {
+        encode_chat_cursor(self.sent_at, self.id)
+    }
+}
+
+/// Opaque-but-stable history cursor: URL-safe base64 (no padding) of the message's send time
+/// as a big-endian `i64` of Unix microseconds followed by its 16-byte id. Clients may build
+/// one from any message they hold to page from there (`ChatHistory.after` after a reconnect).
+pub fn encode_chat_cursor(sent_at: chrono::DateTime<chrono::Utc>, id: uuid::Uuid) -> String {
+    use base64::Engine;
+    let mut raw = [0u8; 24];
+    raw[..8].copy_from_slice(&sent_at.timestamp_micros().to_be_bytes());
+    raw[8..].copy_from_slice(id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// Inverse of [`encode_chat_cursor`]; `None` for anything that is not a cursor.
+pub fn decode_chat_cursor(cursor: &str) -> Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.trim())
+        .ok()?;
+    let raw: [u8; 24] = raw.try_into().ok()?;
+    let micros = i64::from_be_bytes(raw[..8].try_into().ok()?);
+    let sent_at = chrono::DateTime::from_timestamp_micros(micros)?;
+    let id = uuid::Uuid::from_slice(&raw[8..]).ok()?;
+    Some((sent_at, id))
+}
+
+/// Where a user's reading position is in a channel or in the direct conversation with one
+/// peer. Exactly one of `channel_id` / `peer_user_id` is set. `message_sent_at` keeps the
+/// marker comparable after the message itself was swept by retention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatReadMarker {
+    pub user_id: UserId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<ChannelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_user_id: Option<UserId>,
+    pub message_id: uuid::Uuid,
+    pub message_sent_at: chrono::DateTime<chrono::Utc>,
+    pub read_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1298,6 +1423,24 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Pinned vector shared with the Web SDK (sdk/web/test/chat.test.mjs) and the C# SDK
+    /// (ProtocolTests.cs): clients compute cursors locally, so the encoding is a contract.
+    #[test]
+    fn chat_cursor_round_trips() {
+        let id = uuid::Uuid::parse_str("0192f3a4-b5c6-7d8e-9f01-23456789abcd").unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2024-05-06T07:08:09.123456Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cursor = encode_chat_cursor(at, id);
+        assert_eq!(cursor, "AAYXw7tTSoABkvOktcZ9jp8BI0VniavN");
+        assert_eq!(decode_chat_cursor(&cursor), Some((at, id)));
+        assert_eq!(decode_chat_cursor(""), None);
+        assert_eq!(decode_chat_cursor("AAYXw7tTSoAB"), None);
+        assert_eq!(decode_chat_cursor("not base64!"), None);
+        let later = encode_chat_cursor(at, uuid::Uuid::from_bytes([0xff; 16]));
+        assert!(later > cursor, "same instant orders by id");
     }
 
     /// Pinned wire vectors shared with the C# SDK tests (sdk/unity/.../ProtocolTests.cs):
@@ -1608,6 +1751,7 @@ mod tests {
             metadata: None,
             sent_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
             client_ref: None,
+            offline: false,
         };
         let json = serde_json::to_value(ControlMessage::ChatMessageReceived {
             message: msg.clone(),
@@ -1616,7 +1760,7 @@ mod tests {
         assert_eq!(json["type"], "ChatMessageReceived");
         let m = &json["data"]["message"];
         assert!(m.get("channel_id").is_none() && m.get("metadata").is_none());
-        assert!(m.get("client_ref").is_none());
+        assert!(m.get("client_ref").is_none() && m.get("offline").is_none());
         assert_eq!(m["to_user_id"], "00000000-0000-0000-0000-000000000000");
         let back: ControlMessage = serde_json::from_value(json).unwrap();
         match back {

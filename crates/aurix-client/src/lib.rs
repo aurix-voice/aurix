@@ -33,8 +33,8 @@ pub mod regions;
 
 pub use audio::EncoderSettings;
 pub use aurix_common::protocol::{
-    ChatMessage, ParticipantEnergy, Transcript, TransmissionMode, TtsDestination, TtsState,
-    UserPosition,
+    decode_chat_cursor, encode_chat_cursor, ChatMessage, ChatReadMarker, ParticipantEnergy,
+    Transcript, TransmissionMode, TtsDestination, TtsState, UserPosition,
 };
 pub use aurix_common::types::{
     ActionKind, AudioPolicy, ChannelId, ChannelRole, Direction, OpusBandwidth, OpusSignal,
@@ -45,7 +45,9 @@ pub use client::{Client, ClientStats, ParticipantStream, TransmitStats};
 pub use config::{ClientConfig, ReconnectPolicy};
 pub use dsp::{DspConfig, DspStats, NoiseSuppression};
 pub use error::{ClientError, Result};
-pub use events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
+pub use events::{
+    ChannelScope, ChatScope, ConnectionState, Event, Participant, RequestId, SessionInfo,
+};
 pub use media::{IncomingAudio, MediaPath, MediaPathPolicy, MediaStats};
 pub use regions::{GeoLocation, ProbedRegion, Region, RegionEndpoint, RegionsResponse};
 

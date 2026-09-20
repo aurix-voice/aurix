@@ -40,6 +40,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioPolicyChanged, const FAur
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixKicked, FGuid, ChannelId, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixModerationApplied, int64, RequestId, FGuid, ChannelId, FGuid, UserId, EAurixModerationAction, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatMessageReceived, const FAurixChatMessage&, Message);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatHistoryReceived, int64, RequestId, const FAurixChatHistoryPage&, Page);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatReadMarkerChanged, const FAurixReadMarker&, Marker);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixChatReadMarkersReceived, FGuid, ChannelId, FGuid, PeerUserId, const TArray<FAurixReadMarker>&, Markers, int32, UnreadCount);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatInboxSynced, int32, Delivered, bool, bTruncated);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantTyping, FGuid, ChannelId, FGuid, UserId, bool, bTyping);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixTranscriptReceived, const FAurixTranscript&, Transcript);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixTtsStatusChanged, const FAurixTtsStatus&, Status);
@@ -411,6 +415,34 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
 	bool SetTyping(FGuid ChannelId, bool bTyping);
 
+	/**
+	 * One page of the stored history of a joined channel, newest first; answered by
+	 * OnChatHistory (or OnRequestFailed). Before / After are cursors from an earlier page or
+	 * from a message (empty = from the present); Limit 0 = server default.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool ChannelHistory(FGuid ChannelId, const FString& Before, const FString& After, int32 Limit, int64& RequestId);
+
+	/** One page of the stored direct conversation with UserId, newest first (see ChannelHistory). */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool DirectHistory(FGuid UserId, const FString& Before, const FString& After, int32 Limit, int64& RequestId);
+
+	/** Moves this user's read marker in the channel to MessageId (never backwards); every device gets OnChatReadMarker. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool MarkChannelRead(FGuid ChannelId, FGuid MessageId);
+
+	/** Moves this user's read marker in the direct conversation with UserId to MessageId. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool MarkDirectRead(FGuid UserId, FGuid MessageId);
+
+	/** Asks for the read markers and unread count of a channel; answered by OnChatReadMarkers. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool ChannelReadMarkers(FGuid ChannelId);
+
+	/** Asks for the read markers and unread count of the direct conversation with UserId. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool DirectReadMarkers(FGuid UserId);
+
 	/** Server-side text-to-speech as this participant's voice (ChannelId may be invalid for Local). */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Speech")
 	bool Speak(const FString& Text, FGuid ChannelId, EAurixTtsDestination Destination, const FString& Voice, int64& RequestId);
@@ -468,6 +500,12 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixKicked OnKicked;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixModerationApplied OnModerationApplied;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatMessageReceived OnChatMessage;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatHistoryReceived OnChatHistory;
+	/** A read marker moved: this user's (any device) or, with server-side read receipts, another participant's. */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatReadMarkerChanged OnChatReadMarker;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatReadMarkersReceived OnChatReadMarkers;
+	/** Directed messages that arrived while offline were replayed (as OnChatMessage with bOffline); fires once per connection. */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatInboxSynced OnChatInboxSynced;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantTyping OnParticipantTyping;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTranscriptReceived OnTranscript;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTtsStatusChanged OnTtsStatus;

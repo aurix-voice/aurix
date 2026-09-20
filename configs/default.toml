@@ -187,6 +187,15 @@ filter_timeout_ms = 1500
 filter_fail_open = false
 persist = false
 retention_days = 30
+# Stored chat (persist = true) also gives: directed messages to users without a live session
+# are queued and replayed on their next connect, history is paged by opaque cursors, and read
+# markers / unread counts are kept per user and conversation.
+offline_delivery = true
+offline_max_messages = 200      # newest unread directed messages replayed on connect (1..=5000)
+offline_max_age_hours = 0       # 0 = replay anything within retention_days
+history_page_max = 200          # largest history page a client / REST caller may ask for
+unread_count_cap = 1000         # unread counters saturate here
+read_receipts = true            # share read markers with channel members / the direct peer
 [webhooks]
 enabled = true
 timeout_ms = 5000

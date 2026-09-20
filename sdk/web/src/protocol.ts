@@ -105,6 +105,18 @@ export interface ChatMessageWire {
   /** RFC 3339 timestamp. */
   sent_at: string;
   client_ref?: string | null;
+  /** Directed message that waited for an offline recipient (absent = `false`). */
+  offline?: boolean;
+}
+
+export interface ChatReadMarkerWire {
+  user_id: string;
+  channel_id?: string | null;
+  peer_user_id?: string | null;
+  message_id: string;
+  /** RFC 3339 timestamps. */
+  message_sent_at: string;
+  read_at: string;
 }
 
 /** `from_user_id` of messages injected through the REST API (`POST .../messages`). */
@@ -145,6 +157,19 @@ export type ClientMessage =
       data: { user_id: string; text: string; metadata?: JsonValue; client_ref?: string };
     }
   | { type: 'ChatTyping'; data: { channel_id: string; typing: boolean } }
+  | {
+      type: 'ChatHistory';
+      data: {
+        channel_id?: string;
+        user_id?: string;
+        before?: string;
+        after?: string;
+        limit?: number;
+        client_ref?: string;
+      };
+    }
+  | { type: 'ChatMarkRead'; data: { channel_id?: string; user_id?: string; message_id: string } }
+  | { type: 'ChatReadMarkers'; data: { channel_id?: string; user_id?: string } }
   | { type: 'SetTranscripts'; data: { enabled: boolean } }
   | {
       type: 'TtsSpeak';
@@ -239,6 +264,28 @@ export type ServerMessage =
   | { type: 'TransmissionChanged'; data: { mode: TransmissionModeWire } }
   | { type: 'ChannelFocusChanged'; data: { channel_id?: string | null } }
   | { type: 'ChatMessageReceived'; data: { message: ChatMessageWire } }
+  | {
+      type: 'ChatHistoryResult';
+      data: {
+        channel_id?: string | null;
+        user_id?: string | null;
+        messages: ChatMessageWire[];
+        next_before?: string | null;
+        next_after?: string | null;
+        client_ref?: string | null;
+      };
+    }
+  | { type: 'ChatReadMarker'; data: { marker: ChatReadMarkerWire } }
+  | {
+      type: 'ChatReadMarkersResult';
+      data: {
+        channel_id?: string | null;
+        user_id?: string | null;
+        markers: ChatReadMarkerWire[];
+        unread_count: number;
+      };
+    }
+  | { type: 'ChatInboxSynced'; data: { delivered: number; truncated: boolean } }
   | { type: 'ParticipantTyping'; data: { channel_id: string; user_id: string; typing: boolean } }
   | { type: 'ChannelEnergy'; data: { channel_id: string; levels: ParticipantEnergy[] } }
   | { type: 'Transcript'; data: { transcript: TranscriptWire } }

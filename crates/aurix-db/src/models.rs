@@ -194,6 +194,59 @@ pub struct ChatMessageRow {
     pub text: String,
     pub metadata: Option<serde_json::Value>,
     pub sent_at: DateTime<Utc>,
+    /// Directed message accepted while the recipient had no active session.
+    pub offline: bool,
+}
+
+/// Position in a `(sent_at, id)`-ordered message stream; both cursor bounds of a history page
+/// and the inbox/read positions are of this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageCursor {
+    pub sent_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+impl MessageCursor {
+    pub fn of(m: &ChatMessageRow) -> Self {
+        Self {
+            sent_at: m.sent_at,
+            id: m.id,
+        }
+    }
+}
+
+/// Which stored conversation a read marker or history page refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatConversation {
+    Channel(Uuid),
+    /// Directed messages between the acting user and this peer (both directions).
+    Direct(Uuid),
+}
+
+impl ChatConversation {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Channel(_) => "channel",
+            Self::Direct(_) => "direct",
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Channel(id) | Self::Direct(id) => *id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ChatReadMarkerRow {
+    pub app_id: Uuid,
+    pub user_id: Uuid,
+    pub kind: String,
+    pub conversation_id: Uuid,
+    pub message_id: Uuid,
+    pub message_sent_at: DateTime<Utc>,
+    pub read_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

@@ -41,7 +41,9 @@ use crate::control::{
 };
 use crate::dsp::{DspConfig, DspStats, FarEndHandle};
 use crate::error::{ClientError, Result};
-use crate::events::{ChannelScope, ConnectionState, Event, Participant, RequestId, SessionInfo};
+use crate::events::{
+    ChannelScope, ChatScope, ConnectionState, Event, Participant, RequestId, SessionInfo,
+};
 use crate::media::{
     resolve_media_addr, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
     MediaTransport, SequenceCounter, TUNNEL_UPLINK_QUEUE,
@@ -407,6 +409,7 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackedKind {
     Chat,
+    ChatHistory,
     Tts,
 }
 
@@ -1237,6 +1240,7 @@ impl Client {
         let request_id = self.inner.next_request_id();
         let prefix = match kind {
             TrackedKind::Chat => 'm',
+            TrackedKind::ChatHistory => 'h',
             TrackedKind::Tts => 't',
         };
         let client_ref = format!("{prefix}{request_id}-{:x}", rand::random::<u32>());
@@ -1271,7 +1275,9 @@ impl Client {
         })
     }
 
-    /// Directed message to one online user of the same application.
+    /// Directed message to one user of the same application. When the server persists chat
+    /// with offline delivery, an offline recipient gets it on their next connect (the echo then
+    /// carries `offline: true`); otherwise `RequestFailed { code: "USER_OFFLINE" }`.
     pub fn send_direct_chat(
         &self,
         user_id: UserId,
@@ -1296,6 +1302,54 @@ impl Client {
         self.send_cmd(Command::Send(ControlMessage::ChatTyping {
             channel_id,
             typing,
+        }))
+    }
+
+    /// One page of stored history of a joined channel (`ChatScope::Channel`) or of the direct
+    /// conversation with a user, newest first. `before` / `after` are cursors from an earlier
+    /// `ChatHistory` event (or `ChatMessage::cursor()`); `limit` is clamped by the server.
+    /// Completes with `Event::ChatHistory { request_id }` or `RequestFailed`.
+    pub fn chat_history(
+        &self,
+        scope: ChatScope,
+        before: Option<&str>,
+        after: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<RequestId> {
+        let (channel_id, user_id) = scope.split();
+        let before = before.map(str::to_string);
+        let after = after.map(str::to_string);
+        self.tracked(TrackedKind::ChatHistory, move |client_ref| {
+            ControlMessage::ChatHistory {
+                channel_id,
+                user_id,
+                before,
+                after,
+                limit,
+                client_ref: Some(client_ref),
+            }
+        })
+    }
+
+    /// Moves this user's read marker in `scope` to `message_id` (never backwards). Every
+    /// device of the user receives the new marker as `Event::ChatReadMarker`.
+    pub fn mark_chat_read(&self, scope: ChatScope, message_id: uuid::Uuid) -> Result<()> {
+        let (channel_id, user_id) = scope.split();
+        self.send_cmd(Command::Send(ControlMessage::ChatMarkRead {
+            channel_id,
+            user_id,
+            message_id,
+        }))
+    }
+
+    /// Asks for the read markers of `scope` (own, plus the other participants' when the
+    /// server has read receipts on) and the unread count; answered by
+    /// `Event::ChatReadMarkers`.
+    pub fn chat_read_markers(&self, scope: ChatScope) -> Result<()> {
+        let (channel_id, user_id) = scope.split();
+        self.send_cmd(Command::Send(ControlMessage::ChatReadMarkers {
+            channel_id,
+            user_id,
         }))
     }
 
@@ -2804,6 +2858,44 @@ async fn handle_message(
                 message,
             });
         }
+        ControlMessage::ChatHistoryResult {
+            channel_id,
+            user_id,
+            messages,
+            next_before,
+            next_after,
+            client_ref,
+        } => {
+            let request_id = client_ref.as_ref().and_then(|r| {
+                let t = pending.tracked.remove(r)?;
+                (t.kind == TrackedKind::ChatHistory).then_some(t.request_id)
+            });
+            inner.emit(Event::ChatHistory {
+                request_id,
+                scope: ChatScope::from_parts(channel_id, user_id),
+                messages,
+                next_before,
+                next_after,
+            });
+        }
+        ControlMessage::ChatReadMarker { marker } => inner.emit(Event::ChatReadMarker(marker)),
+        ControlMessage::ChatReadMarkersResult {
+            channel_id,
+            user_id,
+            markers,
+            unread_count,
+        } => inner.emit(Event::ChatReadMarkers {
+            scope: ChatScope::from_parts(channel_id, user_id),
+            markers,
+            unread_count,
+        }),
+        ControlMessage::ChatInboxSynced {
+            delivered,
+            truncated,
+        } => inner.emit(Event::ChatInboxSynced {
+            delivered,
+            truncated,
+        }),
         ControlMessage::ParticipantTyping {
             channel_id,
             user_id,
@@ -2913,6 +3005,9 @@ async fn handle_message(
         | ControlMessage::ChatSend { .. }
         | ControlMessage::ChatSendDirect { .. }
         | ControlMessage::ChatTyping { .. }
+        | ControlMessage::ChatHistory { .. }
+        | ControlMessage::ChatMarkRead { .. }
+        | ControlMessage::ChatReadMarkers { .. }
         | ControlMessage::SetTranscripts { .. }
         | ControlMessage::TtsSpeak { .. }
         | ControlMessage::TtsCancel
