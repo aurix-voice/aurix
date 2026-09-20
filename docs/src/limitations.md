@@ -34,6 +34,13 @@ the chapter that explains the boundary.
 * **Browsers get a server-side mix.** The Web SDK receives one mixed (stereo) downlink per
   session; per-participant tracks, insertable-stream encryption and native AURX over UDP are not
   available in browsers ([Web SDK](sdk/web.md)).
+* **Unity WebGL is a browser client.** `AurixWebGLVoiceClient` reuses the Web SDK through a
+  JavaScript bridge, so everything above applies: WebRTC media with one server-mixed stereo
+  downlink, the browser's Opus/AEC/NS/AGC, playback through a hidden `<audio>` element rather than
+  Unity's `AudioSource`/mixer/spatializer (no per-participant PCM, no `AurixParticipantAudioSource`),
+  no PCMU, no `IOpusCodec`/DSP/media-path settings, and audio only after a user gesture (autoplay
+  policy). The native `AurixVoiceClient` throws `PlatformNotSupportedException` in WebGL players
+  ([Unity WebGL](sdk/unity.md#unity-webgl)).
 * **Opus inside; PCMU only as a per-session fallback** for native AURX clients (the node
   transcodes at the edge). No PCMA, no PCMU over WebRTC, no PCMU for `E2ee` frames, no video
   ([codecs](features/channels.md#codecs-opus-and-the-pcmu-fallback)).
@@ -119,6 +126,10 @@ the chapter that explains the boundary.
   and background/foreground transitions on real iOS/Android hardware are not exercised in CI
   ([Unity SDK](sdk/unity.md)). `NativeOpusCodec` is tested against the Linux build of the native
   core; loading from `Plugins/` on other platforms follows Unity's P/Invoke rules and is not run here.
+* **Unity WebGL player builds.** The WebGL path is verified in pieces — the C# client against a
+  scripted bridge, the `.jslib` against the real browser bundle under an Emscripten-like harness,
+  the Unity compile check with `UNITY_WEBGL` — but no Unity WebGL player has been built and run
+  in a browser from this repository ([Unity WebGL](sdk/unity.md#unity-webgl)).
 * **Browser Opus negotiation.** The Web SDK's `fmtp` rewrite and `setParameters` path are unit-
   tested on SDP text and applied in the E2E browser runs; whether a given browser honours
   `useinbandfec`/`usedtx`/`maxplaybackrate` is up to that browser's WebRTC stack.

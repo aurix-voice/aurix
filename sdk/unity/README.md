@@ -2,17 +2,22 @@
 
 Native client for the Aurix Voice Platform. Speaks the **AURX** UDP media protocol directly
 (no WebRTC stack needed), with the control plane over WebSocket. Works in Unity 2021.3+ (.NET Standard 2.1,
-all platforms except WebGL — use the [Web SDK](../web) there) and in plain .NET (dedicated servers, bots, tests).
+every platform) and in plain .NET (dedicated servers, bots, tests). **Unity WebGL** players cannot open UDP
+sockets, so there the same C# API runs on top of the browser's WebRTC through the [Web SDK](../web) —
+see [Unity WebGL](#unity-webgl-browser-webrtc-through-the-web-sdk).
 
 ```
 sdk/unity/
 ├── package.json                 UPM package (com.aurix.voice) — add via "Add package from disk…" or a git URL
 ├── Runtime/
 │   ├── AurixVoiceClient.cs      high-level client: connect → bind media → join channels → audio/events
+│   ├── IAurixVoiceClient.cs     the API both clients implement (native and WebGL)
 │   ├── Protocol/                AURX v2 packet codec (CRC32, AES-256-CTR + HMAC-SHA256, key derivation, replay window), control-message JSON
 │   ├── Transport/               ControlChannel (ClientWebSocket), MediaTransport (UDP, SessionBind, heartbeats)
 │   ├── Audio/                   IOpusCodec abstraction, JitterBuffer, RemoteMixer
-│   └── Unity/AurixVoiceBehaviour.cs  MonoBehaviour: microphone capture + AudioSource playback
+│   ├── WebGL/                   AurixWebGLVoiceClient: the same API over the browser Web SDK (Unity WebGL players)
+│   ├── Plugins/WebGL/AurixWebGL.jslib  Emscripten plugin: loads aurix-web-sdk.js, forwards JSON calls to it
+│   └── Unity/                   AurixVoiceBehaviour (native: microphone + AudioSource), AurixWebGLVoiceBehaviour (WebGL)
 ├── Samples~/Concentus/          IOpusCodec implementation on top of Concentus (pure C# Opus)
 ├── Samples~/VoiceQuickstart/    sample scene: connect, roster, mute/PTT, quality bars, stats, reconnect, chat
 └── DotNet/                      .NET solution: library build, xunit tests, Unity compile check, headless two-client E2E demo
@@ -457,6 +462,89 @@ odd block sizes, and `--scenario reconnect` exercises `ForceReconnect` and `Prob
 TCP proxy that stalls the connection. It was **not** run on a phone: permission dialogs, background
 suspension and route changes need a device test in your project.
 
+### Unity WebGL (browser WebRTC through the Web SDK)
+
+A WebGL player runs inside a browser tab: no UDP, no `ClientWebSocket`, no threads, and the
+microphone/speakers belong to the browser. `AurixVoiceClient` therefore throws
+`PlatformNotSupportedException` in WebGL players, and the package ships a second implementation of
+the same `IAurixVoiceClient` interface, `Aurix.WebGL.AurixWebGLVoiceClient`, that drives the
+browser-native [Web SDK](../web) (WebSocket control plane, **WebRTC** media, browser Opus/AEC/NS/AGC,
+browser playback) through a small JavaScript bridge:
+
+```
+C#  AurixWebGLVoiceClient ──JSON──▶ Plugins/WebGL/AurixWebGL.jslib ──▶ window.AurixWebSdk.AurixBridge ──▶ AurixClient (Web SDK)
+     ▲ Update() drains events  ◀──JSON──                             ◀── ordered, bounded event queue
+```
+
+Setup:
+
+1. Build the standalone bundle once: `cd sdk/web && npm ci && npm run build` produces
+   `sdk/web/dist/aurix-web-sdk.js` (plain script, no module system, defines `window.AurixWebSdk`).
+   Copy it into `Assets/StreamingAssets/` of your project — the default `SdkUrl`
+   (`StreamingAssets/aurix-web-sdk.js`) resolves relative to the player's `index.html`. Alternatively
+   add `<script src="aurix-web-sdk.js"></script>` to your WebGL template; the plugin picks up an
+   already-present `window.AurixWebSdk` and skips the download.
+2. `Runtime/Plugins/WebGL/AurixWebGL.jslib` is part of the package and is linked automatically into WebGL
+   players (it is ignored on every other platform; the assembly definition compiles for all platforms and
+   the native transport/audio classes are compiled out of WebGL players with
+   `#if !(UNITY_WEBGL && !UNITY_EDITOR)`). No native `.dll`/`.so` is needed or used in WebGL.
+3. Drop `AurixWebGLVoiceBehaviour` on a GameObject (or construct `AurixWebGLVoiceClient` yourself and call
+   `Update()` every frame). Inspector fields: API URL (`https://…:8080`, used for TURN credentials and
+   chat history), WebSocket URL (`wss://` on `https://` pages), token, channel id(s), `SdkUrl`,
+   browser microphone processing (echo cancellation / noise suppression / AGC), input gain, output
+   volume / speaker mute, `UseTurn`.
+4. The page origin must be allowed by `AURIX__SERVER__CORS_ORIGINS`, and `media.external_ip` (UDP) or the
+   built-in TURN server must be reachable from the browser — the same requirements as the Web SDK.
+
+```csharp
+var voice = gameObject.AddComponent<AurixWebGLVoiceBehaviour>();
+voice.ApiUrl = "https://voice.example.com:8080";
+voice.WebSocketUrl = "wss://voice.example.com:8081/ws";
+voice.Token = playerJwt;                                       // from your backend, POST /v1/tokens
+voice.TokenRefresher = ct => Backend.FreshTokenAsync();         // optional: refreshToken action tokens
+voice.JoinTokenProvider = (channel, ct) => Backend.JoinTokenAsync(channel); // optional: joinToken
+await voice.Connect();
+var roster = await voice.Client.JoinChannelAsync(channelId);   // same calls and events as AurixVoiceClient
+voice.Client.OnSpeaking += (ch, p, on) => hud.SetSpeaking(p.UserId, on);
+```
+
+How it works and what is different from the native client:
+
+* **Same API, same events.** Everything in `IAurixVoiceClient` works — join/leave/moderate, local mute,
+  per-participant volume, block, transmission mode/focus, positions, recording consent, chat + history +
+  read markers + typing, transcripts, TTS (`SpeakAsync(...).Done`), quality/stats events, reconnect with
+  resume and cross-node failover (`OnRecovering` / `OnEndpointChanged` / `OnRecovered`). Calls are JSON
+  round trips through the bridge; results that need the server come back as tasks completed from
+  `Update()`, so continuations run on the main thread (there is no thread pool in WebGL). Token
+  callbacks are inverted: when the browser client needs a fresh JWT or a join token it queues a
+  `tokenRequest`, the C# client calls your `TokenRefresher` / `JoinTokenProvider` and answers.
+* **Audio is the browser's.** Remote voices play through a hidden `<audio>` element, not through an
+  `AudioSource` — no `AudioListener`, mixer groups, spatializer plugins or `AurixParticipantAudioSource`;
+  positional audio is the server's stereo mix (like the Web SDK), and there are no PCM frames to pull.
+  Capture uses `getUserMedia` with the browser's echo cancellation / noise suppression / AGC; the
+  `IOpusCodec`, `Dsp*`, `MediaPathPolicy`, `PreferredCodec`/PCMU and downlink-mix settings do not apply
+  (WebRTC negotiates Opus itself). `GetStatsAsync()` returns `WebGLStats` (WebRTC RTT/jitter/loss/MOS).
+* **Autoplay.** Browsers only start audio after a user gesture. `OnRemoteAudio(playing: false, reason)`
+  (and `RemoteAudioPlaying` / `RemoteAudioBlockedReason` on the behaviour) tell you playback is blocked;
+  call `ResumeAudio()` from a UI button/tap handler to retry (the browser's transient user activation
+  covers a Unity click processed in the same frame). `getUserMedia` requires `https://` (or `localhost`) and prompts for the microphone on connect.
+* **Devices.** `EnumerateDevicesAsync`, `SetInputDeviceAsync`, `SetOutputDeviceAsync` (output selection
+  only where the browser supports `setSinkId`), `SetInputGain`, `SetOutputVolume`, `SetOutputMuted`.
+* **Loading.** `ConnectAsync` loads `SdkUrl` on first use (`PreloadSdk()` to start earlier); a missing or
+  broken bundle fails the connect with `WebGLBridgeException` naming the URL. Each browser event queue is
+  bounded; if a frame stalls long enough to overflow it, `OnEventsDropped(count)` fires and the client
+  re-syncs from the next roster/state events.
+* **Editor and other platforms.** The WebGL classes compile everywhere, but the jslib is only linked
+  into WebGL players: in the Editor (Play mode) and on desktop/mobile `NativeWebGLBridge` throws
+  `PlatformNotSupportedException` — use `AurixVoiceBehaviour` there, or inject your own `IWebGLBridge`
+  (the unit tests do exactly that with a scripted fake).
+
+What was verified here: the `.jslib` is evaluated under an Emscripten-like harness against the real
+browser bundle (`sdk/web/test/unity-jslib.test.mjs`), the C# client is tested against a scripted
+bridge (`WebGLBridgeTests`: results, events, token callbacks, timeouts, overflow, disposal), and the
+Unity compile check runs with `UNITY_WEBGL` (player and editor). A real Unity WebGL build in a browser
+was **not** run in this repository — that is the first thing to try in your project.
+
 ### One-time action tokens
 
 Instead of the reusable player JWT the backend can mint single-use tokens with
@@ -744,4 +832,5 @@ codec preference, bob on node 2 hears her before and after the move and never se
 * Audio format: 48 kHz, 20 ms frames (`AudioFormat`). Mono uplink; the mixer outputs to any channel count.
 * Capture DSP with echo cancellation and neural noise suppression needs the native core in `Plugins/`; without
   it the managed chain (high-pass + AGC) is used and `Dsp.SupportsEchoCancellation` is `false`.
-* Not supported: WebGL (no UDP) — use the browser SDK; IL2CPP works (no reflection, no dynamic code).
+* WebGL players use `AurixWebGLVoiceClient` (browser WebRTC via the Web SDK), not the native AURX/UDP path
+  — see [Unity WebGL](#unity-webgl-browser-webrtc-through-the-web-sdk). IL2CPP works (no reflection, no dynamic code).

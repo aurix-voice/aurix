@@ -142,6 +142,18 @@ device and the browser's Opus implementation.
 | `Ping` / `Pong` | keepalive + `roundTripMs`; two missed pongs close the socket |
 | reconnect with `['aurix', 'bearer.<jwt>', 'resume.<session_id>.<resume_token>']` | `SessionInitAck {resumed: true}` + replayed `ChannelJoinAck`s within `server.session_resume_grace_secs` |
 
+## Standalone bundle and `AurixBridge`
+
+`npm run build` also produces `dist/aurix-web-sdk.js`, the SDK as one classic script defining
+`window.AurixWebSdk` for pages without a module system, and exports `AurixBridge`: a handle-based
+façade (`create(optionsJson)` → handle, `invoke(handle, method, argsJson, rid?)` → JSON,
+`drain(handle)` → JSON event array, `destroy(handle)`) for hosts that can only exchange strings.
+Promise results arrive as `result` events keyed by `rid`, token callbacks are inverted into
+`tokenRequest` events answered with `provideToken`, remote audio is attached to a hidden `<audio>`
+element with `remoteAudio` / `resumeAudio` for the autoplay policy, and the per-client queue is
+bounded (`overflow` reports drops). This is the contract the Unity WebGL client is built on
+([Unity WebGL](unity.md#unity-webgl)); details in `sdk/web/README.md`.
+
 ## End-to-end encryption
 
 The Web SDK has no end-to-end encryption mode. Native AURX clients may mark frames with the

@@ -1,4 +1,4 @@
-#if UNITY_5_3_OR_NEWER
+#if UNITY_5_3_OR_NEWER && !(UNITY_WEBGL && !UNITY_EDITOR)
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;

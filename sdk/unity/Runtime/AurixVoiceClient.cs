@@ -144,8 +144,10 @@ namespace Aurix
     /// Thread model: network I/O runs on background tasks; all events are raised from
     /// <see cref="Update"/>, which the host must call periodically (e.g. from a MonoBehaviour's
     /// Update). Audio frames are exposed through <see cref="TryDequeueAudio"/> / <see cref="OnAudio"/>.
+    /// Not available in Unity WebGL players (no UDP, no raw WebSocket): use
+    /// <c>Aurix.WebGL.AurixWebGLVoiceClient</c> there — both implement <see cref="IAurixVoiceClient"/>.
     /// </summary>
-    public sealed class AurixVoiceClient : IDisposable
+    public sealed class AurixVoiceClient : IAurixVoiceClient
     {
         public const string SdkVersion = "1.2.0";
 
@@ -509,9 +511,13 @@ namespace Aurix
         /// <param name="token">Per-user credential issued by your backend: a session JWT (<c>POST /v1/tokens</c>) or a one-time <c>login</c> action token (<c>POST /v1/tokens/action</c>).</param>
         public AurixVoiceClient(string wsUrl, string token)
         {
+#if UNITY_WEBGL && !UNITY_EDITOR
+            throw new PlatformNotSupportedException("AurixVoiceClient needs UDP/WebSocket sockets; in WebGL players use Aurix.WebGL.AurixWebGLVoiceClient");
+#else
             _wsUrl = wsUrl ?? throw new ArgumentNullException(nameof(wsUrl));
             _token = token ?? throw new ArgumentNullException(nameof(token));
             Endpoint = _wsUrl;
+#endif
         }
 
         /// <summary>WebSocket URL of the node the client talks to (the constructor URL until a failover moved it).</summary>
@@ -1732,6 +1738,8 @@ namespace Aurix
                 }
             }
         }
+
+        void IAurixVoiceClient.Update() => Update();
 
         public async Task DisconnectAsync(string reason = "client disconnect")
         {

@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "amd",
+    "moduleResolution": "node10",
+    "outFile": "dist/aurix-web-sdk.amd.js",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src"]
+}

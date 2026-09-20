@@ -428,6 +428,46 @@ browser's Opus implementation. Voice channels stay mono whatever the client asks
 Native AURX-over-UDP is not available from browsers (no raw UDP); the native path is used by the
 Unity SDK (`sdk/unity`) and the Rust load generator.
 
+## Standalone bundle and the handle bridge (Unity WebGL, non-JS hosts)
+
+`npm run build` also emits `dist/aurix-web-sdk.js`: the whole SDK as one dependency-free classic
+script (no module system) that defines `window.AurixWebSdk` (`AurixClient`, `AurixBridge`,
+`version`, the wire helpers). It is what the Unity WebGL plugin loads
+(`sdk/unity/Runtime/Plugins/WebGL/AurixWebGL.jslib`) and what any host that cannot import ES modules
+can use with a plain `<script>` tag. The file is generated, not committed.
+
+`AurixBridge` is a façade for code that can only exchange strings — wasm/Emscripten hosts, engine
+scripting layers, `postMessage` — instead of holding JS objects:
+
+```js
+const bridge = new AurixWebSdk.AurixBridge();          // { maxQueuedEvents, document, createClient }
+const h = bridge.create(JSON.stringify({ apiUrl, wsUrl, token, refreshToken: true }));
+bridge.invoke(h, 'connect', '{}', 1);                  // → {"ok":true,"pending":true}
+bridge.invoke(h, 'isMuted', '{}');                     // → {"ok":true,"value":false}
+bridge.drain(h);                                       // → JSON array of queued events, oldest first
+// [{"type":"connectionState","state":"connecting"}, {"type":"result","rid":1,"ok":true,"value":{…session…}},
+//  {"type":"tokenRequest","requestId":1,"kind":"refresh","channelId":null}, …]
+bridge.invoke(h, 'provideToken', JSON.stringify({ requestId: 1, token: freshJwt }));
+bridge.destroy(h);
+```
+
+* `invoke(handle, method, argsJson, rid?)` covers every `AurixClient` method by name with camelCase
+  JSON arguments (`{"channelId": "...", "joinToken": "..."}`); synchronous methods return
+  `{"ok":true,"value":…}` immediately, promise-returning ones return `{"ok":true,"pending":true}` and
+  later queue `{"type":"result","rid":N,"ok":true|false,…}`. Errors are
+  `{"ok":false,"error":{"message","name","code?"}}`.
+* `drain(handle)` returns the ordered event queue (one entry per client event, same names and
+  payloads as `client.on(...)`), plus `result`, `tokenRequest`, `remoteAudio` (playback state of the
+  hidden `<audio>` element the bridge attaches to the remote stream; `resumeAudio` retries after an
+  autoplay block) and `overflow` (`{"dropped":N}` when the bounded queue, default 4096, wrapped).
+  `pending(handle)` is the queue length.
+* `refreshToken: true` / `joinToken: true` in the options invert the token callbacks: the client
+  queues a `tokenRequest` and waits for `provideToken` (`{"requestId","token"}` or
+  `{"requestId","error"}`) — the host supplies tokens, the bridge never holds credentials logic.
+
+The `AurixBridge` contract is covered by `test/bridge.test.mjs`; `test/unity-jslib.test.mjs` runs the
+Unity plugin against the built bundle under an Emscripten-like harness.
+
 ## Requirements
 
 * The API origin must list the page origin in `AURIX__SERVER__CORS_ORIGINS`.

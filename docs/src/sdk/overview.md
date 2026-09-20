@@ -8,10 +8,10 @@ where they differ.
 | | [Web](web.md) | [Unity / .NET](unity.md) | [Native core](native.md) | [Unreal](native.md#unreal-plugin) |
 |---|---|---|---|---|
 | Language | TypeScript (ES2020, no deps) | C# (netstandard2.1) | Rust + C ABI (`aurix_client.h`, C++11 RAII header) | C++ / Blueprint over the C ABI |
-| Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP | AURX v2 over UDP | AURX v2 over UDP |
+| Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP (WS tunnel fallback); Unity WebGL: browser WebRTC through the Web SDK | AURX v2 over UDP (WS tunnel fallback) | AURX v2 over UDP (WS tunnel fallback) |
 | Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) |
 | PCMU (G.711) fallback | — (WebRTC negotiates Opus) | `SetAudioCodecAsync` / `PreferredCodec`, `PcmuCodec` | `set_audio_codec` / `aurix_client_set_audio_codec` | `SetAudioCodec` |
-| Platforms | Chromium, Firefox, Safari | Unity 2021.3+ (all but WebGL), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac |
+| Platforms | Chromium, Firefox, Safari | Unity 2021.3+ incl. WebGL (`AurixWebGLVoiceClient`), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac |
 | Downlink | server-mixed stereo track | per-participant streams, client mixer | per-participant streams, client mixer | client mixer → procedural `USoundWave` |
 | Reconnect / resume | yes | yes | yes | yes |
 | Local mute / volume / block | yes | yes | yes | yes |
@@ -28,7 +28,9 @@ where they differ.
 
 Where a browser is not involved the native path is preferred: it avoids ICE/DTLS, costs ~30
 bytes of header per 20 ms frame and lets the client mix and pan per participant. Browsers cannot
-send raw UDP, so the Web SDK is the only WebRTC client; the server bridges both transports
+send raw UDP, so the Web SDK is the only WebRTC client — Unity WebGL players reuse it through a
+JavaScript bridge (`AurixWebSdk.AurixBridge` + `AurixWebGL.jslib`) behind the same C# interface as
+the native Unity client ([Unity WebGL](unity.md#unity-webgl)); the server bridges both transports
 inside the same channel.
 
 ## Common lifecycle

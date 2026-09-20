@@ -3,7 +3,7 @@
   "rootNamespace": "Aurix",
   "references": [],
   "includePlatforms": [],
-  "excludePlatforms": ["WebGL"],
+  "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": false,
   "precompiledReferences": [],

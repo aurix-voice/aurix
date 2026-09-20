@@ -7,6 +7,8 @@ export {
   transmissionFromWire,
   transmissionToWire,
 } from './client.js';
+export { AurixBridge, errorInfo } from './bridge.js';
+export type { AurixBridgeOptions, BridgeClientOptions, BridgeErrorInfo, BridgeEvent } from './bridge.js';
 export {
   AUDIO_LEVEL_SILENCE,
   AudioLevelMeter,

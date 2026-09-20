@@ -278,6 +278,12 @@ jobs:
           dotnet-version: 8.0.x
       - run: dotnet test Aurix.sln -v q --nologo
         working-directory: sdk/unity/DotNet
+      - name: Unity compile check (WebGL player, WebGL editor, Android defines)
+        run: |
+          dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_WEBGL
+          dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo "-p:UnityExtraDefines=UNITY_WEBGL%3BUNITY_EDITOR"
+          dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_ANDROID
+        working-directory: sdk/unity/DotNet
 
   docs:
     name: OpenAPI + mdBook
