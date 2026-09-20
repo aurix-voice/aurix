@@ -83,4 +83,76 @@ namespace Aurix.Audio
             _phase = endPhase - consumed;
         }
     }
+
+    /// <summary>
+    /// The opposite direction of <see cref="OutputResampler"/>: converts blocks the device produced at its
+    /// own rate into 48 kHz for the echo canceller's render reference (<c>AurixListenerTap</c>). Linear
+    /// interpolation with the phase and last frame carried across blocks; single consumer (audio thread).
+    /// </summary>
+    public sealed class RenderRateConverter
+    {
+        private float[] _last = Array.Empty<float>();
+        private bool _hasLast;
+        private double _phase;
+        private int _channels;
+        private int _inputRate;
+
+        public void Reset()
+        {
+            _hasLast = false;
+            _phase = 0;
+        }
+
+        /// <summary>Output samples (interleaved) produced from <paramref name="frames"/> frames at <paramref name="inputRate"/>; size <paramref name="output"/> with this.</summary>
+        public static int MaxOutputSamples(int frames, int channels, int inputRate)
+            => ((int)Math.Ceiling((frames + 1) * (double)AudioFormat.SampleRate / inputRate) + 1) * channels;
+
+        /// <summary>Convert <paramref name="input"/> (interleaved, <paramref name="inputRate"/>) to 48 kHz into <paramref name="output"/>; returns samples written.</summary>
+        public int Convert(float[] input, int channels, int inputRate, float[] output)
+        {
+            if (channels <= 0 || inputRate <= 0) throw new ArgumentOutOfRangeException(channels <= 0 ? nameof(channels) : nameof(inputRate));
+            int inFrames = input.Length / channels;
+            if (inFrames == 0) return 0;
+            if (inputRate == AudioFormat.SampleRate)
+            {
+                Array.Copy(input, output, inFrames * channels);
+                return inFrames * channels;
+            }
+            if (channels != _channels || inputRate != _inputRate)
+            {
+                _channels = channels;
+                _inputRate = inputRate;
+                if (_last.Length < channels) _last = new float[channels];
+                Reset();
+            }
+            if (!_hasLast)
+            {
+                Array.Copy(input, _last, channels);
+                _hasLast = true;
+                _phase = 1; // first block: start at its own frame 0
+            }
+
+            // Source timeline: frame -1 = _last, frames 0..inFrames-1 = input. Emit every output position
+            // strictly before the last input frame; the remainder waits for the next block.
+            double step = (double)inputRate / AudioFormat.SampleRate;
+            int written = 0;
+            double pos = _phase - 1; // relative to input frame 0
+            while (pos < inFrames - 1 && written + channels <= output.Length)
+            {
+                int i0 = (int)Math.Floor(pos);
+                float t = (float)(pos - i0);
+                for (int c = 0; c < channels; c++)
+                {
+                    float a = i0 < 0 ? _last[c] : input[i0 * channels + c];
+                    float b = input[(i0 + 1) * channels + c];
+                    output[written + c] = a + (b - a) * t;
+                }
+                written += channels;
+                pos += step;
+            }
+            _phase = pos - (inFrames - 1);
+            Array.Copy(input, (inFrames - 1) * channels, _last, 0, channels);
+            return written;
+        }
+    }
 }

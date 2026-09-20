@@ -374,79 +374,175 @@ namespace Aurix.Audio
         /// <paramref name="offset"/> (see <see cref="Mix(float[], int)"/>).
         /// </summary>
         public void Mix(float[] output, int offset, int frames, int outputChannels)
+            => Mix(output, offset, frames, outputChannels, null);
+
+        /// <summary>
+        /// <see cref="Mix(float[], int, int, int)"/> skipping the streams in <paramref name="exclude"/> —
+        /// participants an <c>AurixParticipantAudioSource</c> plays itself. Excluded streams are left
+        /// untouched for their own <see cref="Pull"/>.
+        /// </summary>
+        public void Mix(float[] output, int offset, int frames, int outputChannels, HashSet<uint> exclude)
         {
-            int framesNeeded = frames;
             float master = _outputMuted ? 0f : _outputVolume;
             lock (_streams)
             {
                 long now = DateTime.UtcNow.Ticks;
-                _stale.Clear();
+                ExpireIdle(now);
+                foreach (var kv in _streams)
+                {
+                    if (exclude != null && exclude.Contains(kv.Key)) continue;
+                    RenderStream(kv.Value, output, offset, frames, outputChannels, master, true, now);
+                }
+            }
+            Clip(output, offset, frames * outputChannels);
+        }
+
+        /// <summary>
+        /// Per-participant playout for engine spatialization: <b>overwrite</b> <paramref name="output"/>
+        /// with the sum of the listed streams only — a participant's microphone and its TTS voice
+        /// (<see cref="Aurix.Protocol.AurxPacket.SynthSsrcFlag"/>), typically. No panning is applied (the engine
+        /// positions the AudioSource); a stereo sender keeps its image on a stereo output and is
+        /// downmixed on a mono one. Per-participant volume, the server's gain byte and the master
+        /// volume / mute still apply. Frames past what the jitter buffers hold are silence.
+        /// Returns the frames that carried decoded audio (0 while silent or unknown). A stream is
+        /// consumed by whoever pulls it, so pulling some participants and mixing the rest with
+        /// <see cref="Mix(float[], int, int, int)"/> never plays anyone twice.
+        /// </summary>
+        public int Pull(uint[] ssrcs, float[] output, int offset, int frames, int outputChannels)
+        {
+            Array.Clear(output, offset, frames * outputChannels);
+            float master = _outputMuted ? 0f : _outputVolume;
+            int rendered = 0;
+            lock (_streams)
+            {
+                long now = DateTime.UtcNow.Ticks;
+                ExpireIdle(now);
+                for (int i = 0; i < ssrcs.Length; i++)
+                {
+                    if (!_streams.TryGetValue(ssrcs[i], out var s)) continue;
+                    rendered = Math.Max(rendered, RenderStream(s, output, offset, frames, outputChannels, master, false, now));
+                }
+            }
+            if (rendered > 0) Clip(output, offset, frames * outputChannels);
+            return rendered;
+        }
+
+        /// <summary>Single-stream <see cref="Pull(uint[], float[], int, int, int)"/> covering a participant's microphone and its TTS voice.</summary>
+        public int PullParticipant(uint ssrc, float[] output, int offset, int frames, int outputChannels)
+        {
+            uint mic = ssrc & ~Aurix.Protocol.AurxPacket.SynthSsrcFlag;
+            Array.Clear(output, offset, frames * outputChannels);
+            float master = _outputMuted ? 0f : _outputVolume;
+            int rendered = 0;
+            lock (_streams)
+            {
+                long now = DateTime.UtcNow.Ticks;
+                ExpireIdle(now);
+                if (_streams.TryGetValue(mic, out var s))
+                    rendered = RenderStream(s, output, offset, frames, outputChannels, master, false, now);
+                if (_streams.TryGetValue(mic | Aurix.Protocol.AurxPacket.SynthSsrcFlag, out var tts))
+                    rendered = Math.Max(rendered, RenderStream(tts, output, offset, frames, outputChannels, master, false, now));
+            }
+            if (rendered > 0) Clip(output, offset, frames * outputChannels);
+            return rendered;
+        }
+
+        /// <summary>Snapshot of the streams currently held, for hosts that spawn one emitter per talker.</summary>
+        public void GetStreams(List<StreamInfo> into)
+        {
+            into.Clear();
+            lock (_streams)
+            {
                 foreach (var kv in _streams)
                 {
                     var s = kv.Value;
-                    if (now - s.LastActivityTicks > TimeSpan.TicksPerSecond * 30) { _stale.Add(kv.Key); continue; }
-                    int written = 0;
-                    while (written < framesNeeded)
+                    into.Add(new StreamInfo
                     {
-                        if (s.FramePos >= s.FrameLen)
+                        Ssrc = kv.Key,
+                        Mixed = s.Mixed,
+                        Stereo = s.Decoder.Channels == 2,
+                        Active = !s.Starved,
+                        BufferedFrames = s.Jitter.Count,
+                    });
+                }
+            }
+        }
+
+        private void ExpireIdle(long now)
+        {
+            _stale.Clear();
+            foreach (var kv in _streams)
+                if (now - kv.Value.LastActivityTicks > TimeSpan.TicksPerSecond * 30) _stale.Add(kv.Key);
+            foreach (var k in _stale) { Retire(_streams[k]); _streams.Remove(k); }
+        }
+
+        /// <summary>Render one stream (added) and return the frames written.</summary>
+        private static int RenderStream(Stream s, float[] output, int offset, int framesNeeded, int outputChannels, float master, bool panAllowed, long now)
+        {
+            int written = 0;
+            while (written < framesNeeded)
+            {
+                if (s.FramePos >= s.FrameLen)
+                {
+                    if (!s.Jitter.Pop(out var opus, out var fecFrom))
+                    {
+                        if (s.Jitter.Count == 0 && !s.Starved) { s.Starved = true; s.StarvedAtTicks = now; }
+                        break;
+                    }
+                    int dc = s.Decoder.Channels;
+                    int cap = AudioFormat.FrameSamples * 3 * dc; // up to 60 ms frames
+                    if (s.Frame == null || s.Frame.Length < cap) s.Frame = new float[cap];
+                    int n;
+                    if (opus != null)
+                        n = s.Decoder.Decode(opus, s.Frame, AudioFormat.FrameSamples * 3);
+                    else if (fecFrom != null && s.Fec != null)
+                    {
+                        n = s.Fec.DecodeFec(fecFrom, s.Frame, AudioFormat.FrameSamples);
+                        if (n > 0) s.FecRecovered++;
+                        else n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
+                    }
+                    else
+                        n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
+                    s.FrameLen = Math.Max(0, n) * dc;
+                    s.FramePos = 0;
+                    if (s.FrameLen == 0) break;
+                }
+                int dch = s.Decoder.Channels;
+                int availFrames = (s.FrameLen - s.FramePos) / dch;
+                int take = Math.Min(availFrames, framesNeeded - written);
+                float gain = s.Volume * master;
+                if (gain != 0f)
+                {
+                    bool pan = panAllowed && s.Panned && outputChannels >= 2;
+                    bool downmix = dch == 2 && (outputChannels == 1 || pan);
+                    for (int f = 0; f < take; f++)
+                    {
+                        int i = s.FramePos + f * dch;
+                        if (downmix && outputChannels == 1)
                         {
-                            if (!s.Jitter.Pop(out var opus, out var fecFrom))
-                            {
-                                if (s.Jitter.Count == 0 && !s.Starved) { s.Starved = true; s.StarvedAtTicks = now; }
-                                break;
-                            }
-                            int dc = s.Decoder.Channels;
-                            int cap = AudioFormat.FrameSamples * 3 * dc; // up to 60 ms frames
-                            if (s.Frame == null || s.Frame.Length < cap) s.Frame = new float[cap];
-                            int n;
-                            if (opus != null)
-                                n = s.Decoder.Decode(opus, s.Frame, AudioFormat.FrameSamples * 3);
-                            else if (fecFrom != null && s.Fec != null)
-                            {
-                                n = s.Fec.DecodeFec(fecFrom, s.Frame, AudioFormat.FrameSamples);
-                                if (n > 0) s.FecRecovered++;
-                                else n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
-                            }
-                            else
-                                n = s.Decoder.DecodeLost(s.Frame, AudioFormat.FrameSamples);
-                            s.FrameLen = Math.Max(0, n) * dc;
-                            s.FramePos = 0;
-                            if (s.FrameLen == 0) break;
+                            output[offset + written + f] += (s.Frame[i] + s.Frame[i + 1]) * 0.5f * gain;
+                            continue;
                         }
-                        int dch = s.Decoder.Channels;
-                        int availFrames = (s.FrameLen - s.FramePos) / dch;
-                        int take = Math.Min(availFrames, framesNeeded - written);
-                        float gain = s.Volume * master;
-                        if (gain != 0f)
+                        float mono = downmix ? (s.Frame[i] + s.Frame[i + 1]) * 0.5f : 0f;
+                        for (int c = 0; c < outputChannels; c++)
                         {
-                            bool pan = s.Panned && outputChannels >= 2;
-                            bool downmix = dch == 2 && (outputChannels == 1 || pan);
-                            for (int f = 0; f < take; f++)
-                            {
-                                int i = s.FramePos + f * dch;
-                                if (downmix && outputChannels == 1)
-                                {
-                                    output[offset + written + f] += (s.Frame[i] + s.Frame[i + 1]) * 0.5f * gain;
-                                    continue;
-                                }
-                                float mono = downmix ? (s.Frame[i] + s.Frame[i + 1]) * 0.5f : 0f;
-                                for (int c = 0; c < outputChannels; c++)
-                                {
-                                    float v = downmix ? mono : s.Frame[i + (dch == 1 ? 0 : Math.Min(c, dch - 1))];
-                                    float g = gain;
-                                    if (pan) g *= c == 0 ? s.LeftGain : c == 1 ? s.RightGain : 1f;
-                                    output[offset + (written + f) * outputChannels + c] += v * g;
-                                }
-                            }
+                            float v = downmix ? mono : s.Frame[i + (dch == 1 ? 0 : Math.Min(c, dch - 1))];
+                            float g = gain;
+                            if (pan) g *= c == 0 ? s.LeftGain : c == 1 ? s.RightGain : 1f;
+                            output[offset + (written + f) * outputChannels + c] += v * g;
                         }
-                        s.FramePos += take * dch;
-                        written += take;
                     }
                 }
-                foreach (var k in _stale) { Retire(_streams[k]); _streams.Remove(k); }
+                s.FramePos += take * dch;
+                written += take;
             }
+            return written;
+        }
+
+        private static void Clip(float[] output, int offset, int count)
+        {
             // Soft clip to avoid wrap-around distortion when several loud talkers overlap.
-            int end = offset + frames * outputChannels;
+            int end = offset + count;
             for (int i = offset; i < end; i++)
             {
                 float v = output[i];
@@ -462,5 +558,22 @@ namespace Aurix.Audio
                 _streams.Clear();
             }
         }
+    }
+
+    /// <summary>One downlink stream held by <see cref="RemoteMixer"/> (see <see cref="RemoteMixer.GetStreams"/>).</summary>
+    public struct StreamInfo
+    {
+        public uint Ssrc;
+        /// <summary>Server-mixed channel downlink (<see cref="DownlinkMode.Mixed"/>), not one participant.</summary>
+        public bool Mixed;
+        /// <summary>Decoded two-wide (stereo uplink or server mix).</summary>
+        public bool Stereo;
+        /// <summary>Has audio buffered or arriving; false between talk spurts.</summary>
+        public bool Active;
+        public int BufferedFrames;
+        /// <summary>Server-synthesized voice (TTS) of the owner rather than its microphone.</summary>
+        public bool Synthesized => (Ssrc & Aurix.Protocol.AurxPacket.SynthSsrcFlag) != 0;
+        /// <summary>SSRC of the owning participant (the flag stripped), to look up in a roster.</summary>
+        public uint SourceSsrc => Ssrc & ~Aurix.Protocol.AurxPacket.SynthSsrcFlag;
     }
 }

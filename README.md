@@ -283,6 +283,45 @@ exposed but not rendered. Left/right follow the channel's `coordinate_system` (`
 `Y` up / `Z` forward, by default; `right_handed` mirrors them). Keep the `AudioSource` non-spatialised (2D) — the
 server already did the panning; packets without the flag stay centred, and a mono output ignores the pan.
 
+### Per-participant playback (Unity spatialization, HRTF, occlusion)
+
+When you want Unity — or a spatializer plugin (Steam Audio, Resonance, Oculus/Meta XR Audio) — to position each
+voice instead of the server's stereo panning, give each avatar its own `AudioSource` + `AurixParticipantAudioSource`
+and bind it to the participant:
+
+```csharp
+voice.Playback = VoicePlaybackMode.PerParticipant;   // on the AurixVoiceBehaviour (Inspector or code)
+
+// on the avatar prefab: AudioSource (spatialBlend = 1, your rolloff / spatializer / mixer group) +
+var src = avatar.GetComponent<AurixParticipantAudioSource>();
+src.Bind(participant.UserId);                        // resolves the SSRC, claims the streams
+src.OnActiveChanged += talking => lipSync.enabled = talking;
+// … avatar destroyed → src.Unbind() (OnDisable/OnDestroy do it too)
+```
+
+`AurixParticipantAudioSource.OnAudioFilterRead` pulls that user's decoded PCM (microphone **and** TTS voice) from the
+shared `RemoteMixer` with **no** local panning — `RemoteMixer.PullParticipant(ssrc, buf, offset, frames, channels)`
+writes the raw voice and Unity's `AudioSource` spatialization (spatial blend, rolloff, spatializer plugin, filters,
+reverb zones, mixer routing) is applied afterwards like on any other source. Per-participant volume, the server's
+gain byte, master volume and speaker mute still apply; a stereo (music) sender keeps L/R on a stereo output and is
+downmixed for mono.
+
+Playback modes on the behaviour:
+
+* `Mixed` (default) — everything through the behaviour's own `AudioSource`, server panning, as before.
+* `PerParticipant` — bound sources claim their streams and the behaviour's aggregate `AudioSource` mixes only the
+  *unclaimed* participants (`RemoteMixer.Mix(..., exclude)`), so avatars in view can be spatialized while everyone
+  else stays 2D and nobody is heard twice.
+* `PerParticipantOnly` — the aggregate source is silent; only bound participants are audible.
+
+Claims are per user: a participant that rejoins with a new SSRC (or after node failover) is picked up automatically
+(`Bind` re-resolves via `FindByUser`), one that leaves just goes silent (`IsActive` false). `Mixed` server downlink
+(`DownlinkMode.Mixed`) carries no per-participant streams. The pulled audio is not fed to echo cancellation by
+itself: add `AurixListenerTap` to the `AudioListener` (it forwards Unity's final rendered output, resampled to
+48 kHz, to `Dsp.PushRender` and flips `voice.RenderFedExternally` so the behaviour stops pushing only its own
+mix). Low-level: `RemoteMixer.Pull(ssrcs, buf, offset, frames, channels)` renders any set of SSRCs, and
+`RemoteMixer.GetStreams(list)` (`StreamInfo`: ssrc, mixed, stereo, active, buffered frames, synthesized) enumerates what is buffered.
+
 ### Local mute, per-participant volume, block
 
 Receiver-local controls: they change what *this* client hears, are enforced by the server before audio is

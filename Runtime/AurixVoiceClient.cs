@@ -1510,6 +1510,17 @@ namespace Aurix
             }
         }
 
+        /// <summary>First roster entry of <paramref name="userId"/> across the joined channels, or null.</summary>
+        public Participant FindByUser(Guid userId)
+        {
+            lock (_channels)
+            {
+                foreach (var m in _channels.Values)
+                    if (m.TryGetValue(userId, out var p)) return p;
+                return null;
+            }
+        }
+
         /// <summary>True for SSRCs of server-synthesized speech (a participant's TTS voice or a channel announcement).</summary>
         public static bool IsSynthesizedSsrc(uint ssrc) => (ssrc & AurxPacket.SynthSsrcFlag) != 0;
 
