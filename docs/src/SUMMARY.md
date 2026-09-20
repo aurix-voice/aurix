@@ -36,6 +36,9 @@
 - [Web SDK](sdk/web.md)
 - [Unity SDK](sdk/unity.md)
 - [Native core and Unreal SDK](sdk/native.md)
+- [Godot SDK](sdk/godot.md)
+- [Porting to consoles](sdk/consoles.md)
+- [Flutter and React Native](sdk/mobile-frameworks.md)
 
 # Operations
 

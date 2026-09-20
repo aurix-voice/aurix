@@ -25,7 +25,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
 > audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
 > PCMU fallback, a WebSocket tunnel for blocked UDP, large channels (listeners, per-receiver stream
-> caps, a server mix for native clients), and Web / Unity / native (C ABI) / Unreal SDKs.
+> caps, a server mix for native clients), and Web / Unity / native (C ABI) / Unreal / Godot SDKs.
 > See [Limitations](#limitations) before deploying at scale.
 
 **Documentation**: the full book lives in [`docs/`](docs/src/SUMMARY.md) (`mdbook serve docs`) —
@@ -982,6 +982,7 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 | Unity / .NET (C#) | [`sdk/unity`](sdk/unity) | native AURX v2 over UDP (signed SessionBind, AES-256-CTR + HMAC per packet, replay window), WS control plane; capture DSP via the native core (AEC/NS/AGC) with a managed high-pass + AGC fallback; Unity WebGL players get the same C# API over the Web SDK (browser WebRTC) through `AurixWebGL.jslib` | `dotnet test` (incl. a scripted WebGL bridge) + headless two-client E2E (`Aurix.Demo`, real Opus via Concentus); Unity compile check with `UNITY_WEBGL` |
 | Native core (Rust + C ABI) | [`crates/aurix-client`](crates/aurix-client) | same native AURX v2 path in Rust: Opus/VAD/jitter/mixer, capture DSP (high-pass, acoustic echo cancellation, RNNoise-derived noise suppression, AGC) and a voice-effects chain (pitch shift, ring modulator, host callback) on the uplink, reconnect + resume, all control-plane features; `libaurix_client` + `include/aurix_client.h` for Unreal, mobile and custom engines | unit + fake-server tests, C sample compiled/linked/run in CI, live two-client E2E (`cargo test -p aurix-client --test e2e_live`) |
 | Unreal Engine 5.3+ (C++/Blueprint) | [`sdk/unreal`](sdk/unreal) | `AurixVoice` plugin over the `aurix-client` C ABI: `UAurixVoiceSubsystem` with typed Blueprint events, `AudioCapture` microphone bridge, procedural playback wave + per-participant sound waves for engine spatialization; static-Opus native library staged by `sdk/unreal/scripts/build_native.*` | native library build for Linux + ABI-reference test in CI; UHT/engine compile **not** run here (no Unreal in the dev environment — see the [README](sdk/unreal/README.md)) |
+| Godot 4.3+ (GDExtension) | [`sdk/godot`](sdk/godot) | `aurix_voice` GDExtension over the same C ABI: `AurixVoiceClient` node (signals for every control-plane event, `AudioStreamMicrophone` capture through an `AudioEffectCapture` bus, mixed playback through `AudioStreamGenerator`), `AurixParticipantPlayer` (`AudioStreamPlayer3D` per speaker for engine spatialization), `AurixRegions` for RTT-ranked node discovery; static-Opus native library staged by `sdk/godot/scripts/build_native.sh` | extension build + headless API smoke test (106 checks) in CI; live two-client Godot E2E (`sdk/godot/tests/live.sh`) against a running node; no Web export (browsers cannot run the native transport) |
 
 All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
 
@@ -1016,6 +1017,10 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 * The Unreal plugin has not been compiled against a real engine install yet (none is available
   in the development environment); the first build in your project is the verification step.
   The protocol is documented in `crates/aurix-common/src/protocol.rs`.
+* No console SDKs (PlayStation/Xbox/Switch SDKs are under NDA) and no first-party Flutter /
+  React Native packages: both are integration work on top of the native core's C ABI —
+  [porting guide](docs/src/sdk/consoles.md), [mobile frameworks](docs/src/sdk/mobile-frameworks.md).
+  The Godot extension covers desktop exports only; the Web export has no native transport.
 
 ## License
 

@@ -11,5 +11,15 @@ sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/
 sdk/unreal/AurixVoice/Binaries/
 sdk/unreal/AurixVoice/Intermediate/
 
+# Godot GDExtension: godot-cpp checkout, staged native libraries, SCons/Godot caches
+sdk/godot/godot-cpp
+sdk/godot/addons/aurix_voice/bin/
+sdk/godot/.sconsign.dblite
+sdk/godot/.sconf_temp/
+sdk/godot/src/*.os
+sdk/godot/src/*.o
+sdk/godot/src/*.obj
+sdk/godot/**/.godot/
+
 # mdBook output
 docs/book/

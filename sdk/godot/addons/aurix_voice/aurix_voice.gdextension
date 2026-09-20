@@ -1,0 +1,23 @@
+[configuration]
+
+entry_symbol = "aurix_voice_library_init"
+compatibility_minimum = "4.3"
+reloadable = false
+
+[libraries]
+
+linux.debug.x86_64 = "res://addons/aurix_voice/bin/linux.x86_64/libaurix_voice.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://addons/aurix_voice/bin/linux.x86_64/libaurix_voice.linux.template_release.x86_64.so"
+linux.debug.arm64 = "res://addons/aurix_voice/bin/linux.arm64/libaurix_voice.linux.template_debug.arm64.so"
+linux.release.arm64 = "res://addons/aurix_voice/bin/linux.arm64/libaurix_voice.linux.template_release.arm64.so"
+windows.debug.x86_64 = "res://addons/aurix_voice/bin/windows.x86_64/libaurix_voice.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/aurix_voice/bin/windows.x86_64/libaurix_voice.windows.template_release.x86_64.dll"
+macos.debug = "res://addons/aurix_voice/bin/macos.universal/libaurix_voice.macos.template_debug.framework"
+macos.release = "res://addons/aurix_voice/bin/macos.universal/libaurix_voice.macos.template_release.framework"
+
+[dependencies]
+
+linux.x86_64 = { "res://addons/aurix_voice/bin/linux.x86_64/libaurix_client.so": "" }
+linux.arm64 = { "res://addons/aurix_voice/bin/linux.arm64/libaurix_client.so": "" }
+windows.x86_64 = { "res://addons/aurix_voice/bin/windows.x86_64/aurix_client.dll": "" }
+macos = { "res://addons/aurix_voice/bin/macos.universal/libaurix_client.dylib": "" }

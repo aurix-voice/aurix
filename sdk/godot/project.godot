@@ -1,0 +1,15 @@
+; Engine configuration file.
+; Godot project wrapping the AurixVoice GDExtension: `addons/aurix_voice` is the shippable addon,
+; `demo/` a minimal scene and `tests/` headless scripts run by the SDK CI.
+
+config_version=5
+
+[application]
+
+config/name="AurixVoice"
+run/main_scene="res://demo/main.tscn"
+config/features=PackedStringArray("4.3", "Forward Plus")
+
+[audio]
+
+driver/enable_input=true

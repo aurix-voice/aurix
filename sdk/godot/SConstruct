@@ -1,0 +1,62 @@
+#!/usr/bin/env python
+# Builds the AurixVoice GDExtension (libaurix_voice.<platform>.<target>.<arch>) against godot-cpp
+# and the prebuilt aurix-client C ABI library staged by scripts/build_native.sh.
+#
+#   scons platform=linux target=template_debug            # godot-cpp in ./godot-cpp
+#   scons godot_cpp=/path/to/godot-cpp platform=windows   # explicit checkout
+#
+# Every godot-cpp option (platform, target, arch, use_llvm, ...) is accepted and forwarded.
+import os
+
+here = Dir(".").abspath
+godot_cpp = ARGUMENTS.get("godot_cpp", os.environ.get("GODOT_CPP_PATH", os.path.join(here, "godot-cpp")))
+if not os.path.isfile(os.path.join(godot_cpp, "SConstruct")):
+    print(
+        "godot-cpp not found at %s: clone godotengine/godot-cpp (branch godot-4.3-stable) there "
+        "or pass godot_cpp=/path (or GODOT_CPP_PATH)" % godot_cpp
+    )
+    Exit(2)
+
+env = SConscript(os.path.join(godot_cpp, "SConstruct"))
+
+platform = env["platform"]
+arch = env["arch"]
+bin_dir = os.path.join(here, "addons", "aurix_voice", "bin", "%s.%s" % (platform, arch))
+
+env.Append(CPPPATH=[os.path.join(here, "src"), os.path.join(here, "..", "..", "crates", "aurix-client", "include")])
+env.Append(LIBPATH=[bin_dir])
+
+if platform == "windows":
+    # Rust emits aurix_client.dll + aurix_client.dll.lib (import library).
+    env.Append(LIBS=["aurix_client.dll"])
+elif platform == "macos":
+    env.Append(LIBS=["aurix_client"])
+    env.Append(LINKFLAGS=["-Wl,-rpath,@loader_path"])
+elif platform == "linux" or platform == "android":
+    env.Append(LIBS=["aurix_client"])
+    env.Append(LINKFLAGS=["-Wl,-rpath,$$ORIGIN", "-Wl,--no-undefined"])
+else:
+    print("platform %s: link aurix_client yourself (see README)" % platform)
+
+native = {
+    "windows": "aurix_client.dll",
+    "macos": "libaurix_client.dylib",
+}.get(platform, "libaurix_client.so")
+if not os.path.isfile(os.path.join(bin_dir, native)):
+    print("missing %s in %s: run scripts/build_native.sh first" % (native, bin_dir))
+    Exit(2)
+
+sources = Glob("src/*.cpp")
+
+if platform == "macos":
+    library = env.SharedLibrary(
+        os.path.join(bin_dir, "libaurix_voice{}.framework/libaurix_voice{}".format(env["suffix"], env["suffix"])),
+        source=sources,
+    )
+else:
+    library = env.SharedLibrary(
+        os.path.join(bin_dir, "libaurix_voice{}{}".format(env["suffix"], env["SHLIBSUFFIX"])),
+        source=sources,
+    )
+
+Default(library)

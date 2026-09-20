@@ -346,6 +346,49 @@ jobs:
           dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_ANDROID
         working-directory: sdk/unity/DotNet
 
+  godot:
+    name: Godot GDExtension (build + headless smoke)
+    runs-on: ubuntu-latest
+    env:
+      GODOT_VERSION: 4.3-stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config cmake libopus-dev scons
+      - name: Check out godot-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: godotengine/godot-cpp
+          ref: godot-${{ env.GODOT_VERSION }}
+          path: sdk/godot/godot-cpp
+      - uses: actions/cache@v4
+        with:
+          path: |
+            sdk/godot/godot-cpp/bin
+            sdk/godot/godot-cpp/gen
+            sdk/godot/godot-cpp/src/**/*.os
+          key: godot-cpp-${{ env.GODOT_VERSION }}-${{ runner.os }}-${{ hashFiles('sdk/godot/SConstruct') }}
+      - name: Build aurix-client, stage it and build the extension
+        run: sdk/godot/scripts/build_native.sh
+      - name: Install the Godot ${{ env.GODOT_VERSION }} headless editor
+        run: |
+          set -euo pipefail
+          curl -sSfL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q godot.zip -d "$RUNNER_TEMP/godot"
+          echo "GODOT=$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Import project, parse the demo script, run the API smoke test
+        run: |
+          set -euo pipefail
+          # First import registers the extension; scripts referencing its classes only compile
+          # on the second pass, which must be clean.
+          "$GODOT" --headless --path sdk/godot --import >/dev/null 2>&1 || true
+          "$GODOT" --headless --path sdk/godot --import 2>&1 | tee import.log
+          ! grep -q "ERROR" import.log
+          "$GODOT" --headless --path sdk/godot --check-only -s demo/main.gd 2>&1 | tee check.log
+          ! grep -q "SCRIPT ERROR" check.log
+          timeout 120 "$GODOT" --headless --path sdk/godot -s tests/smoke.gd
+
   docs:
     name: OpenAPI + mdBook
     runs-on: ubuntu-latest

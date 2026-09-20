@@ -1,32 +1,32 @@
 # Client SDKs
 
-Four clients ship in the repository. They share one security model (player JWT or one-time
+Five clients ship in the repository. They share one security model (player JWT or one-time
 action token from **your** backend, API keys never leave the server side), one control plane
 (the [WebSocket protocol](../api/websocket.md)) and one feature vocabulary — the table shows
 where they differ.
 
-| | [Web](web.md) | [Unity / .NET](unity.md) | [Native core](native.md) | [Unreal](native.md#unreal-plugin) |
-|---|---|---|---|---|
-| Language | TypeScript (ES2020, no deps) | C# (netstandard2.1) | Rust + C ABI (`aurix_client.h`, C++11 RAII header) | C++ / Blueprint over the C ABI |
-| Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP (WS tunnel fallback); Unity WebGL: browser WebRTC through the Web SDK | AURX v2 over UDP (WS tunnel fallback) | AURX v2 over UDP (WS tunnel fallback) |
-| Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) |
-| PCMU (G.711) fallback | — (WebRTC negotiates Opus) | `SetAudioCodecAsync` / `PreferredCodec`, `PcmuCodec` | `set_audio_codec` / `aurix_client_set_audio_codec` | `SetAudioCodec` |
-| Platforms | Chromium, Firefox, Safari | Unity 2021.3+ incl. WebGL (`AurixWebGLVoiceClient`), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac |
-| Downlink | server-mixed stereo track | per-participant streams, client mixer | per-participant streams, client mixer | client mixer → procedural `USoundWave` |
-| Reconnect / resume | yes | yes | yes | yes |
-| Local mute / volume / block | yes | yes | yes | yes |
-| Transmission mode / focus | yes | yes | yes | yes |
-| Positional + directional | yes (stereo mix) | yes (client pan) | yes | yes |
-| Echo channel / audio injection | yes | yes | capture push API | capture push API |
-| Text chat lite | yes | yes | yes | yes |
-| Transcripts / TTS | yes | yes | yes | yes |
-| Live translation (`setTranslation`, `original` on transcripts, private translated speech) | yes | yes (native + WebGL) | yes | yes |
-| Voice effects on the uplink | browser audio graph (bring your own) | Unity audio graph (bring your own) | `EffectChain` (pitch, ring mod, callback) | `SetVoiceEffects` / callback |
-| Stats / quality bars | `getStats()` | `GetStats()` | `aurix_client_stats` | `GetStats` |
-| Devices / input gain / speaker mute | yes | yes | host-provided capture | engine `AudioCapture` |
-| Action tokens (`refreshToken`/`joinToken`) | yes | yes | yes | yes |
-| Opus controls (bitrate, bandwidth, complexity, signal, VBR/CVBR, FEC, loss %, DTX) | bitrate, bandwidth, FEC, DTX, CBR via WebRTC `fmtp`/`setParameters` | all (`OpusEncoderSettings`) | all (`EncoderSettings` / `AurixEncoderSettings`) | all (`FAurixEncoderSettings`) |
-| Channel audio policy (`ChannelJoinAck.audio`, `ChannelAudioPolicy`) | merged, applied where WebRTC allows | merged, applied | merged, applied | merged, applied |
+| | [Web](web.md) | [Unity / .NET](unity.md) | [Native core](native.md) | [Unreal](native.md#unreal-plugin) | [Godot](godot.md) |
+|---|---|---|---|---|---|
+| Language | TypeScript (ES2020, no deps) | C# (netstandard2.1) | Rust + C ABI (`aurix_client.h`, C++11 RAII header) | C++ / Blueprint over the C ABI | GDExtension (C++ over the C ABI), GDScript/C# consumers |
+| Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP (WS tunnel fallback); Unity WebGL: browser WebRTC through the Web SDK | AURX v2 over UDP (WS tunnel fallback) | AURX v2 over UDP (WS tunnel fallback) | AURX v2 over UDP (WS tunnel fallback) |
+| Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) | bundled libopus (static) |
+| PCMU (G.711) fallback | — (WebRTC negotiates Opus) | `SetAudioCodecAsync` / `PreferredCodec`, `PcmuCodec` | `set_audio_codec` / `aurix_client_set_audio_codec` | `SetAudioCodec` | `set_audio_codec` |
+| Platforms | Chromium, Firefox, Safari | Unity 2021.3+ incl. WebGL (`AurixWebGLVoiceClient`), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac | Godot 4.3+ Linux/Windows/macOS (no Web export) |
+| Downlink | server-mixed stereo track | per-participant streams, client mixer | per-participant streams, client mixer | client mixer → procedural `USoundWave` | client mixer → `AudioStreamGenerator`; `AurixParticipantPlayer` (`AudioStreamPlayer3D`) per speaker |
+| Reconnect / resume | yes | yes | yes | yes | yes |
+| Local mute / volume / block | yes | yes | yes | yes | yes |
+| Transmission mode / focus | yes | yes | yes | yes | yes |
+| Positional + directional | yes (stereo mix) | yes (client pan) | yes | yes | yes (`update_transforms`) |
+| Echo channel / audio injection | yes | yes | capture push API | capture push API | `push_capture` |
+| Text chat lite | yes | yes | yes | yes | yes |
+| Transcripts / TTS | yes | yes | yes | yes | yes |
+| Live translation (`setTranslation`, `original` on transcripts, private translated speech) | yes | yes (native + WebGL) | yes | yes | yes |
+| Voice effects on the uplink | browser audio graph (bring your own) | Unity audio graph (bring your own) | `EffectChain` (pitch, ring mod, callback) | `SetVoiceEffects` / callback | `set_voice_effects` (pitch, ring mod) |
+| Stats / quality bars | `getStats()` | `GetStats()` | `aurix_client_stats` | `GetStats` | `get_stats` / `network_quality` signal |
+| Devices / input gain / speaker mute | yes | yes | host-provided capture | engine `AudioCapture` | `AudioStreamMicrophone` + `AudioEffectCapture` |
+| Action tokens (`refreshToken`/`joinToken`) | yes | yes | yes | yes | yes |
+| Opus controls (bitrate, bandwidth, complexity, signal, VBR/CVBR, FEC, loss %, DTX) | bitrate, bandwidth, FEC, DTX, CBR via WebRTC `fmtp`/`setParameters` | all (`OpusEncoderSettings`) | all (`EncoderSettings` / `AurixEncoderSettings`) | all (`FAurixEncoderSettings`) | all (`set_encoder_settings`) |
+| Channel audio policy (`ChannelJoinAck.audio`, `ChannelAudioPolicy`) | merged, applied where WebRTC allows | merged, applied | merged, applied | merged, applied | merged, applied |
 
 Where a browser is not involved the native path is preferred: it avoids ICE/DTLS, costs ~30
 bytes of header per 20 ms frame and lets the client mix and pan per participant. Browsers cannot
@@ -34,6 +34,10 @@ send raw UDP, so the Web SDK is the only WebRTC client — Unity WebGL players r
 JavaScript bridge (`AurixWebSdk.AurixBridge` + `AurixWebGL.jslib`) behind the same C# interface as
 the native Unity client ([Unity WebGL](unity.md#unity-webgl)); the server bridges both transports
 inside the same channel.
+
+Beyond these five: [consoles](consoles.md) are a porting exercise on top of the native core
+(the platform layer is yours, under NDA); [Flutter and React Native](mobile-frameworks.md) bind
+the same C ABI from a native plugin.
 
 ## Common lifecycle
 

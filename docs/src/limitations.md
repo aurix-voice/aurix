@@ -13,7 +13,15 @@ the chapter that explains the boundary.
   ([Text chat](features/chat.md)).
 * **No console SDKs.** PlayStation/Xbox/Switch SDKs are under NDA and cannot ship in an
   open-source repository. The native core exposes a C ABI so a console port is an integration
-  task, not a protocol one ([Native core](sdk/native.md)).
+  task, not a protocol one — the [porting guide](sdk/consoles.md) lists what the platform layer
+  has to provide (sockets/TLS, threads, audio callbacks, certification hooks) and where the
+  NDA boundary sits. Likewise no first-party Flutter / React Native packages: the same C ABI is
+  bound from a native plugin ([Flutter and React Native](sdk/mobile-frameworks.md)).
+* **Godot: desktop exports only.** The GDExtension links the native core, so it ships for
+  Linux/Windows/macOS exports; Godot's Web export cannot carry the native transport (no UDP, no
+  raw sockets) and there is no Godot-side WebRTC client — a browser build would have to embed
+  the Web SDK through `JavaScriptBridge`, which is not provided. Android/iOS builds of the
+  extension are not staged by the scripts yet ([Godot SDK](sdk/godot.md)).
 * **No operator web dashboard.** Operations go through the REST API, the `aurix` CLI and the
   Grafana dashboards; a web panel is planned as a separate front end on top of the same API.
 * **No SIP/PSTN gateway**, no server-side noise suppression or echo cancellation — that runs
@@ -134,6 +142,11 @@ the chapter that explains the boundary.
   the native library builds on Linux, but Unreal Header Tool and a real engine compile have not
   run — the first build in your project is the verification step ([Native core and
   Unreal](sdk/native.md)).
+* **Godot editor and devices.** The extension is built and exercised headless in CI (API
+  smoke test, project import, demo script parse) and against a live node in a two-client
+  Godot E2E on Linux; microphone capture through `AudioStreamMicrophone`, `AudioStreamPlayer3D`
+  spatialization and the Windows/macOS extension binaries are not run in CI
+  ([Godot SDK](sdk/godot.md)).
 * **Unity Editor and devices.** The Unity SDK and the sample scene are compiled against a
   UnityEngine stub and exercised through the .NET demo; permission dialogs, audio-route changes
   and background/foreground transitions on real iOS/Android hardware are not exercised in CI
