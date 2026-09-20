@@ -600,6 +600,7 @@ async fn native_client_follows_channel_audio_policy() {
         complexity: Some(6),
         signal: OpusSignal::Music,
         stereo: false,
+        e2ee: false,
     };
     let (alice_token, _) = issue_token(&env, &http, "native-opus-alice", "Alice", channel).await;
     let (bob_token, _) = issue_token(&env, &http, "native-opus-bob", "Bob", channel).await;
@@ -724,6 +725,7 @@ async fn native_client_follows_channel_audio_policy() {
         complexity: None,
         signal: OpusSignal::Voice,
         stereo: false,
+        e2ee: false,
     };
     let ev = wait_for(
         &alice,
@@ -1653,4 +1655,248 @@ async fn native_per_participant_pull_keeps_claimed_talkers_out_of_the_mix() {
     alice.disconnect();
     dave.disconnect();
     bob.disconnect();
+}
+
+/// Group E2EE between native clients: sender keys travel wrapped through the node, plaintext
+/// and unkeyed sessions are refused, join/leave rotate the generation, a resume keeps the keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_group_e2ee_rotates_on_join_and_leave_and_refuses_plaintext() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel = create_channel_with(&env, &http, serde_json::json!({"e2ee": true})).await;
+    let (alice_token, alice_id) =
+        issue_token(&env, &http, "native-e2ee-alice", "Alice", channel).await;
+    let (bob_token, bob_id) = issue_token(&env, &http, "native-e2ee-bob", "Bob", channel).await;
+    let (carol_token, _) = issue_token(&env, &http, "native-e2ee-carol", "Carol", channel).await;
+    let (dave_token, dave_id) = issue_token(&env, &http, "native-e2ee-dave", "Dave", channel).await;
+
+    // Alice uses a pinned identity so her fingerprint is reproducible; the others are ephemeral.
+    let proxy = Proxy::start(ws_upstream(&env.ws)).await;
+    let mut alice_cfg = ClientConfig::new(ws_url_via(&proxy, &ws_with_path(&env.ws)), alice_token);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    alice_cfg.heartbeat_interval = Duration::from_millis(500);
+    alice_cfg.reconnect.initial_delay = Duration::from_millis(200);
+    alice_cfg.e2ee_identity = Some([7u8; 32]);
+    let expected_fp = Client::new(alice_cfg.clone()).unwrap().e2ee_fingerprint();
+    let alice = Client::new(alice_cfg).unwrap();
+    assert_eq!(alice.e2ee_fingerprint(), expected_fp);
+    let bob = Client::new(ClientConfig::new(ws_with_path(&env.ws), bob_token)).unwrap();
+    let mut carol_cfg = ClientConfig::new(ws_with_path(&env.ws), carol_token);
+    carol_cfg.e2ee = false;
+    let carol = Client::new(carol_cfg).unwrap();
+    let mut dave_cfg = ClientConfig::new(ws_with_path(&env.ws), dave_token);
+    dave_cfg.dsp = DspConfig::BYPASS;
+    let dave = Client::new(dave_cfg).unwrap();
+
+    for (c, who) in [
+        (&alice, "alice"),
+        (&bob, "bob"),
+        (&carol, "carol"),
+        (&dave, "dave"),
+    ] {
+        c.connect().unwrap();
+        wait_for(c, &format!("{who} media"), Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaBound)
+        })
+        .await;
+    }
+
+    // --- a session without E2EE support cannot enter the channel at all.
+    let rid = carol.join_channel(channel, None).unwrap();
+    wait_for(&carol, "carol refused", Duration::from_secs(10), |e| {
+        matches!(e, Event::RequestFailed { request_id, code, .. }
+            if *request_id == rid && code == "E2EE_REQUIRED")
+    })
+    .await;
+    assert!(carol.joined_channels().is_empty());
+
+    // --- the operator cannot record the channel either.
+    let rec = http
+        .post(format!("{}/v1/recordings/start", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"channel_id": channel, "user_id": alice_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rec.status(),
+        400,
+        "recording an e2ee channel: {:?}",
+        rec.text().await
+    );
+
+    // --- Alice and Bob join: each learns the other's identity and receives a sender key.
+    alice.join_channel(channel, None).unwrap();
+    wait_for(
+        &alice,
+        "alice join",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ChannelJoined { channel_id, .. } if *channel_id == channel),
+    )
+    .await;
+    bob.join_channel(channel, None).unwrap();
+    wait_for(&bob, "bob join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await;
+    let bob_fp_seen = wait_for(&alice, "alice learns bob", Duration::from_secs(10), |e| {
+        matches!(e, Event::E2eePeerKey { user_id, previous_fingerprint: None, .. } if *user_id == bob_id)
+    })
+    .await;
+    let alice_fp_seen = wait_for(
+        &bob,
+        "bob learns alice",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::E2eePeerKey { user_id, .. } if *user_id == alice_id),
+    )
+    .await;
+    if let Event::E2eePeerKey { fingerprint, .. } = &alice_fp_seen {
+        assert_eq!(fingerprint, &expected_fp, "bob sees alice's real identity");
+    }
+    if let Event::E2eePeerKey { fingerprint, .. } = &bob_fp_seen {
+        assert_eq!(
+            Some(fingerprint.clone()),
+            alice.e2ee_peer_fingerprint(bob_id)
+        );
+        assert_eq!(fingerprint, &bob.e2ee_fingerprint());
+    }
+    // A new member costs each side one rotation; the key Bob receives is the rotated one.
+    let mut gen_two = None;
+    wait_for(&alice, "alice keys bob", Duration::from_secs(10), |e| {
+        if let Event::E2eeKeyRotated { generation } = e {
+            gen_two = Some(*generation);
+        }
+        matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == bob_id)
+    })
+    .await;
+    let gen_two = gen_two.expect("alice rotated before bob could decrypt her");
+    wait_for(&bob, "bob keys alice", Duration::from_secs(10), |e| {
+        matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == alice_id)
+    })
+    .await;
+    assert!(alice.e2ee_peer_decryptable(bob_id) && bob.e2ee_peer_decryptable(alice_id));
+
+    // --- audio flows encrypted end to end and decrypts on Bob's side.
+    let (rms, active) = stream_tone(&alice, &bob, 1.6).await;
+    eprintln!("bob heard e2ee rms={rms:.3} over {active} frames");
+    assert!(active >= 50, "bob mixed only {active} active frames");
+    assert!((0.15..0.35).contains(&rms), "unexpected rms {rms}");
+    let a = alice.stats().transmit;
+    assert!(a.frames_e2ee >= 60, "alice sealed {} frames", a.frames_e2ee);
+    assert_eq!(
+        a.frames_e2ee, a.frames_sent,
+        "every frame to the channel was sealed"
+    );
+    let b = bob.stats().transmit;
+    assert_eq!(
+        b.e2ee_undecryptable, 0,
+        "bob dropped {} frames",
+        b.e2ee_undecryptable
+    );
+
+    // --- Dave joins: Alice rotates to a newer generation, both peers decrypt him and he them.
+    dave.join_channel(channel, None).unwrap();
+    wait_for(&dave, "dave join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await;
+    let mut gen_three = None;
+    wait_for(&alice, "alice decrypts dave", Duration::from_secs(10), |e| {
+        if let Event::E2eeKeyRotated { generation } = e {
+            gen_three = Some(*generation);
+        }
+        matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == dave_id)
+    })
+    .await;
+    let gen_three = gen_three.expect("alice rotated for dave");
+    assert_eq!(gen_three, gen_two.wrapping_add(1));
+    wait_for(&bob, "bob decrypts dave", Duration::from_secs(10), |e| {
+        matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == dave_id)
+    })
+    .await;
+    for peer in [alice_id, bob_id] {
+        wait_for(&dave, "dave decrypts", Duration::from_secs(10), |e| {
+            matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == peer)
+        })
+        .await;
+    }
+    let (rms, active) = stream_tone(&dave, &alice, 1.0).await;
+    eprintln!("alice heard dave rms={rms:.3} over {active} frames");
+    assert!(
+        active >= 30 && (0.15..0.35).contains(&rms),
+        "dave → alice: {rms} / {active}"
+    );
+    let (rms, active) = stream_tone(&alice, &dave, 1.0).await;
+    eprintln!("dave heard alice rms={rms:.3} over {active} frames");
+    assert!(
+        active >= 30 && (0.15..0.35).contains(&rms),
+        "alice → dave: {rms} / {active}"
+    );
+
+    // --- Alice's control socket dies; the resumed session keeps every key and generation.
+    proxy.kill();
+    let recovered = wait_for(&alice, "alice recovered", Duration::from_secs(20), |e| {
+        matches!(e, Event::Recovered { .. })
+    })
+    .await;
+    assert!(matches!(recovered, Event::Recovered { resumed: true, .. }));
+    assert!(alice.e2ee_peer_decryptable(bob_id) && alice.e2ee_peer_decryptable(dave_id));
+    let (rms, active) = stream_tone(&alice, &bob, 1.0).await;
+    eprintln!("bob heard alice after resume rms={rms:.3} over {active} frames");
+    assert!(
+        active >= 30 && (0.15..0.35).contains(&rms),
+        "after resume: {rms} / {active}"
+    );
+
+    // --- Dave leaves: he can no longer be decrypted and the remaining members rotate away from
+    // the key he holds.
+    dave.leave_channel(channel).unwrap();
+    let mut dropped = false;
+    let ev = wait_for(&alice, "alice rotates away from dave", Duration::from_secs(10), |e| {
+        if matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: false } if *user_id == dave_id)
+        {
+            dropped = true;
+        }
+        matches!(e, Event::E2eeKeyRotated { .. })
+    })
+    .await;
+    assert!(dropped, "dave was dropped before the rotation");
+    let Event::E2eeKeyRotated {
+        generation: gen_four,
+    } = ev
+    else {
+        unreachable!()
+    };
+    assert_eq!(gen_four, gen_three.wrapping_add(1));
+    assert!(!alice.e2ee_peer_decryptable(dave_id));
+    wait_for(
+        &bob,
+        "bob rotated after leave",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::E2eeKeyRotated { .. }),
+    )
+    .await;
+    let (rms, active) = stream_tone(&alice, &bob, 1.0).await;
+    eprintln!("bob heard alice after rotation rms={rms:.3} over {active} frames");
+    assert!(
+        active >= 30 && (0.15..0.35).contains(&rms),
+        "after leave: {rms} / {active}"
+    );
+    assert_eq!(bob.stats().transmit.e2ee_undecryptable, 0);
+
+    // --- Bob leaves the channel entirely: nothing of Alice is decryptable to him any more.
+    bob.leave_channel(channel).unwrap();
+    wait_for(&bob, "bob left", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelLeft { .. })
+    })
+    .await;
+    assert!(!bob.e2ee_peer_decryptable(alice_id));
+
+    alice.disconnect();
+    bob.disconnect();
+    carol.disconnect();
+    dave.disconnect();
 }

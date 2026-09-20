@@ -433,6 +433,8 @@ FAurixStats ToStats(const AurixStats& S)
 	Out.HeartbeatsLostConsecutive = static_cast<int32>(S.heartbeats_lost_consecutive);
 	Out.MediaPath = ToMediaPath(S.media_path);
 	Out.UplinkDropped = static_cast<int64>(S.uplink_dropped);
+	Out.FramesE2ee = static_cast<int64>(S.frames_e2ee);
+	Out.E2eeUndecryptable = static_cast<int64>(S.e2ee_undecryptable);
 	Out.FramesLost = static_cast<int64>(S.frames_lost);
 	Out.FramesLate = static_cast<int64>(S.frames_late);
 	Out.Underruns = static_cast<int64>(S.underruns);
@@ -533,6 +535,21 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.media_path = FromMediaPathPolicy(Settings.MediaPath);
 	Cfg.raw.udp_fallback_lost_heartbeats = static_cast<uint32_t>(FMath::Max(0, Settings.UdpFallbackLostHeartbeats));
 	Cfg.raw.udp_reprobe_interval_ms = static_cast<uint32_t>(FMath::Max(0, Settings.UdpReprobeIntervalMs));
+	Cfg.raw.e2ee = Settings.bE2ee;
+	Cfg.raw.has_e2ee_identity = false;
+	if (!Settings.E2eeIdentityHex.IsEmpty())
+	{
+		uint8 Secret[32] = {};
+		if (DecodeHex(Settings.E2eeIdentityHex, Secret, sizeof(Secret)))
+		{
+			FMemory::Memcpy(Cfg.raw.e2ee_identity, Secret, sizeof(Secret));
+			Cfg.raw.has_e2ee_identity = true;
+		}
+		else
+		{
+			UE_LOG(LogAurixVoice, Warning, TEXT("E2eeIdentityHex must be 64 hex characters; using a fresh identity"));
+		}
+	}
 
 	TUniquePtr<FAurixNativeClient> Created = MakeUnique<FAurixNativeClient>();
 	Created->Client = aurix::Client::create(Cfg);
@@ -1225,6 +1242,21 @@ TArray<FString> UAurixVoiceSubsystem::GetFailoverEndpoints() const
 	return Out;
 }
 
+FString UAurixVoiceSubsystem::GetE2eeFingerprint() const
+{
+	return Native ? FromUtf8(Native->Client.e2ee_fingerprint().c_str()) : FString();
+}
+
+FString UAurixVoiceSubsystem::GetE2eePeerFingerprint(FGuid UserId) const
+{
+	return Native ? FromUtf8(Native->Client.e2ee_peer_fingerprint(ToUuid(UserId)).c_str()) : FString();
+}
+
+bool UAurixVoiceSubsystem::IsE2eePeerDecryptable(FGuid UserId) const
+{
+	return Native && Native->Client.e2ee_peer_decryptable(ToUuid(UserId));
+}
+
 bool UAurixVoiceSubsystem::SetTranscripts(bool bEnabled)
 {
 	return Native && Check(Native->Client.set_transcripts(bEnabled), TEXT("set_transcripts"));
@@ -1804,6 +1836,18 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_ENDPOINT_CHANGED:
 		OnEndpointChanged.Broadcast(FromUtf8(aurix_event_message(Raw)));
+		break;
+
+	case AURIX_EVENT_E2EE_PEER_KEY:
+		OnE2eePeerKey.Broadcast(ToGuid(aurix_event_user_id(Raw)), FromUtf8(aurix_event_message(Raw)), FromUtf8(aurix_event_code(Raw)));
+		break;
+
+	case AURIX_EVENT_E2EE_PEER_DECRYPTABLE:
+		OnE2eePeerDecryptable.Broadcast(ToGuid(aurix_event_user_id(Raw)), aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_E2EE_KEY_ROTATED:
+		OnE2eeKeyRotated.Broadcast(static_cast<int32>(aurix_event_number(Raw)));
 		break;
 
 	case AURIX_EVENT_FAILED_TO_RECOVER:

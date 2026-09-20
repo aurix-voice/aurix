@@ -38,3 +38,23 @@ inline std::string ToUtf8(const FString& S)
 	FTCHARToUTF8 Conv(*S);
 	return std::string(reinterpret_cast<const char*>(Conv.Get()), static_cast<size_t>(Conv.Length()));
 }
+
+/// Decodes exactly `Size` bytes of hex (`2 * Size` digits, either case); false on any other input.
+inline bool DecodeHex(const FString& Hex, uint8* Out, int32 Size)
+{
+	if (Hex.Len() != Size * 2)
+	{
+		return false;
+	}
+	for (int32 i = 0; i < Size; ++i)
+	{
+		const TCHAR Hi = Hex[i * 2];
+		const TCHAR Lo = Hex[i * 2 + 1];
+		if (!FChar::IsHexDigit(Hi) || !FChar::IsHexDigit(Lo))
+		{
+			return false;
+		}
+		Out[i] = static_cast<uint8>((FParse::HexDigit(Hi) << 4) | FParse::HexDigit(Lo));
+	}
+	return true;
+}

@@ -503,6 +503,14 @@ pub struct ChannelConfig {
     /// classify → incidents). Independent of `transcription`: transcripts are not delivered to
     /// participants unless that is set too. Never applies to end-to-end encrypted media.
     pub safety_voice: bool,
+    /// End-to-end encryption: participants encrypt their frames with sender keys they exchange
+    /// among themselves (`crate::e2ee`); the node relays the key exchange and the frames but
+    /// cannot decode them. Excludes everything that needs the node to hear the audio:
+    /// recording, transcription, translation, safety, TTS into the channel, the server mix
+    /// (native listeners get per-speaker streams, browsers only their per-participant tracks),
+    /// PCMU transcoding and ambient mixing. Members whose client lacks E2EE support hear
+    /// nothing and are not heard.
+    pub e2ee: bool,
     pub whisper_target: Option<UserId>,
     pub command_speakers: Option<Vec<UserId>>,
 }
@@ -528,6 +536,7 @@ impl Default for ChannelConfig {
             recording_enabled: false,
             transcription: false,
             safety_voice: false,
+            e2ee: false,
             whisper_target: None,
             command_speakers: None,
         }
@@ -580,6 +589,25 @@ impl ChannelConfig {
         if let Some(a) = &self.audience {
             a.validate(self.max_participants)?;
         }
+        if self.e2ee {
+            if self.recording_enabled {
+                return Err("e2ee channels cannot be recorded".into());
+            }
+            if self.transcription || self.safety_voice {
+                return Err(
+                    "e2ee channels cannot be transcribed (transcription/safety_voice)".into(),
+                );
+            }
+            if self.ambient.is_some() {
+                return Err("e2ee channels cannot use ambient mixing".into());
+            }
+            if self.audience.is_some_and(|a| a.mix_for_listeners) {
+                return Err("e2ee channels cannot mix for listeners".into());
+            }
+            if self.channel_type == ChannelType::Echo {
+                return Err("echo channels cannot be end-to-end encrypted".into());
+            }
+        }
         Ok(())
     }
 
@@ -609,6 +637,7 @@ impl ChannelConfig {
                 AudioProfile::Broadcast => OpusSignal::Auto,
             },
             stereo: self.stereo,
+            e2ee: self.e2ee,
         }
     }
 }
@@ -668,6 +697,8 @@ pub struct AudioPolicy {
     pub signal: OpusSignal,
     /// Senders may encode two channels; `false` asks for mono.
     pub stereo: bool,
+    /// Frames into this channel must be end-to-end encrypted (`crate::e2ee`).
+    pub e2ee: bool,
 }
 
 impl Default for AudioPolicy {
@@ -680,7 +711,8 @@ impl AudioPolicy {
     /// Combined policy for a sender whose one encoder feeds several channels: the widest
     /// bitrate and bandwidth so no channel is starved, FEC if any channel wants it, DTX only if
     /// every channel allows it, the highest complexity hint, `Music` if any channel is music,
-    /// and stereo if any channel accepts it.
+    /// stereo if any channel accepts it, and encrypted if any channel requires it (a client
+    /// with one uplink for several channels must then encrypt for all of them).
     pub fn merge(self, other: AudioPolicy) -> AudioPolicy {
         AudioPolicy {
             bitrate_bps: self.bitrate_bps.max(other.bitrate_bps),
@@ -698,6 +730,7 @@ impl AudioPolicy {
                 _ => OpusSignal::Auto,
             },
             stereo: self.stereo || other.stereo,
+            e2ee: self.e2ee || other.e2ee,
         }
     }
 

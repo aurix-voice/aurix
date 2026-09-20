@@ -30,6 +30,8 @@ pub enum Scope {
     Report,
     /// Operator login/setup attempts from one client IP.
     AdminLogin,
+    /// E2EE key-distribution messages relayed for one user.
+    E2ee,
 }
 
 impl Scope {
@@ -42,6 +44,7 @@ impl Scope {
             Self::Block => "block",
             Self::Report => "report",
             Self::AdminLogin => "admin_login",
+            Self::E2ee => "e2ee",
         }
     }
 }
@@ -152,6 +155,7 @@ impl FleetLimiter {
             Scope::Block => Limit::per_minute(c.block_changes_per_minute),
             Scope::Report => Limit::per_minute(c.reports_per_minute),
             Scope::AdminLogin => Limit::per_minute(c.admin_login_per_minute),
+            Scope::E2ee => Limit::per_minute(c.e2ee_messages_per_minute),
         }
     }
 

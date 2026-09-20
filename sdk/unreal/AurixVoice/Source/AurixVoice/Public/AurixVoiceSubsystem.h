@@ -57,6 +57,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRejoinFailed, FGuid, Channe
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRecovering, int32, Attempt, int32, DelayMs, const FString&, Cause);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixRecovered, bool, bResumed, bool, bMigrated);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixEndpointChanged, const FString&, Url);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixE2eePeerKey, FGuid, UserId, const FString&, Fingerprint, const FString&, PreviousFingerprint);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixE2eePeerDecryptable, FGuid, UserId, bool, bDecryptable);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixE2eeKeyRotated, int32, Generation);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixConnectionEnded, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRawEvent, const FString&, Json);
 DECLARE_DYNAMIC_DELEGATE_ThreeParams(FAurixRegionsDiscovered, bool, bSuccess, const TArray<FAurixRegionEndpoint>&, Regions, const FString&, Error);
@@ -399,6 +402,20 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Connection")
 	TArray<FString> GetFailoverEndpoints() const;
 
+	// ---- end-to-end encryption -------------------------------------------------------------
+
+	/** Fingerprint of this client's E2EE identity key; peers see it as OnE2eePeerKey. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Security")
+	FString GetE2eeFingerprint() const;
+
+	/** Fingerprint of a peer's identity key; empty until the peer announced one in a shared encrypted channel. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Security")
+	FString GetE2eePeerFingerprint(FGuid UserId) const;
+
+	/** Whether the peer's encrypted frames currently decode (their sender key arrived). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Security")
+	bool IsE2eePeerDecryptable(FGuid UserId) const;
+
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetTranscripts(bool bEnabled);
 
@@ -547,6 +564,12 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixRecovered OnRecovered;
 	/** A failover node answered while the previous one did not; fires before that connection's OnSessionReady. */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixEndpointChanged OnEndpointChanged;
+	/** A peer announced its E2EE identity; PreviousFingerprint is non-empty when a known user now presents a different key (verify out of band). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixE2eePeerKey OnE2eePeerKey;
+	/** A peer's encrypted frames became decodable (its sender key arrived). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixE2eePeerDecryptable OnE2eePeerDecryptable;
+	/** Our sender key rotated (a member joined or left an encrypted channel). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixE2eeKeyRotated OnE2eeKeyRotated;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixConnectionEnded OnFailedToRecover;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixConnectionEnded OnDisconnected;
 	/** Every event as JSON (positions arrive only here). */

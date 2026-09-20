@@ -23,6 +23,7 @@
 
 use aurix_auth::{JwtService, ValidatedToken};
 use aurix_common::crypto::{constant_time_eq, ResumeToken};
+use aurix_common::e2ee;
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
     decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
@@ -39,7 +40,7 @@ use aurix_control::{
     TranslationService, MIGRATION_SEQUENCE_GAP,
 };
 use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
-use aurix_media::session::MAX_PARTICIPANT_GAIN;
+use aurix_media::session::{Transport, MAX_PARTICIPANT_GAIN};
 use aurix_media::tunnel::MediaTunnel;
 use aurix_media::{MediaEvent, SfuNode};
 use aurix_recording::RecordingService;
@@ -999,6 +1000,16 @@ impl WsState {
                 ServerEvent::ChatReadMarker { app_id, marker } => {
                     self.deliver_read_marker(app_id, marker);
                 }
+                ServerEvent::E2eeRelay {
+                    app_id,
+                    channel_id,
+                    from_user,
+                    from_session,
+                    to,
+                    message,
+                } => {
+                    self.deliver_e2ee(app_id, channel_id, from_user, from_session, to, &message);
+                }
                 ServerEvent::ParticipantTyping {
                     app_id,
                     channel_id,
@@ -1465,6 +1476,42 @@ impl WsState {
                 if !c.text_reaches(&user_id, &conn.user_id) || !c.sees(&conn.user_id, &user_id) {
                     continue;
                 }
+            }
+            let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    /// Relays an E2EE key message to the channel's local members of the same tenant — every
+    /// other member for a `Hello`, only `to` for a `SenderKey`. Membership is the whole
+    /// authorization: key material reaches exactly the people the channel admits, regardless
+    /// of radius or listener visibility (they may need to decrypt later).
+    fn deliver_e2ee(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        from_user: UserId,
+        from_session: SessionId,
+        to: Option<UserId>,
+        message: &ControlMessage,
+    ) {
+        let Ok(json) = serde_json::to_string(message) else {
+            return;
+        };
+        let Some(members) = self.channel_members.get(&channel_id) else {
+            return;
+        };
+        for sid in members.iter() {
+            if *sid == from_session {
+                continue;
+            }
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id
+                || conn.user_id == from_user
+                || to.is_some_and(|t| t != conn.user_id)
+            {
+                continue;
             }
             let _ = conn.tx.try_send(json.clone());
         }
@@ -3148,6 +3195,76 @@ fn channel_role(
     Some(channel.get_role(&session.user_id))
 }
 
+/// Join-time E2EE checks: an encrypted channel takes only sessions that announced E2EE
+/// support, and a browser (one uplink for all channels) cannot hold encrypted and plaintext
+/// channels at the same time.
+fn e2ee_join_allowed(
+    state: &WsState,
+    session_id: &SessionId,
+    config: &aurix_common::types::ChannelConfig,
+) -> Result<(), AurixError> {
+    let sfu = state.sfu.read();
+    let Some(session) = sfu.get_session(session_id) else {
+        return Err(AurixError::SessionNotFound(session_id.to_string()));
+    };
+    if config.e2ee && !session.is_e2ee_capable() {
+        return Err(AurixError::E2eeRequired(
+            "send E2eeHello before joining an encrypted channel".into(),
+        ));
+    }
+    if session.transport() == Transport::WebRtc {
+        let mixed = session.get_channels().iter().any(|c| {
+            sfu.get_channel(c)
+                .is_some_and(|ch| ch.is_e2ee() != config.e2ee)
+        });
+        if mixed {
+            return Err(AurixError::E2eeMixedChannels(
+                "a WebRTC session encrypts all channels or none".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validation shared by the E2EE control messages: rate limit, key encoding, membership of
+/// the sender in an encrypted channel of the same tenant.
+async fn e2ee_relay_allowed(
+    state: &WsState,
+    session_id: SessionId,
+    token: &ValidatedToken,
+    channel_id: &ChannelId,
+    public_key: &str,
+) -> Result<(), AurixError> {
+    if state
+        .control
+        .limits
+        .check(LimitScope::E2ee, &token.user_id.to_string())
+        .await
+        .is_err()
+    {
+        return Err(AurixError::RateLimitExceeded(
+            "too many E2EE key messages".into(),
+        ));
+    }
+    e2ee::parse_public_key(public_key)?;
+    let sfu = state.sfu.read();
+    let session = sfu
+        .get_session(&session_id)
+        .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+    let channel = sfu
+        .get_channel(channel_id)
+        .filter(|c| c.app_id == token.app_id && c.has_participant(&session.user_id))
+        .ok_or_else(|| {
+            AurixError::AuthorizationDenied("Sender is not a participant of this channel".into())
+        })?;
+    if !channel.is_e2ee() {
+        return Err(AurixError::Validation(
+            "channel is not end-to-end encrypted".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Authorization and flow control for a client chat message, then hand-off to `ChatService`.
 /// Channel messages need active membership; directed ones a target user of the same app with
 /// no block between the two. An offline target is refused (`USER_OFFLINE`) unless
@@ -3515,6 +3632,12 @@ async fn handle_control_message(
                 .control
                 .rbac
                 .role_from_permissions(&channel_id, &perms);
+            if let Err(e) = e2ee_join_allowed(state, &session_id, &config) {
+                if resolved.created {
+                    state.control.release_ad_hoc(token.app_id, channel_id).await;
+                }
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
             if let Some(claim) = claim {
                 if let Err(e) = state.control.action_tokens.consume(&claim).await {
                     if resolved.created {
@@ -4327,6 +4450,82 @@ async fn handle_control_message(
             if let Err(e) = result {
                 return send_error(tx, e.error_code(), &e.public_message()).await;
             }
+        }
+
+        ControlMessage::E2eeHello {
+            channel_id,
+            public_key,
+            ..
+        } => {
+            let Some(channel_id) = channel_id else {
+                // Capability announcement: no relay, but the key must at least parse.
+                if let Err(e) = e2ee::parse_public_key(&public_key) {
+                    return send_error(tx, e.error_code(), &e.public_message()).await;
+                }
+                if let Some(session) = state.sfu.read().get_session(&session_id) {
+                    session.set_e2ee_capable(true);
+                }
+                return;
+            };
+            if let Err(e) =
+                e2ee_relay_allowed(state, session_id, token, &channel_id, &public_key).await
+            {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+            if let Some(session) = state.sfu.read().get_session(&session_id) {
+                session.set_e2ee_capable(true);
+            }
+            state.control.events.publish(ServerEvent::E2eeRelay {
+                app_id: token.app_id,
+                channel_id,
+                from_user: token.user_id,
+                from_session: session_id,
+                to: None,
+                message: ControlMessage::E2eeHello {
+                    channel_id: Some(channel_id),
+                    user_id: Some(token.user_id),
+                    public_key,
+                },
+            });
+        }
+
+        ControlMessage::E2eeSenderKey {
+            channel_id,
+            to,
+            public_key,
+            generation,
+            key,
+            ..
+        } => {
+            if let Err(e) =
+                e2ee_relay_allowed(state, session_id, token, &channel_id, &public_key).await
+            {
+                return send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+            match e2ee::decode_bytes(&key) {
+                Ok(k) if k.len() == e2ee::WRAPPED_KEY_LEN => {}
+                _ => {
+                    return send_error(tx, "VALIDATION_ERROR", "Malformed wrapped sender key").await
+                }
+            }
+            if to == token.user_id {
+                return send_error(tx, "VALIDATION_ERROR", "Cannot key yourself").await;
+            }
+            state.control.events.publish(ServerEvent::E2eeRelay {
+                app_id: token.app_id,
+                channel_id,
+                from_user: token.user_id,
+                from_session: session_id,
+                to: Some(to),
+                message: ControlMessage::E2eeSenderKey {
+                    channel_id,
+                    from: Some(token.user_id),
+                    to,
+                    public_key,
+                    generation,
+                    key,
+                },
+            });
         }
 
         ControlMessage::Ping { nonce } => send_msg(tx, &ControlMessage::Pong { nonce }).await,

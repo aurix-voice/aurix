@@ -248,6 +248,7 @@ impl AurixConfig {
                 || rl.block_changes_per_minute == 0
                 || rl.reports_per_minute == 0
                 || rl.admin_login_per_minute == 0
+                || rl.e2ee_messages_per_minute == 0
             {
                 anyhow::bail!("rate_limiting.*_per_minute limits must be > 0");
             }
@@ -1781,6 +1782,11 @@ pub struct RateLimitConfig {
     /// Operator login / setup attempts per client IP.
     #[serde(default = "default_admin_login_per_minute")]
     pub admin_login_per_minute: u32,
+    /// E2EE key-distribution messages (`E2eeHello` / `E2eeSenderKey`) relayed per user. A
+    /// rotation sends one wrapped key per peer, so budget for the largest encrypted channel
+    /// times the join/leave churn a user may see per minute.
+    #[serde(default = "default_e2ee_messages_per_minute")]
+    pub e2ee_messages_per_minute: u32,
     /// Per-IP buckets aggregate IPv6 clients at this prefix length (a host can rotate through
     /// its whole delegated /64 for free otherwise). `0` or `128` keys on the full address.
     #[serde(default = "default_ipv6_prefix")]
@@ -1803,6 +1809,10 @@ fn default_admin_login_per_minute() -> u32 {
     10
 }
 
+fn default_e2ee_messages_per_minute() -> u32 {
+    3000
+}
+
 fn default_ipv6_prefix() -> u8 {
     64
 }
@@ -1822,6 +1832,7 @@ impl Default for RateLimitConfig {
             block_changes_per_minute: default_block_changes_per_minute(),
             reports_per_minute: default_reports_per_minute(),
             admin_login_per_minute: default_admin_login_per_minute(),
+            e2ee_messages_per_minute: default_e2ee_messages_per_minute(),
             ipv6_prefix: default_ipv6_prefix(),
         }
     }

@@ -200,6 +200,8 @@ connects_per_minute = 60
 block_changes_per_minute = 60
 reports_per_minute = 10
 admin_login_per_minute = 10
+# E2EE key-distribution messages relayed per user (one wrapped key per peer per rotation).
+e2ee_messages_per_minute = 3000
 
 # Lightweight in-game text chat over the control WebSocket (channel + directed messages,
 # typing). History is optional and off by default; the filter webhook is the moderation hook.

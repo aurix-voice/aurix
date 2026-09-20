@@ -442,6 +442,12 @@ impl PacketRouter {
         if !sender.transmits_to(&channel_id) {
             return Ok(());
         }
+        if channel.is_e2ee() && !packet.header.has_flag(PacketFlags::E2ee) {
+            aurix_metrics::PACKETS_DROPPED.inc();
+            return Err(AurixError::Validation(
+                "channel requires end-to-end encrypted frames".into(),
+            ));
+        }
 
         // A PCMU uplink enters the channel as Opus so recording, transcription, cascade and
         // Opus receivers never see μ-law; PCMU receivers get it re-encoded in `deliver`.
@@ -524,6 +530,17 @@ impl PacketRouter {
         // sender loudest (focus / positional attenuation) — or the mixers would double the audio.
         let mut per_channel: Vec<(Arc<MediaChannel>, AurixPacket)> = Vec::new();
         let mut best: HashMap<SessionId, (usize, Arc<MediaSession>, Mix)> = HashMap::new();
+        // A browser has one uplink for all its channels and encrypts it end-to-end as soon as
+        // any joined channel is encrypted (Insertable Streams); the node cannot tell from the
+        // bytes, so the frame is flagged from the channel policies. A browser that never
+        // announced E2EE support is not heard in an encrypted channel.
+        let e2ee = sender.is_e2ee_capable()
+            && sender.get_channels().iter().any(|c| {
+                self.shared
+                    .channels
+                    .get(c)
+                    .is_some_and(|ch| ch.value().is_e2ee())
+            });
         for channel_id in channels {
             let channel = match self.shared.channels.get(&channel_id) {
                 Some(c) => c.value().clone(),
@@ -532,13 +549,20 @@ impl PacketRouter {
             if !channel.can_transmit(&sender.user_id) {
                 continue;
             }
-            let packet = AurixPacket::audio(
+            if channel.is_e2ee() && !e2ee {
+                aurix_metrics::PACKETS_DROPPED.inc();
+                continue;
+            }
+            let mut packet = AurixPacket::audio(
                 seq,
                 rtp_time,
                 sender.ssrc,
                 channel_id_hash(&channel_id),
                 Bytes::from(payload.clone()),
             );
+            if e2ee {
+                packet.header.flags |= PacketFlags::E2ee as u16;
+            }
             self.tap_audio(&channel, sender, &packet);
             let idx = per_channel.len();
             for (receiver, mix) in channel.get_receivers_for_audio(sender.ssrc) {
@@ -618,6 +642,7 @@ impl PacketRouter {
             return Err(AurixError::SessionNotFound(sender.session_id.to_string()));
         }
         let channel = self.channel_for_sender(channel_id, sender)?;
+        Self::reject_plaintext_injection(&channel)?;
         let packet = frame.into_packet(channel_id);
         if to_channel {
             if sender
@@ -682,6 +707,7 @@ impl PacketRouter {
                 "Channel belongs to a different application".into(),
             ));
         }
+        Self::reject_plaintext_injection(&channel)?;
         let packet = frame.into_packet(channel_id);
         let receivers = channel.get_receivers_for_announcement();
         self.deliver(&channel, receivers, &packet, None).await;
@@ -701,6 +727,7 @@ impl PacketRouter {
             return Err(AurixError::SessionNotFound(listener.session_id.to_string()));
         }
         let channel = self.channel_for_sender(channel_id, listener)?;
+        Self::reject_plaintext_injection(&channel)?;
         let packet = frame.into_packet(channel_id);
         self.deliver_scoped(
             &channel,
@@ -710,6 +737,16 @@ impl PacketRouter {
             None,
         )
         .await;
+        Ok(())
+    }
+
+    /// Synthesized (server-side) audio has no sender key: it cannot enter an encrypted channel.
+    fn reject_plaintext_injection(channel: &Arc<MediaChannel>) -> Result<()> {
+        if channel.is_e2ee() {
+            return Err(AurixError::Validation(
+                "cannot inject server-side audio into an end-to-end encrypted channel".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -937,9 +974,15 @@ impl PacketRouter {
             if !receiver.is_active() {
                 continue;
             }
+            // Only clients that announced E2EE support get encrypted frames; the rest would
+            // drop them anyway.
+            if e2ee && !receiver.is_e2ee_capable() {
+                continue;
+            }
             match receiver.transport() {
                 Transport::WebRtc => {
-                    if e2ee {
+                    if e2ee && speaker.is_none() {
+                        aurix_metrics::PACKETS_DROPPED.inc();
                         continue;
                     }
                     if let Some(ref webrtc) = self.webrtc {
@@ -951,6 +994,7 @@ impl PacketRouter {
                                 sender_ts: packet.header.timestamp,
                                 volume: mix.volume,
                                 direction: mix.direction,
+                                e2ee,
                                 payload: packet.payload.to_vec(),
                             },
                         );

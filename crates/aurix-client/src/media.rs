@@ -82,6 +82,9 @@ pub struct IncomingAudio {
     /// Server-mixed channel downlink (`PacketFlags::Mixed`): stereo Opus with every
     /// receiver-specific gain already applied; `sender_ssrc` is the channel's mix SSRC.
     pub mixed: bool,
+    /// `PacketFlags::E2ee`: `payload` is an `aurix_common::e2ee` frame sealed by the sender,
+    /// opaque to the server; open it with the sender's key before decoding.
+    pub e2ee: bool,
     pub payload: Bytes,
 }
 
@@ -514,6 +517,7 @@ impl MediaTransport {
                         direction,
                         codec,
                         mixed: packet.header.has_flag(PacketFlags::Mixed),
+                        e2ee: packet.header.has_flag(PacketFlags::E2ee),
                         payload: packet.payload,
                     });
                 }
@@ -597,6 +601,37 @@ impl MediaTransport {
         codec: AudioCodec,
         data: &[u8],
     ) {
+        self.send_audio_packet(channel_hash, timestamp, level, codec, false, data);
+    }
+
+    /// [`Self::send_audio`] for an Opus frame already sealed with the group sender key
+    /// (`PacketFlags::E2ee`): the server relays it opaque to the channel's capable members.
+    pub fn send_audio_e2ee(
+        &self,
+        channel_hash: u32,
+        timestamp: u32,
+        level: Option<u8>,
+        frame: &[u8],
+    ) {
+        self.send_audio_packet(
+            channel_hash,
+            timestamp,
+            level,
+            AudioCodec::Opus,
+            true,
+            frame,
+        );
+    }
+
+    fn send_audio_packet(
+        &self,
+        channel_hash: u32,
+        timestamp: u32,
+        level: Option<u8>,
+        codec: AudioCodec,
+        e2ee: bool,
+        data: &[u8],
+    ) {
         if data.is_empty() || data.len() > MAX_PACKET_SIZE - 64 {
             return;
         }
@@ -615,6 +650,9 @@ impl MediaTransport {
         };
         if codec == AudioCodec::Pcmu {
             packet.header.flags |= PacketFlags::Pcmu as u16;
+        }
+        if e2ee {
+            packet.header.flags |= PacketFlags::E2ee as u16;
         }
         self.send_sealed(&packet);
     }

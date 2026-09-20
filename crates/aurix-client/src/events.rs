@@ -259,6 +259,25 @@ pub enum Event {
         truncated: bool,
     },
     Transcript(Transcript),
+    /// A member of an end-to-end encrypted channel announced its identity key. Show the
+    /// fingerprint for out-of-band verification; `previous_fingerprint` is set when a user
+    /// we already trusted now presents a different key (a reinstall — or an impostor).
+    E2eePeerKey {
+        user_id: UserId,
+        fingerprint: String,
+        previous_fingerprint: Option<String>,
+    },
+    /// We can (or can no longer) decrypt `user_id`: their sender key arrived, or they left
+    /// every encrypted channel we share.
+    E2eePeerDecryptable {
+        user_id: UserId,
+        decryptable: bool,
+    },
+    /// Our sender key rotated (a member joined or left, or the counter wrapped); peers get
+    /// the new key over the control channel.
+    E2eeKeyRotated {
+        generation: u8,
+    },
     TtsStatus {
         request_id: Option<RequestId>,
         server_request_id: uuid::Uuid,

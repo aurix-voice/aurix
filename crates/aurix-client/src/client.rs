@@ -17,6 +17,7 @@
 //! nothing but latency). A tunnelled session re-probes UDP periodically and moves back when it
 //! answers.
 
+use aurix_common::e2ee;
 use aurix_common::protocol::{
     channel_id_hash, ControlMessage, ParticipantBrief, TransmissionMode, TtsDestination, TtsState,
     UserPosition,
@@ -79,6 +80,11 @@ pub struct TransmitStats {
     pub frames_sent: u64,
     /// Frames dropped because the client was muted, gated by VAD or had no target channel.
     pub frames_gated: u64,
+    /// Frames sent end-to-end encrypted (subset of `frames_sent`).
+    pub frames_e2ee: u64,
+    /// Downlink frames flagged E2EE that could not be opened: sender unknown, no key for its
+    /// generation yet (key exchange in flight), or a replay.
+    pub e2ee_undecryptable: u64,
 }
 
 /// Everything the network-quality UI needs, in one snapshot. Counters are lifetime totals of
@@ -255,6 +261,8 @@ struct Inner {
     /// tried first on the next bind so a dual-stack client sticks with the family that works.
     udp_family_hint: Arc<Mutex<Option<bool>>>,
     endpoints: Mutex<Endpoints>,
+    /// Group E2EE state: our identity and sender key, the peers' keys per encrypted channel.
+    e2ee: Mutex<e2ee::Group>,
 }
 
 /// Where the control connection lives and where it may move to.
@@ -333,15 +341,63 @@ impl Inner {
         )
     }
 
-    /// Hashes of the joined channels the microphone currently reaches.
-    fn transmit_targets(&self) -> Vec<u32> {
+    /// Joined channels the microphone currently reaches: `(hash, end_to_end_encrypted)`.
+    fn transmit_targets(&self) -> Vec<(u32, bool)> {
         let prefs = self.prefs.lock();
         let channels = self.channels.lock();
         channels
             .iter()
             .filter(|(id, _)| prefs.transmission.allows(id))
-            .map(|(_, c)| c.hash)
+            .map(|(_, c)| (c.hash, c.audio.e2ee))
             .collect()
+    }
+
+    /// Send `payload` to every target, sealing it once for the encrypted ones. Returns the
+    /// frames handed to the transport and how many of them were encrypted. PCMU frames never
+    /// go to encrypted channels (the server would have to transcode them).
+    fn send_to_targets(
+        &self,
+        media: &MediaTransport,
+        targets: &[(u32, bool)],
+        ts: u32,
+        level: Option<u8>,
+        codec: AudioCodec,
+        payload: &[u8],
+    ) -> (u64, u64) {
+        let mut sent = 0;
+        let mut encrypted = 0;
+        let mut sealed: Option<Vec<u8>> = None;
+        for &(hash, e2ee) in targets {
+            if e2ee {
+                if codec != AudioCodec::Opus {
+                    continue;
+                }
+                let frame = sealed.get_or_insert_with(|| self.e2ee.lock().encrypt(payload));
+                media.send_audio_e2ee(hash, ts, level, frame);
+                encrypted += 1;
+            } else {
+                media.send_audio_frame(hash, ts, level, codec, payload);
+            }
+            sent += 1;
+        }
+        (sent, encrypted)
+    }
+
+    fn user_for_ssrc(&self, ssrc: u32) -> Option<UserId> {
+        let base = crate::source_ssrc(ssrc);
+        self.channels.lock().values().find_map(|c| {
+            c.participants
+                .values()
+                .find(|p| p.ssrc == base)
+                .map(|p| p.user_id)
+        })
+    }
+
+    fn channel_encrypted(&self, hash: u32) -> bool {
+        self.channels
+            .lock()
+            .values()
+            .any(|c| c.hash == hash && c.audio.e2ee)
     }
 
     /// Microphone and TTS-voice SSRCs of `user_id`, if it is in a joined channel's roster.
@@ -376,6 +432,24 @@ impl Inner {
         self.jitter
             .lock()
             .observe(audio.sender_ssrc, audio.timestamp, Instant::now());
+        let payload = if audio.e2ee {
+            let opened = self
+                .user_for_ssrc(audio.sender_ssrc)
+                .and_then(|user| self.e2ee.lock().decrypt(&user, &audio.payload).ok());
+            match opened {
+                Some(plain) => plain,
+                None => {
+                    self.tx_stats.lock().e2ee_undecryptable += 1;
+                    return;
+                }
+            }
+        } else if self.channel_encrypted(audio.channel_hash) {
+            // Plaintext on an encrypted channel is never played: only the members' keys speak there.
+            self.tx_stats.lock().e2ee_undecryptable += 1;
+            return;
+        } else {
+            audio.payload.to_vec()
+        };
         let _ = self.mixer.lock().push_wire_frame(
             audio.sender_ssrc,
             audio.sequence,
@@ -383,7 +457,7 @@ impl Inner {
             audio.direction,
             audio.codec,
             audio.mixed && audio.codec == AudioCodec::Opus,
-            audio.payload.to_vec(),
+            payload,
         );
     }
 }
@@ -492,6 +566,10 @@ impl Client {
             active: cfg.ws_url.clone(),
             failover: Vec::new(),
         };
+        let e2ee_identity = match cfg.e2ee_identity {
+            Some(secret) => e2ee::IdentityKey::from_bytes(secret),
+            None => e2ee::IdentityKey::generate(),
+        };
         let inner = Arc::new(Inner {
             mixer: Mutex::new(RemoteMixer::new(
                 cfg.jitter_target_frames,
@@ -528,6 +606,7 @@ impl Client {
             udp_blocked_until: Mutex::new(None),
             udp_family_hint: Arc::new(Mutex::new(None)),
             endpoints: Mutex::new(endpoints),
+            e2ee: Mutex::new(e2ee::Group::new(e2ee_identity)),
         });
         Ok(Self {
             inner,
@@ -732,13 +811,23 @@ impl Client {
 
     /// User owning `ssrc` (microphone or its synthesized TTS voice), searched across channels.
     pub fn user_for_ssrc(&self, ssrc: u32) -> Option<UserId> {
-        let base = crate::source_ssrc(ssrc);
-        self.inner.channels.lock().values().find_map(|c| {
-            c.participants
-                .values()
-                .find(|p| p.ssrc == base)
-                .map(|p| p.user_id)
-        })
+        self.inner.user_for_ssrc(ssrc)
+    }
+
+    /// Fingerprint of this client's E2EE identity key (`xxxx-xxxx-…`), for the peers to verify
+    /// out of band against the `E2eePeerKey` they see for us.
+    pub fn e2ee_fingerprint(&self) -> String {
+        self.inner.e2ee.lock().identity().fingerprint()
+    }
+
+    /// Fingerprint of a peer's identity key, if it announced one in a shared encrypted channel.
+    pub fn e2ee_peer_fingerprint(&self, user_id: UserId) -> Option<String> {
+        self.inner.e2ee.lock().peer_fingerprint(&user_id)
+    }
+
+    /// Whether we currently hold a sender key for `user_id` (their frames can be decrypted).
+    pub fn e2ee_peer_decryptable(&self, user_id: UserId) -> bool {
+        self.inner.e2ee.lock().has_key_for(&user_id)
     }
 
     // --------------------------------------------------------------------- audio
@@ -769,9 +858,18 @@ impl Client {
                 return;
             }
             if let Some(m) = &media {
-                for hash in &targets {
-                    m.send_audio_frame(*hash, ts, Some(frame.level), frame.codec, &frame.payload);
-                    stats.frames_sent += 1;
+                let (sent, encrypted) = self.inner.send_to_targets(
+                    m,
+                    &targets,
+                    ts,
+                    Some(frame.level),
+                    frame.codec,
+                    &frame.payload,
+                );
+                stats.frames_sent += sent;
+                stats.frames_e2ee += encrypted;
+                if sent == 0 {
+                    stats.frames_gated += 1;
                 }
             } else {
                 stats.frames_gated += 1;
@@ -783,6 +881,7 @@ impl Client {
             s.frames_encoded += stats.frames_encoded;
             s.frames_sent += stats.frames_sent;
             s.frames_gated += stats.frames_gated;
+            s.frames_e2ee += stats.frames_e2ee;
         }
         if let Some(speaking) = speaking_flip {
             self.inner.emit(Event::LocalSpeaking(speaking));
@@ -812,13 +911,14 @@ impl Client {
             .rtp_ts
             .fetch_add(FRAME_SAMPLES as u32, Ordering::Relaxed);
         let targets = self.inner.transmit_targets();
+        let (sent, encrypted) =
+            self.inner
+                .send_to_targets(&media, &targets, ts, level, AudioCodec::Opus, opus);
         let mut s = self.inner.tx_stats.lock();
         s.frames_encoded += 1;
-        for hash in &targets {
-            media.send_audio(*hash, ts, level, opus);
-            s.frames_sent += 1;
-        }
-        if targets.is_empty() {
+        s.frames_sent += sent;
+        s.frames_e2ee += encrypted;
+        if sent == 0 {
             s.frames_gated += 1;
         }
         Ok(())
@@ -1710,6 +1810,7 @@ async fn wait_for_disconnect(
 fn finish(inner: &Inner, pending: &mut Pending, reason: &str, state: ConnectionState) {
     fail_all_pending(inner, pending, "DISCONNECTED", reason);
     let channels: Vec<ChannelId> = inner.channels.lock().drain().map(|(id, _)| id).collect();
+    e2ee_reset(inner);
     for channel_id in channels {
         inner.emit(Event::ChannelLeft { channel_id });
     }
@@ -1804,11 +1905,15 @@ async fn session(
     *resume = Some((ack.session_id, ack.resume_token.clone()));
     inner.set_state(ConnectionState::Connected);
     inner.emit(Event::SessionReady(info));
+    if cfg.e2ee && conn.send(&e2ee_capability(inner)).await.is_err() {
+        return Exit::Dropped("send failed".into());
+    }
 
     // Fresh session after a reconnect: the old memberships are gone on the server.
     if !first && !ack.resumed {
         let old: Vec<ChannelId> = inner.channels.lock().drain().map(|(id, _)| id).collect();
         inner.mixer.lock().clear();
+        e2ee_reset(inner);
         for channel_id in old {
             inner.emit(Event::ChannelLeft { channel_id });
         }
@@ -2046,6 +2151,9 @@ async fn session(
             }
             _ = requests.tick() => {
                 expire_requests(inner, pending);
+                if let Err(exit) = e2ee_rotate(inner, &mut conn).await {
+                    return exit;
+                }
                 if let Err(exit) = pump_joins(inner, cfg, &mut conn, pending).await {
                     return exit;
                 }
@@ -2500,6 +2608,7 @@ async fn handle_command(
 fn forget_channel(inner: &Inner, channel_id: ChannelId) {
     let removed = inner.channels.lock().remove(&channel_id);
     if let Some(ch) = removed {
+        e2ee_left(inner, &channel_id);
         let still_heard: HashSet<u32> = inner
             .channels
             .lock()
@@ -2522,6 +2631,224 @@ fn forget_channel(inner: &Inner, channel_id: ChannelId) {
         inner.emit(Event::ChannelLeft { channel_id });
         refresh_audio_policy(inner);
         inner.refresh_claims();
+    }
+}
+
+// ------------------------------------------------------------------------------- E2EE
+
+fn e2ee_message(inner: &Inner, out: e2ee::Outgoing) -> ControlMessage {
+    match out {
+        e2ee::Outgoing::Hello { channel_id } => ControlMessage::E2eeHello {
+            channel_id: Some(channel_id),
+            user_id: None,
+            public_key: e2ee::encode_bytes(inner.e2ee.lock().identity().public_key()),
+        },
+        e2ee::Outgoing::SenderKey {
+            channel_id,
+            to,
+            generation,
+            wrapped,
+        } => ControlMessage::E2eeSenderKey {
+            channel_id,
+            from: None,
+            to,
+            public_key: e2ee::encode_bytes(inner.e2ee.lock().identity().public_key()),
+            generation,
+            key: e2ee::encode_bytes(&wrapped),
+        },
+    }
+}
+
+async fn e2ee_send(
+    inner: &Inner,
+    conn: &mut ControlConnection,
+    out: Vec<e2ee::Outgoing>,
+) -> std::result::Result<(), Exit> {
+    for o in out {
+        let msg = e2ee_message(inner, o);
+        conn.send(&msg)
+            .await
+            .map_err(|_| Exit::Dropped("send failed".into()))?;
+    }
+    Ok(())
+}
+
+/// Session-level capability announcement, before any encrypted channel is joined.
+fn e2ee_capability(inner: &Inner) -> ControlMessage {
+    ControlMessage::E2eeHello {
+        channel_id: None,
+        user_id: None,
+        public_key: e2ee::encode_bytes(inner.e2ee.lock().identity().public_key()),
+    }
+}
+
+/// We joined (or re-acked after a resume) an encrypted channel: announce ourselves so the
+/// members send their keys — a resume may have missed rotations while the socket was down.
+async fn e2ee_joined(
+    inner: &Inner,
+    conn: &mut ControlConnection,
+    channel_id: ChannelId,
+) -> std::result::Result<(), Exit> {
+    let out = inner.e2ee.lock().joined(channel_id);
+    e2ee_send(inner, conn, out).await
+}
+
+fn e2ee_left(inner: &Inner, channel_id: &ChannelId) {
+    let lost: Vec<UserId> = {
+        let mut g = inner.e2ee.lock();
+        let before = g.decryptable_peers();
+        g.left(channel_id);
+        before.into_iter().filter(|u| !g.has_key_for(u)).collect()
+    };
+    for user_id in lost {
+        inner.emit(Event::E2eePeerDecryptable {
+            user_id,
+            decryptable: false,
+        });
+    }
+}
+
+fn e2ee_peer_left(inner: &Inner, channel_id: &ChannelId, user_id: &UserId) {
+    let lost = {
+        let mut g = inner.e2ee.lock();
+        let had = g.has_key_for(user_id);
+        g.peer_left(channel_id, user_id);
+        had && !g.has_key_for(user_id)
+    };
+    if lost {
+        inner.emit(Event::E2eePeerDecryptable {
+            user_id: *user_id,
+            decryptable: false,
+        });
+    }
+}
+
+fn e2ee_reset(inner: &Inner) {
+    let peers = {
+        let mut g = inner.e2ee.lock();
+        let peers = g.decryptable_peers();
+        g.reset();
+        peers
+    };
+    for user_id in peers {
+        inner.emit(Event::E2eePeerDecryptable {
+            user_id,
+            decryptable: false,
+        });
+    }
+}
+
+fn e2ee_emit_change(inner: &Inner, user_id: UserId, change: Option<e2ee::PeerChange>) {
+    let Some(change) = change else {
+        return;
+    };
+    let fingerprint = inner
+        .e2ee
+        .lock()
+        .peer_fingerprint(&user_id)
+        .unwrap_or_default();
+    let previous_fingerprint = match change {
+        e2ee::PeerChange::New => None,
+        e2ee::PeerChange::KeyChanged {
+            previous_fingerprint,
+        } => Some(previous_fingerprint),
+    };
+    inner.emit(Event::E2eePeerKey {
+        user_id,
+        fingerprint,
+        previous_fingerprint,
+    });
+}
+
+async fn e2ee_on_hello(
+    inner: &Inner,
+    conn: &mut ControlConnection,
+    channel_id: ChannelId,
+    user_id: UserId,
+    public_key: &str,
+) -> std::result::Result<(), Exit> {
+    let Ok(pk) = e2ee::parse_public_key(public_key) else {
+        tracing::warn!(%user_id, "ignoring E2EE hello with a malformed key");
+        return Ok(());
+    };
+    let result = inner.e2ee.lock().on_hello(channel_id, user_id, pk);
+    match result {
+        Ok((out, change)) => {
+            e2ee_emit_change(inner, user_id, change);
+            e2ee_send(inner, conn, out).await
+        }
+        Err(e) => {
+            tracing::warn!(%user_id, "ignoring E2EE hello: {e}");
+            Ok(())
+        }
+    }
+}
+
+async fn e2ee_on_sender_key(
+    inner: &Inner,
+    conn: &mut ControlConnection,
+    channel_id: ChannelId,
+    user_id: UserId,
+    public_key: &str,
+    generation: u8,
+    key: &str,
+) -> std::result::Result<(), Exit> {
+    let (Ok(pk), Ok(wrapped)) = (e2ee::parse_public_key(public_key), e2ee::decode_bytes(key))
+    else {
+        tracing::warn!(%user_id, "ignoring malformed E2EE sender key");
+        return Ok(());
+    };
+    let (result, had) = {
+        let mut g = inner.e2ee.lock();
+        let had = g.has_key_for(&user_id);
+        (
+            g.on_sender_key(channel_id, user_id, pk, generation, &wrapped),
+            had,
+        )
+    };
+    match result {
+        Ok((out, change)) => {
+            e2ee_emit_change(inner, user_id, change);
+            if !had {
+                inner.emit(Event::E2eePeerDecryptable {
+                    user_id,
+                    decryptable: true,
+                });
+            }
+            e2ee_send(inner, conn, out).await
+        }
+        Err(e) => {
+            // Not wrapped for us, or a forged sender: nothing to learn from it.
+            tracing::warn!(%user_id, generation, "rejecting E2EE sender key: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Debounced rotation (a join wave costs one rotation): called on the request tick.
+async fn e2ee_rotate(inner: &Inner, conn: &mut ControlConnection) -> std::result::Result<(), Exit> {
+    let rotated = {
+        let mut g = inner.e2ee.lock();
+        if !g.rotation_pending() {
+            return Ok(());
+        }
+        // Nothing joined: the pending flag only says peers were dropped; a fresh key is picked
+        // on the next rotation anyway.
+        if !g.active() {
+            let _ = g.rotate(false);
+            return Ok(());
+        }
+        g.rotate(false).map(|out| (out, g.generation()))
+    };
+    match rotated {
+        Ok((out, generation)) => {
+            inner.emit(Event::E2eeKeyRotated { generation });
+            e2ee_send(inner, conn, out).await
+        }
+        Err(e) => {
+            tracing::warn!("E2EE rotation failed: {e}");
+            Ok(())
+        }
     }
 }
 
@@ -2613,6 +2940,7 @@ async fn handle_message(
                 roster_radius,
                 text_radius,
             };
+            let encrypted = audio.e2ee;
             let roster: HashMap<UserId, Participant> = participants
                 .iter()
                 .map(|b| (b.user_id, participant_from_brief(b)))
@@ -2645,6 +2973,11 @@ async fn handle_message(
             pending.desired.insert(channel_id);
             refresh_audio_policy(inner);
             inner.refresh_claims();
+            if encrypted {
+                if let Err(exit) = e2ee_joined(inner, conn, channel_id).await {
+                    return Some(exit);
+                }
+            }
             // A resume replays acks for channels we already track: refresh silently.
             if !(existed && request_id == 0) {
                 inner.emit(Event::ChannelJoined {
@@ -2734,6 +3067,7 @@ async fn handle_message(
                     }
                 }
                 inner.refresh_claims();
+                e2ee_peer_left(inner, &channel_id, &user_id);
                 inner.emit(Event::ParticipantLeft {
                     channel_id,
                     user_id,
@@ -3128,6 +3462,32 @@ async fn handle_message(
         | ControlMessage::WebRtcAnswer { .. }
         | ControlMessage::SetParticipantStreams { .. }
         | ControlMessage::ParticipantStreams { .. } => {}
+        ControlMessage::E2eeHello {
+            channel_id: Some(channel_id),
+            user_id: Some(user_id),
+            public_key,
+        } => {
+            if let Err(exit) = e2ee_on_hello(inner, conn, channel_id, user_id, &public_key).await {
+                return Some(exit);
+            }
+        }
+        ControlMessage::E2eeSenderKey {
+            channel_id,
+            from: Some(from),
+            public_key,
+            generation,
+            key,
+            ..
+        } => {
+            if let Err(exit) =
+                e2ee_on_sender_key(inner, conn, channel_id, from, &public_key, generation, &key)
+                    .await
+            {
+                return Some(exit);
+            }
+        }
+        // Relayed without the server-authenticated sender: not trustworthy.
+        ControlMessage::E2eeHello { .. } | ControlMessage::E2eeSenderKey { .. } => {}
     }
     None
 }
@@ -3239,6 +3599,7 @@ mod tests {
             complexity: Some(4),
             signal: OpusSignal::Voice,
             stereo: false,
+            e2ee: false,
         };
         let (id_a, a) = channel(1, voice);
         inner.channels.lock().insert(id_a, a);
@@ -3261,6 +3622,7 @@ mod tests {
             complexity: None,
             signal: OpusSignal::Music,
             stereo: false,
+            e2ee: false,
         };
         let (id_b, b) = channel(2, music);
         inner.channels.lock().insert(id_b, b);

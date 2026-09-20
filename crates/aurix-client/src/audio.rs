@@ -1842,6 +1842,7 @@ mod tests {
             complexity: Some(4),
             signal: OpusSignal::Music,
             stereo: false,
+            e2ee: false,
         };
         let base = EncoderSettings {
             vbr: false,
@@ -2011,6 +2012,7 @@ mod tests {
             complexity: None,
             signal: OpusSignal::Music,
             stereo: false,
+            e2ee: false,
         };
         assert_eq!(stereo.with_policy(&policy, None).channels, 1);
         assert_eq!(

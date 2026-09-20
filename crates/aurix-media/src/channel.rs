@@ -342,6 +342,11 @@ impl MediaChannel {
                 .any(|p| p.value().downlink_mode() == DownlinkMode::Mixed)
     }
 
+    /// Frames into this channel must be end-to-end encrypted (`ChannelConfig::e2ee`).
+    pub fn is_e2ee(&self) -> bool {
+        self.config.read().e2ee
+    }
+
     /// The per-receiver stream cap (`audience.max_streams`) as a slot table configuration:
     /// `max_streams` slots, losers silenced.
     fn stream_cap(&self) -> Option<AmbientConfig> {

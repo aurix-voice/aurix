@@ -280,6 +280,9 @@ pub struct MediaSession {
     pub last_bind_ms: AtomicI64,
     /// Browser RTP SSRC (WebRTC transport only), learned from the first RTP packet.
     pub webrtc_ssrc: AtomicU32,
+    /// The client announced E2EE support (`E2eeHello`): it may receive end-to-end encrypted
+    /// frames and, over WebRTC, encrypts its uplink whenever an encrypted channel is joined.
+    pub e2ee_capable: AtomicBool,
     active: AtomicBool,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
@@ -342,6 +345,7 @@ impl MediaSession {
             replay: Mutex::new(ReplayWindow::default()),
             last_bind_ms: AtomicI64::new(i64::MIN),
             webrtc_ssrc: AtomicU32::new(0),
+            e2ee_capable: AtomicBool::new(false),
             active: AtomicBool::new(true),
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
@@ -368,6 +372,15 @@ impl MediaSession {
 
     pub fn transport(&self) -> Transport {
         *self.transport.read()
+    }
+
+    pub fn is_e2ee_capable(&self) -> bool {
+        self.e2ee_capable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_e2ee_capable(&self, capable: bool) {
+        self.e2ee_capable
+            .store(capable, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_transport(&self, t: Transport) {

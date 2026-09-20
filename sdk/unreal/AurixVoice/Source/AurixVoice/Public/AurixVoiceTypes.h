@@ -429,6 +429,21 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
 	int32 UdpReprobeIntervalMs = 30000;
 
+	/**
+	 * Take part in end-to-end encrypted channels (identity key, sender-key exchange). Off, joining
+	 * an e2ee channel fails with E2EE_REQUIRED. Encrypted channels are never mixed, recorded or
+	 * transcribed by the server.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Security")
+	bool bE2ee = true;
+
+	/**
+	 * Persisted X25519 identity secret as 64 hex characters (32 bytes); empty = a fresh identity per
+	 * client. Keep it to show peers a stable fingerprint across runs (GetE2eeFingerprint).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Security")
+	FString E2eeIdentityHex;
+
 	/** Open the microphone (AudioCapture) as soon as the session is ready. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	bool bAutoStartCapture = true;
@@ -841,6 +856,14 @@ struct AURIXVOICE_API FAurixStats
 	/** Uplink packets dropped because the tunnel send queue was full (0 on UDP). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int64 UplinkDropped = 0;
+
+	/** Frames sent end-to-end encrypted (subset of FramesSent). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 FramesE2ee = 0;
+
+	/** Encrypted downlink frames dropped: unknown sender, sender key not yet received, or replay. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int64 E2eeUndecryptable = 0;
 
 	/** Downlink frames concealed (PLC), discarded as late, and jitter-buffer underruns. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")

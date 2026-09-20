@@ -2364,8 +2364,15 @@ pub async fn start_recording(
         .channels
         .require_channel(app_id, channel_id)
         .await?;
-    let stereo =
-        aurix_control::channel_manager::ChannelManager::config_from_row(&channel_row).stereo;
+    let channel_config =
+        aurix_control::channel_manager::ChannelManager::config_from_row(&channel_row);
+    if channel_config.e2ee {
+        return Err(AurixError::Validation(
+            "end-to-end encrypted channels cannot be recorded".into(),
+        )
+        .into());
+    }
+    let stereo = channel_config.stereo;
     require_user(&state, app_id, user_id).await?;
 
     // The recording is tied to a live session of the user in this channel.

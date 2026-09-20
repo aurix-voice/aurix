@@ -609,6 +609,13 @@ pub struct AurixClientConfig {
     /// `Auto`: how often a tunnelled session re-probes UDP and moves back when it answers
     /// (0 = never; stays tunnelled until the next connect).
     pub udp_reprobe_interval_ms: u32,
+    /// Take part in end-to-end encrypted channels (identity key, sender-key exchange). Off,
+    /// joining an `e2ee` channel fails with `E2EE_REQUIRED`.
+    pub e2ee: bool,
+    /// `true`: `e2ee_identity` holds a persisted 32-byte X25519 secret (stable fingerprint
+    /// across runs); `false`: a fresh identity per client.
+    pub has_e2ee_identity: bool,
+    pub e2ee_identity: [u8; 32],
 }
 
 #[no_mangle]
@@ -637,6 +644,9 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         media_path: d.media_path.into(),
         udp_fallback_lost_heartbeats: d.udp_fallback_lost_heartbeats,
         udp_reprobe_interval_ms: d.udp_reprobe_interval.as_millis() as u32,
+        e2ee: d.e2ee,
+        has_e2ee_identity: false,
+        e2ee_identity: [0; 32],
     };
 }
 
@@ -895,6 +905,8 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.media_path = c.media_path.into();
     cfg.udp_fallback_lost_heartbeats = c.udp_fallback_lost_heartbeats;
     cfg.udp_reprobe_interval = Duration::from_millis(c.udp_reprobe_interval_ms as u64);
+    cfg.e2ee = c.e2ee;
+    cfg.e2ee_identity = c.has_e2ee_identity.then_some(c.e2ee_identity);
     Ok(cfg)
 }
 
@@ -1289,6 +1301,14 @@ pub enum AurixEventType {
     /// `aurix_event_translation`: the server applied `aurix_client_set_translation`
     /// (tags normalised). A fresh session starts untranslated; the request is re-applied.
     AurixEventTranslationChanged = 40,
+    /// `user_id`, `message` = fingerprint of the peer's E2EE identity key, `code` = the
+    /// fingerprint we trusted before (empty for a first sighting; non-empty means the user
+    /// now presents a different key — verify out of band).
+    AurixEventE2eePeerKey = 41,
+    /// `user_id`, `flag` = we hold the peer's sender key (their encrypted frames decode).
+    AurixEventE2eePeerDecryptable = 42,
+    /// `number` = generation of our new sender key (a member joined or left).
+    AurixEventE2eeKeyRotated = 43,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1578,6 +1598,14 @@ impl AurixEvent {
             Event::TtsStatus { message: m, .. } => {
                 extra.push(cstring(m.as_deref().unwrap_or_default()));
             }
+            Event::E2eePeerKey {
+                fingerprint,
+                previous_fingerprint,
+                ..
+            } => {
+                message = fingerprint.clone();
+                code = previous_fingerprint.clone().unwrap_or_default();
+            }
             _ => {}
         }
         Self {
@@ -1636,6 +1664,9 @@ impl AurixEvent {
             Event::Disconnected { .. } => T::AurixEventDisconnected,
             Event::NetworkQuality(_) => T::AurixEventNetworkQuality,
             Event::AudioPolicyChanged(_) => T::AurixEventAudioPolicyChanged,
+            Event::E2eePeerKey { .. } => T::AurixEventE2eePeerKey,
+            Event::E2eePeerDecryptable { .. } => T::AurixEventE2eePeerDecryptable,
+            Event::E2eeKeyRotated { .. } => T::AurixEventE2eeKeyRotated,
         }
     }
 }
@@ -1801,7 +1832,9 @@ pub unsafe extern "C" fn aurix_event_user_id(event: *const AurixEvent) -> AurixU
         | Event::ParticipantSpeaking { user_id, .. }
         | Event::UserBlockChanged { user_id, .. }
         | Event::ModerationApplied { user_id, .. }
-        | Event::ParticipantTyping { user_id, .. } => Some(*user_id),
+        | Event::ParticipantTyping { user_id, .. }
+        | Event::E2eePeerKey { user_id, .. }
+        | Event::E2eePeerDecryptable { user_id, .. } => Some(*user_id),
         Event::Recording { initiated_by, .. } => Some(*initiated_by),
         Event::ChatMessage { message, .. } => Some(message.from_user_id),
         Event::ChatHistory { scope, .. } | Event::ChatReadMarkers { scope, .. } => scope.split().1,
@@ -1843,6 +1876,7 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
         Some(Event::ParticipantTyping { typing, .. }) => *typing,
         Some(Event::Recovered { resumed, .. }) => *resumed,
         Some(Event::ChatInboxSynced { truncated, .. }) => *truncated,
+        Some(Event::E2eePeerDecryptable { decryptable, .. }) => *decryptable,
         _ => false,
     }
 }
@@ -1870,6 +1904,7 @@ pub unsafe extern "C" fn aurix_event_number(event: *const AurixEvent) -> u64 {
         Some(Event::Recovering { attempt, .. }) => *attempt as u64,
         Some(Event::ChatReadMarkers { unread_count, .. }) => u64::from(*unread_count),
         Some(Event::ChatInboxSynced { delivered, .. }) => u64::from(*delivered),
+        Some(Event::E2eeKeyRotated { generation }) => u64::from(*generation),
         _ => 0,
     }
 }
@@ -2521,6 +2556,52 @@ pub unsafe extern "C" fn aurix_client_user_for_ssrc(
 }
 
 // --------------------------------------------------------------------------------- audio
+
+// ---------------------------------------------------------------------------------- e2ee
+
+/// Fingerprint of this client's E2EE identity key (`xxxx-xxxx-…`), shown to peers as
+/// `AurixEventE2eePeerKey`; same buffer contract as `aurix_client_endpoint`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_e2ee_fingerprint(
+    client: *const AurixClient,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    match self::client(client) {
+        Ok(c) => copy_out(&c.e2ee_fingerprint(), buf, capacity),
+        Err(_) => 0,
+    }
+}
+
+/// Fingerprint of `user_id`'s identity key if it announced one in a shared encrypted
+/// channel; same buffer contract as `aurix_client_endpoint`, 0 when unknown.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_e2ee_peer_fingerprint(
+    client: *const AurixClient,
+    user_id: AurixUuid,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    match self::client(client) {
+        Ok(c) => match c.e2ee_peer_fingerprint(UserId(Uuid::from(user_id))) {
+            Some(fp) => copy_out(&fp, buf, capacity),
+            None => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// Whether we hold `user_id`'s current sender key (their encrypted frames decode).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_e2ee_peer_decryptable(
+    client: *const AurixClient,
+    user_id: AurixUuid,
+) -> bool {
+    match self::client(client) {
+        Ok(c) => c.e2ee_peer_decryptable(UserId(Uuid::from(user_id))),
+        Err(_) => false,
+    }
+}
 
 /// Feed interleaved f32 capture PCM (`sample_count` total samples across channels) at any
 /// sample rate. Encodes and sends 20 ms Opus frames. Audio-thread safe.
@@ -3719,6 +3800,10 @@ pub struct AurixStats {
     pub uplink_dropped: u64,
     /// Heartbeats unanswered in a row on the current link (0 = healthy).
     pub heartbeats_lost_consecutive: u32,
+    /// Frames sent end-to-end encrypted (subset of `frames_sent`).
+    pub frames_e2ee: u64,
+    /// Encrypted downlink frames dropped: unknown sender, key not yet received, or replay.
+    pub e2ee_undecryptable: u64,
 }
 
 #[no_mangle]
@@ -3764,6 +3849,8 @@ pub unsafe extern "C" fn aurix_client_stats(
         media_path: s.media_path.into(),
         uplink_dropped: s.media.uplink_dropped,
         heartbeats_lost_consecutive: s.media.heartbeats_lost_consecutive,
+        frames_e2ee: s.transmit.frames_e2ee,
+        e2ee_undecryptable: s.transmit.e2ee_undecryptable,
     };
     AurixResult::AurixOk
 }

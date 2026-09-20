@@ -240,6 +240,17 @@ pub enum ServerEvent {
         session_id: SessionId,
         typing: bool,
     },
+    /// E2EE key-exchange message (`E2eeHello` / `E2eeSenderKey`) from a member hosted on the
+    /// origin node, for the channel's members on every node (`to: None` → everyone else in
+    /// the channel, `Some` → that user only). Opaque to the platform, never exported.
+    E2eeRelay {
+        app_id: AppId,
+        channel_id: ChannelId,
+        from_user: UserId,
+        from_session: SessionId,
+        to: Option<UserId>,
+        message: aurix_common::protocol::ControlMessage,
+    },
     /// Voice activity edge detected by the media node hosting the participant.
     ParticipantSpeaking {
         app_id: AppId,
@@ -355,6 +366,7 @@ impl ServerEvent {
             | Self::ChatMessage { app_id, .. }
             | Self::ChatReadMarker { app_id, .. }
             | Self::ParticipantTyping { app_id, .. }
+            | Self::E2eeRelay { app_id, .. }
             | Self::ParticipantSpeaking { app_id, .. }
             | Self::ChannelEnergy { app_id, .. }
             | Self::ParticipantPositions { app_id, .. }
@@ -420,6 +432,7 @@ impl ServerEvent {
             | Self::AppDeactivated { .. }
             | Self::RecordingConsentGiven { .. }
             | Self::ParticipantPositions { .. }
+            | Self::E2eeRelay { .. }
             | Self::TtsAnnouncement { .. } => return None,
         })
     }

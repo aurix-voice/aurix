@@ -83,6 +83,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.8"
 sha1 = "0.10"
 subtle = "2.6"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 md-5 = "0.10"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }

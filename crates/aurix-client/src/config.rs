@@ -78,6 +78,14 @@ pub struct ClientConfig {
     /// Do not send frames the VAD classifies as silence (saves uplink; the server still learns
     /// the speaking state from the level byte of the frames that are sent).
     pub vad_gate: bool,
+    /// Announce end-to-end encryption support and take part in the sender-key exchange of
+    /// `e2ee` channels (`aurix_common::e2ee`). Off, joining such a channel is refused by the
+    /// server (`E2EE_REQUIRED`).
+    pub e2ee: bool,
+    /// X25519 identity secret (32 bytes) shown to peers as [`crate::Client::e2ee_fingerprint`];
+    /// `None` generates a fresh one per client. Persist it to keep a stable fingerprint across
+    /// runs (peers see a `KeyChanged` otherwise).
+    pub e2ee_identity: Option<[u8; 32]>,
     /// Number of tokio worker threads for the control plane (1 is plenty).
     pub worker_threads: usize,
 }
@@ -101,6 +109,8 @@ impl ClientConfig {
             jitter_target_frames: 2,
             jitter_max_frames: 12,
             vad_gate: false,
+            e2ee: true,
+            e2ee_identity: None,
             worker_threads: 1,
         }
     }

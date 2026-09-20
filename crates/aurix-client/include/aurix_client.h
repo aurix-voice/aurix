@@ -348,6 +348,20 @@ typedef enum AurixEventType {
    * (tags normalised). A fresh session starts untranslated; the request is re-applied.
    */
   AURIX_EVENT_TRANSLATION_CHANGED = 40,
+  /**
+   * `user_id`, `message` = fingerprint of the peer's E2EE identity key, `code` = the
+   * fingerprint we trusted before (empty for a first sighting; non-empty means the user
+   * now presents a different key — verify out of band).
+   */
+  AURIX_EVENT_E2EE_PEER_KEY = 41,
+  /**
+   * `user_id`, `flag` = we hold the peer's sender key (their encrypted frames decode).
+   */
+  AURIX_EVENT_E2EE_PEER_DECRYPTABLE = 42,
+  /**
+   * `number` = generation of our new sender key (a member joined or left).
+   */
+  AURIX_EVENT_E2EE_KEY_ROTATED = 43,
 } AurixEventType;
 
 typedef enum AurixTransmissionMode {
@@ -612,6 +626,17 @@ typedef struct AurixClientConfig {
    * (0 = never; stays tunnelled until the next connect).
    */
   uint32_t udp_reprobe_interval_ms;
+  /**
+   * Take part in end-to-end encrypted channels (identity key, sender-key exchange). Off,
+   * joining an `e2ee` channel fails with `E2EE_REQUIRED`.
+   */
+  bool e2ee;
+  /**
+   * `true`: `e2ee_identity` holds a persisted 32-byte X25519 secret (stable fingerprint
+   * across runs); `false`: a fresh identity per client.
+   */
+  bool has_e2ee_identity;
+  uint8_t e2ee_identity[32];
 } AurixClientConfig;
 
 /**
@@ -1069,6 +1094,14 @@ typedef struct AurixStats {
    * Heartbeats unanswered in a row on the current link (0 = healthy).
    */
   uint32_t heartbeats_lost_consecutive;
+  /**
+   * Frames sent end-to-end encrypted (subset of `frames_sent`).
+   */
+  uint64_t frames_e2ee;
+  /**
+   * Encrypted downlink frames dropped: unknown sender, key not yet received, or replay.
+   */
+  uint64_t e2ee_undecryptable;
 } AurixStats;
 
 /**
@@ -1453,6 +1486,26 @@ size_t aurix_client_participants(const struct AurixClient *client,
 bool aurix_client_user_for_ssrc(const struct AurixClient *client,
                                 uint32_t ssrc,
                                 struct AurixUuid *out);
+
+/**
+ * Fingerprint of this client's E2EE identity key (`xxxx-xxxx-…`), shown to peers as
+ * `AurixEventE2eePeerKey`; same buffer contract as `aurix_client_endpoint`.
+ */
+size_t aurix_client_e2ee_fingerprint(const struct AurixClient *client, char *buf, size_t capacity);
+
+/**
+ * Fingerprint of `user_id`'s identity key if it announced one in a shared encrypted
+ * channel; same buffer contract as `aurix_client_endpoint`, 0 when unknown.
+ */
+size_t aurix_client_e2ee_peer_fingerprint(const struct AurixClient *client,
+                                          struct AurixUuid user_id,
+                                          char *buf,
+                                          size_t capacity);
+
+/**
+ * Whether we hold `user_id`'s current sender key (their encrypted frames decode).
+ */
+bool aurix_client_e2ee_peer_decryptable(const struct AurixClient *client, struct AurixUuid user_id);
 
 /**
  * Feed interleaved f32 capture PCM (`sample_count` total samples across channels) at any

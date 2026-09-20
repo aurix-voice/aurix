@@ -1061,6 +1061,37 @@ pub enum ControlMessage {
     ParticipantStreams {
         streams: Vec<ParticipantStream>,
     },
+    /// End-to-end encryption (`ChannelConfig::e2ee`, see `aurix_common::e2ee`).
+    /// Client→server without `channel_id` (right after `SessionInitAck`, again after a
+    /// resume): "this session supports E2EE and this is its X25519 identity key" — relayed to
+    /// nobody; joining an encrypted channel is refused (`E2EE_REQUIRED`) until sent. In
+    /// encrypted channels only such sessions receive frames and their own frames must carry
+    /// the `E2ee` flag. With `channel_id`, after joining it: "I am in `channel_id` with this
+    /// key" — relayed to every other member of the channel with `user_id` set to the sender;
+    /// members answer with `E2eeSenderKey`.
+    E2eeHello {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        /// Set by the server on delivery; ignored from clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        /// Base64 32-byte X25519 public key.
+        public_key: String,
+    },
+    /// A sender key wrapped for one member (`to`), relayed to that member only with `from`
+    /// set to the sender. The server verifies both are members of `channel_id` and never
+    /// learns the key.
+    E2eeSenderKey {
+        channel_id: ChannelId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<UserId>,
+        to: UserId,
+        /// Sender's base64 X25519 public key (lets the recipient key the sender back).
+        public_key: String,
+        generation: u8,
+        /// Base64 wrapped key (`aurix_common::e2ee::WRAPPED_KEY_LEN` bytes).
+        key: String,
+    },
     /// Client→server: which of the joined channels receive this session's microphone.
     /// `single` must name a joined channel; leaving that channel switches to `none`.
     SetTransmission {
@@ -2107,16 +2138,17 @@ mod tests {
                 complexity: Some(5),
                 signal: OpusSignal::Voice,
                 stereo: false,
+                e2ee: false,
             },
         };
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice","stereo":false}}}"#
+            r#"{"type":"ChannelAudioPolicy","data":{"channel_id":"00000000-0000-0000-0000-000000000000","audio":{"bitrate_bps":24000,"min_bitrate_bps":8000,"fec":true,"dtx":false,"max_bandwidth":"wideband","complexity":5,"signal":"voice","stereo":false,"e2ee":false}}}"#
         );
         let no_hint = serde_json::to_string(&AudioPolicy::default()).unwrap();
         assert_eq!(
             no_hint,
-            r#"{"bitrate_bps":48000,"min_bitrate_bps":12000,"fec":true,"dtx":true,"max_bandwidth":"fullband","complexity":null,"signal":"voice","stereo":false}"#
+            r#"{"bitrate_bps":48000,"min_bitrate_bps":12000,"fec":true,"dtx":true,"max_bandwidth":"fullband","complexity":null,"signal":"voice","stereo":false,"e2ee":false}"#
         );
         let partial: AudioPolicy =
             serde_json::from_str(r#"{"bitrate_bps":16000,"signal":"music"}"#).unwrap();
@@ -2125,5 +2157,6 @@ mod tests {
         assert_eq!(partial.max_bandwidth, OpusBandwidth::Fullband);
         assert!(partial.dtx);
         assert!(!partial.stereo);
+        assert!(!partial.e2ee);
     }
 }

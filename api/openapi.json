@@ -8302,6 +8302,11 @@
             "default": false,
             "description": "Send the speakers' transcripts to the `[safety]` classifier (requires `[stt]`); disclosed to clients as `ChannelJoinAck.safety_voice`. Independent of `transcription`."
           },
+          "e2ee": {
+            "type": "boolean",
+            "default": false,
+            "description": "End-to-end encrypted: frames are sealed with per-sender group keys the node never sees, so it only relays them (no server mix, recording, transcription, safety, TTS or translation; incompatible with `recording_enabled`, `transcription`, `safety_voice`, `ambient`, `audience` mixing and the `echo` type). Only sessions that announced E2EE support (`E2eeHello`) may join (`E2EE_REQUIRED`); a WebRTC session cannot mix encrypted and plaintext channels (`E2EE_MIXED_CHANNELS`). Disclosed as `ChannelJoinAck.audio.e2ee`."
+          },
           "whisper_target": {
             "type": [
               "string",

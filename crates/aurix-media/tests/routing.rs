@@ -663,6 +663,77 @@ async fn cross_app_sessions_cannot_join_channel() {
 /// Operator edits to a live channel reach the sessions in it, are tenant-scoped, cannot
 /// change the channel type, and the per-sender policy is the merge over joined channels.
 #[tokio::test]
+async fn e2ee_channel_admits_only_encrypted_frames_for_capable_receivers() {
+    use aurix_media::router::InjectedFrame;
+
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let cfg = ChannelConfig {
+        e2ee: true,
+        ..ChannelConfig::default()
+    };
+    let mut sessions = Vec::new();
+    for name in ["alice", "bob", "legacy"] {
+        let s = sfu
+            .create_session(SessionId::new(), UserId::new(), app, name.into())
+            .unwrap();
+        sfu.join_channel(&s.session_id, channel, cfg.clone(), ChannelRole::Speaker)
+            .unwrap();
+        sessions.push(s);
+    }
+    let (s_a, s_b, s_l) = (sessions.remove(0), sessions.remove(0), sessions.remove(0));
+    s_a.set_e2ee_capable(true);
+    s_b.set_e2ee_capable(true);
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut l = Client::new(s_l.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+    l.bind(addr).await;
+
+    // Plaintext into an encrypted channel is dropped for everyone.
+    a.send_audio(addr, &channel, b"plain").await;
+    assert!(b.recv().await.is_none());
+    assert!(l.recv().await.is_none());
+
+    // Encrypted frames reach capable members untouched and skip the legacy client.
+    let seq = a.next_seq();
+    let mut pkt = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"sealed"),
+    );
+    pkt.header.flags |= PacketFlags::E2ee as u16;
+    a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+    let got = b.recv().await.expect("capable receiver");
+    assert!(got.header.has_flag(PacketFlags::E2ee));
+    assert_eq!(got.header.ssrc, s_a.ssrc);
+    assert_eq!(&got.payload[..], b"sealed");
+    assert!(l.recv().await.is_none(), "legacy client must get nothing");
+
+    // Server-side audio has no sender key: it cannot be injected.
+    let router = sfu.router().unwrap();
+    let frame = || InjectedFrame {
+        ssrc: 0xE2EE,
+        sequence: 1,
+        timestamp: 960,
+        payload: Bytes::from_static(b"tts"),
+    };
+    assert!(router
+        .inject_system_audio(&app, &channel, frame())
+        .await
+        .is_err());
+    assert!(router
+        .inject_participant_audio(&s_a, &channel, frame(), true, false)
+        .await
+        .is_err());
+    assert!(b.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn channel_config_updates_apply_live_and_merge_per_sender() {
     let (sfu, _addr) = start_sfu().await;
     let app = AppId::new();
@@ -1105,6 +1176,7 @@ async fn directional_positional_downlink_carries_listener_relative_direction() {
     for s in [&s_a, &s_b, &s_c] {
         sfu.join_channel(&s.session_id, world, cfg.clone(), ChannelRole::Speaker)
             .unwrap();
+        s.set_e2ee_capable(true);
     }
     let mut a = Client::new(s_a.clone()).await;
     let mut b = Client::new(s_b.clone()).await;
@@ -2058,6 +2130,7 @@ async fn listeners_get_one_server_mixed_stream_per_channel() {
     ] {
         sfu.join_channel(&s.session_id, channel, config.clone(), role)
             .unwrap();
+        s.set_e2ee_capable(true);
     }
     let mut a = Client::new(s_a.clone()).await;
     let mut b = Client::new(s_b.clone()).await;

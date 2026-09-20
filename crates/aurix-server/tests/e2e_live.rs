@@ -7989,6 +7989,7 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
         complexity: Some(6),
         signal: OpusSignal::Music,
         stereo: false,
+        e2ee: false,
     };
 
     let (tok_a, _) = issue_token(&env, &http, "opus:alice", "Alice", channel_id).await;
@@ -8095,6 +8096,7 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
         complexity: None,
         signal: OpusSignal::Voice,
         stereo: false,
+        e2ee: false,
     };
     assert_eq!(expect_audio_policy(&mut alice, channel_id).await, expected);
     assert_eq!(expect_audio_policy(&mut bob, channel_id).await, expected);

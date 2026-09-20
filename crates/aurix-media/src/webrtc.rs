@@ -59,6 +59,9 @@ pub struct ForwardMedia {
     pub volume: f32,
     /// Where the sender is relative to this listener (directional positional channels).
     pub direction: Option<Direction>,
+    /// End-to-end encrypted: only ever written to a per-participant track (the mixer cannot
+    /// decode it); dropped when the speaker has no track.
+    pub e2ee: bool,
     pub payload: Vec<u8>,
 }
 
@@ -615,6 +618,10 @@ async fn session_task(
                                 }
                             }
                             None => {
+                                if media.e2ee {
+                                    aurix_metrics::PACKETS_DROPPED.inc();
+                                    continue;
+                                }
                                 if let Err(e) = mixer.push_opus(
                                     media.sender_ssrc,
                                     media.volume,

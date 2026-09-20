@@ -300,6 +300,22 @@ public:
         return aurix_client_user_for_ssrc(c_, ssrc, &out.raw);
     }
 
+    // --- end-to-end encryption
+    /// Fingerprint of this client's identity key (shown to peers as `AURIX_EVENT_E2EE_PEER_KEY`).
+    std::string e2ee_fingerprint() const {
+        std::string out(aurix_client_e2ee_fingerprint(c_, nullptr, 0), '\0');
+        if (!out.empty()) aurix_client_e2ee_fingerprint(c_, &out[0], out.size() + 1);
+        return out;
+    }
+    /// Fingerprint of `user`'s identity key; empty when the peer never announced one.
+    std::string e2ee_peer_fingerprint(const Uuid& user) const {
+        std::string out(aurix_client_e2ee_peer_fingerprint(c_, user.raw, nullptr, 0), '\0');
+        if (!out.empty()) aurix_client_e2ee_peer_fingerprint(c_, user.raw, &out[0], out.size() + 1);
+        return out;
+    }
+    /// Whether `user`'s encrypted frames currently decode (their sender key arrived).
+    bool e2ee_peer_decryptable(const Uuid& user) const { return aurix_client_e2ee_peer_decryptable(c_, user.raw); }
+
     // --- audio (real-time thread safe)
     void push_capture(const float* pcm, std::size_t samples, std::uint32_t rate, std::uint8_t channels) {
         aurix_client_push_capture_f32(c_, pcm, samples, rate, channels);

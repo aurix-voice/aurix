@@ -52,6 +52,15 @@ pub enum AurixError {
     #[error("Quota exceeded: {0}")]
     QuotaExceeded(String),
 
+    /// The channel is end-to-end encrypted and the session has not announced E2EE support
+    /// (`E2eeHello`).
+    #[error("End-to-end encryption required: {0}")]
+    E2eeRequired(String),
+
+    /// A single-uplink (WebRTC) session cannot be in encrypted and plaintext channels at once.
+    #[error("Cannot mix encrypted and plaintext channels: {0}")]
+    E2eeMixedChannels(String),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
 
@@ -191,6 +200,8 @@ impl AurixError {
             Self::UserMuted(_) => 403,
             Self::RateLimitExceeded(_) => 429,
             Self::QuotaExceeded(_) => 429,
+            Self::E2eeRequired(_) => 403,
+            Self::E2eeMixedChannels(_) => 409,
             Self::InvalidConfiguration(_) => 400,
             Self::Validation(_) => 400,
             Self::Conflict(_) => 409,
@@ -229,6 +240,8 @@ impl AurixError {
             Self::MediaNodeUnavailable(_) => "MEDIA_NODE_UNAVAILABLE",
             Self::RateLimitExceeded(_) => "RATE_LIMIT_EXCEEDED",
             Self::QuotaExceeded(_) => "QUOTA_EXCEEDED",
+            Self::E2eeRequired(_) => "E2EE_REQUIRED",
+            Self::E2eeMixedChannels(_) => "E2EE_MIXED_CHANNELS",
             Self::InvalidConfiguration(_) => "INVALID_CONFIG",
             Self::Database(_) => "DB_ERROR",
             Self::Redis(_) => "REDIS_ERROR",
