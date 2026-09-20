@@ -1,0 +1,5 @@
+# Cross-building the native core for Windows from Linux with MinGW-w64
+# (`cargo build -p aurix-client --target x86_64-pc-windows-gnu`): the bundled libopus objects
+# reference the stack-protector runtime, which the mingw toolchain only links on request.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-lssp"]

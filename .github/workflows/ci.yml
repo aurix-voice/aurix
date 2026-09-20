@@ -259,6 +259,61 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  native-core:
+    name: native core (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 (MSVC)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: Win64
+          - name: macOS arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            platform: Mac
+          - name: macOS x64
+            os: macos-13
+            target: x86_64-apple-darwin
+            platform: Mac
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # Unit tests, the cbindgen header-drift check and the C / C++ samples (compiled with the
+      # host's gcc/clang against the freshly built cdylib). libopus is built from source by
+      # audiopus_sys (cmake ships with the runner images).
+      - run: cargo test --locked -p aurix-client
+      - name: Stage the Unreal / Unity native library (${{ matrix.platform }})
+        if: runner.os != 'Windows'
+        run: sdk/unreal/scripts/build_native.sh --target ${{ matrix.target }}
+      - name: Stage the Unreal / Unity native library (${{ matrix.platform }})
+        if: runner.os == 'Windows'
+        run: .\sdk\unreal\scripts\build_native.ps1 -Target ${{ matrix.target }}
+      - name: Library exports the C ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/${{ matrix.platform }}
+          ls -la "$lib"
+          if [ "${{ runner.os }}" = macOS ]; then
+            nm -gU "$lib/libaurix_client.dylib" | grep -q ' _aurix_version$'
+          else
+            # MSVC emits the import library next to the DLL only when symbols are exported.
+            test -s "$lib/aurix_client.dll.lib"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aurix-client-${{ matrix.target }}
+          path: |
+            sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/${{ matrix.platform }}
+            sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/include
+          if-no-files-found: error
+
   sdks:
     name: Web + Unity SDK tests
     runs-on: ubuntu-latest

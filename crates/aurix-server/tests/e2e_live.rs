@@ -47,6 +47,37 @@ fn env() -> Option<Env> {
     })
 }
 
+/// A dedicated application for one test, so that app-wide observers — the `/v1/events` SSE
+/// stream, webhooks, moderation / safety listings, quality alerts, app quotas — never see the
+/// traffic of tests running in parallel. Returns the tenant's key and app id; without
+/// `AURIX_E2E_ADMIN_TOKEN` the shared application is used and the test tolerates neighbours as
+/// far as it can.
+async fn isolated_env(base: &Env, http: &reqwest::Client, test: &str) -> (Env, Option<String>) {
+    let Ok(admin) = std::env::var("AURIX_E2E_ADMIN_TOKEN") else {
+        eprintln!(
+            "AURIX_E2E_ADMIN_TOKEN not set; `{test}` shares its application with other tests"
+        );
+        return (base.clone(), None);
+    };
+    let app: serde_json::Value = http
+        .post(format!("{}/v1/apps", base.api))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"name": format!("e2e-{test}-{}", uuid::Uuid::now_v7().simple())}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("create the test's own application")
+        .json()
+        .await
+        .unwrap();
+    let env = Env {
+        api_key: app["api_key"].as_str().expect("api_key").to_string(),
+        ..base.clone()
+    };
+    (env, Some(app["id"].as_str().expect("app id").to_string()))
+}
+
 struct Player {
     name: &'static str,
     token: String,
@@ -4729,11 +4760,12 @@ impl SseClient {
 #[tokio::test]
 #[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
 async fn webhooks_and_sse_deliver_signed_tenant_scoped_events() {
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
     let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "webhooks").await;
     let api = |path: &str| format!("{}{path}", env.api);
 
     // Leftovers of an aborted run would eat the per-app subscription quota.
@@ -5324,11 +5356,12 @@ fn id_list(v: &serde_json::Value) -> Vec<String> {
 #[tokio::test]
 #[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
 async fn ad_hoc_channels_and_channel_wide_moderation() {
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
     let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "moderation").await;
     let name = format!("e2e-match-{}", uuid::Uuid::now_v7().simple());
 
     // Bad grants are refused when the token is issued, not when the player joins.
@@ -6840,11 +6873,12 @@ async fn start_push_receiver() -> (
 #[tokio::test]
 #[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
 async fn live_audio_streams_pull_push_consent_and_isolation() {
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
     let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "live-streams").await;
     let probe = http
         .get(format!("{}/v1/audio/streams", env.api))
         .header("x-api-key", &env.api_key)
@@ -7374,11 +7408,12 @@ async fn live_audio_stream_follows_cascaded_participants() {
 #[tokio::test]
 #[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
 async fn network_quality_bars_bitrate_adaptation_and_session_stats() {
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
     let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "quality").await;
     let channel_id = create_channel(&env, &http).await;
     let (tok_a, uid_a) = issue_token(&env, &http, "quality:alice", "Alice", channel_id).await;
     let (tok_b, _) = issue_token(&env, &http, "quality:bob", "Bob", channel_id).await;
@@ -7781,7 +7816,7 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
 #[tokio::test]
 #[ignore = "requires a running Aurix server with [safety] pointed at examples/mock_speech.rs"]
 async fn content_safety_incidents_evidence_and_auto_actions() {
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
@@ -7790,6 +7825,7 @@ async fn content_safety_incidents_evidence_and_auto_actions() {
         return;
     }
     let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "safety").await;
     let env2 = match std::env::var("AURIX_E2E_WS2") {
         Ok(ws) => Env {
             api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
@@ -9229,37 +9265,24 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
     use aurix_common::types::{ChannelRole, DownlinkMode};
     use aurix_media::mix::channel_mix_ssrc;
 
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let http = reqwest::Client::new();
+    let (env, app_id) = isolated_env(&base, &http, "audience").await;
     let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
         api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
         ws,
         api_key: env.api_key.clone(),
     });
     let far_env = env2.as_ref().unwrap_or(&env);
-    let http = reqwest::Client::new();
 
     // `POST /v1/channels` clamps `max_participants` to the app quota (256 for apps created
-    // with defaults); with an admin token the test raises the quota first, the way an
-    // operator enables large channels for an existing app.
+    // with defaults); with an admin token the test raises the quota of its own app first, the
+    // way an operator enables large channels for an existing app.
     let admin_token = std::env::var("AURIX_E2E_ADMIN_TOKEN").ok();
-    if let Some(token) = &admin_token {
-        let app_id = http
-            .get(format!("{}/v1/channels?per_page=1", env.api))
-            .header("x-api-key", &env.api_key)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["data"][0]["app_id"]
-            .as_str()
-            .expect("at least one channel exists")
-            .to_string();
+    if let (Some(token), Some(app_id)) = (&admin_token, &app_id) {
         let bad = http
             .patch(format!("{}/v1/apps/{app_id}", env.api))
             .bearer_auth(token)
@@ -10164,11 +10187,12 @@ async fn await_processed(env: &Env, http: &reqwest::Client, path: &str) -> serde
 #[tokio::test]
 #[ignore = "requires a running Aurix server with recording enabled and STT pointed at examples/mock_speech.rs"]
 async fn recording_mixdown_and_post_hoc_transcript() {
-    let Some(env) = env() else {
+    let Some(base) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
     let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "mixdown").await;
     let channel_id = create_channel(&env, &http).await;
     let (tok_a, uid_a) = issue_token(&env, &http, "mixdown:alice", "Alice", channel_id).await;
     let (tok_b, uid_b) = issue_token(&env, &http, "mixdown:bob", "Bob", channel_id).await;

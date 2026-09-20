@@ -104,8 +104,12 @@ fn build_and_run_sample(compiler: &str, std_flag: &str, source: &str, exe_name: 
         "1",
     ]);
     let lib_dir = lib.parent().unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut search_path = std::env::split_paths(&path).collect::<Vec<_>>();
+    search_path.insert(0, lib_dir.to_path_buf());
     run.env("LD_LIBRARY_PATH", lib_dir)
         .env("DYLD_LIBRARY_PATH", lib_dir)
+        .env("PATH", std::env::join_paths(search_path).expect("joinable PATH"))
         .env(
             "AURIX_REGIONS_JSON",
             r#"{"regions":[{"region":"eu_west","node_id":"11111111-1111-1111-1111-111111111111","ws_url":"wss://eu1.example/ws","probe_url":"https://eu1.example/health","location":null,"distance_km":null,"nodes":2,"load_factor":0.25}],"recommended":null}"#,

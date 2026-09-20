@@ -133,8 +133,11 @@ the chapter that explains the boundary.
 * **Browser Opus negotiation.** The Web SDK's `fmtp` rewrite and `setParameters` path are unit-
   tested on SDP text and applied in the E2E browser runs; whether a given browser honours
   `useinbandfec`/`usedtx`/`maxplaybackrate` is up to that browser's WebRTC stack.
-* **Windows/macOS native builds** of `aurix-client` are scripted (`build_native.ps1`) but only
-  the Linux build runs in CI.
+* **Windows/macOS native builds** of `aurix-client` are built and unit-tested in CI on
+  `windows-latest` (x64 MSVC), `macos-14` (arm64) and `macos-13` (x64) — including the C/C++
+  samples linked against the freshly built library and the Unreal `ThirdParty` staging scripts —
+  and uploaded as workflow artifacts. What CI does not do is load them from Unity `Plugins/` or
+  compile the Unreal module on those hosts, and there is no 32-bit or ARM64 Windows build.
 * **Admin SSO against real identity providers.** The OIDC relying party is exercised end to end
   against the repository's mock provider (discovery, PKCE, nonce, JWKS rotation, userinfo,
   role mapping) and follows the OpenID Connect Core rules, but no Keycloak / Entra ID / Okta /

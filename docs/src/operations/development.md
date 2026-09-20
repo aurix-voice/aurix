@@ -56,7 +56,16 @@ rejection, resume, action tokens (including a strict `require_action_tokens` run
 preferences, transmission modes, positional/directional audio, echo channels, chat, webhooks and
 SSE, ad-hoc channels, mute-all/kick-all, erasure/export, transcripts and TTS with the mock
 provider (`cargo run -p aurix-server --example mock_speech`), live streams, quality alerts and
-the stats endpoint, plus tenant isolation for each of them.
+the stats endpoint, plus tenant isolation for each of them. The tests run in parallel: each one
+that watches app-wide state — the SSE stream, webhooks, moderation and safety listings, quality
+alerts, app quotas — creates its own application with `AURIX_E2E_ADMIN_TOKEN` (`isolated_env`),
+so events of a neighbouring test never reach its observers; without the admin token those tests
+fall back to the shared key and are best run with `--test-threads=1`. `AURIX_E2E_API_KEY2` is a
+second, unrelated application used for the negative tenant checks.
+
+The `native core` job builds `aurix-client` on Windows x64 (MSVC), macOS arm64 and macOS x64,
+runs its unit tests and the C/C++ samples there and uploads the staged `lib/Win64` / `lib/Mac`
+libraries as artifacts; Linux is covered by the workspace jobs.
 
 ## Drift guards
 

@@ -327,6 +327,13 @@ sdk\unreal\scripts\build_native.ps1                             # Windows → li
 sdk\unreal\scripts\build_native.ps1 -PluginDir C:\MyGame\Plugins\AurixVoice
 ```
 
+A Windows DLL can also be cross-built from Linux with MinGW-w64
+(`rustup target add x86_64-pc-windows-gnu`, `apt install gcc-mingw-w64-x86-64`, then
+`cargo build --release -p aurix-client --target x86_64-pc-windows-gnu`); the repository's
+`.cargo/config.toml` adds the `-lssp` link flag the bundled libopus needs there. The
+`windows-gnu` DLL suits Unity and plain C hosts; for Unreal prefer the MSVC build above, which
+also emits the `.lib` import library UBT links against.
+
 Then copy or symlink `sdk/unreal/AurixVoice` to `<Project>/Plugins/AurixVoice`, regenerate
 project files and build. The `AurixClientLibrary` ThirdParty module fails at UBT time with a
 message naming the missing header/library, so an unstaged plugin never fails silently at
@@ -398,10 +405,15 @@ above with the engine's `HTTP` module (bearer `GET /v1/me/regions`, optional pro
 
 ### Verification status
 
-Verified in CI: the native library builds with statically linked Opus, and
+Verified in CI: the native library builds with statically linked Opus on Linux x64, Windows x64
+(MSVC), macOS arm64 and macOS x64 — the `native core` job runs the crate's unit tests, the
+header-drift check and the C/C++ samples against the freshly built library on each host, stages
+`lib/Win64` / `lib/Mac` with `build_native.ps1` / `build_native.sh` and uploads them as the
+`aurix-client-<target>` artifacts — and
 `unreal_plugin_uses_only_existing_abi` parses the plugin sources and checks that every
 `aurix_*` function, `AURIX_*` constant and `aurix::Client` method they use is declared in the
 committed headers. **Not** verified: Unreal Header Tool and the module compile against a live
 UE 5.3+ install (`AudioCaptureCore` callback signature, `USoundWaveProcedural::GeneratePCMData`)
-and Windows/macOS packaging — treat the first build in your project as a required step; any
+and packaging of a game on Windows/macOS — treat the first build in your project as a required
+step; any
 mismatch surfaces as a compile error in `AurixAudioCapture.cpp` or `AurixVoiceSoundWave.cpp`.
