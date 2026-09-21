@@ -1115,6 +1115,16 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 
 Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aurix CLI](docs/src/backend/cli.md).
 
+## Security, releases and resilience testing
+
+| | Where | What |
+|---|---|---|
+| Threat model + reporting | [`docs/src/concepts/threat-model.md`](docs/src/concepts/threat-model.md), [`SECURITY.md`](SECURITY.md) | what Aurix defends (tenant isolation, auth boundaries, E2EE confidentiality from the node, membership/rate limits) and what it explicitly does not (volumetric DDoS, a malicious operator in non-E2EE channels, cheating clients); private-report process, scope, supported versions |
+| Fuzzing | [`fuzz/`](fuzz) | 12 libFuzzer targets for every network-facing parser (AURX, RTP, STUN/TURN, control JSON, E2EE frames, Opus, Ogg, WAV, live frames, webhook signatures, remote mixer, text parsers); the committed corpus (seeds + `regress_*`) replays on stable in `cargo test`, nightly + ASan smoke in CI |
+| Releases | [`CHANGELOG.md`](CHANGELOG.md), [`docs/src/operations/releases.md`](docs/src/operations/releases.md), [`.github/workflows/release.yml`](.github/workflows/release.yml) | one SemVer number across server, SDKs and chart (`tools/release/check_versions.py`), tag-driven workflow: binaries per platform, SDK packages, container images, SHA-256 checksums, CycloneDX SBOMs, Sigstore keyless signatures and build-provenance attestations |
+| Chaos / HA | [`tools/chaos/`](tools/chaos) | Docker Compose fleet (PostgreSQL, Redis master/replica, three Sentinels, two nodes): node SIGKILL with cross-node resume, Redis Sentinel failover, PostgreSQL stop/start with readiness recovery, stale-node reaper, tenant/session isolation — reusing the live E2E suite; CI `chaos` job |
+| Migration | [`docs/src/migration/`](docs/src/migration) | Vivox, Agora and Photon Voice → Aurix: credential boundary, channel/grant mapping, API-by-API tables, staged migration plan; key chapters also [in Russian](docs/src/ru/README.md) |
+
 ## Limitations
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.

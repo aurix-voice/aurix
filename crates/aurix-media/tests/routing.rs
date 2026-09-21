@@ -633,6 +633,47 @@ async fn capacity_is_enforced_atomically_and_bind_replay_rejected() {
     let _ = c.next_seq();
 }
 
+/// A disconnect (`destroy_session`) racing a reconnect that replaces the same user's session
+/// (`create_session`) must tear the old session down exactly once: the participant counter
+/// would otherwise underflow and the node would refuse every new session as "at capacity".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_destroy_and_replacement_release_the_session_once() {
+    let (sfu, _addr) = start_sfu_with(SfuOptions {
+        max_participants: 8,
+        ..SfuOptions::default()
+    })
+    .await;
+    let sfu = std::sync::Arc::new(sfu);
+    let app = AppId::new();
+    let user = UserId::new();
+    for _ in 0..200 {
+        let old = sfu
+            .create_session(SessionId::new(), user, app, "u".into())
+            .unwrap();
+        let destroy = {
+            let sfu = sfu.clone();
+            let id = old.session_id;
+            tokio::task::spawn_blocking(move || {
+                let _ = sfu.destroy_session(&id);
+            })
+        };
+        let replace = {
+            let sfu = sfu.clone();
+            tokio::task::spawn_blocking(move || {
+                sfu.create_session(SessionId::new(), user, app, "u".into())
+                    .unwrap()
+            })
+        };
+        destroy.await.unwrap();
+        let fresh = replace.await.unwrap();
+        assert_eq!(sfu.active_participants(), 1, "old session torn down twice");
+        assert!(sfu.get_session(&fresh.session_id).is_some());
+        assert!(sfu.get_session(&old.session_id).is_none());
+        sfu.destroy_session(&fresh.session_id).unwrap();
+        assert_eq!(sfu.active_participants(), 0);
+    }
+}
+
 #[tokio::test]
 async fn cross_app_sessions_cannot_join_channel() {
     let (sfu, _addr) = start_sfu().await;

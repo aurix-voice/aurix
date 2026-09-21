@@ -195,10 +195,14 @@ pub fn resolve(cfg: &ConfigFile, ov: &Overrides<'_>, env: EnvFn<'_>) -> anyhow::
         }
     } else if let Some(p) = &profile.api_key_file {
         let p = expand_home(p);
-        (
-            Some(read_secret_file(&p)?),
-            Some(format!("profile api_key_file {}", p.display())),
-        )
+        if p.is_file() {
+            (
+                Some(read_secret_file(&p)?),
+                Some(format!("profile api_key_file {}", p.display())),
+            )
+        } else {
+            (None, None)
+        }
     } else if let Some(var) = &profile.api_key_env {
         match env(var) {
             Some(k) if !k.trim().is_empty() => {
@@ -375,5 +379,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("http://"));
+    }
+
+    #[test]
+    fn profile_api_key_file_may_not_exist_yet() {
+        let dir = std::env::temp_dir().join(format!("aurix-cli-missing-{}", std::process::id()));
+        let mut cfg = ConfigFile::default();
+        cfg.profiles.insert(
+            "dev".into(),
+            Profile {
+                api_key_file: Some(dir.join("app.api-key")),
+                ..Profile::default()
+            },
+        );
+        cfg.default_profile = Some("dev".into());
+        let ov = Overrides {
+            profile: None,
+            server: None,
+            api_key_file: None,
+            api_key_inline: None,
+            admin_token_file: None,
+            timeout_secs: None,
+        };
+        let r = resolve(&cfg, &ov, &no_env).unwrap();
+        assert!(r.api_key.is_none() && r.api_key_source.is_none());
+
+        std::fs::create_dir_all(&dir).unwrap();
+        write_private(&dir.join("app.api-key"), b"aurx_test\n").unwrap();
+        let r = resolve(&cfg, &ov, &no_env).unwrap();
+        assert_eq!(r.api_key.as_deref(), Some("aurx_test"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An explicit --api-key-file that is missing is still an error.
+        let missing = dir.join("nope");
+        let err = resolve(
+            &cfg,
+            &Overrides {
+                api_key_file: Some(&missing),
+                ..ov
+            },
+            &no_env,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reading secret file"));
     }
 }

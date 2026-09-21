@@ -267,6 +267,63 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  fuzz:
+    name: fuzz (corpus replay + libFuzzer smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake clang
+      # Stable: every committed corpus file + edge inputs through the harness bodies. Also
+      # checks that Cargo.toml / fuzz_targets / corpus / TARGETS agree.
+      - run: cargo +stable test --manifest-path fuzz/Cargo.toml --release --locked
+      # Nightly + ASan: a short libFuzzer run per target, seeded from the corpus. Long
+      # campaigns run out of band; this catches regressions that the corpus alone would miss.
+      - run: cargo +nightly install cargo-fuzz --locked
+      - name: libFuzzer smoke (30 s per target)
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" "corpus/$target" -- -max_total_time=30 -max_len=4096 -timeout=10 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  chaos:
+    name: chaos / HA (node kill, Redis Sentinel failover, PostgreSQL restart)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake jq
+      - run: cargo build --locked --bin aurix-server
+      - run: cargo test --locked -p aurix-server --test e2e_live --no-run
+      # Two aurix-server processes on the runner + PostgreSQL, a Redis master/replica pair and
+      # three Sentinels in host-network containers (tools/chaos/docker-compose.yml). Every
+      # scenario reuses the live E2E tests; the harness only injects the faults and asserts the
+      # fleet-level signals (reaper counter, Sentinel master switch, /ready flapping). Single
+      # host, loopback only: real network partitions and cross-region latency are not covered.
+      - name: Chaos scenarios
+        run: tools/chaos/run.sh
+      - name: Node logs
+        if: failure()
+        run: |
+          for f in target/chaos/node*.log; do echo "::group::$f"; tail -n 300 "$f"; echo "::endgroup::"; done
+          docker compose -f tools/chaos/docker-compose.yml logs --tail 100 || true
+
   native-core:
     name: native core (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -283,7 +340,7 @@ jobs:
             target: aarch64-apple-darwin
             platform: Mac
           - name: macOS x64
-            os: macos-13
+            os: macos-15-intel
             target: x86_64-apple-darwin
             platform: Mac
     steps:

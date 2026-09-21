@@ -804,6 +804,11 @@ impl RtpHeader {
                 u16::from_be_bytes([data[header_size + 2], data[header_size + 3]]) as usize;
             header_size += 4 + ext_len * 4;
         }
+        if header_size > data.len() {
+            return Err(AurixError::Transport(
+                "RTP header exceeds packet length".into(),
+            ));
+        }
         Ok(Self {
             version,
             padding,
@@ -2220,5 +2225,27 @@ mod tests {
         assert!(partial.dtx);
         assert!(!partial.stereo);
         assert!(!partial.e2ee);
+    }
+
+    #[test]
+    fn rtp_header_never_extends_past_the_packet() {
+        let mut pkt = vec![0x90, 0x6f, 0, 1, 0, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef];
+        pkt.extend_from_slice(&[0xbe, 0xde, 0x00, 0x01, 0x10, 0x7f, 0, 0]);
+        pkt.extend_from_slice(&[1, 2, 3]);
+        let h = RtpHeader::parse(&pkt).unwrap();
+        assert_eq!(h.header_size, 20);
+        assert_eq!(h.payload(&pkt), &[1, 2, 3]);
+
+        // Extension length claims 0xef words: the header would run 900+ bytes past the end.
+        let mut truncated = vec![
+            0x9e, 0xe0, 0, 0x2b, 0, 0, 0x3a, 0x98, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        truncated.resize(12 + 14 * 4, 0);
+        truncated.extend_from_slice(&[0xbe, 0xde, 0x00, 0xef]);
+        truncated.resize(158, 0);
+        assert!(RtpHeader::parse(&truncated).is_err());
+
+        // CSRC list alone longer than the packet.
+        assert!(RtpHeader::parse(&[0x8f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
     }
 }

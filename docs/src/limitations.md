@@ -261,7 +261,7 @@ the chapter that explains the boundary.
   Safari — the `RTCRtpScriptTransform` path in a real engine — have not been run from this
   repository ([End-to-end encryption](features/e2ee.md#browser-support)).
 * **Windows/macOS native builds** of `aurix-client` are built and unit-tested in CI on
-  `windows-latest` (x64 MSVC), `macos-14` (arm64) and `macos-13` (x64) — including the C/C++
+  `windows-latest` (x64 MSVC), `macos-14` (arm64) and `macos-15-intel` (x64) — including the C/C++
   samples linked against the freshly built library and the Unreal `ThirdParty` staging scripts —
   and uploaded as workflow artifacts. What CI does not do is load them from Unity `Plugins/` or
   compile the Unreal module on those hosts, and there is no 32-bit or ARM64 Windows build.
@@ -283,6 +283,20 @@ the chapter that explains the boundary.
   role mapping) and follows the OpenID Connect Core rules, but no Keycloak / Entra ID / Okta /
   Google tenant has been wired up in CI — claim names and group formats of your provider are
   the thing to verify first ([Administrator accounts and SSO](operations/admin-sso.md)).
+* **Chaos runs on one host.** The `tools/chaos/` harness kills a node, fails Redis over through
+  Sentinel, stops and starts PostgreSQL and checks isolation — but everything (both nodes, the
+  Sentinels, PostgreSQL) shares one machine and one loopback network. Network partitions between
+  hosts, split-brain Sentinel quorums across data centres, PostgreSQL replica promotion and
+  cross-region failover latency are not exercised ([High availability](operations/high-availability.md)).
+* **Fuzzing is short in CI.** The committed corpus replays on every push and each libFuzzer
+  target runs for 30 s with ASan on nightly; longer campaigns (minutes to hours per target, as
+  in the runs that found the RTP and STUN regressions in `fuzz/corpus/`) are run out of band
+  and not on a schedule ([Threat model](concepts/threat-model.md)).
+* **The release workflow has not produced a public release yet.** `release.yml` is validated
+  with `actionlint`, its version/changelog checks run locally, and each build step mirrors a
+  CI job that does run — but no tag has been pushed through it, so the GHCR push, Sigstore
+  signing, attestations and the GitHub release itself are exercised only on the first tag
+  ([Releases](operations/releases.md)).
 
 ## Planned
 

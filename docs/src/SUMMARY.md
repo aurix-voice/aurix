@@ -11,6 +11,7 @@
 
 - [Architecture](concepts/architecture.md)
 - [Security model](concepts/security.md)
+- [Threat model](concepts/threat-model.md)
 - [Tenancy, credentials and permissions](concepts/auth.md)
 
 # Protocols and APIs
@@ -46,6 +47,21 @@
 - [Server SDKs and token servers](backend/server-sdks.md)
 - [The aurix CLI](backend/cli.md)
 
+# Migrating from another provider
+
+- [Overview](migration/README.md)
+- [Vivox → Aurix](migration/vivox.md)
+- [Agora → Aurix](migration/agora.md)
+- [Photon Voice → Aurix](migration/photon-voice.md)
+
+# На русском
+
+- [Обзор](ru/README.md)
+- [Быстрый старт](ru/quick-start.md)
+- [Модель угроз](ru/threat-model.md)
+- [Миграция с Vivox / Agora / Photon Voice](ru/migration.md)
+- [Ограничения и не-цели](ru/limitations.md)
+
 # Operations
 
 - [Deployment and configuration](operations/deployment.md)
@@ -55,6 +71,7 @@
 - [High availability](operations/high-availability.md)
 - [Backups and observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
+- [Releases and versioning](operations/releases.md)
 
 ---
 

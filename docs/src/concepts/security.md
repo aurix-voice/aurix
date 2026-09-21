@@ -1,5 +1,8 @@
 # Security model
 
+Mechanisms, by layer. Who they defend against — and who they do not — is in the
+[threat model](threat-model.md); how to report a hole is in `SECURITY.md`.
+
 ## Media
 
 * Native media uses **AURX protocol v2**: every packet is encrypted (AES-256-CTR) and

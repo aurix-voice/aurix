@@ -670,11 +670,19 @@ impl SfuNode {
     }
 
     fn teardown_session(&self, session: &Arc<MediaSession>) {
+        // Idempotent: `destroy_session` and a replacing `create_session` for the same user
+        // can race on the same `Arc`; whoever removes the id index does the teardown once.
+        if self
+            .sessions_by_id
+            .remove_if(&session.session_id, |_, s| Arc::ptr_eq(s, session))
+            .is_none()
+        {
+            return;
+        }
         session.deactivate();
         if let Some(meter) = self.usage.as_ref() {
             Self::meter_session(meter, session);
         }
-        self.sessions_by_id.remove(&session.session_id);
         if let Some(addr) = session.clear_endpoint() {
             self.sessions_by_addr.remove(&addr);
         }

@@ -97,7 +97,7 @@ and the lifecycle API.
 `user_id`) and a list of channel grants:
 
 ```json
-{"channel_id": "<uuid>", "speak": true, "receive": true, "role": "speaker"}
+{"channel_id": "<uuid>", "join": true, "speak": true, "receive": true, "moderate": false, "priority": false}
 {"ad_hoc": {"name": "match-8f3a", "channel_type": "team", "max_participants": 10}}
 ```
 

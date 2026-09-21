@@ -10535,8 +10535,9 @@ async fn two_nodes_session_failover_resumes_on_the_other_node() {
     let mut carol = connect(&env, "carol", tok_c).await;
     assert_ne!(alice.media_addr.port(), bob.media_addr.port());
     assert!(!alice.migrated && !bob.migrated);
+    let node2_ws = env2.ws.trim_end_matches('/').trim_end_matches("/ws");
     assert!(
-        alice.failover.iter().any(|u| u.contains(":8091")) || alice.failover.is_empty(),
+        alice.failover.iter().any(|u| u.starts_with(node2_ws)) || alice.failover.is_empty(),
         "node 1 must advertise node 2 as failover: {:?}",
         alice.failover
     );

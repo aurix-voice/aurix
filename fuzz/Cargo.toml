@@ -1,0 +1,117 @@
+[package]
+name = "aurix-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "libFuzzer harnesses for every byte-level parser Aurix exposes to the network"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1.5"
+chrono = "0.4"
+serde_json = "1.0"
+uuid = { version = "1.7", features = ["v4"] }
+aurix-common = { path = "../crates/aurix-common" }
+aurix-turn = { path = "../crates/aurix-turn" }
+aurix-recording = { path = "../crates/aurix-recording" }
+aurix-control = { path = "../crates/aurix-control" }
+aurix-client = { path = "../crates/aurix-client" }
+aurix-opus = { path = "../crates/aurix-opus" }
+
+[lib]
+path = "src/lib.rs"
+
+# One binary per target. `cargo fuzz list` reads this table; `tests/corpus.rs` and
+# `src/lib.rs::TARGETS` must agree with it (checked by the test).
+[[bin]]
+name = "aurx_packet"
+path = "fuzz_targets/aurx_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtp_header"
+path = "fuzz_targets/rtp_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stun_message"
+path = "fuzz_targets/stun_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_message"
+path = "fuzz_targets/control_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "e2ee_frame"
+path = "fuzz_targets/e2ee_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opus_packet"
+path = "fuzz_targets/opus_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ogg_opus"
+path = "fuzz_targets/ogg_opus.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wav"
+path = "fuzz_targets/wav.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live_frame"
+path = "fuzz_targets/live_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webhook_signature"
+path = "fuzz_targets/webhook_signature.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_mixer"
+path = "fuzz_targets/remote_mixer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_parsers"
+path = "fuzz_targets/text_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]

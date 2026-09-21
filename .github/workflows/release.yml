@@ -1,0 +1,447 @@
+# Tag-driven release. `git tag v1.3.0 && git push origin v1.3.0` produces a GitHub release with:
+#   * server bundles (aurix-server + aurix CLI + configs + migrations) for Linux x86_64 / aarch64
+#   * aurix CLI and the native client core (libaurix_client + C/C++ headers) for
+#     Linux x86_64 / aarch64, Windows x64, macOS arm64 / x86_64
+#   * SDK packages: Web (npm tgz), Unity UPM (tgz), Unreal plugin (zip, with native libs),
+#     Godot addon (zip, source), server SDKs for Node (tgz) / Python (sdist + wheel) / C# (nupkg)
+#   * SHA256SUMS, a CycloneDX SBOM of the source tree and of the container image
+#   * ghcr.io/<owner>/aurix-server:<version>, :<major>.<minor>, :<major> (+ :latest for stable)
+#   * Sigstore keyless signatures (cosign) for SHA256SUMS and the image, GitHub build-provenance
+#     attestations for every file — both use the workflow's OIDC identity, no stored key.
+#
+# Nothing is published to npm / PyPI / NuGet / pkg.go.dev: packages are attached to the release
+# and consumed from there (or via git URL). Docs: docs/src/operations/releases.md.
+#
+# `workflow_dispatch` runs everything in dry-run mode: builds and checks, uploads workflow
+# artifacts, but neither pushes images nor creates a release.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to dry-run (defaults to the workspace version)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository_owner }}/aurix-server
+
+jobs:
+  verify:
+    name: version + changelog + policy
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = push ]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+          else
+            version="${{ inputs.version }}"
+            [ -n "$version" ] || version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml)
+            publish=false
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "release $version (prerelease=$prerelease publish=$publish)"
+      - name: Every artifact carries this version and CHANGELOG has its section
+        run: python3 tools/release/check_versions.py "${{ steps.meta.outputs.version }}"
+      - name: Release notes render
+        run: python3 tools/release/changelog_section.py "${{ steps.meta.outputs.version }}" > /dev/null
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  server:
+    name: server bundle (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake clang
+      - run: cargo build --release --locked --bin aurix-server --bin aurix --bin aurix-loadtest
+      - name: Stage
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="aurix-server-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$name/bin"
+          cp target/release/aurix-server target/release/aurix target/release/aurix-loadtest "dist/$name/bin/"
+          cp -r configs migrations "dist/$name/"
+          cp README.md LICENSE CHANGELOG.md SECURITY.md "dist/$name/"
+          "dist/$name/bin/aurix" --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-server-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  native:
+    name: CLI + native core (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            platform: Linux
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            platform: Linux
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: Win64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            platform: Mac
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            platform: Mac
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake clang
+      - name: Native core (Unix)
+        if: runner.os != 'Windows'
+        run: sdk/unreal/scripts/build_native.sh --target ${{ matrix.target }}
+      - name: Native core (Windows)
+        if: runner.os == 'Windows'
+        run: .\sdk\unreal\scripts\build_native.ps1 -Target ${{ matrix.target }}
+      - name: CLI
+        run: cargo build --release --locked --bin aurix --target ${{ matrix.target }}
+      - name: Stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tp=sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary
+          core="aurix-client-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$core"
+          cp -r "$tp/include" "dist/$core/include"
+          cp -r "$tp/lib/${{ matrix.platform }}" "dist/$core/lib"
+          cp LICENSE "dist/$core/"
+          cli="aurix-cli-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$cli"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "target/${{ matrix.target }}/release/aurix.exe" "dist/$cli/"
+            cp LICENSE "dist/$cli/"
+            (cd dist && 7z a -bd "$core.zip" "$core" > /dev/null && 7z a -bd "$cli.zip" "$cli" > /dev/null)
+          else
+            cp "target/${{ matrix.target }}/release/aurix" "dist/$cli/"
+            cp LICENSE "dist/$cli/"
+            (cd dist && tar -czf "$core.tar.gz" "$core" && tar -czf "$cli.tar.gz" "$cli")
+          fi
+          rm -rf "dist/$core" "dist/$cli"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-native-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+      # Raw staged libraries for the Unreal plugin assembly below.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-lib-${{ matrix.target }}
+          path: sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/${{ matrix.platform }}
+          if-no-files-found: error
+
+  sdks:
+    name: SDK packages
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: mkdir -p dist
+      - name: Web SDK
+        working-directory: sdk/web
+        run: |
+          npm ci
+          npm run build
+          npm pack --pack-destination ../../dist
+      - name: Unity UPM tarball
+        working-directory: sdk/unity
+        run: npm pack --pack-destination ../../dist
+      - name: Godot addon (source; native libraries are built per platform with sdk/godot/scripts/build_native.sh)
+        run: |
+          (cd sdk/godot/addons && zip -qr "../../../dist/aurix-godot-addon-${VERSION}.zip" aurix_voice -x 'aurix_voice/bin/*')
+          cp LICENSE dist/ && (cd dist && zip -q "aurix-godot-addon-${VERSION}.zip" LICENSE && rm LICENSE)
+      - name: Node server SDK
+        working-directory: sdk/server/node
+        run: |
+          npm ci
+          npm run build
+          npm pack --pack-destination ../../../dist
+      - name: Python server SDK
+        working-directory: sdk/server/python
+        run: |
+          python -m pip install --quiet build
+          python -m build --outdir ../../../dist
+      - name: C# server SDK
+        run: dotnet pack sdk/server/csharp/Aurix.Server/Aurix.Server.csproj -c Release -o dist -p:PackageVersion=${VERSION}
+      - run: ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdks
+          path: dist/
+          if-no-files-found: error
+
+  unreal-plugin:
+    name: Unreal plugin zip (Win64 + Mac universal + Linux)
+    needs: [verify, native]
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-lib-*
+          path: libs
+      - name: Assemble ThirdParty libraries
+        run: |
+          set -euo pipefail
+          tp=sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary
+          mkdir -p "$tp/lib/Win64" "$tp/lib/Mac" "$tp/lib/Linux" "$tp/include"
+          cp libs/native-lib-x86_64-pc-windows-msvc/* "$tp/lib/Win64/"
+          cp libs/native-lib-x86_64-unknown-linux-gnu/libaurix_client.so "$tp/lib/Linux/"
+          lipo -create \
+            libs/native-lib-aarch64-apple-darwin/libaurix_client.dylib \
+            libs/native-lib-x86_64-apple-darwin/libaurix_client.dylib \
+            -output "$tp/lib/Mac/libaurix_client.dylib"
+          lipo -info "$tp/lib/Mac/libaurix_client.dylib"
+          cp crates/aurix-client/include/aurix_client.h crates/aurix-client/include/aurix_client.hpp "$tp/include/"
+          python3 sdk/unreal/scripts/check_plugin.py
+      - name: Zip
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp LICENSE sdk/unreal/AurixVoice/
+          (cd sdk/unreal && zip -qr "../../dist/AurixVoice-unreal-${VERSION}.zip" AurixVoice -x '*/Binaries/*' '*/Intermediate/*')
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-unreal
+          path: dist/*.zip
+          if-no-files-found: error
+
+  image:
+    name: container image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # Release-derived tags only; `latest` follows stable releases, never pre-releases.
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}},value=v${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.title=aurix-server
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.verify.outputs.publish == 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+      - name: Image SBOM (CycloneDX)
+        if: needs.verify.outputs.publish == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: aurix-server-${{ needs.verify.outputs.version }}.image.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Sign image and attest SBOM (Sigstore keyless)
+        if: needs.verify.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@v3
+      - if: needs.verify.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type cyclonedx --predicate "aurix-server-${{ needs.verify.outputs.version }}.image.cdx.json" "${IMAGE}@${DIGEST}"
+      - uses: actions/upload-artifact@v4
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          name: dist-image-sbom
+          path: "*.image.cdx.json"
+          if-no-files-found: error
+
+  publish:
+    name: checksums, SBOM, signatures, GitHub release
+    needs: [verify, server, native, sdks, unreal-plugin, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # Generated before the built artifacts are downloaded so the scan sees the source tree only.
+      - name: Source SBOM (CycloneDX; Cargo.lock, package-lock.json, pyproject, go.mod, csproj)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: aurix-${{ needs.verify.outputs.version }}.source.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: staged
+          merge-multiple: true
+      - run: mv "aurix-${VERSION}.source.cdx.json" staged/
+      - name: SHA256SUMS
+        working-directory: staged
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          sha256sum -- * | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+        if: needs.verify.outputs.publish == 'true'
+      - name: Sign SHA256SUMS (Sigstore keyless, certificate bound to this workflow run)
+        if: needs.verify.outputs.publish == 'true'
+        working-directory: staged
+        run: |
+          cosign sign-blob --yes SHA256SUMS \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            --bundle SHA256SUMS.sigstore.json
+      - name: Build-provenance attestations for every file
+        if: needs.verify.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            staged/*
+            !staged/SHA256SUMS.sig
+            !staged/SHA256SUMS.pem
+            !staged/SHA256SUMS.sigstore.json
+      - name: Release notes
+        run: |
+          {
+            python3 tools/release/changelog_section.py "$VERSION"
+            echo
+            echo "## Verify"
+            echo
+            echo '```sh'
+            echo "sha256sum -c --ignore-missing SHA256SUMS"
+            echo "cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo "cosign verify ${IMAGE}@${{ needs.image.outputs.digest }} \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+            echo
+            echo "Image: \`${IMAGE}:${VERSION}\` (digest \`${{ needs.image.outputs.digest }}\`)."
+          } > notes.md
+          cat notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.verify.outputs.version }}
+          path: |
+            staged/
+            notes.md
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@v2
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          name: Aurix ${{ needs.verify.outputs.version }}
+          body_path: notes.md
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: staged/*
+      # Go resolves a module living in a subdirectory from tags prefixed with that path.
+      - name: Tag the Go server SDK module
+        if: needs.verify.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          tag="sdk/server/go/v${VERSION}"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"

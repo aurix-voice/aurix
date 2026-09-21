@@ -1,0 +1,90 @@
+# Backing services for the chaos / HA harness (tools/chaos/run.sh): one PostgreSQL, a Redis
+# master + replica and three Sentinels, all on the host network so that Sentinel can announce
+# 127.0.0.1 addresses the Aurix nodes (plain host processes) can reach. Ports are shifted away
+# from the defaults so the harness does not collide with a developer's own Postgres/Redis.
+#
+# Redis replica-announce settings are not needed on the host network: every instance is
+# reachable at 127.0.0.1:<port>, which is exactly what INFO/ROLE report to Sentinel.
+name: aurix-chaos
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aurix-chaos-postgres
+    network_mode: host
+    environment:
+      POSTGRES_USER: aurix
+      POSTGRES_PASSWORD: aurix-chaos
+      POSTGRES_DB: aurix
+      PGPORT: "5433"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5433 -U aurix -d aurix"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-a:
+    image: redis:7-alpine
+    container_name: aurix-chaos-redis-a
+    network_mode: host
+    command: ["redis-server", "--port", "6380", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-b:
+    image: redis:7-alpine
+    container_name: aurix-chaos-redis-b
+    network_mode: host
+    depends_on:
+      redis-a:
+        condition: service_healthy
+    command:
+      ["redis-server", "--port", "6381", "--save", "", "--appendonly", "no",
+       "--replicaof", "127.0.0.1", "6380"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6381", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  sentinel-1:
+    image: redis:7-alpine
+    container_name: aurix-chaos-sentinel-1
+    network_mode: host
+    depends_on:
+      redis-b:
+        condition: service_healthy
+    environment:
+      SENTINEL_PORT: "26380"
+    entrypoint: ["/bin/sh", "/sentinel.sh"]
+    volumes:
+      - ./sentinel.sh:/sentinel.sh:ro
+
+  sentinel-2:
+    image: redis:7-alpine
+    container_name: aurix-chaos-sentinel-2
+    network_mode: host
+    depends_on:
+      redis-b:
+        condition: service_healthy
+    environment:
+      SENTINEL_PORT: "26381"
+    entrypoint: ["/bin/sh", "/sentinel.sh"]
+    volumes:
+      - ./sentinel.sh:/sentinel.sh:ro
+
+  sentinel-3:
+    image: redis:7-alpine
+    container_name: aurix-chaos-sentinel-3
+    network_mode: host
+    depends_on:
+      redis-b:
+        condition: service_healthy
+    environment:
+      SENTINEL_PORT: "26382"
+    entrypoint: ["/bin/sh", "/sentinel.sh"]
+    volumes:
+      - ./sentinel.sh:/sentinel.sh:ro

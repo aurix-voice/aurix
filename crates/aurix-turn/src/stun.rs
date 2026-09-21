@@ -330,7 +330,17 @@ impl StunMessage {
 
     fn encode_base(&self) -> BytesMut {
         let mut attrs_buf = BytesMut::new();
-        for attr in &self.attributes {
+        // MESSAGE-INTEGRITY and FINGERPRINT are trailers computed over the encoded message;
+        // any copies carried over from `decode` would go stale and shadow the fresh ones.
+        let trailers = [
+            StunAttributeType::MessageIntegrity.to_u16(),
+            StunAttributeType::Fingerprint.to_u16(),
+        ];
+        for attr in self
+            .attributes
+            .iter()
+            .filter(|a| !trailers.contains(&a.attr_type))
+        {
             attrs_buf.put_u16(attr.attr_type);
             attrs_buf.put_u16(attr.value.len() as u16);
             attrs_buf.put_slice(&attr.value);
@@ -538,6 +548,42 @@ mod tests {
             .is_some());
         assert_eq!(
             decoded.get_string(StunAttributeType::Realm).unwrap(),
+            "aurix"
+        );
+    }
+
+    /// A decoded message keeps its MESSAGE-INTEGRITY/FINGERPRINT attributes; re-encoding must
+    /// replace them rather than leave stale copies in front of the fresh trailers.
+    #[test]
+    fn reencoding_a_decoded_message_regenerates_the_trailers() {
+        let mut m = StunMessage::new(StunMessageType::BindingResponse, [7u8; 12]);
+        m.add_attribute(StunAttributeType::Software, b"aurix".to_vec());
+        let decoded = StunMessage::decode(&m.encode_with_integrity(b"k1")).unwrap();
+        assert!(decoded
+            .get_attribute(StunAttributeType::Fingerprint)
+            .is_some());
+
+        let plain = decoded.encode();
+        assert!(StunMessage::verify_fingerprint(&plain));
+        assert_eq!(
+            StunMessage::decode(&plain)
+                .unwrap()
+                .attributes
+                .iter()
+                .filter(|a| a.attr_type == StunAttributeType::Fingerprint.to_u16())
+                .count(),
+            1
+        );
+
+        let resigned = decoded.encode_with_integrity(b"k2");
+        assert!(StunMessage::verify_integrity(&resigned, b"k2"));
+        assert!(!StunMessage::verify_integrity(&resigned, b"k1"));
+        assert!(StunMessage::verify_fingerprint(&resigned));
+        assert_eq!(
+            StunMessage::decode(&resigned)
+                .unwrap()
+                .get_string(StunAttributeType::Software)
+                .unwrap(),
             "aurix"
         );
     }

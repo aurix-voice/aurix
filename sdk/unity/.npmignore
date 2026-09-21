@@ -1,0 +1,4 @@
+BrowserTests~/
+DotNet~/
+**/bin/
+**/obj/

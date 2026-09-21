@@ -18,6 +18,9 @@ members = [
     "crates/aurix-client",
     "crates/aurix-opus",
 ]
+# libFuzzer harnesses live in their own workspace (cargo-fuzz layout); `fuzz/tests/corpus.rs`
+# replays the committed corpus on stable.
+exclude = ["fuzz"]
 
 [workspace.package]
 rust-version = "1.88"
