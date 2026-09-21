@@ -459,14 +459,15 @@ impl PacketRouter {
         };
         session.update_heartbeat();
 
-        let ack =
-            AurixPacket::session_bind_ack(session.ssrc, session.next_downlink_sequence(), now)
-                .seal(&session.keys);
-        self.reply(source, &ack).await;
+        // Observers learn of the bind no later than the client does.
         let _ = self.events.send(MediaEvent::SessionBound {
             session_id,
             transport,
         });
+        let ack =
+            AurixPacket::session_bind_ack(session.ssrc, session.next_downlink_sequence(), now)
+                .seal(&session.keys);
+        self.reply(source, &ack).await;
         debug!("Session {} bound to {}", session_id, source);
         Ok(())
     }

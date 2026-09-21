@@ -81,7 +81,11 @@ released together.
 * The native core counted an E2EE frame as undecryptable when it overtook its sender key at a
   rotation (media over UDP/QUIC, key over the control plane); such frames now wait up to
   500 ms for the key and are decrypted when it arrives.
-* CI runs the second node the native QUIC/tunnel E2E tests require.
+* CI runs the second node the native QUIC/tunnel E2E tests require, with `server.external_url`
+  set on both nodes (failover advertisement must match the URL clients dial) and the same chat
+  persistence, channel limit and rate-limiting settings on the peer.
+* The media node publishes `SessionBound` before answering the bind, so observers never learn of
+  a bind after the client already treats the session as bound.
 
 ## [1.2.0] - 2026-09-19
 

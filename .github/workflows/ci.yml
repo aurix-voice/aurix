@@ -62,6 +62,7 @@ jobs:
         env:
           AURIX__TURN__ENABLED: "true"
           AURIX__TURN__AUTH_SECRET: ci-only-turn-secret-0123456789abcdefghijklmno
+          AURIX__SERVER__EXTERNAL_URL: http://127.0.0.1:8080
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
           AURIX__RECORDING__ENABLED: "true"
           AURIX__RECORDING__STORAGE_PATH: ${{ runner.temp }}/recordings
@@ -85,6 +86,7 @@ jobs:
         env:
           AURIX__TURN__ENABLED: "false"
           AURIX__RECORDING__ENABLED: "false"
+          AURIX__SERVER__EXTERNAL_URL: http://127.0.0.1:8120
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
           AURIX__MEDIA__QUIC: "false"
           AURIX__MEDIA__CASCADE_SECRET: ci-only-cascade-secret-0123456789abcdef
@@ -94,7 +96,13 @@ jobs:
           AURIX__MEDIA__PORT: "10008"
           AURIX__METRICS__PORT: "9098"
           AURIX__SERVER__SESSION_RESUME_GRACE_SECS: "4"
+          AURIX__CHAT__PERSIST: "true"
+          AURIX__MEDIA__MAX_CHANNELS_PER_SESSION: "4"
           AURIX__QUALITY__PERSIST_INTERVAL_SECS: "10"
+          AURIX__RATE_LIMITING__ENABLED: "true"
+          AURIX__RATE_LIMITING__REQUESTS_PER_SECOND: "500"
+          AURIX__RATE_LIMITING__BURST_SIZE: "1000"
+          AURIX__RATE_LIMITING__REPORTS_PER_MINUTE: "3"
           AURIX__TRACING__LOG_FORMAT: text
         run: |
           nohup ./target/debug/aurix-server > server-node2.log 2>&1 &
