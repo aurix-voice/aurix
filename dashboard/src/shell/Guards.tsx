@@ -4,10 +4,11 @@ import type { ReactNode } from "react";
 import type { T } from "@/api/client";
 import { useAppScope } from "@/api/scope";
 import { useAuth } from "@/auth/AuthProvider";
+import type { AppPermission } from "@/auth/store";
 import { useI18n } from "@/i18n";
 import { EmptyState } from "@/ui/Primitives";
 
-export function Forbidden({ perm }: { perm?: T.AdminPermission }) {
+export function Forbidden({ perm }: { perm?: T.AdminPermission | AppPermission }) {
   const { t } = useI18n();
   return (
     <EmptyState

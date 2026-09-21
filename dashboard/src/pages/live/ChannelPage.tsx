@@ -4,7 +4,6 @@ import { useMemo, useState, type ReactNode } from "react";
 
 import { errorKind, errorMessage, type T } from "@/api/client";
 import {
-  useBanUserMutation,
   useChannelParticipantsQuery,
   useChannelQuery,
   useChannelStreamsQuery,
@@ -21,11 +20,12 @@ import { EventFeed } from "@/components/EventFeed";
 import { useI18n } from "@/i18n";
 import { fmtBytes, fmtDateTime, fmtMos, fmtNumber, fmtPercent, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { BanDialog } from "@/pages/moderation/BanDialog";
 import { channelRoute } from "@/router";
 import { RequireApp } from "@/shell/Guards";
 import { Button } from "@/ui/Button";
 import { ConfirmDialog, FormDialog } from "@/ui/Dialog";
-import { Checkbox, Input, NativeSelect, Textarea } from "@/ui/Input";
+import { Input } from "@/ui/Input";
 import { Menu, TabPanel, Tabs, type MenuItem } from "@/ui/Menu";
 import { PageHeader, QueryError, SplitLayout } from "@/ui/Page";
 import { Badge, Callout, Card, CardHeader, EmptyState, Field, IdChip, KV, Stat, Tip } from "@/ui/Primitives";
@@ -633,18 +633,11 @@ function UserActionDialog({ target, channelId, onClose }: { target: { row: Parti
   const mute = useServerMuteMutation();
   const kick = useKickMutation();
   const priority = useSetPriorityMutation();
-  const ban = useBanUserMutation();
   const [reason, setReason] = useState("");
-  const [scope, setScope] = useState<T.BanScope>("account");
-  const [hours, setHours] = useState("");
-  const [alsoKick, setAlsoKick] = useState(true);
 
   const open = target !== null;
   const close = () => {
     setReason("");
-    setHours("");
-    setScope("account");
-    setAlsoKick(true);
     onClose();
   };
   const who = target ? target.row.display_name || target.row.user_id : "";
@@ -706,42 +699,7 @@ function UserActionDialog({ target, channelId, onClose }: { target: { row: Parti
       </ConfirmDialog>
     );
   }
-  const h = hours.trim() === "" ? null : Number(hours);
-  const hoursOk = h === null || (Number.isFinite(h) && h > 0);
-  return (
-    <ConfirmDialog
-      open={open}
-      onOpenChange={(o) => !o && close()}
-      title={t("live.ban")}
-      description={t("live.ban.confirm", { who })}
-      confirmLabel={t("live.ban")}
-      variant="danger"
-      disabled={!reason.trim() || !hoursOk}
-      onConfirm={() =>
-        wrap(async () => {
-          await ban.mutateAsync({ user_id: row.user_id, scope, reason: reason.trim(), duration_hours: h });
-          if (alsoKick) await kick.mutateAsync({ ...base, reason: reason.trim() });
-        }, "live.banned.done")
-      }
-    >
-      <Field label={t("live.reason")} required>
-        <Textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={2} maxLength={512} autoFocus />
-      </Field>
-      <div className="grid grid-cols-2 gap-3">
-        <Field label={t("live.ban.scope")}>
-          <NativeSelect value={scope} onChange={(e) => setScope(e.target.value as T.BanScope)}>
-            <option value="account">{t("live.ban.scope.account")}</option>
-            <option value="device">{t("live.ban.scope.device")}</option>
-            <option value="ip_address">{t("live.ban.scope.ip")}</option>
-          </NativeSelect>
-        </Field>
-        <Field label={t("live.ban.hours")} hint={t("live.ban.hours.hint")} error={hoursOk ? undefined : t("common.invalidNumber")}>
-          <Input value={hours} onChange={(e) => setHours(e.target.value)} inputMode="numeric" placeholder="∞" />
-        </Field>
-      </div>
-      <Checkbox checked={alsoKick} onChange={(e) => setAlsoKick(e.target.checked)} label={t("live.ban.alsoKick")} />
-    </ConfirmDialog>
-  );
+  return <BanDialog open={open} onClose={close} userId={row.user_id} who={who} channelId={channelId} />;
 }
 
 function StreamsTab({ channelId }: { channelId: string }) {

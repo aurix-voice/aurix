@@ -357,14 +357,122 @@ export function useEventSnapshotQuery(refetchInterval: number | false = 15_000):
   });
 }
 
-export function useModerationEventsQuery(params: T.ListModerationEventsQuery): UseQueryResult<T.ModerationEvent[]> {
+export function useModerationEventsQuery(params: T.ListModerationEventsQuery, enabledOverride = true): UseQueryResult<T.ModerationEvent[]> {
   const api = useApi();
   const { appId, enabled } = useTenantEnabled("moderation:read");
   return useQuery({
     queryKey: qk.moderationEvents(appId ?? "", { ...params }),
     queryFn: () => api.listModerationEvents(params),
+    enabled: enabled && enabledOverride,
+    staleTime: 15_000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useModerationEventQuery(eventId: string | null): UseQueryResult<T.ModerationEvent> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("moderation:read");
+  return useQuery({
+    queryKey: [...qk.moderationEvents(appId ?? "", {}), "event", eventId ?? ""],
+    queryFn: () => api.getModerationEvent(eventId ?? ""),
+    enabled: enabled && !!eventId,
+    staleTime: 15_000,
+  });
+}
+
+export function useSafetyIncidentsQuery(params: T.ListSafetyIncidentsQuery, enabledOverride = true): UseQueryResult<T.ModerationEvent[]> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("moderation:read");
+  return useQuery({
+    queryKey: qk.incidents(appId ?? "", { ...params }),
+    queryFn: () => api.listSafetyIncidents(params),
+    enabled: enabled && enabledOverride,
+    staleTime: 15_000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useSafetyIncidentQuery(incidentId: string | null): UseQueryResult<T.SafetyIncident> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("moderation:read");
+  return useQuery({
+    queryKey: [...qk.incidents(appId ?? "", {}), "detail", incidentId ?? ""],
+    queryFn: () => api.getSafetyIncident(incidentId ?? ""),
+    enabled: enabled && !!incidentId,
+    staleTime: 15_000,
+  });
+}
+
+export function useUserRiskQuery(userId: string | null): UseQueryResult<T.SafetyRisk> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("moderation:read");
+  return useQuery({
+    queryKey: qk.userRisk(appId ?? "", userId ?? ""),
+    queryFn: () => api.getSafetyUserRisk(userId ?? ""),
+    enabled: enabled && !!userId,
+    staleTime: 15_000,
+  });
+}
+
+export function useBansQuery(params: T.ListBansQuery): UseQueryResult<T.Ban[]> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("moderation:read");
+  return useQuery({
+    queryKey: qk.bans(appId ?? "", { ...params }),
+    queryFn: () => api.listBans(params),
     enabled,
     staleTime: 15_000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useUserBlocksQuery(userId: string | null): UseQueryResult<T.UserBlocks> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("users:read");
+  return useQuery({
+    queryKey: qk.userBlocks(appId ?? "", userId ?? ""),
+    queryFn: () => api.listUserBlocks(userId ?? ""),
+    enabled: enabled && !!userId,
+    staleTime: 15_000,
+  });
+}
+
+/** Chat history / search target: one channel or one user's directed messages. */
+export type ChatTarget = { kind: "channel"; id: string } | { kind: "user"; id: string; peer?: string };
+
+export interface ChatPageParams {
+  target: ChatTarget | null;
+  /** Full-text query; empty = plain history. */
+  q: string;
+  before?: string;
+  after?: string;
+  fromUserId?: string;
+  limit: number;
+}
+
+export function useChatPageQuery(params: ChatPageParams): UseQueryResult<T.ChatHistoryPage> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("chat:read");
+  const { target, q, before, after, fromUserId, limit } = params;
+  const search = q.trim();
+  return useQuery({
+    queryKey: qk.chat(appId ?? "", { target, q: search, before, after, fromUserId, limit }),
+    queryFn: () => {
+      if (!target) throw new Error("no chat target");
+      const from_user_id = fromUserId || undefined;
+      if (target.kind === "channel") {
+        return search
+          ? api.searchChannelMessages(target.id, { q: search, from_user_id, before, limit })
+          : api.listChannelMessages(target.id, { before, after, limit });
+      }
+      const peer = target.peer || undefined;
+      return search
+        ? api.searchUserMessages(target.id, { q: search, from_user_id, before, limit, peer })
+        : api.listUserMessages(target.id, { before, after, limit, peer });
+    },
+    enabled: enabled && !!target,
+    staleTime: 10_000,
+    placeholderData: (prev) => prev,
   });
 }
 
@@ -545,6 +653,60 @@ export function useBanUserMutation() {
   return useTenantMutation(
     (api, body: T.BanRequest) => api.banUser(body),
     (app, v) => [qk.user(app, v.user_id), ["t", app, "bans"], ["t", app, "users"], qk.channels(app), qk.sessions(app), ["t", app, "moderation"]],
+  );
+}
+export function useRevokeBanMutation() {
+  return useTenantMutation(
+    (api, v: { banId: string }) => api.revokeBan(v.banId, {}),
+    (app) => [["t", app, "bans"], ["t", app, "users"], ["t", app, "moderation"]],
+  );
+}
+export function useUnbanUserMutation() {
+  return useTenantMutation(
+    (api, v: { userId: string }) => api.unbanUser(v.userId, {}),
+    (app, v) => [qk.user(app, v.userId), ["t", app, "bans"], ["t", app, "users"], ["t", app, "moderation"]],
+  );
+}
+export function useResolveModerationEventMutation() {
+  return useTenantMutation(
+    (api, v: { eventId: string; body: T.ResolveModerationEventRequest }) => api.resolveModerationEvent(v.eventId, v.body),
+    (app) => [["t", app, "moderation"], ["t", app, "incidents"]],
+  );
+}
+export function useReportUserMutation() {
+  return useTenantMutation(
+    (api, body: T.ReportRequest) => api.reportUser(body),
+    (app) => [["t", app, "moderation"]],
+  );
+}
+export function useAddUserBlockMutation() {
+  return useTenantMutation(
+    (api, v: { userId: string; blockedUserId: string }) => api.addUserBlock(v.userId, { blocked_user_id: v.blockedUserId }),
+    (app, v) => [qk.userBlocks(app, v.userId)],
+  );
+}
+export function useRemoveUserBlockMutation() {
+  return useTenantMutation(
+    (api, v: { userId: string; blockedUserId: string }) => api.removeUserBlock(v.userId, v.blockedUserId),
+    (app, v) => [qk.userBlocks(app, v.userId)],
+  );
+}
+export function useDeleteUserMutation() {
+  return useTenantMutation(
+    (api, v: { userId: string; purgeModeration: boolean }) => api.deleteUser(v.userId, { purge_moderation: v.purgeModeration }),
+    (app) => [["t", app, "users"], ["t", app, "bans"], ["t", app, "moderation"], ["t", app, "incidents"], ["t", app, "chat"], qk.channels(app), qk.sessions(app)],
+  );
+}
+export function useDeleteMessageMutation() {
+  return useTenantMutation(
+    (api, v: { messageId: string }) => api.deleteMessage(v.messageId),
+    (app) => [["t", app, "chat"]],
+  );
+}
+export function useSendDirectMessageMutation() {
+  return useTenantMutation(
+    (api, v: { userId: string; body: T.SystemMessageRequest }) => api.sendUserMessage(v.userId, v.body),
+    (app) => [["t", app, "chat"]],
   );
 }
 export function useSendSystemMessageMutation() {
