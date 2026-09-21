@@ -11,7 +11,18 @@ released together.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+* `NetworkQuality.receivers_loss_percent` — the worst downlink loss any local receiver of a
+  session's audio reported over its last interval. The node pushes a `NetworkQuality` as soon as
+  the loss the sender has to protect against crosses the 3 % / 10 % tiers, and the native, Unity,
+  Unreal and Godot clients pick their FEC/DRED loss profile from the higher of the uplink loss
+  and this value, so a listener on a lossy link gets redundancy from the talker. Old nodes and
+  payloads without the field read back `0`.
+* `tools/netem/shape.sh` and `crates/aurix-client/tests/netem_live.rs`: a repeatable lossy-WAN
+  and network-migration E2E on Linux netem (loss, jitter, reordering per direction; QUIC
+  migration under delay and loss) with quantitative MOS / recovery / profile assertions, run in
+  CI.
 
 ## [1.2.0] - 2026-09-19
 

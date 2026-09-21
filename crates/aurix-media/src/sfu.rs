@@ -18,7 +18,7 @@ use aurix_common::types::*;
 use aurix_common::usage::{UsageMeter, UsageMetric};
 use chrono::Utc;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -30,6 +30,19 @@ const ENERGY_REPORT_MIN_STEP_DB: u8 = 3;
 /// `NetworkQuality` is sent unconditionally every this many quality periods.
 const QUALITY_SUMMARY_EVERY: u64 = 5;
 const BARS_LABELS: [&str; 5] = ["1", "2", "3", "4", "5"];
+
+/// Band of the loss a sender has to protect against (the native core turns on FEC from 3 %
+/// and DRED from 10 %); a report that crosses a band is sent at once rather than waiting for
+/// the periodic one.
+fn protect_tier(loss_percent: f32) -> u8 {
+    if loss_percent >= 10.0 {
+        2
+    } else if loss_percent >= 3.0 {
+        1
+    } else {
+        0
+    }
+}
 
 /// Side effects of leaving a channel that the client must be told about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1262,10 +1275,12 @@ impl SfuNode {
     }
 
     /// Every `quality_interval_ms`, close each bound session's uplink interval, merge it with
-    /// the client's report, fold it into the session's summary and emit `NetworkQuality` when
-    /// the bar count moved, the MOS alert state flipped, or at least every fifth period so a
-    /// client that missed one still converges. Sessions without a media path yet are not
-    /// rated. Node-wide Prometheus gauges/histograms are refreshed from the same pass.
+    /// the client's report and the worst downlink loss its local receivers reported, fold it
+    /// into the session's summary and emit `NetworkQuality` when the bar count moved, the
+    /// MOS alert state flipped, the loss a sender must protect against crossed a tier, or at
+    /// least every fifth period so a client that missed one still converges. Sessions
+    /// without a media path yet are not rated. Node-wide Prometheus gauges/histograms are
+    /// refreshed from the same pass.
     fn start_quality_reports(&self) {
         let interval_ms = self.options.quality_interval_ms;
         if interval_ms == 0 {
@@ -1274,27 +1289,48 @@ impl SfuNode {
         let mos_policy = self.options.mos_alert;
         let period_secs = interval_ms as f64 / 1000.0;
         let sessions = self.sessions_by_id.clone();
+        let channels = self.channels.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut tick: u64 = 0;
+            let mut protect_tiers: HashMap<SessionId, u8> = HashMap::new();
+            let mut seen: HashSet<SessionId> = HashSet::new();
             loop {
                 interval.tick().await;
                 tick = tick.wrapping_add(1);
                 let summary = tick.is_multiple_of(QUALITY_SUMMARY_EVERY);
                 let mut by_bars = [0i64; 5];
                 let mut degraded = 0i64;
+                let worst_by_channel: HashMap<ChannelId, [Option<(UserId, f32)>; 2]> = channels
+                    .iter()
+                    .map(|c| (*c.key(), c.value().worst_receiver_loss()))
+                    .collect();
+                seen.clear();
                 for entry in sessions.iter() {
                     let s = entry.value();
                     if !s.is_active() || !s.is_bound() {
                         continue;
                     }
+                    let receivers_loss = s
+                        .channels
+                        .read()
+                        .iter()
+                        .filter_map(|id| worst_by_channel.get(id))
+                        .filter_map(|worst| match worst {
+                            [Some((u, _)), second] if *u == s.user_id => second.map(|(_, l)| l),
+                            [first, _] => first.map(|(_, l)| l),
+                        })
+                        .fold(0.0f32, f32::max);
                     let QualityTick {
                         quality,
                         bars_changed,
                         transition,
-                    } = s.refresh_network_quality(period_secs, mos_policy);
+                    } = s.refresh_network_quality(period_secs, mos_policy, receivers_loss);
+                    let tier = protect_tier(quality.protect_loss_percent());
+                    let tier_changed = protect_tiers.insert(s.session_id, tier) != Some(tier);
+                    seen.insert(s.session_id);
                     by_bars[usize::from(quality.bars.clamp(1, 5)) - 1] += 1;
                     if s.is_mos_alerting() {
                         degraded += 1;
@@ -1303,7 +1339,7 @@ impl SfuNode {
                     aurix_metrics::UPLINK_LOSS_PERCENT
                         .observe(f64::from(quality.uplink_loss_percent));
                     aurix_metrics::UPLINK_JITTER_MS.observe(f64::from(quality.uplink_jitter_ms));
-                    if bars_changed || transition.is_some() || summary {
+                    if bars_changed || transition.is_some() || tier_changed || summary {
                         let _ = events.send(MediaEvent::NetworkQuality {
                             session_id: s.session_id,
                             app_id: s.app_id,
@@ -1313,6 +1349,7 @@ impl SfuNode {
                         });
                     }
                 }
+                protect_tiers.retain(|id, _| seen.contains(id));
                 for (i, n) in by_bars.iter().enumerate() {
                     aurix_metrics::SESSIONS_BY_BARS
                         .with_label_values(&[BARS_LABELS[i]])

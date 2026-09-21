@@ -28,6 +28,7 @@ use aurix_common::types::{
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -831,6 +832,16 @@ impl Client {
     /// Link the media currently travels over; `None` until the first `MediaBound`.
     pub fn media_path(&self) -> Option<MediaPath> {
         self.inner.media.read().as_ref().map(|m| m.path())
+    }
+
+    /// Local address of the UDP/QUIC media socket; `None` before the first bind and while the
+    /// media rides the control WebSocket. Changes after `network_changed`.
+    pub fn media_local_addr(&self) -> Option<SocketAddr> {
+        self.inner
+            .media
+            .read()
+            .as_ref()
+            .and_then(|m| m.local_addr())
     }
 
     /// Tell the client the device's network changed (Wi-Fi ↔ cellular, new interface, VPN).
@@ -3868,7 +3879,7 @@ async fn handle_message(
         }
         ControlMessage::NetworkQuality { quality } => {
             *inner.server_quality.lock() = Some(quality);
-            observe_uplink_loss(inner, quality.uplink_loss_percent);
+            observe_uplink_loss(inner, quality.protect_loss_percent());
             inner.emit(Event::NetworkQuality(quality));
         }
         ControlMessage::RecordingNotification {

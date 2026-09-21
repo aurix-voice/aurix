@@ -12,7 +12,7 @@ use aurix_media::{MediaSession, SfuNode, SfuOptions};
 use bytes::Bytes;
 use quinn::rustls;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -94,7 +94,13 @@ impl Raw {
     }
 
     fn bind_bytes(s: &MediaSession, nonce: u64) -> Bytes {
-        let now = chrono::Utc::now().timestamp_millis();
+        // Strictly increasing per process: the node refuses a bind whose millisecond
+        // timestamp is not newer than the last accepted one, and a loopback bind can be
+        // acked inside the same millisecond.
+        static LAST_MS: Mutex<i64> = Mutex::new(i64::MIN);
+        let mut last = LAST_MS.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis().max(*last + 1);
+        *last = now;
         AurixPacket::session_bind(&s.session_id, s.ssrc, now, nonce)
             .encode_authenticated(&s.keys)
             .freeze()

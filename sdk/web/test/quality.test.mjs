@@ -139,10 +139,26 @@ test('server NetworkQuality is mapped from the wire shape', () => {
     downlinkLossPercent: 1,
     uplinkJitterMs: 3,
     uplinkLossPercent: 0.5,
+    receiversLossPercent: 0,
     uplinkBitrateKbps: 32,
     uplinkPacketsReceived: 5000,
     uplinkPacketsLost: 25,
   });
   const s = assembleClientStats({ last: 10, min: 10, avg: 10, max: 10 }, {}, new LossWindow(), q);
   assert.equal(s.server?.bars, 4);
+  const withReceivers = networkQualityFromWire({
+    bars: 3,
+    r_factor: 70,
+    mos: 3.6,
+    rtt_ms: 80,
+    downlink_jitter_ms: 5,
+    downlink_loss_percent: 1,
+    uplink_jitter_ms: 3,
+    uplink_loss_percent: 0.5,
+    receivers_loss_percent: 12.5,
+    uplink_bitrate_kbps: 32,
+    uplink_packets_received: 5000,
+    uplink_packets_lost: 25,
+  });
+  assert.equal(withReceivers.receiversLossPercent, 12.5);
 });

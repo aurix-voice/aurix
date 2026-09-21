@@ -1347,6 +1347,11 @@ typedef struct AurixNetworkQuality {
   float downlink_loss_percent;
   float uplink_jitter_ms;
   float uplink_loss_percent;
+  /**
+   * Worst downlink loss among the local receivers of our audio; the loss profile follows
+   * the higher of this and `uplink_loss_percent`.
+   */
+  float receivers_loss_percent;
   uint32_t uplink_bitrate_kbps;
   uint64_t uplink_packets_received;
   uint64_t uplink_packets_lost;

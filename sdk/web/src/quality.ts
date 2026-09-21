@@ -58,6 +58,12 @@ export interface NetworkQuality {
   uplinkJitterMs: number;
   /** Sequence gaps in this client's packets over the last report interval. */
   uplinkLossPercent: number;
+  /**
+   * Worst downlink loss any receiver of this client's audio on the same node reported over
+   * its last interval (0 with no receivers). Native senders protect their uplink against the
+   * higher of this and `uplinkLossPercent`.
+   */
+  receiversLossPercent: number;
   uplinkBitrateKbps: number;
   uplinkPacketsReceived: number;
   uplinkPacketsLost: number;
@@ -72,6 +78,7 @@ export interface NetworkQualityWire {
   downlink_loss_percent: number;
   uplink_jitter_ms: number;
   uplink_loss_percent: number;
+  receivers_loss_percent?: number;
   uplink_bitrate_kbps: number;
   uplink_packets_received: number;
   uplink_packets_lost: number;
@@ -87,6 +94,7 @@ export function networkQualityFromWire(w: NetworkQualityWire): NetworkQuality {
     downlinkLossPercent: w.downlink_loss_percent,
     uplinkJitterMs: w.uplink_jitter_ms,
     uplinkLossPercent: w.uplink_loss_percent,
+    receiversLossPercent: w.receivers_loss_percent ?? 0,
     uplinkBitrateKbps: w.uplink_bitrate_kbps,
     uplinkPacketsReceived: w.uplink_packets_received,
     uplinkPacketsLost: w.uplink_packets_lost,

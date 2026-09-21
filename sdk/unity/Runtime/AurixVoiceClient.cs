@@ -640,7 +640,7 @@ namespace Aurix
             return _loss.Shape(s.Clamped(), ceiling);
         }
 
-        /// <summary>Feed a server uplink-loss report to the loss profile; on a tier change retune the encoder and tell the app.</summary>
+        /// <summary>Feed the loss a server report says our uplink must survive to the loss profile; on a tier change retune the encoder and tell the app.</summary>
         private void ObserveUplinkLoss(float uplinkLossPercent)
         {
             bool changed;
@@ -2797,7 +2797,7 @@ namespace Aurix
                     if (q.HasValue)
                     {
                         _serverQuality = q;
-                        ObserveUplinkLoss(q.Value.UplinkLossPercent);
+                        ObserveUplinkLoss(q.Value.ProtectLossPercent);
                         OnNetworkQuality?.Invoke(q.Value);
                     }
                     break;

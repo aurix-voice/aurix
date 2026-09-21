@@ -600,6 +600,29 @@ impl MediaChannel {
         a.value().position.distance_to(&b.value().position) <= radius
     }
 
+    /// The two worst downlink loss reports among local members, as `(user, loss percent)`,
+    /// worst first; the second lets a sender exclude its own report. Members that reported
+    /// nothing yet count as lossless.
+    pub fn worst_receiver_loss(&self) -> [Option<(UserId, f32)>; 2] {
+        let mut worst: [Option<(UserId, f32)>; 2] = [None, None];
+        for e in self.participants.iter() {
+            let loss = e.value().get_quality().packet_loss_percent;
+            let loss = if loss.is_finite() {
+                loss.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let entry = (*e.key(), loss);
+            if worst[0].is_none_or(|(_, l)| loss > l) {
+                worst[1] = worst[0];
+                worst[0] = Some(entry);
+            } else if worst[1].is_none_or(|(_, l)| loss > l) {
+                worst[1] = Some(entry);
+            }
+        }
+        worst
+    }
+
     /// Everything `observer` should currently see in the roster: local and remote members
     /// except themselves, filtered by the roster radius.
     pub fn roster_for(&self, observer: &UserId) -> Vec<RosterEntry> {
@@ -1119,6 +1142,38 @@ mod tests {
         let mut v: Vec<(UserId, f32)> = recv.iter().map(|(s, m)| (s.user_id, m.volume)).collect();
         v.sort_by_key(|(u, _)| u.0);
         v
+    }
+
+    #[test]
+    fn worst_receiver_loss_ranks_reports_and_keeps_a_runner_up() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(ChannelId::new(), app, ChannelConfig::default());
+        assert_eq!(ch.worst_receiver_loss(), [None, None]);
+        let a = session(app, 1);
+        let b = session(app, 2);
+        let c = session(app, 3);
+        for s in [&a, &b, &c] {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        let report = |s: &MediaSession, loss: f32| {
+            s.update_quality(QualityMetrics {
+                rtt_ms: 30.0,
+                jitter_ms: 2.0,
+                packet_loss_percent: loss,
+                bitrate_kbps: 32,
+                mos_score: 0.0,
+            })
+        };
+        report(&a, 12.0);
+        report(&b, f32::NAN);
+        report(&c, 4.0);
+        let [first, second] = ch.worst_receiver_loss();
+        assert_eq!(first, Some((a.user_id, 12.0)));
+        assert_eq!(second, Some((c.user_id, 4.0)));
+        report(&b, 250.0);
+        let [first, second] = ch.worst_receiver_loss();
+        assert_eq!(first, Some((b.user_id, 100.0)));
+        assert_eq!(second, Some((a.user_id, 12.0)));
     }
 
     #[test]

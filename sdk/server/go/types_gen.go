@@ -1235,14 +1235,18 @@ type MuteAllRequest struct {
 // Merged view of the client's `QualityReport` and the SFU's uplink measurements; the worse
 // direction decides the rating (`R ≥ 80 → 5 bars, ≥ 70 → 4, ≥ 60 → 3, ≥ 50 → 2, else 1`).
 type NetworkQuality struct {
-	Bars                  int64    `json:"bars"`
-	RFactor               float64  `json:"r_factor"`
-	MOS                   float64  `json:"mos"`
-	RTTMs                 *float64 `json:"rtt_ms,omitempty"`
-	DownlinkJitterMs      *float64 `json:"downlink_jitter_ms,omitempty"`
-	DownlinkLossPercent   *float64 `json:"downlink_loss_percent,omitempty"`
-	UplinkJitterMs        *float64 `json:"uplink_jitter_ms,omitempty"`
-	UplinkLossPercent     *float64 `json:"uplink_loss_percent,omitempty"`
+	Bars                int64    `json:"bars"`
+	RFactor             float64  `json:"r_factor"`
+	MOS                 float64  `json:"mos"`
+	RTTMs               *float64 `json:"rtt_ms,omitempty"`
+	DownlinkJitterMs    *float64 `json:"downlink_jitter_ms,omitempty"`
+	DownlinkLossPercent *float64 `json:"downlink_loss_percent,omitempty"`
+	UplinkJitterMs      *float64 `json:"uplink_jitter_ms,omitempty"`
+	UplinkLossPercent   *float64 `json:"uplink_loss_percent,omitempty"`
+	// Worst downlink loss any local receiver of this session's audio reported over its last interval
+	// (0 with no receivers). Senders protect their uplink against the higher of this and
+	// `uplink_loss_percent`. Receivers on other nodes are not included.
+	ReceiversLossPercent  *float64 `json:"receivers_loss_percent,omitempty"`
 	UplinkBitrateKbps     *int64   `json:"uplink_bitrate_kbps,omitempty"`
 	UplinkPacketsReceived *int64   `json:"uplink_packets_received,omitempty"`
 	UplinkPacketsLost     *int64   `json:"uplink_packets_lost,omitempty"`

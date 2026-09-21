@@ -267,16 +267,21 @@ the chapter that explains the boundary.
   compile the Unreal module on those hosts, and there is no 32-bit or ARM64 Windows build.
 * **Loss repair is measured, not listened to.** FEC / DRED / PLC recovery is verified with
   synthetic speech-like signals (sample-domain correlation against the original, frame counts
-  by method, stereo, reordering, partial DRED coverage, PCMU bypass) on Linux and in the
-  server-mixer loss simulation; no listening test, no real lossy network and no measurement of
-  OSCE's effect on perceived quality has been run from this repository. `osce_bwe` depends on
-  the libopus build and reads back `false` where it is not compiled in.
+  by method, stereo, reordering, partial DRED coverage, PCMU bypass) on Linux, in the
+  server-mixer loss simulation and against a live node behind Linux netem (20 % downlink loss,
+  12 % uplink loss with jitter and reordering: profile transitions, recovery share, MOS —
+  [Development](operations/development.md#lossy-wan-and-network-migration)). That is an emulated
+  link on loopback: no listening test, no real access network (Wi-Fi contention, bufferbloat,
+  cellular schedulers) and no measurement of OSCE's effect on perceived quality has been run
+  from this repository. `osce_bwe` depends on the libopus build and reads back `false` where it
+  is not compiled in.
 * **QUIC is exercised on one host.** Bind, authenticated media both ways, 0-RTT resume, stale
   connection refusal, early-data replay, wrong pin / wrong key, connection cap, the disabled-QUIC
   node, socket migration through `network_changed()`, fallback to the tunnel and back, IPv4 and
-  IPv6 loopback are all tested in-process and against live nodes — on Linux loopback. No real
-  Wi-Fi ↔ cellular hand-over, no lossy WAN, no measurement of head-of-line gains against the
-  tunnel and no NAT with a short UDP timeout have been run from this repository
+  IPv6 loopback are all tested in-process and against live nodes — on Linux loopback, the
+  migration also under netem delay/jitter/loss. No real Wi-Fi ↔ cellular hand-over (a new radio
+  path, NAT rebinding, a short UDP timeout), no measurement of head-of-line gains against the
+  tunnel have been run from this repository
   ([QUIC](api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)).
 * **Admin SSO against real identity providers.** The OIDC relying party is exercised end to end
   against the repository's mock provider (discovery, PKCE, nonce, JWKS rotation, userinfo,

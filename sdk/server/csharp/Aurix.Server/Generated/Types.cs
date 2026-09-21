@@ -2402,6 +2402,14 @@ public sealed record NetworkQuality
     [JsonPropertyName("uplink_loss_percent")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? UplinkLossPercent { get; init; }
 
+    /// <summary>
+    /// Worst downlink loss any local receiver of this session's audio reported over its last interval
+    /// (0 with no receivers). Senders protect their uplink against the higher of this and
+    /// `uplink_loss_percent`. Receivers on other nodes are not included.
+    /// </summary>
+    [JsonPropertyName("receivers_loss_percent")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ReceiversLossPercent { get; init; }
+
     [JsonPropertyName("uplink_bitrate_kbps")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? UplinkBitrateKbps { get; init; }
 

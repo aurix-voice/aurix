@@ -301,6 +301,7 @@ inline Dictionary network_quality_to_dict(const AurixNetworkQuality& q) {
     d["downlink_loss_percent"] = q.downlink_loss_percent;
     d["uplink_jitter_ms"] = q.uplink_jitter_ms;
     d["uplink_loss_percent"] = q.uplink_loss_percent;
+    d["receivers_loss_percent"] = q.receivers_loss_percent;
     d["uplink_bitrate_kbps"] = static_cast<int64_t>(q.uplink_bitrate_kbps);
     d["uplink_packets_received"] = static_cast<int64_t>(q.uplink_packets_received);
     d["uplink_packets_lost"] = static_cast<int64_t>(q.uplink_packets_lost);

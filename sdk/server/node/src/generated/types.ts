@@ -1090,6 +1090,12 @@ export interface NetworkQuality {
   downlink_loss_percent?: number;
   uplink_jitter_ms?: number;
   uplink_loss_percent?: number;
+  /**
+   * Worst downlink loss any local receiver of this session's audio reported over its last interval
+   * (0 with no receivers). Senders protect their uplink against the higher of this and
+   * `uplink_loss_percent`. Receivers on other nodes are not included.
+   */
+  receivers_loss_percent?: number;
   uplink_bitrate_kbps?: number;
   uplink_packets_received?: number;
   uplink_packets_lost?: number;

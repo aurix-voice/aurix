@@ -1021,6 +1021,10 @@ struct AURIXVOICE_API FAurixNetworkQuality
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float UplinkLossPercent = 0.f;
 
+	/** Worst downlink loss among the receivers of our audio on the node; the loss profile follows the higher of this and UplinkLossPercent. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	float ReceiversLossPercent = 0.f;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	int32 UplinkBitrateKbps = 0;
 

@@ -155,6 +155,20 @@ jobs:
           AURIX_E2E_SUDO_IPTABLES: "1"
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
         run: cargo test --locked -p aurix-client --test e2e_live -- --nocapture
+      # Linux netem on the node's media port (tools/netem/shape.sh): loss, jitter and
+      # reordering in each direction with quantitative MOS / FEC+DRED recovery / loss-profile
+      # assertions, and a QUIC address migration under WAN-like delay and loss.
+      - name: E2E (lossy WAN + network migration under netem)
+        env:
+          AURIX_E2E_API: http://127.0.0.1:8080
+          AURIX_E2E_WS: ws://127.0.0.1:8081
+          AURIX_E2E_UDP: "10000"
+          AURIX_E2E_SUDO_TC: "1"
+          AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
+        run: cargo test --locked -p aurix-client --test netem_live -- --nocapture
+      - name: Clear netem
+        if: always()
+        run: sudo tools/netem/shape.sh clear
       - name: E2E (strict action tokens)
         env:
           AURIX__TURN__ENABLED: "false"

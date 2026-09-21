@@ -4321,6 +4321,9 @@ pub struct AurixNetworkQuality {
     pub downlink_loss_percent: f32,
     pub uplink_jitter_ms: f32,
     pub uplink_loss_percent: f32,
+    /// Worst downlink loss among the local receivers of our audio; the loss profile follows
+    /// the higher of this and `uplink_loss_percent`.
+    pub receivers_loss_percent: f32,
     pub uplink_bitrate_kbps: u32,
     pub uplink_packets_received: u64,
     pub uplink_packets_lost: u64,
@@ -4337,6 +4340,7 @@ impl From<NetworkQuality> for AurixNetworkQuality {
             downlink_loss_percent: q.downlink_loss_percent,
             uplink_jitter_ms: q.uplink_jitter_ms,
             uplink_loss_percent: q.uplink_loss_percent,
+            receivers_loss_percent: q.receivers_loss_percent,
             uplink_bitrate_kbps: q.uplink_bitrate_kbps,
             uplink_packets_received: q.uplink_packets_received,
             uplink_packets_lost: q.uplink_packets_lost,

@@ -40,6 +40,8 @@ cargo deny check                                 # licences, advisories, duplica
 # live end-to-end against a running server (bootstrap steps: .github/workflows/ci.yml)
 AURIX_E2E_API_KEY=aurx_... cargo test -p aurix-server --test e2e_live -- --ignored --nocapture
 cargo test -p aurix-client --test e2e_live -- --nocapture
+# lossy WAN + network migration (Linux, needs `sudo tc`; shapes the node's media port with netem)
+AURIX_E2E_SUDO_TC=1 cargo test -p aurix-client --test netem_live -- --nocapture
 
 # SDKs
 (cd sdk/web && npm ci && npm run check && npm test && npm run build)
@@ -67,6 +69,35 @@ second, unrelated application used for the negative tenant checks.
 The `native core` job builds `aurix-client` on Windows x64 (MSVC), macOS arm64 and macOS x64,
 runs its unit tests and the C/C++ samples there and uploads the staged `lib/Win64` / `lib/Mac`
 libraries as artifacts; Linux is covered by the workspace jobs.
+
+### Lossy WAN and network migration
+
+`crates/aurix-client/tests/netem_live.rs` puts Linux netem on the node's media port through
+`tools/netem/shape.sh` (one `tc prio` qdisc with u32 filters on the UDP port — the WebSocket
+control plane and everything else on the interface stay clean) and measures what two native
+clients on that node go through, direction by direction:
+
+* 20 % loss on the **downlink** only: the node reports the receiver's loss back to the talker
+  as `receivers_loss_percent`, the talker moves to the `High` loss profile within a few seconds,
+  and from then on at least half of what the listener loses is rebuilt from FEC/DRED rather than
+  concealed; the listener's MOS drops below 3.5 and recovers to ≥ 4.0 once the link is cleared,
+  the talker leaves `High` after the dwell.
+* 12 % loss + 20 ± 10 ms delay with reordering on the **uplink** only: the node's own
+  measurement (`uplink_loss_percent`) drives the same profile, reordered packets are put back.
+* QUIC under 2 × (40 ± 15) ms and 3 % loss each way: the heartbeat RTT shows the added delay,
+  `network_changed()` migrates the connection to a new local address without a re-bind or a
+  new session, and audio keeps flowing.
+
+```sh
+sudo tools/netem/shape.sh apply 10000 --down "loss 20%" --up "delay 20ms 10ms reorder 25% 50%"
+sudo tools/netem/shape.sh show
+sudo tools/netem/shape.sh clear      # host-global; always clear
+```
+
+The shaper is the same one you can use by hand against a local node to listen to a lossy link
+with a real SDK. It is a *simulation*: loopback with netem has no NAT, no radio and no real path
+change, so the Wi-Fi ↔ cellular case is covered for the protocol logic (migration, profile,
+repair), not for real networks ([Limitations](../limitations.md)).
 
 ## Drift guards
 

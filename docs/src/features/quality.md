@@ -51,22 +51,28 @@ on resume); loss, R-factor, MOS and bars describe the latest period.
    client report with what the SFU measures on that session's **uplink** — sequence gaps (loss),
    RFC 3550 inter-arrival jitter and bitrate. The worse direction decides the rating. Sessions
    whose media path is not bound yet (no `SessionBind` / no WebRTC track) are not rated.
-4. The result goes back to the client as `NetworkQuality` whenever the bars change and every
-   fifth period as a summary:
+4. The result goes back to the client as `NetworkQuality` whenever the bars change, whenever
+   the loss its senders must protect against crosses a tier (3 % / 10 %) and every fifth period
+   as a summary:
 
 ```json
 {"type":"NetworkQuality","data":{"quality":{"bars":4,"r_factor":76.2,"mos":3.9,"rtt_ms":48.0,
  "downlink_jitter_ms":6.5,"downlink_loss_percent":1.2,"uplink_jitter_ms":3.1,
- "uplink_loss_percent":4.0,"uplink_bitrate_kbps":31,"uplink_packets_received":4120,"uplink_packets_lost":170}}}
+ "uplink_loss_percent":4.0,"receivers_loss_percent":0.0,"uplink_bitrate_kbps":31,
+ "uplink_packets_received":4120,"uplink_packets_lost":170}}}
 ```
 
 5. Uplink loss above `quality.loss_alert_percent` (20 %) over a period raises `quality.alert`
    with `metric: "uplink_packet_loss"` (webhooks/SSE) even if the client reports nothing; the
    same threshold applies to the client-reported loss (`metric: "packet_loss"`).
-6. Native, Unity and Unreal/Godot clients also feed `uplink_loss_percent` to their **loss
-   profile**: ≥ 3 % turns in-band FEC on and tunes it for ≥ 10 % loss, ≥ 10 % adds Opus DRED
-   history and a 28 kbit/s floor; tiers relax after a 6 s dwell below 1 % / 5 %. Lost frames
-   are rebuilt on receivers and in the server mixers from FEC → DRED → neural PLC
+6. `receivers_loss_percent` is the worst downlink loss any *receiver* of that session's audio
+   on the same node reported in its own `QualityReport` (0 with no receivers; receivers hosted
+   on other nodes of a cascade are not included). Only the sender can add redundancy for a
+   receiver on a lossy link, so native, Unity and Unreal/Godot clients feed the higher of
+   `uplink_loss_percent` and `receivers_loss_percent` to their **loss profile**: ≥ 3 % turns
+   in-band FEC on and tunes it for ≥ 10 % loss, ≥ 10 % adds Opus DRED history and a
+   28 kbit/s floor; tiers relax after a 6 s dwell below 1 % / 5 %. Lost frames are rebuilt on
+   receivers and in the server mixers from FEC → DRED → neural PLC
    ([Packet loss](../sdk/native.md#packet-loss-fec-dred-and-the-neural-plc);
    `aurix_mixer_lost_frames_total{method}`).
 

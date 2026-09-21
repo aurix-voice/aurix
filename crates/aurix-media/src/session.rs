@@ -853,16 +853,22 @@ impl MediaSession {
             .record(seq, rtp_ts, bytes, std::time::Instant::now());
     }
 
-    /// Close the current uplink interval and merge it with the client's last `QualityReport`,
-    /// fold the result into the session's summary (`period_secs` of rated time) and run the
-    /// MOS alert detector.
-    pub fn refresh_network_quality(&self, period_secs: f64, mos: MosAlertPolicy) -> QualityTick {
+    /// Close the current uplink interval and merge it with the client's last `QualityReport`
+    /// and the worst downlink loss among this session's receivers, fold the result into the
+    /// session's summary (`period_secs` of rated time) and run the MOS alert detector.
+    pub fn refresh_network_quality(
+        &self,
+        period_secs: f64,
+        mos: MosAlertPolicy,
+        receivers_loss_percent: f32,
+    ) -> QualityTick {
         let sample: UplinkSample = self.uplink.lock().sample(std::time::Instant::now());
         let client = self.get_quality();
         let quality = NetworkQuality::compose(
             &client,
             sample.jitter_ms,
             sample.loss_percent,
+            receivers_loss_percent,
             sample.bitrate_kbps,
             sample.packets_received,
             sample.packets_lost,
@@ -1201,22 +1207,22 @@ mod tests {
             mos_score: 0.0,
         };
         s.update_quality(report(0.0));
-        let good = s.refresh_network_quality(2.0, policy);
+        let good = s.refresh_network_quality(2.0, policy, 0.0);
         assert_eq!(good.quality.bars, 5);
         assert!(good.bars_changed);
         assert_eq!(good.transition, None);
 
         s.update_quality(report(15.0));
-        let first_bad = s.refresh_network_quality(2.0, policy);
+        let first_bad = s.refresh_network_quality(2.0, policy, 0.0);
         assert!(first_bad.quality.mos < 3.1);
         assert_eq!(first_bad.transition, None, "one bad period is not an alert");
         assert!(!s.is_mos_alerting());
-        let second_bad = s.refresh_network_quality(2.0, policy);
+        let second_bad = s.refresh_network_quality(2.0, policy, 0.0);
         assert_eq!(second_bad.transition, Some(MosTransition::Degraded));
         assert!(!second_bad.bars_changed);
         assert!(s.is_mos_alerting());
         assert_eq!(
-            s.refresh_network_quality(2.0, policy).transition,
+            s.refresh_network_quality(2.0, policy, 0.0).transition,
             None,
             "an open alert is not re-raised"
         );
@@ -1239,9 +1245,9 @@ mod tests {
         );
 
         s.update_quality(report(0.0));
-        assert_eq!(s.refresh_network_quality(2.0, policy).transition, None);
+        assert_eq!(s.refresh_network_quality(2.0, policy, 0.0).transition, None);
         assert_eq!(
-            s.refresh_network_quality(2.0, policy).transition,
+            s.refresh_network_quality(2.0, policy, 0.0).transition,
             Some(MosTransition::Recovered)
         );
         assert!(!s.is_mos_alerting());
@@ -1258,7 +1264,7 @@ mod tests {
         assert!(adopted.take_quality_summary_if_dirty().is_none());
         assert!(adopted.take_unmetered_quality().is_empty());
         adopted.update_quality(report(0.0));
-        adopted.refresh_network_quality(2.0, policy);
+        adopted.refresh_network_quality(2.0, policy, 0.0);
         let continued = adopted.take_quality_summary_if_dirty().unwrap();
         assert_eq!(continued.samples, persisted.samples + 1);
         assert_eq!(continued.mos_alerts, 1);

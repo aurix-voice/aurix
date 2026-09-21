@@ -1107,6 +1107,7 @@ NetworkQuality = TypedDict(
         "downlink_loss_percent": NotRequired[float],
         "uplink_jitter_ms": NotRequired[float],
         "uplink_loss_percent": NotRequired[float],
+        "receivers_loss_percent": NotRequired[float],  # Worst downlink loss any local receiver of this session's audio reported over its last interval (0 with no receivers). Senders protect their uplink against the higher of this and `uplink_loss_percent`. Receivers on other nodes are not included.
         "uplink_bitrate_kbps": NotRequired[int],
         "uplink_packets_received": NotRequired[int],
         "uplink_packets_lost": NotRequired[int],

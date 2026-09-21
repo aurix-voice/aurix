@@ -1212,6 +1212,12 @@ pub struct NetworkQuality {
     pub uplink_jitter_ms: f32,
     /// Sequence gaps in the client's packets over the last report interval.
     pub uplink_loss_percent: f32,
+    /// Worst downlink loss any local receiver of this session's audio reported over its
+    /// last interval (0 with no receivers). Senders protect their uplink against the worse
+    /// of this and `uplink_loss_percent`, since only the sender can add FEC/DRED for a
+    /// receiver on a lossy link. Receivers hosted on other nodes are not included.
+    #[serde(default)]
+    pub receivers_loss_percent: f32,
     pub uplink_bitrate_kbps: u32,
     /// Totals since the session started.
     pub uplink_packets_received: u64,
@@ -1223,6 +1229,7 @@ impl NetworkQuality {
         client: &QualityMetrics,
         uplink_jitter_ms: f32,
         uplink_loss_percent: f32,
+        receivers_loss_percent: f32,
         uplink_bitrate_kbps: u32,
         uplink_packets_received: u64,
         uplink_packets_lost: u64,
@@ -1239,10 +1246,27 @@ impl NetworkQuality {
             downlink_loss_percent: client.packet_loss_percent,
             uplink_jitter_ms,
             uplink_loss_percent,
+            receivers_loss_percent,
             uplink_bitrate_kbps,
             uplink_packets_received,
             uplink_packets_lost,
         }
+    }
+
+    /// Loss a sender should protect its uplink against: the worse of what the server sees
+    /// on the uplink and what its worst receiver sees on the downlink.
+    pub fn protect_loss_percent(&self) -> f32 {
+        let up = if self.uplink_loss_percent.is_finite() {
+            self.uplink_loss_percent
+        } else {
+            0.0
+        };
+        let down = if self.receivers_loss_percent.is_finite() {
+            self.receivers_loss_percent
+        } else {
+            0.0
+        };
+        up.max(down).clamp(0.0, 100.0)
     }
 }
 
@@ -2212,7 +2236,25 @@ mod tests {
             bitrate_kbps: 32,
             mos_score: 0.0,
         };
-        NetworkQuality::compose(&client, 2.0, 0.0, 30, 100, 0)
+        NetworkQuality::compose(&client, 2.0, 0.0, 0.0, 30, 100, 0)
+    }
+
+    #[test]
+    fn network_quality_protects_the_worse_direction_and_tolerates_old_nodes() {
+        let mut q = rated(40.0, 0.0);
+        q.uplink_loss_percent = 4.0;
+        q.receivers_loss_percent = 11.0;
+        assert_eq!(q.protect_loss_percent(), 11.0);
+        q.receivers_loss_percent = f32::NAN;
+        assert_eq!(q.protect_loss_percent(), 4.0);
+        q.receivers_loss_percent = 11.0;
+        let mut json: serde_json::Value = serde_json::to_value(q).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("receivers_loss_percent");
+        let old: NetworkQuality = serde_json::from_value(json).unwrap();
+        assert_eq!(old.receivers_loss_percent, 0.0);
+        assert_eq!(old.protect_loss_percent(), 4.0);
     }
 
     #[test]

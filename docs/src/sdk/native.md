@@ -201,22 +201,25 @@ ends the gap can rebuild it. PCMU streams have none of this (μ-law has no redun
 apart; `ClientConfig.decoder` (`DecoderSettings { complexity: 5, osce_bwe: false }`) and
 `set_decoder_settings` / `decoder_settings` tune the decoders of every stream at once.
 
-**Send side — the loss profile.** The server measures the loss on *our* packets and reports it
-in every `NetworkQuality` (`uplink_loss_percent`). A `LossController` maps it to a tier and
-re-shapes the effective encoder settings on top of baseline, channel policy and
+**Send side — the loss profile.** The server measures the loss on *our* packets
+(`NetworkQuality.uplink_loss_percent`) and relays the worst downlink loss any receiver of our
+audio on the node reported (`receivers_loss_percent` — only we can add redundancy for them).
+A `LossController` maps the higher of the two (`NetworkQuality::protect_loss_percent`) to a
+tier and re-shapes the effective encoder settings on top of baseline, channel policy and
 `BitrateCommand`:
 
 | Profile | Enter | Leave (after 6 s dwell) | Effect on the encoder |
 |---|---|---|---|
 | `Low` | — | — | baseline / policy as is |
-| `Moderate` | uplink loss ≥ 3 % | < 1 % | FEC on, `expected_loss_percent` ≥ 10 (or the measured loss) |
+| `Moderate` | loss ≥ 3 % | < 1 % | FEC on, `expected_loss_percent` ≥ 10 (or the measured loss) |
 | `High` | ≥ 10 % | < 5 % | FEC on, `expected_loss_percent` ≥ 20, DRED ≥ 400 ms, bitrate raised to 28 kbit/s where the policy/command ceiling allows |
 
 Escalation is immediate, relaxation waits for the dwell (hysteresis keeps a flapping link from
 toggling redundancy every report). `LossAdaptation::Auto` is the default;
 `Fixed(LossProfile)` pins a tier (a LAN game may want `Low`, a mobile title may start `High`);
 `set_loss_adaptation` / `loss_adaptation` / `loss_profile` and `Event::LossProfileChanged
-{ profile, uplink_loss_percent }` (also when a session ends and the tier resets) expose it;
+{ profile, uplink_loss_percent }` (the loss the tier protects against; also when a session
+ends and the tier resets) expose it;
 `ClientStats.loss_profile` mirrors the current tier. A `dred_duration_ms` in the baseline is
 kept as a floor — the profile only ever raises redundancy. Everything applies equally to E2EE
 frames (redundancy is inside the Opus payload the core seals).

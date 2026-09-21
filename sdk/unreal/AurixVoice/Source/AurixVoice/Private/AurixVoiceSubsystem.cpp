@@ -342,6 +342,7 @@ FAurixNetworkQuality ToNetworkQuality(const AurixNetworkQuality& Q)
 	Out.DownlinkLossPercent = Q.downlink_loss_percent;
 	Out.UplinkJitterMs = Q.uplink_jitter_ms;
 	Out.UplinkLossPercent = Q.uplink_loss_percent;
+	Out.ReceiversLossPercent = Q.receivers_loss_percent;
 	Out.UplinkBitrateKbps = static_cast<int32>(Q.uplink_bitrate_kbps);
 	Out.UplinkPacketsReceived = static_cast<int64>(Q.uplink_packets_received);
 	Out.UplinkPacketsLost = static_cast<int64>(Q.uplink_packets_lost);

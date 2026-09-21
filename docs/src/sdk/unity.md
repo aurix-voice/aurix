@@ -219,7 +219,8 @@ gap in the order FEC (one frame) → DRED (bursts, as far as the packet's covera
 when the packet that ends it arrives, keeps reordered packets, drops ones for slots already
 played (`VoiceStats.FramesLate`) and counts `FramesFecRecovered` / `FramesDredRecovered`;
 Concentus has FEC and classic PLC only. The client's **loss profile** follows the server's
-`NetworkQuality.UplinkLossPercent` — `LossProfile.Low / Moderate / High` at ≥ 3 % / ≥ 10 %
+`NetworkQuality.ProtectLossPercent` (the higher of `UplinkLossPercent` and the worst receiver's
+`ReceiversLossPercent`) — `LossProfile.Low / Moderate / High` at ≥ 3 % / ≥ 10 %
 (FEC on, `ExpectedLossPercent` ≥ 10 / 20, DRED ≥ 400 ms and a 28 kbit/s floor in `High`),
 relaxing after a 6 s dwell below 1 % / 5 % — `client.LossProfile`, `SetLossProfile(profile)`
 to pin / `SetLossProfile(null)` for automatic, `OnLossProfileChanged(profile, lossPercent)`,

@@ -231,10 +231,11 @@ pub enum Event {
         reason: String,
     },
     /// The uplink loss profile (FEC tuning / DRED tier chosen from the loss the server
-    /// measures on our packets) moved to another tier; already applied to the encoder.
+    /// measures on our packets or the worst of our receivers reports on its downlink,
+    /// whichever is higher) moved to another tier; already applied to the encoder.
     LossProfileChanged {
         profile: LossProfile,
-        /// The report that triggered the change (`0` when a session ended).
+        /// Loss the new profile protects against, percent (`0` when a session ended).
         uplink_loss_percent: f32,
     },
     /// The merged audio policy of the joined channels changed (join/leave or an operator
