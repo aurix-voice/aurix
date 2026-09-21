@@ -6,6 +6,13 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.2.0] — 2026-09-19
+
+First tagged release of the package (versioned together with the server). Everything below
+shipped under this number.
+
 ### Added
 
 - UPM package layout: `Documentation~/com.aurix.voice.md`, this changelog, `Editor/` assembly
@@ -37,10 +44,9 @@ server version it ships with (the repository is versioned as one unit).
 - Web SDK (which the WebGL client runs on): a rejected initial WebSocket handshake left the client in
   `connecting`; it now settles to `failed` and `ConnectAsync` rejects.
 
-## [1.2.0] — 2026-09-19
+### Baseline
 
-Version bump to 1.2.0; the 1.2 tree kept growing under this number afterwards, so this entry lists
-what the SDK contains at 1.2.x, newest first:
+Newest first, what the SDK contained before the sections above were added:
 
 - QUIC media path for the native core (`NativeOpusCodec` users) — the C# native transport stays
   on AURX/UDP with the WebSocket tunnel fallback.

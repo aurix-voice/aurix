@@ -121,9 +121,11 @@ gh attestation verify aurix-server-1.3.0-x86_64-unknown-linux-gnu.tar.gz --repo 
   Keyless signing publishes the signing certificate — containing the repository and workflow
   path — to the public Rekor transparency log; if that is unacceptable, remove the `cosign`
   steps or switch them to a key stored in a secret.
-* **Runners.** `ubuntu-22.04-arm` (aarch64 server/CLI/native core) is available for public
-  repositories and for organisations with ARM runners enabled; drop those matrix rows otherwise.
-  macOS and Windows runners build the native core and CLI.
+* **Runners.** `ubuntu-22.04-arm` (aarch64 server/CLI/native core and the `linux/arm64` image —
+  each image architecture is compiled on a runner of that architecture and the two are merged into
+  one manifest list, no QEMU) is available for public repositories and for organisations with ARM
+  runners enabled; drop those matrix rows otherwise. macOS and Windows runners build the native
+  core and CLI.
 * **GHCR.** The image is pushed to `ghcr.io/<repository owner>/aurix-server`; the package's
   visibility is set once, in the GitHub Packages UI.
 

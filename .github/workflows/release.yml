@@ -278,18 +278,24 @@ jobs:
           if-no-files-found: error
 
   image:
-    name: container image
+    name: container image (${{ matrix.platform }})
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            slug: linux-amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            slug: linux-arm64
+            os: ubuntu-22.04-arm
     permissions:
       contents: read
       packages: write
-      id-token: write
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: needs.verify.outputs.publish == 'true'
@@ -297,7 +303,67 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Each architecture compiles on a runner of that architecture (a Rust release build under
+      # QEMU takes hours); the per-arch images are pushed by digest and merged into one tagged
+      # manifest list by `image-manifest`.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=aurix-server
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha,scope=release-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.slug }}
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ needs.verify.outputs.publish == 'true' }}
+      - name: Export digest
+        if: needs.verify.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          name: image-digest-${{ matrix.slug }}
+          path: digests/*
+          if-no-files-found: error
+
+  image-manifest:
+    name: container image manifest, SBOM, signature
+    needs: [verify, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          pattern: image-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+        if: needs.verify.outputs.publish == 'true'
+      - uses: docker/login-action@v3
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: tags
+        if: needs.verify.outputs.publish == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
@@ -307,27 +373,28 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=v${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
             type=semver,pattern={{major}},value=v${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
             type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
-          labels: |
-            org.opencontainers.image.title=aurix-server
-            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
-            org.opencontainers.image.licenses=Apache-2.0
-      - id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ needs.verify.outputs.publish == 'true' }}
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: ${{ steps.tags.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
+      - name: Create the multi-arch manifest list
+        if: needs.verify.outputs.publish == 'true'
+        working-directory: digests
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+      - id: digest
+        if: needs.verify.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          [ -n "$digest" ]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
       - name: Image SBOM (CycloneDX)
         if: needs.verify.outputs.publish == 'true'
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.IMAGE }}@${{ steps.digest.outputs.digest }}
           format: cyclonedx-json
           output-file: aurix-server-${{ needs.verify.outputs.version }}.image.cdx.json
           upload-artifact: false
@@ -337,7 +404,7 @@ jobs:
         uses: sigstore/cosign-installer@v3
       - if: needs.verify.outputs.publish == 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
           cosign sign --yes "${IMAGE}@${DIGEST}"
@@ -351,7 +418,7 @@ jobs:
 
   publish:
     name: checksums, SBOM, signatures, GitHub release
-    needs: [verify, server, native, sdks, unreal-plugin, image]
+    needs: [verify, server, native, sdks, unreal-plugin, image-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -414,12 +481,12 @@ jobs:
             echo "cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \\"
             echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
-            echo "cosign verify ${IMAGE}@${{ needs.image.outputs.digest }} \\"
+            echo "cosign verify ${IMAGE}@${{ needs.image-manifest.outputs.digest }} \\"
             echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
             echo
-            echo "Image: \`${IMAGE}:${VERSION}\` (digest \`${{ needs.image.outputs.digest }}\`)."
+            echo "Image: \`${IMAGE}:${VERSION}\` (digest \`${{ needs.image-manifest.outputs.digest }}\`)."
           } > notes.md
           cat notes.md
       - uses: actions/upload-artifact@v4

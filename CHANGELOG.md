@@ -11,6 +11,14 @@ released together.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.2.0] - 2026-09-19
+
+First tagged release. The whole tree was versioned `1.2.0` while the features below were being
+built, so this section lists everything that shipped under the number; the *Fixed* items are
+defects found and repaired before the tag (CI on real runners, fuzzing, chaos runs).
+
 ### Added
 
 * Per-participant WebRTC downlink tracks (`media.webrtc_participant_streams`) with browser-side
@@ -52,6 +60,8 @@ released together.
 * Forwarded RTP sequence numbers keep short uplink gaps visible to receivers (concealment on the
   receiving side), collapsing only pauses and long jumps.
 * System `libopus-dev` is no longer required to build; `cmake` is.
+* The release workflow builds each container-image architecture on a runner of that
+  architecture and merges them into one manifest list instead of compiling under QEMU.
 
 ### Fixed
 
@@ -87,10 +97,9 @@ released together.
 * The media node publishes `SessionBound` before answering the bind, so observers never learn of
   a bind after the client already treats the session as bound.
 
-## [1.2.0] - 2026-09-19
+### Baseline
 
-First version with a shared version number across server, SDKs and chart. Highlights of what
-the repository contained at this point:
+What the repository already contained when the shared version number was introduced:
 
 * AURX v2 authenticated encryption for native media, signed `SessionBind`, session resume with
   one-time resume tokens, one-time action tokens.
