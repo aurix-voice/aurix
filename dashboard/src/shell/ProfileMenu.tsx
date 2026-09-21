@@ -42,7 +42,7 @@ export function ProfileMenu() {
       label: t("nav.profile"),
       icon: <UserRound className="size-3.5" />,
       separatorBefore: true,
-      onSelect: () => void navigate({ to: "/admin", search: { tab: "profile" } }),
+      onSelect: () => void navigate({ to: "/settings", search: { tab: "profile" } }),
     },
     {
       label: `${t("nav.language")}: ${locale === "ru" ? "Русский" : "English"}`,

@@ -76,7 +76,8 @@ export class AurixHttp {
     this.opts = options;
     const f = options.fetch ?? globalThis.fetch;
     if (typeof f !== "function") throw new Error("AurixClient: no fetch available; pass options.fetch");
-    this.fetchImpl = f;
+    // Browsers reject `fetch` called with a foreign `this` ("Illegal invocation").
+    this.fetchImpl = options.fetch ? f : (input, init) => globalThis.fetch(input, init);
   }
 
   /** Builds the absolute URL for `path` + `query` (nullish values are skipped, arrays repeat). */

@@ -21,7 +21,7 @@ import { cn } from "@/lib/cn";
 import { Logo } from "./Logo";
 
 interface NavItem {
-  to: "/" | "/nodes" | "/apps" | "/live" | "/moderation" | "/recordings" | "/analytics" | "/admin" | "/config";
+  to: "/" | "/nodes" | "/apps" | "/live" | "/moderation" | "/recordings" | "/analytics" | "/settings" | "/config";
   label: MessageKey;
   icon: ReactNode;
   perm?: T.AdminPermission;
@@ -49,7 +49,7 @@ const SECTIONS: Array<{ label: MessageKey; items: NavItem[] }> = [
   {
     label: "nav.section.system",
     items: [
-      { to: "/admin", label: "nav.admin", icon: <Users className="size-4" /> },
+      { to: "/settings", label: "nav.admin", icon: <Users className="size-4" /> },
       { to: "/config", label: "nav.config", icon: <FileCog className="size-4" />, perm: "config:read" },
     ],
   },

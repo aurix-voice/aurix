@@ -301,6 +301,79 @@ export function useUndrainNodeMutation(): UseMutationResult<T.MediaNode, unknown
   });
 }
 
+// ---- administration
+
+export function useAuthMethodsQuery(): UseQueryResult<T.AdminAuthMethods> {
+  const api = useAdminApi();
+  return useQuery({ queryKey: qk.authMethods, queryFn: () => api.adminAuthMethods(), staleTime: 60_000 });
+}
+
+export function useAdminsQuery(): UseQueryResult<T.Admin[]> {
+  const api = useAdminApi();
+  const { can } = useAuth();
+  return useQuery({
+    queryKey: qk.admins,
+    queryFn: async () => (await api.listAdmins()).data,
+    enabled: can("admins:manage"),
+    staleTime: 15_000,
+  });
+}
+
+function useAdminsMutation<Result, Vars>(fn: (api: AurixClient, vars: Vars) => Promise<Result>): UseMutationResult<Result, unknown, Vars> {
+  const api = useAdminApi();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: Vars) => fn(api, vars),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.admins }),
+  });
+}
+
+export function useCreateAdminMutation() {
+  return useAdminsMutation((api, body: T.CreateAdminRequest) => api.createAdmin(body));
+}
+export function useUpdateAdminMutation() {
+  return useAdminsMutation((api, v: { adminId: string; body: T.UpdateAdminRequest }) => api.updateAdmin(v.adminId, v.body));
+}
+export function useResetAdminPasswordMutation() {
+  return useAdminsMutation((api, v: { adminId: string; password: string }) => api.resetAdminPassword(v.adminId, { password: v.password }));
+}
+export function useRevokeAdminTokensMutation() {
+  return useAdminsMutation((api, v: { adminId: string }) => api.revokeAdminTokens(v.adminId));
+}
+
+export function useChangeOwnPasswordMutation(): UseMutationResult<T.TokensRevoked, unknown, T.ChangeOwnPasswordRequest> {
+  const api = useAdminApi();
+  return useMutation({ mutationFn: (body) => api.adminChangeOwnPassword(body) });
+}
+
+export function useLogoutAllMutation(): UseMutationResult<T.TokensRevoked, unknown, void> {
+  const api = useAdminApi();
+  return useMutation({ mutationFn: () => api.adminLogoutAll() });
+}
+
+export function useRetentionSweepMutation(): UseMutationResult<T.SweepReport, unknown, void> {
+  const api = useAdminApi();
+  return useMutation({ mutationFn: () => api.retentionSweep() });
+}
+
+export type AuditScope = "platform" | "app";
+
+/** Platform-wide audit log needs `audit:read`; the per-application view uses the delegated tenant route. */
+export function useAuditLogQuery(scope: AuditScope, params: { page: number; per_page: number }): UseQueryResult<T.AuditLogEntry[]> {
+  const admin = useAdminApi();
+  const tenant = useApi();
+  const { appId } = useAppScope();
+  const { can, canApp } = useAuth();
+  const app = scope === "app" ? appId : null;
+  return useQuery({
+    queryKey: qk.audit({ scope, app, ...params }),
+    queryFn: () => (scope === "app" ? tenant.listAuditLog(params) : admin.adminAuditLog(params)),
+    enabled: scope === "app" ? !!appId && canApp("audit:read") : can("audit:read"),
+    staleTime: 10_000,
+    placeholderData: (prev) => prev,
+  });
+}
+
 export interface RangeParams {
   from: string;
   to: string;

@@ -137,7 +137,7 @@ export const analyticsRoute = createRoute({
 });
 export const adminRoute = createRoute({
   getParentRoute: () => shellRoute,
-  path: "/admin",
+  path: "/settings",
   validateSearch: (s: Record<string, unknown>): { tab?: string } => ({ tab: typeof s.tab === "string" ? s.tab : undefined }),
   component: page(AdminPage),
 });
