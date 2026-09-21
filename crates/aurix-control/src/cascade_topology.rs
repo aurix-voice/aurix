@@ -447,6 +447,8 @@ mod tests {
             bandwidth_out_mbps: 0.0,
             healthy: true,
             last_heartbeat: Utc::now(),
+            version: "1.2.0".into(),
+            registered_at: None,
             capacity: 100,
             relay_only: false,
             drain: None,

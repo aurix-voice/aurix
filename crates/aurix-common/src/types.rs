@@ -1040,6 +1040,12 @@ pub struct MediaNodeInfo {
     pub bandwidth_out_mbps: f32,
     pub healthy: bool,
     pub last_heartbeat: DateTime<Utc>,
+    /// Aurix version the node runs (`CARGO_PKG_VERSION` of the server binary).
+    #[serde(default)]
+    pub version: String,
+    /// When the node first registered with the fleet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_at: Option<DateTime<Utc>>,
     pub capacity: u32,
     /// Pure cascade relay hub (`media.cascade_relay_only`): never hosts clients, never
     /// selected for sessions or failover, preferred as a regional hub for relay trees.

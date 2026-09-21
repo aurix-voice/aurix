@@ -309,14 +309,20 @@ type ActionTokenResponse struct {
 
 // ActiveMember is the `ActiveMember` schema.
 type ActiveMember struct {
-	ChannelID     string  `json:"channel_id"`
-	ChannelType   *string `json:"channel_type,omitempty"`
-	UserID        string  `json:"user_id"`
-	DisplayName   *string `json:"display_name,omitempty"`
+	// Membership row id.
+	ID          *string `json:"id,omitempty"`
+	ChannelID   string  `json:"channel_id"`
+	ChannelType *string `json:"channel_type,omitempty"`
+	UserID      string  `json:"user_id"`
+	// Current display name of the user; `null` only if the user row is missing.
+	DisplayName *string `json:"display_name,omitempty"`
+	// Node hosting the member's session; `null` when the session row is already gone.
+	MediaNodeID   *string `json:"media_node_id,omitempty"`
 	SessionID     string  `json:"session_id"`
 	Role          *string `json:"role,omitempty"`
 	IsMuted       *bool   `json:"is_muted,omitempty"`
 	IsServerMuted *bool   `json:"is_server_muted,omitempty"`
+	IsPriority    *bool   `json:"is_priority,omitempty"`
 	SSRC          *int64  `json:"ssrc,omitempty"`
 	JoinedAt      *string `json:"joined_at,omitempty"`
 }
@@ -2259,7 +2265,7 @@ type ListRegionsQuery struct {
 type ListChannelsQuery struct {
 	Page    *int64
 	PerPage *int64
-	// Only channels with participants.
+	// Only channels with participants; `total` then counts active channels.
 	ActiveOnly *bool
 }
 

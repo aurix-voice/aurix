@@ -6,6 +6,7 @@ import type { T } from "@/api/client";
 import {
   useAppAnalyticsQuery,
   useAppsQuery,
+  useChannelsQuery,
   useEventSnapshotQuery,
   useFleetUsageQuery,
   useModerationEventsQuery,
@@ -21,7 +22,7 @@ import { RangePicker, stepFor, useRange } from "@/components/RangePicker";
 import { useI18n } from "@/i18n";
 import { fmtCompact, fmtMos, fmtNumber, fmtPercent, fmtRelative, shortId } from "@/lib/format";
 import { PageHeader, QueryError } from "@/ui/Page";
-import { Badge, Card, CardHeader, EmptyState, IdChip, Progress, Skeleton, Stat, type Tone } from "@/ui/Primitives";
+import { Badge, Card, CardHeader, EmptyState, IdChip, Mono, Progress, Skeleton, Stat, type Tone } from "@/ui/Primitives";
 import { DataTable, type Column } from "@/ui/Table";
 
 interface Alert {
@@ -73,6 +74,7 @@ export default function OverviewPage() {
   const analytics = useAppAnalyticsQuery({ from: range.from, to: range.to, step });
   const quota = useQuotaQuery();
   const snapshot = useEventSnapshotQuery();
+  const activeChannels = useChannelsQuery({ page: 1, per_page: 50, active_only: true }, 30_000);
   const moderation = useModerationEventsQuery({ status: "pending", page: 1, per_page: 6 });
   const webhooks = useWebhooksQuery();
 
@@ -98,11 +100,26 @@ export default function OverviewPage() {
     };
   }, [fleet.data]);
 
-  const appName = useMemo(() => {
+  const appLabel = useMemo(() => {
     const m = new Map<string, T.App>();
     for (const a of apps.data ?? []) m.set(a.id, a);
-    return (id: string) => m.get(id)?.name ?? shortId(id);
-  }, [apps.data]);
+    return (id: string) => {
+      const known = m.get(id);
+      if (known) return <span className="font-medium">{known.name}</span>;
+      return (
+        <span className="inline-flex items-center gap-1.5">
+          <Mono title={id}>{shortId(id)}</Mono>
+          <Badge>{t("common.deleted")}</Badge>
+        </span>
+      );
+    };
+  }, [apps.data, t]);
+
+  const channelName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of activeChannels.data?.data ?? []) m.set(c.id, c.name);
+    return (id: string) => m.get(id);
+  }, [activeChannels.data]);
 
   const alerts = useMemo<Alert[]>(() => {
     const out: Alert[] = [];
@@ -146,7 +163,7 @@ export default function OverviewPage() {
 
   const appRows = useMemo(() => [...(fleet.data?.apps ?? [])].sort((a, b) => b.participant_minutes - a.participant_minutes).slice(0, 8), [fleet.data]);
   const appColumns: Column<T.FleetUsageAppsItem>[] = [
-    { key: "app", header: t("common.name"), cell: (r) => <span className="font-medium">{appName(r.app_id)}</span> },
+    { key: "app", header: t("common.name"), cell: (r) => appLabel(r.app_id) },
     { key: "peak", header: t("overview.peakSessions"), align: "right", cell: (r) => fmtNumber(locale, r.peak_sessions) },
     { key: "minutes", header: t("overview.participantMinutes"), align: "right", cell: (r) => fmtCompact(locale, r.participant_minutes) },
     { key: "mos", header: t("overview.mos"), align: "right", cell: (r) => <MosBadge mos={r.quality.mos_avg} /> },
@@ -340,7 +357,7 @@ export default function OverviewPage() {
                   <li key={c.channel_id ?? i} className="flex items-center gap-3 px-4 py-2 text-sm">
                     {c.channel_id ? (
                       <Link to="/live/$channelId" params={{ channelId: c.channel_id }} search={{}} className="min-w-0 flex-1 truncate hover:underline">
-                        <IdChip id={c.channel_id} />
+                        {channelName(c.channel_id) ? <span className="font-medium">{channelName(c.channel_id)}</span> : <IdChip id={c.channel_id} />}
                       </Link>
                     ) : (
                       <span className="flex-1" />
@@ -382,4 +399,3 @@ export default function OverviewPage() {
     </div>
   );
 }
-

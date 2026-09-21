@@ -61,6 +61,14 @@ released together.
 
 * Live `ChatMessageReceived.sent_at` is now truncated to microseconds — the precision
   PostgreSQL stores — so a cursor built from a live message matches the stored row.
+* `GET /v1/channels?active_only=true` returned `total` for *all* channels of the app, so
+  clients paginated over pages that did not exist; `total` now counts active channels.
+* `GET /v1/nodes` reports each node's `version` and `registered_at`; the node registers with its
+  package version so fleet views can show version skew.
+* `GET /v1/channels/{id}/participants` memberships now carry `display_name`, `media_node_id`,
+  `is_priority` and the membership `id`, so participants hosted on another node are no longer
+  anonymous to operators; `GET /v1/analytics/usage` totals now include the raw quality
+  counters the OpenAPI schema already declared.
 
 * `NetworkQuality.receivers_loss_percent` — the worst downlink loss any local receiver of a
   session's audio reported over its last interval. The node pushes a `NetworkQuality` as soon as

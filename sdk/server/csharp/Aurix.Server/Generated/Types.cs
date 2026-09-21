@@ -414,6 +414,12 @@ public sealed record ActionTokenResponse
 
 public sealed record ActiveMember
 {
+    /// <summary>
+    /// Membership row id.
+    /// </summary>
+    [JsonPropertyName("id")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Id { get; init; }
+
     [JsonPropertyName("channel_id")]
     public required string ChannelId { get; init; }
 
@@ -423,8 +429,17 @@ public sealed record ActiveMember
     [JsonPropertyName("user_id")]
     public required string UserId { get; init; }
 
+    /// <summary>
+    /// Current display name of the user; `null` only if the user row is missing.
+    /// </summary>
     [JsonPropertyName("display_name")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DisplayName { get; init; }
+
+    /// <summary>
+    /// Node hosting the member's session; `null` when the session row is already gone.
+    /// </summary>
+    [JsonPropertyName("media_node_id")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? MediaNodeId { get; init; }
 
     [JsonPropertyName("session_id")]
     public required string SessionId { get; init; }
@@ -437,6 +452,9 @@ public sealed record ActiveMember
 
     [JsonPropertyName("is_server_muted")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? IsServerMuted { get; init; }
+
+    [JsonPropertyName("is_priority")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? IsPriority { get; init; }
 
     [JsonPropertyName("ssrc")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? Ssrc { get; init; }
@@ -4548,7 +4566,7 @@ public sealed record ListChannelsQuery
     public long? Page { get; init; }
     public long? PerPage { get; init; }
     /// <summary>
-    /// Only channels with participants.
+    /// Only channels with participants; `total` then counts active channels.
     /// </summary>
     public bool? ActiveOnly { get; init; }
 }

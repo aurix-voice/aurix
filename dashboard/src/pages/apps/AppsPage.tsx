@@ -7,17 +7,19 @@ import { useAppsQuery, useCreateAppMutation } from "@/api/hooks";
 import { useAppScope } from "@/api/scope";
 import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
-import { fmtDateTime, fmtNumber } from "@/lib/format";
+import { fmtDate, fmtDateTime, fmtNumber } from "@/lib/format";
 import { Button } from "@/ui/Button";
 import { FormDialog } from "@/ui/Dialog";
 import { Input } from "@/ui/Input";
 import { PageHeader, QueryError, Toolbar } from "@/ui/Page";
 import { Badge, Card, EmptyState, IdChip } from "@/ui/Primitives";
-import { DataTable, sortRows, type Column, type SortState } from "@/ui/Table";
+import { DataTable, Pager, sortRows, type Column, type SortState } from "@/ui/Table";
 import { useToast } from "@/ui/Toast";
 
 import { AppFormFields, EMPTY_APP_FORM, parseLimit, type AppFormValues } from "./AppForm";
 import { SecretReveal } from "./SecretReveal";
+
+const APPS_PAGE_SIZE = 25;
 
 function limitText(locale: "en" | "ru", v: number | undefined, unlimitedLabel: string): string {
   if (v === undefined || v === null) return "—";
@@ -35,6 +37,7 @@ export default function AppsPage() {
 
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<SortState | null>({ key: "created", dir: "desc" });
+  const [page, setPage] = useState(1);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState<AppFormValues>(EMPTY_APP_FORM);
   const [created, setCreated] = useState<T.CreatedApp | null>(null);
@@ -48,7 +51,7 @@ export default function AppsPage() {
         cell: (a) => (
           <div className="flex flex-col min-w-0">
             <span className="font-medium truncate">{a.name}</span>
-            {a.description ? <span className="text-xs text-fg-muted truncate max-w-md">{a.description}</span> : null}
+            {a.description ? <span className="text-xs text-fg-muted truncate max-w-[16rem]">{a.description}</span> : null}
           </div>
         ),
       },
@@ -68,21 +71,21 @@ export default function AppsPage() {
       },
       {
         key: "ccu",
-        header: t("apps.maxConcurrentSessions"),
+        header: t("apps.col.ccu"),
         align: "right",
         sort: (a) => a.max_concurrent_sessions ?? 0,
         cell: (a) => <span className="tabular">{limitText(locale, a.max_concurrent_sessions, t("common.unlimited"))}</span>,
       },
       {
         key: "minutes",
-        header: t("apps.monthlyParticipantMinutes"),
+        header: t("apps.col.minutes"),
         align: "right",
         sort: (a) => a.monthly_participant_minutes ?? 0,
         cell: (a) => <span className="tabular">{limitText(locale, a.monthly_participant_minutes, t("common.unlimited"))}</span>,
       },
       {
         key: "channels",
-        header: t("apps.maxChannels"),
+        header: t("apps.col.channels"),
         align: "right",
         sort: (a) => a.max_channels ?? 0,
         cell: (a) => <span className="tabular">{limitText(locale, a.max_channels, t("common.unlimited"))}</span>,
@@ -91,7 +94,7 @@ export default function AppsPage() {
         key: "created",
         header: t("common.created"),
         sort: (a) => Date.parse(a.created_at),
-        cell: (a) => <span className="text-fg-muted whitespace-nowrap">{fmtDateTime(locale, a.created_at)}</span>,
+        cell: (a) => <span className="text-fg-muted whitespace-nowrap" title={fmtDateTime(locale, a.created_at)}>{fmtDate(locale, a.created_at)}</span>,
       },
       {
         key: "scope",
@@ -120,6 +123,9 @@ export default function AppsPage() {
     const list = (apps.data ?? []).filter((a) => !q || a.name.toLowerCase().includes(q) || a.id.startsWith(q) || (a.description ?? "").toLowerCase().includes(q));
     return sortRows(list, columns, sort);
   }, [apps.data, search, columns, sort]);
+  const pages = Math.max(1, Math.ceil(rows.length / APPS_PAGE_SIZE));
+  const current = Math.min(page, pages);
+  const pageRows = useMemo(() => rows.slice((current - 1) * APPS_PAGE_SIZE, current * APPS_PAGE_SIZE), [rows, current]);
 
   const submit = async () => {
     const name = form.name.trim();
@@ -165,18 +171,31 @@ export default function AppsPage() {
 
       <Card>
         <Toolbar end={<span className="text-xs text-fg-muted tabular">{t("common.count.items", { n: rows.length })}</span>}>
-          <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t("common.search")} className="w-64" aria-label={t("common.search")} />
+          <Input
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            placeholder={t("common.search")}
+            className="w-64"
+            aria-label={t("common.search")}
+          />
         </Toolbar>
         <DataTable
-          rows={rows}
+          rows={pageRows}
           columns={columns}
           rowKey={(a) => a.id}
           loading={apps.isPending}
           error={apps.isError ? <QueryError error={apps.error} onRetry={() => void apps.refetch()} compact /> : undefined}
           sort={sort}
-          onSortChange={setSort}
+          onSortChange={(s) => {
+            setSort(s);
+            setPage(1);
+          }}
           selectedKey={scopeId}
           onRowClick={(a) => void navigate({ to: "/apps/$appId", params: { appId: a.id }, search: {} })}
+          footer={rows.length > APPS_PAGE_SIZE ? <Pager page={current} pages={pages} hasPrev={current > 1} hasNext={current < pages} onPage={(d) => setPage(current + d)} total={rows.length} /> : undefined}
           empty={
             <EmptyState
               compact

@@ -144,14 +144,20 @@ export interface ActionTokenResponse {
 }
 
 export interface ActiveMember {
+  /** Membership row id. */
+  id?: string;
   channel_id: string;
   channel_type?: string;
   user_id: string;
+  /** Current display name of the user; `null` only if the user row is missing. */
   display_name?: string;
+  /** Node hosting the member's session; `null` when the session row is already gone. */
+  media_node_id?: string;
   session_id: string;
   role?: string;
   is_muted?: boolean;
   is_server_muted?: boolean;
+  is_priority?: boolean;
   ssrc?: number;
   joined_at?: string;
 }
@@ -2112,7 +2118,7 @@ export interface ListRegionsQuery {
 export interface ListChannelsQuery {
   page?: number;
   per_page?: number;
-  /** Only channels with participants. */
+  /** Only channels with participants; `total` then counts active channels. */
   active_only?: boolean;
 }
 

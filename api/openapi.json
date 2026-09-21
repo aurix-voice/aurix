@@ -2034,7 +2034,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Only channels with participants."
+            "description": "Only channels with participants; `total` then counts active channels."
           }
         ],
         "responses": {
@@ -8330,6 +8330,11 @@
       "ActiveMember": {
         "type": "object",
         "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Membership row id."
+          },
           "channel_id": {
             "type": "string",
             "format": "uuid"
@@ -8342,7 +8347,15 @@
             "format": "uuid"
           },
           "display_name": {
-            "type": "string"
+            "type": "string",
+            "nullable": true,
+            "description": "Current display name of the user; `null` only if the user row is missing."
+          },
+          "media_node_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Node hosting the member's session; `null` when the session row is already gone."
           },
           "session_id": {
             "type": "string",
@@ -8355,6 +8368,9 @@
             "type": "boolean"
           },
           "is_server_muted": {
+            "type": "boolean"
+          },
+          "is_priority": {
             "type": "boolean"
           },
           "ssrc": {

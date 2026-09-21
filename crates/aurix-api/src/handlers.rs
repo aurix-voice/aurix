@@ -16,6 +16,7 @@ use axum::{
 use base64::Engine;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 type JsonResult = Result<Json<serde_json::Value>, ApiError>;
@@ -664,20 +665,26 @@ pub async fn list_channels(
     ctx.require("channels:read")?;
     let app_id = ctx.app_id;
     let (limit, offset) = paging(query.page, query.per_page);
-    let channels = if query.active_only.unwrap_or(false) {
-        state
-            .control
-            .channels
-            .list_active_channels(app_id, limit, offset)
-            .await?
+    let active_only = query.active_only.unwrap_or(false);
+    let (channels, total) = if active_only {
+        (
+            state
+                .control
+                .channels
+                .list_active_channels(app_id, limit, offset)
+                .await?,
+            state.control.channels.count_active_channels(app_id).await?,
+        )
     } else {
-        state
-            .control
-            .channels
-            .list_channels(app_id, limit, offset)
-            .await?
+        (
+            state
+                .control
+                .channels
+                .list_channels(app_id, limit, offset)
+                .await?,
+            state.control.channels.count_channels(app_id).await?,
+        )
     };
-    let total = state.control.channels.count_channels(app_id).await?;
     Ok(Json(
         serde_json::json!({ "data": channels, "page": query.page, "per_page": limit, "total": total }),
     ))
@@ -792,6 +799,34 @@ pub async fn get_channel_participants(
         .sessions
         .get_channel_members(app_id, channel_id)
         .await?;
+    let roster: HashMap<Uuid, aurix_db::models::ChannelRosterRow> = state
+        .control
+        .sessions
+        .get_channel_roster(app_id, channel_id)
+        .await?
+        .into_iter()
+        .map(|r| (r.session_id, r))
+        .collect();
+    let members: Vec<serde_json::Value> = members
+        .into_iter()
+        .map(|m| {
+            let r = roster.get(&m.session_id);
+            serde_json::json!({
+                "id": m.id,
+                "channel_id": m.channel_id,
+                "user_id": m.user_id,
+                "session_id": m.session_id,
+                "display_name": r.map(|r| r.display_name.as_str()),
+                "media_node_id": r.map(|r| r.media_node_id),
+                "role": m.role,
+                "is_muted": m.is_muted,
+                "is_server_muted": m.is_server_muted,
+                "is_priority": m.is_priority,
+                "ssrc": m.ssrc,
+                "joined_at": m.joined_at,
+            })
+        })
+        .collect();
     let live: Vec<serde_json::Value> = {
         let sfu = state.sfu.read();
         sfu.get_channel_participants(&channel_id)

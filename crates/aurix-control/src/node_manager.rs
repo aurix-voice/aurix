@@ -100,6 +100,8 @@ impl NodeManager {
             bandwidth_out_mbps: row.bandwidth_out_mbps as f32,
             healthy: row.healthy && age <= HEARTBEAT_TIMEOUT_SECS,
             last_heartbeat: row.last_heartbeat,
+            version: row.version.clone(),
+            registered_at: Some(row.registered_at),
             capacity: row.capacity.max(0) as u32,
             relay_only: row.relay_only,
             drain: Self::drain_from_row(row),
@@ -140,9 +142,13 @@ impl NodeManager {
             drain_reason: info.drain.as_ref().and_then(|d| d.reason.clone()),
             draining_since: info.drain.as_ref().map(|d| d.since),
             drained_by: info.drain.as_ref().and_then(|d| d.by),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: if info.version.is_empty() {
+                env!("CARGO_PKG_VERSION").to_string()
+            } else {
+                info.version.clone()
+            },
             last_heartbeat: Utc::now(),
-            registered_at: Utc::now(),
+            registered_at: info.registered_at.unwrap_or_else(Utc::now),
         }
     }
 
@@ -450,6 +456,8 @@ mod tests {
             bandwidth_out_mbps: 0.0,
             healthy: true,
             last_heartbeat: Utc::now(),
+            version: "1.2.0".into(),
+            registered_at: None,
             capacity: 100,
             relay_only: false,
             drain: None,

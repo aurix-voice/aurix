@@ -18,7 +18,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { MosBadge, TimeSeriesChart, chart, type Point } from "@/components/charts";
 import { EventFeed } from "@/components/EventFeed";
 import { useI18n } from "@/i18n";
-import { fmtBytes, fmtDateTime, fmtMos, fmtNumber, fmtPercent, fmtRelative } from "@/lib/format";
+import { fmtBytes, fmtDateTime, fmtMos, fmtNumber, fmtPercent, fmtRelative, shortId } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { BanDialog } from "@/pages/moderation/BanDialog";
 import { channelRoute } from "@/router";
@@ -57,6 +57,7 @@ interface ParticipantRow {
   quality?: T.NetworkQuality | null;
   joined_at?: string;
   live: boolean;
+  node_id?: string | null;
 }
 
 function mergeParticipants(p: T.ChannelParticipants | undefined): ParticipantRow[] {
@@ -78,6 +79,7 @@ function mergeParticipants(p: T.ChannelParticipants | undefined): ParticipantRow
       quality: l?.quality,
       joined_at: m.joined_at,
       live: Boolean(l),
+      node_id: m.media_node_id,
     };
   });
   for (const l of live.values()) {
@@ -328,9 +330,12 @@ function ParticipantsTable({
           {r.is_speaking ? <Badge tone="ok">{t("live.speakingNow")}</Badge> : null}
           {r.role && r.role !== "speaker" ? <Badge tone="neutral">{r.role}</Badge> : null}
           {!r.live ? (
-            <Tip content={t("live.otherNode.hint")}>
+            <Tip content={r.node_id ? `${t("live.otherNode.hint")} (${r.node_id})` : t("live.otherNode.hint")}>
               <span>
-                <Badge tone="neutral">{t("live.otherNode")}</Badge>
+                <Badge tone="neutral">
+                  {t("live.otherNode")}
+                  {r.node_id ? <span className="font-mono ml-1 opacity-70">{shortId(r.node_id)}</span> : null}
+                </Badge>
               </span>
             </Tip>
           ) : null}

@@ -317,7 +317,7 @@ function QualityTab({ range }: { range: Range }) {
       cell: (s) => (s.quality.mos_alerts > 0 ? <span className="text-danger tabular">{s.quality.mos_alerts}</span> : <span className="text-fg-faint">0</span>),
     },
     { key: "bars", header: t("analytics.bars"), cell: (s) => <Bars bars={s.quality.bars} /> },
-    { key: "node", header: t("common.node"), cell: (s) => (s.media_node_id ? <Mono>{s.media_node_id}</Mono> : "—") },
+    { key: "node", header: t("common.node"), cell: (s) => (s.media_node_id ? <Mono title={s.media_node_id}>{shortId(s.media_node_id)}</Mono> : "—") },
     { key: "connected", header: t("analytics.connected"), sort: (s) => s.connected_at, cell: (s) => <span title={fmtDateTime(locale, s.connected_at)}>{fmtRelative(locale, s.connected_at, now)}</span> },
   ];
 
@@ -331,14 +331,14 @@ function QualityTab({ range }: { range: Range }) {
           </Button>
         }
       >
-        <NativeSelect value={String(minSamples)} onChange={(e) => setMinSamples(Number(e.target.value))} className="h-8">
+        <NativeSelect value={String(minSamples)} onChange={(e) => setMinSamples(Number(e.target.value))} className="h-8 w-auto">
           {MIN_SAMPLES.map((n) => (
             <option key={n} value={n}>
               {t("analytics.minSamples", { n })}
             </option>
           ))}
         </NativeSelect>
-        <NativeSelect value={String(limit)} onChange={(e) => setLimit(Number(e.target.value))} className="h-8">
+        <NativeSelect value={String(limit)} onChange={(e) => setLimit(Number(e.target.value))} className="h-8 w-auto">
           {LIMITS.map((n) => (
             <option key={n} value={n}>
               {t("analytics.top", { n })}
@@ -502,7 +502,7 @@ function ChannelsTab({ range }: { range: Range }) {
         }
       >
         <span className="text-xs text-fg-muted">{t("analytics.rankBy")}</span>
-        <NativeSelect value={sortKey} onChange={(e) => setSortKey(CHANNEL_SORTS.find((k) => k === e.target.value) ?? "participant_minutes")} className="h-8">
+        <NativeSelect value={sortKey} onChange={(e) => setSortKey(CHANNEL_SORTS.find((k) => k === e.target.value) ?? "participant_minutes")} className="h-8 w-auto">
           {CHANNEL_SORTS.map((k) => (
             <option key={k} value={k}>
               {t(`analytics.rank.${k}`)}

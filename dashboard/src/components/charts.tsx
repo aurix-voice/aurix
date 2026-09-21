@@ -35,6 +35,21 @@ function tickFormatter(locale: Locale, spanMs: number) {
   return (v: number) => (spanMs > 2 * 86_400_000 ? fmtDateTime(locale, new Date(v).toISOString()).replace(/,? \d{2}:\d{2}.*$/, "") : fmtTime(locale, v));
 }
 
+/** Axis ticks must fit a 44px gutter: 1200 → "1.2k", 3_500_000 → "3.5M". */
+export function compactTick(v: number): string {
+  const abs = Math.abs(v);
+  if (abs < 1000) return Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/\.?0+$/, "");
+  const units = ["k", "M", "G", "T"];
+  let n = abs;
+  let i = -1;
+  while (n >= 1000 && i < units.length - 1) {
+    n /= 1000;
+    i++;
+  }
+  const s = n >= 100 ? n.toFixed(0) : n.toFixed(1).replace(/\.0$/, "");
+  return `${v < 0 ? "-" : ""}${s}${units[i]}`;
+}
+
 function ChartTooltip({ active, payload, label, series, locale }: Partial<TooltipContentProps<ValueType, NameType>> & { series: SeriesDef[]; locale: Locale }) {
   if (!active || !payload?.length || typeof label !== "number") return null;
   return (
@@ -95,9 +110,9 @@ export function TimeSeriesChart({
           tickLine={false}
           minTickGap={40}
         />
-        <YAxis yAxisId="left" tick={{ fontSize: 11, fill: chart.faint }} axisLine={false} tickLine={false} width={44} domain={leftDomain} allowDecimals={false} />
+        <YAxis yAxisId="left" tick={{ fontSize: 11, fill: chart.faint }} axisLine={false} tickLine={false} width={44} domain={leftDomain} allowDecimals={false} tickFormatter={compactTick} />
         {hasRight ? (
-          <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11, fill: chart.faint }} axisLine={false} tickLine={false} width={44} domain={rightDomain} />
+          <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11, fill: chart.faint }} axisLine={false} tickLine={false} width={44} domain={rightDomain} tickFormatter={compactTick} />
         ) : null}
         <Tooltip content={(p) => <ChartTooltip {...p} series={series} locale={locale} />} cursor={{ stroke: chart.grid }} />
         {series.map((s) =>

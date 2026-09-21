@@ -113,7 +113,7 @@ function Recordings() {
     },
     { key: "started", header: t("recordings.started"), sort: (r) => r.started_at, cell: (r) => <span title={fmtDateTime(locale, r.started_at)}>{fmtRelative(locale, r.started_at, now)}</span> },
     { key: "duration", header: t("recordings.duration"), align: "right", sort: (r) => r.duration_secs ?? -1, cell: (r) => (r.duration_secs === undefined ? "—" : fmtDuration(locale, r.duration_secs)) },
-    { key: "size", header: t("recordings.size"), align: "right", sort: (r) => r.file_size_bytes ?? -1, cell: (r) => (r.file_size_bytes === undefined ? "—" : fmtBytes(locale, r.file_size_bytes)) },
+    { key: "size", header: t("recordings.size"), align: "right", sort: (r) => r.file_size_bytes ?? -1, cell: (r) => (r.file_size_bytes === undefined ? "—" : <span className="whitespace-nowrap tabular">{fmtBytes(locale, r.file_size_bytes)}</span>) },
     { key: "format", header: t("recordings.format"), cell: (r) => <span className="text-fg-muted">{r.format === "wav" ? "WAV" : "Opus"}</span> },
     { key: "expires", header: t("recordings.expires"), sort: (r) => r.expires_at, cell: (r) => <span title={fmtDateTime(locale, r.expires_at)}>{fmtRelative(locale, r.expires_at, now)}</span> },
   ];
@@ -188,7 +188,7 @@ function Recordings() {
             ))}
           </NativeSelect>
           <Input value={channelInput} onChange={(e) => setChannel(e.target.value)} placeholder={t("recordings.filter.channel")} className="h-8 w-72 font-mono text-[12.5px]" spellCheck={false} />
-          <NativeSelect value={filter.kind} onChange={(e) => setFilter((f) => ({ ...f, kind: RECORDING_KINDS.find((k) => k === e.target.value) ?? "" }))} className="h-8">
+          <NativeSelect value={filter.kind} onChange={(e) => setFilter((f) => ({ ...f, kind: RECORDING_KINDS.find((k) => k === e.target.value) ?? "" }))} className="h-8 w-auto">
             <option value="">
               {t("recordings.filter.kind")}: {t("common.all")}
             </option>
@@ -198,7 +198,7 @@ function Recordings() {
               </option>
             ))}
           </NativeSelect>
-          <NativeSelect value={filter.status} onChange={(e) => setFilter((f) => ({ ...f, status: RECORDING_STATUSES.find((k) => k === e.target.value) ?? "" }))} className="h-8">
+          <NativeSelect value={filter.status} onChange={(e) => setFilter((f) => ({ ...f, status: RECORDING_STATUSES.find((k) => k === e.target.value) ?? "" }))} className="h-8 w-auto">
             <option value="">
               {t("recordings.filter.status")}: {t("common.all")}
             </option>

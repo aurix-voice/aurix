@@ -1132,6 +1132,8 @@ impl SfuNode {
             bandwidth_out_mbps: 0.0,
             healthy: true,
             last_heartbeat: Utc::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            registered_at: None,
             capacity: self.options.max_participants,
             relay_only: false,
             drain: None,

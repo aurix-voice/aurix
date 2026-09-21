@@ -13,7 +13,7 @@ import { ConfirmDialog, Dialog, FormDialog } from "@/ui/Dialog";
 import { Input, Textarea } from "@/ui/Input";
 import { Segmented } from "@/ui/Menu";
 import { PageHeader, QueryError, Toolbar } from "@/ui/Page";
-import { Badge, Callout, Card, CardHeader, EmptyState, Field, KV, Mono, Progress, Stat, Tip, type Tone } from "@/ui/Primitives";
+import { Badge, Callout, Card, CardHeader, EmptyState, Field, IdChip, KV, Mono, Progress, Stat, Tip, type Tone } from "@/ui/Primitives";
 import { DataTable, sortRows, type Column, type SortState } from "@/ui/Table";
 import { useToast } from "@/ui/Toast";
 
@@ -39,14 +39,14 @@ function nodeState(n: T.MediaNode): { tone: Tone; key: "nodes.healthy" | "nodes.
 
 function Mbps({ v }: { v: number | undefined }) {
   const { locale } = useI18n();
-  return <span className="tabular">{v === undefined ? "—" : `${fmtNumber(locale, v, v < 10 ? 1 : 0)} Mbps`}</span>;
+  return <span className="tabular whitespace-nowrap">{v === undefined ? "—" : `${fmtNumber(locale, v, v < 10 ? 1 : 0)} Mbps`}</span>;
 }
 
 function Pct({ v }: { v: number | undefined }) {
   const { locale } = useI18n();
   if (v === undefined) return <span className="text-fg-faint">—</span>;
   return (
-    <span className="inline-flex items-center gap-2">
+    <span className="inline-flex items-center gap-2 whitespace-nowrap">
       <Progress value={v} max={100} tone={pctTone(v)} className="w-12" />
       <span className="tabular text-xs">{fmtPercent(locale, v, 0)}</span>
     </span>
@@ -128,11 +128,14 @@ export default function NodesPage() {
       header: t("common.node"),
       sort: (n) => n.id,
       cell: (n) => (
-        <span className="inline-flex min-w-0 items-center gap-1.5">
-          <Mono className="truncate">{n.id}</Mono>
-          {n.id === selfId ? <Badge tone="accent">{t("nodes.self")}</Badge> : null}
-          {n.relay_only ? <Badge>{t("nodes.relayOnly")}</Badge> : null}
-        </span>
+        <div className="flex flex-col gap-0.5 min-w-0">
+          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+            <IdChip id={n.id} />
+            {n.id === selfId ? <Badge tone="accent">{t("nodes.self")}</Badge> : null}
+            {n.relay_only ? <Badge>{t("nodes.relayOnly")}</Badge> : null}
+          </span>
+          <span className="text-xs text-fg-muted truncate">{n.api_url ?? n.address}</span>
+        </div>
       ),
     },
     { key: "region", header: t("common.region"), sort: (n) => n.region, cell: (n) => n.region },
@@ -156,7 +159,7 @@ export default function NodesPage() {
       cell: (n) => {
         const pct = loadPct(n);
         return (
-          <span className="inline-flex items-center gap-2">
+          <span className="inline-flex items-center gap-2 whitespace-nowrap">
             <Progress value={n.active_participants ?? 0} max={n.capacity} tone={pctTone(pct)} className="w-16" />
             <span className="tabular text-xs">
               {fmtNumber(locale, n.active_participants ?? 0)}
@@ -167,19 +170,32 @@ export default function NodesPage() {
       },
     },
     { key: "channels", header: t("nodes.channels"), align: "right", sort: (n) => n.active_channels ?? 0, cell: (n) => fmtNumber(locale, n.active_channels ?? 0) },
-    { key: "cpu", header: t("nodes.cpu"), sort: (n) => n.cpu_usage ?? -1, cell: (n) => <Pct v={n.cpu_usage} /> },
-    { key: "mem", header: t("nodes.memory"), sort: (n) => n.memory_usage ?? -1, cell: (n) => <Pct v={n.memory_usage} /> },
+    {
+      key: "res",
+      header: `${t("nodes.cpu")} / ${t("nodes.memory")}`,
+      sort: (n) => Math.max(n.cpu_usage ?? -1, n.memory_usage ?? -1),
+      cell: (n) => (
+        <span className="flex flex-col gap-0.5">
+          <Pct v={n.cpu_usage} />
+          <Pct v={n.memory_usage} />
+        </span>
+      ),
+    },
     {
       key: "bw",
       header: t("nodes.bandwidth"),
       align: "right",
       sort: (n) => (n.bandwidth_in_mbps ?? 0) + (n.bandwidth_out_mbps ?? 0),
       cell: (n) => (
-        <span className="text-xs">
-          <span className="text-fg-faint">{t("nodes.in")} </span>
-          <Mbps v={n.bandwidth_in_mbps} />
-          <span className="text-fg-faint"> · {t("nodes.out")} </span>
-          <Mbps v={n.bandwidth_out_mbps} />
+        <span className="flex flex-col gap-0.5 text-xs whitespace-nowrap">
+          <span>
+            <span className="text-fg-faint">{t("nodes.in")} </span>
+            <Mbps v={n.bandwidth_in_mbps} />
+          </span>
+          <span>
+            <span className="text-fg-faint">{t("nodes.out")} </span>
+            <Mbps v={n.bandwidth_out_mbps} />
+          </span>
         </span>
       ),
     },

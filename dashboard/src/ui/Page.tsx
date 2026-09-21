@@ -1,7 +1,7 @@
-import { AlertTriangle, RefreshCw } from "lucide-react";
+import { AlertTriangle, PowerOff, RefreshCw } from "lucide-react";
 import type { ReactNode } from "react";
 
-import { errorMessage } from "@/api/client";
+import { errorCode, errorMessage } from "@/api/client";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/cn";
 
@@ -35,6 +35,9 @@ export function Toolbar({ children, className, end }: { children?: ReactNode; cl
 export function QueryError({ error, onRetry, compact }: { error: unknown; onRetry?: () => void; compact?: boolean }) {
   const { t, locale } = useI18n();
   const msg = errorMessage(error, locale);
+  if (errorCode(error) === "INVALID_CONFIG") {
+    return <EmptyState compact={compact} icon={<PowerOff className="size-6" strokeWidth={1.5} />} title={t("error.featureDisabled")} description={msg} />;
+  }
   if (compact) {
     return (
       <Callout

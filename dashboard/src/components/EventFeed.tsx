@@ -83,8 +83,9 @@ export function EventFeed({ channelId, className, height = 420, title, descripti
   return (
     <Card className={cn("flex flex-col", className)}>
       <CardHeader
+        className="flex-wrap"
         title={
-          <span className="inline-flex items-center gap-2">
+          <span className="inline-flex items-center gap-2 whitespace-nowrap">
             <Radio className={cn("size-3.5", state === "live" ? "text-ok" : "text-fg-faint")} />
             {title ?? t("live.events")}
           </span>
@@ -92,7 +93,7 @@ export function EventFeed({ channelId, className, height = 420, title, descripti
         description={description ?? t("live.events.desc")}
         actions={
           <>
-            <NativeSelect value={filter} onChange={(e) => setFilter(e.target.value)} className="h-7 text-xs w-32" aria-label={t("live.events.filter")}>
+            <NativeSelect value={filter} onChange={(e) => setFilter(e.target.value)} className="h-7 text-xs w-28" aria-label={t("live.events.filter")}>
               <option value="">{t("common.all")}</option>
               {heads.map((h) => (
                 <option key={h} value={h + "."}>
