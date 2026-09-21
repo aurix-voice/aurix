@@ -496,10 +496,6 @@ jobs:
         if: failure()
         run: tail -n 200 server.log
 
-  docs:
-    name: OpenAPI + mdBook
-    runs-on: ubuntu-latest
-
   unreal:
     name: Unreal plugin (static checks; BuildPlugin only with UE container access)
     runs-on: ubuntu-latest
