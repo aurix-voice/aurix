@@ -389,3 +389,179 @@ export function useWebhooksQuery(): UseQueryResult<T.ListWebhooksResponse> {
     staleTime: 30_000,
   });
 }
+
+// ---- Live: channels, participants, sessions (selected application)
+
+export function useChannelsQuery(params: T.ListChannelsQuery, refetchInterval: number | false = 15_000): UseQueryResult<T.ChannelList> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("channels:read");
+  return useQuery({
+    queryKey: [...qk.channels(appId ?? ""), "list", { ...params }],
+    queryFn: () => api.listChannels(params),
+    enabled,
+    refetchInterval,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useChannelQuery(channelId: string): UseQueryResult<T.Channel> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("channels:read");
+  return useQuery({
+    queryKey: qk.channel(appId ?? "", channelId),
+    queryFn: () => api.getChannel(channelId),
+    enabled,
+    staleTime: 10_000,
+  });
+}
+
+export function useChannelParticipantsQuery(channelId: string, refetchInterval: number | false = 5_000): UseQueryResult<T.ChannelParticipants> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("channels:read");
+  return useQuery({
+    queryKey: qk.channelParticipants(appId ?? "", channelId),
+    queryFn: () => api.getChannelParticipants(channelId),
+    enabled,
+    refetchInterval,
+    placeholderData: (prev) => prev,
+  });
+}
+
+/** Node-local: only sessions whose media is on the node answering the API succeed (404 otherwise). */
+export function useSessionStatsQuery(sessionId: string | null, refetchInterval: number | false = 2_000): UseQueryResult<T.SessionStats> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("channels:read");
+  return useQuery({
+    queryKey: qk.sessionStats(appId ?? "", sessionId ?? ""),
+    queryFn: () => api.getSessionStats(sessionId ?? ""),
+    enabled: enabled && !!sessionId,
+    refetchInterval,
+    retry: false,
+  });
+}
+
+export function useChannelStreamsQuery(channelId: string): UseQueryResult<T.ListChannelStreamsResponse> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("audio_streams:read");
+  return useQuery({
+    queryKey: [...qk.channel(appId ?? "", channelId), "streams"],
+    queryFn: () => api.listChannelStreams(channelId),
+    enabled,
+    refetchInterval: 10_000,
+  });
+}
+
+export function useUsersQuery(params: T.SearchUsersQuery, enabledOverride = true): UseQueryResult<T.User[]> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("users:read");
+  return useQuery({
+    queryKey: qk.users(appId ?? "", { ...params }),
+    queryFn: () => api.searchUsers(params),
+    enabled: enabled && enabledOverride,
+    staleTime: 15_000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useUserQuery(userId: string | null): UseQueryResult<T.UserDetail> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("users:read");
+  return useQuery({
+    queryKey: qk.user(appId ?? "", userId ?? ""),
+    queryFn: () => api.getUser(userId ?? ""),
+    enabled: enabled && !!userId,
+    staleTime: 10_000,
+  });
+}
+
+/** Tenant mutation of the selected application; `keys` are invalidated on success (relative to the tenant prefix). */
+function useTenantMutation<Result, Vars>(
+  fn: (api: AurixClient, vars: Vars) => Promise<Result>,
+  keys: (app: string, vars: Vars) => readonly (readonly unknown[])[],
+): UseMutationResult<Result, unknown, Vars> {
+  const api = useApi();
+  const { appId } = useAppScope();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: Vars) => fn(api, vars),
+    onSuccess: async (_r, vars) => {
+      if (!appId) return;
+      await Promise.all(keys(appId, vars).map((k) => qc.invalidateQueries({ queryKey: k })));
+    },
+  });
+}
+
+const channelKeys = (app: string, channelId: string) => [qk.channels(app), qk.channel(app, channelId), qk.channelParticipants(app, channelId), qk.sessions(app)];
+
+export function useCreateChannelMutation() {
+  return useTenantMutation(
+    (api, body: T.CreateChannelRequest) => api.createChannel(body),
+    (app) => [qk.channels(app)],
+  );
+}
+export function useUpdateChannelConfigMutation() {
+  return useTenantMutation(
+    (api, v: { channelId: string; config: T.ChannelConfig }) => api.updateChannelConfig(v.channelId, v.config),
+    (app, v) => channelKeys(app, v.channelId),
+  );
+}
+export function useDeleteChannelMutation() {
+  return useTenantMutation(
+    (api, v: { channelId: string }) => api.deleteChannel(v.channelId),
+    (app, v) => channelKeys(app, v.channelId),
+  );
+}
+export function useServerMuteMutation() {
+  return useTenantMutation(
+    (api, body: T.ServerMuteRequest) => api.serverMute(body),
+    (app, v) => [qk.channelParticipants(app, v.channel_id), qk.sessions(app)],
+  );
+}
+export function useMuteAllMutation() {
+  return useTenantMutation(
+    (api, body: T.MuteAllRequest) => api.muteAll(body),
+    (app, v) => [qk.channelParticipants(app, v.channel_id), qk.sessions(app)],
+  );
+}
+export function useSetPriorityMutation() {
+  return useTenantMutation(
+    (api, body: T.SetPriorityRequest) => api.setPriority(body),
+    (app, v) => [qk.channelParticipants(app, v.channel_id), qk.sessions(app)],
+  );
+}
+export function useKickMutation() {
+  return useTenantMutation(
+    (api, body: T.KickRequest) => api.kickUser(body),
+    (app, v) => channelKeys(app, v.channel_id),
+  );
+}
+export function useKickAllMutation() {
+  return useTenantMutation(
+    (api, body: T.KickAllRequest) => api.kickAll(body),
+    (app, v) => channelKeys(app, v.channel_id),
+  );
+}
+export function useBanUserMutation() {
+  return useTenantMutation(
+    (api, body: T.BanRequest) => api.banUser(body),
+    (app, v) => [qk.user(app, v.user_id), ["t", app, "bans"], ["t", app, "users"], qk.channels(app), qk.sessions(app), ["t", app, "moderation"]],
+  );
+}
+export function useSendSystemMessageMutation() {
+  return useTenantMutation(
+    (api, v: { channelId: string; body: T.SystemMessageRequest }) => api.sendChannelMessage(v.channelId, v.body),
+    (app) => [["t", app, "chat"]],
+  );
+}
+export function useAnnounceMutation() {
+  return useTenantMutation(
+    (api, v: { channelId: string; body: T.AnnounceRequest }) => api.announceInChannel(v.channelId, v.body),
+    () => [],
+  );
+}
+export function useDeleteStreamMutation() {
+  return useTenantMutation(
+    (api, v: { channelId: string; streamId: string }) => api.deleteStream(v.channelId, v.streamId),
+    (app, v) => [[...qk.channel(app, v.channelId), "streams"]],
+  );
+}
