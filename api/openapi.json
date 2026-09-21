@@ -8347,14 +8347,18 @@
             "format": "uuid"
           },
           "display_name": {
-            "type": "string",
-            "nullable": true,
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Current display name of the user; `null` only if the user row is missing."
           },
           "media_node_id": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "uuid",
-            "nullable": true,
             "description": "Node hosting the member's session; `null` when the session row is already gone."
           },
           "session_id": {

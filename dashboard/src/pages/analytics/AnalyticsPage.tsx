@@ -352,7 +352,7 @@ function QualityTab({ range }: { range: Range }) {
         columns={columns}
         rowKey={(s) => s.session_id}
         loading={worst.isPending}
-        error={worst.isError ? errorMessage(worst.error, locale) : undefined}
+        error={worst.isError ? worst.error : undefined}
         selectedKey={selected}
         onRowClick={(s) => setSelected(s.session_id === selected ? null : s.session_id)}
         dense
@@ -516,7 +516,7 @@ function ChannelsTab({ range }: { range: Range }) {
         columns={columns}
         rowKey={(c) => c.channel_id}
         loading={list.isPending}
-        error={list.isError ? errorMessage(list.error, locale) : undefined}
+        error={list.isError ? list.error : undefined}
         selectedKey={selected}
         onRowClick={(c) => setSelected(c.channel_id === selected ? null : c.channel_id)}
         dense

@@ -157,7 +157,7 @@ export function BansTab() {
           columns={columns}
           rowKey={(b) => b.id}
           loading={bans.isPending}
-          error={bans.isError ? errorMessage(bans.error, locale) : undefined}
+          error={bans.isError ? bans.error : undefined}
           empty={<EmptyState compact icon={<Gavel className="size-5" />} title={userFilter || !showInactive ? t("common.noResults") : t("moderation.bans.empty")} />}
           footer={
             <Pager

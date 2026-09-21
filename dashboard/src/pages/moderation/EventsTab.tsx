@@ -167,7 +167,7 @@ export function EventsTab({ mode }: { mode: "events" | "incidents" }) {
             columns={columns}
             rowKey={(e) => e.id}
             loading={query.isPending}
-            error={query.isError ? errorMessage(query.error, locale) : undefined}
+            error={query.isError ? query.error : undefined}
             empty={<EmptyState compact icon={<ShieldAlert className="size-5" />} title={empty} />}
             onRowClick={(e) => go({ event: e.id === selected ? null : e.id })}
             selectedKey={selected}

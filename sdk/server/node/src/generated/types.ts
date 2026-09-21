@@ -150,9 +150,9 @@ export interface ActiveMember {
   channel_type?: string;
   user_id: string;
   /** Current display name of the user; `null` only if the user row is missing. */
-  display_name?: string;
+  display_name?: string | null;
   /** Node hosting the member's session; `null` when the session row is already gone. */
-  media_node_id?: string;
+  media_node_id?: string | null;
   session_id: string;
   role?: string;
   is_muted?: boolean;

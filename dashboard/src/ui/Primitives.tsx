@@ -147,11 +147,20 @@ export function Mono({ children, className, title }: { children: ReactNode; clas
   );
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Compact id: UUIDs keep the time prefix and the random tail (v7 ids minted together share the prefix). */
+export function shortId(id: string, short = 8): string {
+  if (id.length <= short) return id;
+  if (UUID_RE.test(id)) return `${id.slice(0, short)}…${id.slice(-4)}`;
+  return id.slice(0, short);
+}
+
 export function IdChip({ id, short = 8 }: { id: string; short?: number }) {
   return (
     <span className="inline-flex items-center gap-0.5 group">
       <Mono title={id} className="text-fg-muted">
-        {id.length > short ? id.slice(0, short) : id}
+        {shortId(id, short)}
       </Mono>
       <CopyButton value={id} className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100" />
     </span>

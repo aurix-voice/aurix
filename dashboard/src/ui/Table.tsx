@@ -1,10 +1,11 @@
 import { ChevronLeft, ChevronRight, ChevronsUpDown, ChevronUp, ChevronDown } from "lucide-react";
-import { type ReactNode } from "react";
+import { isValidElement, type ReactNode } from "react";
 
 import { useT } from "@/i18n";
 import { cn } from "@/lib/cn";
 
 import { Button } from "./Button";
+import { QueryError } from "./Page";
 import { EmptyState, Skeleton } from "./Primitives";
 
 export interface Column<Row> {
@@ -30,7 +31,8 @@ export interface DataTableProps<Row> {
   columns: Column<Row>[];
   rowKey: (row: Row) => string;
   loading?: boolean;
-  error?: ReactNode;
+  /** Raw query error (rendered via `QueryError`) or a ready element. */
+  error?: unknown;
   empty?: ReactNode;
   onRowClick?: (row: Row) => void;
   rowClassName?: (row: Row) => string | undefined;
@@ -147,7 +149,7 @@ export function DataTable<Row>({
           {!loading && error ? (
             <tr>
               <td colSpan={cols.length}>
-                <EmptyState compact title={t("common.error")} description={error} />
+                {isValidElement(error) ? error : <QueryError compact error={error} />}
               </td>
             </tr>
           ) : null}
@@ -162,6 +164,7 @@ export function DataTable<Row>({
               <tr
                 key={k}
                 data-testid="row"
+                data-row-key={k}
                 onClick={onRowClick ? () => onRowClick(row) : undefined}
                 className={cn(
                   "border-b border-border last:border-0 transition-colors",

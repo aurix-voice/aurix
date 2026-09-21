@@ -99,7 +99,7 @@ export function UsersTab() {
             columns={columns}
             rowKey={(u) => u.id}
             loading={users.isPending}
-            error={users.isError ? errorMessage(users.error, locale) : undefined}
+            error={users.isError ? users.error : undefined}
             empty={<EmptyState compact icon={<Users className="size-5" />} title={q ? t("common.noResults") : t("moderation.users.empty")} />}
             onRowClick={(u) => go({ user: u.id === selected ? null : u.id })}
             selectedKey={selected}

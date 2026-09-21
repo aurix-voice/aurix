@@ -35,9 +35,10 @@ test.describe("overview, nodes and configuration", () => {
     await expect(table.getByRole("row")).not.toHaveCount(0);
     const healthy = table.getByRole("row").filter({ has: page.getByRole("cell", { name: "Healthy", exact: true }) }).first();
     await expect(healthy).toBeVisible();
-    const nodeId = (await healthy.getByRole("cell").first().innerText()).trim().split(/\s/)[0] ?? "";
+    // The table shows ids shortened; the row carries the full id as its key.
+    const nodeId = (await healthy.getAttribute("data-row-key")) ?? "";
     expect(nodeId).toMatch(/^[0-9a-f-]{36}$/);
-    const row = table.getByRole("row", { name: new RegExp(nodeId) });
+    const row = table.locator(`tr[data-row-key="${nodeId}"]`);
 
     if (await row.getByRole("button", { name: "Undrain" }).isVisible()) {
       await row.getByRole("button", { name: "Undrain" }).click();

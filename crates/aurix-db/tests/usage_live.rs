@@ -5,7 +5,7 @@
 //! Timestamps sit 500 days in the past so the test can share the database with running nodes.
 
 use aurix_common::usage::{APP_BUCKET_SECS, CHANNEL_BUCKET_SECS};
-use aurix_db::models::{AppRow, ChannelRow, SessionRow, UserRow};
+use aurix_db::models::{AppRow, ChannelRow, MediaNodeRow, SessionRow, UserRow};
 use aurix_db::usage::{self as usage, CounterDelta};
 use aurix_db::{queries, DbPool};
 use chrono::{DateTime, Duration, Utc};
@@ -100,6 +100,45 @@ fn session_row(app_id: Uuid, user_id: Uuid, at: DateTime<Utc>) -> SessionRow {
         disconnect_reason: None,
         quality_stats: None,
     }
+}
+
+/// Registers a throwaway node so sessions parked on it are not orphans to the lost-node reaper
+/// of a live node sharing this database. Unhealthy, so nothing routes to it.
+async fn fake_node(pool: &DbPool) -> Uuid {
+    let now = Utc::now();
+    let row = MediaNodeRow {
+        id: Uuid::new_v4(),
+        region: "test".into(),
+        address: "127.0.0.1".into(),
+        address_ipv6: None,
+        media_port: 1,
+        api_port: 1,
+        cascade_port: None,
+        ws_url: None,
+        api_url: None,
+        latitude: None,
+        longitude: None,
+        capacity: 0,
+        active_channels: 0,
+        active_participants: 0,
+        cpu_usage: 0.0,
+        memory_usage: 0.0,
+        bandwidth_in_mbps: 0.0,
+        bandwidth_out_mbps: 0.0,
+        healthy: false,
+        relay_only: false,
+        draining: false,
+        drain_reason: None,
+        draining_since: None,
+        drained_by: None,
+        version: "test".into(),
+        last_heartbeat: now,
+        registered_at: now,
+    };
+    queries::upsert_media_node(pool, &row)
+        .await
+        .expect("node")
+        .id
 }
 
 /// Inserts a session `[from, to)` (`to = None` = still open) and returns its id.
@@ -516,8 +555,8 @@ async fn session_quality_checkpoints_hand_over_and_rank_worst_first() {
     let u = user(&pool, a).await;
     let ub = user(&pool, b).await;
     let t0 = base();
-    let node1 = Uuid::new_v4();
-    let node2 = Uuid::new_v4();
+    let node1 = fake_node(&pool).await;
+    let node2 = fake_node(&pool).await;
     let quality = |samples: i64, mos_avg: f64| serde_json::json!({ "samples": samples, "mos_avg": mos_avg, "bars": [0, 0, 0, 0, samples] });
 
     let mut rows = Vec::new();
@@ -640,6 +679,9 @@ async fn session_quality_checkpoints_hand_over_and_rank_worst_first() {
         "malformed quality_stats rows are ignored"
     );
     cleanup(&pool, &[a, b]).await;
+    for node in [node1, node2] {
+        queries::delete_media_node(&pool, node).await.unwrap();
+    }
 }
 
 #[tokio::test]

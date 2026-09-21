@@ -100,6 +100,17 @@ async fn next_frame(rx: &mut mpsc::UnboundedReceiver<IncomingAudio>) -> Option<I
         .flatten()
 }
 
+async fn wait_for(mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !cond() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met within 3s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn bound_event(events: &mut tokio::sync::broadcast::Receiver<MediaEvent>) -> MediaEvent {
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -309,7 +320,16 @@ async fn rebind_migrates_the_connection_without_a_new_bind() {
     let new_local = a.media.rebind().expect("QUIC link migrates in place");
     assert_ne!(new_local.port(), old_local.port());
     assert_eq!(a.media.local_addr().unwrap(), new_local);
-    assert!(b.media.rebind().is_ok());
+    let b_new_local = b.media.rebind().expect("B migrates too");
+    // The node only learns a new path from the first packet on it (quinn pings after a rebind);
+    // wait until both migrations are visible before routing audio, or the frame for B
+    // legitimately goes to its old, closed socket.
+    let b_link = b.session.quic().expect("B is on QUIC");
+    wait_for(|| {
+        link.remote_address().port() == new_local.port()
+            && b_link.remote_address().port() == b_new_local.port()
+    })
+    .await;
 
     a.media.send_audio(hash, 960, None, &[7, 1]);
     let f = next_frame(&mut b.rx).await.expect("frame after migration");
@@ -319,7 +339,6 @@ async fn rebind_migrates_the_connection_without_a_new_bind() {
         Arc::ptr_eq(&a.session.quic().unwrap(), &link),
         "same connection, same session path"
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_ne!(
         link.remote_address(),
         old_remote,

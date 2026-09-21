@@ -1,7 +1,7 @@
 import { Disc3, Layers, Mic, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
 
-import { errorMessage, type T } from "@/api/client";
+import { type T } from "@/api/client";
 import { useChannelsQuery, useRecordingsQuery } from "@/api/hooks";
 import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
@@ -125,7 +125,7 @@ function Recordings() {
         columns={columns}
         rowKey={(r) => r.id}
         loading={list.isPending}
-        error={list.isError ? errorMessage(list.error, locale) : undefined}
+        error={list.isError ? list.error : undefined}
         selectedKey={id}
         onRowClick={(r) => go({ id: r.id }, false)}
         empty={

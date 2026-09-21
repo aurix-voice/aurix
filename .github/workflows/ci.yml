@@ -531,8 +531,11 @@ jobs:
           AURIX__SERVER__EXTERNAL_URL: http://127.0.0.1:8080
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
           AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
+          AURIX__RECORDING__ENABLED: "true"
+          AURIX__RECORDING__STORAGE_PATH: ${{ runner.temp }}/recordings-dashboard
           AURIX__TRACING__LOG_FORMAT: text
         run: |
+          mkdir -p "${{ runner.temp }}/recordings-dashboard"
           nohup ./target/debug/aurix-server > server.log 2>&1 &
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8080/ready

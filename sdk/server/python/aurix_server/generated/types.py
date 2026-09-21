@@ -143,8 +143,8 @@ ActiveMember = TypedDict(
         "channel_id": str,
         "channel_type": NotRequired[str],
         "user_id": str,
-        "display_name": NotRequired[str],  # Current display name of the user; `null` only if the user row is missing.
-        "media_node_id": NotRequired[str],  # Node hosting the member's session; `null` when the session row is already gone.
+        "display_name": NotRequired[Optional[str]],  # Current display name of the user; `null` only if the user row is missing.
+        "media_node_id": NotRequired[Optional[str]],  # Node hosting the member's session; `null` when the session row is already gone.
         "session_id": str,
         "role": NotRequired[str],
         "is_muted": NotRequired[bool],
