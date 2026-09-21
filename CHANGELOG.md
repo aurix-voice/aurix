@@ -13,6 +13,20 @@ released together.
 
 ### Added
 
+* **Operator dashboard** (`dashboard/`): a separate Vite + React + TypeScript SPA over the admin
+  API — overview (CCU, minutes, MOS, fleet health, quality alerts), nodes with drain / undrain,
+  applications / API keys / limits / webhooks (deliveries, test, resync, rotation), live channels
+  and sessions with moderation actions and per-session statistics, moderation (reports, safety
+  incidents with evidence, bans and blocks, users, stored chat with search), recordings
+  (mixdown, transcripts, downloads), analytics (series, CSV, worst sessions), administrators /
+  roles / OIDC / audit log, and the read-only effective configuration. RU/EN, light / dark /
+  system theme; the UI gates on `AdminPermission` from the node. Shipped as its own Caddy image
+  `ghcr.io/aurix-voice/aurix-dashboard` (same-origin proxy of `/v1`, `/admin`, `/health`,
+  `/ready`, `/openapi.json`, SSE unbuffered, security headers, non-root, no capabilities), a
+  `dashboard` Compose service, and Helm `dashboard.*` (Deployment, Service, PDB, standard
+  `Ingress` or Traefik `IngressRoute`, NetworkPolicy egress to the node). CI job `dashboard`
+  runs typecheck / lint / unit tests / build and a Playwright suite against a live node through
+  the freshly built image; the release workflow publishes, signs and attests the image.
 * Stored text chat grows edits, deletions, reactions and search (migration 18): `ChatEdit` /
   `ChatDelete` (author within `chat.edit_window_secs`, channel moderators may delete) fan out
   `ChatMessageUpdated` — a deletion is a tombstone that keeps the message id and position and

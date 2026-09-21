@@ -64,6 +64,7 @@ SOURCES = [
     ("Go SDKVersion", "sdk/server/go/client.go", lambda p: regex(p, r'SDKVersion\s*=\s*"([^"]+)"')),
     ("C# csproj", "sdk/server/csharp/Aurix.Server/Aurix.Server.csproj", lambda p: regex(p, r"<Version>([^<]+)</Version>")),
     ("C# SdkVersion", "sdk/server/csharp/Aurix.Server/AurixHttp.cs", lambda p: regex(p, r'SdkVersion\s*=\s*"([^"]+)"')),
+    ("Dashboard", "dashboard/package.json", lambda p: json_key(p, "version")),
 ]
 
 

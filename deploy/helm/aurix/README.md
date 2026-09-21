@@ -74,6 +74,13 @@ the Helm release history.
   reachable from every node.
 * Hardened defaults: uid 10001, read-only root, no capabilities, seccomp `RuntimeDefault`, no
   service-account token.
+* **Operator dashboard** (`dashboard.enabled=true`, off by default): a Deployment of the
+  `aurix-dashboard` Caddy image proxying `/v1`, `/admin`, `/health`, `/ready`, `/openapi.json` to
+  the release's API Service (`dashboard.apiUrl`), its own ClusterIP Service, optional PDB, and
+  either `dashboard.ingress` (standard Ingress, any controller) or `dashboard.ingressRoute`
+  (Traefik CRD: host, entry points, cert resolver or TLS secret, middlewares). The dashboard pod
+  is the node's client — add the pod CIDR to `config.trustedProxies`; the NetworkPolicy allows
+  its egress to the API. See [Operator dashboard](../../../docs/src/operations/dashboard.md).
 
 ## Multi-region
 

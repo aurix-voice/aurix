@@ -61,6 +61,34 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-headless" (include "aurix.fullname" .) }}
 {{- end }}
 
+{{- define "aurix.dashboard.fullname" -}}
+{{- printf "%s-dashboard" (include "aurix.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "aurix.dashboard.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "aurix.name" . }}-dashboard
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{- define "aurix.dashboard.labels" -}}
+helm.sh/chart: {{ include "aurix.chart" . }}
+{{ include "aurix.dashboard.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: aurix
+app.kubernetes.io/component: dashboard
+{{- end }}
+
+{{- define "aurix.dashboard.image" -}}
+{{- printf "%s:%s" .Values.dashboard.image.repository (default .Chart.AppVersion .Values.dashboard.image.tag) }}
+{{- end }}
+
+{{- define "aurix.dashboard.apiUrl" -}}
+{{- default (printf "http://%s:%d" (include "aurix.fullname" .) (int .Values.ports.api)) .Values.dashboard.apiUrl }}
+{{- end }}
+
 {{/*
 Hostname of one pod when perNode is enabled: <pod>.<domain>.
 */}}

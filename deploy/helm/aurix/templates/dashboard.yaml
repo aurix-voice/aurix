@@ -1,0 +1,199 @@
+{{- if .Values.dashboard.enabled }}
+{{- if and .Values.dashboard.ingress.enabled (not .Values.dashboard.ingress.host) }}
+{{- fail "dashboard.ingress.host is required when dashboard.ingress.enabled" }}
+{{- end }}
+{{- if and .Values.dashboard.ingressRoute.enabled (not .Values.dashboard.ingressRoute.host) }}
+{{- fail "dashboard.ingressRoute.host is required when dashboard.ingressRoute.enabled" }}
+{{- end }}
+{{- $d := .Values.dashboard }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aurix.dashboard.fullname" . }}
+  labels:
+    {{- include "aurix.dashboard.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $d.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aurix.dashboard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aurix.dashboard.selectorLabels" . | nindent 8 }}
+        {{- with $d.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $d.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: dashboard
+          image: {{ include "aurix.dashboard.image" . | quote }}
+          imagePullPolicy: {{ $d.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: AURIX_API_URL
+              value: {{ include "aurix.dashboard.apiUrl" . | quote }}
+            - name: DASHBOARD_ADDRESS
+              value: {{ printf ":%d" (int $d.port) | quote }}
+            - name: DASHBOARD_TRUSTED_PROXIES
+              value: {{ $d.trustedProxies | quote }}
+            - name: DASHBOARD_HEALTHCHECK_URL
+              value: {{ printf "http://127.0.0.1:%d/-/healthz" (int $d.port) | quote }}
+          ports:
+            - name: http
+              containerPort: {{ $d.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /-/healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /-/healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml $d.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: config
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with $d.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $d.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $d.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aurix.dashboard.fullname" . }}
+  labels:
+    {{- include "aurix.dashboard.labels" . | nindent 4 }}
+  {{- with $d.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $d.service.type }}
+  selector:
+    {{- include "aurix.dashboard.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+{{- if $d.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "aurix.dashboard.fullname" . }}
+  labels:
+    {{- include "aurix.dashboard.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ $d.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "aurix.dashboard.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if $d.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "aurix.dashboard.fullname" . }}
+  labels:
+    {{- include "aurix.dashboard.labels" . | nindent 4 }}
+  {{- with $d.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $d.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $d.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $d.ingress.host | quote }}
+      {{- with $d.ingress.tls.secretName }}
+      secretName: {{ . }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ $d.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aurix.dashboard.fullname" . }}
+                port:
+                  name: http
+{{- end }}
+{{- if $d.ingressRoute.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "aurix.dashboard.fullname" . }}
+  labels:
+    {{- include "aurix.dashboard.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    {{- toYaml $d.ingressRoute.entryPoints | nindent 4 }}
+  routes:
+    - kind: Rule
+      match: Host(`{{ $d.ingressRoute.host }}`)
+      {{- with $d.ingressRoute.middlewares }}
+      middlewares:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      services:
+        - name: {{ include "aurix.dashboard.fullname" . }}
+          port: http
+  tls:
+    {{- if $d.ingressRoute.certResolver }}
+    certResolver: {{ $d.ingressRoute.certResolver }}
+    {{- else if $d.ingressRoute.tls.secretName }}
+    secretName: {{ $d.ingressRoute.tls.secretName }}
+    {{- else }}
+    {}
+    {{- end }}
+{{- end }}
+{{- end }}

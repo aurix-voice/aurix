@@ -16,10 +16,15 @@ config:
     realm: voice.example.com
 ingress:
   enabled: true
-  className: nginx
+  className: traefik
   host: voice.example.com
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   tls:
     secretName: voice-example-com-tls
+dashboard:
+  enabled: true
+  ingress:
+    enabled: true
+    className: traefik
+    host: dashboard.voice.example.com
+    tls:
+      secretName: dashboard-voice-example-com-tls

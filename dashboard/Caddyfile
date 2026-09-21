@@ -1,0 +1,71 @@
+# Aurix operator dashboard: static SPA + same-origin reverse proxy to one Aurix node.
+#
+# Environment:
+#   AURIX_API_URL              node REST base URL the API prefixes are proxied to
+#                              (default http://aurix:8080 - the docker-compose service)
+#   DASHBOARD_ADDRESS          Caddy site address (default :8080). A hostname such as
+#                              dashboard.example.com turns on automatic HTTPS; then publish
+#                              80/443 and keep /data persistent for the certificates.
+#   DASHBOARD_TRUSTED_PROXIES  proxies whose X-Forwarded-* is honoured and forwarded to the
+#                              node (default private_ranges: Traefik/Caddy on the same network)
+#
+# The browser never talks to the node directly, so the dashboard origin does not have to be
+# listed in the node's CORS origins. The node sees the dashboard container as its client;
+# list it in `server.trusted_proxies` so audit and rate limiting use the real player IP.
+{
+	admin off
+	servers {
+		trusted_proxies static {$DASHBOARD_TRUSTED_PROXIES:private_ranges}
+	}
+}
+
+{$DASHBOARD_ADDRESS::8080} {
+	encode zstd gzip
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+	}
+
+	# Liveness of the dashboard container itself; /health and /ready belong to the node.
+	handle /-/healthz {
+		header Cache-Control no-store
+		respond "ok" 200
+	}
+
+	@api path /v1/* /admin/* /health /ready /openapi.json
+	handle @api {
+		# flush_interval -1 streams GET /v1/events (SSE) without buffering.
+		reverse_proxy {$AURIX_API_URL:http://aurix:8080} {
+			flush_interval -1
+			header_up Host {upstream_hostport}
+			transport http {
+				dial_timeout 5s
+			}
+		}
+	}
+
+	# Hashed bundles: immutable when present, a plain 404 when not (never the SPA shell).
+	handle /assets/* {
+		root * /srv
+		@exists file
+		header @exists Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# SPA shell and the handful of public files: always revalidated.
+	handle {
+		root * /srv
+		header Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

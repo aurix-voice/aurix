@@ -395,12 +395,26 @@ only ever carry the caller's tenant.
 
 ```bash
 cp .env.example .env        # fill in secrets: openssl rand -base64 48
-docker compose up -d --build
+docker compose up -d --build                   # node + operator dashboard on localhost:8090
 docker compose --profile observability up -d   # + Prometheus & Grafana on localhost
 ```
 
 The image runs as uid 10001 with a read-only root filesystem, drops all capabilities and has a
 `/ready` healthcheck. Secrets are only taken from the environment; nothing sensitive is baked in.
+
+### Operator dashboard
+
+[`dashboard/`](dashboard) is the operator web UI — a separate service, never served by the node:
+a Vite + React SPA on Caddy (`ghcr.io/aurix-voice/aurix-dashboard`, Compose service `dashboard`,
+Helm `dashboard.enabled=true` with a standard `Ingress` or a Traefik `IngressRoute`). Caddy
+proxies `/v1`, `/admin`, `/health`, `/ready` and `/openapi.json` to the node so the browser stays
+same-origin (SSE unbuffered, no CORS entry). Overview / fleet health, nodes with drain / undrain,
+applications / keys / limits / webhooks, live channels and sessions with moderation, safety
+incidents and evidence, bans, users, stored chat with search, recordings / mixdown / transcripts,
+analytics with CSV export, administrators / roles / SSO / audit, and the node's effective
+configuration read-only with secrets masked. RU/EN, light / dark. Permissions come from the node
+(`AdminPermission`); Playwright E2E runs against a live node and the built image in CI —
+[Operator dashboard](docs/src/operations/dashboard.md).
 
 ### Configuration
 
@@ -958,7 +972,7 @@ thousands of ports.
 
 ### TLS
 
-Either terminate TLS at a reverse proxy (nginx / Caddy / cloud LB — set `trusted_proxies` so
+Either terminate TLS at a reverse proxy (Caddy / Traefik / cloud LB — set `trusted_proxies` so
 client IPs are correct), or point `tls_cert_path`/`tls_key_path` at PEM files and expose 8080/8081
 directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regardless of TLS.
 

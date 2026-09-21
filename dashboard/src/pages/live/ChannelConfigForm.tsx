@@ -124,8 +124,8 @@ export function ChannelConfigForm({
                   </NativeSelect>
                 </Field>
               ) : null}
-              <Field label={t("live.maxParticipants")}>
-                <Input type="number" min={1} value={value.max_participants ?? ""} onChange={(e) => set("max_participants", num(e.target.value))} placeholder="256" />
+              <Field label={t("live.maxParticipants")} htmlFor="channel-max-participants">
+                <Input id="channel-max-participants" type="number" min={1} value={value.max_participants ?? ""} onChange={(e) => set("max_participants", num(e.target.value))} placeholder="256" />
               </Field>
               <Field label={t("live.audioProfile")}>
                 <NativeSelect value={value.audio_profile ?? "voice"} onChange={(e) => set("audio_profile", e.target.value as T.AudioProfile)}>

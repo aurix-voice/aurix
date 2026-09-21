@@ -105,8 +105,9 @@ export function LoginPage() {
 
         {passwordEnabled ? (
           <form onSubmit={onSubmit} className="space-y-3" noValidate>
-            <Field label={t("auth.email")}>
+            <Field label={t("auth.email")} htmlFor="login-email">
               <Input
+                id="login-email"
                 type="email"
                 name="email"
                 autoComplete="username"
@@ -116,8 +117,9 @@ export function LoginPage() {
                 onChange={(e) => setEmail(e.target.value)}
               />
             </Field>
-            <Field label={t("auth.password")}>
+            <Field label={t("auth.password")} htmlFor="login-password">
               <Input
+                id="login-password"
                 type="password"
                 name="password"
                 autoComplete="current-password"

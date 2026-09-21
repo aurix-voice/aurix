@@ -17,6 +17,12 @@ GET /v1/regions to address one node, enable perNode with a domain.
 
 REST API: https://{{ .Values.ingress.host }}   (OpenAPI: /openapi.json)
 {{- end }}
+{{- if .Values.dashboard.enabled }}
+
+Dashboard: {{ include "aurix.dashboard.fullname" . }} ({{ .Values.dashboard.replicaCount }} replica(s)) proxying to {{ include "aurix.dashboard.apiUrl" . }}
+{{- if .Values.dashboard.ingress.enabled }}  ->  https://{{ .Values.dashboard.ingress.host }}{{ end }}
+{{- if .Values.dashboard.ingressRoute.enabled }}  ->  https://{{ .Values.dashboard.ingressRoute.host }} (Traefik IngressRoute){{ end }}
+{{- end }}
 
 Check the fleet:  kubectl -n {{ .Release.Namespace }} logs statefulset/{{ include "aurix.fullname" . }} | grep -i "advertising"
 First admin:      POST https://<api>/admin/setup with X-Bootstrap-Token (then drop the token from the secret).

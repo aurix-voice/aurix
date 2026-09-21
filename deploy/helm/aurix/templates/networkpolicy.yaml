@@ -16,9 +16,16 @@ spec:
           protocol: TCP
         - port: ws
           protocol: TCP
-      {{- with .Values.networkPolicy.apiFrom }}
+      {{- if or .Values.networkPolicy.apiFrom .Values.dashboard.enabled }}
       from:
+        {{- with .Values.networkPolicy.apiFrom }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.dashboard.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "aurix.dashboard.selectorLabels" . | nindent 14 }}
+        {{- end }}
       {{- end }}
     - ports:
         - port: metrics

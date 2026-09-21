@@ -9,9 +9,12 @@ for a single node, required for a fleet).
 
 ```bash
 cp .env.example .env        # fill in secrets: openssl rand -base64 48
-docker compose up -d --build
+docker compose up -d --build                   # node + operator dashboard on localhost:8090
 docker compose --profile observability up -d   # + Prometheus & Grafana on localhost
 ```
+
+The `dashboard` service is the operator UI on its own Caddy image; it proxies the API same-origin
+and is described in [Operator dashboard](dashboard.md).
 
 The image runs as uid 10001 with a read-only root filesystem, drops all capabilities and has a
 `/ready` healthcheck; secrets come only from the environment. `.env.example` lists what you must
@@ -40,7 +43,9 @@ What the chart handles for you: `config.externalIpSource` (`static` / `hostIP` /
 `config.region` / `config.location`; readiness and liveness probes on `/ready` and `/health`;
 non-root, read-only-rootfs, no-capabilities security context; anti-affinity; an optional
 migrations `Job` (`aurix-server --migrate-only`) as a pre-upgrade hook; PVC for local recordings;
-`ServiceMonitor`, `NetworkPolicy` and `PodDisruptionBudget`. `deploy/helm/aurix/README.md` lists
+`ServiceMonitor`, `NetworkPolicy` and `PodDisruptionBudget`; `dashboard.enabled` adds the operator
+dashboard Deployment behind a standard `Ingress` or a Traefik `IngressRoute`
+([Operator dashboard](dashboard.md)). `deploy/helm/aurix/README.md` lists
 every value and the ports to open; `ci/*.yaml` are lint/template fixtures for single-node,
 multi-node and `hostNetwork: false` (`hostPort`) layouts — the last one cannot carry the TURN relay
 range.
@@ -160,7 +165,7 @@ not public IPv6 reachability of a deployment.
 
 ## TLS
 
-Either terminate TLS at a reverse proxy (nginx / Caddy / cloud LB — set `server.trusted_proxies`
+Either terminate TLS at a reverse proxy (Caddy / Traefik / cloud LB — set `server.trusted_proxies`
 so client IPs are right for rate limits and the audit log), or point
 `server.tls_cert_path` / `tls_key_path` at PEM files and expose 8080/8081 directly (rustls; no
 ACME — renew with your tooling and restart). Media is protected independently of TLS: AURX v2

@@ -32,6 +32,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/${{ github.repository_owner }}/aurix-server
+  DASHBOARD_IMAGE: ghcr.io/${{ github.repository_owner }}/aurix-dashboard
 
 jobs:
   verify:
@@ -416,9 +417,82 @@ jobs:
           path: "*.image.cdx.json"
           if-no-files-found: error
 
+  dashboard-image:
+    name: dashboard image (Caddy, multi-arch), SBOM, signature
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DASHBOARD_IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}},value=v${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
+      # The SPA is compiled once on the build platform; only the Caddy runtime stage is per-arch,
+      # so a single multi-platform build is cheap enough here (unlike the Rust server image).
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dashboard/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.verify.outputs.publish == 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=aurix-dashboard
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha,scope=release-dashboard
+          cache-to: type=gha,mode=max,scope=release-dashboard
+          provenance: mode=max
+          sbom: true
+      - name: Image SBOM (CycloneDX)
+        if: needs.verify.outputs.publish == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.DASHBOARD_IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: aurix-dashboard-${{ needs.verify.outputs.version }}.image.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: sigstore/cosign-installer@v3
+        if: needs.verify.outputs.publish == 'true'
+      - name: Sign image and attest SBOM (Sigstore keyless)
+        if: needs.verify.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${DASHBOARD_IMAGE}@${DIGEST}"
+          cosign attest --yes --type cyclonedx --predicate "aurix-dashboard-${{ needs.verify.outputs.version }}.image.cdx.json" "${DASHBOARD_IMAGE}@${DIGEST}"
+      - uses: actions/upload-artifact@v4
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          name: dist-dashboard-image-sbom
+          path: "*.image.cdx.json"
+          if-no-files-found: error
+
   publish:
     name: checksums, SBOM, signatures, GitHub release
-    needs: [verify, server, native, sdks, unreal-plugin, image-manifest]
+    needs: [verify, server, native, sdks, unreal-plugin, image-manifest, dashboard-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -484,9 +558,12 @@ jobs:
             echo "cosign verify ${IMAGE}@${{ needs.image-manifest.outputs.digest }} \\"
             echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo "cosign verify ${DASHBOARD_IMAGE}@${{ needs.dashboard-image.outputs.digest }} \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
             echo
-            echo "Image: \`${IMAGE}:${VERSION}\` (digest \`${{ needs.image-manifest.outputs.digest }}\`)."
+            echo "Images: \`${IMAGE}:${VERSION}\` (digest \`${{ needs.image-manifest.outputs.digest }}\`), \`${DASHBOARD_IMAGE}:${VERSION}\` (digest \`${{ needs.dashboard-image.outputs.digest }}\`)."
           } > notes.md
           cat notes.md
       - uses: actions/upload-artifact@v4

@@ -479,6 +479,97 @@ jobs:
           dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_ANDROID
         working-directory: sdk/unity/DotNet~
 
+  dashboard:
+    name: dashboard (check + lint + unit + Caddy image + Playwright vs live node)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aurix
+          POSTGRES_PASSWORD: aurix
+          POSTGRES_DB: aurix
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aurix" --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+        working-directory: dashboard
+      - run: npm run check && npm run lint && npm test && npm run build
+        working-directory: dashboard
+      - uses: docker/setup-buildx-action@v3
+      - name: Dashboard image (Caddy)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dashboard/Dockerfile
+          push: false
+          load: true
+          tags: aurix-dashboard:ci
+          cache-from: type=gha,scope=dashboard
+          cache-to: type=gha,mode=max,scope=dashboard
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
+      - run: cargo build --locked --bin aurix-server
+      - name: Run node
+        env:
+          AURIX__SERVER__EXTERNAL_URL: http://127.0.0.1:8080
+          AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
+          AURIX__TRACING__LOG_FORMAT: text
+        run: |
+          nohup ./target/debug/aurix-server > server.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/ready && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/ready
+      - name: Run the dashboard image against the node (hardened like docker-compose)
+        run: |
+          set -euo pipefail
+          docker run -d --name dashboard --network host --read-only --tmpfs /tmp --tmpfs /config \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e AURIX_API_URL=http://127.0.0.1:8080 -e DASHBOARD_ADDRESS=:8090 aurix-dashboard:ci
+          for i in $(seq 1 30); do
+            [ "$(docker inspect dashboard --format '{{.State.Health.Status}}')" = healthy ] && break; sleep 1
+          done
+          docker inspect dashboard --format '{{.State.Health.Status}}' | grep -qx healthy
+          docker exec dashboard id | grep -q 'uid=10001'
+          curl -fsS http://127.0.0.1:8090/ready
+          curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/assets/missing.js | grep -qx 404
+      - run: npx playwright install --with-deps chromium
+        working-directory: dashboard
+      - name: Playwright E2E (first administrator is created through /setup)
+        env:
+          DASHBOARD_URL: http://127.0.0.1:8090
+          AURIX_E2E_ADMIN_EMAIL: dashboard-ci@example.com
+          AURIX_E2E_ADMIN_PASSWORD: ci-only-dashboard-admin-password-0123456789
+          AURIX_E2E_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
+        run: npx playwright test
+        working-directory: dashboard
+      - if: failure()
+        run: |
+          tail -n 200 server.log || true
+          docker logs dashboard 2>&1 | tail -n 100 || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: dashboard-playwright-report
+          path: |
+            dashboard/playwright-report/
+            dashboard/test-results/
+          if-no-files-found: ignore
+
   server-sdks:
     name: Server SDKs (Node/Python/Go/C#) + token servers
     runs-on: ubuntu-latest

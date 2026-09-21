@@ -97,6 +97,37 @@ services:
       driver: json-file
       options: { max-size: "50m", max-file: "5" }
 
+  # Operator dashboard: static SPA on Caddy that proxies /v1, /admin, /health, /ready and
+  # /openapi.json to the node, so the browser stays same-origin (no CORS entry needed).
+  # Put TLS in front (Traefik/Caddy) or set DASHBOARD_ADDRESS to a hostname for automatic HTTPS.
+  # Add the compose network to AURIX_TRUSTED_PROXIES so the node sees real admin IPs in audit.
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    image: aurix-dashboard:local
+    restart: unless-stopped
+    depends_on:
+      aurix: { condition: service_started }
+    ports:
+      - "${AURIX_DASHBOARD_PORT:-127.0.0.1:8090}:8080"
+    environment:
+      AURIX_API_URL: http://aurix:8080
+      DASHBOARD_ADDRESS: ${AURIX_DASHBOARD_ADDRESS:-:8080}
+      DASHBOARD_TRUSTED_PROXIES: ${AURIX_DASHBOARD_TRUSTED_PROXIES:-private_ranges}
+    volumes:
+      - dashdata:/data
+    read_only: true
+    tmpfs: [/tmp, /config]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128m }
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
   prometheus:
     image: prom/prometheus:v2.53.0
     restart: unless-stopped
@@ -125,5 +156,6 @@ services:
 volumes:
   pgdata:
   recordings:
+  dashdata:
   promdata:
   grafanadata:

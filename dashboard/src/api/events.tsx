@@ -79,6 +79,7 @@ function invalidationsFor(app: string, type: string, data: Record<string, unknow
   const head = type.split(".")[0];
   switch (head) {
     case "channel":
+      if (type === "channel.destroyed") return [qk.channelLists(app)];
       return channelId ? [qk.channels(app), qk.channel(app, channelId)] : [qk.channels(app)];
     case "participant":
       if (type === "participant.speaking") return [];

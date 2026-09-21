@@ -43,6 +43,7 @@ export const qk = {
   moderationEventsAdmin: (params: Record<string, unknown>) => ["admin", "moderation", params] as const,
   tenant: (app: string) => ["t", app] as const,
   channels: (app: string) => ["t", app, "channels"] as const,
+  channelLists: (app: string) => ["t", app, "channels", "list"] as const,
   channel: (app: string, id: string) => ["t", app, "channels", id] as const,
   channelParticipants: (app: string, id: string) => ["t", app, "channels", id, "participants"] as const,
   channelRecordings: (app: string, id: string) => ["t", app, "channels", id, "recordings"] as const,
@@ -577,7 +578,7 @@ export function useChannelsQuery(params: T.ListChannelsQuery, refetchInterval: n
   const api = useApi();
   const { appId, enabled } = useTenantEnabled("channels:read");
   return useQuery({
-    queryKey: [...qk.channels(appId ?? ""), "list", { ...params }],
+    queryKey: [...qk.channelLists(appId ?? ""), { ...params }],
     queryFn: () => api.listChannels(params),
     enabled,
     refetchInterval,
@@ -687,10 +688,19 @@ export function useUpdateChannelConfigMutation() {
   );
 }
 export function useDeleteChannelMutation() {
-  return useTenantMutation(
-    (api, v: { channelId: string }) => api.deleteChannel(v.channelId),
-    (app, v) => channelKeys(app, v.channelId),
-  );
+  const api = useApi();
+  const { appId } = useAppScope();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { channelId: string }) => api.deleteChannel(v.channelId),
+    onSuccess: async (_r, v) => {
+      if (!appId) return;
+      // Only the collections: the channel's own queries would 404 while its page is still mounted.
+      await Promise.all([qc.invalidateQueries({ queryKey: qk.channelLists(appId) }), qc.invalidateQueries({ queryKey: qk.sessions(appId) })]);
+      qc.removeQueries({ queryKey: qk.channel(appId, v.channelId), type: "inactive" });
+      qc.removeQueries({ queryKey: qk.channelParticipants(appId, v.channelId), type: "inactive" });
+    },
+  });
 }
 export function useServerMuteMutation() {
   return useTenantMutation(

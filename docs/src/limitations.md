@@ -27,8 +27,14 @@ the chapter that explains the boundary.
 * **Godot Android/iOS are staged, not built.** `build_native.sh` knows the cargo-ndk / Xcode
   recipes and the `.gdextension` lists the slices, but this CI has no NDK or Xcode: nothing
   mobile is compiled, exported or run on a device here ([Godot SDK](sdk/godot.md#android-and-ios)).
-* **No operator web dashboard.** Operations go through the REST API, the `aurix` CLI and the
-  Grafana dashboards; a web panel is planned as a separate front end on top of the same API.
+* **The operator dashboard is a client of the API, not a control plane of its own.** It is a
+  separate Caddy-served SPA (`dashboard/`, image `aurix-dashboard`) over the same admin routes:
+  configuration is read-only (no runtime mutation API exists by design), drain / undrain is the
+  only node action, administrators are fleet-global (application scope is a filter, not a
+  tenancy boundary), and nobody can listen to audio from it. It is verified by Playwright
+  against a live node and the built image in CI, not yet by an operator pilot; the supported
+  pairing is dashboard and node of the same minor version
+  ([Operator dashboard](operations/dashboard.md)).
 * **No SIP/PSTN gateway**, no server-side noise suppression or echo cancellation — that runs
   on the client: browsers via `getUserMedia` constraints, the native core / Unity / Unreal via
   the built-in capture DSP ([Native core](sdk/native.md#capture-dsp-echo-cancellation-noise-suppression-agc)).
@@ -306,4 +312,5 @@ the chapter that explains the boundary.
 
 ## Planned
 
-The operator web panel is tracked separately.
+Console SDKs (PlayStation / Xbox / Switch) beyond the porting guide; a pilot on real devices and
+networks.

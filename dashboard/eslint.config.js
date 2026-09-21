@@ -9,7 +9,7 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        projectService: { allowDefaultProject: ["eslint.config.js"] },
+        projectService: { allowDefaultProject: ["eslint.config.js", "public/*.js"] },
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -31,6 +31,14 @@ export default tseslint.config(
   {
     files: ["*.config.{js,ts}", "e2e/**/*.ts"],
     rules: { "@typescript-eslint/no-unsafe-assignment": "off" },
+  },
+  {
+    // Plain browser script loaded before the bundle (see index.html); not part of the TS project.
+    files: ["public/*.js"],
+    languageOptions: {
+      globals: { document: "readonly", localStorage: "readonly", matchMedia: "readonly" },
+    },
+    rules: { "@typescript-eslint/no-unused-vars": ["error", { caughtErrors: "none" }] },
   },
   {
     // TanStack Router signals redirects/not-found by throwing plain objects.

@@ -150,6 +150,64 @@ ingress:
     enabled: true
     secretName: ""
 
+# Operator dashboard: a separate Deployment (static SPA on Caddy) that proxies /v1, /admin,
+# /health, /ready and /openapi.json to this release's API Service, so the browser stays
+# same-origin and no CORS entry is needed. Build the image with
+# `docker build -f dashboard/Dockerfile -t <registry>/aurix-dashboard:<tag> .`
+# Add the pod CIDR to config.trustedProxies so audit and rate limiting see admin IPs.
+dashboard:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: aurix-dashboard
+    # Defaults to .Chart.AppVersion.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Node URL the dashboard proxies to. Empty = this release's API Service.
+  apiUrl: ""
+  # Proxies in front of the dashboard whose X-Forwarded-* headers are trusted (Caddy syntax:
+  # `private_ranges` or space-separated CIDRs).
+  trustedProxies: private_ranges
+  port: 8080
+  service:
+    type: ClusterIP
+    annotations: {}
+  # Standard Ingress (any controller: set className to traefik, or leave it to the default class).
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls:
+      enabled: true
+      secretName: ""
+  # Traefik-native alternative to `ingress` (needs the Traefik CRDs installed).
+  ingressRoute:
+    enabled: false
+    host: ""
+    entryPoints: [websecure]
+    # Traefik certificate resolver for automatic TLS; leave empty to use tls.secretName.
+    certResolver: ""
+    tls:
+      secretName: ""
+    # Names of extra Traefik Middleware objects (same namespace) applied to the route.
+    middlewares: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+
 persistence:
   # Local recordings volume per pod (volumeClaimTemplate). Irrelevant when recordings are
   # disabled or S3 is configured.

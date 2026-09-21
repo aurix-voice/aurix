@@ -42,14 +42,15 @@ export function SetupPage() {
       <h1 className="text-lg font-semibold tracking-tight">{t("auth.setup.title")}</h1>
       <p className="text-[13px] text-fg-muted mt-1">{t("auth.setup.desc")}</p>
       <form onSubmit={onSubmit} className="mt-5 space-y-3" noValidate>
-        <Field label={t("auth.setup.displayName")}>
-          <Input required autoFocus value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+        <Field label={t("auth.setup.displayName")} htmlFor="setup-name">
+          <Input id="setup-name" required autoFocus value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
         </Field>
-        <Field label={t("auth.email")}>
-          <Input type="email" required autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <Field label={t("auth.email")} htmlFor="setup-email">
+          <Input id="setup-email" type="email" required autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} />
         </Field>
-        <Field label={t("auth.password")} hint={t("auth.newPassword.hint")}>
+        <Field label={t("auth.password")} hint={t("auth.newPassword.hint")} htmlFor="setup-password">
           <Input
+            id="setup-password"
             type="password"
             required
             autoComplete="new-password"
@@ -58,8 +59,8 @@ export function SetupPage() {
             onChange={(e) => setPassword(e.target.value)}
           />
         </Field>
-        <Field label={t("auth.setup.bootstrapToken")} hint={t("auth.setup.bootstrapToken.hint")}>
-          <Input type="password" autoComplete="off" value={bootstrapToken} onChange={(e) => setBootstrapToken(e.target.value)} />
+        <Field label={t("auth.setup.bootstrapToken")} hint={t("auth.setup.bootstrapToken.hint")} htmlFor="setup-token">
+          <Input id="setup-token" type="password" autoComplete="off" value={bootstrapToken} onChange={(e) => setBootstrapToken(e.target.value)} />
         </Field>
         {error ? <Callout tone="danger">{error}</Callout> : null}
         <Button type="submit" className="w-full" loading={busy} disabled={!email || !password || !displayName}>

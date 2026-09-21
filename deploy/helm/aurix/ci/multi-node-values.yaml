@@ -24,10 +24,19 @@ perNode:
   domain: voice.example.com
 ingress:
   enabled: true
-  className: nginx
+  className: traefik
   host: api.voice.example.com
   tls:
     secretName: voice-example-com-tls
+dashboard:
+  enabled: true
+  replicaCount: 2
+  podDisruptionBudget:
+    enabled: true
+  ingressRoute:
+    enabled: true
+    host: dashboard.voice.example.com
+    certResolver: letsencrypt
 secrets:
   databaseUrl: postgres://aurix:REPLACE_ME@db.internal:5432/aurix
   redisUrl: rediss://redis.internal:6379
@@ -45,6 +54,6 @@ networkPolicy:
   apiFrom:
     - namespaceSelector:
         matchLabels:
-          kubernetes.io/metadata.name: ingress-nginx
+          kubernetes.io/metadata.name: traefik
 podDisruptionBudget:
   enabled: true
