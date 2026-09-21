@@ -5,7 +5,8 @@ namespace Aurix.Audio
     /// <summary>
     /// Redundancy tier of the uplink encoder (mirrors the native core's <c>LossProfile</c>): how much
     /// in-band FEC, expected loss and Deep REDundancy the encoder spends, chosen from the loss the
-    /// <b>server</b> measures on our packets (<see cref="NetworkQuality.UplinkLossPercent"/>).
+    /// <b>server</b> measures on our packets or the worst of our receivers sees on its downlink,
+    /// whichever is higher (<see cref="NetworkQuality.ProtectLossPercent"/>).
     /// </summary>
     public enum LossProfile
     {

@@ -413,6 +413,7 @@ namespace Aurix.WebGL
             DownlinkLossPercent = F32(o, "downlinkLossPercent"),
             UplinkJitterMs = F32(o, "uplinkJitterMs"),
             UplinkLossPercent = F32(o, "uplinkLossPercent"),
+            ReceiversLossPercent = F32(o, "receiversLossPercent"),
             UplinkBitrateKbps = MiniJson.GetUInt32(o, "uplinkBitrateKbps"),
             UplinkPacketsReceived = I64(o, "uplinkPacketsReceived"),
             UplinkPacketsLost = I64(o, "uplinkPacketsLost"),

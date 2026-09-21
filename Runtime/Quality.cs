@@ -100,9 +100,29 @@ namespace Aurix
         public float UplinkJitterMs;
         /// <summary>Sequence gaps in this client's packets over the last report interval.</summary>
         public float UplinkLossPercent;
+        /// <summary>
+        /// Worst downlink loss any receiver of this client's audio on the same node reported
+        /// over its last interval (0 with no receivers). The loss profile protects the uplink
+        /// against the higher of this and <see cref="UplinkLossPercent"/>.
+        /// </summary>
+        public float ReceiversLossPercent;
         public uint UplinkBitrateKbps;
         public long UplinkPacketsReceived;
         public long UplinkPacketsLost;
+
+        /// <summary>
+        /// Loss our uplink has to survive: the higher of <see cref="UplinkLossPercent"/> and
+        /// <see cref="ReceiversLossPercent"/> (only the sender can add FEC/DRED for a receiver on a lossy link).
+        /// </summary>
+        public float ProtectLossPercent
+        {
+            get
+            {
+                float up = float.IsFinite(UplinkLossPercent) ? UplinkLossPercent : 0f;
+                float down = float.IsFinite(ReceiversLossPercent) ? ReceiversLossPercent : 0f;
+                return Math.Clamp(Math.Max(up, down), 0f, 100f);
+            }
+        }
 
         /// <summary>Typed view of a <c>NetworkQuality</c> payload (<c>data.quality</c>).</summary>
         public static NetworkQuality? FromMessage(ControlMessage m)
@@ -123,6 +143,7 @@ namespace Aurix
             DownlinkLossPercent = (float)MiniJson.GetNumber(q, "downlink_loss_percent"),
             UplinkJitterMs = (float)MiniJson.GetNumber(q, "uplink_jitter_ms"),
             UplinkLossPercent = (float)MiniJson.GetNumber(q, "uplink_loss_percent"),
+            ReceiversLossPercent = (float)MiniJson.GetNumber(q, "receivers_loss_percent"),
             UplinkBitrateKbps = (uint)MiniJson.GetNumber(q, "uplink_bitrate_kbps"),
             UplinkPacketsReceived = (long)MiniJson.GetNumber(q, "uplink_packets_received"),
             UplinkPacketsLost = (long)MiniJson.GetNumber(q, "uplink_packets_lost"),
