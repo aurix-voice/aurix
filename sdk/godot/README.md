@@ -12,7 +12,8 @@ native events into signals on the main thread and bridge Godot's audio server to
 sdk/godot/
 ├── addons/aurix_voice/
 │   ├── aurix_voice.gdextension           library map + native dependency per platform
-│   └── bin/<platform>.<arch>/            staged by scripts/build_native.sh (git-ignored)
+│   ├── bin/<platform>.<arch>/            staged by scripts/build_native.sh (git-ignored)
+│   └── web/aurix_web_voice_client.gd     AurixWebVoiceClient — Web export over JavaScriptBridge + Web SDK
 ├── src/
 │   ├── aurix_voice_client.{h,cpp}        AurixVoiceClient : Node — the whole API + signals
 │   ├── aurix_participant_player.{h,cpp}  AurixParticipantPlayer : AudioStreamPlayer3D
@@ -20,9 +21,14 @@ sdk/godot/
 │   ├── aurix_conversions.h               C ABI structs → Dictionary / String / Array
 │   └── register_types.cpp                GDExtension entry point
 ├── SConstruct                            builds against godot-cpp + the staged native library
-├── scripts/build_native.sh               cargo build aurix-client → stage → scons
+├── scripts/build_native.sh               cargo build aurix-client → stage → scons (desktop, Android via cargo-ndk, iOS xcframeworks)
+├── scripts/build_web.sh                  Web export + aurix-web-sdk.js next to index.html
+├── export_presets.cfg                    "Web" preset (threads off)
 ├── demo/main.tscn + main.gd              lobby UI: connect, join, mute, chat, 3D per speaker
+├── demo/web_main.tscn + web_main.gd      the same lobby for the Web export (main scene on web)
 ├── tests/smoke.gd                        headless API smoke test (no server)
+├── tests/web_smoke.gd                    headless AurixWebVoiceClient smoke test (no browser)
+├── tests/web/godot_web_e2e.py            Playwright: exported lobby in Chromium (+ live node)
 ├── tests/live.gd + live.sh               headless two-client test against a running node
 └── project.godot                         minimal project wrapping the addon
 ```
@@ -32,12 +38,16 @@ sdk/godot/
 | `AurixVoiceClient` | `Node` | one per player: connect, channels, capture, playback, receiver controls, chat, speech, stats; every native event is a signal |
 | `AurixParticipantPlayer` | `AudioStreamPlayer3D` | one per remote speaker you want spatialised by Godot; pulls that participant's PCM from the client |
 | `AurixRegions` | `RefCounted` | parses `GET /v1/me/regions`, stores RTT probes, ranks endpoints |
+| `AurixWebVoiceClient` | `Node` (GDScript) | Web export only: same signals/dictionaries as `AurixVoiceClient`, media by the browser through the [Web SDK](../web/README.md) (`JavaScriptBridge`) |
 
 Platforms: Linux x86_64/arm64, Windows x86_64, macOS (universal) — wherever `aurix-client`
-builds and godot-cpp has a template. Android/iOS follow the same recipe with the matching
-Rust target and godot-cpp `platform=`; Web (wasm) is **not** supported by this extension (the
-native core needs UDP or a raw WebSocket — use the [Web SDK](../web/README.md) from JavaScript
-instead). Consoles: see [Porting to consoles](../../docs/src/sdk/consoles.md).
+builds and godot-cpp has a template. Android (arm64/arm32/x86_64, `cargo-ndk`) and iOS (arm64
+device + simulator xcframeworks, Xcode) are staged by `build_native.sh --target …` and listed in
+the `.gdextension`, but are not built in this repository's CI. Web (wasm) cannot load the
+extension; `AurixWebVoiceClient` + `scripts/build_web.sh` cover it (browser owns capture and
+playback; no `AurixParticipantPlayer`). Consoles: see
+[Porting to consoles](../../docs/src/sdk/consoles.md). Details:
+[docs/src/sdk/godot.md](../../docs/src/sdk/godot.md).
 
 ## 1. Build
 

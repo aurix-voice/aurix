@@ -101,13 +101,105 @@ AURIX_E2E_API=… AURIX_E2E_WS=… AURIX_E2E_API_KEY=… sdk/godot/tests/live.sh
 ```
 
 `addons/aurix_voice/aurix_voice.gdextension` maps Linux x86_64/arm64, Windows x86_64 and
-macOS universal to `bin/<platform>.<arch>/` and declares `aurix_client` as a `[dependencies]`
-entry so export templates ship both libraries. Android/iOS follow the same recipe with the
-matching Rust target and godot-cpp platform; Web exports are not supported by this extension
-(the native core needs UDP or a raw WebSocket — use the [Web SDK](web.md) from JavaScript).
+macOS universal, Android arm64/arm32/x86_64 and iOS arm64 to `bin/<platform>.<arch>/` and
+declares `aurix_client` as a `[dependencies]` entry so export templates ship both libraries.
+Web exports cannot load the extension (no UDP, no raw sockets in a browser); they use the
+separate [`AurixWebVoiceClient`](#web-export-aurixwebvoiceclient) instead.
 Consoles: [Porting to consoles](consoles.md). Flutter / React Native:
 [Mobile app frameworks](mobile-frameworks.md).
 
 `demo/main.tscn` is a lobby scene (connect, join, mute, chat, roster with speaking/mute flags,
 network quality, a "3D per speaker" toggle that spawns `AurixParticipantPlayer`s) that reads
 `AURIX_GODOT_WS` / `AURIX_GODOT_TOKEN_A` / `AURIX_GODOT_CHANNEL` when set.
+
+### Android and iOS
+
+`scripts/build_native.sh --target <triple>` stages the mobile slices with the same layout as
+desktop; the `.gdextension` already lists them, so a Godot Android/iOS export picks them up once
+the files exist:
+
+| Target | Prerequisites | Staged |
+|---|---|---|
+| `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android` | `cargo install cargo-ndk`, `ANDROID_NDK_HOME` (or `ANDROID_HOME` with `ndk/`), API 21+ (`ANDROID_API_LEVEL`) | `bin/android.<arm64|arm32|x86_64>/libaurix_client.so` + `libaurix_voice.android.<target>.<arch>.so` (scons `platform=android`) |
+| `aarch64-apple-ios` (device + `aarch64-apple-ios-sim`) | macOS with Xcode (`xcodebuild`, cmake) | `bin/ios.arm64/libaurix_client.xcframework` (static, device + simulator) + `libaurix_voice.ios.<target>.xcframework` built from two static archives (`ios_simulator=no|yes`) |
+
+cargo-ndk points the bundled libopus build (cmake) at the NDK toolchain; on iOS both
+`aurix_client` and the extension are static archives, linked by the Xcode project Godot
+generates, so nothing is `dlopen`ed at runtime. The Android export needs the `RECORD_AUDIO`
+permission and, for media over UDP/QUIC, `INTERNET`; iOS needs `NSMicrophoneUsageDescription`.
+Background audio, CallKit/AudioSession routing and Android audio focus are the game's
+responsibility — the extension only pushes and pulls PCM.
+
+**Not verified here:** this repository's CI has no Android NDK or Xcode, so the mobile slices
+are neither built nor exported nor run on a device by it — the recipe above is staged and
+documented, and the first `build_native.sh --target aarch64-linux-android` on a machine with the
+NDK is the verification step ([Limitations](../limitations.md)).
+
+## Web export: `AurixWebVoiceClient`
+
+A Godot **Web** export cannot run the GDExtension, but it can run the browser: the addon ships
+`addons/aurix_voice/web/aurix_web_voice_client.gd`, a plain GDScript node that drives the
+[Web SDK](web.md) through `JavaScriptBridge`. The bundle `aurix-web-sdk.js` is loaded next to
+`index.html` (or from `sdk_url`), `AurixWebSdk.AurixBridge` (the same handle-based façade the
+Unity WebGL client uses) is created per node, commands are `invoke()`d as JSON, and events are
+drained every frame in `_process` and re-emitted as Godot signals with the **same names and
+dictionary shapes as the native `AurixVoiceClient`** (`state_changed`, `session_ready`,
+`channel_joined`, `participant_joined/left/speaking/mute_changed`, `chat_message`,
+`transcript`, `network_quality`, `recovering/recovered`, …) plus browser-only ones
+(`sdk_status_changed`, `token_requested`, `remote_audio`, `participant_streams_changed`,
+`participant_visemes`, `e2ee_peer_key`, `devices_changed`, `stats`). Methods return the native
+`RESULT_*` codes; asynchronous calls (`join_channel`, `send_chat`, `channel_history`, …) return
+a positive request id and finish through the corresponding signal or `request_failed`.
+
+```
+ Godot Web export (wasm, main thread)                      browser
+ ┌──────────────────────────────────┐  JavaScriptBridge   ┌────────────────────────────────┐
+ │ AurixWebVoiceClient : Node       │──── invoke(json) ──►│ AurixGodot glue → AurixBridge  │
+ │   _process(): drain() → signals  │◄─── drain() ────────│ AurixClient (Web SDK)          │──► wss control
+ │   same signals as the native node│                     │ getUserMedia → WebRTC ◄── mixed + per-participant tracks
+ └──────────────────────────────────┘                     │ HTML audio / Web Audio / HRTF  │
+                                                           └────────────────────────────────┘
+```
+
+What differs from the native node is **audio ownership**: the browser captures the microphone
+(`getUserMedia`) and plays remote audio (HTML audio, or Web Audio with HRTF when
+`spatial_audio` is on and per-participant tracks are enabled) — `AudioStreamGenerator`,
+`AurixParticipantPlayer`, `push_capture`/`pull_participant`, engine-side 3D and the native
+DSP/codec/transport knobs simply do not exist on this node (no emulation; `network_changed()`
+maps to a WebRTC renegotiation and `get_media_path()` reports `MEDIA_WEBRTC`). Positions are
+still sent (`update_positions`/`update_transforms`) and the browser spatializes with the
+channel's `positional` policy. Autoplay policy applies: call
+`resume_audio()` from a user gesture when `remote_audio(false, "autoplay")` fires. E2EE,
+visemes, voice effects, transcripts/translation, chat/history, TTS, devices, quality/stats and
+token refresh (`token_requested` → `provide_token`, or `set_token` for a static token) follow
+the Web SDK.
+
+```gdscript
+const WebClient := preload("res://addons/aurix_voice/web/aurix_web_voice_client.gd")
+
+func _ready() -> void:
+    if not WebClient.is_supported():   # false outside a Web export
+        return
+    var voice := WebClient.new()       # exported vars: participant_streams, spatial_audio, e2ee, visemes, sdk_url…
+    add_child(voice)
+    voice.session_ready.connect(func(s): voice.join_channel(CHANNEL))
+    voice.remote_audio.connect(func(playing, reason): if not playing: $EnableAudio.show())
+    voice.connect_to_server("wss://voice.example.com/ws", token)
+```
+
+`project.godot` sets `run/main_scene.web = res://demo/web_main.tscn`: the Web lobby
+(`demo/web_main.gd`) mirrors the native demo (connect/join/mute/chat/roster/quality) and reads
+`?ws=&api=&token=&channel=` from the page URL. `scripts/build_web.sh` exports the `Web` preset
+(`export_presets.cfg`, threads off so no COOP/COEP headers are needed) and copies
+`sdk/web/dist/aurix-web-sdk.js` next to `index.html`; serve the folder over HTTP(S). The export
+still contains the desktop `.gdextension`, so the browser console shows one harmless
+`No GDExtension library found for current OS and architecture (web.wasm32)` line at boot —
+the native node is intentionally absent on the Web.
+
+Tests: `tests/web_smoke.gd` (headless, no browser — unsupported-platform paths, helper
+conversions and every bridge event → signal mapping) and `tests/web/godot_web_e2e.py`
+(Playwright/Chromium: the real export boots, loads the SDK and fails a dead endpoint cleanly;
+with `AURIX_API_URL`/`AURIX_WS_URL`/`AURIX_API_KEY` it joins a channel next to a plain Web SDK
+peer and checks roster, per-participant stream layout, speaking, chat both ways, network
+quality, stats, mute/volume/pin, leave and disconnect). Both run in the `godot` / `godot-web`
+CI jobs. Firefox/Safari and real microphones are not exercised in CI.

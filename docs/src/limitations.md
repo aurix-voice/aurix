@@ -17,11 +17,15 @@ the chapter that explains the boundary.
   has to provide (sockets/TLS, threads, audio callbacks, certification hooks) and where the
   NDA boundary sits. Likewise no first-party Flutter / React Native packages: the same C ABI is
   bound from a native plugin ([Flutter and React Native](sdk/mobile-frameworks.md)).
-* **Godot: desktop exports only.** The GDExtension links the native core, so it ships for
-  Linux/Windows/macOS exports; Godot's Web export cannot carry the native transport (no UDP, no
-  raw sockets) and there is no Godot-side WebRTC client — a browser build would have to embed
-  the Web SDK through `JavaScriptBridge`, which is not provided. Android/iOS builds of the
-  extension are not staged by the scripts yet ([Godot SDK](sdk/godot.md)).
+* **Godot Web is a different node.** The GDExtension links the native core and ships for
+  desktop (and, staged, mobile) exports; a Web export cannot carry the native transport, so it
+  uses `AurixWebVoiceClient` — GDScript over `JavaScriptBridge` and the Web SDK — with the same
+  signals and dictionaries but browser-owned audio: no `AudioStreamGenerator`/
+  `AurixParticipantPlayer`, no engine-side 3D, no native DSP knobs, autoplay gating
+  (`resume_audio()`), WebRTC only ([Godot SDK](sdk/godot.md#web-export-aurixwebvoiceclient)).
+* **Godot Android/iOS are staged, not built.** `build_native.sh` knows the cargo-ndk / Xcode
+  recipes and the `.gdextension` lists the slices, but this CI has no NDK or Xcode: nothing
+  mobile is compiled, exported or run on a device here ([Godot SDK](sdk/godot.md#android-and-ios)).
 * **No operator web dashboard.** Operations go through the REST API, the `aurix` CLI and the
   Grafana dashboards; a web panel is planned as a separate front end on top of the same API.
 * **No SIP/PSTN gateway**, no server-side noise suppression or echo cancellation — that runs
@@ -211,8 +215,10 @@ the chapter that explains the boundary.
   Unreal](sdk/native.md)).
 * **Godot editor and devices.** The extension is built and exercised headless in CI (API
   smoke test, project import, demo script parse) and against a live node in a two-client
-  Godot E2E on Linux; microphone capture through `AudioStreamMicrophone`, `AudioStreamPlayer3D`
-  spatialization and the Windows/macOS extension binaries are not run in CI
+  Godot E2E on Linux; the Web export runs in headless Chromium against a live node (boot, SDK
+  glue, join/roster/speaking/chat/quality). Microphone capture through
+  `AudioStreamMicrophone`, `AudioStreamPlayer3D` spatialization, the Windows/macOS extension
+  binaries, real microphones/headphones in the Web export and Firefox/Safari are not run in CI
   ([Godot SDK](sdk/godot.md)).
 * **Unity Editor and devices.** The Unity SDK and the sample scene are compiled against a
   UnityEngine stub and exercised through the .NET demo; permission dialogs, audio-route changes

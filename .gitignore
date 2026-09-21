@@ -23,3 +23,6 @@ sdk/godot/**/.godot/
 
 # mdBook output
 docs/book/
+
+# Godot Web export output
+sdk/godot/build/

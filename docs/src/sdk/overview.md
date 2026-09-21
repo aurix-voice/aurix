@@ -11,7 +11,7 @@ where they differ.
 | Media transport | WebRTC (Opus, single peer connection) | AURX v2 over UDP (WS tunnel fallback); Unity WebGL: browser WebRTC through the Web SDK | AURX v2 over QUIC datagrams (0-RTT, migration) → UDP → WS tunnel | AURX v2 over QUIC → UDP → WS tunnel | AURX v2 over QUIC → UDP → WS tunnel |
 | Codec | browser Opus | `IOpusCodec` — Concentus sample (pure C#) or `NativeOpusCodec` (libopus from the native core) | bundled libopus (static) | bundled libopus (static) | bundled libopus (static) |
 | PCMU (G.711) fallback | — (WebRTC negotiates Opus) | `SetAudioCodecAsync` / `PreferredCodec`, `PcmuCodec` | `set_audio_codec` / `aurix_client_set_audio_codec` | `SetAudioCodec` | `set_audio_codec` |
-| Platforms | Chromium, Firefox, Safari | Unity 2021.3+ incl. WebGL (`AurixWebGLVoiceClient`), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac | Godot 4.3+ Linux/Windows/macOS (no Web export) |
+| Platforms | Chromium, Firefox, Safari | Unity 2021.3+ incl. WebGL (`AurixWebGLVoiceClient`), iOS/Android, plain .NET | Linux, macOS, Windows | UE 5.3+ Win64/Linux/Mac | Godot 4.3+ Linux/Windows/macOS; Web via `AurixWebVoiceClient` (Web SDK); Android/iOS staged |
 | Downlink | server-mixed stereo track + up to `webrtc_participant_streams` per-participant tracks (Web Audio HRTF) | per-participant streams, client mixer; WebGL: as Web | per-participant streams, client mixer | client mixer → procedural `USoundWave` | client mixer → `AudioStreamGenerator`; `AurixParticipantPlayer` (`AudioStreamPlayer3D`) per speaker |
 | Reconnect / resume | yes | yes | yes | yes | yes |
 | Local mute / volume / block | yes | yes | yes | yes | yes |

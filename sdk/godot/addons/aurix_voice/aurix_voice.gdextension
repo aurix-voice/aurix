@@ -14,6 +14,14 @@ windows.debug.x86_64 = "res://addons/aurix_voice/bin/windows.x86_64/libaurix_voi
 windows.release.x86_64 = "res://addons/aurix_voice/bin/windows.x86_64/libaurix_voice.windows.template_release.x86_64.dll"
 macos.debug = "res://addons/aurix_voice/bin/macos.universal/libaurix_voice.macos.template_debug.framework"
 macos.release = "res://addons/aurix_voice/bin/macos.universal/libaurix_voice.macos.template_release.framework"
+android.debug.arm64 = "res://addons/aurix_voice/bin/android.arm64/libaurix_voice.android.template_debug.arm64.so"
+android.release.arm64 = "res://addons/aurix_voice/bin/android.arm64/libaurix_voice.android.template_release.arm64.so"
+android.debug.arm32 = "res://addons/aurix_voice/bin/android.arm32/libaurix_voice.android.template_debug.arm32.so"
+android.release.arm32 = "res://addons/aurix_voice/bin/android.arm32/libaurix_voice.android.template_release.arm32.so"
+android.debug.x86_64 = "res://addons/aurix_voice/bin/android.x86_64/libaurix_voice.android.template_debug.x86_64.so"
+android.release.x86_64 = "res://addons/aurix_voice/bin/android.x86_64/libaurix_voice.android.template_release.x86_64.so"
+ios.debug = "res://addons/aurix_voice/bin/ios.arm64/libaurix_voice.ios.template_debug.xcframework"
+ios.release = "res://addons/aurix_voice/bin/ios.arm64/libaurix_voice.ios.template_release.xcframework"
 
 [dependencies]
 
@@ -21,3 +29,7 @@ linux.x86_64 = { "res://addons/aurix_voice/bin/linux.x86_64/libaurix_client.so":
 linux.arm64 = { "res://addons/aurix_voice/bin/linux.arm64/libaurix_client.so": "" }
 windows.x86_64 = { "res://addons/aurix_voice/bin/windows.x86_64/aurix_client.dll": "" }
 macos = { "res://addons/aurix_voice/bin/macos.universal/libaurix_client.dylib": "" }
+android.arm64 = { "res://addons/aurix_voice/bin/android.arm64/libaurix_client.so": "" }
+android.arm32 = { "res://addons/aurix_voice/bin/android.arm32/libaurix_client.so": "" }
+android.x86_64 = { "res://addons/aurix_voice/bin/android.x86_64/libaurix_client.so": "" }
+ios = { "res://addons/aurix_voice/bin/ios.arm64/libaurix_client.xcframework": "" }
