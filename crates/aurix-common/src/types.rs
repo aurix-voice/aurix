@@ -1045,6 +1045,10 @@ pub struct MediaNodeInfo {
     /// selected for sessions or failover, preferred as a regional hub for relay trees.
     #[serde(default)]
     pub relay_only: bool,
+    /// Operator drain in progress: existing sessions stay (and may resume), fresh sessions,
+    /// failover and region discovery skip the node. Persisted until `undrain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<NodeDrain>,
 }
 
 impl MediaNodeInfo {
@@ -1056,8 +1060,23 @@ impl MediaNodeInfo {
     }
 
     pub fn is_available(&self) -> bool {
-        self.healthy && !self.relay_only && self.load_factor() < 0.9
+        self.healthy && !self.relay_only && self.drain.is_none() && self.load_factor() < 0.9
     }
+
+    pub fn is_draining(&self) -> bool {
+        self.drain.is_some()
+    }
+}
+
+/// Who put a node into maintenance, when and why (`POST /v1/nodes/{id}/drain`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDrain {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub since: DateTime<Utc>,
+    /// Administrator id that started the drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<Uuid>,
 }
 
 /// WGS-84 coordinates in degrees.
@@ -1723,6 +1742,8 @@ pub enum AuditAction {
     LiveStreamStopped,
     UserDataExported,
     RetentionSweep,
+    NodeDrained,
+    NodeUndrained,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1867,6 +1888,8 @@ pub enum AdminPermission {
     AppsDelete,
     KeysRotate,
     NodesRead,
+    NodesDrain,
+    ConfigRead,
     AuditRead,
     ModerationRead,
     AnalyticsRead,
@@ -1875,12 +1898,14 @@ pub enum AdminPermission {
 }
 
 impl AdminPermission {
-    pub const ALL: [AdminPermission; 10] = [
+    pub const ALL: [AdminPermission; 12] = [
         Self::AppsRead,
         Self::AppsWrite,
         Self::AppsDelete,
         Self::KeysRotate,
         Self::NodesRead,
+        Self::NodesDrain,
+        Self::ConfigRead,
         Self::AuditRead,
         Self::ModerationRead,
         Self::AnalyticsRead,
@@ -1892,7 +1917,9 @@ impl AdminPermission {
         match self {
             Self::AppsRead | Self::NodesRead | Self::AnalyticsRead => AdminRole::Viewer,
             Self::AuditRead | Self::ModerationRead => AdminRole::Moderator,
-            Self::AppsWrite | Self::KeysRotate => AdminRole::Admin,
+            Self::AppsWrite | Self::KeysRotate | Self::NodesDrain | Self::ConfigRead => {
+                AdminRole::Admin
+            }
             Self::AppsDelete | Self::RetentionRun | Self::AdminsManage => AdminRole::Superadmin,
         }
     }
@@ -1904,6 +1931,8 @@ impl AdminPermission {
             Self::AppsDelete => "apps:delete",
             Self::KeysRotate => "keys:rotate",
             Self::NodesRead => "nodes:read",
+            Self::NodesDrain => "nodes:drain",
+            Self::ConfigRead => "config:read",
             Self::AuditRead => "audit:read",
             Self::ModerationRead => "moderation:read",
             Self::AnalyticsRead => "analytics:read",

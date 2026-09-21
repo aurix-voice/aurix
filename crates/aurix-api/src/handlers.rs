@@ -2333,6 +2333,93 @@ pub async fn list_media_nodes(
     to_json(state.control.nodes.get_all_nodes())
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct DrainNodeRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Puts a node into maintenance: it keeps (and resumes) the sessions it hosts but is skipped
+/// for fresh sessions, failover and region discovery until `undrain`. Fleet-wide: the target
+/// node applies the flag on its next heartbeat.
+pub async fn drain_media_node(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(node_id): Path<Uuid>,
+    body: Option<Json<DrainNodeRequest>>,
+) -> JsonResult {
+    admin.require(AdminPermission::NodesDrain)?;
+    let reason = body
+        .and_then(|Json(b)| b.reason)
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    if reason.as_ref().is_some_and(|r| r.chars().count() > 512) {
+        return Err(AurixError::Validation("reason must be at most 512 characters".into()).into());
+    }
+    let node = state
+        .control
+        .nodes
+        .set_drain(
+            MediaNodeId::from_uuid(node_id),
+            Some((reason.as_deref(), admin.admin_id)),
+        )
+        .await?
+        .ok_or_else(|| AurixError::NotFound("Node not found".into()))?;
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        AuditAction::NodeDrained,
+        "node",
+        &node_id.to_string(),
+        serde_json::json!({ "reason": reason, "region": node.region.as_str() }),
+        client_ip_string(ip),
+    );
+    to_json(node)
+}
+
+pub async fn undrain_media_node(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(node_id): Path<Uuid>,
+) -> JsonResult {
+    admin.require(AdminPermission::NodesDrain)?;
+    let node = state
+        .control
+        .nodes
+        .set_drain(MediaNodeId::from_uuid(node_id), None)
+        .await?
+        .ok_or_else(|| AurixError::NotFound("Node not found".into()))?;
+    state.control.audit.log(
+        None,
+        UserId(admin.admin_id),
+        AuditAction::NodeUndrained,
+        "node",
+        &node_id.to_string(),
+        serde_json::json!({ "region": node.region.as_str() }),
+        client_ip_string(ip),
+    );
+    to_json(node)
+}
+
+/// Effective configuration of *this* node with every secret masked (read-only; nodes are
+/// configured through files/env, never through the API).
+pub async fn admin_effective_config(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+) -> JsonResult {
+    admin.require(AdminPermission::ConfigRead)?;
+    Ok(Json(serde_json::json!({
+        "node_id": state.control.node_id,
+        "version": env!("CARGO_PKG_VERSION"),
+        "region": state.control.config.server.region.as_str(),
+        "environment": state.control.config.server.environment,
+        "production": state.control.config.is_production(),
+        "config": state.control.config.redacted(),
+    })))
+}
+
 // ── Analytics ──
 
 // ── API keys ──

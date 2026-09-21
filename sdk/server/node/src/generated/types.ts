@@ -12,8 +12,8 @@ export const AdminAuthSourceValues: readonly AdminAuthSource[] = ["password", "o
 export type AdminExportUsageFormat = "json" | "csv";
 export const AdminExportUsageFormatValues: readonly AdminExportUsageFormat[] = ["json", "csv"] as const;
 
-export type AdminPermission = "apps:read" | "apps:write" | "apps:delete" | "keys:rotate" | "nodes:read" | "audit:read" | "moderation:read" | "analytics:read" | "retention:run" | "admins:manage";
-export const AdminPermissionValues: readonly AdminPermission[] = ["apps:read", "apps:write", "apps:delete", "keys:rotate", "nodes:read", "audit:read", "moderation:read", "analytics:read", "retention:run", "admins:manage"] as const;
+export type AdminPermission = "apps:read" | "apps:write" | "apps:delete" | "keys:rotate" | "nodes:read" | "nodes:drain" | "config:read" | "audit:read" | "moderation:read" | "analytics:read" | "retention:run" | "admins:manage";
+export const AdminPermissionValues: readonly AdminPermission[] = ["apps:read", "apps:write", "apps:delete", "keys:rotate", "nodes:read", "nodes:drain", "config:read", "audit:read", "moderation:read", "analytics:read", "retention:run", "admins:manage"] as const;
 
 /** Administrator role. Each role includes the permissions of the ones before it. */
 export type AdminRole = "viewer" | "moderator" | "admin" | "superadmin";
@@ -783,6 +783,11 @@ export interface DeleteRecordingResponse {
   id?: string;
 }
 
+export interface DrainNodeRequest {
+  /** Why the node is drained; shown in the fleet overview and the audit log. */
+  reason?: string | null;
+}
+
 /**
  * Priority-speaker ducking. Applied by the node to server-mixed and native per-participant
  * delivery (after the receiver's own mute/volume/block and positional attenuation, before
@@ -811,6 +816,19 @@ export interface EditMessageRequest {
   text: string;
   /** Replaces the stored metadata; absent or `null` clears it. */
   metadata?: unknown | null;
+}
+
+export interface EffectiveConfig {
+  node_id: string;
+  version: string;
+  region: string;
+  environment: string;
+  production: boolean;
+  /**
+   * The merged `AurixConfig` tree (`server`, `database`, `redis`, `media`, `auth`, `turn`,
+   * `recording`, `stt`, `tts`, …) with secrets masked as `"***"`.
+   */
+  config: Record<string, unknown>;
 }
 
 export interface ErrorDetail {
@@ -1054,6 +1072,12 @@ export interface MediaNode {
    * traffic in the `region_tree` topology.
    */
   relay_only?: boolean;
+  /**
+   * Present while the node is being drained (`POST /v1/nodes/{node_id}/drain`): it keeps and resumes
+   * the sessions it already hosts but is skipped for fresh sessions, failover endpoints and region
+   * discovery. Absent/`null` otherwise.
+   */
+  drain?: NodeDrain | null;
   capacity?: number;
   active_channels?: number;
   active_participants?: number;
@@ -1129,6 +1153,15 @@ export interface NetworkQuality {
   uplink_bitrate_kbps?: number;
   uplink_packets_received?: number;
   uplink_packets_lost?: number;
+}
+
+/** Operator drain (maintenance) in progress on a node. */
+export interface NodeDrain {
+  /** Free-text reason given by the operator. */
+  reason?: string | null;
+  since: string;
+  /** Administrator who started the drain. */
+  by?: string | null;
 }
 
 /**

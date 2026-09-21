@@ -2816,6 +2816,43 @@ pub async fn mark_node_unhealthy(pool: &DbPool, node_id: Uuid) -> Result<(), sql
     Ok(())
 }
 
+/// Starts (`Some(reason)`) or ends (`None`) an operator drain. Returns the updated row, or
+/// `None` when the node is unknown. Heartbeats never touch these columns.
+pub async fn set_media_node_drain(
+    pool: &DbPool,
+    node_id: Uuid,
+    drain: Option<(Option<&str>, Uuid)>,
+) -> Result<Option<MediaNodeRow>, sqlx::Error> {
+    match drain {
+        Some((reason, by)) => {
+            sqlx::query_as::<_, MediaNodeRow>(
+                r#"UPDATE media_nodes
+                   SET draining = true, drain_reason = $2,
+                       draining_since = COALESCE(CASE WHEN draining THEN draining_since END, NOW()),
+                       drained_by = $3
+                   WHERE id = $1
+                   RETURNING *"#,
+            )
+            .bind(node_id)
+            .bind(reason)
+            .bind(by)
+            .fetch_optional(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, MediaNodeRow>(
+                r#"UPDATE media_nodes
+                   SET draining = false, drain_reason = NULL, draining_since = NULL, drained_by = NULL
+                   WHERE id = $1
+                   RETURNING *"#,
+            )
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await
+        }
+    }
+}
+
 pub async fn delete_media_node(pool: &DbPool, node_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM media_nodes WHERE id = $1")
         .bind(node_id)

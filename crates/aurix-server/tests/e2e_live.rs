@@ -14456,3 +14456,722 @@ async fn translation_counters(http: &reqwest::Client) -> Option<HashMap<String, 
             .collect(),
     )
 }
+
+/// A tenant call authenticated as an administrator acting on one application
+/// (`Authorization: Bearer <admin jwt>` + `X-Aurix-App`), the way the dashboard talks to nodes.
+async fn delegated(
+    http: &reqwest::Client,
+    env: &Env,
+    method: reqwest::Method,
+    path: &str,
+    admin_token: &str,
+    app: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let mut req = http
+        .request(method, format!("{}{path}", env.api))
+        .bearer_auth(admin_token)
+        .header("x-aurix-app", app);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+/// Creates a password administrator with `role` and signs it in; returns `(id, token)`.
+async fn admin_with_role(
+    http: &reqwest::Client,
+    env: &Env,
+    superadmin: &str,
+    role: &str,
+    run: &str,
+) -> (String, String) {
+    let email = format!("{role}.{run}@example.com");
+    let password = format!("{role}-password-{run}");
+    let (status, created) = admin_json(
+        http,
+        reqwest::Method::POST,
+        format!("{}/admin/admins", env.api),
+        superadmin,
+        Some(serde_json::json!({
+            "email": email,
+            "password": password,
+            "display_name": format!("{role} {run}"),
+            "role": role,
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "create {role}: {created}");
+    let resp = http
+        .post(format!("{}/admin/login", env.api))
+        .json(&serde_json::json!({"email": email, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "login {role}");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    (
+        created["id"].as_str().unwrap().to_string(),
+        body["token"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Dashboard-style tenant access: an administrator's own JWT plus `X-Aurix-App` stands in for
+/// the application's API key. The admin's role maps onto tenant permissions, tenant data stays
+/// scoped to the named application, moderation is attributed to the administrator, a real API
+/// key always wins over the header, and unknown / deleted applications are indistinguishable.
+/// Needs `AURIX_E2E_ADMIN_TOKEN` (a superadmin).
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn admin_jwt_with_x_aurix_app_acts_as_the_application() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Ok(superadmin) = std::env::var("AURIX_E2E_ADMIN_TOKEN") else {
+        eprintln!("AURIX_E2E_ADMIN_TOKEN not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let (env_a, app_a) = isolated_env(&env, &http, "delegation-a").await;
+    let (env_b, app_b) = isolated_env(&env, &http, "delegation-b").await;
+    let (app_a, app_b) = (app_a.unwrap(), app_b.unwrap());
+
+    // ── a superadmin creates and lists channels of application A without its key ──
+    let (status, ch) = delegated(
+        &http,
+        &env,
+        reqwest::Method::POST,
+        "/v1/channels",
+        &superadmin,
+        &app_a,
+        Some(serde_json::json!({"name": format!("delegated-{run}"), "type": "positional"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{ch}");
+    let channel_id: ChannelId = ChannelId::from_uuid(ch["id"].as_str().unwrap().parse().unwrap());
+    let names = |v: &serde_json::Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let (status, listed) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels?per_page=100",
+        &superadmin,
+        &app_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{listed}");
+    assert!(names(&listed).contains(&format!("delegated-{run}")));
+    // The channel belongs to A only; B sees nothing of it. The key of A confirms the same view.
+    let (status, listed_b) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels?per_page=100",
+        &superadmin,
+        &app_b,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{listed_b}");
+    assert!(!names(&listed_b).contains(&format!("delegated-{run}")));
+    let (status, via_key) = tenant_get(&env_a, &http, "/v1/channels?per_page=100").await;
+    assert_eq!(status, 200);
+    assert!(names(&via_key).contains(&format!("delegated-{run}")));
+    let (status, via_key_b) = tenant_get(&env_b, &http, "/v1/channels?per_page=100").await;
+    assert_eq!(status, 200);
+    assert!(!names(&via_key_b).contains(&format!("delegated-{run}")));
+
+    // ── the header never overrides a real API key ──
+    let resp = http
+        .get(format!("{}/v1/channels?per_page=100", env.api))
+        .header("x-api-key", &env_b.api_key)
+        .header("x-aurix-app", &app_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        !names(&body).contains(&format!("delegated-{run}")),
+        "an API key must keep its own tenant regardless of X-Aurix-App"
+    );
+
+    // ── malformed / missing / foreign credentials ──
+    let (status, _) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels",
+        &superadmin,
+        "not-an-application",
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "X-Aurix-App must be a uuid");
+    let (status, _) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels",
+        &superadmin,
+        &uuid::Uuid::now_v7().to_string(),
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "unknown application");
+    let resp = http
+        .get(format!("{}/v1/channels", env.api))
+        .header("x-aurix-app", &app_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "X-Aurix-App without a bearer token"
+    );
+    let (player_token, uid_a) =
+        issue_token(&env_a, &http, "delegation:alice", "Alice", channel_id).await;
+    let (status, _) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels",
+        &player_token,
+        &app_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, 401, "a player token is not an administrator");
+
+    // ── roles map onto tenant permissions ──
+    let (_, viewer) = admin_with_role(&http, &env, &superadmin, "viewer", &run).await;
+    let (moderator_id, moderator) =
+        admin_with_role(&http, &env, &superadmin, "moderator", &run).await;
+    let (status, _) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels",
+        &viewer,
+        &app_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "viewers read channels");
+    let (status, body) = delegated(
+        &http,
+        &env,
+        reqwest::Method::POST,
+        "/v1/channels",
+        &viewer,
+        &app_a,
+        Some(serde_json::json!({"name": "nope", "type": "positional"})),
+    )
+    .await;
+    assert_eq!(status, 403, "viewers cannot write channels: {body}");
+    let (status, _) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/moderation/events",
+        &viewer,
+        &app_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "viewers have no moderation:read");
+    let (status, body) = delegated(
+        &http,
+        &env,
+        reqwest::Method::POST,
+        "/v1/channels",
+        &moderator,
+        &app_a,
+        Some(serde_json::json!({"name": "nope", "type": "positional"})),
+    )
+    .await;
+    assert_eq!(status, 403, "moderators cannot write channels: {body}");
+
+    // ── a moderator kicks a live player; the audit trail names the administrator ──
+    let mut alice = connect(&env_a, "alice", player_token).await;
+    join(&mut alice, channel_id).await;
+    let (status, body) = delegated(
+        &http,
+        &env,
+        reqwest::Method::POST,
+        "/v1/moderation/kick",
+        &moderator,
+        &app_a,
+        Some(serde_json::json!({
+            "user_id": uid_a,
+            "channel_id": channel_id.to_string(),
+            "reason": "delegated kick",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    alice
+        .expect(
+            "Kick",
+            |m| matches!(m, ControlMessage::Kick { reason, .. } if reason == "delegated kick"),
+        )
+        .await;
+    let (status, audit) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/audit-log?per_page=50",
+        &moderator,
+        &app_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{audit}");
+    let kick = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "user_kicked" && e["target_id"] == uid_a)
+        .unwrap_or_else(|| panic!("kick must be audited: {audit}"));
+    assert_eq!(
+        kick["actor_id"], moderator_id,
+        "the acting administrator is the audit actor, not an API key"
+    );
+
+    // ── a deleted application is gone for delegation too ──
+    let (status, _) = admin_json(
+        &http,
+        reqwest::Method::DELETE,
+        format!("{}/v1/apps/{app_b}", env.api),
+        &superadmin,
+        None,
+    )
+    .await;
+    assert!(status == 200 || status == 204, "delete app B: {status}");
+    let (status, _) = delegated(
+        &http,
+        &env,
+        reqwest::Method::GET,
+        "/v1/channels",
+        &superadmin,
+        &app_b,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "inactive applications cannot be acted on");
+}
+
+/// `GET /admin/config` is read-only, `config:read` (Admin+) and never leaks a secret: every
+/// `*secret*` / `*password*` / `*_key` / `*_token` field and URL credential is `***`, while
+/// non-secret settings and node-local metadata stay readable. There is no mutation route.
+/// Needs a superadmin `AURIX_E2E_ADMIN_TOKEN`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn effective_config_is_read_only_and_redacted() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let Ok(superadmin) = std::env::var("AURIX_E2E_ADMIN_TOKEN") else {
+        eprintln!("AURIX_E2E_ADMIN_TOKEN not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let (_, viewer) = admin_with_role(&http, &env, &superadmin, "viewer", &run).await;
+    let (_, moderator) = admin_with_role(&http, &env, &superadmin, "moderator", &run).await;
+    let (_, admin) = admin_with_role(&http, &env, &superadmin, "admin", &run).await;
+    let url = format!("{}/admin/config", env.api);
+
+    for (token, role) in [(&viewer, "viewer"), (&moderator, "moderator")] {
+        let (status, body) =
+            admin_json(&http, reqwest::Method::GET, url.clone(), token, None).await;
+        assert_eq!(status, 403, "{role} must not read config: {body}");
+    }
+    let (status, body) =
+        admin_json(&http, reqwest::Method::GET, url.clone(), &env.api_key, None).await;
+    assert_eq!(status, 401, "API keys are not admins: {body}");
+    for method in [
+        reqwest::Method::PUT,
+        reqwest::Method::PATCH,
+        reqwest::Method::POST,
+        reqwest::Method::DELETE,
+    ] {
+        let (status, _) = admin_json(
+            &http,
+            method.clone(),
+            url.clone(),
+            &superadmin,
+            Some(serde_json::json!({"server": {"region": "eu_west"}})),
+        )
+        .await;
+        assert_eq!(status, 405, "{method} must not exist on /admin/config");
+    }
+
+    let (status, body) = admin_json(&http, reqwest::Method::GET, url.clone(), &admin, None).await;
+    assert_eq!(status, 200, "{body}");
+    uuid::Uuid::parse_str(body["node_id"].as_str().unwrap()).unwrap();
+    assert!(!body["version"].as_str().unwrap().is_empty());
+    assert!(!body["region"].as_str().unwrap().is_empty());
+    assert!(body["production"].is_boolean());
+    let config = &body["config"];
+    assert!(config.is_object(), "{body}");
+    assert_eq!(config["auth"]["jwt_secret"], "***");
+    assert!(config["server"]["api_port"].is_number(), "{config}");
+    assert!(config["server"]["ws_port"].is_number(), "{config}");
+    assert!(config["media"]["port"].is_number(), "{config}");
+    let db_url = config["database"]["url"].as_str().unwrap();
+    assert!(
+        !db_url.contains("aurix:aurix@") && db_url.starts_with("postgres"),
+        "database credentials must be masked: {db_url}"
+    );
+
+    // Nothing that looks like a secret survives anywhere in the tree.
+    fn walk(v: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    let lower = k.to_ascii_lowercase();
+                    let secret_key = lower.contains("secret")
+                        || lower.contains("password")
+                        || lower == "api_key"
+                        || lower.ends_with("_key")
+                        || lower.ends_with("_token");
+                    let p = format!("{path}/{k}");
+                    match child {
+                        serde_json::Value::String(s) if secret_key && s != "***" => out.push(p),
+                        serde_json::Value::String(s) if s.contains("ci-only-") => out.push(p),
+                        serde_json::Value::String(s) if s.contains(":aurix@") => out.push(p),
+                        _ => walk(child, &p, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk(child, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut leaks = Vec::new();
+    walk(config, "", &mut leaks);
+    assert!(leaks.is_empty(), "unredacted secrets at {leaks:?}");
+    let (status, same) = admin_json(&http, reqwest::Method::GET, url, &superadmin, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(same["node_id"], body["node_id"]);
+}
+
+/// Node maintenance. Draining node 2 keeps it healthy in the registry but removes it from
+/// fresh admission, cross-node takeover, region discovery and the failover list of node 1;
+/// players already on it stay and resume there. Undrain restores everything; drain state is
+/// operator-owned and survives heartbeats. Runs alone (`AURIX_E2E_DRAIN=1`) because it changes
+/// which nodes the fleet offers.
+/// Needs `AURIX_E2E_WS2` / `AURIX_E2E_API2` and a superadmin `AURIX_E2E_ADMIN_TOKEN`.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn draining_a_node_stops_fresh_sessions_but_keeps_its_own() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    if std::env::var("AURIX_E2E_DRAIN").is_err() {
+        eprintln!("AURIX_E2E_DRAIN not set; skipping");
+        return;
+    }
+    let Ok(ws2) = std::env::var("AURIX_E2E_WS2") else {
+        eprintln!("AURIX_E2E_WS2 not set; skipping");
+        return;
+    };
+    let Ok(superadmin) = std::env::var("AURIX_E2E_ADMIN_TOKEN") else {
+        eprintln!("AURIX_E2E_ADMIN_TOKEN not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let (env, _) = isolated_env(&env, &http, "drain").await;
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: ws2,
+        api_key: env.api_key.clone(),
+    };
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let channel_id = create_channel(&env, &http).await;
+
+    let node_of = |body: &serde_json::Value, api: &str| -> serde_json::Value {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["api_url"].as_str() == Some(api) && n["healthy"] == true)
+            .cloned()
+            .unwrap_or_else(|| panic!("no healthy node advertises {api}: {body}"))
+    };
+    let nodes = |env: &Env| {
+        let http = http.clone();
+        let url = format!("{}/v1/nodes", env.api);
+        let token = superadmin.clone();
+        async move {
+            let (status, body) = admin_json(&http, reqwest::Method::GET, url, &token, None).await;
+            assert_eq!(status, 200, "{body}");
+            body
+        }
+    };
+    let overview = nodes(&env).await;
+    let node2 = node_of(&overview, &env2.api);
+    let node2_id = node2["id"].as_str().unwrap().to_string();
+    assert!(node2["drain"].is_null(), "node 2 starts undrained: {node2}");
+    let node2_ws = env2.ws.trim_end_matches('/').trim_end_matches("/ws");
+
+    // Bob lives on node 2 before the drain. Alice is on node 1 and already sees node 2 as failover.
+    let (tok_a, _) = issue_token(
+        &env,
+        &http,
+        &format!("drain:{run}:alice"),
+        "Alice",
+        channel_id,
+    )
+    .await;
+    let (tok_b, _) =
+        issue_token(&env2, &http, &format!("drain:{run}:bob"), "Bob", channel_id).await;
+    let (tok_c, _) = issue_token(
+        &env2,
+        &http,
+        &format!("drain:{run}:carol"),
+        "Carol",
+        channel_id,
+    )
+    .await;
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env2, "bob", tok_b.clone()).await;
+    assert!(
+        alice.failover.iter().any(|u| u.starts_with(node2_ws)),
+        "node 1 must offer node 2 before the drain: {:?}",
+        alice.failover
+    );
+    for p in [&mut alice, &mut bob] {
+        bind_media(p).await;
+        join(p, channel_id).await;
+    }
+
+    // ── permissions and validation ──
+    let (_, viewer) = admin_with_role(&http, &env, &superadmin, "viewer", &run).await;
+    let (status, _) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/nodes/{node2_id}/drain", env.api),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "viewers cannot drain");
+    let (status, _) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/nodes/{node2_id}/drain", env.api),
+        &superadmin,
+        Some(serde_json::json!({"reason": "x".repeat(513)})),
+    )
+    .await;
+    assert_eq!(status, 400, "reason is capped at 512 characters");
+    let (status, _) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/nodes/{}/drain", env.api, uuid::Uuid::now_v7()),
+        &superadmin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "unknown node");
+
+    // ── drain node 2 from node 1: state is fleet-wide ──
+    let (status, drained) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/nodes/{node2_id}/drain", env.api),
+        &superadmin,
+        Some(serde_json::json!({"reason": format!("kernel update {run}")})),
+    )
+    .await;
+    assert_eq!(status, 200, "{drained}");
+    assert_eq!(drained["id"], node2_id);
+    assert_eq!(drained["drain"]["reason"], format!("kernel update {run}"));
+    assert!(drained["drain"]["since"].is_string());
+    assert_eq!(drained["healthy"], true, "drain is not unhealthiness");
+    let since = drained["drain"]["since"].clone();
+
+    // Both nodes report it (node 2 learns through its own registry refresh / heartbeat), and a
+    // heartbeat later the drain is still there with the original timestamp.
+    let mut seen_on_node2 = false;
+    for _ in 0..40 {
+        let n2 = node_of(&nodes(&env2).await, &env2.api);
+        if n2["drain"]["since"] == since {
+            seen_on_node2 = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(seen_on_node2, "node 2 must see its own drain");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let n2 = node_of(&nodes(&env).await, &env2.api);
+    assert_eq!(
+        n2["drain"]["since"], since,
+        "heartbeats must not clear or restamp the drain: {n2}"
+    );
+
+    // ── fresh sessions: refused with 503 on node 2, region discovery and failover skip it ──
+    match try_connect(&env2, &tok_c, None).await {
+        Err(503) => {}
+        Err(other) => panic!("draining node must answer 503, got {other}"),
+        Ok(_) => panic!("draining node must not accept a fresh session"),
+    }
+    let (status, regions) = tenant_get(&env, &http, "/v1/regions").await;
+    assert_eq!(status, 200, "{regions}");
+    assert!(
+        regions["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["node_id"] != node2_id),
+        "region discovery must not hand out a draining node: {regions}"
+    );
+    let mut dave = connect(
+        &env,
+        "dave",
+        issue_token(
+            &env,
+            &http,
+            &format!("drain:{run}:dave"),
+            "Dave",
+            channel_id,
+        )
+        .await
+        .0,
+    )
+    .await;
+    assert!(
+        !dave.failover.iter().any(|u| u.starts_with(node2_ws)),
+        "node 1 must stop advertising the draining node 2 as failover: {:?}",
+        dave.failover
+    );
+    dave.ws.close(None).await.ok();
+
+    // ── Bob stays on node 2, keeps talking and can resume there ──
+    let payload = Bytes::from(vec![0x42u8; 40]);
+    send_audio(&bob, channel_id, 1, &payload).await;
+    assert!(
+        count_audio_from(&alice, bob.ssrc, &payload).await >= 5,
+        "a player on a draining node keeps talking"
+    );
+    let Player {
+        session_id: sid_b,
+        resume_token: token_b,
+        ws: bob_ws,
+        ..
+    } = bob;
+    drop(bob_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let bob = connect_with(&env2, "bob@node2", tok_b.clone(), Some((sid_b, &token_b))).await;
+    assert!(
+        bob.resumed,
+        "an existing session resumes on its draining node"
+    );
+    assert_eq!(bob.session_id, sid_b);
+
+    // ── a stale failover list pointing at node 2 gets 503 there; the home node still resumes ──
+    let Player {
+        session_id: sid_a,
+        resume_token: token_a,
+        ws: alice_ws,
+        ..
+    } = alice;
+    drop(alice_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    match try_connect(&env2, &tok_a, Some((sid_a, &token_a))).await {
+        Err(503) => {}
+        Err(other) => panic!("a draining node must not adopt foreign sessions, got {other}"),
+        Ok(_) => panic!("a draining node must not adopt foreign sessions"),
+    }
+    let alice = connect_with(&env, "alice@node1", tok_a.clone(), Some((sid_a, &token_a))).await;
+    assert!(
+        alice.resumed && !alice.migrated,
+        "the home node still resumes"
+    );
+    assert_eq!(alice.session_id, sid_a);
+
+    // ── undrain: idempotent, restores admission, discovery and failover ──
+    let (status, undrained) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/nodes/{node2_id}/undrain", env.api),
+        &superadmin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{undrained}");
+    assert!(undrained["drain"].is_null(), "{undrained}");
+    let (status, again) = admin_json(
+        &http,
+        reqwest::Method::POST,
+        format!("{}/v1/nodes/{node2_id}/undrain", env.api),
+        &superadmin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "undrain is idempotent: {again}");
+    let mut accepted = false;
+    for _ in 0..40 {
+        if try_connect(&env2, &tok_c, None).await.is_ok() {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(accepted, "node 2 must take fresh sessions again");
+    let (_, regions) = tenant_get(&env, &http, "/v1/regions").await;
+    assert!(
+        regions["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["nodes"].as_u64().unwrap_or(0) >= 2 || r["node_id"] == node2_id),
+        "node 2 is back in region discovery: {regions}"
+    );
+
+    // ── the audit log names the operator for both transitions ──
+    let (status, audit) = admin_json(
+        &http,
+        reqwest::Method::GET,
+        format!("{}/admin/audit-log?per_page=100", env.api),
+        &superadmin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{audit}");
+    let entries = audit.as_array().unwrap();
+    let drained_entry = entries
+        .iter()
+        .find(|e| e["action"] == "node_drained" && e["target_id"] == node2_id)
+        .unwrap_or_else(|| panic!("node_drained must be audited: {audit}"));
+    assert_eq!(
+        drained_entry["details"]["reason"],
+        format!("kernel update {run}")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"] == "node_undrained" && e["target_id"] == node2_id),
+        "node_undrained must be audited: {audit}"
+    );
+}

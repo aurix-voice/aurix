@@ -55,13 +55,15 @@ impl NodeManager {
                 rows.iter().map(|r| MediaNodeId::from_uuid(r.id)).collect();
             for row in rows {
                 let info = Self::info_from_row(&row);
-                // Never let a stale DB row downgrade a fresher local heartbeat.
-                let keep_local = self
+                // Never let a stale DB row downgrade a fresher local heartbeat; the drain flag
+                // is operator-owned and always authoritative in the database.
+                let kept_local = self
                     .nodes
-                    .get(&info.id)
-                    .map(|cur| cur.last_heartbeat >= info.last_heartbeat)
-                    .unwrap_or(false);
-                if !keep_local {
+                    .get_mut(&info.id)
+                    .filter(|cur| cur.last_heartbeat >= info.last_heartbeat)
+                    .map(|mut cur| cur.drain = info.drain.clone())
+                    .is_some();
+                if !kept_local {
                     self.nodes.insert(info.id, info);
                 }
             }
@@ -100,7 +102,16 @@ impl NodeManager {
             last_heartbeat: row.last_heartbeat,
             capacity: row.capacity.max(0) as u32,
             relay_only: row.relay_only,
+            drain: Self::drain_from_row(row),
         }
+    }
+
+    fn drain_from_row(row: &MediaNodeRow) -> Option<NodeDrain> {
+        row.draining.then(|| NodeDrain {
+            reason: row.drain_reason.clone().filter(|r| !r.is_empty()),
+            since: row.draining_since.unwrap_or(row.last_heartbeat),
+            by: row.drained_by,
+        })
     }
 
     fn row_from_info(info: &MediaNodeInfo) -> MediaNodeRow {
@@ -125,32 +136,82 @@ impl NodeManager {
             bandwidth_out_mbps: info.bandwidth_out_mbps as f64,
             healthy: info.healthy,
             relay_only: info.relay_only,
+            draining: info.drain.is_some(),
+            drain_reason: info.drain.as_ref().and_then(|d| d.reason.clone()),
+            draining_since: info.drain.as_ref().map(|d| d.since),
+            drained_by: info.drain.as_ref().and_then(|d| d.by),
             version: env!("CARGO_PKG_VERSION").to_string(),
             last_heartbeat: Utc::now(),
             registered_at: Utc::now(),
         }
     }
 
-    pub async fn register_node(&self, info: MediaNodeInfo) -> Result<()> {
+    /// Upserts the node's own row. The drain columns are operator-owned and not part of the
+    /// upsert, so the persisted state is read back and applied to the local entry.
+    async fn upsert_self(&self, info: MediaNodeInfo, what: &str) -> Result<()> {
         let row = Self::row_from_info(&info);
-
-        aurix_db::queries::upsert_media_node(&self.pool, &row)
+        let id = info.id;
+        self.nodes.insert(id, info);
+        let stored = aurix_db::queries::upsert_media_node(&self.pool, &row)
             .await
-            .map_err(|e| AurixError::Database(format!("Failed to register node: {e}")))?;
-
-        self.nodes.insert(info.id, info);
+            .map_err(|e| AurixError::Database(format!("{what} failed: {e}")))?;
+        let drain = Self::drain_from_row(&stored);
+        if let Some(mut node) = self.nodes.get_mut(&id) {
+            if node.drain.is_some() != drain.is_some() {
+                match &drain {
+                    Some(d) => info!(
+                        "Node {id} is draining (reason: {})",
+                        d.reason.as_deref().unwrap_or("-")
+                    ),
+                    None => info!("Node {id} drain ended"),
+                }
+            }
+            node.drain = drain;
+        }
         Ok(())
     }
 
+    pub async fn register_node(&self, info: MediaNodeInfo) -> Result<()> {
+        self.upsert_self(info, "Node registration").await
+    }
+
     pub async fn heartbeat(&self, node_id: MediaNodeId, info: MediaNodeInfo) -> Result<()> {
-        let row = Self::row_from_info(&info);
-        self.nodes.insert(node_id, info);
+        debug_assert_eq!(node_id, info.id);
+        self.upsert_self(info, "Node heartbeat").await
+    }
 
-        aurix_db::queries::upsert_media_node(&self.pool, &row)
+    /// Operator drain / undrain of any node in the fleet. The target node observes the change
+    /// on its next heartbeat (`media.heartbeat_interval_ms`); this node applies it at once.
+    /// `Ok(None)` when the node is unknown.
+    pub async fn set_drain(
+        &self,
+        node_id: MediaNodeId,
+        drain: Option<(Option<&str>, uuid::Uuid)>,
+    ) -> Result<Option<MediaNodeInfo>> {
+        let row = aurix_db::queries::set_media_node_drain(&self.pool, node_id.0, drain)
             .await
-            .map_err(|e| AurixError::Database(format!("Node heartbeat failed: {e}")))?;
+            .map_err(|e| AurixError::Database(format!("Failed to update node drain: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored = Self::drain_from_row(&row);
+        let info = match self.nodes.get_mut(&node_id) {
+            Some(mut node) => {
+                node.drain = stored;
+                node.clone()
+            }
+            None => {
+                let info = Self::info_from_row(&row);
+                self.nodes.insert(node_id, info.clone());
+                info
+            }
+        };
+        Ok(Some(info))
+    }
 
-        Ok(())
+    /// Whether `node_id` (normally this node) is in an operator drain.
+    pub fn is_draining(&self, node_id: MediaNodeId) -> bool {
+        self.nodes.get(&node_id).is_some_and(|n| n.is_draining())
     }
 
     pub fn select_node(&self, region: Region) -> Result<MediaNodeInfo> {
@@ -391,6 +452,7 @@ mod tests {
             last_heartbeat: Utc::now(),
             capacity: 100,
             relay_only: false,
+            drain: None,
         }
     }
 
@@ -436,6 +498,42 @@ mod tests {
             Some("https://eu-west.example/health")
         );
         assert!((regions[0].load_factor - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn draining_node_is_skipped_for_selection_discovery_and_failover() {
+        let m = manager();
+        let busy = insert(
+            &m,
+            node(Region::EuWest, Some("wss://eu1.example/ws"), 50, None),
+        );
+        let mut idle = node(Region::EuWest, Some("wss://eu2.example/ws"), 10, None);
+        idle.drain = Some(NodeDrain {
+            reason: Some("kernel upgrade".into()),
+            since: Utc::now(),
+            by: None,
+        });
+        assert!(!idle.is_available());
+        let idle_id = insert(&m, idle);
+        let self_id = insert(
+            &m,
+            node(Region::UsEast, Some("wss://us.example/ws"), 0, None),
+        );
+
+        assert_eq!(m.select_node(Region::EuWest).map(|n| n.id).ok(), Some(busy));
+        let regions = m.regions(&SelectionHint::default());
+        let eu = regions.iter().find(|r| r.region == Region::EuWest).unwrap();
+        assert_eq!(eu.node_id, busy);
+        assert_eq!(eu.nodes, 1);
+        assert_eq!(
+            m.failover_endpoints(self_id, 5),
+            vec!["wss://eu1.example/ws".to_string()]
+        );
+        assert!(m.is_draining(idle_id));
+        assert!(!m.is_draining(busy));
+        // The overview still lists the node, with its drain state.
+        assert!(m.get_all_nodes().iter().any(|n| n.id == idle_id
+            && n.drain.as_ref().and_then(|d| d.reason.as_deref()) == Some("kernel upgrade")));
     }
 
     #[tokio::test]

@@ -86,6 +86,7 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::revoke_admin_tokens),
         )
         .route("/admin/audit-log", get(handlers::admin_list_audit_logs))
+        .route("/admin/config", get(handlers::admin_effective_config))
         .route(
             "/admin/retention/sweep",
             post(handlers::admin_retention_sweep),
@@ -105,6 +106,11 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::admin_rotate_app_key),
         )
         .route("/v1/nodes", get(handlers::list_media_nodes))
+        .route("/v1/nodes/:node_id/drain", post(handlers::drain_media_node))
+        .route(
+            "/v1/nodes/:node_id/undrain",
+            post(handlers::undrain_media_node),
+        )
         .route("/admin/analytics/usage", get(analytics::admin_usage))
         .route(
             "/admin/analytics/export",

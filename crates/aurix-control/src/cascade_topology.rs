@@ -449,6 +449,7 @@ mod tests {
             last_heartbeat: Utc::now(),
             capacity: 100,
             relay_only: false,
+            drain: None,
         }
     }
 

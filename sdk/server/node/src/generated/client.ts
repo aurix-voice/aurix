@@ -204,6 +204,24 @@ export class AurixClient extends AurixHttp {
   }
 
   /**
+   * Effective configuration of this node (secrets redacted)
+   *
+   * The configuration the answering node runs with, after file, environment and defaults were merged
+   * — read-only. Every credential is masked: fields named like `*secret*`, `*password*`, `*_key`,
+   * `api_key`, `*_token` become `"***"` when set, and `user:password@` in URLs (database, Redis,
+   * sentinels, endpoints) is masked. File paths, ports, flags and timings are returned verbatim.
+   * Node-local: behind a load balancer, address the node you want to inspect (`api_url` in `GET
+   * /v1/nodes`). Nodes are configured through files/env/Helm; there is deliberately no write
+   * counterpart.
+   *
+   * `GET /admin/config`
+   * Auth: AdminToken.
+   */
+  adminEffectiveConfig(options?: RequestOptions): Promise<T.EffectiveConfig> {
+    return this.json<T.EffectiveConfig>("GET", "/admin/config", { ...options });
+  }
+
+  /**
    * Run a retention sweep now
    *
    * Applies the `[retention]` rules immediately. The sweep holds a PostgreSQL advisory lock so only
@@ -351,13 +369,46 @@ export class AurixClient extends AurixHttp {
   /**
    * Media node fleet
    *
-   * Every node registers itself and heartbeats; nodes silent for 30 s are marked unhealthy.
+   * Every node registers itself and heartbeats; nodes silent for 30 s are marked unhealthy. `drain`
+   * is set while an operator drains the node.
    *
    * `GET /v1/nodes`
    * Auth: AdminToken.
    */
   listNodes(options?: RequestOptions): Promise<T.MediaNode[]> {
     return this.json<T.MediaNode[]>("GET", "/v1/nodes", { ...options });
+  }
+
+  /**
+   * Drain a node (maintenance)
+   *
+   * Marks the node as draining, fleet-wide and persistently (survives restarts and heartbeats) until
+   * `undrainNode`. A draining node keeps the sessions it hosts and still accepts their reconnects
+   * (resume), but takes no fresh sessions and adopts no sessions from other nodes (`/ws` answers
+   * `503` to both; clients move to the next failover endpoint), is left out of failover endpoints
+   * handed to other nodes' clients and of region discovery. It does not change the node's health or
+   * configuration; to empty it, watch `active_participants` in `GET /v1/nodes` and stop the node
+   * when it reaches 0 (or earlier — remaining clients then resume on another node through failover).
+   * Audited as `node_drained`.
+   *
+   * `POST /v1/nodes/{node_id}/drain`
+   * Auth: AdminToken.
+   */
+  drainNode(nodeId: string, body?: T.DrainNodeRequest, options?: RequestOptions): Promise<T.MediaNode> {
+    return this.json<T.MediaNode>("POST", `/v1/nodes/${encodeURIComponent(nodeId)}/drain`, { body, ...options });
+  }
+
+  /**
+   * End a node drain
+   *
+   * Makes the node eligible for fresh sessions, failover and region discovery again. Audited as
+   * `node_undrained`.
+   *
+   * `POST /v1/nodes/{node_id}/undrain`
+   * Auth: AdminToken.
+   */
+  undrainNode(nodeId: string, options?: RequestOptions): Promise<T.MediaNode> {
+    return this.json<T.MediaNode>("POST", `/v1/nodes/${encodeURIComponent(nodeId)}/undrain`, { ...options });
   }
 
   /**

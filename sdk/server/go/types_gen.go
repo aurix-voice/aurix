@@ -42,6 +42,8 @@ const (
 	AdminPermissionAppsDelete     AdminPermission = "apps:delete"
 	AdminPermissionKeysRotate     AdminPermission = "keys:rotate"
 	AdminPermissionNodesRead      AdminPermission = "nodes:read"
+	AdminPermissionNodesDrain     AdminPermission = "nodes:drain"
+	AdminPermissionConfigRead     AdminPermission = "config:read"
 	AdminPermissionAuditRead      AdminPermission = "audit:read"
 	AdminPermissionModerationRead AdminPermission = "moderation:read"
 	AdminPermissionAnalyticsRead  AdminPermission = "analytics:read"
@@ -928,6 +930,12 @@ type DeleteRecordingResponse struct {
 	ID      *string `json:"id,omitempty"`
 }
 
+// DrainNodeRequest is the `DrainNodeRequest` schema.
+type DrainNodeRequest struct {
+	// Why the node is drained; shown in the fleet overview and the audit log.
+	Reason *string `json:"reason,omitempty"`
+}
+
 // Priority-speaker ducking. Applied by the node to server-mixed and native per-participant
 // delivery (after the receiver's own mute/volume/block and positional attenuation, before
 // ambient/`max_streams` ranking); receivers of dedicated WebRTC tracks apply the same envelope
@@ -953,6 +961,18 @@ type EditMessageRequest struct {
 	Text string `json:"text"`
 	// Replaces the stored metadata; absent or `null` clears it.
 	Metadata any `json:"metadata,omitempty"`
+}
+
+// EffectiveConfig is the `EffectiveConfig` schema.
+type EffectiveConfig struct {
+	NodeID      string `json:"node_id"`
+	Version     string `json:"version"`
+	Region      string `json:"region"`
+	Environment string `json:"environment"`
+	Production  bool   `json:"production"`
+	// The merged `AurixConfig` tree (`server`, `database`, `redis`, `media`, `auth`, `turn`,
+	// `recording`, `stt`, `tts`, …) with secrets masked as `"***"`.
+	Config map[string]any `json:"config"`
 }
 
 // ErrorDetail is the `ErrorDetail` schema.
@@ -1204,18 +1224,22 @@ type MediaNode struct {
 	// The node is a pure cascade relay hub (`media.cascade_relay_only`): it hosts no client sessions
 	// (no `ws_url`, `capacity` 0, never selected for failover) and forwards inter-regional cascade
 	// traffic in the `region_tree` topology.
-	RelayOnly          *bool    `json:"relay_only,omitempty"`
-	Capacity           *int64   `json:"capacity,omitempty"`
-	ActiveChannels     *int64   `json:"active_channels,omitempty"`
-	ActiveParticipants *int64   `json:"active_participants,omitempty"`
-	CPUUsage           *float64 `json:"cpu_usage,omitempty"`
-	MemoryUsage        *float64 `json:"memory_usage,omitempty"`
-	BandwidthInMbps    *float64 `json:"bandwidth_in_mbps,omitempty"`
-	BandwidthOutMbps   *float64 `json:"bandwidth_out_mbps,omitempty"`
-	Healthy            bool     `json:"healthy"`
-	Version            string   `json:"version"`
-	LastHeartbeat      string   `json:"last_heartbeat"`
-	RegisteredAt       *string  `json:"registered_at,omitempty"`
+	RelayOnly *bool `json:"relay_only,omitempty"`
+	// Present while the node is being drained (`POST /v1/nodes/{node_id}/drain`): it keeps and resumes
+	// the sessions it already hosts but is skipped for fresh sessions, failover endpoints and region
+	// discovery. Absent/`null` otherwise.
+	Drain              *NodeDrain `json:"drain,omitempty"`
+	Capacity           *int64     `json:"capacity,omitempty"`
+	ActiveChannels     *int64     `json:"active_channels,omitempty"`
+	ActiveParticipants *int64     `json:"active_participants,omitempty"`
+	CPUUsage           *float64   `json:"cpu_usage,omitempty"`
+	MemoryUsage        *float64   `json:"memory_usage,omitempty"`
+	BandwidthInMbps    *float64   `json:"bandwidth_in_mbps,omitempty"`
+	BandwidthOutMbps   *float64   `json:"bandwidth_out_mbps,omitempty"`
+	Healthy            bool       `json:"healthy"`
+	Version            string     `json:"version"`
+	LastHeartbeat      string     `json:"last_heartbeat"`
+	RegisteredAt       *string    `json:"registered_at,omitempty"`
 	// Public WebSocket URL advertised for region discovery; `null` when the node is not advertised.
 	WSURL    *string      `json:"ws_url,omitempty"`
 	APIURL   *string      `json:"api_url,omitempty"`
@@ -1277,6 +1301,15 @@ type NetworkQuality struct {
 	UplinkBitrateKbps     *int64   `json:"uplink_bitrate_kbps,omitempty"`
 	UplinkPacketsReceived *int64   `json:"uplink_packets_received,omitempty"`
 	UplinkPacketsLost     *int64   `json:"uplink_packets_lost,omitempty"`
+}
+
+// Operator drain (maintenance) in progress on a node.
+type NodeDrain struct {
+	// Free-text reason given by the operator.
+	Reason *string `json:"reason,omitempty"`
+	Since  string  `json:"since"`
+	// Administrator who started the drain.
+	By *string `json:"by,omitempty"`
 }
 
 // Offset pagination envelope used by list endpoints (`page` starts at 1, `per_page` is capped

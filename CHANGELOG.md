@@ -25,6 +25,23 @@ released together.
   events `chat.message_updated` and `chat.reaction`. Web, Unity (native + WebGL), native core /
   C ABI / C++, Unreal, Godot (native + Web) and the generated Node / Python / Go / C# server
   SDKs expose the new calls and events.
+* Operator **node drain** (migration 19): `POST /v1/nodes/{id}/drain` / `undrain` (admin
+  permission `nodes:drain`, optional reason, audited as `node_drained` / `node_undrained`).
+  A draining node stays healthy but is skipped by node selection, region discovery and the
+  failover list, and its `/ws` answers `503` to fresh sessions and cross-node takeovers;
+  sessions already there stay and resume locally. The state is persisted in `media_nodes`
+  (`MediaNode.drain {reason, since, by}`), survives heartbeats and restarts, and is applied by
+  the node within one heartbeat. `aurix node drain|undrain`.
+* `GET /admin/config` (`config:read`): the node's effective, merged configuration with every
+  secret-bearing field (`*secret*`, `*password*`, `*_key`, `api_key`, `*_token`) and URL
+  credential masked as `***`, plus node id, version, region and environment. Read-only — there
+  is no mutation route by design. `aurix node config`.
+* Administrators can act on one application without its API key: admin JWT +
+  `X-Aurix-App: <app_id>` scopes any tenant route to that application, with the role mapped to
+  tenant permissions (viewer → reads, moderator → moderation/chat/audit, admin → writes,
+  superadmin → `*`). An API key in the request still takes precedence; unknown or deactivated
+  applications are `404`. Audit and moderation actors record the administrator. This is the
+  access path for the operator dashboard so keys never reach a browser.
 
 ### Fixed
 

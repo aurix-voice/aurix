@@ -22,8 +22,8 @@ AdminAuthSource_VALUES: List[AdminAuthSource] = ["password", "oidc"]
 AdminExportUsageFormat = Literal["json", "csv"]
 AdminExportUsageFormat_VALUES: List[AdminExportUsageFormat] = ["json", "csv"]
 
-AdminPermission = Literal["apps:read", "apps:write", "apps:delete", "keys:rotate", "nodes:read", "audit:read", "moderation:read", "analytics:read", "retention:run", "admins:manage"]
-AdminPermission_VALUES: List[AdminPermission] = ["apps:read", "apps:write", "apps:delete", "keys:rotate", "nodes:read", "audit:read", "moderation:read", "analytics:read", "retention:run", "admins:manage"]
+AdminPermission = Literal["apps:read", "apps:write", "apps:delete", "keys:rotate", "nodes:read", "nodes:drain", "config:read", "audit:read", "moderation:read", "analytics:read", "retention:run", "admins:manage"]
+AdminPermission_VALUES: List[AdminPermission] = ["apps:read", "apps:write", "apps:delete", "keys:rotate", "nodes:read", "nodes:drain", "config:read", "audit:read", "moderation:read", "analytics:read", "retention:run", "admins:manage"]
 
 AdminRole = Literal["viewer", "moderator", "admin", "superadmin"]
 """Administrator role. Each role includes the permissions of the ones before it."""
@@ -767,6 +767,13 @@ DeleteRecordingResponse = TypedDict(
     },
 )
 
+DrainNodeRequest = TypedDict(
+    "DrainNodeRequest",
+    {
+        "reason": NotRequired[Optional[str]],  # Why the node is drained; shown in the fleet overview and the audit log.
+    },
+)
+
 DuckingConfig = TypedDict(
     "DuckingConfig",
     {
@@ -784,6 +791,18 @@ EditMessageRequest = TypedDict(
     {
         "text": str,  # New text; `chat.max_message_bytes` applies.
         "metadata": NotRequired[Optional[Any]],  # Replaces the stored metadata; absent or `null` clears it.
+    },
+)
+
+EffectiveConfig = TypedDict(
+    "EffectiveConfig",
+    {
+        "node_id": str,
+        "version": str,
+        "region": str,
+        "environment": str,
+        "production": bool,
+        "config": Dict[str, Any],  # The merged `AurixConfig` tree (`server`, `database`, `redis`, `media`, `auth`, `turn`, `recording`, `stt`, `tts`, …) with secrets masked as `"***"`.
     },
 )
 
@@ -1061,6 +1080,7 @@ MediaNode = TypedDict(
         "api_port": int,
         "cascade_port": NotRequired[Optional[int]],
         "relay_only": NotRequired[bool],  # The node is a pure cascade relay hub (`media.cascade_relay_only`): it hosts no client sessions (no `ws_url`, `capacity` 0, never selected for failover) and forwards inter-regional cascade traffic in the `region_tree` topology.
+        "drain": NotRequired[Optional["NodeDrain"]],  # Present while the node is being drained (`POST /v1/nodes/{node_id}/drain`): it keeps and resumes the sessions it already hosts but is skipped for fresh sessions, failover endpoints and region discovery. Absent/`null` otherwise.
         "capacity": NotRequired[int],
         "active_channels": NotRequired[int],
         "active_participants": NotRequired[int],
@@ -1136,6 +1156,16 @@ NetworkQuality = TypedDict(
     },
 )
 """Merged view of the client's `QualityReport` and the SFU's uplink measurements; the worse direction decides the rating (`R ≥ 80 → 5 bars, ≥ 70 → 4, ≥ 60 → 3, ≥ 50 → 2, else 1`)."""
+
+NodeDrain = TypedDict(
+    "NodeDrain",
+    {
+        "reason": NotRequired[Optional[str]],  # Free-text reason given by the operator.
+        "since": str,
+        "by": NotRequired[Optional[str]],  # Administrator who started the drain.
+    },
+)
+"""Operator drain (maintenance) in progress on a node."""
 
 Pagination = TypedDict(
     "Pagination",

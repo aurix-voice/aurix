@@ -50,12 +50,14 @@ public static class AdminPermission
     public const string AppsDelete = "apps:delete";
     public const string KeysRotate = "keys:rotate";
     public const string NodesRead = "nodes:read";
+    public const string NodesDrain = "nodes:drain";
+    public const string ConfigRead = "config:read";
     public const string AuditRead = "audit:read";
     public const string ModerationRead = "moderation:read";
     public const string AnalyticsRead = "analytics:read";
     public const string RetentionRun = "retention:run";
     public const string AdminsManage = "admins:manage";
-    public static readonly IReadOnlyList<string> All = new[] { AppsRead, AppsWrite, AppsDelete, KeysRotate, NodesRead, AuditRead, ModerationRead, AnalyticsRead, RetentionRun, AdminsManage };
+    public static readonly IReadOnlyList<string> All = new[] { AppsRead, AppsWrite, AppsDelete, KeysRotate, NodesRead, NodesDrain, ConfigRead, AuditRead, ModerationRead, AnalyticsRead, RetentionRun, AdminsManage };
 }
 
 /// <summary>
@@ -1742,6 +1744,15 @@ public sealed record DeleteRecordingResponse
     public string? Id { get; init; }
 }
 
+public sealed record DrainNodeRequest
+{
+    /// <summary>
+    /// Why the node is drained; shown in the fleet overview and the audit log.
+    /// </summary>
+    [JsonPropertyName("reason")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Reason { get; init; }
+}
+
 /// <summary>
 /// Priority-speaker ducking. Applied by the node to server-mixed and native per-participant
 /// delivery (after the receiver's own mute/volume/block and positional attenuation, before
@@ -1796,6 +1807,31 @@ public sealed record EditMessageRequest
     /// </summary>
     [JsonPropertyName("metadata")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public object? Metadata { get; init; }
+}
+
+public sealed record EffectiveConfig
+{
+    [JsonPropertyName("node_id")]
+    public required string NodeId { get; init; }
+
+    [JsonPropertyName("version")]
+    public required string Version { get; init; }
+
+    [JsonPropertyName("region")]
+    public required string Region { get; init; }
+
+    [JsonPropertyName("environment")]
+    public required string Environment { get; init; }
+
+    [JsonPropertyName("production")]
+    public required bool Production { get; init; }
+
+    /// <summary>
+    /// The merged `AurixConfig` tree (`server`, `database`, `redis`, `media`, `auth`, `turn`,
+    /// `recording`, `stt`, `tts`, …) with secrets masked as `"***"`.
+    /// </summary>
+    [JsonPropertyName("config")]
+    public required Dictionary<string, object?> Config { get; init; }
 }
 
 public sealed record ErrorDetail
@@ -2306,6 +2342,14 @@ public sealed record MediaNode
     [JsonPropertyName("relay_only")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? RelayOnly { get; init; }
 
+    /// <summary>
+    /// Present while the node is being drained (`POST /v1/nodes/{node_id}/drain`): it keeps and resumes
+    /// the sessions it already hosts but is skipped for fresh sessions, failover endpoints and region
+    /// discovery. Absent/`null` otherwise.
+    /// </summary>
+    [JsonPropertyName("drain")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public NodeDrain? Drain { get; init; }
+
     [JsonPropertyName("capacity")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? Capacity { get; init; }
 
@@ -2480,6 +2524,27 @@ public sealed record NetworkQuality
 
     [JsonPropertyName("uplink_packets_lost")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? UplinkPacketsLost { get; init; }
+}
+
+/// <summary>
+/// Operator drain (maintenance) in progress on a node.
+/// </summary>
+public sealed record NodeDrain
+{
+    /// <summary>
+    /// Free-text reason given by the operator.
+    /// </summary>
+    [JsonPropertyName("reason")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Reason { get; init; }
+
+    [JsonPropertyName("since")]
+    public required string Since { get; init; }
+
+    /// <summary>
+    /// Administrator who started the drain.
+    /// </summary>
+    [JsonPropertyName("by")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? By { get; init; }
 }
 
 /// <summary>

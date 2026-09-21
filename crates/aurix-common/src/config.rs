@@ -127,6 +127,15 @@ impl AurixConfig {
             || self.server.environment.eq_ignore_ascii_case("prod")
     }
 
+    /// The effective configuration with every secret removed, for `GET /admin/config`.
+    /// Secret-bearing fields (`*secret*`, `*password*`, `*_key`, `api_key`, `*_token`) become
+    /// `"***"` when set; credentials embedded in URLs (`scheme://user:pass@host`) are masked.
+    pub fn redacted(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        redact_value(&mut value, None);
+        value
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.server.api_port == 0 {
             anyhow::bail!("API port must be non-zero");
@@ -637,6 +646,74 @@ pub fn is_placeholder_secret(secret: &str) -> bool {
         || s.contains("secret-here")
         || s == "secret"
         || s == "password"
+}
+
+const REDACTED: &str = "***";
+
+/// Whether a configuration key holds a credential. `*_key_path` / `*_ttl_*` style keys point
+/// at files or durations and are kept.
+pub fn is_secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    if k.ends_with("_path") || k.ends_with("_file") {
+        return false;
+    }
+    k.contains("secret")
+        || k.contains("password")
+        || k.contains("passwd")
+        || k == "api_key"
+        || k.ends_with("_key")
+        || k.ends_with("_token")
+}
+
+/// Masks `user:password@` in a URL-like string; other strings are returned unchanged.
+pub fn redact_url_credentials(s: &str) -> String {
+    let Some(scheme_end) = s.find("://") else {
+        return s.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = s[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(s.len(), |i| authority_start + i);
+    let authority = &s[authority_start..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return s.to_string();
+    };
+    let userinfo = &authority[..at];
+    let masked = match userinfo.find(':') {
+        Some(colon) if userinfo.len() > colon + 1 => format!("{}:{REDACTED}", &userinfo[..colon]),
+        Some(_) => userinfo.to_string(),
+        None => REDACTED.to_string(),
+    };
+    format!(
+        "{}{masked}{}",
+        &s[..authority_start],
+        &s[authority_start + at..]
+    )
+}
+
+fn redact_value(value: &mut serde_json::Value, key: Option<&str>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                redact_value(v, Some(k));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                redact_value(v, key);
+            }
+        }
+        serde_json::Value::String(s) => {
+            if key.is_some_and(is_secret_key) {
+                if !s.is_empty() {
+                    *s = REDACTED.to_string();
+                }
+            } else {
+                *s = redact_url_credentials(s);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2704,6 +2781,81 @@ mod tests {
         let mut cfg = AurixConfig::default();
         cfg.server.environment = "development".into();
         cfg
+    }
+
+    #[test]
+    fn redacted_config_keeps_no_secret() {
+        let mut cfg = dev_config();
+        cfg.auth.jwt_secret = "jwt-top-secret-value-0123456789abcdef".into();
+        cfg.auth.admin_bootstrap_token = Some("bootstrap-xyz".into());
+        cfg.auth.oidc.client_secret = Some("oidc-client-secret".into());
+        cfg.database.url = "postgres://aurix:dbpass@db.internal:5432/aurix?sslmode=require".into();
+        cfg.redis.url = "rediss://:redispass@redis.internal:6380/0".into();
+        cfg.redis.sentinels = vec!["redis://:sentinelpass@sentinel-1:26379".into()];
+        cfg.turn.auth_secret = "turn-shared-secret".into();
+        cfg.stt.api_key = Some("stt-key".into());
+        cfg.recording.encryption_key = Some("hexkeyhexkey".into());
+        cfg.recording.s3_secret_key = Some("s3-secret".into());
+
+        let redacted = cfg.redacted();
+        let text = redacted.to_string();
+        for secret in [
+            "jwt-top-secret-value",
+            "bootstrap-xyz",
+            "oidc-client-secret",
+            "dbpass",
+            "redispass",
+            "sentinelpass",
+            "turn-shared-secret",
+            "stt-key",
+            "hexkeyhexkey",
+            "s3-secret",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(redacted["auth"]["jwt_secret"], "***");
+        assert_eq!(
+            redacted["database"]["url"],
+            "postgres://aurix:***@db.internal:5432/aurix?sslmode=require"
+        );
+        assert_eq!(
+            redacted["redis"]["url"],
+            "rediss://:***@redis.internal:6380/0"
+        );
+        assert_eq!(
+            redacted["redis"]["sentinels"][0],
+            "redis://:***@sentinel-1:26379"
+        );
+        // Non-secret structure survives: ports, paths, flags.
+        assert_eq!(redacted["server"]["api_port"], cfg.server.api_port);
+        assert_eq!(
+            redacted["auth"]["admin_password_login"],
+            cfg.auth.admin_password_login
+        );
+        assert!(redacted["auth"]["jwt_public_key_path"].is_null());
+        assert_eq!(redacted["stt"]["api_key"], "***");
+    }
+
+    #[test]
+    fn url_credential_masking_is_conservative() {
+        assert_eq!(
+            redact_url_credentials("wss://voice.example.com/ws"),
+            "wss://voice.example.com/ws"
+        );
+        assert_eq!(redact_url_credentials("not a url"), "not a url");
+        assert_eq!(
+            redact_url_credentials("http://user@host/p"),
+            "http://***@host/p"
+        );
+        assert_eq!(
+            redact_url_credentials("http://user:@host"),
+            "http://user:@host"
+        );
+        assert_eq!(redact_url_credentials("http://host/a@b"), "http://host/a@b");
+        assert!(is_secret_key("cascade_secret"));
+        assert!(is_secret_key("s3_access_key"));
+        assert!(!is_secret_key("jwt_private_key_path"));
+        assert!(!is_secret_key("token_ttl_secs"));
     }
 
     #[test]

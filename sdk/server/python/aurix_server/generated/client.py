@@ -192,6 +192,23 @@ class AurixClient(BaseClient):
         """
         return self._json("GET", "/admin/audit-log", query={"page": page, "per_page": per_page}, options=options)  # type: ignore[no-any-return]
 
+    def admin_effective_config(self, *, options: Optional[RequestOptions] = None) -> "T.EffectiveConfig":
+        """Effective configuration of this node (secrets redacted)
+
+
+        The configuration the answering node runs with, after file, environment and defaults were merged
+        — read-only. Every credential is masked: fields named like `*secret*`, `*password*`, `*_key`,
+        `api_key`, `*_token` become `"***"` when set, and `user:password@` in URLs (database, Redis,
+        sentinels, endpoints) is masked. File paths, ports, flags and timings are returned verbatim.
+        Node-local: behind a load balancer, address the node you want to inspect (`api_url` in `GET
+        /v1/nodes`). Nodes are configured through files/env/Helm; there is deliberately no write
+        counterpart.
+
+        `GET /admin/config`
+        Auth: AdminToken.
+        """
+        return self._json("GET", "/admin/config", options=options)  # type: ignore[no-any-return]
+
     def retention_sweep(self, *, options: Optional[RequestOptions] = None) -> "T.SweepReport":
         """Run a retention sweep now
 
@@ -330,12 +347,43 @@ class AurixClient(BaseClient):
         """Media node fleet
 
 
-        Every node registers itself and heartbeats; nodes silent for 30 s are marked unhealthy.
+        Every node registers itself and heartbeats; nodes silent for 30 s are marked unhealthy. `drain`
+        is set while an operator drains the node.
 
         `GET /v1/nodes`
         Auth: AdminToken.
         """
         return self._json("GET", "/v1/nodes", options=options)  # type: ignore[no-any-return]
+
+    def drain_node(self, node_id: str, body: Optional["T.DrainNodeRequest"] = None, *, options: Optional[RequestOptions] = None) -> "T.MediaNode":
+        """Drain a node (maintenance)
+
+
+        Marks the node as draining, fleet-wide and persistently (survives restarts and heartbeats) until
+        `undrainNode`. A draining node keeps the sessions it hosts and still accepts their reconnects
+        (resume), but takes no fresh sessions and adopts no sessions from other nodes (`/ws` answers
+        `503` to both; clients move to the next failover endpoint), is left out of failover endpoints
+        handed to other nodes' clients and of region discovery. It does not change the node's health or
+        configuration; to empty it, watch `active_participants` in `GET /v1/nodes` and stop the node
+        when it reaches 0 (or earlier — remaining clients then resume on another node through failover).
+        Audited as `node_drained`.
+
+        `POST /v1/nodes/{node_id}/drain`
+        Auth: AdminToken.
+        """
+        return self._json("POST", f"/v1/nodes/{_p(node_id)}/drain", body=body, options=options)  # type: ignore[no-any-return]
+
+    def undrain_node(self, node_id: str, *, options: Optional[RequestOptions] = None) -> "T.MediaNode":
+        """End a node drain
+
+
+        Makes the node eligible for fresh sessions, failover and region discovery again. Audited as
+        `node_undrained`.
+
+        `POST /v1/nodes/{node_id}/undrain`
+        Auth: AdminToken.
+        """
+        return self._json("POST", f"/v1/nodes/{_p(node_id)}/undrain", options=options)  # type: ignore[no-any-return]
 
     def issue_token(self, body: "T.GenerateTokenRequest", *, options: Optional[RequestOptions] = None) -> "T.TokenResponse":
         """Issue a player session token
@@ -1701,6 +1749,23 @@ class AsyncAurixClient:
         """
         return await self._run(self.sync.admin_audit_log, page=page, per_page=per_page, options=options)  # type: ignore[no-any-return]
 
+    async def admin_effective_config(self, *, options: Optional[RequestOptions] = None) -> "T.EffectiveConfig":
+        """Effective configuration of this node (secrets redacted)
+
+
+        The configuration the answering node runs with, after file, environment and defaults were merged
+        — read-only. Every credential is masked: fields named like `*secret*`, `*password*`, `*_key`,
+        `api_key`, `*_token` become `"***"` when set, and `user:password@` in URLs (database, Redis,
+        sentinels, endpoints) is masked. File paths, ports, flags and timings are returned verbatim.
+        Node-local: behind a load balancer, address the node you want to inspect (`api_url` in `GET
+        /v1/nodes`). Nodes are configured through files/env/Helm; there is deliberately no write
+        counterpart.
+
+        `GET /admin/config`
+        Auth: AdminToken.
+        """
+        return await self._run(self.sync.admin_effective_config, options=options)  # type: ignore[no-any-return]
+
     async def retention_sweep(self, *, options: Optional[RequestOptions] = None) -> "T.SweepReport":
         """Run a retention sweep now
 
@@ -1839,12 +1904,43 @@ class AsyncAurixClient:
         """Media node fleet
 
 
-        Every node registers itself and heartbeats; nodes silent for 30 s are marked unhealthy.
+        Every node registers itself and heartbeats; nodes silent for 30 s are marked unhealthy. `drain`
+        is set while an operator drains the node.
 
         `GET /v1/nodes`
         Auth: AdminToken.
         """
         return await self._run(self.sync.list_nodes, options=options)  # type: ignore[no-any-return]
+
+    async def drain_node(self, node_id: str, body: Optional["T.DrainNodeRequest"] = None, *, options: Optional[RequestOptions] = None) -> "T.MediaNode":
+        """Drain a node (maintenance)
+
+
+        Marks the node as draining, fleet-wide and persistently (survives restarts and heartbeats) until
+        `undrainNode`. A draining node keeps the sessions it hosts and still accepts their reconnects
+        (resume), but takes no fresh sessions and adopts no sessions from other nodes (`/ws` answers
+        `503` to both; clients move to the next failover endpoint), is left out of failover endpoints
+        handed to other nodes' clients and of region discovery. It does not change the node's health or
+        configuration; to empty it, watch `active_participants` in `GET /v1/nodes` and stop the node
+        when it reaches 0 (or earlier — remaining clients then resume on another node through failover).
+        Audited as `node_drained`.
+
+        `POST /v1/nodes/{node_id}/drain`
+        Auth: AdminToken.
+        """
+        return await self._run(self.sync.drain_node, node_id, body, options=options)  # type: ignore[no-any-return]
+
+    async def undrain_node(self, node_id: str, *, options: Optional[RequestOptions] = None) -> "T.MediaNode":
+        """End a node drain
+
+
+        Makes the node eligible for fresh sessions, failover and region discovery again. Audited as
+        `node_undrained`.
+
+        `POST /v1/nodes/{node_id}/undrain`
+        Auth: AdminToken.
+        """
+        return await self._run(self.sync.undrain_node, node_id, options=options)  # type: ignore[no-any-return]
 
     async def issue_token(self, body: "T.GenerateTokenRequest", *, options: Optional[RequestOptions] = None) -> "T.TokenResponse":
         """Issue a player session token

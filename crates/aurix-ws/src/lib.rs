@@ -2274,6 +2274,19 @@ pub async fn ws_handler(
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.chars().take(255).collect::<String>());
+    // A draining node (operator maintenance) keeps serving the sessions it hosts — their
+    // reconnects are still accepted — but takes no fresh sessions and adopts none from other
+    // nodes; clients move on to the next failover endpoint. Checked before the login token is
+    // spent so a refused client can still connect elsewhere.
+    if state.control.nodes.is_draining(state.control.node_id) {
+        let resumes_local = creds
+            .resume
+            .as_ref()
+            .is_some_and(|(sid, _)| state.connections.contains_key(sid));
+        if !resumes_local {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
     // A `login` action token opens exactly one fresh session. It is claimed on a resume as
     // well (so a token presented for a resume cannot open a second session later), and an
     // already-spent token is honoured only for reattaching a session it proves ownership of.
@@ -2303,6 +2316,9 @@ pub async fn ws_handler(
     };
     if !fresh_allowed && resume.is_none() && takeover.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if resume.is_none() && state.control.nodes.is_draining(state.control.node_id) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let ws = ws.max_message_size(MAX_TEXT_FRAME);
     let ws = if creds.echo_subprotocol {

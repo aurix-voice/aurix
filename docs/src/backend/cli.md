@@ -76,6 +76,9 @@ aurix admin setup --email ops@example.com --display-name Ops --bootstrap-token-f
 aurix admin login --email ops@example.com --save     # JWT saved for the profile (0600)
 aurix app create --name MyGame --key-out ~/.config/aurix/mygame.api-key   # first API key, written once (0600)
 aurix node list                                      # fleet with load and regions (operator token)
+aurix node drain <node-id> --reason "kernel update"  # stop fresh admission; players already there stay
+aurix node undrain <node-id>
+aurix node config                                    # effective configuration of the node you talk to, secrets masked
 ```
 
 Every command prints JSON: `-o pretty` (default, indented) or `-o json` (one compact document

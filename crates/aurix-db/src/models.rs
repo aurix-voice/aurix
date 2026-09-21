@@ -385,6 +385,15 @@ pub struct MediaNodeRow {
     /// Pure inter-regional cascade hub: hosts no clients, only forwards relay traffic.
     #[sqlx(default)]
     pub relay_only: bool,
+    /// Operator drain (maintenance): owned by `set_media_node_drain`, never by heartbeats.
+    #[sqlx(default)]
+    pub draining: bool,
+    #[sqlx(default)]
+    pub drain_reason: Option<String>,
+    #[sqlx(default)]
+    pub draining_since: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub drained_by: Option<Uuid>,
     pub version: String,
     pub last_heartbeat: DateTime<Utc>,
     pub registered_at: DateTime<Utc>,

@@ -1134,6 +1134,7 @@ impl SfuNode {
             last_heartbeat: Utc::now(),
             capacity: self.options.max_participants,
             relay_only: false,
+            drain: None,
         }
     }
 

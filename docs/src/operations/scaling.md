@@ -12,6 +12,29 @@ Each node registers itself in `media_nodes` (`server.node_id` or a generated UUI
 the fleet with load, CPU, memory and bandwidth. When a node goes away its sessions are cleaned
 up (`recover_node_state`) and channels that only lived there emit `channel.deactivated`.
 
+## Node maintenance (drain)
+
+`POST /v1/nodes/{id}/drain` (admin JWT, `nodes:drain`, optional `{"reason": "…"}` up to 512
+characters) puts a node into **operator drain**; `POST /v1/nodes/{id}/undrain` lifts it. The
+state lives in `media_nodes` (`draining`, `drain_reason`, `draining_since`, `drained_by`), is
+returned as `MediaNode.drain {reason, since, by}`, survives heartbeats and restarts, and is
+applied by the drained node on its next heartbeat (`media.heartbeat_interval_ms`, 5 s) — the
+node that took the request applies it immediately. Both transitions are audited
+(`node_drained` / `node_undrained` with the actor).
+
+A draining node keeps `healthy` and `relay_only` exactly as they are; only admission changes:
+
+* it is skipped by node selection, region discovery (`GET /v1/regions`, `/v1/me/regions`) and
+  the failover list handed to new sessions on other nodes;
+* its `/ws` answers `503` to fresh sessions **and** to cross-node takeovers — clients move on
+  to the next failover endpoint, so a drain never strands a player;
+* sessions already on it stay, keep their audio and can still **resume** there; they leave
+  when the players do (or on `SIGTERM`, which closes them with `server_shutdown`).
+
+`aurix node drain <id> --reason "kernel update"` / `aurix node undrain <id>` do the same from
+the [CLI](../backend/cli.md). Combine with a rolling restart: drain, wait for
+`active_participants` to reach zero (or a deadline), restart, undrain.
+
 ## Where a session lives
 
 A session is anchored to the node that accepted its **WebSocket**: `SessionInitAck.media_addr`

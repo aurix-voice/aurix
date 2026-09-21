@@ -194,11 +194,40 @@ enum NodeCmd {
         #[arg(long)]
         region: Option<String>,
     },
+    /// Drain a node for maintenance: keeps its sessions, takes no new ones (admin).
+    Drain {
+        node_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// End a node drain (admin).
+    Undrain { node_id: String },
+    /// Effective configuration of the node behind the profile URL, secrets redacted (admin).
+    Config,
 }
 
 pub async fn nodes(ctx: &Ctx, args: NodeArgs) -> anyhow::Result<()> {
     match args.cmd {
         NodeCmd::List => ctx.print(&ctx.api.get("/v1/nodes", &[], Auth::Admin).await?),
+        NodeCmd::Drain { node_id, reason } => ctx.print(
+            &ctx.api
+                .post(
+                    &format!("/v1/nodes/{}/drain", seg(&node_id)),
+                    json!({ "reason": reason }),
+                    Auth::Admin,
+                )
+                .await?,
+        ),
+        NodeCmd::Undrain { node_id } => ctx.print(
+            &ctx.api
+                .post(
+                    &format!("/v1/nodes/{}/undrain", seg(&node_id)),
+                    json!({}),
+                    Auth::Admin,
+                )
+                .await?,
+        ),
+        NodeCmd::Config => ctx.print(&ctx.api.get("/admin/config", &[], Auth::Admin).await?),
         NodeCmd::Endpoint { region } => {
             let q = query(vec![("region", region)]);
             let v = ctx.api.get("/v1/regions", &q, Auth::ApiKey).await?;

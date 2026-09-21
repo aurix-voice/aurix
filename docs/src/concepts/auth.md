@@ -15,7 +15,7 @@ is reported as `404 NOT_FOUND`.
 | **API key** `aurx_…` | `X-API-Key: aurx_…` or `Authorization: Bearer aurx_…` | your game backend / game server | everything under `/v1/*` except the player routes |
 | **Player JWT** | `Authorization: Bearer <jwt>` (REST), `bearer.<jwt>` sub-protocol or header (WebSocket) | the game client | opening a session, `/v1/me/*`, `/v1/webrtc/offer` |
 | **Action token** | same places as the player JWT | the game client, one action | `login`, `join`, `kick`, `mute`, `unmute` — single use |
-| **Admin JWT** | `Authorization: Bearer <jwt>` from `POST /admin/login` or the SSO callback | operators | `/admin/*`, `/v1/apps*`, `/v1/nodes` |
+| **Admin JWT** | `Authorization: Bearer <jwt>` from `POST /admin/login` or the SSO callback | operators | `/admin/*`, `/v1/apps*`, `/v1/nodes`; with `X-Aurix-App: <app_id>` also every API-key route of that application |
 | **Bootstrap token** | `X-Bootstrap-Token` | the operator installing the system | `POST /admin/setup` after the first admin exists |
 
 The OpenAPI document declares these as the security schemes `ApiKeyHeader`, `ApiKeyBearer`,
@@ -68,6 +68,8 @@ FORBIDDEN` otherwise).
 | `moderation:read` | reserved for cross-app moderation views | | ✓ | ✓ | ✓ |
 | `apps:write` | `POST /v1/apps`, `PATCH /v1/apps/{id}` | | | ✓ | ✓ |
 | `keys:rotate` | `POST /v1/apps/{id}/rotate-key` | | | ✓ | ✓ |
+| `nodes:drain` | `POST /v1/nodes/{id}/drain`, `POST /v1/nodes/{id}/undrain` — [node maintenance](../operations/scaling.md#node-maintenance-drain) | | | ✓ | ✓ |
+| `config:read` | `GET /admin/config` — the node's effective configuration with secrets masked | | | ✓ | ✓ |
 | `apps:delete` | `DELETE /v1/apps/{id}` | | | | ✓ |
 | `retention:run` | `POST /admin/retention/sweep` | | | | ✓ |
 | `admins:manage` | `GET/POST /admin/admins`, `GET/PATCH /admin/admins/{id}`, password reset, `logout-all` of others | | | | ✓ |
@@ -75,6 +77,26 @@ FORBIDDEN` otherwise).
 `GET /admin/me`, `POST /admin/me/password` and `POST /admin/logout-all` need only an active
 account. `GET /admin/me` returns the role and the `permissions` list, so a dashboard can hide
 what the operator cannot do.
+
+### Acting on one application
+
+An administrator can use the tenant routes (`/v1/channels`, `/v1/moderation/*`, `/v1/webhooks`,
+`/v1/recordings`, `/v1/events`, …) without holding an API key: send the admin JWT together with
+`X-Aurix-App: <app_id>`. The request is then scoped to that application exactly like an API-key
+request, and the role stands in for the key's permission list. Read-only roles never obtain a
+write permission this way; an operator dashboard relies on it so that API keys never reach a
+browser.
+
+| Role | API permissions with `X-Aurix-App` |
+| --- | --- |
+| `viewer` | `channels:read`, `users:read`, `analytics:read`, `events:read`, `webhooks:read`, `recordings:read`, `audio_streams:read` |
+| `moderator` | + `moderation:read`, `moderation:write`, `chat:read`, `chat:write`, `audit:read`, `users:write` |
+| `admin` | + `channels:write`, `webhooks:write`, `recordings:write`, `audio_streams:write`, `keys:manage`, `tokens:issue`, `turn:issue`, `tts:write`, `users:export` |
+| `superadmin` | `*` (including `users:erase`) |
+
+Audit-log entries and moderation events record the administrator's id as the actor. An API key
+in the same request takes precedence and the header is ignored; a header without an admin token
+is `401`, an unknown or deactivated application `404`.
 
 **Tokens follow the database, not their claims.** An admin JWT is checked against the account
 row on every request: the *current* role and active flag apply, and the token carries a

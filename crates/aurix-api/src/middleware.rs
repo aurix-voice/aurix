@@ -1,7 +1,7 @@
 use crate::errors::ApiError;
 use crate::state::AppState;
 use aurix_common::error::AurixError;
-use aurix_common::types::{AdminContext, AppId, UserId};
+use aurix_common::types::{AdminContext, AdminRole, AppId, UserId};
 use aurix_control::{Limit, LimitScope};
 use aurix_db::models::ApiKeyRow;
 use axum::{
@@ -16,10 +16,23 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
-/// Identity of a server-to-server caller authenticated with an API key.
+/// Header an administrator uses to act on one application over the API-key routes.
+pub const ADMIN_APP_HEADER: &str = "x-aurix-app";
+
+/// Who is behind an application-scoped request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiCaller {
+    /// A tenant API key.
+    ApiKey { key_id: Uuid },
+    /// An administrator acting on the application named in `X-Aurix-App`.
+    Admin { admin_id: Uuid, role: AdminRole },
+}
+
+/// Identity of a caller on the application-scoped (`/v1/*`) routes: a tenant API key, or an
+/// administrator acting on one application.
 #[derive(Clone, Debug)]
 pub struct ApiKeyContext {
-    pub key_id: Uuid,
+    pub caller: ApiCaller,
     pub app_id: AppId,
     pub permissions: Arc<serde_json::Value>,
 }
@@ -27,15 +40,29 @@ pub struct ApiKeyContext {
 impl ApiKeyContext {
     fn from_row(row: &ApiKeyRow) -> Self {
         Self {
-            key_id: row.id,
+            caller: ApiCaller::ApiKey { key_id: row.id },
             app_id: AppId::from_uuid(row.app_id),
             permissions: Arc::new(row.permissions.clone()),
         }
     }
 
-    /// Audit/moderation actor identity for actions performed with this key.
+    fn for_admin(admin: &AdminContext, app_id: AppId) -> Self {
+        Self {
+            caller: ApiCaller::Admin {
+                admin_id: admin.admin_id,
+                role: admin.role,
+            },
+            app_id,
+            permissions: Arc::new(admin_api_permissions(admin.role)),
+        }
+    }
+
+    /// Audit/moderation actor identity: the API key id, or the administrator id.
     pub fn actor(&self) -> UserId {
-        UserId::from_uuid(self.key_id)
+        match self.caller {
+            ApiCaller::ApiKey { key_id } => UserId::from_uuid(key_id),
+            ApiCaller::Admin { admin_id, .. } => UserId::from_uuid(admin_id),
+        }
     }
 
     /// Permissions are a JSON array of strings (`"*"` = everything). The legacy object form
@@ -62,6 +89,50 @@ impl ApiKeyContext {
             )
         }
     }
+}
+
+/// API-key permissions an administrator role holds when acting on an application through
+/// `X-Aurix-App`. Read-only roles never get a write permission; `superadmin` gets everything.
+pub fn admin_api_permissions(role: AdminRole) -> serde_json::Value {
+    const VIEWER: &[&str] = &[
+        "channels:read",
+        "users:read",
+        "analytics:read",
+        "events:read",
+        "webhooks:read",
+        "recordings:read",
+        "audio_streams:read",
+    ];
+    const MODERATOR: &[&str] = &[
+        "moderation:read",
+        "moderation:write",
+        "chat:read",
+        "chat:write",
+        "audit:read",
+        "users:write",
+    ];
+    const ADMIN: &[&str] = &[
+        "channels:write",
+        "webhooks:write",
+        "recordings:write",
+        "audio_streams:write",
+        "keys:manage",
+        "tokens:issue",
+        "turn:issue",
+        "tts:write",
+        "users:export",
+    ];
+    if role >= AdminRole::Superadmin {
+        return serde_json::json!(["*"]);
+    }
+    let mut out: Vec<&str> = VIEWER.to_vec();
+    if role >= AdminRole::Moderator {
+        out.extend_from_slice(MODERATOR);
+    }
+    if role >= AdminRole::Admin {
+        out.extend_from_slice(ADMIN);
+    }
+    serde_json::Value::Array(out.into_iter().map(serde_json::Value::from).collect())
 }
 
 /// Real client IP after trusted-proxy resolution.
@@ -114,7 +185,9 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-/// Tenant API key from `X-API-Key` (or `Authorization: Bearer aurx_...`).
+/// Tenant API key from `X-API-Key` (or `Authorization: Bearer aurx_...`); alternatively an
+/// admin JWT plus `X-Aurix-App: <app_id>` — the administrator then acts on that application
+/// with the permissions of its role ([`admin_api_permissions`]).
 pub async fn api_key_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -124,8 +197,20 @@ pub async fn api_key_middleware(
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .or_else(|| bearer_token(request.headers()).filter(|t| t.starts_with("aurx_")))
-        .ok_or_else(|| AurixError::AuthenticationFailed("Missing API key".into()))?;
+        .or_else(|| bearer_token(request.headers()).filter(|t| t.starts_with("aurx_")));
+    let Some(api_key) = api_key else {
+        let app_header = request
+            .headers()
+            .get(ADMIN_APP_HEADER)
+            .ok_or_else(|| AurixError::AuthenticationFailed("Missing API key".into()))?
+            .to_str()
+            .map_err(|_| AurixError::Validation("X-Aurix-App must be an application id".into()))?
+            .to_owned();
+        let ctx = admin_on_app(&state, request.headers(), &app_header).await?;
+        request.extensions_mut().insert(ctx.app_id);
+        request.extensions_mut().insert(ctx);
+        return Ok(next.run(request).await);
+    };
     let key_row = state.control.api_keys.validate_key(api_key).await?;
     let ctx = ApiKeyContext::from_row(&key_row);
     let limits = &state.control.limits;
@@ -142,6 +227,29 @@ pub async fn api_key_middleware(
     request.extensions_mut().insert(ctx.app_id);
     request.extensions_mut().insert(ctx);
     Ok(next.run(request).await)
+}
+
+async fn admin_on_app(
+    state: &AppState,
+    headers: &HeaderMap,
+    app_header: &str,
+) -> Result<ApiKeyContext, ApiError> {
+    let app_id = Uuid::parse_str(app_header.trim())
+        .map_err(|_| AurixError::Validation("X-Aurix-App must be an application id".into()))?;
+    let token = bearer_token(headers)
+        .filter(|t| !t.starts_with("aurx_"))
+        .ok_or_else(|| {
+            AurixError::AuthenticationFailed("X-Aurix-App requires an admin bearer token".into())
+        })?;
+    let admin: AdminContext = state.control.authenticate_admin(token).await?;
+    admin.require(aurix_common::types::AdminPermission::AppsRead)?;
+    let app = aurix_db::queries::get_app(&state.control.pool, app_id)
+        .await?
+        .ok_or_else(|| AurixError::NotFound("Application not found".into()))?;
+    if !app.active {
+        return Err(AurixError::NotFound("Application not found".into()).into());
+    }
+    Ok(ApiKeyContext::for_admin(&admin, AppId(app_id)))
 }
 
 /// Admin JWT; also confirms the account is still active.
@@ -237,7 +345,9 @@ mod tests {
     #[test]
     fn api_key_permissions() {
         let ctx = ApiKeyContext {
-            key_id: Uuid::nil(),
+            caller: ApiCaller::ApiKey {
+                key_id: Uuid::nil(),
+            },
             app_id: AppId::from_uuid(Uuid::nil()),
             permissions: Arc::new(serde_json::json!(["channels:read"])),
         };
@@ -253,5 +363,36 @@ mod tests {
             ..ctx
         };
         assert!(star.has("moderation:write"));
+    }
+
+    #[test]
+    fn admin_roles_map_to_cumulative_api_permissions() {
+        let perms = |role: AdminRole| ApiKeyContext {
+            caller: ApiCaller::Admin {
+                admin_id: Uuid::nil(),
+                role,
+            },
+            app_id: AppId::from_uuid(Uuid::nil()),
+            permissions: Arc::new(admin_api_permissions(role)),
+        };
+        let viewer = perms(AdminRole::Viewer);
+        assert!(viewer.has("channels:read"));
+        assert!(!viewer.has("channels:write"));
+        assert!(!viewer.has("chat:read"));
+        assert!(!viewer.has("moderation:write"));
+        let moderator = perms(AdminRole::Moderator);
+        assert!(moderator.has("channels:read"));
+        assert!(moderator.has("moderation:write"));
+        assert!(moderator.has("chat:read"));
+        assert!(!moderator.has("channels:write"));
+        assert!(!moderator.has("webhooks:write"));
+        assert!(!moderator.has("users:erase"));
+        let admin = perms(AdminRole::Admin);
+        assert!(admin.has("webhooks:write"));
+        assert!(admin.has("keys:manage"));
+        assert!(!admin.has("users:erase"));
+        let superadmin = perms(AdminRole::Superadmin);
+        assert!(superadmin.has("users:erase"));
+        assert_eq!(superadmin.actor(), UserId::from_uuid(Uuid::nil()));
     }
 }

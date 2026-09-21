@@ -139,6 +139,17 @@ jobs:
           AURIX_E2E_MAX_CHANNELS: "4"
           AURIX_E2E_REPORTS_PER_MINUTE: "3"
         run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture
+      # Drains node 2 for the duration of the test, so it runs alone after the parallel suite.
+      - name: E2E (operator drain of node 2)
+        env:
+          AURIX_E2E_API: http://127.0.0.1:8080
+          AURIX_E2E_WS: ws://127.0.0.1:8081
+          AURIX_E2E_API2: http://127.0.0.1:8120
+          AURIX_E2E_WS2: ws://127.0.0.1:8121
+          AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
+          AURIX_E2E_ADMIN_TOKEN: ${{ steps.bootstrap.outputs.admin_token }}
+          AURIX_E2E_DRAIN: "1"
+        run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture draining_a_node
       - name: PostgreSQL integration (chat history, usage aggregation)
         env:
           AURIX_E2E_DATABASE_URL: postgres://aurix:aurix@127.0.0.1:5432/aurix
