@@ -579,9 +579,28 @@ project files and build. The `AurixClientLibrary` ThirdParty module fails at UBT
 message naming the missing header/library, so an unstaged plugin never fails silently at
 runtime; the library is copied next to the game binaries through `RuntimeDependencies`.
 
+The plugin is laid out for `RunUAT BuildPlugin` / Fab: `Config/FilterPlugin.ini`,
+`Resources/Icon128.png`, `Docs/`, docs/support URLs and `SupportedTargetPlatforms` in the
+descriptor, and two runtime modules — `AurixVoice` (the API) and the optional
+`AurixVoiceSamples` (Blueprint components on top of the public API only). Packaging steps and
+the Fab checklist: `sdk/unreal/AurixVoice/Docs/Packaging.md`.
+
 ### Usage
 
-Blueprint: *Get Game Instance Subsystem → Aurix Voice Subsystem*, build *Aurix Voice Settings*
+Blueprint, sample components (`sdk/unreal/AurixVoice/Docs/QuickStart.md` has the node-by-node
+walk-through): **Aurix Voice Lobby** on the PlayerController — `Web Socket Url`, optional
+`Channel Id` / `Push To Talk`, `Connect With Token` with the backend-minted token; it joins on
+session ready and emits a UI-ready roster (`On Roster Changed`), status (`On Status Changed`:
+state, media path, endpoint, quality bars, MOS, RTT), chat lines and errors; input goes to
+`Set Push To Talk Pressed` / `Toggle Microphone Muted`, listener-side preferences to
+`Set Participant Muted Locally` / `Set Participant Volume Locally`. **Aurix Proximity Voice**
+on the local pawn — `Set Channel` after the join; it reports the pose when the pawn moved, and
+`Attach Participant Voice(UserId, AvatarHead)` puts a talker's voice on their avatar through
+Unreal attenuation/spatialization (the talker leaves the 2D mix while attached). **Aurix Voice
+Blueprint Library** — `Get Aurix Voice`, `Make Voice Settings`, state/media-path/bars/MOS to
+text, `Guid To Uuid`.
+
+Blueprint, subsystem directly: *Get Game Instance Subsystem → Aurix Voice Subsystem*, build *Aurix Voice Settings*
 (WebSocket URL, token from your backend), **Connect**; on *On Session Ready* call **Join
 Channel** (`Parse Uuid`, join token empty unless `require_action_tokens`); bind *On Channel
 Joined*, *On Participant Joined/Left*, *On Participant Speaking*, *On Channel Energy*, *On Chat
@@ -657,8 +676,16 @@ header-drift check and the C/C++ samples against the freshly built library on ea
 `aurix-client-<target>` artifacts — and
 `unreal_plugin_uses_only_existing_abi` parses the plugin sources and checks that every
 `aurix_*` function, `AURIX_*` constant and `aurix::Client` method they use is declared in the
-committed headers. **Not** verified: Unreal Header Tool and the module compile against a live
+committed headers (and that `AurixVoiceSamples` never reaches the C ABI). The `unreal` job runs
+`sdk/unreal/scripts/check_plugin.py` — descriptor schema/URLs/version parity, packaging files,
+`.generated.h` / `GENERATED_BODY` / `*_API` / `UFUNCTION`-handler conventions, module dependency
+direction — and, only when the repository has `UE_GHCR_TOKEN` + `UE_GHCR_USER` from an
+Epic-linked GitHub account, `RunUAT BuildPlugin -TargetPlatforms=Linux -Rocket -StrictIncludes`
+inside Epic's `ghcr.io/epicgames/unreal-engine:dev-slim-5.3.2` image with the packaged plugin
+as an artifact; without the secrets it prints a notice and does **not** claim a compile.
+**Not** verified here: Unreal Header Tool and the module compile against a live
 UE 5.3+ install (`AudioCaptureCore` callback signature, `USoundWaveProcedural::GeneratePCMData`)
-and packaging of a game on Windows/macOS — treat the first build in your project as a required
+, `BuildPlugin` itself and packaging of a game on Windows/macOS — treat the first build in your project as a required
 step; any
-mismatch surfaces as a compile error in `AurixAudioCapture.cpp` or `AurixVoiceSoundWave.cpp`.
+mismatch surfaces as a compile error in `AurixAudioCapture.cpp`, `AurixVoiceSoundWave.cpp` or
+the sample components.

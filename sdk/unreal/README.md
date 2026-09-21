@@ -13,16 +13,24 @@ that pumps native events into Blueprint delegates on the game thread, feeds the 
 sdk/unreal/
 ├── AurixVoice/
 │   ├── AurixVoice.uplugin
+│   ├── Config/FilterPlugin.ini               extra files for `RunUAT BuildPlugin` (Docs/)
+│   ├── Resources/Icon128.png                 plugin browser icon
+│   ├── Docs/QuickStart.md | Packaging.md     Blueprint quick start, Fab/Marketplace packaging
 │   └── Source/
 │       ├── AurixVoice/                       runtime module
 │       │   ├── Public/AurixVoiceTypes.h      Blueprint enums/structs mirroring the C ABI
 │       │   ├── Public/AurixVoiceSubsystem.h  UAurixVoiceSubsystem: the whole API + events
 │       │   ├── Public/AurixVoiceSoundWave.h  procedural 48 kHz stereo playback wave
 │       │   └── Private/AurixAudioCapture.*   microphone → aurix_client_push_capture_f32
+│       ├── AurixVoiceSamples/                runtime module, Blueprint-ready layer (optional)
+│       │   ├── Public/AurixVoiceLobbyComponent.h      connect/join/roster/PTT/chat for a lobby UI
+│       │   ├── Public/AurixProximityVoiceComponent.h  pose reporting + voices on avatars
+│       │   └── Public/AurixVoiceBlueprintLibrary.h    status → text helpers, subsystem getter
 │       └── ThirdParty/AurixClientLibrary/    external module: headers + prebuilt library
 │           ├── include/                      staged by the scripts (git-ignored)
 │           └── lib/{Win64,Linux,Mac}/        staged by the scripts (git-ignored)
-└── scripts/build_native.sh | .ps1            build aurix-client and stage it into the plugin
+├── scripts/build_native.sh | .ps1            build aurix-client and stage it into the plugin
+└── scripts/check_plugin.py                   engine-free descriptor / UHT-convention checks (CI)
 ```
 
 ## 1. Build and stage the native library
@@ -60,6 +68,12 @@ Copy (or symlink) `sdk/unreal/AurixVoice` to `<Project>/Plugins/AurixVoice`, reg
 files and build. The plugin enables the engine's `AudioCapture` plugin as a dependency.
 `CanContainContent` is false — everything is C++/Blueprint-callable, there are no assets.
 
+Two runtime modules ship: `AurixVoice` (the API) and `AurixVoiceSamples` (Blueprint-spawnable
+components built only on the public API — delete the folder and its `Modules` entry if you
+drive the subsystem yourself). To distribute a prebuilt plugin (Fab / Marketplace, teams
+without a Rust toolchain) run `RunUAT BuildPlugin` as described in
+[`AurixVoice/Docs/Packaging.md`](AurixVoice/Docs/Packaging.md).
+
 ## 3. Security model (identical to the Unity/Web SDKs)
 
 * API keys never ship inside a build. Your game backend calls `POST /v1/tokens` (or
@@ -81,6 +95,28 @@ files and build. The plugin enables the engine's `AudioCapture` plugin as a depe
 ## 4. Usage
 
 ### Blueprint
+
+**Fastest path — the sample components** (step-by-step with node names in
+[`AurixVoice/Docs/QuickStart.md`](AurixVoice/Docs/QuickStart.md)):
+
+* **Aurix Voice Lobby** on the PlayerController: set `Web Socket Url` (+ optional `Channel Id`,
+  `Push To Talk`), call `Connect With Token` with the token from your backend; it joins the
+  channel on `On Session Ready`, keeps a UI-ready roster (`On Roster Changed`: name, self,
+  speaking, energy, muted / server-muted / locally-muted, priority, local volume), a status
+  line (`On Status Changed`: state, media path, endpoint, quality bars, MOS, RTT), chat
+  (`On Chat Line` / `Send Chat`) and errors (`On Error` with the server's codes). Input goes to
+  `Set Push To Talk Pressed` / `Toggle Microphone Muted`; per-player context menus to
+  `Set Participant Muted Locally` / `Set Participant Volume Locally`.
+* **Aurix Proximity Voice** on the local pawn: `Set Channel` after the join; it reports the
+  pawn's (or `Pose Source`'s) pose at `Updates Per Second` when it moved, and
+  `Attach Participant Voice(UserId, AvatarHead)` / `Detach Participant Voice` put a talker's
+  voice on their avatar through Unreal attenuation/spatialization (the talker leaves the 2D mix
+  while attached).
+* **Aurix Voice Blueprint Library**: `Get Aurix Voice`, `Make Voice Settings`,
+  `Connection State To Text`, `Media Path To Text`, `Quality Bars To Text`, `Format Mos`,
+  `Guid To Uuid`.
+
+**Directly on the subsystem:**
 
 1. `Get Game Instance Subsystem → Aurix Voice Subsystem`.
 2. Make `Aurix Voice Settings` (WebSocket URL from your config, Token from your backend call),
@@ -297,17 +333,28 @@ What has been verified in this repository:
 * `cargo test -p aurix-client --test c_abi` includes `unreal_plugin_uses_only_existing_abi`,
   which parses the `.uplugin`, checks the module/Build.cs layout and verifies that every
   `aurix_*` function, `AURIX_*` constant and `aurix::Client` / `aurix::Regions` method the
-  plugin sources call is declared in the committed headers — ABI drift breaks CI, not the game
-  build.
+  `AurixVoice` module calls is declared in the committed headers, and that `AurixVoiceSamples`
+  never touches the C ABI — ABI drift breaks CI, not the game build.
+* `python3 sdk/unreal/scripts/check_plugin.py` (CI job `unreal`): `.uplugin` schema, URLs and
+  `VersionName` == workspace version, `DocsURL` target exists, `FilterPlugin.ini` entries
+  resolve, icon is a 128×128 PNG, every declared module has its `Build.cs` and every `Source/`
+  module is declared, `#pragma once`, `.generated.h` naming/position, `GENERATED_BODY()` count,
+  `*_API` export of public `UCLASS`es, every `AddDynamic` handler is a `UFUNCTION`, module
+  dependency direction (samples → AurixVoice → ThirdParty, no cycles, no direct ABI use).
 
 What has **not** been run here, because no Unreal Engine installation is available in the
 development environment: Unreal Header Tool and the actual module compile on UE 5.3+, the
 `AudioCaptureCore` stream callback signature (`Audio::FOnAudioCaptureFunction`,
 `OpenAudioCaptureStream`) and `USoundWaveProcedural::GeneratePCMData` semantics against a live
 engine, the `HTTP` module request/response API used by `AurixRegionDiscovery.cpp`, packaging on
-Windows/macOS. Treat the first build in your project as a required
+Windows/macOS, `RunUAT BuildPlugin` and the Fab/Marketplace packaging conventions in
+`Docs/Packaging.md` (the CI job runs `BuildPlugin` inside Epic's `dev-slim` container only when
+the repository has `UE_GHCR_TOKEN` / `UE_GHCR_USER` from an Epic-linked GitHub account; without
+them it prints a notice and does not claim a compile). Treat the first build in your project as a required
 verification step; the plugin sources are small and any mismatch surfaces as a compile error
 in one of the three bridge files (`AurixAudioCapture.cpp`, `AurixVoiceSoundWave.cpp`,
-`AurixRegionDiscovery.cpp`) or in `AurixParticipantSoundWave.cpp`; the participant sound
+`AurixRegionDiscovery.cpp`), in `AurixParticipantSoundWave.cpp` or in the `AurixVoiceSamples`
+components (which use only engine-core types: `UActorComponent`, `TMap`, dynamic multicast
+delegates, `UGameplayStatics`); the participant sound
 wave's spatialization behaviour (mono source + attenuation / spatializer plugin) has likewise
 not been heard through a real engine build.

@@ -208,21 +208,41 @@ fn unreal_plugin_uses_only_existing_abi() {
     let uplugin: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(plugin.join("AurixVoice.uplugin")).unwrap())
             .expect("AurixVoice.uplugin is valid JSON");
+    let mut sources = Vec::new();
+    let mut sample_sources = Vec::new();
     for module in uplugin["Modules"].as_array().expect("Modules array") {
         let name = module["Name"].as_str().expect("module name");
         let build_cs = plugin.join(format!("Source/{name}/{name}.Build.cs"));
         assert!(build_cs.is_file(), "missing {}", build_cs.display());
+        if name == "AurixVoice" {
+            collect_sources(&plugin.join("Source/AurixVoice"), &mut sources);
+        } else {
+            collect_sources(&plugin.join(format!("Source/{name}")), &mut sample_sources);
+        }
     }
     assert!(plugin
         .join("Source/ThirdParty/AurixClientLibrary/AurixClientLibrary.Build.cs")
         .is_file());
 
-    let mut sources = Vec::new();
-    collect_sources(&plugin.join("Source/AurixVoice"), &mut sources);
     assert!(
         sources.len() >= 8,
         "unexpectedly few plugin sources: {sources:?}"
     );
+    assert!(
+        !sample_sources.is_empty(),
+        "expected at least one non-core module (AurixVoiceSamples)"
+    );
+    for path in &sample_sources {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            identifiers(&text, "aurix_", true, &['(']).is_empty()
+                && identifiers(&text, "AURIX_", true, &[')', ',', ':', ';', ' ']).is_empty()
+                && !text.contains("aurix::")
+                && !text.contains("aurix_client.h"),
+            "{} reaches the C ABI directly; sample modules must go through UAurixVoiceSubsystem",
+            path.display()
+        );
+    }
 
     let declared_functions = identifiers(&header, "aurix_", true, &['(']);
     let declared_constants = identifiers(&header, "AURIX_", true, &[' ', ',', '\n']);

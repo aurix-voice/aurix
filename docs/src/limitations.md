@@ -209,10 +209,13 @@ the chapter that explains the boundary.
 
 * **Helm chart and Terraform example** are linted, rendered, schema-validated (`kubeconform`)
   and `terraform validate`d in CI, but not applied against a live cluster or AWS account.
-* **Unreal plugin compile.** The `AurixVoice` plugin is checked against the C ABI header and
-  the native library builds on Linux, but Unreal Header Tool and a real engine compile have not
-  run — the first build in your project is the verification step ([Native core and
-  Unreal](sdk/native.md)).
+* **Unreal plugin compile.** The `AurixVoice` plugin (and the `AurixVoiceSamples` Blueprint
+  components) is checked against the C ABI header, for UHT/packaging conventions
+  (`sdk/unreal/scripts/check_plugin.py`) and the native library builds on Linux, Windows and
+  macOS, but Unreal Header Tool, a real engine compile and `RunUAT BuildPlugin` have not run —
+  the CI job only runs `BuildPlugin` in Epic's container when an Epic-linked GHCR token is
+  configured, and this repository has none. The first build in your project is the
+  verification step ([Native core and Unreal](sdk/native.md)).
 * **Godot editor and devices.** The extension is built and exercised headless in CI (API
   smoke test, project import, demo script parse) and against a live node in a two-client
   Godot E2E on Linux; the Web export runs in headless Chromium against a live node (boot, SDK
