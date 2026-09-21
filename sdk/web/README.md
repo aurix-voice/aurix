@@ -183,6 +183,10 @@ client.on('failedToRecover', (err) => showError(err));   // state is now 'failed
 client.on('sessionClosed', (reason) => { /* kicked/banned/shutdown: no reconnect */ });
 ```
 
+A `connect()` that never reaches the server (handshake refused, bad token, unreachable host) rejects
+and leaves `connectionState` at `'failed'` — there is no automatic retry before the first session,
+call `connect()` again yourself.
+
 * Within the server's grace window (`client.resumeGrace`, default 30 s) the same session comes
   back (`info.resumed === true`): same SSRC, same channels — peers never see a leave. The server
   replays one `ChannelJoinAck` per channel, so `channelJoined` fires again with a fresh roster.

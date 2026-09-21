@@ -336,17 +336,20 @@ jobs:
         working-directory: sdk/web
       - run: npm run check && npm test
         working-directory: sdk/web
+      - name: Unity WebGL plugin (.jslib) against the real Web SDK bundle (Node, Emscripten stand-in — not a Unity player build)
+        run: node --test test/unity-jslib.test.mjs
+        working-directory: sdk/web
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
       - run: dotnet test Aurix.sln -v q --nologo
-        working-directory: sdk/unity/DotNet
+        working-directory: sdk/unity/DotNet~
       - name: Unity compile check (WebGL player, WebGL editor, Android defines)
         run: |
           dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_WEBGL
           dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo "-p:UnityExtraDefines=UNITY_WEBGL%3BUNITY_EDITOR"
           dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_ANDROID
-        working-directory: sdk/unity/DotNet
+        working-directory: sdk/unity/DotNet~
 
   godot:
     name: Godot GDExtension (build + headless smoke)
@@ -393,7 +396,7 @@ jobs:
           timeout 120 "$GODOT" --headless --path sdk/godot -s tests/web_smoke.gd
 
   godot-web:
-    name: Godot Web export (Chromium, live node)
+    name: Godot Web export + Unity WebGL bridge (Chromium, live node)
     runs-on: ubuntu-latest
     needs: [lint]
     env:
@@ -453,6 +456,9 @@ jobs:
       - name: Run server
         env:
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          # Chromium never gathers loopback host candidates, so browser media reaches a 127.0.0.1 node only via TURN.
+          AURIX__TURN__ENABLED: "true"
+          AURIX__TURN__AUTH_SECRET: ci-only-turn-secret-0123456789abcdefghijklmno
           # The exported lobby is served from an ephemeral 127.0.0.1 port (not production mode).
           AURIX__SERVER__CORS_ORIGINS: "*"
           AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
@@ -480,6 +486,12 @@ jobs:
           AURIX_WS_URL: ws://127.0.0.1:8081/ws
           AURIX_API_KEY: ${{ steps.bootstrap.outputs.key }}
         run: python sdk/godot/tests/web/godot_web_e2e.py
+      - name: Unity WebGL template + AurixWebGL.jslib in Chromium (Emscripten stand-in, live join/chat/speaking/quality — not a Unity player build)
+        env:
+          AURIX_API_URL: http://127.0.0.1:8080
+          AURIX_WS_URL: ws://127.0.0.1:8081/ws
+          AURIX_API_KEY: ${{ steps.bootstrap.outputs.key }}
+        run: python sdk/unity/BrowserTests~/webgl_bridge_e2e.py
       - name: Server log
         if: failure()
         run: tail -n 200 server.log

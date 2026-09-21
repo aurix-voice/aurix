@@ -73,7 +73,7 @@ Hand the player JWT to the client and pick an SDK:
 * Browser: [Web SDK](../sdk/web.md) — `npm run demo` in `sdk/web` opens a two-tab demo page.
 * Unity: [Unity SDK](../sdk/unity.md) — import the *Voice quick start* sample and press Play.
 * Unreal / custom engine: [Native core and Unreal SDK](../sdk/native.md).
-* Headless: `dotnet run --project sdk/unity/DotNet/Aurix.Demo` or
+* Headless: `dotnet run --project sdk/unity/DotNet~/Aurix.Demo` or
   `cargo test -p aurix-client --test e2e_live` drive two clients against a running node.
 
 What happens on the wire is described in [Client flow](client-flow.md). For a production

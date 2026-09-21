@@ -188,10 +188,15 @@ test('Create / Invoke / Drain / Destroy round-trip JSON through the real bundle'
   assert.deepEqual(JSON.parse(callString('AurixWebGL_Drain', handle)), [{ type: 'connectionState', state: 'connecting' }]);
   await new Promise((r) => setTimeout(r, 20));
   const events = JSON.parse(callString('AurixWebGL_Drain', handle));
-  assert.equal(events[0].type, 'result');
-  assert.equal(events[0].rid, 7);
-  assert.equal(events[0].ok, false);
-  assert.equal(typeof events[0].error.message, 'string');
+  assert.deepEqual(
+    events.filter((e) => e.type === 'connectionState'),
+    [{ type: 'connectionState', state: 'failed' }],
+    'a failed connect settles the state instead of leaving it at "connecting"'
+  );
+  const result = events.find((e) => e.type === 'result');
+  assert.equal(result.rid, 7);
+  assert.equal(result.ok, false);
+  assert.equal(typeof result.error.message, 'string');
   assert.equal(callString('AurixWebGL_Drain', handle), '[]');
 
   call('AurixWebGL_Destroy', handle);

@@ -220,15 +220,18 @@ the chapter that explains the boundary.
   `AudioStreamMicrophone`, `AudioStreamPlayer3D` spatialization, the Windows/macOS extension
   binaries, real microphones/headphones in the Web export and Firefox/Safari are not run in CI
   ([Godot SDK](sdk/godot.md)).
-* **Unity Editor and devices.** The Unity SDK and the sample scene are compiled against a
-  UnityEngine stub and exercised through the .NET demo; permission dialogs, audio-route changes
+* **Unity Editor and devices.** The Unity SDK, the Editor menu, the NUnit tests and the sample
+  scenes are compiled against a UnityEngine stub and exercised through the .NET demo; the Unity
+  Test Runner, package import through the Package Manager, permission dialogs, audio-route changes
   and background/foreground transitions on real iOS/Android hardware are not exercised in CI
   ([Unity SDK](sdk/unity.md)). `NativeOpusCodec` is tested against the Linux build of the native
   core; loading from `Plugins/` on other platforms follows Unity's P/Invoke rules and is not run here.
 * **Unity WebGL player builds.** The WebGL path is verified in pieces — the C# client against a
-  scripted bridge, the `.jslib` against the real browser bundle under an Emscripten-like harness,
-  the Unity compile check with `UNITY_WEBGL` — but no Unity WebGL player has been built and run
-  in a browser from this repository ([Unity WebGL](sdk/unity.md#unity-webgl)).
+  scripted bridge, the real `.jslib` and the sample's WebGL template against the real browser
+  bundle under an Emscripten stand-in (Node, and Chromium against a live node in CI), the Unity
+  compile check with `UNITY_WEBGL` — but the stand-in is not Unity's Emscripten runtime and no
+  Unity-built WebGL player has been run in a browser from this repository
+  ([Unity WebGL](sdk/unity.md#unity-webgl)).
 * **Browser spatial audio is tested against a fake Web Audio graph.** The Web SDK's per-track
   graph (gain → `PannerNode` → master), listener/source placement and mute/block/focus gains are
   unit-tested on a scripted `AudioContext`, and the multi-track SDP negotiation, slot handout,

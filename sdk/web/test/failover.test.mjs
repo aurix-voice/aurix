@@ -39,3 +39,31 @@ test('SessionInitAck carries migrated and failover; older servers default to nei
   assert.equal(legacy.data.migrated, undefined);
   assert.equal(legacy.data.failover, undefined);
 });
+
+test('a rejected handshake fails connect() and settles connectionState to failed (no stuck "connecting")', async () => {
+  class RefusingSocket {
+    static OPEN = 1;
+    static CLOSED = 3;
+    constructor() {
+      this.readyState = RefusingSocket.CLOSED;
+      queueMicrotask(() => {
+        this.onerror?.({});
+        this.onclose?.({ code: 1006, reason: '' });
+      });
+    }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = RefusingSocket;
+  const { AurixClient } = await import('../dist/client.js');
+  const client = new AurixClient({ apiUrl: 'http://api', wsUrl: 'ws://dead/ws', token: 't', autoReconnect: false, pingIntervalMs: 0 });
+  client.on('error', () => {});
+  const states = [];
+  client.on('connectionState', (s) => states.push(s));
+  await assert.rejects(client.connect(), /websocket error/);
+  assert.deepEqual(states, ['connecting', 'failed']);
+  assert.equal(client.connectionState, 'failed');
+  // The client is reusable: a second connect() starts over from "connecting".
+  await assert.rejects(client.connect(), /websocket error/);
+  assert.deepEqual(states.slice(2), ['connecting', 'failed']);
+});

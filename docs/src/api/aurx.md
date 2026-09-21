@@ -229,4 +229,4 @@ Metrics: `aurix_quic_connections`, `aurix_quic_sessions`,
 
 * Rust: `crates/aurix-client/src/media.rs` (client), `crates/aurix-media/src/router.rs` (server).
 * C#: `sdk/unity/Runtime/Protocol/*.cs` — same test vectors as Rust in
-  `sdk/unity/DotNet/Aurix.Voice.Tests`.
+  `sdk/unity/DotNet~/Aurix.Voice.Tests`.

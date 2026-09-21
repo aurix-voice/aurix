@@ -2444,9 +2444,15 @@ export class AurixClient {
     this.statsSnapshot = undefined;
     this.setState('connecting');
 
-    await this.ensureE2ee();
-    if (this.closedByUser) throw new Error('disconnected');
-    const info = await this.openControlChannel(this.opts.wsUrl);
+    let info: SessionInfo;
+    try {
+      await this.ensureE2ee();
+      if (this.closedByUser) throw new Error('disconnected');
+      info = await this.openControlChannel(this.opts.wsUrl);
+    } catch (e) {
+      if (!this.closedByUser) this.teardown('connect failed', 'failed');
+      throw e;
+    }
     this.session = info;
     this.setState('connected');
     this.emit('sessionReady', info);

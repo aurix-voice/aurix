@@ -7,7 +7,7 @@ same API over the browser Web SDK, see [Unity WebGL](#unity-webgl)) and in plain
 
 ```
 sdk/unity/
-├── package.json                     UPM package
+├── package.json                     UPM package (com.aurix.voice); CHANGELOG.md, Documentation~/com.aurix.voice.md
 ├── Runtime/
 │   ├── AurixVoiceClient.cs          the client: connect → bind media → join → audio/events
 │   ├── Protocol/                    AURX v2 codec (AES-256-CTR + HMAC, replay window), control JSON
@@ -16,15 +16,21 @@ sdk/unity/
 │   ├── WebGL/                       AurixWebGLVoiceClient: same API over the browser Web SDK (WebGL players)
 │   ├── Plugins/WebGL/AurixWebGL.jslib Emscripten plugin bridging to window.AurixWebSdk
 │   └── Unity/                       AurixVoiceBehaviour (microphone → Opus → uplink, downlink → AudioSource), AurixWebGLVoiceBehaviour
+├── Editor/                          Aurix Voice menu: project setup check, copy Web SDK bundle to StreamingAssets, docs
+├── Tests/Runtime/                   NUnit tests for the Unity Test Runner (wire format, E2EE vectors, WebGL bridge contract)
 ├── Samples~/Concentus/              IOpusCodec on top of Concentus (pure C# Opus)
 ├── Samples~/VoiceQuickstart/        sample scene (see below)
-└── DotNet/                          solution: library, xunit tests, Unity compile check, headless E2E demo
+├── Samples~/WebGLQuickstart/        the same lobby for WebGL players + WebGL template shipping aurix-web-sdk.js
+├── DotNet~/                         development-only solution: library, xunit tests, Unity compile check, headless E2E demo
+└── BrowserTests~/                   Chromium test of the real .jslib + Web SDK bundle (Emscripten stand-in, live node optional)
 ```
 
 ## Install
 
-1. *Window ▸ Package Manager ▸ + ▸ Add package from disk…* → `sdk/unity/package.json` (or a git
-   URL pointing at that folder).
+1. *Window ▸ Package Manager ▸ + ▸ Add package from git URL…* →
+   `https://github.com/aurix-voice/aurix.git?path=sdk/unity#<tag-or-commit>` (the same string works
+   as a dependency in `Packages/manifest.json`; pin the tag/commit of the server you deploy), or
+   *Add package from disk…* → `sdk/unity/package.json` of a checkout.
 2. On the package page import the **Concentus Opus codec** sample and put the
    [Concentus](https://www.nuget.org/packages/Concentus) 2.x `netstandard2.0` assembly into
    `Assets/Plugins/` — or ship the native core and use `NativeOpusCodec` (libopus); see
@@ -43,7 +49,7 @@ panel — no prefabs or extra packages, so it doubles as copy-paste reference co
 2. Mint a player token: `POST /v1/tokens` with `user_id`, `display_name`, `channels: [<id>]`. In a
    real game **your backend** does this — the API key must never be in a Unity build.
 3. Press Play, fill in *WebSocket URL* (`ws://<host>:8081/ws`), token and channel id, press
-   **Connect**. Start a second instance (or `dotnet run --project sdk/unity/DotNet/Aurix.Demo`)
+   **Connect**. Start a second instance (or `dotnet run --project sdk/unity/DotNet~/Aurix.Demo`)
    with a token for another `user_id` to hear each other.
 
 | Panel control | SDK call |
@@ -58,8 +64,22 @@ panel — no prefabs or extra packages, so it doubles as copy-paste reference co
 | Log | `OnStateChanged`, `OnRecovering/OnRecovered/OnFailedToRecover`, `OnKicked`, `OnRecording`, `OnServerError` |
 
 The sample is compiled in CI together with the Unity-only runtime code
-(`DotNet/Aurix.Voice.UnityCheck`, against `UnityEngine` stubs, warnings as errors), but Unity
-Editor itself is not part of CI — import it into your project once before relying on it.
+(`DotNet~/Aurix.Voice.UnityCheck`, against `UnityEngine` stubs, warnings as errors), and the
+`Tests/Runtime` NUnit tests compile the same way, but Unity Editor itself is not part of CI —
+import the package into your project once before relying on it.
+
+## The WebGL sample: WebGL quick start
+
+The same lobby for browser players: `WebGLQuickstart.cs` drives `AurixWebGLVoiceBehaviour`, reads
+`?ws=…&api=…&token=…&channel=…` from the page URL (so a backend can hand out a ready link), shows
+the browser autoplay state with an **Enable audio** button (`ResumeAudioAsync`), per-participant
+"HRTF" markers (`IsParticipantSpatialized`), WebRTC stats/MOS, chat and the event log. Its
+`WebGLTemplates/Aurix/index.html` loads `aurix-web-sdk.js` *before* the Unity loader, reports a
+missing bundle and an insecure origin on the page, and hides the loading overlay once
+`createUnityInstance` resolves. The sample README covers bundle placement, CORS, `https://`,
+TURN and compression. Verified here in Chromium with the real `.jslib` and bundle under an
+Emscripten stand-in (`BrowserTests~/webgl_bridge_e2e.py`, in CI against a live node); a
+Unity-built player was not.
 
 ## Minimal integration
 
@@ -370,7 +390,7 @@ custom pipelines; `ControlChannel` implements `IMediaTunnel`.
 ## .NET: build, test, demo
 
 ```bash
-cd sdk/unity/DotNet
+cd sdk/unity/DotNet~
 dotnet build          # library + tests + demo + Unity compile check (warnings as errors)
 dotnet test           # packet layout, wire vectors shared with the Rust tests, seal/open, replay, JSON, jitter buffer, resampler
 AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081/ws
@@ -436,7 +456,8 @@ gesture — `OnRemoteAudio(playing: false, reason)` reports the block and `Resum
 click retries both the `<audio>` element and the Web Audio graph. Results are tasks completed from `Update()` on the main thread; browser event queues
 are bounded and report drops through `OnEventsDropped`. In the Editor and on other platforms the
 jslib is not linked (`NativeWebGLBridge` throws) — use `AurixVoiceBehaviour` there or inject a test
-`IWebGLBridge`. Verified here: the jslib against the real bundle under an Emscripten-like harness,
-the C# client against a scripted bridge, the Unity compile check with `UNITY_WEBGL`; a real Unity
-WebGL player build was not run in this repository. Details and the full option list:
+`IWebGLBridge`. Verified here: the jslib and the sample's WebGL template against the real bundle
+under an Emscripten stand-in (Node and Chromium, the latter also joining a live node in CI), the
+C# client against a scripted bridge, the Unity compile check with `UNITY_WEBGL`; a Unity-built
+WebGL player was not run in this repository. Details and the full option list:
 `sdk/unity/README.md` ("Unity WebGL").

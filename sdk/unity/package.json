@@ -2,21 +2,30 @@
   "name": "com.aurix.voice",
   "version": "1.2.0",
   "displayName": "Aurix Voice SDK",
-  "description": "Native AURX/UDP voice client for Aurix Voice Platform: WebSocket control plane, HMAC-authenticated media, jitter buffer and Unity microphone/playback components.",
+  "description": "Game voice client for the Aurix Voice Platform: native AURX media (QUIC/UDP/WebSocket tunnel) with the WebSocket control plane on desktop, mobile and .NET servers, and the same IAurixVoiceClient API over browser WebRTC in Unity WebGL players. Opus, E2EE, per-participant spatial audio, chat, transcripts, TTS, quality stats.",
   "unity": "2021.3",
-  "keywords": ["voice", "voip", "opus", "aurix"],
-  "license": "MIT",
+  "type": "library",
+  "keywords": ["voice", "voip", "voice chat", "opus", "webrtc", "e2ee", "spatial audio", "aurix"],
+  "license": "Apache-2.0",
   "author": { "name": "Aurix contributors" },
+  "documentationUrl": "https://github.com/aurix-voice/aurix/blob/main/sdk/unity/Documentation~/com.aurix.voice.md",
+  "changelogUrl": "https://github.com/aurix-voice/aurix/blob/main/sdk/unity/CHANGELOG.md",
+  "hideInEditor": false,
   "samples": [
     {
       "displayName": "Concentus Opus codec",
-      "description": "IOpusCodec implementation using the pure-C# Concentus library.",
+      "description": "IOpusCodec implementation using the pure-C# Concentus library (add the Concentus 2.x netstandard2.0 assembly to Assets/Plugins).",
       "path": "Samples~/Concentus"
     },
     {
       "displayName": "Voice quick start",
-      "description": "Scene + MonoBehaviour: connect with a player token, join a channel, roster with speaking/energy, mute and push-to-talk, network quality bars and client stats, reconnect, chat. Requires the Concentus sample.",
+      "description": "Scene + MonoBehaviour for desktop/mobile players: connect with a player token, join a channel, roster with speaking/energy, mute and push-to-talk, network quality bars and client stats, reconnect, chat. Requires the Concentus sample (or the native core).",
       "path": "Samples~/VoiceQuickstart"
+    },
+    {
+      "displayName": "WebGL quick start",
+      "description": "Scene + MonoBehaviour for Unity WebGL players: the same lobby over AurixWebGLVoiceBehaviour (browser WebRTC through aurix-web-sdk.js), reads ws/api/token/channel from the page URL, autoplay unlock button. Includes a WebGL template that ships the Web SDK bundle.",
+      "path": "Samples~/WebGLQuickstart"
     }
   ]
 }

@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Compile check for the Unity-only code paths (Runtime/Unity/*.cs and the samples), which the plain
-       Aurix.Voice library never sees because they sit behind UNITY_5_3_OR_NEWER. UnityStubs.cs declares
-       just enough of the UnityEngine surface to type-check them; nothing here is shipped. -->
+  <!-- Compile check for the Unity-only code paths (Runtime/Unity/*.cs, Editor/, Tests/ and the samples), which
+       the plain Aurix.Voice library never sees because they sit behind UNITY_5_3_OR_NEWER / UNITY_EDITOR.
+       UnityStubs.cs declares just enough of the UnityEngine/UnityEditor surface to type-check them; the Unity
+       Test Framework tests compile against the real NUnit 3 package; nothing here is shipped. -->
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <LangVersion>9.0</LangVersion>
@@ -18,6 +19,9 @@
     <Compile Include="UnityStubs.cs" />
     <Compile Include="../../Runtime/**/*.cs" />
     <Compile Include="../../Samples~/**/*.cs" />
+    <Compile Include="../../Editor/**/*.cs" />
+    <Compile Include="../../Tests/**/*.cs" />
     <PackageReference Include="Concentus" Version="2.2.2" />
+    <PackageReference Include="NUnit" Version="3.14.0" />
   </ItemGroup>
 </Project>

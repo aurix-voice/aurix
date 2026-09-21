@@ -21,7 +21,7 @@ Rust stable (`rust-version = "1.88"` in `Cargo.toml`), PostgreSQL 15+, Redis 7+,
 dependencies `pkg-config libssl-dev cmake` (Debian names — `libssl-dev` is only needed because the
 WebRTC stack pulls OpenSSL transitively; everything else uses rustls; `cmake` builds the bundled
 libopus 1.6 — no system `libopus` is used). For the SDKs:
-Node 20 (`sdk/web`), .NET 8 SDK (`sdk/unity/DotNet`), mdBook 0.5 for the book.
+Node 20 (`sdk/web`), .NET 8 SDK (`sdk/unity/DotNet~`), mdBook 0.5 for the book.
 
 ```bash
 docker run -d --name aurix-pg -e POSTGRES_PASSWORD=aurix -e POSTGRES_USER=aurix -e POSTGRES_DB=aurix -p 5432:5432 postgres:16
@@ -43,7 +43,7 @@ cargo test -p aurix-client --test e2e_live -- --nocapture
 
 # SDKs
 (cd sdk/web && npm ci && npm run check && npm test && npm run build)
-(cd sdk/unity/DotNet && dotnet test Aurix.sln -v q --nologo)
+(cd sdk/unity/DotNet~ && dotnet test Aurix.sln -v q --nologo)
 
 # contract + docs
 cargo test -p aurix-api --test openapi_contract
@@ -82,7 +82,7 @@ silence them:
   `WireVectorsMatchServer` in `Aurix.Voice.Tests` pin the packet layout and key derivation with
   the same fixtures; the quality model (R-factor → bars) is pinned the same way in Rust, C# and
   TypeScript.
-* `sdk/unity/DotNet/Aurix.Voice.UnityCheck` — compiles the Unity-only code (`AurixVoiceBehaviour`,
+* `sdk/unity/DotNet~/Aurix.Voice.UnityCheck` — compiles the Unity-only code (`AurixVoiceBehaviour`,
   the samples) against a UnityEngine stub with the Unity/Android defines, because the Editor is
   not available in CI.
 
