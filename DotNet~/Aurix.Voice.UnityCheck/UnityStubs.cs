@@ -44,7 +44,13 @@ namespace UnityEngine
         public static void GetDeviceCaps(string d, out int min, out int max) { min = 0; max = 0; }
     }
     public delegate void AudioConfigurationChangeHandler(bool deviceWasChanged);
-    public static class AudioSettings { public static int outputSampleRate => 48000; public static event AudioConfigurationChangeHandler OnAudioConfigurationChanged; }
+    public struct AudioConfiguration { public int sampleRate; }
+    public static class AudioSettings
+    {
+        public static int outputSampleRate => 48000;
+        public static event AudioConfigurationChangeHandler OnAudioConfigurationChanged;
+        public static AudioConfiguration GetConfiguration() => new AudioConfiguration { sampleRate = 48000 };
+    }
     public enum NetworkReachability { NotReachable, ReachableViaCarrierDataNetwork, ReachableViaLocalAreaNetwork }
     public enum UserAuthorization { WebCam = 1, Microphone = 2 }
     public static class Application
@@ -52,8 +58,11 @@ namespace UnityEngine
         public static NetworkReachability internetReachability => NetworkReachability.ReachableViaLocalAreaNetwork;
         public static bool HasUserAuthorization(UserAuthorization m) => true;
         public static AsyncOperation RequestUserAuthorization(UserAuthorization m) => null;
+        public static string absoluteURL => "";
+        public static string streamingAssetsPath => "";
+        public static void OpenURL(string url) { }
     }
-    public static class Debug { public static void LogWarning(object o) { } public static void Log(object o) { } }
+    public static class Debug { public static void LogWarning(object o) { } public static void Log(object o) { } public static void LogError(object o) { } }
     public static class Time { public static float deltaTime; public static float unscaledTime; public static float unscaledDeltaTime; public static float realtimeSinceStartup; }
     public static class Mathf
     {
@@ -105,3 +114,30 @@ namespace UnityEngine.Audio
 {
     public class AudioMixer : Object { public bool GetFloat(string name, out float value) { value = 0f; return true; } public bool SetFloat(string name, float value) => true; }
 }
+
+#if UNITY_EDITOR
+namespace UnityEditor
+{
+    using UnityEngine;
+    public enum BuildTarget { StandaloneWindows64, StandaloneLinux64, StandaloneOSX, Android, iOS, WebGL }
+    public enum WebGLCompressionFormat { Brotli, Gzip, Disabled }
+    public sealed class MenuItem : Attribute { public MenuItem(string path, bool validate = false, int priority = 0) { } }
+    public static class EditorUserBuildSettings { public static BuildTarget activeBuildTarget => BuildTarget.StandaloneLinux64; }
+    public static class EditorUtility
+    {
+        public static string OpenFilePanel(string title, string dir, string ext) => "";
+        public static bool DisplayDialog(string title, string message, string ok) => true;
+    }
+    public static class AssetDatabase { public static void Refresh() { } }
+    public static class PlayerSettings
+    {
+        public static class WebGL
+        {
+            public static string template => "APPLICATION:Default";
+            public static WebGLCompressionFormat compressionFormat => WebGLCompressionFormat.Brotli;
+            public static bool decompressionFallback => false;
+        }
+        public static class iOS { public static string microphoneUsageDescription => ""; }
+    }
+}
+#endif

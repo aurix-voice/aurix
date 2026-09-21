@@ -10,8 +10,11 @@ namespace Aurix.WebGL
     /// </summary>
     public sealed class WebGLClientOptions
     {
-        /// <summary>Force TURN relay for WebRTC (<c>iceTransportPolicy: "relay"</c>).</summary>
-        public bool UseTurn;
+        /// <summary>
+        /// Fetch the node's TURN credentials (<c>GET /v1/me/turn-credentials</c>) and add its relay to the ICE servers, like
+        /// the Web SDK does by default; failures are non-fatal. False = host/STUN candidates only.
+        /// </summary>
+        public bool UseTurn = true;
         /// <summary>
         /// Extra ICE servers as the JSON array the browser expects (<c>[{"urls":"turn:…","username":"…","credential":"…"}]</c>);
         /// null = only what the Aurix node advertises.

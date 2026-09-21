@@ -42,8 +42,8 @@ namespace Aurix.Unity
         [Range(0f, 1f)] public float OutputVolume = 1f;
         [Tooltip("Speaker mute: hear nobody, without telling the server or affecting your microphone.")]
         public bool OutputMuted = false;
-        [Tooltip("Force the WebRTC media through the node's TURN relay (restrictive networks).")]
-        public bool UseTurn = false;
+        [Tooltip("Fetch the node's TURN credentials and offer its relay as an ICE server (needed behind symmetric NAT). Off = host/STUN candidates only.")]
+        public bool UseTurn = true;
         [Tooltip("Per-participant downlink tracks to negotiate next to the server mix (-1 = as many as the node allows, 0 = mix only). Each is spatialized by the browser from UpdatePositionAsync positions.")]
         public int ParticipantStreams = -1;
         [Tooltip("How the browser renders per-participant tracks: HRTF (binaural), equal-power panning, or none (tracks negotiated, playback left to the page).")]

@@ -24,7 +24,7 @@ Everything is driven by `VoiceQuickstart.cs`, a small `MonoBehaviour` that wires
    key must never be shipped in a Unity build.
 3. Press Play. Fill in *WebSocket URL* (`ws://<host>:8081/ws`), paste the token and channel id,
    press **Connect**. Run a second instance (another editor / build, or the .NET demo
-   `dotnet run --project DotNet/Aurix.Demo`) with a token for a different `user_id` to hear each other.
+   `dotnet run --project DotNet~/Aurix.Demo`) with a token for a different `user_id` to hear each other.
 
 Panel controls:
 
@@ -53,4 +53,4 @@ Inspector fields: `PushToTalkKey` (default `None` = open microphone), `ConnectOn
 
 The sample compiles under the same rules as the runtime (`netstandard2.1`, no `unsafe`, no
 reflection); CI type-checks it together with the Unity-only runtime code via
-`DotNet/Aurix.Voice.UnityCheck`.
+`DotNet~/Aurix.Voice.UnityCheck`.

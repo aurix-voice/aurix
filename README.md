@@ -8,7 +8,8 @@ see [Unity WebGL](#unity-webgl-browser-webrtc-through-the-web-sdk).
 
 ```
 sdk/unity/
-├── package.json                 UPM package (com.aurix.voice) — add via "Add package from disk…" or a git URL
+├── package.json                 UPM package (com.aurix.voice) — add via git URL (?path=sdk/unity) or "Add package from disk…"
+├── CHANGELOG.md, Documentation~/ package changelog and the UPM documentation page (install, layout, verification)
 ├── Runtime/
 │   ├── AurixVoiceClient.cs      high-level client: connect → bind media → join channels → audio/events
 │   ├── IAurixVoiceClient.cs     the API both clients implement (native and WebGL)
@@ -18,9 +19,13 @@ sdk/unity/
 │   ├── WebGL/                   AurixWebGLVoiceClient: the same API over the browser Web SDK (Unity WebGL players)
 │   ├── Plugins/WebGL/AurixWebGL.jslib  Emscripten plugin: loads aurix-web-sdk.js, forwards JSON calls to it
 │   └── Unity/                   AurixVoiceBehaviour (native: microphone + AudioSource), AurixWebGLVoiceBehaviour (WebGL)
+├── Editor/                      Aurix Voice menu: project setup check, copy Web SDK bundle to StreamingAssets, docs
+├── Tests/Runtime/               NUnit tests for the Unity Test Runner: wire format, E2EE vectors, WebGL bridge contract
 ├── Samples~/Concentus/          IOpusCodec implementation on top of Concentus (pure C# Opus)
 ├── Samples~/VoiceQuickstart/    sample scene: connect, roster, mute/PTT, quality bars, stats, reconnect, chat
-└── DotNet/                      .NET solution: library build, xunit tests, Unity compile check, headless two-client E2E demo
+├── Samples~/WebGLQuickstart/    the same lobby for WebGL players + a WebGL template that ships aurix-web-sdk.js
+├── DotNet~/                     .NET solution (not imported by Unity): library build, xunit tests, Unity compile check, headless E2E demo
+└── BrowserTests~/               Chromium test of the real .jslib + Web SDK bundle (Emscripten stand-in; live node optional)
 ```
 
 ## Security model (mirrors the server)
@@ -41,7 +46,9 @@ sdk/unity/
 Fastest path: import the **Voice quick start** sample (see `Samples~/VoiceQuickstart/README.md`) and press Play —
 it is a complete, IMGUI-driven client you can copy from. The manual route:
 
-1. Add the package (`Window ▸ Package Manager ▸ + ▸ Add package from disk… ▸ sdk/unity/package.json`).
+1. Add the package: `Window ▸ Package Manager ▸ + ▸ Add package from git URL…` →
+   `https://github.com/aurix-voice/aurix.git?path=sdk/unity#<tag-or-commit>` (or *Add package from
+   disk… ▸ sdk/unity/package.json* from a checkout). Details: `Documentation~/com.aurix.voice.md`.
 2. Provide an Opus codec: import the **Concentus** sample from the package and drop the `Concentus` 2.x DLL
    (netstandard2.0 build from NuGet) into `Assets/Plugins/` (pure C#, works everywhere), or ship the native
    core for libopus quality/CPU (`NativeOpusCodec`, see [Opus codec and encoder controls](#opus-codec-and-encoder-controls)).
@@ -550,12 +557,19 @@ How it works and what is different from the native client:
   `PlatformNotSupportedException` — use `AurixVoiceBehaviour` there, or inject your own `IWebGLBridge`
   (the unit tests do exactly that with a scripted fake).
 
-What was verified here: the `.jslib` is evaluated under an Emscripten-like harness against the real
-browser bundle (`sdk/web/test/unity-jslib.test.mjs`), the C# client is tested against a scripted
-bridge (`WebGLBridgeTests`: results, events, token callbacks, timeouts, overflow, disposal,
-participant-track options/layout), and the
-Unity compile check runs with `UNITY_WEBGL` (player and editor). A real Unity WebGL build in a browser
-was **not** run in this repository — that is the first thing to try in your project.
+The **WebGL quick start** sample (`Samples~/WebGLQuickstart`) is the ready-made lobby for this path,
+including a WebGL template that loads the bundle before the Unity loader; `Aurix Voice ▸ Check project
+setup` flags a missing bundle/template and Brotli-without-`Content-Encoding` setups.
+
+What was verified here: the `.jslib` is evaluated against the real browser bundle under an
+Emscripten stand-in, both in Node (`sdk/web/test/unity-jslib.test.mjs`) and in Chromium
+(`BrowserTests~/webgl_bridge_e2e.py`: template boot, plugin protocol, and against a live node
+connect/join/roster/chat/media/quality/mute/volume/pin/leave — the last one runs in CI); the C# client
+is tested against a scripted bridge (`WebGLBridgeTests`: results, events, token callbacks, timeouts,
+overflow, disposal, participant-track options/layout) and the Unity compile check runs with
+`UNITY_WEBGL` (player and editor). A **Unity-built** WebGL player was not run in this repository —
+the harness stands in for Emscripten's runtime, not for Unity — so build the sample once in your
+project before relying on it.
 
 ### One-time action tokens
 
@@ -888,11 +902,17 @@ per-participant tracks from the priority members' speaking state.
 ## .NET: build, test, end-to-end demo
 
 ```bash
-cd sdk/unity/DotNet
-dotnet build                     # library (netstandard2.1) + tests + demo + Unity compile check (Runtime/Unity + Samples~ against UnityEngine stubs), warnings as errors
+cd sdk/unity/DotNet~
+dotnet build                     # library (netstandard2.1) + tests + demo + Unity compile check (Runtime + Editor + Tests + Samples~ against UnityEngine stubs), warnings as errors
 dotnet test                      # packet layout, CRC32/UUID vectors, seal/open + tamper detection, server wire vectors, replay window, JSON, jitter buffer
 AURIX_API_KEY=aurx_... dotnet run --project Aurix.Demo -- --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081/ws
 ```
+
+`Tests/Runtime` holds the NUnit tests that run inside Unity (*Window ▸ General ▸ Test Runner*) — the
+same wire/E2EE vectors as the xunit suite plus the WebGL bridge contract; the Unity compile check builds
+them too, but the Unity Editor is not part of CI. `BrowserTests~/webgl_bridge_e2e.py` (Python +
+Playwright Chromium) runs the real `.jslib` and the WebGL template against the real Web SDK bundle under an
+Emscripten stand-in, and with `AURIX_API_URL` / `AURIX_WS_URL` / `AURIX_API_KEY` set also joins a live node.
 
 The demo creates a channel, issues two tokens, connects "alice" and "bob" over real UDP, streams an Opus-encoded
 440 Hz tone for half the run and mutes for the other half, and asserts: all packets verified (0 bad auth / replays),
