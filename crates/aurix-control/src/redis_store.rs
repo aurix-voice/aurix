@@ -27,6 +27,11 @@ pub struct RedisStore {
     handle: arc_swap::ArcSwap<Handle>,
     /// Bumped on every master switch; long-lived consumers (Pub/Sub) reconnect on change.
     generation: tokio::sync::watch::Sender<u64>,
+    /// `true` while the cross-node event subscriber is attached to the current master.
+    /// Pub/Sub is not durable: events published while this is `false` never reach this node,
+    /// so readiness reports it.
+    subscribed: std::sync::atomic::AtomicBool,
+    subscriber_started: std::sync::atomic::AtomicBool,
     node_id: MediaNodeId,
 }
 
@@ -39,6 +44,8 @@ impl RedisStore {
             source,
             handle: arc_swap::ArcSwap::from_pointee(handle),
             generation,
+            subscribed: std::sync::atomic::AtomicBool::new(false),
+            subscriber_started: std::sync::atomic::AtomicBool::new(false),
             node_id,
         };
         Ok(store)
@@ -61,6 +68,13 @@ impl RedisStore {
 
     pub fn is_sentinel(&self) -> bool {
         self.source.is_sentinel()
+    }
+
+    /// Whether cross-node events currently reach this node. `true` when replication was never
+    /// started (nothing to receive), otherwise only while the Pub/Sub subscriber is attached.
+    pub fn event_subscriber_connected(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.subscriber_started.load(Ordering::Acquire) || self.subscribed.load(Ordering::Acquire)
     }
 
     /// Address of the master currently in use (`host:port`), for logs and health output.
@@ -159,11 +173,14 @@ impl RedisStore {
         self.start_event_subscriber(bus);
     }
 
-    pub fn start_event_subscriber(&self, local_bus: Arc<EventBus>) {
+    pub fn start_event_subscriber(self: &Arc<Self>, local_bus: Arc<EventBus>) {
+        use std::sync::atomic::Ordering;
+        self.subscriber_started.store(true, Ordering::Release);
         let handle = self.handle.load_full();
         let mut generation = self.generation.subscribe();
         let source = self.source.clone();
         let self_id = self.node_id;
+        let store = self.clone();
         tokio::spawn(async move {
             let mut seen: std::collections::VecDeque<uuid::Uuid> =
                 std::collections::VecDeque::with_capacity(4096);
@@ -174,10 +191,11 @@ impl RedisStore {
                     Ok(mut pubsub) => {
                         if let Err(e) = pubsub.subscribe(EVENT_CHANNEL).await {
                             tracing::error!("Redis subscribe failed: {e}");
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            Self::backoff(&mut generation, Duration::from_secs(2)).await;
                             continue;
                         }
                         tracing::info!("Redis Pub/Sub subscriber connected");
+                        store.subscribed.store(true, Ordering::Release);
                         let mut stream = pubsub.on_message();
                         loop {
                             let msg = tokio::select! {
@@ -208,10 +226,12 @@ impl RedisStore {
                             seen.push_back(env.id);
                             local_bus.deliver_remote(env.event);
                         }
+                        store.subscribed.store(false, Ordering::Release);
+                        tracing::warn!("Redis Pub/Sub subscriber disconnected");
                     }
                     Err(e) => {
                         tracing::error!("Redis Pub/Sub connection failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        Self::backoff(&mut generation, Duration::from_secs(5)).await;
                     }
                 }
                 // Whatever the reason for the drop, point at the current master.
@@ -220,6 +240,14 @@ impl RedisStore {
                 }
             }
         });
+    }
+
+    /// Sleep between subscriber attempts, cut short by a master switch.
+    async fn backoff(generation: &mut tokio::sync::watch::Receiver<u64>, max: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(max) => {}
+            _ = generation.changed() => {}
+        }
     }
 
     pub async fn ping(&self) -> Result<()> {

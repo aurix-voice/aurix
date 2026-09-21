@@ -97,7 +97,10 @@ pool_size = 20
 Use this with a single Redis or with a **managed HA endpoint** whose address does not change on
 failover (ElastiCache primary endpoint, Memorystore, a keepalived VIP). The connection manager
 reconnects with backoff when the endpoint drops, Pub/Sub re-subscribes on reconnect and
-`/ready` pings Redis.
+`/ready` pings Redis **and** requires the cross-node event subscriber to be attached: Pub/Sub is
+not durable, so a node whose subscriber is still reconnecting would silently miss presence,
+chat and moderation events from other nodes. The balancer therefore holds new connections
+back for the second or two the re-subscription takes.
 
 ### Sentinel mode
 

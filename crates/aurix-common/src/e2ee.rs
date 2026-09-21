@@ -501,6 +501,15 @@ impl Group {
         self.peers.get(user_id).is_some_and(|p| !p.keys.is_empty())
     }
 
+    /// Whether `user_id` is a known peer whose key for `generation` has not arrived (yet).
+    /// A frame of such a generation is not corrupt: its key is still in flight on the
+    /// control plane, which media over UDP can overtake.
+    pub fn awaiting_generation(&self, user_id: &UserId, generation: u8) -> bool {
+        self.peers
+            .get(user_id)
+            .is_some_and(|p| !p.keys.has_generation(generation))
+    }
+
     /// Whether a rotation is due ([`Group::rotate`] performs it).
     pub fn rotation_pending(&self) -> bool {
         self.rotation_pending
@@ -1028,6 +1037,33 @@ mod tests {
         let bob = groups.get_mut(&b).unwrap();
         assert_eq!(bob.decrypt(&a, &new).unwrap(), b"new gen");
         assert_eq!(bob.decrypt(&a, &old).unwrap(), b"old gen");
+    }
+
+    #[test]
+    fn frame_ahead_of_its_key_is_awaited_not_rejected() {
+        let a = user(1);
+        let b = user(2);
+        let channel = ch(1);
+        let mut groups: HashMap<UserId, Group> = HashMap::new();
+        for u in [a, b] {
+            groups.insert(u, Group::new(IdentityKey::generate()));
+            let out = groups.get_mut(&u).unwrap().joined(channel);
+            drive(&mut groups, u, out);
+        }
+        settle(&mut groups);
+        // Alice rotates and seals before her new key reaches Bob (media overtook control).
+        let out = groups.get_mut(&a).unwrap().rotate(true).unwrap();
+        let early = groups.get_mut(&a).unwrap().encrypt(b"early");
+        let (generation, _) = SenderKey::peek(&early).unwrap();
+        let bob = groups.get_mut(&b).unwrap();
+        assert!(bob.decrypt(&a, &early).is_err());
+        assert!(bob.awaiting_generation(&a, generation));
+        assert!(!bob.awaiting_generation(&a, generation.wrapping_sub(1)));
+        assert!(!bob.awaiting_generation(&user(9), generation));
+        drive(&mut groups, a, out);
+        let bob = groups.get_mut(&b).unwrap();
+        assert!(!bob.awaiting_generation(&a, generation));
+        assert_eq!(bob.decrypt(&a, &early).unwrap(), b"early");
     }
 
     #[test]

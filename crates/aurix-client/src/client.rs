@@ -69,6 +69,10 @@ const TUNNEL_BIND_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a failed UDP bind keeps `Auto` reconnects going straight to the tunnel when
 /// re-probing is disabled.
 const UDP_BLOCK_MEMORY: Duration = Duration::from_secs(60);
+/// How long a sealed frame may wait for its sender key before it counts as lost.
+const E2EE_PENDING_MAX_AGE: Duration = Duration::from_millis(500);
+/// Frames held per sender while their key is in flight (25 × 20 ms).
+const E2EE_PENDING_MAX_FRAMES: usize = 25;
 /// Client refs of chat/TTS requests are kept this long after the last status so late
 /// `TtsStatus` updates still map to the request id.
 const REF_RETENTION: Duration = Duration::from_secs(600);
@@ -281,6 +285,9 @@ struct Inner {
     channels: Mutex<HashMap<ChannelId, ChannelState>>,
     /// Participants rendered by the host through `pull_participant_*`, kept out of the mix.
     claimed_users: Mutex<HashSet<UserId>>,
+    /// E2EE frames of a generation whose sender key has not arrived yet (UDP media can
+    /// overtake the control plane at a rotation); replayed when the key lands.
+    e2ee_pending: Mutex<HashMap<UserId, VecDeque<(Instant, IncomingAudio)>>>,
     prefs: Mutex<Prefs>,
     session: Mutex<Option<SessionInfo>>,
     identity: Mutex<TokenIdentity>,
@@ -502,13 +509,32 @@ impl Inner {
         self.jitter
             .lock()
             .observe(audio.sender_ssrc, audio.timestamp, Instant::now());
+        self.deliver_audio(audio, true);
+    }
+
+    /// Decrypts (if sealed) and hands a downlink frame to the mixer. With `park`, a frame of
+    /// a generation whose key is still in flight waits in `e2ee_pending` instead of counting
+    /// as undecryptable.
+    fn deliver_audio(&self, audio: IncomingAudio, park: bool) {
         let payload = if audio.e2ee {
-            let opened = self
-                .user_for_ssrc(audio.sender_ssrc)
-                .and_then(|user| self.e2ee.lock().decrypt(&user, &audio.payload).ok());
+            let Some(user) = self.user_for_ssrc(audio.sender_ssrc) else {
+                self.tx_stats.lock().e2ee_undecryptable += 1;
+                return;
+            };
+            let opened = {
+                let mut g = self.e2ee.lock();
+                g.decrypt(&user, &audio.payload).ok().ok_or_else(|| {
+                    park && e2ee::SenderKey::peek(&audio.payload)
+                        .is_some_and(|(generation, _)| g.awaiting_generation(&user, generation))
+                })
+            };
             match opened {
-                Some(plain) => plain,
-                None => {
+                Ok(plain) => plain,
+                Err(true) => {
+                    self.park_e2ee_frame(user, audio);
+                    return;
+                }
+                Err(false) => {
                     self.tx_stats.lock().e2ee_undecryptable += 1;
                     return;
                 }
@@ -529,6 +555,46 @@ impl Inner {
             audio.mixed && audio.codec == AudioCodec::Opus,
             payload,
         );
+    }
+
+    fn park_e2ee_frame(&self, user: UserId, audio: IncomingAudio) {
+        let now = Instant::now();
+        let mut expired = 0u64;
+        {
+            let mut pending = self.e2ee_pending.lock();
+            let queue = pending.entry(user).or_default();
+            while queue
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > E2EE_PENDING_MAX_AGE)
+            {
+                queue.pop_front();
+                expired += 1;
+            }
+            if queue.len() >= E2EE_PENDING_MAX_FRAMES {
+                queue.pop_front();
+                expired += 1;
+            }
+            queue.push_back((now, audio));
+        }
+        if expired > 0 {
+            self.tx_stats.lock().e2ee_undecryptable += expired;
+        }
+    }
+
+    /// Replays the frames parked for `user` now that a key of theirs arrived; whatever still
+    /// does not open counts as undecryptable.
+    fn replay_e2ee_pending(&self, user: UserId) {
+        let Some(queue) = self.e2ee_pending.lock().remove(&user) else {
+            return;
+        };
+        let now = Instant::now();
+        for (at, audio) in queue {
+            if now.duration_since(at) > E2EE_PENDING_MAX_AGE {
+                self.tx_stats.lock().e2ee_undecryptable += 1;
+            } else {
+                self.deliver_audio(audio, false);
+            }
+        }
     }
 }
 
@@ -664,6 +730,7 @@ impl Client {
             local_speaking: AtomicBool::new(false),
             channels: Mutex::new(HashMap::new()),
             claimed_users: Mutex::new(HashSet::new()),
+            e2ee_pending: Mutex::new(HashMap::new()),
             prefs: Mutex::new(Prefs {
                 transcripts_enabled: true,
                 ..Prefs::default()
@@ -3176,6 +3243,7 @@ fn e2ee_left(inner: &Inner, channel_id: &ChannelId) {
         before.into_iter().filter(|u| !g.has_key_for(u)).collect()
     };
     for user_id in lost {
+        inner.e2ee_pending.lock().remove(&user_id);
         inner.emit(Event::E2eePeerDecryptable {
             user_id,
             decryptable: false,
@@ -3191,6 +3259,7 @@ fn e2ee_peer_left(inner: &Inner, channel_id: &ChannelId, user_id: &UserId) {
         had && !g.has_key_for(user_id)
     };
     if lost {
+        inner.e2ee_pending.lock().remove(user_id);
         inner.emit(Event::E2eePeerDecryptable {
             user_id: *user_id,
             decryptable: false,
@@ -3205,6 +3274,7 @@ fn e2ee_reset(inner: &Inner) {
         g.reset();
         peers
     };
+    inner.e2ee_pending.lock().clear();
     for user_id in peers {
         inner.emit(Event::E2eePeerDecryptable {
             user_id,
@@ -3290,6 +3360,7 @@ async fn e2ee_on_sender_key(
                     decryptable: true,
                 });
             }
+            inner.replay_e2ee_pending(user_id);
             e2ee_send(inner, conn, out).await
         }
         Err(e) => {

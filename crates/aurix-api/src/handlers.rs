@@ -97,7 +97,7 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<serde_json::Val
         .fetch_one(&state.control.pool)
         .await?;
     let redis_ok = match &state.control.redis {
-        Some(r) => r.ping().await.is_ok(),
+        Some(r) => r.ping().await.is_ok() && r.event_subscriber_connected(),
         None => !state.control.config.is_production(),
     };
     if !redis_ok {

@@ -77,7 +77,10 @@ Key distribution rides on the control WebSocket ([messages](../api/websocket.md#
    newcomer cannot read earlier frames — or leaves, so the leaver cannot read later ones;
    also when a peer shows up with a different identity key, after 2³¹ frames, and on
    `rotateE2eeKey()` / `RotateE2eeKey()`. Receivers keep the last four generations of every
-   peer so frames in flight across a rotation still decrypt.
+   peer so frames in flight across a rotation still decrypt. The new key travels on the
+   control plane while media takes UDP/QUIC, so a receiver may see a frame before its key:
+   the native core parks such frames (up to 25 per sender, 500 ms) and decrypts them when the
+   key lands; frames that wait longer count as lost.
 4. Every frame is checked against a per-generation replay window; tampered, replayed, stale or
    unknown-generation frames are dropped (`e2ee_undecryptable` in the client statistics) and
    never reach the speaker.

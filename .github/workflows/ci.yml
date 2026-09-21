@@ -74,11 +74,32 @@ jobs:
           AURIX__RATE_LIMITING__BURST_SIZE: "1000"
           AURIX__RATE_LIMITING__REPORTS_PER_MINUTE: "3"
           AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
+          AURIX__MEDIA__CASCADE_SECRET: ci-only-cascade-secret-0123456789abcdef
+          AURIX__MEDIA__CASCADE_DISCOVERY_INTERVAL_MS: "2000"
           AURIX__TRACING__LOG_FORMAT: text
         run: |
           nohup ./target/debug/aurix-server > server.log 2>&1 &
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8080/ready
+      - name: Run second node (cascade peer without QUIC)
+        env:
+          AURIX__TURN__ENABLED: "false"
+          AURIX__RECORDING__ENABLED: "false"
+          AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          AURIX__MEDIA__QUIC: "false"
+          AURIX__MEDIA__CASCADE_SECRET: ci-only-cascade-secret-0123456789abcdef
+          AURIX__MEDIA__CASCADE_DISCOVERY_INTERVAL_MS: "2000"
+          AURIX__SERVER__API_PORT: "8120"
+          AURIX__SERVER__WS_PORT: "8121"
+          AURIX__MEDIA__PORT: "10008"
+          AURIX__METRICS__PORT: "9098"
+          AURIX__SERVER__SESSION_RESUME_GRACE_SECS: "4"
+          AURIX__QUALITY__PERSIST_INTERVAL_SECS: "10"
+          AURIX__TRACING__LOG_FORMAT: text
+        run: |
+          nohup ./target/debug/aurix-server > server-node2.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8120/ready && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8120/ready
       - name: Bootstrap admin, app and API key
         id: bootstrap
         run: |
@@ -102,6 +123,8 @@ jobs:
         env:
           AURIX_E2E_API: http://127.0.0.1:8080
           AURIX_E2E_WS: ws://127.0.0.1:8081
+          AURIX_E2E_API2: http://127.0.0.1:8120
+          AURIX_E2E_WS2: ws://127.0.0.1:8121
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
           AURIX_E2E_API_KEY2: ${{ steps.bootstrap.outputs.key2 }}
           AURIX_E2E_ADMIN_TOKEN: ${{ steps.bootstrap.outputs.admin_token }}
@@ -116,6 +139,12 @@ jobs:
         env:
           AURIX_E2E_API: http://127.0.0.1:8080
           AURIX_E2E_WS: ws://127.0.0.1:8081
+          AURIX_E2E_UDP: "10000"
+          AURIX_E2E_METRICS: http://127.0.0.1:4040/metrics
+          AURIX_E2E_API2: http://127.0.0.1:8120
+          AURIX_E2E_WS2: ws://127.0.0.1:8121
+          AURIX_E2E_UDP2: "10008"
+          AURIX_E2E_SUDO_IPTABLES: "1"
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
         run: cargo test --locked -p aurix-client --test e2e_live -- --nocapture
       - name: E2E (strict action tokens)
@@ -249,6 +278,7 @@ jobs:
       - if: failure()
         run: |
           tail -n 200 server.log
+          tail -n 200 server-node2.log || true
           tail -n 100 server-strict.log || true
           tail -n 200 server-speech.log || true
           tail -n 50 mock-speech.log || true
@@ -289,6 +319,11 @@ jobs:
       - run: cargo +nightly install cargo-fuzz --locked
       - name: libFuzzer smoke (30 s per target)
         working-directory: fuzz
+        # Nightly deprecates APIs ahead of stable (e.g. `fetch_update` -> `try_update`); the
+        # stable `fmt + clippy` job is the warnings gate, so do not let the moving nightly
+        # toolchain turn its own deprecation notices into a failed fuzz build.
+        env:
+          RUSTFLAGS: ""
         run: |
           set -euo pipefail
           for target in $(cargo +nightly fuzz list); do

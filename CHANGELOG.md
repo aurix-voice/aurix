@@ -71,6 +71,17 @@ released together.
 * The Docker image build did not copy `api/openapi.json`, which `aurix-api` embeds.
 * The Unity Concentus sample let Concentus pick a host `libopus` when one was present, making
   its behaviour machine-dependent; it now always runs the managed port.
+* `/ready` reported ready while the Redis Pub/Sub subscriber was still reconnecting after a
+  Sentinel failover, so a balancer could send players to a node that missed other nodes'
+  roster/chat/moderation events for a few seconds. Readiness now requires the subscriber to be
+  attached, and a master switch wakes the subscriber immediately instead of waiting out its
+  5-second backoff.
+* The Godot Web export preset shipped the desktop demo scene, whose script needs the native
+  GDExtension that the Web build does not include.
+* The native core counted an E2EE frame as undecryptable when it overtook its sender key at a
+  rotation (media over UDP/QUIC, key over the control plane); such frames now wait up to
+  500 ms for the key and are decrypted when it arrives.
+* CI runs the second node the native QUIC/tunnel E2E tests require.
 
 ## [1.2.0] - 2026-09-19
 
