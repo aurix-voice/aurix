@@ -179,16 +179,17 @@ pub fn stun_message(data: &[u8]) {
 }
 
 /// Control-plane JSON (`ControlMessage`, both directions): deserialize, then the
-/// serialize → deserialize round trip must reproduce the same JSON value.
+/// serialize → deserialize → serialize round trip must reproduce the same JSON text.
+/// (Text, not `serde_json::Value`: `Value` widens `f32` fields to `f64`, so `5.6` would
+/// compare unequal to itself.)
 pub fn control_message(data: &[u8]) {
     let Ok(msg) = serde_json::from_slice::<ControlMessage>(data) else {
         return;
     };
     let text = serde_json::to_string(&msg).expect("ControlMessage serializes");
     let again: ControlMessage = serde_json::from_str(&text).expect("own JSON must parse");
-    let a: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let b: serde_json::Value = serde_json::to_value(&again).unwrap();
-    assert_eq!(a, b, "ControlMessage round trip must be stable");
+    let text_again = serde_json::to_string(&again).expect("ControlMessage re-serializes");
+    assert_eq!(text, text_again, "ControlMessage round trip must be stable");
 }
 
 fn fixed_identity(seed: u8) -> IdentityKey {
