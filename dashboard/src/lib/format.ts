@@ -43,6 +43,21 @@ export function fmtDateTime(locale: Locale, iso: string | null | undefined): str
   }).format(d);
 }
 
+/** Compact "Sep 21, 18:43:51" for dense log tables; pair with the full `fmtDateTime` in a title. */
+export function fmtDateTimeShort(locale: Locale, iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(bcp47[locale], {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(d);
+}
+
 export function fmtDate(locale: Locale, iso: string | null | undefined): string {
   if (!iso) return "—";
   const d = new Date(iso);

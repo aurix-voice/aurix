@@ -98,7 +98,7 @@ function Recordings() {
         const name = channelName(r.channel_id);
         return name ? (
           <span className="inline-flex items-center gap-1.5 min-w-0">
-            <span className="truncate font-medium">{name}</span>
+            <span className="truncate font-medium max-w-[14rem]" title={name}>{name}</span>
             <ChannelRef id={r.channel_id} />
           </span>
         ) : (

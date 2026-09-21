@@ -6,12 +6,12 @@ import { useAuditLogQuery, useSelectedApp, type AuditScope } from "@/api/hooks";
 import { useAppScope } from "@/api/scope";
 import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
-import { fmtDateTime } from "@/lib/format";
+import { fmtDateTime, fmtDateTimeShort } from "@/lib/format";
 import { Dialog } from "@/ui/Dialog";
 import { Input, NativeSelect } from "@/ui/Input";
 import { Segmented } from "@/ui/Menu";
 import { QueryError, Toolbar } from "@/ui/Page";
-import { Badge, Callout, Card, CodeBlock, CopyButton, EmptyState, IdChip, KV, Mono, Tip } from "@/ui/Primitives";
+import { Badge, Callout, Card, CodeBlock, CopyButton, EmptyState, IdChip, KV, Mono, shortId, Tip } from "@/ui/Primitives";
 import { DataTable, Pager, type Column } from "@/ui/Table";
 
 import { auditActions, chainLinks, chainSummary, detailsPreview, filterAudit, type ChainLink } from "./model";
@@ -81,7 +81,11 @@ export function AuditTab() {
     {
       key: "time",
       header: t("common.time"),
-      cell: (e) => <span className="text-fg-muted whitespace-nowrap tabular">{fmtDateTime(locale, e.created_at)}</span>,
+      cell: (e) => (
+        <span className="text-fg-muted whitespace-nowrap tabular" title={fmtDateTime(locale, e.created_at)}>
+          {fmtDateTimeShort(locale, e.created_at)}
+        </span>
+      ),
     },
     { key: "action", header: t("audit.action"), cell: (e) => <ActionBadge action={e.action} /> },
     { key: "actor", header: t("audit.actor"), cell: (e) => <IdChip id={e.actor_id} /> },
@@ -89,10 +93,10 @@ export function AuditTab() {
       key: "target",
       header: t("audit.target"),
       cell: (e) => (
-        <span className="inline-flex items-center gap-1.5 min-w-0">
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
           <Badge tone="neutral">{e.target_type}</Badge>
-          <Mono className="truncate max-w-[14rem] text-xs" title={e.target_id}>
-            {e.target_id}
+          <Mono className="text-xs text-fg-muted" title={e.target_id}>
+            {shortId(e.target_id)}
           </Mono>
         </span>
       ),
@@ -100,7 +104,7 @@ export function AuditTab() {
     {
       key: "details",
       header: t("common.details"),
-      cell: (e) => <Mono className="text-xs text-fg-muted truncate max-w-[20rem] block">{detailsPreview(e.details) || "—"}</Mono>,
+      cell: (e) => <Mono className="text-xs text-fg-muted truncate max-w-[9rem] block" title={detailsPreview(e.details)}>{detailsPreview(e.details) || "—"}</Mono>,
     },
     { key: "app", header: t("common.app"), hidden: effectiveScope === "app", cell: (e) => (e.app_id ? <IdChip id={e.app_id} /> : <span className="text-fg-faint">{t("audit.scope.platform")}</span>) },
     { key: "ip", header: t("audit.ip"), cell: (e) => (e.ip_address ? <Mono className="text-xs">{e.ip_address}</Mono> : <span className="text-fg-faint">—</span>) },

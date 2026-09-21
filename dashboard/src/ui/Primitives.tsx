@@ -158,7 +158,7 @@ export function shortId(id: string, short = 8): string {
 
 export function IdChip({ id, short = 8 }: { id: string; short?: number }) {
   return (
-    <span className="inline-flex items-center gap-0.5 group">
+    <span className="inline-flex items-center gap-0.5 group whitespace-nowrap">
       <Mono title={id} className="text-fg-muted">
         {shortId(id, short)}
       </Mono>

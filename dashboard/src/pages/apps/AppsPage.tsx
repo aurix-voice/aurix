@@ -49,8 +49,8 @@ export default function AppsPage() {
         header: t("common.name"),
         sort: (a) => a.name,
         cell: (a) => (
-          <div className="flex flex-col min-w-0">
-            <span className="font-medium truncate">{a.name}</span>
+          <div className="flex flex-col min-w-0 max-w-[18rem]">
+            <span className="font-medium truncate" title={a.name}>{a.name}</span>
             {a.description ? <span className="text-xs text-fg-muted truncate max-w-[16rem]">{a.description}</span> : null}
           </div>
         ),

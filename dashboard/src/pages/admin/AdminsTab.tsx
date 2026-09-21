@@ -80,12 +80,12 @@ export function AdminsTab() {
         header: t("admin.displayName"),
         sort: (a) => a.display_name,
         cell: (a) => (
-          <div className="flex flex-col min-w-0">
-            <span className="font-medium truncate inline-flex items-center gap-1.5">
-              {a.display_name}
+          <div className="flex flex-col min-w-0 max-w-[18rem]">
+            <span className="font-medium truncate inline-flex items-center gap-1.5" title={a.display_name}>
+              <span className="truncate">{a.display_name}</span>
               {a.id === me?.id ? <Badge tone="accent">{t("admin.you")}</Badge> : null}
             </span>
-            <span className="text-xs text-fg-muted truncate">{a.email}</span>
+            <span className="text-xs text-fg-muted truncate" title={a.email}>{a.email}</span>
           </div>
         ),
       },

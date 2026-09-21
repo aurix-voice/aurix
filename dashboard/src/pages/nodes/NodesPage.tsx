@@ -6,6 +6,7 @@ import type { T } from "@/api/client";
 import { useDrainNodeMutation, useEffectiveConfigQuery, useNodesQuery, useUndrainNodeMutation } from "@/api/hooks";
 import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
+import { cn } from "@/lib/cn";
 import { fmtDateTime, fmtNumber, fmtPercent, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { Button } from "@/ui/Button";
@@ -51,6 +52,13 @@ function Pct({ v }: { v: number | undefined }) {
       <span className="tabular text-xs">{fmtPercent(locale, v, 0)}</span>
     </span>
   );
+}
+
+function PctText({ v }: { v: number | undefined }) {
+  const { locale } = useI18n();
+  if (v === undefined) return <span className="text-fg-faint">—</span>;
+  const tone = pctTone(v);
+  return <span className={cn(tone === "danger" && "text-danger", tone === "warn" && "text-warn")}>{fmtPercent(locale, v, 0)}</span>;
 }
 
 function StateBadge({ node }: { node: T.MediaNode }) {
@@ -172,28 +180,20 @@ export default function NodesPage() {
     { key: "channels", header: t("nodes.channels"), align: "right", sort: (n) => n.active_channels ?? 0, cell: (n) => fmtNumber(locale, n.active_channels ?? 0) },
     {
       key: "res",
-      header: `${t("nodes.cpu")} / ${t("nodes.memory")}`,
+      header: t("nodes.resources"),
       sort: (n) => Math.max(n.cpu_usage ?? -1, n.memory_usage ?? -1),
       cell: (n) => (
-        <span className="flex flex-col gap-0.5">
-          <Pct v={n.cpu_usage} />
-          <Pct v={n.memory_usage} />
-        </span>
-      ),
-    },
-    {
-      key: "bw",
-      header: t("nodes.bandwidth"),
-      align: "right",
-      sort: (n) => (n.bandwidth_in_mbps ?? 0) + (n.bandwidth_out_mbps ?? 0),
-      cell: (n) => (
         <span className="flex flex-col gap-0.5 text-xs whitespace-nowrap">
-          <span>
+          <span className="tabular">
+            <span className="text-fg-faint">{t("nodes.cpu")} </span>
+            <PctText v={n.cpu_usage} />
+            <span className="text-fg-faint"> · {t("nodes.memoryShort")} </span>
+            <PctText v={n.memory_usage} />
+          </span>
+          <span className="tabular">
             <span className="text-fg-faint">{t("nodes.in")} </span>
             <Mbps v={n.bandwidth_in_mbps} />
-          </span>
-          <span>
-            <span className="text-fg-faint">{t("nodes.out")} </span>
+            <span className="text-fg-faint"> · {t("nodes.out")} </span>
             <Mbps v={n.bandwidth_out_mbps} />
           </span>
         </span>
