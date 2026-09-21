@@ -11,16 +11,24 @@ namespace Aurix.Samples
     /// as the codec factory. Honours the full <see cref="OpusEncoderSettings"/> set and rebuilds lost
     /// frames from in-band FEC (<see cref="IOpusFecDecoder"/>). Roughly 5–10× the CPU of libopus per
     /// stream; keep <see cref="OpusEncoderSettings.Complexity"/> ≤ 5 on mobile.
+    /// Always runs the managed port: Concentus 2.x would otherwise P/Invoke whatever <c>libopus</c> the
+    /// host happens to ship, which makes behaviour depend on the machine. Use <see cref="NativeOpusCodec"/>
+    /// for the bundled libopus.
     /// </summary>
     public sealed class ConcentusOpusCodec : IOpusCodec, IOpusEncoderControls, IOpusFecDecoder
     {
-        private readonly IOpusEncoder _encoder;
+        private IOpusEncoder _encoder;
         private readonly IOpusDecoder _decoder;
         private readonly object _encLock = new object();
         private OpusEncoderSettings _settings;
 
         public int SampleRate { get; }
         public int Channels { get; }
+
+        static ConcentusOpusCodec()
+        {
+            OpusCodecFactory.AttemptToUseNativeLibrary = false;
+        }
 
         public ConcentusOpusCodec(int sampleRate = AudioFormat.SampleRate, int channels = 1, int bitrateBps = 32000)
             : this(sampleRate, channels, WithBitrate(OpusEncoderSettings.Default, bitrateBps)) { }
@@ -49,7 +57,13 @@ namespace Aurix.Samples
             var s = settings.Clamped();
             lock (_encLock)
             {
-                _encoder.Application = Application(s.Signal);
+                // The managed encoder refuses an application change once it has encoded; rebuilding it
+                // is the equivalent of libopus' OPUS_SET_APPLICATION (a fresh encoder state).
+                var application = Application(s.Signal);
+                if (_encoder.Application != application)
+                {
+                    _encoder = OpusCodecFactory.CreateEncoder(SampleRate, Channels, application);
+                }
                 _encoder.SignalType = Signal(s.Signal);
                 _encoder.MaxBandwidth = Bandwidth(s.MaxBandwidth);
                 _encoder.Complexity = s.Complexity;
