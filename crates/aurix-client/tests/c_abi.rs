@@ -76,17 +76,29 @@ fn build_and_run_sample(compiler: &str, std_flag: &str, source: &str, exe_name: 
     let out_dir = target.join("aurix-client-samples");
     std::fs::create_dir_all(&out_dir).unwrap();
     let exe = out_dir.join(exe_name);
-    let compile = Command::new(compiler)
+    let mut compile = Command::new(compiler);
+    compile
         .arg(crate_dir().join(source))
         .arg(std_flag)
         .arg("-Wall")
         .arg("-Wextra")
         .arg("-Werror")
         .arg("-I")
-        .arg(crate_dir().join("include"))
-        .arg("-L")
-        .arg(lib.parent().unwrap())
-        .args(["-laurix_client", "-lpthread", "-lm", "-o"])
+        .arg(crate_dir().join("include"));
+    // On Windows `-laurix_client` would resolve to the MSVC staticlib `aurix_client.lib` (whose
+    // UCRT references a MinGW toolchain cannot satisfy); the samples link the DLL via its import
+    // library instead, like any engine integration does.
+    let import_lib = lib.with_extension("dll.lib");
+    if cfg!(target_os = "windows") && import_lib.exists() {
+        compile.arg(&import_lib);
+    } else {
+        compile
+            .arg("-L")
+            .arg(lib.parent().unwrap())
+            .arg("-laurix_client");
+    }
+    let compile = compile
+        .args(["-lpthread", "-lm", "-o"])
         .arg(&exe)
         .output()
         .expect("run compiler");

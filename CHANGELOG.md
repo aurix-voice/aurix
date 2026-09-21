@@ -63,6 +63,14 @@ released together.
 * `aurix` profiles that point `api_key_file` at a not-yet-created file no longer fail every
   command before `aurix app create` has written it.
 * Race in E2E firewall tests (shared state now behind an `RwLock`).
+* An app's default API key was created with the never-enforced `100` requests/minute budget and
+  throttled as soon as `rate_limiting.per_key` applied; it now starts at `6000` like keys from
+  `POST /v1/api-keys`.
+* `POST /v1/recordings/{id}/transcribe` checked the node's `[stt]` configuration before the
+  recording's tenant, so a foreign tenant got `400` instead of `404`.
+* The Docker image build did not copy `api/openapi.json`, which `aurix-api` embeds.
+* The Unity Concentus sample let Concentus pick a host `libopus` when one was present, making
+  its behaviour machine-dependent; it now always runs the managed port.
 
 ## [1.2.0] - 2026-09-19
 

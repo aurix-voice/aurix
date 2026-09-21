@@ -188,9 +188,10 @@ migrations refuses to start. Migrations are additive, so an older node keeps wor
 newer schema during the roll-out.
 
 Per-key request budgets (`[rate_limiting].per_key`, see [Fleet-wide rate limits](scaling.md#fleet-wide-rate-limits))
-are enforced since the fleet limiter landed. Keys created before that carry the old, never
-enforced default of `100` requests/minute; with `rate_limiting.enabled = true` they now throttle
-at that rate. Raise them before the roll-out (`PATCH /v1/api-keys/{id}` with `{"rate_limit": 6000}`,
+are enforced since the fleet limiter landed. Keys created by older releases carry the old, never
+enforced default of `100` requests/minute (new keys, including an app's default key, start at
+`6000`); with `rate_limiting.enabled = true` they throttle at that rate. Raise them before the
+roll-out (`PATCH /v1/api-keys/{id}` with `{"rate_limit": 6000}`,
 or `UPDATE api_keys SET rate_limit = 6000 WHERE rate_limit = 100;`) or keep `per_key = false`
 until you have.
 

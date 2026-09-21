@@ -3535,7 +3535,7 @@ pub async fn create_app(
             app_id,
             "default",
             serde_json::json!(DEFAULT_KEY_PERMISSIONS),
-            100,
+            DEFAULT_KEY_RATE_LIMIT,
             None,
         )
         .await?;

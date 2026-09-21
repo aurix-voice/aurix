@@ -258,6 +258,9 @@ jobs:
   audit:
     name: cargo audit / deny
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
@@ -558,8 +561,8 @@ jobs:
           set -euo pipefail
           (cd sdk/web && npm ci && npm run build)
           sdk/godot/scripts/build_web.sh 2>&1 | tee export.log
-          # The desktop .gdextension has no web.wasm32 slice by design; any other ERROR fails the job.
-          ! grep "ERROR" export.log | grep -v "No suitable library found for GDExtension" | grep -q .
+          # The desktop GDExtension is neither built nor shipped here; any other ERROR fails the job.
+          sdk/godot/scripts/check_web_export_log.sh export.log
       - run: cargo build --locked --bin aurix-server
       - name: Run server
         env:

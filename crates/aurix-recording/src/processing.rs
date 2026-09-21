@@ -454,15 +454,15 @@ impl RecordingService {
         recording_id: Uuid,
     ) -> Result<RecordingTranscriptRow> {
         self.require_processing()?;
+        let row = self
+            .get_recording(app_id, recording_id)
+            .await?
+            .ok_or_else(|| AurixError::NotFound("Recording not found".into()))?;
         let Some(stt) = self.stt.clone() else {
             return Err(AurixError::InvalidConfiguration(
                 "No speech-to-text provider configured ([stt])".into(),
             ));
         };
-        let row = self
-            .get_recording(app_id, recording_id)
-            .await?
-            .ok_or_else(|| AurixError::NotFound("Recording not found".into()))?;
         if row.status != "ready" {
             return Err(AurixError::Conflict(format!(
                 "Recording is not ready (status: {})",
