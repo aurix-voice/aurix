@@ -259,6 +259,8 @@ export const en = {
   "nodes.ws": "WebSocket",
   "nodes.cascade": "Cascade",
   "nodes.cpu": "CPU",
+  "nodes.resources": "Resources",
+  "nodes.memoryShort": "Mem",
   "nodes.memory": "Memory",
   "nodes.bandwidth": "Bandwidth",
   "nodes.in": "in",

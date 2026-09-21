@@ -261,6 +261,8 @@ export const ru: Messages = {
   "nodes.ws": "WebSocket",
   "nodes.cascade": "Каскад",
   "nodes.cpu": "CPU",
+  "nodes.resources": "Ресурсы",
+  "nodes.memoryShort": "ОЗУ",
   "nodes.memory": "Память",
   "nodes.bandwidth": "Трафик",
   "nodes.in": "вход",
