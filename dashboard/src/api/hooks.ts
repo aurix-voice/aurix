@@ -4,7 +4,7 @@ import { useMemo } from "react";
 import { useAuth } from "@/auth/AuthProvider";
 import type { AppPermission } from "@/auth/store";
 
-import { makeClient, type AurixClient, type T } from "./client";
+import { isStatus, makeClient, type AurixClient, type T } from "./client";
 import { useAppScope } from "./scope";
 
 /** Client for admin-only routes (no tenant header). */
@@ -480,7 +480,7 @@ export function useSessionQualityQuery(params: T.ListSessionQualityQuery): UseQu
   const api = useApi();
   const { appId, enabled } = useTenantEnabled("analytics:read");
   return useQuery({
-    queryKey: qk.adminSessions({ app: appId, ...params }),
+    queryKey: qk.analytics(appId ?? "", { sessions: true, ...params }),
     queryFn: () => api.listSessionQuality(params),
     enabled,
     staleTime: 60_000,
@@ -726,4 +726,115 @@ export function useDeleteStreamMutation() {
     (api, v: { channelId: string; streamId: string }) => api.deleteStream(v.channelId, v.streamId),
     (app, v) => [[...qk.channel(app, v.channelId), "streams"]],
   );
+}
+
+// ---- Recordings
+
+/** Polling interval derived from the last result (e.g. faster while a job is in flight). */
+export type Poll<Data> = number | false | ((data: Data | undefined) => number | false);
+
+function pollOption<Data>(poll: Poll<Data>): number | false | ((q: { state: { data: Data | undefined } }) => number | false) {
+  return typeof poll === "function" ? (q) => poll(q.state.data) : poll;
+}
+
+export function useRecordingsQuery(params: T.ListRecordingsQuery, poll: Poll<T.Recording[]> = false): UseQueryResult<T.Recording[]> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("recordings:read");
+  return useQuery({
+    queryKey: qk.recordings(appId ?? "", { ...params }),
+    queryFn: () => api.listRecordings(params),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: pollOption(poll),
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useRecordingQuery(recordingId: string | null, poll: Poll<T.GetRecordingResponse> = false): UseQueryResult<T.GetRecordingResponse> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("recordings:read");
+  return useQuery({
+    queryKey: qk.recording(appId ?? "", recordingId ?? ""),
+    queryFn: () => api.getRecording(recordingId ?? ""),
+    enabled: enabled && !!recordingId,
+    staleTime: 10_000,
+    refetchInterval: pollOption(poll),
+  });
+}
+
+export function useTranscriptQuery(recordingId: string | null, poll: Poll<T.RecordingTranscript | null> = false): UseQueryResult<T.RecordingTranscript | null> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("recordings:read");
+  return useQuery({
+    queryKey: qk.transcript(appId ?? "", recordingId ?? ""),
+    queryFn: async () => {
+      try {
+        return await api.getRecordingTranscript(recordingId ?? "", { format: "json" });
+      } catch (e) {
+        if (isStatus(e, 404)) return null;
+        throw e;
+      }
+    },
+    enabled: enabled && !!recordingId,
+    staleTime: 10_000,
+    refetchInterval: pollOption(poll),
+    retry: false,
+  });
+}
+
+const recordingKeys = (app: string, id?: string) => (id ? [["t", app, "recordings"], qk.recording(app, id), qk.transcript(app, id)] : [["t", app, "recordings"]]);
+
+export function useStartRecordingMutation() {
+  return useTenantMutation(
+    (api, body: T.StartRecordingRequest) => api.startRecording(body),
+    (app, v) => [...recordingKeys(app), qk.channelRecordings(app, v.channel_id)],
+  );
+}
+export function useStopRecordingMutation() {
+  return useTenantMutation(
+    (api, v: { recordingId: string }) => api.stopRecording(v.recordingId),
+    (app, v) => recordingKeys(app, v.recordingId),
+  );
+}
+export function useDeleteRecordingMutation() {
+  return useTenantMutation(
+    (api, v: { recordingId: string }) => api.deleteRecording(v.recordingId),
+    (app, v) => recordingKeys(app, v.recordingId),
+  );
+}
+export function useMixdownMutation() {
+  return useTenantMutation(
+    (api, body: T.MixdownRecordingsRequest) => api.mixdownRecordings(body),
+    (app, v) => [...recordingKeys(app), qk.channelRecordings(app, v.channel_id)],
+  );
+}
+export function useTranscribeMutation() {
+  return useTenantMutation(
+    (api, v: { recordingId: string }) => api.transcribeRecording(v.recordingId),
+    (app, v) => recordingKeys(app, v.recordingId),
+  );
+}
+
+// ---- Analytics (tenant)
+
+export function useChannelUsageListQuery(params: T.ListChannelUsageQuery): UseQueryResult<T.ChannelUsageList> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("analytics:read");
+  return useQuery({
+    queryKey: qk.analytics(appId ?? "", { channels: true, ...params }),
+    queryFn: () => api.listChannelUsage(params),
+    enabled,
+    staleTime: 60_000,
+  });
+}
+
+export function useChannelUsageQuery(channelId: string | null, params: T.GetChannelUsageQuery): UseQueryResult<T.ChannelUsage> {
+  const api = useApi();
+  const { appId, enabled } = useTenantEnabled("analytics:read");
+  return useQuery({
+    queryKey: qk.analytics(appId ?? "", { channel: channelId, ...params }),
+    queryFn: () => api.getChannelUsage(channelId ?? "", params),
+    enabled: enabled && !!channelId,
+    staleTime: 60_000,
+  });
 }

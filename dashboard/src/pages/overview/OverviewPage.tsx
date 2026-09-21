@@ -73,7 +73,7 @@ export default function OverviewPage() {
   const analytics = useAppAnalyticsQuery({ from: range.from, to: range.to, step });
   const quota = useQuotaQuery();
   const snapshot = useEventSnapshotQuery();
-  const moderation = useModerationEventsQuery({ status: "open", page: 1, per_page: 6 });
+  const moderation = useModerationEventsQuery({ status: "pending", page: 1, per_page: 6 });
   const webhooks = useWebhooksQuery();
 
   const fleetTotals = useMemo(() => {
