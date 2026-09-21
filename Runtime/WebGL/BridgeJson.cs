@@ -301,6 +301,56 @@ namespace Aurix.WebGL
                 SentAt = Time(o, "sentAt"),
                 ClientRef = MiniJson.GetString(o, "clientRef"),
                 Offline = MiniJson.GetBool(o, "offline"),
+                EditedAt = OptionalTime(o, "editedAt"),
+                DeletedAt = OptionalTime(o, "deletedAt"),
+                DeletedBy = MiniJson.GetGuid(o, "deletedBy"),
+                Reactions = Reactions(Arr(o, "reactions")),
+            };
+        }
+
+        private static DateTimeOffset? OptionalTime(Dictionary<string, object> o, string key)
+        {
+            var s = MiniJson.GetString(o, key);
+            return s != null && DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var ts)
+                ? ts
+                : (DateTimeOffset?)null;
+        }
+
+        private static List<ChatReaction> Reactions(List<object> arr)
+        {
+            var list = new List<ChatReaction>();
+            if (arr == null) return list;
+            foreach (var item in arr)
+            {
+                var o = MiniJson.AsObject(item);
+                var name = o != null ? MiniJson.GetString(o, "reaction") : null;
+                if (string.IsNullOrEmpty(name)) continue;
+                var r = new ChatReaction { Reaction = name, Count = (int)MiniJson.GetNumber(o, "count") };
+                var ids = Arr(o, "userIds");
+                if (ids != null)
+                    foreach (var id in ids)
+                        if (id is string str && Guid.TryParse(str, out var g)) r.UserIds.Add(g);
+                list.Add(r);
+            }
+            return list;
+        }
+
+        internal static ChatReactionChange ReactionChange(Dictionary<string, object> o)
+        {
+            if (o == null) return null;
+            var reaction = MiniJson.GetString(o, "reaction");
+            if (string.IsNullOrEmpty(reaction)) return null;
+            return new ChatReactionChange
+            {
+                MessageId = Id(o, "messageId"),
+                ChannelId = MiniJson.GetGuid(o, "channelId"),
+                MessageFromUserId = Id(o, "messageFromUserId"),
+                MessageToUserId = MiniJson.GetGuid(o, "messageToUserId"),
+                UserId = Id(o, "userId"),
+                Reaction = reaction,
+                Added = MiniJson.GetBool(o, "added"),
+                Count = (int)MiniJson.GetNumber(o, "count"),
+                Timestamp = Time(o, "timestamp"),
             };
         }
 
@@ -312,6 +362,7 @@ namespace Aurix.WebGL
                 PeerUserId = peerUserId,
                 NextBefore = MiniJson.GetString(o, "nextBefore"),
                 NextAfter = MiniJson.GetString(o, "nextAfter"),
+                Query = MiniJson.GetString(o, "query"),
             };
             var arr = Arr(o, "messages");
             if (arr != null)

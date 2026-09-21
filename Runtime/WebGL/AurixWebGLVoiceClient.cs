@@ -139,6 +139,8 @@ namespace Aurix.WebGL
         public event Action<ChatMessage> OnChatMessage;
         public event Action<ChatReadMarker> OnChatReadMarker;
         public event Action<int, bool> OnChatInboxSynced;
+        public event Action<ChatMessage> OnChatMessageUpdated;
+        public event Action<ChatReactionChange> OnChatReactionChanged;
         public event Action<Guid, Guid, bool> OnParticipantTyping;
         public event Action<Transcript> OnTranscript;
         public event Action<TranslationPrefs> OnTranslationChanged;
@@ -554,6 +556,40 @@ namespace Aurix.WebGL
         {
             if (before != null) args["before"] = before;
             if (after != null) args["after"] = after;
+            if (limit.HasValue) args["limit"] = limit.Value;
+            return args;
+        }
+
+        public Task<ChatMessage> EditMessageAsync(Guid messageId, string text, object metadata = null, CancellationToken ct = default) =>
+            CallAsync("editMessage", ChatArgs(new Dictionary<string, object> { { "messageId", messageId }, { "text", text } }, metadata, null),
+                o => BridgeJson.Message(o), ct);
+
+        public Task<ChatMessage> DeleteMessageAsync(Guid messageId, CancellationToken ct = default) =>
+            CallAsync("deleteMessage", new Dictionary<string, object> { { "messageId", messageId } }, o => BridgeJson.Message(o), ct);
+
+        public Task ReactAsync(Guid messageId, string reaction, bool add = true, CancellationToken ct = default)
+        {
+            ChatReaction.Validate(reaction);
+            return Sync("react", new Dictionary<string, object> { { "messageId", messageId }, { "reaction", reaction }, { "add", add } });
+        }
+
+        public Task<ChatHistoryPage> SearchAsync(Guid channelId, string query, Guid? fromUserId = null, string before = null, int? limit = null, CancellationToken ct = default) =>
+            CallAsync("search", SearchArgs(Channel(channelId), query, fromUserId, before, limit), o => BridgeJson.History(o, channelId, null), ct);
+
+        /// <summary>The Web SDK needs a conversation: searching every direct conversation (<paramref name="userId"/> null) is not available in WebGL.</summary>
+        public Task<ChatHistoryPage> SearchDirectAsync(Guid? userId, string query, Guid? fromUserId = null, string before = null, int? limit = null, CancellationToken ct = default)
+        {
+            if (!userId.HasValue) throw new NotSupportedException("WebGL search needs a channel or a peer user");
+            return CallAsync("search", SearchArgs(new Dictionary<string, object> { { "userId", userId.Value } }, query, fromUserId, before, limit),
+                o => BridgeJson.History(o, null, userId), ct);
+        }
+
+        private static Dictionary<string, object> SearchArgs(Dictionary<string, object> args, string query, Guid? fromUserId, string before, int? limit)
+        {
+            if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is empty", nameof(query));
+            args["query"] = query;
+            if (fromUserId.HasValue) args["fromUserId"] = fromUserId.Value;
+            if (before != null) args["before"] = before;
             if (limit.HasValue) args["limit"] = limit.Value;
             return args;
         }
@@ -1055,6 +1091,18 @@ namespace Aurix.WebGL
                 case "chatInboxSynced":
                     OnChatInboxSynced?.Invoke((int)MiniJson.GetNumber(e, "delivered"), MiniJson.GetBool(e, "truncated"));
                     return;
+                case "chatMessageUpdated":
+                {
+                    var message = BridgeJson.Message(BridgeJson.Obj(e, "message"));
+                    if (message != null) OnChatMessageUpdated?.Invoke(message);
+                    return;
+                }
+                case "chatReactionChanged":
+                {
+                    var change = BridgeJson.ReactionChange(BridgeJson.Obj(e, "change"));
+                    if (change != null) OnChatReactionChanged?.Invoke(change);
+                    return;
+                }
                 case "participantTyping":
                     OnParticipantTyping?.Invoke(BridgeJson.Id(e, "channelId"), BridgeJson.Id(e, "userId"), MiniJson.GetBool(e, "typing"));
                     return;

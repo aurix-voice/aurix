@@ -95,6 +95,9 @@ namespace Aurix.Voice.Tests
             bridge.Async.Add("joinChannel");
             bridge.Async.Add("sendMessage");
             bridge.Async.Add("history");
+            bridge.Async.Add("editMessage");
+            bridge.Async.Add("deleteMessage");
+            bridge.Async.Add("search");
             bridge.Async.Add("speak");
             bridge.Async.Add("getStats");
             bridge.Async.Add("enumerateDevices");
@@ -764,6 +767,95 @@ namespace Aurix.Voice.Tests
             var mark = bridge.Last("markRead").args;
             Assert.Equal(Bob.ToString(), MiniJson.GetString(mark, "userId"));
             Assert.Equal(received.Id.ToString(), MiniJson.GetString(mark, "messageId"));
+        }
+
+        [Fact]
+        public async Task ChatEditDeleteReactionsAndSearchGoThroughTheBridge()
+        {
+            var (client, bridge) = NewClient();
+            await Connect(client, bridge);
+            var msgId = "33333333-3333-3333-3333-333333333333";
+
+            var edit = client.EditMessageAsync(Guid.Parse(msgId), "fixed", new Dictionary<string, object> { { "k", "v" } });
+            var call = bridge.Last("editMessage");
+            Assert.Equal(msgId, MiniJson.GetString(call.args, "messageId"));
+            Assert.Equal("fixed", MiniJson.GetString(call.args, "text"));
+            Assert.Equal("v", MiniJson.GetString(MiniJson.AsObject(call.args["metadata"]), "k"));
+            var edited = new Dictionary<string, object>
+            {
+                { "id", msgId }, { "channelId", Channel.ToString() }, { "fromUserId", Alice.ToString() }, { "displayName", "alice" },
+                { "text", "fixed" }, { "sentAt", "2024-05-01T10:00:00Z" }, { "editedAt", "2024-05-01T10:01:00Z" },
+                { "reactions", new List<object> { new Dictionary<string, object> { { "reaction", "👍" }, { "count", 2.0 }, { "userIds", new List<object> { Bob.ToString() } } } } },
+            };
+            bridge.Resolve(call.rid, edited);
+            client.Update();
+            var m = await edit;
+            Assert.True(m.IsEdited);
+            Assert.Equal(TimeSpan.FromMinutes(1), m.EditedAt.Value - m.SentAt);
+            Assert.Single(m.Reactions);
+            Assert.Equal(2, m.Reactions[0].Count);
+            Assert.Equal(new[] { Bob }, m.Reactions[0].UserIds);
+
+            var delete = client.DeleteMessageAsync(Guid.Parse(msgId));
+            call = bridge.Last("deleteMessage");
+            Assert.Equal(msgId, MiniJson.GetString(call.args, "messageId"));
+            bridge.Resolve(call.rid, new Dictionary<string, object>
+            {
+                { "id", msgId }, { "channelId", Channel.ToString() }, { "fromUserId", Alice.ToString() }, { "displayName", "alice" },
+                { "text", "" }, { "sentAt", "2024-05-01T10:00:00Z" }, { "deletedAt", "2024-05-01T10:02:00Z" }, { "deletedBy", Alice.ToString() }, { "reactions", new List<object>() },
+            });
+            client.Update();
+            var tomb = await delete;
+            Assert.True(tomb.IsDeleted);
+            Assert.Equal(Alice, tomb.DeletedBy);
+            Assert.Empty(tomb.Reactions);
+
+            await client.ReactAsync(Guid.Parse(msgId), "🔥");
+            var react = bridge.Last("react").args;
+            Assert.Equal("🔥", MiniJson.GetString(react, "reaction"));
+            Assert.True(MiniJson.GetBool(react, "add"));
+            await client.ReactAsync(Guid.Parse(msgId), "🔥", add: false);
+            Assert.False(MiniJson.GetBool(bridge.Last("react").args, "add"));
+            await Assert.ThrowsAsync<ArgumentException>(() => client.ReactAsync(Guid.Parse(msgId), "not a token"));
+
+            var search = client.SearchAsync(Channel, "raid -cancelled", fromUserId: Bob, before: "cur", limit: 5);
+            call = bridge.Last("search");
+            Assert.Equal(Channel.ToString(), MiniJson.GetString(call.args, "channelId"));
+            Assert.Equal("raid -cancelled", MiniJson.GetString(call.args, "query"));
+            Assert.Equal(Bob.ToString(), MiniJson.GetString(call.args, "fromUserId"));
+            Assert.Equal("cur", MiniJson.GetString(call.args, "before"));
+            Assert.Equal(5, (int)MiniJson.GetNumber(call.args, "limit"));
+            bridge.Resolve(call.rid, new Dictionary<string, object>
+            {
+                { "query", "raid -cancelled" }, { "messages", new List<object> { edited } }, { "nextBefore", "older" },
+            });
+            client.Update();
+            var page = await search;
+            Assert.Equal(Channel, page.ChannelId);
+            Assert.Equal("raid -cancelled", page.Query);
+            Assert.Single(page.Messages);
+            Assert.Equal("older", page.NextBefore);
+            await Assert.ThrowsAsync<NotSupportedException>(() => client.SearchDirectAsync(null, "x"));
+            await Assert.ThrowsAsync<ArgumentException>(() => client.SearchAsync(Channel, "  "));
+
+            ChatMessage updatedEvent = null;
+            ChatReactionChange changeEvent = null;
+            client.OnChatMessageUpdated += u => updatedEvent = u;
+            client.OnChatReactionChanged += c => changeEvent = c;
+            bridge.Emit("chatMessageUpdated", ("message", edited));
+            bridge.Emit("chatReactionChanged", ("change", new Dictionary<string, object>
+            {
+                { "messageId", msgId }, { "channelId", Channel.ToString() }, { "messageFromUserId", Alice.ToString() }, { "userId", Bob.ToString() },
+                { "reaction", "👍" }, { "added", true }, { "count", 2.0 }, { "timestamp", "2024-05-01T10:03:00Z" },
+            }));
+            client.Update();
+            Assert.True(updatedEvent.IsEdited);
+            Assert.Equal(Guid.Parse(msgId), changeEvent.MessageId);
+            Assert.Equal(Bob, changeEvent.UserId);
+            Assert.Equal("👍", changeEvent.Reaction);
+            Assert.True(changeEvent.Added);
+            Assert.Equal(2, changeEvent.Count);
+            Assert.Null(changeEvent.MessageToUserId);
         }
 
         [Fact]

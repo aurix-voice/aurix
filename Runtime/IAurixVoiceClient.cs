@@ -50,6 +50,8 @@ namespace Aurix
         event Action<ChatMessage> OnChatMessage;
         event Action<ChatReadMarker> OnChatReadMarker;
         event Action<int, bool> OnChatInboxSynced;
+        event Action<ChatMessage> OnChatMessageUpdated;
+        event Action<ChatReactionChange> OnChatReactionChanged;
         event Action<Guid, Guid, bool> OnParticipantTyping;
         event Action<Transcript> OnTranscript;
         event Action<TranslationPrefs> OnTranslationChanged;
@@ -116,6 +118,11 @@ namespace Aurix
         Task MarkDirectReadAsync(Guid userId, Guid messageId, CancellationToken ct = default);
         Task<ChatReadMarkers> ReadMarkersAsync(Guid channelId, CancellationToken ct = default);
         Task<ChatReadMarkers> DirectReadMarkersAsync(Guid userId, CancellationToken ct = default);
+        Task<ChatMessage> EditMessageAsync(Guid messageId, string text, object metadata = null, CancellationToken ct = default);
+        Task<ChatMessage> DeleteMessageAsync(Guid messageId, CancellationToken ct = default);
+        Task ReactAsync(Guid messageId, string reaction, bool add = true, CancellationToken ct = default);
+        Task<ChatHistoryPage> SearchAsync(Guid channelId, string query, Guid? fromUserId = null, string before = null, int? limit = null, CancellationToken ct = default);
+        Task<ChatHistoryPage> SearchDirectAsync(Guid? userId, string query, Guid? fromUserId = null, string before = null, int? limit = null, CancellationToken ct = default);
         Task SetTypingAsync(Guid channelId, bool typing, TimeSpan? interval = null, CancellationToken ct = default);
 
         Task<SpeechRequest> SpeakAsync(string text, Guid? channelId = null, TtsDestination destination = TtsDestination.Channel,
