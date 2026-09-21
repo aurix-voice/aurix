@@ -11315,11 +11315,17 @@ async fn recording_mixdown_and_post_hoc_transcript() {
     want.sort();
     assert_eq!(sources, want, "{mix}");
     let mix_id: uuid::Uuid = mix["id"].as_str().unwrap().parse().unwrap();
-    // Not downloadable while rendering.
-    assert_eq!(
-        status_of(&env, &http, &format!("/v1/recordings/{mix_id}/download")).await,
-        409
-    );
+    // Not downloadable while rendering; a two-second mixdown may already be finished by the
+    // time this request lands, and then only a `ready` job may answer 200.
+    let early = status_of(&env, &http, &format!("/v1/recordings/{mix_id}/download")).await;
+    match early {
+        409 => {}
+        200 => {
+            let job = recording_json(&env, &http, &format!("/v1/recordings/{mix_id}")).await;
+            assert_eq!(job["status"], "ready", "download served for {job}");
+        }
+        other => panic!("download of a rendering mixdown answered {other}"),
+    }
     let done = await_processed(&env, &http, &format!("/v1/recordings/{mix_id}")).await;
     assert_eq!(done["status"], "ready", "{done}");
     let duration = done["duration_secs"].as_f64().unwrap();
