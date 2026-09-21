@@ -78,6 +78,7 @@ jobs:
           AURIX__MEDIA__CASCADE_SECRET: ci-only-cascade-secret-0123456789abcdef
           AURIX__MEDIA__CASCADE_DISCOVERY_INTERVAL_MS: "2000"
           AURIX__TRACING__LOG_FORMAT: text
+          RUST_LOG: info,aurix_media::quic=debug
         run: |
           nohup ./target/debug/aurix-server > server.log 2>&1 &
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/ready && break; sleep 1; done
@@ -174,6 +175,7 @@ jobs:
           AURIX_E2E_API: http://127.0.0.1:8080
           AURIX_E2E_WS: ws://127.0.0.1:8081
           AURIX_E2E_UDP: "10000"
+          AURIX_E2E_METRICS: http://127.0.0.1:4040/metrics
           AURIX_E2E_SUDO_TC: "1"
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
         run: cargo test --locked -p aurix-client --test netem_live -- --nocapture
@@ -546,7 +548,7 @@ jobs:
           docker inspect dashboard --format '{{.State.Health.Status}}' | grep -qx healthy
           docker exec dashboard id | grep -q 'uid=10001'
           curl -fsS http://127.0.0.1:8090/ready
-          curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/assets/missing.js | grep -qx 404
+          curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/assets/missing.js | grep -qx 404
       - run: npx playwright install --with-deps chromium
         working-directory: dashboard
       - name: Playwright E2E (first administrator is created through /setup)

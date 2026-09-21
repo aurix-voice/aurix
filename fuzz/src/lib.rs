@@ -68,7 +68,8 @@ fn with_fixed_checksum(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut fixed = data.to_vec();
-    let authenticated = u16::from_be_bytes([fixed[5], fixed[6]]) & PacketFlags::Authenticated as u16 != 0;
+    let authenticated =
+        u16::from_be_bytes([fixed[5], fixed[6]]) & PacketFlags::Authenticated as u16 != 0;
     let tag = if authenticated { 16 } else { 0 };
     let body_len = fixed.len().checked_sub(HEADER_SIZE + tag)?;
     let body_len = u16::try_from(body_len).ok()?;
@@ -85,7 +86,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -118,8 +123,8 @@ fn exercise_packet(data: &[u8], keys: &MediaKeys) {
     }
     let sealed = packet.seal(keys);
     assert!(sealed.len() <= MAX_RELAY_PACKET_SIZE + HEADER_SIZE);
-    let mut roundtrip =
-        AurixPacket::decode_bounded(&sealed, MAX_RELAY_PACKET_SIZE + HEADER_SIZE).expect("sealed decodes");
+    let mut roundtrip = AurixPacket::decode_bounded(&sealed, MAX_RELAY_PACKET_SIZE + HEADER_SIZE)
+        .expect("sealed decodes");
     assert!(roundtrip.open(keys), "own seal must open");
     assert_eq!(roundtrip.payload, packet.payload);
 }
@@ -174,15 +179,26 @@ pub fn stun_message(data: &[u8]) {
     assert_eq!(again.transaction_id, msg.transaction_id);
     assert_eq!(again.msg_type, msg.msg_type);
     let signed = msg.encode_with_integrity(STUN_KEY);
-    assert!(StunMessage::verify_integrity(&signed, STUN_KEY), "own integrity must verify");
-    assert!(StunMessage::verify_fingerprint(&signed), "own fingerprint must verify");
+    assert!(
+        StunMessage::verify_integrity(&signed, STUN_KEY),
+        "own integrity must verify"
+    );
+    assert!(
+        StunMessage::verify_fingerprint(&signed),
+        "own fingerprint must verify"
+    );
 }
 
 /// Control-plane JSON (`ControlMessage`, both directions): deserialize, then the
 /// serialize → deserialize → serialize round trip must reproduce the same JSON text.
 /// (Text, not `serde_json::Value`: `Value` widens `f32` fields to `f64`, so `5.6` would
-/// compare unequal to itself.)
+/// compare unequal to itself.) Inputs with a number outside the `f32` range are skipped:
+/// serde widens them to `±inf`, which serializes as `null` and is not a round-trip property
+/// of the message — handlers reject non-finite floats at validation.
 pub fn control_message(data: &[u8]) {
+    if has_f32_overflow(data) {
+        return;
+    }
     let Ok(msg) = serde_json::from_slice::<ControlMessage>(data) else {
         return;
     };
@@ -190,6 +206,20 @@ pub fn control_message(data: &[u8]) {
     let again: ControlMessage = serde_json::from_str(&text).expect("own JSON must parse");
     let text_again = serde_json::to_string(&again).expect("ControlMessage re-serializes");
     assert_eq!(text, text_again, "ControlMessage round trip must be stable");
+}
+
+fn has_f32_overflow(data: &[u8]) -> bool {
+    fn walk(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Number(n) => n
+                .as_f64()
+                .is_some_and(|f| !f.is_finite() || f.abs() > f32::MAX as f64),
+            serde_json::Value::Array(a) => a.iter().any(walk),
+            serde_json::Value::Object(o) => o.values().any(walk),
+            _ => false,
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(data).is_ok_and(|v| walk(&v))
 }
 
 fn fixed_identity(seed: u8) -> IdentityKey {
@@ -334,10 +364,22 @@ pub fn webhook_signature(data: &[u8]) {
     }
     let sig = sign(WEBHOOK_SECRET, now.timestamp(), body);
     assert!(verify_signature(WEBHOOK_SECRET, &sig, body, now, tolerance));
-    assert!(!verify_signature("other-secret", &sig, body, now, tolerance));
+    assert!(!verify_signature(
+        "other-secret",
+        &sig,
+        body,
+        now,
+        tolerance
+    ));
     let mut other = body.to_vec();
     other.push(0);
-    assert!(!verify_signature(WEBHOOK_SECRET, &sig, &other, now, tolerance));
+    assert!(!verify_signature(
+        WEBHOOK_SECRET,
+        &sig,
+        &other,
+        now,
+        tolerance
+    ));
 }
 
 /// The native client's downlink: a hostile node feeds arbitrary frames (SSRC, sequence,
@@ -357,7 +399,11 @@ pub fn remote_mixer(data: &[u8]) {
         let take = len.min(rest.len());
         let payload = rest[..take].to_vec();
         rest = &rest[take..];
-        let codec = if ctl & 0x01 != 0 { AudioCodec::Pcmu } else { AudioCodec::Opus };
+        let codec = if ctl & 0x01 != 0 {
+            AudioCodec::Pcmu
+        } else {
+            AudioCodec::Opus
+        };
         let mixed = ctl & 0x02 != 0;
         let direction = (ctl & 0x04 != 0).then_some(Direction {
             azimuth: (seq as f32 / 4096.0 - 0.5) * 6.0,

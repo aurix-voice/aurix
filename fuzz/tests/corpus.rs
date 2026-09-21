@@ -47,10 +47,19 @@ fn dir_entries(dir: &Path, strip: &str) -> BTreeSet<String> {
 fn targets_agree_everywhere() {
     let expected: BTreeSet<String> = aurix_fuzz::TARGETS.iter().map(|s| s.to_string()).collect();
     assert_eq!(manifest_bins(), expected, "[[bin]] table vs TARGETS");
-    assert_eq!(dir_entries(&root().join("fuzz_targets"), ".rs"), expected, "fuzz_targets/ vs TARGETS");
-    assert_eq!(dir_entries(&root().join("corpus"), ""), expected, "corpus/ vs TARGETS");
+    assert_eq!(
+        dir_entries(&root().join("fuzz_targets"), ".rs"),
+        expected,
+        "fuzz_targets/ vs TARGETS"
+    );
+    assert_eq!(
+        dir_entries(&root().join("corpus"), ""),
+        expected,
+        "corpus/ vs TARGETS"
+    );
     for target in aurix_fuzz::TARGETS {
-        let src = fs::read_to_string(root().join("fuzz_targets").join(format!("{target}.rs"))).unwrap();
+        let src =
+            fs::read_to_string(root().join("fuzz_targets").join(format!("{target}.rs"))).unwrap();
         assert!(
             src.contains(&format!("aurix_fuzz::{target}(data)")),
             "{target}.rs must call aurix_fuzz::{target}"
@@ -69,7 +78,10 @@ fn corpus_replays_without_panics() {
             .filter(|p| p.is_file())
             .collect();
         entries.sort();
-        assert!(!entries.is_empty(), "corpus/{target} has no seeds; run the seed_corpus test");
+        assert!(
+            !entries.is_empty(),
+            "corpus/{target} has no seeds; run the seed_corpus test"
+        );
         for path in entries {
             let data = fs::read(&path).unwrap();
             let name = path.display().to_string();
@@ -78,7 +90,10 @@ fn corpus_replays_without_panics() {
             files += 1;
         }
     }
-    eprintln!("replayed {files} corpus files across {} targets", aurix_fuzz::TARGETS.len());
+    eprintln!(
+        "replayed {files} corpus files across {} targets",
+        aurix_fuzz::TARGETS.len()
+    );
 }
 
 /// Every harness must survive the classic edge inputs even without a corpus.
@@ -123,17 +138,41 @@ fn seed_corpus() {
     let channel = ChannelId::from_uuid(uuid::Uuid::from_u128(0x77));
 
     // --- Opus frames shared by several targets ---------------------------------------
-    let mut enc = aurix_opus::Encoder::new(48_000, aurix_opus::Channels::Mono, aurix_opus::Application::Voip).unwrap();
+    let mut enc = aurix_opus::Encoder::new(
+        48_000,
+        aurix_opus::Channels::Mono,
+        aurix_opus::Application::Voip,
+    )
+    .unwrap();
     enc.set_inband_fec(true).unwrap();
     enc.set_packet_loss_perc(20).unwrap();
     let pcm = aurix_opus::testing::speech_like_i16(4);
-    let opus_frames: Vec<Vec<u8>> = pcm.chunks(960).map(|c| enc.encode_vec(c, 400).unwrap()).collect();
-    let mut dred_enc = aurix_opus::Encoder::new(48_000, aurix_opus::Channels::Mono, aurix_opus::Application::Voip).unwrap();
+    let opus_frames: Vec<Vec<u8>> = pcm
+        .chunks(960)
+        .map(|c| enc.encode_vec(c, 400).unwrap())
+        .collect();
+    let mut dred_enc = aurix_opus::Encoder::new(
+        48_000,
+        aurix_opus::Channels::Mono,
+        aurix_opus::Application::Voip,
+    )
+    .unwrap();
     dred_enc.set_dred_duration(20).unwrap();
-    let dred_frames: Vec<Vec<u8>> = pcm.chunks(960).map(|c| dred_enc.encode_vec(c, 1200).unwrap()).collect();
-    let mut stereo_enc = aurix_opus::Encoder::new(48_000, aurix_opus::Channels::Stereo, aurix_opus::Application::Audio).unwrap();
+    let dred_frames: Vec<Vec<u8>> = pcm
+        .chunks(960)
+        .map(|c| dred_enc.encode_vec(c, 1200).unwrap())
+        .collect();
+    let mut stereo_enc = aurix_opus::Encoder::new(
+        48_000,
+        aurix_opus::Channels::Stereo,
+        aurix_opus::Application::Audio,
+    )
+    .unwrap();
     let stereo_pcm: Vec<i16> = pcm.iter().flat_map(|s| [*s, s / 2]).collect();
-    let stereo_frames: Vec<Vec<u8>> = stereo_pcm.chunks(1920).map(|c| stereo_enc.encode_vec(c, 600).unwrap()).collect();
+    let stereo_frames: Vec<Vec<u8>> = stereo_pcm
+        .chunks(1920)
+        .map(|c| stereo_enc.encode_vec(c, 600).unwrap())
+        .collect();
 
     // --- aurx_packet ---------------------------------------------------------------------
     let audio = AurixPacket::new(
@@ -143,22 +182,47 @@ fn seed_corpus() {
     write_seed("aurx_packet", "audio_plain", &audio.encode());
     write_seed("aurx_packet", "audio_sealed", &audio.seal(&keys));
     let bind = AurixPacket::session_bind(&session, 0xdead_beef, 1_738_000_000_000, 42);
-    write_seed("aurx_packet", "session_bind", &bind.encode_authenticated(&keys));
-    write_seed("aurx_packet", "session_bind_ack", &AurixPacket::session_bind_ack(0xdead_beef, 1, 1_738_000_000_000).encode());
+    write_seed(
+        "aurx_packet",
+        "session_bind",
+        &bind.encode_authenticated(&keys),
+    );
+    write_seed(
+        "aurx_packet",
+        "session_bind_ack",
+        &AurixPacket::session_bind_ack(0xdead_beef, 1, 1_738_000_000_000).encode(),
+    );
     let relay = AurixPacket::relay_envelope(&audio, 0x0102_0304, 99, &user);
     write_seed("aurx_packet", "relay_envelope", &relay.seal(&keys));
     let relay_hop = AurixPacket::relay_envelope_hop(&audio, 0x0102_0304, 100, &user, 2);
     write_seed("aurx_packet", "relay_envelope_hop", &relay_hop.encode());
     let mut pcmu_header = PacketHeader::new(PacketType::Audio, 5, 5 * 160, 0x11);
     pcmu_header.flags |= aurix_common::protocol::PacketFlags::Pcmu as u16;
-    write_seed("aurx_packet", "audio_pcmu", &AurixPacket::new(pcmu_header, Bytes::from(vec![0xffu8; 160])).encode());
-    write_seed("aurx_packet", "heartbeat", &AurixPacket::new(PacketHeader::new(PacketType::Heartbeat, 1, 0, 0x11), Bytes::new()).seal(&keys));
+    write_seed(
+        "aurx_packet",
+        "audio_pcmu",
+        &AurixPacket::new(pcmu_header, Bytes::from(vec![0xffu8; 160])).encode(),
+    );
+    write_seed(
+        "aurx_packet",
+        "heartbeat",
+        &AurixPacket::new(
+            PacketHeader::new(PacketType::Heartbeat, 1, 0, 0x11),
+            Bytes::new(),
+        )
+        .seal(&keys),
+    );
 
     // --- rtp_header ----------------------------------------------------------------------
-    let mut rtp = vec![0x80, 111, 0x00, 0x2a, 0, 0, 0x3a, 0x98, 0xde, 0xad, 0xbe, 0xef];
+    let mut rtp = vec![
+        0x80, 111, 0x00, 0x2a, 0, 0, 0x3a, 0x98, 0xde, 0xad, 0xbe, 0xef,
+    ];
     rtp.extend_from_slice(&opus_frames[1]);
     write_seed("rtp_header", "opus_pt111", &rtp);
-    let mut rtp_ext = vec![0x90, 0xe0, 0x00, 0x2b, 0, 0, 0x3a, 0x98, 0xde, 0xad, 0xbe, 0xef, 0xbe, 0xde, 0x00, 0x01, 0x10, 0x7f, 0, 0];
+    let mut rtp_ext = vec![
+        0x90, 0xe0, 0x00, 0x2b, 0, 0, 0x3a, 0x98, 0xde, 0xad, 0xbe, 0xef, 0xbe, 0xde, 0x00, 0x01,
+        0x10, 0x7f, 0, 0,
+    ];
     rtp_ext.extend_from_slice(&opus_frames[2]);
     write_seed("rtp_header", "opus_with_extension", &rtp_ext);
 
@@ -174,10 +238,17 @@ fn seed_corpus() {
     alloc.add_attribute(StunAttributeType::Realm, b"aurix".to_vec());
     alloc.add_attribute(StunAttributeType::Nonce, b"0123456789abcdef".to_vec());
     alloc.add_attribute(StunAttributeType::Lifetime, 600u32.to_be_bytes().to_vec());
-    write_seed("stun_message", "allocate_with_integrity", &alloc.encode_with_integrity(b"fuzz-turn-key"));
+    write_seed(
+        "stun_message",
+        "allocate_with_integrity",
+        &alloc.encode_with_integrity(b"fuzz-turn-key"),
+    );
     let mut resp = StunMessage::new(StunMessageType::BindingRequest.success_response(), tid);
     resp.add_xor_mapped_address("203.0.113.9:40000".parse().unwrap());
-    resp.add_xor_address(StunAttributeType::XorRelayedAddress, "[2001:db8::1]:50000".parse().unwrap());
+    resp.add_xor_address(
+        StunAttributeType::XorRelayedAddress,
+        "[2001:db8::1]:50000".parse().unwrap(),
+    );
     write_seed("stun_message", "success_response_v4_v6", &resp.encode());
     let mut err = StunMessage::new(StunMessageType::AllocateRequest.error_response(), tid);
     err.add_error_code(401, "Unauthorized");
@@ -185,29 +256,77 @@ fn seed_corpus() {
 
     // --- control_message -----------------------------------------------------------------
     let msgs = [
-        ("channel_join", ControlMessage::ChannelJoin { channel_id: channel, token: "join-token".into() }),
-        ("channel_leave", ControlMessage::ChannelLeave { channel_id: channel }),
-        ("set_participant_mute", ControlMessage::SetParticipantMute { user_id: user, channel_id: Some(channel), muted: true }),
-        ("set_participant_volume", ControlMessage::SetParticipantVolume { user_id: user, volume: 0.5 }),
-        ("set_user_block", ControlMessage::SetUserBlock { user_id: user, blocked: true }),
+        (
+            "channel_join",
+            ControlMessage::ChannelJoin {
+                channel_id: channel,
+                token: "join-token".into(),
+            },
+        ),
+        (
+            "channel_leave",
+            ControlMessage::ChannelLeave {
+                channel_id: channel,
+            },
+        ),
+        (
+            "set_participant_mute",
+            ControlMessage::SetParticipantMute {
+                user_id: user,
+                channel_id: Some(channel),
+                muted: true,
+            },
+        ),
+        (
+            "set_participant_volume",
+            ControlMessage::SetParticipantVolume {
+                user_id: user,
+                volume: 0.5,
+            },
+        ),
+        (
+            "set_user_block",
+            ControlMessage::SetUserBlock {
+                user_id: user,
+                blocked: true,
+            },
+        ),
     ];
     for (name, msg) in msgs {
-        write_seed("control_message", name, serde_json::to_string(&msg).unwrap().as_bytes());
+        write_seed(
+            "control_message",
+            name,
+            serde_json::to_string(&msg).unwrap().as_bytes(),
+        );
     }
     write_seed("control_message", "ping", br#"{"type":"Ping"}"#);
+    // Regression: a volume beyond f32::MAX parses as +inf, which serializes as `null`.
+    write_seed(
+        "control_message",
+        "volume_f32_overflow",
+        br#"{"type":"SetParticipantVolume","data":{"user_id":"00000000-0000-0000-0000-000000abcdef","volume":111111111111111111111111111111111111111111111110.5}}"#,
+    );
 
     // --- e2ee_frame ----------------------------------------------------------------------
     use aurix_common::e2ee::{IdentityKey, SenderKey};
     let key = SenderKey::derive(3, &[0x42u8; 32]);
     write_seed("e2ee_frame", "sealed_frame", &key.seal(7, &opus_frames[0]));
-    write_seed("e2ee_frame", "sealed_frame_gen3_counter9", &key.seal(9, &opus_frames[1]));
+    write_seed(
+        "e2ee_frame",
+        "sealed_frame_gen3_counter9",
+        &key.seal(9, &opus_frames[1]),
+    );
     let me = IdentityKey::from_bytes([1u8; 32]);
     let them = IdentityKey::from_bytes([2u8; 32]);
     // Wrapped for `me` by `them` (the harness unwraps with identity 1 from public key 2).
     let mut wrapped = them.public_key().to_vec();
     wrapped.extend(them.wrap(me.public_key(), 1, &[0x42u8; 32]).unwrap());
     write_seed("e2ee_frame", "wrapped_key_from_peer2", &wrapped);
-    write_seed("e2ee_frame", "public_key_b64", aurix_common::e2ee::encode_bytes(them.public_key()).as_bytes());
+    write_seed(
+        "e2ee_frame",
+        "public_key_b64",
+        aurix_common::e2ee::encode_bytes(them.public_key()).as_bytes(),
+    );
 
     // --- opus_packet ---------------------------------------------------------------------
     for (i, f) in opus_frames.iter().enumerate() {
@@ -224,7 +343,8 @@ fn seed_corpus() {
     // --- ogg_opus ------------------------------------------------------------------------
     let mut ogg = Vec::new();
     {
-        let mut w = aurix_recording::ogg::OggOpusWriter::new(&mut ogg, 0x0bad_cafe, 48_000, 1).unwrap();
+        let mut w =
+            aurix_recording::ogg::OggOpusWriter::new(&mut ogg, 0x0bad_cafe, 48_000, 1).unwrap();
         for f in &opus_frames {
             w.write_packet(f).unwrap();
         }
@@ -242,7 +362,11 @@ fn seed_corpus() {
     write_seed("ogg_opus", "stereo_4_frames", &ogg2);
 
     // --- wav -------------------------------------------------------------------------------
-    for (name, bits, rate, ch) in [("pcm16_mono_16k", 16u16, 16_000u32, 1u16), ("pcm24_stereo_48k", 24, 48_000, 2), ("float32_mono_24k", 32, 24_000, 1)] {
+    for (name, bits, rate, ch) in [
+        ("pcm16_mono_16k", 16u16, 16_000u32, 1u16),
+        ("pcm24_stereo_48k", 24, 48_000, 2),
+        ("float32_mono_24k", 32, 24_000, 1),
+    ] {
         let frames = 96usize;
         let block = ch * bits / 8;
         let data_len = frames as u32 * block as u32;
@@ -272,12 +396,40 @@ fn seed_corpus() {
     }
 
     // --- live_frame ----------------------------------------------------------------------
-    write_seed("live_frame", "opus_frame", &aurix_recording::live::encode_frame(0, 0, 0xdead_beef, 960, 1_738_000_000_000, &user, &opus_frames[0]));
-    write_seed("live_frame", "pcm_frame_flag1", &aurix_recording::live::encode_frame(1, 1, 0x11, 1920, 1_738_000_000_020, &user, &[0u8; 64]));
+    write_seed(
+        "live_frame",
+        "opus_frame",
+        &aurix_recording::live::encode_frame(
+            0,
+            0,
+            0xdead_beef,
+            960,
+            1_738_000_000_000,
+            &user,
+            &opus_frames[0],
+        ),
+    );
+    write_seed(
+        "live_frame",
+        "pcm_frame_flag1",
+        &aurix_recording::live::encode_frame(
+            1,
+            1,
+            0x11,
+            1920,
+            1_738_000_000_020,
+            &user,
+            &[0u8; 64],
+        ),
+    );
 
     // --- webhook_signature -----------------------------------------------------------------
     let body = br#"{"id":"evt_1","type":"channel.created","data":{}}"#;
-    let sig = aurix_control::webhooks::sign("whsec_fuzz_0123456789abcdef0123456789abcdef", 1_738_000_000, body);
+    let sig = aurix_control::webhooks::sign(
+        "whsec_fuzz_0123456789abcdef0123456789abcdef",
+        1_738_000_000,
+        body,
+    );
     let mut seed = sig.into_bytes();
     seed.push(b'\n');
     seed.extend_from_slice(body);
@@ -314,7 +466,13 @@ fn seed_corpus() {
         ("cidr", "10.0.0.0/8"),
         ("metric", "rtt_sum_ms"),
         ("url", "https://hooks.example.com/aurix"),
-        ("chat_cursor", &aurix_common::protocol::encode_chat_cursor(chrono::DateTime::from_timestamp(1_738_000_000, 0).unwrap(), uuid::Uuid::from_u128(0x99))),
+        (
+            "chat_cursor",
+            &aurix_common::protocol::encode_chat_cursor(
+                chrono::DateTime::from_timestamp(1_738_000_000, 0).unwrap(),
+                uuid::Uuid::from_u128(0x99),
+            ),
+        ),
     ] {
         write_seed("text_parsers", name, s.as_bytes());
     }

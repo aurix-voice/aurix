@@ -11094,15 +11094,35 @@ async fn join_ack(
 /// Collects up to 400 ms of downlink audio at `to`: `(frames per SSRC, mixed-flag frames,
 /// peak stereo RMS of the mixed frames)`.
 async fn downlink_summary(to: &Player) -> (std::collections::HashMap<u32, usize>, usize, f32) {
+    downlink_summary_for(to, Duration::ZERO).await
+}
+
+/// Like [`downlink_summary`], but keeps listening for at least `min_wait` before a 400 ms
+/// gap ends the summary — for summaries that run concurrently with a sender whose pacing
+/// (and the server mix, which is silent while nothing is queued) can stall on a loaded host.
+async fn downlink_summary_for(
+    to: &Player,
+    min_wait: Duration,
+) -> (std::collections::HashMap<u32, usize>, usize, f32) {
+    let deadline = tokio::time::Instant::now() + min_wait;
     let mut per_ssrc: std::collections::HashMap<u32, usize> = Default::default();
     let mut mixed = 0;
     let mut level = 0.0f32;
     let mut dec = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
     let mut pcm = vec![0i16; 960 * 2];
     let mut buf = vec![0u8; 2048];
-    while let Ok(Ok((n, _))) =
-        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
-    {
+    loop {
+        let (n, _) = match tokio::time::timeout(
+            Duration::from_millis(400),
+            to.udp.recv_from(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => break,
+            Err(_) if tokio::time::Instant::now() < deadline => continue,
+            Err(_) => break,
+        };
         let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
         assert!(p.open(&to.keys), "{}: sealed with another key", to.name);
         if p.header.packet_type != PacketType::Audio {
@@ -11296,9 +11316,10 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
     // ── audio: listeners get the channel mix, speakers get per-speaker streams ──
     let mix_ssrc = channel_mix_ssrc(&stage);
     let tone = opus_tone(440.0, 600);
+    let stream_wait = Duration::from_millis(20 * tone.len() as u64 + 400);
     let (_, to_alice) = tokio::join!(
         stream_frames(&alice, stage, 1, &tone, false),
-        downlink_summary(&bob)
+        downlink_summary_for(&bob, stream_wait)
     );
     assert_eq!(to_alice.1, 0, "Bob (streams) gets no mixed frames");
     assert!(
@@ -11357,7 +11378,7 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
     ));
     let (_, to_bob) = tokio::join!(
         stream_frames(&alice, stage, 100, &tone, false),
-        downlink_summary(&bob)
+        downlink_summary_for(&bob, stream_wait)
     );
     assert!(to_bob.1 >= 20, "Bob (mixed) got {} mixed frames", to_bob.1);
     assert!(
@@ -11389,7 +11410,7 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
     .await;
     let (_, to_bob) = tokio::join!(
         stream_frames(&alice, stage, 200, &tone, false),
-        downlink_summary(&bob)
+        downlink_summary_for(&bob, stream_wait)
     );
     assert_eq!(to_bob.1, 0);
     assert!(to_bob.0.get(&alice.ssrc).copied().unwrap_or(0) >= 25);

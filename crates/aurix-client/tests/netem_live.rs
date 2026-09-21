@@ -348,7 +348,7 @@ async fn stream(alice: &Client, bob: &Client, secs: f32, clock: &mut usize) -> S
     st.bob_after = bob.stats();
     let s = &st.bob_after;
     eprintln!(
-        "[stretch {secs}s] active={}/{} rms={:.3} lost={} recovered={} ratio={:.2} bob loss={:.1}% mos={:.2} jitter={:.1}ms | alice profile={:?} server={:?}",
+        "[stretch {secs}s] active={}/{} rms={:.3} lost={} recovered={} ratio={:.2} bob loss={:.1}% mos={:.2} jitter={:.1}ms path={:?} rx={} audio={} bad_auth={} replayed={} hb_lost={} | alice profile={:?} tx={} server={:?}",
         st.active,
         st.frames,
         st.rms,
@@ -358,20 +358,72 @@ async fn stream(alice: &Client, bob: &Client, secs: f32, clock: &mut usize) -> S
         s.loss_percent,
         s.mos,
         s.jitter_ms,
+        s.media_path,
+        s.media.packets_received,
+        s.media.audio_frames_received,
+        s.media.bad_auth,
+        s.media.replayed,
+        s.media.heartbeats_lost,
         alice.stats().loss_profile,
+        alice.stats().media.packets_sent,
         alice.stats().server,
     );
     st
 }
 
-fn assert_heard(st: &Stretch, label: &str, min_active_share: f32) {
+/// Fails the test when Bob heard too little of Alice in `st`, dumping both clients' stats
+/// and the node's view of both sessions first so a CI-only failure is diagnosable.
+async fn assert_heard(
+    env: &Env,
+    alice: &Client,
+    bob: &Client,
+    st: &Stretch,
+    label: &str,
+    min_active_share: f32,
+) {
     let share = st.active as f32 / st.frames.max(1) as f32;
-    assert!(
-        share >= min_active_share && st.rms >= 0.03,
+    if share >= min_active_share && st.rms >= 0.03 {
+        return;
+    }
+    eprintln!("[{label}] alice stats: {:#?}", alice.stats());
+    eprintln!("[{label}] bob stats: {:#?}", bob.stats());
+    let http = reqwest::Client::new();
+    for (name, client) in [("alice", alice), ("bob", bob)] {
+        let Some(session) = client.session() else {
+            eprintln!("[{label}] {name}: no session");
+            continue;
+        };
+        let stats = http
+            .get(format!(
+                "{}/v1/sessions/{}/stats",
+                env.api, session.session_id
+            ))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await;
+        match stats {
+            Ok(r) => eprintln!(
+                "[{label}] {name} node-side {}: {}",
+                r.status(),
+                r.text().await.unwrap_or_default()
+            ),
+            Err(e) => eprintln!("[{label}] {name} node-side stats failed: {e}"),
+        }
+    }
+    if let Ok(metrics) = std::env::var("AURIX_E2E_METRICS") {
+        if let Ok(r) = http.get(&metrics).send().await {
+            let body = r.text().await.unwrap_or_default();
+            for line in body
+                .lines()
+                .filter(|l| l.starts_with("aurix_quic_") || l.starts_with("aurix_packets_dropped"))
+            {
+                eprintln!("[{label}] {line}");
+            }
+        }
+    }
+    panic!(
         "[{label}] bob did not hear alice: active {}/{} ({share:.2}), rms {:.3}",
-        st.active,
-        st.frames,
-        st.rms
+        st.active, st.frames, st.rms
     );
 }
 
@@ -401,7 +453,7 @@ async fn lossy_link_is_measured_in_both_directions_and_protected_by_the_sender()
 
     // 1. clean
     let clean = stream(&alice, &bob, 4.0, &mut clock).await;
-    assert_heard(&clean, "clean", 0.8);
+    assert_heard(&env, &alice, &bob, &clean, "clean", 0.8).await;
     assert!(
         clean.lost() <= 2,
         "loopback lost {} frames without shaping",
@@ -449,7 +501,7 @@ async fn lossy_link_is_measured_in_both_directions_and_protected_by_the_sender()
         "the loss must show up on the receivers' side only: {server:?}"
     );
     let lossy = stream(&alice, &bob, 8.0, &mut clock).await;
-    assert_heard(&lossy, "20% downlink loss", 0.7);
+    assert_heard(&env, &alice, &bob, &lossy, "20% downlink loss", 0.7).await;
     let expected_lost = (lossy.frames as f32 * 0.2) as u64;
     assert!(
         lossy.lost() >= expected_lost / 2 && lossy.lost() <= expected_lost * 2,
@@ -494,7 +546,7 @@ async fn lossy_link_is_measured_in_both_directions_and_protected_by_the_sender()
         );
     }
     let recovered = stream(&alice, &bob, 3.0, &mut clock).await;
-    assert_heard(&recovered, "cleared", 0.8);
+    assert_heard(&env, &alice, &bob, &recovered, "cleared", 0.8).await;
     assert!(
         recovered.bob_after.mos >= 4.0,
         "MOS {:.2} after the link cleared",
@@ -529,7 +581,15 @@ async fn lossy_link_is_measured_in_both_directions_and_protected_by_the_sender()
         server.uplink_loss_percent
     );
     let uplink = stream(&alice, &bob, 6.0, &mut clock).await;
-    assert_heard(&uplink, "12% uplink loss + reorder", 0.7);
+    assert_heard(
+        &env,
+        &alice,
+        &bob,
+        &uplink,
+        "12% uplink loss + reorder",
+        0.7,
+    )
+    .await;
     assert!(
         uplink.recovery_ratio() >= 0.4,
         "rebuilt only {:.2} of the frames lost on the uplink ({} of {})",
@@ -569,7 +629,7 @@ async fn quic_session_migrates_under_wan_conditions() {
         Some("delay 40ms 15ms loss 3%"),
     );
     let before = stream(&alice, &bob, 6.0, &mut clock).await;
-    assert_heard(&before, "wan before migration", 0.7);
+    assert_heard(&env, &alice, &bob, &before, "wan before migration", 0.7).await;
     // 2 × (40 ± 15) ms on top of loopback: every heartbeat sees 50..110 ms.
     let media = alice.stats().media;
     assert!(
@@ -595,7 +655,7 @@ async fn quic_session_migrates_under_wan_conditions() {
     assert_ne!(addr_before, addr_after, "the local address did not change");
 
     let after = stream(&alice, &bob, 6.0, &mut clock).await;
-    assert_heard(&after, "wan after migration", 0.7);
+    assert_heard(&env, &alice, &bob, &after, "wan after migration", 0.7).await;
     assert!(
         !after
             .alice
