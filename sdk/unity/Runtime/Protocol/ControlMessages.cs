@@ -223,8 +223,18 @@ namespace Aurix.Protocol
         /// <c>OnChatInboxSynced</c>) or, on the sender's own echo, stored because the recipient is offline.
         /// </summary>
         public bool Offline;
+        /// <summary>When the text/metadata was last edited by its author, or null.</summary>
+        public DateTimeOffset? EditedAt;
+        /// <summary>When the message was deleted (tombstone: <see cref="Text"/> is empty, <see cref="Metadata"/> null), or null.</summary>
+        public DateTimeOffset? DeletedAt;
+        /// <summary>Who deleted it: the author, a channel moderator, or <see cref="SystemUserId"/> for the REST API.</summary>
+        public Guid? DeletedBy;
+        /// <summary>Reaction tallies (each with up to the server's cap of user ids).</summary>
+        public List<ChatReaction> Reactions = new List<ChatReaction>();
 
         public bool IsSystem => FromUserId == SystemUserId;
+        public bool IsEdited => EditedAt.HasValue;
+        public bool IsDeleted => DeletedAt.HasValue;
         public bool IsDirect => ToUserId.HasValue;
         /// <summary>Echo of a message this client sent (the server returns <c>client_ref</c> only to the sender).</summary>
         public bool IsOwn => ClientRef != null;
@@ -260,6 +270,41 @@ namespace Aurix.Protocol
         }
     }
 
+    /// <summary>One reaction on a message: how many users set it and (up to the server's cap) who.</summary>
+    public sealed class ChatReaction
+    {
+        /// <summary>Server cap on the byte length of a reaction token.</summary>
+        public const int MaxBytes = 32;
+
+        public string Reaction;
+        public int Count;
+        public List<Guid> UserIds = new List<Guid>();
+
+        /// <summary>The server's reaction rules: non-empty, no whitespace or control characters, at most <see cref="MaxBytes"/> UTF-8 bytes.</summary>
+        public static void Validate(string reaction)
+        {
+            if (string.IsNullOrEmpty(reaction)) throw new ArgumentException("reaction is empty", nameof(reaction));
+            foreach (var c in reaction)
+                if (char.IsWhiteSpace(c) || char.IsControl(c)) throw new ArgumentException("reaction must not contain whitespace or control characters", nameof(reaction));
+            if (System.Text.Encoding.UTF8.GetByteCount(reaction) > MaxBytes) throw new ArgumentException("reaction is too long", nameof(reaction));
+        }
+    }
+
+    /// <summary>A user added or removed a reaction on a message this client can see.</summary>
+    public sealed class ChatReactionChange
+    {
+        public Guid MessageId;
+        public Guid? ChannelId;
+        public Guid MessageFromUserId;
+        public Guid? MessageToUserId;
+        public Guid UserId;
+        public string Reaction;
+        public bool Added;
+        /// <summary>Users carrying <see cref="Reaction"/> after the change.</summary>
+        public int Count;
+        public DateTimeOffset Timestamp;
+    }
+
     /// <summary>One page of stored chat history, newest first.</summary>
     public sealed class ChatHistoryPage
     {
@@ -271,6 +316,8 @@ namespace Aurix.Protocol
         public string NextBefore;
         /// <summary>Cursor for the next newer page, or null when the page is the most recent.</summary>
         public string NextAfter;
+        /// <summary>The full-text query of a search page; null for plain history.</summary>
+        public string Query;
     }
 
     /// <summary>A user's reading position in a channel or a direct conversation.</summary>
@@ -661,6 +708,31 @@ namespace Aurix.Protocol
                 System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTimeOffset.MinValue;
         }
 
+        private static DateTimeOffset? ParseOptionalTime(Dictionary<string, object> o, string key)
+        {
+            var s = MiniJson.GetString(o, key);
+            return s != null && DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var ts) ? ts : (DateTimeOffset?)null;
+        }
+
+        private static List<ChatReaction> ParseReactions(object v)
+        {
+            var list = new List<ChatReaction>();
+            if (!(MiniJson.AsArray(v) is List<object> arr)) return list;
+            foreach (var item in arr)
+            {
+                var o = MiniJson.AsObject(item);
+                var name = o != null ? MiniJson.GetString(o, "reaction") : null;
+                if (string.IsNullOrEmpty(name)) continue;
+                var r = new ChatReaction { Reaction = name, Count = (int)MiniJson.GetNumber(o, "count") };
+                if (o.TryGetValue("user_ids", out var users) && MiniJson.AsArray(users) is List<object> ids)
+                    foreach (var id in ids)
+                        if (id is string str && Guid.TryParse(str, out var g)) r.UserIds.Add(g);
+                list.Add(r);
+            }
+            return list;
+        }
+
         private static ChatMessage ParseChatMessage(Dictionary<string, object> o)
         {
             if (o == null) return null;
@@ -676,6 +748,31 @@ namespace Aurix.Protocol
                 SentAt = ParseTime(o, "sent_at"),
                 ClientRef = MiniJson.GetString(o, "client_ref"),
                 Offline = MiniJson.GetBool(o, "offline"),
+                EditedAt = ParseOptionalTime(o, "edited_at"),
+                DeletedAt = ParseOptionalTime(o, "deleted_at"),
+                DeletedBy = MiniJson.GetGuid(o, "deleted_by"),
+                Reactions = ParseReactions(o.TryGetValue("reactions", out var rx) ? rx : null),
+            };
+        }
+
+        /// <summary>Typed view of a <c>ChatReactionChanged</c> payload; null if malformed.</summary>
+        public ChatReactionChange ReactionChange()
+        {
+            if (Data == null) return null;
+            var messageId = MiniJson.GetGuid(Data, "message_id");
+            var reaction = MiniJson.GetString(Data, "reaction");
+            if (!messageId.HasValue || string.IsNullOrEmpty(reaction)) return null;
+            return new ChatReactionChange
+            {
+                MessageId = messageId.Value,
+                ChannelId = MiniJson.GetGuid(Data, "channel_id"),
+                MessageFromUserId = MiniJson.GetGuid(Data, "message_from_user_id") ?? Guid.Empty,
+                MessageToUserId = MiniJson.GetGuid(Data, "message_to_user_id"),
+                UserId = MiniJson.GetGuid(Data, "user_id") ?? Guid.Empty,
+                Reaction = reaction,
+                Added = MiniJson.GetBool(Data, "added"),
+                Count = (int)MiniJson.GetNumber(Data, "count"),
+                Timestamp = ParseTime(Data, "timestamp"),
             };
         }
 
@@ -693,7 +790,7 @@ namespace Aurix.Protocol
             };
         }
 
-        /// <summary>Typed view of a <c>ChatHistoryResult</c> payload.</summary>
+        /// <summary>Typed view of a <c>ChatHistoryResult</c> or <c>ChatSearchResult</c> payload.</summary>
         public ChatHistoryPage ChatHistory()
         {
             if (Data == null) return null;
@@ -703,6 +800,7 @@ namespace Aurix.Protocol
                 PeerUserId = MiniJson.GetGuid(Data, "user_id"),
                 NextBefore = MiniJson.GetString(Data, "next_before"),
                 NextAfter = MiniJson.GetString(Data, "next_after"),
+                Query = MiniJson.GetString(Data, "query"),
             };
             if (Data.TryGetValue("messages", out var v) && MiniJson.AsArray(v) is List<object> arr)
                 foreach (var item in arr)
@@ -874,6 +972,37 @@ namespace Aurix.Protocol
 
         public static string ChatReadMarkers(Guid? channelId, Guid? userId) =>
             Serialize("ChatReadMarkers", Scope(channelId, userId));
+
+        public static string ChatEdit(Guid messageId, string text, object metadata, string clientRef)
+        {
+            var d = new Dictionary<string, object> { { "message_id", messageId }, { "text", text } };
+            if (metadata != null) d["metadata"] = metadata;
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("ChatEdit", d);
+        }
+
+        public static string ChatDelete(Guid messageId, string clientRef)
+        {
+            var d = new Dictionary<string, object> { { "message_id", messageId } };
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("ChatDelete", d);
+        }
+
+        public static string ChatReact(Guid messageId, string reaction, bool add) =>
+            Serialize("ChatReact", new Dictionary<string, object> { { "message_id", messageId }, { "reaction", reaction }, { "add", add } });
+
+        /// <summary>Search a channel, one direct conversation, or (both null) every direct conversation of this user.</summary>
+        public static string ChatSearch(Guid? channelId, Guid? userId, string query, Guid? fromUserId, string before, int? limit, string clientRef)
+        {
+            var d = new Dictionary<string, object> { { "query", query } };
+            if (channelId.HasValue) d["channel_id"] = channelId.Value;
+            else if (userId.HasValue) d["user_id"] = userId.Value;
+            if (fromUserId.HasValue) d["from_user_id"] = fromUserId.Value;
+            if (before != null) d["before"] = before;
+            if (limit.HasValue) d["limit"] = limit.Value;
+            if (clientRef != null) d["client_ref"] = clientRef;
+            return Serialize("ChatSearch", d);
+        }
 
         public static string SetTranscripts(bool enabled) =>
             Serialize("SetTranscripts", new Dictionary<string, object> { { "enabled", enabled } });

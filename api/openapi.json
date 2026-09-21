@@ -7410,6 +7410,548 @@
           "chat:read"
         ]
       }
+    },
+    "/v1/channels/{channel_id}/messages/search": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Search channel messages",
+        "operationId": "searchChannelMessages",
+        "description": "Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues to older matches (`next_after` is never set for a search page).",
+        "parameters": [
+          {
+            "name": "channel_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "required": true,
+            "description": "Web-search syntax: words are ANDed, `\"a phrase\"` matches in order, `-word` excludes, `or` alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A query without searchable terms yields an empty page."
+          },
+          {
+            "name": "from_user_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Only matches sent by this user."
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors are `400`."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Page size; clamped to `chat.history_page_max` (default 200)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatHistoryPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:read"
+        ]
+      }
+    },
+    "/v1/users/{user_id}/messages/search": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Search a user's messages",
+        "operationId": "searchUserMessages",
+        "description": "Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues to older matches (`next_after` is never set for a search page). Without `peer` the search covers every directed message the user sent or received (moderation view).",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "required": true,
+            "description": "Web-search syntax: words are ANDed, `\"a phrase\"` matches in order, `-word` excludes, `or` alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A query without searchable terms yields an empty page."
+          },
+          {
+            "name": "from_user_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Only matches sent by this user."
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors are `400`."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Page size; clamped to `chat.history_page_max` (default 200)."
+          },
+          {
+            "name": "peer",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Restrict to the direct conversation with this user."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatHistoryPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:read"
+        ]
+      }
+    },
+    "/v1/messages/{message_id}": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Get a stored message",
+        "operationId": "getMessage",
+        "description": "One stored message of the app with its reaction tallies; deleted messages are returned as tombstones (`deleted_at` set, empty `text`). Requires `chat.persist = true` (otherwise `404`).",
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:read"
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Edit a message",
+        "operationId": "editMessage",
+        "description": "Operator edit of any stored, not deleted message of the app: replaces `text` and `metadata`, sets `edited_at`. The author / `chat.edit_window_secs` rules and the text filters apply to players, not to this endpoint. Everyone who sees the message receives `ChatMessageUpdated`; the id and `sent_at` never change.",
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditMessageRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:write"
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Delete a message",
+        "operationId": "deleteMessage",
+        "description": "Operator deletion: the message becomes a tombstone (`deleted_at`, `deleted_by` = nil system user) that keeps its id and position in history but loses text, metadata and reactions. Deleted messages are excluded from search, unread counts and offline replay. Deleting again is `404`.",
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:write"
+        ]
+      }
+    },
+    "/v1/messages/{message_id}/reactions/{reaction}": {
+      "put": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Add a reaction on behalf of a user",
+        "operationId": "addMessageReaction",
+        "description": "Sets `user_id`'s `reaction` on the message (idempotent: repeating is `changed: false`). A message carries at most `chat.reactions_per_message` distinct reactions (`400` beyond that); direct messages accept reactions only from their two parties (`404` otherwise). Changes fan out as `ChatReactionChanged` to everyone who sees the message.",
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "reaction",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "required": true,
+            "description": "Any 1..=32 byte token without whitespace — an emoji, a shortcode, a game-specific id. URL-encode it."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReactionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReactionChange"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:write"
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Remove a user's reaction",
+        "operationId": "removeMessageReaction",
+        "description": "Clears `user_id`'s `reaction` from the message (idempotent).",
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true
+          },
+          {
+            "name": "reaction",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "required": true,
+            "description": "Any 1..=32 byte token without whitespace — an emoji, a shortcode, a game-specific id. URL-encode it."
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true,
+            "description": "The user whose reaction is removed."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReactionChange"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ],
+        "x-aurix-permissions": [
+          "chat:write"
+        ]
+      }
     }
   },
   "components": {
@@ -8736,6 +9278,37 @@
             "type": "boolean",
             "default": false,
             "description": "Directed message accepted while the recipient had no live session; it was stored for replay when they connect. Omitted when `false`."
+          },
+          "edited_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set when the text / metadata were changed after sending; omitted otherwise."
+          },
+          "deleted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set on tombstones: the message was deleted, `text` is empty and `metadata` / `reactions` are gone. Omitted for live messages."
+          },
+          "deleted_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Who deleted it: the author, a channel moderator, or the nil system user for REST deletions."
+          },
+          "reactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatReaction"
+            },
+            "description": "Reaction tallies (history, search and `GET /v1/messages/{id}` only); omitted when empty."
           }
         },
         "required": [
@@ -8745,7 +9318,104 @@
           "text",
           "sent_at"
         ],
-        "description": "Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history."
+        "description": "Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history. Edits keep `id` / `sent_at` and set `edited_at`; deletions leave a tombstone (`deleted_at`)."
+      },
+      "ChatReaction": {
+        "type": "object",
+        "properties": {
+          "reaction": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Users carrying this reaction."
+          },
+          "user_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Up to 20 of them (the reader first when known); `count` may exceed the list length."
+          }
+        },
+        "required": [
+          "reaction",
+          "count"
+        ],
+        "description": "One reaction token on a message and who set it."
+      },
+      "EditMessageRequest": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "New text; `chat.max_message_bytes` applies."
+          },
+          "metadata": {
+            "oneOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replaces the stored metadata; absent or `null` clears it."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "ReactionRequest": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The user the reaction belongs to (must exist in the app)."
+          }
+        },
+        "required": [
+          "user_id"
+        ]
+      },
+      "ReactionChange": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reaction": {
+            "type": "string"
+          },
+          "added": {
+            "type": "boolean",
+            "description": "`true` for PUT, `false` for DELETE."
+          },
+          "changed": {
+            "type": "boolean",
+            "description": "`false` when the reaction was already in the requested state (nothing was published)."
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Users carrying `reaction` after the request."
+          }
+        },
+        "required": [
+          "message_id",
+          "user_id",
+          "reaction",
+          "added",
+          "changed",
+          "count"
+        ]
       },
       "CoordinateSystem": {
         "type": "string",

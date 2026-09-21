@@ -2152,3 +2152,165 @@ func (c *Client) ListChannelReadMarkers(ctx context.Context, channelID string, o
 	}
 	return &out, nil
 }
+
+// SearchChannelMessages — Search channel messages
+//
+// Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+// `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+// to older matches (`next_after` is never set for a search page).
+//
+// `GET /v1/channels/{channel_id}/messages/search`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:read.
+func (c *Client) SearchChannelMessages(ctx context.Context, channelID string, query *SearchChannelMessagesQuery, opts ...RequestOption) (*ChatHistoryPage, error) {
+	q := url.Values{}
+	if query != nil {
+		if query.Q != nil {
+			q.Set("q", *query.Q)
+		}
+		if query.FromUserID != nil {
+			q.Set("from_user_id", *query.FromUserID)
+		}
+		if query.Before != nil {
+			q.Set("before", *query.Before)
+		}
+		if query.Limit != nil {
+			q.Set("limit", strconv.FormatInt(*query.Limit, 10))
+		}
+	}
+	var out ChatHistoryPage
+	if err := c.doJSON(ctx, "GET", "/v1/channels/"+url.PathEscape(channelID)+"/messages/search", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SearchUserMessages — Search a user's messages
+//
+// Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+// `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+// to older matches (`next_after` is never set for a search page). Without `peer` the search covers
+// every directed message the user sent or received (moderation view).
+//
+// `GET /v1/users/{user_id}/messages/search`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:read.
+func (c *Client) SearchUserMessages(ctx context.Context, userID string, query *SearchUserMessagesQuery, opts ...RequestOption) (*ChatHistoryPage, error) {
+	q := url.Values{}
+	if query != nil {
+		if query.Q != nil {
+			q.Set("q", *query.Q)
+		}
+		if query.FromUserID != nil {
+			q.Set("from_user_id", *query.FromUserID)
+		}
+		if query.Before != nil {
+			q.Set("before", *query.Before)
+		}
+		if query.Limit != nil {
+			q.Set("limit", strconv.FormatInt(*query.Limit, 10))
+		}
+		if query.Peer != nil {
+			q.Set("peer", *query.Peer)
+		}
+	}
+	var out ChatHistoryPage
+	if err := c.doJSON(ctx, "GET", "/v1/users/"+url.PathEscape(userID)+"/messages/search", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetMessage — Get a stored message
+//
+// One stored message of the app with its reaction tallies; deleted messages are returned as
+// tombstones (`deleted_at` set, empty `text`). Requires `chat.persist = true` (otherwise `404`).
+//
+// `GET /v1/messages/{message_id}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:read.
+func (c *Client) GetMessage(ctx context.Context, messageID string, opts ...RequestOption) (*ChatMessage, error) {
+	var q url.Values
+	var out ChatMessage
+	if err := c.doJSON(ctx, "GET", "/v1/messages/"+url.PathEscape(messageID), q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// EditMessage — Edit a message
+//
+// Operator edit of any stored, not deleted message of the app: replaces `text` and `metadata`,
+// sets `edited_at`. The author / `chat.edit_window_secs` rules and the text filters apply to
+// players, not to this endpoint. Everyone who sees the message receives `ChatMessageUpdated`; the
+// id and `sent_at` never change.
+//
+// `PATCH /v1/messages/{message_id}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:write.
+func (c *Client) EditMessage(ctx context.Context, messageID string, body EditMessageRequest, opts ...RequestOption) (*ChatMessage, error) {
+	var q url.Values
+	var out ChatMessage
+	if err := c.doJSON(ctx, "PATCH", "/v1/messages/"+url.PathEscape(messageID), q, body, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteMessage — Delete a message
+//
+// Operator deletion: the message becomes a tombstone (`deleted_at`, `deleted_by` = nil system
+// user) that keeps its id and position in history but loses text, metadata and reactions. Deleted
+// messages are excluded from search, unread counts and offline replay. Deleting again is `404`.
+//
+// `DELETE /v1/messages/{message_id}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:write.
+func (c *Client) DeleteMessage(ctx context.Context, messageID string, opts ...RequestOption) (*ChatMessage, error) {
+	var q url.Values
+	var out ChatMessage
+	if err := c.doJSON(ctx, "DELETE", "/v1/messages/"+url.PathEscape(messageID), q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AddMessageReaction — Add a reaction on behalf of a user
+//
+// Sets `user_id`'s `reaction` on the message (idempotent: repeating is `changed: false`). A
+// message carries at most `chat.reactions_per_message` distinct reactions (`400` beyond that);
+// direct messages accept reactions only from their two parties (`404` otherwise). Changes fan out
+// as `ChatReactionChanged` to everyone who sees the message.
+//
+// `PUT /v1/messages/{message_id}/reactions/{reaction}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:write.
+func (c *Client) AddMessageReaction(ctx context.Context, messageID string, reaction string, body ReactionRequest, opts ...RequestOption) (*ReactionChange, error) {
+	var q url.Values
+	var out ReactionChange
+	if err := c.doJSON(ctx, "PUT", "/v1/messages/"+url.PathEscape(messageID)+"/reactions/"+url.PathEscape(reaction), q, body, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RemoveMessageReaction — Remove a user's reaction
+//
+// Clears `user_id`'s `reaction` from the message (idempotent).
+//
+// `DELETE /v1/messages/{message_id}/reactions/{reaction}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:write.
+func (c *Client) RemoveMessageReaction(ctx context.Context, messageID string, reaction string, query *RemoveMessageReactionQuery, opts ...RequestOption) (*ReactionChange, error) {
+	q := url.Values{}
+	if query != nil {
+		if query.UserID != nil {
+			q.Set("user_id", *query.UserID)
+		}
+	}
+	var out ReactionChange
+	if err := c.doJSON(ctx, "DELETE", "/v1/messages/"+url.PathEscape(messageID)+"/reactions/"+url.PathEscape(reaction), q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

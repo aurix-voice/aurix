@@ -304,6 +304,11 @@ public:
     int mark_direct_read(const String& user_id, const String& message_id);
     int channel_read_markers(const String& channel_id);
     int direct_read_markers(const String& user_id);
+    int64_t edit_chat(const String& message_id, const String& text, const String& metadata_json);
+    int64_t delete_chat(const String& message_id);
+    int react_chat(const String& message_id, const String& reaction, bool add);
+    int64_t search_channel_chat(const String& channel_id, const String& query, const String& from_user_id, const String& before, int limit);
+    int64_t search_direct_chat(const String& user_id, const String& query, const String& from_user_id, const String& before, int limit);
     int64_t moderate(const String& channel_id, const String& user_id, ModerationAction action,
                      const String& action_token, const String& reason);
     int64_t speak(const String& text, const String& channel_id, TtsDestination destination, const String& voice);

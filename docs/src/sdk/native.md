@@ -40,9 +40,12 @@ Full reference: `crates/aurix-client/README.md` and `sdk/unreal/README.md`.
   `aurix_client_failover_endpoint*`, `AURIX_EVENT_ENDPOINT_CHANGED`, `migrated` on
   `RECOVERED` — same session/SSRC, new media key/endpoint, see
   [High availability](../operations/high-availability.md#cross-node-session-failover)), chat
-  (including stored history pages, read markers and the offline inbox —
-  `aurix_client_chat_history`, `aurix_client_mark_chat_read`, `aurix_client_chat_read_markers`,
-  `AURIX_EVENT_CHAT_HISTORY` / `CHAT_READ_MARKER(S)` / `CHAT_INBOX_SYNCED`, see
+  (including stored history pages, read markers, the offline inbox, edits / deletions,
+  reactions and search — `aurix_client_chat_history`, `aurix_client_mark_chat_read`,
+  `aurix_client_chat_read_markers`, `aurix_client_edit_chat` / `aurix_client_delete_chat`,
+  `aurix_client_react_chat`, `aurix_client_search_chat`, `AURIX_EVENT_CHAT_HISTORY` /
+  `CHAT_READ_MARKER(S)` / `CHAT_INBOX_SYNCED` / `CHAT_MESSAGE_UPDATED` / `CHAT_REACTION_CHANGED` /
+  `CHAT_SEARCH_RESULT`, see
   [Text chat](../features/chat.md#stored-chat-history-offline-delivery-read-markers)),
   moderation with action tokens, transcripts, TTS, recording consent, positions, statistics —
   behind a synchronous, thread-safe API with a poll-based event queue.

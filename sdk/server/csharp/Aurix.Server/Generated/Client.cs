@@ -1939,4 +1939,142 @@ public sealed partial class AurixClient : AurixHttp
         return SendJsonAsync<ListChannelReadMarkersResponse>("/v1/channels/" + Uri.EscapeDataString(channelId) + "/read-markers", HttpMethod.Get, q, null, options, cancellationToken);
     }
 
+    /// <summary>
+    /// Search channel messages
+    ///
+    /// Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+    /// `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+    /// to older matches (`next_after` is never set for a search page).
+    ///
+    /// `GET /v1/channels/{channel_id}/messages/search`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:read.
+    /// </summary>
+    public Task<ChatHistoryPage> SearchChannelMessagesAsync(string channelId, SearchChannelMessagesQuery? query = null, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        var q = new Dictionary<string, string>();
+        if (query is not null)
+        {
+            if (query.Q is not null) q["q"] = query.Q;
+            if (query.FromUserId is not null) q["from_user_id"] = query.FromUserId;
+            if (query.Before is not null) q["before"] = query.Before;
+            if (query.Limit is not null) q["limit"] = query.Limit.Value.ToString(CultureInfo.InvariantCulture);
+        }
+        return SendJsonAsync<ChatHistoryPage>("/v1/channels/" + Uri.EscapeDataString(channelId) + "/messages/search", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Search a user's messages
+    ///
+    /// Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+    /// `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+    /// to older matches (`next_after` is never set for a search page). Without `peer` the search covers
+    /// every directed message the user sent or received (moderation view).
+    ///
+    /// `GET /v1/users/{user_id}/messages/search`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:read.
+    /// </summary>
+    public Task<ChatHistoryPage> SearchUserMessagesAsync(string userId, SearchUserMessagesQuery? query = null, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        var q = new Dictionary<string, string>();
+        if (query is not null)
+        {
+            if (query.Q is not null) q["q"] = query.Q;
+            if (query.FromUserId is not null) q["from_user_id"] = query.FromUserId;
+            if (query.Before is not null) q["before"] = query.Before;
+            if (query.Limit is not null) q["limit"] = query.Limit.Value.ToString(CultureInfo.InvariantCulture);
+            if (query.Peer is not null) q["peer"] = query.Peer;
+        }
+        return SendJsonAsync<ChatHistoryPage>("/v1/users/" + Uri.EscapeDataString(userId) + "/messages/search", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Get a stored message
+    ///
+    /// One stored message of the app with its reaction tallies; deleted messages are returned as
+    /// tombstones (`deleted_at` set, empty `text`). Requires `chat.persist = true` (otherwise `404`).
+    ///
+    /// `GET /v1/messages/{message_id}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:read.
+    /// </summary>
+    public Task<ChatMessage> GetMessageAsync(string messageId, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<ChatMessage>("/v1/messages/" + Uri.EscapeDataString(messageId), HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Edit a message
+    ///
+    /// Operator edit of any stored, not deleted message of the app: replaces `text` and `metadata`,
+    /// sets `edited_at`. The author / `chat.edit_window_secs` rules and the text filters apply to
+    /// players, not to this endpoint. Everyone who sees the message receives `ChatMessageUpdated`; the
+    /// id and `sent_at` never change.
+    ///
+    /// `PATCH /v1/messages/{message_id}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:write.
+    /// </summary>
+    public Task<ChatMessage> EditMessageAsync(string messageId, EditMessageRequest body, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<ChatMessage>("/v1/messages/" + Uri.EscapeDataString(messageId), HttpMethod.Patch, q, body, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Delete a message
+    ///
+    /// Operator deletion: the message becomes a tombstone (`deleted_at`, `deleted_by` = nil system
+    /// user) that keeps its id and position in history but loses text, metadata and reactions. Deleted
+    /// messages are excluded from search, unread counts and offline replay. Deleting again is `404`.
+    ///
+    /// `DELETE /v1/messages/{message_id}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:write.
+    /// </summary>
+    public Task<ChatMessage> DeleteMessageAsync(string messageId, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<ChatMessage>("/v1/messages/" + Uri.EscapeDataString(messageId), HttpMethod.Delete, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Add a reaction on behalf of a user
+    ///
+    /// Sets `user_id`'s `reaction` on the message (idempotent: repeating is `changed: false`). A
+    /// message carries at most `chat.reactions_per_message` distinct reactions (`400` beyond that);
+    /// direct messages accept reactions only from their two parties (`404` otherwise). Changes fan out
+    /// as `ChatReactionChanged` to everyone who sees the message.
+    ///
+    /// `PUT /v1/messages/{message_id}/reactions/{reaction}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:write.
+    /// </summary>
+    public Task<ReactionChange> AddMessageReactionAsync(string messageId, string reaction, ReactionRequest body, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<ReactionChange>("/v1/messages/" + Uri.EscapeDataString(messageId) + "/reactions/" + Uri.EscapeDataString(reaction), HttpMethod.Put, q, body, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Remove a user's reaction
+    ///
+    /// Clears `user_id`'s `reaction` from the message (idempotent).
+    ///
+    /// `DELETE /v1/messages/{message_id}/reactions/{reaction}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:write.
+    /// </summary>
+    public Task<ReactionChange> RemoveMessageReactionAsync(string messageId, string reaction, RemoveMessageReactionQuery? query = null, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        var q = new Dictionary<string, string>();
+        if (query is not null)
+        {
+            if (query.UserId is not null) q["user_id"] = query.UserId;
+        }
+        return SendJsonAsync<ReactionChange>("/v1/messages/" + Uri.EscapeDataString(messageId) + "/reactions/" + Uri.EscapeDataString(reaction), HttpMethod.Delete, q, null, options, cancellationToken);
+    }
+
 }

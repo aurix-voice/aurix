@@ -455,6 +455,43 @@ export interface ChatMessage {
   offline: boolean;
   /** Opaque history cursor of this message (`before` / `after` of {@link AurixClient.history}). */
   cursor: string;
+  /** When the text was last edited; `undefined` for a never-edited message. */
+  editedAt?: Date;
+  /**
+   * Tombstone of a deleted message: same `id`, `sentAt` and `cursor` as the original, empty
+   * `text`, no `metadata`, no `reactions`. Replace the displayed copy with a placeholder.
+   */
+  deletedAt?: Date;
+  /** Who deleted it: the author, a channel moderator or (`SYSTEM_USER_ID`) the operator. */
+  deletedBy?: string;
+  /** Reaction tallies of a stored message (history / search); live messages start with none. */
+  reactions: ChatReaction[];
+}
+
+/** One reaction on a message and who carries it. */
+export interface ChatReaction {
+  /** Emoji or a short game-defined token (≤ 32 bytes). */
+  reaction: string;
+  count: number;
+  /** At most the first 20 users; compare with `count` to know whether the list is complete. */
+  userIds: string[];
+}
+
+/** A user added or removed a reaction; see {@link AurixEvents.chatReactionChanged}. */
+export interface ChatReactionChange {
+  messageId: string;
+  /** Set for channel messages. */
+  channelId?: string;
+  /** Author and (direct messages) recipient of the message the reaction is on. */
+  messageFromUserId: string;
+  messageToUserId?: string;
+  /** Who reacted (`own` when this user, possibly from another device). */
+  userId: string;
+  reaction: string;
+  added: boolean;
+  /** Users carrying `reaction` on the message after this change. */
+  count: number;
+  timestamp: Date;
 }
 
 /** A stored text conversation: a joined channel, or the direct exchange with one user. */
@@ -476,6 +513,27 @@ export interface HistoryPage {
   nextBefore?: string;
   /** Cursor for the next newer page; `undefined` when the page is the most recent. */
   nextAfter?: string;
+}
+
+export interface SearchOptions {
+  /** Only messages of this author. */
+  fromUserId?: string;
+  /** Cursor (`nextBefore` of a previous result page): only older matches. */
+  before?: string;
+  /** Page size; the server clamps it (`chat.history_page_max`). */
+  limit?: number;
+}
+
+/** One page of search matches, newest first; page on with `{ before: nextBefore }`. */
+export interface SearchPage {
+  query: string;
+  messages: ChatMessage[];
+  nextBefore?: string;
+}
+
+export interface EditMessageOptions {
+  /** New game payload. An edit replaces the whole message: omitting it clears the current one. */
+  metadata?: JsonValue;
 }
 
 /** A user's reading position in a channel or a direct conversation. */
@@ -704,6 +762,14 @@ export interface AurixEvents {
    * the server has read receipts on, another participant's in a shared conversation.
    */
   chatReadMarker: (marker: ReadMarker) => void;
+  /**
+   * A message of one of this client's conversations was edited or deleted — the server's
+   * full copy with the same `id`; replace the displayed one. The editing / deleting client
+   * itself receives it too (also resolved from `editMessage` / `deleteMessage`).
+   */
+  chatMessageUpdated: (message: ChatMessage) => void;
+  /** Someone (this user included) added or removed a reaction on a message this client can see. */
+  chatReactionChanged: (change: ChatReactionChange) => void;
   /**
    * Once per connection, after the directed messages that arrived while this user was
    * offline were replayed as `chatMessage` events with `offline: true`. `truncated`: older
@@ -962,6 +1028,7 @@ export class AurixClient {
   /** client_ref → pending `sendMessage`/`sendDirectMessage`. */
   private pendingChat = new Map<string, Pending<ChatMessage>>();
   private pendingHistory = new Map<string, Pending<HistoryPage>>();
+  private pendingSearch = new Map<string, Pending<SearchPage>>();
   private pendingReadMarkers = new Map<string, Pending<ReadMarkers>[]>();
   private chatRefCounter = 0;
   /** channel id → last `ChatTyping { typing: true }` sent (ms, `performance.now()` clock). */
@@ -2563,6 +2630,11 @@ export class AurixClient {
       p.reject(new Error(reason));
     }
     this.pendingHistory.clear();
+    for (const p of this.pendingSearch.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this.pendingSearch.clear();
     for (const list of this.pendingReadMarkers.values()) {
       for (const p of list) {
         clearTimeout(p.timer);
@@ -2911,6 +2983,80 @@ export class AurixClient {
       }, this.opts.requestTimeoutMs);
       this.pendingChat.set(clientRef, { resolve, reject, timer });
       this.send(build(clientRef));
+    });
+  }
+
+  /**
+   * Replace the text (and optionally the metadata) of a message this user sent, within the
+   * server's edit window (`chat.edit_window_secs`, 15 min by default). Resolves with the
+   * updated copy (`editedAt` set), which every participant also receives as
+   * `chatMessageUpdated`. Rejects with `AUTH_DENIED` (not the author / window over / edits
+   * disabled), `NOT_FOUND`, `MESSAGE_BLOCKED`, `RATE_LIMIT_EXCEEDED` or `VALIDATION_ERROR`.
+   */
+  editMessage(messageId: string, text: string, options: EditMessageOptions = {}): Promise<ChatMessage> {
+    return this.sendChat((clientRef) => ({
+      type: 'ChatEdit',
+      data: {
+        message_id: messageId,
+        text,
+        ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
+        client_ref: clientRef,
+      },
+    }));
+  }
+
+  /**
+   * Delete a message: this user's own (within the edit window) or, as a moderator of the
+   * channel it was sent in, anyone's. The message becomes a tombstone (same `id`, empty
+   * `text`, `deletedAt` set) that every participant receives as `chatMessageUpdated` and
+   * that stays in history in place. Deleting an already deleted message resolves with the
+   * existing tombstone. Rejects with `AUTH_DENIED` or `NOT_FOUND`.
+   */
+  deleteMessage(messageId: string): Promise<ChatMessage> {
+    return this.sendChat((clientRef) => ({
+      type: 'ChatDelete',
+      data: { message_id: messageId, client_ref: clientRef },
+    }));
+  }
+
+  /**
+   * Add (`add: true`) or remove this user's `reaction` (an emoji or a short token, ≤ 32
+   * bytes) on a message this client can see. Idempotent: repeating a state is a silent
+   * no-op; a change reaches everyone — this client included — as `chatReactionChanged`.
+   * Refusals (`AUTH_DENIED`, `NOT_FOUND`, `RATE_LIMIT_EXCEEDED`, `VALIDATION_ERROR` — e.g.
+   * the per-message cap on distinct reactions) arrive as `serverError`.
+   */
+  react(messageId: string, reaction: string, add = true): void {
+    this.requireOpen();
+    this.send({ type: 'ChatReact', data: { message_id: messageId, reaction, add } });
+  }
+
+  /**
+   * Full-text search (`chat.search` on the server) in a joined channel or in the direct
+   * conversation with a user, newest match first; deleted messages never match. Rate
+   * limited per session (`chat.searches_per_minute`). Rejects with `AUTH_DENIED`,
+   * `NOT_FOUND` (search / storage off), `RATE_LIMIT_EXCEEDED`, `VALIDATION_ERROR`.
+   */
+  search(scope: ChatScope, query: string, options: SearchOptions = {}): Promise<SearchPage> {
+    this.requireOpen();
+    const clientRef = `s${++this.chatRefCounter}-${Date.now().toString(36)}`;
+    return new Promise<SearchPage>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingSearch.delete(clientRef);
+        reject(new Error('search request timed out'));
+      }, this.opts.requestTimeoutMs);
+      this.pendingSearch.set(clientRef, { resolve, reject, timer });
+      this.send({
+        type: 'ChatSearch',
+        data: {
+          ...scopeWire(scope),
+          query,
+          ...(options.fromUserId !== undefined ? { from_user_id: options.fromUserId } : {}),
+          ...(options.before !== undefined ? { before: options.before } : {}),
+          ...(options.limit !== undefined ? { limit: options.limit } : {}),
+          client_ref: clientRef,
+        },
+      });
     });
   }
 
@@ -3657,6 +3803,12 @@ export class AurixClient {
             this.pendingHistory.delete(d.client_ref);
             history.reject(new Error(`${d.code}: ${d.message}`));
           }
+          const search = this.pendingSearch.get(d.client_ref);
+          if (search) {
+            clearTimeout(search.timer);
+            this.pendingSearch.delete(d.client_ref);
+            search.reject(new Error(`${d.code}: ${d.message}`));
+          }
           const speak = this.pendingSpeak.get(d.client_ref);
           if (speak) {
             clearTimeout(speak.timer);
@@ -3702,6 +3854,47 @@ export class AurixClient {
           }
         }
         this.emit('chatMessage', message);
+        return;
+      }
+      case 'ChatMessageUpdated': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatMessageUpdated' }>).data;
+        const message = this.toChatMessage(d.message);
+        if (message.clientRef !== undefined) {
+          const pending = this.pendingChat.get(message.clientRef);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingChat.delete(message.clientRef);
+            pending.resolve(message);
+          }
+        }
+        this.emit('chatMessageUpdated', message);
+        return;
+      }
+      case 'ChatReactionChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatReactionChanged' }>).data;
+        const change: ChatReactionChange = {
+          messageId: d.message_id,
+          messageFromUserId: d.message_from_user_id,
+          userId: d.user_id,
+          reaction: d.reaction,
+          added: d.added,
+          count: d.count,
+          timestamp: new Date(d.timestamp),
+        };
+        if (d.channel_id != null) change.channelId = d.channel_id;
+        if (d.message_to_user_id != null) change.messageToUserId = d.message_to_user_id;
+        this.emit('chatReactionChanged', change);
+        return;
+      }
+      case 'ChatSearchResult': {
+        const d = (msg as Extract<ServerMessage, { type: 'ChatSearchResult' }>).data;
+        const pending = d.client_ref != null ? this.pendingSearch.get(d.client_ref) : undefined;
+        if (!pending || d.client_ref == null) return;
+        clearTimeout(pending.timer);
+        this.pendingSearch.delete(d.client_ref);
+        const page: SearchPage = { query: d.query, messages: d.messages.map((m) => this.toChatMessage(m)) };
+        if (d.next_before != null) page.nextBefore = d.next_before;
+        pending.resolve(page);
         return;
       }
       case 'ChatHistoryResult': {
@@ -4076,11 +4269,15 @@ export class AurixClient {
       system: w.from_user_id === SYSTEM_USER_ID,
       offline: w.offline === true,
       cursor: encodeChatCursor(w.sent_at, w.id),
+      reactions: (w.reactions ?? []).map((r) => ({ reaction: r.reaction, count: r.count, userIds: r.user_ids ?? [] })),
     };
     if (w.channel_id != null) m.channelId = w.channel_id;
     if (w.to_user_id != null) m.toUserId = w.to_user_id;
     if (w.metadata != null) m.metadata = w.metadata;
     if (clientRef !== undefined) m.clientRef = clientRef;
+    if (w.edited_at != null) m.editedAt = new Date(w.edited_at);
+    if (w.deleted_at != null) m.deletedAt = new Date(w.deleted_at);
+    if (w.deleted_by != null) m.deletedBy = w.deleted_by;
     return m;
   }
 

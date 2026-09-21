@@ -19,6 +19,7 @@ public class AurixVoice : ModuleRules
 			"AudioCaptureCore",
 			"AudioCapture",
 			"HTTP",
+			"Json",
 			"Projects",
 			"AurixClientLibrary",
 		});

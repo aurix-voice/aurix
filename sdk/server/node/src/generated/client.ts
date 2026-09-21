@@ -1525,4 +1525,109 @@ export class AurixClient extends AurixHttp {
     return this.json<T.ListChannelReadMarkersResponse>("GET", `/v1/channels/${encodeURIComponent(channelId)}/read-markers`, { ...options });
   }
 
+  /**
+   * Search channel messages
+   *
+   * Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+   * `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+   * to older matches (`next_after` is never set for a search page).
+   *
+   * `GET /v1/channels/{channel_id}/messages/search`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:read.
+   */
+  searchChannelMessages(channelId: string, query: T.SearchChannelMessagesQuery, options?: RequestOptions): Promise<T.ChatHistoryPage> {
+    return this.json<T.ChatHistoryPage>("GET", `/v1/channels/${encodeURIComponent(channelId)}/messages/search`, { query, ...options });
+  }
+
+  /**
+   * Search a user's messages
+   *
+   * Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+   * `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+   * to older matches (`next_after` is never set for a search page). Without `peer` the search covers
+   * every directed message the user sent or received (moderation view).
+   *
+   * `GET /v1/users/{user_id}/messages/search`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:read.
+   */
+  searchUserMessages(userId: string, query: T.SearchUserMessagesQuery, options?: RequestOptions): Promise<T.ChatHistoryPage> {
+    return this.json<T.ChatHistoryPage>("GET", `/v1/users/${encodeURIComponent(userId)}/messages/search`, { query, ...options });
+  }
+
+  /**
+   * Get a stored message
+   *
+   * One stored message of the app with its reaction tallies; deleted messages are returned as
+   * tombstones (`deleted_at` set, empty `text`). Requires `chat.persist = true` (otherwise `404`).
+   *
+   * `GET /v1/messages/{message_id}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:read.
+   */
+  getMessage(messageId: string, options?: RequestOptions): Promise<T.ChatMessage> {
+    return this.json<T.ChatMessage>("GET", `/v1/messages/${encodeURIComponent(messageId)}`, { ...options });
+  }
+
+  /**
+   * Edit a message
+   *
+   * Operator edit of any stored, not deleted message of the app: replaces `text` and `metadata`,
+   * sets `edited_at`. The author / `chat.edit_window_secs` rules and the text filters apply to
+   * players, not to this endpoint. Everyone who sees the message receives `ChatMessageUpdated`; the
+   * id and `sent_at` never change.
+   *
+   * `PATCH /v1/messages/{message_id}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:write.
+   */
+  editMessage(messageId: string, body: T.EditMessageRequest, options?: RequestOptions): Promise<T.ChatMessage> {
+    return this.json<T.ChatMessage>("PATCH", `/v1/messages/${encodeURIComponent(messageId)}`, { body, ...options });
+  }
+
+  /**
+   * Delete a message
+   *
+   * Operator deletion: the message becomes a tombstone (`deleted_at`, `deleted_by` = nil system
+   * user) that keeps its id and position in history but loses text, metadata and reactions. Deleted
+   * messages are excluded from search, unread counts and offline replay. Deleting again is `404`.
+   *
+   * `DELETE /v1/messages/{message_id}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:write.
+   */
+  deleteMessage(messageId: string, options?: RequestOptions): Promise<T.ChatMessage> {
+    return this.json<T.ChatMessage>("DELETE", `/v1/messages/${encodeURIComponent(messageId)}`, { ...options });
+  }
+
+  /**
+   * Add a reaction on behalf of a user
+   *
+   * Sets `user_id`'s `reaction` on the message (idempotent: repeating is `changed: false`). A
+   * message carries at most `chat.reactions_per_message` distinct reactions (`400` beyond that);
+   * direct messages accept reactions only from their two parties (`404` otherwise). Changes fan out
+   * as `ChatReactionChanged` to everyone who sees the message.
+   *
+   * `PUT /v1/messages/{message_id}/reactions/{reaction}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:write.
+   */
+  addMessageReaction(messageId: string, reaction: string, body: T.ReactionRequest, options?: RequestOptions): Promise<T.ReactionChange> {
+    return this.json<T.ReactionChange>("PUT", `/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reaction)}`, { body, ...options });
+  }
+
+  /**
+   * Remove a user's reaction
+   *
+   * Clears `user_id`'s `reaction` from the message (idempotent).
+   *
+   * `DELETE /v1/messages/{message_id}/reactions/{reaction}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:write.
+   */
+  removeMessageReaction(messageId: string, reaction: string, query: T.RemoveMessageReactionQuery, options?: RequestOptions): Promise<T.ReactionChange> {
+    return this.json<T.ReactionChange>("DELETE", `/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reaction)}`, { query, ...options });
+  }
+
 }

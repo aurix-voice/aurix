@@ -5,9 +5,11 @@ import type {
   ChatScope,
   E2eeOptions,
   ConnectionState,
+  EditMessageOptions,
   HistoryOptions,
   ParticipantStreamInfo,
   ReconnectPolicy,
+  SearchOptions,
   SendMessageOptions,
   SpeakOptions,
   TransmissionMode,
@@ -387,6 +389,26 @@ export class AurixBridge {
         return null;
       case 'readMarkers':
         return c.readMarkers(chatScope(a));
+      case 'editMessage': {
+        const options: EditMessageOptions = {};
+        if (a['metadata'] !== undefined) options.metadata = a['metadata'] as JsonValue;
+        return c.editMessage(str(a, 'messageId'), str(a, 'text'), options);
+      }
+      case 'deleteMessage':
+        return c.deleteMessage(str(a, 'messageId'));
+      case 'react':
+        c.react(str(a, 'messageId'), str(a, 'reaction'), a['add'] !== false);
+        return null;
+      case 'search': {
+        const options: SearchOptions = {};
+        const fromUserId = optString(a, 'fromUserId');
+        const before = optString(a, 'before');
+        const limit = optNumber(a, 'limit');
+        if (fromUserId !== undefined) options.fromUserId = fromUserId;
+        if (before !== undefined) options.before = before;
+        if (limit !== undefined) options.limit = limit;
+        return c.search(chatScope(a), str(a, 'query'), options);
+      }
 
       // Speech
       case 'speak': {
@@ -568,6 +590,8 @@ export class AurixBridge {
     on('sessionClosed', (reason) => q({ type: 'sessionClosed', reason }));
     on('chatMessage', (message) => q({ type: 'chatMessage', message }));
     on('chatReadMarker', (marker) => q({ type: 'chatReadMarker', marker }));
+    on('chatMessageUpdated', (message) => q({ type: 'chatMessageUpdated', message }));
+    on('chatReactionChanged', (change) => q({ type: 'chatReactionChanged', change }));
     on('chatInboxSynced', (delivered, truncated) => q({ type: 'chatInboxSynced', delivered, truncated }));
     on('participantTyping', (channelId, userId, typing) => q({ type: 'participantTyping', channelId, userId, typing }));
     on('transcript', (transcript) => q({ type: 'transcript', transcript }));

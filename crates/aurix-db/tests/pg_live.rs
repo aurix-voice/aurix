@@ -3,7 +3,9 @@
 //! inbox, tenant scoping and the deletion cascades. Every run uses fresh app ids and removes
 //! them afterwards, so it can share the database with running nodes.
 
-use aurix_db::models::{AppRow, ChatConversation, ChatMessageRow, MessageCursor, UserRow};
+use aurix_db::models::{
+    AppRow, ChatConversation, ChatMessageRow, ChatSearchScope, MessageCursor, ReactionAdd, UserRow,
+};
 use aurix_db::queries;
 use aurix_db::DbPool;
 use chrono::{DateTime, Duration, Utc};
@@ -96,6 +98,9 @@ async fn insert(
         metadata: None,
         sent_at,
         offline,
+        edited_at: None,
+        deleted_at: None,
+        deleted_by: None,
     };
     queries::insert_chat_message(pool, &row)
         .await
@@ -580,4 +585,521 @@ fn cursor_of(m: &aurix_db::models::ChatReadMarkerRow) -> MessageCursor {
         sent_at: m.message_sent_at,
         id: m.message_id,
     }
+}
+
+/// Edits keep the row's cursor and stamp `edited_at`; a deletion is a tombstone (empty text, no
+/// metadata, reactions gone, `deleted_by` recorded) that stays in history at its position but
+/// leaves search, unread counts and the offline inbox; reactions are idempotent per
+/// (user, reaction), capped per message in distinct kinds, counted exactly and listed with a
+/// bounded reader-first user list; search is tenant-, conversation- and author-scoped, pages
+/// backwards by keyset and treats a term-less query as "nothing to search".
+#[tokio::test]
+#[ignore = "requires PostgreSQL (AURIX_E2E_DATABASE_URL)"]
+async fn edits_tombstones_reactions_and_search() {
+    let Some(pool) = pool().await else {
+        eprintln!("AURIX_E2E_DATABASE_URL not set; skipping");
+        return;
+    };
+    let app_id = app(&pool, "edits").await;
+    let other_app = app(&pool, "edits-other").await;
+    let alice = user(&pool, app_id, "alice").await;
+    let bob = user(&pool, app_id, "bob").await;
+    let carol = user(&pool, app_id, "carol").await;
+    let stranger = user(&pool, other_app, "stranger").await;
+    let channel = Uuid::new_v4();
+    // Whole seconds: PostgreSQL stores microseconds, and the test compares round-tripped stamps.
+    let base = DateTime::<Utc>::from_timestamp(Utc::now().timestamp() - 600, 0).unwrap();
+
+    // Channel: three "loot" messages (two by Alice, one by Bob) plus one unrelated.
+    let loot1 = insert(
+        &pool,
+        app_id,
+        Some(channel),
+        alice,
+        None,
+        "loot drop at the bridge",
+        base,
+        false,
+    )
+    .await;
+    let loot2 = insert(
+        &pool,
+        app_id,
+        Some(channel),
+        bob,
+        None,
+        "who took the loot?",
+        base + Duration::seconds(1),
+        false,
+    )
+    .await;
+    let loot3 = insert(
+        &pool,
+        app_id,
+        Some(channel),
+        alice,
+        None,
+        "LOOT is mine, GG",
+        base + Duration::seconds(2),
+        false,
+    )
+    .await;
+    let other = insert(
+        &pool,
+        app_id,
+        Some(channel),
+        bob,
+        None,
+        "regroup at spawn",
+        base + Duration::seconds(3),
+        false,
+    )
+    .await;
+    // Direct: Alice ↔ Bob and Carol → Alice (offline), all mentioning loot; a foreign tenant too.
+    let dm_ab = insert(
+        &pool,
+        app_id,
+        None,
+        alice,
+        Some(bob),
+        "keep the loot",
+        base,
+        false,
+    )
+    .await;
+    let dm_ba = insert(
+        &pool,
+        app_id,
+        None,
+        bob,
+        Some(alice),
+        "loot split 50/50",
+        base + Duration::seconds(1),
+        false,
+    )
+    .await;
+    let dm_ca = insert(
+        &pool,
+        app_id,
+        None,
+        carol,
+        Some(alice),
+        "need loot too",
+        base + Duration::seconds(2),
+        true,
+    )
+    .await;
+    insert(
+        &pool,
+        other_app,
+        Some(channel),
+        stranger,
+        None,
+        "loot loot loot",
+        base,
+        false,
+    )
+    .await;
+
+    // ── edit ──
+    let edited = queries::update_chat_message_text(
+        &pool,
+        app_id,
+        loot2.id,
+        "who took the epic loot?",
+        &Some(serde_json::json!({"k": 1})),
+    )
+    .await
+    .unwrap()
+    .expect("edited row");
+    assert_eq!(edited.text, "who took the epic loot?");
+    assert_eq!(edited.metadata, Some(serde_json::json!({"k": 1})));
+    assert!(edited.edited_at.is_some() && edited.deleted_at.is_none());
+    assert_eq!(
+        edited.sent_at, loot2.sent_at,
+        "edit keeps the original position"
+    );
+    assert!(
+        queries::update_chat_message_text(&pool, other_app, loot2.id, "x", &None)
+            .await
+            .unwrap()
+            .is_none(),
+        "another tenant cannot edit by id"
+    );
+    assert_eq!(
+        queries::get_chat_message(&pool, app_id, loot2.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        "who took the epic loot?"
+    );
+
+    // ── reactions ──
+    let add = |msg: Uuid, who: Uuid, r: &'static str| {
+        let pool = pool.clone();
+        async move {
+            queries::add_chat_reaction(&pool, app_id, msg, who, r, 2)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(add(loot1.id, bob, "+1").await, ReactionAdd::Added);
+    assert_eq!(
+        add(loot1.id, bob, "+1").await,
+        ReactionAdd::AlreadySet,
+        "duplicate add is a no-op"
+    );
+    assert_eq!(add(loot1.id, carol, "+1").await, ReactionAdd::Added);
+    assert_eq!(add(loot1.id, alice, "+1").await, ReactionAdd::Added);
+    assert_eq!(add(loot1.id, alice, "fire").await, ReactionAdd::Added);
+    assert_eq!(
+        add(loot1.id, bob, "skull").await,
+        ReactionAdd::TooManyDistinct,
+        "third distinct reaction exceeds max_distinct = 2"
+    );
+    assert_eq!(
+        add(loot1.id, bob, "fire").await,
+        ReactionAdd::Added,
+        "an existing kind is still open"
+    );
+    assert_eq!(
+        queries::count_chat_reaction(&pool, app_id, loot1.id, "+1")
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        queries::count_chat_reaction(&pool, app_id, loot1.id, "fire")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        queries::count_chat_reaction(&pool, app_id, loot1.id, "skull")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        queries::count_chat_reaction(&pool, other_app, loot1.id, "+1")
+            .await
+            .unwrap(),
+        0,
+        "counts are tenant-scoped"
+    );
+    assert!(
+        queries::remove_chat_reaction(&pool, app_id, loot1.id, carol, "+1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !queries::remove_chat_reaction(&pool, app_id, loot1.id, carol, "+1")
+            .await
+            .unwrap(),
+        "duplicate remove is a no-op"
+    );
+    assert!(
+        !queries::remove_chat_reaction(&pool, other_app, loot1.id, bob, "+1")
+            .await
+            .unwrap(),
+        "another tenant cannot remove"
+    );
+    assert_eq!(
+        queries::count_chat_reaction(&pool, app_id, loot1.id, "+1")
+            .await
+            .unwrap(),
+        2
+    );
+    // Bounded, reader-first user list: shown = 1 lists only the reader when they reacted.
+    let tallies =
+        queries::list_chat_reactions(&pool, app_id, &[loot1.id, loot2.id], Some(alice), 1)
+            .await
+            .unwrap();
+    let plus = tallies
+        .iter()
+        .find(|t| t.message_id == loot1.id && t.reaction == "+1")
+        .expect("+1 tally");
+    assert_eq!(plus.count, 2);
+    assert_eq!(
+        plus.user_ids,
+        vec![alice],
+        "reader first, list bounded to `shown`"
+    );
+    let fire = tallies
+        .iter()
+        .find(|t| t.message_id == loot1.id && t.reaction == "fire")
+        .expect("fire tally");
+    assert_eq!(fire.count, 2);
+    assert_eq!(fire.user_ids.len(), 1);
+    assert!(
+        !tallies.iter().any(|t| t.message_id == loot2.id),
+        "messages without reactions have no tally"
+    );
+    let full = queries::list_chat_reactions(&pool, app_id, &[loot1.id], Some(bob), 20)
+        .await
+        .unwrap();
+    let plus_full = full.iter().find(|t| t.reaction == "+1").unwrap();
+    assert_eq!(plus_full.user_ids.len(), 2);
+    assert_eq!(plus_full.user_ids[0], bob, "the reader comes first");
+    assert!(
+        queries::list_chat_reactions(&pool, other_app, &[loot1.id], None, 20)
+            .await
+            .unwrap()
+            .is_empty(),
+        "tallies are tenant-scoped"
+    );
+
+    // ── search ──
+    let search = |scope: ChatSearchScope,
+                  q: &'static str,
+                  from: Option<Uuid>,
+                  before: Option<MessageCursor>,
+                  limit: i64| {
+        let pool = pool.clone();
+        async move {
+            queries::search_chat_messages(&pool, app_id, scope, q, from, before, limit)
+                .await
+                .unwrap()
+        }
+    };
+    let hits = search(ChatSearchScope::Channel(channel), "loot", None, None, 10)
+        .await
+        .expect("query has terms");
+    assert_eq!(
+        hits.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![loot3.id, loot2.id, loot1.id],
+        "newest first, case-insensitive, the edited text still matches"
+    );
+    assert!(
+        !hits.iter().any(|m| m.id == other.id),
+        "non-matching messages are not returned"
+    );
+    let alice_only = search(
+        ChatSearchScope::Channel(channel),
+        "loot",
+        Some(alice),
+        None,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        alice_only.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![loot3.id, loot1.id]
+    );
+    let page1 = search(ChatSearchScope::Channel(channel), "loot", None, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+    let page2 = search(
+        ChatSearchScope::Channel(channel),
+        "loot",
+        None,
+        Some(cursor(&page1[1])),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page2.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![loot1.id],
+        "keyset paging continues past the last hit"
+    );
+    let phrase = search(
+        ChatSearchScope::Channel(channel),
+        "\"epic loot\" -mine",
+        None,
+        None,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        phrase.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![loot2.id],
+        "web-search syntax: phrase + exclusion"
+    );
+    assert!(
+        search(ChatSearchScope::Channel(channel), "-", None, None, 10)
+            .await
+            .is_none(),
+        "a query without searchable terms is None"
+    );
+    assert!(
+        search(
+            ChatSearchScope::Channel(Uuid::new_v4()),
+            "loot",
+            None,
+            None,
+            10
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "unknown channel finds nothing"
+    );
+    assert!(
+        queries::search_chat_messages(
+            &pool,
+            other_app,
+            ChatSearchScope::Channel(channel),
+            "loot",
+            None,
+            None,
+            10
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .iter()
+        .all(|m| m.from_user_id == stranger),
+        "the other tenant only ever sees its own rows"
+    );
+    let direct = search(ChatSearchScope::Direct(alice, bob), "loot", None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        direct.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![dm_ba.id, dm_ab.id],
+        "both directions of one conversation"
+    );
+    let all_of_alice = search(ChatSearchScope::User(alice), "loot", None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        all_of_alice.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![dm_ca.id, dm_ba.id, dm_ab.id],
+        "every direct conversation of the user, no channel messages"
+    );
+    let all_of_carol = search(ChatSearchScope::User(carol), "loot", None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        all_of_carol.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![dm_ca.id]
+    );
+
+    // ── delete → tombstone ──
+    let unread_before = queries::count_unread_messages(
+        &pool,
+        app_id,
+        alice,
+        ChatConversation::Direct(carol),
+        None,
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(unread_before, 1);
+    assert_eq!(
+        queries::list_unread_offline_messages(&pool, app_id, alice, None, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let tomb = queries::delete_chat_message(&pool, app_id, dm_ca.id, carol)
+        .await
+        .unwrap()
+        .expect("deleted row");
+    assert_eq!(tomb.text, "");
+    assert!(tomb.metadata.is_none());
+    assert!(tomb.deleted_at.is_some());
+    assert_eq!(tomb.deleted_by, Some(carol));
+    assert_eq!(
+        tomb.sent_at, dm_ca.sent_at,
+        "the tombstone keeps its position"
+    );
+    assert!(
+        queries::delete_chat_message(&pool, app_id, dm_ca.id, alice)
+            .await
+            .unwrap()
+            .is_none(),
+        "a second delete changes nothing"
+    );
+    assert_eq!(
+        queries::count_unread_messages(
+            &pool,
+            app_id,
+            alice,
+            ChatConversation::Direct(carol),
+            None,
+            100
+        )
+        .await
+        .unwrap(),
+        0,
+        "deleted messages do not count as unread"
+    );
+    assert!(
+        queries::list_unread_offline_messages(&pool, app_id, alice, None, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "deleted messages are not replayed"
+    );
+    assert!(
+        search(ChatSearchScope::User(carol), "loot", None, None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "deleted messages leave search"
+    );
+    // Reactions vanish with the message; the tombstone stays in history at its place.
+    assert_eq!(add(loot1.id, bob, "+1").await, ReactionAdd::AlreadySet);
+    let tomb_ch = queries::delete_chat_message(&pool, app_id, loot1.id, Uuid::nil())
+        .await
+        .unwrap()
+        .expect("channel tombstone");
+    assert_eq!(
+        tomb_ch.deleted_by,
+        Some(Uuid::nil()),
+        "operator deletion records the nil user"
+    );
+    assert_eq!(
+        queries::count_chat_reaction(&pool, app_id, loot1.id, "+1")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        queries::list_chat_reactions(&pool, app_id, &[loot1.id], None, 20)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        add(loot1.id, bob, "+1").await,
+        ReactionAdd::Added,
+        "the storage layer does not refuse reactions on tombstones — ChatService::react does (live_message)"
+    );
+    let history = queries::list_channel_messages(&pool, app_id, channel, None, None, false, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        history.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![other.id, loot3.id, loot2.id, loot1.id],
+        "history keeps the tombstone in place"
+    );
+    let first = history.iter().find(|m| m.id == loot1.id).unwrap();
+    assert!(first.deleted_at.is_some() && first.text.is_empty());
+    let after_tomb =
+        queries::list_channel_messages(&pool, app_id, channel, None, Some(cursor(first)), true, 50)
+            .await
+            .unwrap();
+    assert_eq!(after_tomb.len(), 3, "the tombstone still works as a cursor");
+    assert_eq!(
+        search(ChatSearchScope::Channel(channel), "loot", None, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![loot3.id, loot2.id]
+    );
+
+    cleanup(&pool, &[app_id, other_app]).await;
+    assert_eq!(count(&pool, "chat_messages", app_id).await, 0);
+    assert_eq!(count(&pool, "chat_reactions", app_id).await, 0);
 }

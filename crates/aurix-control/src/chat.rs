@@ -7,15 +7,21 @@
 use crate::event_bus::{EventBus, ServerEvent};
 use aurix_common::config::ChatConfig;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::protocol::{ChatMessage, ChatReadMarker};
+use aurix_common::protocol::{
+    ChatMessage, ChatReaction, ChatReadMarker, REACTION_MAX_BYTES, REACTION_USERS_SHOWN,
+};
 use aurix_common::rate_limit::RateLimiter;
 use aurix_common::types::{AppId, ChannelId, SessionId, UserId};
 use aurix_common::usage::{UsageMeter, UsageMetric};
-use aurix_db::models::{ChatConversation, ChatMessageRow, ChatReadMarkerRow, MessageCursor};
+use aurix_db::models::{
+    ChatConversation, ChatMessageRow, ChatReactionRow, ChatReadMarkerRow, ChatSearchScope,
+    MessageCursor, ReactionAdd,
+};
 use aurix_db::DbPool;
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -54,6 +60,14 @@ pub enum Conversation {
 }
 
 impl Conversation {
+    fn search_scope(&self) -> ChatSearchScope {
+        match self {
+            Self::Channel(c) => ChatSearchScope::Channel(c.0),
+            Self::Direct { user, peer } => ChatSearchScope::Direct(user.0, peer.0),
+            Self::User(u) => ChatSearchScope::User(u.0),
+        }
+    }
+
     fn contains(&self, m: &ChatMessageRow, reader: UserId) -> bool {
         match self {
             Self::Channel(c) => m.channel_id == Some(c.0),
@@ -77,6 +91,16 @@ impl Conversation {
     }
 }
 
+/// Parameters of a full-text search: web-search syntax `query`, optional author filter, the
+/// opaque `before` cursor of the previous page and the page size.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchQuery<'a> {
+    pub query: &'a str,
+    pub from_user_id: Option<UserId>,
+    pub before: Option<&'a str>,
+    pub limit: Option<u32>,
+}
+
 /// One page of history, newest first. `next_before` is set when older messages exist,
 /// `next_after` when newer ones do.
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +110,51 @@ pub struct HistoryPage {
     pub next_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_after: Option<String>,
+}
+
+/// Who edits, deletes or reacts: a player through a session, or the REST API (`SYSTEM_USER`
+/// with no session), which is not bound by authorship or the edit window.
+#[derive(Debug, Clone, Copy)]
+pub struct Actor {
+    pub user_id: UserId,
+    pub session_id: Option<SessionId>,
+    /// The actor moderates the message's channel (checked by the caller against the live
+    /// roster): may delete others' messages there. Never applies to direct messages.
+    pub moderator: bool,
+}
+
+impl Actor {
+    pub fn system() -> Self {
+        Self {
+            user_id: SYSTEM_USER,
+            session_id: None,
+            moderator: true,
+        }
+    }
+
+    fn is_system(&self) -> bool {
+        self.user_id == SYSTEM_USER && self.session_id.is_none()
+    }
+}
+
+/// Result of `ChatService::react`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReactionChange {
+    pub message: ChatMessage,
+    pub reaction: String,
+    /// `false` when the request was a no-op (already set / already absent).
+    pub changed: bool,
+    /// Users carrying `reaction` after the change.
+    pub count: u32,
+}
+
+/// Result of `ChatService::delete`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Deletion {
+    /// The tombstone.
+    pub message: ChatMessage,
+    /// `false` when the message was already deleted (nothing published).
+    pub changed: bool,
 }
 
 /// Request body sent to `chat.filter_webhook`.
@@ -185,6 +254,7 @@ pub struct ChatService {
     /// Run in order; a `Replace` feeds the next stage, the first `Block` wins.
     filters: Vec<Arc<dyn TextFilter>>,
     flood: RateLimiter,
+    searches: RateLimiter,
     typing: DashMap<(SessionId, ChannelId), Instant>,
     usage: Option<Arc<UsageMeter>>,
 }
@@ -227,12 +297,16 @@ impl ChatService {
         filters: Vec<Arc<dyn TextFilter>>,
     ) -> Self {
         let flood = RateLimiter::new(cfg.messages_per_second, cfg.message_burst);
+        // `searches_per_minute` sustained (refill N/s, cost 60 per search) with the same burst.
+        let per_minute = cfg.searches_per_minute.max(1);
+        let searches = RateLimiter::new(per_minute, per_minute.saturating_mul(60));
         Self {
             cfg,
             pool,
             events,
             filters,
             flood,
+            searches,
             typing: DashMap::new(),
             usage: None,
         }
@@ -271,6 +345,17 @@ impl ChatService {
         } else {
             Err(AurixError::RateLimitExceeded(
                 "Too many chat messages".into(),
+            ))
+        }
+    }
+
+    /// Per-session budget of history searches (`chat.searches_per_minute`).
+    pub fn check_search_rate(&self, session_id: SessionId) -> Result<()> {
+        if self.searches.check_with_cost(&session_id.to_string(), 60.0) {
+            Ok(())
+        } else {
+            Err(AurixError::RateLimitExceeded(
+                "Too many chat searches".into(),
             ))
         }
     }
@@ -354,9 +439,15 @@ impl ChatService {
             to_user_id: msg.to_user_id,
             text: msg.text,
             metadata: msg.metadata,
-            sent_at: Utc::now(),
+            // Microsecond precision: what PostgreSQL stores, so live messages, history
+            // rows and keyset cursors agree on the position.
+            sent_at: Utc::now().trunc_subsecs(6),
             client_ref: None,
             offline: msg.offline,
+            edited_at: None,
+            deleted_at: None,
+            deleted_by: None,
+            reactions: Vec::new(),
         };
 
         if self.cfg.persist {
@@ -371,6 +462,9 @@ impl ChatService {
                 metadata: message.metadata.clone(),
                 sent_at: message.sent_at,
                 offline: message.offline,
+                edited_at: None,
+                deleted_at: None,
+                deleted_by: None,
             };
             aurix_db::queries::insert_chat_message(&self.pool, &row)
                 .await
@@ -388,6 +482,366 @@ impl ChatService {
             from_session_id: msg.from_session_id,
         });
         Ok(message)
+    }
+
+    /// A stored message of the app (tombstones included), without reactions — for callers
+    /// that need the conversation before authorising a mutation.
+    pub async fn message(&self, app_id: AppId, message_id: uuid::Uuid) -> Result<ChatMessage> {
+        self.ensure_history()?;
+        aurix_db::queries::get_chat_message(&self.pool, app_id.0, message_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_messages query: {e}")))?
+            .map(row_to_message)
+            .ok_or_else(|| AurixError::NotFound("Message not found".into()))
+    }
+
+    /// A stored message — tombstones included — with its reaction tallies.
+    pub async fn stored_message(
+        &self,
+        app_id: AppId,
+        message_id: uuid::Uuid,
+    ) -> Result<ChatMessage> {
+        self.ensure_history()?;
+        let row = aurix_db::queries::get_chat_message(&self.pool, app_id.0, message_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_messages query: {e}")))?
+            .ok_or_else(|| AurixError::NotFound("Message not found".into()))?;
+        Ok(self
+            .with_reactions(app_id, vec![row], None)
+            .await?
+            .remove(0))
+    }
+
+    async fn live_message(&self, app_id: AppId, message_id: uuid::Uuid) -> Result<ChatMessageRow> {
+        aurix_db::queries::get_chat_message(&self.pool, app_id.0, message_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_messages query: {e}")))?
+            .filter(|m| m.deleted_at.is_none())
+            .ok_or_else(|| AurixError::NotFound("Message not found".into()))
+    }
+
+    /// Authors may change their own messages within `chat.edit_window_secs`; the REST API
+    /// may change any message of the app.
+    fn check_author_window(
+        &self,
+        actor: Actor,
+        row: &ChatMessageRow,
+        verb: &str,
+        past: &str,
+    ) -> Result<()> {
+        if actor.is_system() {
+            return Ok(());
+        }
+        if row.from_user_id != actor.user_id.0 {
+            return Err(AurixError::AuthorizationDenied(format!(
+                "Only the author can {verb} this message"
+            )));
+        }
+        let window = self.cfg.edit_window_secs;
+        if window > 0 && Utc::now() - row.sent_at > chrono::Duration::seconds(window as i64) {
+            return Err(AurixError::AuthorizationDenied(format!(
+                "The message can no longer be {past} ({window} s window)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replaces the text / metadata of a stored message. Players edit only their own
+    /// messages within the edit window (filters apply); the REST API edits any message.
+    /// Publishes the result for every node; the returned copy has no `client_ref`.
+    pub async fn edit(
+        &self,
+        app_id: AppId,
+        message_id: uuid::Uuid,
+        actor: Actor,
+        mut text: String,
+        metadata: Option<serde_json::Value>,
+        client_ref: Option<String>,
+    ) -> Result<ChatMessage> {
+        self.ensure_history()?;
+        if !self.cfg.edits && !actor.is_system() {
+            return Err(AurixError::NotImplemented(
+                "Message edits are disabled (chat.edits = false)".into(),
+            ));
+        }
+        self.validate(&text, metadata.as_ref())?;
+        let row = self.live_message(app_id, message_id).await?;
+        self.check_author_window(actor, &row, "edit", "edited")?;
+        if !actor.is_system() {
+            let req = FilterRequest {
+                app_id,
+                channel_id: row.channel_id.map(ChannelId::from_uuid),
+                from_user_id: actor.user_id,
+                to_user_id: row.to_user_id.map(UserId::from_uuid),
+                session_id: actor.session_id,
+                display_name: &row.display_name,
+                text: &text,
+                metadata: metadata.as_ref(),
+            };
+            if let Some(replaced) = self.filter_text(req, self.cfg.max_message_bytes).await? {
+                text = replaced;
+            }
+        }
+        let row = aurix_db::queries::update_chat_message_text(
+            &self.pool, app_id.0, message_id, &text, &metadata,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("chat_messages update: {e}")))?
+        .ok_or_else(|| AurixError::NotFound("Message not found".into()))?;
+        let message = self
+            .with_reactions(app_id, vec![row], None)
+            .await?
+            .remove(0);
+        let mut published = message.clone();
+        published.client_ref = client_ref;
+        self.events.publish(ServerEvent::ChatMessageUpdated {
+            app_id,
+            message: published,
+            from_session_id: actor.session_id,
+        });
+        Ok(message)
+    }
+
+    /// Turns a message into a tombstone. Authors delete their own messages within the edit
+    /// window, channel moderators (`actor.moderator`) any message of that channel, the REST
+    /// API anything in the app. Reactions go with it; the row stays for cursors / markers.
+    /// Deleting a tombstone again is idempotent: the existing tombstone comes back to anyone
+    /// who could have deleted it, nothing is published.
+    pub async fn delete(
+        &self,
+        app_id: AppId,
+        message_id: uuid::Uuid,
+        actor: Actor,
+        client_ref: Option<String>,
+    ) -> Result<Deletion> {
+        self.ensure_history()?;
+        let row = aurix_db::queries::get_chat_message(&self.pool, app_id.0, message_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_messages query: {e}")))?
+            .ok_or_else(|| AurixError::NotFound("Message not found".into()))?;
+        let moderated = actor.moderator && row.channel_id.is_some() && !actor.is_system();
+        if row.deleted_at.is_some() {
+            let may_delete = moderated || actor.is_system() || row.from_user_id == actor.user_id.0;
+            return if may_delete {
+                Ok(Deletion {
+                    message: row_to_message(row),
+                    changed: false,
+                })
+            } else {
+                Err(AurixError::NotFound("Message not found".into()))
+            };
+        }
+        if !moderated {
+            self.check_author_window(actor, &row, "delete", "deleted")?;
+        }
+        let row = aurix_db::queries::delete_chat_message(
+            &self.pool,
+            app_id.0,
+            message_id,
+            actor.user_id.0,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("chat_messages delete: {e}")))?
+        .ok_or_else(|| AurixError::NotFound("Message not found".into()))?;
+        let message = row_to_message(row);
+        let mut published = message.clone();
+        published.client_ref = client_ref;
+        self.events.publish(ServerEvent::ChatMessageUpdated {
+            app_id,
+            message: published,
+            from_session_id: actor.session_id,
+        });
+        Ok(Deletion {
+            message,
+            changed: true,
+        })
+    }
+
+    pub fn validate_reaction(&self, reaction: &str) -> Result<()> {
+        self.ensure_enabled()?;
+        if self.cfg.reactions_per_message == 0 {
+            return Err(AurixError::NotImplemented(
+                "Reactions are disabled (chat.reactions_per_message = 0)".into(),
+            ));
+        }
+        if reaction.is_empty()
+            || reaction.len() > REACTION_MAX_BYTES
+            || reaction
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(AurixError::Validation(format!(
+                "Reaction must be 1..={REACTION_MAX_BYTES} bytes without whitespace"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Adds or removes `actor`'s `reaction` on a message. The caller has verified the actor
+    /// may see the conversation (channel membership); for direct messages the actor must be
+    /// one of the two parties. Idempotent: repeating a change is reported as `changed: false`
+    /// and not published.
+    pub async fn react(
+        &self,
+        app_id: AppId,
+        message_id: uuid::Uuid,
+        actor: Actor,
+        reaction: &str,
+        add: bool,
+    ) -> Result<ReactionChange> {
+        self.ensure_history()?;
+        self.validate_reaction(reaction)?;
+        let row = self.live_message(app_id, message_id).await?;
+        if row.channel_id.is_none()
+            && !actor.is_system()
+            && row.from_user_id != actor.user_id.0
+            && row.to_user_id != Some(actor.user_id.0)
+        {
+            return Err(AurixError::NotFound("Message not found".into()));
+        }
+        let changed = if add {
+            match aurix_db::queries::add_chat_reaction(
+                &self.pool,
+                app_id.0,
+                message_id,
+                actor.user_id.0,
+                reaction,
+                i64::from(self.cfg.reactions_per_message),
+            )
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_reactions insert: {e}")))?
+            {
+                ReactionAdd::Added => true,
+                ReactionAdd::AlreadySet => false,
+                ReactionAdd::TooManyDistinct => {
+                    return Err(AurixError::Validation(format!(
+                        "Message already carries {} distinct reactions",
+                        self.cfg.reactions_per_message
+                    )))
+                }
+            }
+        } else {
+            aurix_db::queries::remove_chat_reaction(
+                &self.pool,
+                app_id.0,
+                message_id,
+                actor.user_id.0,
+                reaction,
+            )
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_reactions delete: {e}")))?
+        };
+        let count =
+            aurix_db::queries::count_chat_reaction(&self.pool, app_id.0, message_id, reaction)
+                .await
+                .map_err(|e| AurixError::Database(format!("chat_reactions count: {e}")))?;
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        let message = row_to_message(row);
+        if changed {
+            self.events.publish(ServerEvent::ChatReactionChanged {
+                app_id,
+                message_id,
+                channel_id: message.channel_id,
+                message_from_user_id: message.from_user_id,
+                message_to_user_id: message.to_user_id,
+                user_id: actor.user_id,
+                reaction: reaction.to_string(),
+                added: add,
+                count,
+                timestamp: Utc::now(),
+                from_session_id: actor.session_id,
+            });
+        }
+        Ok(ReactionChange {
+            message,
+            reaction: reaction.to_string(),
+            changed,
+            count,
+        })
+    }
+
+    /// Full-text search over a conversation's stored messages, newest first (`before` pages
+    /// back). `reader` gets their own id first in reaction lists. The query is web-search
+    /// syntax; one without searchable terms yields an empty page.
+    pub async fn search(
+        &self,
+        app_id: AppId,
+        conversation: Conversation,
+        search: SearchQuery<'_>,
+        reader: Option<UserId>,
+    ) -> Result<HistoryPage> {
+        self.ensure_history()?;
+        if !self.cfg.search {
+            return Err(AurixError::NotImplemented(
+                "Chat search is disabled (chat.search = false)".into(),
+            ));
+        }
+        let query = search.query.trim();
+        if query.is_empty() || query.len() > 256 {
+            return Err(AurixError::Validation(
+                "Search query must be 1..=256 bytes".into(),
+            ));
+        }
+        let before = Self::cursor(search.before, "before")?;
+        let limit = self.page_limit(search.limit);
+        let rows = aurix_db::queries::search_chat_messages(
+            &self.pool,
+            app_id.0,
+            conversation.search_scope(),
+            query,
+            search.from_user_id.map(|u| u.0),
+            before,
+            limit + 1,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("chat_messages search: {e}")))?
+        .unwrap_or_default();
+        let mut page = self
+            .page(app_id, rows, before, None, false, limit as usize, reader)
+            .await?;
+        // A search page is not contiguous with the present: newer matches are unknown.
+        page.next_after = None;
+        Ok(page)
+    }
+
+    /// Attaches reaction tallies to stored rows (in the rows' order).
+    async fn with_reactions(
+        &self,
+        app_id: AppId,
+        rows: Vec<ChatMessageRow>,
+        reader: Option<UserId>,
+    ) -> Result<Vec<ChatMessage>> {
+        let mut messages: Vec<ChatMessage> = rows.into_iter().map(row_to_message).collect();
+        if self.cfg.reactions_per_message == 0 || messages.is_empty() {
+            return Ok(messages);
+        }
+        let ids: Vec<uuid::Uuid> = messages
+            .iter()
+            .filter(|m| !m.is_deleted())
+            .map(|m| m.id)
+            .collect();
+        let rows = aurix_db::queries::list_chat_reactions(
+            &self.pool,
+            app_id.0,
+            &ids,
+            reader.map(|u| u.0),
+            REACTION_USERS_SHOWN as i64,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("chat_reactions query: {e}")))?;
+        let mut by_message: HashMap<uuid::Uuid, Vec<ChatReaction>> = HashMap::new();
+        for r in rows {
+            by_message
+                .entry(r.message_id)
+                .or_default()
+                .push(row_to_reaction(r));
+        }
+        for m in &mut messages {
+            if let Some(reactions) = by_message.remove(&m.id) {
+                m.reactions = reactions;
+            }
+        }
+        Ok(messages)
     }
 
     /// Runs the configured content filters (safety stage, then webhook) over player-authored
@@ -495,6 +949,7 @@ impl ChatService {
         before: Option<&str>,
         after: Option<&str>,
         limit: Option<u32>,
+        reader: Option<UserId>,
     ) -> Result<HistoryPage> {
         self.ensure_history()?;
         let before = Self::cursor(before, "before")?;
@@ -541,22 +996,27 @@ impl ChatService {
             }
         }
         .map_err(|e| AurixError::Database(format!("chat_messages query: {e}")))?;
-        Ok(Self::page(rows, before, after, forward, limit as usize))
+        self.page(app_id, rows, before, after, forward, limit as usize, reader)
+            .await
     }
 
-    fn page(
+    #[allow(clippy::too_many_arguments)]
+    async fn page(
+        &self,
+        app_id: AppId,
         mut rows: Vec<ChatMessageRow>,
         before: Option<MessageCursor>,
         after: Option<MessageCursor>,
         forward: bool,
         limit: usize,
-    ) -> HistoryPage {
+        reader: Option<UserId>,
+    ) -> Result<HistoryPage> {
         let more = rows.len() > limit;
         rows.truncate(limit);
         if forward {
             rows.reverse();
         }
-        let messages: Vec<ChatMessage> = rows.into_iter().map(row_to_message).collect();
+        let messages = self.with_reactions(app_id, rows, reader).await?;
         let newest = messages.first().map(ChatMessage::cursor);
         let oldest = messages.last().map(ChatMessage::cursor);
         let (older_exist, newer_exist) = if forward {
@@ -564,11 +1024,11 @@ impl ChatService {
         } else {
             (more, before.is_some())
         };
-        HistoryPage {
+        Ok(HistoryPage {
             next_before: oldest.filter(|_| older_exist),
             next_after: newest.filter(|_| newer_exist),
             messages,
-        }
+        })
     }
 
     /// Advances `user_id`'s marker in `conversation` to `message_id`. The message must belong
@@ -788,6 +1248,18 @@ fn row_to_message(r: ChatMessageRow) -> ChatMessage {
         sent_at: r.sent_at,
         client_ref: None,
         offline: r.offline,
+        edited_at: r.edited_at,
+        deleted_at: r.deleted_at,
+        deleted_by: r.deleted_by.map(UserId::from_uuid),
+        reactions: Vec::new(),
+    }
+}
+
+fn row_to_reaction(r: ChatReactionRow) -> ChatReaction {
+    ChatReaction {
+        reaction: r.reaction,
+        count: u32::try_from(r.count).unwrap_or(u32::MAX),
+        user_ids: r.user_ids.into_iter().map(UserId::from_uuid).collect(),
     }
 }
 
@@ -867,6 +1339,121 @@ mod tests {
         assert!(matches!(
             off.validate("hi", None),
             Err(AurixError::ChatDisabled)
+        ));
+    }
+
+    fn stored(from: UserId, age_secs: i64) -> ChatMessageRow {
+        ChatMessageRow {
+            id: uuid::Uuid::now_v7(),
+            app_id: uuid::Uuid::new_v4(),
+            channel_id: Some(uuid::Uuid::new_v4()),
+            from_user_id: from.0,
+            display_name: "p".into(),
+            to_user_id: None,
+            text: "hi".into(),
+            metadata: None,
+            sent_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            offline: false,
+            edited_at: None,
+            deleted_at: None,
+            deleted_by: None,
+        }
+    }
+
+    fn player(user_id: UserId) -> Actor {
+        Actor {
+            user_id,
+            session_id: Some(SessionId::new()),
+            moderator: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn author_window_rules() {
+        let s = svc(
+            ChatConfig {
+                edit_window_secs: 60,
+                ..Default::default()
+            },
+            None,
+        );
+        let author = UserId::new();
+        let fresh = stored(author, 5);
+        let stale = stored(author, 61);
+        assert!(s
+            .check_author_window(player(author), &fresh, "edit", "edited")
+            .is_ok());
+        let denied = s
+            .check_author_window(player(UserId::new()), &fresh, "edit", "edited")
+            .unwrap_err();
+        assert!(
+            matches!(denied, AurixError::AuthorizationDenied(ref m) if m == "Only the author can edit this message"),
+            "{denied:?}"
+        );
+        let expired = s
+            .check_author_window(player(author), &stale, "delete", "deleted")
+            .unwrap_err();
+        assert!(
+            matches!(expired, AurixError::AuthorizationDenied(ref m) if m == "The message can no longer be deleted (60 s window)"),
+            "{expired:?}"
+        );
+        // A channel moderator flag alone does not extend the author window for edits.
+        let moderator = Actor {
+            user_id: UserId::new(),
+            session_id: Some(SessionId::new()),
+            moderator: true,
+        };
+        assert!(s
+            .check_author_window(moderator, &fresh, "edit", "edited")
+            .is_err());
+        // The REST API (system actor) bypasses both author and window checks.
+        assert!(s
+            .check_author_window(Actor::system(), &stale, "edit", "edited")
+            .is_ok());
+        // `edit_window_secs = 0` means "no window".
+        let unlimited = svc(
+            ChatConfig {
+                edit_window_secs: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(unlimited
+            .check_author_window(player(author), &stale, "edit", "edited")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn reaction_validation() {
+        let s = svc(ChatConfig::default(), None);
+        for ok in ["+1", "👍", "fire", "thumbs_up", ":skull:", "é"] {
+            assert!(s.validate_reaction(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "tab\there",
+            "nl\n",
+            "\u{7f}",
+            &"x".repeat(33),
+        ] {
+            assert!(
+                matches!(s.validate_reaction(bad), Err(AurixError::Validation(_))),
+                "{bad:?}"
+            );
+        }
+        assert!(s.validate_reaction(&"x".repeat(32)).is_ok());
+        let off = svc(
+            ChatConfig {
+                reactions_per_message: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(matches!(
+            off.validate_reaction("+1"),
+            Err(AurixError::NotImplemented(_))
         ));
     }
 

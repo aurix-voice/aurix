@@ -1440,7 +1440,8 @@ public sealed record ChatHistoryPage
 }
 
 /// <summary>
-/// Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history.
+/// Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history. Edits keep
+/// `id` / `sent_at` and set `edited_at`; deletions leave a tombstone (`deleted_at`).
 /// </summary>
 public sealed record ChatMessage
 {
@@ -1480,6 +1481,52 @@ public sealed record ChatMessage
     /// </summary>
     [JsonPropertyName("offline")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Offline { get; init; }
+
+    /// <summary>
+    /// Set when the text / metadata were changed after sending; omitted otherwise.
+    /// </summary>
+    [JsonPropertyName("edited_at")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EditedAt { get; init; }
+
+    /// <summary>
+    /// Set on tombstones: the message was deleted, `text` is empty and `metadata` / `reactions` are
+    /// gone. Omitted for live messages.
+    /// </summary>
+    [JsonPropertyName("deleted_at")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeletedAt { get; init; }
+
+    /// <summary>
+    /// Who deleted it: the author, a channel moderator, or the nil system user for REST deletions.
+    /// </summary>
+    [JsonPropertyName("deleted_by")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeletedBy { get; init; }
+
+    /// <summary>
+    /// Reaction tallies (history, search and `GET /v1/messages/{id}` only); omitted when empty.
+    /// </summary>
+    [JsonPropertyName("reactions")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ChatReaction>? Reactions { get; init; }
+}
+
+/// <summary>
+/// One reaction token on a message and who set it.
+/// </summary>
+public sealed record ChatReaction
+{
+    [JsonPropertyName("reaction")]
+    public required string Reaction { get; init; }
+
+    /// <summary>
+    /// Users carrying this reaction.
+    /// </summary>
+    [JsonPropertyName("count")]
+    public required long Count { get; init; }
+
+    /// <summary>
+    /// Up to 20 of them (the reader first when known); `count` may exceed the list length.
+    /// </summary>
+    [JsonPropertyName("user_ids")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? UserIds { get; init; }
 }
 
 /// <summary>
@@ -1734,6 +1781,21 @@ public sealed record DuckingConfig
     /// </summary>
     [JsonPropertyName("moderators")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Moderators { get; init; }
+}
+
+public sealed record EditMessageRequest
+{
+    /// <summary>
+    /// New text; `chat.max_message_bytes` applies.
+    /// </summary>
+    [JsonPropertyName("text")]
+    public required string Text { get; init; }
+
+    /// <summary>
+    /// Replaces the stored metadata; absent or `null` clears it.
+    /// </summary>
+    [JsonPropertyName("metadata")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public object? Metadata { get; init; }
 }
 
 public sealed record ErrorDetail
@@ -2672,6 +2734,45 @@ public sealed record QuotaState
     /// </summary>
     [JsonPropertyName("month_start")]
     public required string MonthStart { get; init; }
+}
+
+public sealed record ReactionChange
+{
+    [JsonPropertyName("message_id")]
+    public required string MessageId { get; init; }
+
+    [JsonPropertyName("user_id")]
+    public required string UserId { get; init; }
+
+    [JsonPropertyName("reaction")]
+    public required string Reaction { get; init; }
+
+    /// <summary>
+    /// `true` for PUT, `false` for DELETE.
+    /// </summary>
+    [JsonPropertyName("added")]
+    public required bool Added { get; init; }
+
+    /// <summary>
+    /// `false` when the reaction was already in the requested state (nothing was published).
+    /// </summary>
+    [JsonPropertyName("changed")]
+    public required bool Changed { get; init; }
+
+    /// <summary>
+    /// Users carrying `reaction` after the request.
+    /// </summary>
+    [JsonPropertyName("count")]
+    public required long Count { get; init; }
+}
+
+public sealed record ReactionRequest
+{
+    /// <summary>
+    /// The user the reaction belongs to (must exist in the app).
+    /// </summary>
+    [JsonPropertyName("user_id")]
+    public required string UserId { get; init; }
 }
 
 public sealed record ReadMarkerRequest
@@ -4650,4 +4751,65 @@ public sealed record ListUserReadMarkersQuery
     /// Direct conversation with this user (mutually exclusive with `channel_id`).
     /// </summary>
     public string? PeerUserId { get; init; }
+}
+
+/// <summary>Query parameters of <c>searchChannelMessages</c>.</summary>
+public sealed record SearchChannelMessagesQuery
+{
+    /// <summary>
+    /// Web-search syntax: words are ANDed, `"a phrase"` matches in order, `-word` excludes, `or`
+    /// alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A
+    /// query without searchable terms yields an empty page.
+    /// </summary>
+    public string? Q { get; init; }
+    /// <summary>
+    /// Only matches sent by this user.
+    /// </summary>
+    public string? FromUserId { get; init; }
+    /// <summary>
+    /// Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors
+    /// are `400`.
+    /// </summary>
+    public string? Before { get; init; }
+    /// <summary>
+    /// Page size; clamped to `chat.history_page_max` (default 200).
+    /// </summary>
+    public long? Limit { get; init; }
+}
+
+/// <summary>Query parameters of <c>searchUserMessages</c>.</summary>
+public sealed record SearchUserMessagesQuery
+{
+    /// <summary>
+    /// Web-search syntax: words are ANDed, `"a phrase"` matches in order, `-word` excludes, `or`
+    /// alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A
+    /// query without searchable terms yields an empty page.
+    /// </summary>
+    public string? Q { get; init; }
+    /// <summary>
+    /// Only matches sent by this user.
+    /// </summary>
+    public string? FromUserId { get; init; }
+    /// <summary>
+    /// Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors
+    /// are `400`.
+    /// </summary>
+    public string? Before { get; init; }
+    /// <summary>
+    /// Page size; clamped to `chat.history_page_max` (default 200).
+    /// </summary>
+    public long? Limit { get; init; }
+    /// <summary>
+    /// Restrict to the direct conversation with this user.
+    /// </summary>
+    public string? Peer { get; init; }
+}
+
+/// <summary>Query parameters of <c>removeMessageReaction</c>.</summary>
+public sealed record RemoveMessageReactionQuery
+{
+    /// <summary>
+    /// The user whose reaction is removed.
+    /// </summary>
+    public string? UserId { get; init; }
 }

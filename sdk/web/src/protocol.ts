@@ -143,6 +143,24 @@ export interface ChatMessageWire {
   client_ref?: string | null;
   /** Directed message that waited for an offline recipient (absent = `false`). */
   offline?: boolean;
+  /** RFC 3339 timestamp of the last edit; absent when never edited. */
+  edited_at?: string | null;
+  /**
+   * Tombstone: RFC 3339 timestamp of the deletion. The message keeps its id and position;
+   * `text` is empty, `metadata` absent, reactions gone.
+   */
+  deleted_at?: string | null;
+  /** Who deleted it (author / moderator); the nil UUID for the operator (REST). */
+  deleted_by?: string | null;
+  /** Reaction tallies (history / search only; live messages carry none). */
+  reactions?: ChatReactionWire[];
+}
+
+export interface ChatReactionWire {
+  reaction: string;
+  count: number;
+  /** At most the first 20 users carrying the reaction. */
+  user_ids?: string[];
 }
 
 export interface ChatReadMarkerWire {
@@ -210,6 +228,24 @@ export type ClientMessage =
     }
   | { type: 'ChatMarkRead'; data: { channel_id?: string; user_id?: string; message_id: string } }
   | { type: 'ChatReadMarkers'; data: { channel_id?: string; user_id?: string } }
+  | {
+      type: 'ChatEdit';
+      data: { message_id: string; text: string; metadata?: JsonValue; client_ref?: string };
+    }
+  | { type: 'ChatDelete'; data: { message_id: string; client_ref?: string } }
+  | { type: 'ChatReact'; data: { message_id: string; reaction: string; add: boolean } }
+  | {
+      type: 'ChatSearch';
+      data: {
+        channel_id?: string;
+        user_id?: string;
+        query: string;
+        from_user_id?: string;
+        before?: string;
+        limit?: number;
+        client_ref?: string;
+      };
+    }
   | { type: 'SetTranscripts'; data: { enabled: boolean } }
   | {
       type: 'SetTranslation';
@@ -345,6 +381,33 @@ export type ServerMessage =
       };
     }
   | { type: 'ChatReadMarker'; data: { marker: ChatReadMarkerWire } }
+  | { type: 'ChatMessageUpdated'; data: { message: ChatMessageWire } }
+  | {
+      type: 'ChatReactionChanged';
+      data: {
+        message_id: string;
+        channel_id?: string | null;
+        message_from_user_id: string;
+        message_to_user_id?: string | null;
+        user_id: string;
+        reaction: string;
+        added: boolean;
+        count: number;
+        /** RFC 3339 timestamp. */
+        timestamp: string;
+      };
+    }
+  | {
+      type: 'ChatSearchResult';
+      data: {
+        channel_id?: string | null;
+        user_id?: string | null;
+        query: string;
+        messages: ChatMessageWire[];
+        next_before?: string | null;
+        client_ref?: string | null;
+      };
+    }
   | {
       type: 'ChatReadMarkersResult';
       data: {

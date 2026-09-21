@@ -1569,6 +1569,19 @@ pub enum AurixEventType {
     /// value, `number2` = the server-measured uplink loss in whole percent that triggered
     /// it); FEC tuning / DRED already applied to the encoder.
     AurixEventLossProfileChanged = 46,
+    /// `chat` (`aurix_event_chat`): a message of one of this client's conversations was
+    /// edited (`edited_at_ms`) or deleted (`deleted_at_ms`, empty text) — replace the copy
+    /// with the same `message_id`; `request_id` is set on the echo of this client's own
+    /// `aurix_client_edit_chat` / `aurix_client_delete_chat`.
+    AurixEventChatMessageUpdated = 47,
+    /// `aurix_event_reaction`: a user added (`flag`) or removed a reaction on a message;
+    /// `object_id` = message, `user_id` = who, `channel_id` = conversation (zero for direct).
+    AurixEventChatReactionChanged = 48,
+    /// `request_id`, `channel_id` / `user_id` = searched conversation (both zero = every
+    /// direct conversation), `message` = the query, `aurix_event_chat_history` (count,
+    /// `next_before`) + `aurix_event_chat_history_message`: answer to
+    /// `aurix_client_search_chat`, newest match first.
+    AurixEventChatSearchResult = 49,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1638,6 +1651,17 @@ pub struct AurixChatMessage {
     pub offline: bool,
     /// History cursor of this message (`before` / `after` of `aurix_client_chat_history`).
     pub cursor: *const c_char,
+    /// Unix milliseconds of the last edit, 0 when never edited.
+    pub edited_at_ms: i64,
+    /// Unix milliseconds of the deletion, 0 for a live message. A deleted message (tombstone)
+    /// keeps its id and position; `text` is empty, `metadata_json` and `reactions_json` are
+    /// `NULL`.
+    pub deleted_at_ms: i64,
+    /// Who deleted it (author, moderator or the zero UUID for the operator); zero when live.
+    pub deleted_by: AurixUuid,
+    /// Reaction tallies as a JSON array `[{"reaction","count","user_ids"}]`, or `NULL` when
+    /// there are none (live `ChatMessage` events never carry them; history / search do).
+    pub reactions_json: *const c_char,
 }
 
 /// One page of chat history (`AurixEventChatHistory`). Strings owned by the event.
@@ -1650,6 +1674,26 @@ pub struct AurixChatHistory {
     pub next_before: *const c_char,
     /// Cursor for the next newer page, or `NULL` when the page is the most recent.
     pub next_after: *const c_char,
+}
+
+/// A reaction change (`AurixEventChatReactionChanged`). Strings owned by the event.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AurixChatReaction {
+    pub message_id: AurixUuid,
+    /// Zero UUID for a direct message.
+    pub channel_id: AurixUuid,
+    /// Author of the message; `message_recipient_id` is its recipient (zero for channels).
+    pub message_sender_id: AurixUuid,
+    pub message_recipient_id: AurixUuid,
+    /// Who added / removed the reaction.
+    pub user_id: AurixUuid,
+    pub reaction: *const c_char,
+    pub added: bool,
+    /// Users carrying `reaction` after the change.
+    pub count: u32,
+    /// Unix milliseconds.
+    pub timestamp_ms: i64,
 }
 
 /// A user's reading position in a channel or a direct conversation.
@@ -1678,8 +1722,9 @@ fn marker_to_c(m: &aurix_common::protocol::ChatReadMarker) -> AurixReadMarker {
     }
 }
 
-/// Strings of one chat message in `OwnedStrings::extra`: name, text, metadata, cursor.
-const CHAT_STRINGS: usize = 4;
+/// Strings of one chat message in `OwnedStrings::extra`: name, text, metadata, cursor,
+/// reactions.
+const CHAT_STRINGS: usize = 5;
 
 fn push_chat_strings(extra: &mut Vec<CString>, m: &ChatMessage) {
     extra.push(cstring(&m.display_name));
@@ -1691,6 +1736,11 @@ fn push_chat_strings(extra: &mut Vec<CString>, m: &ChatMessage) {
             .unwrap_or_default(),
     ));
     extra.push(cstring(&m.cursor()));
+    extra.push(cstring(&if m.reactions.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&m.reactions).unwrap_or_default()
+    }));
 }
 
 fn chat_to_c(m: &ChatMessage, strings: &[CString], request_id: u64) -> AurixChatMessage {
@@ -1710,6 +1760,14 @@ fn chat_to_c(m: &ChatMessage, strings: &[CString], request_id: u64) -> AurixChat
         request_id,
         offline: m.offline,
         cursor: strings[3].as_ptr(),
+        edited_at_ms: m.edited_at.map(|t| t.timestamp_millis()).unwrap_or(0),
+        deleted_at_ms: m.deleted_at.map(|t| t.timestamp_millis()).unwrap_or(0),
+        deleted_by: m.deleted_by.map(|u| u.0.into()).unwrap_or_else(zero),
+        reactions_json: if m.reactions.is_empty() {
+            ptr::null()
+        } else {
+            strings[4].as_ptr()
+        },
     }
 }
 
@@ -1830,7 +1888,8 @@ impl AurixEvent {
                 code = c.clone();
                 message = m.clone();
             }
-            Event::ChatMessage { message: m, .. } => push_chat_strings(&mut extra, m),
+            Event::ChatMessage { message: m, .. }
+            | Event::ChatMessageUpdated { message: m, .. } => push_chat_strings(&mut extra, m),
             Event::ChatHistory {
                 messages,
                 next_before,
@@ -1843,6 +1902,20 @@ impl AurixEvent {
                     push_chat_strings(&mut extra, m);
                 }
             }
+            Event::ChatSearchResult {
+                query,
+                messages,
+                next_before,
+                ..
+            } => {
+                message = query.clone();
+                extra.push(cstring(next_before.as_deref().unwrap_or_default()));
+                extra.push(cstring(""));
+                for m in messages {
+                    push_chat_strings(&mut extra, m);
+                }
+            }
+            Event::ChatReactionChanged { reaction, .. } => extra.push(cstring(reaction)),
             Event::Transcript(t) => {
                 extra.push(cstring(&t.text));
                 extra.push(cstring(t.language.as_deref().unwrap_or_default()));
@@ -1914,7 +1987,10 @@ impl AurixEvent {
             Event::Kicked { .. } => T::AurixEventKicked,
             Event::ModerationApplied { .. } => T::AurixEventModerationApplied,
             Event::ChatMessage { .. } => T::AurixEventChatMessage,
+            Event::ChatMessageUpdated { .. } => T::AurixEventChatMessageUpdated,
+            Event::ChatReactionChanged { .. } => T::AurixEventChatReactionChanged,
             Event::ChatHistory { .. } => T::AurixEventChatHistory,
+            Event::ChatSearchResult { .. } => T::AurixEventChatSearchResult,
             Event::ChatReadMarker(_) => T::AurixEventChatReadMarker,
             Event::ChatReadMarkers { .. } => T::AurixEventChatReadMarkers,
             Event::ChatInboxSynced { .. } => T::AurixEventChatInboxSynced,
@@ -2045,7 +2121,9 @@ pub unsafe extern "C" fn aurix_event_request_id(event: *const AurixEvent) -> u64
         | Some(Event::ModerationApplied { request_id, .. })
         | Some(Event::RequestFailed { request_id, .. }) => *request_id,
         Some(Event::ChatMessage { request_id, .. })
+        | Some(Event::ChatMessageUpdated { request_id, .. })
         | Some(Event::ChatHistory { request_id, .. })
+        | Some(Event::ChatSearchResult { request_id, .. })
         | Some(Event::TtsStatus { request_id, .. }) => request_id.unwrap_or(0),
         _ => 0,
     }
@@ -2079,8 +2157,12 @@ pub unsafe extern "C" fn aurix_event_channel_id(event: *const AurixEvent) -> Aur
         | Event::RejoinFailed { channel_id, .. } => Some(*channel_id),
         Event::ChannelFocusChanged(c) => *c,
         Event::TransmissionChanged(TransmissionMode::Single { channel_id }) => Some(*channel_id),
-        Event::ChatMessage { message, .. } => message.channel_id,
+        Event::ChatMessage { message, .. } | Event::ChatMessageUpdated { message, .. } => {
+            message.channel_id
+        }
+        Event::ChatReactionChanged { channel_id, .. } => *channel_id,
         Event::ChatHistory { scope, .. } | Event::ChatReadMarkers { scope, .. } => scope.split().0,
+        Event::ChatSearchResult { scope, .. } => scope.and_then(|s| s.split().0),
         Event::ChatReadMarker(m) => m.channel_id,
         Event::Transcript(t) => Some(t.channel_id),
         _ => None,
@@ -2106,8 +2188,12 @@ pub unsafe extern "C" fn aurix_event_user_id(event: *const AurixEvent) -> AurixU
         | Event::E2eePeerKey { user_id, .. }
         | Event::E2eePeerDecryptable { user_id, .. } => Some(*user_id),
         Event::Recording { initiated_by, .. } => Some(*initiated_by),
-        Event::ChatMessage { message, .. } => Some(message.from_user_id),
+        Event::ChatMessage { message, .. } | Event::ChatMessageUpdated { message, .. } => {
+            Some(message.from_user_id)
+        }
+        Event::ChatReactionChanged { user_id, .. } => Some(*user_id),
         Event::ChatHistory { scope, .. } | Event::ChatReadMarkers { scope, .. } => scope.split().1,
+        Event::ChatSearchResult { scope, .. } => scope.and_then(|s| s.split().1),
         Event::ChatReadMarker(m) => Some(m.user_id),
         Event::Transcript(t) => Some(t.user_id),
         _ => None,
@@ -2126,7 +2212,10 @@ pub unsafe extern "C" fn aurix_event_object_id(event: *const AurixEvent) -> Auri
         Event::TtsStatus {
             server_request_id, ..
         } => (*server_request_id).into(),
-        Event::ChatMessage { message, .. } => message.id.into(),
+        Event::ChatMessage { message, .. } | Event::ChatMessageUpdated { message, .. } => {
+            message.id.into()
+        }
+        Event::ChatReactionChanged { message_id, .. } => (*message_id).into(),
         Event::ChatReadMarker(m) => m.message_id.into(),
         _ => zero(),
     }
@@ -2148,6 +2237,7 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
         Some(Event::ParticipantTyping { typing, .. }) => *typing,
         Some(Event::Recovered { resumed, .. }) => *resumed,
         Some(Event::ChatInboxSynced { truncated, .. }) => *truncated,
+        Some(Event::ChatReactionChanged { added, .. }) => *added,
         Some(Event::E2eePeerDecryptable { decryptable, .. }) => *decryptable,
         _ => false,
     }
@@ -2177,6 +2267,7 @@ pub unsafe extern "C" fn aurix_event_number(event: *const AurixEvent) -> u64 {
         Some(Event::Recovering { attempt, .. }) => *attempt as u64,
         Some(Event::ChatReadMarkers { unread_count, .. }) => u64::from(*unread_count),
         Some(Event::ChatInboxSynced { delivered, .. }) => u64::from(*delivered),
+        Some(Event::ChatReactionChanged { count, .. }) => u64::from(*count),
         Some(Event::E2eeKeyRotated { generation }) => u64::from(*generation),
         _ => 0,
     }
@@ -2344,18 +2435,23 @@ pub unsafe extern "C" fn aurix_event_chat(
     let Some(e) = self::event(event) else {
         return false;
     };
-    let Event::ChatMessage {
-        request_id,
-        message,
-    } = &e.event
-    else {
-        return false;
+    let (request_id, message) = match &e.event {
+        Event::ChatMessage {
+            request_id,
+            message,
+        }
+        | Event::ChatMessageUpdated {
+            request_id,
+            message,
+        } => (request_id, message),
+        _ => return false,
     };
     *out = chat_to_c(message, &e.strings.extra, request_id.unwrap_or(0));
     true
 }
 
-/// Page summary of a `ChatHistory` event.
+/// Page summary of a `ChatHistory` or `ChatSearchResult` event (`next_after` is always
+/// `NULL` for a search).
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_chat_history(
     event: *const AurixEvent,
@@ -2367,14 +2463,19 @@ pub unsafe extern "C" fn aurix_event_chat_history(
     let Some(e) = self::event(event) else {
         return false;
     };
-    let Event::ChatHistory {
-        messages,
-        next_before,
-        next_after,
-        ..
-    } = &e.event
-    else {
-        return false;
+    let (messages, next_before, next_after) = match &e.event {
+        Event::ChatHistory {
+            messages,
+            next_before,
+            next_after,
+            ..
+        } => (messages, next_before, next_after),
+        Event::ChatSearchResult {
+            messages,
+            next_before,
+            ..
+        } => (messages, next_before, &None),
+        _ => return false,
     };
     let s = &e.strings.extra;
     *out = AurixChatHistory {
@@ -2393,7 +2494,8 @@ pub unsafe extern "C" fn aurix_event_chat_history(
     true
 }
 
-/// Message `index` (0 = newest) of a `ChatHistory` page; `request_id` is 0 for all of them.
+/// Message `index` (0 = newest) of a `ChatHistory` / `ChatSearchResult` page; `request_id`
+/// is 0 for all of them.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_chat_history_message(
     event: *const AurixEvent,
@@ -2406,14 +2508,55 @@ pub unsafe extern "C" fn aurix_event_chat_history_message(
     let Some(e) = self::event(event) else {
         return false;
     };
-    let Event::ChatHistory { messages, .. } = &e.event else {
-        return false;
+    let messages = match &e.event {
+        Event::ChatHistory { messages, .. } | Event::ChatSearchResult { messages, .. } => messages,
+        _ => return false,
     };
     let Some(m) = messages.get(index) else {
         return false;
     };
     let start = 2 + index * CHAT_STRINGS;
     *out = chat_to_c(m, &e.strings.extra[start..start + CHAT_STRINGS], 0);
+    true
+}
+
+/// The change of a `ChatReactionChanged` event.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_reaction(
+    event: *const AurixEvent,
+    out: *mut AurixChatReaction,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(e) = self::event(event) else {
+        return false;
+    };
+    let Event::ChatReactionChanged {
+        message_id,
+        channel_id,
+        message_from_user_id,
+        message_to_user_id,
+        user_id,
+        added,
+        count,
+        timestamp,
+        ..
+    } = &e.event
+    else {
+        return false;
+    };
+    *out = AurixChatReaction {
+        message_id: (*message_id).into(),
+        channel_id: channel_id.map(|c| c.0.into()).unwrap_or_else(zero),
+        message_sender_id: message_from_user_id.0.into(),
+        message_recipient_id: message_to_user_id.map(|u| u.0.into()).unwrap_or_else(zero),
+        user_id: user_id.0.into(),
+        reaction: e.strings.extra[0].as_ptr(),
+        added: *added,
+        count: *count,
+        timestamp_ms: timestamp.timestamp_millis(),
+    };
     true
 }
 
@@ -4257,6 +4400,155 @@ pub unsafe extern "C" fn aurix_client_chat_read_markers(
     }
 }
 
+/// Replaces the text of this user's own message (within the server's edit window);
+/// `metadata_json` `NULL` clears the metadata. Answered by `AurixEventChatMessageUpdated`
+/// with this `request_id`, or `RequestFailed`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_edit_chat(
+    client: *mut AurixClient,
+    message_id: *const AurixUuid,
+    text: *const c_char,
+    metadata_json: *const c_char,
+    request_id_out: *mut u64,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let message_id = match uuid_arg(message_id, "message_id") {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let text = match cstr_arg(text, "text") {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let meta = match opt_cstr_arg(metadata_json, "metadata_json").and_then(parse_metadata) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    match c.edit_chat(message_id, &text, meta) {
+        Ok(id) => {
+            if !request_id_out.is_null() {
+                *request_id_out = id;
+            }
+            AurixResult::AurixOk
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Deletes a message: this user's own (within the edit window) or, in a channel this user
+/// moderates, anyone's. Answered by `AurixEventChatMessageUpdated` (a tombstone) with this
+/// `request_id`, or `RequestFailed`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_delete_chat(
+    client: *mut AurixClient,
+    message_id: *const AurixUuid,
+    request_id_out: *mut u64,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let message_id = match uuid_arg(message_id, "message_id") {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    match c.delete_chat(message_id) {
+        Ok(id) => {
+            if !request_id_out.is_null() {
+                *request_id_out = id;
+            }
+            AurixResult::AurixOk
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Adds (`add`) or removes this user's `reaction` (≤ 32 bytes, no whitespace) on a message
+/// of a joined channel or own direct conversation. The result reaches everyone — this
+/// client included — as `AurixEventChatReactionChanged`; refusals as `ServerError`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_react_chat(
+    client: *mut AurixClient,
+    message_id: *const AurixUuid,
+    reaction: *const c_char,
+    add: bool,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let message_id = match uuid_arg(message_id, "message_id") {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let reaction = match cstr_arg(reaction, "reaction") {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    ok(c.react_chat(message_id, &reaction, add))
+}
+
+/// Full-text search over stored history: a joined `channel_id`, the direct conversation
+/// with `user_id`, or every direct conversation of this user (both `NULL`). Optional
+/// `from_user_id` keeps only that author's messages; `before` continues from a previous
+/// result's `next_before`; `limit` 0 = server default. Answered by
+/// `AurixEventChatSearchResult` (newest match first) or `RequestFailed`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_search_chat(
+    client: *mut AurixClient,
+    channel_id: *const AurixUuid,
+    user_id: *const AurixUuid,
+    query: *const c_char,
+    from_user_id: *const AurixUuid,
+    before: *const c_char,
+    limit: u32,
+    request_id_out: *mut u64,
+) -> AurixResult {
+    let c = match self::client(client) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let scope = if channel_id.is_null() && user_id.is_null() {
+        None
+    } else {
+        match chat_scope_arg(channel_id, user_id) {
+            Ok(s) => Some(s),
+            Err(r) => return r,
+        }
+    };
+    let query = match cstr_arg(query, "query") {
+        Ok(q) => q,
+        Err(r) => return r,
+    };
+    let from_user_id = if from_user_id.is_null() {
+        None
+    } else {
+        Some(UserId((*from_user_id).into()))
+    };
+    let before = match opt_cstr_arg(before, "before") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match c.search_chat(
+        scope,
+        &query,
+        from_user_id,
+        before.as_deref(),
+        (limit > 0).then_some(limit),
+    ) {
+        Ok(id) => {
+            if !request_id_out.is_null() {
+                *request_id_out = id;
+            }
+            AurixResult::AurixOk
+        }
+        Err(e) => fail(e),
+    }
+}
+
 // ----------------------------------------------------------------------------------- TTS
 
 /// Server-side text-to-speech as this participant's voice. `channel_id` may be `NULL` for
@@ -5888,6 +6180,10 @@ mod tests {
             client_ref: None,
             sent_at: chrono::Utc::now(),
             offline: true,
+            edited_at: None,
+            deleted_at: None,
+            deleted_by: None,
+            reactions: Vec::new(),
         };
         let ev = Box::into_raw(Box::new(AurixEvent::new(Event::ChatMessage {
             request_id: Some(7),
@@ -5906,6 +6202,9 @@ mod tests {
                 "{\"k\":1}"
             );
             assert!(chat.offline);
+            assert_eq!(chat.edited_at_ms, 0);
+            assert_eq!(chat.deleted_at_ms, 0);
+            assert!(chat.reactions_json.is_null());
             let cursor = CStr::from_ptr(chat.cursor).to_str().unwrap();
             let (sent_at, id) = aurix_common::protocol::decode_chat_cursor(cursor).unwrap();
             assert_eq!(id.as_bytes(), &chat.message_id.bytes);
@@ -5913,6 +6212,132 @@ mod tests {
             let json = CStr::from_ptr(aurix_event_json(ev)).to_str().unwrap();
             assert!(json.contains("\"type\":\"chat_message\""), "{json}");
             assert!(!aurix_event_transcript(ev, ptr::null_mut()));
+            aurix_event_free(ev);
+        }
+    }
+
+    #[test]
+    fn chat_update_search_and_reaction_events_map() {
+        let deleted_by = UserId::new();
+        let tombstone = ChatMessage {
+            id: Uuid::new_v4(),
+            channel_id: None,
+            from_user_id: UserId::new(),
+            display_name: "Alice".into(),
+            to_user_id: Some(deleted_by),
+            text: String::new(),
+            metadata: None,
+            client_ref: Some("u9-1".into()),
+            sent_at: chrono::Utc::now(),
+            offline: false,
+            edited_at: Some(chrono::Utc::now()),
+            deleted_at: Some(chrono::Utc::now()),
+            deleted_by: Some(deleted_by),
+            reactions: Vec::new(),
+        };
+        let ev = Box::into_raw(Box::new(AurixEvent::new(Event::ChatMessageUpdated {
+            request_id: Some(9),
+            message: tombstone.clone(),
+        })));
+        unsafe {
+            assert_eq!(
+                aurix_event_type(ev),
+                AurixEventType::AurixEventChatMessageUpdated
+            );
+            assert_eq!(aurix_event_request_id(ev), 9);
+            assert_eq!(aurix_event_object_id(ev).bytes, *tombstone.id.as_bytes());
+            let mut chat = std::mem::MaybeUninit::<AurixChatMessage>::uninit();
+            assert!(aurix_event_chat(ev, chat.as_mut_ptr()));
+            let chat = chat.assume_init();
+            assert_eq!(CStr::from_ptr(chat.text).to_str().unwrap(), "");
+            assert!(chat.edited_at_ms > 0 && chat.deleted_at_ms > 0);
+            assert_eq!(chat.deleted_by.bytes, *deleted_by.0.as_bytes());
+            assert!(chat.metadata_json.is_null());
+            aurix_event_free(ev);
+        }
+
+        let reacted = ChatMessage {
+            text: "gg".into(),
+            edited_at: None,
+            deleted_at: None,
+            deleted_by: None,
+            client_ref: None,
+            reactions: vec![aurix_common::protocol::ChatReaction {
+                reaction: "👍".into(),
+                count: 2,
+                user_ids: vec![deleted_by],
+            }],
+            ..tombstone
+        };
+        let ev = Box::into_raw(Box::new(AurixEvent::new(Event::ChatSearchResult {
+            request_id: Some(4),
+            scope: None,
+            query: "gg".into(),
+            messages: vec![reacted.clone()],
+            next_before: Some("cursor".into()),
+        })));
+        unsafe {
+            assert_eq!(
+                aurix_event_type(ev),
+                AurixEventType::AurixEventChatSearchResult
+            );
+            assert_eq!(aurix_event_request_id(ev), 4);
+            assert_eq!(aurix_event_channel_id(ev).bytes, [0; 16]);
+            assert_eq!(aurix_event_user_id(ev).bytes, [0; 16]);
+            assert_eq!(
+                CStr::from_ptr(aurix_event_message(ev)).to_str().unwrap(),
+                "gg"
+            );
+            let mut page = std::mem::MaybeUninit::<AurixChatHistory>::uninit();
+            assert!(aurix_event_chat_history(ev, page.as_mut_ptr()));
+            let page = page.assume_init();
+            assert_eq!(page.count, 1);
+            assert_eq!(CStr::from_ptr(page.next_before).to_str().unwrap(), "cursor");
+            assert!(page.next_after.is_null());
+            let mut chat = std::mem::MaybeUninit::<AurixChatMessage>::uninit();
+            assert!(aurix_event_chat_history_message(ev, 0, chat.as_mut_ptr()));
+            let chat = chat.assume_init();
+            assert_eq!(CStr::from_ptr(chat.text).to_str().unwrap(), "gg");
+            let reactions: Vec<aurix_common::protocol::ChatReaction> =
+                serde_json::from_str(CStr::from_ptr(chat.reactions_json).to_str().unwrap())
+                    .unwrap();
+            assert_eq!(reactions, reacted.reactions);
+            let mut sink = std::mem::MaybeUninit::<AurixChatMessage>::uninit();
+            assert!(!aurix_event_chat_history_message(ev, 1, sink.as_mut_ptr()));
+            aurix_event_free(ev);
+        }
+
+        let channel_id = ChannelId::new();
+        let ev = Box::into_raw(Box::new(AurixEvent::new(Event::ChatReactionChanged {
+            message_id: reacted.id,
+            channel_id: Some(channel_id),
+            message_from_user_id: reacted.from_user_id,
+            message_to_user_id: None,
+            user_id: deleted_by,
+            reaction: "👍".into(),
+            added: true,
+            count: 3,
+            timestamp: chrono::Utc::now(),
+        })));
+        unsafe {
+            assert_eq!(
+                aurix_event_type(ev),
+                AurixEventType::AurixEventChatReactionChanged
+            );
+            assert!(aurix_event_flag(ev));
+            assert_eq!(aurix_event_number(ev), 3);
+            assert_eq!(aurix_event_channel_id(ev).bytes, *channel_id.0.as_bytes());
+            assert_eq!(aurix_event_user_id(ev).bytes, *deleted_by.0.as_bytes());
+            assert_eq!(aurix_event_object_id(ev).bytes, *reacted.id.as_bytes());
+            let mut r = std::mem::MaybeUninit::<AurixChatReaction>::uninit();
+            assert!(aurix_event_reaction(ev, r.as_mut_ptr()));
+            let r = r.assume_init();
+            assert_eq!(CStr::from_ptr(r.reaction).to_str().unwrap(), "👍");
+            assert!(r.added);
+            assert_eq!(r.count, 3);
+            assert_eq!(r.message_recipient_id.bytes, [0; 16]);
+            let mut sink = std::mem::MaybeUninit::<AurixChatMessage>::uninit();
+            assert!(!aurix_event_chat(ev, sink.as_mut_ptr()));
             aurix_event_free(ev);
         }
     }

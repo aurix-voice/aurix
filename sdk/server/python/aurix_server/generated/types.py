@@ -631,9 +631,23 @@ ChatMessage = TypedDict(
         "metadata": NotRequired[Optional[Any]],
         "sent_at": str,
         "offline": NotRequired[bool],  # Directed message accepted while the recipient had no live session; it was stored for replay when they connect. Omitted when `false`.
+        "edited_at": NotRequired[Optional[str]],  # Set when the text / metadata were changed after sending; omitted otherwise.
+        "deleted_at": NotRequired[Optional[str]],  # Set on tombstones: the message was deleted, `text` is empty and `metadata` / `reactions` are gone. Omitted for live messages.
+        "deleted_by": NotRequired[Optional[str]],  # Who deleted it: the author, a channel moderator, or the nil system user for REST deletions.
+        "reactions": NotRequired[List["ChatReaction"]],  # Reaction tallies (history, search and `GET /v1/messages/{id}` only); omitted when empty.
     },
 )
-"""Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history."""
+"""Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history. Edits keep `id` / `sent_at` and set `edited_at`; deletions leave a tombstone (`deleted_at`)."""
+
+ChatReaction = TypedDict(
+    "ChatReaction",
+    {
+        "reaction": str,
+        "count": int,  # Users carrying this reaction.
+        "user_ids": NotRequired[List[str]],  # Up to 20 of them (the reader first when known); `count` may exceed the list length.
+    },
+)
+"""One reaction token on a message and who set it."""
 
 ChatReadMarker = TypedDict(
     "ChatReadMarker",
@@ -764,6 +778,14 @@ DuckingConfig = TypedDict(
     },
 )
 """Priority-speaker ducking. Applied by the node to server-mixed and native per-participant delivery (after the receiver's own mute/volume/block and positional attenuation, before ambient/`max_streams` ranking); receivers of dedicated WebRTC tracks apply the same envelope locally. Several simultaneous priority speakers keep the duck engaged; priority streams are never attenuated."""
+
+EditMessageRequest = TypedDict(
+    "EditMessageRequest",
+    {
+        "text": str,  # New text; `chat.max_message_bytes` applies.
+        "metadata": NotRequired[Optional[Any]],  # Replaces the stored metadata; absent or `null` clears it.
+    },
+)
 
 ErrorDetail = TypedDict(
     "ErrorDetail",
@@ -1207,6 +1229,25 @@ QuotaState = TypedDict(
     },
 )
 """Per-application limits and their current consumption. `0` means unlimited."""
+
+ReactionChange = TypedDict(
+    "ReactionChange",
+    {
+        "message_id": str,
+        "user_id": str,
+        "reaction": str,
+        "added": bool,  # `true` for PUT, `false` for DELETE.
+        "changed": bool,  # `false` when the reaction was already in the requested state (nothing was published).
+        "count": int,  # Users carrying `reaction` after the request.
+    },
+)
+
+ReactionRequest = TypedDict(
+    "ReactionRequest",
+    {
+        "user_id": str,  # The user the reaction belongs to (must exist in the app).
+    },
+)
 
 ReadMarkerRequest = TypedDict(
     "ReadMarkerRequest",
@@ -2250,3 +2291,34 @@ ListUserReadMarkersQuery = TypedDict(
     },
 )
 """Query parameters of `listUserReadMarkers`."""
+
+SearchChannelMessagesQuery = TypedDict(
+    "SearchChannelMessagesQuery",
+    {
+        "q": str,
+        "from_user_id": NotRequired[str],
+        "before": NotRequired[str],
+        "limit": NotRequired[int],
+    },
+)
+"""Query parameters of `searchChannelMessages`."""
+
+SearchUserMessagesQuery = TypedDict(
+    "SearchUserMessagesQuery",
+    {
+        "q": str,
+        "from_user_id": NotRequired[str],
+        "before": NotRequired[str],
+        "limit": NotRequired[int],
+        "peer": NotRequired[str],
+    },
+)
+"""Query parameters of `searchUserMessages`."""
+
+RemoveMessageReactionQuery = TypedDict(
+    "RemoveMessageReactionQuery",
+    {
+        "user_id": str,
+    },
+)
+"""Query parameters of `removeMessageReaction`."""

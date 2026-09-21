@@ -6,9 +6,10 @@ the chapter that explains the boundary.
 ## Scope decisions
 
 * **No social layer.** No friends/buddy lists, presence beyond "who has a live session / who is
-  in this channel", no attachments, threads or reactions. Text chat is a channel/direct message
-  with typing indicators; with `chat.persist` a deployment also gets paged history, directed
-  messages queued for offline users and read markers, but replay is per user (read-marker
+  in this channel", no attachments or threads. Text chat is a channel/direct message with
+  typing indicators; with `chat.persist` a deployment also gets paged history, directed
+  messages queued for offline users, read markers, edits / tombstone deletions, reactions and
+  PostgreSQL full-text search (exact words, no stemming), but replay is per user (read-marker
   driven, one live session per user and node), not an exactly-once per-device queue
   ([Text chat](features/chat.md)).
 * **No console SDKs.** PlayStation/Xbox/Switch SDKs are under NDA and cannot ship in an

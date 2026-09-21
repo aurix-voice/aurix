@@ -278,6 +278,11 @@ pub async fn erase_user(
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    sqlx::query("DELETE FROM chat_reactions WHERE app_id = $1 AND user_id = $2")
+        .bind(app_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
     let user_blocks = delete_user_rows(
         &mut tx,
         "DELETE FROM user_blocks WHERE app_id = $1 AND (user_id = $2 OR blocked_user_id = $2)",
@@ -423,6 +428,23 @@ pub async fn export_user_chat_messages(
     sqlx::query_as::<_, ChatMessageRow>(
         r#"SELECT * FROM chat_messages WHERE app_id = $1 AND (from_user_id = $2 OR to_user_id = $2)
            ORDER BY sent_at DESC LIMIT $3"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn export_user_chat_reactions(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<UserReactionRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserReactionRow>(
+        r#"SELECT message_id, reaction, reacted_at FROM chat_reactions
+           WHERE app_id = $1 AND user_id = $2 ORDER BY reacted_at DESC LIMIT $3"#,
     )
     .bind(app_id)
     .bind(user_id)
@@ -1967,6 +1989,233 @@ pub async fn get_chat_message(
         .await
 }
 
+/// Replaces text/metadata of a live (not deleted) message; `None` when there is no such
+/// message in the app.
+pub async fn update_chat_message_text(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+    text: &str,
+    metadata: &Option<serde_json::Value>,
+) -> Result<Option<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(
+        r#"UPDATE chat_messages SET text = $3, metadata = $4, edited_at = NOW()
+           WHERE app_id = $1 AND id = $2 AND deleted_at IS NULL
+           RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(id)
+    .bind(text)
+    .bind(metadata)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Turns a live message into a tombstone (empty text, no metadata, no reactions); `None`
+/// when there is no live message with that id in the app.
+pub async fn delete_chat_message(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+    deleted_by: Uuid,
+) -> Result<Option<ChatMessageRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query_as::<_, ChatMessageRow>(
+        r#"UPDATE chat_messages
+           SET text = '', metadata = NULL, deleted_at = NOW(), deleted_by = $3
+           WHERE app_id = $1 AND id = $2 AND deleted_at IS NULL
+           RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(id)
+    .bind(deleted_by)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if row.is_some() {
+        sqlx::query("DELETE FROM chat_reactions WHERE app_id = $1 AND message_id = $2")
+            .bind(app_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(row)
+}
+
+// ── Chat reactions ──
+
+/// Adds `reaction` by `user_id` unless the message already carries `max_distinct` other
+/// reactions; idempotent for a repeated (user, reaction).
+pub async fn add_chat_reaction(
+    pool: &DbPool,
+    app_id: Uuid,
+    message_id: Uuid,
+    user_id: Uuid,
+    reaction: &str,
+    max_distinct: i64,
+) -> Result<ReactionAdd, sqlx::Error> {
+    let (others,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(DISTINCT reaction) FROM chat_reactions
+           WHERE app_id = $1 AND message_id = $2 AND reaction <> $3"#,
+    )
+    .bind(app_id)
+    .bind(message_id)
+    .bind(reaction)
+    .fetch_one(pool)
+    .await?;
+    if others >= max_distinct {
+        let (exists,): (bool,) = sqlx::query_as(
+            r#"SELECT EXISTS(SELECT 1 FROM chat_reactions
+                             WHERE app_id = $1 AND message_id = $2 AND reaction = $3)"#,
+        )
+        .bind(app_id)
+        .bind(message_id)
+        .bind(reaction)
+        .fetch_one(pool)
+        .await?;
+        if !exists {
+            return Ok(ReactionAdd::TooManyDistinct);
+        }
+    }
+    let r = sqlx::query(
+        r#"INSERT INTO chat_reactions (app_id, message_id, user_id, reaction)
+           VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"#,
+    )
+    .bind(app_id)
+    .bind(message_id)
+    .bind(user_id)
+    .bind(reaction)
+    .execute(pool)
+    .await?;
+    Ok(if r.rows_affected() > 0 {
+        ReactionAdd::Added
+    } else {
+        ReactionAdd::AlreadySet
+    })
+}
+
+/// Removes `user_id`'s `reaction`; `false` when it was not set.
+pub async fn remove_chat_reaction(
+    pool: &DbPool,
+    app_id: Uuid,
+    message_id: Uuid,
+    user_id: Uuid,
+    reaction: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"DELETE FROM chat_reactions
+           WHERE app_id = $1 AND message_id = $2 AND user_id = $3 AND reaction = $4"#,
+    )
+    .bind(app_id)
+    .bind(message_id)
+    .bind(user_id)
+    .bind(reaction)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Users currently carrying `reaction` on the message.
+pub async fn count_chat_reaction(
+    pool: &DbPool,
+    app_id: Uuid,
+    message_id: Uuid,
+    reaction: &str,
+) -> Result<i64, sqlx::Error> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM chat_reactions
+           WHERE app_id = $1 AND message_id = $2 AND reaction = $3"#,
+    )
+    .bind(app_id)
+    .bind(message_id)
+    .bind(reaction)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Reaction tallies of a page of messages, most-used first per message. `user_ids` is cut
+/// at `shown` reactors, the `reader` (when they reacted) always first.
+pub async fn list_chat_reactions(
+    pool: &DbPool,
+    app_id: Uuid,
+    message_ids: &[Uuid],
+    reader: Option<Uuid>,
+    shown: i64,
+) -> Result<Vec<ChatReactionRow>, sqlx::Error> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, ChatReactionRow>(
+        r#"SELECT message_id, reaction, COUNT(*) AS count,
+                  (ARRAY_AGG(user_id ORDER BY COALESCE(user_id = $3::uuid, false) DESC, reacted_at ASC, user_id ASC))[1:$4] AS user_ids
+           FROM chat_reactions
+           WHERE app_id = $1 AND message_id = ANY($2)
+           GROUP BY message_id, reaction
+           ORDER BY message_id, count DESC, MIN(reacted_at) ASC, reaction ASC"#,
+    )
+    .bind(app_id)
+    .bind(message_ids)
+    .bind(reader)
+    .bind(shown as i32)
+    .fetch_all(pool)
+    .await
+}
+
+// ── Chat search ──
+
+/// Newest-first page of live messages of `scope` matching the web-search style `query`
+/// (`websearch_to_tsquery('simple', …)`: words are AND-ed, `"quoted phrases"`, `-excluded`,
+/// `or`). `None` when the query has no searchable term.
+pub async fn search_chat_messages(
+    pool: &DbPool,
+    app_id: Uuid,
+    scope: ChatSearchScope,
+    query: &str,
+    from_user_id: Option<Uuid>,
+    before: Option<MessageCursor>,
+    limit: i64,
+) -> Result<Option<Vec<ChatMessageRow>>, sqlx::Error> {
+    let (has_terms,): (bool,) =
+        sqlx::query_as("SELECT numnode(websearch_to_tsquery('simple', $1)) > 0")
+            .bind(query)
+            .fetch_one(pool)
+            .await?;
+    if !has_terms {
+        return Ok(None);
+    }
+    let (channel_id, user_a, user_b) = match scope {
+        ChatSearchScope::Channel(c) => (Some(c), None, None),
+        ChatSearchScope::Direct(a, b) => (None, Some(a), Some(b)),
+        ChatSearchScope::User(u) => (None, Some(u), None),
+    };
+    let rows = sqlx::query_as::<_, ChatMessageRow>(
+        r#"SELECT * FROM chat_messages
+           WHERE app_id = $1 AND deleted_at IS NULL
+             AND text_search @@ websearch_to_tsquery('simple', $2)
+             AND (($3::uuid IS NOT NULL AND channel_id = $3)
+                  OR ($3::uuid IS NULL AND $5::uuid IS NOT NULL
+                      AND ((from_user_id = $4 AND to_user_id = $5) OR (from_user_id = $5 AND to_user_id = $4)))
+                  OR ($3::uuid IS NULL AND $5::uuid IS NULL AND to_user_id IS NOT NULL
+                      AND (from_user_id = $4 OR to_user_id = $4)))
+             AND ($6::uuid IS NULL OR from_user_id = $6)
+             AND ($7::timestamptz IS NULL OR (sent_at, id) < ($7, $8::uuid))
+           ORDER BY sent_at DESC, id DESC LIMIT $9"#,
+    )
+    .bind(app_id)
+    .bind(query)
+    .bind(channel_id)
+    .bind(user_a)
+    .bind(user_b)
+    .bind(from_user_id)
+    .bind(before.map(|c| c.sent_at))
+    .bind(before.map(|c| c.id))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(rows))
+}
+
 /// Number of messages in a conversation newer than `after` that `user_id` did not send, capped
 /// at `cap` so a long-idle member cannot trigger a full scan.
 pub async fn count_unread_messages(
@@ -1986,6 +2235,7 @@ pub async fn count_unread_messages(
              SELECT 1 FROM chat_messages
              WHERE app_id = $1
                AND from_user_id <> $2
+               AND deleted_at IS NULL
                AND (($3::uuid IS NOT NULL AND channel_id = $3)
                     OR ($4::uuid IS NOT NULL AND to_user_id = $2 AND from_user_id = $4))
                AND ($5::timestamptz IS NULL OR (sent_at, id) > ($5, $6::uuid))
@@ -2023,6 +2273,7 @@ pub async fn list_unread_offline_messages(
                ON rm.app_id = m.app_id AND rm.user_id = m.to_user_id
               AND rm.kind = 'direct' AND rm.conversation_id = m.from_user_id
              WHERE m.app_id = $1 AND m.to_user_id = $2 AND m.offline
+               AND m.deleted_at IS NULL
                AND ($3::timestamptz IS NULL OR m.sent_at >= $3)
                AND (rm.message_id IS NULL
                     OR (m.sent_at, m.id) > (rm.message_sent_at, rm.message_id))

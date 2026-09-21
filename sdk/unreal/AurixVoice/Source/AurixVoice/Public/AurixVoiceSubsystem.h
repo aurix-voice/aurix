@@ -42,6 +42,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixKicked, FGuid, ChannelId, con
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixModerationApplied, int64, RequestId, FGuid, ChannelId, FGuid, UserId, EAurixModerationAction, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatMessageReceived, const FAurixChatMessage&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatHistoryReceived, int64, RequestId, const FAurixChatHistoryPage&, Page);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatMessageUpdated, int64, RequestId, const FAurixChatMessage&, Message);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatReactionChanged, const FAurixChatReactionChange&, Change);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatReadMarkerChanged, const FAurixReadMarker&, Marker);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixChatReadMarkersReceived, FGuid, ChannelId, FGuid, PeerUserId, const TArray<FAurixReadMarker>&, Markers, int32, UnreadCount);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatInboxSynced, int32, Delivered, bool, bTruncated);
@@ -570,6 +572,37 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
 	bool DirectReadMarkers(FGuid UserId);
 
+	/**
+	 * Replaces the text of this user's own message (within the server's edit window; empty
+	 * MetadataJson clears the metadata). Answered by OnChatMessageUpdated with RequestId, or
+	 * OnRequestFailed.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool EditChat(FGuid MessageId, const FString& Text, const FString& MetadataJson, int64& RequestId);
+
+	/**
+	 * Deletes a message: this user's own (within the edit window) or, in a channel this user
+	 * moderates, anyone's. Answered by a tombstone OnChatMessageUpdated with RequestId.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool DeleteChat(FGuid MessageId, int64& RequestId);
+
+	/** Adds (bAdd) or removes this user's reaction on a message; everyone gets OnChatReactionChanged. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool ReactChat(FGuid MessageId, const FString& Reaction, bool bAdd);
+
+	/**
+	 * Full-text search in the stored history of a joined channel; FromUserId (optional) keeps
+	 * one author's messages, Before continues from a previous page's NextBefore, Limit 0 =
+	 * server default. Answered by OnChatSearchResult (newest match first) or OnRequestFailed.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool SearchChannelChat(FGuid ChannelId, const FString& Query, FGuid FromUserId, const FString& Before, int32 Limit, int64& RequestId);
+
+	/** Full-text search in the direct conversation with UserId (invalid GUID = every direct conversation of this user). */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Chat")
+	bool SearchDirectChat(FGuid UserId, const FString& Query, FGuid FromUserId, const FString& Before, int32 Limit, int64& RequestId);
+
 	/** Server-side text-to-speech as this participant's voice (ChannelId may be invalid for Local). */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Speech")
 	bool Speak(const FString& Text, FGuid ChannelId, EAurixTtsDestination Destination, const FString& Voice, int64& RequestId);
@@ -639,6 +672,11 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixModerationApplied OnModerationApplied;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatMessageReceived OnChatMessage;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatHistoryReceived OnChatHistory;
+	/** A message of one of this client's conversations was edited or deleted (replace the copy with the same MessageId). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatMessageUpdated OnChatMessageUpdated;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatReactionChanged OnChatReactionChanged;
+	/** Answer to SearchChannelChat / SearchDirectChat (Page.Query set, NextAfter always empty). */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatHistoryReceived OnChatSearchResult;
 	/** A read marker moved: this user's (any device) or, with server-side read receipts, another participant's. */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatReadMarkerChanged OnChatReadMarker;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChatReadMarkersReceived OnChatReadMarkers;

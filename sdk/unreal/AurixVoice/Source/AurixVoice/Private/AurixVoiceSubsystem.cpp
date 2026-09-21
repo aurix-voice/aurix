@@ -8,10 +8,13 @@
 #include "AurixVoiceSoundWave.h"
 #include "Components/AudioComponent.h"
 #include "Components/SceneComponent.h"
+#include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "Kismet/GameplayStatics.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Sound/SoundAttenuation.h"
 #include "Sound/SoundClass.h"
 
@@ -276,6 +279,47 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	return Out;
 }
 
+TArray<FAurixChatReactionTally> ParseReactions(const char* Json)
+{
+	TArray<FAurixChatReactionTally> Out;
+	if (!Json || !*Json)
+	{
+		return Out;
+	}
+	TArray<TSharedPtr<FJsonValue>> Items;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FromUtf8(Json));
+	if (!FJsonSerializer::Deserialize(Reader, Items))
+	{
+		return Out;
+	}
+	for (const TSharedPtr<FJsonValue>& Item : Items)
+	{
+		const TSharedPtr<FJsonObject>* Obj = nullptr;
+		if (!Item.IsValid() || !Item->TryGetObject(Obj) || !Obj || !Obj->IsValid())
+		{
+			continue;
+		}
+		FAurixChatReactionTally Tally;
+		(*Obj)->TryGetStringField(TEXT("reaction"), Tally.Reaction);
+		(*Obj)->TryGetNumberField(TEXT("count"), Tally.Count);
+		const TArray<TSharedPtr<FJsonValue>>* Users = nullptr;
+		if ((*Obj)->TryGetArrayField(TEXT("user_ids"), Users) && Users)
+		{
+			for (const TSharedPtr<FJsonValue>& U : *Users)
+			{
+				FString Id;
+				FGuid Guid;
+				if (U.IsValid() && U->TryGetString(Id) && FGuid::Parse(Id, Guid))
+				{
+					Tally.UserIds.Add(Guid);
+				}
+			}
+		}
+		Out.Add(MoveTemp(Tally));
+	}
+	return Out;
+}
+
 FAurixChatMessage ToChatMessage(const AurixChatMessage& M)
 {
 	FAurixChatMessage Out;
@@ -290,7 +334,47 @@ FAurixChatMessage ToChatMessage(const AurixChatMessage& M)
 	Out.RequestId = static_cast<int64>(M.request_id);
 	Out.bOffline = M.offline;
 	Out.Cursor = FromUtf8(M.cursor);
+	Out.bEdited = M.edited_at_ms != 0;
+	Out.EditedAt = FromUnixMs(M.edited_at_ms);
+	Out.bDeleted = M.deleted_at_ms != 0;
+	Out.DeletedAt = FromUnixMs(M.deleted_at_ms);
+	Out.DeletedBy = ToGuid(M.deleted_by);
+	Out.Reactions = ParseReactions(M.reactions_json);
 	return Out;
+}
+
+FAurixChatReactionChange ToReactionChange(const AurixChatReaction& R)
+{
+	FAurixChatReactionChange Out;
+	Out.MessageId = ToGuid(R.message_id);
+	Out.ChannelId = ToGuid(R.channel_id);
+	Out.MessageSenderId = ToGuid(R.message_sender_id);
+	Out.MessageRecipientId = ToGuid(R.message_recipient_id);
+	Out.UserId = ToGuid(R.user_id);
+	Out.Reaction = FromUtf8(R.reaction);
+	Out.bAdded = R.added;
+	Out.Count = static_cast<int32>(R.count);
+	Out.Timestamp = FromUnixMs(R.timestamp_ms);
+	return Out;
+}
+
+FAurixChatHistoryPage ReadHistoryPage(const AurixEvent* Raw, const AurixChatHistory& H, FGuid ChannelId, FGuid UserId)
+{
+	FAurixChatHistoryPage Page;
+	Page.ChannelId = ChannelId;
+	Page.PeerUserId = UserId;
+	Page.NextBefore = FromUtf8(H.next_before);
+	Page.NextAfter = FromUtf8(H.next_after);
+	Page.Messages.Reserve(static_cast<int32>(H.count));
+	for (size_t i = 0; i < H.count; ++i)
+	{
+		AurixChatMessage M;
+		if (aurix_event_chat_history_message(Raw, i, &M))
+		{
+			Page.Messages.Add(ToChatMessage(M));
+		}
+	}
+	return Page;
 }
 
 FAurixReadMarker ToReadMarker(const AurixReadMarker& M)
@@ -1665,6 +1749,69 @@ bool UAurixVoiceSubsystem::DirectReadMarkers(FGuid UserId)
 	return Native && Check(Native->Client.direct_read_markers(ToUuid(UserId)), TEXT("direct_read_markers"));
 }
 
+bool UAurixVoiceSubsystem::EditChat(FGuid MessageId, const FString& Text, const FString& MetadataJson, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string Meta = ToUtf8(MetadataJson);
+	const bool bOk = Check(Native->Client.edit_chat(ToUuid(MessageId), ToUtf8(Text), MetadataJson.IsEmpty() ? nullptr : Meta.c_str(), &Id), TEXT("edit_chat"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::DeleteChat(FGuid MessageId, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const bool bOk = Check(Native->Client.delete_chat(ToUuid(MessageId), &Id), TEXT("delete_chat"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::ReactChat(FGuid MessageId, const FString& Reaction, bool bAdd)
+{
+	return Native && Check(Native->Client.react_chat(ToUuid(MessageId), ToUtf8(Reaction), bAdd), TEXT("react_chat"));
+}
+
+bool UAurixVoiceSubsystem::SearchChannelChat(FGuid ChannelId, const FString& Query, FGuid FromUserId, const FString& Before, int32 Limit, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string BeforeUtf8 = ToUtf8(Before);
+	const aurix::Uuid From = ToUuid(FromUserId);
+	const bool bOk = Check(Native->Client.search_channel_chat(ToUuid(ChannelId), ToUtf8(Query), FromUserId.IsValid() ? &From : nullptr, Before.IsEmpty() ? nullptr : BeforeUtf8.c_str(), static_cast<uint32_t>(FMath::Max(0, Limit)), &Id), TEXT("search_channel_chat"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
+bool UAurixVoiceSubsystem::SearchDirectChat(FGuid UserId, const FString& Query, FGuid FromUserId, const FString& Before, int32 Limit, int64& RequestId)
+{
+	RequestId = 0;
+	if (!Native)
+	{
+		return false;
+	}
+	uint64_t Id = 0;
+	const std::string BeforeUtf8 = ToUtf8(Before);
+	const aurix::Uuid User = ToUuid(UserId);
+	const aurix::Uuid From = ToUuid(FromUserId);
+	const bool bOk = Check(Native->Client.search_direct_chat(UserId.IsValid() ? &User : nullptr, ToUtf8(Query), FromUserId.IsValid() ? &From : nullptr, Before.IsEmpty() ? nullptr : BeforeUtf8.c_str(), static_cast<uint32_t>(FMath::Max(0, Limit)), &Id), TEXT("search_direct_chat"));
+	RequestId = static_cast<int64>(Id);
+	return bOk;
+}
+
 bool UAurixVoiceSubsystem::Speak(const FString& Text, FGuid ChannelId, EAurixTtsDestination Destination, const FString& Voice, int64& RequestId)
 {
 	RequestId = 0;
@@ -1952,21 +2099,39 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		AurixChatHistory H;
 		if (aurix_event_chat_history(Raw, &H))
 		{
-			FAurixChatHistoryPage Page;
-			Page.ChannelId = ChannelId;
-			Page.PeerUserId = UserId;
-			Page.NextBefore = FromUtf8(H.next_before);
-			Page.NextAfter = FromUtf8(H.next_after);
-			Page.Messages.Reserve(static_cast<int32>(H.count));
-			for (size_t i = 0; i < H.count; ++i)
-			{
-				AurixChatMessage M;
-				if (aurix_event_chat_history_message(Raw, i, &M))
-				{
-					Page.Messages.Add(ToChatMessage(M));
-				}
-			}
-			OnChatHistory.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), Page);
+			OnChatHistory.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), ReadHistoryPage(Raw, H, ChannelId, UserId));
+		}
+		break;
+	}
+
+	case AURIX_EVENT_CHAT_SEARCH_RESULT:
+	{
+		AurixChatHistory H;
+		if (aurix_event_chat_history(Raw, &H))
+		{
+			FAurixChatHistoryPage Page = ReadHistoryPage(Raw, H, ChannelId, UserId);
+			Page.Query = FromUtf8(aurix_event_message(Raw));
+			OnChatSearchResult.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), Page);
+		}
+		break;
+	}
+
+	case AURIX_EVENT_CHAT_MESSAGE_UPDATED:
+	{
+		AurixChatMessage M;
+		if (aurix_event_chat(Raw, &M))
+		{
+			OnChatMessageUpdated.Broadcast(static_cast<int64>(aurix_event_request_id(Raw)), ToChatMessage(M));
+		}
+		break;
+	}
+
+	case AURIX_EVENT_CHAT_REACTION_CHANGED:
+	{
+		AurixChatReaction R;
+		if (aurix_event_reaction(Raw, &R))
+		{
+			OnChatReactionChanged.Broadcast(ToReactionChange(R));
 		}
 		break;
 	}

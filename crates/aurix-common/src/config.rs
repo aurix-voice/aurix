@@ -312,6 +312,12 @@ impl AurixConfig {
             if self.chat.unread_count_cap == 0 {
                 anyhow::bail!("chat.unread_count_cap must be > 0");
             }
+            if self.chat.reactions_per_message > 200 {
+                anyhow::bail!("chat.reactions_per_message must be within 0..=200");
+            }
+            if self.chat.search && self.chat.searches_per_minute == 0 {
+                anyhow::bail!("chat.searches_per_minute must be > 0 when chat.search is on");
+            }
             if let Some(url) = &self.chat.filter_webhook {
                 if !url.starts_with("http://") && !url.starts_with("https://") {
                     anyhow::bail!("chat.filter_webhook must be an http(s) URL");
@@ -2059,6 +2065,23 @@ pub struct ChatConfig {
     /// (`false` = a user only ever sees their own markers).
     #[serde(default = "default_true")]
     pub read_receipts: bool,
+    /// Authors may edit their stored messages (`ChatEdit`); needs `persist`.
+    #[serde(default = "default_true")]
+    pub edits: bool,
+    /// How long after sending an author may still edit or delete a message (`0` = no limit).
+    /// Channel moderators and the REST API are not bound by it.
+    #[serde(default = "default_chat_edit_window_secs")]
+    pub edit_window_secs: u64,
+    /// Distinct reactions (emoji / short tokens) one message may carry; `0` disables
+    /// reactions. Needs `persist`.
+    #[serde(default = "default_chat_reactions_per_message")]
+    pub reactions_per_message: u32,
+    /// Full-text search over stored history (`ChatSearch`, `GET …/messages/search`).
+    #[serde(default = "default_true")]
+    pub search: bool,
+    /// Per-session limit of search requests (sustained per minute; burst = the same number).
+    #[serde(default = "default_chat_searches_per_minute")]
+    pub searches_per_minute: u32,
 }
 
 fn default_chat_max_message_bytes() -> usize {
@@ -2091,6 +2114,15 @@ fn default_chat_filter_timeout_ms() -> u64 {
 fn default_chat_retention_days() -> u32 {
     30
 }
+fn default_chat_edit_window_secs() -> u64 {
+    900
+}
+fn default_chat_reactions_per_message() -> u32 {
+    20
+}
+fn default_chat_searches_per_minute() -> u32 {
+    30
+}
 
 impl Default for ChatConfig {
     fn default() -> Self {
@@ -2112,6 +2144,11 @@ impl Default for ChatConfig {
             history_page_max: default_chat_history_page_max(),
             unread_count_cap: default_chat_unread_count_cap(),
             read_receipts: true,
+            edits: true,
+            edit_window_secs: default_chat_edit_window_secs(),
+            reactions_per_message: default_chat_reactions_per_message(),
+            search: true,
+            searches_per_minute: default_chat_searches_per_minute(),
         }
     }
 }

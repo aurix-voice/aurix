@@ -88,6 +88,9 @@ signal chat_history(request_id: int, channel_id: String, user_id: String, messag
 signal chat_read_marker(marker: Dictionary)
 signal chat_read_markers(channel_id: String, user_id: String, unread: int, markers: Array)
 signal chat_inbox_synced(delivered: int, truncated: bool)
+signal chat_message_updated(message: Dictionary)
+signal chat_reaction_changed(change: Dictionary)
+signal chat_search_result(request_id: int, channel_id: String, user_id: String, query: String, messages: Array, next_before: String)
 signal translation_changed(translation: Dictionary)
 
 # --- browser-only signals
@@ -619,6 +622,36 @@ func direct_history(user_id: String, before := "", after := "", limit := 50) -> 
 	return _history({"userId": user_id}, "", user_id, before, after, limit)
 
 
+func edit_chat(message_id: String, text: String, metadata_json := "") -> int:
+	var args := {"messageId": message_id, "text": text}
+	_metadata(args, metadata_json)
+	var rid := _request("chat_update")
+	var r := _result(_invoke("editMessage", args, rid))
+	return rid if r == RESULT_OK else -r
+
+
+func delete_chat(message_id: String) -> int:
+	var rid := _request("chat_update")
+	var r := _result(_invoke("deleteMessage", {"messageId": message_id}, rid))
+	return rid if r == RESULT_OK else -r
+
+
+func react_chat(message_id: String, reaction: String, add := true) -> int:
+	return _result(_invoke("react", {"messageId": message_id, "reaction": reaction, "add": add}))
+
+
+func search_channel_chat(channel_id: String, query: String, from_user_id := "", before := "", limit := 50) -> int:
+	return _search({"channelId": channel_id}, channel_id, "", query, from_user_id, before, limit)
+
+
+## The Web SDK searches one conversation: [param user_id] is required here (an empty one is
+## RESULT_INVALID_ARGUMENT), unlike the native client's "every direct conversation" form.
+func search_direct_chat(user_id: String, query: String, from_user_id := "", before := "", limit := 50) -> int:
+	if user_id.is_empty():
+		return -RESULT_INVALID_ARGUMENT
+	return _search({"userId": user_id}, "", user_id, query, from_user_id, before, limit)
+
+
 func mark_channel_read(channel_id: String, message_id: String) -> int:
 	return _result(_invoke("markRead", {"channelId": channel_id, "messageId": message_id}))
 
@@ -927,6 +960,19 @@ func _history(scope: Dictionary, channel_id: String, user_id: String, before: St
 	return rid if r == RESULT_OK else -r
 
 
+func _search(scope: Dictionary, channel_id: String, user_id: String, query: String, from_user_id: String, before: String, limit: int) -> int:
+	var args := scope.duplicate()
+	args["query"] = query
+	if not from_user_id.is_empty():
+		args["fromUserId"] = from_user_id
+	if not before.is_empty():
+		args["before"] = before
+	args["limit"] = limit
+	var rid := _request("search", {"channel_id": channel_id, "user_id": user_id, "query": query})
+	var r := _result(_invoke("search", args, rid))
+	return rid if r == RESULT_OK else -r
+
+
 static func _metadata(args: Dictionary, metadata_json: String) -> void:
 	if metadata_json.is_empty():
 		return
@@ -1121,6 +1167,14 @@ func _dispatch(e: Dictionary) -> void:
 				chat_read_marker.emit(marker)
 		"chatInboxSynced":
 			chat_inbox_synced.emit(int(e.get("delivered", 0)), e.get("truncated", false) == true)
+		"chatMessageUpdated":
+			var m := _chat_message(e.get("message"))
+			if not m.is_empty():
+				chat_message_updated.emit(m)
+		"chatReactionChanged":
+			var change := _reaction_change(e.get("change"))
+			if not change.is_empty():
+				chat_reaction_changed.emit(change)
 		"participantTyping":
 			participant_typing.emit(_str(e.get("channelId")), _str(e.get("userId")), e.get("typing", false) == true)
 		"transcript":
@@ -1198,6 +1252,14 @@ func _on_result(e: Dictionary) -> void:
 				if not cm.is_empty():
 					messages.append(cm)
 			chat_history.emit(rid, String(req.get("channel_id", "")), String(req.get("user_id", "")), messages, _str(page.get("nextBefore")), _str(page.get("nextAfter")))
+		"search":
+			var page: Dictionary = value if value is Dictionary else {}
+			var messages: Array = []
+			for m in page.get("messages", []):
+				var cm := _chat_message(m)
+				if not cm.is_empty():
+					messages.append(cm)
+			chat_search_result.emit(rid, String(req.get("channel_id", "")), String(req.get("user_id", "")), String(req.get("query", "")), messages, _str(page.get("nextBefore")))
 		"read_markers":
 			var rm: Dictionary = value if value is Dictionary else {}
 			var markers: Array = []
@@ -1435,6 +1497,39 @@ static func _chat_message(v: Variant) -> Dictionary:
 		"cursor": _str(m.get("cursor")),
 		"own": m.get("own", false) == true,
 		"system": m.get("system", false) == true,
+		"edited_at_ms": _ms(m.get("editedAt")) if m.get("editedAt") != null else 0,
+		"deleted_at_ms": _ms(m.get("deletedAt")) if m.get("deletedAt") != null else 0,
+		"deleted_by": _str(m.get("deletedBy")),
+		"reactions_json": _reactions_json(m.get("reactions")),
+	}
+
+
+## Same shape as the native client's `reactions_json`: `[{"reaction","count","user_ids"}]`,
+## empty when there are none.
+static func _reactions_json(v: Variant) -> String:
+	if not (v is Array) or (v as Array).is_empty():
+		return ""
+	var out: Array = []
+	for r in v:
+		if r is Dictionary:
+			out.append({"reaction": _str(r.get("reaction")), "count": int(r.get("count", 0)), "user_ids": r.get("userIds", [])})
+	return JSON.stringify(out)
+
+
+static func _reaction_change(v: Variant) -> Dictionary:
+	if not (v is Dictionary):
+		return {}
+	var c: Dictionary = v
+	return {
+		"message_id": _str(c.get("messageId")),
+		"channel_id": _str(c.get("channelId")),
+		"message_sender_id": _str(c.get("messageFromUserId")),
+		"message_recipient_id": _str(c.get("messageToUserId")),
+		"user_id": _str(c.get("userId")),
+		"reaction": _str(c.get("reaction")),
+		"added": c.get("added", false) == true,
+		"count": int(c.get("count", 0)),
+		"timestamp_ms": _ms(c.get("timestamp")),
 	}
 
 

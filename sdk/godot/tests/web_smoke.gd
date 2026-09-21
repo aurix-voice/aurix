@@ -47,6 +47,11 @@ func _init() -> void:
 	_check(client.join_channel("00000000-0000-4000-8000-000000000001") == -Web.RESULT_NOT_CONNECTED, "join without client → -NOT_CONNECTED")
 	_check(client.leave_channel("x") == Web.RESULT_NOT_CONNECTED, "leave without client → NOT_CONNECTED")
 	_check(client.send_chat("x", "hi") == -Web.RESULT_NOT_CONNECTED, "chat without client → -NOT_CONNECTED")
+	_check(client.edit_chat("m1", "fixed") == -Web.RESULT_NOT_CONNECTED, "edit_chat without client → -NOT_CONNECTED")
+	_check(client.delete_chat("m1") == -Web.RESULT_NOT_CONNECTED, "delete_chat without client → -NOT_CONNECTED")
+	_check(client.react_chat("m1", "thumbs_up") == Web.RESULT_NOT_CONNECTED, "react_chat without client → NOT_CONNECTED")
+	_check(client.search_channel_chat("c1", "loot") == -Web.RESULT_NOT_CONNECTED, "search_channel_chat without client → -NOT_CONNECTED")
+	_check(client.search_direct_chat("", "loot") == -Web.RESULT_INVALID_ARGUMENT, "web search_direct_chat needs a peer")
 	_check(client.set_participant_volume("u", 0.5) == Web.RESULT_NOT_CONNECTED, "volume without client → NOT_CONNECTED")
 	_check(client.set_token("") == Web.RESULT_INVALID_ARGUMENT, "empty token rejected")
 	_check(client.set_token("t") == Web.RESULT_OK, "set_token stores the credential")
@@ -78,7 +83,7 @@ func _init() -> void:
 	_check(frame["dominant"] == Web.VISEME_AA and (frame["weights"] as PackedFloat32Array).size() == 9 and frame["sequence"] == 7, "viseme frame conversion")
 
 	# --- event dispatch: bridge JSON → native-shaped signals
-	for sig in ["state_changed", "session_ready", "media_bound", "media_path_changed", "channel_joined", "participant_joined", "participant_speaking", "participant_mute_changed", "channel_energy", "chat_message", "transcript", "tts_status", "network_quality", "recovering", "recovered", "failed_to_recover", "disconnected", "token_requested", "participant_streams_changed", "ducking_changed", "request_failed", "remote_audio", "events_dropped", "server_error", "chat_history", "moderation_applied", "channel_left", "participant_left", "e2ee_peer_key"]:
+	for sig in ["state_changed", "session_ready", "media_bound", "media_path_changed", "channel_joined", "participant_joined", "participant_speaking", "participant_mute_changed", "channel_energy", "chat_message", "transcript", "tts_status", "network_quality", "recovering", "recovered", "failed_to_recover", "disconnected", "token_requested", "participant_streams_changed", "ducking_changed", "request_failed", "remote_audio", "events_dropped", "server_error", "chat_history", "moderation_applied", "channel_left", "participant_left", "e2ee_peer_key", "chat_message_updated", "chat_reaction_changed", "chat_search_result"]:
 		client.connect(sig, _record(sig))
 
 	client._dispatch({"type": "connectionState", "state": "connecting"})
@@ -156,8 +161,21 @@ func _init() -> void:
 	client._requests[23] = {"kind": "history", "channel_id": "c1", "user_id": ""}
 	client._dispatch({"type": "result", "rid": 23, "ok": true, "value": {"messages": [{"id": "m0", "channelId": "c1", "fromUserId": "u2", "displayName": "Bob", "text": "old", "sentAt": "2026-01-01T00:00:00Z", "own": false, "system": false, "offline": false, "cursor": "c0"}], "nextBefore": "c0"}})
 	_check(_got["chat_history"][0] == 23 and (_got["chat_history"][3] as Array).size() == 1 and _got["chat_history"][4] == "c0", "chat_history page")
+	client._requests[24] = {"kind": "search", "channel_id": "c1", "user_id": "", "query": "old"}
+	client._dispatch({"type": "result", "rid": 24, "ok": true, "value": {"messages": [{"id": "m0", "channelId": "c1", "fromUserId": "u2", "displayName": "Bob", "text": "old", "sentAt": "2026-01-01T00:00:00Z", "own": false, "system": false, "offline": false, "cursor": "c0", "editedAt": "2026-01-01T00:01:00Z", "reactions": [{"reaction": "thumbs_up", "count": 2, "userIds": ["u1", "u2"]}]}], "nextBefore": "c0"}})
+	var found: Array = _got["chat_search_result"]
+	_check(found[0] == 24 and found[1] == "c1" and found[3] == "old" and (found[4] as Array).size() == 1 and found[5] == "c0", "chat_search_result page")
+	var hit: Dictionary = (found[4] as Array)[0]
+	_check(hit["edited_at_ms"] == 1767225660000 and hit["deleted_at_ms"] == 0 and hit["reactions_json"].contains('"count":2') and hit["reactions_json"].contains('"user_ids":["u1","u2"]'), "search hit carries edited_at + reactions_json: %s" % hit["reactions_json"])
 	client._dispatch({"type": "result", "rid": 99, "ok": true, "value": 1})
 	_check(true, "unknown result id ignored")
+
+	client._dispatch({"type": "chatMessageUpdated", "message": {"id": "m0", "channelId": "c1", "fromUserId": "u2", "displayName": "Bob", "text": "", "sentAt": "2026-01-01T00:00:00Z", "own": false, "system": false, "offline": false, "cursor": "c0", "deletedAt": "2026-01-01T00:02:00Z", "deletedBy": "u9", "reactions": [], "clientRef": "31"}})
+	var tomb: Dictionary = _got["chat_message_updated"][0]
+	_check(tomb["deleted_at_ms"] == 1767225720000 and tomb["deleted_by"] == "u9" and tomb["text"] == "" and tomb["reactions_json"] == "" and tomb["request_id"] == 31 and tomb["cursor"] == "c0", "chat_message_updated tombstone keeps id/cursor, maps clientRef → request_id")
+	client._dispatch({"type": "chatReactionChanged", "change": {"messageId": "m0", "channelId": "c1", "messageFromUserId": "u2", "messageToUserId": null, "userId": "u1", "reaction": "thumbs_up", "added": true, "count": 3, "timestamp": "2026-01-01T00:03:00Z"}})
+	var change: Dictionary = _got["chat_reaction_changed"][0]
+	_check(change["message_id"] == "m0" and change["message_sender_id"] == "u2" and change["message_recipient_id"] == "" and change["added"] == true and change["count"] == 3 and change["timestamp_ms"] == 1767225780000, "chat_reaction_changed uses native keys")
 
 	client._dispatch({"type": "channelLeft", "channelId": "c1"})
 	_check(_got["channel_left"][0] == "c1" and client.get_joined_channels().is_empty(), "channel_left clears roster")

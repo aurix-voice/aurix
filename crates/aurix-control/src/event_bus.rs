@@ -257,6 +257,27 @@ pub enum ServerEvent {
         app_id: AppId,
         marker: aurix_common::protocol::ChatReadMarker,
     },
+    /// A stored message was edited or deleted (tombstone); delivered like the original to
+    /// the conversation's audience, the acting session's copy carrying `client_ref`.
+    ChatMessageUpdated {
+        app_id: AppId,
+        message: aurix_common::protocol::ChatMessage,
+        from_session_id: Option<SessionId>,
+    },
+    /// `user_id` added / removed `reaction` on a message; `count` is the resulting tally.
+    ChatReactionChanged {
+        app_id: AppId,
+        message_id: uuid::Uuid,
+        channel_id: Option<ChannelId>,
+        message_from_user_id: UserId,
+        message_to_user_id: Option<UserId>,
+        user_id: UserId,
+        reaction: String,
+        added: bool,
+        count: u32,
+        timestamp: DateTime<Utc>,
+        from_session_id: Option<SessionId>,
+    },
     ParticipantTyping {
         app_id: AppId,
         channel_id: ChannelId,
@@ -391,6 +412,8 @@ impl ServerEvent {
             | Self::UserBlockChanged { app_id, .. }
             | Self::ChatMessage { app_id, .. }
             | Self::ChatReadMarker { app_id, .. }
+            | Self::ChatMessageUpdated { app_id, .. }
+            | Self::ChatReactionChanged { app_id, .. }
             | Self::ParticipantTyping { app_id, .. }
             | Self::E2eeRelay { app_id, .. }
             | Self::ParticipantSpeaking { app_id, .. }
@@ -447,6 +470,8 @@ impl ServerEvent {
             Self::UserBlockChanged { .. } => "user.block_changed",
             Self::ChatMessage { .. } => "chat.message",
             Self::ChatReadMarker { .. } => "chat.read_marker",
+            Self::ChatMessageUpdated { .. } => "chat.message_updated",
+            Self::ChatReactionChanged { .. } => "chat.reaction",
             Self::ParticipantTyping { .. } => "participant.typing",
             Self::ParticipantSpeaking { .. } => "participant.speaking",
             Self::ChannelEnergy { .. } => "channel.energy",
@@ -492,6 +517,8 @@ impl ServerEvent {
         "quality.recovered",
         "chat.message",
         "chat.read_marker",
+        "chat.message_updated",
+        "chat.reaction",
         "participant.typing",
         "participant.speaking",
         "channel.energy",

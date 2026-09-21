@@ -632,7 +632,10 @@ export interface ChatHistoryPage {
   next_after?: string;
 }
 
-/** Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history. */
+/**
+ * Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history. Edits keep
+ * `id` / `sent_at` and set `edited_at`; deletions leave a tombstone (`deleted_at`).
+ */
 export interface ChatMessage {
   id: string;
   /** `null` for directed (user-to-user) messages. */
@@ -649,6 +652,26 @@ export interface ChatMessage {
    * they connect. Omitted when `false`.
    */
   offline?: boolean;
+  /** Set when the text / metadata were changed after sending; omitted otherwise. */
+  edited_at?: string | null;
+  /**
+   * Set on tombstones: the message was deleted, `text` is empty and `metadata` / `reactions` are
+   * gone. Omitted for live messages.
+   */
+  deleted_at?: string | null;
+  /** Who deleted it: the author, a channel moderator, or the nil system user for REST deletions. */
+  deleted_by?: string | null;
+  /** Reaction tallies (history, search and `GET /v1/messages/{id}` only); omitted when empty. */
+  reactions?: ChatReaction[];
+}
+
+/** One reaction token on a message and who set it. */
+export interface ChatReaction {
+  reaction: string;
+  /** Users carrying this reaction. */
+  count: number;
+  /** Up to 20 of them (the reader first when known); `count` may exceed the list length. */
+  user_ids?: string[];
 }
 
 /**
@@ -781,6 +804,13 @@ export interface DuckingConfig {
    * `priority` grants always do).
    */
   moderators?: boolean;
+}
+
+export interface EditMessageRequest {
+  /** New text; `chat.max_message_bytes` applies. */
+  text: string;
+  /** Replaces the stored metadata; absent or `null` clears it. */
+  metadata?: unknown | null;
 }
 
 export interface ErrorDetail {
@@ -1213,6 +1243,23 @@ export interface QuotaState {
   participant_minutes_this_month: number;
   /** Start of the current UTC calendar month; the monthly quota resets here. */
   month_start: string;
+}
+
+export interface ReactionChange {
+  message_id: string;
+  user_id: string;
+  reaction: string;
+  /** `true` for PUT, `false` for DELETE. */
+  added: boolean;
+  /** `false` when the reaction was already in the requested state (nothing was published). */
+  changed: boolean;
+  /** Users carrying `reaction` after the request. */
+  count: number;
+}
+
+export interface ReactionRequest {
+  /** The user the reaction belongs to (must exist in the app). */
+  user_id: string;
 }
 
 export interface ReadMarkerRequest {
@@ -2241,4 +2288,50 @@ export interface ListUserReadMarkersQuery {
   channel_id?: string;
   /** Direct conversation with this user (mutually exclusive with `channel_id`). */
   peer_user_id?: string;
+}
+
+/** Query parameters of `searchChannelMessages`. */
+export interface SearchChannelMessagesQuery {
+  /**
+   * Web-search syntax: words are ANDed, `"a phrase"` matches in order, `-word` excludes, `or`
+   * alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A
+   * query without searchable terms yields an empty page.
+   */
+  q: string;
+  /** Only matches sent by this user. */
+  from_user_id?: string;
+  /**
+   * Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors
+   * are `400`.
+   */
+  before?: string;
+  /** Page size; clamped to `chat.history_page_max` (default 200). */
+  limit?: number;
+}
+
+/** Query parameters of `searchUserMessages`. */
+export interface SearchUserMessagesQuery {
+  /**
+   * Web-search syntax: words are ANDed, `"a phrase"` matches in order, `-word` excludes, `or`
+   * alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A
+   * query without searchable terms yields an empty page.
+   */
+  q: string;
+  /** Only matches sent by this user. */
+  from_user_id?: string;
+  /**
+   * Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors
+   * are `400`.
+   */
+  before?: string;
+  /** Page size; clamped to `chat.history_page_max` (default 200). */
+  limit?: number;
+  /** Restrict to the direct conversation with this user. */
+  peer?: string;
+}
+
+/** Query parameters of `removeMessageReaction`. */
+export interface RemoveMessageReactionQuery {
+  /** The user whose reaction is removed. */
+  user_id: string;
 }

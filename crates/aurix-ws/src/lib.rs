@@ -31,7 +31,7 @@ use aurix_common::protocol::{
     TtsDestination, UserPosition,
 };
 use aurix_common::types::*;
-use aurix_control::chat::{Conversation, OutgoingMessage, SYSTEM_USER};
+use aurix_control::chat::{Actor, Conversation, OutgoingMessage, SearchQuery, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::session_manager::ClientInfo;
 use aurix_control::{
@@ -1079,7 +1079,46 @@ impl WsState {
                     message,
                     from_session_id,
                 } => {
-                    self.deliver_chat(app_id, message, from_session_id);
+                    self.deliver_chat(app_id, message, from_session_id, |message| {
+                        ControlMessage::ChatMessageReceived { message }
+                    });
+                }
+                ServerEvent::ChatMessageUpdated {
+                    app_id,
+                    message,
+                    from_session_id,
+                } => {
+                    self.deliver_chat(app_id, message, from_session_id, |message| {
+                        ControlMessage::ChatMessageUpdated { message }
+                    });
+                }
+                ServerEvent::ChatReactionChanged {
+                    app_id,
+                    message_id,
+                    channel_id,
+                    message_from_user_id,
+                    message_to_user_id,
+                    user_id,
+                    reaction,
+                    added,
+                    count,
+                    timestamp,
+                    from_session_id: _,
+                } => {
+                    self.deliver_reaction(
+                        app_id,
+                        ControlMessage::ChatReactionChanged {
+                            message_id,
+                            channel_id,
+                            message_from_user_id,
+                            message_to_user_id,
+                            user_id,
+                            reaction,
+                            added,
+                            count,
+                            timestamp,
+                        },
+                    );
                 }
                 ServerEvent::ChatReadMarker { app_id, marker } => {
                     self.deliver_read_marker(app_id, marker);
@@ -1402,14 +1441,15 @@ impl WsState {
         }
     }
 
-    /// Local delivery of an accepted chat message: channel members (or the target user's
-    /// sessions) that have no block relationship with the sender, plus the sender's own echo
-    /// carrying `client_ref`.
+    /// Local delivery of an accepted chat message (or an edit / tombstone of one): channel
+    /// members (or the target user's sessions) that have no block relationship with the
+    /// sender, plus the sender's own echo carrying `client_ref`.
     fn deliver_chat(
         &self,
         app_id: AppId,
         message: ChatMessage,
         from_session_id: Option<SessionId>,
+        wrap: impl Fn(ChatMessage) -> ControlMessage,
     ) {
         let mut recipients: Vec<SessionId> = match (message.channel_id, message.to_user_id) {
             (Some(channel_id), _) => self
@@ -1429,15 +1469,11 @@ impl WsState {
                 }
             }
         }
-        let echo = ControlMessage::ChatMessageReceived {
-            message: message.clone(),
-        };
-        let plain = ControlMessage::ChatMessageReceived {
-            message: ChatMessage {
-                client_ref: None,
-                ..message.clone()
-            },
-        };
+        let echo = wrap(message.clone());
+        let plain = wrap(ChatMessage {
+            client_ref: None,
+            ..message.clone()
+        });
         let (Ok(echo_json), Ok(plain_json)) =
             (serde_json::to_string(&echo), serde_json::to_string(&plain))
         else {
@@ -1467,6 +1503,60 @@ impl WsState {
                 continue;
             }
             let json = if is_sender { &echo_json } else { &plain_json };
+            let _ = conn.tx.try_send(json.clone());
+        }
+    }
+
+    /// A reaction change goes to whoever sees the message: the channel's local members who
+    /// see the reacting user, or both parties of a direct message — never across a block.
+    fn deliver_reaction(&self, app_id: AppId, event: ControlMessage) {
+        let ControlMessage::ChatReactionChanged {
+            channel_id,
+            message_from_user_id,
+            message_to_user_id,
+            user_id: reactor,
+            ..
+        } = &event
+        else {
+            return;
+        };
+        let (recipients, channel) = match (channel_id, message_to_user_id) {
+            (Some(channel_id), _) => (
+                self.channel_members
+                    .get(channel_id)
+                    .map(|m| m.iter().map(|s| *s).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                self.sfu.read().get_channel(channel_id),
+            ),
+            (None, Some(to)) => {
+                let mut r = self.sessions_of_user(app_id, *message_from_user_id);
+                for sid in self.sessions_of_user(app_id, *to) {
+                    if !r.contains(&sid) {
+                        r.push(sid);
+                    }
+                }
+                (r, None)
+            }
+            (None, None) => return,
+        };
+        let Ok(json) = serde_json::to_string(&event) else {
+            return;
+        };
+        for sid in recipients {
+            let Some(conn) = self.connections.get(&sid) else {
+                continue;
+            };
+            if conn.app_id != app_id {
+                continue;
+            }
+            if conn.user_id != *reactor
+                && (!self.text_allowed(&sid, reactor)
+                    || channel
+                        .as_ref()
+                        .is_some_and(|c| !c.sees(&conn.user_id, reactor)))
+            {
+                continue;
+            }
             let _ = conn.tx.try_send(json.clone());
         }
     }
@@ -3494,6 +3584,34 @@ async fn send_chat(
     chat.accept(msg).await.map(|_| ())
 }
 
+/// Locates a stored message and decides how `token`'s session relates to it: a channel
+/// message needs active membership here (moderators of that channel may delete others'
+/// messages), a direct message must involve the user — otherwise it "does not exist".
+async fn chat_actor(
+    state: &WsState,
+    session_id: SessionId,
+    token: &ValidatedToken,
+    message_id: uuid::Uuid,
+) -> Result<Actor, AurixError> {
+    let message = state.control.chat.message(token.app_id, message_id).await?;
+    let moderator = match message.channel_id {
+        Some(channel_id) => channel_role(state, &session_id, &channel_id)
+            .ok_or_else(|| AurixError::AuthorizationDenied("Not a member of this channel".into()))?
+            .can_moderate(),
+        None => {
+            if message.from_user_id != token.user_id && message.to_user_id != Some(token.user_id) {
+                return Err(AurixError::NotFound("Message not found".into()));
+            }
+            false
+        }
+    };
+    Ok(Actor {
+        user_id: token.user_id,
+        session_id: Some(session_id),
+        moderator,
+    })
+}
+
 /// Resolves a client's `channel_id` / `user_id` conversation selector against its
 /// memberships: a channel needs active membership on this node, a direct conversation must
 /// name another user of the app.
@@ -4468,6 +4586,7 @@ async fn handle_control_message(
                         before.as_deref(),
                         after.as_deref(),
                         limit,
+                        Some(token.user_id),
                     )
                     .await
             }
@@ -4490,6 +4609,136 @@ async fn handle_control_message(
                 Err(e) => {
                     send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
                 }
+            }
+        }
+
+        ControlMessage::ChatSearch {
+            channel_id,
+            user_id,
+            query,
+            from_user_id,
+            before,
+            limit,
+            client_ref,
+        } => {
+            let result = async {
+                let chat = &state.control.chat;
+                chat.check_search_rate(session_id)?;
+                // No selector: every direct conversation of the requesting user.
+                let conversation = if channel_id.is_none() && user_id.is_none() {
+                    Conversation::User(token.user_id)
+                } else {
+                    chat_conversation(state, session_id, token.user_id, channel_id, user_id)?
+                };
+                chat.search(
+                    token.app_id,
+                    conversation,
+                    SearchQuery {
+                        query: &query,
+                        from_user_id,
+                        before: before.as_deref(),
+                        limit,
+                    },
+                    Some(token.user_id),
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(page) => {
+                    send_msg(
+                        tx,
+                        &ControlMessage::ChatSearchResult {
+                            channel_id,
+                            user_id,
+                            query,
+                            messages: page.messages,
+                            next_before: page.next_before,
+                            client_ref,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+                }
+            }
+        }
+
+        ControlMessage::ChatEdit {
+            message_id,
+            text,
+            metadata,
+            client_ref,
+        } => {
+            // The edited copy arrives through the event bus like a fresh message.
+            let result = async {
+                let chat = &state.control.chat;
+                chat_sender_allowed(state, &session_id)?;
+                chat.check_flood(session_id)?;
+                let actor = chat_actor(state, session_id, token, message_id).await?;
+                chat.edit(
+                    token.app_id,
+                    message_id,
+                    actor,
+                    text,
+                    metadata,
+                    client_ref.clone(),
+                )
+                .await
+            }
+            .await;
+            if let Err(e) = result {
+                send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+            }
+        }
+
+        ControlMessage::ChatDelete {
+            message_id,
+            client_ref,
+        } => {
+            let result = async {
+                let chat = &state.control.chat;
+                chat.check_flood(session_id)?;
+                let actor = chat_actor(state, session_id, token, message_id).await?;
+                chat.delete(token.app_id, message_id, actor, client_ref.clone())
+                    .await
+            }
+            .await;
+            match result {
+                // A fresh tombstone fans out through the event bus (echo carries client_ref);
+                // repeating the delete only answers the requester with the existing one.
+                Ok(deletion) if !deletion.changed => {
+                    let mut message = deletion.message;
+                    message.client_ref = client_ref;
+                    send_msg(tx, &ControlMessage::ChatMessageUpdated { message }).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    send_error_ref(tx, e.error_code(), &e.public_message(), client_ref).await;
+                }
+            }
+        }
+
+        ControlMessage::ChatReact {
+            message_id,
+            reaction,
+            add,
+        } => {
+            // A no-op (already set / already absent) is silently accepted; changes fan out
+            // as `ChatReactionChanged` to everyone who sees the message, including the actor.
+            let result = async {
+                let chat = &state.control.chat;
+                chat.validate_reaction(&reaction)?;
+                chat_sender_allowed(state, &session_id)?;
+                chat.check_flood(session_id)?;
+                let actor = chat_actor(state, session_id, token, message_id).await?;
+                chat.react(token.app_id, message_id, actor, &reaction, add)
+                    .await
+            }
+            .await;
+            if let Err(e) = result {
+                send_error(tx, e.error_code(), &e.public_message()).await;
             }
         }
 
@@ -4805,7 +5054,10 @@ async fn handle_control_message(
         | ControlMessage::Kick { .. }
         | ControlMessage::ModerateParticipantAck { .. }
         | ControlMessage::ChatMessageReceived { .. }
+        | ControlMessage::ChatMessageUpdated { .. }
+        | ControlMessage::ChatReactionChanged { .. }
         | ControlMessage::ChatHistoryResult { .. }
+        | ControlMessage::ChatSearchResult { .. }
         | ControlMessage::ChatReadMarker { .. }
         | ControlMessage::ChatReadMarkersResult { .. }
         | ControlMessage::ChatInboxSynced { .. }

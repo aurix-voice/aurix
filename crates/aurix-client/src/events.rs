@@ -274,6 +274,35 @@ pub enum Event {
         next_before: Option<String>,
         next_after: Option<String>,
     },
+    /// A message of a conversation this client takes part in was edited (`edited_at`) or
+    /// deleted (`deleted_at`, empty text): replace the copy with the same `id`. `request_id`
+    /// is set on the echo of this client's own `edit_chat` / `delete_chat`.
+    ChatMessageUpdated {
+        request_id: Option<RequestId>,
+        message: ChatMessage,
+    },
+    /// `user_id` added or removed `reaction` on `message_id`; `count` is the number of users
+    /// now carrying that reaction. `channel_id` / `message_*_user_id` locate the conversation.
+    ChatReactionChanged {
+        message_id: uuid::Uuid,
+        channel_id: Option<ChannelId>,
+        message_from_user_id: UserId,
+        message_to_user_id: Option<UserId>,
+        user_id: UserId,
+        reaction: String,
+        added: bool,
+        count: u32,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
+    /// Answer to `Client::search_chat`: matches newest first; `next_before` pages further
+    /// back. `scope` is `None` for a search across every direct conversation.
+    ChatSearchResult {
+        request_id: Option<RequestId>,
+        scope: Option<ChatScope>,
+        query: String,
+        messages: Vec<ChatMessage>,
+        next_before: Option<String>,
+    },
     /// A read marker moved: this user's own (any device) or, with server-side read receipts,
     /// another participant's.
     ChatReadMarker(ChatReadMarker),

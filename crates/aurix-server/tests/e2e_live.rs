@@ -4337,6 +4337,918 @@ async fn chat_history_pagination_offline_delivery_and_read_markers() {
     }
 }
 
+async fn expect_updated(p: &mut Player, what: &str) -> aurix_common::protocol::ChatMessage {
+    let m = p
+        .expect(what, |m| {
+            matches!(m, ControlMessage::ChatMessageUpdated { .. })
+        })
+        .await;
+    let ControlMessage::ChatMessageUpdated { message } = m else {
+        unreachable!()
+    };
+    message
+}
+
+struct ReactionEvent {
+    message_id: uuid::Uuid,
+    user_id: UserId,
+    reaction: String,
+    added: bool,
+    count: u32,
+}
+
+async fn expect_reaction(p: &mut Player, what: &str) -> ReactionEvent {
+    let m = p
+        .expect(what, |m| {
+            matches!(m, ControlMessage::ChatReactionChanged { .. })
+        })
+        .await;
+    let ControlMessage::ChatReactionChanged {
+        message_id,
+        user_id,
+        reaction,
+        added,
+        count,
+        ..
+    } = m
+    else {
+        unreachable!()
+    };
+    ReactionEvent {
+        message_id,
+        user_id,
+        reaction,
+        added,
+        count,
+    }
+}
+
+struct SearchPage {
+    messages: Vec<aurix_common::protocol::ChatMessage>,
+    next_before: Option<String>,
+}
+
+async fn expect_search(p: &mut Player, client_ref: &str) -> SearchPage {
+    let m = p
+        .expect("ChatSearchResult", |m| {
+            matches!(m, ControlMessage::ChatSearchResult { client_ref: r, .. }
+                if r.as_deref() == Some(client_ref))
+        })
+        .await;
+    let ControlMessage::ChatSearchResult {
+        messages,
+        next_before,
+        ..
+    } = m
+    else {
+        unreachable!()
+    };
+    SearchPage {
+        messages,
+        next_before,
+    }
+}
+
+async fn assert_no_chat_change(p: &mut Player, why: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    while let Some(m) = p
+        .try_recv(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .await
+    {
+        assert!(
+            !matches!(
+                m,
+                ControlMessage::ChatMessageUpdated { .. }
+                    | ControlMessage::ChatReactionChanged { .. }
+                    | ControlMessage::Error { .. }
+            ),
+            "{}: must not receive a chat change while {why}: {m:?}",
+            p.name
+        );
+    }
+}
+
+async fn expect_error_ref(p: &mut Player, what: &str, code: &str, client_ref: &str) {
+    let m = p
+        .expect(what, |m| {
+            matches!(m, ControlMessage::Error { client_ref: r, .. }
+                if r.as_deref() == Some(client_ref))
+        })
+        .await;
+    let ControlMessage::Error {
+        code: got, message, ..
+    } = m
+    else {
+        unreachable!()
+    };
+    assert_eq!(got, code, "{}: {what}: {message}", p.name);
+}
+
+fn tally<'a>(
+    m: &'a aurix_common::protocol::ChatMessage,
+    reaction: &str,
+) -> Option<&'a aurix_common::protocol::ChatReaction> {
+    m.reactions.iter().find(|r| r.reaction == reaction)
+}
+
+/// Stored chat mutations: authors edit / delete their own messages (others get AUTH_DENIED,
+/// non-members too), channel moderators delete anything in their channel, repeated deletions
+/// are idempotent (tombstone back to the actor, nothing fanned out), reactions are counted
+/// exactly and fanned out to everyone who sees the message with duplicates silently
+/// absorbed, history carries `edited_at` / tombstones / tallies at the original position,
+/// full-text search pages newest-first over live messages only (channel, one direct
+/// conversation, or all of a user's direct chats) and the REST API acts as the operator
+/// (edits anything, reacts on behalf of a user). Bob sits on the second node when there is
+/// one, so every fan-out crosses nodes.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with chat.persist = true; see the e2e job in .github/workflows/ci.yml"]
+async fn chat_edit_delete_reactions_and_search() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    if !chat_persists(&env, &http, channel_id).await {
+        eprintln!("chat.persist is off on this server; skipping");
+        return;
+    }
+    let env2 = match std::env::var("AURIX_E2E_WS2") {
+        Ok(ws2) => Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+            ws: ws2,
+            api_key: env.api_key.clone(),
+        },
+        Err(_) => {
+            eprintln!("AURIX_E2E_WS2 not set; running on one node");
+            Env {
+                api: env.api.clone(),
+                ws: env.ws.clone(),
+                api_key: env.api_key.clone(),
+            }
+        }
+    };
+    let other_channel = create_channel(&env, &http).await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ext = |who: &str| format!("e2e:edit-{who}-{run}");
+    let (tok_a, uid_a) = issue_token(&env, &http, &ext("alice"), "Alice", channel_id).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, &ext("bob"), "Bob", channel_id).await;
+    let (tok_m, uid_m) = issue_token_grants(
+        &env,
+        &http,
+        &ext("mod"),
+        "Mod",
+        vec![serde_json::json!({
+            "channel_id": channel_id, "join": true, "speak": true, "receive": true, "moderate": true
+        })],
+    )
+    .await;
+    let (tok_d, _) = issue_token(&env, &http, &ext("dave"), "Dave", other_channel).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let uid_m = UserId::from_uuid(uid_m.parse().unwrap());
+
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env2, "bob", tok_b).await;
+    let mut moderator = connect(&env, "mod", tok_m).await;
+    let mut dave = connect(&env, "dave", tok_d).await;
+    for p in [&mut alice, &mut bob, &mut moderator, &mut dave] {
+        expect_inbox(p).await;
+    }
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        join(p, channel_id).await;
+    }
+    join(&mut dave, other_channel).await;
+    // Everyone sees the joins; drain so the chat expectations start clean.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for p in [&mut alice, &mut bob, &mut moderator, &mut dave] {
+        while p.try_recv(Duration::from_millis(50)).await.is_some() {}
+    }
+
+    // ── two channel messages ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "loot drop at the bridge".into(),
+            metadata: None,
+            client_ref: Some("m1".into()),
+        })
+        .await;
+    let m1 = expect_chat(&mut alice, "m1 echo").await;
+    for p in [&mut bob, &mut moderator] {
+        assert_eq!(expect_chat(p, "m1").await.id, m1.id);
+    }
+    bob.send(&ControlMessage::ChatSend {
+        channel_id,
+        text: "no loot for you".into(),
+        metadata: None,
+        client_ref: Some("m2".into()),
+    })
+    .await;
+    let m2 = expect_chat(&mut bob, "m2 echo").await;
+    for p in [&mut alice, &mut moderator] {
+        assert_eq!(expect_chat(p, "m2").await.id, m2.id);
+    }
+
+    // ── edit: author ok (fans out, client_ref only to the actor), others / non-members denied ──
+    alice
+        .send(&ControlMessage::ChatEdit {
+            message_id: m1.id,
+            text: "loot drop at the OLD bridge".into(),
+            metadata: Some(serde_json::json!({"edited": true})),
+            client_ref: Some("e1".into()),
+        })
+        .await;
+    let own = expect_updated(&mut alice, "own edit").await;
+    assert_eq!(own.client_ref.as_deref(), Some("e1"));
+    assert_eq!(own.text, "loot drop at the OLD bridge");
+    assert!(own.edited_at.is_some() && own.deleted_at.is_none());
+    assert_eq!(
+        (own.id, own.sent_at),
+        (m1.id, m1.sent_at),
+        "id and position are stable"
+    );
+    for p in [&mut bob, &mut moderator] {
+        let u = expect_updated(p, "peer sees the edit").await;
+        assert_eq!(u.id, m1.id);
+        assert_eq!(u.text, "loot drop at the OLD bridge");
+        assert_eq!(u.metadata, Some(serde_json::json!({"edited": true})));
+        assert!(u.edited_at.is_some() && u.client_ref.is_none());
+    }
+    assert_no_chat_change(&mut dave, "a non-member (other channel)").await;
+    bob.send(&ControlMessage::ChatEdit {
+        message_id: m1.id,
+        text: "hijack".into(),
+        metadata: None,
+        client_ref: Some("e2".into()),
+    })
+    .await;
+    expect_error_ref(&mut bob, "edit by non-author", "AUTH_DENIED", "e2").await;
+    moderator
+        .send(&ControlMessage::ChatEdit {
+            message_id: m1.id,
+            text: "moderators cannot edit".into(),
+            metadata: None,
+            client_ref: Some("e3".into()),
+        })
+        .await;
+    expect_error_ref(&mut moderator, "edit by moderator", "AUTH_DENIED", "e3").await;
+    dave.send(&ControlMessage::ChatEdit {
+        message_id: m1.id,
+        text: "outsider".into(),
+        metadata: None,
+        client_ref: Some("e4".into()),
+    })
+    .await;
+    expect_error_ref(&mut dave, "edit by non-member", "AUTH_DENIED", "e4").await;
+    dave.send(&ControlMessage::ChatEdit {
+        message_id: uuid::Uuid::new_v4(),
+        text: "ghost".into(),
+        metadata: None,
+        client_ref: Some("e5".into()),
+    })
+    .await;
+    expect_error_ref(&mut dave, "edit of unknown id", "NOT_FOUND", "e5").await;
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        assert_no_chat_change(p, "denied edits").await;
+    }
+
+    // ── reactions: exact counts, cross-node fan-out, idempotent duplicates ──
+    bob.send(&ControlMessage::ChatReact {
+        message_id: m1.id,
+        reaction: "+1".into(),
+        add: true,
+    })
+    .await;
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let r = expect_reaction(p, "bob +1").await;
+        assert_eq!(
+            (
+                r.message_id,
+                r.user_id,
+                r.reaction.as_str(),
+                r.added,
+                r.count
+            ),
+            (m1.id, uid_b, "+1", true, 1),
+            "{}",
+            p.name
+        );
+    }
+    alice
+        .send(&ControlMessage::ChatReact {
+            message_id: m1.id,
+            reaction: "+1".into(),
+            add: true,
+        })
+        .await;
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let r = expect_reaction(p, "alice +1").await;
+        assert_eq!(
+            (r.user_id, r.added, r.count),
+            (uid_a, true, 2),
+            "{}",
+            p.name
+        );
+    }
+    bob.send(&ControlMessage::ChatReact {
+        message_id: m1.id,
+        reaction: "+1".into(),
+        add: true,
+    })
+    .await;
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        assert_no_chat_change(p, "a duplicate reaction add").await;
+    }
+    bob.send(&ControlMessage::ChatReact {
+        message_id: m1.id,
+        reaction: "+1".into(),
+        add: false,
+    })
+    .await;
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let r = expect_reaction(p, "bob removes +1").await;
+        assert_eq!(
+            (r.user_id, r.added, r.count),
+            (uid_b, false, 1),
+            "{}",
+            p.name
+        );
+    }
+    bob.send(&ControlMessage::ChatReact {
+        message_id: m1.id,
+        reaction: "+1".into(),
+        add: false,
+    })
+    .await;
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        assert_no_chat_change(p, "a duplicate reaction remove").await;
+    }
+    bob.send(&ControlMessage::ChatReact {
+        message_id: m1.id,
+        reaction: "not allowed".into(),
+        add: true,
+    })
+    .await;
+    expect_error(&mut bob, "reaction with whitespace", "VALIDATION_ERROR").await;
+    dave.send(&ControlMessage::ChatReact {
+        message_id: m1.id,
+        reaction: "fire".into(),
+        add: true,
+    })
+    .await;
+    expect_error(&mut dave, "reaction by non-member", "AUTH_DENIED").await;
+    assert_no_chat_change(&mut alice, "denied reactions").await;
+
+    // ── history carries the edit and the tally at the original position ──
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: None,
+        limit: Some(10),
+        client_ref: Some("h1".into()),
+    })
+    .await;
+    let h1 = expect_history(&mut bob, "h1").await;
+    assert_eq!(
+        h1.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![m2.id, m1.id]
+    );
+    let stored = &h1.messages[1];
+    assert_eq!(stored.text, "loot drop at the OLD bridge");
+    assert!(stored.edited_at.is_some());
+    let plus = tally(stored, "+1").expect("+1 tally in history");
+    assert_eq!((plus.count, plus.user_ids.as_slice()), (1, &[uid_a][..]));
+    assert!(h1.messages[0].reactions.is_empty());
+
+    // ── search over the channel: newest first, author filter, keyset paging, membership ──
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "loot".into(),
+        from_user_id: None,
+        before: None,
+        limit: None,
+        client_ref: Some("s1".into()),
+    })
+    .await;
+    let s1 = expect_search(&mut bob, "s1").await;
+    assert_eq!(
+        s1.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![m2.id, m1.id],
+        "both live messages match, newest first"
+    );
+    assert!(
+        s1.next_before.is_none(),
+        "a short page has no further cursor"
+    );
+    assert!(
+        tally(&s1.messages[1], "+1").is_some(),
+        "search hits carry reaction tallies"
+    );
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "loot".into(),
+        from_user_id: Some(uid_a),
+        before: None,
+        limit: None,
+        client_ref: Some("s2".into()),
+    })
+    .await;
+    let s2 = expect_search(&mut bob, "s2").await;
+    assert_eq!(
+        s2.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![m1.id]
+    );
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "loot".into(),
+        from_user_id: None,
+        before: None,
+        limit: Some(1),
+        client_ref: Some("s3".into()),
+    })
+    .await;
+    let s3 = expect_search(&mut bob, "s3").await;
+    assert_eq!(s3.messages.len(), 1);
+    assert_eq!(s3.messages[0].id, m2.id);
+    let cursor = s3.next_before.expect("a full page has a cursor");
+    assert_eq!(cursor, s3.messages[0].cursor());
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "loot".into(),
+        from_user_id: None,
+        before: Some(cursor),
+        limit: Some(1),
+        client_ref: Some("s4".into()),
+    })
+    .await;
+    let s4 = expect_search(&mut bob, "s4").await;
+    assert_eq!(
+        s4.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![m1.id]
+    );
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "\"OLD bridge\"".into(),
+        from_user_id: None,
+        before: None,
+        limit: None,
+        client_ref: Some("s5".into()),
+    })
+    .await;
+    let s5 = expect_search(&mut bob, "s5").await;
+    assert_eq!(
+        s5.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![m1.id],
+        "phrase search sees the edited text"
+    );
+    dave.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "loot".into(),
+        from_user_id: None,
+        before: None,
+        limit: None,
+        client_ref: Some("s6".into()),
+    })
+    .await;
+    expect_error_ref(&mut dave, "search by non-member", "AUTH_DENIED", "s6").await;
+
+    // ── direct messages: edit reaches the peer, search is per conversation, outsiders 404 ──
+    alice
+        .send(&ControlMessage::ChatSendDirect {
+            user_id: uid_b,
+            text: "secret loot stash".into(),
+            metadata: None,
+            client_ref: Some("d1".into()),
+        })
+        .await;
+    let d1 = expect_chat(&mut alice, "d1 echo").await;
+    assert_eq!(expect_chat(&mut bob, "d1").await.id, d1.id);
+    alice
+        .send(&ControlMessage::ChatEdit {
+            message_id: d1.id,
+            text: "secret loot stash moved".into(),
+            metadata: None,
+            client_ref: Some("e6".into()),
+        })
+        .await;
+    assert_eq!(
+        expect_updated(&mut alice, "own direct edit")
+            .await
+            .client_ref
+            .as_deref(),
+        Some("e6")
+    );
+    let u = expect_updated(&mut bob, "peer sees the direct edit").await;
+    assert_eq!((u.id, u.text.as_str()), (d1.id, "secret loot stash moved"));
+    assert_no_chat_change(&mut moderator, "a direct edit between two others").await;
+    moderator
+        .send(&ControlMessage::ChatReact {
+            message_id: d1.id,
+            reaction: "eyes".into(),
+            add: true,
+        })
+        .await;
+    expect_error(
+        &mut moderator,
+        "reaction on someone else's direct message",
+        "NOT_FOUND",
+    )
+    .await;
+    moderator
+        .send(&ControlMessage::ChatDelete {
+            message_id: d1.id,
+            client_ref: Some("x1".into()),
+        })
+        .await;
+    expect_error_ref(
+        &mut moderator,
+        "moderator role does not reach direct messages",
+        "NOT_FOUND",
+        "x1",
+    )
+    .await;
+    bob.send(&ControlMessage::ChatReact {
+        message_id: d1.id,
+        reaction: "eyes".into(),
+        add: true,
+    })
+    .await;
+    for p in [&mut alice, &mut bob] {
+        let r = expect_reaction(p, "bob reacts on the direct message").await;
+        assert_eq!(
+            (r.message_id, r.user_id, r.count),
+            (d1.id, uid_b, 1),
+            "{}",
+            p.name
+        );
+    }
+    // Every direct conversation of Bob (no selector) and the one with Alice both find it;
+    // the moderator's own direct search does not (he is not a participant).
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: None,
+        user_id: None,
+        query: "stash".into(),
+        from_user_id: None,
+        before: None,
+        limit: None,
+        client_ref: Some("s7".into()),
+    })
+    .await;
+    let s7 = expect_search(&mut bob, "s7").await;
+    assert_eq!(
+        s7.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![d1.id]
+    );
+    assert_eq!(tally(&s7.messages[0], "eyes").map(|t| t.count), Some(1));
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: None,
+        user_id: Some(uid_a),
+        query: "stash".into(),
+        from_user_id: None,
+        before: None,
+        limit: None,
+        client_ref: Some("s8".into()),
+    })
+    .await;
+    assert_eq!(expect_search(&mut bob, "s8").await.messages.len(), 1);
+    moderator
+        .send(&ControlMessage::ChatSearch {
+            channel_id: None,
+            user_id: Some(uid_a),
+            query: "stash".into(),
+            from_user_id: None,
+            before: None,
+            limit: None,
+            client_ref: Some("s9".into()),
+        })
+        .await;
+    assert!(
+        expect_search(&mut moderator, "s9")
+            .await
+            .messages
+            .is_empty(),
+        "another user's direct conversation is invisible"
+    );
+
+    // ── delete: non-author denied, moderator ok, repeat is idempotent, author ok ──
+    bob.send(&ControlMessage::ChatDelete {
+        message_id: m1.id,
+        client_ref: Some("x2".into()),
+    })
+    .await;
+    expect_error_ref(&mut bob, "delete by non-author", "AUTH_DENIED", "x2").await;
+    moderator
+        .send(&ControlMessage::ChatDelete {
+            message_id: m1.id,
+            client_ref: Some("x3".into()),
+        })
+        .await;
+    let tomb = expect_updated(&mut moderator, "moderator deletion").await;
+    assert_eq!(tomb.client_ref.as_deref(), Some("x3"));
+    assert_eq!((tomb.id, tomb.sent_at), (m1.id, m1.sent_at));
+    assert!(tomb.text.is_empty() && tomb.metadata.is_none() && tomb.reactions.is_empty());
+    assert_eq!(tomb.deleted_by, Some(uid_m));
+    assert!(tomb.deleted_at.is_some());
+    for p in [&mut alice, &mut bob] {
+        let t = expect_updated(p, "peers see the tombstone").await;
+        assert_eq!(t.id, m1.id);
+        assert!(t.deleted_at.is_some() && t.text.is_empty() && t.client_ref.is_none());
+        assert_eq!(t.deleted_by, Some(uid_m));
+    }
+    moderator
+        .send(&ControlMessage::ChatDelete {
+            message_id: m1.id,
+            client_ref: Some("x4".into()),
+        })
+        .await;
+    let again = expect_updated(&mut moderator, "repeated deletion").await;
+    assert_eq!(again.client_ref.as_deref(), Some("x4"));
+    assert_eq!(
+        (again.id, again.deleted_at, again.deleted_by),
+        (m1.id, tomb.deleted_at, Some(uid_m)),
+        "the existing tombstone comes back unchanged"
+    );
+    for p in [&mut alice, &mut bob] {
+        assert_no_chat_change(p, "a repeated deletion").await;
+    }
+    alice
+        .send(&ControlMessage::ChatReact {
+            message_id: m1.id,
+            reaction: "fire".into(),
+            add: true,
+        })
+        .await;
+    expect_error(&mut alice, "reaction on a tombstone", "NOT_FOUND").await;
+    alice
+        .send(&ControlMessage::ChatEdit {
+            message_id: m1.id,
+            text: "resurrect".into(),
+            metadata: None,
+            client_ref: Some("e7".into()),
+        })
+        .await;
+    expect_error_ref(&mut alice, "edit of a tombstone", "NOT_FOUND", "e7").await;
+    alice
+        .send(&ControlMessage::ChatDelete {
+            message_id: m2.id,
+            client_ref: Some("x5".into()),
+        })
+        .await;
+    expect_error_ref(
+        &mut alice,
+        "delete of someone else's message",
+        "AUTH_DENIED",
+        "x5",
+    )
+    .await;
+    bob.send(&ControlMessage::ChatDelete {
+        message_id: m2.id,
+        client_ref: Some("x6".into()),
+    })
+    .await;
+    let own_tomb = expect_updated(&mut bob, "own deletion").await;
+    assert_eq!(
+        (
+            own_tomb.id,
+            own_tomb.deleted_by,
+            own_tomb.client_ref.as_deref()
+        ),
+        (m2.id, Some(uid_b), Some("x6"))
+    );
+    for p in [&mut alice, &mut moderator] {
+        assert_eq!(expect_updated(p, "own deletion fan-out").await.id, m2.id);
+    }
+
+    // Tombstones stay in history in place, leave search.
+    bob.send(&ControlMessage::ChatHistory {
+        channel_id: Some(channel_id),
+        user_id: None,
+        before: None,
+        after: None,
+        limit: Some(10),
+        client_ref: Some("h2".into()),
+    })
+    .await;
+    let h2 = expect_history(&mut bob, "h2").await;
+    assert_eq!(
+        h2.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![m2.id, m1.id]
+    );
+    assert!(h2
+        .messages
+        .iter()
+        .all(|m| m.deleted_at.is_some() && m.text.is_empty() && m.reactions.is_empty()));
+    assert_eq!(h2.messages[1].sent_at, m1.sent_at);
+    bob.send(&ControlMessage::ChatSearch {
+        channel_id: Some(channel_id),
+        user_id: None,
+        query: "loot".into(),
+        from_user_id: None,
+        before: None,
+        limit: None,
+        client_ref: Some("s10".into()),
+    })
+    .await;
+    assert!(
+        expect_search(&mut bob, "s10").await.messages.is_empty(),
+        "deleted messages leave search"
+    );
+
+    // ── REST: the operator edits anything, reacts on behalf of a user, deletes, searches ──
+    alice
+        .send(&ControlMessage::ChatSend {
+            channel_id,
+            text: "gg wp".into(),
+            metadata: None,
+            client_ref: Some("m3".into()),
+        })
+        .await;
+    let m3 = expect_chat(&mut alice, "m3 echo").await;
+    for p in [&mut bob, &mut moderator] {
+        expect_chat(p, "m3").await;
+    }
+    let edited: serde_json::Value = http
+        .patch(format!("{}/v1/messages/{}", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"text": "gg wp (edited by the operator)"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edited["text"], "gg wp (edited by the operator)");
+    assert!(edited["edited_at"].is_string());
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let u = expect_updated(p, "operator edit").await;
+        assert_eq!(
+            (u.id, u.text.as_str()),
+            (m3.id, "gg wp (edited by the operator)")
+        );
+    }
+    let reacted: serde_json::Value = http
+        .put(format!("{}/v1/messages/{}/reactions/gg", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"user_id": uid_b}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (&reacted["changed"], &reacted["count"]),
+        (&true.into(), &1.into())
+    );
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let r = expect_reaction(p, "operator reaction on behalf of bob").await;
+        assert_eq!(
+            (r.message_id, r.user_id, r.reaction.as_str(), r.count),
+            (m3.id, uid_b, "gg", 1)
+        );
+    }
+    let dup: serde_json::Value = http
+        .put(format!("{}/v1/messages/{}/reactions/gg", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"user_id": uid_b}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!((&dup["changed"], &dup["count"]), (&false.into(), &1.into()));
+    let unknown_user = http
+        .put(format!("{}/v1/messages/{}/reactions/gg", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({"user_id": uuid::Uuid::new_v4()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown_user.status(),
+        404,
+        "reactions need a user of this app"
+    );
+    let one: serde_json::Value = http
+        .get(format!("{}/v1/messages/{}", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["reactions"][0]["reaction"], "gg");
+    assert_eq!(one["reactions"][0]["count"], 1);
+    assert_eq!(one["reactions"][0]["user_ids"][0], serde_json::json!(uid_b));
+    let found: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{}/messages/search",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .query(&[("q", "operator")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(found["messages"][0]["id"], serde_json::json!(m3.id));
+    let direct_found: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/messages/search", env.api, uid_a))
+        .header("x-api-key", &env.api_key)
+        .query(&[("q", "stash"), ("peer", &uid_b.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(direct_found["messages"][0]["id"], serde_json::json!(d1.id));
+    let empty_query = http
+        .get(format!(
+            "{}/v1/channels/{}/messages/search",
+            env.api, channel_id
+        ))
+        .header("x-api-key", &env.api_key)
+        .query(&[("q", "   ")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty_query.status(), 400);
+    let removed: serde_json::Value = http
+        .delete(format!("{}/v1/messages/{}/reactions/gg", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .query(&[("user_id", uid_b.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (&removed["changed"], &removed["count"]),
+        (&true.into(), &0.into())
+    );
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let r = expect_reaction(p, "operator removes the reaction").await;
+        assert_eq!((r.added, r.count), (false, 0));
+    }
+    let deleted: serde_json::Value = http
+        .delete(format!("{}/v1/messages/{}", env.api, m3.id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(deleted["deleted_at"].is_string());
+    assert_eq!(deleted["deleted_by"], serde_json::json!(uuid::Uuid::nil()));
+    for p in [&mut alice, &mut bob, &mut moderator] {
+        let t = expect_updated(p, "operator deletion").await;
+        assert!(t.id == m3.id && t.deleted_at.is_some());
+    }
+    let missing = http
+        .get(format!("{}/v1/messages/{}", env.api, uuid::Uuid::new_v4()))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    for p in [&mut alice, &mut bob, &mut moderator, &mut dave] {
+        p.ws.close(None).await.unwrap();
+    }
+}
+
 /// Transmission policy and channel focus over the control plane: a `Single` policy drops the
 /// sender's audio in every other joined channel and `None` everywhere, focus attenuates the
 /// listener's other channels by the configured gain, both reset when their channel is left,

@@ -1266,6 +1266,86 @@ pub enum ControlMessage {
     ChatMessageReceived {
         message: ChatMessage,
     },
+    /// Client → server: replace the text / metadata of a stored message this session's user
+    /// sent (`chat.edits`, within `chat.edit_window_secs`). The edited message reaches the
+    /// original audience as `ChatMessageUpdated`; the editor's copy echoes `client_ref`.
+    ChatEdit {
+        message_id: uuid::Uuid,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Client → server: remove a stored message — the author's own (within the edit window)
+    /// or, in a channel, any message when the caller moderates that channel. The audience
+    /// receives a tombstone (`ChatMessageUpdated` with `deleted_at`, empty `text`).
+    ChatDelete {
+        message_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Server → client: a message of a conversation the client takes part in was edited or
+    /// deleted; `message.id` identifies the copy to replace.
+    ChatMessageUpdated {
+        message: ChatMessage,
+    },
+    /// Client → server: add (`add: true`) or remove this user's `reaction` (an emoji or a
+    /// short token, ≤ 32 bytes) on a message of a joined channel / own direct conversation.
+    ChatReact {
+        message_id: uuid::Uuid,
+        reaction: String,
+        #[serde(default = "default_true")]
+        add: bool,
+    },
+    /// Server → conversation audience: `user_id` added/removed `reaction`; `count` is the
+    /// resulting number of users with that reaction. `channel_id` / `message_to_user_id`
+    /// locate the conversation for clients that do not hold the message.
+    ChatReactionChanged {
+        message_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        message_from_user_id: UserId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_to_user_id: Option<UserId>,
+        user_id: UserId,
+        reaction: String,
+        added: bool,
+        count: u32,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
+    /// Client → server: full-text search (`chat.search`) over stored history of a joined
+    /// channel (`channel_id`), the direct conversation with `user_id`, or — with neither —
+    /// every direct conversation of the caller. Newest first; `before` pages further back.
+    ChatSearch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        query: String,
+        /// Only messages sent by this user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_user_id: Option<UserId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
+    /// Server → client: matches of a `ChatSearch`, newest first, deleted messages excluded.
+    ChatSearchResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<UserId>,
+        query: String,
+        messages: Vec<ChatMessage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ref: Option<String>,
+    },
     /// Client → server: a page of stored history (`chat.persist`) of a joined channel or of the
     /// direct conversation with `user_id` (exactly one). Newest first; `before`/`after` are
     /// opaque cursors from a previous `ChatHistoryResult`, `limit` is capped by
@@ -1581,6 +1661,19 @@ pub struct ChatMessage {
     /// after connecting.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub offline: bool,
+    /// Set once the author (or an operator) changed the text / metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Tombstone: the message was removed; `text` is empty and `metadata` absent. The row
+    /// stays so cursors and read markers remain valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Who removed it: the author, a channel moderator, or the nil user for the REST API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<UserId>,
+    /// Reaction tallies, most-used first. Empty for live deliveries of a fresh message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<ChatReaction>,
 }
 
 impl ChatMessage {
@@ -1588,7 +1681,27 @@ impl ChatMessage {
     pub fn cursor(&self) -> String {
         encode_chat_cursor(self.sent_at, self.id)
     }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
 }
+
+/// One reaction on a message: how many users set it and (up to [`REACTION_USERS_SHOWN`]) who.
+/// When the reader reacted, their id is always included — `user_ids.contains(me)` is "mine".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatReaction {
+    pub reaction: String,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_ids: Vec<UserId>,
+}
+
+/// Upper bound on `ChatReaction::user_ids`; `count` is exact regardless.
+pub const REACTION_USERS_SHOWN: usize = 20;
+
+/// Largest accepted reaction token (UTF-8 bytes): a few code points of emoji with modifiers.
+pub const REACTION_MAX_BYTES: usize = 32;
 
 /// Opaque-but-stable history cursor: URL-safe base64 (no padding) of the message's send time
 /// as a big-endian `i64` of Unix microseconds followed by its 16-byte id. Clients may build
@@ -1672,6 +1785,10 @@ pub struct UserPosition {
 
 fn default_participant_role() -> ChannelRole {
     ChannelRole::Speaker
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -2042,6 +2159,10 @@ mod tests {
             sent_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
             client_ref: None,
             offline: false,
+            edited_at: None,
+            deleted_at: None,
+            deleted_by: None,
+            reactions: Vec::new(),
         };
         let json = serde_json::to_value(ControlMessage::ChatMessageReceived {
             message: msg.clone(),

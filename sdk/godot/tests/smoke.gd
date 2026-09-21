@@ -56,6 +56,11 @@ func _init() -> void:
 	_check(client.set_participant_volume("00000000-0000-4000-8000-000000000001", 1.0) == AurixVoiceClient.RESULT_NOT_CONNECTED, "volume without client → NOT_CONNECTED")
 	_check(client.set_token("x") == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_token without client → NOT_CONNECTED")
 	_check(client.send_chat("00000000-0000-4000-8000-000000000001", "hi") == 0, "chat without client → 0")
+	_check(client.edit_chat("00000000-0000-4000-8000-000000000009", "fixed") == 0, "edit_chat without client → 0")
+	_check(client.delete_chat("00000000-0000-4000-8000-000000000009") == 0, "delete_chat without client → 0")
+	_check(client.react_chat("00000000-0000-4000-8000-000000000009", "thumbs_up") == AurixVoiceClient.RESULT_NOT_CONNECTED, "react_chat without client → NOT_CONNECTED")
+	_check(client.search_channel_chat("00000000-0000-4000-8000-000000000001", "loot") == 0, "search_channel_chat without client → 0")
+	_check(client.search_direct_chat("", "loot") == 0, "search_direct_chat (all conversations) without client → 0")
 	_check(client.get_participants("not-a-uuid").is_empty(), "participants of malformed id empty")
 	_check(client.get_channel_info("00000000-0000-4000-8000-000000000001").is_empty(), "channel info empty")
 	_check(client.user_for_ssrc(1) == "", "unknown ssrc → empty user")
@@ -171,7 +176,8 @@ func _init() -> void:
 			"chat_inbox_synced", "translation_changed", "raw_event", "request_failed", "kicked",
 			"recording", "audio_policy_changed", "audio_codec_changed", "disconnected", "server_error",
 			"transmission_changed", "channel_focus_changed", "user_block_changed", "moderation_applied",
-			"positions", "rejoin_failed", "bitrate_changed", "chat_read_markers", "loss_profile_changed"]:
+			"positions", "rejoin_failed", "bitrate_changed", "chat_read_markers", "loss_profile_changed",
+			"chat_message_updated", "chat_reaction_changed", "chat_search_result"]:
 		_check(client.has_signal(sig), "signal %s" % sig)
 
 	# Region discovery helper.

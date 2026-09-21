@@ -153,6 +153,24 @@ inline Dictionary chat_to_dict(const AurixChatMessage& m) {
     d["request_id"] = static_cast<int64_t>(m.request_id);
     d["offline"] = m.offline;
     d["cursor"] = cstr(m.cursor);
+    d["edited_at_ms"] = static_cast<int64_t>(m.edited_at_ms);
+    d["deleted_at_ms"] = static_cast<int64_t>(m.deleted_at_ms);
+    d["deleted_by"] = uuid_to_string(m.deleted_by);
+    d["reactions_json"] = cstr(m.reactions_json);
+    return d;
+}
+
+inline Dictionary reaction_to_dict(const AurixChatReaction& r) {
+    Dictionary d;
+    d["message_id"] = uuid_to_string(r.message_id);
+    d["channel_id"] = uuid_to_string(r.channel_id);
+    d["message_sender_id"] = uuid_to_string(r.message_sender_id);
+    d["message_recipient_id"] = uuid_to_string(r.message_recipient_id);
+    d["user_id"] = uuid_to_string(r.user_id);
+    d["reaction"] = cstr(r.reaction);
+    d["added"] = r.added;
+    d["count"] = static_cast<int64_t>(r.count);
+    d["timestamp_ms"] = static_cast<int64_t>(r.timestamp_ms);
     return d;
 }
 

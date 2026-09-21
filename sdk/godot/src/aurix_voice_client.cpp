@@ -789,6 +789,58 @@ int64_t AurixVoiceClient::direct_history(const String& user_id, const String& be
     return static_cast<int64_t>(request_id);
 }
 
+int64_t AurixVoiceClient::edit_chat(const String& message_id, const String& text, const String& metadata_json) {
+    AurixUuid message;
+    if (!client_ || !parse_uuid_arg(message_id, message, "message")) return 0;
+    uint64_t request_id = 0;
+    const CharString meta = metadata_json.utf8();
+    if (client_.edit_chat(aurix::Uuid(message), text.utf8().get_data(), opt_cstr(meta), &request_id) != AURIX_OK) return 0;
+    return static_cast<int64_t>(request_id);
+}
+
+int64_t AurixVoiceClient::delete_chat(const String& message_id) {
+    AurixUuid message;
+    if (!client_ || !parse_uuid_arg(message_id, message, "message")) return 0;
+    uint64_t request_id = 0;
+    if (client_.delete_chat(aurix::Uuid(message), &request_id) != AURIX_OK) return 0;
+    return static_cast<int64_t>(request_id);
+}
+
+int AurixVoiceClient::react_chat(const String& message_id, const String& reaction, bool add) {
+    AurixUuid message;
+    if (!client_) return AURIX_NOT_CONNECTED;
+    if (!parse_uuid_arg(message_id, message, "message")) return AURIX_INVALID_ARGUMENT;
+    return client_.react_chat(aurix::Uuid(message), reaction.utf8().get_data(), add);
+}
+
+int64_t AurixVoiceClient::search_channel_chat(const String& channel_id, const String& query, const String& from_user_id, const String& before, int limit) {
+    AurixUuid channel{}, from{};
+    if (!client_ || !parse_uuid_arg(channel_id, channel, "channel")) return 0;
+    const bool has_from = !from_user_id.is_empty();
+    if (has_from && !parse_uuid_arg(from_user_id, from, "from_user")) return 0;
+    const aurix::Uuid from_uuid(from);
+    uint64_t request_id = 0;
+    const CharString b = before.utf8();
+    if (client_.search_channel_chat(aurix::Uuid(channel), query.utf8().get_data(), has_from ? &from_uuid : nullptr, opt_cstr(b),
+                                    static_cast<uint32_t>(std::max(0, limit)), &request_id) != AURIX_OK) return 0;
+    return static_cast<int64_t>(request_id);
+}
+
+int64_t AurixVoiceClient::search_direct_chat(const String& user_id, const String& query, const String& from_user_id, const String& before, int limit) {
+    AurixUuid user{}, from{};
+    if (!client_) return 0;
+    const bool has_user = !user_id.is_empty();
+    if (has_user && !parse_uuid_arg(user_id, user, "user")) return 0;
+    const bool has_from = !from_user_id.is_empty();
+    if (has_from && !parse_uuid_arg(from_user_id, from, "from_user")) return 0;
+    const aurix::Uuid user_uuid(user), from_uuid(from);
+    uint64_t request_id = 0;
+    const CharString b = before.utf8();
+    if (client_.search_direct_chat(has_user ? &user_uuid : nullptr, query.utf8().get_data(), has_from ? &from_uuid : nullptr, opt_cstr(b),
+                                   static_cast<uint32_t>(std::max(0, limit)), &request_id) != AURIX_OK) return 0;
+    return static_cast<int64_t>(request_id);
+}
+
 int AurixVoiceClient::mark_channel_read(const String& channel_id, const String& message_id) {
     AurixUuid channel, message;
     if (!client_) return AURIX_NOT_CONNECTED;
@@ -1055,6 +1107,25 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     case AURIX_EVENT_CHAT_INBOX_SYNCED:
         emit_signal("chat_inbox_synced", static_cast<int64_t>(ev.number()), ev.flag());
         break;
+    case AURIX_EVENT_CHAT_MESSAGE_UPDATED: {
+        AurixChatMessage m;
+        if (ev.chat(m)) emit_signal("chat_message_updated", chat_to_dict(m));
+        break;
+    }
+    case AURIX_EVENT_CHAT_REACTION_CHANGED: {
+        AurixChatReaction r;
+        if (ev.reaction(r)) emit_signal("chat_reaction_changed", reaction_to_dict(r));
+        break;
+    }
+    case AURIX_EVENT_CHAT_SEARCH_RESULT: {
+        AurixChatHistory page{};
+        if (ev.chat_history(page)) {
+            Array messages;
+            for (const AurixChatMessage& m : ev.chat_history_messages()) messages.push_back(chat_to_dict(m));
+            emit_signal("chat_search_result", static_cast<int64_t>(ev.request_id()), channel, user, gstr(ev.message()), messages, cstr(page.next_before));
+        }
+        break;
+    }
     case AURIX_EVENT_TRANSLATION_CHANGED: {
         AurixTranslation t;
         if (ev.translation(t)) emit_signal("translation_changed", translation_to_dict(t));
@@ -1220,6 +1291,13 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("mark_direct_read", "user_id", "message_id"), &AurixVoiceClient::mark_direct_read);
     ClassDB::bind_method(D_METHOD("channel_read_markers", "channel_id"), &AurixVoiceClient::channel_read_markers);
     ClassDB::bind_method(D_METHOD("direct_read_markers", "user_id"), &AurixVoiceClient::direct_read_markers);
+    ClassDB::bind_method(D_METHOD("edit_chat", "message_id", "text", "metadata_json"), &AurixVoiceClient::edit_chat, DEFVAL(String()));
+    ClassDB::bind_method(D_METHOD("delete_chat", "message_id"), &AurixVoiceClient::delete_chat);
+    ClassDB::bind_method(D_METHOD("react_chat", "message_id", "reaction", "add"), &AurixVoiceClient::react_chat, DEFVAL(true));
+    ClassDB::bind_method(D_METHOD("search_channel_chat", "channel_id", "query", "from_user_id", "before", "limit"), &AurixVoiceClient::search_channel_chat,
+                         DEFVAL(String()), DEFVAL(String()), DEFVAL(50));
+    ClassDB::bind_method(D_METHOD("search_direct_chat", "user_id", "query", "from_user_id", "before", "limit"), &AurixVoiceClient::search_direct_chat,
+                         DEFVAL(String()), DEFVAL(String()), DEFVAL(50));
     ClassDB::bind_method(D_METHOD("moderate", "channel_id", "user_id", "action", "action_token", "reason"), &AurixVoiceClient::moderate, DEFVAL(String()));
     ClassDB::bind_method(D_METHOD("speak", "text", "channel_id", "destination", "voice"), &AurixVoiceClient::speak, DEFVAL(String()), DEFVAL(TTS_BOTH), DEFVAL(String()));
     ClassDB::bind_method(D_METHOD("cancel_speech"), &AurixVoiceClient::cancel_speech);
@@ -1286,6 +1364,11 @@ void AurixVoiceClient::_bind_methods() {
     ADD_SIGNAL(MethodInfo("chat_read_markers", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
                           PropertyInfo(Variant::INT, "unread"), PropertyInfo(Variant::ARRAY, "markers")));
     ADD_SIGNAL(MethodInfo("chat_inbox_synced", PropertyInfo(Variant::INT, "delivered"), PropertyInfo(Variant::BOOL, "truncated")));
+    ADD_SIGNAL(MethodInfo("chat_message_updated", PropertyInfo(Variant::DICTIONARY, "message")));
+    ADD_SIGNAL(MethodInfo("chat_reaction_changed", PropertyInfo(Variant::DICTIONARY, "change")));
+    ADD_SIGNAL(MethodInfo("chat_search_result", PropertyInfo(Variant::INT, "request_id"), PropertyInfo(Variant::STRING, "channel_id"),
+                          PropertyInfo(Variant::STRING, "user_id"), PropertyInfo(Variant::STRING, "query"), PropertyInfo(Variant::ARRAY, "messages"),
+                          PropertyInfo(Variant::STRING, "next_before")));
     ADD_SIGNAL(MethodInfo("translation_changed", PropertyInfo(Variant::DICTIONARY, "translation")));
 
     // enums

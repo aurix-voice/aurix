@@ -800,6 +800,14 @@ namespace Aurix
         /// page them with <see cref="HistoryAsync"/>.
         /// </summary>
         public event Action<int, bool> OnChatInboxSynced;
+        /// <summary>
+        /// A message this client can see was edited or deleted (the full message: check
+        /// <see cref="ChatMessage.IsEdited"/> / <see cref="ChatMessage.IsDeleted"/>). Own mutations are raised
+        /// here too, with <see cref="ChatMessage.ClientRef"/> set.
+        /// </summary>
+        public event Action<ChatMessage> OnChatMessageUpdated;
+        /// <summary>A reaction was added to or removed from a message this client can see.</summary>
+        public event Action<ChatReactionChange> OnChatReactionChanged;
         /// <summary>Another member of the channel started/stopped typing (channel, user, typing).</summary>
         public event Action<Guid, Guid, bool> OnParticipantTyping;
         /// <summary>
@@ -1734,6 +1742,71 @@ namespace Aurix
                 await _control.SendAsync(ControlMessage.ChatHistory(channelId, userId, before, after, limit, reference), ct).ConfigureAwait(false);
                 using (var timeout = new CancellationTokenSource(RequestTimeout))
                 using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("history request timeout"))))
+                using (ct.Register(() => tcs.TrySetCanceled()))
+                    return await tcs.Task.ConfigureAwait(false);
+            }
+            finally { lock (_pendingHistory) _pendingHistory.Remove(reference); }
+        }
+
+        /// <summary>
+        /// Replace the text (and game payload — an edit replaces the whole message, so pass
+        /// <paramref name="metadata"/> again to keep it) of one of this user's own messages within the
+        /// server's edit window (<c>chat.edit_window_secs</c>). Completes with the updated message, also raised
+        /// through <see cref="OnChatMessageUpdated"/> for everyone who can see it; faults with <c>AUTH_DENIED</c>
+        /// (not the author / window elapsed / edits disabled), <c>NOT_FOUND</c>, <c>MESSAGE_BLOCKED</c>, <c>VALIDATION_ERROR</c>.
+        /// </summary>
+        public Task<ChatMessage> EditMessageAsync(Guid messageId, string text, object metadata = null, CancellationToken ct = default) =>
+            SendChatAsync(r => ControlMessage.ChatEdit(messageId, text, metadata, r), null, ct);
+
+        /// <summary>
+        /// Delete a message: the author within the edit window, or a moderator of the channel at any time.
+        /// The message stays in history as a tombstone (empty text, <see cref="ChatMessage.DeletedAt"/> set)
+        /// so cursors stay valid; repeating the delete returns the same tombstone.
+        /// </summary>
+        public Task<ChatMessage> DeleteMessageAsync(Guid messageId, CancellationToken ct = default) =>
+            SendChatAsync(r => ControlMessage.ChatDelete(messageId, r), null, ct);
+
+        /// <summary>
+        /// Add (<paramref name="add"/> = true) or remove this user's <paramref name="reaction"/> (a short token
+        /// such as an emoji, no whitespace, ≤ 32 bytes) on a message of a joined channel or of a direct
+        /// conversation this user is part of. Idempotent; the outcome arrives through
+        /// <see cref="OnChatReactionChanged"/> (nothing is raised for a no-op), errors through <see cref="OnServerError"/>.
+        /// </summary>
+        public Task ReactAsync(Guid messageId, string reaction, bool add = true, CancellationToken ct = default)
+        {
+            ChatReaction.Validate(reaction);
+            EnsureConnected();
+            return _control.SendAsync(ControlMessage.ChatReact(messageId, reaction, add), ct);
+        }
+
+        /// <summary>
+        /// Full-text search over the stored history of a joined channel, newest match first. Web-search
+        /// syntax: words are ANDed, <c>"a phrase"</c>, <c>-excluded</c>, <c>or</c>. Restrict to one author with
+        /// <paramref name="fromUserId"/>; page with <paramref name="before"/> = <see cref="ChatHistoryPage.NextBefore"/>.
+        /// Faults with <c>AUTH_DENIED</c> (not a member), <c>NOT_FOUND</c> (search disabled), <c>RATE_LIMIT_EXCEEDED</c>.
+        /// </summary>
+        public Task<ChatHistoryPage> SearchAsync(Guid channelId, string query, Guid? fromUserId = null, string before = null, int? limit = null, CancellationToken ct = default) =>
+            SearchAsync(channelId, null, query, fromUserId, before, limit, ct);
+
+        /// <summary>
+        /// Search the direct conversation with <paramref name="userId"/>, or every direct conversation of this
+        /// user when <paramref name="userId"/> is null; see <see cref="SearchAsync(Guid, string, Guid?, string, int?, CancellationToken)"/>.
+        /// </summary>
+        public Task<ChatHistoryPage> SearchDirectAsync(Guid? userId, string query, Guid? fromUserId = null, string before = null, int? limit = null, CancellationToken ct = default) =>
+            SearchAsync(null, userId, query, fromUserId, before, limit, ct);
+
+        private async Task<ChatHistoryPage> SearchAsync(Guid? channelId, Guid? userId, string query, Guid? fromUserId, string before, int? limit, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is empty", nameof(query));
+            EnsureConnected();
+            var reference = $"q{Interlocked.Increment(ref _chatRefCounter)}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
+            var tcs = new TaskCompletionSource<ChatHistoryPage>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pendingHistory) _pendingHistory[reference] = tcs;
+            try
+            {
+                await _control.SendAsync(ControlMessage.ChatSearch(channelId, userId, query, fromUserId, before, limit, reference), ct).ConfigureAwait(false);
+                using (var timeout = new CancellationTokenSource(RequestTimeout))
+                using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("search request timeout"))))
                 using (ct.Register(() => tcs.TrySetCanceled()))
                     return await tcs.Task.ConfigureAwait(false);
             }
@@ -2932,6 +3005,18 @@ namespace Aurix
                 case "ChatInboxSynced":
                     OnChatInboxSynced?.Invoke((int)m.Num("delivered"), m.Bool("truncated"));
                     break;
+                case "ChatMessageUpdated":
+                {
+                    var chat = m.ChatMessage();
+                    if (chat != null) OnChatMessageUpdated?.Invoke(chat);
+                    break;
+                }
+                case "ChatReactionChanged":
+                {
+                    var change = m.ReactionChange();
+                    if (change != null) OnChatReactionChanged?.Invoke(change);
+                    break;
+                }
                 case "Transcript":
                 {
                     var t = m.Transcript();
@@ -3020,13 +3105,13 @@ namespace Aurix
         }
 
         /// <summary>
-        /// Runs on the network thread: the sender's echo (which alone carries <c>client_ref</c>) or an
-        /// <c>Error</c> tagged with the same <c>client_ref</c> settles the matching send.
+        /// Runs on the network thread: the sender's echo (which alone carries <c>client_ref</c>) — of a send,
+        /// an edit or a delete — or an <c>Error</c> tagged with the same <c>client_ref</c> settles the request.
         /// </summary>
         private void CompletePendingChat(ControlMessage m)
         {
             string reference;
-            if (m.Type == "ChatMessageReceived") reference = m.ChatMessage()?.ClientRef;
+            if (m.Type == "ChatMessageReceived" || m.Type == "ChatMessageUpdated") reference = m.ChatMessage()?.ClientRef;
             else if (m.Type == "Error") reference = m.Str("client_ref");
             else return;
             if (reference == null) return;
@@ -3037,8 +3122,8 @@ namespace Aurix
         }
 
         /// <summary>
-        /// Runs on the network thread: a <c>ChatHistoryResult</c> (or an <c>Error</c>) tagged with our
-        /// <c>client_ref</c> settles the matching history request; a <c>ChatReadMarkersResult</c> settles the
+        /// Runs on the network thread: a <c>ChatHistoryResult</c> / <c>ChatSearchResult</c> (or an <c>Error</c>)
+        /// tagged with our <c>client_ref</c> settles the matching history or search request; a <c>ChatReadMarkersResult</c> settles the
         /// oldest read-marker query of the same conversation (the server answers them in order).
         /// </summary>
         private void CompletePendingHistory(ControlMessage m)
@@ -3056,7 +3141,7 @@ namespace Aurix
                 waiter?.TrySetResult(m.ReadMarkers());
                 return;
             }
-            if (m.Type != "ChatHistoryResult" && m.Type != "Error") return;
+            if (m.Type != "ChatHistoryResult" && m.Type != "ChatSearchResult" && m.Type != "Error") return;
             var reference = m.Str("client_ref");
             if (reference == null) return;
             TaskCompletionSource<ChatHistoryPage> tcs;

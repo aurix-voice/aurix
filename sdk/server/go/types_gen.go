@@ -782,7 +782,8 @@ type ChatHistoryPage struct {
 	NextAfter *string `json:"next_after,omitempty"`
 }
 
-// Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history.
+// Same shape as the WebSocket `ChatMessage`; `client_ref` is never part of history. Edits keep
+// `id` / `sent_at` and set `edited_at`; deletions leave a tombstone (`deleted_at`).
 type ChatMessage struct {
 	ID string `json:"id"`
 	// `null` for directed (user-to-user) messages.
@@ -797,6 +798,24 @@ type ChatMessage struct {
 	// Directed message accepted while the recipient had no live session; it was stored for replay when
 	// they connect. Omitted when `false`.
 	Offline *bool `json:"offline,omitempty"`
+	// Set when the text / metadata were changed after sending; omitted otherwise.
+	EditedAt *string `json:"edited_at,omitempty"`
+	// Set on tombstones: the message was deleted, `text` is empty and `metadata` / `reactions` are
+	// gone. Omitted for live messages.
+	DeletedAt *string `json:"deleted_at,omitempty"`
+	// Who deleted it: the author, a channel moderator, or the nil system user for REST deletions.
+	DeletedBy *string `json:"deleted_by,omitempty"`
+	// Reaction tallies (history, search and `GET /v1/messages/{id}` only); omitted when empty.
+	Reactions []ChatReaction `json:"reactions,omitempty"`
+}
+
+// One reaction token on a message and who set it.
+type ChatReaction struct {
+	Reaction string `json:"reaction"`
+	// Users carrying this reaction.
+	Count int64 `json:"count"`
+	// Up to 20 of them (the reader first when known); `count` may exceed the list length.
+	UserIds []string `json:"user_ids,omitempty"`
 }
 
 // A user's reading position in one conversation: everything at or before `message_id` (ordered by
@@ -926,6 +945,14 @@ type DuckingConfig struct {
 	// Members with role `moderator`/`administrator` count as priority speakers too (explicit
 	// `priority` grants always do).
 	Moderators *bool `json:"moderators,omitempty"`
+}
+
+// EditMessageRequest is the `EditMessageRequest` schema.
+type EditMessageRequest struct {
+	// New text; `chat.max_message_bytes` applies.
+	Text string `json:"text"`
+	// Replaces the stored metadata; absent or `null` clears it.
+	Metadata any `json:"metadata,omitempty"`
 }
 
 // ErrorDetail is the `ErrorDetail` schema.
@@ -1356,6 +1383,25 @@ type QuotaState struct {
 	ParticipantMinutesThisMonth float64 `json:"participant_minutes_this_month"`
 	// Start of the current UTC calendar month; the monthly quota resets here.
 	MonthStart string `json:"month_start"`
+}
+
+// ReactionChange is the `ReactionChange` schema.
+type ReactionChange struct {
+	MessageID string `json:"message_id"`
+	UserID    string `json:"user_id"`
+	Reaction  string `json:"reaction"`
+	// `true` for PUT, `false` for DELETE.
+	Added bool `json:"added"`
+	// `false` when the reaction was already in the requested state (nothing was published).
+	Changed bool `json:"changed"`
+	// Users carrying `reaction` after the request.
+	Count int64 `json:"count"`
+}
+
+// ReactionRequest is the `ReactionRequest` schema.
+type ReactionRequest struct {
+	// The user the reaction belongs to (must exist in the app).
+	UserID string `json:"user_id"`
 }
 
 // ReadMarkerRequest is the `ReadMarkerRequest` schema.
@@ -2365,4 +2411,42 @@ type ListUserReadMarkersQuery struct {
 	ChannelID *string
 	// Direct conversation with this user (mutually exclusive with `channel_id`).
 	PeerUserID *string
+}
+
+// SearchChannelMessagesQuery holds the query parameters of `searchChannelMessages`.
+type SearchChannelMessagesQuery struct {
+	// Web-search syntax: words are ANDed, `"a phrase"` matches in order, `-word` excludes, `or`
+	// alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A
+	// query without searchable terms yields an empty page.
+	Q *string
+	// Only matches sent by this user.
+	FromUserID *string
+	// Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors
+	// are `400`.
+	Before *string
+	// Page size; clamped to `chat.history_page_max` (default 200).
+	Limit *int64
+}
+
+// SearchUserMessagesQuery holds the query parameters of `searchUserMessages`.
+type SearchUserMessagesQuery struct {
+	// Web-search syntax: words are ANDed, `"a phrase"` matches in order, `-word` excludes, `or`
+	// alternates. Matching is on PostgreSQL's `simple` dictionary (case-insensitive, no stemming). A
+	// query without searchable terms yields an empty page.
+	Q *string
+	// Only matches sent by this user.
+	FromUserID *string
+	// Only matches older than this cursor (`next_before` of the previous search page). Invalid cursors
+	// are `400`.
+	Before *string
+	// Page size; clamped to `chat.history_page_max` (default 200).
+	Limit *int64
+	// Restrict to the direct conversation with this user.
+	Peer *string
+}
+
+// RemoveMessageReactionQuery holds the query parameters of `removeMessageReaction`.
+type RemoveMessageReactionQuery struct {
+	// The user whose reaction is removed.
+	UserID *string
 }

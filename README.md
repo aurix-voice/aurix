@@ -219,7 +219,9 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
    are a member of, `ChatSendDirect { user_id, … }` to a user of the same application (live-only
    by default; with `chat.persist` an offline recipient gets it queued and replayed on connect,
    and `ChatHistory` / `ChatMarkRead` / `ChatReadMarkers` give cursor-paged history, read markers
-   and unread counts — see [Text chat](docs/src/features/chat.md)), `ChatTyping { channel_id, typing }`. Everyone
+   and unread counts, `ChatEdit` / `ChatDelete` / `ChatReact` / `ChatSearch` edit or tombstone
+   your own messages, react and search — see [Text chat](docs/src/features/chat.md)),
+   `ChatTyping { channel_id, typing }`. Everyone
    entitled to see the message — including the sender — receives one
    `ChatMessageReceived { message }` with a server-assigned `id`/`sent_at`; the sender's copy
    also carries the `client_ref`, nobody else's does. A rejected send comes back as
@@ -321,6 +323,7 @@ The full message set is in `crates/aurix-common/src/protocol.rs` (`ControlMessag
 | API key | `POST /v1/channels/:id/messages`, `POST /v1/users/:id/messages` | server/system text message into a channel or to one user's live sessions (`chat:write`; sender is the nil user id, bypasses the content filter; fire-and-forget — dropped if nobody is online unless persisted) |
 | API key | `GET /v1/channels/:id/messages`, `GET /v1/users/:id/messages[?peer=]` | history, newest first, opaque `?before=`/`?after=` cursors (`next_before`/`next_after` in the page) and `limit` up to `chat.history_page_max` — only when `chat.persist = true`, otherwise `404 NOT_FOUND` (`chat:read`) |
 | API key | `GET|PUT /v1/users/:id/read-markers`, `GET /v1/channels/:id/read-markers` | read markers and unread counts per channel / direct conversation (`chat:read`, `PUT` needs `chat:write`; stored chat only) |
+| API key | `GET|PATCH|DELETE /v1/messages/:id`, `PUT|DELETE /v1/messages/:id/reactions/:reaction`, `GET /v1/channels/:id/messages/search?q=`, `GET /v1/users/:id/messages/search?q=[&peer=]` | one stored message with reaction tallies; operator edit / tombstone deletion (no author-window rule, fans out `ChatMessageUpdated`); set / clear a reaction on behalf of `user_id`; full-text search, newest first, `?before=` cursor (`chat:read` / `chat:write`; stored chat only) |
 | API key | `POST /v1/moderation/{ban,mute,kick,report}`, `GET /v1/moderation/bans`, `POST …/bans/:id/revoke`, `GET /v1/moderation/events[/:id]`, `POST …/:id/resolve` | moderation |
 | API key | `POST /v1/moderation/{mute-all,kick-all}` | channel-wide server mute / kick of everyone currently present minus `except: [user ids]`; response lists `affected`, `skipped`, `failed`; every target still gets its own `user.muted`/`user.kicked` event and audit entry plus one `channel_mute_all`/`channel_kick_all` summary |
 | API key | `GET /v1/safety/incidents[/:id]`, `GET …/:id/export`, `GET /v1/safety/users/:id/risk` | content-safety incidents (moderation events `safety.voice`/`safety.text`), self-contained evidence bundle (inline decrypted audio when the key also has `recordings:read`), decayed per-user risk (`moderation:read`; see [Content safety](#content-safety)) |
@@ -353,7 +356,7 @@ Event types (`GET /v1/webhooks/events` lists them): `channel.created|destroyed|a
 (activated = first participant in, deactivated = last one out — also emitted for channels a
 crashed node left behind), `participant.joined|left|muted|unmuted|kicked`, `user.banned`,
 `user.block_changed`, `moderation.event`, `recording.started|stopped|consent_required|processed`,
-`audio_stream.started|stopped`, `quality.alert`, `quality.recovered`, `chat.message`, `chat.read_marker`. `participant.typing`, `participant.speaking` and `channel.energy`
+`audio_stream.started|stopped`, `quality.alert`, `quality.recovered`, `chat.message`, `chat.message_updated`, `chat.reaction`, `chat.read_marker`. `participant.typing`, `participant.speaking` and `channel.energy`
 are high-frequency UX signals: SSE delivers them only when named in `?types=`, webhooks refuse them.
 
 **Webhooks.** `POST /v1/webhooks {"url","events":["*"]|[…],"description"}` returns the signing
@@ -1129,10 +1132,10 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
 * No SIP/PSTN gateway, no server-side noise suppression (the native core / SDKs do it on the client).
-* Text chat is deliberately "lite": channel/directed messages and typing, no attachments,
-  threads or reactions. History, offline delivery of directed messages and read markers exist
-  only with `chat.persist = true`, and offline replay is per user (read-marker driven), not an
-  exactly-once per-device queue.
+* Text chat is deliberately "lite": channel/directed messages and typing, no attachments or
+  threads. History, offline delivery of directed messages, read markers, edits / deletions,
+  reactions and full-text search exist only with `chat.persist = true`, and offline replay is
+  per user (read-marker driven), not an exactly-once per-device queue.
 * STT/TTS, live translation and the content-safety classifier talk to HTTP servers you host
   (OpenAI-compatible, LibreTranslate-compatible); no speech, translation or moderation model
   ships with Aurix, transcripts and translations are not stored server-side, and translation is

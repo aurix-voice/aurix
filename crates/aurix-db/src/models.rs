@@ -203,6 +203,51 @@ pub struct ChatMessageRow {
     pub sent_at: DateTime<Utc>,
     /// Directed message accepted while the recipient had no active session.
     pub offline: bool,
+    #[sqlx(default)]
+    pub edited_at: Option<DateTime<Utc>>,
+    /// Tombstone: `text` is empty and `metadata` `None`; the row stays for cursors/markers.
+    #[sqlx(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub deleted_by: Option<Uuid>,
+}
+
+/// Aggregated reaction on one message: `user_ids` holds at most the first N reactors (the
+/// reading user first when they reacted), `count` is exact.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ChatReactionRow {
+    pub message_id: Uuid,
+    pub reaction: String,
+    pub count: i64,
+    pub user_ids: Vec<Uuid>,
+}
+
+/// One reaction a user set (data export).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct UserReactionRow {
+    pub message_id: Uuid,
+    pub reaction: String,
+    pub reacted_at: DateTime<Utc>,
+}
+
+/// Outcome of adding a reaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionAdd {
+    Added,
+    /// The user already had this reaction on the message.
+    AlreadySet,
+    /// The message already carries the configured number of distinct reactions.
+    TooManyDistinct,
+}
+
+/// Scope of a full-text search over stored chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSearchScope {
+    Channel(Uuid),
+    /// Both directions between the two users.
+    Direct(Uuid, Uuid),
+    /// Everything this user sent or received directly.
+    User(Uuid),
 }
 
 /// Position in a `(sent_at, id)`-ordered message stream; both cursor bounds of a history page

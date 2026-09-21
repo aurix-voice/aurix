@@ -634,7 +634,9 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackedKind {
     Chat,
+    ChatUpdate,
     ChatHistory,
+    ChatSearch,
     Tts,
 }
 
@@ -1679,7 +1681,9 @@ impl Client {
         let request_id = self.inner.next_request_id();
         let prefix = match kind {
             TrackedKind::Chat => 'm',
+            TrackedKind::ChatUpdate => 'u',
             TrackedKind::ChatHistory => 'h',
+            TrackedKind::ChatSearch => 's',
             TrackedKind::Tts => 't',
         };
         let client_ref = format!("{prefix}{request_id}-{:x}", rand::random::<u32>());
@@ -1742,6 +1746,92 @@ impl Client {
             channel_id,
             typing,
         }))
+    }
+
+    /// Replaces the text (and metadata) of this user's own stored message, within the
+    /// server's `chat.edit_window_secs`. The updated copy comes back as
+    /// `ChatMessageUpdated { request_id: Some(id) }`; refusals as `RequestFailed`.
+    pub fn edit_chat(
+        &self,
+        message_id: uuid::Uuid,
+        text: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<RequestId> {
+        if text.trim().is_empty() {
+            return Err(ClientError::InvalidArgument("text is empty".into()));
+        }
+        let text = text.to_string();
+        self.tracked(TrackedKind::ChatUpdate, move |client_ref| {
+            ControlMessage::ChatEdit {
+                message_id,
+                text,
+                metadata,
+                client_ref: Some(client_ref),
+            }
+        })
+    }
+
+    /// Deletes a stored message: this user's own (within the edit window) or, in a channel
+    /// this user moderates, anyone's. The tombstone comes back as
+    /// `ChatMessageUpdated { request_id: Some(id) }` with `deleted_at` set.
+    pub fn delete_chat(&self, message_id: uuid::Uuid) -> Result<RequestId> {
+        self.tracked(TrackedKind::ChatUpdate, move |client_ref| {
+            ControlMessage::ChatDelete {
+                message_id,
+                client_ref: Some(client_ref),
+            }
+        })
+    }
+
+    /// Adds (`add`) or removes this user's `reaction` (an emoji or a short token, ≤ 32 bytes,
+    /// no whitespace) on a message of a joined channel or own direct conversation. The
+    /// resulting `ChatReactionChanged` reaches every participant, this client included;
+    /// refusals arrive as `ServerError`.
+    pub fn react_chat(&self, message_id: uuid::Uuid, reaction: &str, add: bool) -> Result<()> {
+        if reaction.is_empty() || reaction.chars().any(char::is_whitespace) {
+            return Err(ClientError::InvalidArgument(
+                "reaction must be a non-empty token without whitespace".into(),
+            ));
+        }
+        if reaction.len() > aurix_common::protocol::REACTION_MAX_BYTES {
+            return Err(ClientError::InvalidArgument("reaction is too long".into()));
+        }
+        self.send_cmd(Command::Send(ControlMessage::ChatReact {
+            message_id,
+            reaction: reaction.to_string(),
+            add,
+        }))
+    }
+
+    /// Full-text search over stored history of a joined channel, the direct conversation
+    /// with a user, or (`scope: None`) every direct conversation of this user. Matches come
+    /// newest first in `Event::ChatSearchResult { request_id }`; `before` continues from its
+    /// `next_before`. Web-search syntax: words are ANDed, `"a phrase"`, `-excluded`, `or`.
+    pub fn search_chat(
+        &self,
+        scope: Option<ChatScope>,
+        query: &str,
+        from_user_id: Option<UserId>,
+        before: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<RequestId> {
+        if query.trim().is_empty() {
+            return Err(ClientError::InvalidArgument("query is empty".into()));
+        }
+        let (channel_id, user_id) = scope.map(ChatScope::split).unwrap_or((None, None));
+        let query = query.to_string();
+        let before = before.map(str::to_string);
+        self.tracked(TrackedKind::ChatSearch, move |client_ref| {
+            ControlMessage::ChatSearch {
+                channel_id,
+                user_id,
+                query,
+                from_user_id,
+                before,
+                limit,
+                client_ref: Some(client_ref),
+            }
+        })
     }
 
     /// One page of stored history of a joined channel (`ChatScope::Channel`) or of the direct
@@ -3948,6 +4038,59 @@ async fn handle_message(
                 message,
             });
         }
+        ControlMessage::ChatMessageUpdated { message } => {
+            let request_id = message.client_ref.as_ref().and_then(|r| {
+                let t = pending.tracked.remove(r)?;
+                (t.kind == TrackedKind::ChatUpdate).then_some(t.request_id)
+            });
+            inner.emit(Event::ChatMessageUpdated {
+                request_id,
+                message,
+            });
+        }
+        ControlMessage::ChatReactionChanged {
+            message_id,
+            channel_id,
+            message_from_user_id,
+            message_to_user_id,
+            user_id,
+            reaction,
+            added,
+            count,
+            timestamp,
+        } => inner.emit(Event::ChatReactionChanged {
+            message_id,
+            channel_id,
+            message_from_user_id,
+            message_to_user_id,
+            user_id,
+            reaction,
+            added,
+            count,
+            timestamp,
+        }),
+        ControlMessage::ChatSearchResult {
+            channel_id,
+            user_id,
+            query,
+            messages,
+            next_before,
+            client_ref,
+        } => {
+            let request_id = client_ref.as_ref().and_then(|r| {
+                let t = pending.tracked.remove(r)?;
+                (t.kind == TrackedKind::ChatSearch).then_some(t.request_id)
+            });
+            let scope = (channel_id.is_some() || user_id.is_some())
+                .then(|| ChatScope::from_parts(channel_id, user_id));
+            inner.emit(Event::ChatSearchResult {
+                request_id,
+                scope,
+                query,
+                messages,
+                next_before,
+            });
+        }
         ControlMessage::ChatHistoryResult {
             channel_id,
             user_id,
@@ -4099,6 +4242,10 @@ async fn handle_message(
         | ControlMessage::ChatHistory { .. }
         | ControlMessage::ChatMarkRead { .. }
         | ControlMessage::ChatReadMarkers { .. }
+        | ControlMessage::ChatEdit { .. }
+        | ControlMessage::ChatDelete { .. }
+        | ControlMessage::ChatReact { .. }
+        | ControlMessage::ChatSearch { .. }
         | ControlMessage::SetTranscripts { .. }
         | ControlMessage::SetTranslation { .. }
         | ControlMessage::TtsSpeak { .. }

@@ -4,7 +4,7 @@ use crate::state::AppState;
 use aurix_auth::ValidatedToken;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
-use aurix_control::chat::{Conversation, OutgoingMessage, SYSTEM_USER};
+use aurix_control::chat::{Actor, Conversation, OutgoingMessage, SearchQuery, SYSTEM_USER};
 use aurix_control::moderation_actions::{self, ModerationTarget};
 use aurix_control::safety::{event_type_for_source, is_safety_event, IncidentExport};
 use aurix_control::{LimitScope, SelectionHint};
@@ -1059,6 +1059,7 @@ pub async fn list_channel_messages(
             query.before.as_deref(),
             query.after.as_deref(),
             query.limit,
+            None,
         )
         .await?;
     to_json(page)
@@ -1089,9 +1090,215 @@ pub async fn list_user_messages(
             query.before.as_deref(),
             query.after.as_deref(),
             query.limit,
+            None,
         )
         .await?;
     to_json(page)
+}
+
+#[derive(Deserialize)]
+pub struct ChatSearchQuery {
+    /// Web-search syntax (`words`, `"a phrase"`, `-excluded`, `or`); 1..=256 bytes.
+    pub q: String,
+    /// Only messages from this user.
+    pub from_user_id: Option<Uuid>,
+    pub before: Option<String>,
+    pub limit: Option<u32>,
+    /// `GET /v1/users/{id}/messages/search` only: the direct conversation with this user.
+    pub peer: Option<Uuid>,
+}
+
+/// `GET /v1/channels/{id}/messages/search`: full-text search over the channel's stored
+/// messages (deleted ones excluded), newest match first; `next_before` pages back.
+pub async fn search_channel_messages(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<ChatSearchQuery>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let page = state
+        .control
+        .chat
+        .search(
+            ctx.app_id,
+            Conversation::Channel(channel_id),
+            SearchQuery {
+                query: &query.q,
+                from_user_id: query.from_user_id.map(UserId::from_uuid),
+                before: query.before.as_deref(),
+                limit: query.limit,
+            },
+            None,
+        )
+        .await?;
+    to_json(page)
+}
+
+/// `GET /v1/users/{id}/messages/search`: search everything the user sent or received
+/// (moderation view), or with `?peer=` one direct conversation.
+pub async fn search_user_messages(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<ChatSearchQuery>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let conversation = match query.peer {
+        Some(peer) => Conversation::Direct {
+            user: user_id,
+            peer: UserId::from_uuid(peer),
+        },
+        None => Conversation::User(user_id),
+    };
+    let page = state
+        .control
+        .chat
+        .search(
+            ctx.app_id,
+            conversation,
+            SearchQuery {
+                query: &query.q,
+                from_user_id: query.from_user_id.map(UserId::from_uuid),
+                before: query.before.as_deref(),
+                limit: query.limit,
+            },
+            None,
+        )
+        .await?;
+    to_json(page)
+}
+
+/// `GET /v1/messages/{id}`: one stored message with its reaction tallies (tombstones included).
+pub async fn get_message(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(message_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let message = state
+        .control
+        .chat
+        .stored_message(ctx.app_id, message_id)
+        .await?;
+    to_json(message)
+}
+
+#[derive(Deserialize)]
+pub struct EditMessageRequest {
+    pub text: String,
+    /// Replaces the stored metadata (`null` / absent clears it).
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// `PATCH /v1/messages/{id}`: operator edit of any stored message of the app (no author /
+/// window rule, filters skipped); everyone who sees the message gets `ChatMessageUpdated`.
+pub async fn edit_message(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(message_id): Path<Uuid>,
+    Json(req): Json<EditMessageRequest>,
+) -> JsonResult {
+    ctx.require("chat:write")?;
+    let message = state
+        .control
+        .chat
+        .edit(
+            ctx.app_id,
+            message_id,
+            Actor::system(),
+            req.text,
+            req.metadata,
+            None,
+        )
+        .await?;
+    to_json(message)
+}
+
+/// `DELETE /v1/messages/{id}`: operator deletion — the message becomes a tombstone
+/// (`deleted_by` = nil system user) and loses its text, metadata and reactions.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(message_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("chat:write")?;
+    let message = state
+        .control
+        .chat
+        .delete(ctx.app_id, message_id, Actor::system(), None)
+        .await?;
+    to_json(message.message)
+}
+
+#[derive(Deserialize)]
+pub struct ReactionRequest {
+    /// The user the reaction belongs to.
+    pub user_id: Uuid,
+}
+
+/// `PUT /v1/messages/{id}/reactions/{reaction}`: sets `user_id`'s reaction (idempotent).
+pub async fn put_message_reaction(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path((message_id, reaction)): Path<(Uuid, String)>,
+    Json(req): Json<ReactionRequest>,
+) -> JsonResult {
+    react_via_api(state, ctx, message_id, reaction, req.user_id, true).await
+}
+
+/// `DELETE /v1/messages/{id}/reactions/{reaction}?user_id=`: clears the user's reaction.
+pub async fn delete_message_reaction(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path((message_id, reaction)): Path<(Uuid, String)>,
+    Query(req): Query<ReactionRequest>,
+) -> JsonResult {
+    react_via_api(state, ctx, message_id, reaction, req.user_id, false).await
+}
+
+async fn react_via_api(
+    state: AppState,
+    ctx: ApiKeyContext,
+    message_id: Uuid,
+    reaction: String,
+    user_id: Uuid,
+    add: bool,
+) -> JsonResult {
+    ctx.require("chat:write")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let change = state
+        .control
+        .chat
+        .react(
+            ctx.app_id,
+            message_id,
+            Actor {
+                user_id,
+                session_id: None,
+                moderator: false,
+            },
+            &reaction,
+            add,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "message_id": message_id,
+        "user_id": user_id,
+        "reaction": change.reaction,
+        "added": add,
+        "changed": change.changed,
+        "count": change.count,
+    })))
 }
 
 /// Selects one conversation of a user: exactly one of `channel_id` / `peer_user_id`.

@@ -116,10 +116,15 @@ public:
     AurixModerationAction moderation_action() const { return aurix_event_moderation_action(ev_); }
 
     bool session(AurixSessionInfo& out) const { return aurix_event_session(ev_, &out); }
+    /// `AURIX_EVENT_CHAT_MESSAGE` and `AURIX_EVENT_CHAT_MESSAGE_UPDATED` (edit / tombstone).
     bool chat(AurixChatMessage& out) const { return aurix_event_chat(ev_, &out); }
-    /// `AURIX_EVENT_CHAT_HISTORY`: page summary (cursors are owned by the event).
+    /// `AURIX_EVENT_CHAT_REACTION_CHANGED`.
+    bool reaction(AurixChatReaction& out) const { return aurix_event_reaction(ev_, &out); }
+    /// `AURIX_EVENT_CHAT_HISTORY` / `AURIX_EVENT_CHAT_SEARCH_RESULT`: page summary (cursors
+    /// are owned by the event).
     bool chat_history(AurixChatHistory& out) const { return aurix_event_chat_history(ev_, &out); }
-    /// Messages of an `AURIX_EVENT_CHAT_HISTORY` page, newest first.
+    /// Messages of an `AURIX_EVENT_CHAT_HISTORY` / `AURIX_EVENT_CHAT_SEARCH_RESULT` page,
+    /// newest first.
     std::vector<AurixChatMessage> chat_history_messages() const {
         AurixChatHistory page{};
         if (!aurix_event_chat_history(ev_, &page)) return {};
@@ -510,6 +515,32 @@ public:
     }
     AurixResult channel_read_markers(const Uuid& channel) { return aurix_client_chat_read_markers(c_, &channel.raw, nullptr); }
     AurixResult direct_read_markers(const Uuid& user) { return aurix_client_chat_read_markers(c_, nullptr, &user.raw); }
+    /// Edits own message; answered by `AURIX_EVENT_CHAT_MESSAGE_UPDATED` with `request_id`.
+    AurixResult edit_chat(const Uuid& message, const std::string& text, const char* metadata_json,
+                          std::uint64_t* request_id) {
+        return aurix_client_edit_chat(c_, &message.raw, text.c_str(), metadata_json, request_id);
+    }
+    /// Deletes own (or, as channel moderator, anyone's) message; answered by a tombstone
+    /// `AURIX_EVENT_CHAT_MESSAGE_UPDATED`.
+    AurixResult delete_chat(const Uuid& message, std::uint64_t* request_id) {
+        return aurix_client_delete_chat(c_, &message.raw, request_id);
+    }
+    /// Adds / removes this user's reaction; everyone gets `AURIX_EVENT_CHAT_REACTION_CHANGED`.
+    AurixResult react_chat(const Uuid& message, const std::string& reaction, bool add) {
+        return aurix_client_react_chat(c_, &message.raw, reaction.c_str(), add);
+    }
+    /// Full-text search in a joined channel; `from_user` / `before` may be null.
+    AurixResult search_channel_chat(const Uuid& channel, const std::string& query, const Uuid* from_user,
+                                    const char* before, std::uint32_t limit, std::uint64_t* request_id) {
+        return aurix_client_search_chat(c_, &channel.raw, nullptr, query.c_str(), from_user ? &from_user->raw : nullptr,
+                                        before, limit, request_id);
+    }
+    /// Full-text search in the direct conversation with `user` (null = every direct conversation).
+    AurixResult search_direct_chat(const Uuid* user, const std::string& query, const Uuid* from_user,
+                                   const char* before, std::uint32_t limit, std::uint64_t* request_id) {
+        return aurix_client_search_chat(c_, nullptr, user ? &user->raw : nullptr, query.c_str(),
+                                        from_user ? &from_user->raw : nullptr, before, limit, request_id);
+    }
     AurixResult speak(const std::string& text, const Uuid* channel, AurixTtsDestination destination,
                       const char* voice, std::uint64_t* request_id) {
         return aurix_client_speak(c_, text.c_str(), channel ? &channel->raw : nullptr, destination, voice, request_id);

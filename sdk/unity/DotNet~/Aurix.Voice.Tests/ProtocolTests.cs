@@ -497,6 +497,82 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void ChatEditDeleteReactionsSearchMatchServerWire()
+        {
+            var team = Guid.Parse("01a0b6d1-131f-7160-afd2-056622380dd3");
+            var bob = Guid.Parse("01a0b6d1-132a-7385-8e7a-9ac1eceaeb0c");
+            var msg = Guid.Parse("0192f3a4-b5c6-7d8e-9f01-23456789abcd");
+
+            Assert.Equal(
+                "{\"type\":\"ChatEdit\",\"data\":{\"message_id\":\"" + msg + "\",\"text\":\"fixed\",\"metadata\":{\"k\":1},\"client_ref\":\"e1\"}}",
+                ControlMessage.ChatEdit(msg, "fixed", new Dictionary<string, object> { { "k", 1 } }, "e1"));
+            Assert.Equal(
+                "{\"type\":\"ChatDelete\",\"data\":{\"message_id\":\"" + msg + "\",\"client_ref\":\"d1\"}}",
+                ControlMessage.ChatDelete(msg, "d1"));
+            Assert.Equal(
+                "{\"type\":\"ChatReact\",\"data\":{\"message_id\":\"" + msg + "\",\"reaction\":\"👍\",\"add\":false}}",
+                ControlMessage.ChatReact(msg, "👍", false));
+            Assert.Equal(
+                "{\"type\":\"ChatSearch\",\"data\":{\"query\":\"raid -cancelled\",\"channel_id\":\"" + team + "\",\"from_user_id\":\"" + bob + "\",\"before\":\"AAA\",\"limit\":20,\"client_ref\":\"q1\"}}",
+                ControlMessage.ChatSearch(team, null, "raid -cancelled", bob, "AAA", 20, "q1"));
+            Assert.Equal(
+                "{\"type\":\"ChatSearch\",\"data\":{\"query\":\"gg\",\"client_ref\":\"q2\"}}",
+                ControlMessage.ChatSearch(null, null, "gg", null, null, null, "q2"));
+
+            ChatReaction.Validate("👍");
+            ChatReaction.Validate(":+1:");
+            Assert.Throws<ArgumentException>(() => ChatReaction.Validate(""));
+            Assert.Throws<ArgumentException>(() => ChatReaction.Validate("thumbs up"));
+            Assert.Throws<ArgumentException>(() => ChatReaction.Validate("a\nb"));
+            Assert.Throws<ArgumentException>(() => ChatReaction.Validate(new string('x', 33)));
+            ChatReaction.Validate(new string('x', 32));
+
+            var updated = ControlMessage.Parse("{\"type\":\"ChatMessageUpdated\",\"data\":{\"message\":{\"id\":\"" + msg + "\"," +
+                "\"channel_id\":\"" + team + "\",\"from_user_id\":\"" + bob + "\",\"display_name\":\"Bob\",\"text\":\"fixed\"," +
+                "\"sent_at\":\"2024-05-06T07:08:09Z\",\"client_ref\":\"e1\",\"edited_at\":\"2024-05-06T07:09:09Z\"," +
+                "\"reactions\":[{\"reaction\":\"👍\",\"count\":21,\"user_ids\":[\"" + bob + "\"]}]}}}").ChatMessage();
+            Assert.True(updated.IsEdited);
+            Assert.False(updated.IsDeleted);
+            Assert.Equal("e1", updated.ClientRef);
+            Assert.Equal(TimeSpan.FromMinutes(1), updated.EditedAt.Value - updated.SentAt);
+            Assert.Single(updated.Reactions);
+            Assert.Equal("👍", updated.Reactions[0].Reaction);
+            Assert.Equal(21, updated.Reactions[0].Count);
+            Assert.Equal(new[] { bob }, updated.Reactions[0].UserIds);
+
+            var tombstone = ControlMessage.Parse("{\"type\":\"ChatMessageUpdated\",\"data\":{\"message\":{\"id\":\"" + msg + "\"," +
+                "\"channel_id\":\"" + team + "\",\"from_user_id\":\"" + bob + "\",\"display_name\":\"Bob\",\"text\":\"\"," +
+                "\"sent_at\":\"2024-05-06T07:08:09Z\",\"deleted_at\":\"2024-05-06T07:10:09Z\",\"deleted_by\":\"" + team + "\",\"reactions\":[]}}}").ChatMessage();
+            Assert.True(tombstone.IsDeleted);
+            Assert.Equal(team, tombstone.DeletedBy);
+            Assert.Equal(string.Empty, tombstone.Text);
+            Assert.Empty(tombstone.Reactions);
+            // Tombstones keep their cursor: the original sent_at/id still orders history.
+            Assert.Equal(ChatCursor.Encode(tombstone.SentAt, msg), tombstone.Cursor);
+
+            var change = ControlMessage.Parse("{\"type\":\"ChatReactionChanged\",\"data\":{\"message_id\":\"" + msg + "\",\"channel_id\":\"" + team + "\"," +
+                "\"message_from_user_id\":\"" + bob + "\",\"user_id\":\"" + bob + "\",\"reaction\":\"🔥\",\"added\":true,\"count\":3," +
+                "\"timestamp\":\"2024-05-06T07:11:09Z\"}}").ReactionChange();
+            Assert.Equal(msg, change.MessageId);
+            Assert.Equal(team, change.ChannelId);
+            Assert.Null(change.MessageToUserId);
+            Assert.Equal(bob, change.UserId);
+            Assert.Equal("🔥", change.Reaction);
+            Assert.True(change.Added);
+            Assert.Equal(3, change.Count);
+            Assert.Null(ControlMessage.Parse("{\"type\":\"ChatReactionChanged\",\"data\":{\"reaction\":\"x\"}}").ReactionChange());
+
+            var found = ControlMessage.Parse("{\"type\":\"ChatSearchResult\",\"data\":{\"channel_id\":\"" + team + "\",\"query\":\"raid\",\"messages\":[" +
+                "{\"id\":\"" + msg + "\",\"channel_id\":\"" + team + "\",\"from_user_id\":\"" + bob + "\",\"display_name\":\"Bob\"," +
+                "\"text\":\"raid at 9\",\"sent_at\":\"2024-05-06T07:08:09Z\"}],\"next_before\":\"BBB\",\"client_ref\":\"q1\"}}").ChatHistory();
+            Assert.Equal(team, found.ChannelId);
+            Assert.Equal("raid", found.Query);
+            Assert.Single(found.Messages);
+            Assert.Equal("BBB", found.NextBefore);
+            Assert.Null(found.NextAfter);
+        }
+
+        [Fact]
         public void AudioLevelMatchesServerEncoding()
         {
             // Same vectors as encode_audio_level / decode_audio_level in crates/aurix-common/src/protocol.rs.

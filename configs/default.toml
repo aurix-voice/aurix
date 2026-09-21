@@ -246,6 +246,12 @@ offline_max_age_hours = 0       # 0 = replay anything within retention_days
 history_page_max = 200          # largest history page a client / REST caller may ask for
 unread_count_cap = 1000         # unread counters saturate here
 read_receipts = true            # share read markers with channel members / the direct peer
+# Stored chat also gives edits, deletions (tombstones), reactions and full-text search.
+edits = true                    # players may edit / delete their own messages (REST always can)
+edit_window_secs = 900          # …within this many seconds of sending (0 = no limit)
+reactions_per_message = 20      # distinct reactions one message may carry (0 = reactions off)
+search = true                   # ChatSearch over the WebSocket (REST search is always available)
+searches_per_minute = 30        # per session
 [webhooks]
 enabled = true
 timeout_ms = 5000

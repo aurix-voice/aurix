@@ -466,6 +466,25 @@ typedef enum AurixEventType {
    * it); FEC tuning / DRED already applied to the encoder.
    */
   AURIX_EVENT_LOSS_PROFILE_CHANGED = 46,
+  /**
+   * `chat` (`aurix_event_chat`): a message of one of this client's conversations was
+   * edited (`edited_at_ms`) or deleted (`deleted_at_ms`, empty text) — replace the copy
+   * with the same `message_id`; `request_id` is set on the echo of this client's own
+   * `aurix_client_edit_chat` / `aurix_client_delete_chat`.
+   */
+  AURIX_EVENT_CHAT_MESSAGE_UPDATED = 47,
+  /**
+   * `aurix_event_reaction`: a user added (`flag`) or removed a reaction on a message;
+   * `object_id` = message, `user_id` = who, `channel_id` = conversation (zero for direct).
+   */
+  AURIX_EVENT_CHAT_REACTION_CHANGED = 48,
+  /**
+   * `request_id`, `channel_id` / `user_id` = searched conversation (both zero = every
+   * direct conversation), `message` = the query, `aurix_event_chat_history` (count,
+   * `next_before`) + `aurix_event_chat_history_message`: answer to
+   * `aurix_client_search_chat`, newest match first.
+   */
+  AURIX_EVENT_CHAT_SEARCH_RESULT = 49,
 } AurixEventType;
 
 /**
@@ -961,6 +980,25 @@ typedef struct AurixChatMessage {
    * History cursor of this message (`before` / `after` of `aurix_client_chat_history`).
    */
   const char *cursor;
+  /**
+   * Unix milliseconds of the last edit, 0 when never edited.
+   */
+  int64_t edited_at_ms;
+  /**
+   * Unix milliseconds of the deletion, 0 for a live message. A deleted message (tombstone)
+   * keeps its id and position; `text` is empty, `metadata_json` and `reactions_json` are
+   * `NULL`.
+   */
+  int64_t deleted_at_ms;
+  /**
+   * Who deleted it (author, moderator or the zero UUID for the operator); zero when live.
+   */
+  struct AurixUuid deleted_by;
+  /**
+   * Reaction tallies as a JSON array `[{"reaction","count","user_ids"}]`, or `NULL` when
+   * there are none (live `ChatMessage` events never carry them; history / search do).
+   */
+  const char *reactions_json;
 } AurixChatMessage;
 
 /**
@@ -980,6 +1018,36 @@ typedef struct AurixChatHistory {
    */
   const char *next_after;
 } AurixChatHistory;
+
+/**
+ * A reaction change (`AurixEventChatReactionChanged`). Strings owned by the event.
+ */
+typedef struct AurixChatReaction {
+  struct AurixUuid message_id;
+  /**
+   * Zero UUID for a direct message.
+   */
+  struct AurixUuid channel_id;
+  /**
+   * Author of the message; `message_recipient_id` is its recipient (zero for channels).
+   */
+  struct AurixUuid message_sender_id;
+  struct AurixUuid message_recipient_id;
+  /**
+   * Who added / removed the reaction.
+   */
+  struct AurixUuid user_id;
+  const char *reaction;
+  bool added;
+  /**
+   * Users carrying `reaction` after the change.
+   */
+  uint32_t count;
+  /**
+   * Unix milliseconds.
+   */
+  int64_t timestamp_ms;
+} AurixChatReaction;
 
 /**
  * A user's reading position in a channel or a direct conversation.
@@ -1736,16 +1804,23 @@ bool aurix_event_participant(const struct AurixEvent *event,
 bool aurix_event_chat(const struct AurixEvent *event, struct AurixChatMessage *out);
 
 /**
- * Page summary of a `ChatHistory` event.
+ * Page summary of a `ChatHistory` or `ChatSearchResult` event (`next_after` is always
+ * `NULL` for a search).
  */
 bool aurix_event_chat_history(const struct AurixEvent *event, struct AurixChatHistory *out);
 
 /**
- * Message `index` (0 = newest) of a `ChatHistory` page; `request_id` is 0 for all of them.
+ * Message `index` (0 = newest) of a `ChatHistory` / `ChatSearchResult` page; `request_id`
+ * is 0 for all of them.
  */
 bool aurix_event_chat_history_message(const struct AurixEvent *event,
                                       size_t index,
                                       struct AurixChatMessage *out);
+
+/**
+ * The change of a `ChatReactionChanged` event.
+ */
+bool aurix_event_reaction(const struct AurixEvent *event, struct AurixChatReaction *out);
 
 /**
  * The marker of a `ChatReadMarker` event.
@@ -2311,6 +2386,52 @@ enum AurixResult aurix_client_mark_chat_read(struct AurixClient *client,
 enum AurixResult aurix_client_chat_read_markers(struct AurixClient *client,
                                                 const struct AurixUuid *channel_id,
                                                 const struct AurixUuid *user_id);
+
+/**
+ * Replaces the text of this user's own message (within the server's edit window);
+ * `metadata_json` `NULL` clears the metadata. Answered by `AurixEventChatMessageUpdated`
+ * with this `request_id`, or `RequestFailed`.
+ */
+enum AurixResult aurix_client_edit_chat(struct AurixClient *client,
+                                        const struct AurixUuid *message_id,
+                                        const char *text,
+                                        const char *metadata_json,
+                                        uint64_t *request_id_out);
+
+/**
+ * Deletes a message: this user's own (within the edit window) or, in a channel this user
+ * moderates, anyone's. Answered by `AurixEventChatMessageUpdated` (a tombstone) with this
+ * `request_id`, or `RequestFailed`.
+ */
+enum AurixResult aurix_client_delete_chat(struct AurixClient *client,
+                                          const struct AurixUuid *message_id,
+                                          uint64_t *request_id_out);
+
+/**
+ * Adds (`add`) or removes this user's `reaction` (≤ 32 bytes, no whitespace) on a message
+ * of a joined channel or own direct conversation. The result reaches everyone — this
+ * client included — as `AurixEventChatReactionChanged`; refusals as `ServerError`.
+ */
+enum AurixResult aurix_client_react_chat(struct AurixClient *client,
+                                         const struct AurixUuid *message_id,
+                                         const char *reaction,
+                                         bool add);
+
+/**
+ * Full-text search over stored history: a joined `channel_id`, the direct conversation
+ * with `user_id`, or every direct conversation of this user (both `NULL`). Optional
+ * `from_user_id` keeps only that author's messages; `before` continues from a previous
+ * result's `next_before`; `limit` 0 = server default. Answered by
+ * `AurixEventChatSearchResult` (newest match first) or `RequestFailed`.
+ */
+enum AurixResult aurix_client_search_chat(struct AurixClient *client,
+                                          const struct AurixUuid *channel_id,
+                                          const struct AurixUuid *user_id,
+                                          const char *query,
+                                          const struct AurixUuid *from_user_id,
+                                          const char *before,
+                                          uint32_t limit,
+                                          uint64_t *request_id_out);
 
 /**
  * Server-side text-to-speech as this participant's voice. `channel_id` may be `NULL` for

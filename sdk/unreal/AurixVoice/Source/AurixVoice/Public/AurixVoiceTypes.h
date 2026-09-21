@@ -651,6 +651,22 @@ struct AURIXVOICE_API FAurixParticipant
 	bool bPriority = false;
 };
 
+/** One reaction on a stored message and who carries it (at most the first 20 users). */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixChatReactionTally
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString Reaction;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 Count = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	TArray<FGuid> UserIds;
+};
+
 USTRUCT(BlueprintType)
 struct AURIXVOICE_API FAurixChatMessage
 {
@@ -694,6 +710,66 @@ struct AURIXVOICE_API FAurixChatMessage
 	/** Opaque history cursor of this message (Before / After of ChannelHistory / DirectHistory). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	FString Cursor;
+
+	/** True once the author edited the text (EditedAt is then valid). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bEdited = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FDateTime EditedAt;
+
+	/** Tombstone: the message was deleted; Text is empty, MetadataJson empty, Reactions gone. Same MessageId / position. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bDeleted = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FDateTime DeletedAt;
+
+	/** Who deleted it: the author, a channel moderator, or an invalid GUID for the operator (REST). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid DeletedBy;
+
+	/** Reaction tallies (history / search only; live messages carry none). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	TArray<FAurixChatReactionTally> Reactions;
+};
+
+/** A user added or removed a reaction on a message (OnChatReactionChanged). */
+USTRUCT(BlueprintType)
+struct AURIXVOICE_API FAurixChatReactionChange
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid MessageId;
+
+	/** Invalid GUID for a direct message. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid ChannelId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid MessageSenderId;
+
+	/** Recipient of a direct message; invalid GUID for channels. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid MessageRecipientId;
+
+	/** Who added / removed the reaction. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid UserId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString Reaction;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bAdded = false;
+
+	/** Users carrying Reaction after the change. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	int32 Count = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FDateTime Timestamp;
 };
 
 /** One page of stored chat history (newest first). */
@@ -720,6 +796,10 @@ struct AURIXVOICE_API FAurixChatHistoryPage
 	/** Cursor of the next newer page; empty when this page is the most recent. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	FString NextAfter;
+
+	/** The search query for OnChatSearchResult pages; empty for history. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FString Query;
 };
 
 /** A user's reading position in a channel or a direct conversation. */

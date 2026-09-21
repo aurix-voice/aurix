@@ -1413,6 +1413,104 @@ class AurixClient(BaseClient):
         """
         return self._json("GET", f"/v1/channels/{_p(channel_id)}/read-markers", options=options)  # type: ignore[no-any-return]
 
+    def search_channel_messages(self, channel_id: str, *, q: str, from_user_id: Optional[str] = None, before: Optional[str] = None, limit: Optional[int] = None, options: Optional[RequestOptions] = None) -> "T.ChatHistoryPage":
+        """Search channel messages
+
+
+        Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+        `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+        to older matches (`next_after` is never set for a search page).
+
+        `GET /v1/channels/{channel_id}/messages/search`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return self._json("GET", f"/v1/channels/{_p(channel_id)}/messages/search", query={"q": q, "from_user_id": from_user_id, "before": before, "limit": limit}, options=options)  # type: ignore[no-any-return]
+
+    def search_user_messages(self, user_id: str, *, q: str, from_user_id: Optional[str] = None, before: Optional[str] = None, limit: Optional[int] = None, peer: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.ChatHistoryPage":
+        """Search a user's messages
+
+
+        Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+        `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+        to older matches (`next_after` is never set for a search page). Without `peer` the search covers
+        every directed message the user sent or received (moderation view).
+
+        `GET /v1/users/{user_id}/messages/search`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return self._json("GET", f"/v1/users/{_p(user_id)}/messages/search", query={"q": q, "from_user_id": from_user_id, "before": before, "limit": limit, "peer": peer}, options=options)  # type: ignore[no-any-return]
+
+    def get_message(self, message_id: str, *, options: Optional[RequestOptions] = None) -> "T.ChatMessage":
+        """Get a stored message
+
+
+        One stored message of the app with its reaction tallies; deleted messages are returned as
+        tombstones (`deleted_at` set, empty `text`). Requires `chat.persist = true` (otherwise `404`).
+
+        `GET /v1/messages/{message_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return self._json("GET", f"/v1/messages/{_p(message_id)}", options=options)  # type: ignore[no-any-return]
+
+    def edit_message(self, message_id: str, body: "T.EditMessageRequest", *, options: Optional[RequestOptions] = None) -> "T.ChatMessage":
+        """Edit a message
+
+
+        Operator edit of any stored, not deleted message of the app: replaces `text` and `metadata`,
+        sets `edited_at`. The author / `chat.edit_window_secs` rules and the text filters apply to
+        players, not to this endpoint. Everyone who sees the message receives `ChatMessageUpdated`; the
+        id and `sent_at` never change.
+
+        `PATCH /v1/messages/{message_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return self._json("PATCH", f"/v1/messages/{_p(message_id)}", body=body, options=options)  # type: ignore[no-any-return]
+
+    def delete_message(self, message_id: str, *, options: Optional[RequestOptions] = None) -> "T.ChatMessage":
+        """Delete a message
+
+
+        Operator deletion: the message becomes a tombstone (`deleted_at`, `deleted_by` = nil system
+        user) that keeps its id and position in history but loses text, metadata and reactions. Deleted
+        messages are excluded from search, unread counts and offline replay. Deleting again is `404`.
+
+        `DELETE /v1/messages/{message_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return self._json("DELETE", f"/v1/messages/{_p(message_id)}", options=options)  # type: ignore[no-any-return]
+
+    def add_message_reaction(self, message_id: str, reaction: str, body: "T.ReactionRequest", *, options: Optional[RequestOptions] = None) -> "T.ReactionChange":
+        """Add a reaction on behalf of a user
+
+
+        Sets `user_id`'s `reaction` on the message (idempotent: repeating is `changed: false`). A
+        message carries at most `chat.reactions_per_message` distinct reactions (`400` beyond that);
+        direct messages accept reactions only from their two parties (`404` otherwise). Changes fan out
+        as `ChatReactionChanged` to everyone who sees the message.
+
+        `PUT /v1/messages/{message_id}/reactions/{reaction}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return self._json("PUT", f"/v1/messages/{_p(message_id)}/reactions/{_p(reaction)}", body=body, options=options)  # type: ignore[no-any-return]
+
+    def remove_message_reaction(self, message_id: str, reaction: str, *, user_id: str, options: Optional[RequestOptions] = None) -> "T.ReactionChange":
+        """Remove a user's reaction
+
+
+        Clears `user_id`'s `reaction` from the message (idempotent).
+
+        `DELETE /v1/messages/{message_id}/reactions/{reaction}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return self._json("DELETE", f"/v1/messages/{_p(message_id)}/reactions/{_p(reaction)}", query={"user_id": user_id}, options=options)  # type: ignore[no-any-return]
+
 
 class AsyncAurixClient:
     """`asyncio` façade over `AurixClient`: every call runs the blocking request in a worker thread."""
@@ -2823,3 +2921,101 @@ class AsyncAurixClient:
         Permissions: chat:read.
         """
         return await self._run(self.sync.list_channel_read_markers, channel_id, options=options)  # type: ignore[no-any-return]
+
+    async def search_channel_messages(self, channel_id: str, *, q: str, from_user_id: Optional[str] = None, before: Optional[str] = None, limit: Optional[int] = None, options: Optional[RequestOptions] = None) -> "T.ChatHistoryPage":
+        """Search channel messages
+
+
+        Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+        `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+        to older matches (`next_after` is never set for a search page).
+
+        `GET /v1/channels/{channel_id}/messages/search`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return await self._run(self.sync.search_channel_messages, channel_id, q=q, from_user_id=from_user_id, before=before, limit=limit, options=options)  # type: ignore[no-any-return]
+
+    async def search_user_messages(self, user_id: str, *, q: str, from_user_id: Optional[str] = None, before: Optional[str] = None, limit: Optional[int] = None, peer: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.ChatHistoryPage":
+        """Search a user's messages
+
+
+        Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
+        `404` / `501`). Deleted messages never match. Matches are newest first; `next_before` continues
+        to older matches (`next_after` is never set for a search page). Without `peer` the search covers
+        every directed message the user sent or received (moderation view).
+
+        `GET /v1/users/{user_id}/messages/search`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return await self._run(self.sync.search_user_messages, user_id, q=q, from_user_id=from_user_id, before=before, limit=limit, peer=peer, options=options)  # type: ignore[no-any-return]
+
+    async def get_message(self, message_id: str, *, options: Optional[RequestOptions] = None) -> "T.ChatMessage":
+        """Get a stored message
+
+
+        One stored message of the app with its reaction tallies; deleted messages are returned as
+        tombstones (`deleted_at` set, empty `text`). Requires `chat.persist = true` (otherwise `404`).
+
+        `GET /v1/messages/{message_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return await self._run(self.sync.get_message, message_id, options=options)  # type: ignore[no-any-return]
+
+    async def edit_message(self, message_id: str, body: "T.EditMessageRequest", *, options: Optional[RequestOptions] = None) -> "T.ChatMessage":
+        """Edit a message
+
+
+        Operator edit of any stored, not deleted message of the app: replaces `text` and `metadata`,
+        sets `edited_at`. The author / `chat.edit_window_secs` rules and the text filters apply to
+        players, not to this endpoint. Everyone who sees the message receives `ChatMessageUpdated`; the
+        id and `sent_at` never change.
+
+        `PATCH /v1/messages/{message_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return await self._run(self.sync.edit_message, message_id, body, options=options)  # type: ignore[no-any-return]
+
+    async def delete_message(self, message_id: str, *, options: Optional[RequestOptions] = None) -> "T.ChatMessage":
+        """Delete a message
+
+
+        Operator deletion: the message becomes a tombstone (`deleted_at`, `deleted_by` = nil system
+        user) that keeps its id and position in history but loses text, metadata and reactions. Deleted
+        messages are excluded from search, unread counts and offline replay. Deleting again is `404`.
+
+        `DELETE /v1/messages/{message_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return await self._run(self.sync.delete_message, message_id, options=options)  # type: ignore[no-any-return]
+
+    async def add_message_reaction(self, message_id: str, reaction: str, body: "T.ReactionRequest", *, options: Optional[RequestOptions] = None) -> "T.ReactionChange":
+        """Add a reaction on behalf of a user
+
+
+        Sets `user_id`'s `reaction` on the message (idempotent: repeating is `changed: false`). A
+        message carries at most `chat.reactions_per_message` distinct reactions (`400` beyond that);
+        direct messages accept reactions only from their two parties (`404` otherwise). Changes fan out
+        as `ChatReactionChanged` to everyone who sees the message.
+
+        `PUT /v1/messages/{message_id}/reactions/{reaction}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return await self._run(self.sync.add_message_reaction, message_id, reaction, body, options=options)  # type: ignore[no-any-return]
+
+    async def remove_message_reaction(self, message_id: str, reaction: str, *, user_id: str, options: Optional[RequestOptions] = None) -> "T.ReactionChange":
+        """Remove a user's reaction
+
+
+        Clears `user_id`'s `reaction` from the message (idempotent).
+
+        `DELETE /v1/messages/{message_id}/reactions/{reaction}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return await self._run(self.sync.remove_message_reaction, message_id, reaction, user_id=user_id, options=options)  # type: ignore[no-any-return]

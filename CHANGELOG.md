@@ -13,6 +13,24 @@ released together.
 
 ### Added
 
+* Stored text chat grows edits, deletions, reactions and search (migration 18): `ChatEdit` /
+  `ChatDelete` (author within `chat.edit_window_secs`, channel moderators may delete) fan out
+  `ChatMessageUpdated` — a deletion is a tombstone that keeps the message id and position and
+  disappears from search, offline replay and unread counts; `ChatReact` keeps exact per-message
+  tallies (`message.reactions[]`, `chat.reactions_per_message` distinct, idempotent duplicates)
+  and fans out `ChatReactionChanged`; `ChatSearch` runs PostgreSQL full-text search over one
+  conversation with the history cursor (`chat.search`, `chat.searches_per_minute`). REST:
+  `GET|PATCH|DELETE /v1/messages/{id}`, `PUT|DELETE /v1/messages/{id}/reactions/{reaction}`,
+  `GET /v1/channels/{id}/messages/search`, `GET /v1/users/{id}/messages/search`; webhook / SSE
+  events `chat.message_updated` and `chat.reaction`. Web, Unity (native + WebGL), native core /
+  C ABI / C++, Unreal, Godot (native + Web) and the generated Node / Python / Go / C# server
+  SDKs expose the new calls and events.
+
+### Fixed
+
+* Live `ChatMessageReceived.sent_at` is now truncated to microseconds — the precision
+  PostgreSQL stores — so a cursor built from a live message matches the stored row.
+
 * `NetworkQuality.receivers_loss_percent` — the worst downlink loss any local receiver of a
   session's audio reported over its last interval. The node pushes a `NetworkQuality` as soon as
   the loss the sender has to protect against crosses the 3 % / 10 % tiers, and the native, Unity,

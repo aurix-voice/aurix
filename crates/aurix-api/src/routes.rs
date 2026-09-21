@@ -165,8 +165,26 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::list_channel_messages).post(handlers::send_channel_message),
         )
         .route(
+            "/v1/channels/:channel_id/messages/search",
+            get(handlers::search_channel_messages),
+        )
+        .route(
             "/v1/users/:user_id/messages",
             get(handlers::list_user_messages).post(handlers::send_user_message),
+        )
+        .route(
+            "/v1/users/:user_id/messages/search",
+            get(handlers::search_user_messages),
+        )
+        .route(
+            "/v1/messages/:message_id",
+            get(handlers::get_message)
+                .patch(handlers::edit_message)
+                .delete(handlers::delete_message),
+        )
+        .route(
+            "/v1/messages/:message_id/reactions/:reaction",
+            put(handlers::put_message_reaction).delete(handlers::delete_message_reaction),
         )
         .route(
             "/v1/users/:user_id/read-markers",
