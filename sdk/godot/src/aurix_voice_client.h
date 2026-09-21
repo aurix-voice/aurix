@@ -65,11 +65,13 @@ public:
         MEDIA_NONE = AURIX_MEDIA_NONE,
         MEDIA_UDP = AURIX_MEDIA_UDP,
         MEDIA_TUNNEL = AURIX_MEDIA_TUNNEL,
+        MEDIA_QUIC = AURIX_MEDIA_QUIC,
     };
     enum MediaPathPolicy {
         MEDIA_PATH_AUTO = AURIX_MEDIA_PATH_AUTO,
         MEDIA_PATH_UDP_ONLY = AURIX_MEDIA_PATH_UDP_ONLY,
         MEDIA_PATH_TUNNEL_ONLY = AURIX_MEDIA_PATH_TUNNEL_ONLY,
+        MEDIA_PATH_QUIC_ONLY = AURIX_MEDIA_PATH_QUIC_ONLY,
     };
     enum ModerationAction {
         MODERATION_KICK = AURIX_MODERATION_KICK,
@@ -174,6 +176,8 @@ public:
     bool get_follow_channel_policy() const;
     void set_media_path_policy(MediaPathPolicy policy);
     MediaPathPolicy get_media_path_policy() const;
+    void set_quic_enabled(bool enabled);
+    bool get_quic_enabled() const;
     void set_auto_capture(bool enabled);
     bool get_auto_capture() const;
     void set_auto_playback(bool enabled);
@@ -202,6 +206,9 @@ public:
     String get_endpoint() const;
     PackedStringArray get_failover_endpoints() const;
     MediaPath get_media_path() const;
+    /// The device's network changed: a QUIC link migrates in place, a UDP link re-announces the
+    /// session. `false` when not connected.
+    bool network_changed();
     String get_last_error() const;
     static String get_native_version();
 

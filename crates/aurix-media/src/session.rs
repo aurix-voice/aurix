@@ -6,6 +6,7 @@ use aurix_common::protocol::{
 use aurix_common::types::*;
 
 use crate::quality::{MosAlertPolicy, QualityTick, QualityTrack, UplinkEstimator, UplinkSample};
+use crate::quic::QuicLink;
 use crate::tunnel::MediaTunnel;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -225,11 +226,46 @@ pub enum MediaEndpoint {
     Udp(SocketAddr),
     /// AURX-over-WebSocket tunnel of the session's control connection.
     Tunnel(Arc<MediaTunnel>),
+    /// QUIC connection on the media port that authenticated a `SessionBind`.
+    Quic(Arc<QuicLink>),
 }
 
 impl MediaEndpoint {
     pub fn is_tunnel(&self) -> bool {
         matches!(self, MediaEndpoint::Tunnel(_))
+    }
+
+    pub fn is_quic(&self) -> bool {
+        matches!(self, MediaEndpoint::Quic(_))
+    }
+
+    /// UDP source address to (un)register in the by-address index, if this is a UDP path.
+    pub fn udp_addr(&self) -> Option<SocketAddr> {
+        match self {
+            MediaEndpoint::Udp(addr) => Some(*addr),
+            _ => None,
+        }
+    }
+
+    fn track_metrics(previous: Option<&MediaEndpoint>, next: Option<&MediaEndpoint>) {
+        let was_tunnel = previous.is_some_and(|e| e.is_tunnel());
+        let is_tunnel = next.is_some_and(|e| e.is_tunnel());
+        if was_tunnel != is_tunnel {
+            if is_tunnel {
+                aurix_metrics::TUNNEL_SESSIONS.inc();
+            } else {
+                aurix_metrics::TUNNEL_SESSIONS.dec();
+            }
+        }
+        let was_quic = previous.is_some_and(|e| e.is_quic());
+        let is_quic = next.is_some_and(|e| e.is_quic());
+        if was_quic != is_quic {
+            if is_quic {
+                aurix_metrics::QUIC_SESSIONS.inc();
+            } else {
+                aurix_metrics::QUIC_SESSIONS.dec();
+            }
+        }
     }
 }
 
@@ -425,49 +461,75 @@ impl MediaSession {
         self.endpoint.read().as_ref().is_some_and(|e| e.is_tunnel())
     }
 
+    /// True while the downlink goes through a QUIC connection.
+    pub fn is_quic(&self) -> bool {
+        self.endpoint.read().as_ref().is_some_and(|e| e.is_quic())
+    }
+
     /// Wire-level transport as reported to clients and operators.
     pub fn transport_kind(&self) -> MediaTransportKind {
         match self.transport() {
             Transport::WebRtc => MediaTransportKind::WebRtc,
             Transport::Aurx if self.is_tunneled() => MediaTransportKind::Tunnel,
+            Transport::Aurx if self.is_quic() => MediaTransportKind::Quic,
             Transport::Aurx => MediaTransportKind::Udp,
         }
     }
 
-    fn replace_endpoint(&self, next: Option<MediaEndpoint>) -> Option<MediaEndpoint> {
+    /// Installs `next` as the media path and returns the one it displaces. Callers unregister
+    /// a displaced UDP address from the by-address index and close a displaced QUIC link
+    /// (see [`MediaSession::release_displaced`]).
+    pub fn replace_endpoint(&self, next: Option<MediaEndpoint>) -> Option<MediaEndpoint> {
         let mut slot = self.endpoint.write();
-        let was_tunnel = slot.as_ref().is_some_and(|e| e.is_tunnel());
-        let is_tunnel = next.as_ref().is_some_and(|e| e.is_tunnel());
-        if was_tunnel != is_tunnel {
-            if is_tunnel {
-                aurix_metrics::TUNNEL_SESSIONS.inc();
-            } else {
-                aurix_metrics::TUNNEL_SESSIONS.dec();
-            }
-        }
+        MediaEndpoint::track_metrics(slot.as_ref(), next.as_ref());
         std::mem::replace(&mut *slot, next)
     }
 
-    /// Binds the downlink to a UDP source (replacing a tunnel, if the session was on one).
-    pub fn set_remote_addr(&self, addr: SocketAddr) {
-        self.replace_endpoint(Some(MediaEndpoint::Udp(addr)));
+    /// Closes a displaced QUIC link (a newer bind superseded it) and returns the displaced UDP
+    /// address, if any, for the caller to unregister.
+    pub fn release_displaced(displaced: Option<MediaEndpoint>) -> Option<SocketAddr> {
+        match displaced {
+            Some(MediaEndpoint::Udp(addr)) => Some(addr),
+            Some(MediaEndpoint::Quic(link)) => {
+                link.close("superseded by a newer media path");
+                None
+            }
+            Some(MediaEndpoint::Tunnel(_)) | None => None,
+        }
+    }
+
+    /// Binds the downlink to a UDP source (replacing a tunnel or QUIC link, if the session was
+    /// on one); returns the UDP address it replaces, if any (a displaced QUIC link is closed).
+    pub fn set_remote_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        Self::release_displaced(self.replace_endpoint(Some(MediaEndpoint::Udp(addr))))
     }
 
     /// Binds the downlink to a WebSocket tunnel; returns the UDP address it replaces (to be
-    /// unregistered from the by-address index), if any.
+    /// unregistered from the by-address index), if any (a displaced QUIC link is closed).
     pub fn set_tunnel(&self, tunnel: Arc<MediaTunnel>) -> Option<SocketAddr> {
-        match self.replace_endpoint(Some(MediaEndpoint::Tunnel(tunnel))) {
-            Some(MediaEndpoint::Udp(addr)) => Some(addr),
-            _ => None,
-        }
+        Self::release_displaced(self.replace_endpoint(Some(MediaEndpoint::Tunnel(tunnel))))
     }
 
-    /// Drops the media path (UDP or tunnel); returns the UDP address to unregister, if any.
-    pub fn clear_endpoint(&self) -> Option<SocketAddr> {
-        match self.replace_endpoint(None) {
-            Some(MediaEndpoint::Udp(addr)) => Some(addr),
-            _ => None,
+    /// Binds the downlink to a QUIC connection; returns the UDP address it replaces, if any.
+    /// A different QUIC link the session was on is closed as superseded.
+    pub fn set_quic(&self, link: Arc<QuicLink>) -> Option<SocketAddr> {
+        let mut slot = self.endpoint.write();
+        if let Some(MediaEndpoint::Quic(current)) = slot.as_ref() {
+            if **current == *link {
+                return None;
+            }
         }
+        let next = Some(MediaEndpoint::Quic(link));
+        MediaEndpoint::track_metrics(slot.as_ref(), next.as_ref());
+        let displaced = std::mem::replace(&mut *slot, next);
+        drop(slot);
+        Self::release_displaced(displaced)
+    }
+
+    /// Drops the media path (UDP, tunnel or QUIC — a QUIC link is closed); returns the UDP
+    /// address to unregister, if any.
+    pub fn clear_endpoint(&self) -> Option<SocketAddr> {
+        Self::release_displaced(self.replace_endpoint(None))
     }
 
     /// Drops the tunnel `tunnel` if it is still this session's media path (a later bind may
@@ -478,6 +540,20 @@ impl MediaSession {
             Some(MediaEndpoint::Tunnel(current)) if **current == *tunnel => {
                 *slot = None;
                 aurix_metrics::TUNNEL_SESSIONS.dec();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drops the QUIC link `link` if it is still this session's media path (a later bind may
+    /// already have moved the session elsewhere). Returns whether anything changed.
+    pub fn clear_quic(&self, link: &QuicLink) -> bool {
+        let mut slot = self.endpoint.write();
+        match slot.as_ref() {
+            Some(MediaEndpoint::Quic(current)) if **current == *link => {
+                *slot = None;
+                aurix_metrics::QUIC_SESSIONS.dec();
                 true
             }
             _ => false,
@@ -496,6 +572,14 @@ impl MediaSession {
     pub fn tunnel(&self) -> Option<Arc<MediaTunnel>> {
         match self.endpoint.read().as_ref() {
             Some(MediaEndpoint::Tunnel(t)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// QUIC link of the media path (`None` when unbound or on another path).
+    pub fn quic(&self) -> Option<Arc<QuicLink>> {
+        match self.endpoint.read().as_ref() {
+            Some(MediaEndpoint::Quic(l)) => Some(l.clone()),
             _ => None,
         }
     }

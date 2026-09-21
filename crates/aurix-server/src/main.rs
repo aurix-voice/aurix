@@ -107,6 +107,24 @@ async fn main() -> anyhow::Result<()> {
             rx_workers: config.media.rx_workers,
             media_tunnel: config.media.media_tunnel,
             tunnel_queue_packets: config.media.tunnel_queue_packets,
+            quic: aurix_media::quic::QuicOptions {
+                enabled: config.media.quic,
+                idle_timeout: std::time::Duration::from_millis(config.media.quic_idle_timeout_ms),
+                zero_rtt: config.media.quic_zero_rtt,
+                migration: config.media.quic_migration,
+                queue_packets: config.media.quic_queue_packets,
+                max_connections: if config.media.quic_max_connections == 0 {
+                    config.media.max_participants_per_node as usize * 2
+                } else {
+                    config.media.quic_max_connections
+                },
+                cert: config
+                    .media
+                    .quic_cert_path
+                    .clone()
+                    .zip(config.media.quic_key_path.clone()),
+                server_name: config.media.quic_server_name.clone(),
+            },
             downlink_mix: config.media.downlink_mix,
             webrtc_participant_streams: config.media.webrtc_participant_streams,
             mos_alert: aurix_media::quality::MosAlertPolicy {

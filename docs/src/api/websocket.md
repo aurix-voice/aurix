@@ -22,6 +22,7 @@ Immediately after the upgrade the server sends
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
   "migrated":false,"failover":["wss://eu2.voice.example.com/ws","wss://eu3.voice.example.com/ws"],
   "media_tunnel":true,"downlink_mix":true,"webrtc_participant_streams":16,"unfocused_channel_gain":0.3,
+  "quic":{"cert_sha256":"<hex, 64 chars>","server_name":"aurix-media"},
   "translation":{"speech":true,"languages":["en","de","fr"]}}}
 ```
 
@@ -32,7 +33,10 @@ clients try the candidates in order and stick with the family that answers `Sess
 `media_tunnel` says the node also accepts AURX packets as **binary
 frames on this very connection** when UDP is blocked
 ([tunnel](aurx.md#tunnel-aurx-over-the-control-websocket)) — text frames are always control
-messages, binary frames are always media; `downlink_mix` says native sessions may ask for a
+messages, binary frames are always media; `quic` (absent when the node does not speak it)
+carries the certificate hash a native client pins and the SNI it presents to reach the
+[QUIC media path](aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration) on
+`media_addr`; `downlink_mix` says native sessions may ask for a
 [server-mixed downlink](../features/channels.md#server-mix-for-native-clients); `translation`
 (absent when the node does not translate) lists the target languages listeners may request with
 `SetTranslation` and whether translations can also be spoken to them
@@ -86,7 +90,7 @@ See [High availability](../operations/high-availability.md#cross-node-session-fa
 | --- | --- | --- |
 | `ChannelJoin { channel_id, token }` | `ChannelJoinAck { channel_id, participants, role, participant_count, hidden_listeners, transcription, safety_voice, audio, positional?, roster_radius?, text_radius? }` | `token` = player JWT listing the channel, or a `join` action token; `role` is yours (`listener` = receive-only), `participant_count` the headcount across nodes including listeners hidden from `participants` when `hidden_listeners` is set ([audiences](../features/channels.md#large-channels-and-audiences)); `positional` (the channel's distance/direction settings, present for positional channels) lets a client reproduce the node's attenuation on [per-participant tracks](../features/channels.md#per-participant-tracks-for-browsers); the radii are present only for [radius-scoped](../features/channels.md#radius-scoped-presence-and-text) positional channels |
 | `ChannelLeave { channel_id }` | `ParticipantJoined { channel_id, user_id, display_name, ssrc, role, is_muted }`, `ParticipantLeft` | roster; `ssrc` identifies the sender's AURX packets; in a radius-scoped channel these also report players moving in and out of `roster_radius` |
-| — | `MediaBound { session_id, transport }` | the `SessionBind` was accepted; `transport` = `udp` or `tunnel` (the WebSocket itself) |
+| — | `MediaBound { session_id, transport }` | the `SessionBind` was accepted; `transport` = `udp`, `quic` or `tunnel` (the WebSocket itself) |
 | — | `SessionClose { session_id, reason }`, `Kick { channel_id, user_id, reason }` | session is gone / removed from a channel |
 | — | `MuteStateChanged { channel_id, user_id, muted, server_muted }` | sender-side and moderator mutes (never receiver-local ones) |
 | `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…, codec, downlink}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |

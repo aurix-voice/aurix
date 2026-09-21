@@ -2981,6 +2981,10 @@ async fn handle_ws_connection(
         resume_grace_ms: grace.as_millis() as u64,
         resumed,
         media_tunnel: tunnel.is_some(),
+        quic: match state.sfu.read().get_session(&session_id) {
+            Some(s) if s.transport() != Transport::WebRtc => state.sfu.read().quic_info(),
+            _ => None,
+        },
         downlink_mix: state.sfu.read().downlink_mix_enabled(),
         webrtc_participant_streams: state.sfu.read().webrtc_participant_streams(),
         unfocused_channel_gain: Some(state.sfu.read().unfocused_channel_gain()),

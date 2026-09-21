@@ -19,8 +19,8 @@
 
 use aurix_common::e2ee;
 use aurix_common::protocol::{
-    channel_id_hash, ControlMessage, ParticipantBrief, TransmissionMode, TtsDestination, TtsState,
-    UserPosition,
+    channel_id_hash, ControlMessage, ParticipantBrief, QuicInfo, TransmissionMode, TtsDestination,
+    TtsState, UserPosition,
 };
 use aurix_common::types::{
     quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode,
@@ -49,7 +49,7 @@ use crate::events::{
 };
 use crate::media::{
     resolve_media_candidates, FrameKind, IncomingAudio, MediaPath, MediaPathPolicy, MediaStats,
-    MediaTransport, SequenceCounter, TUNNEL_UPLINK_QUEUE,
+    MediaTransport, QuicClientState, SequenceCounter, TUNNEL_UPLINK_QUEUE,
 };
 use crate::resilience::{LossAdaptation, LossController, LossProfile};
 use crate::visemes::VisemeFrame;
@@ -295,6 +295,12 @@ struct Inner {
     /// A UDP bind failed or UDP heartbeats died at least until this instant: `Auto` sessions
     /// opened before it go straight to the tunnel and let the re-probe find UDP again.
     udp_blocked_until: Mutex<Option<Instant>>,
+    /// A QUIC bind failed (while UDP may work) at least until this instant: `Auto` sessions
+    /// opened before it skip QUIC and go straight to UDP.
+    quic_blocked_until: Mutex<Option<Instant>>,
+    /// Certificate pin + resumption tickets of the node last connected over QUIC; reused on
+    /// every reconnect to the same certificate so the bind can go out as 0-RTT.
+    quic_state: Mutex<Option<Arc<QuicClientState>>>,
     /// Address family of the last UDP endpoint that answered a `SessionBind` (`true` = IPv6);
     /// tried first on the next bind so a dual-stack client sticks with the family that works.
     udp_family_hint: Arc<Mutex<Option<bool>>>,
@@ -555,6 +561,7 @@ enum Command {
     Disconnect {
         reason: String,
     },
+    NetworkChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -672,6 +679,8 @@ impl Client {
             closing: AtomicBool::new(false),
             resume_seq: Mutex::new(None),
             udp_blocked_until: Mutex::new(None),
+            quic_blocked_until: Mutex::new(None),
+            quic_state: Mutex::new(None),
             udp_family_hint: Arc::new(Mutex::new(None)),
             endpoints: Mutex::new(endpoints),
             e2ee: Mutex::new(e2ee::Group::new(e2ee_identity)),
@@ -755,6 +764,15 @@ impl Client {
     /// Link the media currently travels over; `None` until the first `MediaBound`.
     pub fn media_path(&self) -> Option<MediaPath> {
         self.inner.media.read().as_ref().map(|m| m.path())
+    }
+
+    /// Tell the client the device's network changed (Wi-Fi ↔ cellular, new interface, VPN).
+    /// On QUIC the connection migrates to a fresh local socket without renegotiating anything
+    /// (same session, sequence counter and E2EE state); on UDP the session re-announces itself
+    /// to the node with a signed `SessionBind` so the downlink follows the new source address.
+    /// The control WebSocket is left to its own reconnect. Emits `MediaPathChanged` on QUIC.
+    pub fn network_changed(&self) -> Result<()> {
+        self.send_cmd(Command::NetworkChanged)
     }
 
     pub fn session(&self) -> Option<SessionInfo> {
@@ -1968,6 +1986,7 @@ async fn wait_for_disconnect(
         match cmd_rx.recv().await {
             None => return "client dropped".into(),
             Some(Command::Disconnect { reason }) => return reason,
+            Some(Command::NetworkChanged) => {}
             Some(Command::Join {
                 channel_id,
                 token,
@@ -2091,6 +2110,7 @@ async fn session(
         resume_grace: ack.resume_grace,
         resumed: ack.resumed,
         media_tunnel: ack.media_tunnel,
+        media_quic: ack.quic.is_some(),
         downlink_mix: ack.downlink_mix,
         migrated: ack.migrated,
         endpoint: url.to_string(),
@@ -2119,6 +2139,27 @@ async fn session(
         inner.mixer.lock().resync();
     }
 
+    let quic_wanted = match cfg.media_path {
+        MediaPathPolicy::QuicOnly => true,
+        MediaPathPolicy::Auto => cfg.quic,
+        MediaPathPolicy::UdpOnly | MediaPathPolicy::TunnelOnly => false,
+    };
+    let quic = match &ack.quic {
+        Some(info) if quic_wanted => {
+            let mut slot = inner.quic_state.lock();
+            match QuicClientState::for_node(slot.as_ref(), info) {
+                Ok(state) => {
+                    *slot = Some(Arc::clone(&state));
+                    Some((info.clone(), state))
+                }
+                Err(e) => {
+                    tracing::warn!("node advertised an unusable QUIC certificate pin: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let links = MediaLinks {
         sid: ack.session_id,
         ssrc: ack.ssrc,
@@ -2131,6 +2172,8 @@ async fn session(
         ),
         family_hint: Arc::clone(&inner.udp_family_hint),
         tunnel_offered: ack.media_tunnel,
+        quic,
+        quic_idle_timeout: (cfg.heartbeat_interval * 4).max(Duration::from_secs(10)),
     };
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Vec<u8>>(TUNNEL_UPLINK_QUEUE);
     // Control messages the server sent while a tunnel handshake was waiting for its ack.
@@ -2154,6 +2197,9 @@ async fn session(
         path: media.path(),
         reason: first_path,
     });
+    if media.path() == MediaPath::Udp && links.quic.is_some() {
+        mark_quic_blocked(inner, cfg);
+    }
 
     if !first {
         inner.emit(Event::Recovered {
@@ -2213,7 +2259,7 @@ async fn session(
     let reprobe_enabled = cfg.media_path == MediaPathPolicy::Auto
         && links.tunnel_offered
         && !cfg.udp_reprobe_interval.is_zero()
-        && links.udp_addrs.is_ok();
+        && (links.udp_addrs.is_ok() || links.quic.is_some());
     let mut reprobe = tokio::time::interval(if reprobe_enabled {
         cfg.udp_reprobe_interval
     } else {
@@ -2238,7 +2284,7 @@ async fn session(
                 last_rx = Instant::now();
                 match msg {
                     Ok(Some(Inbound::Control(m))) => {
-                        if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
+                        if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, *m).await {
                             return exit;
                         }
                     }
@@ -2269,6 +2315,20 @@ async fn session(
                         conn.close(ack.session_id, &reason).await;
                         return Exit::UserClose(reason);
                     }
+                    Some(Command::NetworkChanged) => match media.path() {
+                        MediaPath::Quic => match media.rebind() {
+                            Ok(local) => {
+                                media.send_heartbeat();
+                                inner.emit(Event::MediaPathChanged {
+                                    path: MediaPath::Quic,
+                                    reason: format!("network changed: QUIC migrated to {local}"),
+                                });
+                            }
+                            Err(e) => tracing::warn!("QUIC migration failed: {e}"),
+                        },
+                        MediaPath::Udp => media.send_bind(),
+                        MediaPath::Tunnel => {}
+                    },
                     Some(cmd) => {
                         if let Err(exit) = handle_command(inner, cfg, &mut conn, pending, cmd).await {
                             return exit;
@@ -2289,18 +2349,46 @@ async fn session(
                 media.send_heartbeat();
                 let stats = inner_stats(inner, &media);
                 media.send_quality_report(stats.0, stats.1, stats.2);
-                let udp_dead = media.path() == MediaPath::Udp
-                    && cfg.media_path == MediaPathPolicy::Auto
-                    && links.tunnel_offered
-                    && cfg.udp_fallback_lost_heartbeats > 0
+                let native = matches!(media.path(), MediaPath::Udp | MediaPath::Quic);
+                let heartbeats_dead = cfg.udp_fallback_lost_heartbeats > 0
                     && media.consecutive_heartbeats_lost() >= cfg.udp_fallback_lost_heartbeats;
-                if udp_dead {
+                let native_dead = native
+                    && cfg.media_path == MediaPathPolicy::Auto
+                    && (heartbeats_dead || media.is_closed());
+                if native_dead && !links.tunnel_offered && media.path() == MediaPath::Quic && media.is_closed() {
+                    // Nowhere to fall back to but raw UDP: re-open the native link in place.
+                    let reason = media.close_reason().unwrap_or_default();
+                    match links.native_attempt(true, 1, PROBE_TIMEOUT) {
+                        Ok(fut) => match fut.await {
+                            Ok(t) => {
+                                let t = Arc::new(t);
+                                install_media(inner, &t, Some(&media));
+                                media = t;
+                                inner.emit(Event::MediaPathChanged {
+                                    path: media.path(),
+                                    reason: format!("QUIC connection closed ({reason}); re-bound"),
+                                });
+                            }
+                            Err(e) => tracing::warn!("QUIC connection closed ({reason}) and the re-bind failed: {e}"),
+                        },
+                        Err(e) => tracing::warn!("QUIC connection closed ({reason}); no candidate to re-bind: {e}"),
+                    }
+                } else if native_dead && links.tunnel_offered {
                     let lost = media.consecutive_heartbeats_lost();
+                    let was = media.path();
+                    let closed = media.close_reason();
                     mark_udp_blocked(inner, cfg);
+                    if was == MediaPath::Quic {
+                        mark_quic_blocked(inner, cfg);
+                    }
                     let tunnel = Arc::new(links.tunnel(&tunnel_tx));
                     match bind_tunnel(&mut conn, &tunnel, &mut deferred).await {
                         Ok(()) => {
-                            let reason = format!("{lost} UDP heartbeats unanswered");
+                            let reason = match (was, closed) {
+                                (MediaPath::Quic, Some(why)) => format!("QUIC connection closed: {why}"),
+                                (MediaPath::Quic, None) => format!("{lost} QUIC heartbeats unanswered"),
+                                _ => format!("{lost} UDP heartbeats unanswered"),
+                            };
                             install_media(inner, &tunnel, Some(&media));
                             media = tunnel;
                             inner.emit(Event::MediaPathChanged { path: MediaPath::Tunnel, reason });
@@ -2309,7 +2397,7 @@ async fn session(
                         Err(ClientError::Transport(e)) => {
                             return Exit::Dropped(format!("media tunnel bind failed: {e}"));
                         }
-                        Err(e) => tracing::warn!("UDP is silent and the tunnel bind failed: {e}"),
+                        Err(e) => tracing::warn!("{was:?} media is dead and the tunnel bind failed: {e}"),
                     }
                     for m in std::mem::take(&mut deferred) {
                         if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
@@ -2319,30 +2407,33 @@ async fn session(
                 }
             }
             _ = reprobe.tick(), if reprobe_enabled && probe.is_none() && media.path() == MediaPath::Tunnel => {
-                probe = links.udp_attempt(1, PROBE_TIMEOUT).ok().map(tokio::spawn);
+                probe = links.native_attempt(true, 1, PROBE_TIMEOUT).ok().map(tokio::spawn);
             }
             probed = async { probe.as_mut().expect("guarded by the branch condition").await }, if probe.is_some() => {
                 probe = None;
                 match probed {
-                    Ok(Ok(udp)) => {
-                        let udp = Arc::new(udp);
-                        install_media(inner, &udp, Some(&media));
-                        media = udp;
+                    Ok(Ok(native)) => {
+                        let native = Arc::new(native);
+                        install_media(inner, &native, Some(&media));
+                        media = native;
                         *inner.udp_blocked_until.lock() = None;
+                        if media.path() == MediaPath::Quic {
+                            *inner.quic_blocked_until.lock() = None;
+                        }
                         inner.emit(Event::MediaPathChanged {
-                            path: MediaPath::Udp,
-                            reason: "UDP re-probe answered".into(),
+                            path: media.path(),
+                            reason: format!("{} re-probe answered", path_name(media.path())),
                         });
                     }
                     Ok(Err(e)) => {
-                        tracing::debug!("UDP re-probe failed, staying tunnelled: {e}");
+                        tracing::debug!("native re-probe failed, staying tunnelled: {e}");
                         // The probe's SessionBind may have reached the node even though its ack
                         // did not come back; reclaim the endpoint for the tunnel.
                         if media.path() == MediaPath::Tunnel {
                             media.send_bind();
                         }
                     }
-                    Err(e) => tracing::warn!("UDP re-probe task failed: {e}"),
+                    Err(e) => tracing::warn!("native re-probe task failed: {e}"),
                 }
             }
             _ = requests.tick() => {
@@ -2368,19 +2459,31 @@ fn inner_stats(inner: &Inner, media: &MediaTransport) -> (f32, f32, f32) {
     (m.rtt_ms, inner.jitter.lock().jitter_ms, loss)
 }
 
-/// Everything needed to open either media link for one session.
+fn path_name(path: MediaPath) -> &'static str {
+    match path {
+        MediaPath::Udp => "UDP",
+        MediaPath::Tunnel => "tunnel",
+        MediaPath::Quic => "QUIC",
+    }
+}
+
+/// Everything needed to open any media link for one session.
 struct MediaLinks {
     sid: SessionId,
     ssrc: u32,
     key: Vec<u8>,
     /// Shared by every link of the session so the server's replay window keeps accepting
-    /// packets across UDP ↔ tunnel switches.
+    /// packets across QUIC ↔ UDP ↔ tunnel switches.
     seq: SequenceCounter,
     /// UDP candidates (IPv4 first as advertised, then IPv6); `Err` when nothing resolved.
     udp_addrs: Result<Vec<std::net::SocketAddr>>,
     /// Shared with `Inner::udp_family_hint`.
     family_hint: Arc<Mutex<Option<bool>>>,
     tunnel_offered: bool,
+    /// The node's QUIC advertisement and our pinned TLS state for it; `None` when the node
+    /// offers no QUIC or the policy excludes it.
+    quic: Option<(QuicInfo, Arc<QuicClientState>)>,
+    quic_idle_timeout: Duration,
 }
 
 impl MediaLinks {
@@ -2392,6 +2495,69 @@ impl MediaLinks {
             Arc::clone(&self.seq),
             uplink.clone(),
         )
+    }
+
+    /// QUIC bind to the first candidate that completes the handshake and acks the bind.
+    async fn bind_quic(&self, attempts: u32, timeout: Duration) -> Result<MediaTransport> {
+        let quic = self
+            .quic
+            .clone()
+            .ok_or_else(|| ClientError::Transport("the node offers no QUIC media".into()))?;
+        let bind = QuicBind {
+            addrs: self.ordered_addrs()?,
+            quic,
+            sid: self.sid,
+            ssrc: self.ssrc,
+            key: self.key.clone(),
+            seq: Arc::clone(&self.seq),
+            attempts,
+            timeout,
+            idle_timeout: self.quic_idle_timeout,
+            hint: Arc::clone(&self.family_hint),
+        };
+        bind.run().await
+    }
+
+    /// UDP candidates, the family that answered last time first.
+    fn ordered_addrs(&self) -> Result<Vec<std::net::SocketAddr>> {
+        let mut addrs = self.udp_addrs.clone()?;
+        if let Some(v6_first) = *self.family_hint.lock() {
+            addrs.sort_by_key(|a| a.is_ipv6() != v6_first);
+        }
+        Ok(addrs)
+    }
+
+    /// A future that opens the best native link: QUIC (when offered and `try_quic`), then the
+    /// UDP candidates. Used by the `Auto` bind, the tunnelled re-probe and the in-place
+    /// re-bind after a closed QUIC connection.
+    fn native_attempt(
+        &self,
+        try_quic: bool,
+        attempts: u32,
+        timeout: Duration,
+    ) -> Result<impl std::future::Future<Output = Result<MediaTransport>> + Send + 'static> {
+        let udp = self.udp_attempt(attempts, timeout)?;
+        let quic = self.quic.clone().filter(|_| try_quic).map(|quic| QuicBind {
+            addrs: self.ordered_addrs().unwrap_or_default(),
+            quic,
+            sid: self.sid,
+            ssrc: self.ssrc,
+            key: self.key.clone(),
+            seq: Arc::clone(&self.seq),
+            attempts,
+            timeout,
+            idle_timeout: self.quic_idle_timeout,
+            hint: Arc::clone(&self.family_hint),
+        });
+        Ok(async move {
+            if let Some(quic) = quic {
+                match quic.run().await {
+                    Ok(t) => return Ok(t),
+                    Err(e) => tracing::debug!("QUIC did not bind ({e}); trying raw UDP"),
+                }
+            }
+            udp.await
+        })
     }
 
     /// UDP bind off the async threads (blocking socket I/O with retries).
@@ -2412,10 +2578,7 @@ impl MediaLinks {
         attempts: u32,
         timeout: Duration,
     ) -> Result<impl std::future::Future<Output = Result<MediaTransport>> + Send + 'static> {
-        let mut addrs = self.udp_addrs.clone()?;
-        if let Some(v6_first) = *self.family_hint.lock() {
-            addrs.sort_by_key(|a| a.is_ipv6() != v6_first);
-        }
+        let addrs = self.ordered_addrs()?;
         let (sid, ssrc, key, seq) = (self.sid, self.ssrc, self.key.clone(), Arc::clone(&self.seq));
         let hint = Arc::clone(&self.family_hint);
         Ok(async move {
@@ -2443,6 +2606,53 @@ impl MediaLinks {
     }
 }
 
+/// One QUIC bind attempt over the session's media candidates, in order.
+struct QuicBind {
+    addrs: Vec<std::net::SocketAddr>,
+    quic: (QuicInfo, Arc<QuicClientState>),
+    sid: SessionId,
+    ssrc: u32,
+    key: Vec<u8>,
+    seq: SequenceCounter,
+    attempts: u32,
+    timeout: Duration,
+    idle_timeout: Duration,
+    hint: Arc<Mutex<Option<bool>>>,
+}
+
+impl QuicBind {
+    async fn run(self) -> Result<MediaTransport> {
+        let (info, state) = &self.quic;
+        let mut last_err = ClientError::Transport("no QUIC candidate".into());
+        for addr in self.addrs {
+            match MediaTransport::bind_quic(
+                addr,
+                info,
+                state,
+                self.sid,
+                self.ssrc,
+                &self.key,
+                Arc::clone(&self.seq),
+                self.attempts,
+                self.timeout,
+                self.idle_timeout,
+            )
+            .await
+            {
+                Ok(t) => {
+                    *self.hint.lock() = Some(addr.is_ipv6());
+                    return Ok(t);
+                }
+                Err(e) => {
+                    tracing::debug!("QUIC candidate {addr} did not bind: {e}");
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+}
+
 /// Picks the first media link per `ClientConfig::media_path`. Returns the transport and a
 /// human-readable reason for the `MediaPathChanged` event.
 async fn bind_initial_media(
@@ -2463,6 +2673,16 @@ async fn bind_initial_media(
             let udp = links.bind_udp(BIND_ATTEMPTS, BIND_TIMEOUT).await?;
             Ok((Arc::new(udp), "UDP bound".into()))
         }
+        MediaPathPolicy::QuicOnly => {
+            if links.quic.is_none() {
+                return Err(ClientError::Transport(
+                    "media path is QUIC-only but the node offers no QUIC media".into(),
+                ));
+            }
+            let quic = links.bind_quic(BIND_ATTEMPTS, BIND_TIMEOUT).await?;
+            let reason = quic_reason(&quic);
+            Ok((Arc::new(quic), reason))
+        }
         MediaPathPolicy::TunnelOnly => {
             if !links.tunnel_offered {
                 return Err(ClientError::Transport(
@@ -2471,11 +2691,19 @@ async fn bind_initial_media(
             }
             tunnel("tunnel-only policy".into()).await
         }
-        MediaPathPolicy::Auto if !links.tunnel_offered => {
-            let udp = links.bind_udp(BIND_ATTEMPTS, BIND_TIMEOUT).await?;
-            Ok((Arc::new(udp), "UDP bound".into()))
-        }
         MediaPathPolicy::Auto => {
+            let quic_blocked = inner
+                .quic_blocked_until
+                .lock()
+                .is_some_and(|until| until > Instant::now());
+            let try_quic = links.quic.is_some() && !quic_blocked;
+            if !links.tunnel_offered {
+                let native = links
+                    .native_attempt(try_quic, BIND_ATTEMPTS, BIND_TIMEOUT)?
+                    .await?;
+                let reason = native_reason(&native);
+                return Ok((Arc::new(native), reason));
+            }
             let udp_blocked = inner
                 .udp_blocked_until
                 .lock()
@@ -2483,18 +2711,41 @@ async fn bind_initial_media(
             if udp_blocked {
                 return tunnel("UDP was blocked before this session".into()).await;
             }
-            match links
-                .bind_udp(FALLBACK_BIND_ATTEMPTS, FALLBACK_BIND_TIMEOUT)
-                .await
-            {
-                Ok(udp) => Ok((Arc::new(udp), "UDP bound".into())),
+            let attempt =
+                match links.native_attempt(try_quic, FALLBACK_BIND_ATTEMPTS, FALLBACK_BIND_TIMEOUT)
+                {
+                    Ok(fut) => fut.await,
+                    Err(e) => Err(e),
+                };
+            match attempt {
+                Ok(native) => {
+                    let reason = native_reason(&native);
+                    Ok((Arc::new(native), reason))
+                }
                 Err(e) => {
-                    tracing::info!("UDP bind failed ({e}); falling back to the media tunnel");
+                    tracing::info!(
+                        "native media bind failed ({e}); falling back to the media tunnel"
+                    );
                     mark_udp_blocked(inner, cfg);
-                    tunnel(format!("UDP bind failed: {e}")).await
+                    tunnel(format!("native bind failed: {e}")).await
                 }
             }
         }
+    }
+}
+
+fn quic_reason(t: &MediaTransport) -> String {
+    if t.zero_rtt() {
+        "QUIC bound (0-RTT)".into()
+    } else {
+        "QUIC bound".into()
+    }
+}
+
+fn native_reason(t: &MediaTransport) -> String {
+    match t.path() {
+        MediaPath::Quic => quic_reason(t),
+        _ => "UDP bound".into(),
     }
 }
 
@@ -2505,6 +2756,15 @@ fn mark_udp_blocked(inner: &Inner, cfg: &ClientConfig) {
         cfg.udp_reprobe_interval
     };
     *inner.udp_blocked_until.lock() = Some(Instant::now() + memory);
+}
+
+fn mark_quic_blocked(inner: &Inner, cfg: &ClientConfig) {
+    let memory = if cfg.udp_reprobe_interval.is_zero() {
+        UDP_BLOCK_MEMORY
+    } else {
+        cfg.udp_reprobe_interval
+    };
+    *inner.quic_blocked_until.lock() = Some(Instant::now() + memory);
 }
 
 /// Tunnel handshake: signed `SessionBind` out as a binary frame, sealed `SessionBindAck` back.
@@ -2534,7 +2794,7 @@ async fn bind_tunnel(
                 Ok(Err(e)) => return Err(e),
             };
             match next {
-                Inbound::Control(m) => deferred.push(m),
+                Inbound::Control(m) => deferred.push(*m),
                 Inbound::Media(data) => {
                     if tunnel.handle_frame(&data) == FrameKind::BindAck {
                         return Ok(());
@@ -2795,7 +3055,7 @@ async fn handle_command(
             pending.moderation_queue.push_back(cmd);
             pump_joins(inner, cfg, conn, pending).await
         }
-        Command::Disconnect { .. } => Ok(()),
+        Command::Disconnect { .. } | Command::NetworkChanged => Ok(()),
     }
 }
 

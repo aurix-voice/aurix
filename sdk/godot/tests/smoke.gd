@@ -103,6 +103,14 @@ func _init() -> void:
 	_check(client.playback_mode == AurixVoiceClient.PLAYBACK_PER_PARTICIPANT, "playback mode stored")
 	client.media_path_policy = AurixVoiceClient.MEDIA_PATH_TUNNEL_ONLY
 	_check(client.media_path_policy == AurixVoiceClient.MEDIA_PATH_TUNNEL_ONLY, "media path policy stored")
+	client.media_path_policy = AurixVoiceClient.MEDIA_PATH_QUIC_ONLY
+	_check(client.media_path_policy == AurixVoiceClient.MEDIA_PATH_QUIC_ONLY, "quic-only media path policy stored")
+	_check(client.quic, "quic preferred by default")
+	client.quic = false
+	_check(not client.quic, "quic switch stored")
+	client.quic = true
+	_check(not client.network_changed(), "network_changed without a client is false")
+	_check(AurixVoiceClient.MEDIA_QUIC == 3, "media path quic constant")
 	client.auto_reconnect = false
 	client.reconnect_max_attempts = 3
 	_check(not client.auto_reconnect and client.reconnect_max_attempts == 3, "reconnect settings stored")

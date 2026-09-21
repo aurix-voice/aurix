@@ -711,14 +711,14 @@ pub struct AurixClientConfig {
     /// and encoder; `aurix_dsp_config_default` = everything on, `aurix_dsp_config_bypass` for
     /// hosts with their own processing. Changeable later with `aurix_client_set_dsp`.
     pub dsp: AurixDspConfig,
-    /// Which link carries media: UDP with the WebSocket tunnel as fallback (default), UDP
-    /// only, or tunnel only.
+    /// Which link carries media: QUIC (when the node offers it) then UDP, with the WebSocket
+    /// tunnel as fallback (default), or exactly one of them.
     pub media_path: AurixMediaPathPolicy,
-    /// `Auto`: unanswered UDP heartbeats in a row before media moves to the tunnel (0 = never
-    /// fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
+    /// `Auto`: unanswered QUIC/UDP heartbeats in a row before media moves to the tunnel (0 =
+    /// never fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
     pub udp_fallback_lost_heartbeats: u32,
-    /// `Auto`: how often a tunnelled session re-probes UDP and moves back when it answers
-    /// (0 = never; stays tunnelled until the next connect).
+    /// `Auto`: how often a tunnelled session re-probes the native links (QUIC, then UDP) and
+    /// moves back when one answers (0 = never; stays tunnelled until the next connect).
     pub udp_reprobe_interval_ms: u32,
     /// Take part in end-to-end encrypted channels (identity key, sender-key exchange). Off,
     /// joining an `e2ee` channel fails with `E2EE_REQUIRED`.
@@ -733,6 +733,9 @@ pub struct AurixClientConfig {
     /// Uplink redundancy: adapt FEC / DRED to the server's loss reports (default) or pin a
     /// tier; `aurix_client_set_loss_adaptation` changes it later.
     pub loss_adaptation: AurixLossAdaptation,
+    /// `Auto`: try QUIC before raw UDP when the node offers it (default true). Off, `Auto`
+    /// is UDP → tunnel as before; `AurixMediaPathQuicOnly` ignores this switch.
+    pub quic: bool,
 }
 
 #[no_mangle]
@@ -766,6 +769,7 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         e2ee_identity: [0; 32],
         decoder: d.decoder.into(),
         loss_adaptation: d.loss_adaptation.into(),
+        quic: d.quic,
     };
 }
 
@@ -773,10 +777,13 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AurixMediaPathPolicy {
-    /// UDP first; WebSocket tunnel when UDP is blocked; back to UDP when it answers again.
+    /// QUIC (when offered and `quic`), then UDP; WebSocket tunnel when both are blocked; back
+    /// to a native link when it answers again.
     AurixMediaPathAuto = 0,
     AurixMediaPathUdpOnly = 1,
     AurixMediaPathTunnelOnly = 2,
+    /// QUIC only; a node without QUIC (or a blocked media port) fails the connection.
+    AurixMediaPathQuicOnly = 3,
 }
 
 impl From<MediaPathPolicy> for AurixMediaPathPolicy {
@@ -785,6 +792,7 @@ impl From<MediaPathPolicy> for AurixMediaPathPolicy {
             MediaPathPolicy::Auto => Self::AurixMediaPathAuto,
             MediaPathPolicy::UdpOnly => Self::AurixMediaPathUdpOnly,
             MediaPathPolicy::TunnelOnly => Self::AurixMediaPathTunnelOnly,
+            MediaPathPolicy::QuicOnly => Self::AurixMediaPathQuicOnly,
         }
     }
 }
@@ -795,6 +803,7 @@ impl From<AurixMediaPathPolicy> for MediaPathPolicy {
             AurixMediaPathPolicy::AurixMediaPathAuto => Self::Auto,
             AurixMediaPathPolicy::AurixMediaPathUdpOnly => Self::UdpOnly,
             AurixMediaPathPolicy::AurixMediaPathTunnelOnly => Self::TunnelOnly,
+            AurixMediaPathPolicy::AurixMediaPathQuicOnly => Self::QuicOnly,
         }
     }
 }
@@ -811,6 +820,9 @@ pub enum AurixMediaPath {
     /// AURX packets as binary frames on the control WebSocket (TCP; higher latency under
     /// loss).
     AurixMediaTunnel = 2,
+    /// Native AURX as QUIC datagrams (0-RTT reconnect, connection migration on
+    /// `aurix_client_network_changed`).
+    AurixMediaQuic = 3,
 }
 
 impl From<Option<MediaPath>> for AurixMediaPath {
@@ -819,6 +831,7 @@ impl From<Option<MediaPath>> for AurixMediaPath {
             None => Self::AurixMediaNone,
             Some(MediaPath::Udp) => Self::AurixMediaUdp,
             Some(MediaPath::Tunnel) => Self::AurixMediaTunnel,
+            Some(MediaPath::Quic) => Self::AurixMediaQuic,
         }
     }
 }
@@ -1028,6 +1041,7 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.e2ee_identity = c.has_e2ee_identity.then_some(c.e2ee_identity);
     cfg.decoder = c.decoder.into();
     cfg.loss_adaptation = c.loss_adaptation.into();
+    cfg.quic = c.quic;
     Ok(cfg)
 }
 
@@ -1328,6 +1342,8 @@ pub struct AurixSessionInfo {
     pub translation: bool,
     /// Translations can also be spoken into this session's downlink.
     pub translation_speech: bool,
+    /// The node accepts media as QUIC datagrams on its media port.
+    pub media_quic: bool,
 }
 
 /// `false` when no session is open.
@@ -1355,6 +1371,7 @@ pub unsafe extern "C" fn aurix_client_session(
                 migrated: s.migrated,
                 translation: s.translation.is_some(),
                 translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
+                media_quic: s.media_quic,
             };
             true
         }
@@ -1421,6 +1438,18 @@ pub unsafe extern "C" fn aurix_client_media_path(client: *const AurixClient) -> 
     match self::client(client) {
         Ok(c) => c.media_path().into(),
         Err(_) => AurixMediaPath::AurixMediaNone,
+    }
+}
+
+/// Tell the client the device's network changed (Wi-Fi ↔ cellular, VPN, new interface). On
+/// QUIC the connection migrates to a fresh local socket in place (same session, sequence
+/// counter and E2EE state; `AurixEventMediaPathChanged` follows); on UDP the session
+/// re-announces itself to the node. `false` when not connected.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_network_changed(client: *const AurixClient) -> bool {
+    match self::client(client) {
+        Ok(c) => c.network_changed().is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -2269,6 +2298,7 @@ pub unsafe extern "C" fn aurix_event_session(
                 migrated: s.migrated,
                 translation: s.translation.is_some(),
                 translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
+                media_quic: s.media_quic,
             };
             true
         }

@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-aurix-common = { path = "../aurix-common" }
+aurix-common = { path = "../aurix-common", features = ["quic"] }
 aurix-metrics = { path = "../aurix-metrics" }
 tokio = { workspace = true }
 bytes = { workspace = true }
@@ -30,6 +30,8 @@ opus = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true }
+quinn = { workspace = true }
+rcgen = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

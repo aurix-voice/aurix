@@ -343,6 +343,12 @@ UDP bind is tried and the media moves back the moment it answers. `MediaHeartbea
 path is a reconnect), `TunnelOnly` never opens a UDP socket. `Auto` needs the node to advertise
 the tunnel (`SessionInfo.MediaTunnel`, `media.media_tunnel = true`).
 
+The C# transport does not speak the node's
+[QUIC media path](../api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)
+(0-RTT resume, connection migration); it ignores `SessionInitAck.quic` and stays on UDP/tunnel.
+QUIC reaches Unity only where the native core does — through the C ABI (`NativeOpusCodec` is a
+codec binding, not a transport).
+
 ```csharp
 client.MediaPathPolicy = MediaPathPolicy.Auto;
 client.UdpFallbackLostHeartbeats = 3;

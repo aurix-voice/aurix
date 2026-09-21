@@ -10268,9 +10268,10 @@
             "enum": [
               "udp",
               "tunnel",
+              "quic",
               "web_rtc"
             ],
-            "description": "Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), or WebRTC."
+            "description": "Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), or WebRTC."
           },
           "channels": {
             "type": "array",

@@ -12,7 +12,7 @@ name = "aurix_client"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-aurix-common = { path = "../aurix-common", default-features = false }
+aurix-common = { path = "../aurix-common", default-features = false, features = ["quic"] }
 tokio = { version = "1.36", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 futures-util = { workspace = true }
@@ -29,8 +29,10 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+quinn = { workspace = true }
 
 [dev-dependencies]
 cbindgen = { version = "0.29", default-features = false }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
+aurix-media = { path = "../aurix-media" }

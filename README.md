@@ -25,7 +25,8 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
 > audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
-> PCMU fallback, a WebSocket tunnel for blocked UDP, large channels (listeners, per-receiver stream
+> PCMU fallback, QUIC media with 0-RTT resume and connection migration, a WebSocket tunnel for
+> blocked UDP, large channels (listeners, per-receiver stream
 > caps, a server mix for native clients), cross-node failover with Redis session mirrors, a
 > region-aware cascade backbone, stereo/music uplinks, per-participant PCM for engine
 > spatialization, per-participant WebRTC tracks with Web Audio HRTF for browsers / Unity WebGL,
@@ -866,7 +867,7 @@ Corporate NATs, hotel Wi-Fi and some carriers drop UDP entirely. A native AURX s
 carry **the same sealed packets** — one per binary WebSocket frame, both directions — over the
 control WebSocket it already authenticated with; text frames stay the JSON control plane. The
 node advertises it in `SessionInitAck.media_tunnel` (`media.media_tunnel = true`, default) and
-reports the live link in `MediaBound.transport` (`udp` / `tunnel`) and
+reports the live link in `MediaBound.transport` (`quic` / `udp` / `tunnel`) and
 `GET /v1/sessions/{id}/stats`. A tunnel belongs to exactly one connection and therefore one
 session: the binary `SessionBind` must name that session, the SSRC/HMAC/AEAD/replay checks are
 the ones UDP uses, and the packet then walks the same router — mutes, blocks, volume, focus,
@@ -875,14 +876,42 @@ link it came from. Downlink to a tunnelled receiver is sealed per receiver and q
 socket (`media.tunnel_queue_packets`, 128); a stalled TCP connection drops *its own* packets
 (`aurix_tunnel_packets_total{direction="downlink",outcome="dropped"}`), never anyone else's. The
 newest signed bind wins, so a client moves between UDP and the tunnel by simply binding again on
-the other link, keeping one sequence counter. SDKs (`Auto` by default): UDP first, tunnel when
-the UDP bind gets no answer or `udp_fallback_lost_heartbeats` heartbeats vanish mid-call, UDP
-re-probed every `udp_reprobe_interval` and taken back as soon as it answers — native
+the other link, keeping one sequence counter. SDKs (`Auto` by default): QUIC, then UDP (native; the Unity C# transport starts at UDP), tunnel when
+neither native bind gets an answer or `udp_fallback_lost_heartbeats` heartbeats vanish mid-call, UDP
+(and QUIC) re-probed every `udp_reprobe_interval` and taken back as soon as one answers — native
 `Event::MediaPathChanged` / `aurix_client_media_path`, Unity `OnMediaPathChanged` /
-`ActiveMediaPath`, Unreal `OnMediaPathChanged` / `GetMediaPath`; `UdpOnly` and `TunnelOnly`
-pin a link. TCP head-of-line blocking applies: the tunnel keeps the player in the call, UDP
+`ActiveMediaPath`, Unreal `OnMediaPathChanged` / `GetMediaPath`; `QuicOnly`, `UdpOnly` and
+`TunnelOnly` pin a link. TCP head-of-line blocking applies: the tunnel keeps the player in the call, UDP
 remains the path to be on. WebRTC clients are untouched (they have ICE/TURN). Metrics:
 `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
+
+### QUIC for native media: 0-RTT resume and connection migration
+
+Next to raw UDP a native session may send **the same sealed AURX packets as QUIC DATAGRAM
+frames** to the same media address: the node speaks QUIC, AURX and WebRTC on one socket
+(server-chosen connection ids start with a byte ≥ 0x80, so they never spell the AURX magic),
+streams are disabled, so a lost datagram never delays the next one — none of the tunnel's
+head-of-line blocking. The node advertises `SessionInitAck.quic { cert_sha256, server_name }`
+(`media.quic = true`, default; self-signed certificate generated at start unless
+`quic_cert_path`/`quic_key_path` name a PEM pair) and clients **pin that hash** — it arrived over
+the authenticated control channel, so no CA and no trust store are involved. TLS is not trusted
+for ownership: a connection speaks for a session only after the signed `SessionBind` arrived on
+it, it belongs to that one session for its lifetime, and datagrams are attributed to the bound
+connection rather than to a source address. That is what makes **connection migration** safe —
+when the address changes (Wi-Fi ↔ cellular, NAT rebinding; the game calls
+`network_changed()` / Unreal `NetworkChanged()` / Godot `network_changed()`) QUIC path validation
+moves the connection and the session keeps id, key, sequence counter, replay and E2EE state
+without a re-bind. **0-RTT**: resumption state is kept per node in the client, so a reconnect
+sends the `SessionBind` as early data and media is back one round trip later; early data is
+replayable, which the AURX layer already tolerates (strictly increasing bind timestamps,
+per-session anti-replay windows), and `media.quic_zero_rtt = false` forces 1-RTT. The newest
+signed bind still wins across links, superseded connections are closed, stale ones cannot
+deliver media or reclaim a session. SDKs (`Auto`): QUIC → UDP → tunnel, a failed QUIC bind is
+remembered for `udp_reprobe_interval`, `QuicOnly` / `quic = false` pin the behaviour,
+`MediaBound.transport = "quic"` and `SessionInfo.media_quic` report it; old clients and
+`media.quic = false` nodes interoperate unchanged. Metrics: `aurix_quic_connections`,
+`aurix_quic_sessions`, `aurix_quic_handshakes_total{outcome}`,
+`aurix_quic_packets_total{direction,outcome}`, `aurix_quic_migrations_total`.
 
 ### Large channels: listeners, stream caps and the native server mix
 
@@ -1104,7 +1133,8 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
   decoder per speaker it hears.
 * The blocked-UDP fallback for native clients is the control WebSocket (TCP): head-of-line
   blocking under loss, a bounded per-session downlink queue, and it needs the WebSocket port
-  itself to be reachable. No QUIC, no TURN for native media.
+  itself to be reachable. QUIC shares the media UDP port and is blocked by the same firewalls;
+  no HTTP/3, no TURN for native media, no QUIC for browsers or the Unity C# transport.
 * Server-side mixing for native clients bypasses E2EE frames (they stay per-speaker), costs the
   node one Opus decode per selected speaker plus one stereo encode per mixer, and is capped at
   `MAX_MIXERS` (8192) per node; a channel's speaker admission (`max_speakers`) is enforced at

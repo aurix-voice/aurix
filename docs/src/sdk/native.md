@@ -27,8 +27,10 @@ Full reference: `crates/aurix-client/README.md` and `sdk/unreal/README.md`.
   cancellation, RNNoise-derived neural noise suppression, speech-gated AGC — between resampling
   and the input gain / VAD / encoder ([below](#capture-dsp-echo-cancellation-noise-suppression-agc)).
 * **Media:** signed `SessionBind`, AES-256-CTR + HMAC on every packet, replay windows,
-  heartbeats with RTT, quality reports; UDP first, the same packets over the control WebSocket
-  when UDP is blocked ([below](#when-udp-is-blocked-the-websocket-tunnel)).
+  heartbeats with RTT, quality reports; QUIC datagrams first (0-RTT resume, connection
+  migration — [below](#quic-0-rtt-resume-and-connection-migration)), raw UDP next, the same
+  packets over the control WebSocket when UDP is blocked
+  ([below](#when-udp-is-blocked-the-websocket-tunnel)).
 * **Control:** `Authorization: Bearer` WebSocket, one-time resume tokens, typed
   `ControlMessage`s.
 * **Client:** one voice session on a small private Tokio runtime; reconnect with backoff and
@@ -382,23 +384,62 @@ with `push_capture_*` is decimated to 8 kHz and μ-law encoded, μ-law downlink 
 the preferred codec is negotiated again. The node transcodes at the edge, so other participants
 are unaffected ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 
+## QUIC: 0-RTT resume and connection migration
+
+When the node advertises it (`SessionInfo::media_quic`, `SessionInitAck.quic`) the core carries
+the same sealed AURX packets as **QUIC datagrams** to the same media address
+([protocol](../api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)).
+What it buys a player over raw UDP:
+
+* **Connection migration.** Call `client.network_changed()` when the OS reports a network
+  change (Wi-Fi ↔ cellular, VPN up/down, laptop lid) — the core rebinds its socket and QUIC
+  path validation moves the connection; the session, SSRC, media key, sequence counter, replay
+  and E2EE state stay, nothing is re-negotiated and no `SessionBind` is sent
+  (`Event::MediaPathChanged { path: Quic, reason: "network changed: QUIC migrated to …" }`).
+  On raw UDP the same call re-sends `SessionBind` from the new address; on the tunnel it is a
+  no-op. Migration also happens implicitly when a NAT rebinds the address mid-call.
+* **0-RTT reconnect.** The TLS session ticket of a node is kept per node for the lifetime of
+  the `Client` (`QuicClientState`), so after a control-channel reconnect the `SessionBind`
+  travels as early data and media resumes one round trip after the socket is up
+  (`reason: "QUIC bound (0-RTT)"`, `aurix_quic_handshakes_total{outcome="accepted_0rtt"}` on the
+  node); a first connection to a node is a normal 1-RTT handshake (`"QUIC bound"`).
+* **No head-of-line blocking** under loss, unlike the tunnel: each datagram is independent, the
+  jitter buffer sees gaps rather than bursts and the FEC/DRED/PLC path
+  ([packet loss](#packet-loss-fec-dred-and-the-neural-plc)) works exactly as on UDP.
+
+Security is the AURX layer's, not TLS's: the core pins the node certificate hash received over
+the authenticated control WebSocket (no CA, no system trust store — a self-signed node
+certificate is fine), and the node attributes datagrams to a session only after the signed
+`SessionBind` arrived on that very connection. `ClientConfig::quic = false` keeps `Auto` on the
+pre-QUIC order (UDP → tunnel); `MediaPathPolicy::QuicOnly` refuses nodes that do not offer QUIC
+and treats a blocked media port as a connection failure. A failed QUIC bind is remembered for
+`udp_reprobe_interval` so the next attempts go straight to UDP, and `udp_fallback_lost_heartbeats`
+unanswered heartbeats (or the connection closing) move a QUIC session to the tunnel exactly like
+a UDP one; the tunnel re-probe tries QUIC first again. C: `AurixClientConfig.quic`,
+`AURIX_MEDIA_PATH_QUIC_ONLY`, `AURIX_MEDIA_QUIC`, `AurixSessionInfo.media_quic`,
+`aurix_client_network_changed`. Nodes without QUIC and clients built before it interoperate
+unchanged.
+
 ## When UDP is blocked: the WebSocket tunnel
 
 `ClientConfig::media_path` picks the link ([protocol](../api/aurx.md#tunnel-aurx-over-the-control-websocket)):
 
-* `MediaPathPolicy::Auto` (default) — bind over UDP; if the bind gets no answer, carry the
-  media over the already-authenticated control WebSocket instead. While on UDP,
+* `MediaPathPolicy::Auto` (default) — bind over [QUIC](#quic-0-rtt-resume-and-connection-migration)
+  when offered, then raw UDP; if neither bind gets an answer, carry the media over the
+  already-authenticated control WebSocket instead. While on a native link,
   `udp_fallback_lost_heartbeats` (3) unanswered heartbeats in a row move the session onto the
   tunnel mid-call; while tunnelled, every `udp_reprobe_interval` (30 s, `0` = never) the core
-  binds UDP again and moves back as soon as it answers. The node must advertise the tunnel
+  binds natively again and moves back as soon as it answers. The node must advertise the tunnel
   (`SessionInfo::media_tunnel`); otherwise `Auto` behaves like `UdpOnly`.
 * `MediaPathPolicy::UdpOnly` — never tunnel (a dead UDP path is a reconnect, as before).
 * `MediaPathPolicy::TunnelOnly` — never open a UDP socket (tests, environments that forbid it).
+* `MediaPathPolicy::QuicOnly` — QUIC or nothing.
 
-The uplink sequence counter is shared by both links, so the server's replay window and the
+The uplink sequence counter is shared by all links, so the server's replay window and the
 receivers' jitter buffers see one continuous stream across a switch; a resume re-binds on the
 link the policy selects. `Event::MediaPathChanged { path, reason }` fires after every bind and
-switch (`"UDP bind failed: …"`, `"3 UDP heartbeats unanswered"`, `"UDP re-probe answered"`),
+switch (`"QUIC bound (0-RTT)"`, `"native bind failed: …"`, `"3 QUIC heartbeats unanswered"`,
+`"UDP re-probe answered"`),
 `client.media_path()` returns the current link and `ClientStats` adds `media_path`,
 `heartbeats_lost_consecutive` and `uplink_dropped` (frames the tunnel's bounded send queue
 refused — always 0 on UDP). C: `AurixClientConfig.media_path` (`AURIX_MEDIA_PATH_*`),
@@ -592,11 +633,13 @@ expose the shared quality model; `OnRawEvent` delivers every event as JSON for a
 a typed delegate. Events are dispatched from the subsystem tick, up to 256 per tick, nothing
 dropped.
 
-Blocked UDP: `FAurixVoiceSettings.MediaPath` (`EAurixMediaPathPolicy` Auto / UdpOnly /
-TunnelOnly), `UdpFallbackLostHeartbeats`, `UdpReprobeIntervalMs`; `GetMediaPath()`
-(`EAurixMediaPath`), `OnMediaPathChanged(Path, Reason)`, `FAurixSessionInfo.bMediaTunnel` and
-`FAurixStats.MediaPath` — the core's [tunnel behaviour](#when-udp-is-blocked-the-websocket-tunnel)
-unchanged.
+Media links: `FAurixVoiceSettings.MediaPath` (`EAurixMediaPathPolicy` Auto / UdpOnly /
+TunnelOnly / QuicOnly), `bQuic`, `UdpFallbackLostHeartbeats`, `UdpReprobeIntervalMs`;
+`GetMediaPath()` (`EAurixMediaPath`, includes `Quic`), `OnMediaPathChanged(Path, Reason)`,
+`NetworkChanged()` (Blueprint-callable; wire it to your platform's connectivity notification
+for [QUIC migration](#quic-0-rtt-resume-and-connection-migration)), `FAurixSessionInfo.bMediaTunnel`
+/ `bMediaQuic` and `FAurixStats.MediaPath` — the core's
+[tunnel behaviour](#when-udp-is-blocked-the-websocket-tunnel) unchanged.
 
 **Regions.** `DiscoverRegions(FAurixRegionDiscoveryRequest, OnComplete)` runs the whole flow
 above with the engine's `HTTP` module (bearer `GET /v1/me/regions`, optional probes with

@@ -203,11 +203,16 @@ typedef enum AurixNoiseSuppression {
  */
 typedef enum AurixMediaPathPolicy {
   /**
-   * UDP first; WebSocket tunnel when UDP is blocked; back to UDP when it answers again.
+   * QUIC (when offered and `quic`), then UDP; WebSocket tunnel when both are blocked; back
+   * to a native link when it answers again.
    */
   AURIX_MEDIA_PATH_AUTO = 0,
   AURIX_MEDIA_PATH_UDP_ONLY = 1,
   AURIX_MEDIA_PATH_TUNNEL_ONLY = 2,
+  /**
+   * QUIC only; a node without QUIC (or a blocked media port) fails the connection.
+   */
+  AURIX_MEDIA_PATH_QUIC_ONLY = 3,
 } AurixMediaPathPolicy;
 
 /**
@@ -250,6 +255,11 @@ typedef enum AurixMediaPath {
    * loss).
    */
   AURIX_MEDIA_TUNNEL = 2,
+  /**
+   * Native AURX as QUIC datagrams (0-RTT reconnect, connection migration on
+   * `aurix_client_network_changed`).
+   */
+  AURIX_MEDIA_QUIC = 3,
 } AurixMediaPath;
 
 typedef enum AurixEventType {
@@ -799,18 +809,18 @@ typedef struct AurixClientConfig {
    */
   struct AurixDspConfig dsp;
   /**
-   * Which link carries media: UDP with the WebSocket tunnel as fallback (default), UDP
-   * only, or tunnel only.
+   * Which link carries media: QUIC (when the node offers it) then UDP, with the WebSocket
+   * tunnel as fallback (default), or exactly one of them.
    */
   enum AurixMediaPathPolicy media_path;
   /**
-   * `Auto`: unanswered UDP heartbeats in a row before media moves to the tunnel (0 = never
-   * fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
+   * `Auto`: unanswered QUIC/UDP heartbeats in a row before media moves to the tunnel (0 =
+   * never fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
    */
   uint32_t udp_fallback_lost_heartbeats;
   /**
-   * `Auto`: how often a tunnelled session re-probes UDP and moves back when it answers
-   * (0 = never; stays tunnelled until the next connect).
+   * `Auto`: how often a tunnelled session re-probes the native links (QUIC, then UDP) and
+   * moves back when one answers (0 = never; stays tunnelled until the next connect).
    */
   uint32_t udp_reprobe_interval_ms;
   /**
@@ -834,6 +844,11 @@ typedef struct AurixClientConfig {
    * tier; `aurix_client_set_loss_adaptation` changes it later.
    */
   enum AurixLossAdaptation loss_adaptation;
+  /**
+   * `Auto`: try QUIC before raw UDP when the node offers it (default true). Off, `Auto`
+   * is UDP → tunnel as before; `AurixMediaPathQuicOnly` ignores this switch.
+   */
+  bool quic;
 } AurixClientConfig;
 
 /**
@@ -879,6 +894,10 @@ typedef struct AurixSessionInfo {
    * Translations can also be spoken into this session's downlink.
    */
   bool translation_speech;
+  /**
+   * The node accepts media as QUIC datagrams on its media port.
+   */
+  bool media_quic;
 } AurixSessionInfo;
 
 /**
@@ -1571,6 +1590,14 @@ size_t aurix_client_failover_endpoint(const struct AurixClient *client,
  * Link the media currently uses; `AurixMediaNone` before the first bind.
  */
 enum AurixMediaPath aurix_client_media_path(const struct AurixClient *client);
+
+/**
+ * Tell the client the device's network changed (Wi-Fi ↔ cellular, VPN, new interface). On
+ * QUIC the connection migrates to a fresh local socket in place (same session, sequence
+ * counter and E2EE state; `AurixEventMediaPathChanged` follows); on UDP the session
+ * re-announces itself to the node. `false` when not connected.
+ */
+bool aurix_client_network_changed(const struct AurixClient *client);
 
 /**
  * Next queued event or `NULL`. Caller owns the result (`aurix_event_free`).

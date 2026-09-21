@@ -4,6 +4,7 @@ use crate::channel::MediaChannel;
 use crate::mix::MixHub;
 use crate::mixer::MixerConfig;
 use crate::quality::{MosAlertPolicy, QualityTick};
+use crate::quic::{QuicLink, QuicOptions, QuicServer};
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
 use crate::transport::bind_media_socket;
@@ -11,7 +12,7 @@ use crate::tunnel::MediaTunnel;
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
 use aurix_common::crypto::CryptoProvider;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::protocol::channel_id_hash;
+use aurix_common::protocol::{channel_id_hash, QuicInfo};
 use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
 use aurix_common::usage::{UsageMeter, UsageMetric};
@@ -82,6 +83,8 @@ pub struct SfuOptions {
     pub media_tunnel: bool,
     /// Downlink queue depth per tunneled session (see `MediaConfig::tunnel_queue_packets`).
     pub tunnel_queue_packets: usize,
+    /// AURX over QUIC datagrams on the media socket (see `MediaConfig::quic*`).
+    pub quic: QuicOptions,
     /// Serve native sessions one server-mixed stream per channel on request
     /// (see `MediaConfig::downlink_mix`).
     pub downlink_mix: bool,
@@ -113,6 +116,7 @@ impl Default for SfuOptions {
             rx_workers: 0,
             media_tunnel: true,
             tunnel_queue_packets: 128,
+            quic: QuicOptions::default(),
             downlink_mix: true,
             webrtc_participant_streams: 16,
         }
@@ -132,6 +136,7 @@ pub struct SfuNode {
     active_participant_count: Arc<AtomicU32>,
     webrtc_manager: Option<Arc<WebRtcManager>>,
     router: Option<Arc<PacketRouter>>,
+    quic: Option<Arc<QuicServer>>,
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
@@ -166,6 +171,7 @@ impl SfuNode {
             active_participant_count: Arc::new(AtomicU32::new(0)),
             webrtc_manager: None,
             router: None,
+            quic: None,
             cascade: None,
             audio_pipeline: None,
             audio_sink: None,
@@ -249,6 +255,17 @@ impl SfuNode {
     /// The packet router; `None` until `start`.
     pub fn router(&self) -> Option<&Arc<PacketRouter>> {
         self.router.as_ref()
+    }
+
+    /// The QUIC media endpoint; `None` until `start` or when disabled.
+    pub fn quic(&self) -> Option<&Arc<QuicServer>> {
+        self.quic.as_ref()
+    }
+
+    /// What native clients need to reach the media socket over QUIC (`None` when QUIC is
+    /// disabled or the node is not started) — advertised in `SessionInitAck.quic`.
+    pub fn quic_info(&self) -> Option<QuicInfo> {
+        self.quic.as_ref().map(|q| q.info().clone())
     }
 
     /// Subscribe to media-plane notifications (speaking/mute changes, session binds).
@@ -403,7 +420,11 @@ impl SfuNode {
                             if let Some(session) =
                                 sessions_by_id.get(&session_id).map(|s| s.value().clone())
                             {
-                                session.set_remote_addr(remote);
+                                if let Some(old) = session.set_remote_addr(remote) {
+                                    if old != remote {
+                                        sessions_by_addr.remove(&old);
+                                    }
+                                }
                                 session.update_heartbeat();
                                 sessions_by_addr.insert(remote, session.clone());
                                 let _ = events.send(MediaEvent::SessionBound {
@@ -451,13 +472,42 @@ impl SfuNode {
                 }));
         }
 
+        let quic = if self.options.quic.enabled {
+            let server = QuicServer::start(socket.clone(), self.options.quic.clone())?;
+            let on_datagram = {
+                let router = router.clone();
+                move |link: Arc<QuicLink>, data: bytes::Bytes| {
+                    let router = router.clone();
+                    Box::pin(async move {
+                        if let Err(e) = router.route_quic_packet(&data, &link).await {
+                            tracing::debug!("Packet dropped from quic#{}: {}", link.id(), e);
+                        }
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                }
+            };
+            let on_closed = {
+                let router = router.clone();
+                move |link: Arc<QuicLink>| {
+                    router.quic_link_closed(&link);
+                }
+            };
+            server.clone().run_accept_loop(on_datagram, on_closed);
+            Some(server)
+        } else {
+            None
+        };
+
         // UDP receive workers. Several tasks drain the same socket so that per-packet work
         // (HMAC verification, fan-out signing, sends) runs in parallel across the runtime
         // instead of serialising behind a single recv loop and overflowing SO_RCVBUF.
+        // Demultiplexing by first byte: AURX magic, WebRTC (STUN/DTLS/RTP ranges), else QUIC
+        // (fixed bit set; the ranges are disjoint, see `quic` module docs).
         let workers = Self::rx_worker_count(self.options.rx_workers);
         for worker in 0..workers {
             let router = router.clone();
             let webrtc = webrtc_mgr.clone();
+            let quic = quic.clone();
             let socket = socket.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
@@ -471,6 +521,11 @@ impl SfuNode {
                                 }
                             } else if WebRtcManager::is_webrtc_packet(data) {
                                 webrtc.handle_packet(data, src).await;
+                            } else if let Some(quic) = quic
+                                .as_ref()
+                                .filter(|_| aurix_common::protocol::is_quic_packet(data))
+                            {
+                                quic.feed(src, data);
                             }
                         }
                         Err(e) => {
@@ -494,6 +549,7 @@ impl SfuNode {
         self.family = Some(socket.family());
         self.advertised = advertised.clone();
         self.router = Some(router);
+        self.quic = quic;
         self.started = true;
         info!(
             "SFU node {} started in region {:?}, listening on {} ({:?}, advertised {:?})",
@@ -1119,6 +1175,9 @@ impl SfuNode {
         let n = ids.len();
         for sid in ids {
             let _ = self.destroy_session(&sid);
+        }
+        if let Some(quic) = &self.quic {
+            quic.shutdown();
         }
         n
     }

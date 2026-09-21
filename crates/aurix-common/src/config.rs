@@ -195,6 +195,33 @@ impl AurixConfig {
         if !(8..=4096).contains(&self.media.tunnel_queue_packets) {
             anyhow::bail!("media.tunnel_queue_packets must be within 8..=4096");
         }
+        if !(8..=4096).contains(&self.media.quic_queue_packets) {
+            anyhow::bail!("media.quic_queue_packets must be within 8..=4096");
+        }
+        if self.media.quic {
+            let min_idle = self
+                .media
+                .heartbeat_interval_ms
+                .saturating_mul(3)
+                .max(1_000);
+            if self.media.quic_idle_timeout_ms < min_idle {
+                anyhow::bail!(
+                    "media.quic_idle_timeout_ms must be at least three heartbeats ({min_idle} ms)"
+                );
+            }
+            if self.media.quic_cert_path.is_some() != self.media.quic_key_path.is_some() {
+                anyhow::bail!("media.quic_cert_path and media.quic_key_path must be set together");
+            }
+            if self.media.quic_server_name.is_empty()
+                || !self
+                    .media
+                    .quic_server_name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+            {
+                anyhow::bail!("media.quic_server_name must be a DNS-style name");
+            }
+        }
         if self.media.webrtc_participant_streams > MAX_WEBRTC_PARTICIPANT_STREAMS {
             anyhow::bail!(
                 "media.webrtc_participant_streams must be at most {MAX_WEBRTC_PARTICIPANT_STREAMS}"
@@ -1375,6 +1402,49 @@ pub struct MediaConfig {
     /// packet per speaker heard.
     #[serde(default = "default_tunnel_queue_packets")]
     pub tunnel_queue_packets: usize,
+    /// Speak QUIC on the media port next to plain AURX/UDP and WebRTC: native clients that
+    /// prefer it send the same sealed AURX packets as QUIC datagrams and get a 0-RTT resume
+    /// handshake plus connection migration (the session survives a Wi-Fi ↔ cellular /
+    /// NAT-rebinding address change without a re-bind). Costs one TLS handshake per
+    /// connection and QUIC framing (~1 % of the audio bitrate).
+    #[serde(default = "default_true")]
+    pub quic: bool,
+    /// Idle timeout of a QUIC media connection (ms). Clients heartbeat every
+    /// `heartbeat_interval_ms`; keep this at least three heartbeats.
+    #[serde(default = "default_quic_idle_timeout_ms")]
+    pub quic_idle_timeout_ms: u64,
+    /// Accept 0-RTT (early-data) datagrams from resuming clients. Early data is replayable at
+    /// the transport layer, which is harmless here: every AURX packet carries its own
+    /// per-session authentication, `SessionBind` timestamps and anti-replay sequence
+    /// windows, and nothing state-changing rides on the media path. Disable to force a full
+    /// 1-RTT handshake before any datagram is read.
+    #[serde(default = "default_true")]
+    pub quic_zero_rtt: bool,
+    /// Let QUIC connections migrate to a new client address (path validation is performed by
+    /// the QUIC stack; the AURX session keeps its id, key, sequence and replay state).
+    /// Disable to drop connections whose address changes.
+    #[serde(default = "default_true")]
+    pub quic_migration: bool,
+    /// Downlink datagrams buffered per QUIC session before the node drops that session's
+    /// audio (a congested path never blocks the SFU). Same unit as `tunnel_queue_packets`.
+    #[serde(default = "default_tunnel_queue_packets")]
+    pub quic_queue_packets: usize,
+    /// Concurrent QUIC connections the node accepts (handshaking or bound); `0` = twice
+    /// `max_participants_per_node`.
+    #[serde(default)]
+    pub quic_max_connections: usize,
+    /// PEM certificate chain / private key for the QUIC endpoint. Unset: the node generates
+    /// a self-signed certificate at start-up. Clients never rely on the CA chain — they pin
+    /// the certificate hash advertised in `SessionInitAck.quic` over the authenticated
+    /// control WebSocket, so a self-signed certificate is as secure as an issued one.
+    #[serde(default)]
+    pub quic_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub quic_key_path: Option<PathBuf>,
+    /// TLS server name of the QUIC endpoint (SAN of the generated certificate; clients
+    /// present it as SNI; the pin, not the name, is what they verify).
+    #[serde(default = "default_quic_server_name")]
+    pub quic_server_name: String,
     /// Let native AURX sessions receive one server-mixed stream per channel
     /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
     /// A mixed receiver whose channel has no per-receiver rules shares one mixer with every
@@ -1472,6 +1542,14 @@ fn default_tunnel_queue_packets() -> usize {
     128
 }
 
+fn default_quic_idle_timeout_ms() -> u64 {
+    20_000
+}
+
+fn default_quic_server_name() -> String {
+    "aurix-media".into()
+}
+
 fn default_webrtc_participant_streams() -> u32 {
     16
 }
@@ -1514,6 +1592,15 @@ impl Default for MediaConfig {
             mixer_decoder_complexity: default_mixer_decoder_complexity(),
             webrtc_participant_streams: default_webrtc_participant_streams(),
             tunnel_queue_packets: default_tunnel_queue_packets(),
+            quic: true,
+            quic_idle_timeout_ms: default_quic_idle_timeout_ms(),
+            quic_zero_rtt: true,
+            quic_migration: true,
+            quic_queue_packets: default_tunnel_queue_packets(),
+            quic_max_connections: 0,
+            quic_cert_path: None,
+            quic_key_path: None,
+            quic_server_name: default_quic_server_name(),
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

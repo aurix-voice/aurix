@@ -457,11 +457,19 @@ public:
 	EAurixDownlinkMode GetDownlinkMode() const;
 
 	/**
-	 * Link the media uses right now: UDP, the WebSocket tunnel (UDP blocked — expect higher
-	 * latency under packet loss) or None before the first OnMediaBound.
+	 * Link the media uses right now: QUIC, UDP, the WebSocket tunnel (native links blocked —
+	 * expect higher latency under packet loss) or None before the first OnMediaBound.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
 	EAurixMediaPath GetMediaPath() const;
+
+	/**
+	 * The device's network changed (Wi-Fi ↔ cellular, VPN, new interface). A QUIC link migrates
+	 * in place (same session, sequence counter and E2EE state; OnMediaPathChanged follows), a UDP
+	 * link re-announces the session. False when not connected.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Connection")
+	bool NetworkChanged();
 
 	/** WebSocket URL of the node serving the session (the configured URL until a failover moved it). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Connection")

@@ -97,6 +97,9 @@ pub struct SessionInfo {
     pub resumed: bool,
     /// The node accepts AURX media as binary frames on the control WebSocket.
     pub media_tunnel: bool,
+    /// The node accepts AURX media as QUIC datagrams on its media port (0-RTT reconnects,
+    /// connection migration); `Auto` sessions prefer it when `ClientConfig::quic` is on.
+    pub media_quic: bool,
     /// The node can deliver one server-mixed stream per channel instead of one stream per
     /// speaker (`Client::set_downlink_mode`).
     pub downlink_mix: bool,

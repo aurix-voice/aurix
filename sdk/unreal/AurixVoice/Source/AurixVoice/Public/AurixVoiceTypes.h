@@ -65,10 +65,12 @@ enum class EAurixDownlinkMode : uint8
 UENUM(BlueprintType)
 enum class EAurixMediaPathPolicy : uint8
 {
-	/** UDP first; the WebSocket tunnel when UDP is blocked; back to UDP once it answers again. */
+	/** QUIC (when the node offers it and bQuic), then UDP; the WebSocket tunnel when both are blocked; back to a native link once it answers again. */
 	Auto,
 	UdpOnly,
 	TunnelOnly,
+	/** QUIC only; a node without QUIC (or a blocked media port) fails the connection. */
+	QuicOnly,
 };
 
 /** Link the media currently travels over. */
@@ -81,6 +83,8 @@ enum class EAurixMediaPath : uint8
 	Udp,
 	/** AURX packets as binary frames on the control WebSocket (TCP: higher latency under loss). */
 	Tunnel,
+	/** Native AURX as QUIC datagrams (0-RTT reconnect, connection migration on NetworkChanged). */
+	Quic,
 };
 
 UENUM(BlueprintType)
@@ -508,17 +512,22 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	bool bVadGate = true;
 
 	/**
-	 * Media link: UDP with the WebSocket tunnel as fallback (default), UDP only, or tunnel only.
-	 * The tunnel keeps the same session, SSRC, key and encryption; only latency under loss differs.
+	 * Media link: QUIC (when offered) then UDP with the WebSocket tunnel as fallback (default), or
+	 * exactly one of them. Every link keeps the same session, SSRC, key and encryption; only
+	 * latency under loss and reconnect behaviour differ.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
 	EAurixMediaPathPolicy MediaPath = EAurixMediaPathPolicy::Auto;
 
-	/** Auto: unanswered UDP heartbeats in a row before media moves to the tunnel (0 = never mid-session). */
+	/** Auto: try QUIC before raw UDP when the node offers it. Off, Auto is UDP → tunnel. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
+	bool bQuic = true;
+
+	/** Auto: unanswered QUIC/UDP heartbeats in a row before media moves to the tunnel (0 = never mid-session). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
 	int32 UdpFallbackLostHeartbeats = 3;
 
-	/** Auto: how often a tunnelled session re-probes UDP and moves back when it answers (0 = never). */
+	/** Auto: how often a tunnelled session re-probes the native links (QUIC, then UDP) and moves back when one answers (0 = never). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
 	int32 UdpReprobeIntervalMs = 30000;
 
@@ -581,6 +590,10 @@ struct AURIXVOICE_API FAurixSessionInfo
 	/** The node accepts media tunnelled over the control WebSocket (fallback when UDP is blocked). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bMediaTunnel = false;
+
+	/** The node accepts media as QUIC datagrams on its media port (0-RTT reconnect, migration). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bMediaQuic = false;
 
 	/** The node can deliver one server-mixed stream per channel (SetDownlinkMode Mixed). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")

@@ -100,6 +100,22 @@ media_tunnel = true
 # Downlink packets queued per tunneled session (≈20 ms of audio per packet per speaker heard)
 # before that session's packets are dropped; a stalled TCP connection never blocks the SFU.
 tunnel_queue_packets = 128
+# Speak QUIC on the media port next to plain AURX/UDP and WebRTC (one socket, classified by
+# first byte). Native clients that prefer it send the same sealed AURX packets as QUIC DATAGRAM
+# frames and get a 0-RTT resume handshake plus connection migration (Wi-Fi ↔ cellular / NAT
+# rebinding without a re-bind). Authentication stays the AURX one: a connection speaks for a
+# session only after its signed SessionBind. Clients pin the certificate hash advertised in
+# SessionInitAck.quic, so the self-signed certificate generated at start-up is enough; set
+# quic_cert_path/quic_key_path (PEM) to use your own (the pin, not the SAN, is what clients check).
+quic = true
+quic_idle_timeout_ms = 20000       # ≥ 3 × heartbeat_interval_ms
+quic_zero_rtt = true               # false: full 1-RTT handshake before any datagram is read
+quic_migration = true              # false: drop connections whose client address changes
+quic_queue_packets = 128           # downlink datagrams buffered per connection (as tunnel_queue_packets)
+quic_max_connections = 0           # 0 = 2 × max_participants_per_node
+# quic_cert_path = "/etc/aurix/quic.crt"
+# quic_key_path = "/etc/aurix/quic.key"
+quic_server_name = "aurix-media"
 # Let native AURX sessions receive one server-mixed stereo stream per channel instead of a
 # stream per speaker (`SetDownlinkMode { mode: "mixed" }`; forced on listeners of channels
 # with `audience.mix_for_listeners`). Receivers without per-receiver rules share one mixer per

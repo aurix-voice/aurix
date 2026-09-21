@@ -431,6 +431,53 @@ pub static TUNNEL_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `direction` is `uplink`/`downlink`; `outcome` is `received`/`sent`, `dropped` (datagram
+/// queue full, connection gone or ingress queue overflow) or `rejected` (uplink datagram that
+/// failed decoding or authentication).
+pub static QUIC_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_quic_packets_total",
+        "AURX packets carried as QUIC datagrams on the media port",
+        &["direction", "outcome"]
+    )
+    .unwrap()
+});
+
+/// `outcome` is `accepted`, `accepted_0rtt` (early data was read before the handshake
+/// finished), `refused` (connection cap) or `failed` (handshake error).
+pub static QUIC_HANDSHAKES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_quic_handshakes_total",
+        "Incoming QUIC connection attempts on the media port",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+pub static QUIC_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_quic_connections",
+        "Open QUIC connections on the media port (bound to a session or not yet)"
+    )
+    .unwrap()
+});
+
+pub static QUIC_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_quic_sessions",
+        "Native sessions whose media is currently bound through a QUIC connection"
+    )
+    .unwrap()
+});
+
+pub static QUIC_MIGRATIONS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_quic_migrations_total",
+        "QUIC connections whose peer address changed while bound to a session"
+    )
+    .unwrap()
+});
+
 /// `kind` is `shared` (one mix for every uniform receiver of a channel) or `private`.
 pub static DOWNLINK_MIXERS: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
@@ -488,6 +535,11 @@ pub fn gather_metrics() -> String {
     let _ = &*PCMU_SESSIONS;
     let _ = &*TUNNEL_PACKETS;
     let _ = &*TUNNEL_SESSIONS;
+    let _ = &*QUIC_PACKETS;
+    let _ = &*QUIC_HANDSHAKES;
+    let _ = &*QUIC_CONNECTIONS;
+    let _ = &*QUIC_SESSIONS;
+    let _ = &*QUIC_MIGRATIONS;
     let _ = &*DOWNLINK_MIXERS;
     let _ = &*DOWNLINK_MIX_FRAMES;
     let _ = &*STREAMS_CAPPED;

@@ -5,6 +5,7 @@ pub mod channel;
 pub mod mix;
 pub mod mixer;
 pub mod quality;
+pub mod quic;
 pub mod router;
 pub mod session;
 pub mod sfu;

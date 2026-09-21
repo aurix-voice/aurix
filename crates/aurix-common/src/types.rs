@@ -228,6 +228,8 @@ pub enum MediaTransportKind {
     Udp,
     /// Native AURX tunneled through the control WebSocket (UDP-blocked fallback).
     Tunnel,
+    /// Native AURX as QUIC datagrams on the media port (0-RTT resume, connection migration).
+    Quic,
     /// Browser WebRTC (str0m).
     WebRtc,
 }

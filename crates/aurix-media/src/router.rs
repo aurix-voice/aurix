@@ -30,6 +30,7 @@ use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::{MediaChannel, Mix};
 use crate::mix::MixHub;
+use crate::quic::QuicLink;
 use crate::session::{MediaEndpoint, MediaSession, Transport};
 use crate::transcode::{PcmuDownlink, PcmuUplink};
 use crate::tunnel::MediaTunnel;
@@ -108,6 +109,7 @@ pub enum MediaEvent {
 enum PacketSource<'a> {
     Udp(SocketAddr),
     Tunnel(&'a Arc<MediaTunnel>),
+    Quic(&'a Arc<QuicLink>),
 }
 
 impl std::fmt::Display for PacketSource<'_> {
@@ -115,6 +117,7 @@ impl std::fmt::Display for PacketSource<'_> {
         match self {
             PacketSource::Udp(addr) => write!(f, "{addr}"),
             PacketSource::Tunnel(t) => write!(f, "tunnel#{}", t.id()),
+            PacketSource::Quic(l) => write!(f, "quic#{} ({})", l.id(), l.remote_address()),
         }
     }
 }
@@ -191,6 +194,39 @@ impl PacketRouter {
         res
     }
 
+    /// Routes one AURX packet that arrived as a QUIC datagram on `link`. Also notices peer
+    /// address changes (connection migration) of links bound to a session.
+    pub async fn route_quic_packet(&self, data: &[u8], link: &Arc<QuicLink>) -> Result<()> {
+        if let Some(old) = link.observe_path() {
+            if let Some(session_id) = link.session_id() {
+                aurix_metrics::QUIC_MIGRATIONS.inc();
+                debug!(
+                    "Session {} migrated quic#{} {} -> {}",
+                    session_id,
+                    link.id(),
+                    old,
+                    link.remote_address()
+                );
+            }
+        }
+        let res = self.route_from(data, PacketSource::Quic(link)).await;
+        aurix_metrics::QUIC_PACKETS
+            .with_label_values(&["uplink", if res.is_ok() { "received" } else { "rejected" }])
+            .inc();
+        res
+    }
+
+    /// A QUIC connection closed: drop it as the media path of the session it was bound to
+    /// (unless a newer bind already moved the session elsewhere).
+    pub fn quic_link_closed(&self, link: &QuicLink) -> bool {
+        link.session_id().is_some_and(|session_id| {
+            self.shared
+                .sessions_by_id
+                .get(&session_id)
+                .is_some_and(|s| s.clear_quic(link))
+        })
+    }
+
     async fn route_from(&self, data: &[u8], source: PacketSource<'_>) -> Result<()> {
         let mut packet = AurixPacket::decode(data)?;
         if packet.header.packet_type == PacketType::SessionBind {
@@ -237,8 +273,9 @@ impl PacketRouter {
         }
     }
 
-    /// Resolve the sender by *bound address* (UDP) or by the *authenticated connection* (tunnel),
-    /// verify the tag, decrypt the payload in place and check the anti-replay window.
+    /// Resolve the sender by *bound address* (UDP) or by the *authenticated connection*
+    /// (tunnel, QUIC), verify the tag, decrypt the payload in place and check the anti-replay
+    /// window.
     fn authenticate(
         &self,
         packet: &mut AurixPacket,
@@ -263,6 +300,25 @@ impl PacketRouter {
                 if !session.tunnel().is_some_and(|t| *t == **tunnel) {
                     return Err(AurixError::AuthenticationFailed(
                         "Unbound media tunnel".into(),
+                    ));
+                }
+                session
+            }
+            PacketSource::Quic(link) => {
+                // The connection speaks for a session only after an authenticated
+                // `SessionBind` arrived on it, and only while it is still the session's path.
+                let session_id = link.session_id().ok_or_else(|| {
+                    AurixError::AuthenticationFailed("Unbound QUIC connection".into())
+                })?;
+                let session = self
+                    .shared
+                    .sessions_by_id
+                    .get(&session_id)
+                    .map(|s| s.value().clone())
+                    .ok_or_else(|| AurixError::SessionNotFound("QUIC session is gone".into()))?;
+                if !session.quic().is_some_and(|l| *l == **link) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "Stale QUIC connection".into(),
                     ));
                 }
                 session
@@ -322,6 +378,15 @@ impl PacketRouter {
                 ));
             }
         }
+        if let PacketSource::Quic(link) = source {
+            // A connection that already authenticated as one session stays that session's.
+            if link.session_id().is_some_and(|owner| owner != session_id) {
+                aurix_metrics::PACKETS_DROPPED.inc();
+                return Err(AurixError::AuthenticationFailed(
+                    "SessionBind for a session the connection does not own".into(),
+                ));
+            }
+        }
         let session = self
             .shared
             .sessions_by_id
@@ -364,12 +429,11 @@ impl PacketRouter {
         session.set_transport(Transport::Aurx);
         let transport = match source {
             PacketSource::Udp(src_addr) => {
-                if let Some(old) = session.get_remote_addr() {
+                if let Some(old) = session.set_remote_addr(src_addr) {
                     if old != src_addr {
                         self.shared.sessions_by_addr.remove(&old);
                     }
                 }
-                session.set_remote_addr(src_addr);
                 self.shared
                     .sessions_by_addr
                     .insert(src_addr, session.clone());
@@ -380,6 +444,17 @@ impl PacketRouter {
                     self.shared.sessions_by_addr.remove(&old);
                 }
                 MediaTransportKind::Tunnel
+            }
+            PacketSource::Quic(link) => {
+                if !link.claim(session_id) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "QUIC connection already owned by another session".into(),
+                    ));
+                }
+                if let Some(old) = session.set_quic(link.clone()) {
+                    self.shared.sessions_by_addr.remove(&old);
+                }
+                MediaTransportKind::Quic
             }
         };
         session.update_heartbeat();
@@ -404,6 +479,9 @@ impl PacketRouter {
             }
             PacketSource::Tunnel(tunnel) => {
                 tunnel.send(bytes.to_vec());
+            }
+            PacketSource::Quic(link) => {
+                link.send(Bytes::copy_from_slice(bytes));
             }
         }
     }
@@ -1053,6 +1131,16 @@ impl PacketRouter {
                         MediaEndpoint::Tunnel(tunnel) => {
                             let n = out.len() as u64;
                             if tunnel.send(out.to_vec()) {
+                                receiver.record_packet_sent(n);
+                                aurix_metrics::PACKETS_SENT.inc();
+                                aurix_metrics::BYTES_SENT.inc_by(n);
+                            } else {
+                                aurix_metrics::PACKETS_DROPPED.inc();
+                            }
+                        }
+                        MediaEndpoint::Quic(link) => {
+                            let n = out.len() as u64;
+                            if link.send(out.freeze()) {
                                 receiver.record_packet_sent(n);
                                 aurix_metrics::PACKETS_SENT.inc();
                                 aurix_metrics::BYTES_SENT.inc_by(n);

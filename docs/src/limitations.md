@@ -101,8 +101,17 @@ the chapter that explains the boundary.
   UDP is blocked the SDKs carry AURX packets over the authenticated WebSocket
   ([tunnel](api/aurx.md#tunnel-aurx-over-the-control-websocket)); that inherits TCP head-of-line
   blocking (latency bursts under loss) and the node's per-session downlink queue drops when the
-  client's connection stalls. There is no QUIC/HTTP/3 path, no TURN for native clients, and the
-  tunnel needs the WebSocket itself to be reachable (`wss://` on 443 is the usual answer).
+  client's connection stalls. The [QUIC path](api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)
+  is a UDP path too — it shares the media port and is blocked by the same firewalls, so it does
+  not help there; there is no HTTP/3, no TURN for native clients, and the tunnel needs the
+  WebSocket itself to be reachable (`wss://` on 443 is the usual answer).
+* **QUIC is native-only and datagram-only.** Browsers keep WebRTC (no WebTransport), the Unity
+  C# transport keeps UDP/tunnel (QUIC reaches Unity only through the native core), and QUIC
+  streams are disabled — it moves the same AURX packets, nothing else. Connection migration
+  needs the game to call `network_changed()` (or a NAT rebind); the core does not watch OS
+  network interfaces itself. Resumption state lives in the node process: the first connection
+  after a node restart or a cross-node failover is a full 1-RTT handshake, 0-RTT applies to
+  reconnects to a node the client already talked to.
 * **Browsers own their encoder.** The Web SDK can set the bitrate ceiling, FEC, DTX, maximum
   bandwidth and CBR through WebRTC (`fmtp` / `setParameters`); complexity, signal mode, VBR mode
   and expected loss are only controllable in the native, Unity and Unreal SDKs
@@ -239,6 +248,13 @@ the chapter that explains the boundary.
   server-mixer loss simulation; no listening test, no real lossy network and no measurement of
   OSCE's effect on perceived quality has been run from this repository. `osce_bwe` depends on
   the libopus build and reads back `false` where it is not compiled in.
+* **QUIC is exercised on one host.** Bind, authenticated media both ways, 0-RTT resume, stale
+  connection refusal, early-data replay, wrong pin / wrong key, connection cap, the disabled-QUIC
+  node, socket migration through `network_changed()`, fallback to the tunnel and back, IPv4 and
+  IPv6 loopback are all tested in-process and against live nodes — on Linux loopback. No real
+  Wi-Fi ↔ cellular hand-over, no lossy WAN, no measurement of head-of-line gains against the
+  tunnel and no NAT with a short UDP timeout have been run from this repository
+  ([QUIC](api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)).
 * **Admin SSO against real identity providers.** The OIDC relying party is exercised end to end
   against the repository's mock provider (discovery, PKCE, nonce, JWKS rotation, userinfo,
   role mapping) and follows the OpenID Connect Core rules, but no Keycloak / Entra ID / Okta /

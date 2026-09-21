@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
 struct Env {
     api: String,
@@ -42,11 +43,15 @@ fn env() -> Option<Env> {
 /// Silently drops every UDP datagram one server media port sends back to this host
 /// (`sudo iptables`), so a client of that node sees a UDP black hole — its packets leave, the
 /// server even processes them, nothing returns — while other nodes stay reachable. Removes
-/// the rule again on drop (also when the test panics).
+/// the rule again on drop (also when the test panics). The rule is host-global, so tests that
+/// block a port hold [`FIREWALL`] for writing and every other test holds it for reading: the
+/// ordinary tests still run in parallel, a firewall test never overlaps anything.
 struct UdpBlock {
     port: u16,
     active: bool,
 }
+
+static FIREWALL: RwLock<()> = RwLock::const_new(());
 
 impl UdpBlock {
     fn rule(port: u16) -> [String; 7] {
@@ -335,6 +340,7 @@ async fn native_clients_talk_chat_resume_and_leave() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.read().await;
     let http = reqwest::Client::new();
     let channel = create_channel(&env, &http).await;
     let (alice_token, alice_id) = issue_token(&env, &http, "native-alice", "Alice", channel).await;
@@ -579,6 +585,7 @@ async fn native_client_follows_channel_audio_policy() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.read().await;
     let http = reqwest::Client::new();
     let channel = create_channel_with(
         &env,
@@ -798,7 +805,9 @@ async fn native_client_follows_channel_audio_policy() {
 
 /// Media over the control WebSocket when UDP is unusable. Alice sits on the second node
 /// (`AURIX_E2E_WS2`, default `ws://127.0.0.1:8091`, media UDP `AURIX_E2E_UDP2`, default 10002),
-/// Bob on the first one over plain UDP, so the tunnelled uplink also crosses the cascade.
+/// Bob on the first one over plain UDP (`quic = false`), so the tunnelled uplink also crosses
+/// the cascade. The second node runs with `AURIX__MEDIA__QUIC=false` so Alice's `Auto` is the
+/// pre-QUIC UDP → tunnel dance; the QUIC variant is `native_client_prefers_quic_migrates_and_falls_back`.
 ///
 /// 1. `TunnelOnly`: bind, both directions of audio, heartbeats, REST `media_path = tunnel`.
 /// 2. With `AURIX_E2E_SUDO_IPTABLES=1` the host drops UDP to Alice's node: `Auto` falls back
@@ -811,6 +820,7 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.write().await;
     let env2 = Env {
         api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
         ws: std::env::var("AURIX_E2E_WS2").unwrap_or_else(|_| "ws://127.0.0.1:8091".into()),
@@ -828,6 +838,7 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     let mut bob_cfg = ClientConfig::new(ws_with_path(&env.ws), bob_token);
     bob_cfg.heartbeat_interval = Duration::from_millis(500);
     bob_cfg.dsp = DspConfig::BYPASS;
+    bob_cfg.quic = false;
     let bob = Client::new(bob_cfg).unwrap();
     bob.connect().unwrap();
     wait_for(&bob, "bob media", Duration::from_secs(10), |e| {
@@ -968,7 +979,7 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
         unreachable!()
     };
     eprintln!("fell back to the tunnel after {:?}: {reason}", t0.elapsed());
-    assert!(reason.contains("UDP bind failed"), "{reason}");
+    assert!(reason.contains("bind failed"), "{reason}");
     let session = alice.session().unwrap();
     assert_eq!(
         session_media_path(&env2, &http, &session.session_id.to_string()).await,
@@ -1089,6 +1100,423 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     bob.disconnect();
 }
 
+/// Reads one plain (label-free or exact-label) sample from a node's `/metrics`; a series that
+/// has not been touched yet reads as zero.
+async fn metric(http: &reqwest::Client, url: &str, name: &str) -> f64 {
+    let body = http
+        .get(url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    body.lines()
+        .find_map(|l| {
+            l.strip_prefix(name)
+                .and_then(|rest| rest.trim().parse::<f64>().ok())
+        })
+        .unwrap_or(0.0)
+}
+
+/// QUIC media end to end. Alice talks to the first node, which offers QUIC; Bob sits on the
+/// second node (`AURIX_E2E_WS2`, default `ws://127.0.0.1:8091`), started with
+/// `AURIX__MEDIA__QUIC=false`, so his `Auto` session stays on raw UDP and the audio also
+/// crosses the cascade.
+///
+/// 1. `Auto` on a QUIC node binds over QUIC (`SessionInfo::media_quic`, REST `media_path =
+///    quic`), audio flows both ways, heartbeats are answered on the QUIC path.
+/// 2. `network_changed()` migrates the QUIC connection to a new local port: same session, same
+///    SSRC, no new bind, audio keeps flowing (the node counts one migration).
+/// 3. A control-plane drop resumes the same session and re-binds media over QUIC with 0-RTT
+///    (the TLS ticket from the first connection is reused).
+/// 4. `QuicOnly` binds on the QUIC node and is refused by the node without QUIC; `quic = false`
+///    keeps `Auto` on UDP against the QUIC node.
+/// 5. With `AURIX_E2E_SUDO_IPTABLES=1` the host drops UDP from Alice's node: the QUIC session
+///    falls back to the tunnel mid-session and moves back to QUIC when the block lifts.
+///
+/// `AURIX_E2E_METRICS` (e.g. `http://127.0.0.1:4040/metrics`) enables the node-side counter
+/// checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_client_prefers_quic_migrates_and_falls_back() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let _firewall = FIREWALL.write().await;
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: std::env::var("AURIX_E2E_WS2").unwrap_or_else(|_| "ws://127.0.0.1:8091".into()),
+        api_key: env.api_key.clone(),
+    };
+    let udp1: u16 = std::env::var("AURIX_E2E_UDP")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(10000);
+    let metrics = std::env::var("AURIX_E2E_METRICS").ok();
+    let http = reqwest::Client::new();
+    let channel = create_channel(&env, &http).await;
+    let (alice_token, alice_id) = issue_token(&env, &http, "quic-alice", "Alice", channel).await;
+    let (bob_token, bob_id) = issue_token(&env, &http, "quic-bob", "Bob", channel).await;
+    let (carol_token, _) = issue_token(&env, &http, "quic-carol", "Carol", channel).await;
+    let (dave_token, _) = issue_token(&env, &http, "quic-dave", "Dave", channel).await;
+
+    // Bob: Auto on the node without QUIC → raw UDP, `media_quic` not advertised.
+    let mut bob_cfg = ClientConfig::new(ws_with_path(&env2.ws), bob_token);
+    bob_cfg.heartbeat_interval = Duration::from_millis(500);
+    bob_cfg.dsp = DspConfig::BYPASS;
+    let bob = Client::new(bob_cfg).unwrap();
+    bob.connect().unwrap();
+    let Event::SessionReady(bob_session) =
+        wait_for(&bob, "bob session", Duration::from_secs(10), |e| {
+            matches!(e, Event::SessionReady(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        !bob_session.media_quic,
+        "second node must run with quic = false for this test: {bob_session:?}"
+    );
+    wait_for(&bob, "bob media", Duration::from_secs(10), |e| {
+        matches!(e, Event::MediaBound)
+    })
+    .await;
+    assert_eq!(bob.media_path(), Some(MediaPath::Udp));
+    bob.join_channel(channel, None).unwrap();
+    wait_for(&bob, "bob join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await;
+
+    async fn check_audio(alice: &Client, bob: &Client, label: &str) {
+        let (rms, active) = stream_tone(alice, bob, 1.2).await;
+        eprintln!("[{label}] bob heard rms={rms:.3} over {active} frames");
+        assert!(
+            active >= 30 && (0.15..0.35).contains(&rms),
+            "[{label}] alice → bob: rms={rms} active={active}"
+        );
+        let (rms, active) = stream_tone(bob, alice, 1.2).await;
+        eprintln!("[{label}] alice heard rms={rms:.3} over {active} frames");
+        assert!(
+            active >= 30 && (0.15..0.35).contains(&rms),
+            "[{label}] bob → alice: rms={rms} active={active}"
+        );
+    }
+
+    // --- 1. Alice: Auto on the QUIC node binds over QUIC.
+    let proxy = Proxy::start(ws_upstream(&env.ws)).await;
+    let mut alice_cfg = ClientConfig::new(ws_url_via(&proxy, &ws_with_path(&env.ws)), alice_token);
+    alice_cfg.heartbeat_interval = Duration::from_millis(500);
+    alice_cfg.udp_fallback_lost_heartbeats = 3;
+    alice_cfg.udp_reprobe_interval = Duration::from_secs(3);
+    alice_cfg.reconnect.initial_delay = Duration::from_millis(200);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    let alice = Client::new(alice_cfg).unwrap();
+    alice.connect().unwrap();
+    let Event::SessionReady(session) =
+        wait_for(&alice, "alice session", Duration::from_secs(10), |e| {
+            matches!(e, Event::SessionReady(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        session.media_quic,
+        "node does not offer QUIC media: {session:?}"
+    );
+    assert!(
+        session.media_tunnel,
+        "node does not offer the media tunnel: {session:?}"
+    );
+    let Event::MediaPathChanged { reason, .. } =
+        wait_for(&alice, "alice quic", Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(reason.starts_with("QUIC bound"), "{reason}");
+    eprintln!("first bind: {reason}");
+    assert_eq!(alice.state(), ConnectionState::MediaBound);
+    assert_eq!(alice.media_path(), Some(MediaPath::Quic));
+    assert_eq!(
+        session_media_path(&env, &http, &session.session_id.to_string()).await,
+        "quic"
+    );
+    alice.join_channel(channel, None).unwrap();
+    wait_for(&alice, "alice join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { participants, .. }
+            if participants.iter().any(|p| p.user_id == bob_id))
+    })
+    .await;
+    wait_for(
+        &bob,
+        "alice joined",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ParticipantJoined { participant, .. } if participant.user_id == alice_id),
+    )
+    .await;
+    check_audio(&alice, &bob, "quic").await;
+    let stats = alice.stats();
+    assert_eq!(stats.media_path, Some(MediaPath::Quic), "{stats:?}");
+    assert!(
+        stats.media.rtt_samples > 0 && stats.media.rtt_ms > 0.0,
+        "{stats:?}"
+    );
+    assert_eq!(stats.media.heartbeats_lost_consecutive, 0, "{stats:?}");
+    assert!(
+        stats.media.bad_auth == 0 && stats.media.replayed == 0 && stats.media.uplink_dropped == 0,
+        "{stats:?}"
+    );
+    if let Some(m) = &metrics {
+        assert!(metric(&http, m, "aurix_quic_sessions ").await >= 1.0);
+        assert!(metric(&http, m, "aurix_quic_connections ").await >= 1.0);
+    }
+
+    // --- 2. Network change: the QUIC connection migrates to a new local port in place.
+    let migrations_before = match &metrics {
+        Some(m) => metric(&http, m, "aurix_quic_migrations_total ").await,
+        None => 0.0,
+    };
+    let t0 = Instant::now();
+    alice.network_changed().unwrap();
+    let Event::MediaPathChanged { reason, path } =
+        wait_for(&alice, "migration", Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("migrated after {:?}: {reason}", t0.elapsed());
+    assert_eq!(path, MediaPath::Quic);
+    assert!(reason.contains("migrated"), "{reason}");
+    let after = alice.session().unwrap();
+    assert_eq!(after.session_id, session.session_id);
+    assert_eq!(after.ssrc, session.ssrc);
+    assert_eq!(
+        session_media_path(&env, &http, &session.session_id.to_string()).await,
+        "quic"
+    );
+    check_audio(&alice, &bob, "migrated").await;
+    let stats = alice.stats();
+    assert_eq!(stats.media.heartbeats_lost_consecutive, 0, "{stats:?}");
+    assert_eq!(stats.media.bad_auth, 0, "{stats:?}");
+    if let Some(m) = &metrics {
+        let now = metric(&http, m, "aurix_quic_migrations_total ").await;
+        assert!(now > migrations_before, "{migrations_before} → {now}");
+    }
+
+    // --- 3. Control-plane drop: resume re-binds media over QUIC with the 0-RTT ticket.
+    let zero_rtt_before = match &metrics {
+        Some(m) => {
+            metric(
+                &http,
+                m,
+                "aurix_quic_handshakes_total{outcome=\"accepted_0rtt\"}",
+            )
+            .await
+        }
+        None => 0.0,
+    };
+    proxy.kill();
+    wait_for(&alice, "recovering", Duration::from_secs(15), |e| {
+        matches!(e, Event::Recovering { .. })
+    })
+    .await;
+    let t0 = Instant::now();
+    let Event::MediaPathChanged { reason, path } =
+        wait_for(&alice, "rebound", Duration::from_secs(15), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("resumed in {:?}: {reason}", t0.elapsed());
+    assert_eq!(path, MediaPath::Quic);
+    assert_eq!(reason, "QUIC bound (0-RTT)");
+    let recovered = wait_for(&alice, "recovered", Duration::from_secs(15), |e| {
+        matches!(e, Event::Recovered { .. })
+    })
+    .await;
+    assert!(
+        matches!(recovered, Event::Recovered { resumed: true, .. }),
+        "{recovered:?}"
+    );
+    let after = alice.session().unwrap();
+    assert_eq!(after.session_id, session.session_id);
+    assert_eq!(after.ssrc, session.ssrc);
+    assert_eq!(alice.joined_channels(), vec![channel]);
+    while let Some(ev) = bob.poll_event() {
+        assert!(
+            !matches!(ev, Event::ParticipantLeft { user_id, .. } if user_id == alice_id),
+            "bob saw alice leave during resume"
+        );
+    }
+    check_audio(&alice, &bob, "resumed-0rtt").await;
+    if let Some(m) = &metrics {
+        let now = metric(
+            &http,
+            m,
+            "aurix_quic_handshakes_total{outcome=\"accepted_0rtt\"}",
+        )
+        .await;
+        assert!(now > zero_rtt_before, "{zero_rtt_before} → {now}");
+    }
+    let stats = alice.stats();
+    assert!(
+        stats.media.bad_auth == 0 && stats.media.replayed == 0,
+        "{stats:?}"
+    );
+
+    // --- 4. Policies: QuicOnly works on the QUIC node and is refused by the other one;
+    //        `quic = false` keeps Auto on UDP against the QUIC node.
+    let mut carol_cfg = ClientConfig::new(ws_with_path(&env.ws), carol_token.clone());
+    carol_cfg.media_path = MediaPathPolicy::QuicOnly;
+    carol_cfg.heartbeat_interval = Duration::from_millis(500);
+    let carol = Client::new(carol_cfg).unwrap();
+    carol.connect().unwrap();
+    let Event::MediaPathChanged { reason, path } =
+        wait_for(&carol, "carol quic-only", Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(path, MediaPath::Quic, "{reason}");
+    assert_eq!(
+        session_media_path(
+            &env,
+            &http,
+            &carol.session().unwrap().session_id.to_string()
+        )
+        .await,
+        "quic"
+    );
+    carol.disconnect();
+
+    let mut carol_cfg = ClientConfig::new(ws_with_path(&env2.ws), carol_token);
+    carol_cfg.media_path = MediaPathPolicy::QuicOnly;
+    carol_cfg.reconnect.max_attempts = 1;
+    let carol = Client::new(carol_cfg).unwrap();
+    carol.connect().unwrap();
+    let refused = wait_for(&carol, "carol refused", Duration::from_secs(10), |e| {
+        matches!(e, Event::Recovering { .. } | Event::Disconnected { .. })
+    })
+    .await;
+    match &refused {
+        Event::Recovering { cause, .. } => assert!(cause.contains("QUIC-only"), "{cause}"),
+        Event::Disconnected { reason } => assert!(reason.contains("QUIC-only"), "{reason}"),
+        _ => unreachable!(),
+    }
+    assert_ne!(carol.media_path(), Some(MediaPath::Quic));
+    carol.disconnect();
+
+    let mut dave_cfg = ClientConfig::new(ws_with_path(&env.ws), dave_token);
+    dave_cfg.quic = false;
+    dave_cfg.heartbeat_interval = Duration::from_millis(500);
+    let dave = Client::new(dave_cfg).unwrap();
+    dave.connect().unwrap();
+    let Event::MediaPathChanged { reason, path } =
+        wait_for(&dave, "dave udp", Duration::from_secs(10), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(path, MediaPath::Udp, "{reason}");
+    assert!(dave.session().unwrap().media_quic);
+    assert_eq!(
+        session_media_path(&env, &http, &dave.session().unwrap().session_id.to_string()).await,
+        "udp"
+    );
+    dave.disconnect();
+
+    if std::env::var("AURIX_E2E_SUDO_IPTABLES").is_err() {
+        eprintln!("AURIX_E2E_SUDO_IPTABLES not set; skipping the blocked-UDP part");
+        alice.disconnect();
+        bob.disconnect();
+        return;
+    }
+
+    // --- 5. The host drops everything Alice's node sends over UDP (QUIC included): the QUIC
+    //        session falls back to the tunnel, and the re-probe brings it back to QUIC.
+    let mut block = UdpBlock::new(udp1);
+    block.block();
+    let t0 = Instant::now();
+    let Event::MediaPathChanged { reason, .. } =
+        wait_for(&alice, "quic → tunnel", Duration::from_secs(30), |e| {
+            matches!(
+                e,
+                Event::MediaPathChanged {
+                    path: MediaPath::Tunnel,
+                    ..
+                }
+            )
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("fell back to the tunnel after {:?}: {reason}", t0.elapsed());
+    assert!(reason.contains("QUIC"), "{reason}");
+    assert_eq!(
+        session_media_path(&env, &http, &session.session_id.to_string()).await,
+        "tunnel"
+    );
+    assert_eq!(alice.session().unwrap().session_id, session.session_id);
+    check_audio(&alice, &bob, "quic→tunnel").await;
+
+    block.unblock();
+    let t0 = Instant::now();
+    let Event::MediaPathChanged { reason, .. } =
+        wait_for(&alice, "back to QUIC", Duration::from_secs(30), |e| {
+            matches!(
+                e,
+                Event::MediaPathChanged {
+                    path: MediaPath::Quic,
+                    ..
+                }
+            )
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("moved back to QUIC after {:?}: {reason}", t0.elapsed());
+    assert!(reason.contains("re-probe"), "{reason}");
+    assert_eq!(
+        session_media_path(&env, &http, &session.session_id.to_string()).await,
+        "quic"
+    );
+    check_audio(&alice, &bob, "reprobed-quic").await;
+    let stats = alice.stats();
+    assert!(
+        stats.media.bad_auth == 0 && stats.media.replayed == 0,
+        "{stats:?}"
+    );
+    eprintln!("final stats: {stats:?}");
+
+    alice.disconnect();
+    wait_for(
+        &bob,
+        "alice gone",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ParticipantLeft { user_id, .. } if *user_id == alice_id),
+    )
+    .await;
+    bob.disconnect();
+}
+
 /// Large-channel path end to end through the native core: Alice speaks, Bob asks for the
 /// server mix and hears the tone on one synthetic stereo stream (Alice's SSRC never reaches
 /// his mixer), Carol joins with `speak: false` and is a hidden listener — receive-only,
@@ -1099,6 +1527,7 @@ async fn native_client_takes_a_server_mixed_downlink_and_listener_role() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.read().await;
     let http = reqwest::Client::new();
     let channel = create_channel_with(
         &env,
@@ -1314,6 +1743,7 @@ async fn native_stereo_uplink_keeps_the_image_and_stays_mono_elsewhere() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.read().await;
     let http = reqwest::Client::new();
     let music = create_channel_with(
         &env,
@@ -1555,6 +1985,7 @@ async fn native_per_participant_pull_keeps_claimed_talkers_out_of_the_mix() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.read().await;
     let http = reqwest::Client::new();
     let channel = create_channel(&env, &http).await;
     let (alice_token, alice_id) = issue_token(&env, &http, "pull-alice", "Alice", channel).await;
@@ -1665,6 +2096,7 @@ async fn native_group_e2ee_rotates_on_join_and_leave_and_refuses_plaintext() {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
     };
+    let _firewall = FIREWALL.read().await;
     let http = reqwest::Client::new();
     let channel = create_channel_with(&env, &http, serde_json::json!({"e2ee": true})).await;
     let (alice_token, alice_id) =
@@ -1817,12 +2249,19 @@ async fn native_group_e2ee_rotates_on_join_and_leave_and_refuses_plaintext() {
         matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == dave_id)
     })
     .await;
-    for peer in [alice_id, bob_id] {
-        wait_for(&dave, "dave decrypts", Duration::from_secs(10), |e| {
-            matches!(e, Event::E2eePeerDecryptable { user_id, decryptable: true } if *user_id == peer)
-        })
-        .await;
-    }
+    // The two peers' keys arrive in either order.
+    let mut pending = vec![alice_id, bob_id];
+    wait_for(&dave, "dave decrypts", Duration::from_secs(10), |e| {
+        if let Event::E2eePeerDecryptable {
+            user_id,
+            decryptable: true,
+        } = e
+        {
+            pending.retain(|p| p != user_id);
+        }
+        pending.is_empty()
+    })
+    .await;
     let (rms, active) = stream_tone(&dave, &alice, 1.0).await;
     eprintln!("alice heard dave rms={rms:.3} over {active} frames");
     assert!(

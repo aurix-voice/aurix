@@ -1,23 +1,29 @@
 //! Native AURX v2 media transport: signed `SessionBind`, AES-CTR + HMAC on every packet,
-//! per-sender replay windows, heartbeats with RTT measurement — over one of two links:
+//! per-sender replay windows, heartbeats with RTT measurement — over one of three links:
 //!
-//! * **UDP** (default): one socket per session; the receive loop runs on a dedicated OS thread
+//! * **QUIC** (preferred when the node offers it): the same sealed packets, one per QUIC
+//!   DATAGRAM, on a connection pinned to the node's advertised certificate. Buys 0-RTT
+//!   reconnects (resumption tickets are kept per node) and connection migration
+//!   ([`MediaTransport::rebind`]) on top of UDP; no head-of-line blocking (no streams).
+//! * **UDP**: one socket per session; the receive loop runs on a dedicated OS thread
 //!   (no runtime hop between the socket and the mixer).
 //! * **Tunnel**: the same sealed packets as binary frames on the control WebSocket, for
 //!   networks that block UDP. Uplink packets are queued to the control task (bounded, drop on
 //!   overflow), downlink frames are handed in by the control task through
 //!   [`MediaTransport::handle_frame`]. TCP head-of-line blocking applies.
 //!
-//! Both links share the uplink sequence counter so a mid-session switch keeps the server's
+//! All links share the uplink sequence counter so a mid-session switch keeps the server's
 //! replay window happy.
 
 use aurix_common::crypto::MediaKeys;
 use aurix_common::protocol::{
-    AurixPacket, PacketFlags, PacketHeader, PacketType, ReplayWindow, MAX_PACKET_SIZE,
+    AurixPacket, PacketFlags, PacketHeader, PacketType, QuicInfo, ReplayWindow, MAX_PACKET_SIZE,
 };
+use aurix_common::quic::{client_config, client_tls_config, endpoint_config};
 use aurix_common::types::{AudioCodec, Direction, SessionId};
 use bytes::Bytes;
 use parking_lot::Mutex;
+use quinn::rustls;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -36,20 +42,25 @@ pub enum MediaPath {
     Udp,
     /// Native AURX as binary frames on the control WebSocket (UDP blocked).
     Tunnel,
+    /// Native AURX as QUIC datagrams on the node's media port (0-RTT, migration).
+    Quic,
 }
 
 /// Link selection policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaPathPolicy {
-    /// UDP first; fall back to the tunnel when the UDP bind fails or heartbeats stop being
-    /// acknowledged, and re-probe UDP periodically while tunnelled.
+    /// QUIC when the node offers it (and `ClientConfig::quic`), then raw UDP; fall back to
+    /// the tunnel when neither binds or heartbeats stop being acknowledged, and re-probe the
+    /// native links periodically while tunnelled.
     #[default]
     Auto,
     /// UDP only; a blocked UDP path fails the connection as before.
     UdpOnly,
     /// Tunnel only (testing, or hosts known to block UDP).
     TunnelOnly,
+    /// QUIC only; a node without QUIC (or a blocked port) fails the connection.
+    QuicOnly,
 }
 
 /// Shared uplink sequence counter: one per session, handed to every link the session uses.
@@ -208,6 +219,49 @@ fn split_host_port(s: &str) -> Option<(&str, u16)> {
 /// (~1.3 s of audio at 20 ms frames).
 pub const TUNNEL_UPLINK_QUEUE: usize = 64;
 
+/// Datagram queue depth of the QUIC link, in packets, both directions.
+pub const QUIC_QUEUE_PACKETS: usize = 64;
+
+/// Client TLS state for one node: certificate pin plus the resumption tickets rustls stores
+/// in the `ClientConfig`. Keep it across reconnects to the same node (same fingerprint) —
+/// that is what lets the next QUIC connection start with 0-RTT.
+pub struct QuicClientState {
+    fingerprint: String,
+    tls: Arc<rustls::ClientConfig>,
+}
+
+impl std::fmt::Debug for QuicClientState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicClientState")
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+impl QuicClientState {
+    /// Reuses `existing` when it was built for the same certificate, otherwise pins the new
+    /// one (a different node after a failover, or a rotated certificate).
+    pub fn for_node(
+        existing: Option<&Arc<Self>>,
+        info: &QuicInfo,
+    ) -> Result<Arc<Self>, ClientError> {
+        if let Some(state) = existing {
+            if state.fingerprint == info.cert_sha256 {
+                return Ok(Arc::clone(state));
+            }
+        }
+        let tls = client_tls_config(info).map_err(|e| ClientError::Transport(e.to_string()))?;
+        Ok(Arc::new(Self {
+            fingerprint: info.cert_sha256.clone(),
+            tls,
+        }))
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
 enum Link {
     Udp {
         socket: UdpSocket,
@@ -215,6 +269,13 @@ enum Link {
     },
     Tunnel {
         uplink: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    Quic {
+        endpoint: quinn::Endpoint,
+        conn: quinn::Connection,
+        server: SocketAddr,
+        /// The bind went out as 0-RTT early data and the node accepted it.
+        zero_rtt: AtomicBool,
     },
 }
 
@@ -237,6 +298,7 @@ pub struct MediaTransport {
     started: Instant,
     sink: Mutex<Option<Sink>>,
     recv_thread: Mutex<Option<JoinHandle<()>>>,
+    recv_task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl MediaTransport {
@@ -322,6 +384,126 @@ impl MediaTransport {
         Ok(me)
     }
 
+    /// Open a QUIC connection to the node's media port (certificate pinned to
+    /// `info.cert_sha256`) and authenticate it with `SessionBind` → `SessionBindAck`, retrying
+    /// the bind `attempts` times with `timeout` each (the handshake itself gets one `timeout`).
+    /// With a resumption ticket for this node in `state`, the bind goes out as 0-RTT early
+    /// data; if the node declines early data the bind is simply sent again once the handshake
+    /// completes. Must run inside a Tokio runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_quic(
+        server: SocketAddr,
+        info: &QuicInfo,
+        state: &QuicClientState,
+        session_id: SessionId,
+        ssrc: u32,
+        media_key: &[u8],
+        sequence: SequenceCounter,
+        attempts: u32,
+        timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        let transport_err =
+            |e: &dyn std::fmt::Display| ClientError::Transport(format!("QUIC: {e}"));
+        let socket = UdpSocket::bind(unspecified_for(server)).map_err(|e| transport_err(&e))?;
+        let mut endpoint = quinn::Endpoint::new(
+            endpoint_config(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| transport_err(&e))?;
+        endpoint.set_default_client_config(
+            client_config(
+                Arc::clone(&state.tls),
+                idle_timeout,
+                QUIC_QUEUE_PACKETS,
+                None,
+            )
+            .map_err(|e| transport_err(&e))?,
+        );
+        let connecting = endpoint
+            .connect(server, &info.server_name)
+            .map_err(|e| transport_err(&e))?;
+        let (conn, mut early) = match connecting.into_0rtt() {
+            Ok((conn, accepted)) => (conn, Some(Box::pin(accepted))),
+            Err(connecting) => {
+                let conn = tokio::time::timeout(timeout, connecting)
+                    .await
+                    .map_err(|_| ClientError::Timeout("QUIC handshake".into()))?
+                    .map_err(|e| transport_err(&e))?;
+                (conn, None)
+            }
+        };
+        if conn.max_datagram_size().is_none() {
+            conn.close(quinn::VarInt::from_u32(0), b"no datagram support");
+            return Err(ClientError::Protocol(
+                "QUIC peer does not support datagrams".into(),
+            ));
+        }
+
+        let me = Self::new(
+            Link::Quic {
+                endpoint,
+                conn: conn.clone(),
+                server,
+                zero_rtt: AtomicBool::new(false),
+            },
+            session_id,
+            ssrc,
+            MediaKeys::derive(media_key),
+            sequence,
+        );
+        let mut zero_rtt_accepted = false;
+        'attempts: for _ in 0..attempts.max(1) {
+            me.send_bind();
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                tokio::select! {
+                    accepted = async { early.as_mut().expect("guarded").await }, if early.is_some() => {
+                        early = None;
+                        zero_rtt_accepted = accepted;
+                        if !accepted {
+                            // Early data was discarded; the bind must go again in 1-RTT.
+                            me.send_bind();
+                        }
+                    }
+                    datagram = tokio::time::timeout_at(deadline, conn.read_datagram()) => {
+                        match datagram {
+                            Err(_) => break,
+                            Ok(Err(e)) => {
+                                return Err(ClientError::Transport(format!(
+                                    "QUIC connection lost during bind: {e}"
+                                )))
+                            }
+                            Ok(Ok(data)) => {
+                                if me.process(&data, None) == FrameKind::BindAck {
+                                    break 'attempts;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !me.is_bound() {
+            conn.close(quinn::VarInt::from_u32(0), b"no SessionBindAck");
+            return Err(ClientError::Transport(
+                "no SessionBindAck from media server over QUIC".into(),
+            ));
+        }
+        if let Some(accepted) = early.take() {
+            // The ack came back, so the handshake is complete and this resolves at once.
+            zero_rtt_accepted = tokio::time::timeout(Duration::from_millis(50), accepted)
+                .await
+                .unwrap_or(false);
+        }
+        if let Link::Quic { zero_rtt, .. } = &me.link {
+            zero_rtt.store(zero_rtt_accepted, Ordering::Relaxed);
+        }
+        Ok(me)
+    }
+
     /// A transport whose packets travel as binary frames on the control WebSocket. Unbound
     /// until the control task has sent [`Self::bind_packet`] and fed the `SessionBindAck`
     /// back through [`Self::handle_frame`].
@@ -364,6 +546,7 @@ impl MediaTransport {
             started: Instant::now(),
             sink: Mutex::new(None),
             recv_thread: Mutex::new(None),
+            recv_task: Mutex::new(None),
         }
     }
 
@@ -371,6 +554,56 @@ impl MediaTransport {
         match self.link {
             Link::Udp { .. } => MediaPath::Udp,
             Link::Tunnel { .. } => MediaPath::Tunnel,
+            Link::Quic { .. } => MediaPath::Quic,
+        }
+    }
+
+    /// QUIC link whose `SessionBind` was accepted as 0-RTT early data (`false` elsewhere).
+    pub fn zero_rtt(&self) -> bool {
+        match &self.link {
+            Link::Quic { zero_rtt, .. } => zero_rtt.load(Ordering::Relaxed),
+            _ => false,
+        }
+    }
+
+    /// The QUIC connection is gone (idle timeout, closed by the node, transport error);
+    /// always `false` for the other links, whose liveness is judged by heartbeats.
+    pub fn is_closed(&self) -> bool {
+        match &self.link {
+            Link::Quic { conn, .. } => conn.close_reason().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Why the QUIC connection closed, once it has.
+    pub fn close_reason(&self) -> Option<String> {
+        match &self.link {
+            Link::Quic { conn, .. } => conn.close_reason().map(|e| e.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Moves a QUIC link to a fresh local socket (new source port, and the interface the OS
+    /// now routes through): QUIC connection migration for a network change. The connection,
+    /// session binding, sequence counter and replay state all continue. Returns the new local
+    /// address; `Err` for UDP/tunnel links (the caller re-binds those instead).
+    pub fn rebind(&self) -> Result<SocketAddr, ClientError> {
+        match &self.link {
+            Link::Quic {
+                endpoint, server, ..
+            } => {
+                let socket = UdpSocket::bind(unspecified_for(*server))
+                    .map_err(|e| ClientError::Transport(format!("QUIC rebind: {e}")))?;
+                endpoint
+                    .rebind(socket)
+                    .map_err(|e| ClientError::Transport(format!("QUIC rebind: {e}")))?;
+                endpoint
+                    .local_addr()
+                    .map_err(|e| ClientError::Transport(format!("QUIC rebind: {e}")))
+            }
+            _ => Err(ClientError::InvalidArgument(
+                "only the QUIC link migrates in place".into(),
+            )),
         }
     }
 
@@ -391,10 +624,10 @@ impl MediaTransport {
         .to_vec()
     }
 
-    /// Server address of the UDP link.
+    /// Server address of the UDP / QUIC link.
     pub fn server(&self) -> Option<SocketAddr> {
         match &self.link {
-            Link::Udp { server, .. } => Some(*server),
+            Link::Udp { server, .. } | Link::Quic { server, .. } => Some(*server),
             Link::Tunnel { .. } => None,
         }
     }
@@ -406,6 +639,7 @@ impl MediaTransport {
     pub fn local_addr(&self) -> Option<SocketAddr> {
         match &self.link {
             Link::Udp { socket, .. } => socket.local_addr().ok(),
+            Link::Quic { endpoint, .. } => endpoint.local_addr().ok(),
             Link::Tunnel { .. } => None,
         }
     }
@@ -426,18 +660,36 @@ impl MediaTransport {
     }
 
     /// Start delivering authenticated audio frames to `sink`: spawns the receive thread on
-    /// UDP; on a tunnel the control task feeds frames through [`Self::handle_frame`].
+    /// UDP, a receive task (on the current Tokio runtime) on QUIC; on a tunnel the control
+    /// task feeds frames through [`Self::handle_frame`].
     pub fn start(self: &Arc<Self>, sink: Sink) {
         *self.sink.lock() = Some(Arc::clone(&sink));
-        if !matches!(self.link, Link::Udp { .. }) {
-            return;
+        match &self.link {
+            Link::Udp { .. } => {
+                let me = Arc::clone(self);
+                let handle = std::thread::Builder::new()
+                    .name("aurix-media-rx".into())
+                    .spawn(move || me.recv_loop(sink))
+                    .expect("spawn media receive thread");
+                *self.recv_thread.lock() = Some(handle);
+            }
+            Link::Quic { conn, .. } => {
+                let me = Arc::clone(self);
+                let conn = conn.clone();
+                let task = tokio::spawn(async move {
+                    while !me.stop.load(Ordering::Relaxed) {
+                        match conn.read_datagram().await {
+                            Ok(data) => {
+                                me.process(&data, Some(&sink));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                *self.recv_task.lock() = Some(task.abort_handle());
+            }
+            Link::Tunnel { .. } => {}
         }
-        let me = Arc::clone(self);
-        let handle = std::thread::Builder::new()
-            .name("aurix-media-rx".into())
-            .spawn(move || me.recv_loop(sink))
-            .expect("spawn media receive thread");
-        *self.recv_thread.lock() = Some(handle);
     }
 
     fn recv_loop(&self, sink: Sink) {
@@ -562,6 +814,18 @@ impl MediaTransport {
         let len = wire.len() as u64;
         let sent = match &self.link {
             Link::Udp { socket, .. } => socket.send(&wire).is_ok(),
+            Link::Quic { conn, .. } => {
+                if self.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match conn.send_datagram(Bytes::from(wire)) {
+                    Ok(()) => true,
+                    Err(_) => {
+                        self.stats.lock().uplink_dropped += 1;
+                        false
+                    }
+                }
+            }
             Link::Tunnel { uplink } => {
                 if self.stop.load(Ordering::Relaxed) {
                     return;
@@ -704,8 +968,8 @@ impl MediaTransport {
         self.replay.lock().remove(&ssrc);
     }
 
-    /// Stop receiving: joins the UDP thread; a tunnelled transport ignores further frames and
-    /// stops queueing uplink packets.
+    /// Stop receiving: joins the UDP thread, closes the QUIC connection; a tunnelled transport
+    /// ignores further frames and stops queueing uplink packets.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.bound.store(false, Ordering::Relaxed);
@@ -714,12 +978,29 @@ impl MediaTransport {
                 let _ = h.join();
             }
         }
+        if let Some(task) = self.recv_task.lock().take() {
+            task.abort();
+        }
+        if let Link::Quic { conn, .. } = &self.link {
+            conn.close(quinn::VarInt::from_u32(0), b"client stopped");
+        }
     }
 }
 
 impl Drop for MediaTransport {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Link::Quic { conn, .. } = &self.link {
+            conn.close(quinn::VarInt::from_u32(0), b"client dropped");
+        }
+    }
+}
+
+fn unspecified_for(server: SocketAddr) -> SocketAddr {
+    if server.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        ([0u16; 8], 0).into()
     }
 }
 

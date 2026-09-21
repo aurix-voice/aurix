@@ -29,6 +29,9 @@ server = [
     "dep:unicode-normalization",
     "dep:socket2",
 ]
+# QUIC transport parameters + client certificate pinning shared by the media node and the
+# native client (`quic` module).
+quic = ["dep:quinn", "dep:hex"]
 
 [dependencies]
 serde = { workspace = true }
@@ -66,3 +69,5 @@ aho-corasick = { workspace = true, optional = true }
 unicode-normalization = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 x25519-dalek = { workspace = true }
+quinn = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }

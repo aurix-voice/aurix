@@ -138,6 +138,63 @@ remain the JSON control plane. The node advertises support with `SessionInitAck.
 
 Metrics: `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
 
+## QUIC: AURX datagrams with 0-RTT resume and connection migration
+
+Native clients may also carry AURX over **QUIC** (RFC 9000, DATAGRAM extension RFC 9221) to
+the very same media address: the node speaks QUIC, raw AURX and WebRTC on one UDP socket and
+classifies packets by their first byte (server-chosen connection ids start with a byte ≥ 0x80,
+so a QUIC short-header packet can never spell the AURX magic). Nothing about the packets
+changes — **one sealed AURX packet per QUIC DATAGRAM frame**, both directions, no streams
+(`max_concurrent_*_streams = 0`), so a lost datagram never holds up the next one. The node
+advertises the path in `SessionInitAck.quic { cert_sha256, server_name }` (`media.quic`, on by
+default) and reports it as `MediaBound.transport = "quic"` / `GET /v1/sessions/{id}/stats`.
+
+* **Handshake.** TLS 1.3, ALPN `aurix-media/1`, SNI `server_name` (informational). Clients **pin**
+  `cert_sha256` (SHA-256 of the DER certificate) that arrived over the authenticated control
+  WebSocket and ignore the CA chain — the node's self-signed certificate (generated at start
+  unless `media.quic_cert_path`/`quic_key_path` point at a PEM pair) is exactly as secure as an
+  issued one, and no CA can impersonate a node. Session tickets let a client that already
+  talked to the node resume with **0-RTT**: the `SessionBind` travels as early data and its
+  ack comes back with the handshake, so a reconnect costs one round trip in total.
+* **Bind and ownership.** TLS identity is *not* trusted for session ownership. A connection
+  speaks for a session only after an authenticated `SessionBind` (same signature, same
+  `SESSION_BIND_MAX_SKEW_MS` window, timestamp strictly newer than the session's last bind)
+  arrived on it; a connection is owned by exactly one session for its lifetime and a bind for
+  another session on the same connection is refused. Later datagrams are attributed to the
+  connection the session is bound to — never to the source address, which migration changes.
+  The newest bind wins across links: a bind over QUIC moves the session off UDP/tunnel and a
+  later UDP/tunnel bind moves it back, closing the superseded connection; a stale connection
+  (one the session already left) can neither deliver media nor reclaim the session without a
+  fresh, newer bind.
+* **Same checks.** Tag, SSRC, protocol version, replay window and sequence continuity are
+  verified exactly as for UDP, so keep the **same sequence counter** across path changes; the
+  E2EE payload stays opaque to the node; PCMU and mixed downlinks work unchanged.
+* **0-RTT is replayable** at the transport layer, which is why nothing new is derived from
+  early data: a replayed early `SessionBind` fails the strictly-newer-timestamp rule, replayed
+  media/heartbeats fall into the per-session anti-replay window. `media.quic_zero_rtt = false`
+  forces a 1-RTT handshake before any datagram is read.
+* **Migration.** When the client's address changes (Wi-Fi ↔ cellular, NAT rebinding) QUIC path
+  validation moves the connection and the session keeps its id, key, sequence counter, replay
+  and E2EE state — no re-bind, no audible gap beyond the path's own RTT
+  (`aurix_quic_migrations_total`). `media.quic_migration = false` drops migrating connections
+  instead (the client then re-binds like a UDP client).
+* **Downlink.** Sealed per receiver as usual and queued per connection
+  (`media.quic_queue_packets`, 128); a congested path drops *its own* packets
+  (`aurix_quic_packets_total{direction="downlink",outcome="dropped"}`), never anyone else's.
+* **Lifecycle.** Idle timeout `media.quic_idle_timeout_ms` (20 s, ≥ 3 heartbeats); connections
+  above `media.quic_max_connections` (default 2 × `max_participants_per_node`) are refused
+  during the handshake (`aurix_quic_handshakes_total{outcome="refused"}`); the connection is
+  closed when its session ends or is superseded.
+* **Cost.** One TLS handshake per fresh connection (none on 0-RTT resume) and QUIC framing
+  (≈ 1 % of the audio bitrate). Every SDK tries QUIC first, then raw UDP, then the tunnel
+  ([native SDK](../sdk/native.md#when-udp-is-blocked-the-websocket-tunnel)); nodes without
+  `quic` in their `SessionInitAck` and clients that never learned QUIC interoperate as before.
+  WebRTC clients are unaffected.
+
+Metrics: `aurix_quic_connections`, `aurix_quic_sessions`,
+`aurix_quic_handshakes_total{outcome="accepted"|"accepted_0rtt"|"refused"|"failed"}`,
+`aurix_quic_packets_total{direction,outcome}`, `aurix_quic_migrations_total`.
+
 ## What the server does with your packets
 
 * Drops anything from an unbound address, with a bad tag, wrong SSRC, protocol version ≠ 2,

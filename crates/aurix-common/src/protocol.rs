@@ -893,9 +893,14 @@ pub enum ControlMessage {
         /// operator has not configured `[translation]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         translation: Option<TranslationInfo>,
+        /// The media port also speaks QUIC: the same sealed AURX packets as QUIC datagrams
+        /// (`SessionBind` first), with a 0-RTT resume handshake and connection migration when
+        /// the client's address changes. Absent when the node runs UDP/tunnel only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic: Option<QuicInfo>,
     },
     /// Sent by the server once a media path has been authenticated via `SessionBind`:
-    /// `transport` is `udp`, `tunnel` (AURX over this WebSocket) or `webrtc`.
+    /// `transport` is `udp`, `quic`, `tunnel` (AURX over this WebSocket) or `webrtc`.
     MediaBound {
         session_id: SessionId,
         #[serde(default)]
@@ -1462,6 +1467,28 @@ pub struct TranslationInfo {
     /// Target languages listeners may request; empty = any language tag.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
+}
+
+/// QUIC media endpoint of the node (`SessionInitAck.quic`). The endpoint shares the UDP
+/// media port(s) of `media_addrs`; the client authenticates the node by pinning
+/// `cert_sha256` (the node's certificate is self-signed unless the operator installed one)
+/// and offers `server_name` as SNI. ALPN is [`QUIC_ALPN`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct QuicInfo {
+    /// Lowercase hex SHA-256 of the node's DER-encoded end-entity certificate.
+    pub cert_sha256: String,
+    /// TLS server name the client presents (matches the certificate's SAN).
+    pub server_name: String,
+}
+
+/// ALPN token of the native media QUIC endpoint.
+pub const QUIC_ALPN: &[u8] = b"aurix-media/1";
+
+/// The first byte of a QUIC packet has the fixed bit (0x40) set; AURX packets start with the
+/// `MAGIC_BYTES` `A` (0x41, fixed bit set too) so they are told apart by the full magic, and
+/// WebRTC (STUN 0x00–0x03, DTLS 0x14–0x17, RTP/RTCP 0x80–0xBF) never sets it.
+pub fn is_quic_packet(data: &[u8]) -> bool {
+    !data.is_empty() && data[0] & 0x40 != 0 && !is_aurix_packet(data)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

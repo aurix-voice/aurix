@@ -4,7 +4,7 @@
 //! tunnelled (see [`crate::media`]). Connection policy (reconnects, re-joins) lives in
 //! [`crate::client`].
 
-use aurix_common::protocol::{ControlMessage, TranslationInfo};
+use aurix_common::protocol::{ControlMessage, QuicInfo, TranslationInfo};
 use aurix_common::types::{SessionId, UserId};
 use base64::Engine;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -40,6 +40,9 @@ pub struct SessionAck {
     pub resumed: bool,
     /// The node accepts AURX media as binary frames on this WebSocket (UDP-blocked fallback).
     pub media_tunnel: bool,
+    /// The node accepts AURX media as QUIC datagrams on its media port: certificate pin and
+    /// TLS server name to connect with. `None` from nodes without QUIC (or older ones).
+    pub quic: Option<QuicInfo>,
     /// The node offers server-side mixed downlink (`SetDownlinkMode`).
     pub downlink_mix: bool,
     /// Resumed on a different node than the one that opened the session.
@@ -134,7 +137,7 @@ pub struct ControlConnection {
 /// One frame from the server: JSON control (text) or a sealed AURX packet (binary).
 #[derive(Debug)]
 pub enum Inbound {
-    Control(ControlMessage),
+    Control(Box<ControlMessage>),
     Media(Vec<u8>),
 }
 
@@ -196,6 +199,7 @@ impl ControlConnection {
                     resume_grace_ms,
                     resumed,
                     media_tunnel,
+                    quic,
                     downlink_mix,
                     migrated,
                     failover,
@@ -218,6 +222,7 @@ impl ControlConnection {
                         resume_grace: Duration::from_millis(resume_grace_ms),
                         resumed,
                         media_tunnel,
+                        quic,
                         downlink_mix,
                         migrated,
                         failover,
@@ -270,7 +275,7 @@ impl ControlConnection {
                 Some(Err(e)) => return Err(map_ws_error(e)),
                 Some(Ok(Message::Text(text))) => {
                     return serde_json::from_str::<ControlMessage>(&text)
-                        .map(|m| Some(Inbound::Control(m)))
+                        .map(|m| Some(Inbound::Control(Box::new(m))))
                         .map_err(Into::into);
                 }
                 Some(Ok(Message::Binary(data))) => return Ok(Some(Inbound::Media(data))),
@@ -284,7 +289,7 @@ impl ControlConnection {
     pub async fn recv_control(&mut self) -> Result<Option<ControlMessage>> {
         loop {
             match self.recv().await? {
-                Some(Inbound::Control(m)) => return Ok(Some(m)),
+                Some(Inbound::Control(m)) => return Ok(Some(*m)),
                 Some(Inbound::Media(_)) => {}
                 None => return Ok(None),
             }

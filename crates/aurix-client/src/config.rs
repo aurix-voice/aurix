@@ -52,14 +52,19 @@ pub struct ClientConfig {
     pub ping_interval: Duration,
     /// Media heartbeat (NAT keepalive + RTT probe).
     pub heartbeat_interval: Duration,
-    /// Which link carries media: UDP first with the WebSocket tunnel as fallback (default),
-    /// UDP only, or tunnel only.
+    /// Which link carries media: QUIC (when offered) then UDP with the WebSocket tunnel as
+    /// fallback (default), or exactly one of them.
     pub media_path: MediaPathPolicy,
-    /// `Auto` only: unanswered heartbeats in a row on UDP before media moves to the tunnel
-    /// (with the default 5 s heartbeat, 3 ≈ 15 s of silence).
+    /// `Auto` only: try QUIC before raw UDP when the node offers it. Off, `Auto` behaves as
+    /// before QUIC existed (UDP → tunnel); `QuicOnly` ignores this switch.
+    pub quic: bool,
+    /// `Auto` only: unanswered heartbeats in a row on QUIC/UDP before media moves to the
+    /// tunnel (with the default 5 s heartbeat, 3 ≈ 15 s of silence). A QUIC connection the
+    /// node closed or that timed out moves at the next heartbeat regardless.
     pub udp_fallback_lost_heartbeats: u32,
-    /// `Auto` only: how often a tunnelled session re-probes UDP and moves back when it
-    /// answers; zero disables re-probing (the session stays tunnelled until it reconnects).
+    /// `Auto` only: how often a tunnelled session re-probes the native links (QUIC, then UDP)
+    /// and moves back when one answers; zero disables re-probing (the session stays tunnelled
+    /// until it reconnects).
     pub udp_reprobe_interval: Duration,
     /// Uplink Opus encoder before any channel policy applies (bitrate, complexity, bandwidth,
     /// VBR/FEC/DTX).
@@ -110,6 +115,7 @@ impl ClientConfig {
             ping_interval: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(5),
             media_path: MediaPathPolicy::Auto,
+            quic: true,
             udp_fallback_lost_heartbeats: 3,
             udp_reprobe_interval: Duration::from_secs(30),
             encoder: EncoderSettings::default(),

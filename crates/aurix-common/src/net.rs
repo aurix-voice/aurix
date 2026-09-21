@@ -188,6 +188,14 @@ impl FamilyUdpSocket {
         self.socket
             .try_send_to(buf, crate::addr::wire(target, self.family.socket_is_v6()))
     }
+
+    /// Readiness for another `try_send_to` after one returned `WouldBlock`.
+    pub fn poll_send_ready(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.socket.poll_send_ready(cx)
+    }
 }
 
 /// Addresses an operator-supplied URL must never reach unless private targets are explicitly

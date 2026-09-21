@@ -12,6 +12,8 @@ pub mod jitter_buffer;
 #[cfg(feature = "server")]
 pub mod net;
 pub mod protocol;
+#[cfg(feature = "quic")]
+pub mod quic;
 #[cfg(feature = "server")]
 pub mod rate_limit;
 #[cfg(feature = "server")]

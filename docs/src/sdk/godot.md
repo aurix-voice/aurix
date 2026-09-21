@@ -3,15 +3,15 @@
 `sdk/godot` is a Godot **4.3+** GDExtension over the [native core](native.md): the C++ classes
 call `aurix_client.hpp` (the header-only wrapper of the stable C ABI) and translate between
 Godot types and the C structs. No protocol, codec, crypto or networking code lives in the
-extension — AURX v2 over UDP/tunnel, the WebSocket control plane, Opus, jitter buffers, VAD, the
+extension — AURX v2 over QUIC/UDP/tunnel, the WebSocket control plane, Opus, jitter buffers, VAD, the
 DSP chain, reconnect/resume and cross-node failover are the same Rust library that Unreal and
 the C samples use. Full reference: `sdk/godot/README.md`.
 
 ```
  Godot scene tree (main thread)                     aurix-client (own threads)
  ┌──────────────────────────────┐   _process()      ┌──────────────────────────┐
- │ AurixVoiceClient : Node      │──── push PCM ────►│ capture → DSP → Opus     │──► UDP / WS tunnel
- │   AudioStreamMicrophone      │◄─── mix_output ───│ jitter → decode → mixer  │◄── UDP / WS tunnel
+ │ AurixVoiceClient : Node      │──── push PCM ────►│ capture → DSP → Opus     │──► QUIC / UDP / WS tunnel
+ │   AudioStreamMicrophone      │◄─── mix_output ───│ jitter → decode → mixer  │◄── QUIC / UDP / WS tunnel
  │   → AurixCapture bus         │◄─── poll_event ───│ event queue              │◄── WebSocket (wss)
  │   AudioStreamGenerator out   │      → signals    └──────────────────────────┘
  │ AurixParticipantPlayer ×N    │◄── pull_participant (claimed users leave the mix)
@@ -29,7 +29,7 @@ the C samples use. Full reference: `sdk/godot/README.md`.
 | `AurixRegions` | `RefCounted` | region discovery response parser and ranker |
 
 Results are the C ABI's `AurixResult` (`RESULT_OK`, `RESULT_NOT_CONNECTED`, …), states
-`STATE_DISCONNECTED … STATE_FAILED`, media path `MEDIA_NONE | MEDIA_UDP | MEDIA_TUNNEL`; all
+`STATE_DISCONNECTED … STATE_FAILED`, media path `MEDIA_NONE | MEDIA_UDP | MEDIA_TUNNEL | MEDIA_QUIC`; all
 enums from the header are bound as constants on `AurixVoiceClient`.
 
 ```gdscript
@@ -62,6 +62,13 @@ func join(channel_id: String) -> void:
 * **Server-side directional audio:** `update_transforms(channel_id, {user_id: Transform3D})`
   (Godot's `-Z` forward is converted).
 * **AEC reference:** `push_render(PackedVector2Array)` when you mix game audio yourself.
+* **Media link:** `media_path_policy` (`MEDIA_PATH_AUTO | UDP_ONLY | TUNNEL_ONLY | QUIC_ONLY`),
+  the `quic` property (`Auto` tries QUIC before UDP when the node offers it), `get_media_path()`,
+  the `media_path_changed(path, reason)` signal and `network_changed()` — call it from your
+  platform's connectivity notification so a QUIC session migrates to the new address instead
+  of timing out; `session_ready`'s dictionary carries `media_quic` / `media_tunnel`. Semantics in
+  [QUIC](native.md#quic-0-rtt-resume-and-connection-migration) and
+  [the tunnel](native.md#when-udp-is-blocked-the-websocket-tunnel).
 * **Packet loss:** the core rebuilds lost frames from FEC / DRED and conceals the rest with
   libopus' neural PLC; `get_encoder_settings()["dred_duration_ms"]`,
   `set_decoder_settings({"complexity": 5, "osce_bwe": false})` / `get_decoder_settings()`,
