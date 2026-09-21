@@ -45,6 +45,7 @@ export async function* eventStream(client: AurixHttp, options: EventStreamOption
     if (options.signal?.aborted) return;
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
+      ...client.opts.headers,
       ...client.authHeaders(options.auth ?? client.opts),
       ...options.headers,
     };
