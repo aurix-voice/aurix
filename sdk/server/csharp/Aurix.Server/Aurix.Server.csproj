@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>CS1591</NoWarn>
+    <PackageId>Aurix.Server</PackageId>
+    <Version>1.2.0</Version>
+    <Authors>Aurix contributors</Authors>
+    <Description>Server-side (game backend) SDK for the Aurix voice platform REST API: token issuance, channels, moderation, analytics, webhooks and the SSE event stream. Generated from api/openapi.json.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RootNamespace>Aurix.Server</RootNamespace>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+</Project>

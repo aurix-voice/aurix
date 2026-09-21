@@ -204,6 +204,17 @@ the chapter that explains the boundary.
   coordinates the client sends, and load; the client-side RTT probe is what actually picks the
   nearest node. Discovery hands out a node's own `wss://` URL, so every node needs a public
   hostname and certificate ([Regions](operations/scaling.md#regions)).
+* **Server SDKs are generated, unpublished, and REST-only.** The Node, Python, Go and C#
+  clients are emitted from `api/openapi.json` and cannot drift from it, but they are not
+  published to npm / PyPI / NuGet / pkg.go.dev from this repository (path dependencies or your
+  own registry), and webhook / SSE payloads are typed only as the contract types them
+  (`EventEnvelope { type, data }`). There are no Java / PHP / Ruby clients. The token servers
+  are examples of the credential boundary — `/dev/login` is a development stand-in for your
+  game's login, not an authentication system — and ship without TLS termination, client-side
+  rate limits or metrics. The `aurix` CLI is a REST client with an embedded copy of the
+  contract: it never joins a channel or sends audio, and against a node of another version
+  `aurix diagnose` lists the operations the two sides disagree on
+  ([Server SDKs and token servers](backend/server-sdks.md), [The aurix CLI](backend/cli.md)).
 
 ## Not verified in this repository's CI
 

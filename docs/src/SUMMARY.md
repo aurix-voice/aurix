@@ -41,6 +41,11 @@
 - [Porting to consoles](sdk/consoles.md)
 - [Flutter and React Native](sdk/mobile-frameworks.md)
 
+# Game backend
+
+- [Server SDKs and token servers](backend/server-sdks.md)
+- [The aurix CLI](backend/cli.md)
+
 # Operations
 
 - [Deployment and configuration](operations/deployment.md)

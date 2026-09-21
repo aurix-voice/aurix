@@ -970,6 +970,26 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The server SDKs (sdk/server/*) verify signatures against this shared vector; if the
+    /// scheme changes, regenerate `sdk/server/vectors/webhook_signature.json` too.
+    #[test]
+    fn signature_matches_shared_sdk_vector() {
+        let raw = include_str!("../../../sdk/server/vectors/webhook_signature.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("vector json");
+        let secret = v["secret"].as_str().unwrap();
+        let t = v["timestamp"].as_i64().unwrap();
+        let body = v["body"].as_str().unwrap().as_bytes();
+        assert_eq!(sign(secret, t, body), v["header"].as_str().unwrap());
+        let now = DateTime::<Utc>::from_timestamp(t + 10, 0).unwrap();
+        assert!(verify_signature(
+            secret,
+            v["header"].as_str().unwrap(),
+            body,
+            now,
+            Duration::from_secs(v["tolerance_sec"].as_u64().unwrap())
+        ));
+    }
+
     #[test]
     fn signature_round_trips_and_rejects_tampering() {
         let body = br#"{"id":"1","type":"participant.joined"}"#;

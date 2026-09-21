@@ -336,15 +336,19 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "aurix-common",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
+ "hex",
  "hmac",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tokio",
+ "toml 0.8.23",
  "uuid",
 ]
 

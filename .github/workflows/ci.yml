@@ -351,6 +351,57 @@ jobs:
           dotnet build Aurix.Voice.UnityCheck --no-incremental -v q --nologo -p:UnityExtraDefines=UNITY_ANDROID
         working-directory: sdk/unity/DotNet~
 
+  server-sdks:
+    name: Server SDKs (Node/Python/Go/C#) + token servers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generated clients match api/openapi.json
+        run: python3 tools/openapi-sdk/generate.py --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            sdk/server/node/package-lock.json
+            sdk/server/examples/token-server/node/package-lock.json
+      - name: Node SDK
+        run: npm ci && npm run check && npm test
+        working-directory: sdk/server/node
+      - name: Node token server
+        run: npm ci && npm test
+        working-directory: sdk/server/examples/token-server/node
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet "pytest>=8" "mypy>=1.10" "ruff>=0.6"
+      - name: Python SDK
+        run: python3 -m mypy aurix_server tests && python3 -m pytest -q && python3 -m ruff check .
+        working-directory: sdk/server/python
+      - name: Python token server
+        run: python3 -m pytest -q && PYTHONPATH=../../../python python3 -m mypy . && python3 -m ruff check .
+        working-directory: sdk/server/examples/token-server/python
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false   # stdlib-only modules, no go.sum
+      - name: Go SDK
+        run: test -z "$(gofmt -l .)" && go vet ./... && go test -count=1 ./...
+        working-directory: sdk/server/go
+      - name: Go token server
+        run: test -z "$(gofmt -l .)" && go vet ./... && go test -count=1 ./...
+        working-directory: sdk/server/examples/token-server/go
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: C# SDK
+        run: dotnet test Aurix.Server.sln -c Release -v q --nologo
+        working-directory: sdk/server/csharp
+      - name: C# token server
+        run: dotnet test TokenServer.sln -c Release -v q --nologo
+        working-directory: sdk/server/examples/token-server/csharp
+      # the aurix CLI (crates/aurix-cli, embedded contract + integration tests) is covered by `lint` and `test`
+
   godot:
     name: Godot GDExtension (build + headless smoke)
     runs-on: ubuntu-latest

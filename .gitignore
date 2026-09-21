@@ -26,3 +26,6 @@ docs/book/
 
 # Godot Web export output
 sdk/godot/build/
+
+# Python bytecode caches (tools/, sdk/server/python examples)
+__pycache__/

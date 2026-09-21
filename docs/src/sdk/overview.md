@@ -39,7 +39,9 @@ inside the same channel.
 
 Beyond these five: [consoles](consoles.md) are a porting exercise on top of the native core
 (the platform layer is yours, under NDA); [Flutter and React Native](mobile-frameworks.md) bind
-the same C ABI from a native plugin.
+the same C ABI from a native plugin. The other half of every integration — the game backend
+that mints the tokens these clients connect with — has its own typed SDKs (Node, Python, Go,
+C#), reference token servers and the `aurix` CLI: [Game backend](../backend/server-sdks.md).
 
 ## Common lifecycle
 

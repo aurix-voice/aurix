@@ -1,0 +1,18 @@
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = false
+
+[tool.ruff]
+line-length = 140
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "../../../python"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

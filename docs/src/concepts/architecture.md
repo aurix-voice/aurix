@@ -29,7 +29,7 @@ the same PostgreSQL + Redis for a fleet ([Scaling out](../operations/scaling.md)
 | `aurix-recording` | Ogg/Opus writer, consent, retention, encryption, S3, live audio streams |
 | `aurix-metrics` | Prometheus registry |
 | `aurix-server` | the binary; wires everything together |
-| `aurix-cli` | `aurix` admin CLI |
+| `aurix-cli` | `aurix` CLI: operator, backend and diagnostic commands over the embedded OpenAPI contract ([The aurix CLI](../backend/cli.md)) |
 | `aurix-client` | native client core (Rust + C ABI) used by the Unreal plugin |
 | `aurix-loadtest` | reproducible load generator behaving like real native clients |
 

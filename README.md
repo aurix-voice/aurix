@@ -72,7 +72,7 @@ quick start, protocols, SDK guides, operations. The REST contract is
 | `aurix-recording` | Ogg/Opus writer/reader, consent, retention, encryption, S3, mixdown + post-hoc STT jobs |
 | `aurix-metrics` | Prometheus registry |
 | `aurix-server` | the binary; wires everything together |
-| `aurix-cli` | `aurix` admin CLI |
+| `aurix-cli` | `aurix` CLI: operator, backend and diagnostic commands over the embedded OpenAPI contract |
 
 ### Security model (short)
 
@@ -1105,6 +1105,16 @@ parallel receive workers and non-blocking sends; that is what `media.rx_workers`
 
 All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys stay on your backend.
 
+## Game backend: server SDKs, token servers, CLI
+
+| | Path | What |
+|---|---|---|
+| Server SDKs (Node, Python, Go, C#) | [`sdk/server`](sdk/server) | typed clients generated from `api/openapi.json` (`python3 tools/openapi-sdk/generate.py --check` guards drift) with hand-written transports: retries with `Retry-After`, structured errors, API-key / operator / bootstrap credentials, webhook signature verification, SSE iterator |
+| Token servers | [`sdk/server/examples/token-server`](sdk/server/examples/token-server) | the same backend in all four languages: your game session → `POST /voice/token` → `POST /v1/tokens` with the API key → allowlisted `{token, user_id, expires_at, endpoint}` to the client; the key never reaches the client, identity is never taken from the request body |
+| `aurix` CLI | [`crates/aurix-cli`](crates/aurix-cli) | profiles that reference (never store) secrets, `token issue`, channel/user/moderation/webhook/analytics/recording/admin commands, `events tail`, `diagnose`, and `aurix api <operationId>` for every operation of the embedded contract |
+
+Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aurix CLI](docs/src/backend/cli.md).
+
 ## Limitations
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
@@ -1147,6 +1157,10 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
   [porting guide](docs/src/sdk/consoles.md), [mobile frameworks](docs/src/sdk/mobile-frameworks.md).
   The Godot Web export uses `AurixWebVoiceClient` (GDScript over the Web SDK, browser-owned
   audio) instead of the native extension; Godot Android/iOS slices are staged but not built in CI.
+* Server SDKs (Node/Python/Go/C#) are generated from the OpenAPI contract but not published to
+  registries; the token servers are examples of the credential boundary (their `/dev/login` is a
+  development stand-in for your game's login), and the `aurix` CLI is a REST client — it never
+  joins a channel or sends audio.
 
 ## License
 

@@ -1,0 +1,8 @@
+{
+  "_comment": "Shared webhook-signature vector for the server SDK tests (scheme: X-Aurix-Signature: t=<unix>,v1=hex(HMAC-SHA256(secret, '<t>.<raw body>')); reference: aurix_control::webhooks::sign).",
+  "secret": "whsec_test_secret",
+  "timestamp": 1738000000,
+  "body": "{\"id\":\"3b9f0c1e-0000-4000-8000-000000000001\",\"type\":\"participant.joined\",\"app_id\":\"7e1a2b3c-0000-4000-8000-000000000002\",\"created_at\":\"2025-01-27T18:26:40.123Z\",\"data\":{\"channel_id\":\"c1\",\"user_id\":\"u1\"}}",
+  "header": "t=1738000000,v1=7bab837da083762d92200f3c5a54e98c65e36dc6610f3b1643bfe8be2d09eb66",
+  "tolerance_sec": 300
+}

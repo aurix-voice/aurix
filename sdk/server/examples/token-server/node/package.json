@@ -1,0 +1,18 @@
+{
+  "name": "aurix-token-server-example",
+  "private": true,
+  "version": "1.2.0",
+  "description": "Backend-only Aurix token server: game clients call it, it calls POST /v1/tokens with the API key.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "start": "node token_server.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@aurix/server-sdk": "file:../../../node"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
