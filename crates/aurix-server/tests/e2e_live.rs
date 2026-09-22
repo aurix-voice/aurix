@@ -8774,7 +8774,10 @@ async fn live_audio_streams_pull_push_consent_and_isolation() {
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let (ctl, _) = collect_stream(&mut pull, Duration::from_millis(200)).await;
+    // Audio collected here is kept: on a loaded runner the pre-consent packets may reach the
+    // node only after Alice's consent, in which case they are legitimately forwarded and
+    // carry the participant's FLAG_FIRST.
+    let (ctl, mut audio) = collect_stream(&mut pull, Duration::from_millis(200)).await;
     assert!(
         ctl.iter().any(|c| matches!(c, aurix_recording::live::ControlFrame::Participant { user_id, consent: Some(RecordingConsent::Accepted), .. } if *user_id == uid_a)),
         "consumer is told about Alice's consent: {ctl:?}"
@@ -8796,7 +8799,8 @@ async fn live_audio_streams_pull_push_consent_and_isolation() {
         },
         stream_frames(&bob, channel_id, 1, &tone[..10], false),
     );
-    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(500)).await;
+    let (_, later) = collect_stream(&mut pull, Duration::from_millis(500)).await;
+    audio.extend(later);
     let from_alice: Vec<_> = audio.iter().filter(|a| a.0 == uid_a).collect();
     assert!(
         from_alice.len() >= 8,
