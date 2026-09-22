@@ -222,8 +222,10 @@ stops capture, unbinds the sound waves and only then destroys the client.
   your submix so it is cancelled too. `bEchoCancellation = false` if you prefer the capture
   device's hardware AEC.
 
-* **PCMU fallback:** `SetAudioCodec(EAurixAudioCodec::Pcmu)` negotiates G.711 μ-law for this
-  session (8 kHz, no Opus CPU; the node transcodes at the edge, other participants keep Opus).
+* **G.711 fallback:** `SetAudioCodec(EAurixAudioCodec::Pcmu)` (μ-law) or `Pcma` (A-law) negotiates
+  G.711 for this session (8 kHz, no Opus CPU; in plaintext channels the node transcodes at the edge and
+  other participants keep Opus, in E2EE channels the sealed G.711 frames are relayed as they are and
+  every peer decodes them).
   `OnAudioCodecChanged` / `GetAudioCodec()` report what the server acknowledged; capture and
   playback switch codec inside the native core, nothing changes in the bridge. Refused with
   `CODEC_NOT_AVAILABLE` when the node runs `media.pcmu_fallback = false`.

@@ -145,6 +145,7 @@ export {
   decodeDirection,
   decodePacket,
   decodeVolumeByte,
+  downlinkCodec,
   encodeHeader,
   heartbeatHeader,
   opusPacketIsStereo,
@@ -153,7 +154,8 @@ export {
   sessionBindPayload,
   uuidBytes,
 } from './aurx.js';
-export type { AurxDirection, AurxHeader, AurxPacket, DownlinkAudio } from './aurx.js';
+export type { AurxDirection, AurxHeader, AurxPacket, DownlinkAudio, DownlinkCodec } from './aurx.js';
+export { decodeG711, G711_FRAME_SIZES, G711_SAMPLE_RATE, G711Upsampler, type G711Law } from './g711.js';
 export {
   AURX_FRAME_SAMPLES,
   AURX_SAMPLE_RATE,

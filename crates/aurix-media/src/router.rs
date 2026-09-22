@@ -13,6 +13,7 @@
 
 use crate::transport::MediaSocket;
 use aurix_common::error::{AurixError, Result};
+use aurix_common::g711::Law;
 use aurix_common::protocol::*;
 use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
@@ -32,17 +33,18 @@ use crate::channel::{MediaChannel, Mix};
 use crate::denoise::{Cleaned, DenoisePool, UplinkDenoiser};
 use crate::mix::MixHub;
 use crate::quic::QuicLink;
+use crate::session::g711_metric_label;
 use crate::session::{MediaEndpoint, MediaSession, Transport};
 use crate::tls::TlsLink;
-use crate::transcode::{PcmuDownlink, PcmuUplink, Transcoded};
+use crate::transcode::{G711Downlink, G711Uplink, Transcoded};
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{ForwardMedia, WebRtcManager};
 use crate::webtransport::WebTransportLink;
 
-/// Sweep idle PCMU downlink decoders when the table grows past this.
-const PCMU_DOWNLINK_PRUNE_AT: usize = 256;
-/// A PCMU downlink decoder unused this long belongs to a stream that ended.
-const PCMU_DOWNLINK_IDLE: Duration = Duration::from_secs(30);
+/// Sweep idle G.711 downlink decoders when the table grows past this.
+const G711_DOWNLINK_PRUNE_AT: usize = 256;
+/// A G.711 downlink decoder unused this long belongs to a stream that ended.
+const G711_DOWNLINK_IDLE: Duration = Duration::from_secs(30);
 
 /// One synthesized Opus frame handed to the router for injection.
 pub struct InjectedFrame {
@@ -155,8 +157,8 @@ pub struct PacketRouter {
     require_packet_auth: bool,
     speaking_energy_threshold: f32,
     events: broadcast::Sender<MediaEvent>,
-    /// Opus → μ-law decoders for PCMU receivers, per `(sender ssrc, channel hash)` stream.
-    pcmu_downlinks: DashMap<(u32, u32), Mutex<PcmuDownlink>>,
+    /// Opus → G.711 decoders for PCMU / PCMA receivers, per `(sender ssrc, channel hash, law)`.
+    g711_downlinks: DashMap<(u32, u32, Law), Mutex<G711Downlink>>,
     /// Server-side mixers for native receivers in `DownlinkMode::Mixed`
     /// (`None`: `media.downlink_mix = false`, everyone gets per-speaker streams).
     mix: Option<Arc<MixHub>>,
@@ -189,7 +191,7 @@ impl PacketRouter {
             require_packet_auth,
             speaking_energy_threshold,
             events,
-            pcmu_downlinks: DashMap::new(),
+            g711_downlinks: DashMap::new(),
             mix,
             denoise,
         }
@@ -679,29 +681,31 @@ impl PacketRouter {
         }
 
         // Node-side denoising: an encrypted frame cannot be, a frame into a stereo channel is
-        // not (the model is mono speech); a PCMU frame is cleaned inside its transcode below.
-        let denoise = !packet.header.has_flag(PacketFlags::E2ee)
+        // not (the model is mono speech); a G.711 frame is cleaned inside its transcode below.
+        let e2ee = packet.header.has_flag(PacketFlags::E2ee);
+        let denoise = !e2ee
             && !channel.is_stereo()
             && self.arm_denoiser(sender, channel.requires_noise_suppression());
 
-        // A PCMU uplink enters the channel as Opus so recording, transcription, cascade and
-        // Opus receivers never see μ-law; PCMU receivers get it re-encoded in `deliver`.
+        // A plaintext G.711 uplink enters the channel as Opus so recording, transcription,
+        // cascade and Opus receivers never see μ-law / A-law; G.711 receivers get it re-encoded
+        // in `deliver`. A sealed G.711 frame is as opaque as a sealed Opus one: it is relayed
+        // with its codec flag so the receivers pick the right decoder after opening it.
+        let frame_codec = packet.header.audio_codec();
         let transcoded;
-        let packet = if packet.header.has_flag(PacketFlags::Pcmu) {
-            if packet.header.has_flag(PacketFlags::E2ee) {
+        let packet = if frame_codec.is_g711() {
+            if sender.codec() != frame_codec {
                 aurix_metrics::PACKETS_DROPPED.inc();
-                return Err(AurixError::Validation(
-                    "PCMU frames cannot be end-to-end encrypted".into(),
-                ));
+                return Err(AurixError::AuthorizationDenied(format!(
+                    "{frame_codec:?} frame from a session that did not negotiate it"
+                )));
             }
-            if sender.codec() != AudioCodec::Pcmu {
-                aurix_metrics::PACKETS_DROPPED.inc();
-                return Err(AurixError::AuthorizationDenied(
-                    "PCMU frame from a session that did not negotiate pcmu".into(),
-                ));
+            if e2ee {
+                packet
+            } else {
+                transcoded = self.transcode_g711_uplink(sender, packet, denoise)?;
+                &transcoded
             }
-            transcoded = self.transcode_pcmu_uplink(sender, packet, denoise)?;
-            &transcoded
         } else if let Some(cleaned) = denoise
             .then(|| self.denoise_opus(sender, packet.header.timestamp, &packet.payload))
             .flatten()
@@ -1054,8 +1058,8 @@ impl PacketRouter {
                 true
             }
             None => {
-                let path = if sender.codec() == AudioCodec::Pcmu {
-                    "pcmu"
+                let path = if sender.codec().is_g711() {
+                    "g711"
                 } else {
                     "opus"
                 };
@@ -1102,16 +1106,21 @@ impl PacketRouter {
         cleaned
     }
 
-    fn transcode_pcmu_uplink(
+    fn transcode_g711_uplink(
         &self,
         sender: &Arc<MediaSession>,
         packet: &AurixPacket,
         denoise: bool,
     ) -> Result<AurixPacket> {
+        let codec = packet.header.audio_codec();
+        let law = codec
+            .g711_law()
+            .ok_or_else(|| AurixError::Validation("g711 transcode of an Opus frame".into()))?;
+        let metric_codec = g711_metric_label(codec).unwrap_or("pcmu");
         let mut slot = sender.pcmu_uplink.lock();
         let uplink = match slot.as_mut() {
-            Some(u) => u,
-            None => slot.insert(PcmuUplink::new()?),
+            Some(u) if u.law() == law => u,
+            _ => slot.insert(G711Uplink::new(law)?),
         };
         let mut denoiser = sender.denoiser.lock();
         let narrowband = denoise
@@ -1126,11 +1135,11 @@ impl PacketRouter {
                 Err(e) => {
                     if cleaned {
                         aurix_metrics::NOISE_SUPPRESSION_FRAMES
-                            .with_label_values(&["pcmu", "error"])
+                            .with_label_values(&["g711", "error"])
                             .inc();
                     }
-                    aurix_metrics::PCMU_FRAMES
-                        .with_label_values(&["uplink", "error"])
+                    aurix_metrics::G711_FRAMES
+                        .with_label_values(&[metric_codec, "uplink", "error"])
                         .inc();
                     aurix_metrics::PACKETS_DROPPED.inc();
                     return Err(e);
@@ -1138,60 +1147,62 @@ impl PacketRouter {
             };
         if cleaned {
             aurix_metrics::NOISE_SUPPRESSION_FRAMES
-                .with_label_values(&["pcmu", outcome])
+                .with_label_values(&["g711", outcome])
                 .inc();
         }
-        aurix_metrics::PCMU_FRAMES
-            .with_label_values(&["uplink", "ok"])
+        aurix_metrics::G711_FRAMES
+            .with_label_values(&[metric_codec, "uplink", "ok"])
             .inc();
         let mut header = packet.header.clone();
-        header.flags &= !(PacketFlags::Pcmu as u16);
+        header.set_audio_codec(AudioCodec::Opus);
         Ok(AurixPacket::new(header, opus))
     }
 
-    /// μ-law copy of an Opus frame for PCMU receivers; `None` when it cannot be decoded.
-    fn pcmu_downlink_frame(&self, packet: &AurixPacket) -> Option<Bytes> {
-        let key = (packet.header.ssrc, packet.header.channel_id_hash);
-        if !self.pcmu_downlinks.contains_key(&key) {
-            if self.pcmu_downlinks.len() >= PCMU_DOWNLINK_PRUNE_AT {
-                self.pcmu_downlinks
-                    .retain(|_, d| d.lock().last_used.elapsed() < PCMU_DOWNLINK_IDLE);
+    /// G.711 copy of an Opus frame for PCMU / PCMA receivers; `None` when it cannot be decoded.
+    fn g711_downlink_frame(&self, packet: &AurixPacket, codec: AudioCodec) -> Option<Bytes> {
+        let law = codec.g711_law()?;
+        let metric_codec = g711_metric_label(codec)?;
+        let key = (packet.header.ssrc, packet.header.channel_id_hash, law);
+        if !self.g711_downlinks.contains_key(&key) {
+            if self.g711_downlinks.len() >= G711_DOWNLINK_PRUNE_AT {
+                self.g711_downlinks
+                    .retain(|_, d| d.lock().last_used.elapsed() < G711_DOWNLINK_IDLE);
             }
-            match PcmuDownlink::new() {
+            match G711Downlink::new(law) {
                 Ok(d) => {
-                    self.pcmu_downlinks
+                    self.g711_downlinks
                         .entry(key)
                         .or_insert_with(|| Mutex::new(d));
                 }
                 Err(e) => {
-                    warn!("PCMU downlink decoder: {e}");
+                    warn!("G.711 downlink decoder: {e}");
                     return None;
                 }
             }
         }
-        let entry = self.pcmu_downlinks.get(&key)?;
+        let entry = self.g711_downlinks.get(&key)?;
         let result = entry.lock().transcode(&packet.payload);
         drop(entry);
         match result {
-            Ok(ulaw) => {
-                aurix_metrics::PCMU_FRAMES
-                    .with_label_values(&["downlink", "ok"])
+            Ok(coded) => {
+                aurix_metrics::G711_FRAMES
+                    .with_label_values(&[metric_codec, "downlink", "ok"])
                     .inc();
-                Some(ulaw)
+                Some(coded)
             }
             Err(e) => {
-                aurix_metrics::PCMU_FRAMES
-                    .with_label_values(&["downlink", "error"])
+                aurix_metrics::G711_FRAMES
+                    .with_label_values(&[metric_codec, "downlink", "error"])
                     .inc();
-                debug!("PCMU downlink transcode failed: {e}");
+                debug!("G.711 downlink transcode failed: {e}");
                 None
             }
         }
     }
 
-    /// Forget the μ-law decoders of a sender that left (or of a whole channel).
-    pub fn forget_pcmu_downlinks(&self, sender_ssrc: Option<u32>, channel_hash: Option<u32>) {
-        self.pcmu_downlinks.retain(|(ssrc, hash), _| {
+    /// Forget the G.711 decoders of a sender that left (or of a whole channel).
+    pub fn forget_g711_downlinks(&self, sender_ssrc: Option<u32>, channel_hash: Option<u32>) {
+        self.g711_downlinks.retain(|(ssrc, hash, _), _| {
             !(sender_ssrc.is_none_or(|s| s == *ssrc) && channel_hash.is_none_or(|h| h == *hash))
         });
     }
@@ -1320,8 +1331,8 @@ impl PacketRouter {
         let e2ee = packet.header.has_flag(PacketFlags::E2ee);
         let receivers = self.split_mixed(channel, receivers, packet, e2ee, shared_ok);
         let speaker = speaker.filter(|_| channel.browser_reproducible_gain());
-        // Computed once per packet, on the first PCMU receiver.
-        let mut pcmu_frame: Option<Option<Bytes>> = None;
+        // Computed once per packet and law, on the first PCMU / PCMA receiver.
+        let mut g711_frames: [Option<Option<Bytes>>; 2] = [None, None];
         for (receiver, mix) in receivers {
             if !receiver.is_active() {
                 continue;
@@ -1363,9 +1374,10 @@ impl PacketRouter {
                     };
                     let out = if e2ee {
                         AurixPacket::seal_parts(&packet.header, &packet.payload, &receiver.keys)
-                    } else if receiver.codec() == AudioCodec::Pcmu {
-                        let frame = pcmu_frame
-                            .get_or_insert_with(|| self.pcmu_downlink_frame(packet))
+                    } else if let Some(law) = receiver.codec().g711_law() {
+                        let codec = receiver.codec();
+                        let frame = g711_frames[law as usize]
+                            .get_or_insert_with(|| self.g711_downlink_frame(packet, codec))
                             .clone();
                         let Some(frame) = frame else {
                             aurix_metrics::PACKETS_DROPPED.inc();
@@ -1373,7 +1385,7 @@ impl PacketRouter {
                         };
                         let (mut header, body) =
                             packet.downlink_parts_with(&frame, mix.volume, mix.direction.as_ref());
-                        header.flags |= PacketFlags::Pcmu as u16;
+                        header.set_audio_codec(codec);
                         AurixPacket::seal_parts(&header, &body, &receiver.keys)
                     } else {
                         let (header, body) =

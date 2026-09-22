@@ -50,6 +50,7 @@ have packet-type values but the WebSocket control plane is used for them.
 | --- | --- | --- |
 | `Encrypted` | `0x0001` | payload is AES-256-CTR encrypted (always set by `seal`) |
 | `Dtx` | `0x0004` | discontinuous transmission (comfort-noise / silence) |
+| `Pcma` | `0x0010` | the audio frame is G.711 A-law, not Opus — the PCMA twin of `Pcmu` (`SetAudioCodec {codec: "pcma"}`); never combined with `Pcmu` |
 | `Relay` | `0x0040` | packet crossed a cascade hop |
 | `VolumeAttenuated` | `0x0080` | downlink payload starts with a gain byte (`128` = unity, `255` ≈ 2.0) |
 | `E2ee` | `0x0100` | client end-to-end encrypted frame — forwarded untouched, never decoded |
@@ -57,8 +58,8 @@ have packet-type values but the WebSocket control plane is used for them.
 | `Authenticated` | `0x0400` | 16-byte HMAC tag follows the payload |
 | `Energy` | `0x0800` | uplink payload starts with an RFC 6464 `-dBov` level byte (`127` = silence); stripped before fan-out |
 | `Directional` | `0x1000` | downlink payload carries 2 signed bytes (azimuth in π/127, elevation in π/254 units) after the gain byte |
-| `Pcmu` | `0x2000` | the audio frame is G.711 μ-law, not Opus — only on sessions that negotiated `SetAudioCodec {codec: "pcmu"}` ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)); the server sets it on the downlink copies sent to such sessions |
-| `Mixed` | `0x4000` | downlink only: the frame is the server's stereo mix of a whole channel for this receiver (`SetDownlinkMode {mode: "mixed"}`, [server mix](../features/channels.md#server-mix-for-native-clients)), under the channel's synthetic mix SSRC with its own sequence; per-receiver gains are baked in — never combined with `E2ee` or `Directional`, combined with `Pcmu` for PCMU sessions |
+| `Pcmu` | `0x2000` | the audio frame is G.711 μ-law, not Opus — only on sessions that negotiated `SetAudioCodec {codec: "pcmu"}` ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)); the server sets it on the downlink copies sent to such sessions. With `E2ee` (`Pcmu`/`Pcma`) the sealed frame is relayed untouched and the flag tells receivers which decoder to use after opening it |
+| `Mixed` | `0x4000` | downlink only: the frame is the server's stereo mix of a whole channel for this receiver (`SetDownlinkMode {mode: "mixed"}`, [server mix](../features/channels.md#server-mix-for-native-clients)), under the channel's synthetic mix SSRC with its own sequence; per-receiver gains are baked in — never combined with `E2ee` or `Directional`, combined with `Pcmu` / `Pcma` for G.711 sessions |
 | `RelayHop` | `0x8000` | `Relay` envelopes only: a hop byte (`0x80 \| hops`) follows the 16-byte sender id, so a [relay-tree](../operations/scaling.md#cascade-sfu-to-sfu-relay) hub can re-forward the envelope; hops are capped at 3 and a receiver never re-forwards an envelope without it |
 
 ## Keys and sealing
@@ -298,12 +299,14 @@ Metrics: `aurix_webtransport_connections`, `aurix_webtransport_sessions`,
   Timestamps are forwarded unchanged. The server mixers do the same repair on their own
   decoders (`media.mixer_decoder_complexity`, `aurix_mixer_lost_frames_total{method}`) —
   see [Packet loss](../sdk/native.md#packet-loss-fec-dred-and-the-neural-plc).
-* On a session that negotiated PCMU: decodes the μ-law uplink and re-encodes it as narrowband
-  Opus before any of the above, so the rest of the channel is unaffected; encodes the Opus it
-  would have sent to that session as μ-law after the per-receiver step (gain/direction bytes and
-  the seal are the same as for Opus). PCMU frames from a session that did not negotiate and
-  `Pcmu | E2ee` frames are dropped (`aurix_packets_dropped_total`); frames of a length other
-  than 80/160/320/480 bytes fail the transcode (`aurix_pcmu_frames_total{outcome="error"}`).
+* On a session that negotiated PCMU or PCMA: decodes the G.711 uplink and re-encodes it as
+  narrowband Opus before any of the above, so the rest of the channel is unaffected; encodes the
+  Opus it would have sent to that session as μ-law / A-law after the per-receiver step
+  (gain/direction bytes and the seal are the same as for Opus). G.711 frames from a session that
+  did not negotiate, or flagged with the other law, are dropped (`aurix_packets_dropped_total`);
+  frames of a length other than 80/160/320/480 bytes fail the transcode
+  (`aurix_g711_frames_total{codec,outcome="error"}`). `E2ee` G.711 frames are not transcoded at
+  all: they are relayed sealed, with the codec flag, exactly like E2EE Opus.
 * Drops uplink audio from members whose channel role is `listener`, withholds per-speaker frames
   over a receiver's `audience.max_streams` cap, and for receivers in `mixed` downlink mode feeds
   the frame to their channel mixer instead of forwarding it (E2EE frames are still forwarded

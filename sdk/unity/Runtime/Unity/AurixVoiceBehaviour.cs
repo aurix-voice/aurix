@@ -154,8 +154,9 @@ namespace Aurix.Unity
         /// </summary>
         public Func<IOpusCodec> StereoCodecFactory;
 
-        [Tooltip("Session codec to negotiate on connect. PCMU (G.711 μ-law, 8 kHz) needs no Opus on this device; " +
-                 "the server transcodes, so other participants keep Opus. Requires media.pcmu_fallback on the node.")]
+        [Tooltip("Session codec to negotiate on connect. PCMU / PCMA (G.711, 8 kHz) need no Opus on this device; " +
+                 "in plaintext channels the server transcodes, so other participants keep Opus (E2EE channels relay " +
+                 "the sealed G.711 frames as they are). Requires media.pcmu_fallback on the node.")]
         public AudioCodec PreferredCodec = AudioCodec.Opus;
 
         [Tooltip("Mixed: one server-mixed stereo stream per channel instead of one stream per speaker — constant " +
@@ -317,8 +318,8 @@ namespace Aurix.Unity
         private IOpusCodec _encoder;
         private bool _warnedNoStereoCodec;
         private bool _warnedNoNativeVoice;
-        private readonly PcmuCodec _pcmuEncoder = new PcmuCodec();
-        private readonly byte[] _pcmuOut = new byte[AudioFormat.FrameSamples / PcmuCodec.Decimation];
+        private G711Codec _g711Encoder;
+        private readonly byte[] _g711Out = new byte[AudioFormat.FrameSamples / G711Codec.Decimation];
         private RemoteMixer _mixer;
         private int _micRate;
         private int _micChannels;
@@ -400,7 +401,7 @@ namespace Aurix.Unity
             MatchEncoderWidth(Client.EffectiveEncoderSettings);
             Client.OnParticipantLeft += (_, p) => { _mixer?.Remove(p.Ssrc); _mixer?.Remove(p.Ssrc | AurxPacket.SynthSsrcFlag); };
             Client.OnDisconnected += _ => StopMic();
-            Client.OnAudioCodecChanged += _ => _pcmuEncoder.Reset();
+            Client.OnAudioCodecChanged += codec => _g711Encoder = codec.IsG711() ? new G711Codec(codec) : null;
             ApplyVoiceSettings();
             if (PreferredCodec != AudioCodec.Opus) await Client.SetAudioCodecAsync(PreferredCodec);
             if (PreferredDownlinkMode != DownlinkMode.Streams) await Client.SetDownlinkModeAsync(PreferredDownlinkMode);
@@ -847,10 +848,12 @@ namespace Aurix.Unity
                 Client.SkipFrame(AudioFormat.FrameSamples);
                 return;
             }
-            if (Client.AudioCodec == AudioCodec.Pcmu)
+            var codec = Client.AudioCodec;
+            if (codec.IsG711())
             {
-                int n = _pcmuEncoder.Encode(_mono, AudioFormat.FrameSamples, _pcmuOut);
-                if (n > 0) Client.TransmitAudioFrame(AudioCodec.Pcmu, _pcmuOut, n, AudioFormat.FrameSamples, Vad.Level);
+                if (_g711Encoder == null || _g711Encoder.Law != codec) _g711Encoder = new G711Codec(codec);
+                int n = _g711Encoder.Encode(_mono, AudioFormat.FrameSamples, _g711Out);
+                if (n > 0) Client.TransmitAudioFrame(codec, _g711Out, n, AudioFormat.FrameSamples, Vad.Level);
             }
             else
             {

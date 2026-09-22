@@ -37,6 +37,8 @@ enum class EAurixAudioCodec : uint8
 	Opus,
 	/** G.711 mu-law fallback: 8 kHz, 64 kbit/s, no Opus CPU cost, telephone quality. */
 	Pcmu,
+	/** G.711 A-law fallback: same as Pcmu with the A-law companding. */
+	Pcma,
 };
 
 UENUM(BlueprintType)

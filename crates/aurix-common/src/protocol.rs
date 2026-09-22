@@ -218,6 +218,28 @@ impl PacketHeader {
     pub fn has_flag(&self, flag: PacketFlags) -> bool {
         self.flags & (flag as u16) != 0
     }
+
+    /// Codec of the audio frame according to the `Pcmu` / `Pcma` flags (Opus when neither).
+    pub fn audio_codec(&self) -> AudioCodec {
+        if self.has_flag(PacketFlags::Pcmu) {
+            AudioCodec::Pcmu
+        } else if self.has_flag(PacketFlags::Pcma) {
+            AudioCodec::Pcma
+        } else {
+            AudioCodec::Opus
+        }
+    }
+
+    /// Replaces the codec flags with the ones for `codec`.
+    pub fn set_audio_codec(&mut self, codec: AudioCodec) {
+        self.clear_flag(PacketFlags::Pcmu);
+        self.clear_flag(PacketFlags::Pcma);
+        match codec {
+            AudioCodec::Opus => {}
+            AudioCodec::Pcmu => self.set_flag(PacketFlags::Pcmu),
+            AudioCodec::Pcma => self.set_flag(PacketFlags::Pcma),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,7 +250,8 @@ pub enum PacketFlags {
     Compressed = 0x0002,
     Dtx = 0x0004,
     Fec = 0x0008,
-    KeyFrame = 0x0010,
+    /// The audio frame is G.711 A-law (`g711`) instead of Opus; the PCMA twin of `Pcmu`.
+    Pcma = 0x0010,
     Priority = 0x0020,
     Relay = 0x0040,
     /// Payload starts with one gain byte (see `encode_volume_byte`) followed by the Opus frame.
@@ -246,7 +269,9 @@ pub enum PacketFlags {
     Directional = 0x1000,
     /// The audio frame is G.711 μ-law (`g711`) instead of Opus. Set by a client that negotiated
     /// `AudioCodec::Pcmu` with `SetAudioCodec`; the server transcodes so everybody else still
-    /// receives Opus, and sets it on the downlink copies sent to PCMU sessions.
+    /// receives Opus, and sets it on the downlink copies sent to PCMU sessions. Combined with
+    /// `E2ee` the frame is a sealed G.711 frame the server relays untouched: the flag tells the
+    /// receivers which decoder to use once they have opened it.
     Pcmu = 0x2000,
     /// Downlink only: the frame is the server's mix of a whole channel for this receiver
     /// (`DownlinkMode::Mixed`) — stereo Opus under the channel's system-voice SSRC
@@ -1100,9 +1125,13 @@ pub enum ControlMessage {
         noise_suppression: bool,
     },
     /// Client→server (native AURX only): switch this session's own audio frames to `codec`.
-    /// With `pcmu` the client sends G.711 μ-law frames flagged `PacketFlags::Pcmu` and receives
-    /// its downlink as PCMU; the server transcodes to/from the Opus the rest of the channel
-    /// uses. Rejected when the node disables `media.pcmu_fallback` or the session is WebRTC.
+    /// With `pcmu` / `pcma` the client sends G.711 frames flagged `PacketFlags::Pcmu` /
+    /// `PacketFlags::Pcma` and receives its plaintext downlink in that codec; the server
+    /// transcodes to/from the Opus the rest of the channel uses. In end-to-end encrypted
+    /// channels nothing is transcoded: the client seals its G.711 frames like Opus ones (the
+    /// codec flag stays visible next to `E2ee`) and receives every speaker's frames in the
+    /// codec that speaker sent. Rejected when the node disables `media.pcmu_fallback` or the
+    /// session is WebRTC.
     SetAudioCodec {
         codec: AudioCodec,
     },

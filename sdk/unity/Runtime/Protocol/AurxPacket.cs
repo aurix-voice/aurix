@@ -38,7 +38,8 @@ namespace Aurix.Protocol
         Compressed = 0x0002,
         Dtx = 0x0004,
         Fec = 0x0008,
-        KeyFrame = 0x0010,
+        /// <summary>Payload is G.711 A-law (8 kHz) instead of Opus — only on sessions that negotiated PCMA.</summary>
+        Pcma = 0x0010,
         Priority = 0x0020,
         Relay = 0x0040,
         VolumeAttenuated = 0x0080,
@@ -367,6 +368,14 @@ namespace Aurix.Protocol
 
         public static bool IsAurxPacket(ReadOnlySpan<byte> data) =>
             data.Length >= HeaderSize && data.Slice(0, 4).SequenceEqual(Magic);
+
+        /// <summary>The header flag naming <paramref name="codec"/> (<see cref="PacketFlags.None"/> for Opus).</summary>
+        public static PacketFlags CodecFlag(AudioCodec codec) =>
+            codec == AudioCodec.Pcmu ? PacketFlags.Pcmu : codec == AudioCodec.Pcma ? PacketFlags.Pcma : PacketFlags.None;
+
+        /// <summary>The codec named by the <see cref="PacketFlags.Pcmu"/> / <see cref="PacketFlags.Pcma"/> flags (Opus when neither).</summary>
+        public static AudioCodec CodecOf(PacketFlags flags) =>
+            (flags & PacketFlags.Pcmu) != 0 ? AudioCodec.Pcmu : (flags & PacketFlags.Pcma) != 0 ? AudioCodec.Pcma : AudioCodec.Opus;
 
         public static AurxPacket Audio(uint seq, uint ts, uint ssrc, uint channelHash, byte[] opusFrame)
         {

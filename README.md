@@ -887,26 +887,29 @@ nodes without the feature stay in the mixed track. Unity WebGL exposes it as
 `WebGLClientOptions.ParticipantStreams` / `SpatialAudio`, `SetPinnedParticipantsAsync`,
 `OnParticipantStreams`, `IsParticipantSpatialized`.
 
-### PCMU (G.711) fallback for weak devices
+### PCMU / PCMA (G.711) fallback for weak devices
 
-Channels are Opus internally, but a native AURX session can ask to run on **G.711 μ-law** —
-8 kHz, 64 kbit/s, no Opus CPU on the device (old phones, embedded/handheld hardware, very cheap
-SoCs). It is a **per-session** negotiation, never a channel setting: `SetAudioCodec {codec:
-"pcmu"}` over the control connection → `AudioCodecChanged {codec}` ack, after which the client
-sends 8 kHz μ-law frames (80/160/320/480 bytes = 10/20/40/60 ms) flagged `Pcmu` (`0x2000`) and
-receives its downlink as PCMU. The node transcodes at the edge: PCMU uplink is decoded and
-encoded to narrowband Opus **before** recording, transcription, safety, live streams, cascade
-and fan-out (so every other participant, browsers included, keeps receiving Opus), and internal
-Opus is decoded/encoded to μ-law only for PCMU receivers, after mutes, blocks, volume, focus,
-positional attenuation and direction have been applied (the gain/direction bytes and the
-per-receiver seal are identical to Opus downlinks). `ReceiverPreferences.codec` replays the
-session's codec after a resume; a fresh session starts on Opus and the SDKs re-negotiate the
-preferred codec. Not available to WebRTC sessions (browsers negotiate Opus in SDP), never for
-`E2ee` frames (the server cannot transcode what it cannot read — such frames are dropped), and
-switched off node-wide with `media.pcmu_fallback = false`
-(`CODEC_NOT_AVAILABLE`). Metrics: `aurix_pcmu_sessions`,
-`aurix_pcmu_frames_total{direction="uplink"|"downlink",outcome="ok"|"error"}`. SDKs: Unity `SetAudioCodecAsync` / behaviour
-`PreferredCodec`, native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec`.
+Channels are Opus internally, but a native AURX session can ask to run on **G.711** — μ-law
+(PCMU) or A-law (PCMA): 8 kHz, 64 kbit/s, no Opus CPU on the device (old phones,
+embedded/handheld hardware, very cheap SoCs). It is a **per-session** negotiation, never a
+channel setting: `SetAudioCodec {codec: "pcmu" | "pcma"}` over the control connection →
+`AudioCodecChanged {codec}` ack, after which the client sends 8 kHz G.711 frames (80/160/320/480
+bytes = 10/20/40/60 ms) flagged `Pcmu` (`0x2000`) / `Pcma` (`0x0010`) and receives its downlink
+in the same law. In plaintext channels the node transcodes at the edge: the G.711 uplink is
+decoded and encoded to narrowband Opus **before** recording, transcription, safety, live streams,
+cascade and fan-out (so every other participant, browsers included, keeps receiving Opus), and
+internal Opus is decoded/encoded to μ-law / A-law only for G.711 receivers, after mutes, blocks,
+volume, focus, positional attenuation and direction have been applied (the gain/direction bytes
+and the per-receiver seal are identical to Opus downlinks). In **E2EE channels** the node
+cannot transcode what it cannot read, so sealed G.711 frames are relayed as they are with the
+codec flag and every peer (native, Unity, Unreal, Godot, browsers over WebTransport) decodes them
+itself. `ReceiverPreferences.codec` replays the session's codec after a resume or failover; a
+fresh session starts on Opus and the SDKs re-negotiate the preferred codec. Not available to
+WebRTC sessions (browsers negotiate Opus in SDP) and switched off node-wide with
+`media.pcmu_fallback = false` (`CODEC_NOT_AVAILABLE`). Metrics: `aurix_g711_sessions{codec}`,
+`aurix_g711_frames_total{codec,direction="uplink"|"downlink",outcome="ok"|"error"}`. SDKs: Unity
+`SetAudioCodecAsync` / behaviour `PreferredCodec`, native `aurix_client_set_audio_codec`, Unreal
+`SetAudioCodec`, Godot `set_audio_codec`.
 
 ### When UDP is blocked: AURX over the control WebSocket
 
@@ -1249,9 +1252,9 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
   Unreal SDKs have the full set, and browsers get it only on the WebTransport path (WebCodecs
   Opus), which needs a Chromium-based browser and the node's `webtransport_port` reachable over
   UDP directly (no reverse proxy) — everything else stays on WebRTC.
-* PCMU is a per-session fallback for native AURX clients only (no PCMA, no WebRTC PCMU, no
-  PCMU for `E2ee` frames); each PCMU session costs the node one Opus encoder plus one Opus
-  decoder per speaker it hears.
+* PCMU / PCMA are per-session fallbacks for native AURX clients only (no G.711 over WebRTC);
+  each plaintext G.711 session costs the node one Opus encoder plus one Opus decoder per speaker
+  it hears, and in E2EE channels a G.711 device is heard narrowband by everyone.
 * The blocked-UDP fallbacks for native clients are TCP — the dedicated TLS tunnel
   (`media.tls_tunnel_port`, pinned QUIC certificate, TLS-passthrough proxies only, no ACME) or
   the control WebSocket: head-of-line blocking under loss and a bounded per-connection downlink

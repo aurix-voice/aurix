@@ -84,12 +84,22 @@ AurixTransmissionMode FromTransmission(EAurixTransmissionMode M)
 
 EAurixAudioCodec ToCodec(AurixAudioCodec C)
 {
-	return C == AURIX_CODEC_PCMU ? EAurixAudioCodec::Pcmu : EAurixAudioCodec::Opus;
+	switch (C)
+	{
+	case AURIX_CODEC_PCMU: return EAurixAudioCodec::Pcmu;
+	case AURIX_CODEC_PCMA: return EAurixAudioCodec::Pcma;
+	default: return EAurixAudioCodec::Opus;
+	}
 }
 
 AurixAudioCodec FromCodec(EAurixAudioCodec C)
 {
-	return C == EAurixAudioCodec::Pcmu ? AURIX_CODEC_PCMU : AURIX_CODEC_OPUS;
+	switch (C)
+	{
+	case EAurixAudioCodec::Pcmu: return AURIX_CODEC_PCMU;
+	case EAurixAudioCodec::Pcma: return AURIX_CODEC_PCMA;
+	default: return AURIX_CODEC_OPUS;
+	}
 }
 
 EAurixDownlinkMode ToDownlinkMode(AurixDownlinkMode M)

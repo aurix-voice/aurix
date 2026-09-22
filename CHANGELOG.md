@@ -171,6 +171,24 @@ released together.
   `AurixSessionInfo.noise_suppression` in the C ABI / C++), `SetServerNoiseSuppression` /
   `IsServerNoiseSuppressionEnabled` / `OnServerNoiseSuppressionChanged` (Unreal),
   `set_server_noise_suppression` / `server_noise_suppression_changed` (Godot native + Web).
+* **PCMA (G.711 A-law) and end-to-end encrypted G.711.** `SetAudioCodec { codec: "pcma" }`
+  joins `"pcmu"` as a per-session fallback for native AURX clients: the same 8 kHz / 64 kbit/s
+  frames, A-law companded, flagged with the new `PacketFlags::Pcma` (`0x0010`, the never-used
+  `KeyFrame` bit; `Pcmu` stays `0x2000`). In plaintext channels the node transcodes each law at
+  the edge exactly as it did PCMU — a PCMA uplink becomes narrowband Opus, an Opus/PCMU speaker
+  reaches a PCMA listener re-encoded in A-law — and frames in the wrong law for the session are
+  dropped. In **E2EE channels G.711 now works**: a `Pcmu | E2ee` / `Pcma | E2ee` frame is
+  relayed sealed with its codec flag, byte for byte and only to capable members, like E2EE Opus
+  (the node never decodes, transcodes, mixes, records, transcribes or denoises it); every SDK
+  picks the decoder from the flag after opening the frame, browsers over WebTransport included.
+  The negotiated law survives resume and cross-node failover (`ReceiverPreferences.codec`).
+  Metrics are now per law: `aurix_g711_sessions{codec}` and
+  `aurix_g711_frames_total{codec,direction,outcome}` replace `aurix_pcmu_sessions` /
+  `aurix_pcmu_frames_total` (update dashboards and alert rules). SDKs: `AudioCodec.Pcma`
+  everywhere — `G711Codec(AudioCodec)` (`PcmuCodec` kept as the μ-law alias), `AurxPacket.CodecFlag`
+  / `CodecOf`, E2EE uplink for any codec (Unity); `Law::A` in `aurix_common::g711`,
+  `AURIX_CODEC_PCMA` in the C ABI / C++ / Unreal `EAurixAudioCodec::Pcma` / Godot `CODEC_PCMA`;
+  `g711.ts` A-law/μ-law decoding for E2EE frames in the Web SDK.
 
 ### Fixed
 

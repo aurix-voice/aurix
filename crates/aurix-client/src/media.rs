@@ -100,7 +100,8 @@ pub struct IncomingAudio {
     pub volume: f32,
     /// Speaker bearing relative to this listener in directional channels.
     pub direction: Option<Direction>,
-    /// Codec of `payload`: Opus, or PCMU when the packet carries `PacketFlags::Pcmu`.
+    /// Codec of `payload` (from `PacketFlags::Pcmu` / `PacketFlags::Pcma`; Opus otherwise).
+    /// On an `e2ee` frame it is the codec of the plaintext inside the sealed frame.
     pub codec: AudioCodec,
     /// Server-mixed channel downlink (`PacketFlags::Mixed`): stereo Opus with every
     /// receiver-specific gain already applied; `sender_ssrc` is the channel's mix SSRC.
@@ -959,11 +960,7 @@ impl MediaTransport {
                 }
                 let (volume, direction) = packet.take_downlink_meta();
                 self.stats.lock().audio_frames_received += 1;
-                let codec = if packet.header.has_flag(PacketFlags::Pcmu) {
-                    AudioCodec::Pcmu
-                } else {
-                    AudioCodec::Opus
-                };
+                let codec = packet.header.audio_codec();
                 if let Some(sink) = sink {
                     sink(IncomingAudio {
                         sender_ssrc: sender,
@@ -1060,8 +1057,8 @@ impl MediaTransport {
         self.send_audio_frame(channel_hash, timestamp, level, AudioCodec::Opus, opus);
     }
 
-    /// [`Self::send_audio`] for a frame in either codec; PCMU frames are flagged
-    /// `PacketFlags::Pcmu` so the server transcodes them.
+    /// [`Self::send_audio`] for a frame in any codec; G.711 frames are flagged
+    /// `PacketFlags::Pcmu` / `PacketFlags::Pcma` so the server transcodes them.
     pub fn send_audio_frame(
         &self,
         channel_hash: u32,
@@ -1073,23 +1070,19 @@ impl MediaTransport {
         self.send_audio_packet(channel_hash, timestamp, level, codec, false, data);
     }
 
-    /// [`Self::send_audio`] for an Opus frame already sealed with the group sender key
+    /// [`Self::send_audio`] for a frame already sealed with the group sender key
     /// (`PacketFlags::E2ee`): the server relays it opaque to the channel's capable members.
+    /// `codec` is the codec of the plaintext inside `frame`; it travels as the codec flag so
+    /// the receivers know what to decode after opening it.
     pub fn send_audio_e2ee(
         &self,
         channel_hash: u32,
         timestamp: u32,
         level: Option<u8>,
+        codec: AudioCodec,
         frame: &[u8],
     ) {
-        self.send_audio_packet(
-            channel_hash,
-            timestamp,
-            level,
-            AudioCodec::Opus,
-            true,
-            frame,
-        );
+        self.send_audio_packet(channel_hash, timestamp, level, codec, true, frame);
     }
 
     fn send_audio_packet(
@@ -1117,9 +1110,7 @@ impl MediaTransport {
                 Bytes::copy_from_slice(data),
             ),
         };
-        if codec == AudioCodec::Pcmu {
-            packet.header.flags |= PacketFlags::Pcmu as u16;
-        }
+        packet.header.set_audio_codec(codec);
         if e2ee {
             packet.header.flags |= PacketFlags::E2ee as u16;
         }

@@ -158,23 +158,25 @@ voice.StereoCodecFactory = () => new ConcentusOpusCodec(48000, 2);    // or Nati
   ones and averages L/R for a mono output. With no stereo factory the mono factory decodes stereo packets
   downmixed.
 
-### PCMU (G.711) fallback for weak devices
+### PCMU / PCMA (G.711) fallback for weak devices
 
-A session can run on **G.711 μ-law** instead of Opus — 8 kHz, 64 kbit/s, a lookup table with no encoder
-state, for hardware where even Concentus at complexity 0 does not fit. The codec is negotiated per
-session; the server transcodes at the edge, so every other participant keeps Opus and notices nothing
-(the PCMU listener hears narrowband audio).
+A session can run on **G.711** — μ-law (`AudioCodec.Pcmu`) or A-law (`AudioCodec.Pcma`) — instead of
+Opus: 8 kHz, 64 kbit/s, a lookup table with no encoder state, for hardware where even Concentus at
+complexity 0 does not fit. The codec is negotiated per session; in plaintext channels the server
+transcodes at the edge, so every other participant keeps Opus and notices nothing (the G.711 listener
+hears narrowband audio); in E2EE channels the sealed G.711 frame is relayed untouched with its codec flag
+and every member decodes it after opening.
 
 ```csharp
 // AurixVoiceBehaviour: PreferredCodec = AudioCodec.Pcmu in the inspector, or at runtime:
 await voice.SetAudioCodec(AudioCodec.Pcmu);      // ActiveCodec flips when the server acks
 
 // AurixVoiceClient with your own capture:
-var pcmu = new PcmuCodec();                      // IOpusCodec: 48 kHz float in/out, μ-law on the wire
-client.OnAudioCodecChanged += codec => Debug.Log($"codec now {codec}");
-await client.SetAudioCodecAsync(AudioCodec.Pcmu);
-int n = pcmu.Encode(mono48k, AudioFormat.FrameSamples, ulaw);          // 960 samples → 160 bytes
-client.TransmitAudioFrame(client.AudioCodec, ulaw, n, AudioFormat.FrameSamples, vad.Level);
+var alaw = new G711Codec(AudioCodec.Pcma);       // IOpusCodec: 48 kHz float in/out, A-law on the wire
+client.OnAudioCodecChanged += codec => Debug.Log($"codec now {codec}");   // (PcmuCodec = μ-law alias)
+await client.SetAudioCodecAsync(AudioCodec.Pcma);
+int n = alaw.Encode(mono48k, AudioFormat.FrameSamples, g711);           // 960 samples → 160 bytes
+client.TransmitAudioFrame(client.AudioCodec, g711, n, AudioFormat.FrameSamples, vad.Level);
 await client.SetAudioCodecAsync(AudioCodec.Opus);                       // back to Opus
 ```
 
@@ -182,12 +184,12 @@ await client.SetAudioCodecAsync(AudioCodec.Opus);                       // back 
   you asked for; the behaviour picks its encoder from `AudioCodec` on every frame, so no frame is sent in
   the wrong codec around a switch. A resumed session keeps the codec; after a fresh session the client
   re-sends `SetAudioCodec` for a non-Opus preference.
-* Downlink frames arrive flagged `PacketFlags.Pcmu`; `IncomingAudio.Codec`/`Payload` tell you which
-  (the old `Opus` field is kept but obsolete), and `RemoteMixer` decodes PCMU and Opus streams side by
-  side, replacing a stream's decoder when its codec changes. `SendOpusFrame`/`TransmitOpusFrame` still
+* Downlink frames arrive flagged `PacketFlags.Pcmu` / `PacketFlags.Pcma`; `IncomingAudio.Codec`/`Payload`
+  tell you which (the old `Opus` field is kept but obsolete), and `RemoteMixer` decodes PCMU, PCMA and
+  Opus streams side by side, replacing a stream's decoder when its codec changes. `SendOpusFrame`/`TransmitOpusFrame` still
   work and simply mean `AudioCodec.Opus`.
-* `PcmuCodec.SetBitrate` is a no-op and `OpusEncoderSettings` / channel audio policies are not applied
-  while PCMU is active. Not available on WebRTC sessions or for E2EE frames; the node may refuse with
+* `G711Codec.SetBitrate` is a no-op and `OpusEncoderSettings` / channel audio policies are not applied
+  while G.711 is active. Not available on WebRTC sessions; the node may refuse with
   `CODEC_NOT_AVAILABLE` (`media.pcmu_fallback = false`).
 
 ### When UDP is blocked: the WebSocket tunnel

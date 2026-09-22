@@ -205,8 +205,13 @@ async fn quic_link_binds_and_carries_authenticated_media_both_ways() {
         )
         .unwrap();
     }
-    b.media
-        .send_audio_e2ee(sealed_hash, 1920, None, b"sealed-by-sender");
+    b.media.send_audio_e2ee(
+        sealed_hash,
+        1920,
+        None,
+        AudioCodec::Opus,
+        b"sealed-by-sender",
+    );
     let f = next_frame(&mut a.rx).await.expect("e2ee frame");
     assert!(f.e2ee);
     assert_eq!(f.channel_hash, sealed_hash);

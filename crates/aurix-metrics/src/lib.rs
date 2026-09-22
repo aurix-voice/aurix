@@ -370,13 +370,13 @@ pub static SAFETY_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
-/// `direction` is `uplink` (μ-law → Opus) or `downlink` (Opus → μ-law); `outcome` is `ok` or
-/// `error`.
-pub static PCMU_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
+/// `codec` is `pcmu` or `pcma`; `direction` is `uplink` (G.711 → Opus) or `downlink` (Opus →
+/// G.711); `outcome` is `ok` or `error`.
+pub static G711_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
-        "aurix_pcmu_frames_total",
-        "Audio frames transcoded for sessions that negotiated the PCMU fallback codec",
-        &["direction", "outcome"]
+        "aurix_g711_frames_total",
+        "Audio frames transcoded for sessions that negotiated a G.711 fallback codec",
+        &["codec", "direction", "outcome"]
     )
     .unwrap()
 });
@@ -403,10 +403,12 @@ pub static TRANSLATION_LATENCY: Lazy<Histogram> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static PCMU_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!(
-        "aurix_pcmu_sessions",
-        "Sessions currently using the PCMU fallback codec"
+/// `codec` is `pcmu` or `pcma`.
+pub static G711_SESSIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aurix_g711_sessions",
+        "Sessions currently using a G.711 fallback codec",
+        &["codec"]
     )
     .unwrap()
 });
@@ -665,8 +667,8 @@ pub static CASCADE_TCP_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 pub fn gather_metrics() -> String {
-    let _ = &*PCMU_FRAMES;
-    let _ = &*PCMU_SESSIONS;
+    let _ = &*G711_FRAMES;
+    let _ = &*G711_SESSIONS;
     let _ = &*NOISE_SUPPRESSION_SESSIONS;
     let _ = &*NOISE_SUPPRESSION_FRAMES;
     let _ = &*TUNNEL_PACKETS;

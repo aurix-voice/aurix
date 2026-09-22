@@ -112,8 +112,11 @@
   `UpdatePositionAsync`), нет PCMU, нет `IOpusCodec`/DSP/настроек медиа-пути, звук только после
   жеста пользователя (autoplay policy). Нативный `AurixVoiceClient` в WebGL-плеерах бросает
   `PlatformNotSupportedException` ([Unity WebGL](../sdk/unity.md#unity-webgl)).
-* **Внутри Opus; PCMU — только как fallback на сессию** для нативных AURX-клиентов (нода
-  транскодирует на краю). Нет PCMA, нет PCMU по WebRTC, нет PCMU для `E2ee`-кадров, нет видео
+* **Внутри Opus; G.711 (PCMU/PCMA) — только как fallback на сессию** для нативных AURX-клиентов:
+  в открытых каналах нода транскодирует на краю (один Opus-энкодер плюс декодер на каждого
+  слышимого спикера на сессию), в E2EE-каналах запечатанный G.711 ретранслируется как есть с
+  флагом кодека и декодируется получателями. Нет G.711 по WebRTC (браузер получает G.711 только
+  как E2EE-кадры по WebTransport), нет видео
   ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 * **TCP-fallback'и для нативного медиа — это TCP.** Когда UDP заблокирован, SDK несут AURX-пакеты
   по выделенному [TLS-туннелю](../api/aurx.md#tls-tunnel-aurx-frames-on-a-dedicated-443-port) ноды

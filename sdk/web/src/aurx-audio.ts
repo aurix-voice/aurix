@@ -10,6 +10,8 @@
  *   SSRC; the node is a plain `AudioNode` the spatial renderer places like a WebRTC track.
  */
 
+import type { DownlinkCodec } from './aurx.js';
+import { decodeG711, G711_SAMPLE_RATE, G711Upsampler, type G711Law } from './g711.js';
 import type { AudioPolicy } from './opus.js';
 
 export const AURX_SAMPLE_RATE = 48_000;
@@ -541,6 +543,8 @@ interface PlaybackSlot {
   channels: 1 | 2;
   lastSeq: number | undefined;
   underruns: number;
+  /** 8 kHz → 48 kHz interpolator, created on the first G.711 frame of the stream. */
+  g711: G711Upsampler | undefined;
 }
 
 export interface AurxPlaybackStats {
@@ -590,7 +594,7 @@ export class AurxPlayback {
       outputChannelCount: [2],
     });
     node.port.postMessage({ type: 'prime', samples: this.primeFrames * AURX_FRAME_SAMPLES });
-    const slot: PlaybackSlot = { node, decoder: undefined, channels: stereo ? 2 : 1, lastSeq: undefined, underruns: 0 };
+    const slot: PlaybackSlot = { node, decoder: undefined, channels: stereo ? 2 : 1, lastSeq: undefined, underruns: 0, g711: undefined };
     node.port.onmessage = (ev: MessageEvent<{ type: string; count?: number }>) => {
       if (ev.data?.type === 'underrun') slot.underruns = ev.data.count ?? slot.underruns + 1;
     };
@@ -598,8 +602,8 @@ export class AurxPlayback {
     return node;
   }
 
-  /** Decode one Opus frame of `ssrc` and queue it for playback. */
-  push(ssrc: number, frame: Uint8Array, sequence: number, timestamp: number, stereo: boolean): void {
+  /** Decode one frame of `ssrc` (Opus, or G.711 when `codec` says so) and queue it for playback. */
+  push(ssrc: number, frame: Uint8Array, sequence: number, timestamp: number, stereo: boolean, codec: DownlinkCodec = 'opus'): void {
     const slot = this.slots.get(ssrc);
     if (!slot) return;
     if (slot.lastSeq !== undefined) {
@@ -610,6 +614,10 @@ export class AurxPlayback {
       }
     }
     slot.lastSeq = sequence;
+    if (codec !== 'opus') {
+      this.pushG711(slot, codec, frame);
+      return;
+    }
     // An Opus DTX "nothing to send" frame decodes to nothing; the player just runs dry.
     if (frame.length === 0) return;
     const wantChannels: 1 | 2 = stereo ? 2 : 1;
@@ -636,6 +644,19 @@ export class AurxPlayback {
       this.framesDropped += 1;
       this.onError(e instanceof Error ? e : new Error(String(e)));
     }
+  }
+
+  /** G.711 is decoded here (no WebCodecs decoder exists for it): table lookup, then 8 → 48 kHz. */
+  private pushG711(slot: PlaybackSlot, law: G711Law, frame: Uint8Array): void {
+    const narrow = decodeG711(law, frame);
+    if (!narrow) {
+      this.framesDropped += 1;
+      return;
+    }
+    slot.g711 ??= new G711Upsampler(AURX_SAMPLE_RATE / G711_SAMPLE_RATE);
+    const wide = slot.g711.process(narrow);
+    this.framesDecoded += 1;
+    slot.node.port.postMessage({ type: 'pcm', planes: [wide] }, [wide.buffer]);
   }
 
   remove(ssrc: number): void {

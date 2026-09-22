@@ -430,11 +430,8 @@ impl Inner {
         let mut sealed: Option<Vec<u8>> = None;
         for &(hash, e2ee) in targets {
             if e2ee {
-                if codec != AudioCodec::Opus {
-                    continue;
-                }
                 let frame = sealed.get_or_insert_with(|| self.e2ee.lock().encrypt(payload));
-                media.send_audio_e2ee(hash, ts, level, frame);
+                media.send_audio_e2ee(hash, ts, level, codec, frame);
                 encrypted += 1;
             } else {
                 media.send_audio_frame(hash, ts, level, codec, payload);
@@ -1511,9 +1508,11 @@ impl Client {
     }
 
     /// Ask the server to switch this session's uplink and downlink to `codec`. Opus is the
-    /// default; `Pcmu` (G.711 μ-law, 8 kHz, 64 kbit/s, no Opus CPU cost) is a fallback for
-    /// very weak devices and is only available on native AURX sessions of nodes with
-    /// `media.pcmu_fallback` enabled. Frames switch once `AudioCodecChanged` arrives.
+    /// default; `Pcmu` / `Pcma` (G.711 μ-law / A-law, 8 kHz, 64 kbit/s, no Opus CPU cost) are
+    /// fallbacks for very weak devices and are only available on native AURX sessions of
+    /// nodes with `media.pcmu_fallback` enabled. In plaintext channels the node transcodes;
+    /// in end-to-end encrypted channels the sealed G.711 frames reach every peer as they
+    /// are. Frames switch once `AudioCodecChanged` arrives.
     pub fn set_audio_codec(&self, codec: AudioCodec) -> Result<()> {
         self.inner.prefs.lock().codec = codec;
         self.send_cmd(Command::Send(ControlMessage::SetAudioCodec { codec }))

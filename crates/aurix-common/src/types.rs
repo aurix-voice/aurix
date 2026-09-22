@@ -195,8 +195,9 @@ pub enum ConnectionState {
 }
 
 /// Audio codec of a media stream. Channels always carry Opus; a native AURX session may
-/// negotiate PCMU for its own uplink/downlink with `SetAudioCodec`, in which case the server
-/// transcodes between the two.
+/// negotiate G.711 (PCMU or PCMA) for its own uplink/downlink with `SetAudioCodec`, in which
+/// case the server transcodes between the two — except for end-to-end encrypted frames, which
+/// travel as the sender coded them and are decoded by the receivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioCodec {
@@ -204,6 +205,24 @@ pub enum AudioCodec {
     Opus,
     /// ITU-T G.711 μ-law, 8 kHz mono, 64 kbit/s (see `aurix_common::g711`).
     Pcmu,
+    /// ITU-T G.711 A-law, 8 kHz mono, 64 kbit/s (see `aurix_common::g711`).
+    Pcma,
+}
+
+impl AudioCodec {
+    /// `true` for the G.711 codecs (one byte per 8 kHz sample, no Opus).
+    pub fn is_g711(self) -> bool {
+        self.g711_law().is_some()
+    }
+
+    /// Companding law of a G.711 codec; `None` for Opus.
+    pub fn g711_law(self) -> Option<crate::g711::Law> {
+        match self {
+            AudioCodec::Opus => None,
+            AudioCodec::Pcmu => Some(crate::g711::Law::Mu),
+            AudioCodec::Pcma => Some(crate::g711::Law::A),
+        }
+    }
 }
 
 /// How a native AURX session receives channel audio (`SetDownlinkMode`).

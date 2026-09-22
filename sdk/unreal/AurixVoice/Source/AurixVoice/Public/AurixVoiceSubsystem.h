@@ -440,9 +440,10 @@ public:
 	bool SetChannelFocus(FGuid ChannelId);
 
 	/**
-	 * Ask the server to run this session on Codec. Pcmu (G.711) is a low-CPU fallback for weak
-	 * devices; the node transcodes, so Opus participants are unaffected. Needs
-	 * `media.pcmu_fallback` on the node; applied on OnAudioCodecChanged.
+	 * Ask the server to run this session on Codec. Pcmu / Pcma (G.711) are low-CPU fallbacks for
+	 * weak devices; in plaintext channels the node transcodes, so Opus participants are unaffected,
+	 * in end-to-end encrypted channels the sealed G.711 frames are relayed as they are and peers
+	 * decode them. Needs `media.pcmu_fallback` on the node; applied on OnAudioCodecChanged.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
 	bool SetAudioCodec(EAurixAudioCodec Codec);

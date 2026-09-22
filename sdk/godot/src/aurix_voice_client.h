@@ -56,6 +56,7 @@ public:
     enum AudioCodec {
         CODEC_OPUS = AURIX_CODEC_OPUS,
         CODEC_PCMU = AURIX_CODEC_PCMU,
+        CODEC_PCMA = AURIX_CODEC_PCMA,
     };
     enum DownlinkMode {
         DOWNLINK_STREAMS = AURIX_DOWNLINK_STREAMS,

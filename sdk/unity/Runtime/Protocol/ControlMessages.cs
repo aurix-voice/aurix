@@ -572,10 +572,10 @@ namespace Aurix.Protocol
         internal static string DownlinkModeToWire(DownlinkMode mode) => mode == Protocol.DownlinkMode.Mixed ? "mixed" : "streams";
 
         internal static Aurix.Audio.AudioCodec AudioCodecFromWire(string s) =>
-            s == "pcmu" ? Aurix.Audio.AudioCodec.Pcmu : Aurix.Audio.AudioCodec.Opus;
+            s == "pcmu" ? Aurix.Audio.AudioCodec.Pcmu : s == "pcma" ? Aurix.Audio.AudioCodec.Pcma : Aurix.Audio.AudioCodec.Opus;
 
         internal static string AudioCodecToWire(Aurix.Audio.AudioCodec codec) =>
-            codec == Aurix.Audio.AudioCodec.Pcmu ? "pcmu" : "opus";
+            codec == Aurix.Audio.AudioCodec.Pcmu ? "pcmu" : codec == Aurix.Audio.AudioCodec.Pcma ? "pcma" : "opus";
 
         /// <summary>Typed view of a <c>TransmissionChanged</c> payload.</summary>
         public TransmissionMode Transmission() =>

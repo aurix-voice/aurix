@@ -380,15 +380,18 @@ language, spoken_language, speech)`, `AURIX_EVENT_TRANSLATION_CHANGED` + `aurix_
 `bTranslationSpeech`, `FAurixTranscript.OriginalText` / `OriginalLanguage`. See
 [live translation](../features/speech.md#live-translation).
 
-## PCMU (G.711) fallback
+## PCMU / PCMA (G.711) fallback
 
-`client.set_audio_codec(AudioCodec::Pcmu)` asks the server to run the session on G.711 μ-law
-(8 kHz, 64 kbit/s, no Opus CPU); `Event::AudioCodecChanged(codec)` confirms it and
-`client.audio_codec()` reports the acknowledged codec. The core does the rest: capture pushed
-with `push_capture_*` is decimated to 8 kHz and μ-law encoded, μ-law downlink frames (flagged
-`Pcmu`) are decoded and upsampled into the same mixer as Opus streams, and after a fresh session
-the preferred codec is negotiated again. The node transcodes at the edge, so other participants
-are unaffected ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+`client.set_audio_codec(AudioCodec::Pcmu)` (or `AudioCodec::Pcma`) asks the server to run the
+session on G.711 μ-law / A-law (8 kHz, 64 kbit/s, no Opus CPU); `Event::AudioCodecChanged(codec)`
+confirms it and `client.audio_codec()` reports the acknowledged codec. The core does the rest:
+capture pushed with `push_capture_*` is decimated to 8 kHz and companded in the negotiated law,
+G.711 downlink frames (flagged `Pcmu` / `Pcma`) are decoded in the law the flag names and
+upsampled into the same mixer as Opus streams, and after a fresh session the preferred codec is
+negotiated again. In plaintext channels the node transcodes at the edge, so other participants
+are unaffected; in an E2EE channel the core seals the G.711 frame like an Opus one and the node
+relays it untouched with its codec flag — every member decodes it after opening
+([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 
 ## QUIC: 0-RTT resume and connection migration
 
@@ -562,9 +565,9 @@ the client has not been introduced to (the mixer plays it; the host names it whe
 entry arrives). C: `AurixChannelScope` (a `0` radius means unscoped) via
 `aurix_client_channel_scope` / `aurix_event_channel_scope`, C++ `Client::channel_scope`,
 Unreal `GetChannelScope` ([radius-scoped presence](../features/channels.md#radius-scoped-presence-and-text)).
-C: `aurix_client_set_audio_codec(client, AURIX_CODEC_PCMU)`, `aurix_client_audio_codec`,
-`AURIX_EVENT_AUDIO_CODEC_CHANGED` + `aurix_event_audio_codec`; C++ `set_audio_codec` /
-`audio_codec`; Unreal `SetAudioCodec(EAurixAudioCodec::Pcmu)`, `GetAudioCodec`,
+C: `aurix_client_set_audio_codec(client, AURIX_CODEC_PCMU | AURIX_CODEC_PCMA)`,
+`aurix_client_audio_codec`, `AURIX_EVENT_AUDIO_CODEC_CHANGED` + `aurix_event_audio_codec`; C++
+`set_audio_codec` / `audio_codec`; Unreal `SetAudioCodec(EAurixAudioCodec::Pcmu | Pcma)`, `GetAudioCodec`,
 `OnAudioCodecChanged`. Fails with `CODEC_NOT_AVAILABLE` when the node sets
 `media.pcmu_fallback = false`.
 

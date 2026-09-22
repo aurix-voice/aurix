@@ -118,26 +118,37 @@ the channel pick it up (channel type changes take effect for subsequent frames).
 
 Every channel is Opus internally — `ChannelConfig.codec` only accepts `opus`, and that is what
 recording, transcription, live streams, cascade and every WebRTC participant see. A **native
-AURX session** may nevertheless run on **G.711 μ-law (PCMU)**: 8 kHz, 64 kbit/s, a lookup table
-instead of an Opus encoder/decoder — for devices where Opus does not fit the CPU budget.
+AURX session** may nevertheless run on **G.711** — **μ-law (PCMU)** or **A-law (PCMA)**: 8 kHz,
+64 kbit/s, a lookup table instead of an Opus encoder/decoder — for devices where Opus does not
+fit the CPU budget.
 
-* The client sends `SetAudioCodec { codec: "pcmu" }` over the control connection and waits
-  for `AudioCodecChanged { codec }`; from then on its uplink frames are μ-law of 80/160/320/480
-  bytes (10/20/40/60 ms) flagged `Pcmu` and its downlink arrives as μ-law with the same flag.
-  `SetAudioCodec { codec: "opus" }` switches back; the ack decides which codec the next frames
-  use. The negotiated codec is replayed in `ReceiverPreferences.codec` after a resume; a fresh
-  session starts on Opus and the SDKs send `SetAudioCodec` again.
-* The node transcodes **at the edge**: a PCMU uplink is decoded and encoded to narrowband Opus
-  before it enters the channel, and the Opus a PCMU receiver would get is converted to μ-law
-  after mutes, blocks, per-participant volume, focus, positional attenuation and direction have
-  been applied — the gain/direction bytes and the per-receiver seal are exactly as for Opus.
-  Opus participants in the same channel notice nothing; a PCMU listener hears narrowband audio.
-* Not available to WebRTC sessions (`CODEC_NOT_AVAILABLE`; browsers negotiate Opus in SDP) and
-  never for `E2ee` frames — the node cannot transcode what it cannot decrypt, so `Pcmu | E2ee`
-  frames are dropped. PCMU frames from a session that did not negotiate are dropped too.
-* `media.pcmu_fallback = false` refuses the negotiation node-wide. Cost per PCMU session: one
-  Opus encoder plus one Opus decoder per speaker it hears, on the node. Metrics:
-  `aurix_pcmu_sessions`, `aurix_pcmu_frames_total{direction,outcome}`.
+* The client sends `SetAudioCodec { codec: "pcmu" | "pcma" }` over the control connection and
+  waits for `AudioCodecChanged { codec }`; from then on its uplink frames are G.711 of
+  80/160/320/480 bytes (10/20/40/60 ms) flagged `Pcmu` / `Pcma` and its downlink arrives in the
+  same law with the same flag. `SetAudioCodec { codec: "opus" }` switches back; the ack decides
+  which codec the next frames use. The negotiated codec is replayed in
+  `ReceiverPreferences.codec` after a resume or a cross-node failover; a fresh session starts on
+  Opus and the SDKs send `SetAudioCodec` again.
+* In plaintext channels the node transcodes **at the edge**: a G.711 uplink is decoded and
+  encoded to narrowband Opus before it enters the channel, and the Opus a G.711 receiver would
+  get is converted to its law after mutes, blocks, per-participant volume, focus, positional
+  attenuation and direction have been applied — the gain/direction bytes and the per-receiver
+  seal are exactly as for Opus. Opus participants in the same channel notice nothing; a G.711
+  listener hears narrowband audio. A PCMU and a PCMA session in one channel each get their own
+  law.
+* In **end-to-end encrypted** channels the node cannot transcode what it cannot decrypt, so a
+  `Pcmu | E2ee` / `Pcma | E2ee` frame is relayed sealed exactly like E2EE Opus, codec flag
+  included: every member decodes the G.711 frame itself after opening it (all SDKs do, browsers
+  over WebTransport too — `Pcmu`/`Pcma` E2EE frames are the one case where a browser receives
+  G.711). A G.711 device in an E2EE channel is heard narrowband by everybody, and hears Opus
+  speakers only if it can decode Opus — the fallback saves the *uplink* encoder there, not the
+  decoders.
+* Not available to WebRTC sessions (`CODEC_NOT_AVAILABLE`; browsers negotiate Opus in SDP).
+  G.711 frames from a session that did not negotiate, or in the other law, are dropped.
+* `media.pcmu_fallback = false` refuses the negotiation (both laws) node-wide. Cost per plaintext
+  G.711 session: one Opus encoder plus one Opus decoder per speaker it hears, on the node; E2EE
+  G.711 sessions cost nothing extra. Metrics: `aurix_g711_sessions{codec}`,
+  `aurix_g711_frames_total{codec,direction,outcome}`.
 
 SDKs: Unity `client.SetAudioCodecAsync(AudioCodec.Pcmu)` / `AurixVoiceBehaviour.PreferredCodec`,
 native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec` ([overview](../sdk/overview.md)).

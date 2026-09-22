@@ -4,7 +4,7 @@
 //! decoder, mixed into one interleaved output with per-participant gain and constant-power
 //! panning). Mirrors `sdk/unity/Runtime/Audio` so all clients sound the same.
 
-use aurix_common::g711::{self, PCMU_FRAME_SAMPLES, PCMU_FRAME_SIZES, PCMU_SAMPLE_RATE};
+use aurix_common::g711::{Law, PCMU_FRAME_SAMPLES, PCMU_FRAME_SIZES, PCMU_SAMPLE_RATE};
 use aurix_common::protocol::{
     decode_audio_level, encode_audio_level, opus_packet_is_stereo, AUDIO_LEVEL_SILENCE,
 };
@@ -236,31 +236,31 @@ impl NarrowbandFir {
     }
 }
 
-/// 48 kHz mono → G.711 μ-law at 8 kHz, one 20 ms frame at a time.
+/// 48 kHz mono → G.711 (μ-law or A-law) at 8 kHz, one 20 ms frame at a time.
 #[derive(Debug, Clone)]
-pub struct PcmuEncoder {
+pub struct G711Encoder {
     fir: NarrowbandFir,
 }
 
-impl Default for PcmuEncoder {
+impl Default for G711Encoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PcmuEncoder {
+impl G711Encoder {
     pub fn new() -> Self {
         Self {
             fir: NarrowbandFir::new(1.0),
         }
     }
 
-    /// `pcm` is 48 kHz mono; every 6th low-passed sample becomes one μ-law byte in `out`.
-    pub fn encode(&mut self, pcm: &[f32], out: &mut Vec<u8>) {
+    /// `pcm` is 48 kHz mono; every 6th low-passed sample becomes one `law` byte in `out`.
+    pub fn encode(&mut self, law: Law, pcm: &[f32], out: &mut Vec<u8>) {
         for (i, &s) in pcm.iter().enumerate() {
             let y = self.fir.process(s);
             if i % PCMU_DECIMATION == PCMU_DECIMATION - 1 {
-                out.push(g711::ulaw_encode((y.clamp(-1.0, 1.0) * 32767.0) as i16));
+                out.push(law.encode_sample((y.clamp(-1.0, 1.0) * 32767.0) as i16));
             }
         }
     }
@@ -270,20 +270,21 @@ impl PcmuEncoder {
     }
 }
 
-/// G.711 μ-law at 8 kHz → 48 kHz mono, with hold-last-sample concealment for lost frames.
+/// G.711 (μ-law or A-law) at 8 kHz → 48 kHz mono, with hold-last-sample concealment for
+/// lost frames.
 #[derive(Debug, Clone)]
-pub struct PcmuDecoder {
+pub struct G711Decoder {
     fir: NarrowbandFir,
     last: f32,
 }
 
-impl Default for PcmuDecoder {
+impl Default for G711Decoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PcmuDecoder {
+impl G711Decoder {
     pub fn new() -> Self {
         Self {
             fir: NarrowbandFir::new(PCMU_DECIMATION as f32),
@@ -291,15 +292,15 @@ impl PcmuDecoder {
         }
     }
 
-    /// Decodes one μ-law frame (10/20/40/60 ms) into `out` at 48 kHz. Returns the number of
+    /// Decodes one `law` frame (10/20/40/60 ms) into `out` at 48 kHz. Returns the number of
     /// samples written, or `None` for a frame of unsupported size.
-    pub fn decode(&mut self, ulaw: &[u8], out: &mut [f32]) -> Option<usize> {
-        if !PCMU_FRAME_SIZES.contains(&ulaw.len()) || out.len() < ulaw.len() * PCMU_DECIMATION {
+    pub fn decode(&mut self, law: Law, coded: &[u8], out: &mut [f32]) -> Option<usize> {
+        if !PCMU_FRAME_SIZES.contains(&coded.len()) || out.len() < coded.len() * PCMU_DECIMATION {
             return None;
         }
         let mut n = 0;
-        for &b in ulaw {
-            let s = g711::ulaw_decode(b) as f32 / 32768.0;
+        for &b in coded {
+            let s = law.decode_sample(b) as f32 / 32768.0;
             self.last = s;
             for k in 0..PCMU_DECIMATION {
                 out[n] = self.fir.process(if k == 0 { s } else { 0.0 });
@@ -808,7 +809,7 @@ pub struct CaptureEncoder {
     /// Channels the current `encoder` was created with.
     encoder_channels: u8,
     music: bool,
-    pcmu: PcmuEncoder,
+    g711: G711Encoder,
     codec: AudioCodec,
     /// One resampler per encoded channel.
     resamplers: Vec<Resampler>,
@@ -830,7 +831,7 @@ pub struct CaptureEncoder {
     visemes: Option<Box<VisemeAnalyzer>>,
     settings: EncoderSettings,
     out: [u8; 1275],
-    ulaw: Vec<u8>,
+    g711_out: Vec<u8>,
 }
 
 impl CaptureEncoder {
@@ -841,7 +842,7 @@ impl CaptureEncoder {
             encoder,
             encoder_channels: settings.channels,
             music: settings.signal == OpusSignal::Music,
-            pcmu: PcmuEncoder::new(),
+            g711: G711Encoder::new(),
             codec: AudioCodec::Opus,
             resamplers: Vec::new(),
             split: Vec::new(),
@@ -855,7 +856,7 @@ impl CaptureEncoder {
             visemes: None,
             settings,
             out: [0u8; 1275],
-            ulaw: Vec::with_capacity(PCMU_FRAME_SAMPLES),
+            g711_out: Vec::with_capacity(PCMU_FRAME_SAMPLES),
         };
         this.apply(this.settings)?;
         Ok(this)
@@ -875,7 +876,7 @@ impl CaptureEncoder {
     pub fn set_codec(&mut self, codec: AudioCodec) {
         if self.codec != codec {
             self.codec = codec;
-            self.pcmu.reset();
+            self.g711.reset();
             let _ = self.encoder.reset_state();
         }
     }
@@ -885,11 +886,11 @@ impl CaptureEncoder {
     }
 
     /// Channels of the frames currently produced: `settings.channels` for Opus, always 1
-    /// for PCMU.
+    /// for G.711.
     pub fn channels(&self) -> u8 {
         match self.codec {
             AudioCodec::Opus => self.settings.channels,
-            AudioCodec::Pcmu => 1,
+            AudioCodec::Pcmu | AudioCodec::Pcma => 1,
         }
     }
 
@@ -1025,12 +1026,13 @@ impl CaptureEncoder {
                         }),
                         _ => {}
                     },
-                    AudioCodec::Pcmu => {
-                        self.ulaw.clear();
-                        self.pcmu.encode(frame, &mut self.ulaw);
+                    codec @ (AudioCodec::Pcmu | AudioCodec::Pcma) => {
+                        let law = codec.g711_law().unwrap_or(Law::Mu);
+                        self.g711_out.clear();
+                        self.g711.encode(law, frame, &mut self.g711_out);
                         sink(EncodedFrame {
-                            payload: self.ulaw.clone(),
-                            codec: AudioCodec::Pcmu,
+                            payload: self.g711_out.clone(),
+                            codec,
                             level: self.vad.level(),
                             energy,
                             speech: self.vad.speaking(),
@@ -1115,7 +1117,7 @@ impl CaptureEncoder {
             v.reset();
         }
         let _ = self.encoder.reset_state();
-        self.pcmu.reset();
+        self.g711.reset();
     }
 }
 
@@ -1238,7 +1240,7 @@ struct WireFrame {
 struct Stream {
     jitter: JitterBuffer<WireFrame>,
     decoder: opus::Decoder,
-    pcmu: PcmuDecoder,
+    g711: G711Decoder,
     /// DRED parsed from the packet that closes the current gap, reused for each lost frame
     /// of that gap.
     dred: Option<Box<StreamDred>>,
@@ -1596,7 +1598,7 @@ impl RemoteMixer {
                 self.streams.entry(ssrc).or_insert(Stream {
                     jitter: JitterBuffer::new(self.target_depth, self.max_depth),
                     decoder,
-                    pcmu: PcmuDecoder::new(),
+                    g711: G711Decoder::new(),
                     dred: None,
                     fec_recovered: 0,
                     dred_recovered: 0,
@@ -1825,15 +1827,18 @@ impl RemoteMixer {
                         s.codec = codec;
                         match codec {
                             AudioCodec::Opus => s.decoder.decode_float(&data, &mut s.frame, false),
-                            AudioCodec::Pcmu => Ok(s.pcmu.decode(&data, &mut s.frame).unwrap_or(0)),
+                            AudioCodec::Pcmu | AudioCodec::Pcma => {
+                                let law = codec.g711_law().unwrap_or(Law::Mu);
+                                Ok(s.g711.decode(law, &data, &mut s.frame).unwrap_or(0))
+                            }
                         }
                     }
                     JitterSlot::Lost => match s.codec {
                         AudioCodec::Opus => Self::conceal_opus(s, dred.as_deref_mut()),
-                        AudioCodec::Pcmu => Ok(s.pcmu.conceal(&mut s.frame)),
+                        AudioCodec::Pcmu | AudioCodec::Pcma => Ok(s.g711.conceal(&mut s.frame)),
                     },
                 };
-                // PCMU is always mono, even on a stream that also carried stereo Opus.
+                // G.711 is always mono, even on a stream that also carried stereo Opus.
                 s.len = n.unwrap_or(0);
                 s.pos = 0;
                 if s.len == 0 {
@@ -2079,33 +2084,35 @@ mod tests {
     }
 
     #[test]
-    fn pcmu_encoder_decimates_and_decoder_restores_tone() {
-        let mut enc = PcmuEncoder::new();
-        let mut dec = PcmuDecoder::new();
-        let pcm = sine(FRAME_SAMPLES * 20, 48_000, 440.0, 0.5);
-        let mut ulaw = Vec::new();
-        let mut out = Vec::new();
-        let mut frame = vec![0f32; FRAME_SAMPLES];
-        for chunk in pcm.chunks(FRAME_SAMPLES) {
-            ulaw.clear();
-            enc.encode(chunk, &mut ulaw);
-            assert_eq!(ulaw.len(), PCMU_FRAME_SAMPLES);
-            assert_eq!(dec.decode(&ulaw, &mut frame), Some(FRAME_SAMPLES));
-            out.extend_from_slice(&frame);
+    fn g711_encoder_decimates_and_decoder_restores_tone() {
+        for law in [Law::Mu, Law::A] {
+            let mut enc = G711Encoder::new();
+            let mut dec = G711Decoder::new();
+            let pcm = sine(FRAME_SAMPLES * 20, 48_000, 440.0, 0.5);
+            let mut ulaw = Vec::new();
+            let mut out = Vec::new();
+            let mut frame = vec![0f32; FRAME_SAMPLES];
+            for chunk in pcm.chunks(FRAME_SAMPLES) {
+                ulaw.clear();
+                enc.encode(law, chunk, &mut ulaw);
+                assert_eq!(ulaw.len(), PCMU_FRAME_SAMPLES);
+                assert_eq!(dec.decode(law, &ulaw, &mut frame), Some(FRAME_SAMPLES));
+                out.extend_from_slice(&frame);
+            }
+            assert_eq!(out.len(), pcm.len());
+            // Skip the FIR group delay of both filters, then the tone must come back at level.
+            let e = rms(&out[FRAME_SAMPLES * 2..]);
+            assert!((e - 0.3535).abs() < 0.03, "{law:?}: {e}");
+            // Unsupported frame sizes are refused rather than misinterpreted.
+            assert_eq!(dec.decode(law, &[0xff; 100], &mut frame), None);
+            assert_eq!(
+                dec.decode(law, &[0xff; 80], &mut frame),
+                Some(80 * PCMU_DECIMATION)
+            );
+            // Concealment fades to silence and never exceeds one frame.
+            assert_eq!(dec.conceal(&mut frame), FRAME_SAMPLES);
+            assert!(frame[FRAME_SAMPLES - 1].abs() < 1e-3);
         }
-        assert_eq!(out.len(), pcm.len());
-        // Skip the FIR group delay of both filters, then the tone must come back at level.
-        let e = rms(&out[FRAME_SAMPLES * 2..]);
-        assert!((e - 0.3535).abs() < 0.03, "{e}");
-        // Unsupported frame sizes are refused rather than misinterpreted.
-        assert_eq!(dec.decode(&[0xff; 100], &mut frame), None);
-        assert_eq!(
-            dec.decode(&[0xff; 80], &mut frame),
-            Some(80 * PCMU_DECIMATION)
-        );
-        // Concealment fades to silence and never exceeds one frame.
-        assert_eq!(dec.conceal(&mut frame), FRAME_SAMPLES);
-        assert!(frame[FRAME_SAMPLES - 1].abs() < 1e-3);
     }
 
     #[test]
@@ -2578,7 +2585,7 @@ mod tests {
             .all(|f| f.codec == AudioCodec::Pcmu && f.payload.len() == PCMU_FRAME_SAMPLES));
         let mut decoded = Vec::new();
         for f in &frames[10..] {
-            g711::decode_f32(&f.payload, &mut decoded);
+            aurix_common::g711::decode_f32(&f.payload, &mut decoded);
         }
         let crossings = decoded
             .windows(2)

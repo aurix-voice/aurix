@@ -891,7 +891,7 @@ impl SfuNode {
         channel.remove_participant(&session.user_id);
         left.admitted = channel.admit_waiting();
         if let Some(ref router) = self.router {
-            router.forget_pcmu_downlinks(Some(session.ssrc), Some(channel_id_hash(channel_id)));
+            router.forget_g711_downlinks(Some(session.ssrc), Some(channel_id_hash(channel_id)));
             if let Some(hub) = router.mix_hub() {
                 hub.forget_receiver(&session.session_id, channel_id);
             }

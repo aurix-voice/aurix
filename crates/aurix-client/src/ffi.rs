@@ -261,6 +261,8 @@ pub enum AurixAudioCodec {
     AurixCodecOpus = 0,
     /// G.711 μ-law fallback: 8 kHz, 64 kbit/s, no Opus CPU cost, telephone quality.
     AurixCodecPcmu = 1,
+    /// G.711 A-law fallback: same as PCMU with the A-law companding.
+    AurixCodecPcma = 2,
 }
 
 impl From<AudioCodec> for AurixAudioCodec {
@@ -268,6 +270,7 @@ impl From<AudioCodec> for AurixAudioCodec {
         match c {
             AudioCodec::Opus => Self::AurixCodecOpus,
             AudioCodec::Pcmu => Self::AurixCodecPcmu,
+            AudioCodec::Pcma => Self::AurixCodecPcma,
         }
     }
 }
@@ -277,6 +280,7 @@ impl From<AurixAudioCodec> for AudioCodec {
         match c {
             AurixAudioCodec::AurixCodecOpus => Self::Opus,
             AurixAudioCodec::AurixCodecPcmu => Self::Pcmu,
+            AurixAudioCodec::AurixCodecPcma => Self::Pcma,
         }
     }
 }
@@ -4031,10 +4035,12 @@ pub unsafe extern "C" fn aurix_client_set_channel_focus(
     }
 }
 
-/// Ask the server to run this session on `codec`. PCMU (G.711 μ-law) is a low-CPU fallback
-/// for weak devices: the node transcodes, so Opus participants of the same channel are
-/// unaffected. Requires `media.pcmu_fallback` on the node (otherwise `ServerError`
-/// `CODEC_NOT_AVAILABLE`); the switch takes effect on `AurixEventAudioCodecChanged`.
+/// Ask the server to run this session on `codec`. PCMU / PCMA (G.711 μ-law / A-law) are
+/// low-CPU fallbacks for weak devices: in plaintext channels the node transcodes, so Opus
+/// participants of the same channel are unaffected; in end-to-end encrypted channels the
+/// sealed G.711 frames are relayed as they are and every peer decodes them itself. Requires
+/// `media.pcmu_fallback` on the node (otherwise `ServerError` `CODEC_NOT_AVAILABLE`); the
+/// switch takes effect on `AurixEventAudioCodecChanged`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_client_set_audio_codec(
     client: *mut AurixClient,

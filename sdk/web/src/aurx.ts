@@ -33,12 +33,15 @@ export const AurxFlags = {
   Encrypted: 0x0001,
   Dtx: 0x0004,
   Fec: 0x0008,
+  /** The frame is G.711 A-law (PCMA) instead of Opus. */
+  Pcma: 0x0010,
   Priority: 0x0020,
   VolumeAttenuated: 0x0080,
   E2ee: 0x0100,
   Authenticated: 0x0400,
   Energy: 0x0800,
   Directional: 0x1000,
+  /** The frame is G.711 μ-law (PCMU) instead of Opus. */
   Pcmu: 0x2000,
   Mixed: 0x4000,
 } as const;
@@ -329,8 +332,22 @@ export interface DownlinkAudio {
   direction: AurxDirection | undefined;
   e2ee: boolean;
   mixed: boolean;
-  pcmu: boolean;
+  /**
+   * Codec of `frame` (of the plaintext inside it when `e2ee`). A browser only ever sees G.711
+   * on sealed frames of native participants on the PCMU / PCMA fallback; the node re-encodes
+   * plaintext G.711 to Opus before it reaches a browser.
+   */
+  codec: DownlinkCodec;
   frame: Uint8Array;
+}
+
+export type DownlinkCodec = 'opus' | 'pcmu' | 'pcma';
+
+/** The codec named by the `Pcmu` / `Pcma` flags of an audio header (Opus when neither). */
+export function downlinkCodec(flags: number): DownlinkCodec {
+  if (flags & AurxFlags.Pcmu) return 'pcmu';
+  if (flags & AurxFlags.Pcma) return 'pcma';
+  return 'opus';
 }
 
 export function parseDownlinkAudio(p: AurxPacket): DownlinkAudio | undefined {
@@ -358,7 +375,7 @@ export function parseDownlinkAudio(p: AurxPacket): DownlinkAudio | undefined {
     direction,
     e2ee: (f & AurxFlags.E2ee) !== 0,
     mixed: (f & AurxFlags.Mixed) !== 0,
-    pcmu: (f & AurxFlags.Pcmu) !== 0,
+    codec: downlinkCodec(f),
     frame: p.payload.subarray(off),
   };
 }

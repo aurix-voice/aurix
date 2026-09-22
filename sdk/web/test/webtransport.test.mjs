@@ -426,6 +426,30 @@ test('client: capture energy follows the encoder when it re-stamps outputs, DTX 
   client.disconnect();
 });
 
+test('client: G.711 downlink frames are decoded in the SDK (no WebCodecs decoder) and played', async () => {
+  const node = new FakeNode(KEY, 7);
+  FakeWebTransport.node = node;
+  const { client, sock, ctx, errors } = await connectClient();
+  await until(() => client.connectionState === 'media-connected', 5000, 'media-connected');
+  await joined(client, sock, CHANNEL, [brief('me', 7), brief('alice', 8), brief('bob', 9)]);
+  const t = FakeWebTransport.all[0];
+  const decodersBefore = FakeAudioDecoder.all.length;
+  const playersBefore = ctx.created.filter((n) => n.kind === 'worklet:aurix-aurx-player').length;
+  t.deliver(await node.audioPacket(8, 1, new Uint8Array(160).fill(0xd5), { pcma: true }));
+  t.deliver(await node.audioPacket(9, 1, new Uint8Array(160).fill(0xff), { pcmu: true }));
+  t.deliver(await node.audioPacket(8, 2, new Uint8Array(7), { pcma: true })); // not a G.711 frame size
+  await until(() => ctx.created.filter((n) => n.kind === 'worklet:aurix-aurx-player').length === playersBefore + 2, 5000, 'two players');
+  await settle();
+  const players = ctx.created.filter((n) => n.kind === 'worklet:aurix-aurx-player').slice(-2);
+  assert.equal(FakeAudioDecoder.all.length, decodersBefore, 'G.711 never opens a WebCodecs decoder');
+  for (const p of players) assert.equal(p.processor.queued, 960, '20 ms at 8 kHz became 960 samples at 48 kHz');
+  const stats = await client.getStats();
+  assert.equal(stats.packetsReceived, 3);
+  assert.deepEqual(client.getParticipantStreams().map((s) => s.userId).sort(), ['alice', 'bob']);
+  assert.deepEqual(errors, []);
+  client.disconnect();
+});
+
 test('client: an empty downlink frame is accepted and skipped, not fed to the decoder', async () => {
   const node = new FakeNode(KEY, 7);
   FakeWebTransport.node = node;

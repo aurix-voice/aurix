@@ -158,7 +158,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 | Recording consent | `OnRecording(RecordingNotice)`, `RespondToRecordingAsync(id, RecordingConsent)` |
 | Stats / quality | `GetStats()` → `VoiceStats`, `OnStats`, `OnNetworkQuality`, `LastNetworkQuality`, `QualityReportInterval`, `OnBitrateCommand(BitrateCommand)` |
 | Opus controls | `OpusEncoderSettings`, `SetEncoderSettings`, `SetComplexity`, `FollowChannelPolicy`, `Encoder`, `EffectiveEncoderSettings`, `AudioPolicy`, `OnAudioPolicyChanged`, `OnEncoderSettingsChanged`; `NativeOpusCodec` / `ConcentusOpusCodec`, `IOpusEncoderControls`, `IOpusFecDecoder` |
-| PCMU (G.711) fallback | `SetAudioCodecAsync(AudioCodec)`, `AudioCodec` / `PreferredAudioCodec`, `OnAudioCodecChanged`; behaviour `PreferredCodec`, `SetAudioCodec()`, `ActiveCodec`; `PcmuCodec`, `G711`, `TransmitAudioFrame(codec, …)`, `IncomingAudio.Codec` |
+| PCMU / PCMA (G.711) fallback | `SetAudioCodecAsync(AudioCodec)`, `AudioCodec` / `PreferredAudioCodec`, `OnAudioCodecChanged`; behaviour `PreferredCodec`, `SetAudioCodec()`, `ActiveCodec`; `G711Codec` (`PcmuCodec`), `G711`, `TransmitAudioFrame(codec, …)`, `IncomingAudio.Codec` |
 | Server-side noise suppression | `SetServerNoiseSuppressionAsync(bool)`, `ServerNoiseSuppression`, `OnServerNoiseSuppressionChanged`, `SessionInfo.NoiseSuppression` — the node denoises this session's uplink (for PCMU devices or builds without the client DSP); `NOISE_SUPPRESSION_UNAVAILABLE` when the node has it off or full; kept across reconnects; never for E2EE / stereo — see [server-side noise suppression](../features/channels.md#server-side-noise-suppression) |
 | Large channels | `GetChannelInfo(channel)` → `ChannelInfo? { Role, ParticipantCount, HiddenListeners, Transcription, SafetyVoice, CanSpeak }`, `CanSpeakIn(channel)`, `SetDownlinkModeAsync(DownlinkMode)`, `DownlinkMode` / `PreferredDownlinkMode`, `OnDownlinkModeChanged`, `SessionInfo.DownlinkMix`, `IncomingAudio.Mixed`; behaviour `PreferredDownlinkMode`, `SetDownlinkMode()`, `ActiveDownlinkMode`, `StereoCodecFactory` — [below](#large-channels-listeners-and-the-server-mix) |
 | Blocked UDP | `MediaPathPolicy` (`Auto`/`UdpOnly`/`TunnelOnly`), `UdpFallbackLostHeartbeats`, `UdpReprobeInterval`, `MediaHeartbeatInterval`, `ActiveMediaPath`, `OnMediaPathChanged(path, reason)`, `SessionInfo.MediaTunnel`, `VoiceStats.MediaPath` / `HeartbeatsLostConsecutive` / `UplinkDropped`; behaviour `MediaPath`, `UdpFallbackLostHeartbeats`, `UdpReprobeIntervalSeconds` — [below](#when-udp-is-blocked-the-websocket-tunnel) |
@@ -252,12 +252,14 @@ packet (falling back to the mono factory, which downmixes, when none is set), ke
 for non-positional senders, downmixes before panning directional ones and averages L/R for a
 mono output.
 
-## PCMU (G.711) fallback
+## PCMU / PCMA (G.711) fallback
 
 For devices where even Concentus at low complexity is too expensive, a session can run on
-**G.711 μ-law** instead of Opus (8 kHz, 64 kbit/s, telephone quality; a lookup table, no
-encoder state). It is negotiated per session with the server, which transcodes at the edge —
-everyone else in the channel keeps Opus ([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+**G.711** — μ-law (`AudioCodec.Pcmu`) or A-law (`AudioCodec.Pcma`) — instead of Opus (8 kHz,
+64 kbit/s, telephone quality; a lookup table, no encoder state). It is negotiated per session
+with the server, which transcodes at the edge in plaintext channels — everyone else in the
+channel keeps Opus — and relays sealed G.711 frames untouched in E2EE channels
+([codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 
 ```csharp
 // AurixVoiceBehaviour: set PreferredCodec = AudioCodec.Pcmu in the inspector (or before Connect),
@@ -266,19 +268,20 @@ await voice.SetAudioCodec(AudioCodec.Pcmu);   // await voice.SetAudioCodec(Audio
 voice.ActiveCodec;                            // what the server acknowledged
 
 // AurixVoiceClient with your own capture pipeline:
-client.OnAudioCodecChanged += codec => encoder = codec == AudioCodec.Pcmu ? pcmu : opus;
-await client.SetAudioCodecAsync(AudioCodec.Pcmu);
-int n = pcmu.Encode(pcm48k, AudioFormat.FrameSamples, ulaw);   // PcmuCodec: 960 → 160 bytes
-client.TransmitAudioFrame(client.AudioCodec, ulaw, n, AudioFormat.FrameSamples, vad.Level);
+client.OnAudioCodecChanged += codec => encoder = codec.IsG711() ? new G711Codec(codec) : opus;
+await client.SetAudioCodecAsync(AudioCodec.Pcma);
+int n = encoder.Encode(pcm48k, AudioFormat.FrameSamples, alaw);   // G711Codec: 960 → 160 bytes
+client.TransmitAudioFrame(client.AudioCodec, alaw, n, AudioFormat.FrameSamples, vad.Level);
 ```
 
 The behaviour switches its encoder when `OnAudioCodecChanged` fires, so frames always match the
 codec the server expects; `PreferredCodec` is re-negotiated automatically after a fresh session
-(a resumed session keeps it). `PcmuCodec` implements `IOpusCodec`, so `RemoteMixer` decodes PCMU
-downlink streams (`IncomingAudio.Codec`) next to Opus ones — a stream that changes codec gets a
-fresh decoder. `SetBitrate` is a no-op on it (G.711 is fixed-rate), and `OpusEncoderSettings` /
-channel audio policies do not apply while PCMU is active. Rejected with `CODEC_NOT_AVAILABLE`
-when the node runs `media.pcmu_fallback = false`.
+(a resumed session keeps it). `G711Codec` (`PcmuCodec` is the μ-law alias) implements
+`IOpusCodec`, so `RemoteMixer` decodes PCMU and PCMA downlink streams (`IncomingAudio.Codec`)
+next to Opus ones — a stream that changes codec gets a fresh decoder. `SetBitrate` is a no-op on
+it (G.711 is fixed-rate), and `OpusEncoderSettings` / channel audio policies do not apply while
+G.711 is active. Rejected with `CODEC_NOT_AVAILABLE` when the node runs
+`media.pcmu_fallback = false`.
 
 ## Large channels: listeners and the server mix
 
@@ -346,7 +349,8 @@ PlayerPrefs.SetString("aurix.e2ee", Convert.ToBase64String(client.ExportE2eeIden
 With `E2ee = false` the client never joins encrypted channels (`E2EE_REQUIRED`); it never sends
 plaintext into one or plays plaintext coming out of one — such frames count as
 `E2eeUndecryptable`. Encrypted speakers always arrive as separate streams, also in `Mixed`
-downlink mode, and only Opus can be encrypted (PCMU sessions are inaudible there).
+downlink mode; a G.711 session seals its μ-law / A-law frames the same way and the node relays
+them with their codec flag (`AurxPacket.CodecOf(flags)` after decryption picks the decoder).
 `AurixWebGLVoiceClient` exposes the same surface (`E2ee` / `E2eeIdentity` / `E2eeTransform` /
 `E2eeWorkerUrl` in `WebGLClientOptions`, `E2eeAvailable`, `E2eeTransformApi`,
 `GetE2eeStatsAsync`, `RotateE2eeKeyAsync`) over the browser implementation — see

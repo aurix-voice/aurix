@@ -1,23 +1,25 @@
-//! PCMU ⇄ Opus transcoding for sessions that negotiated `AudioCodec::Pcmu`.
+//! G.711 ⇄ Opus transcoding for sessions that negotiated `AudioCodec::Pcmu` / `Pcma`.
 //!
-//! Channels always carry Opus. A PCMU session's uplink frames are decoded from μ-law and
-//! re-encoded with an 8 kHz Opus encoder before they enter the router (so recording, STT,
-//! cascade and every Opus receiver see an ordinary Opus stream); Opus frames addressed to a
-//! PCMU receiver are decoded at 8 kHz and μ-law encoded per sender.
+//! Channels always carry Opus. A G.711 session's plaintext uplink frames are decoded from
+//! μ-law / A-law and re-encoded with an 8 kHz Opus encoder before they enter the router (so
+//! recording, STT, cascade and every Opus receiver see an ordinary Opus stream); Opus frames
+//! addressed to a G.711 receiver are decoded at 8 kHz and companded per sender. End-to-end
+//! encrypted frames never come here: the router relays them with their codec flag intact.
 
 use aurix_common::error::{AurixError, Result};
-use aurix_common::g711::{self, PCMU_FRAME_SIZES, PCMU_SAMPLE_RATE};
+use aurix_common::g711::{Law, PCMU_FRAME_SIZES, PCMU_SAMPLE_RATE};
 use bytes::Bytes;
 use std::time::Instant;
 
-/// Opus bitrate of the transcoded uplink of a PCMU session. Narrowband speech is transparent
+/// Opus bitrate of the transcoded uplink of a G.711 session. Narrowband speech is transparent
 /// well below this; it stays comfortably under every channel policy floor.
 pub const PCMU_UPLINK_BITRATE: i32 = 24_000;
-/// Longest Opus frame a PCMU receiver may get (120 ms @ 8 kHz).
+/// Longest Opus frame a G.711 receiver may get (120 ms @ 8 kHz).
 const MAX_DECODE_SAMPLES: usize = 960;
 
-/// μ-law → Opus for one session's uplink.
-pub struct PcmuUplink {
+/// G.711 → Opus for one session's uplink.
+pub struct G711Uplink {
+    law: Law,
     encoder: opus::Encoder,
     pcm: Vec<i16>,
     out: Vec<u8>,
@@ -26,7 +28,7 @@ pub struct PcmuUplink {
     last: Option<(u32, bool, Vec<u8>, Bytes)>,
 }
 
-/// Outcome of [`PcmuUplink::transcode`].
+/// Outcome of [`G711Uplink::transcode`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Transcoded {
     Fresh(Bytes),
@@ -42,14 +44,16 @@ impl Transcoded {
     }
 }
 
-impl std::fmt::Debug for PcmuUplink {
+impl std::fmt::Debug for G711Uplink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PcmuUplink")
+        f.debug_struct("G711Uplink")
+            .field("law", &self.law)
+            .finish()
     }
 }
 
-impl PcmuUplink {
-    pub fn new() -> Result<Self> {
+impl G711Uplink {
+    pub fn new(law: Law) -> Result<Self> {
         let mut encoder = opus::Encoder::new(
             PCMU_SAMPLE_RATE,
             opus::Channels::Mono,
@@ -62,6 +66,7 @@ impl PcmuUplink {
         let _ = encoder.set_inband_fec(true);
         let _ = encoder.set_packet_loss_perc(10);
         Ok(Self {
+            law,
             encoder,
             pcm: Vec::with_capacity(480),
             out: vec![0u8; 1275],
@@ -69,30 +74,34 @@ impl PcmuUplink {
         })
     }
 
-    /// Encode one μ-law frame (10/20/40/60 ms) to Opus, denoising the PCM in between when the
+    pub fn law(&self) -> Law {
+        self.law
+    }
+
+    /// Encode one G.711 frame (10/20/40/60 ms) to Opus, denoising the PCM in between when the
     /// session's uplink is cleaned by the node. A repeat of the previous frame (same
     /// `timestamp`, bytes and cleaning) gets the previous output.
     pub fn transcode(
         &mut self,
         timestamp: u32,
-        ulaw: &[u8],
+        coded: &[u8],
         denoiser: Option<&mut crate::denoise::NarrowbandDenoiser>,
     ) -> Result<Transcoded> {
-        if !PCMU_FRAME_SIZES.contains(&ulaw.len()) {
+        if !PCMU_FRAME_SIZES.contains(&coded.len()) {
             return Err(AurixError::Codec(format!(
-                "pcmu frame of {} bytes (expected one of {:?})",
-                ulaw.len(),
+                "g711 frame of {} bytes (expected one of {:?})",
+                coded.len(),
                 PCMU_FRAME_SIZES
             )));
         }
         let cleaned = denoiser.is_some();
         if let Some((ts, c, input, output)) = &self.last {
-            if *ts == timestamp && *c == cleaned && input == ulaw {
+            if *ts == timestamp && *c == cleaned && input == coded {
                 return Ok(Transcoded::Repeated(output.clone()));
             }
         }
         self.pcm.clear();
-        g711::decode(ulaw, &mut self.pcm);
+        self.law.decode(coded, &mut self.pcm);
         if let Some(denoiser) = denoiser {
             denoiser.process(&mut self.pcm)?;
         }
@@ -101,32 +110,35 @@ impl PcmuUplink {
             .encode(&self.pcm, &mut self.out)
             .map_err(|e| AurixError::Codec(format!("pcmu uplink encode: {e}")))?;
         let opus = Bytes::copy_from_slice(&self.out[..n]);
-        self.last = Some((timestamp, cleaned, ulaw.to_vec(), opus.clone()));
+        self.last = Some((timestamp, cleaned, coded.to_vec(), opus.clone()));
         Ok(Transcoded::Fresh(opus))
     }
 }
 
-/// Opus → μ-law for the frames of one sender heard by a PCMU receiver.
-pub struct PcmuDownlink {
+/// Opus → G.711 for the frames of one sender heard by a G.711 receiver.
+pub struct G711Downlink {
+    law: Law,
     decoder: opus::Decoder,
     pcm: Vec<i16>,
     out: Vec<u8>,
     pub last_used: Instant,
 }
 
-impl std::fmt::Debug for PcmuDownlink {
+impl std::fmt::Debug for G711Downlink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PcmuDownlink")
+        f.debug_struct("G711Downlink")
+            .field("law", &self.law)
             .field("last_used", &self.last_used)
             .finish()
     }
 }
 
-impl PcmuDownlink {
-    pub fn new() -> Result<Self> {
+impl G711Downlink {
+    pub fn new(law: Law) -> Result<Self> {
         let decoder = opus::Decoder::new(PCMU_SAMPLE_RATE, opus::Channels::Mono)
             .map_err(|e| AurixError::Codec(format!("pcmu downlink decoder: {e}")))?;
         Ok(Self {
+            law,
             decoder,
             pcm: vec![0i16; MAX_DECODE_SAMPLES],
             out: Vec::with_capacity(MAX_DECODE_SAMPLES),
@@ -134,7 +146,11 @@ impl PcmuDownlink {
         })
     }
 
-    /// Decode one Opus frame at 8 kHz and μ-law encode it.
+    pub fn law(&self) -> Law {
+        self.law
+    }
+
+    /// Decode one Opus frame at 8 kHz and compand it.
     pub fn transcode(&mut self, opus: &[u8]) -> Result<Bytes> {
         self.last_used = Instant::now();
         let n = self
@@ -142,7 +158,7 @@ impl PcmuDownlink {
             .decode(opus, &mut self.pcm, false)
             .map_err(|e| AurixError::Codec(format!("pcmu downlink decode: {e}")))?;
         self.out.clear();
-        g711::encode(&self.pcm[..n], &mut self.out);
+        self.law.encode(&self.pcm[..n], &mut self.out);
         Ok(Bytes::copy_from_slice(&self.out))
     }
 }
@@ -150,7 +166,7 @@ impl PcmuDownlink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aurix_common::g711::PCMU_FRAME_SAMPLES;
+    use aurix_common::g711::{self, PCMU_FRAME_SAMPLES};
 
     fn tone(frames: usize, hz: f32, amp: f32) -> Vec<i16> {
         (0..frames * PCMU_FRAME_SAMPLES)
@@ -171,7 +187,7 @@ mod tests {
 
     #[test]
     fn uplink_rejects_odd_frame_sizes() {
-        let mut up = PcmuUplink::new().unwrap();
+        let mut up = G711Uplink::new(Law::Mu).unwrap();
         assert!(up.transcode(0, &[0xFF; 159], None).is_err());
         assert!(up.transcode(0, &[], None).is_err());
         assert!(up.transcode(0, &[0xFF; 160], None).is_ok());
@@ -180,7 +196,7 @@ mod tests {
 
     #[test]
     fn uplink_reuses_the_encode_for_a_repeated_frame() {
-        let mut up = PcmuUplink::new().unwrap();
+        let mut up = G711Uplink::new(Law::Mu).unwrap();
         let frame = [0x55u8; 160];
         let Transcoded::Fresh(first) = up.transcode(160, &frame, None).unwrap() else {
             panic!("first frame is fresh");
@@ -202,28 +218,30 @@ mod tests {
     }
 
     #[test]
-    fn pcmu_round_trip_through_opus_keeps_level() {
+    fn g711_round_trip_through_opus_keeps_level() {
         let pcm = tone(25, 440.0, 0.4);
-        let mut ulaw = Vec::new();
-        g711::encode(&pcm, &mut ulaw);
-        let mut up = PcmuUplink::new().unwrap();
-        let mut down = PcmuDownlink::new().unwrap();
-        let mut back = Vec::new();
-        for frame in ulaw.chunks(PCMU_FRAME_SAMPLES) {
-            let opus = up.transcode(0, frame, None).unwrap().into_bytes();
-            assert!(!opus.is_empty() && opus.len() < 100, "{} bytes", opus.len());
-            let out = down.transcode(&opus).unwrap();
-            assert_eq!(out.len(), PCMU_FRAME_SAMPLES);
-            g711::decode(&out, &mut back);
+        for (up_law, down_law) in [(Law::Mu, Law::Mu), (Law::A, Law::A), (Law::A, Law::Mu)] {
+            let mut coded = Vec::new();
+            up_law.encode(&pcm, &mut coded);
+            let mut up = G711Uplink::new(up_law).unwrap();
+            let mut down = G711Downlink::new(down_law).unwrap();
+            let mut back = Vec::new();
+            for frame in coded.chunks(PCMU_FRAME_SAMPLES) {
+                let opus = up.transcode(0, frame, None).unwrap().into_bytes();
+                assert!(!opus.is_empty() && opus.len() < 100, "{} bytes", opus.len());
+                let out = down.transcode(&opus).unwrap();
+                assert_eq!(out.len(), PCMU_FRAME_SAMPLES);
+                down_law.decode(&out, &mut back);
+            }
+            // Skip the encoder's warm-up frames.
+            let tail = &back[PCMU_FRAME_SAMPLES * 5..];
+            let expected = rms(&pcm[PCMU_FRAME_SAMPLES * 5..]);
+            let got = rms(tail);
+            assert!(
+                (got - expected).abs() < expected * 0.15,
+                "{up_law:?}→{down_law:?}: rms {got} vs {expected}"
+            );
         }
-        // Skip the encoder's warm-up frames.
-        let tail = &back[PCMU_FRAME_SAMPLES * 5..];
-        let expected = rms(&pcm[PCMU_FRAME_SAMPLES * 5..]);
-        let got = rms(tail);
-        assert!(
-            (got - expected).abs() < expected * 0.15,
-            "rms {got} vs {expected}"
-        );
     }
 
     #[test]
@@ -236,7 +254,7 @@ mod tests {
             .collect();
         let mut buf = vec![0u8; 1275];
         let n = enc.encode(&pcm, &mut buf).unwrap();
-        let mut down = PcmuDownlink::new().unwrap();
+        let mut down = G711Downlink::new(Law::A).unwrap();
         let out = down.transcode(&buf[..n]).unwrap();
         assert_eq!(out.len(), PCMU_FRAME_SAMPLES);
     }
@@ -255,7 +273,7 @@ mod tests {
             })
             .collect();
         let mut buf = vec![0u8; 1275];
-        let mut down = PcmuDownlink::new().unwrap();
+        let mut down = G711Downlink::new(Law::Mu).unwrap();
         let mut last = Vec::new();
         for _ in 0..8 {
             let n = enc.encode(&pcm, &mut buf).unwrap();

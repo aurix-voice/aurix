@@ -326,8 +326,8 @@ pub struct MediaSession {
     pub codec: RwLock<AudioCodec>,
     /// How this native session wants channel audio delivered (`SetDownlinkMode`).
     pub downlink_mode: RwLock<DownlinkMode>,
-    /// μ-law → Opus encoder state while `codec == Pcmu`.
-    pub pcmu_uplink: Mutex<Option<crate::transcode::PcmuUplink>>,
+    /// G.711 → Opus encoder state while `codec` is PCMU / PCMA.
+    pub pcmu_uplink: Mutex<Option<crate::transcode::G711Uplink>>,
     /// The client asked the node to denoise its uplink (`SetNoiseSuppression`); a channel
     /// policy (`ChannelConfig::noise_suppression`) cleans it regardless.
     pub noise_suppression: AtomicBool,
@@ -384,6 +384,15 @@ pub struct MediaSession {
     /// Byte totals already handed to the usage meter.
     metered_sent: AtomicU64,
     metered_received: AtomicU64,
+}
+
+/// `codec` label of the G.711 metrics; `None` for Opus.
+pub fn g711_metric_label(codec: AudioCodec) -> Option<&'static str> {
+    match codec {
+        AudioCodec::Opus => None,
+        AudioCodec::Pcmu => Some("pcmu"),
+        AudioCodec::Pcma => Some("pcma"),
+    }
 }
 
 impl MediaSession {
@@ -462,8 +471,12 @@ impl MediaSession {
     }
 
     pub fn deactivate(&self) {
-        if self.active.swap(false, Ordering::Relaxed) && self.codec() == AudioCodec::Pcmu {
-            aurix_metrics::PCMU_SESSIONS.dec();
+        if self.active.swap(false, Ordering::Relaxed) {
+            if let Some(label) = g711_metric_label(self.codec()) {
+                aurix_metrics::G711_SESSIONS
+                    .with_label_values(&[label])
+                    .dec();
+            }
         }
     }
 
@@ -483,7 +496,7 @@ impl MediaSession {
     pub fn set_transport(&self, t: Transport) {
         *self.transport.write() = t;
         if t != Transport::Aurx {
-            // Browser media is Opus by SDP; a PCMU negotiation from before the offer is void.
+            // Browser media is Opus by SDP; a G.711 negotiation from before the offer is void.
             let _ = self.set_codec(AudioCodec::Opus);
         }
     }
@@ -814,12 +827,18 @@ impl MediaSession {
         }
         let previous = std::mem::replace(&mut *self.codec.write(), codec);
         if self.is_active() && previous != codec {
-            match codec {
-                AudioCodec::Pcmu => aurix_metrics::PCMU_SESSIONS.inc(),
-                AudioCodec::Opus => aurix_metrics::PCMU_SESSIONS.dec(),
+            if let Some(label) = g711_metric_label(previous) {
+                aurix_metrics::G711_SESSIONS
+                    .with_label_values(&[label])
+                    .dec();
+            }
+            if let Some(label) = g711_metric_label(codec) {
+                aurix_metrics::G711_SESSIONS
+                    .with_label_values(&[label])
+                    .inc();
             }
         }
-        if codec == AudioCodec::Opus {
+        if previous != codec {
             *self.pcmu_uplink.lock() = None;
         }
         Ok(())

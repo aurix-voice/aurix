@@ -114,9 +114,10 @@ the chapter that explains the boundary.
   no PCMU, no `IOpusCodec`/DSP/media-path settings, and audio only after a user gesture (autoplay
   policy). The native `AurixVoiceClient` throws `PlatformNotSupportedException` in WebGL players
   ([Unity WebGL](sdk/unity.md#unity-webgl)).
-* **Opus inside; PCMU only as a per-session fallback** for native AURX clients (the node
-  transcodes at the edge). No PCMA, no PCMU over WebRTC, no PCMU for `E2ee` frames, no video
-  ([codecs](features/channels.md#codecs-opus-and-the-pcmu-fallback)).
+* **Opus inside; PCMU / PCMA only as per-session fallbacks** for native AURX clients (the node
+  transcodes at the edge in plaintext channels; in E2EE channels the sealed G.711 frames are
+  relayed and every peer decodes them, so a G.711 device is heard narrowband by all). No G.711
+  over WebRTC, no video ([codecs](features/channels.md#codecs-opus-and-the-pcmu-fallback)).
 * **The TCP fallbacks for native media are TCP.** When UDP is blocked the SDKs carry AURX
   packets over the node's dedicated [TLS tunnel](api/aurx.md#tls-tunnel-aurx-frames-on-a-dedicated-443-port)
   (`media.tls_tunnel_port`, meant for 443) or, failing that, the authenticated control WebSocket

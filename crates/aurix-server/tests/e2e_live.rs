@@ -6058,8 +6058,8 @@ async fn echo_channel_loops_audio_back_to_the_sender_only() {
 
 // ── PCMU fallback ──
 
-/// Audio from `ssrc` collected at `to`, decoded per the packet codec (Opus at 48 kHz, μ-law at
-/// 8 kHz); returns (frames, PCMU frames, rms, first volume byte).
+/// Audio from `ssrc` collected at `to`, decoded per the packet codec (Opus at 48 kHz, G.711 at
+/// 8 kHz in the flagged law); returns (frames, G.711 frames, rms, first volume byte).
 async fn levels_from(to: &Player, ssrc: u32) -> (usize, usize, f32, Option<u8>) {
     let mut dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
     let mut pcm48 = vec![0i16; 960];
@@ -6083,11 +6083,11 @@ async fn levels_from(to: &Player, ssrc: u32) -> (usize, usize, f32, Option<u8>) 
             &p.payload[..]
         };
         frames += 1;
-        if p.header.has_flag(PacketFlags::Pcmu) {
+        if let Some(law) = p.header.audio_codec().g711_law() {
             pcmu += 1;
             assert_eq!(body.len(), aurix_common::g711::PCMU_FRAME_SAMPLES);
             let mut pcm8 = Vec::new();
-            aurix_common::g711::decode(body, &mut pcm8);
+            law.decode(body, &mut pcm8);
             sum += pcm8
                 .iter()
                 .map(|&s| (s as f64 / 32768.0).powi(2))
@@ -6112,6 +6112,10 @@ async fn levels_from(to: &Player, ssrc: u32) -> (usize, usize, f32, Option<u8>) 
 
 /// 20 ms μ-law frames of a mono sine at 8 kHz (0.35 amplitude, like `opus_tone`).
 fn ulaw_tone(hz: f32, ms: u32) -> Vec<Bytes> {
+    g711_tone(aurix_common::g711::Law::Mu, hz, ms)
+}
+
+fn g711_tone(law: aurix_common::g711::Law, hz: f32, ms: u32) -> Vec<Bytes> {
     use aurix_common::g711::{PCMU_FRAME_SAMPLES, PCMU_SAMPLE_RATE};
     (0..ms / 20)
         .map(|f| {
@@ -6122,7 +6126,7 @@ fn ulaw_tone(hz: f32, ms: u32) -> Vec<Bytes> {
                 })
                 .collect();
             let mut out = Vec::new();
-            aurix_common::g711::encode(&pcm, &mut out);
+            law.encode(&pcm, &mut out);
             Bytes::from(out)
         })
         .collect()
@@ -6135,11 +6139,22 @@ async fn stream_pcmu(
     frames: &[Bytes],
     e2ee: bool,
 ) {
+    stream_g711(from, channel_id, first_seq, frames, AudioCodec::Pcmu, e2ee).await
+}
+
+async fn stream_g711(
+    from: &Player,
+    channel_id: ChannelId,
+    first_seq: u32,
+    frames: &[Bytes],
+    codec: AudioCodec,
+    e2ee: bool,
+) {
     let hash = channel_id_hash(&channel_id);
     for (i, payload) in frames.iter().enumerate() {
         let seq = first_seq + i as u32;
         let mut pkt = AurixPacket::audio(seq, seq * 960, from.ssrc, hash, payload.clone());
-        pkt.header.set_flag(PacketFlags::Pcmu);
+        pkt.header.set_audio_codec(codec);
         if e2ee {
             pkt.header.set_flag(PacketFlags::E2ee);
         }
@@ -6272,7 +6287,7 @@ async fn pcmu_fallback_is_negotiated_per_session_and_transcoded() {
         "gain rides in the volume byte"
     );
 
-    // μ-law cannot be end-to-end encrypted (the server could not transcode it): dropped.
+    // A sealed μ-law frame is relayed only to E2EE-capable receivers; Bob never said E2eeHello.
     stream_pcmu(&alice, team, 200, &ulaw, true).await;
     assert_eq!(levels_from(&bob, alice.ssrc).await.0, 0, "e2ee PCMU");
 
@@ -6329,6 +6344,177 @@ async fn pcmu_fallback_is_negotiated_per_session_and_transcoded() {
     for p in [&mut alice, &mut bob] {
         p.send(&ControlMessage::ChannelLeave { channel_id: team })
             .await;
+    }
+}
+
+/// PCMA is negotiated and transcoded exactly like PCMU, in A-law; in an end-to-end encrypted
+/// channel the node relays sealed G.711 frames untouched with their codec flag to capable
+/// receivers, and the negotiated codec survives a resume.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn pcma_is_transcoded_and_e2ee_g711_is_relayed_sealed() {
+    use aurix_common::g711::Law;
+
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let team = create_channel(&env, &http).await;
+    let vault = create_channel_with(&env, &http, serde_json::json!({"e2ee": true})).await;
+    let (tok_a, _) = issue_token_for(&env, &http, "pcma:alice", "Alice", &[team, vault]).await;
+    let (tok_b, _) = issue_token_for(&env, &http, "pcma:bob", "Bob", &[team, vault]).await;
+    let (tok_c, _) = issue_token_for(&env, &http, "pcma:carol", "Carol", &[team, vault]).await;
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        p.expect("ReceiverPreferences", |m| {
+            matches!(m, ControlMessage::ReceiverPreferences { .. })
+        })
+        .await;
+        bind_media(p).await;
+        p.send(&ControlMessage::E2eeHello {
+            channel_id: None,
+            user_id: None,
+            public_key: base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+        })
+        .await;
+        join(p, team).await;
+        join(p, vault).await;
+    }
+    for (p, codec) in [
+        (&mut alice, AudioCodec::Pcma),
+        (&mut carol, AudioCodec::Pcmu),
+    ] {
+        p.send(&ControlMessage::SetAudioCodec { codec }).await;
+        p.expect(
+            "AudioCodecChanged",
+            |m| matches!(m, ControlMessage::AudioCodecChanged { codec: c } if *c == codec),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Alice (PCMA) → Bob (Opus) and Carol (PCMU): transcoded into each receiver's codec.
+    let alaw = g711_tone(Law::A, 440.0, 200);
+    stream_g711(&alice, team, 1, &alaw, AudioCodec::Pcma, false).await;
+    let (frames, g711, rms, _) = levels_from(&bob, alice.ssrc).await;
+    assert!(frames >= 8, "Bob got {frames} frames");
+    assert_eq!(g711, 0, "Opus receiver never sees G.711");
+    assert!((rms - 0.247).abs() < 0.06, "Bob hears rms {rms}");
+    let (frames, g711, rms, _) = levels_from(&carol, alice.ssrc).await;
+    assert!(frames >= 8 && g711 == frames, "Carol got {frames}/{g711}");
+    assert!((rms - 0.247).abs() < 0.06, "Carol hears rms {rms}");
+
+    // Bob (Opus) → Alice: A-law downlink, flagged Pcma and never Pcmu.
+    let opus = opus_tone(440.0, 200);
+    stream_frames(&bob, team, 100, &opus, false).await;
+    let (frames, g711, rms, _) = levels_from(&alice, bob.ssrc).await;
+    assert!(frames >= 8 && g711 == frames, "Alice got {frames}/{g711}");
+    assert!((rms - 0.247).abs() < 0.06, "Alice hears rms {rms}");
+
+    // μ-law from the PCMA session is the wrong law: dropped.
+    stream_g711(
+        &alice,
+        team,
+        200,
+        &ulaw_tone(440.0, 100),
+        AudioCodec::Pcmu,
+        false,
+    )
+    .await;
+    assert_eq!(levels_from(&bob, alice.ssrc).await.0, 0, "wrong law");
+
+    // E2EE channel: sealed PCMA frames reach capable peers byte-for-byte with the Pcma flag.
+    let sealed: Vec<Bytes> = (0..10u8).map(|i| Bytes::from(vec![i; 41])).collect();
+    stream_g711(&alice, vault, 300, &sealed, AudioCodec::Pcma, true).await;
+    for (peer, own) in [(&bob, AudioCodec::Opus), (&carol, AudioCodec::Pcmu)] {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 2048];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(1000), peer.udp.recv_from(&mut buf)).await
+        {
+            let mut p = AurixPacket::decode(&buf[..n]).unwrap();
+            assert!(p.open(&peer.keys));
+            if p.header.packet_type != PacketType::Audio || p.header.ssrc != alice.ssrc {
+                continue;
+            }
+            assert!(p.header.has_flag(PacketFlags::E2ee), "flag survives");
+            assert_eq!(
+                p.header.audio_codec(),
+                AudioCodec::Pcma,
+                "{}: sender codec flag, not the receiver's {own:?}",
+                peer.name
+            );
+            got.push(p.payload);
+        }
+        assert!(
+            got.len() >= 5,
+            "{} got {} sealed frames",
+            peer.name,
+            got.len()
+        );
+        assert!(
+            got.iter().all(|f| sealed.contains(f)),
+            "{}: sealed payloads untouched",
+            peer.name
+        );
+    }
+    // Sealed Opus from Bob reaches Alice (a PCMA session) as sealed Opus: no transcode, no flag.
+    stream_frames(&bob, vault, 400, &sealed, true).await;
+    let mut got = 0;
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(1000), alice.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).unwrap();
+        assert!(p.open(&alice.keys));
+        if p.header.packet_type != PacketType::Audio || p.header.ssrc != bob.ssrc {
+            continue;
+        }
+        assert!(p.header.has_flag(PacketFlags::E2ee));
+        assert_eq!(p.header.audio_codec(), AudioCodec::Opus);
+        assert!(sealed.contains(&p.payload));
+        got += 1;
+    }
+    assert!(got >= 5, "Alice got {got} sealed Opus frames");
+
+    // The codec survives a resume.
+    let Player {
+        session_id: sid_a,
+        resume_token,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut alice = connect_with(&env, "alice", tok_a, Some((sid_a, &resume_token))).await;
+    assert!(alice.resumed, "expected a resumed session");
+    alice
+        .expect("ReceiverPreferences(pcma)", |m| {
+            matches!(
+                m,
+                ControlMessage::ReceiverPreferences {
+                    codec: AudioCodec::Pcma,
+                    ..
+                }
+            )
+        })
+        .await;
+    bind_media(&mut alice).await;
+    stream_frames(&bob, team, 500, &opus, false).await;
+    let (frames, g711, _, _) = levels_from(&alice, bob.ssrc).await;
+    assert!(
+        frames >= 8 && g711 == frames,
+        "after resume: {frames}/{g711}"
+    );
+
+    for p in [&mut alice, &mut bob, &mut carol] {
+        for ch in [team, vault] {
+            p.send(&ControlMessage::ChannelLeave { channel_id: ch })
+                .await;
+        }
     }
 }
 

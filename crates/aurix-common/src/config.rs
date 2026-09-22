@@ -1596,9 +1596,10 @@ pub struct MediaConfig {
     /// (`SetChannelFocus`); `1.0` makes focus a no-op.
     #[serde(default = "default_unfocused_channel_gain")]
     pub unfocused_channel_gain: f32,
-    /// Let native AURX sessions negotiate G.711 μ-law (`SetAudioCodec { codec: "pcmu" }`).
-    /// Each PCMU session costs one Opus encoder plus one decoder per sender it hears on the
-    /// node; disable on CPU-bound nodes.
+    /// Let native AURX sessions negotiate G.711 (`SetAudioCodec { codec: "pcmu" | "pcma" }`).
+    /// Each G.711 session in a plaintext channel costs one Opus encoder plus one decoder per
+    /// sender it hears on the node (end-to-end encrypted frames are relayed as they are);
+    /// disable on CPU-bound nodes.
     #[serde(default = "default_true")]
     pub pcmu_fallback: bool,
     /// Let native AURX sessions carry media over their control WebSocket when UDP is

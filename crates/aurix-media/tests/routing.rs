@@ -2103,6 +2103,253 @@ async fn pcmu_sessions_are_transcoded_at_the_edge() {
     assert_eq!(&got.payload[1..], &frame[..]);
 }
 
+/// PCMA is the A-law twin of PCMU: a PCMA uplink is transcoded to Opus at the edge, an Opus
+/// speaker is re-encoded as A-law for PCMA receivers, and a PCMU and a PCMA session in one
+/// channel each get their own law; frames in the wrong law are refused.
+#[tokio::test]
+async fn pcma_sessions_are_transcoded_like_pcmu_in_their_own_law() {
+    use aurix_common::g711::{Law, PCMU_FRAME_SAMPLES, PCMU_SAMPLE_RATE};
+
+    fn tone(law: Law, frame: usize, amp: f32) -> Vec<u8> {
+        let pcm: Vec<i16> = (0..PCMU_FRAME_SAMPLES)
+            .map(|i| {
+                let t = (frame * PCMU_FRAME_SAMPLES + i) as f32 / PCMU_SAMPLE_RATE as f32;
+                ((t * 440.0 * std::f32::consts::TAU).sin() * amp * 32767.0) as i16
+            })
+            .collect();
+        let mut out = Vec::new();
+        law.encode(&pcm, &mut out);
+        out
+    }
+    fn rms_i16(pcm: &[i16]) -> f32 {
+        (pcm.iter()
+            .map(|&s| (s as f32 / 32768.0).powi(2))
+            .sum::<f32>()
+            / pcm.len() as f32)
+            .sqrt()
+    }
+    fn g711_level(law: Law, data: &[u8]) -> f32 {
+        let mut pcm = Vec::new();
+        law.decode(data, &mut pcm);
+        rms_i16(&pcm)
+    }
+
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let team = ChannelId::new();
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "a".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "b".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "c".into())
+        .unwrap();
+    for s in [&s_a, &s_b, &s_c] {
+        sfu.join_channel(
+            &s.session_id,
+            team,
+            ChannelConfig::default(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+    c.bind(addr).await;
+
+    s_a.set_codec(AudioCodec::Pcma).unwrap();
+    s_c.set_codec(AudioCodec::Pcmu).unwrap();
+    assert_eq!(s_a.codec(), AudioCodec::Pcma);
+
+    // A μ-law flagged frame from the PCMA session is refused (wrong law).
+    let seq = a.next_seq();
+    let mut bad = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_a.ssrc,
+        channel_id_hash(&team),
+        Bytes::from(tone(Law::Mu, 0, 0.5)),
+    );
+    bad.header.set_audio_codec(AudioCodec::Pcmu);
+    a.sock.send_to(&bad.seal(&s_a.keys), addr).await.unwrap();
+    assert!(b.recv().await.is_none(), "wrong law must be dropped");
+
+    // A (PCMA) speaks: B (Opus) hears Opus, C (PCMU) hears μ-law.
+    let mut opus_dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut pcm48 = vec![0i16; 960];
+    let (mut b_level, mut c_level) = (0.0, 0.0);
+    for i in 0..10 {
+        let seq = a.next_seq();
+        let mut pkt = AurixPacket::audio_with_level(
+            seq,
+            seq * 960,
+            s_a.ssrc,
+            channel_id_hash(&team),
+            12,
+            &tone(Law::A, i, 0.5),
+        );
+        pkt.header.set_audio_codec(AudioCodec::Pcma);
+        a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+
+        let got = b.recv().await.expect("B hears A");
+        assert_eq!(got.header.audio_codec(), AudioCodec::Opus);
+        let n = opus_dec.decode(&got.payload, &mut pcm48, false).unwrap();
+        assert_eq!(n, 960);
+        b_level = rms_i16(&pcm48[..n]);
+
+        let got = c.recv().await.expect("C hears A");
+        assert_eq!(got.header.audio_codec(), AudioCodec::Pcmu);
+        assert!(!got.header.has_flag(PacketFlags::Pcma));
+        assert_eq!(got.payload.len(), PCMU_FRAME_SAMPLES);
+        c_level = g711_level(Law::Mu, &got.payload);
+    }
+    assert!((b_level - 0.3535).abs() < 0.06, "B level {b_level}");
+    assert!((c_level - 0.3535).abs() < 0.03, "C level {c_level}");
+
+    // B (Opus) speaks: A gets A-law, C gets μ-law, both at level.
+    let mut enc =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let (mut a_level, mut c_level) = (0.0, 0.0);
+    for i in 0..10 {
+        let pcm: Vec<i16> = (0..960)
+            .map(|k| {
+                let t = (i * 960 + k) as f32 / 48_000.0;
+                ((t * 440.0 * std::f32::consts::TAU).sin() * 0.5 * 32767.0) as i16
+            })
+            .collect();
+        let frame = enc.encode_vec(&pcm, 1275).unwrap();
+        b.send_audio(addr, &team, &frame).await;
+
+        let got = a.recv().await.expect("A hears B");
+        assert_eq!(got.header.audio_codec(), AudioCodec::Pcma);
+        assert!(!got.header.has_flag(PacketFlags::Pcmu));
+        assert_eq!(got.payload.len(), PCMU_FRAME_SAMPLES);
+        a_level = g711_level(Law::A, &got.payload);
+
+        let got = c.recv().await.expect("C hears B");
+        assert_eq!(got.header.audio_codec(), AudioCodec::Pcmu);
+        c_level = g711_level(Law::Mu, &got.payload);
+    }
+    assert!((a_level - 0.3535).abs() < 0.06, "A level {a_level}");
+    assert!((c_level - 0.3535).abs() < 0.06, "C level {c_level}");
+    // Decoding A's frame as μ-law would not be at level: the law on the wire matters.
+    assert!(a.recv().await.is_none());
+}
+
+/// In an end-to-end encrypted channel a G.711 session's sealed frames are relayed untouched
+/// with their codec flag (the node cannot transcode them), for PCMU and PCMA alike, to every
+/// capable receiver whatever its own codec — and never decoded into a mixer.
+#[tokio::test]
+async fn e2ee_g711_frames_are_relayed_sealed_with_their_codec_flag() {
+    let (sfu, addr) = start_sfu().await;
+    let app = AppId::new();
+    let channel = ChannelId::new();
+    let cfg = ChannelConfig {
+        e2ee: true,
+        ..ChannelConfig::default()
+    };
+    let mut sessions = Vec::new();
+    for name in ["mu", "a", "opus"] {
+        let s = sfu
+            .create_session(SessionId::new(), UserId::new(), app, name.into())
+            .unwrap();
+        sfu.join_channel(&s.session_id, channel, cfg.clone(), ChannelRole::Speaker)
+            .unwrap();
+        s.set_e2ee_capable(true);
+        sessions.push(s);
+    }
+    let (s_mu, s_a, s_o) = (sessions.remove(0), sessions.remove(0), sessions.remove(0));
+    s_mu.set_codec(AudioCodec::Pcmu).unwrap();
+    s_a.set_codec(AudioCodec::Pcma).unwrap();
+    let mut clients = Vec::new();
+    for s in [&s_mu, &s_a, &s_o] {
+        let mut c = Client::new(s.clone()).await;
+        c.bind(addr).await;
+        clients.push(c);
+    }
+
+    let sealed = |n: u8| Bytes::from(vec![n; 37]);
+    for (speaker, sess, codec) in [
+        (0usize, &s_mu, AudioCodec::Pcmu),
+        (1, &s_a, AudioCodec::Pcma),
+    ] {
+        let seq = clients[speaker].next_seq();
+        let mut pkt = AurixPacket::audio_with_level(
+            seq,
+            seq * 960,
+            sess.ssrc,
+            channel_id_hash(&channel),
+            9,
+            &sealed(seq as u8),
+        );
+        pkt.header.set_audio_codec(codec);
+        pkt.header.flags |= PacketFlags::E2ee as u16;
+        clients[speaker]
+            .sock
+            .send_to(&pkt.seal(&sess.keys), addr)
+            .await
+            .unwrap();
+
+        for (i, other) in clients.iter_mut().enumerate() {
+            if i == speaker {
+                assert!(other.recv().await.is_none(), "no echo");
+                continue;
+            }
+            let got = other
+                .recv()
+                .await
+                .expect("capable receiver hears the sealed frame");
+            assert_eq!(got.header.ssrc, sess.ssrc);
+            assert!(got.header.has_flag(PacketFlags::E2ee));
+            assert_eq!(got.header.audio_codec(), codec, "codec flag preserved");
+            assert!(!got.header.has_flag(PacketFlags::Energy), "level stripped");
+            assert_eq!(
+                &got.payload[..],
+                &sealed(seq as u8)[..],
+                "payload untouched"
+            );
+        }
+    }
+    let o = clients.pop().unwrap();
+    let mut a = clients.pop().unwrap();
+    let mut mu = clients.pop().unwrap();
+
+    // Sealed frames carry no plaintext, so a length the transcoder would reject is fine too.
+    let seq = a.next_seq();
+    let mut pkt = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_a.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from_static(b"odd"),
+    );
+    pkt.header.set_audio_codec(AudioCodec::Pcma);
+    pkt.header.flags |= PacketFlags::E2ee as u16;
+    a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+    let got = o.recv().await.expect("relayed");
+    assert_eq!(&got.payload[..], b"odd");
+    assert!(mu.recv().await.is_some());
+
+    // Plaintext G.711 into the encrypted channel is dropped like plaintext Opus.
+    let seq = mu.next_seq();
+    let mut pkt = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_mu.ssrc,
+        channel_id_hash(&channel),
+        Bytes::from(vec![0xffu8; 160]),
+    );
+    pkt.header.set_audio_codec(AudioCodec::Pcmu);
+    mu.sock.send_to(&pkt.seal(&s_mu.keys), addr).await.unwrap();
+    assert!(a.recv().await.is_none());
+    assert!(o.recv().await.is_none());
+}
+
 #[tokio::test]
 async fn listeners_get_one_server_mixed_stream_per_channel() {
     use aurix_common::g711::{self, PCMU_FRAME_SAMPLES};

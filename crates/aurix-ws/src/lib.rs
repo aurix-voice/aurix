@@ -2760,8 +2760,8 @@ async fn adopt_mirrored_session(
     media_session
         .is_muted
         .store(mirror.prefs.muted, Ordering::Relaxed);
-    if mirror.prefs.codec == AudioCodec::Pcmu && state.control.config.media.pcmu_fallback {
-        let _ = media_session.set_codec(AudioCodec::Pcmu);
+    if mirror.prefs.codec.is_g711() && state.control.config.media.pcmu_fallback {
+        let _ = media_session.set_codec(mirror.prefs.codec);
     }
     let translation = state
         .control
@@ -4549,11 +4549,11 @@ async fn handle_control_message(
         }
 
         ControlMessage::SetAudioCodec { codec } => {
-            if codec == AudioCodec::Pcmu && !state.control.config.media.pcmu_fallback {
+            if codec.is_g711() && !state.control.config.media.pcmu_fallback {
                 return send_error(
                     tx,
                     "CODEC_NOT_AVAILABLE",
-                    "The PCMU fallback codec is disabled on this node",
+                    "The G.711 fallback codecs are disabled on this node",
                 )
                 .await;
             }

@@ -4734,7 +4734,6 @@ export class AurixClient {
     const playback = this.wtPlayback;
     const renderer = this.renderer;
     if (!playback || !renderer) return;
-    if (audio.pcmu) return;
     const now = Date.now();
     let slot = this.wtSlots.get(audio.ssrc);
     if (!slot) {
@@ -4761,16 +4760,16 @@ export class AurixClient {
         .then(() => group.decrypt(userId, audio.frame))
         .then((plain) => {
           if (this.wtPlayback !== playback || this.wtSlots.get(audio.ssrc) !== current) return;
-          current.stereo ||= opusPacketIsStereo(plain);
+          if (audio.codec === 'opus') current.stereo ||= opusPacketIsStereo(plain);
           this.renderWebTransportSlot(audio.ssrc, current, undefined);
-          playback.push(audio.ssrc, plain, audio.sequence, audio.timestamp, current.stereo);
+          playback.push(audio.ssrc, plain, audio.sequence, audio.timestamp, current.stereo, audio.codec);
         })
         .catch(() => undefined);
       return;
     }
-    slot.stereo ||= audio.mixed || opusPacketIsStereo(audio.frame);
+    if (audio.codec === 'opus') slot.stereo ||= audio.mixed || opusPacketIsStereo(audio.frame);
     this.renderWebTransportSlot(audio.ssrc, slot, audio);
-    playback.push(audio.ssrc, audio.frame, audio.sequence, audio.timestamp, slot.stereo);
+    playback.push(audio.ssrc, audio.frame, audio.sequence, audio.timestamp, slot.stereo, audio.codec);
   }
 
   /**

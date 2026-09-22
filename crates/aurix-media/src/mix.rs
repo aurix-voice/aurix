@@ -36,8 +36,9 @@ use tracing::{debug, warn};
 
 use crate::channel::{MediaChannel, Mix};
 use crate::mixer::{MixerConfig, OpusMixer, FRAME_SAMPLES};
+use crate::session::g711_metric_label;
 use crate::session::{MediaEndpoint, MediaSession};
-use crate::transcode::PcmuDownlink;
+use crate::transcode::G711Downlink;
 use crate::tts::SYNTH_SSRC_FLAG;
 
 /// One mixed frame per 20 ms, like every Opus stream in a channel.
@@ -92,7 +93,8 @@ pub struct MixNode {
     mixer: Mutex<OpusMixer>,
     subscribers: Mutex<HashMap<SessionId, Subscriber>>,
     last_fed: Mutex<Instant>,
-    pcmu: Mutex<Option<PcmuDownlink>>,
+    /// Opus → G.711 decoders of the mix for PCMU / PCMA subscribers, one per law.
+    g711: Mutex<Vec<G711Downlink>>,
     started: AtomicBool,
     closed: AtomicBool,
 }
@@ -139,7 +141,7 @@ impl MixNode {
             .collect();
         let channel = *self.slot.channel();
         let shared = matches!(self.slot, Slot::Shared(_));
-        let mut pcmu_frame: Option<Option<Bytes>> = None;
+        let mut g711_frames: [Option<Option<Bytes>>; 2] = [None, None];
         let mut gone = Vec::new();
         for (session, sequence) in subs {
             if !session.is_active() || !session.channels.read().contains(&channel) {
@@ -149,9 +151,10 @@ impl MixNode {
             let Some(endpoint) = session.endpoint() else {
                 continue;
             };
-            let body: Bytes = if session.codec() == AudioCodec::Pcmu {
-                let f = pcmu_frame
-                    .get_or_insert_with(|| self.pcmu_frame(frame))
+            let codec = session.codec();
+            let body: Bytes = if let Some(law) = codec.g711_law() {
+                let f = g711_frames[law as usize]
+                    .get_or_insert_with(|| self.g711_frame(frame, codec))
                     .clone();
                 let Some(f) = f else {
                     aurix_metrics::DOWNLINK_MIX_FRAMES
@@ -172,9 +175,7 @@ impl MixNode {
             );
             header.channel_id_hash = self.channel_hash;
             header.flags |= PacketFlags::Mixed as u16;
-            if session.codec() == AudioCodec::Pcmu {
-                header.flags |= PacketFlags::Pcmu as u16;
-            }
+            header.set_audio_codec(codec);
             // A private mix already carries the receiver's focus gain (it is part of every
             // sender's delivery gain); a shared mix is at unity and applies it here.
             let volume = if shared {
@@ -223,30 +224,32 @@ impl MixNode {
         }
     }
 
-    fn pcmu_frame(&self, opus: &[u8]) -> Option<Bytes> {
-        let mut guard = self.pcmu.lock();
-        if guard.is_none() {
-            match PcmuDownlink::new() {
-                Ok(d) => *guard = Some(d),
+    fn g711_frame(&self, opus: &[u8], codec: AudioCodec) -> Option<Bytes> {
+        let law = codec.g711_law()?;
+        let metric_codec = g711_metric_label(codec)?;
+        let mut guard = self.g711.lock();
+        if !guard.iter().any(|d| d.law() == law) {
+            match G711Downlink::new(law) {
+                Ok(d) => guard.push(d),
                 Err(e) => {
-                    warn!("PCMU downlink decoder for mix: {e}");
+                    warn!("G.711 downlink decoder for mix: {e}");
                     return None;
                 }
             }
         }
-        let result = guard.as_mut()?.transcode(opus);
+        let result = guard.iter_mut().find(|d| d.law() == law)?.transcode(opus);
         match result {
-            Ok(ulaw) => {
-                aurix_metrics::PCMU_FRAMES
-                    .with_label_values(&["downlink", "ok"])
+            Ok(coded) => {
+                aurix_metrics::G711_FRAMES
+                    .with_label_values(&[metric_codec, "downlink", "ok"])
                     .inc();
-                Some(ulaw)
+                Some(coded)
             }
             Err(e) => {
-                aurix_metrics::PCMU_FRAMES
-                    .with_label_values(&["downlink", "error"])
+                aurix_metrics::G711_FRAMES
+                    .with_label_values(&[metric_codec, "downlink", "error"])
                     .inc();
-                debug!("PCMU transcode of mix: {e}");
+                debug!("G.711 transcode of mix: {e}");
                 None
             }
         }
@@ -375,7 +378,7 @@ impl MixHub {
             mixer: Mutex::new(mixer),
             subscribers: Mutex::new(HashMap::new()),
             last_fed: Mutex::new(Instant::now()),
-            pcmu: Mutex::new(None),
+            g711: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         });

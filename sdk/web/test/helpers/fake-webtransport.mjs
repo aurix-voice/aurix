@@ -273,7 +273,7 @@ export class FakeNode {
     return (await this.ready()).seal(header, payload);
   }
   /** A sealed downlink audio datagram from `ssrc` (server gain/direction bytes optional). */
-  async audioPacket(ssrc, sequence, frame, { channelIdHash = 0, timestamp = sequence * 960, gain, direction, e2ee = false, mixed = false, pcmu = false } = {}) {
+  async audioPacket(ssrc, sequence, frame, { channelIdHash = 0, timestamp = sequence * 960, gain, direction, e2ee = false, mixed = false, pcmu = false, pcma = false } = {}) {
     let flags = 0;
     const parts = [];
     if (gain !== undefined) {
@@ -287,6 +287,7 @@ export class FakeNode {
     if (e2ee) flags |= AurxFlags.E2ee;
     if (mixed) flags |= AurxFlags.Mixed;
     if (pcmu) flags |= AurxFlags.Pcmu;
+    if (pcma) flags |= AurxFlags.Pcma;
     const payload = new Uint8Array(parts.length + frame.length);
     payload.set(parts, 0);
     payload.set(frame, parts.length);
