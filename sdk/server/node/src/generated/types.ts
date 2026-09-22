@@ -98,10 +98,11 @@ export const SafetySourceValues: readonly SafetySource[] = ["voice", "text"] as 
 /**
  * Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the
  * control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume,
- * connection migration), or WebRTC.
+ * connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style
+ * fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
  */
-export type SessionStatsMediaPath = "udp" | "tunnel" | "quic" | "web_rtc";
-export const SessionStatsMediaPathValues: readonly SessionStatsMediaPath[] = ["udp", "tunnel", "quic", "web_rtc"] as const;
+export type SessionStatsMediaPath = "udp" | "tunnel" | "quic" | "tls" | "web_transport" | "web_rtc";
+export const SessionStatsMediaPathValues: readonly SessionStatsMediaPath[] = ["udp", "tunnel", "quic", "tls", "web_transport", "web_rtc"] as const;
 
 export type StreamFormat = "opus" | "pcm_s16le";
 export const StreamFormatValues: readonly StreamFormat[] = ["opus", "pcm_s16le"] as const;
@@ -1638,7 +1639,8 @@ export interface SessionStats {
   /**
    * Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the
    * control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume,
-   * connection migration), or WebRTC.
+   * connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style
+   * fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
    */
   media_path?: SessionStatsMediaPath;
   channels: string[];

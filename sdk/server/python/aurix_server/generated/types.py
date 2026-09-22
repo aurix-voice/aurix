@@ -92,9 +92,9 @@ RolloffCurve_VALUES: List[RolloffCurve] = ["linear", "logarithmic", "custom_spli
 SafetySource = Literal["voice", "text"]
 SafetySource_VALUES: List[SafetySource] = ["voice", "text"]
 
-SessionStatsMediaPath = Literal["udp", "tunnel", "quic", "web_rtc"]
-"""Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), or WebRTC."""
-SessionStatsMediaPath_VALUES: List[SessionStatsMediaPath] = ["udp", "tunnel", "quic", "web_rtc"]
+SessionStatsMediaPath = Literal["udp", "tunnel", "quic", "tls", "web_transport", "web_rtc"]
+"""Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC."""
+SessionStatsMediaPath_VALUES: List[SessionStatsMediaPath] = ["udp", "tunnel", "quic", "tls", "web_transport", "web_rtc"]
 
 StreamFormat = Literal["opus", "pcm_s16le"]
 StreamFormat_VALUES: List[StreamFormat] = ["opus", "pcm_s16le"]
@@ -1638,7 +1638,7 @@ SessionStats = TypedDict(
         "session_id": str,
         "user_id": str,
         "transport": str,  # Session transport family: `Aurx` (native) or `WebRtc`.
-        "media_path": NotRequired["SessionStatsMediaPath"],  # Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), or WebRTC.
+        "media_path": NotRequired["SessionStatsMediaPath"],  # Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
         "channels": List[str],
         "packets_sent": int,
         "bytes_sent": int,

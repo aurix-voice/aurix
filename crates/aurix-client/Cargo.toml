@@ -37,3 +37,5 @@ cbindgen = { version = "0.29", default-features = false }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
 aurix-media = { path = "../aurix-media" }
+wtransport = { workspace = true }
+hex = { workspace = true }

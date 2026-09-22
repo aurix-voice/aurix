@@ -27,6 +27,7 @@ import {
   type TurnCredentials,
   type UnknownMessage,
   type UserPosition,
+  type WebTransportInfoWire,
 } from './protocol.js';
 import {
   E2eeGroup,
@@ -87,6 +88,7 @@ import {
   type RtcStatsInput,
 } from './quality.js';
 import {
+  DEFAULT_AUDIO_POLICY,
   applyOpusSenderPreferences,
   audioPoliciesEqual,
   mergeAllAudioPolicies,
@@ -98,6 +100,78 @@ import {
   type OpusBrowserOptions,
   type OpusSenderPreferences,
 } from './opus.js';
+import { channelIdHash, opusPacketIsStereo, type AurxDirection, type DownlinkAudio } from './aurx.js';
+import {
+  AURX_FRAME_SAMPLES,
+  AurxCapture,
+  AurxPlayback,
+  opusConfigFor,
+  supportsAurxAudio,
+  type AurxCaptureFrame,
+  type AurxOpusConfig,
+} from './aurx-audio.js';
+import { AurxWebTransport, detectWebTransportSupport, type AurxWebTransportOptions } from './webtransport.js';
+
+/** `SessionInitAck.media_key` length: the AURX master key. */
+const AURX_MEDIA_KEY_BYTES = 32;
+
+/** One downlink SSRC rendered through the spatial graph while on WebTransport. */
+interface WebTransportSlot {
+  userId: string | undefined;
+  /** Carries E2EE frames: rendered from local preferences, not server metadata. */
+  e2ee: boolean;
+  /** Latched once a stereo frame is seen (decoders only upgrade). */
+  stereo: boolean;
+  lastPacketAt: number;
+  /** Last server-applied gain/direction (skips redundant `render` calls). */
+  gain: number;
+  direction?: AurxDirection | undefined;
+}
+
+function wtSlotKey(ssrc: number): string {
+  return `wt:${ssrc}`;
+}
+
+function directionsEqual(a: AurxDirection | undefined, b: AurxDirection | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.azimuth === b.azimuth && a.elevation === b.elevation;
+}
+
+type InboundRtpStats = NonNullable<RtcStatsInput['inbound']>;
+
+/**
+ * One `inbound-rtp` entry per downlink track (mixed + per-participant): counters add up, jitter
+ * is the worst track that actually carried packets.
+ */
+function mergeInboundStats(acc: InboundRtpStats | undefined, s: InboundRtpStats): InboundRtpStats {
+  if (!acc) return { ...s };
+  const accJitter = (acc.packetsReceived ?? 0) > 0 ? (acc.jitter ?? 0) : 0;
+  const jitter = (s.packetsReceived ?? 0) > 0 ? Math.max(accJitter, s.jitter ?? 0) : accJitter;
+  return {
+    jitter,
+    packetsReceived: (acc.packetsReceived ?? 0) + (s.packetsReceived ?? 0),
+    packetsLost: (acc.packetsLost ?? 0) + (s.packetsLost ?? 0),
+    bytesReceived: (acc.bytesReceived ?? 0) + (s.bytesReceived ?? 0),
+    concealedSamples: (acc.concealedSamples ?? 0) + (s.concealedSamples ?? 0),
+    packetsDiscarded: (acc.packetsDiscarded ?? 0) + (s.packetsDiscarded ?? 0),
+    jitterBufferDelay: (acc.jitterBufferDelay ?? 0) + (s.jitterBufferDelay ?? 0),
+    jitterBufferEmittedCount: (acc.jitterBufferEmittedCount ?? 0) + (s.jitterBufferEmittedCount ?? 0),
+  };
+}
+
+function webTransportAdvertised(info: WebTransportInfoWire | undefined): info is WebTransportInfoWire {
+  return info !== undefined && Array.isArray(info.urls) && info.urls.some((u) => typeof u === 'string' && u.length > 0);
+}
+
+/** Why AURX over WebTransport cannot run in this browser (`undefined` = it can). */
+function webTransportCapabilityBlocker(): string | undefined {
+  const support = detectWebTransportSupport();
+  if (!support.webTransport) return 'no WebTransport in this browser';
+  if (!support.datagrams) return 'WebTransport datagrams are unsupported here';
+  if (!support.crypto) return 'WebCrypto is unavailable (insecure context?)';
+  if (!supportsAurxAudio()) return 'WebCodecs Opus / AudioWorklet are unavailable here';
+  return undefined;
+}
 
 export interface AurixClientOptions {
   /** REST base URL, e.g. `https://voice.example.com` (used for TURN credentials). */
@@ -203,6 +277,44 @@ export interface AurixClientOptions {
    * no plaintext fallback). `false`: never join encrypted channels.
    */
   e2ee?: boolean | E2eeOptions;
+  /**
+   * Media path. `'auto'` (default) carries AURX over WebTransport (HTTP/3 datagrams sealed
+   * with the session key, Opus via WebCodecs) when the node advertises it and the browser has
+   * WebTransport + WebCodecs, and negotiates WebRTC otherwise or when the WebTransport
+   * connection fails. `'webrtc'` never tries WebTransport; `'webtransport'` requires it
+   * (`connect()` fails instead of falling back).
+   */
+  transport?: MediaTransportPreference;
+  /** Tuning of the WebTransport media path (ignored on WebRTC). */
+  webTransport?: WebTransportClientOptions;
+}
+
+/** The media path a session ended up on. */
+export type MediaTransport = 'webrtc' | 'webtransport';
+export type MediaTransportPreference = 'auto' | MediaTransport;
+
+export interface WebTransportClientOptions {
+  /** Per-URL connect + `SessionBind` budget (ms). Default 4000. */
+  connectTimeoutMs?: number;
+  /** Heartbeat period (ms), also the RTT probe; 0 disables heartbeats. Default 2000. */
+  heartbeatIntervalMs?: number;
+  /** Consecutive unanswered heartbeats before the path counts as dead. Default 5. */
+  heartbeatLossLimit?: number;
+  /**
+   * Opus encoder settings layered over the channel audio policy — the full set browsers
+   * lack on WebRTC: `complexity`, `signal`, `application`, `expectedLossPct`, `cbr`.
+   */
+  opus?: Partial<AurxOpusConfig>;
+  /** Forget a downlink stream (and free its decoder) after this long without a packet (ms). Default 5000. */
+  idleTimeoutMs?: number;
+}
+
+/** WebTransport media endpoint the node advertised in `SessionInitAck`. */
+export interface WebTransportAdvertisement {
+  /** `https://host:port/aurix` URLs, tried in order. */
+  urls: string[];
+  /** SHA-256 pins (hex) of the node's generated certificate (current, next); empty = WebPKI. */
+  certSha256: string[];
 }
 
 export interface E2eeOptions {
@@ -270,6 +382,8 @@ export interface SessionInfo {
   translation?: TranslationInfo;
   /** Per-participant downlink tracks the node serves this browser at most (`0` = mixed only). */
   participantStreamCap: number;
+  /** AURX-over-WebTransport endpoint of the node, when it offers one for this session. */
+  webTransport?: WebTransportAdvertisement;
 }
 
 /** Live-translation capability of the node. */
@@ -645,6 +759,8 @@ export type ConnectionState =
 export interface AurixEvents {
   connectionState: (state: ConnectionState) => void;
   sessionReady: (info: SessionInfo) => void;
+  /** Which media path came up (after `sessionReady`, again after every reconnect). */
+  mediaTransport: (transport: MediaTransport) => void;
   /** Remote mixed audio stream from the SFU; attach to an `<audio>` element. */
   remoteStream: (stream: MediaStream) => void;
   channelJoined: (channelId: string, participants: Participant[]) => void;
@@ -1102,6 +1218,26 @@ export class AurixClient {
   private e2eeRotateTimer: ReturnType<typeof setTimeout> | undefined;
   private e2eeModeValue: E2eeMode = 'plain';
 
+  // ── AURX over WebTransport ──
+  /** Session media key (`SessionInitAck.media_key`); seals AURX datagrams. */
+  private mediaKey: Uint8Array | undefined;
+  private webTransportInfo: WebTransportInfoWire | undefined;
+  private mediaTransportValue: MediaTransport | undefined;
+  private wt: AurxWebTransport | undefined;
+  private wtCapture: AurxCapture | undefined;
+  private wtPlayback: AurxPlayback | undefined;
+  /** Downlink streams by SSRC: the participant they belong to and their last render inputs. */
+  private readonly wtSlots = new Map<number, WebTransportSlot>();
+  /** AURX channel hash → channel id for the channels we are in (rebuilt lazily). */
+  private wtChannelByHash = new Map<number, string>();
+  private wtIdleTimer: ReturnType<typeof setInterval> | undefined;
+  /** Serialises E2EE frame decryption per SSRC (WebCrypto is async, playback wants order). */
+  private wtDecryptQueue: Promise<void> = Promise.resolve();
+  /** Uplink sequence carried across WebTransport reconnects (receivers keep their loss accounting). */
+  private wtNextSequence: number | undefined;
+  /** SSRC → user of the last WebTransport frame (E2EE frames need the sender to decrypt). */
+  private wtUserBySsrc = new Map<number, string>();
+
   constructor(options: AurixClientOptions) {
     this.opts = {
       useTurn: true,
@@ -1161,6 +1297,11 @@ export class AurixClient {
 
   get sessionInfo(): SessionInfo | undefined {
     return this.session;
+  }
+
+  /** The media path in use once media is up (`undefined` before / between connections). */
+  get mediaTransport(): MediaTransport | undefined {
+    return this.mediaTransportValue;
   }
 
   /** WebSocket URL of the node the client talks to (`wsUrl` until a failover moved it). */
@@ -1361,6 +1502,15 @@ export class AurixClient {
     const o = this.e2eeOptions();
     const support = detectE2eeSupport(o.transform ?? 'auto');
     if (!support.ok) {
+      if (support.crypto && this.webTransportPossible()) {
+        // No encoded-frame API, but AURX over WebTransport encrypts frames itself: keep the
+        // group and drop it at `SessionInitAck` if that path is not offered.
+        const identity = await E2eeIdentity.create(o.identity);
+        this.e2eeGroup = await E2eeGroup.create(identity);
+        this.e2eeGroup.onRotateNeeded = () => this.scheduleE2eeRotate();
+        this.e2eeApi = undefined;
+        return;
+      }
       if (this.opts.e2ee !== undefined) {
         const why = !support.crypto ? 'WebCrypto is unavailable (insecure context?)' : 'no encoded-frame API (RTCRtpScriptTransform / createEncodedStreams)';
         this.emit('error', new Error(`E2EE unavailable: ${why}; encrypted channels cannot be joined`));
@@ -1537,6 +1687,26 @@ export class AurixClient {
     const group = this.e2eeGroup;
     if (group) this.emitE2eeGone(group.reset());
     this.refreshE2eeMode();
+  }
+
+  /**
+   * Give up E2EE for this connection: the group is discarded and any encrypted channel we sit
+   * in is left (we could neither read nor produce its frames).
+   */
+  private dropE2ee(why: string): void {
+    if (!this.e2eeGroup) return;
+    const channels = Array.from(this.e2eeChannels);
+    this.e2eeSessionEnded();
+    this.e2eeGroup = undefined;
+    this.e2eeApi = undefined;
+    if (this.opts.e2ee !== undefined || channels.length > 0) {
+      this.emit('error', new Error(`E2EE unavailable: ${why}; encrypted channels cannot be joined`));
+    }
+    for (const channelId of channels) {
+      if (!this.channels.has(channelId)) continue;
+      this.trySend({ type: 'ChannelLeave', data: { channel_id: channelId } });
+      this.forgetChannel(channelId);
+    }
   }
 
   private onE2eeHello(d: { channel_id?: string; user_id?: string; public_key: string }): void {
@@ -1799,6 +1969,7 @@ export class AurixClient {
     await loadVisemeWorklet(ctx);
     if (!this.visemesEnabledValue || this.renderer !== renderer) return;
     for (const mid of this.participantTracks.keys()) this.attachVisemeTap(mid);
+    for (const ssrc of this.wtSlots.keys()) this.attachVisemeTap(wtSlotKey(ssrc));
   }
 
   private attachVisemeTap(mid: string): void {
@@ -1807,7 +1978,7 @@ export class AurixClient {
     const ctx = workletContext(renderer.context);
     if (!ctx) return;
     const tap = createVisemeNode(ctx, (frame) => {
-      const userId = this.participantLayout.get(mid);
+      const userId = this.slotUser(mid);
       if (userId === undefined || this.visemeTaps.get(mid) !== tap) return;
       this.participantVisemeFrames.set(userId, frame);
       this.emit('participantVisemes', userId, frame);
@@ -1817,7 +1988,15 @@ export class AurixClient {
       return;
     }
     this.visemeTaps.set(mid, tap);
-    this.visemeTapUsers.set(mid, this.participantLayout.get(mid));
+    this.visemeTapUsers.set(mid, this.slotUser(mid));
+  }
+
+  /** The participant heard on renderer slot `mid` (a WebRTC track or a WebTransport SSRC). */
+  private slotUser(mid: string): string | undefined {
+    const fromLayout = this.participantLayout.get(mid);
+    if (fromLayout !== undefined) return fromLayout;
+    for (const [ssrc, slot] of this.wtSlots) if (wtSlotKey(ssrc) === mid) return slot.userId;
+    return undefined;
   }
 
   private detachVisemeTap(mid: string): void {
@@ -1976,6 +2155,7 @@ export class AurixClient {
   async resumeAudio(): Promise<boolean> {
     let ok = true;
     if (this.renderer) ok = await this.renderer.resume();
+    if (this.wtCapture && !(await this.wtCapture.resume())) ok = false;
     for (const el of this.outputElements) {
       if (el.paused && el.srcObject) {
         try {
@@ -2318,19 +2498,24 @@ export class AurixClient {
     const n = Math.max(0, Math.min(cap, Math.floor(wanted)));
     if (n === 0) return 0;
     if (!this.rendersParticipantTracks()) return n;
-    if (!this.renderer) {
-      const ctx = (this.opts.audioContext as SpatialAudioContextLike | undefined) ?? createAudioContext();
-      if (!ctx) return 0;
-      this.renderer = new SpatialRenderer(ctx, {
-        panningModel: this.opts.spatialAudio === 'equalpower' ? 'equalpower' : 'HRTF',
-      });
-      this.renderer.setMasterVolume(this.outputVolumeValue);
-      this.renderer.setMasterMuted(this.outputMutedValue);
-      if (this.outputDeviceIdValue !== undefined) {
-        void this.renderer.setSinkId(this.outputDeviceIdValue).catch(() => undefined);
-      }
+    return this.ensureRenderer() ? n : 0;
+  }
+
+  /** The Web Audio graph remote voices are rendered through (created on first use). */
+  private ensureRenderer(): SpatialRenderer | undefined {
+    if (this.renderer) return this.renderer;
+    const ctx = (this.opts.audioContext as SpatialAudioContextLike | undefined) ?? createAudioContext();
+    if (!ctx) return undefined;
+    const renderer = new SpatialRenderer(ctx, {
+      panningModel: this.opts.spatialAudio === 'equalpower' ? 'equalpower' : 'HRTF',
+    });
+    renderer.setMasterVolume(this.outputVolumeValue);
+    renderer.setMasterMuted(this.outputMutedValue);
+    if (this.outputDeviceIdValue !== undefined) {
+      void renderer.setSinkId(this.outputDeviceIdValue).catch(() => undefined);
     }
-    return n;
+    this.renderer = renderer;
+    return renderer;
   }
 
   private onParticipantTrack(mid: string, stream: MediaStream): void {
@@ -2408,11 +2593,15 @@ export class AurixClient {
   private renderParticipant(userId: string): void {
     if (!this.renderer) return;
     for (const [mid, user] of this.participantLayout) if (user === userId) this.renderMid(mid);
+    for (const [ssrc, slot] of this.wtSlots) {
+      if (slot.e2ee && slot.userId === userId) this.renderWebTransportSlot(ssrc, slot, undefined);
+    }
   }
 
   private renderParticipants(): void {
     if (!this.renderer) return;
     for (const mid of this.participantTracks.keys()) this.renderMid(mid);
+    for (const [ssrc, slot] of this.wtSlots) if (slot.e2ee) this.renderWebTransportSlot(ssrc, slot, undefined);
   }
 
   /** Remember a position of `channelId`'s member for browser-side spatialisation. */
@@ -2560,6 +2749,10 @@ export class AurixClient {
     this.pc?.close();
     this.pc = undefined;
     this.clearParticipantTracks();
+    this.stopWebTransportMedia();
+    this.wtNextSequence = undefined;
+    this.mediaKey = undefined;
+    this.webTransportInfo = undefined;
     if (this.renderer && this.opts.audioContext === undefined) {
       void this.renderer.close();
       this.renderer = undefined;
@@ -2718,6 +2911,11 @@ export class AurixClient {
   leaveChannel(channelId: string): void {
     this.requireOpen();
     this.send({ type: 'ChannelLeave', data: { channel_id: channelId } });
+    this.forgetChannel(channelId);
+  }
+
+  /** Local bookkeeping of a channel we left (or were dropped from) on our own initiative. */
+  private forgetChannel(channelId: string): void {
     this.dropDucking(channelId);
     this.typingSentAt.delete(channelId);
     this.transcribedChannels.delete(channelId);
@@ -2726,6 +2924,7 @@ export class AurixClient {
     this.channelInfos.delete(channelId);
     this.forgetChannelSpatial(channelId);
     if (this.channels.delete(channelId)) this.emit('channelLeft', channelId);
+    this.webTransportRosterChanged();
     if (this.channelPolicies.delete(channelId)) this.refreshAudioPolicy();
     this.e2eeChannelLeft(channelId);
     this.renderParticipants();
@@ -3070,6 +3269,7 @@ export class AurixClient {
     this.inputPipeline?.stream?.getAudioTracks().forEach((t) => {
       t.enabled = !muted;
     });
+    this.wtCapture?.setPaused(muted);
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.userId) return;
     for (const channelId of this.channels.keys()) {
       this.send({
@@ -3126,6 +3326,7 @@ export class AurixClient {
   }
 
   private async sampleStats(): Promise<ClientStats> {
+    if (this.wt) return this.webTransportStats(this.wt);
     const input: RtcStatsInput = {};
     const pc = this.pc;
     if (pc) {
@@ -3142,7 +3343,7 @@ export class AurixClient {
         if (entry.kind !== undefined && entry.kind !== 'audio') return;
         switch (entry.type) {
           case 'inbound-rtp':
-            input.inbound = s as NonNullable<RtcStatsInput['inbound']>;
+            input.inbound = mergeInboundStats(input.inbound, s as NonNullable<RtcStatsInput['inbound']>);
             break;
           case 'outbound-rtp':
             input.outbound = s as NonNullable<RtcStatsInput['outbound']>;
@@ -3162,7 +3363,9 @@ export class AurixClient {
       const iceRtt = nominatedRtt ?? succeededRtt;
       if (iceRtt !== undefined) input.iceRttSeconds = iceRtt;
     }
-    return assembleClientStats(this.rtt, input, this.lossWindow, this.serverQuality);
+    const out = assembleClientStats(this.rtt, input, this.lossWindow, this.serverQuality);
+    if (pc) out.transport = 'webrtc';
+    return out;
   }
 
   // ── Internals: control channel ──
@@ -3318,13 +3521,14 @@ export class AurixClient {
 
   /** After a reconnect: keep a still-connected peer connection, otherwise renegotiate. */
   private async restoreMedia(sameSession: boolean): Promise<void> {
-    if (sameSession && this.pc && this.pc.connectionState === 'connected') {
+    if (sameSession && ((this.pc && this.pc.connectionState === 'connected') || this.wt?.isOpen)) {
       this.setState('media-connected');
       return;
     }
     this.pc?.close();
     this.pc = undefined;
     this.clearParticipantTracks();
+    this.stopWebTransportMedia();
     await this.startMedia();
   }
 
@@ -3380,7 +3584,7 @@ export class AurixClient {
     if (!track) return;
     track.addEventListener('ended', () => {
       // Device unplugged / revoked: fall back to the default microphone while media is up.
-      if (this.localStream !== stream || !this.pc || stream === this.opts.localStream) return;
+      if (this.localStream !== stream || (!this.pc && !this.wt) || stream === this.opts.localStream) return;
       this.inputDeviceIdValue = undefined;
       void this.openMicrophone()
         .then((s) => this.adoptLocalStream(s))
@@ -3402,6 +3606,7 @@ export class AurixClient {
       const track = stream.getAudioTracks()[0];
       const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'audio' || s.track === null);
       if (track && sender) await sender.replaceTrack(track);
+      this.wtCapture?.setStream(stream);
       this.stopLocalMeter();
       this.startLocalMeter(stream);
     }
@@ -3428,6 +3633,7 @@ export class AurixClient {
       });
     }
     if (processed) {
+      this.wtCapture?.setStream(processed);
       this.stopLocalMeter();
       this.startLocalMeter(processed);
     }
@@ -3457,6 +3663,8 @@ export class AurixClient {
         const d = (msg as Extract<ServerMessage, { type: 'SessionInitAck' }>).data;
         const endpoint = this.pendingInit?.url ?? this.activeEndpoint;
         this.failoverEndpoints = (d.failover ?? []).filter((u) => u !== endpoint);
+        this.mediaKey = d.media_key ? base64ToBytes(d.media_key) : undefined;
+        this.webTransportInfo = webTransportAdvertised(d.webtransport) ? d.webtransport : undefined;
         const info: SessionInfo = {
           sessionId: d.session_id,
           userId: this.userId ?? '',
@@ -3466,6 +3674,14 @@ export class AurixClient {
           endpoint,
           failover: [...this.failoverEndpoints],
           participantStreamCap: d.webrtc_participant_streams ?? 0,
+          ...(this.webTransportInfo
+            ? {
+                webTransport: {
+                  urls: [...this.webTransportInfo.urls],
+                  certSha256: [...(this.webTransportInfo.cert_sha256 ?? [])],
+                },
+              }
+            : {}),
           ...(d.translation
             ? {
                 translation: {
@@ -3482,6 +3698,9 @@ export class AurixClient {
         if (this.pinnedParticipants.length > this.participantStreamCapValue) {
           this.pinnedParticipants = this.pinnedParticipants.slice(0, this.participantStreamCapValue);
         }
+        // E2EE that only WebTransport can carry (no encoded-frame API) is announced only when
+        // that is the path we are going to take.
+        if (this.e2eeGroup && this.e2eeApi === undefined && !this.webTransportPlanned()) this.dropE2ee('WebTransport is not available here');
         const pending = this.pendingInit;
         this.pendingInit = undefined;
         if (pending) {
@@ -3529,6 +3748,7 @@ export class AurixClient {
           if (me) this.userId = me.user_id;
         }
         this.channels.set(d.channel_id, roster);
+        this.webTransportRosterChanged();
         if (d.transcription) this.transcribedChannels.add(d.channel_id);
         else this.transcribedChannels.delete(d.channel_id);
         if (d.safety_voice) this.monitoredChannels.add(d.channel_id);
@@ -3575,6 +3795,7 @@ export class AurixClient {
           priority: d.is_priority === true,
         };
         roster.set(d.user_id, p);
+        this.webTransportRosterChanged();
         this.renderParticipant(d.user_id);
         this.emit('participantJoined', d.channel_id, p);
         return;
@@ -3583,6 +3804,7 @@ export class AurixClient {
         const d = (msg as Extract<ServerMessage, { type: 'ParticipantLeft' }>).data;
         this.channels.get(d.channel_id)?.delete(d.user_id);
         this.positions.get(d.channel_id)?.delete(d.user_id);
+        this.webTransportRosterChanged();
         this.renderParticipant(d.user_id);
         this.e2eePeerLeft(d.channel_id, d.user_id);
         this.emit('participantLeft', d.channel_id, d.user_id);
@@ -4000,14 +4222,31 @@ export class AurixClient {
 
   private async startMedia(): Promise<void> {
     this.setState('media-connecting');
-    const iceServers: RTCIceServer[] = [...(this.opts.iceServers ?? [])];
-    if (this.opts.useTurn) {
-      const turn = await this.fetchTurnCredentials();
-      if (turn) {
-        iceServers.push({ urls: turn.uris, username: turn.username, credential: turn.password });
+    const sent = await this.openLocalMedia();
+    const preference = this.opts.transport ?? 'auto';
+    if (preference !== 'webrtc') {
+      const blocker = this.webTransportBlocker();
+      if (blocker === undefined) {
+        try {
+          await this.startWebTransportMedia(sent);
+          return;
+        } catch (e) {
+          this.stopWebTransportMedia();
+          if (this.closedByUser || !this.ws) throw e;
+          const err = e instanceof Error ? e : new Error(String(e));
+          if (preference === 'webtransport') throw err;
+          this.emit('error', new Error(`WebTransport media failed, falling back to WebRTC: ${err.message}`));
+        }
+      } else if (preference === 'webtransport') {
+        throw new Error(`WebTransport unavailable: ${blocker}`);
       }
     }
+    if (this.e2eeGroup && this.e2eeApi === undefined) this.dropE2ee('no encoded-frame API for WebRTC');
+    await this.startWebRtcMedia(sent);
+  }
 
+  /** Microphone, gain pipeline, meter and device watching — shared by both media paths. */
+  private async openLocalMedia(): Promise<MediaStream> {
     if (!this.localStream) {
       this.localStream = this.opts.localStream ?? (await this.openMicrophone());
       this.watchInputTrack(this.localStream);
@@ -4026,6 +4265,17 @@ export class AurixClient {
     if (typeof navigator !== 'undefined') {
       navigator.mediaDevices?.addEventListener?.('devicechange', this.onDeviceChange);
     }
+    return sent;
+  }
+
+  private async startWebRtcMedia(sent: MediaStream): Promise<void> {
+    const iceServers: RTCIceServer[] = [...(this.opts.iceServers ?? [])];
+    if (this.opts.useTurn) {
+      const turn = await this.fetchTurnCredentials();
+      if (turn) {
+        iceServers.push({ urls: turn.uris, username: turn.username, credential: turn.password });
+      }
+    }
 
     const pcConfig: RTCConfiguration & { encodedInsertableStreams?: boolean } = {
       iceServers,
@@ -4035,6 +4285,7 @@ export class AurixClient {
     if (this.e2eeGroup && this.e2eeApi === 'streams') pcConfig.encodedInsertableStreams = true;
     const pc = new RTCPeerConnection(pcConfig);
     this.pc = pc;
+    this.mediaTransportValue = 'webrtc';
     this.lossWindow.reset();
     this.startQualityTimer();
     // One sendrecv audio transceiver: uplink microphone, downlink server-side mix. Then up to
@@ -4071,6 +4322,7 @@ export class AurixClient {
         case 'connected':
           if (this.state === 'connected' || this.state === 'media-connecting') {
             this.setState('media-connected');
+            this.emit('mediaTransport', 'webrtc');
           }
           break;
         case 'failed':
@@ -4153,7 +4405,316 @@ export class AurixClient {
     this.audioPolicyValue = merged;
     this.transientBitrateBps = undefined;
     void this.applySenderPreferences();
+    this.reconfigureWebTransportCapture();
     this.emit('audioPolicy', merged);
+  }
+
+  // ── Internals: AURX over WebTransport ──
+
+  /** Why AURX over WebTransport cannot be used in this browser at all (`undefined` = it can). */
+  private webTransportPossible(): boolean {
+    return this.opts.transport !== 'webrtc' && webTransportCapabilityBlocker() === undefined;
+  }
+
+  /** Why this session cannot use WebTransport right now (`undefined` = it can). */
+  private webTransportBlocker(): string | undefined {
+    if (!this.webTransportInfo) return 'the node does not offer WebTransport for this session';
+    if (!this.mediaKey || this.mediaKey.length !== AURX_MEDIA_KEY_BYTES) return 'no session media key';
+    return webTransportCapabilityBlocker();
+  }
+
+  private webTransportPlanned(): boolean {
+    return this.opts.transport !== 'webrtc' && this.webTransportBlocker() === undefined;
+  }
+
+  private async startWebTransportMedia(sent: MediaStream): Promise<void> {
+    const info = this.webTransportInfo;
+    const session = this.session;
+    const key = this.mediaKey;
+    if (!info || !session || !key) throw new Error('WebTransport is not offered for this session');
+    const renderer = this.ensureRenderer();
+    const ctx = renderer ? workletContext(renderer.context) : undefined;
+    if (!renderer || !ctx) throw new Error('Web Audio is unavailable');
+
+    const playback = new AurxPlayback(ctx, (e) => this.emit('error', e));
+    this.wtPlayback = playback;
+    await playback.init();
+    if (this.wtPlayback !== playback) throw new Error('media torn down');
+
+    const o = this.opts.webTransport ?? {};
+    const options: AurxWebTransportOptions = {};
+    if (o.connectTimeoutMs !== undefined) options.connectTimeoutMs = o.connectTimeoutMs;
+    if (o.heartbeatIntervalMs !== undefined) options.heartbeatIntervalMs = o.heartbeatIntervalMs;
+    if (o.heartbeatLossLimit !== undefined) options.heartbeatLossLimit = o.heartbeatLossLimit;
+    if (this.wtNextSequence !== undefined) options.startSequence = this.wtNextSequence;
+    const transport = new AurxWebTransport(
+      { sessionId: session.sessionId, ssrc: session.ssrc, masterKey: key },
+      {
+        onAudio: (audio) => {
+          if (this.wt === transport) this.onWebTransportAudio(audio);
+        },
+        onBitrate: (bps) => {
+          if (this.wt === transport) this.onWebTransportBitrate(bps);
+        },
+        onClosed: (reason) => {
+          if (this.wt === transport) this.onWebTransportClosed(reason);
+        },
+        onError: (e) => {
+          if (this.wt === transport) this.emit('error', e);
+        },
+      },
+      options,
+    );
+    this.wt = transport;
+    await transport.connect(info);
+    if (this.wt !== transport) throw new Error('media torn down');
+
+    const capture = new AurxCapture(
+      (frame) => {
+        if (this.wtCapture === capture) this.onCaptureFrame(frame);
+      },
+      (e) => {
+        if (this.wtCapture === capture) this.emit('error', e);
+      },
+    );
+    this.wtCapture = capture;
+    capture.setPaused(this.muted);
+    await capture.start(sent, this.webTransportOpusConfig());
+    if (this.wt !== transport || this.wtCapture !== capture) throw new Error('media torn down');
+
+    this.mediaTransportValue = 'webtransport';
+    this.lossWindow.reset();
+    this.startQualityTimer();
+    this.wtIdleTimer = setInterval(() => this.sweepWebTransportSlots(), 1_000);
+    if (this.state === 'connected' || this.state === 'media-connecting') this.setState('media-connected');
+    this.emit('mediaTransport', 'webtransport');
+  }
+
+  private stopWebTransportMedia(): void {
+    const transport = this.wt;
+    this.wt = undefined;
+    if (transport) {
+      this.wtNextSequence = transport.nextSequence;
+      transport.close();
+    }
+    const capture = this.wtCapture;
+    this.wtCapture = undefined;
+    capture?.stop();
+    if (this.wtIdleTimer !== undefined) clearInterval(this.wtIdleTimer);
+    this.wtIdleTimer = undefined;
+    for (const ssrc of Array.from(this.wtSlots.keys())) this.removeWebTransportSlot(ssrc);
+    const playback = this.wtPlayback;
+    this.wtPlayback = undefined;
+    playback?.clear();
+    this.wtUserBySsrc.clear();
+    this.wtDecryptQueue = Promise.resolve();
+    if (this.mediaTransportValue === 'webtransport') this.mediaTransportValue = undefined;
+  }
+
+  /** Encoder settings: channel policy → `opus` browser options → `webTransport.opus` overrides. */
+  private webTransportOpusConfig(): AurxOpusConfig {
+    const prefs = this.opusPreferences;
+    const overrides: Partial<AurxOpusConfig> = {};
+    if (prefs.maxBitrateBps !== undefined) overrides.bitrateBps = prefs.maxBitrateBps;
+    if (prefs.fec !== undefined) overrides.fec = prefs.fec;
+    if (prefs.dtx !== undefined) overrides.dtx = prefs.dtx;
+    if (prefs.cbr !== undefined) overrides.cbr = prefs.cbr;
+    overrides.channels = prefs.stereo === true ? 2 : 1;
+    return opusConfigFor(this.audioPolicyValue ?? DEFAULT_AUDIO_POLICY, {
+      ...overrides,
+      ...(this.opts.webTransport?.opus ?? {}),
+    });
+  }
+
+  private reconfigureWebTransportCapture(): void {
+    this.wtCapture?.reconfigure(this.webTransportOpusConfig());
+  }
+
+  private onWebTransportBitrate(bps: number): void {
+    this.transientBitrateBps = bps;
+    this.reconfigureWebTransportCapture();
+    this.emit('bitrate', Math.round(bps / 1000), 'server', 0);
+  }
+
+  private onWebTransportClosed(reason: string): void {
+    if (this.closedByUser || !this.ws) return;
+    this.emit('error', new Error(`WebTransport media closed: ${reason}`));
+    this.pc?.close();
+    this.pc = undefined;
+    this.stopWebTransportMedia();
+    if (this.state === 'media-connected' || this.state === 'media-connecting') this.setState('connected');
+    void this.startMedia().catch((e: unknown) => {
+      this.emit('error', e instanceof Error ? e : new Error(String(e)));
+    });
+  }
+
+  /** The channels a captured frame goes to, split by whether they carry E2EE frames. */
+  private captureTargets(): { plain: number[]; encrypted: number[] } {
+    const plain: number[] = [];
+    const encrypted: number[] = [];
+    const mode = this.transmission;
+    if (mode.type === 'none') return { plain, encrypted };
+    for (const channelId of this.channels.keys()) {
+      if (mode.type === 'single' && mode.channelId !== channelId) continue;
+      if (this.channelInfos.get(channelId)?.role === 'listener') continue;
+      const hash = this.channelHash(channelId);
+      if (hash === undefined) continue;
+      if (this.e2eeChannels.has(channelId)) encrypted.push(hash);
+      else plain.push(hash);
+    }
+    return { plain, encrypted };
+  }
+
+  private channelHash(channelId: string): number | undefined {
+    for (const [hash, id] of this.wtChannelByHash) if (id === channelId) return hash;
+    let hash: number;
+    try {
+      hash = channelIdHash(channelId);
+    } catch {
+      return undefined;
+    }
+    this.wtChannelByHash.set(hash, channelId);
+    return hash;
+  }
+
+  private onCaptureFrame(frame: AurxCaptureFrame): void {
+    const wt = this.wt;
+    if (!wt?.isOpen || frame.opus.length === 0) return;
+    const { plain, encrypted } = this.captureTargets();
+    for (const hash of plain) wt.sendAudio(frame.opus, hash, frame.timestamp, { energy: frame.energy });
+    if (encrypted.length === 0) return;
+    const group = this.e2eeGroup;
+    if (!group) return;
+    void group
+      .encrypt(frame.opus)
+      .then((sealed) => {
+        if (this.wt !== wt || !wt.isOpen) return;
+        for (const hash of encrypted) wt.sendAudio(sealed, hash, frame.timestamp, { energy: frame.energy, e2ee: true });
+      })
+      .catch((e: unknown) => this.emit('error', e instanceof Error ? e : new Error(String(e))));
+  }
+
+  /** Who is behind a downlink SSRC, from the rosters of the channels we are in. */
+  private userForSsrc(ssrc: number): string | undefined {
+    const cached = this.wtUserBySsrc.get(ssrc);
+    if (cached !== undefined) return cached;
+    for (const roster of this.channels.values()) {
+      for (const p of roster.values()) {
+        if (p.ssrc === ssrc) {
+          this.wtUserBySsrc.set(ssrc, p.userId);
+          return p.userId;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private onWebTransportAudio(audio: DownlinkAudio): void {
+    const playback = this.wtPlayback;
+    const renderer = this.renderer;
+    if (!playback || !renderer) return;
+    if (audio.pcmu) return;
+    const now = Date.now();
+    let slot = this.wtSlots.get(audio.ssrc);
+    if (!slot) {
+      const key = wtSlotKey(audio.ssrc);
+      const node = playback.node(audio.ssrc, audio.mixed);
+      renderer.addSource(key, node);
+      slot = { userId: this.userForSsrc(audio.ssrc), e2ee: false, stereo: audio.mixed, lastPacketAt: now, gain: 0 };
+      this.wtSlots.set(audio.ssrc, slot);
+      if (this.visemesEnabledValue) void this.attachWebTransportVisemeTap(key);
+    }
+    slot.lastPacketAt = now;
+    if (slot.userId === undefined) slot.userId = this.userForSsrc(audio.ssrc);
+    if (audio.e2ee) {
+      const group = this.e2eeGroup;
+      const userId = slot.userId;
+      if (!group || userId === undefined) return;
+      slot.e2ee = true;
+      const current = slot;
+      this.wtDecryptQueue = this.wtDecryptQueue
+        .then(() => group.decrypt(userId, audio.frame))
+        .then((plain) => {
+          if (this.wtPlayback !== playback || this.wtSlots.get(audio.ssrc) !== current) return;
+          current.stereo ||= opusPacketIsStereo(plain);
+          this.renderWebTransportSlot(audio.ssrc, current, undefined);
+          playback.push(audio.ssrc, plain, audio.sequence, audio.timestamp, current.stereo);
+        })
+        .catch(() => undefined);
+      return;
+    }
+    slot.stereo ||= audio.mixed || opusPacketIsStereo(audio.frame);
+    this.renderWebTransportSlot(audio.ssrc, slot, audio);
+    playback.push(audio.ssrc, audio.frame, audio.sequence, audio.timestamp, slot.stereo);
+  }
+
+  /**
+   * Server-processed frames carry the receiver's gain/direction (mutes, volumes, focus, ducking,
+   * positional audio were applied on the node); E2EE frames arrive raw and are rendered here.
+   */
+  private renderWebTransportSlot(ssrc: number, slot: WebTransportSlot, audio: DownlinkAudio | undefined): void {
+    const renderer = this.renderer;
+    if (!renderer) return;
+    const key = wtSlotKey(ssrc);
+    if (audio) {
+      if (slot.gain === audio.gain && directionsEqual(slot.direction, audio.direction)) return;
+      slot.gain = audio.gain;
+      slot.direction = audio.direction;
+      renderer.render(key, audio.direction ? { gain: audio.gain, direction: audio.direction } : { gain: audio.gain });
+      return;
+    }
+    renderer.render(key, slot.userId ? renderParams(this.renderInputsFor(slot.userId)) : { gain: 0 });
+  }
+
+  private async attachWebTransportVisemeTap(key: string): Promise<void> {
+    const renderer = this.renderer;
+    const ctx = renderer ? workletContext(renderer.context) : undefined;
+    if (!renderer || !ctx) return;
+    await loadVisemeWorklet(ctx);
+    if (this.visemesEnabledValue && this.renderer === renderer) this.attachVisemeTap(key);
+  }
+
+  private removeWebTransportSlot(ssrc: number): void {
+    if (!this.wtSlots.delete(ssrc)) return;
+    const key = wtSlotKey(ssrc);
+    this.detachVisemeTap(key);
+    this.renderer?.removeTrack(key);
+    this.wtPlayback?.remove(ssrc);
+  }
+
+  private sweepWebTransportSlots(): void {
+    const idle = this.opts.webTransport?.idleTimeoutMs ?? 5_000;
+    const cutoff = Date.now() - idle;
+    for (const [ssrc, slot] of this.wtSlots) if (slot.lastPacketAt < cutoff) this.removeWebTransportSlot(ssrc);
+  }
+
+  /** Roster changed: SSRC → user lookups start over, departed speakers stop rendering. */
+  private webTransportRosterChanged(): void {
+    if (!this.wt) return;
+    this.wtUserBySsrc.clear();
+    for (const [ssrc, slot] of this.wtSlots) {
+      if (slot.userId === undefined) continue;
+      if (this.userForSsrc(ssrc) !== slot.userId) this.removeWebTransportSlot(ssrc);
+    }
+  }
+
+  private webTransportStats(transport: AurxWebTransport): ClientStats {
+    const s = transport.stats();
+    const playback = this.wtPlayback?.stats;
+    const input: RtcStatsInput = {
+      inbound: {
+        packetsReceived: s.audioPacketsReceived,
+        packetsLost: s.audioPacketsLost,
+        bytesReceived: s.bytesReceived,
+        packetsDiscarded: s.packetsRejected + (playback?.framesDropped ?? 0),
+        concealedSamples: (playback?.underruns ?? 0) * AURX_FRAME_SAMPLES,
+      },
+      outbound: { packetsSent: s.packetsSent, bytesSent: s.bytesSent },
+    };
+    if (s.rttMs !== undefined) input.iceRttSeconds = s.rttMs / 1000;
+    const out = assembleClientStats(this.rtt, input, this.lossWindow, this.serverQuality);
+    out.transport = 'webtransport';
+    return out;
   }
 
   /**

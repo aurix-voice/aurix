@@ -187,6 +187,7 @@ export interface SpatialAudioContextLike {
   createGain(): GainNodeLike;
   createPanner(): PannerNodeLike;
   createMediaStreamSource(stream: MediaStream): AudioNodeLike;
+  createMediaStreamDestination?(): AudioNodeLike & { readonly stream: MediaStream };
   resume(): Promise<void>;
   close(): Promise<void>;
   setSinkId?(sinkId: string): Promise<void>;
@@ -203,7 +204,7 @@ export interface SpatialRendererOptions {
 }
 
 interface Slot {
-  stream: MediaStream;
+  stream: MediaStream | undefined;
   source: AudioNodeLike;
   gain: GainNodeLike;
   duck: GainNodeLike;
@@ -231,6 +232,7 @@ export class SpatialRenderer {
   private readonly slots = new Map<string, Slot>();
   private masterVolume = 1;
   private masterMuted = false;
+  private streamOut: (AudioNodeLike & { readonly stream: MediaStream }) | undefined;
   private readonly panningModel: PanningModelType;
   private readonly document: Document | null;
 
@@ -256,8 +258,16 @@ export class SpatialRenderer {
 
   /** Start rendering `stream` (one remote audio track) on slot `mid`, initially silent. */
   addTrack(mid: string, stream: MediaStream): void {
+    this.addSlot(mid, this.context.createMediaStreamSource(stream), stream);
+  }
+
+  /** Start rendering an already-decoded voice (`source` node of this context) on slot `mid`. */
+  addSource(mid: string, source: AudioNodeLike): void {
+    this.addSlot(mid, source, undefined);
+  }
+
+  private addSlot(mid: string, source: AudioNodeLike, stream: MediaStream | undefined): void {
     this.removeTrack(mid);
-    const source = this.context.createMediaStreamSource(stream);
     const gain = this.context.createGain();
     gain.gain.value = 0;
     const duck = this.context.createGain();
@@ -266,7 +276,7 @@ export class SpatialRenderer {
     gain.connect(duck);
     duck.connect(this.master);
     let keepAlive: HTMLAudioElement | undefined;
-    if (this.document) {
+    if (this.document && stream) {
       keepAlive = this.document.createElement('audio');
       keepAlive.muted = true;
       keepAlive.autoplay = true;
@@ -322,6 +332,31 @@ export class SpatialRenderer {
   /** Drop every slot (media torn down); the context stays usable. */
   clear(): void {
     for (const mid of Array.from(this.slots.keys())) this.removeTrack(mid);
+  }
+
+  /**
+   * Route the whole graph into a `MediaStream` instead of the context's output (the caller
+   * plays it through media elements, which then own volume, mute and the output device); the
+   * master gain stays at unity while this is active. `undefined` when the context cannot.
+   */
+  outputStream(): MediaStream | undefined {
+    if (this.streamOut) return this.streamOut.stream;
+    if (typeof this.context.createMediaStreamDestination !== 'function') return undefined;
+    const dest = this.context.createMediaStreamDestination();
+    this.master.disconnect();
+    this.master.connect(dest);
+    this.streamOut = dest;
+    this.applyMaster();
+    return dest.stream;
+  }
+
+  /** Back to the context's output after {@link outputStream}. */
+  outputSpeakers(): void {
+    if (!this.streamOut) return;
+    this.master.disconnect();
+    this.master.connect(this.context.destination);
+    this.streamOut = undefined;
+    this.applyMaster();
   }
 
   /** Apply gain and direction to slot `mid`; a missing direction routes the voice around the panner. */
@@ -403,7 +438,7 @@ export class SpatialRenderer {
   }
 
   private applyMaster(): void {
-    const v = this.masterMuted ? 0 : this.masterVolume;
+    const v = this.streamOut ? 1 : this.masterMuted ? 0 : this.masterVolume;
     this.master.gain.setTargetAtTime(v, this.context.currentTime, RAMP_TC);
   }
 

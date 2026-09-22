@@ -911,10 +911,16 @@ pub enum ControlMessage {
         /// `media.tls_tunnel_port` is unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tls_tunnel: Option<TlsTunnelInfo>,
+        /// The node accepts browsers over WebTransport (HTTP/3, normally UDP/443): the same
+        /// sealed AURX packets as WebTransport datagrams, `SessionBind` first. Lets a browser
+        /// skip WebRTC (full Opus control, no SDP/ICE) where the network allows QUIC. Absent
+        /// when `media.webtransport_port` is unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        webtransport: Option<WebTransportInfo>,
     },
     /// Sent by the server once a media path has been authenticated via `SessionBind`:
-    /// `transport` is `udp`, `quic`, `tls` (dedicated TLS tunnel), `tunnel` (AURX over this
-    /// WebSocket) or `webrtc`.
+    /// `transport` is `udp`, `quic`, `tls` (dedicated TLS tunnel), `web_transport`, `tunnel`
+    /// (AURX over this WebSocket) or `web_rtc`.
     MediaBound {
         session_id: SessionId,
         #[serde(default)]
@@ -1597,6 +1603,28 @@ pub struct TlsTunnelInfo {
 /// ALPN token of the dedicated TLS media tunnel.
 pub const TLS_TUNNEL_ALPN: &[u8] = b"aurix-tunnel/1";
 
+/// Browser media over WebTransport (`SessionInitAck.webtransport`): an HTTP/3 endpoint,
+/// normally on UDP/443, whose WebTransport session at [`WEBTRANSPORT_PATH`] carries sealed
+/// AURX packets one per datagram — exactly the QUIC wire format native clients use, so
+/// authentication, replay protection, E2EE and packet limits are the AURX ones. Browsers
+/// cannot pin arbitrary certificates: `cert_sha256` lists the hashes to pass as
+/// `serverCertificateHashes` when the node runs its own short-lived (≤ 14 days, ECDSA)
+/// certificate — the current one and the next one it will rotate to — and is empty when the
+/// node presents a publicly trusted certificate the browser validates through the Web PKI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WebTransportInfo {
+    /// `https://host:port/aurix` URLs of the endpoint (public IPs of the node or the
+    /// operator's DNS name), IPv4 first.
+    pub urls: Vec<String>,
+    /// Lowercase hex SHA-256 hashes of the DER end-entity certificates the endpoint presents
+    /// now or after its next rotation; empty for a Web-PKI certificate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cert_sha256: Vec<String>,
+}
+
+/// Request path of the WebTransport media session.
+pub const WEBTRANSPORT_PATH: &str = "/aurix";
+
 /// The first byte of a QUIC packet has the fixed bit (0x40) set; AURX packets start with the
 /// `MAGIC_BYTES` `A` (0x41, fixed bit set too) so they are told apart by the full magic, and
 /// WebRTC (STUN 0x00–0x03, DTLS 0x14–0x17, RTP/RTCP 0x80–0xBF) never sets it.
@@ -1861,6 +1889,59 @@ mod tests {
             hex(&bind.encode_authenticated(&keys)),
             "415552580233040005060708cfe568000000001e0000000000200e1d7cbb111111111111111111111111111111110000018bcfe5680001020304050607086b0c72c29a059fa0e0627df1d5942167"
         );
+    }
+
+    /// Pinned vectors shared with the Web SDK's AURX-over-WebTransport implementation
+    /// (sdk/web/test/aurx.test.mjs): bind, uplink audio with energy, heartbeat, downlink
+    /// audio with volume + direction metadata, bind ack and bitrate command.
+    #[test]
+    fn webtransport_wire_vectors_are_stable() {
+        let keys = MediaKeys::derive(&[7u8; 32]);
+        let sid = SessionId(uuid::Uuid::parse_str("0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap());
+        let bind = AurixPacket::session_bind(&sid, 0x11223344, 1_700_000_000_123, 42);
+        assert_eq!(
+            hex(&bind.encode_authenticated(&keys)),
+            "41555258023304000000002acfe5687b1122334400000000002075b2926e0192a1b2c3d47e5f8a9b0c1d2e3f4a5b0000018bcfe5687b000000000000002ab20b439b0f57c9928c47a39fd821cf0e"
+        );
+        let audio =
+            AurixPacket::audio_with_level(1, 960, 0x11223344, 0xdeadbeef, 33, &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            hex(&audio.seal(&keys)),
+            "4155525802010c0100000001000003c011223344deadbeef00061c81a8879d0d693a856f8454e9e4da0ad81761922ab6a96e23a0"
+        );
+        let mut hb = AurixPacket::heartbeat(0x11223344, 5000);
+        hb.header.sequence = 2;
+        assert_eq!(
+            hex(&hb.seal(&keys)),
+            "41555258022004010000000200001388112233440000000000000000000010c18cded68e76bb65aa8d97dde50d27"
+        );
+        let mut hdr = PacketHeader::new(PacketType::Audio, 7, 1920, 0x55667788);
+        hdr.channel_id_hash = 0xdeadbeef;
+        hdr.flags |= PacketFlags::VolumeAttenuated as u16 | PacketFlags::Directional as u16;
+        let dir = Direction {
+            azimuth: std::f32::consts::FRAC_PI_2,
+            elevation: -std::f32::consts::FRAC_PI_4,
+        };
+        let mut payload = vec![encode_volume_byte(0.5)];
+        payload.extend_from_slice(&encode_direction(&dir));
+        payload.extend_from_slice(&[0xfc, 0xff, 0xfe]);
+        let down = AurixPacket::new(hdr, Bytes::from(payload));
+        assert_eq!(
+            hex(&down.seal(&keys)),
+            "4155525802011481000000070000078055667788deadbeef0006d13270689bda1e726600198b1937f696a2a37221af3b24eaf970"
+        );
+        let ack = AurixPacket::session_bind_ack(0x11223344, 42, 1_700_000_000_200);
+        assert_eq!(
+            hex(&ack.seal(&keys)),
+            "41555258023404010000002acfe568c811223344000000000008645f07538302e45d21afa5d3937ef0dc2c3c8b0c3527f96e0c7fc6a6"
+        );
+        let bc = AurixPacket::bitrate_command(0x11223344, 24000);
+        assert_eq!(
+            hex(&bc.seal(&keys)),
+            "41555258027104010000000000000000112233440000000000048edd324bc5e6cb501516d9a8c1ef98bb4f9f310a6edae57e"
+        );
+        let ch = ChannelId(uuid::Uuid::parse_str("0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap());
+        assert_eq!(channel_id_hash(&ch), 1_883_494_404);
     }
 
     #[test]

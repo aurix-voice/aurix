@@ -233,6 +233,8 @@ pub enum MediaTransportKind {
     /// Native AURX as length-prefixed frames on the dedicated TLS tunnel port (443-style
     /// fallback for networks that block UDP and the WebSocket port).
     Tls,
+    /// Browser AURX as WebTransport datagrams (HTTP/3 on the WebTransport port).
+    WebTransport,
     /// Browser WebRTC (str0m).
     WebRtc,
 }

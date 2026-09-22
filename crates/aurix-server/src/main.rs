@@ -146,6 +146,30 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 idle_timeout: std::time::Duration::from_millis(config.media.quic_idle_timeout_ms),
             },
+            webtransport: aurix_media::webtransport::WebTransportOptions {
+                enabled: config.media.webtransport_port != 0,
+                port: config.media.webtransport_port,
+                advertise: config.media.webtransport_endpoints(),
+                cert: config
+                    .media
+                    .webtransport_cert_path
+                    .clone()
+                    .zip(config.media.webtransport_key_path.clone()),
+                cert_validity: std::time::Duration::from_secs(
+                    u64::from(config.media.webtransport_cert_days) * 86_400,
+                ),
+                server_name: config.media.quic_server_name.clone(),
+                queue_packets: config.media.webtransport_queue_packets,
+                max_connections: if config.media.webtransport_max_connections == 0 {
+                    config.media.max_participants_per_node as usize * 2
+                } else {
+                    config.media.webtransport_max_connections
+                },
+                bind_timeout: std::time::Duration::from_millis(
+                    config.media.webtransport_bind_timeout_ms,
+                ),
+                idle_timeout: std::time::Duration::from_millis(config.media.quic_idle_timeout_ms),
+            },
             downlink_mix: config.media.downlink_mix,
             webrtc_participant_streams: config.media.webrtc_participant_streams,
             mos_alert: aurix_media::quality::MosAlertPolicy {

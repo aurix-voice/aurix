@@ -133,6 +133,26 @@ tls_tunnel_port = 0
 tls_tunnel_queue_packets = 128     # downlink packets buffered per connection (as tunnel_queue_packets)
 tls_tunnel_max_connections = 0     # 0 = 2 × max_participants_per_node
 tls_tunnel_bind_timeout_ms = 10000 # close connections that never send an authenticated SessionBind
+# WebTransport for browsers: an HTTP/3 (QUIC) endpoint on `host:webtransport_port` (UDP,
+# separate from media.port) whose `/aurix` session carries the same sealed AURX packets as
+# datagrams — the Web SDK gets the native codec controls (complexity, signal, VBR, expected
+# loss) and no WebRTC in the loop. HTTP reverse proxies (Caddy, Traefik) do not forward
+# WebTransport sessions, so this UDP port must reach the node directly — 443 gets through most
+# firewalls that already block media.port. 0 disables the endpoint.
+webtransport_port = 0
+# host:port endpoints advertised as https://host:port/aurix; empty = external_ip/external_ipv6 +
+# webtransport_port. Use the DNS name when webtransport_cert_path is a publicly trusted certificate.
+# webtransport_advertise = ["voice.example.com:443"]
+# Without a PEM pair the node runs a short-lived ECDSA P-256 certificate (browsers accept those
+# via serverCertificateHashes only up to 14 days) and advertises its SHA-256 in
+# SessionInitAck.webtransport.cert_sha256 — works for bare IPs, no DNS or CA needed; a fresh
+# certificate is generated at half the validity and its hash advertised ahead of the switch.
+# webtransport_cert_path = "/etc/aurix/webtransport.crt"
+# webtransport_key_path = "/etc/aurix/webtransport.key"
+webtransport_cert_days = 13
+webtransport_queue_packets = 128     # downlink datagrams buffered per session (as tunnel_queue_packets)
+webtransport_max_connections = 0     # 0 = 2 × max_participants_per_node
+webtransport_bind_timeout_ms = 10000 # close sessions that never send an authenticated SessionBind
 # Let native AURX sessions receive one server-mixed stereo stream per channel instead of a
 # stream per speaker (`SetDownlinkMode { mode: "mixed" }`; forced on listeners of channels
 # with `audience.mix_for_listeners`). Receivers without per-receiver rules share one mixer per

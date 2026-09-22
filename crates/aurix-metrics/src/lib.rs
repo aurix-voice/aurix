@@ -517,6 +517,56 @@ pub static TLS_TUNNEL_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `direction` is `uplink`/`downlink`; `outcome` is `received`/`sent`, `dropped` (datagram
+/// buffer full, oversized for the path or session gone), `rejected` (uplink datagram that
+/// failed decoding or authentication) or `malformed` (not an AURX packet).
+pub static WEBTRANSPORT_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_webtransport_packets_total",
+        "AURX packets carried as datagrams on WebTransport sessions",
+        &["direction", "outcome"]
+    )
+    .unwrap()
+});
+
+/// `outcome` is `accepted`, `refused` (connection cap), `failed` (QUIC/HTTP/3 handshake
+/// error), `not_found` (wrong request path) or `unbound` (no authenticated `SessionBind`
+/// within the bind timeout).
+pub static WEBTRANSPORT_HANDSHAKES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_webtransport_handshakes_total",
+        "Incoming WebTransport session attempts",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+pub static WEBTRANSPORT_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_webtransport_connections",
+        "Open WebTransport sessions (bound to a media session or not yet)"
+    )
+    .unwrap()
+});
+
+pub static WEBTRANSPORT_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_webtransport_sessions",
+        "Browser sessions whose media is currently bound through WebTransport"
+    )
+    .unwrap()
+});
+
+/// `outcome` is `rotated` (a fresh short-lived certificate took over) or `failed`.
+pub static WEBTRANSPORT_CERT_ROTATIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_webtransport_cert_rotations_total",
+        "Rotations of the node-generated WebTransport certificate",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
 /// `kind` is `shared` (one mix for every uniform receiver of a channel) or `private`.
 pub static DOWNLINK_MIXERS: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
@@ -606,6 +656,11 @@ pub fn gather_metrics() -> String {
     let _ = &*TLS_TUNNEL_HANDSHAKES;
     let _ = &*TLS_TUNNEL_CONNECTIONS;
     let _ = &*TLS_TUNNEL_SESSIONS;
+    let _ = &*WEBTRANSPORT_PACKETS;
+    let _ = &*WEBTRANSPORT_HANDSHAKES;
+    let _ = &*WEBTRANSPORT_CONNECTIONS;
+    let _ = &*WEBTRANSPORT_SESSIONS;
+    let _ = &*WEBTRANSPORT_CERT_ROTATIONS;
     let _ = &*DOWNLINK_MIXERS;
     let _ = &*DOWNLINK_MIX_FRAMES;
     let _ = &*STREAMS_CAPPED;

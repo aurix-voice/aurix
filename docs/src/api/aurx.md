@@ -186,7 +186,8 @@ default) and reports it as `MediaBound.transport = "quic"` / `GET /v1/sessions/{
   during the handshake (`aurix_quic_handshakes_total{outcome="refused"}`); the connection is
   closed when its session ends or is superseded.
 * **Cost.** One TLS handshake per fresh connection (none on 0-RTT resume) and QUIC framing
-  (≈ 1 % of the audio bitrate). Every SDK tries QUIC first, then raw UDP, then the tunnel
+  (≈ 1 % of the audio bitrate). Every SDK tries QUIC first, then raw UDP, then the
+  [TLS tunnel](#tls-tunnel-aurx-frames-on-a-dedicated-443-port), then the WebSocket tunnel
   ([native SDK](../sdk/native.md#when-udp-is-blocked-the-websocket-tunnel)); nodes without
   `quic` in their `SessionInitAck` and clients that never learned QUIC interoperate as before.
   WebRTC clients are unaffected.
@@ -194,6 +195,89 @@ default) and reports it as `MediaBound.transport = "quic"` / `GET /v1/sessions/{
 Metrics: `aurix_quic_connections`, `aurix_quic_sessions`,
 `aurix_quic_handshakes_total{outcome="accepted"|"accepted_0rtt"|"refused"|"failed"}`,
 `aurix_quic_packets_total{direction,outcome}`, `aurix_quic_migrations_total`.
+
+## TLS tunnel: AURX frames on a dedicated 443 port
+
+Networks that block UDP *and* anything but 443/TCP (hotel and corporate egress, some mobile
+carriers) leave the WebSocket tunnel with no port to reach. For those the node can open a
+**dedicated TCP listener** (`media.tls_tunnel_port`, default `0` = off; run it on 443 or
+behind a TLS-passthrough Caddy/Traefik that routes on SNI) speaking TLS 1.3 with ALPN
+`aurix-tunnel/1`. Inside, **one sealed AURX packet per `u16`-length-prefixed frame**, both
+directions — the same bytes as UDP, so tag, SSRC, protocol version, replay window and sequence
+continuity are checked exactly as for UDP and the E2EE payload stays opaque. The node
+advertises it in `SessionInitAck.tls_tunnel { addrs, cert_sha256, server_name }` and reports
+`MediaBound.transport = "tls"`.
+
+* **Certificate.** The listener shares the QUIC certificate (`media.quic_cert_path`/`quic_key_path`
+  or the self-signed one generated at start), so clients pin the same `cert_sha256` they got over
+  the authenticated control WebSocket; the ALPN must match or the handshake is refused. A
+  passthrough proxy in front must not terminate TLS (the pin would fail); set
+  `media.tls_tunnel_advertise` to the proxy's `host:port` in that case. Renewing a PEM pair is
+  the operator's job — files are read once at start-up (no ACME).
+* **Bind and ownership.** As on QUIC: a connection speaks for a session only after an
+  authenticated `SessionBind` arrived on it, is owned by that one session for its lifetime,
+  and the newest bind wins across links (a later UDP/QUIC bind moves the session back and closes
+  the superseded connection). Connections that send no valid bind within
+  `media.tls_tunnel_bind_timeout_ms` (10 s) are closed; a zero-length, oversized
+  (> `MAX_PACKET_SIZE`) or truncated frame closes the connection.
+* **Downlink.** Sealed per receiver, queued per connection (`media.tls_tunnel_queue_packets`,
+  128); a stalled connection drops its own packets
+  (`aurix_tls_tunnel_packets_total{direction="downlink",outcome="dropped"}`), never anyone
+  else's. Connections above `media.tls_tunnel_max_connections` (default
+  2 × `max_participants_per_node`) are refused during the handshake.
+* **Cost.** TCP: head-of-line blocking under loss, like the WebSocket tunnel, plus one TLS
+  handshake per connection. Every SDK slots it into `Auto` after QUIC and UDP and before the
+  WebSocket tunnel, and keeps re-probing UDP while on it.
+
+Metrics: `aurix_tls_tunnel_connections`, `aurix_tls_tunnel_sessions`,
+`aurix_tls_tunnel_handshakes_total{outcome="accepted"|"refused"|"failed"|"unbound"}`,
+`aurix_tls_tunnel_packets_total{direction,outcome}`.
+
+## WebTransport: AURX datagrams for browsers
+
+Browsers cannot open UDP sockets or QUIC connections of their own, but they can open a
+**WebTransport** session (HTTP/3 over QUIC, RFC 9220 / RFC 9221 datagrams) — the browser
+equivalent of the native QUIC path. The node runs a dedicated HTTP/3 endpoint
+(`media.webtransport_port`, default `0` = off; meant for **UDP/443**, separate from
+`media.port`) that accepts one WebTransport session per browser at `/aurix`; inside it,
+**one sealed AURX packet per datagram**, both directions, exactly the bytes a native QUIC
+client sends. To the router a browser on WebTransport *is* a native AURX session: it gets
+per-speaker streams (or a `Mixed` downlink on request), the E2EE payload stays opaque,
+`BitrateCommand` and heartbeats work unchanged — no SDP, no ICE, no TURN, no WebRTC. The node
+advertises the endpoint in `SessionInitAck.webtransport { urls, cert_sha256 }` (URLs are
+`https://host:port/aurix`, IPv4 first) and reports `MediaBound.transport = "webtransport"`.
+
+* **Certificate.** A browser validates the endpoint's certificate either through the Web PKI
+  (operator PEM pair `media.webtransport_cert_path`/`webtransport_key_path`, DNS name in
+  `media.webtransport_advertise`, `cert_sha256` empty) or — the default, and the only option for
+  a bare IP — by hash: the node generates a **short-lived ECDSA P-256 certificate**
+  (`media.webtransport_cert_days`, 1–14, browsers refuse longer ones for
+  `serverCertificateHashes`), generates the next one at half the validity and advertises **both
+  hashes** (current, next) so a browser that connects around the switch still matches
+  (`aurix_webtransport_cert_rotations_total`). No CA is contacted (no ACME).
+* **Bind and ownership.** TLS identity is not trusted for session ownership. Exactly as on QUIC:
+  a WebTransport session speaks for an Aurix session only after an authenticated `SessionBind`
+  arrived on it, never changes owner, and the newest bind wins across links; sessions that send
+  no valid bind within `media.webtransport_bind_timeout_ms` (10 s) or no uplink datagram for
+  `media.quic_idle_timeout_ms` (20 s; browsers heartbeat every 2 s) are closed. A datagram over
+  `MAX_PACKET_SIZE`, with a bad tag, wrong SSRC or inside the replay window is dropped and
+  counted.
+* **Downlink.** Sealed per receiver, queued per session (`media.webtransport_queue_packets`,
+  128); a congested browser drops its own packets
+  (`aurix_webtransport_packets_total{direction="downlink",outcome="dropped"}`). Sessions above
+  `media.webtransport_max_connections` (default 2 × `max_participants_per_node`) are refused
+  (`aurix_webtransport_handshakes_total{outcome="refused"}`); a wrong path or an unsupported
+  request is refused with 404.
+* **Deployment.** Ordinary HTTP reverse proxies (Caddy, Traefik) do not forward WebTransport
+  sessions, so the UDP port must reach the node directly — 443 gets through most firewalls that
+  block `media.port`. The endpoint is HTTP/3 only (no TCP listener); browsers that lack
+  WebTransport datagrams or WebCodecs Opus stay on WebRTC
+  ([Web SDK](../sdk/web.md#webtransport-aurx-datagrams-without-webrtc)).
+
+Metrics: `aurix_webtransport_connections`, `aurix_webtransport_sessions`,
+`aurix_webtransport_handshakes_total{outcome="accepted"|"refused"|"failed"|"not_found"|"unbound"}`,
+`aurix_webtransport_packets_total{direction,outcome}`,
+`aurix_webtransport_cert_rotations_total{outcome="rotated"|"failed"}`.
 
 ## What the server does with your packets
 

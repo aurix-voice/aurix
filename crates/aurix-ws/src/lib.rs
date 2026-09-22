@@ -3095,6 +3095,10 @@ async fn handle_ws_connection(
             Some(s) if s.transport() != Transport::WebRtc => state.sfu.read().tls_tunnel_info(),
             _ => None,
         },
+        webtransport: match state.sfu.read().get_session(&session_id) {
+            Some(s) if s.transport() != Transport::WebRtc => state.sfu.read().webtransport_info(),
+            _ => None,
+        },
         downlink_mix: state.sfu.read().downlink_mix_enabled(),
         webrtc_participant_streams: state.sfu.read().webrtc_participant_streams(),
         unfocused_channel_gain: Some(state.sfu.read().unfocused_channel_gain()),

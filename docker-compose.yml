@@ -48,6 +48,11 @@ services:
       - "8081:8081"          # WebSocket signalling
       - "10000:10000/udp"    # native AURX media
       - "10001:10001/udp"    # SFU-to-SFU cascade (only reachable from other nodes; firewall it)
+      # Strict-firewall paths (off unless AURIX_TLS_TUNNEL_PORT / AURIX_WEBTRANSPORT_PORT are set in
+      # .env; both are meant for 443). The TLS tunnel may sit behind a TLS-passthrough Caddy/Traefik;
+      # WebTransport is HTTP/3 over UDP and must reach the node directly (no reverse proxy).
+      # - "443:443/tcp"      # native TLS media tunnel
+      # - "443:443/udp"      # browser WebTransport
       - "3478:3478/udp"      # TURN
       - "3478:3478/tcp"
       # TURN relay range: must match AURIX__TURN__MIN_PORT / MAX_PORT. Docker publishes each port
@@ -69,6 +74,8 @@ services:
       AURIX__MEDIA__EXTERNAL_IPV6: ${AURIX_PUBLIC_IPV6:-}
       AURIX__MEDIA__HOST: ${AURIX_MEDIA_BIND:-0.0.0.0}
       AURIX__MEDIA__CASCADE_SECRET: ${AURIX_CASCADE_SECRET:-}
+      AURIX__MEDIA__TLS_TUNNEL_PORT: ${AURIX_TLS_TUNNEL_PORT:-0}
+      AURIX__MEDIA__WEBTRANSPORT_PORT: ${AURIX_WEBTRANSPORT_PORT:-0}
       AURIX__TURN__ENABLED: ${AURIX_TURN_ENABLED:-true}
       AURIX__TURN__EXTERNAL_IP: ${AURIX_PUBLIC_IP}
       AURIX__TURN__EXTERNAL_IPV6: ${AURIX_PUBLIC_IPV6:-}

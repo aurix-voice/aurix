@@ -66,6 +66,54 @@ released together.
   TLS. Covered by listener tests (framing, ALPN/pin refusal, bind timeout, queue overflow, cap),
   client↔SFU integration tests, Unity tests against a TLS 1.3 fake node and a live E2E that
   black-holes UDP with `iptables`. Certificate renewal stays the operator's job (no ACME).
+* **AURX over WebTransport for browsers.** `media.webtransport_port` (default `0` = off; meant
+  for UDP/443, separate from `media.port`) runs an HTTP/3 endpoint (`wtransport`) whose
+  WebTransport session at `/aurix` carries sealed AURX packets one per QUIC datagram — the same
+  bytes a native QUIC client sends, so `SessionBind` ownership, authentication, anti-replay, the
+  1400-byte bound, E2EE frames, mixed downlinks and `BitrateCommand` are the AURX ones and a
+  browser session is a native (`aurx`) session to the router: per-speaker streams, no SDP/ICE/
+  TURN, no WebRTC. Certificates: an operator PEM pair (`webtransport_cert_path`/`key_path`, Web
+  PKI, advertise the DNS name in `webtransport_advertise`) or — the default, fine for bare IPs —
+  a node-generated short-lived ECDSA P-256 certificate (`webtransport_cert_days`, 1–14) that is
+  rotated at half its validity; both the current and the next hash go to browsers in
+  `SessionInitAck.webtransport { urls, cert_sha256 }` for `serverCertificateHashes`. Bounded
+  downlink queues (`webtransport_queue_packets`), a connection cap
+  (`webtransport_max_connections`), a bind timeout (`webtransport_bind_timeout_ms`) and the
+  20 s idle timeout protect the node; `aurix_webtransport_{packets_total,handshakes_total,
+  connections,sessions,cert_rotations_total}` and `transport = "webtransport"` in `MediaBound` /
+  session stats expose it. **Web SDK**: `transport: 'auto' | 'webrtc' | 'webtransport'`
+  (`auto`, the default, takes WebTransport when the node advertises it and the browser has
+  WebTransport datagrams + WebCrypto + WebCodecs, otherwise — or when every advertised URL
+  fails — negotiates WebRTC as before; `webtransport` fails `connect()` instead of falling
+  back; `webrtc` never tries), `webTransport: { connectTimeoutMs, heartbeatIntervalMs,
+  heartbeatLossLimit, opus, idleTimeoutMs }`, `client.mediaTransport`, the `mediaTransport`
+  event and `ClientStats.transport`. On this path the browser runs Opus itself through WebCodecs
+  (`AudioEncoder`/`AudioDecoder`, 20 ms AudioWorklet capture) with the full parameter set the
+  native SDKs have — complexity, signal, application, expected loss, FEC, DTX, CBR, bitrate —
+  merged from the channel policies exactly like the native core; downlink SSRCs become sources
+  of the same spatial renderer (HRTF, per-participant gains, visemes, ducking) as WebRTC tracks,
+  server-processed frames carry the receiver's gain/direction, E2EE frames are decrypted in the
+  page, heartbeats give RTT/loss for `QualityReport`, a session that loses the path
+  re-establishes media (WebRTC when `auto`) with a continuous sequence counter. Covered by 22
+  focused SDK tests against a fake WebTransport node (capability blocker, hash filtering,
+  `SessionBind`, URL fallback, capture routing plain/E2EE, playback, stats, mute, reconnect,
+  packet-size drops, heartbeat RTT/loss, `SessionClose`, `BitrateCommand`, strict/auto/webrtc
+  policies, sequence continuity, bind-retry cleanup, heartbeat opt-out), client↔SFU integration tests over a real
+  `wtransport` client (bind, media both ways, browser↔native UDP peer, wrong path/pin/key/
+  unbound refusals, session replacement, connection cap) and a Chromium E2E
+  (`sdk/web/test/browser/webtransport_e2e.py`, in the `godot-web` CI job) with strict/auto/
+  WebRTC tabs sharing a channel, cross-transport audio, mute and E2EE. Browsers missing any of
+  WebTransport datagrams, `serverCertificateHashes` (for the node-generated certificate),
+  WebCrypto or WebCodecs Opus stay on WebRTC under `auto` (Chromium-based browsers have the set).
+
+### Fixed
+
+* **Web SDK `getStats()` with per-participant tracks.** The WebRTC snapshot took whichever
+  `inbound-rtp` entry `getStats()` listed last, so with dedicated downlink tracks
+  (`participantStreams`) `packetsReceived`/`packetsLost`/`bytesReceived`/`concealedSamples`/
+  `packetsDiscarded` described one arbitrary track — often an idle one. The counters now add up
+  across all audio tracks; `jitterMs` is the worst track that carried packets and
+  `jitterBufferDelayMs` the emitted-weighted mean.
 
 ## [1.4.0] - 2026-09-22
 

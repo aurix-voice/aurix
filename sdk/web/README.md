@@ -1,9 +1,11 @@
 # @aurix/web-sdk
 
-Browser client for [Aurix](../../README.md): JSON control channel over WebSocket and a single
-WebRTC peer connection (Opus) carrying the microphone uplink, the server-mixed downlink and a
-bounded set of per-participant downlink tracks the SDK spatializes with Web Audio (HRTF).
-No runtime dependencies; ES2020 module with type declarations.
+Browser client for [Aurix](../../README.md): JSON control channel over WebSocket and one of two
+media paths — **WebTransport** (HTTP/3 datagrams carrying the native sealed AURX packets, Opus
+through WebCodecs, per-speaker streams) when the node advertises it and the browser can do it, or
+a single WebRTC peer connection (Opus) carrying the microphone uplink, the server-mixed downlink
+and a bounded set of per-participant downlink tracks. Either way the SDK spatializes speakers
+with Web Audio (HRTF). No runtime dependencies; ES2020 module with type declarations.
 
 ```bash
 npm install && npm run build      # -> dist/
@@ -452,12 +454,14 @@ client.setOpusOptions({ maxBandwidth: 'superwideband' }); // bitrate part applie
 await client.renegotiateMedia();                          // … fmtp part at the next negotiation
 ```
 
-Everything goes through WebRTC, so only these controls exist: the bitrate ceiling (live, via
+On WebRTC only these controls exist: the bitrate ceiling (live, via
 `setParameters`, and `maxaveragebitrate` at negotiation), in-band FEC, DTX, maximum bandwidth
 , CBR and stereo — all `fmtp` parameters of the Opus payload in the server's answer (RFC 7587: the
 receiver states what the sender should do). **Complexity, signal mode, VBR mode and expected
-loss are owned by the browser** and cannot be set; the policy still exposes them for parity with
-the native SDKs. The server's `BitrateCommand` moves the ceiling within the policy's
+loss are owned by the browser** on that path and cannot be set; the policy still exposes them for
+parity with the native SDKs. On WebTransport the SDK runs Opus itself (WebCodecs) and applies the
+whole policy — complexity, signal, application, expected loss, FEC, DTX, CBR, bitrate — with
+`webTransport.opus` overrides on top. The server's `BitrateCommand` moves the ceiling within the policy's
 `minBitrateBps..=bitrateBps`; the browser's congestion control keeps running underneath. Helpers
 (`parseAudioPolicy`, `mergeAudioPolicies`, `resolveOpusSenderPreferences`,
 `applyOpusSenderPreferences`, `negotiatedOpusPreferences`, `defaultAudioConstraints`) are
@@ -471,12 +475,44 @@ browser's voice processing downmixes to mono. Takes effect at the next negotiati
 (`renegotiateMedia()`); whether two channels really go out also depends on the device and the
 browser's Opus implementation. Voice channels stay mono whatever the client asks.
 
+### WebTransport: AURX datagrams instead of WebRTC
+
+```ts
+const client = new AurixClient({
+  // ...
+  transport: 'auto',            // 'auto' (default) | 'webrtc' | 'webtransport'
+  webTransport: {
+    connectTimeoutMs: 4000,
+    heartbeatIntervalMs: 2000,
+    heartbeatLossLimit: 5,
+    opus: { complexity: 10, signal: 'voice', expectedLossPct: 5 },
+  },
+});
+client.on('mediaTransport', (t) => console.log('media over', t)); // 'webtransport' | 'webrtc'
+console.log(client.mediaTransport, client.sessionInfo?.webTransport, (await client.getStats()).transport);
+```
+
+A node with `media.webtransport_port` set advertises `SessionInitAck.webtransport { urls,
+cert_sha256 }`. The SDK opens `https://host:port/aurix` (pinning `cert_sha256` through
+`serverCertificateHashes` when the node runs its own short-lived certificate), sends a signed
+`SessionBind`, and from then on every datagram is one sealed AURX packet — the same WebCrypto
+AES-256-CTR + HMAC envelope, sequence and replay rules as native clients, so the router sees a
+native session: per-speaker downlink streams (no track cap, no server mix), opaque E2EE frames
+decrypted in the page, `BitrateCommand`, heartbeats with RTT/loss. No SDP, ICE or TURN is
+involved. Policies: `auto` takes WebTransport when advertised and the browser has WebTransport
+datagrams + WebCrypto + WebCodecs + AudioWorklet, tries each URL in turn and falls back to WebRTC
+when all fail (the failure is aggregated in the `error` event); `webtransport` rejects
+`connect()` instead of falling back; `webrtc` never attempts it. The port is HTTP/3 over UDP
+(usually 443) and must reach the node directly — Caddy/Traefik do not proxy WebTransport, and a
+UDP-blocked browser ends up on WebRTC over TURN.
+
 ## How it maps to the server
 
 | SDK | server |
 |---|---|
 | `new WebSocket(wsUrl, ['aurix', 'bearer.<jwt>'])` | JWT authenticated at upgrade; `SessionInitAck` carries `session_id`/`ssrc` |
 | `connect()` → `WebRtcOffer` over WS | `SfuNode::attach_webrtc` (str0m, ICE-lite, host candidate = `media.external_ip:media.port`) |
+| `connect()` → WebTransport `https://…/aurix` + sealed `SessionBind` datagram | `webtransport.rs`: HTTP/3 session → `MediaEndpoint::WebTransport`, `MediaBound.transport = "webtransport"`, same router as UDP/QUIC/TLS clients |
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's own relay candidates |
 | `discoverRegions()` → `GET /v1/me/regions` + `GET <probe_url>` | `NodeManager::regions`: healthy, non-saturated nodes with a public `ws_url`, least-loaded node per region |
 | `joinChannel()` → `ChannelJoin{channel_id, token}` | membership check against the token's channel claims |
@@ -488,8 +524,9 @@ browser's Opus implementation. Voice channels stay mono whatever the client asks
 | `Ping`/`Pong` | keepalive + `roundTripMs` |
 | reconnect with `['aurix', 'bearer.<jwt>', 'resume.<session_id>.<resume_token>']` | `SessionInitAck{resumed: true}` + replayed `ChannelJoinAck`s within `server.session_resume_grace_secs` |
 
-Native AURX-over-UDP is not available from browsers (no raw UDP); the native path is used by the
-Unity SDK (`sdk/unity`) and the Rust load generator.
+Native AURX-over-UDP/QUIC/TLS is not available from browsers (no raw sockets) — WebTransport is the
+browser's way onto the AURX path; the UDP/QUIC/TLS links are used by the native core, the Unity
+SDK (`sdk/unity`) and the Rust load generator.
 
 ## Standalone bundle and the handle bridge (Unity WebGL, non-JS hosts)
 
@@ -541,3 +578,6 @@ Unity plugin against the built bundle under an Emscripten-like harness.
 * Browsers only allow `getUserMedia` on `https://` or `http://localhost`.
 * `media.external_ip` must be reachable from the browser (UDP `media.port`), or a TURN server
   (built-in `AURIX__TURN__*`) must be reachable.
+* For WebTransport, `media.webtransport_port` (UDP, HTTP/3) must be reachable directly and the
+  browser must support WebTransport datagrams and WebCodecs (Chromium-based browsers today);
+  otherwise the SDK uses WebRTC.

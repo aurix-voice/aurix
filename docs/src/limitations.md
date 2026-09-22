@@ -86,16 +86,19 @@ the chapter that explains the boundary.
   at once. Identity keys are authenticated by the node, so protection against a *malicious
   operator* relies on comparing fingerprints out of band ([End-to-end
   encryption](features/e2ee.md), [Security](concepts/security.md)).
-* **Browsers get a server-side mix plus a bounded number of per-participant tracks.** The
-  Web SDK always receives one mixed (stereo) downlink per session; on top of it a node hands out
+* **Browsers on WebRTC get a server-side mix plus a bounded number of per-participant tracks.**
+  On WebRTC the Web SDK receives one mixed (stereo) downlink per session; on top of it a node hands out
   at most `media.webrtc_participant_streams` (default 16, hard cap 64) dedicated tracks, each
   forwarding one speaker's Opus frames as-is, which the browser spatializes with Web Audio
   (`PannerNode`, HRTF by default). Speakers beyond that many, and everyone in ambient channels,
   stay in the mix (stereo panning only); the mapping changes hands with a short hold, so a
   speaker you first heard in the mix may move to a dedicated track (and back) mid-sentence.
   Web Audio needs a user gesture (autoplay policy) and a running `AudioContext`; without it the
-  SDK falls back to the mixed track. Native AURX over UDP is not available in browsers
-  ([Web SDK](sdk/web.md#per-participant-tracks-and-spatial-audio)).
+  SDK falls back to the mixed track. Native AURX reaches a browser only through
+  [WebTransport](sdk/web.md#webtransport-aurx-datagrams-without-webrtc) (per-speaker streams,
+  WebCodecs Opus), which needs the node's `media.webtransport_port` open on UDP straight to the
+  browser and a browser with WebTransport datagrams, WebCrypto and WebCodecs Opus — Chromium-based
+  browsers today; others stay on WebRTC ([Web SDK](sdk/web.md#per-participant-tracks-and-spatial-audio)).
 * **Unity WebGL is a browser client.** `AurixWebGLVoiceClient` reuses the Web SDK through a
   JavaScript bridge, so everything above applies: WebRTC media with a server-mixed stereo
   downlink plus bounded per-participant tracks, the browser's Opus/AEC/NS/AGC, playback through a
@@ -108,24 +111,34 @@ the chapter that explains the boundary.
 * **Opus inside; PCMU only as a per-session fallback** for native AURX clients (the node
   transcodes at the edge). No PCMA, no PCMU over WebRTC, no PCMU for `E2ee` frames, no video
   ([codecs](features/channels.md#codecs-opus-and-the-pcmu-fallback)).
-* **The TCP fallback for native media is the control WebSocket, not a second transport.** When
-  UDP is blocked the SDKs carry AURX packets over the authenticated WebSocket
-  ([tunnel](api/aurx.md#tunnel-aurx-over-the-control-websocket)); that inherits TCP head-of-line
-  blocking (latency bursts under loss) and the node's per-session downlink queue drops when the
-  client's connection stalls. The [QUIC path](api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)
-  is a UDP path too — it shares the media port and is blocked by the same firewalls, so it does
-  not help there; there is no HTTP/3, no TURN for native clients, and the tunnel needs the
-  WebSocket itself to be reachable (`wss://` on 443 is the usual answer).
-* **QUIC is native-only and datagram-only.** Browsers keep WebRTC (no WebTransport), the Unity
-  C# transport keeps UDP/tunnel (QUIC reaches Unity only through the native core), and QUIC
-  streams are disabled — it moves the same AURX packets, nothing else. Connection migration
+* **The TCP fallbacks for native media are TCP.** When UDP is blocked the SDKs carry AURX
+  packets over the node's dedicated [TLS tunnel](api/aurx.md#tls-tunnel-aurx-frames-on-a-dedicated-443-port)
+  (`media.tls_tunnel_port`, meant for 443) or, failing that, the authenticated control WebSocket
+  ([tunnel](api/aurx.md#tunnel-aurx-over-the-control-websocket)); both inherit TCP head-of-line
+  blocking (latency bursts under loss) and the node's per-connection downlink queue drops when
+  the client's connection stalls. The [QUIC path](api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)
+  is a UDP path too — it shares the media port and is blocked by the same firewalls. There is no
+  TURN for native clients; the TLS tunnel's certificate is the QUIC one, pinned by hash (a proxy
+  in front must pass TLS through, not terminate it), and renewing a PEM pair is the operator's
+  job (no ACME). Browsers have no TCP fallback for AURX — the [WebTransport](api/aurx.md#webtransport-aurx-datagrams-for-browsers)
+  endpoint is HTTP/3 only, so a browser behind a UDP-blocking firewall lands on WebRTC over TURN.
+* **QUIC and WebTransport are datagram-only.** Native QUIC is for native clients (the Unity C#
+  transport keeps UDP/TLS/tunnel; QUIC reaches Unity only through the native core), browsers use
+  the separate WebTransport endpoint (`media.webtransport_port` — ordinary HTTP reverse proxies
+  do not forward WebTransport, the UDP port must reach the node directly), and QUIC / WebTransport
+  streams are disabled — both move the same AURX packets, nothing else. Connection migration
   needs the game to call `network_changed()` (or a NAT rebind); the core does not watch OS
   network interfaces itself. Resumption state lives in the node process: the first connection
   after a node restart or a cross-node failover is a full 1-RTT handshake, 0-RTT applies to
-  reconnects to a node the client already talked to.
-* **Browsers own their encoder.** The Web SDK can set the bitrate ceiling, FEC, DTX, maximum
-  bandwidth and CBR through WebRTC (`fmtp` / `setParameters`); complexity, signal mode, VBR mode
-  and expected loss are only controllable in the native, Unity and Unreal SDKs
+  reconnects to a node the client already talked to; WebTransport sessions have no 0-RTT and no
+  migration (a dropped connection is re-established, WebRTC under `'auto'`). The node-generated
+  WebTransport certificate is valid at most 14 days (browser rule for `serverCertificateHashes`)
+  and is rotated by the node; a publicly trusted certificate is the operator's to renew.
+* **On WebRTC, browsers own their encoder.** There the Web SDK can set the bitrate ceiling, FEC,
+  DTX, maximum bandwidth and CBR (`fmtp` / `setParameters`); complexity, signal mode, VBR mode
+  and expected loss are controllable in the native, Unity and Unreal SDKs and in browsers only on
+  the WebTransport path, where the SDK runs Opus itself through WebCodecs — whether a given
+  parameter takes effect there is up to the browser's `AudioEncoder`
   ([Web SDK](sdk/web.md#opus-in-the-browser)). Native mono encoders are capped at 300 kbit/s
   (libopus), channel configs at `media.max_bitrate`.
 * **Loss repair is bounded by what the wire carries.** In-band FEC covers one frame back and
@@ -296,6 +309,16 @@ the chapter that explains the boundary.
   path, NAT rebinding, a short UDP timeout), no measurement of head-of-line gains against the
   tunnel have been run from this repository
   ([QUIC](api/aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration)).
+* **TLS tunnel and WebTransport are exercised on one host.** The TLS tunnel: bind, media both
+  ways, wrong ALPN / pin / key, framing violations, connection cap, `Auto` ordering and the live
+  E2E that black-holes UDP with `iptables`. WebTransport: `wtransport` client integration tests
+  (bind, media both ways, browser ↔ native UDP peer, wrong path / pin / key, session
+  replacement, connection cap), 21 Web SDK tests against a fake WebTransport node and a
+  Chromium E2E with strict / auto / WebRTC tabs sharing a channel (cross-transport audio, mute,
+  E2EE). No Firefox or Safari WebTransport run, no real 443-only network, no publicly trusted
+  WebTransport certificate and no certificate rotation across a live browser session have been
+  exercised from this repository
+  ([WebTransport](api/aurx.md#webtransport-aurx-datagrams-for-browsers)).
 * **Admin SSO against real identity providers.** The OIDC relying party is exercised end to end
   against the repository's mock provider (discovery, PKCE, nonce, JWKS rotation, userinfo,
   role mapping) and follows the OpenID Connect Core rules, but no Keycloak / Entra ID / Okta /

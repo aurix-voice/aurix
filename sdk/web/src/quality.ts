@@ -137,6 +137,13 @@ export interface ClientStats {
   bars: 1 | 2 | 3 | 4 | 5;
   /** Latest server-side quality (both directions), when received. */
   server?: NetworkQuality;
+  /**
+   * Media path the counters describe: WebRTC (`RTCPeerConnection.getStats()`) or AURX over
+   * WebTransport (the SDK's own counters: `iceRttMs` is then the heartbeat RTT,
+   * `packetsDiscarded` the datagrams that failed authentication / replay, `concealedSamples`
+   * the playout underruns × 960). Absent without media.
+   */
+  transport?: 'webrtc' | 'webtransport';
 }
 
 /** Per-period loss from cumulative `packetsLost`/`packetsReceived` counters. */

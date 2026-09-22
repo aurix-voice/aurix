@@ -12,9 +12,10 @@ use crate::tls::{TlsLink, TlsTunnelOptions, TlsTunnelServer};
 use crate::transport::bind_media_socket;
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
+use crate::webtransport::{WebTransportLink, WebTransportOptions, WebTransportServer};
 use aurix_common::crypto::CryptoProvider;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::protocol::{channel_id_hash, QuicInfo, TlsTunnelInfo};
+use aurix_common::protocol::{channel_id_hash, QuicInfo, TlsTunnelInfo, WebTransportInfo};
 use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
 use aurix_common::usage::{UsageMeter, UsageMetric};
@@ -104,6 +105,9 @@ pub struct SfuOptions {
     /// AURX over a dedicated TLS/TCP listener (see `MediaConfig::tls_tunnel_*`). Shares the
     /// certificate configured in `quic`.
     pub tls_tunnel: TlsTunnelOptions,
+    /// AURX as WebTransport datagrams for browsers on a dedicated HTTP/3 endpoint (see
+    /// `MediaConfig::webtransport_*`).
+    pub webtransport: WebTransportOptions,
     /// Serve native sessions one server-mixed stream per channel on request
     /// (see `MediaConfig::downlink_mix`).
     pub downlink_mix: bool,
@@ -138,6 +142,7 @@ impl Default for SfuOptions {
             tunnel_queue_packets: 128,
             quic: QuicOptions::default(),
             tls_tunnel: TlsTunnelOptions::default(),
+            webtransport: WebTransportOptions::default(),
             downlink_mix: true,
             webrtc_participant_streams: 16,
         }
@@ -159,6 +164,7 @@ pub struct SfuNode {
     router: Option<Arc<PacketRouter>>,
     quic: Option<Arc<QuicServer>>,
     tls_tunnel: Option<Arc<TlsTunnelServer>>,
+    webtransport: Option<Arc<WebTransportServer>>,
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
@@ -195,6 +201,7 @@ impl SfuNode {
             router: None,
             quic: None,
             tls_tunnel: None,
+            webtransport: None,
             cascade: None,
             audio_pipeline: None,
             audio_sink: None,
@@ -300,6 +307,17 @@ impl SfuNode {
     /// not started) — advertised in `SessionInitAck.tls_tunnel`.
     pub fn tls_tunnel_info(&self) -> Option<TlsTunnelInfo> {
         self.tls_tunnel.as_ref().map(|t| t.info().clone())
+    }
+
+    /// The WebTransport endpoint; `None` until `start` or when disabled.
+    pub fn webtransport(&self) -> Option<&Arc<WebTransportServer>> {
+        self.webtransport.as_ref()
+    }
+
+    /// What browsers need to reach the WebTransport endpoint (`None` when disabled or the
+    /// node is not started) — advertised in `SessionInitAck.webtransport`.
+    pub fn webtransport_info(&self) -> Option<WebTransportInfo> {
+        self.webtransport.as_ref().map(|w| w.info())
     }
 
     /// Subscribe to media-plane notifications (speaking/mute changes, session binds).
@@ -586,6 +604,38 @@ impl SfuNode {
             None
         };
 
+        let webtransport = if self.options.webtransport.enabled {
+            let bind = SocketAddr::new(bind_addr.ip(), self.options.webtransport.port);
+            let server =
+                WebTransportServer::bind(bind, &advertised, self.options.webtransport.clone())?;
+            let on_packet = {
+                let router = router.clone();
+                move |link: Arc<WebTransportLink>, data: bytes::Bytes| {
+                    let router = router.clone();
+                    Box::pin(async move {
+                        if let Err(e) = router.route_webtransport_packet(&data, &link).await {
+                            tracing::debug!(
+                                "Packet dropped from webtransport#{}: {}",
+                                link.id(),
+                                e
+                            );
+                        }
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                }
+            };
+            let on_closed = {
+                let router = router.clone();
+                move |link: Arc<WebTransportLink>| {
+                    router.webtransport_link_closed(&link);
+                }
+            };
+            server.clone().run_accept_loop(on_packet, on_closed);
+            Some(server)
+        } else {
+            None
+        };
+
         // UDP receive workers. Several tasks drain the same socket so that per-packet work
         // (HMAC verification, fan-out signing, sends) runs in parallel across the runtime
         // instead of serialising behind a single recv loop and overflowing SO_RCVBUF.
@@ -639,6 +689,7 @@ impl SfuNode {
         self.router = Some(router);
         self.quic = quic;
         self.tls_tunnel = tls_tunnel;
+        self.webtransport = webtransport;
         self.started = true;
         info!(
             "SFU node {} started in region {:?}, listening on {} ({:?}, advertised {:?})",
@@ -1281,6 +1332,9 @@ impl SfuNode {
         }
         if let Some(tls) = &self.tls_tunnel {
             tls.shutdown();
+        }
+        if let Some(wt) = &self.webtransport {
+            wt.shutdown();
         }
         if let Some(cascade) = &self.cascade {
             cascade.shutdown();

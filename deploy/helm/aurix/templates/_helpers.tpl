@@ -142,6 +142,10 @@ Non-secret environment shared by the server pods and the migration job.
   value: {{ or .job (not .root.Values.migrations.enabled) | quote }}
 - name: AURIX__MEDIA__PORT
   value: {{ .root.Values.ports.media | quote }}
+- name: AURIX__MEDIA__TLS_TUNNEL_PORT
+  value: {{ .root.Values.ports.tlsTunnel | default 0 | quote }}
+- name: AURIX__MEDIA__WEBTRANSPORT_PORT
+  value: {{ .root.Values.ports.webtransport | default 0 | quote }}
 - name: AURIX__TURN__ENABLED
   value: {{ and (not .job) .root.Values.config.turn.enabled | quote }}
 {{- if .job }}

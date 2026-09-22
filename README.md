@@ -25,8 +25,8 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 > Status: 1.2 — production-hardened core (auth, tenant isolation, media auth, TURN, recording) plus
 > the full player feature set: reconnect/resume, chat, energy/VAD, positional/directional/ambient
 > audio with radius-scoped presence, action tokens, webhooks/SSE, transcripts/TTS, content safety,
-> PCMU fallback, QUIC media with 0-RTT resume and connection migration, a WebSocket tunnel for
-> blocked UDP, large channels (listeners, per-receiver stream
+> PCMU fallback, QUIC media with 0-RTT resume and connection migration, a TLS tunnel on 443 and a
+> WebSocket tunnel for blocked UDP, AURX over WebTransport for browsers, large channels (listeners, per-receiver stream
 > caps, a server mix for native clients), cross-node failover with Redis session mirrors, a
 > region-aware cascade backbone, stereo/music uplinks, per-participant PCM for engine
 > spatialization, per-participant WebRTC tracks with Web Audio HRTF for browsers / Unity WebGL,
@@ -894,14 +894,22 @@ link it came from. Downlink to a tunnelled receiver is sealed per receiver and q
 socket (`media.tunnel_queue_packets`, 128); a stalled TCP connection drops *its own* packets
 (`aurix_tunnel_packets_total{direction="downlink",outcome="dropped"}`), never anyone else's. The
 newest signed bind wins, so a client moves between UDP and the tunnel by simply binding again on
-the other link, keeping one sequence counter. SDKs (`Auto` by default): QUIC, then UDP (native; the Unity C# transport starts at UDP), tunnel when
-neither native bind gets an answer or `udp_fallback_lost_heartbeats` heartbeats vanish mid-call, UDP
-(and QUIC) re-probed every `udp_reprobe_interval` and taken back as soon as one answers — native
-`Event::MediaPathChanged` / `aurix_client_media_path`, Unity `OnMediaPathChanged` /
-`ActiveMediaPath`, Unreal `OnMediaPathChanged` / `GetMediaPath`; `QuicOnly`, `UdpOnly` and
-`TunnelOnly` pin a link. TCP head-of-line blocking applies: the tunnel keeps the player in the call, UDP
-remains the path to be on. WebRTC clients are untouched (they have ICE/TURN). Metrics:
-`aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
+the other link, keeping one sequence counter. Where only 443/TCP gets out, the node can also run
+a **dedicated TLS tunnel** (`media.tls_tunnel_port`, normally 443 or behind a TLS-passthrough
+Caddy/Traefik): TLS 1.3 with ALPN `aurix-tunnel/1`, the QUIC certificate pinned by the hash from
+`SessionInitAck.tls_tunnel`, one sealed packet per length-prefixed frame, the same bind/ownership,
+queue (`tls_tunnel_queue_packets`), bind-timeout and connection-cap rules, `MediaBound.transport =
+"tls"`. SDKs (`Auto` by default): QUIC, then UDP (native; the Unity C# transport starts at UDP),
+then the TLS tunnel, then the WebSocket tunnel when no earlier bind gets an answer or
+`udp_fallback_lost_heartbeats` heartbeats vanish mid-call; UDP (and QUIC) re-probed every
+`udp_reprobe_interval` and taken back as soon as one answers — native `Event::MediaPathChanged` /
+`aurix_client_media_path`, Unity `OnMediaPathChanged` / `ActiveMediaPath`, Unreal
+`OnMediaPathChanged` / `GetMediaPath`; `QuicOnly`, `UdpOnly`, `TlsOnly` and `TunnelOnly` pin a
+link. TCP head-of-line blocking applies: the tunnels keep the player in the call, UDP remains the
+path to be on. WebRTC clients are untouched (they have ICE/TURN). Metrics: `aurix_tunnel_sessions`,
+`aurix_tunnel_packets_total{direction,outcome}`, `aurix_tls_tunnel_connections`,
+`aurix_tls_tunnel_sessions`, `aurix_tls_tunnel_handshakes_total{outcome}`,
+`aurix_tls_tunnel_packets_total{direction,outcome}`.
 
 ### QUIC for native media: 0-RTT resume and connection migration
 
@@ -930,6 +938,32 @@ remembered for `udp_reprobe_interval`, `QuicOnly` / `quic = false` pin the behav
 `media.quic = false` nodes interoperate unchanged. Metrics: `aurix_quic_connections`,
 `aurix_quic_sessions`, `aurix_quic_handshakes_total{outcome}`,
 `aurix_quic_packets_total{direction,outcome}`, `aurix_quic_migrations_total`.
+
+### WebTransport for browsers: AURX datagrams without WebRTC
+
+Browsers cannot open UDP or QUIC sockets, but they can open a WebTransport session (HTTP/3 over
+QUIC, datagrams). A node with `media.webtransport_port` set (default off; meant for **UDP/443**,
+separate from `media.port` — HTTP reverse proxies do not forward WebTransport, so the port must
+reach the node directly) accepts one session per browser at `https://host:port/aurix` and moves
+**one sealed AURX packet per datagram**, both directions: a browser becomes a native session to
+the router — per-speaker streams, opaque E2EE frames, `BitrateCommand`, heartbeats — with no SDP,
+ICE, TURN or WebRTC. Ownership follows the QUIC rules (signed `SessionBind` first, newest bind
+wins, `webtransport_bind_timeout_ms`, bounded `webtransport_queue_packets`,
+`webtransport_max_connections`). Certificates: an operator PEM pair (`webtransport_cert_path` /
+`webtransport_key_path`, DNS name in `webtransport_advertise`) or, by default and fine for a bare
+IP, a node-generated short-lived ECDSA P-256 certificate (`webtransport_cert_days`, 1–14) rotated
+at half its validity with both hashes advertised in `SessionInitAck.webtransport { urls,
+cert_sha256 }` for the browser's `serverCertificateHashes` — no CA, no ACME. The Web SDK's
+`transport: 'auto' | 'webrtc' | 'webtransport'` (default `auto`: WebTransport when the node
+advertises it and the browser has WebTransport datagrams + WebCrypto + WebCodecs, WebRTC
+otherwise or when every advertised URL fails; `webtransport` is strict, `webrtc` never tries)
+runs Opus itself through WebCodecs with the full native parameter set (complexity, signal,
+application, expected loss, FEC, DTX, CBR, bitrate — `webTransport.opus` overrides), feeds every
+downlink SSRC into the same HRTF renderer as per-participant WebRTC tracks, decrypts E2EE frames
+in the page and reports `client.mediaTransport` / the `mediaTransport` event /
+`ClientStats.transport`. Metrics: `aurix_webtransport_connections`, `aurix_webtransport_sessions`,
+`aurix_webtransport_handshakes_total{outcome}`, `aurix_webtransport_packets_total{direction,outcome}`,
+`aurix_webtransport_cert_rotations_total{outcome}`.
 
 ### Large channels: listeners, stream caps and the native server mix
 
@@ -1173,16 +1207,21 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
 * Cross-node failover needs Redis (session mirrors); Sentinel and Cluster are both supported,
   but sharded Pub/Sub needs Redis 7 (`redis.sharded_pubsub = false` on older clusters), and the
   chaos suite exercises the cluster on one host only.
-* Browsers cannot set Opus complexity, signal mode, VBR mode or expected loss — only the
-  bitrate ceiling, FEC, DTX, max bandwidth and CBR that WebRTC exposes; the native, Unity and
-  Unreal SDKs have the full set.
+* On WebRTC, browsers cannot set Opus complexity, signal mode, VBR mode or expected loss — only
+  the bitrate ceiling, FEC, DTX, max bandwidth and CBR that WebRTC exposes; the native, Unity and
+  Unreal SDKs have the full set, and browsers get it only on the WebTransport path (WebCodecs
+  Opus), which needs a Chromium-based browser and the node's `webtransport_port` reachable over
+  UDP directly (no reverse proxy) — everything else stays on WebRTC.
 * PCMU is a per-session fallback for native AURX clients only (no PCMA, no WebRTC PCMU, no
   PCMU for `E2ee` frames); each PCMU session costs the node one Opus encoder plus one Opus
   decoder per speaker it hears.
-* The blocked-UDP fallback for native clients is the control WebSocket (TCP): head-of-line
-  blocking under loss, a bounded per-session downlink queue, and it needs the WebSocket port
-  itself to be reachable. QUIC shares the media UDP port and is blocked by the same firewalls;
-  no HTTP/3, no TURN for native media, no QUIC for browsers or the Unity C# transport.
+* The blocked-UDP fallbacks for native clients are TCP — the dedicated TLS tunnel
+  (`media.tls_tunnel_port`, pinned QUIC certificate, TLS-passthrough proxies only, no ACME) or
+  the control WebSocket: head-of-line blocking under loss and a bounded per-connection downlink
+  queue. QUIC shares the media UDP port and is blocked by the same firewalls; no TURN for native
+  media, no QUIC for the Unity C# transport. Browsers have no TCP fallback for AURX — the
+  WebTransport endpoint is HTTP/3 only, so a UDP-blocked browser lands on WebRTC over TURN;
+  WebTransport sessions have no 0-RTT or migration.
 * Server-side mixing for native clients bypasses E2EE frames (they stay per-speaker), costs the
   node one Opus decode per selected speaker plus one stereo encode per mixer, and is capped at
   `MAX_MIXERS` (8192) per node; a channel's speaker admission (`max_speakers`) is enforced at

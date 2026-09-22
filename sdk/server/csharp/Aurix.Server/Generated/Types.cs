@@ -285,15 +285,18 @@ public static class SafetySource
 /// <summary>
 /// Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the
 /// control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume,
-/// connection migration), or WebRTC.
+/// connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style
+/// fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
 /// </summary>
 public static class SessionStatsMediaPath
 {
     public const string Udp = "udp";
     public const string Tunnel = "tunnel";
     public const string Quic = "quic";
+    public const string Tls = "tls";
+    public const string WebTransport = "web_transport";
     public const string WebRtc = "web_rtc";
-    public static readonly IReadOnlyList<string> All = new[] { Udp, Tunnel, Quic, WebRtc };
+    public static readonly IReadOnlyList<string> All = new[] { Udp, Tunnel, Quic, Tls, WebTransport, WebRtc };
 }
 
 /// <summary>
@@ -3576,7 +3579,8 @@ public sealed record SessionStats
     /// <summary>
     /// Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the
     /// control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume,
-    /// connection migration), or WebRTC.
+    /// connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style
+    /// fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
     /// </summary>
     [JsonPropertyName("media_path")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? MediaPath { get; init; }

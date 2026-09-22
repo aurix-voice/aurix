@@ -41,6 +41,7 @@
   </div>
   <label>Player token (JWT from <code>POST /v1/tokens</code>) <input id="token" placeholder="eyJ..."></label>
   <label>Channel ID(s), comma-separated <input id="channel" placeholder="uuid[, uuid…]"></label>
+  <label>Media transport <select id="transport"><option value="auto">auto (WebTransport when offered, else WebRTC)</option><option value="webrtc">WebRTC</option><option value="webtransport">WebTransport (no fallback)</option></select></label>
   <details>
     <summary>Development helper: issue a token with an API key (never ship an API key to browsers)</summary>
     <div class="row">
@@ -268,6 +269,7 @@ $('connect').onclick = async () => {
     apiUrl: $('api').value, wsUrl: $('ws').value, token: $('token').value.trim(),
     ...($('mic').value ? { inputDeviceId: $('mic').value } : {}),
     inputGain: Number($('gain').value),
+    transport: $('transport').value,
   });
   client.attachAudioOutput($('remote'));
   client.setOutputVolume(Number($('vol').value));
@@ -275,6 +277,7 @@ $('connect').onclick = async () => {
   if ($('spk').value) client.setOutputDevice($('spk').value).catch((e) => log('speaker select failed:', e.message));
   client.on('connectionState', (s) => { $('state').textContent = s; setButtons(s !== 'disconnected' && s !== 'failed', client.joinedChannels().length > 0); });
   client.on('sessionReady', (i) => { log('session', i, `per-participant tracks: ${client.participantStreamCap}`); client.resumeAudio().catch(() => {}); });
+  client.on('mediaTransport', (t) => log('media transport', t));
   client.on('participantStreams', (streams) => {
     log('participant tracks', streams.map((s) => `${s.mid}:${s.userId ? s.userId.slice(0, 8) : '-'}${s.stream ? '' : ' (no track)'}`).join(' '));
     renderRoster();

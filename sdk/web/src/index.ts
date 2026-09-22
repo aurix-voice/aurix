@@ -102,6 +102,8 @@ export type {
   DuckingConfig,
   HistoryOptions,
   HistoryPage,
+  MediaTransport,
+  MediaTransportPreference,
   ReadMarker,
   ReadMarkers,
   Participant,
@@ -123,7 +125,56 @@ export type {
   TtsDestination,
   TtsState,
   TtsStatus,
+  WebTransportAdvertisement,
+  WebTransportClientOptions,
 } from './client.js';
+export {
+  AURX_AUTH_TAG_SIZE,
+  AURX_HEADER_SIZE,
+  AURX_MAX_PACKET_SIZE,
+  AURX_PROTOCOL_VERSION,
+  AurxFlags,
+  AurxKeys,
+  AurxPacketType,
+  ReplayWindow,
+  SequenceLoss,
+  audioHeader,
+  audioLevelByte,
+  channelIdHash,
+  crc32,
+  decodeDirection,
+  decodePacket,
+  decodeVolumeByte,
+  encodeHeader,
+  heartbeatHeader,
+  opusPacketIsStereo,
+  parseDownlinkAudio,
+  sessionBindHeader,
+  sessionBindPayload,
+  uuidBytes,
+} from './aurx.js';
+export type { AurxDirection, AurxHeader, AurxPacket, DownlinkAudio } from './aurx.js';
+export {
+  AURX_FRAME_SAMPLES,
+  AURX_SAMPLE_RATE,
+  AurxCapture,
+  AurxPlayback,
+  aurxOpusSupported,
+  aurxWorkletSource,
+  loadAurxWorklet,
+  opusConfigFor,
+  supportsAurxAudio,
+} from './aurx-audio.js';
+export type { AurxCaptureFrame, AurxOpusConfig, AurxPlaybackStats } from './aurx-audio.js';
+export { AurxWebTransport, certificateHashes, detectWebTransportSupport } from './webtransport.js';
+export type {
+  AurxWebTransportEvents,
+  AurxWebTransportOptions,
+  AurxWebTransportStats,
+  WebTransportConstructor,
+  WebTransportSessionKeys,
+  WebTransportSupport,
+} from './webtransport.js';
 export {
   MAX_DISTORTION_DRIVE,
   MAX_FILTER_HZ,

@@ -1,7 +1,11 @@
-# No hostNetwork: UDP media/cascade via hostPort, TURN disabled, node IPs listed per ordinal.
+# No hostNetwork: UDP media/cascade and the 443 strict-firewall paths via hostPort, TURN disabled,
+# node IPs listed per ordinal.
 replicaCount: 2
 hostNetwork: false
 existingSecret: aurix-secrets
+ports:
+  tlsTunnel: 443
+  webtransport: 443
 config:
   externalUrl: https://voice.example.com
   corsOrigins: [https://game.example.com]

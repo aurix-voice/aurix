@@ -11195,9 +11195,11 @@
               "udp",
               "tunnel",
               "quic",
+              "tls",
+              "web_transport",
               "web_rtc"
             ],
-            "description": "Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), or WebRTC."
+            "description": "Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume, connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC."
           },
           "channels": {
             "type": "array",

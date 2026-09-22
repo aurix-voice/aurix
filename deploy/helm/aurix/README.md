@@ -23,6 +23,15 @@ balancing and no session migration. Each pod therefore needs:
   `turn.minPort–maxPort` relay range reachable on that IP. `hostNetwork: true` gives all of
   that for free; `hostNetwork: false` publishes the single ports with `hostPort` and cannot
   carry the TURN relay range;
+* optionally the strict-firewall paths on the same IP, both off by default and published like
+  `ports.media` (hostNetwork/hostPort, never through the Ingress): `ports.tlsTunnel` (TCP, native
+  clients' TLS tunnel — usually 443) and `ports.webtransport` (UDP, browsers' HTTP/3 WebTransport
+  — usually 443 too; HTTP reverse proxies do not forward WebTransport). Certificates come from the
+  node (short-lived, hash-pinned via `SessionInitAck`) unless you mount a PEM pair and point
+  `AURIX__MEDIA__WEBTRANSPORT_CERT_PATH` / `..._KEY_PATH` at it via `config.extraEnv`. Ports
+  below 1024 with `hostNetwork: false` get `net.ipv4.ip_unprivileged_port_start=0` in the pod's
+  security context (the container is non-root); with `hostNetwork: true` set that sysctl on the
+  Kubernetes node itself;
 * its **own hostname** for the WebSocket if you want region discovery and session resume to
   address one node: `perNode.enabled` renders `<release>-<ordinal>.<perNode.domain>` — a
   Service pinned to the pod plus an Ingress rule — and sets `server.external_url` /

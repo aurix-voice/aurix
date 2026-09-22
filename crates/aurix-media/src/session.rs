@@ -9,6 +9,7 @@ use crate::quality::{MosAlertPolicy, QualityTick, QualityTrack, UplinkEstimator,
 use crate::quic::QuicLink;
 use crate::tls::TlsLink;
 use crate::tunnel::MediaTunnel;
+use crate::webtransport::WebTransportLink;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -231,6 +232,8 @@ pub enum MediaEndpoint {
     Quic(Arc<QuicLink>),
     /// Connection on the dedicated TLS tunnel port that authenticated a `SessionBind`.
     Tls(Arc<TlsLink>),
+    /// Browser WebTransport session that authenticated a `SessionBind`.
+    WebTransport(Arc<WebTransportLink>),
 }
 
 impl MediaEndpoint {
@@ -244,6 +247,10 @@ impl MediaEndpoint {
 
     pub fn is_tls(&self) -> bool {
         matches!(self, MediaEndpoint::Tls(_))
+    }
+
+    pub fn is_webtransport(&self) -> bool {
+        matches!(self, MediaEndpoint::WebTransport(_))
     }
 
     /// UDP source address to (un)register in the by-address index, if this is a UDP path.
@@ -280,6 +287,15 @@ impl MediaEndpoint {
                 aurix_metrics::TLS_TUNNEL_SESSIONS.inc();
             } else {
                 aurix_metrics::TLS_TUNNEL_SESSIONS.dec();
+            }
+        }
+        let was_wt = previous.is_some_and(|e| e.is_webtransport());
+        let is_wt = next.is_some_and(|e| e.is_webtransport());
+        if was_wt != is_wt {
+            if is_wt {
+                aurix_metrics::WEBTRANSPORT_SESSIONS.inc();
+            } else {
+                aurix_metrics::WEBTRANSPORT_SESSIONS.dec();
             }
         }
     }
@@ -490,6 +506,14 @@ impl MediaSession {
         self.endpoint.read().as_ref().is_some_and(|e| e.is_tls())
     }
 
+    /// True while the downlink goes through a WebTransport session.
+    pub fn is_webtransport(&self) -> bool {
+        self.endpoint
+            .read()
+            .as_ref()
+            .is_some_and(|e| e.is_webtransport())
+    }
+
     /// Wire-level transport as reported to clients and operators.
     pub fn transport_kind(&self) -> MediaTransportKind {
         match self.transport() {
@@ -497,6 +521,7 @@ impl MediaSession {
             Transport::Aurx if self.is_tunneled() => MediaTransportKind::Tunnel,
             Transport::Aurx if self.is_quic() => MediaTransportKind::Quic,
             Transport::Aurx if self.is_tls() => MediaTransportKind::Tls,
+            Transport::Aurx if self.is_webtransport() => MediaTransportKind::WebTransport,
             Transport::Aurx => MediaTransportKind::Udp,
         }
     }
@@ -520,6 +545,10 @@ impl MediaSession {
                 None
             }
             Some(MediaEndpoint::Tls(link)) => {
+                link.close("superseded by a newer media path");
+                None
+            }
+            Some(MediaEndpoint::WebTransport(link)) => {
                 link.close("superseded by a newer media path");
                 None
             }
@@ -565,6 +594,22 @@ impl MediaSession {
             }
         }
         let next = Some(MediaEndpoint::Tls(link));
+        MediaEndpoint::track_metrics(slot.as_ref(), next.as_ref());
+        let displaced = std::mem::replace(&mut *slot, next);
+        drop(slot);
+        Self::release_displaced(displaced)
+    }
+
+    /// Binds the downlink to a WebTransport session; returns the UDP address it replaces, if
+    /// any. A different WebTransport link the session was on is closed as superseded.
+    pub fn set_webtransport(&self, link: Arc<WebTransportLink>) -> Option<SocketAddr> {
+        let mut slot = self.endpoint.write();
+        if let Some(MediaEndpoint::WebTransport(current)) = slot.as_ref() {
+            if **current == *link {
+                return None;
+            }
+        }
+        let next = Some(MediaEndpoint::WebTransport(link));
         MediaEndpoint::track_metrics(slot.as_ref(), next.as_ref());
         let displaced = std::mem::replace(&mut *slot, next);
         drop(slot);
@@ -619,6 +664,20 @@ impl MediaSession {
         }
     }
 
+    /// Drops the WebTransport link `link` if it is still this session's media path (a later
+    /// bind may already have moved the session elsewhere). Returns whether anything changed.
+    pub fn clear_webtransport(&self, link: &WebTransportLink) -> bool {
+        let mut slot = self.endpoint.write();
+        match slot.as_ref() {
+            Some(MediaEndpoint::WebTransport(current)) if **current == *link => {
+                *slot = None;
+                aurix_metrics::WEBTRANSPORT_SESSIONS.dec();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// UDP source address of the media path (`None` when unbound or tunneled).
     pub fn get_remote_addr(&self) -> Option<SocketAddr> {
         match self.endpoint.read().as_ref() {
@@ -647,6 +706,14 @@ impl MediaSession {
     pub fn tls(&self) -> Option<Arc<TlsLink>> {
         match self.endpoint.read().as_ref() {
             Some(MediaEndpoint::Tls(l)) => Some(l.clone()),
+            _ => None,
+        }
+    }
+
+    /// WebTransport link of the media path (`None` when unbound or on another path).
+    pub fn webtransport(&self) -> Option<Arc<WebTransportLink>> {
+        match self.endpoint.read().as_ref() {
+            Some(MediaEndpoint::WebTransport(l)) => Some(l.clone()),
             _ => None,
         }
     }

@@ -216,6 +216,9 @@ impl AurixConfig {
         if !(8..=4096).contains(&self.media.tls_tunnel_queue_packets) {
             anyhow::bail!("media.tls_tunnel_queue_packets must be within 8..=4096");
         }
+        if !(8..=4096).contains(&self.media.webtransport_queue_packets) {
+            anyhow::bail!("media.webtransport_queue_packets must be within 8..=4096");
+        }
         if self.media.tls_tunnel_port != 0 {
             if self.media.tls_tunnel_bind_timeout_ms < 1_000 {
                 anyhow::bail!("media.tls_tunnel_bind_timeout_ms must be at least 1000");
@@ -229,7 +232,33 @@ impl AurixConfig {
                 }
             }
         }
-        if self.media.quic || self.media.tls_tunnel_port != 0 {
+        if self.media.webtransport_port != 0 {
+            if self.media.webtransport_port == self.media.port {
+                anyhow::bail!("media.webtransport_port must differ from media.port");
+            }
+            if self.media.webtransport_bind_timeout_ms < 1_000 {
+                anyhow::bail!("media.webtransport_bind_timeout_ms must be at least 1000");
+            }
+            if !(1..=14).contains(&self.media.webtransport_cert_days) {
+                anyhow::bail!("media.webtransport_cert_days must be within 1..=14");
+            }
+            if self.media.webtransport_cert_path.is_some()
+                != self.media.webtransport_key_path.is_some()
+            {
+                anyhow::bail!(
+                    "media.webtransport_cert_path and media.webtransport_key_path must be set together"
+                );
+            }
+            for endpoint in &self.media.webtransport_advertise {
+                let (host, port) = crate::addr::split_host_port(endpoint).ok_or_else(|| {
+                    anyhow::anyhow!("media.webtransport_advertise: `{endpoint}` is not host:port")
+                })?;
+                if host.is_empty() || port == 0 {
+                    anyhow::bail!("media.webtransport_advertise: `{endpoint}` is not host:port");
+                }
+            }
+        }
+        if self.media.quic || self.media.tls_tunnel_port != 0 || self.media.webtransport_port != 0 {
             let min_idle = self
                 .media
                 .heartbeat_interval_ms
@@ -871,17 +900,42 @@ impl MediaConfig {
     /// verbatim when set, else the external addresses with `tls_tunnel_port`. Empty when the
     /// listener is disabled or nothing is advertisable (callers fall back to the bind host).
     pub fn tls_tunnel_endpoints(&self) -> Vec<String> {
-        if self.tls_tunnel_port == 0 {
+        Self::port_endpoints(
+            self.tls_tunnel_port,
+            &self.tls_tunnel_advertise,
+            self.external_ip.as_deref(),
+            self.external_ipv6.as_deref(),
+        )
+    }
+
+    /// Public `host:port` endpoints of the WebTransport endpoint, same rules as
+    /// [`Self::tls_tunnel_endpoints`] with `webtransport_advertise` / `webtransport_port`.
+    pub fn webtransport_endpoints(&self) -> Vec<String> {
+        Self::port_endpoints(
+            self.webtransport_port,
+            &self.webtransport_advertise,
+            self.external_ip.as_deref(),
+            self.external_ipv6.as_deref(),
+        )
+    }
+
+    fn port_endpoints(
+        port: u16,
+        advertise: &[String],
+        external_ip: Option<&str>,
+        external_ipv6: Option<&str>,
+    ) -> Vec<String> {
+        if port == 0 {
             return Vec::new();
         }
-        if !self.tls_tunnel_advertise.is_empty() {
-            return self.tls_tunnel_advertise.clone();
+        if !advertise.is_empty() {
+            return advertise.to_vec();
         }
-        [self.external_ip.as_deref(), self.external_ipv6.as_deref()]
+        [external_ip, external_ipv6]
             .into_iter()
             .flatten()
             .filter(|h| !h.is_empty())
-            .map(|h| crate::addr::host_port(h, self.tls_tunnel_port))
+            .map(|h| crate::addr::host_port(h, port))
             .collect()
     }
 }
@@ -1616,6 +1670,46 @@ pub struct MediaConfig {
     /// (handshake included) before the node closes it (ms).
     #[serde(default = "default_tls_tunnel_bind_timeout_ms")]
     pub tls_tunnel_bind_timeout_ms: u64,
+    /// Browser media over WebTransport: an HTTP/3 (QUIC) endpoint on this UDP port (on
+    /// `host`) whose WebTransport session at `/aurix` carries the same sealed AURX packets
+    /// as datagrams — the browser equivalent of the native QUIC path (full Opus control, no
+    /// WebRTC). Run it on 443/UDP; browsers do not follow proxies for QUIC, so the node
+    /// itself must own the port. `0` disables the endpoint.
+    #[serde(default)]
+    pub webtransport_port: u16,
+    /// `host:port` endpoints advertised to browsers for WebTransport (turned into
+    /// `https://host:port/aurix`). Empty: `external_ip` / `external_ipv6` with
+    /// `webtransport_port`. Set it to the DNS name when `webtransport_cert_path` names a
+    /// publicly trusted certificate (browsers validate the host name against it).
+    #[serde(default)]
+    pub webtransport_advertise: Vec<String>,
+    /// Publicly trusted PEM certificate chain / private key for the WebTransport endpoint,
+    /// validated by browsers through the Web PKI (no hash pinning; renewal — ACME or
+    /// otherwise — is the operator's job, the files are read once at start-up). Unset: the
+    /// node runs its own short-lived ECDSA certificate (see `webtransport_cert_days`) and
+    /// tells browsers its hash via `SessionInitAck.webtransport.cert_sha256`, which works
+    /// for IP addresses and needs no DNS or CA.
+    #[serde(default)]
+    pub webtransport_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub webtransport_key_path: Option<PathBuf>,
+    /// Validity (days, `1..=14`) of the node-generated WebTransport certificate; browsers
+    /// refuse hash-pinned certificates valid longer than 14 days. The node rotates to a
+    /// fresh certificate at half the validity and advertises the next hash ahead of time.
+    #[serde(default = "default_webtransport_cert_days")]
+    pub webtransport_cert_days: u16,
+    /// Downlink datagrams queued per WebTransport session before the node drops that
+    /// session's audio. Same unit as `quic_queue_packets`.
+    #[serde(default = "default_tunnel_queue_packets")]
+    pub webtransport_queue_packets: usize,
+    /// Concurrent WebTransport connections the node accepts (handshaking or bound); `0` =
+    /// twice `max_participants_per_node`.
+    #[serde(default)]
+    pub webtransport_max_connections: usize,
+    /// Time a WebTransport session may stay open without an authenticated `SessionBind`
+    /// before the node closes it (ms).
+    #[serde(default = "default_tls_tunnel_bind_timeout_ms")]
+    pub webtransport_bind_timeout_ms: u64,
     /// Let native AURX sessions receive one server-mixed stream per channel
     /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
     /// A mixed receiver whose channel has no per-receiver rules shares one mixer with every
@@ -1737,6 +1831,10 @@ fn default_tls_tunnel_bind_timeout_ms() -> u64 {
     10_000
 }
 
+fn default_webtransport_cert_days() -> u16 {
+    13
+}
+
 fn default_webrtc_participant_streams() -> u32 {
     16
 }
@@ -1793,6 +1891,14 @@ impl Default for MediaConfig {
             tls_tunnel_queue_packets: default_tunnel_queue_packets(),
             tls_tunnel_max_connections: 0,
             tls_tunnel_bind_timeout_ms: default_tls_tunnel_bind_timeout_ms(),
+            webtransport_port: 0,
+            webtransport_advertise: Vec::new(),
+            webtransport_cert_path: None,
+            webtransport_key_path: None,
+            webtransport_cert_days: default_webtransport_cert_days(),
+            webtransport_queue_packets: default_tunnel_queue_packets(),
+            webtransport_max_connections: 0,
+            webtransport_bind_timeout_ms: default_tls_tunnel_bind_timeout_ms(),
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

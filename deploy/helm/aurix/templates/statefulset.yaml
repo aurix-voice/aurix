@@ -66,6 +66,15 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- /* 443 as a non-root user: sysctl in the pod's own netns (net.* is not allowed with hostNetwork; set it on the host there) */ -}}
+        {{- $tls := int (default 0 .Values.ports.tlsTunnel) }}
+        {{- $wt := int (default 0 .Values.ports.webtransport) }}
+        {{- $privileged := or (and (gt $tls 0) (lt $tls 1024)) (and (gt $wt 0) (lt $wt 1024)) }}
+        {{- if and $privileged (not .Values.hostNetwork) (not .Values.podSecurityContext.sysctls) }}
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+        {{- end }}
       {{- if eq .Values.config.externalIpSource "script" }}
       initContainers:
         - name: resolve-external-ip
@@ -131,6 +140,22 @@ spec:
               {{- if not .Values.hostNetwork }}
               hostPort: {{ add .Values.ports.media 1 }}
               {{- end }}
+            {{- if .Values.ports.tlsTunnel }}
+            - name: tls-tunnel
+              containerPort: {{ .Values.ports.tlsTunnel }}
+              protocol: TCP
+              {{- if not .Values.hostNetwork }}
+              hostPort: {{ .Values.ports.tlsTunnel }}
+              {{- end }}
+            {{- end }}
+            {{- if .Values.ports.webtransport }}
+            - name: webtransport
+              containerPort: {{ .Values.ports.webtransport }}
+              protocol: UDP
+              {{- if not .Values.hostNetwork }}
+              hostPort: {{ .Values.ports.webtransport }}
+              {{- end }}
+            {{- end }}
             {{- if .Values.config.turn.enabled }}
             - name: turn-udp
               containerPort: {{ .Values.ports.turn }}

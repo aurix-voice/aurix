@@ -101,14 +101,24 @@ pub fn bind_udp(
     dual_stack: bool,
     buffer_bytes: usize,
 ) -> std::io::Result<(tokio::net::UdpSocket, BoundFamily)> {
+    let (std_socket, family) = bind_udp_std(addr, dual_stack, buffer_bytes)?;
+    Ok((tokio::net::UdpSocket::from_std(std_socket)?, family))
+}
+
+/// [`bind_udp`] returning the blocking `std` socket (non-blocking mode already set) for
+/// stacks that wrap the socket themselves (QUIC endpoints).
+pub fn bind_udp_std(
+    addr: SocketAddr,
+    dual_stack: bool,
+    buffer_bytes: usize,
+) -> std::io::Result<(std::net::UdpSocket, BoundFamily)> {
     let (socket, family) = dual_stack_socket(addr, socket2::Type::DGRAM, dual_stack)?;
     if buffer_bytes > 0 {
         // Best effort: the kernel clamps to its own maximum.
         let _ = socket.set_recv_buffer_size(buffer_bytes);
         let _ = socket.set_send_buffer_size(buffer_bytes);
     }
-    let std_socket: std::net::UdpSocket = socket.into();
-    Ok((tokio::net::UdpSocket::from_std(std_socket)?, family))
+    Ok((socket.into(), family))
 }
 
 /// Bind a TCP listener with the same family semantics as [`bind_udp`].

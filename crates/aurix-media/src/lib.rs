@@ -17,6 +17,7 @@ pub mod transport;
 pub mod tts;
 pub mod tunnel;
 pub mod webrtc;
+pub mod webtransport;
 
 pub use channel::MediaChannel;
 pub use router::MediaEvent;

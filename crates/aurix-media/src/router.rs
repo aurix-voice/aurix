@@ -36,6 +36,7 @@ use crate::tls::TlsLink;
 use crate::transcode::{PcmuDownlink, PcmuUplink};
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{ForwardMedia, WebRtcManager};
+use crate::webtransport::WebTransportLink;
 
 /// Sweep idle PCMU downlink decoders when the table grows past this.
 const PCMU_DOWNLINK_PRUNE_AT: usize = 256;
@@ -112,6 +113,7 @@ enum PacketSource<'a> {
     Tunnel(&'a Arc<MediaTunnel>),
     Quic(&'a Arc<QuicLink>),
     Tls(&'a Arc<TlsLink>),
+    WebTransport(&'a Arc<WebTransportLink>),
 }
 
 impl std::fmt::Display for PacketSource<'_> {
@@ -121,6 +123,9 @@ impl std::fmt::Display for PacketSource<'_> {
             PacketSource::Tunnel(t) => write!(f, "tunnel#{}", t.id()),
             PacketSource::Quic(l) => write!(f, "quic#{} ({})", l.id(), l.remote_address()),
             PacketSource::Tls(l) => write!(f, "tls#{} ({})", l.id(), l.remote_address()),
+            PacketSource::WebTransport(l) => {
+                write!(f, "webtransport#{} ({})", l.id(), l.remote_address())
+            }
         }
     }
 }
@@ -250,6 +255,32 @@ impl PacketRouter {
         })
     }
 
+    /// Routes one AURX packet that arrived as a datagram on the WebTransport session `link`.
+    pub async fn route_webtransport_packet(
+        &self,
+        data: &[u8],
+        link: &Arc<WebTransportLink>,
+    ) -> Result<()> {
+        let res = self
+            .route_from(data, PacketSource::WebTransport(link))
+            .await;
+        aurix_metrics::WEBTRANSPORT_PACKETS
+            .with_label_values(&["uplink", if res.is_ok() { "received" } else { "rejected" }])
+            .inc();
+        res
+    }
+
+    /// A WebTransport session closed: drop it as the media path of the session it was bound
+    /// to (unless a newer bind already moved the session elsewhere).
+    pub fn webtransport_link_closed(&self, link: &WebTransportLink) -> bool {
+        link.session_id().is_some_and(|session_id| {
+            self.shared
+                .sessions_by_id
+                .get(&session_id)
+                .is_some_and(|s| s.clear_webtransport(link))
+        })
+    }
+
     async fn route_from(&self, data: &[u8], source: PacketSource<'_>) -> Result<()> {
         let mut packet = AurixPacket::decode(data)?;
         if packet.header.packet_type == PacketType::SessionBind {
@@ -365,6 +396,25 @@ impl PacketRouter {
                 }
                 session
             }
+            PacketSource::WebTransport(link) => {
+                let session_id = link.session_id().ok_or_else(|| {
+                    AurixError::AuthenticationFailed("Unbound WebTransport session".into())
+                })?;
+                let session = self
+                    .shared
+                    .sessions_by_id
+                    .get(&session_id)
+                    .map(|s| s.value().clone())
+                    .ok_or_else(|| {
+                        AurixError::SessionNotFound("WebTransport session is gone".into())
+                    })?;
+                if !session.webtransport().is_some_and(|l| *l == **link) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "Stale WebTransport session".into(),
+                    ));
+                }
+                session
+            }
         };
         if !session.is_active() {
             return Err(AurixError::SessionNotFound("Session inactive".into()));
@@ -424,6 +474,7 @@ impl PacketRouter {
         let owner = match source {
             PacketSource::Quic(link) => link.session_id(),
             PacketSource::Tls(link) => link.session_id(),
+            PacketSource::WebTransport(link) => link.session_id(),
             PacketSource::Udp(_) | PacketSource::Tunnel(_) => None,
         };
         if owner.is_some_and(|owner| owner != session_id) {
@@ -512,6 +563,17 @@ impl PacketRouter {
                 }
                 MediaTransportKind::Tls
             }
+            PacketSource::WebTransport(link) => {
+                if !link.claim(session_id) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "WebTransport session already owned by another session".into(),
+                    ));
+                }
+                if let Some(old) = session.set_webtransport(link.clone()) {
+                    self.shared.sessions_by_addr.remove(&old);
+                }
+                MediaTransportKind::WebTransport
+            }
         };
         session.update_heartbeat();
 
@@ -542,6 +604,9 @@ impl PacketRouter {
             }
             PacketSource::Tls(link) => {
                 link.send(bytes.to_vec());
+            }
+            PacketSource::WebTransport(link) => {
+                link.send(bytes);
             }
         }
     }
@@ -1211,6 +1276,16 @@ impl PacketRouter {
                         MediaEndpoint::Tls(link) => {
                             let n = out.len() as u64;
                             if link.send(out.to_vec()) {
+                                receiver.record_packet_sent(n);
+                                aurix_metrics::PACKETS_SENT.inc();
+                                aurix_metrics::BYTES_SENT.inc_by(n);
+                            } else {
+                                aurix_metrics::PACKETS_DROPPED.inc();
+                            }
+                        }
+                        MediaEndpoint::WebTransport(link) => {
+                            let n = out.len() as u64;
+                            if link.send(&out) {
                                 receiver.record_packet_sent(n);
                                 aurix_metrics::PACKETS_SENT.inc();
                                 aurix_metrics::BYTES_SENT.inc_by(n);

@@ -431,8 +431,9 @@ unchanged.
 `ClientConfig::media_path` picks the link ([protocol](../api/aurx.md#tunnel-aurx-over-the-control-websocket)):
 
 * `MediaPathPolicy::Auto` (default) — bind over [QUIC](#quic-0-rtt-resume-and-connection-migration)
-  when offered, then raw UDP; if neither bind gets an answer, carry the media over the
-  already-authenticated control WebSocket instead. While on a native link,
+  when offered, then raw UDP; if neither bind gets an answer, try the node's
+  [dedicated TLS tunnel](#when-everything-but-443-is-blocked-the-tls-tunnel) when offered, and
+  finally carry the media over the already-authenticated control WebSocket. While on a native link,
   `udp_fallback_lost_heartbeats` (3) unanswered heartbeats in a row move the session onto the
   tunnel mid-call; while tunnelled, every `udp_reprobe_interval` (30 s, `0` = never) the core
   binds natively again and moves back as soon as it answers. The node must advertise the tunnel
@@ -440,6 +441,7 @@ unchanged.
 * `MediaPathPolicy::UdpOnly` — never tunnel (a dead UDP path is a reconnect, as before).
 * `MediaPathPolicy::TunnelOnly` — never open a UDP socket (tests, environments that forbid it).
 * `MediaPathPolicy::QuicOnly` — QUIC or nothing.
+* `MediaPathPolicy::TlsOnly` — the dedicated TLS tunnel or nothing.
 
 The uplink sequence counter is shared by all links, so the server's replay window and the
 receivers' jitter buffers see one continuous stream across a switch; a resume re-binds on the
@@ -454,6 +456,22 @@ refused — always 0 on UDP). C: `AurixClientConfig.media_path` (`AURIX_MEDIA_PA
 
 Expect more latency on the tunnel (TCP retransmits stall everything behind a lost segment);
 it is a way to stay in the call, not a replacement for UDP.
+
+## When everything but 443 is blocked: the TLS tunnel
+
+Some networks block UDP *and* the node's WebSocket port, leaving only 443/TCP. A node with
+`media.tls_tunnel_port` set (`SessionInfo::media_tls`, `SessionInitAck.tls_tunnel`) offers a
+[TLS 1.3 listener](../api/aurx.md#tls-tunnel-aurx-frames-on-a-dedicated-443-port) — normally on
+443, or behind a TLS-passthrough Caddy/Traefik — that carries the same sealed AURX packets as
+length-prefixed frames. The core pins the advertised certificate hash (the QUIC one; no CA, no
+system trust store), requires ALPN `aurix-tunnel/1`, sends the signed `SessionBind` as the first
+frame and keeps the shared sequence counter, so the switch is invisible to receivers.
+`ClientConfig::tls_tunnel = false` removes it from `Auto`; `MediaPathPolicy::TlsOnly` refuses
+nodes without it. A TLS connection the node closes falls to the WebSocket tunnel, a TLS session
+re-probes UDP every `udp_reprobe_interval` and moves back, and a resumed session re-binds over
+TLS. `Event::MediaPathChanged { path: Tls, .. }`, `ClientStats::media_path = "tls"`. C:
+`AurixClientConfig.tls_tunnel`, `AURIX_MEDIA_PATH_TLS_ONLY`, `AURIX_MEDIA_TLS`,
+`AurixSessionInfo.media_tls`. Same latency caveat as the WebSocket tunnel: TCP.
 
 ## Large channels: roles and the server mix
 

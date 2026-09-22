@@ -9,6 +9,10 @@ use aurix_common::quic::cert_fingerprint;
 use aurix_common::{AurixError, Result};
 use quinn::rustls;
 use std::path::Path;
+use std::time::Duration;
+
+/// Longest validity browsers accept for a hash-pinned (WebTransport) certificate.
+pub const MAX_SHORT_LIVED_DAYS: i64 = 14;
 
 /// Certificate chain plus private key, and the pin clients check.
 pub struct MediaCert {
@@ -32,29 +36,41 @@ impl MediaCert {
     /// Reads the PEM pair at `cert_path` / `key_path`. Errors name the `media.quic_*` keys the
     /// operator set.
     pub fn load(cert_path: &Path, key_path: &Path, server_name: &str) -> Result<Self> {
+        Self::load_named(cert_path, key_path, server_name, "media.quic")
+    }
+
+    /// [`Self::load`] with errors naming `{config_key}_cert_path` / `{config_key}_key_path`.
+    pub fn load_named(
+        cert_path: &Path,
+        key_path: &Path,
+        server_name: &str,
+        config_key: &str,
+    ) -> Result<Self> {
         use rustls::pki_types::pem::PemObject;
         let cert_pem = std::fs::read(cert_path).map_err(|e| {
             AurixError::InvalidConfiguration(format!(
-                "media.quic_cert_path {}: {e}",
+                "{config_key}_cert_path {}: {e}",
                 cert_path.display()
             ))
         })?;
         let key_pem = std::fs::read(key_path).map_err(|e| {
             AurixError::InvalidConfiguration(format!(
-                "media.quic_key_path {}: {e}",
+                "{config_key}_key_path {}: {e}",
                 key_path.display()
             ))
         })?;
         let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| AurixError::InvalidConfiguration(format!("media.quic_cert_path: {e}")))?;
+            .map_err(|e| {
+                AurixError::InvalidConfiguration(format!("{config_key}_cert_path: {e}"))
+            })?;
         if certs.is_empty() {
-            return Err(AurixError::InvalidConfiguration(
-                "media.quic_cert_path contains no certificate".into(),
-            ));
+            return Err(AurixError::InvalidConfiguration(format!(
+                "{config_key}_cert_path contains no certificate"
+            )));
         }
         let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
-            .map_err(|e| AurixError::InvalidConfiguration(format!("media.quic_key_path: {e}")))?;
+            .map_err(|e| AurixError::InvalidConfiguration(format!("{config_key}_key_path: {e}")))?;
         Ok(Self::new(certs, key, server_name))
     }
 
@@ -67,6 +83,32 @@ impl MediaCert {
             rustls::pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der()),
         );
         Ok(Self::new(vec![cert], key, server_name))
+    }
+
+    /// Generates a self-signed ECDSA P-256 certificate valid from one hour ago for
+    /// `validity`, with `names` (DNS names or IP literals) as SANs. This is the shape browsers
+    /// accept for `serverCertificateHashes` pinning (WebTransport): ECDSA, at most two weeks
+    /// of validity — so the node rotates it, see `crate::webtransport`.
+    pub fn short_lived(server_name: &str, names: &[String], validity: Duration) -> Result<Self> {
+        let internal = |e: &dyn std::fmt::Display| {
+            AurixError::Internal(format!("short-lived media certificate: {e}"))
+        };
+        let mut params = rcgen::CertificateParams::new(names.to_vec()).map_err(|e| internal(&e))?;
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(1);
+        params.not_after = now
+            + time::Duration::try_from(validity)
+                .unwrap_or_else(|_| time::Duration::days(MAX_SHORT_LIVED_DAYS));
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, server_name);
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .map_err(|e| internal(&e))?;
+        let cert = params.self_signed(&key).map_err(|e| internal(&e))?;
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+        );
+        Ok(Self::new(vec![cert.der().clone()], key, server_name))
     }
 
     /// The operator pair when configured, else a fresh self-signed certificate.

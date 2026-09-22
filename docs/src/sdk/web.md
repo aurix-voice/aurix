@@ -1,9 +1,11 @@
 # Web SDK (`@aurix/web-sdk`)
 
-Browser client: JSON control channel over WebSocket plus **one** WebRTC peer connection carrying
-the Opus microphone uplink and the server-mixed downlink. ES2020 module with type declarations
-and no runtime dependencies. Source and full API reference: `sdk/web/README.md`; a complete demo
-page lives in `sdk/web/demo`.
+Browser client: JSON control channel over WebSocket plus media on one of two paths — sealed AURX
+datagrams over [WebTransport](#webtransport-aurx-datagrams-without-webrtc) (HTTP/3, WebCodecs
+Opus, per-speaker streams; taken automatically when the node and the browser support it) or
+**one** WebRTC peer connection carrying the Opus microphone uplink and the server-mixed
+downlink. ES2020 module with type declarations and no runtime dependencies. Source and full API
+reference: `sdk/web/README.md`; a complete demo page lives in `sdk/web/demo`.
 
 ```bash
 cd sdk/web
@@ -93,6 +95,7 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | Lip-sync (visemes) | `AurixClient.supportsVisemes()`, `setVisemes(bool)`, `visemesEnabled`, `getParticipantVisemes(userId)` / `getLocalVisemes()` → `VisemeFrame { weights[9], dominant, mouthOpen, energy, confidence, sequence }`, `participantVisemes(userId, frame)` / `localVisemes(frame)` events | analysed in the page from decoded (decrypted) audio — participants on a dedicated per-participant track only, the mixed track cannot be split; nothing leaves the browser; see [visemes](../features/speech.md#visemes-lip-sync) |
 | Priority speakers / ducking | `setPriority(channelId, priority, userId?)`, `isPriority(channelId)`, `Participant.priority`, `channelInfo(id).priority` / `.ducking`, `getChannelDucking(id)`, `isDuckingActive(id)`, `participantPriorityChanged(channelId, userId, priority)`, `duckingChanged(channelId, active, config)` | the node ducks the mixed track; the SDK applies the same envelope to its per-participant tracks from the priority members' speaking state; `duckingChanged` is the hook for game audio — see [priority speakers](../features/channels.md#priority-speakers-and-ducking) |
 | Stats / quality | `getStats()` → `ClientStats`, `stats`, `networkQuality`, `client.networkQuality`, `qualityReportIntervalMs`, `bitrate` | see [Network quality](../features/quality.md) |
+| Media path | `transport: 'auto' \| 'webrtc' \| 'webtransport'`, `webTransport: {connectTimeoutMs, heartbeatIntervalMs, heartbeatLossLimit, opus, idleTimeoutMs}`, `client.mediaTransport`, `mediaTransport` event, `sessionInfo.webTransport`, `ClientStats.transport` | see [WebTransport](#webtransport-aurx-datagrams-without-webrtc) |
 | Opus controls | `opus: {maxBitrateBps, fec, dtx, maxBandwidth, cbr, followChannelPolicy}`, `setOpusOptions()`, `audioPolicy` / `channelAudioPolicy(id)`, `opusPreferences`, `negotiatedOpus`, `renegotiateMedia()`, `audioPolicy` event | see [Opus in the browser](#opus-in-the-browser) |
 | Errors | rejected promises carry `Error('<CODE>: <message>')`; unsolicited server errors arrive as `serverError` | codes listed in [Errors](../concepts/auth.md#errors) |
 
@@ -138,9 +141,11 @@ cap the count (`media.webrtc_participant_streams`, ≤ 64); expect ~1 RTP stream
 
 ## Opus in the browser
 
-A browser never exposes its Opus encoder; everything goes through WebRTC, so the SDK applies the
-server's channel audio policy ([channels](../features/channels.md#configuration)) only where
-WebRTC has a knob for it:
+On the [WebTransport path](#webtransport-aurx-datagrams-without-webrtc) the SDK runs the Opus
+encoder itself (WebCodecs) and applies the channel audio policy in full, like the native SDKs.
+On WebRTC the browser never exposes its Opus encoder, so the SDK applies the server's channel
+audio policy ([channels](../features/channels.md#configuration)) only where WebRTC has a knob
+for it:
 
 | Control | Mechanism | Takes effect |
 |---|---|---|
@@ -173,11 +178,63 @@ to override. Stereo takes effect at the next negotiation (`renegotiateMedia()`) 
 `negotiatedOpus.stereo`; whether the browser actually sends two channels also depends on the
 device and the browser's Opus implementation.
 
+## WebTransport: AURX datagrams without WebRTC
+
+When the node runs a [WebTransport endpoint](../api/aurx.md#webtransport-aurx-datagrams-for-browsers)
+(`media.webtransport_port`, `SessionInitAck.webtransport` → `sessionInfo.webTransport`), the SDK
+can skip WebRTC entirely: it opens a WebTransport session to `https://host:port/aurix`, sends
+the signed `SessionBind` as the first datagram and from then on exchanges the same sealed AURX
+packets a native client does — Opus encoded and decoded in the page with WebCodecs
+(`AudioEncoder` / `AudioDecoder`, 20 ms frames from an `AudioWorklet`), sealed and opened with
+WebCrypto. What changes for the page:
+
+* **Per-speaker streams by default**, like the native SDKs: every remote SSRC becomes a source
+  of the same spatial renderer the per-participant WebRTC tracks use (HRTF / equal-power
+  panning, per-participant volume, visemes, ducking), without the `webrtc_participant_streams`
+  cap; server-processed streams (`Mixed` downlinks, positional stereo) are played as delivered.
+* **The full Opus parameter set.** The channel policy applies completely — complexity, signal
+  mode, application, expected loss, FEC, DTX, CBR, bitrate — and `webTransport.opus` layers
+  your own overrides on top; `BitrateCommand` reconfigures the encoder live. `opus.stereo`
+  still needs a stereo channel policy.
+* **E2EE without Insertable Streams**: frames are encrypted and decrypted in the page with the
+  group sender keys; the node sees only opaque payloads, as on the native path.
+* **No SDP, ICE or TURN** — one QUIC connection to the node's UDP port (normally 443).
+  Heartbeats every `heartbeatIntervalMs` (2 s) give `ClientStats.rtt` / loss and the
+  `QualityReport`; `heartbeatLossLimit` (5) misses in a row count as a dead path.
+
+```ts
+const client = new AurixClient({
+  // ...
+  transport: 'auto',                    // default: WebTransport when possible, WebRTC otherwise
+  webTransport: {
+    connectTimeoutMs: 4000,             // per advertised URL, including the SessionBind
+    opus: { complexity: 10, signal: 'voice', expectedLossPct: 5 },
+  },
+});
+client.on('mediaTransport', (t) => console.log('media over', t)); // 'webtransport' | 'webrtc'
+console.log(client.mediaTransport, (await client.getStats()).transport);
+```
+
+`transport` policies: `'auto'` (default) takes WebTransport when the node advertises it and the
+browser has WebTransport datagrams, WebCrypto and WebCodecs Opus (Chromium-based browsers; the
+node-generated certificate additionally needs `serverCertificateHashes`), and negotiates WebRTC
+when any of that is missing or every advertised URL fails within `connectTimeoutMs`;
+`'webtransport'` makes `connect()` reject instead of falling back (strict deployments, tests);
+`'webrtc'` never tries. A WebTransport path that dies mid-call (`heartbeatLossLimit`, a
+`SessionClose`, the connection closing) re-establishes media — WebRTC under `'auto'` — with the
+AURX sequence counter carried over, so the node sees one continuous sender. Certificates: an
+operator-provided publicly trusted certificate needs nothing on the page; the node's own
+short-lived certificate arrives as `certSha256` (current and next hash) and is pinned through
+`serverCertificateHashes` — no CA, works for a bare IP. Ordinary HTTP reverse proxies do not
+forward WebTransport, so the node's `webtransport_port` must be reachable directly over UDP; when
+it is not, `'auto'` simply lands on WebRTC (via TURN if needed).
+
 ## How it maps to the server
 
 | SDK | server |
 |---|---|
 | `new WebSocket(wsUrl, ['aurix', 'bearer.<jwt>'])` | JWT authenticated at upgrade; `SessionInitAck` carries `session_id` / `ssrc` |
+| `connect()` → WebTransport session at `SessionInitAck.webtransport.urls[i]`, first datagram `SessionBind` (when `transport` allows and the browser can) | `webtransport::WebTransportServer` accepts `/aurix`, binds the session on the authenticated `SessionBind`, then routes each datagram as a native AURX packet (`MediaBound.transport = "webtransport"`) |
 | `connect()` → `WebRtcOffer` (1 `sendrecv` + N `recvonly` audio m-lines) | `SfuNode::attach_webrtc` (str0m, ICE-lite, host candidate = `media.external_ip:media.port`); first m-line = server mix, the rest per-participant tracks up to `media.webrtc_participant_streams` |
 | `setPinnedParticipants()` → `SetParticipantStreams {pinned}` | `ParticipantStreams {streams: [{mid, user_id}]}` on negotiation and every layout change |
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's relay candidates |

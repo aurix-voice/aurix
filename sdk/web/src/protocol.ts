@@ -306,6 +306,12 @@ export type ServerMessage =
         webrtc_participant_streams?: number;
         /** Gain the node applies to voices of unfocused channels; the browser mirrors it on per-participant tracks. */
         unfocused_channel_gain?: number;
+        /**
+         * The node's WebTransport media endpoint (HTTP/3, normally UDP/443): sealed AURX
+         * packets as QUIC datagrams instead of WebRTC. `cert_sha256` carries the pins of the
+         * node's generated certificate (current and next); absent for a CA certificate.
+         */
+        webtransport?: WebTransportInfoWire;
       };
     }
   | { type: 'MediaBound'; data: { session_id: string } }
@@ -497,6 +503,13 @@ export interface TranslationInfoWire {
   speech?: boolean;
   /** Target languages listeners may request; empty/absent = any tag. */
   languages?: string[];
+}
+
+export interface WebTransportInfoWire {
+  /** `https://host:port/aurix` URLs to try in order (IPv4 first, then IPv6). */
+  urls: string[];
+  /** SHA-256 fingerprints (hex) of the node's generated certificate: current, then next. */
+  cert_sha256?: string[];
 }
 
 /**

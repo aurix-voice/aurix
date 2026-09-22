@@ -19,6 +19,8 @@
         "api": { "$ref": "#/$defs/port" },
         "ws": { "$ref": "#/$defs/port" },
         "media": { "$ref": "#/$defs/port" },
+        "tlsTunnel": { "$ref": "#/$defs/optionalPort" },
+        "webtransport": { "$ref": "#/$defs/optionalPort" },
         "turn": { "$ref": "#/$defs/port" },
         "metrics": { "$ref": "#/$defs/port" }
       }
@@ -165,6 +167,7 @@
     }
   },
   "$defs": {
-    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "optionalPort": { "type": "integer", "minimum": 0, "maximum": 65535 }
   }
 }

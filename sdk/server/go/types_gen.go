@@ -237,14 +237,17 @@ const (
 
 // Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the
 // control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume,
-// connection migration), or WebRTC.
+// connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style
+// fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
 type SessionStatsMediaPath string
 
 const (
-	SessionStatsMediaPathUDP    SessionStatsMediaPath = "udp"
-	SessionStatsMediaPathTunnel SessionStatsMediaPath = "tunnel"
-	SessionStatsMediaPathQuic   SessionStatsMediaPath = "quic"
-	SessionStatsMediaPathWebRtc SessionStatsMediaPath = "web_rtc"
+	SessionStatsMediaPathUDP          SessionStatsMediaPath = "udp"
+	SessionStatsMediaPathTunnel       SessionStatsMediaPath = "tunnel"
+	SessionStatsMediaPathQuic         SessionStatsMediaPath = "quic"
+	SessionStatsMediaPathTLS          SessionStatsMediaPath = "tls"
+	SessionStatsMediaPathWebTransport SessionStatsMediaPath = "web_transport"
+	SessionStatsMediaPathWebRtc       SessionStatsMediaPath = "web_rtc"
 )
 
 // StreamFormat enumerates the values accepted by the API.
@@ -1789,7 +1792,8 @@ type SessionStats struct {
 	Transport string `json:"transport"`
 	// Wire path the media currently takes: native AURX over UDP, native AURX tunneled through the
 	// control WebSocket (UDP-blocked fallback), native AURX as QUIC datagrams (0-RTT resume,
-	// connection migration), or WebRTC.
+	// connection migration), native AURX as frames on the dedicated TLS tunnel port (TCP/443-style
+	// fallback), browser AURX as WebTransport datagrams (HTTP/3), or WebRTC.
 	MediaPath       *SessionStatsMediaPath `json:"media_path,omitempty"`
 	Channels        []string               `json:"channels"`
 	PacketsSent     int64                  `json:"packets_sent"`

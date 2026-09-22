@@ -696,7 +696,7 @@ jobs:
           timeout 120 "$GODOT" --headless --path sdk/godot -s tests/web_smoke.gd
 
   godot-web:
-    name: Godot Web export + Unity WebGL bridge (Chromium, live node)
+    name: Godot Web export + Unity WebGL bridge + WebTransport media (Chromium, live node)
     runs-on: ubuntu-latest
     needs: [lint]
     env:
@@ -759,6 +759,8 @@ jobs:
           # Chromium never gathers loopback host candidates, so browser media reaches a 127.0.0.1 node only via TURN.
           AURIX__TURN__ENABLED: "true"
           AURIX__TURN__AUTH_SECRET: ci-only-turn-secret-0123456789abcdefghijklmno
+          # AURX over WebTransport on its own UDP port; the node's short-lived certificate is pinned by hash.
+          AURIX__MEDIA__WEBTRANSPORT_PORT: "10445"
           # The exported lobby is served from an ephemeral 127.0.0.1 port (not production mode).
           AURIX__SERVER__CORS_ORIGINS: "*"
           AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-0123456789
@@ -792,6 +794,12 @@ jobs:
           AURIX_WS_URL: ws://127.0.0.1:8081/ws
           AURIX_API_KEY: ${{ steps.bootstrap.outputs.key }}
         run: python sdk/unity/BrowserTests~/webgl_bridge_e2e.py
+      - name: Web SDK AURX over WebTransport in Chromium (strict/auto/webrtc tabs, cross-transport audio, mute, E2EE)
+        env:
+          AURIX_API_URL: http://127.0.0.1:8080
+          AURIX_WS_URL: ws://127.0.0.1:8081/ws
+          AURIX_API_KEY: ${{ steps.bootstrap.outputs.key }}
+        run: python sdk/web/test/browser/webtransport_e2e.py
       - name: Server log
         if: failure()
         run: tail -n 200 server.log
