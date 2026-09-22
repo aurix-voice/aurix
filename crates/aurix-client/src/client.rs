@@ -19,8 +19,8 @@
 
 use aurix_common::e2ee;
 use aurix_common::protocol::{
-    channel_id_hash, ControlMessage, ParticipantBrief, QuicInfo, TransmissionMode, TtsDestination,
-    TtsState, UserPosition,
+    channel_id_hash, ControlMessage, ParticipantBrief, QuicInfo, TlsTunnelInfo, TransmissionMode,
+    TtsDestination, TtsState, UserPosition,
 };
 use aurix_common::types::{
     quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode,
@@ -306,6 +306,8 @@ struct Inner {
     /// A QUIC bind failed (while UDP may work) at least until this instant: `Auto` sessions
     /// opened before it skip QUIC and go straight to UDP.
     quic_blocked_until: Mutex<Option<Instant>>,
+    /// The TLS tunnel port did not answer recently: `Auto` sessions skip it until then.
+    tls_blocked_until: Mutex<Option<Instant>>,
     /// Certificate pin + resumption tickets of the node last connected over QUIC; reused on
     /// every reconnect to the same certificate so the bind can go out as 0-RTT.
     quic_state: Mutex<Option<Arc<QuicClientState>>>,
@@ -750,6 +752,7 @@ impl Client {
             resume_seq: Mutex::new(None),
             udp_blocked_until: Mutex::new(None),
             quic_blocked_until: Mutex::new(None),
+            tls_blocked_until: Mutex::new(None),
             quic_state: Mutex::new(None),
             udp_family_hint: Arc::new(Mutex::new(None)),
             endpoints: Mutex::new(endpoints),
@@ -2279,6 +2282,7 @@ async fn session(
         resumed: ack.resumed,
         media_tunnel: ack.media_tunnel,
         media_quic: ack.quic.is_some(),
+        media_tls: ack.tls_tunnel.is_some(),
         downlink_mix: ack.downlink_mix,
         migrated: ack.migrated,
         endpoint: url.to_string(),
@@ -2310,8 +2314,24 @@ async fn session(
     let quic_wanted = match cfg.media_path {
         MediaPathPolicy::QuicOnly => true,
         MediaPathPolicy::Auto => cfg.quic,
-        MediaPathPolicy::UdpOnly | MediaPathPolicy::TunnelOnly => false,
+        MediaPathPolicy::UdpOnly | MediaPathPolicy::TunnelOnly | MediaPathPolicy::TlsOnly => false,
     };
+    let tls_wanted = match cfg.media_path {
+        MediaPathPolicy::TlsOnly => true,
+        MediaPathPolicy::Auto => cfg.tls_tunnel,
+        MediaPathPolicy::UdpOnly | MediaPathPolicy::TunnelOnly | MediaPathPolicy::QuicOnly => false,
+    };
+    let fallback_host = ws_host(url).unwrap_or_else(|| "127.0.0.1".into());
+    let tls =
+        ack.tls_tunnel.clone().filter(|_| tls_wanted).and_then(
+            |info| match resolve_media_candidates("", &info.addrs, &fallback_host) {
+                Ok(addrs) => Some((info, addrs)),
+                Err(e) => {
+                    tracing::warn!("node advertised an unusable TLS tunnel endpoint: {e}");
+                    None
+                }
+            },
+        );
     let quic = match &ack.quic {
         Some(info) if quic_wanted => {
             let mut slot = inner.quic_state.lock();
@@ -2333,14 +2353,11 @@ async fn session(
         ssrc: ack.ssrc,
         key: ack.media_key.clone(),
         seq: Arc::new(AtomicU32::new(take_pending_sequence(inner))),
-        udp_addrs: resolve_media_candidates(
-            &ack.media_addr,
-            &ack.media_addrs,
-            &ws_host(url).unwrap_or_else(|| "127.0.0.1".into()),
-        ),
+        udp_addrs: resolve_media_candidates(&ack.media_addr, &ack.media_addrs, &fallback_host),
         family_hint: Arc::clone(&inner.udp_family_hint),
         tunnel_offered: ack.media_tunnel,
         quic,
+        tls,
         quic_idle_timeout: (cfg.heartbeat_interval * 4).max(Duration::from_secs(10)),
     };
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Vec<u8>>(TUNNEL_UPLINK_QUEUE);
@@ -2367,6 +2384,9 @@ async fn session(
     });
     if media.path() == MediaPath::Udp && links.quic.is_some() {
         mark_quic_blocked(inner, cfg);
+    }
+    if media.path() == MediaPath::Tunnel && links.tls.is_some() {
+        mark_tls_blocked(inner, cfg);
     }
 
     if !first {
@@ -2425,7 +2445,7 @@ async fn session(
     let mut last_rx = Instant::now();
     let mut ping_nonce: u64 = rand::random();
     let reprobe_enabled = cfg.media_path == MediaPathPolicy::Auto
-        && links.tunnel_offered
+        && links.fallback_offered()
         && !cfg.udp_reprobe_interval.is_zero()
         && (links.udp_addrs.is_ok() || links.quic.is_some());
     let mut reprobe = tokio::time::interval(if reprobe_enabled {
@@ -2495,7 +2515,7 @@ async fn session(
                             Err(e) => tracing::warn!("QUIC migration failed: {e}"),
                         },
                         MediaPath::Udp => media.send_bind(),
-                        MediaPath::Tunnel => {}
+                        MediaPath::Tunnel | MediaPath::Tls => {}
                     },
                     Some(cmd) => {
                         if let Err(exit) = handle_command(inner, cfg, &mut conn, pending, cmd).await {
@@ -2520,10 +2540,10 @@ async fn session(
                 let native = matches!(media.path(), MediaPath::Udp | MediaPath::Quic);
                 let heartbeats_dead = cfg.udp_fallback_lost_heartbeats > 0
                     && media.consecutive_heartbeats_lost() >= cfg.udp_fallback_lost_heartbeats;
-                let native_dead = native
-                    && cfg.media_path == MediaPathPolicy::Auto
-                    && (heartbeats_dead || media.is_closed());
-                if native_dead && !links.tunnel_offered && media.path() == MediaPath::Quic && media.is_closed() {
+                let auto = cfg.media_path == MediaPathPolicy::Auto;
+                let native_dead = native && auto && (heartbeats_dead || media.is_closed());
+                let tls_dead = media.path() == MediaPath::Tls && auto && (heartbeats_dead || media.is_closed());
+                if native_dead && !links.fallback_offered() && media.path() == MediaPath::Quic && media.is_closed() {
                     // Nowhere to fall back to but raw UDP: re-open the native link in place.
                     let reason = media.close_reason().unwrap_or_default();
                     match links.native_attempt(true, 1, PROBE_TIMEOUT) {
@@ -2541,41 +2561,87 @@ async fn session(
                         },
                         Err(e) => tracing::warn!("QUIC connection closed ({reason}); no candidate to re-bind: {e}"),
                     }
-                } else if native_dead && links.tunnel_offered {
+                } else if (native_dead && links.fallback_offered()) || tls_dead {
                     let lost = media.consecutive_heartbeats_lost();
                     let was = media.path();
                     let closed = media.close_reason();
-                    mark_udp_blocked(inner, cfg);
-                    if was == MediaPath::Quic {
-                        mark_quic_blocked(inner, cfg);
-                    }
-                    let tunnel = Arc::new(links.tunnel(&tunnel_tx));
-                    match bind_tunnel(&mut conn, &tunnel, &mut deferred).await {
-                        Ok(()) => {
-                            let reason = match (was, closed) {
-                                (MediaPath::Quic, Some(why)) => format!("QUIC connection closed: {why}"),
-                                (MediaPath::Quic, None) => format!("{lost} QUIC heartbeats unanswered"),
-                                _ => format!("{lost} UDP heartbeats unanswered"),
-                            };
-                            install_media(inner, &tunnel, Some(&media));
-                            media = tunnel;
-                            inner.emit(Event::MediaPathChanged { path: MediaPath::Tunnel, reason });
-                            reprobe.reset();
+                    let why = match (was, closed) {
+                        (MediaPath::Quic, Some(why)) => format!("QUIC connection closed: {why}"),
+                        (MediaPath::Quic, None) => format!("{lost} QUIC heartbeats unanswered"),
+                        (MediaPath::Tls, Some(why)) => format!("TLS tunnel closed: {why}"),
+                        (MediaPath::Tls, None) => format!("{lost} TLS tunnel heartbeats unanswered"),
+                        _ => format!("{lost} UDP heartbeats unanswered"),
+                    };
+                    match was {
+                        MediaPath::Quic => {
+                            mark_udp_blocked(inner, cfg);
+                            mark_quic_blocked(inner, cfg);
                         }
-                        Err(ClientError::Transport(e)) => {
-                            return Exit::Dropped(format!("media tunnel bind failed: {e}"));
-                        }
-                        Err(e) => tracing::warn!("{was:?} media is dead and the tunnel bind failed: {e}"),
+                        MediaPath::Udp => mark_udp_blocked(inner, cfg),
+                        MediaPath::Tls => mark_tls_blocked(inner, cfg),
+                        MediaPath::Tunnel => {}
                     }
-                    for m in std::mem::take(&mut deferred) {
-                        if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
-                            return exit;
+                    let tls_blocked = inner
+                        .tls_blocked_until
+                        .lock()
+                        .is_some_and(|until| until > Instant::now());
+                    let mut moved = false;
+                    if was != MediaPath::Tls && links.tls.is_some() && !tls_blocked {
+                        match links.bind_tls(FALLBACK_BIND_ATTEMPTS, FALLBACK_BIND_TIMEOUT).await {
+                            Ok(t) => {
+                                let t = Arc::new(t);
+                                install_media(inner, &t, Some(&media));
+                                media = t;
+                                inner.emit(Event::MediaPathChanged { path: MediaPath::Tls, reason: why.clone() });
+                                reprobe.reset();
+                                moved = true;
+                            }
+                            Err(e) => {
+                                tracing::info!("{why}; the TLS tunnel did not bind either ({e})");
+                                mark_tls_blocked(inner, cfg);
+                            }
+                        }
+                    }
+                    if !moved && links.tunnel_offered {
+                        let tunnel = Arc::new(links.tunnel(&tunnel_tx));
+                        match bind_tunnel(&mut conn, &tunnel, &mut deferred).await {
+                            Ok(()) => {
+                                install_media(inner, &tunnel, Some(&media));
+                                media = tunnel;
+                                inner.emit(Event::MediaPathChanged { path: MediaPath::Tunnel, reason: why });
+                                reprobe.reset();
+                            }
+                            Err(ClientError::Transport(e)) => {
+                                return Exit::Dropped(format!("media tunnel bind failed: {e}"));
+                            }
+                            Err(e) => tracing::warn!("{was:?} media is dead and the tunnel bind failed: {e}"),
+                        }
+                        for m in std::mem::take(&mut deferred) {
+                            if let Some(exit) = handle_message(inner, cfg, &mut conn, pending, resume, m).await {
+                                return exit;
+                            }
+                        }
+                    } else if !moved && tls_dead {
+                        // Only the TLS tunnel is offered: re-open it in place.
+                        match links.bind_tls(1, PROBE_TIMEOUT).await {
+                            Ok(t) => {
+                                let t = Arc::new(t);
+                                install_media(inner, &t, Some(&media));
+                                media = t;
+                                inner.emit(Event::MediaPathChanged {
+                                    path: MediaPath::Tls,
+                                    reason: format!("{why}; re-bound"),
+                                });
+                            }
+                            Err(e) => tracing::warn!("{why} and the re-bind failed: {e}"),
                         }
                     }
                 }
             }
-            _ = reprobe.tick(), if reprobe_enabled && probe.is_none() && media.path() == MediaPath::Tunnel => {
-                probe = links.native_attempt(true, 1, PROBE_TIMEOUT).ok().map(tokio::spawn);
+            _ = reprobe.tick(), if reprobe_enabled && probe.is_none() && matches!(media.path(), MediaPath::Tunnel | MediaPath::Tls) => {
+                let try_tls = media.path() == MediaPath::Tunnel
+                    && !inner.tls_blocked_until.lock().is_some_and(|until| until > Instant::now());
+                probe = links.reprobe_attempt(try_tls, PROBE_TIMEOUT).ok().map(tokio::spawn);
             }
             probed = async { probe.as_mut().expect("guarded by the branch condition").await }, if probe.is_some() => {
                 probe = None;
@@ -2584,9 +2650,14 @@ async fn session(
                         let native = Arc::new(native);
                         install_media(inner, &native, Some(&media));
                         media = native;
-                        *inner.udp_blocked_until.lock() = None;
-                        if media.path() == MediaPath::Quic {
-                            *inner.quic_blocked_until.lock() = None;
+                        match media.path() {
+                            MediaPath::Quic => {
+                                *inner.udp_blocked_until.lock() = None;
+                                *inner.quic_blocked_until.lock() = None;
+                            }
+                            MediaPath::Udp => *inner.udp_blocked_until.lock() = None,
+                            MediaPath::Tls => *inner.tls_blocked_until.lock() = None,
+                            MediaPath::Tunnel => {}
                         }
                         inner.emit(Event::MediaPathChanged {
                             path: media.path(),
@@ -2594,12 +2665,10 @@ async fn session(
                         });
                     }
                     Ok(Err(e)) => {
-                        tracing::debug!("native re-probe failed, staying tunnelled: {e}");
+                        tracing::debug!("re-probe failed, staying on {}: {e}", path_name(media.path()));
                         // The probe's SessionBind may have reached the node even though its ack
-                        // did not come back; reclaim the endpoint for the tunnel.
-                        if media.path() == MediaPath::Tunnel {
-                            media.send_bind();
-                        }
+                        // did not come back; reclaim the endpoint for the current link.
+                        media.send_bind();
                     }
                     Err(e) => tracing::warn!("native re-probe task failed: {e}"),
                 }
@@ -2632,6 +2701,7 @@ fn path_name(path: MediaPath) -> &'static str {
         MediaPath::Udp => "UDP",
         MediaPath::Tunnel => "tunnel",
         MediaPath::Quic => "QUIC",
+        MediaPath::Tls => "TLS tunnel",
     }
 }
 
@@ -2651,10 +2721,64 @@ struct MediaLinks {
     /// The node's QUIC advertisement and our pinned TLS state for it; `None` when the node
     /// offers no QUIC or the policy excludes it.
     quic: Option<(QuicInfo, Arc<QuicClientState>)>,
+    /// The node's TLS tunnel advertisement with its resolved endpoints; `None` when the node
+    /// offers no tunnel port or the policy excludes it.
+    tls: Option<(TlsTunnelInfo, Vec<std::net::SocketAddr>)>,
     quic_idle_timeout: Duration,
 }
 
 impl MediaLinks {
+    /// Something other than the native links is on offer (TLS tunnel or WebSocket tunnel).
+    fn fallback_offered(&self) -> bool {
+        self.tunnel_offered || self.tls.is_some()
+    }
+
+    /// TLS tunnel bind to the first advertised endpoint that completes the handshake and acks
+    /// the bind (`attempts × timeout` each).
+    async fn bind_tls(&self, attempts: u32, timeout: Duration) -> Result<MediaTransport> {
+        let bind = self
+            .tls_bind(attempts, timeout)
+            .ok_or_else(|| ClientError::Transport("the node offers no TLS tunnel".into()))?;
+        bind.run().await
+    }
+
+    fn tls_bind(&self, attempts: u32, timeout: Duration) -> Option<TlsBind> {
+        let (info, addrs) = self.tls.clone()?;
+        Some(TlsBind {
+            addrs,
+            info,
+            sid: self.sid,
+            ssrc: self.ssrc,
+            key: self.key.clone(),
+            seq: Arc::clone(&self.seq),
+            attempts,
+            timeout,
+        })
+    }
+
+    /// The re-probe while tunnelled: the native links first and, when `try_tls` (we sit on
+    /// the WebSocket tunnel), the TLS tunnel after them.
+    fn reprobe_attempt(
+        &self,
+        try_tls: bool,
+        timeout: Duration,
+    ) -> Result<impl std::future::Future<Output = Result<MediaTransport>> + Send + 'static> {
+        let native = self.native_attempt(true, 1, timeout)?;
+        let tls = self.tls_bind(1, timeout).filter(|_| try_tls);
+        Ok(async move {
+            match native.await {
+                Ok(t) => Ok(t),
+                Err(e) => match tls {
+                    Some(tls) => {
+                        tracing::debug!("native re-probe failed ({e}); trying the TLS tunnel");
+                        tls.run().await
+                    }
+                    None => Err(e),
+                },
+            }
+        })
+    }
+
     fn tunnel(&self, uplink: &mpsc::Sender<Vec<u8>>) -> MediaTransport {
         MediaTransport::tunnel(
             self.sid,
@@ -2821,6 +2945,45 @@ impl QuicBind {
     }
 }
 
+/// One TLS tunnel bind attempt over the node's advertised tunnel endpoints, in order.
+struct TlsBind {
+    addrs: Vec<std::net::SocketAddr>,
+    info: TlsTunnelInfo,
+    sid: SessionId,
+    ssrc: u32,
+    key: Vec<u8>,
+    seq: SequenceCounter,
+    attempts: u32,
+    timeout: Duration,
+}
+
+impl TlsBind {
+    async fn run(self) -> Result<MediaTransport> {
+        let mut last_err = ClientError::Transport("no TLS tunnel candidate".into());
+        for addr in self.addrs {
+            match MediaTransport::bind_tls(
+                addr,
+                &self.info,
+                self.sid,
+                self.ssrc,
+                &self.key,
+                Arc::clone(&self.seq),
+                self.attempts,
+                self.timeout,
+            )
+            .await
+            {
+                Ok(t) => return Ok(t),
+                Err(e) => {
+                    tracing::debug!("TLS tunnel candidate {addr} did not bind: {e}");
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+}
+
 /// Picks the first media link per `ClientConfig::media_path`. Returns the transport and a
 /// human-readable reason for the `MediaPathChanged` event.
 async fn bind_initial_media(
@@ -2859,25 +3022,54 @@ async fn bind_initial_media(
             }
             tunnel("tunnel-only policy".into()).await
         }
+        MediaPathPolicy::TlsOnly => {
+            if links.tls.is_none() {
+                return Err(ClientError::Transport(
+                    "media path is TLS-only but the node offers no TLS tunnel".into(),
+                ));
+            }
+            let tls = links.bind_tls(BIND_ATTEMPTS, BIND_TIMEOUT).await?;
+            Ok((Arc::new(tls), "TLS tunnel bound".into()))
+        }
         MediaPathPolicy::Auto => {
-            let quic_blocked = inner
-                .quic_blocked_until
-                .lock()
-                .is_some_and(|until| until > Instant::now());
-            let try_quic = links.quic.is_some() && !quic_blocked;
-            if !links.tunnel_offered {
+            let blocked = |slot: &Mutex<Option<Instant>>| {
+                slot.lock().is_some_and(|until| until > Instant::now())
+            };
+            let try_quic = links.quic.is_some() && !blocked(&inner.quic_blocked_until);
+            if !links.fallback_offered() {
                 let native = links
                     .native_attempt(try_quic, BIND_ATTEMPTS, BIND_TIMEOUT)?
                     .await?;
                 let reason = native_reason(&native);
                 return Ok((Arc::new(native), reason));
             }
-            let udp_blocked = inner
-                .udp_blocked_until
-                .lock()
-                .is_some_and(|until| until > Instant::now());
-            if udp_blocked {
-                return tunnel("UDP was blocked before this session".into()).await;
+            // The fallbacks in order: the TLS tunnel (when offered and not known blocked),
+            // then the WebSocket tunnel.
+            let fallback = |why: String| async move {
+                if links.tls.is_some() && !blocked(&inner.tls_blocked_until) {
+                    match links
+                        .bind_tls(FALLBACK_BIND_ATTEMPTS, FALLBACK_BIND_TIMEOUT)
+                        .await
+                    {
+                        Ok(tls) => return Ok((Arc::new(tls), why)),
+                        Err(e) => {
+                            tracing::info!("{why}; the TLS tunnel did not bind either ({e})");
+                            mark_tls_blocked(inner, cfg);
+                            if !links.tunnel_offered {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                if !links.tunnel_offered {
+                    return Err(ClientError::Transport(format!(
+                        "{why}; the TLS tunnel is blocked and the node offers no WebSocket tunnel"
+                    )));
+                }
+                tunnel(why).await
+            };
+            if blocked(&inner.udp_blocked_until) {
+                return fallback("UDP was blocked before this session".into()).await;
             }
             let attempt =
                 match links.native_attempt(try_quic, FALLBACK_BIND_ATTEMPTS, FALLBACK_BIND_TIMEOUT)
@@ -2891,11 +3083,9 @@ async fn bind_initial_media(
                     Ok((Arc::new(native), reason))
                 }
                 Err(e) => {
-                    tracing::info!(
-                        "native media bind failed ({e}); falling back to the media tunnel"
-                    );
+                    tracing::info!("native media bind failed ({e}); falling back to a tunnel");
                     mark_udp_blocked(inner, cfg);
-                    tunnel(format!("native bind failed: {e}")).await
+                    fallback(format!("native bind failed: {e}")).await
                 }
             }
         }
@@ -2933,6 +3123,15 @@ fn mark_quic_blocked(inner: &Inner, cfg: &ClientConfig) {
         cfg.udp_reprobe_interval
     };
     *inner.quic_blocked_until.lock() = Some(Instant::now() + memory);
+}
+
+fn mark_tls_blocked(inner: &Inner, cfg: &ClientConfig) {
+    let memory = if cfg.udp_reprobe_interval.is_zero() {
+        UDP_BLOCK_MEMORY
+    } else {
+        cfg.udp_reprobe_interval
+    };
+    *inner.tls_blocked_until.lock() = Some(Instant::now() + memory);
 }
 
 /// Tunnel handshake: signed `SessionBind` out as a binary frame, sealed `SessionBindAck` back.

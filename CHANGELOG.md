@@ -44,6 +44,28 @@ released together.
   their own 3-hop cap, so upgrade hubs first). Live E2E now blocks UDP between the hubs
   with `iptables` (`AURIX_E2E_SUDO_IPTABLES=1`) and checks audio, table and metrics through the
   fallback and back.
+* **Dedicated TLS media tunnel (TCP/443) for native clients.** `media.tls_tunnel_port` (default
+  `0` = off; run it on 443 or behind a TLS-passthrough Caddy/Traefik) opens a TLS 1.3 listener
+  (ALPN `aurix-tunnel/1`, `tokio-rustls`) that carries the very same sealed AURX packets as
+  `u16`-length-prefixed frames — AURX authentication, anti-replay, E2EE and the 1400-byte packet
+  bound are unchanged; a zero-length, oversized or truncated frame closes the connection. The
+  listener shares the QUIC certificate (`quic_cert_path`/`quic_key_path` or the generated
+  self-signed one) and its `host:port` list plus the SHA-256 pin are advertised in
+  `SessionInitAck.tls_tunnel` (`media.tls_tunnel_advertise` overrides the addresses when a proxy
+  fronts the node). Bounded downlink queues (`tls_tunnel_queue_packets`), a connection cap
+  (`tls_tunnel_max_connections`) and a bind timeout (`tls_tunnel_bind_timeout_ms`) protect the
+  node; `aurix_tls_tunnel_{packets_total,handshakes_total,connections,sessions}` and
+  `media_path = "tls"` in session stats expose it. **Native core** (`ClientConfig.tls_tunnel`,
+  `MediaPathPolicy::TlsOnly`, `MediaPath::Tls`, `SessionInfo.media_tls`; C ABI
+  `AURIX_MEDIA_TLS` = 5, `AURIX_MEDIA_PATH_TLS_ONLY`, C++/Unreal/Godot bindings) and the
+  **Unity C# SDK** (`TlsMediaTunnel` on `SslStream`, `MediaPathPolicy.TlsOnly`,
+  `MediaPath.Tls`, `AurixVoiceClient.TlsTunnel`) pin the advertised certificate, require the
+  ALPN and slot the tunnel into `Auto` after QUIC and UDP and before the WebSocket tunnel: a
+  blocked-UDP bind falls to TLS, a TLS session re-probes UDP periodically and moves back, a TLS
+  connection the node closes falls to the WebSocket tunnel, and a resumed session re-binds over
+  TLS. Covered by listener tests (framing, ALPN/pin refusal, bind timeout, queue overflow, cap),
+  client↔SFU integration tests, Unity tests against a TLS 1.3 fake node and a live E2E that
+  black-holes UDP with `iptables`. Certificate renewal stays the operator's job (no ACME).
 
 ## [1.4.0] - 2026-09-22
 

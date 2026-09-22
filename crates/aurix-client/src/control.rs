@@ -4,7 +4,7 @@
 //! tunnelled (see [`crate::media`]). Connection policy (reconnects, re-joins) lives in
 //! [`crate::client`].
 
-use aurix_common::protocol::{ControlMessage, QuicInfo, TranslationInfo};
+use aurix_common::protocol::{ControlMessage, QuicInfo, TlsTunnelInfo, TranslationInfo};
 use aurix_common::types::{SessionId, UserId};
 use base64::Engine;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -43,6 +43,9 @@ pub struct SessionAck {
     /// The node accepts AURX media as QUIC datagrams on its media port: certificate pin and
     /// TLS server name to connect with. `None` from nodes without QUIC (or older ones).
     pub quic: Option<QuicInfo>,
+    /// The node accepts AURX media as frames on a dedicated TLS tunnel port (normally 443):
+    /// endpoints, certificate pin and TLS server name. `None` when the port is not enabled.
+    pub tls_tunnel: Option<TlsTunnelInfo>,
     /// The node offers server-side mixed downlink (`SetDownlinkMode`).
     pub downlink_mix: bool,
     /// Resumed on a different node than the one that opened the session.
@@ -200,6 +203,7 @@ impl ControlConnection {
                     resumed,
                     media_tunnel,
                     quic,
+                    tls_tunnel,
                     downlink_mix,
                     migrated,
                     failover,
@@ -223,6 +227,7 @@ impl ControlConnection {
                         resumed,
                         media_tunnel,
                         quic,
+                        tls_tunnel,
                         downlink_mix,
                         migrated,
                         failover,

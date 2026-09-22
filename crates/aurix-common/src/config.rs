@@ -213,7 +213,23 @@ impl AurixConfig {
         if !(8..=4096).contains(&self.media.quic_queue_packets) {
             anyhow::bail!("media.quic_queue_packets must be within 8..=4096");
         }
-        if self.media.quic {
+        if !(8..=4096).contains(&self.media.tls_tunnel_queue_packets) {
+            anyhow::bail!("media.tls_tunnel_queue_packets must be within 8..=4096");
+        }
+        if self.media.tls_tunnel_port != 0 {
+            if self.media.tls_tunnel_bind_timeout_ms < 1_000 {
+                anyhow::bail!("media.tls_tunnel_bind_timeout_ms must be at least 1000");
+            }
+            for endpoint in &self.media.tls_tunnel_advertise {
+                let (host, port) = crate::addr::split_host_port(endpoint).ok_or_else(|| {
+                    anyhow::anyhow!("media.tls_tunnel_advertise: `{endpoint}` is not host:port")
+                })?;
+                if host.is_empty() || port == 0 {
+                    anyhow::bail!("media.tls_tunnel_advertise: `{endpoint}` is not host:port");
+                }
+            }
+        }
+        if self.media.quic || self.media.tls_tunnel_port != 0 {
             let min_idle = self
                 .media
                 .heartbeat_interval_ms
@@ -849,6 +865,24 @@ impl MediaConfig {
                 .ok()
         });
         (v4, v6)
+    }
+
+    /// Public `host:port` endpoints of the dedicated TLS media tunnel: `tls_tunnel_advertise`
+    /// verbatim when set, else the external addresses with `tls_tunnel_port`. Empty when the
+    /// listener is disabled or nothing is advertisable (callers fall back to the bind host).
+    pub fn tls_tunnel_endpoints(&self) -> Vec<String> {
+        if self.tls_tunnel_port == 0 {
+            return Vec::new();
+        }
+        if !self.tls_tunnel_advertise.is_empty() {
+            return self.tls_tunnel_advertise.clone();
+        }
+        [self.external_ip.as_deref(), self.external_ipv6.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|h| !h.is_empty())
+            .map(|h| crate::addr::host_port(h, self.tls_tunnel_port))
+            .collect()
     }
 }
 
@@ -1554,6 +1588,34 @@ pub struct MediaConfig {
     /// present it as SNI; the pin, not the name, is what they verify).
     #[serde(default = "default_quic_server_name")]
     pub quic_server_name: String,
+    /// Dedicated TLS media tunnel: a TCP listener on this port (on `host`) speaking TLS 1.3
+    /// (ALPN `aurix-tunnel/1`) that carries the same sealed AURX packets as length-prefixed
+    /// frames, for native clients behind firewalls that block UDP *and* the WebSocket port.
+    /// Run it on 443 (or behind a TLS-passthrough proxy routing on `quic_server_name`).
+    /// Uses the `quic_cert_path` / `quic_key_path` pair (or the same self-signed certificate)
+    /// — clients pin the hash from `SessionInitAck.tls_tunnel`. `0` disables the listener.
+    /// Certificate renewal is the operator's (or the proxy's) job: PEM files are read once at
+    /// start-up.
+    #[serde(default)]
+    pub tls_tunnel_port: u16,
+    /// `host:port` endpoints advertised to clients for the TLS tunnel. Empty: `external_ip` /
+    /// `external_ipv6` with `tls_tunnel_port`. Set it when a proxy terminates 443 in front of
+    /// the node (e.g. `["voice.example.com:443"]`).
+    #[serde(default)]
+    pub tls_tunnel_advertise: Vec<String>,
+    /// Downlink packets queued per TLS-tunneled session before the node drops that session's
+    /// audio (a stalled TCP connection never blocks the SFU). Same unit as
+    /// `tunnel_queue_packets`.
+    #[serde(default = "default_tunnel_queue_packets")]
+    pub tls_tunnel_queue_packets: usize,
+    /// Concurrent TLS tunnel connections the node accepts (handshaking or bound); `0` =
+    /// twice `max_participants_per_node`.
+    #[serde(default)]
+    pub tls_tunnel_max_connections: usize,
+    /// Time a TLS tunnel connection may stay open without an authenticated `SessionBind`
+    /// (handshake included) before the node closes it (ms).
+    #[serde(default = "default_tls_tunnel_bind_timeout_ms")]
+    pub tls_tunnel_bind_timeout_ms: u64,
     /// Let native AURX sessions receive one server-mixed stream per channel
     /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
     /// A mixed receiver whose channel has no per-receiver rules shares one mixer with every
@@ -1671,6 +1733,10 @@ fn default_quic_server_name() -> String {
     "aurix-media".into()
 }
 
+fn default_tls_tunnel_bind_timeout_ms() -> u64 {
+    10_000
+}
+
 fn default_webrtc_participant_streams() -> u32 {
     16
 }
@@ -1722,6 +1788,11 @@ impl Default for MediaConfig {
             quic_cert_path: None,
             quic_key_path: None,
             quic_server_name: default_quic_server_name(),
+            tls_tunnel_port: 0,
+            tls_tunnel_advertise: Vec::new(),
+            tls_tunnel_queue_packets: default_tunnel_queue_packets(),
+            tls_tunnel_max_connections: 0,
+            tls_tunnel_bind_timeout_ms: default_tls_tunnel_bind_timeout_ms(),
             rx_workers: 0,
             cascade_secret: None,
             cascade_peers: Vec::new(),

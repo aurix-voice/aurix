@@ -230,6 +230,9 @@ pub enum MediaTransportKind {
     Tunnel,
     /// Native AURX as QUIC datagrams on the media port (0-RTT resume, connection migration).
     Quic,
+    /// Native AURX as length-prefixed frames on the dedicated TLS tunnel port (443-style
+    /// fallback for networks that block UDP and the WebSocket port).
+    Tls,
     /// Browser WebRTC (str0m).
     WebRtc,
 }

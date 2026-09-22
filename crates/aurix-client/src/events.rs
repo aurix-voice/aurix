@@ -100,6 +100,9 @@ pub struct SessionInfo {
     /// The node accepts AURX media as QUIC datagrams on its media port (0-RTT reconnects,
     /// connection migration); `Auto` sessions prefer it when `ClientConfig::quic` is on.
     pub media_quic: bool,
+    /// The node accepts AURX media as frames on a dedicated TLS tunnel port (normally 443);
+    /// `Auto` sessions use it before the WebSocket tunnel when UDP and QUIC are blocked.
+    pub media_tls: bool,
     /// The node can deliver one server-mixed stream per channel instead of one stream per
     /// speaker (`Client::set_downlink_mode`).
     pub downlink_mix: bool,

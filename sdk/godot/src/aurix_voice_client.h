@@ -66,12 +66,15 @@ public:
         MEDIA_UDP = AURIX_MEDIA_UDP,
         MEDIA_TUNNEL = AURIX_MEDIA_TUNNEL,
         MEDIA_QUIC = AURIX_MEDIA_QUIC,
+        MEDIA_WEBRTC = AURIX_MEDIA_WEBRTC,
+        MEDIA_TLS = AURIX_MEDIA_TLS,
     };
     enum MediaPathPolicy {
         MEDIA_PATH_AUTO = AURIX_MEDIA_PATH_AUTO,
         MEDIA_PATH_UDP_ONLY = AURIX_MEDIA_PATH_UDP_ONLY,
         MEDIA_PATH_TUNNEL_ONLY = AURIX_MEDIA_PATH_TUNNEL_ONLY,
         MEDIA_PATH_QUIC_ONLY = AURIX_MEDIA_PATH_QUIC_ONLY,
+        MEDIA_PATH_TLS_ONLY = AURIX_MEDIA_PATH_TLS_ONLY,
     };
     enum ModerationAction {
         MODERATION_KICK = AURIX_MODERATION_KICK,
@@ -178,6 +181,8 @@ public:
     MediaPathPolicy get_media_path_policy() const;
     void set_quic_enabled(bool enabled);
     bool get_quic_enabled() const;
+    void set_tls_tunnel_enabled(bool enabled);
+    bool get_tls_tunnel_enabled() const;
     void set_auto_capture(bool enabled);
     bool get_auto_capture() const;
     void set_auto_playback(bool enabled);

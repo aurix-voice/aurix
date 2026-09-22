@@ -77,6 +77,8 @@ void AurixVoiceClient::set_media_path_policy(MediaPathPolicy policy) { config_.m
 AurixVoiceClient::MediaPathPolicy AurixVoiceClient::get_media_path_policy() const { return static_cast<MediaPathPolicy>(config_.media_path); }
 void AurixVoiceClient::set_quic_enabled(bool enabled) { config_.quic = enabled; }
 bool AurixVoiceClient::get_quic_enabled() const { return config_.quic; }
+void AurixVoiceClient::set_tls_tunnel_enabled(bool enabled) { config_.tls_tunnel = enabled; }
+bool AurixVoiceClient::get_tls_tunnel_enabled() const { return config_.tls_tunnel; }
 void AurixVoiceClient::set_auto_capture(bool enabled) { auto_capture_ = enabled; }
 bool AurixVoiceClient::get_auto_capture() const { return auto_capture_; }
 void AurixVoiceClient::set_auto_playback(bool enabled) { auto_playback_ = enabled; }
@@ -1154,6 +1156,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_media_path_policy"), &AurixVoiceClient::get_media_path_policy);
     ClassDB::bind_method(D_METHOD("set_quic_enabled", "enabled"), &AurixVoiceClient::set_quic_enabled);
     ClassDB::bind_method(D_METHOD("get_quic_enabled"), &AurixVoiceClient::get_quic_enabled);
+    ClassDB::bind_method(D_METHOD("set_tls_tunnel_enabled", "enabled"), &AurixVoiceClient::set_tls_tunnel_enabled);
+    ClassDB::bind_method(D_METHOD("get_tls_tunnel_enabled"), &AurixVoiceClient::get_tls_tunnel_enabled);
     ClassDB::bind_method(D_METHOD("set_auto_capture", "enabled"), &AurixVoiceClient::set_auto_capture);
     ClassDB::bind_method(D_METHOD("get_auto_capture"), &AurixVoiceClient::get_auto_capture);
     ClassDB::bind_method(D_METHOD("set_auto_playback", "enabled"), &AurixVoiceClient::set_auto_playback);
@@ -1177,8 +1181,9 @@ void AurixVoiceClient::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::INT, "jitter_target_frames"), "set_jitter_target_frames", "get_jitter_target_frames");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vad_gate"), "set_vad_gate_enabled", "get_vad_gate_enabled");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_channel_policy"), "set_follow_channel_policy", "get_follow_channel_policy");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "media_path_policy", PROPERTY_HINT_ENUM, "Auto,UDP Only,Tunnel Only,QUIC Only"), "set_media_path_policy", "get_media_path_policy");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "media_path_policy", PROPERTY_HINT_ENUM, "Auto,UDP Only,Tunnel Only,QUIC Only,TLS Only"), "set_media_path_policy", "get_media_path_policy");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "quic"), "set_quic_enabled", "get_quic_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tls_tunnel"), "set_tls_tunnel_enabled", "get_tls_tunnel_enabled");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_capture"), "set_auto_capture", "get_auto_capture");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_playback"), "set_auto_playback", "get_auto_playback");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_buffer_seconds", PROPERTY_HINT_RANGE, "0.02,1.0,0.01"), "set_playback_buffer_seconds", "get_playback_buffer_seconds");
@@ -1400,10 +1405,13 @@ void AurixVoiceClient::_bind_methods() {
     BIND_ENUM_CONSTANT(MEDIA_UDP);
     BIND_ENUM_CONSTANT(MEDIA_TUNNEL);
     BIND_ENUM_CONSTANT(MEDIA_QUIC);
+    BIND_ENUM_CONSTANT(MEDIA_WEBRTC);
+    BIND_ENUM_CONSTANT(MEDIA_TLS);
     BIND_ENUM_CONSTANT(MEDIA_PATH_AUTO);
     BIND_ENUM_CONSTANT(MEDIA_PATH_UDP_ONLY);
     BIND_ENUM_CONSTANT(MEDIA_PATH_TUNNEL_ONLY);
     BIND_ENUM_CONSTANT(MEDIA_PATH_QUIC_ONLY);
+    BIND_ENUM_CONSTANT(MEDIA_PATH_TLS_ONLY);
     BIND_ENUM_CONSTANT(MODERATION_KICK);
     BIND_ENUM_CONSTANT(MODERATION_MUTE);
     BIND_ENUM_CONSTANT(MODERATION_UNMUTE);

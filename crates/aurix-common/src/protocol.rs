@@ -905,9 +905,16 @@ pub enum ControlMessage {
         /// the client's address changes. Absent when the node runs UDP/tunnel only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic: Option<QuicInfo>,
+        /// The node listens for AURX over TLS on a dedicated TCP port (normally 443): the
+        /// same sealed packets as length-prefixed frames on a TLS 1.3 stream, `SessionBind`
+        /// first. For networks that block UDP and the WebSocket port. Absent when
+        /// `media.tls_tunnel_port` is unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tls_tunnel: Option<TlsTunnelInfo>,
     },
     /// Sent by the server once a media path has been authenticated via `SessionBind`:
-    /// `transport` is `udp`, `quic`, `tunnel` (AURX over this WebSocket) or `webrtc`.
+    /// `transport` is `udp`, `quic`, `tls` (dedicated TLS tunnel), `tunnel` (AURX over this
+    /// WebSocket) or `webrtc`.
     MediaBound {
         session_id: SessionId,
         #[serde(default)]
@@ -1570,6 +1577,25 @@ pub struct QuicInfo {
 
 /// ALPN token of the native media QUIC endpoint.
 pub const QUIC_ALPN: &[u8] = b"aurix-media/1";
+
+/// Dedicated TLS media tunnel (`SessionInitAck.tls_tunnel`): a TCP listener, normally on
+/// 443, that speaks TLS 1.3 with ALPN [`TLS_TUNNEL_ALPN`] and carries sealed AURX packets as
+/// length-prefixed frames ([`crate::framing`]). For networks that block UDP *and* the
+/// WebSocket port; same certificate pin and server name as [`QuicInfo`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TlsTunnelInfo {
+    /// `host:port` endpoints of the tunnel (public IPs of the node, or the operator's
+    /// TLS-passthrough proxy), IPv4 first.
+    pub addrs: Vec<String>,
+    /// Lowercase hex SHA-256 of the node's DER-encoded end-entity certificate.
+    pub cert_sha256: String,
+    /// TLS server name the client presents as SNI (matches the certificate's SAN; a proxy
+    /// may route on it).
+    pub server_name: String,
+}
+
+/// ALPN token of the dedicated TLS media tunnel.
+pub const TLS_TUNNEL_ALPN: &[u8] = b"aurix-tunnel/1";
 
 /// The first byte of a QUIC packet has the fixed bit (0x40) set; AURX packets start with the
 /// `MAGIC_BYTES` `A` (0x41, fixed bit set too) so they are told apart by the full magic, and

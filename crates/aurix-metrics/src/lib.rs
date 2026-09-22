@@ -478,6 +478,45 @@ pub static QUIC_MIGRATIONS: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
+/// `direction` is `uplink`/`downlink`; `outcome` is `received`/`sent`, `dropped` (downlink
+/// queue full or connection gone), `rejected` (uplink packet that failed decoding or
+/// authentication) or `malformed` (framing violation — the connection is closed).
+pub static TLS_TUNNEL_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_tls_tunnel_packets_total",
+        "AURX packets carried as frames on the dedicated TLS tunnel port",
+        &["direction", "outcome"]
+    )
+    .unwrap()
+});
+
+/// `outcome` is `accepted`, `refused` (connection cap), `failed` (TLS handshake error or
+/// wrong ALPN) or `unbound` (no authenticated `SessionBind` within the bind timeout).
+pub static TLS_TUNNEL_HANDSHAKES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_tls_tunnel_handshakes_total",
+        "Incoming connection attempts on the TLS tunnel port",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+pub static TLS_TUNNEL_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_tls_tunnel_connections",
+        "Open connections on the TLS tunnel port (bound to a session or not yet)"
+    )
+    .unwrap()
+});
+
+pub static TLS_TUNNEL_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_tls_tunnel_sessions",
+        "Native sessions whose media is currently bound through the TLS tunnel"
+    )
+    .unwrap()
+});
+
 /// `kind` is `shared` (one mix for every uniform receiver of a channel) or `private`.
 pub static DOWNLINK_MIXERS: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
@@ -563,6 +602,10 @@ pub fn gather_metrics() -> String {
     let _ = &*QUIC_CONNECTIONS;
     let _ = &*QUIC_SESSIONS;
     let _ = &*QUIC_MIGRATIONS;
+    let _ = &*TLS_TUNNEL_PACKETS;
+    let _ = &*TLS_TUNNEL_HANDSHAKES;
+    let _ = &*TLS_TUNNEL_CONNECTIONS;
+    let _ = &*TLS_TUNNEL_SESSIONS;
     let _ = &*DOWNLINK_MIXERS;
     let _ = &*DOWNLINK_MIX_FRAMES;
     let _ = &*STREAMS_CAPPED;

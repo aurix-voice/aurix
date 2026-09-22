@@ -130,10 +130,13 @@ namespace Aurix.Unity
         public bool ReconnectOnNetworkChange = true;
 
         [Header("Media path")]
-        [Tooltip("Auto: UDP, falling back to the same sealed AURX packets as binary frames on the control WebSocket " +
-                 "when UDP does not bind or its heartbeats die (re-probing UDP periodically). UdpOnly: the classic behaviour. " +
-                 "TunnelOnly: always tunnel (testing / networks known to drop UDP). The tunnel is TCP — more latency under loss.")]
+        [Tooltip("Auto: UDP, falling back to the same sealed AURX packets over TCP when UDP does not bind or its heartbeats die: " +
+                 "first the node's dedicated TLS tunnel (usually port 443), then binary frames on the control WebSocket " +
+                 "(re-probing UDP periodically). UdpOnly: the classic behaviour. TunnelOnly / TlsOnly: always that tunnel " +
+                 "(testing / networks known to drop UDP). Tunnels are TCP — more latency under loss.")]
         public MediaPathPolicy MediaPath = MediaPathPolicy.Auto;
+        [Tooltip("Let Auto use the node's TLS media tunnel (port 443) before the WebSocket tunnel.")]
+        public bool TlsTunnel = true;
         [Tooltip("Consecutive unanswered UDP heartbeats (5 s apart) before Auto moves to the tunnel. 0 = never.")]
         [Range(0, 10)] public int UdpFallbackLostHeartbeats = 3;
         [Tooltip("Seconds between UDP re-probes while tunnelled; the media moves back to UDP as soon as one is answered. 0 = never.")]
@@ -387,6 +390,7 @@ namespace Aurix.Unity
             Client.Mixer = _mixer;
             Client.FollowChannelPolicy = FollowChannelPolicy;
             Client.MediaPathPolicy = MediaPath;
+            Client.TlsTunnel = TlsTunnel;
             Client.UdpFallbackLostHeartbeats = UdpFallbackLostHeartbeats;
             Client.UdpReprobeInterval = TimeSpan.FromSeconds(Math.Max(0f, UdpReprobeIntervalSeconds));
             Client.SetEncoderSettings(EncoderSettingsFromInspector());

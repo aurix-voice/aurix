@@ -65,12 +65,14 @@ enum class EAurixDownlinkMode : uint8
 UENUM(BlueprintType)
 enum class EAurixMediaPathPolicy : uint8
 {
-	/** QUIC (when the node offers it and bQuic), then UDP; the WebSocket tunnel when both are blocked; back to a native link once it answers again. */
+	/** QUIC (when the node offers it and bQuic), then UDP; the TLS tunnel (when offered and bTlsTunnel) and then the WebSocket tunnel when both are blocked; back to a native link once it answers again. */
 	Auto,
 	UdpOnly,
 	TunnelOnly,
 	/** QUIC only; a node without QUIC (or a blocked media port) fails the connection. */
 	QuicOnly,
+	/** TLS tunnel only; a node without the tunnel port (or a blocked port) fails the connection. */
+	TlsOnly,
 };
 
 /** Link the media currently travels over. */
@@ -85,6 +87,8 @@ enum class EAurixMediaPath : uint8
 	Tunnel,
 	/** Native AURX as QUIC datagrams (0-RTT reconnect, connection migration on NetworkChanged). */
 	Quic,
+	/** AURX packets as frames on a TLS connection to the node's dedicated tunnel port (normally 443; TCP: higher latency under loss). */
+	Tls,
 };
 
 UENUM(BlueprintType)
@@ -512,8 +516,8 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	bool bVadGate = true;
 
 	/**
-	 * Media link: QUIC (when offered) then UDP with the WebSocket tunnel as fallback (default), or
-	 * exactly one of them. Every link keeps the same session, SSRC, key and encryption; only
+	 * Media link: QUIC (when offered) then UDP with the TLS tunnel (port 443) and then the WebSocket
+	 * tunnel as fallbacks (default), or exactly one of them. Every link keeps the same session, SSRC, key and encryption; only
 	 * latency under loss and reconnect behaviour differ.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
@@ -523,7 +527,11 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
 	bool bQuic = true;
 
-	/** Auto: unanswered QUIC/UDP heartbeats in a row before media moves to the tunnel (0 = never mid-session). */
+	/** Auto: when neither QUIC nor UDP binds, try the node's dedicated TLS tunnel port (normally 443) before the WebSocket tunnel. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
+	bool bTlsTunnel = true;
+
+	/** Auto: unanswered QUIC/UDP heartbeats in a row before media moves to a tunnel (0 = never mid-session). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Network")
 	int32 UdpFallbackLostHeartbeats = 3;
 
@@ -594,6 +602,10 @@ struct AURIXVOICE_API FAurixSessionInfo
 	/** The node accepts media as QUIC datagrams on its media port (0-RTT reconnect, migration). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bMediaQuic = false;
+
+	/** The node accepts media as frames on its dedicated TLS tunnel port (normally 443). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bMediaTls = false;
 
 	/** The node can deliver one server-mixed stream per channel (SetDownlinkMode Mixed). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")

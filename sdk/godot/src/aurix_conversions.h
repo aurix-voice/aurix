@@ -48,6 +48,7 @@ inline Dictionary session_to_dict(const AurixSessionInfo& s) {
     d["migrated"] = s.migrated;
     d["media_tunnel"] = s.media_tunnel;
     d["media_quic"] = s.media_quic;
+    d["media_tls"] = s.media_tls;
     d["downlink_mix"] = s.downlink_mix;
     d["translation"] = s.translation;
     d["translation_speech"] = s.translation_speech;

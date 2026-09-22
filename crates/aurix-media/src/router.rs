@@ -32,6 +32,7 @@ use crate::channel::{MediaChannel, Mix};
 use crate::mix::MixHub;
 use crate::quic::QuicLink;
 use crate::session::{MediaEndpoint, MediaSession, Transport};
+use crate::tls::TlsLink;
 use crate::transcode::{PcmuDownlink, PcmuUplink};
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{ForwardMedia, WebRtcManager};
@@ -110,6 +111,7 @@ enum PacketSource<'a> {
     Udp(SocketAddr),
     Tunnel(&'a Arc<MediaTunnel>),
     Quic(&'a Arc<QuicLink>),
+    Tls(&'a Arc<TlsLink>),
 }
 
 impl std::fmt::Display for PacketSource<'_> {
@@ -118,6 +120,7 @@ impl std::fmt::Display for PacketSource<'_> {
             PacketSource::Udp(addr) => write!(f, "{addr}"),
             PacketSource::Tunnel(t) => write!(f, "tunnel#{}", t.id()),
             PacketSource::Quic(l) => write!(f, "quic#{} ({})", l.id(), l.remote_address()),
+            PacketSource::Tls(l) => write!(f, "tls#{} ({})", l.id(), l.remote_address()),
         }
     }
 }
@@ -227,6 +230,26 @@ impl PacketRouter {
         })
     }
 
+    /// Routes one AURX packet that arrived as a frame on the TLS tunnel connection `link`.
+    pub async fn route_tls_packet(&self, data: &[u8], link: &Arc<TlsLink>) -> Result<()> {
+        let res = self.route_from(data, PacketSource::Tls(link)).await;
+        aurix_metrics::TLS_TUNNEL_PACKETS
+            .with_label_values(&["uplink", if res.is_ok() { "received" } else { "rejected" }])
+            .inc();
+        res
+    }
+
+    /// A TLS tunnel connection closed: drop it as the media path of the session it was bound
+    /// to (unless a newer bind already moved the session elsewhere).
+    pub fn tls_link_closed(&self, link: &TlsLink) -> bool {
+        link.session_id().is_some_and(|session_id| {
+            self.shared
+                .sessions_by_id
+                .get(&session_id)
+                .is_some_and(|s| s.clear_tls(link))
+        })
+    }
+
     async fn route_from(&self, data: &[u8], source: PacketSource<'_>) -> Result<()> {
         let mut packet = AurixPacket::decode(data)?;
         if packet.header.packet_type == PacketType::SessionBind {
@@ -323,6 +346,25 @@ impl PacketRouter {
                 }
                 session
             }
+            PacketSource::Tls(link) => {
+                let session_id = link.session_id().ok_or_else(|| {
+                    AurixError::AuthenticationFailed("Unbound TLS tunnel connection".into())
+                })?;
+                let session = self
+                    .shared
+                    .sessions_by_id
+                    .get(&session_id)
+                    .map(|s| s.value().clone())
+                    .ok_or_else(|| {
+                        AurixError::SessionNotFound("TLS tunnel session is gone".into())
+                    })?;
+                if !session.tls().is_some_and(|l| *l == **link) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "Stale TLS tunnel connection".into(),
+                    ));
+                }
+                session
+            }
         };
         if !session.is_active() {
             return Err(AurixError::SessionNotFound("Session inactive".into()));
@@ -378,14 +420,17 @@ impl PacketRouter {
                 ));
             }
         }
-        if let PacketSource::Quic(link) = source {
-            // A connection that already authenticated as one session stays that session's.
-            if link.session_id().is_some_and(|owner| owner != session_id) {
-                aurix_metrics::PACKETS_DROPPED.inc();
-                return Err(AurixError::AuthenticationFailed(
-                    "SessionBind for a session the connection does not own".into(),
-                ));
-            }
+        // A connection that already authenticated as one session stays that session's.
+        let owner = match source {
+            PacketSource::Quic(link) => link.session_id(),
+            PacketSource::Tls(link) => link.session_id(),
+            PacketSource::Udp(_) | PacketSource::Tunnel(_) => None,
+        };
+        if owner.is_some_and(|owner| owner != session_id) {
+            aurix_metrics::PACKETS_DROPPED.inc();
+            return Err(AurixError::AuthenticationFailed(
+                "SessionBind for a session the connection does not own".into(),
+            ));
         }
         let session = self
             .shared
@@ -456,6 +501,17 @@ impl PacketRouter {
                 }
                 MediaTransportKind::Quic
             }
+            PacketSource::Tls(link) => {
+                if !link.claim(session_id) {
+                    return Err(AurixError::AuthenticationFailed(
+                        "TLS tunnel connection already owned by another session".into(),
+                    ));
+                }
+                if let Some(old) = session.set_tls(link.clone()) {
+                    self.shared.sessions_by_addr.remove(&old);
+                }
+                MediaTransportKind::Tls
+            }
         };
         session.update_heartbeat();
 
@@ -483,6 +539,9 @@ impl PacketRouter {
             }
             PacketSource::Quic(link) => {
                 link.send(Bytes::copy_from_slice(bytes));
+            }
+            PacketSource::Tls(link) => {
+                link.send(bytes.to_vec());
             }
         }
     }
@@ -1142,6 +1201,16 @@ impl PacketRouter {
                         MediaEndpoint::Quic(link) => {
                             let n = out.len() as u64;
                             if link.send(out.freeze()) {
+                                receiver.record_packet_sent(n);
+                                aurix_metrics::PACKETS_SENT.inc();
+                                aurix_metrics::BYTES_SENT.inc_by(n);
+                            } else {
+                                aurix_metrics::PACKETS_DROPPED.inc();
+                            }
+                        }
+                        MediaEndpoint::Tls(link) => {
+                            let n = out.len() as u64;
+                            if link.send(out.to_vec()) {
                                 receiver.record_packet_sent(n);
                                 aurix_metrics::PACKETS_SENT.inc();
                                 aurix_metrics::BYTES_SENT.inc_by(n);

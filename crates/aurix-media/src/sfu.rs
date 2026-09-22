@@ -1,5 +1,6 @@
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::{CascadeOptions, CascadeRelay};
+use crate::cert::MediaCert;
 use crate::channel::MediaChannel;
 use crate::mix::MixHub;
 use crate::mixer::MixerConfig;
@@ -7,12 +8,13 @@ use crate::quality::{MosAlertPolicy, QualityTick};
 use crate::quic::{QuicLink, QuicOptions, QuicServer};
 use crate::router::{MediaEvent, PacketRouter, RouterShared};
 use crate::session::{MediaSession, ReceiverPrefs, Transport, DEFAULT_UNFOCUSED_GAIN};
+use crate::tls::{TlsLink, TlsTunnelOptions, TlsTunnelServer};
 use crate::transport::bind_media_socket;
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
 use aurix_common::crypto::CryptoProvider;
 use aurix_common::error::{AurixError, Result};
-use aurix_common::protocol::{channel_id_hash, QuicInfo};
+use aurix_common::protocol::{channel_id_hash, QuicInfo, TlsTunnelInfo};
 use aurix_common::sink::AudioSink;
 use aurix_common::types::*;
 use aurix_common::usage::{UsageMeter, UsageMetric};
@@ -99,6 +101,9 @@ pub struct SfuOptions {
     pub tunnel_queue_packets: usize,
     /// AURX over QUIC datagrams on the media socket (see `MediaConfig::quic*`).
     pub quic: QuicOptions,
+    /// AURX over a dedicated TLS/TCP listener (see `MediaConfig::tls_tunnel_*`). Shares the
+    /// certificate configured in `quic`.
+    pub tls_tunnel: TlsTunnelOptions,
     /// Serve native sessions one server-mixed stream per channel on request
     /// (see `MediaConfig::downlink_mix`).
     pub downlink_mix: bool,
@@ -132,6 +137,7 @@ impl Default for SfuOptions {
             media_tunnel: true,
             tunnel_queue_packets: 128,
             quic: QuicOptions::default(),
+            tls_tunnel: TlsTunnelOptions::default(),
             downlink_mix: true,
             webrtc_participant_streams: 16,
         }
@@ -152,6 +158,7 @@ pub struct SfuNode {
     webrtc_manager: Option<Arc<WebRtcManager>>,
     router: Option<Arc<PacketRouter>>,
     quic: Option<Arc<QuicServer>>,
+    tls_tunnel: Option<Arc<TlsTunnelServer>>,
     cascade: Option<Arc<CascadeRelay>>,
     audio_pipeline: Option<Arc<AudioAnalysisPipeline>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
@@ -187,6 +194,7 @@ impl SfuNode {
             webrtc_manager: None,
             router: None,
             quic: None,
+            tls_tunnel: None,
             cascade: None,
             audio_pipeline: None,
             audio_sink: None,
@@ -281,6 +289,17 @@ impl SfuNode {
     /// disabled or the node is not started) — advertised in `SessionInitAck.quic`.
     pub fn quic_info(&self) -> Option<QuicInfo> {
         self.quic.as_ref().map(|q| q.info().clone())
+    }
+
+    /// The TLS tunnel listener; `None` until `start` or when disabled.
+    pub fn tls_tunnel(&self) -> Option<&Arc<TlsTunnelServer>> {
+        self.tls_tunnel.as_ref()
+    }
+
+    /// What native clients need to reach the TLS tunnel (`None` when disabled or the node is
+    /// not started) — advertised in `SessionInitAck.tls_tunnel`.
+    pub fn tls_tunnel_info(&self) -> Option<TlsTunnelInfo> {
+        self.tls_tunnel.as_ref().map(|t| t.info().clone())
     }
 
     /// Subscribe to media-plane notifications (speaking/mute changes, session binds).
@@ -496,8 +515,24 @@ impl SfuNode {
                 }));
         }
 
-        let quic = if self.options.quic.enabled {
-            let server = QuicServer::start(socket.clone(), self.options.quic.clone())?;
+        let tls_wanted = self.options.tls_tunnel.enabled;
+        let cert = if self.options.quic.enabled || tls_wanted {
+            let pair = self
+                .options
+                .quic
+                .cert
+                .as_ref()
+                .map(|(c, k)| (c.as_path(), k.as_path()));
+            Some(MediaCert::load_or_generate(
+                pair,
+                &self.options.quic.server_name,
+            )?)
+        } else {
+            None
+        };
+
+        let quic = if let Some(cert) = cert.as_ref().filter(|_| self.options.quic.enabled) {
+            let server = QuicServer::start(socket.clone(), self.options.quic.clone(), cert)?;
             let on_datagram = {
                 let router = router.clone();
                 move |link: Arc<QuicLink>, data: bytes::Bytes| {
@@ -517,6 +552,35 @@ impl SfuNode {
                 }
             };
             server.clone().run_accept_loop(on_datagram, on_closed);
+            Some(server)
+        } else {
+            None
+        };
+
+        let tls_tunnel = if let Some(cert) = cert.as_ref().filter(|_| tls_wanted) {
+            let bind = SocketAddr::new(bind_addr.ip(), self.options.tls_tunnel.port);
+            let server =
+                TlsTunnelServer::bind(bind, &advertised, self.options.tls_tunnel.clone(), cert)
+                    .await?;
+            let on_packet = {
+                let router = router.clone();
+                move |link: Arc<TlsLink>, data: Vec<u8>| {
+                    let router = router.clone();
+                    Box::pin(async move {
+                        if let Err(e) = router.route_tls_packet(&data, &link).await {
+                            tracing::debug!("Packet dropped from tls#{}: {}", link.id(), e);
+                        }
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                }
+            };
+            let on_closed = {
+                let router = router.clone();
+                move |link: Arc<TlsLink>| {
+                    router.tls_link_closed(&link);
+                }
+            };
+            server.clone().run_accept_loop(on_packet, on_closed);
             Some(server)
         } else {
             None
@@ -574,6 +638,7 @@ impl SfuNode {
         self.advertised = advertised.clone();
         self.router = Some(router);
         self.quic = quic;
+        self.tls_tunnel = tls_tunnel;
         self.started = true;
         info!(
             "SFU node {} started in region {:?}, listening on {} ({:?}, advertised {:?})",
@@ -1213,6 +1278,9 @@ impl SfuNode {
         }
         if let Some(quic) = &self.quic {
             quic.shutdown();
+        }
+        if let Some(tls) = &self.tls_tunnel {
+            tls.shutdown();
         }
         if let Some(cascade) = &self.cascade {
             cascade.shutdown();

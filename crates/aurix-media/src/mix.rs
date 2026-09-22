@@ -198,6 +198,7 @@ impl MixNode {
                 },
                 MediaEndpoint::Tunnel(tunnel) => tunnel.send(out.to_vec()),
                 MediaEndpoint::Quic(link) => link.send(out.freeze()),
+                MediaEndpoint::Tls(link) => link.send(out.to_vec()),
             };
             if sent {
                 session.record_packet_sent(n);

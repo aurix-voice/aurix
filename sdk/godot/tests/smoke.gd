@@ -116,6 +116,12 @@ func _init() -> void:
 	client.quic = true
 	_check(not client.network_changed(), "network_changed without a client is false")
 	_check(AurixVoiceClient.MEDIA_QUIC == 3, "media path quic constant")
+	_check(AurixVoiceClient.MEDIA_TLS == 5, "media path tls constant")
+	_check(AurixVoiceClient.MEDIA_PATH_TLS_ONLY == 4, "tls-only media path policy constant")
+	_check(client.tls_tunnel, "tls tunnel preferred over the websocket tunnel by default")
+	client.tls_tunnel = false
+	_check(not client.tls_tunnel, "tls tunnel switch stored")
+	client.tls_tunnel = true
 	client.auto_reconnect = false
 	client.reconnect_max_attempts = 3
 	_check(not client.auto_reconnect and client.reconnect_max_attempts == 3, "reconnect settings stored")

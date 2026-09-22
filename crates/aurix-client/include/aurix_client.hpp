@@ -465,7 +465,7 @@ public:
     /// channels); needs `AurixSessionInfo.downlink_mix`. Acked by `AURIX_EVENT_DOWNLINK_MODE_CHANGED`.
     AurixResult set_downlink_mode(AurixDownlinkMode mode) { return aurix_client_set_downlink_mode(c_, mode); }
     AurixDownlinkMode downlink_mode() const { return aurix_client_downlink_mode(c_); }
-    /// Link the media currently uses (QUIC, UDP or the WebSocket tunnel); `AURIX_MEDIA_NONE` before bind.
+    /// Link the media currently uses (QUIC, UDP, the TLS tunnel or the WebSocket tunnel); `AURIX_MEDIA_NONE` before bind.
     AurixMediaPath media_path() const { return aurix_client_media_path(c_); }
     /// The device's network changed: migrate a QUIC link in place / re-announce a UDP one.
     bool network_changed() { return aurix_client_network_changed(c_); }

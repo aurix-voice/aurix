@@ -27,9 +27,10 @@
 //!   control channel (`SessionInitAck.quic.cert_sha256`) and pinned by the client, so no PKI
 //!   is needed and no CA can impersonate the node.
 
+use crate::cert::MediaCert;
 use crate::transport::MediaSocket;
 use aurix_common::protocol::{QuicInfo, QUIC_ALPN};
-use aurix_common::quic::{cert_fingerprint, endpoint_config, transport_config};
+use aurix_common::quic::{endpoint_config, transport_config};
 use aurix_common::types::SessionId;
 use aurix_common::{AurixError, Result};
 use parking_lot::Mutex;
@@ -312,67 +313,20 @@ impl std::fmt::Debug for QuicServer {
     }
 }
 
-/// Loads the operator PEM pair or generates a self-signed certificate for `server_name`.
-fn load_or_generate_cert(
-    options: &QuicOptions,
-) -> Result<(
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
-    if let Some((cert_path, key_path)) = &options.cert {
-        let cert_pem = std::fs::read(cert_path).map_err(|e| {
-            AurixError::InvalidConfiguration(format!(
-                "media.quic_cert_path {}: {e}",
-                cert_path.display()
-            ))
-        })?;
-        let key_pem = std::fs::read(key_path).map_err(|e| {
-            AurixError::InvalidConfiguration(format!(
-                "media.quic_key_path {}: {e}",
-                key_path.display()
-            ))
-        })?;
-        use rustls::pki_types::pem::PemObject;
-        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| AurixError::InvalidConfiguration(format!("media.quic_cert_path: {e}")))?;
-        if certs.is_empty() {
-            return Err(AurixError::InvalidConfiguration(
-                "media.quic_cert_path contains no certificate".into(),
-            ));
-        }
-        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
-            .map_err(|e| AurixError::InvalidConfiguration(format!("media.quic_key_path: {e}")))?;
-        return Ok((certs, key));
-    }
-    let generated = rcgen::generate_simple_self_signed(vec![options.server_name.clone()])
-        .map_err(|e| AurixError::Internal(format!("QUIC self-signed certificate: {e}")))?;
-    let cert = generated.cert.der().clone();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-        generated.signing_key.serialize_der(),
-    ));
-    Ok((vec![cert], key))
-}
-
 impl QuicServer {
-    /// Creates the endpoint on `socket`. `heartbeat` is the client heartbeat period (used to
-    /// size the idle timeout sanity floor). Returns the server and the queue the receive
-    /// workers feed QUIC datagrams into.
-    pub fn start(socket: Arc<MediaSocket>, options: QuicOptions) -> Result<Arc<Self>> {
-        let (certs, key) = load_or_generate_cert(&options)?;
+    /// Creates the endpoint on `socket` with the node's media certificate (shared with the
+    /// TLS tunnel, so one pin covers both).
+    pub fn start(
+        socket: Arc<MediaSocket>,
+        options: QuicOptions,
+        cert: &MediaCert,
+    ) -> Result<Arc<Self>> {
         let info = QuicInfo {
-            cert_sha256: cert_fingerprint(&certs[0]),
-            server_name: options.server_name.clone(),
+            cert_sha256: cert.fingerprint().to_string(),
+            server_name: cert.server_name().to_string(),
         };
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| AurixError::Internal(format!("QUIC TLS config: {e}")))?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| AurixError::InvalidConfiguration(format!("QUIC certificate: {e}")))?;
-        tls.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+        let mut tls = cert.server_config(QUIC_ALPN)?;
         // 0-RTT needs resumption state; keep enough for the connection cap (or a sane default).
         let tickets = if options.max_connections > 0 {
             options.max_connections.saturating_mul(2).max(256)
@@ -565,9 +519,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn self_signed_cert_is_generated_when_unconfigured() {
-        let (certs, _key) = load_or_generate_cert(&QuicOptions::default()).unwrap();
-        assert_eq!(certs.len(), 1);
-        assert_eq!(cert_fingerprint(&certs[0]).len(), 64);
+    fn options_default_to_self_signed_media_identity() {
+        let options = QuicOptions::default();
+        assert!(options.cert.is_none());
+        let cert = MediaCert::self_signed(&options.server_name).unwrap();
+        assert_eq!(cert.fingerprint().len(), 64);
     }
 }

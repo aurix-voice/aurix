@@ -30,8 +30,8 @@ extends Node
 enum { RESULT_OK = 0, RESULT_NULL_POINTER = 1, RESULT_INVALID_ARGUMENT = 2, RESULT_NOT_CONNECTED = 3, RESULT_CLOSED = 4, RESULT_TRANSPORT = 5, RESULT_UNAUTHORIZED = 6, RESULT_TIMEOUT = 7, RESULT_SERVER_REJECTED = 8, RESULT_CODEC = 9, RESULT_PROTOCOL = 10 }
 enum { STATE_DISCONNECTED = 0, STATE_CONNECTING = 1, STATE_CONNECTED = 2, STATE_MEDIA_BOUND = 3, STATE_RECONNECTING = 4, STATE_FAILED = 5 }
 enum { TRANSMIT_NONE = 0, TRANSMIT_SINGLE = 1, TRANSMIT_ALL = 2 }
-## Browsers always use WebRTC; `MEDIA_WEBRTC` extends the native `MediaPath` values.
-enum { MEDIA_NONE = 0, MEDIA_UDP = 1, MEDIA_TUNNEL = 2, MEDIA_QUIC = 3, MEDIA_WEBRTC = 4 }
+## Browsers always use WebRTC; the values match the native `AurixVoiceClient.MediaPath`.
+enum { MEDIA_NONE = 0, MEDIA_UDP = 1, MEDIA_TUNNEL = 2, MEDIA_QUIC = 3, MEDIA_WEBRTC = 4, MEDIA_TLS = 5 }
 enum { MODERATION_KICK = 0, MODERATION_MUTE = 1, MODERATION_UNMUTE = 2 }
 enum { ROLE_LISTENER = 0, ROLE_SPEAKER = 1, ROLE_MODERATOR = 2, ROLE_ADMINISTRATOR = 3 }
 enum { TTS_BOTH = 0, TTS_CHANNEL = 1, TTS_LOCAL = 2 }
@@ -1344,6 +1344,7 @@ func _apply_session(info: Variant) -> void:
 		"migrated": i.get("migrated", false) == true,
 		"media_tunnel": false,
 		"media_quic": false,
+		"media_tls": false,
 		"media_webrtc": true,
 		"downlink_mix": true,
 		"participant_stream_cap": int(i.get("participantStreamCap", 0)),

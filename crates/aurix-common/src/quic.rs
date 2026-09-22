@@ -7,7 +7,7 @@
 //! one, so authentication, replay protection and E2EE do not depend on TLS at all.
 
 use crate::error::{AurixError, Result};
-use crate::protocol::{QuicInfo, MAX_PACKET_SIZE, QUIC_ALPN};
+use crate::protocol::{QuicInfo, MAX_PACKET_SIZE, QUIC_ALPN, TLS_TUNNEL_ALPN};
 use quinn::rustls;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -157,6 +157,21 @@ pub fn client_tls_config(info: &QuicInfo) -> Result<Arc<rustls::ClientConfig>> {
         .with_no_client_auth();
     tls.alpn_protocols = vec![QUIC_ALPN.to_vec()];
     tls.enable_early_data = true;
+    Ok(Arc::new(tls))
+}
+
+/// Client TLS configuration for the dedicated TLS media tunnel of one node: the same pinned
+/// certificate check as [`client_tls_config`], TLS 1.3 only, ALPN [`TLS_TUNNEL_ALPN`].
+pub fn tunnel_tls_config(cert_sha256: &str) -> Result<Arc<rustls::ClientConfig>> {
+    let verifier = PinnedServerVerifier::new(cert_sha256)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| AurixError::Internal(format!("TLS tunnel config: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![TLS_TUNNEL_ALPN.to_vec()];
     Ok(Arc::new(tls))
 }
 

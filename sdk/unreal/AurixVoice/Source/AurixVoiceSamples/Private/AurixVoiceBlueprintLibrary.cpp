@@ -40,6 +40,7 @@ FString UAurixVoiceBlueprintLibrary::MediaPathToText(EAurixMediaPath Path)
 	case EAurixMediaPath::Udp: return TEXT("UDP");
 	case EAurixMediaPath::Tunnel: return TEXT("WebSocket tunnel");
 	case EAurixMediaPath::Quic: return TEXT("QUIC");
+	case EAurixMediaPath::Tls: return TEXT("TLS tunnel");
 	}
 	return TEXT("Unknown");
 }

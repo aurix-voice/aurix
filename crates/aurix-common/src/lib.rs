@@ -6,6 +6,7 @@ pub mod config;
 pub mod crypto;
 pub mod e2ee;
 pub mod error;
+pub mod framing;
 pub mod g711;
 #[cfg(feature = "server")]
 pub mod jitter_buffer;

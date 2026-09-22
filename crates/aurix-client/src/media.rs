@@ -7,6 +7,9 @@
 //!   ([`MediaTransport::rebind`]) on top of UDP; no head-of-line blocking (no streams).
 //! * **UDP**: one socket per session; the receive loop runs on a dedicated OS thread
 //!   (no runtime hop between the socket and the mixer).
+//! * **TLS**: the same sealed packets as length-prefixed frames on a TLS 1.3 connection to the
+//!   node's dedicated tunnel port (normally 443), pinned to the node's advertised certificate.
+//!   For networks that block UDP but let HTTPS through; TCP head-of-line blocking applies.
 //! * **Tunnel**: the same sealed packets as binary frames on the control WebSocket, for
 //!   networks that block UDP. Uplink packets are queued to the control task (bounded, drop on
 //!   overflow), downlink frames are handed in by the control task through
@@ -16,10 +19,12 @@
 //! replay window happy.
 
 use aurix_common::crypto::MediaKeys;
+use aurix_common::framing::{encode_frame, FrameDecoder};
 use aurix_common::protocol::{
-    AurixPacket, PacketFlags, PacketHeader, PacketType, QuicInfo, ReplayWindow, MAX_PACKET_SIZE,
+    AurixPacket, PacketFlags, PacketHeader, PacketType, QuicInfo, ReplayWindow, TlsTunnelInfo,
+    MAX_PACKET_SIZE, TLS_TUNNEL_ALPN,
 };
-use aurix_common::quic::{client_config, client_tls_config, endpoint_config};
+use aurix_common::quic::{client_config, client_tls_config, endpoint_config, tunnel_tls_config};
 use aurix_common::types::{AudioCodec, Direction, SessionId};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -31,6 +36,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsConnector;
 
 use crate::error::ClientError;
 
@@ -44,6 +51,8 @@ pub enum MediaPath {
     Tunnel,
     /// Native AURX as QUIC datagrams on the node's media port (0-RTT, migration).
     Quic,
+    /// Native AURX as frames on a TLS connection to the node's dedicated tunnel port (443).
+    Tls,
 }
 
 /// Link selection policy.
@@ -51,16 +60,19 @@ pub enum MediaPath {
 #[serde(rename_all = "snake_case")]
 pub enum MediaPathPolicy {
     /// QUIC when the node offers it (and `ClientConfig::quic`), then raw UDP; fall back to
-    /// the tunnel when neither binds or heartbeats stop being acknowledged, and re-probe the
+    /// the TLS tunnel (when offered and `ClientConfig::tls_tunnel`), then the WebSocket tunnel
+    /// when nothing native binds or heartbeats stop being acknowledged, and re-probe the
     /// native links periodically while tunnelled.
     #[default]
     Auto,
     /// UDP only; a blocked UDP path fails the connection as before.
     UdpOnly,
-    /// Tunnel only (testing, or hosts known to block UDP).
+    /// WebSocket tunnel only (testing, or hosts known to block UDP).
     TunnelOnly,
     /// QUIC only; a node without QUIC (or a blocked port) fails the connection.
     QuicOnly,
+    /// TLS tunnel only; a node without the tunnel port (or a blocked port) fails the connection.
+    TlsOnly,
 }
 
 /// Shared uplink sequence counter: one per session, handed to every link the session uses.
@@ -222,6 +234,12 @@ pub const TUNNEL_UPLINK_QUEUE: usize = 64;
 /// Datagram queue depth of the QUIC link, in packets, both directions.
 pub const QUIC_QUEUE_PACKETS: usize = 64;
 
+/// Uplink frames that may wait for the TLS writer before the link drops them.
+pub const TLS_UPLINK_QUEUE: usize = 64;
+
+/// Read chunk of the TLS link; frames are reassembled by [`FrameDecoder`].
+const TLS_READ_CHUNK: usize = 4096;
+
 /// Client TLS state for one node: certificate pin plus the resumption tickets rustls stores
 /// in the `ClientConfig`. Keep it across reconnects to the same node (same fingerprint) —
 /// that is what lets the next QUIC connection start with 0-RTT.
@@ -277,6 +295,62 @@ enum Link {
         /// The bind went out as 0-RTT early data and the node accepted it.
         zero_rtt: AtomicBool,
     },
+    Tls {
+        /// Sealed packets for the writer task (framed there); bounded, drop on overflow.
+        uplink: tokio::sync::mpsc::Sender<Vec<u8>>,
+        writer: tokio::task::AbortHandle,
+        /// Read half plus decoder state, handed to the receive task by [`MediaTransport::start`].
+        reader: Mutex<Option<TlsReader>>,
+        server: SocketAddr,
+        local: SocketAddr,
+        closed: Arc<TlsClosed>,
+    },
+}
+
+type TunnelStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+/// Read side of a TLS link between the bind handshake and the receive task.
+pub struct TlsReader {
+    half: tokio::io::ReadHalf<TunnelStream>,
+    decoder: FrameDecoder,
+    buf: Vec<u8>,
+}
+
+impl TlsReader {
+    /// Next complete frame; `Err` once the connection is gone or the peer broke framing.
+    async fn next_frame(&mut self) -> Result<Vec<u8>, String> {
+        loop {
+            match self.decoder.next_frame() {
+                Ok(Some(frame)) => return Ok(frame),
+                Ok(None) => {}
+                Err(e) => return Err(format!("bad frame from the node: {e}")),
+            }
+            let n = self
+                .half
+                .read(&mut self.buf)
+                .await
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("the node closed the TLS tunnel".into());
+            }
+            self.decoder.push(&self.buf[..n]);
+        }
+    }
+}
+
+/// Closed-state of a TLS link, shared by the reader and writer tasks.
+#[derive(Default)]
+struct TlsClosed {
+    flag: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl TlsClosed {
+    fn set(&self, reason: String) {
+        if !self.flag.swap(true, Ordering::Relaxed) {
+            *self.reason.lock() = Some(reason);
+        }
+    }
 }
 
 type Sink = Arc<dyn Fn(IncomingAudio) + Send + Sync>;
@@ -504,6 +578,110 @@ impl MediaTransport {
         Ok(me)
     }
 
+    /// Open a TLS 1.3 connection to the node's dedicated tunnel port (certificate pinned to
+    /// `info.cert_sha256`, ALPN `aurix-tunnel/1`) and authenticate it with `SessionBind` →
+    /// `SessionBindAck`, retrying the bind `attempts` times with `timeout` each (the TCP
+    /// connect and the handshake get one `timeout` each). Must run inside a Tokio runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_tls(
+        server: SocketAddr,
+        info: &TlsTunnelInfo,
+        session_id: SessionId,
+        ssrc: u32,
+        media_key: &[u8],
+        sequence: SequenceCounter,
+        attempts: u32,
+        timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        let transport_err =
+            |e: &dyn std::fmt::Display| ClientError::Transport(format!("TLS tunnel: {e}"));
+        let tls = tunnel_tls_config(&info.cert_sha256).map_err(|e| transport_err(&e))?;
+        let name = rustls::pki_types::ServerName::try_from(info.server_name.clone())
+            .map_err(|e| transport_err(&e))?;
+        let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(server))
+            .await
+            .map_err(|_| ClientError::Timeout("TLS tunnel connect".into()))?
+            .map_err(|e| transport_err(&e))?;
+        let _ = tcp.set_nodelay(true);
+        let local = tcp.local_addr().map_err(|e| transport_err(&e))?;
+        let stream = tokio::time::timeout(timeout, TlsConnector::from(tls).connect(name, tcp))
+            .await
+            .map_err(|_| ClientError::Timeout("TLS tunnel handshake".into()))?
+            .map_err(|e| transport_err(&e))?;
+        if stream.get_ref().1.alpn_protocol() != Some(TLS_TUNNEL_ALPN) {
+            return Err(ClientError::Protocol(
+                "the TLS tunnel peer did not negotiate aurix-tunnel/1".into(),
+            ));
+        }
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let closed = Arc::new(TlsClosed::default());
+        let (uplink, mut uplink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TLS_UPLINK_QUEUE);
+        let writer = {
+            let closed = Arc::clone(&closed);
+            tokio::spawn(async move {
+                while let Some(packet) = uplink_rx.recv().await {
+                    let Some(frame) = encode_frame(&packet) else {
+                        continue;
+                    };
+                    if let Err(e) = write_half.write_all(&frame).await {
+                        closed.set(format!("write failed: {e}"));
+                        break;
+                    }
+                }
+                let _ = write_half.shutdown().await;
+            })
+            .abort_handle()
+        };
+        let mut reader = TlsReader {
+            half: read_half,
+            decoder: FrameDecoder::new(),
+            buf: vec![0u8; TLS_READ_CHUNK],
+        };
+        let me = Self::new(
+            Link::Tls {
+                uplink,
+                writer,
+                reader: Mutex::new(None),
+                server,
+                local,
+                closed: Arc::clone(&closed),
+            },
+            session_id,
+            ssrc,
+            MediaKeys::derive(media_key),
+            sequence,
+        );
+        'attempts: for _ in 0..attempts.max(1) {
+            me.send_bind();
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                match tokio::time::timeout_at(deadline, reader.next_frame()).await {
+                    Err(_) => break,
+                    Ok(Err(e)) => {
+                        closed.set(e.clone());
+                        return Err(ClientError::Transport(format!(
+                            "TLS tunnel lost during bind: {e}"
+                        )));
+                    }
+                    Ok(Ok(frame)) => {
+                        if me.process(&frame, None) == FrameKind::BindAck {
+                            break 'attempts;
+                        }
+                    }
+                }
+            }
+        }
+        if !me.is_bound() {
+            return Err(ClientError::Transport(
+                "no SessionBindAck from media server over the TLS tunnel".into(),
+            ));
+        }
+        if let Link::Tls { reader: slot, .. } = &me.link {
+            *slot.lock() = Some(reader);
+        }
+        Ok(me)
+    }
+
     /// A transport whose packets travel as binary frames on the control WebSocket. Unbound
     /// until the control task has sent [`Self::bind_packet`] and fed the `SessionBindAck`
     /// back through [`Self::handle_frame`].
@@ -555,6 +733,7 @@ impl MediaTransport {
             Link::Udp { .. } => MediaPath::Udp,
             Link::Tunnel { .. } => MediaPath::Tunnel,
             Link::Quic { .. } => MediaPath::Quic,
+            Link::Tls { .. } => MediaPath::Tls,
         }
     }
 
@@ -566,19 +745,21 @@ impl MediaTransport {
         }
     }
 
-    /// The QUIC connection is gone (idle timeout, closed by the node, transport error);
-    /// always `false` for the other links, whose liveness is judged by heartbeats.
+    /// The QUIC or TLS connection is gone (idle timeout, closed by the node, transport
+    /// error); always `false` for the other links, whose liveness is judged by heartbeats.
     pub fn is_closed(&self) -> bool {
         match &self.link {
             Link::Quic { conn, .. } => conn.close_reason().is_some(),
+            Link::Tls { closed, .. } => closed.flag.load(Ordering::Relaxed),
             _ => false,
         }
     }
 
-    /// Why the QUIC connection closed, once it has.
+    /// Why the QUIC or TLS connection closed, once it has.
     pub fn close_reason(&self) -> Option<String> {
         match &self.link {
             Link::Quic { conn, .. } => conn.close_reason().map(|e| e.to_string()),
+            Link::Tls { closed, .. } => closed.reason.lock().clone(),
             _ => None,
         }
     }
@@ -624,10 +805,12 @@ impl MediaTransport {
         .to_vec()
     }
 
-    /// Server address of the UDP / QUIC link.
+    /// Server address of the UDP / QUIC / TLS link.
     pub fn server(&self) -> Option<SocketAddr> {
         match &self.link {
-            Link::Udp { server, .. } | Link::Quic { server, .. } => Some(*server),
+            Link::Udp { server, .. } | Link::Quic { server, .. } | Link::Tls { server, .. } => {
+                Some(*server)
+            }
             Link::Tunnel { .. } => None,
         }
     }
@@ -640,6 +823,7 @@ impl MediaTransport {
         match &self.link {
             Link::Udp { socket, .. } => socket.local_addr().ok(),
             Link::Quic { endpoint, .. } => endpoint.local_addr().ok(),
+            Link::Tls { local, .. } => Some(*local),
             Link::Tunnel { .. } => None,
         }
     }
@@ -660,8 +844,8 @@ impl MediaTransport {
     }
 
     /// Start delivering authenticated audio frames to `sink`: spawns the receive thread on
-    /// UDP, a receive task (on the current Tokio runtime) on QUIC; on a tunnel the control
-    /// task feeds frames through [`Self::handle_frame`].
+    /// UDP, a receive task (on the current Tokio runtime) on QUIC and TLS; on a tunnel the
+    /// control task feeds frames through [`Self::handle_frame`].
     pub fn start(self: &Arc<Self>, sink: Sink) {
         *self.sink.lock() = Some(Arc::clone(&sink));
         match &self.link {
@@ -683,6 +867,27 @@ impl MediaTransport {
                                 me.process(&data, Some(&sink));
                             }
                             Err(_) => break,
+                        }
+                    }
+                });
+                *self.recv_task.lock() = Some(task.abort_handle());
+            }
+            Link::Tls { reader, closed, .. } => {
+                let Some(mut reader) = reader.lock().take() else {
+                    return;
+                };
+                let me = Arc::clone(self);
+                let closed = Arc::clone(closed);
+                let task = tokio::spawn(async move {
+                    while !me.stop.load(Ordering::Relaxed) {
+                        match reader.next_frame().await {
+                            Ok(frame) => {
+                                me.process(&frame, Some(&sink));
+                            }
+                            Err(e) => {
+                                closed.set(e);
+                                break;
+                            }
                         }
                     }
                 });
@@ -826,7 +1031,7 @@ impl MediaTransport {
                     }
                 }
             }
-            Link::Tunnel { uplink } => {
+            Link::Tunnel { uplink } | Link::Tls { uplink, .. } => {
                 if self.stop.load(Ordering::Relaxed) {
                     return;
                 }
@@ -968,8 +1173,8 @@ impl MediaTransport {
         self.replay.lock().remove(&ssrc);
     }
 
-    /// Stop receiving: joins the UDP thread, closes the QUIC connection; a tunnelled transport
-    /// ignores further frames and stops queueing uplink packets.
+    /// Stop receiving: joins the UDP thread, closes the QUIC or TLS connection; a tunnelled
+    /// transport ignores further frames and stops queueing uplink packets.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.bound.store(false, Ordering::Relaxed);
@@ -981,8 +1186,23 @@ impl MediaTransport {
         if let Some(task) = self.recv_task.lock().take() {
             task.abort();
         }
-        if let Link::Quic { conn, .. } = &self.link {
-            conn.close(quinn::VarInt::from_u32(0), b"client stopped");
+        self.close_link("client stopped");
+    }
+
+    fn close_link(&self, reason: &str) {
+        match &self.link {
+            Link::Quic { conn, .. } => conn.close(quinn::VarInt::from_u32(0), reason.as_bytes()),
+            Link::Tls {
+                writer,
+                reader,
+                closed,
+                ..
+            } => {
+                closed.set(reason.into());
+                writer.abort();
+                reader.lock().take();
+            }
+            Link::Udp { .. } | Link::Tunnel { .. } => {}
         }
     }
 }
@@ -990,9 +1210,10 @@ impl MediaTransport {
 impl Drop for MediaTransport {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Link::Quic { conn, .. } = &self.link {
-            conn.close(quinn::VarInt::from_u32(0), b"client dropped");
+        if let Some(task) = self.recv_task.lock().take() {
+            task.abort();
         }
+        self.close_link("client dropped");
     }
 }
 

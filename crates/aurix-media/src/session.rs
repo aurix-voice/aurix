@@ -7,6 +7,7 @@ use aurix_common::types::*;
 
 use crate::quality::{MosAlertPolicy, QualityTick, QualityTrack, UplinkEstimator, UplinkSample};
 use crate::quic::QuicLink;
+use crate::tls::TlsLink;
 use crate::tunnel::MediaTunnel;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -228,6 +229,8 @@ pub enum MediaEndpoint {
     Tunnel(Arc<MediaTunnel>),
     /// QUIC connection on the media port that authenticated a `SessionBind`.
     Quic(Arc<QuicLink>),
+    /// Connection on the dedicated TLS tunnel port that authenticated a `SessionBind`.
+    Tls(Arc<TlsLink>),
 }
 
 impl MediaEndpoint {
@@ -237,6 +240,10 @@ impl MediaEndpoint {
 
     pub fn is_quic(&self) -> bool {
         matches!(self, MediaEndpoint::Quic(_))
+    }
+
+    pub fn is_tls(&self) -> bool {
+        matches!(self, MediaEndpoint::Tls(_))
     }
 
     /// UDP source address to (un)register in the by-address index, if this is a UDP path.
@@ -264,6 +271,15 @@ impl MediaEndpoint {
                 aurix_metrics::QUIC_SESSIONS.inc();
             } else {
                 aurix_metrics::QUIC_SESSIONS.dec();
+            }
+        }
+        let was_tls = previous.is_some_and(|e| e.is_tls());
+        let is_tls = next.is_some_and(|e| e.is_tls());
+        if was_tls != is_tls {
+            if is_tls {
+                aurix_metrics::TLS_TUNNEL_SESSIONS.inc();
+            } else {
+                aurix_metrics::TLS_TUNNEL_SESSIONS.dec();
             }
         }
     }
@@ -469,31 +485,41 @@ impl MediaSession {
         self.endpoint.read().as_ref().is_some_and(|e| e.is_quic())
     }
 
+    /// True while the downlink goes through the TLS tunnel.
+    pub fn is_tls(&self) -> bool {
+        self.endpoint.read().as_ref().is_some_and(|e| e.is_tls())
+    }
+
     /// Wire-level transport as reported to clients and operators.
     pub fn transport_kind(&self) -> MediaTransportKind {
         match self.transport() {
             Transport::WebRtc => MediaTransportKind::WebRtc,
             Transport::Aurx if self.is_tunneled() => MediaTransportKind::Tunnel,
             Transport::Aurx if self.is_quic() => MediaTransportKind::Quic,
+            Transport::Aurx if self.is_tls() => MediaTransportKind::Tls,
             Transport::Aurx => MediaTransportKind::Udp,
         }
     }
 
     /// Installs `next` as the media path and returns the one it displaces. Callers unregister
-    /// a displaced UDP address from the by-address index and close a displaced QUIC link
-    /// (see [`MediaSession::release_displaced`]).
+    /// a displaced UDP address from the by-address index and close a displaced QUIC or TLS
+    /// link (see [`MediaSession::release_displaced`]).
     pub fn replace_endpoint(&self, next: Option<MediaEndpoint>) -> Option<MediaEndpoint> {
         let mut slot = self.endpoint.write();
         MediaEndpoint::track_metrics(slot.as_ref(), next.as_ref());
         std::mem::replace(&mut *slot, next)
     }
 
-    /// Closes a displaced QUIC link (a newer bind superseded it) and returns the displaced UDP
-    /// address, if any, for the caller to unregister.
+    /// Closes a displaced QUIC or TLS link (a newer bind superseded it) and returns the
+    /// displaced UDP address, if any, for the caller to unregister.
     pub fn release_displaced(displaced: Option<MediaEndpoint>) -> Option<SocketAddr> {
         match displaced {
             Some(MediaEndpoint::Udp(addr)) => Some(addr),
             Some(MediaEndpoint::Quic(link)) => {
+                link.close("superseded by a newer media path");
+                None
+            }
+            Some(MediaEndpoint::Tls(link)) => {
                 link.close("superseded by a newer media path");
                 None
             }
@@ -529,8 +555,24 @@ impl MediaSession {
         Self::release_displaced(displaced)
     }
 
-    /// Drops the media path (UDP, tunnel or QUIC — a QUIC link is closed); returns the UDP
-    /// address to unregister, if any.
+    /// Binds the downlink to a TLS tunnel connection; returns the UDP address it replaces, if
+    /// any. A different TLS link the session was on is closed as superseded.
+    pub fn set_tls(&self, link: Arc<TlsLink>) -> Option<SocketAddr> {
+        let mut slot = self.endpoint.write();
+        if let Some(MediaEndpoint::Tls(current)) = slot.as_ref() {
+            if **current == *link {
+                return None;
+            }
+        }
+        let next = Some(MediaEndpoint::Tls(link));
+        MediaEndpoint::track_metrics(slot.as_ref(), next.as_ref());
+        let displaced = std::mem::replace(&mut *slot, next);
+        drop(slot);
+        Self::release_displaced(displaced)
+    }
+
+    /// Drops the media path (UDP, tunnel, QUIC or TLS — a QUIC/TLS link is closed); returns
+    /// the UDP address to unregister, if any.
     pub fn clear_endpoint(&self) -> Option<SocketAddr> {
         Self::release_displaced(self.replace_endpoint(None))
     }
@@ -563,6 +605,20 @@ impl MediaSession {
         }
     }
 
+    /// Drops the TLS link `link` if it is still this session's media path (a later bind may
+    /// already have moved the session elsewhere). Returns whether anything changed.
+    pub fn clear_tls(&self, link: &TlsLink) -> bool {
+        let mut slot = self.endpoint.write();
+        match slot.as_ref() {
+            Some(MediaEndpoint::Tls(current)) if **current == *link => {
+                *slot = None;
+                aurix_metrics::TLS_TUNNEL_SESSIONS.dec();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// UDP source address of the media path (`None` when unbound or tunneled).
     pub fn get_remote_addr(&self) -> Option<SocketAddr> {
         match self.endpoint.read().as_ref() {
@@ -583,6 +639,14 @@ impl MediaSession {
     pub fn quic(&self) -> Option<Arc<QuicLink>> {
         match self.endpoint.read().as_ref() {
             Some(MediaEndpoint::Quic(l)) => Some(l.clone()),
+            _ => None,
+        }
+    }
+
+    /// TLS tunnel link of the media path (`None` when unbound or on another path).
+    pub fn tls(&self) -> Option<Arc<TlsLink>> {
+        match self.endpoint.read().as_ref() {
+            Some(MediaEndpoint::Tls(l)) => Some(l.clone()),
             _ => None,
         }
     }

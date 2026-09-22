@@ -203,8 +203,9 @@ typedef enum AurixNoiseSuppression {
  */
 typedef enum AurixMediaPathPolicy {
   /**
-   * QUIC (when offered and `quic`), then UDP; WebSocket tunnel when both are blocked; back
-   * to a native link when it answers again.
+   * QUIC (when offered and `quic`), then UDP; the TLS tunnel (when offered and
+   * `tls_tunnel`) and then the WebSocket tunnel when both are blocked; back to a native
+   * link when it answers again.
    */
   AURIX_MEDIA_PATH_AUTO = 0,
   AURIX_MEDIA_PATH_UDP_ONLY = 1,
@@ -213,6 +214,11 @@ typedef enum AurixMediaPathPolicy {
    * QUIC only; a node without QUIC (or a blocked media port) fails the connection.
    */
   AURIX_MEDIA_PATH_QUIC_ONLY = 3,
+  /**
+   * TLS tunnel only; a node without the tunnel port (or a blocked port) fails the
+   * connection.
+   */
+  AURIX_MEDIA_PATH_TLS_ONLY = 4,
 } AurixMediaPathPolicy;
 
 /**
@@ -260,6 +266,16 @@ typedef enum AurixMediaPath {
    * `aurix_client_network_changed`).
    */
   AURIX_MEDIA_QUIC = 3,
+  /**
+   * WebRTC; never reported by the native core. Reserved so the browser bridges (Unity
+   * WebGL, Godot Web) share one numbering with the native SDKs.
+   */
+  AURIX_MEDIA_WEBRTC = 4,
+  /**
+   * AURX packets as frames on a TLS connection to the node's dedicated tunnel port
+   * (normally 443; TCP, higher latency under loss).
+   */
+  AURIX_MEDIA_TLS = 5,
 } AurixMediaPath;
 
 typedef enum AurixEventType {
@@ -828,12 +844,12 @@ typedef struct AurixClientConfig {
    */
   struct AurixDspConfig dsp;
   /**
-   * Which link carries media: QUIC (when the node offers it) then UDP, with the WebSocket
-   * tunnel as fallback (default), or exactly one of them.
+   * Which link carries media: QUIC (when the node offers it) then UDP, with the TLS tunnel
+   * (port 443) and then the WebSocket tunnel as fallbacks (default), or exactly one of them.
    */
   enum AurixMediaPathPolicy media_path;
   /**
-   * `Auto`: unanswered QUIC/UDP heartbeats in a row before media moves to the tunnel (0 =
+   * `Auto`: unanswered QUIC/UDP heartbeats in a row before media moves to a tunnel (0 =
    * never fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
    */
   uint32_t udp_fallback_lost_heartbeats;
@@ -868,6 +884,12 @@ typedef struct AurixClientConfig {
    * is UDP → tunnel as before; `AurixMediaPathQuicOnly` ignores this switch.
    */
   bool quic;
+  /**
+   * `Auto`: when neither QUIC nor UDP binds, try the node's dedicated TLS tunnel port
+   * (normally 443) before the WebSocket tunnel (default true); `AurixMediaPathTlsOnly`
+   * ignores this switch.
+   */
+  bool tls_tunnel;
 } AurixClientConfig;
 
 /**
@@ -917,6 +939,10 @@ typedef struct AurixSessionInfo {
    * The node accepts media as QUIC datagrams on its media port.
    */
   bool media_quic;
+  /**
+   * The node accepts media as frames on its dedicated TLS tunnel port (normally 443).
+   */
+  bool media_tls;
 } AurixSessionInfo;
 
 /**

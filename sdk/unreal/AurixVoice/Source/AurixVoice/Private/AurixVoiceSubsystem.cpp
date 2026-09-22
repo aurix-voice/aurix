@@ -199,6 +199,7 @@ EAurixMediaPath ToMediaPath(AurixMediaPath P)
 	case AURIX_MEDIA_UDP: return EAurixMediaPath::Udp;
 	case AURIX_MEDIA_TUNNEL: return EAurixMediaPath::Tunnel;
 	case AURIX_MEDIA_QUIC: return EAurixMediaPath::Quic;
+	case AURIX_MEDIA_TLS: return EAurixMediaPath::Tls;
 	case AURIX_MEDIA_NONE:
 	default: return EAurixMediaPath::None;
 	}
@@ -211,6 +212,7 @@ AurixMediaPathPolicy FromMediaPathPolicy(EAurixMediaPathPolicy P)
 	case EAurixMediaPathPolicy::UdpOnly: return AURIX_MEDIA_PATH_UDP_ONLY;
 	case EAurixMediaPathPolicy::TunnelOnly: return AURIX_MEDIA_PATH_TUNNEL_ONLY;
 	case EAurixMediaPathPolicy::QuicOnly: return AURIX_MEDIA_PATH_QUIC_ONLY;
+	case EAurixMediaPathPolicy::TlsOnly: return AURIX_MEDIA_PATH_TLS_ONLY;
 	case EAurixMediaPathPolicy::Auto:
 	default: return AURIX_MEDIA_PATH_AUTO;
 	}
@@ -272,6 +274,7 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	Out.bResumed = S.resumed;
 	Out.bMediaTunnel = S.media_tunnel;
 	Out.bMediaQuic = S.media_quic;
+	Out.bMediaTls = S.media_tls;
 	Out.bDownlinkMix = S.downlink_mix;
 	Out.bTranslation = S.translation;
 	Out.bTranslationSpeech = S.translation_speech;
@@ -754,6 +757,7 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.vad_gate = Settings.bVadGate;
 	Cfg.raw.media_path = FromMediaPathPolicy(Settings.MediaPath);
 	Cfg.raw.quic = Settings.bQuic;
+	Cfg.raw.tls_tunnel = Settings.bTlsTunnel;
 	Cfg.raw.udp_fallback_lost_heartbeats = static_cast<uint32_t>(FMath::Max(0, Settings.UdpFallbackLostHeartbeats));
 	Cfg.raw.udp_reprobe_interval_ms = static_cast<uint32_t>(FMath::Max(0, Settings.UdpReprobeIntervalMs));
 	Cfg.raw.e2ee = Settings.bE2ee;

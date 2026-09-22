@@ -32,6 +32,7 @@ base64 = { workspace = true }
 tokio-util = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -711,10 +711,10 @@ pub struct AurixClientConfig {
     /// and encoder; `aurix_dsp_config_default` = everything on, `aurix_dsp_config_bypass` for
     /// hosts with their own processing. Changeable later with `aurix_client_set_dsp`.
     pub dsp: AurixDspConfig,
-    /// Which link carries media: QUIC (when the node offers it) then UDP, with the WebSocket
-    /// tunnel as fallback (default), or exactly one of them.
+    /// Which link carries media: QUIC (when the node offers it) then UDP, with the TLS tunnel
+    /// (port 443) and then the WebSocket tunnel as fallbacks (default), or exactly one of them.
     pub media_path: AurixMediaPathPolicy,
-    /// `Auto`: unanswered QUIC/UDP heartbeats in a row before media moves to the tunnel (0 =
+    /// `Auto`: unanswered QUIC/UDP heartbeats in a row before media moves to a tunnel (0 =
     /// never fall back mid-session; the default 3 ≈ 15 s with 5 s heartbeats).
     pub udp_fallback_lost_heartbeats: u32,
     /// `Auto`: how often a tunnelled session re-probes the native links (QUIC, then UDP) and
@@ -736,6 +736,10 @@ pub struct AurixClientConfig {
     /// `Auto`: try QUIC before raw UDP when the node offers it (default true). Off, `Auto`
     /// is UDP → tunnel as before; `AurixMediaPathQuicOnly` ignores this switch.
     pub quic: bool,
+    /// `Auto`: when neither QUIC nor UDP binds, try the node's dedicated TLS tunnel port
+    /// (normally 443) before the WebSocket tunnel (default true); `AurixMediaPathTlsOnly`
+    /// ignores this switch.
+    pub tls_tunnel: bool,
 }
 
 #[no_mangle]
@@ -770,6 +774,7 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         decoder: d.decoder.into(),
         loss_adaptation: d.loss_adaptation.into(),
         quic: d.quic,
+        tls_tunnel: d.tls_tunnel,
     };
 }
 
@@ -777,13 +782,17 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AurixMediaPathPolicy {
-    /// QUIC (when offered and `quic`), then UDP; WebSocket tunnel when both are blocked; back
-    /// to a native link when it answers again.
+    /// QUIC (when offered and `quic`), then UDP; the TLS tunnel (when offered and
+    /// `tls_tunnel`) and then the WebSocket tunnel when both are blocked; back to a native
+    /// link when it answers again.
     AurixMediaPathAuto = 0,
     AurixMediaPathUdpOnly = 1,
     AurixMediaPathTunnelOnly = 2,
     /// QUIC only; a node without QUIC (or a blocked media port) fails the connection.
     AurixMediaPathQuicOnly = 3,
+    /// TLS tunnel only; a node without the tunnel port (or a blocked port) fails the
+    /// connection.
+    AurixMediaPathTlsOnly = 4,
 }
 
 impl From<MediaPathPolicy> for AurixMediaPathPolicy {
@@ -793,6 +802,7 @@ impl From<MediaPathPolicy> for AurixMediaPathPolicy {
             MediaPathPolicy::UdpOnly => Self::AurixMediaPathUdpOnly,
             MediaPathPolicy::TunnelOnly => Self::AurixMediaPathTunnelOnly,
             MediaPathPolicy::QuicOnly => Self::AurixMediaPathQuicOnly,
+            MediaPathPolicy::TlsOnly => Self::AurixMediaPathTlsOnly,
         }
     }
 }
@@ -804,6 +814,7 @@ impl From<AurixMediaPathPolicy> for MediaPathPolicy {
             AurixMediaPathPolicy::AurixMediaPathUdpOnly => Self::UdpOnly,
             AurixMediaPathPolicy::AurixMediaPathTunnelOnly => Self::TunnelOnly,
             AurixMediaPathPolicy::AurixMediaPathQuicOnly => Self::QuicOnly,
+            AurixMediaPathPolicy::AurixMediaPathTlsOnly => Self::TlsOnly,
         }
     }
 }
@@ -823,6 +834,12 @@ pub enum AurixMediaPath {
     /// Native AURX as QUIC datagrams (0-RTT reconnect, connection migration on
     /// `aurix_client_network_changed`).
     AurixMediaQuic = 3,
+    /// WebRTC; never reported by the native core. Reserved so the browser bridges (Unity
+    /// WebGL, Godot Web) share one numbering with the native SDKs.
+    AurixMediaWebrtc = 4,
+    /// AURX packets as frames on a TLS connection to the node's dedicated tunnel port
+    /// (normally 443; TCP, higher latency under loss).
+    AurixMediaTls = 5,
 }
 
 impl From<Option<MediaPath>> for AurixMediaPath {
@@ -832,6 +849,7 @@ impl From<Option<MediaPath>> for AurixMediaPath {
             Some(MediaPath::Udp) => Self::AurixMediaUdp,
             Some(MediaPath::Tunnel) => Self::AurixMediaTunnel,
             Some(MediaPath::Quic) => Self::AurixMediaQuic,
+            Some(MediaPath::Tls) => Self::AurixMediaTls,
         }
     }
 }
@@ -1042,6 +1060,7 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.decoder = c.decoder.into();
     cfg.loss_adaptation = c.loss_adaptation.into();
     cfg.quic = c.quic;
+    cfg.tls_tunnel = c.tls_tunnel;
     Ok(cfg)
 }
 
@@ -1344,6 +1363,8 @@ pub struct AurixSessionInfo {
     pub translation_speech: bool,
     /// The node accepts media as QUIC datagrams on its media port.
     pub media_quic: bool,
+    /// The node accepts media as frames on its dedicated TLS tunnel port (normally 443).
+    pub media_tls: bool,
 }
 
 /// `false` when no session is open.
@@ -1372,6 +1393,7 @@ pub unsafe extern "C" fn aurix_client_session(
                 translation: s.translation.is_some(),
                 translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
                 media_quic: s.media_quic,
+                media_tls: s.media_tls,
             };
             true
         }
@@ -2390,6 +2412,7 @@ pub unsafe extern "C" fn aurix_event_session(
                 translation: s.translation.is_some(),
                 translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
                 media_quic: s.media_quic,
+                media_tls: s.media_tls,
             };
             true
         }

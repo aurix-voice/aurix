@@ -893,6 +893,7 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     // --- 1. forced tunnel.
     let mut alice_cfg = ClientConfig::new(ws_with_path(&env2.ws), alice_token.clone());
     alice_cfg.media_path = MediaPathPolicy::TunnelOnly;
+    alice_cfg.tls_tunnel = false;
     alice_cfg.heartbeat_interval = Duration::from_millis(500);
     alice_cfg.dsp = DspConfig::BYPASS;
     let alice = Client::new(alice_cfg).unwrap();
@@ -956,6 +957,7 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     block.block();
     let proxy = Proxy::start(ws_upstream(&env2.ws)).await;
     let mut alice_cfg = ClientConfig::new(ws_url_via(&proxy, &ws_with_path(&env2.ws)), alice_token);
+    alice_cfg.tls_tunnel = false;
     alice_cfg.heartbeat_interval = Duration::from_millis(500);
     alice_cfg.udp_fallback_lost_heartbeats = 3;
     alice_cfg.udp_reprobe_interval = Duration::from_secs(3);
@@ -1100,6 +1102,251 @@ async fn native_client_tunnels_media_when_udp_is_blocked() {
     bob.disconnect();
 }
 
+/// The dedicated TLS media tunnel (`media.tls_tunnel_port` on node 2): a `TlsOnly` client binds
+/// over it and talks to a UDP peer; with the host firewall dropping UDP, `Auto` picks the TLS
+/// tunnel ahead of the WebSocket at bind and on heartbeat loss, moves back to UDP when the
+/// re-probe answers, and a control-plane resume keeps the TLS link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_client_uses_the_tls_tunnel_when_udp_is_blocked() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let _firewall = FIREWALL.write().await;
+    let env2 = Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws: std::env::var("AURIX_E2E_WS2").unwrap_or_else(|_| "ws://127.0.0.1:8091".into()),
+        api_key: env.api_key.clone(),
+    };
+    let udp2: u16 = std::env::var("AURIX_E2E_UDP2")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(10002);
+    let http = reqwest::Client::new();
+    let channel = create_channel(&env, &http).await;
+    let (alice_token, alice_id) = issue_token(&env, &http, "tls-alice", "Alice", channel).await;
+    let (bob_token, bob_id) = issue_token(&env, &http, "tls-bob", "Bob", channel).await;
+
+    let mut bob_cfg = ClientConfig::new(ws_with_path(&env.ws), bob_token);
+    bob_cfg.heartbeat_interval = Duration::from_millis(500);
+    bob_cfg.dsp = DspConfig::BYPASS;
+    bob_cfg.quic = false;
+    let bob = Client::new(bob_cfg).unwrap();
+    bob.connect().unwrap();
+    wait_for(&bob, "bob media", Duration::from_secs(10), |e| {
+        matches!(e, Event::MediaBound)
+    })
+    .await;
+    assert_eq!(bob.media_path(), Some(MediaPath::Udp));
+    bob.join_channel(channel, None).unwrap();
+    wait_for(&bob, "bob join", Duration::from_secs(10), |e| {
+        matches!(e, Event::ChannelJoined { .. })
+    })
+    .await;
+
+    async fn check_audio(alice: &Client, bob: &Client, label: &str) {
+        let (rms, active) = stream_tone(alice, bob, 1.2).await;
+        eprintln!("[{label}] bob heard rms={rms:.3} over {active} frames");
+        assert!(
+            active >= 30 && (0.15..0.35).contains(&rms),
+            "[{label}] alice → bob: rms={rms} active={active}"
+        );
+        let (rms, active) = stream_tone(bob, alice, 1.2).await;
+        eprintln!("[{label}] alice heard rms={rms:.3} over {active} frames");
+        assert!(
+            active >= 30 && (0.15..0.35).contains(&rms),
+            "[{label}] bob → alice: rms={rms} active={active}"
+        );
+    }
+    async fn join(
+        alice: &Client,
+        bob: &Client,
+        channel: ChannelId,
+        alice_id: UserId,
+        bob_id: UserId,
+    ) {
+        alice.join_channel(channel, None).unwrap();
+        wait_for(alice, "alice join", Duration::from_secs(10), |e| {
+            matches!(e, Event::ChannelJoined { participants, .. }
+                if participants.iter().any(|p| p.user_id == bob_id))
+        })
+        .await;
+        wait_for(
+            bob,
+            "alice joined",
+            Duration::from_secs(10),
+            |e| matches!(e, Event::ParticipantJoined { participant, .. } if participant.user_id == alice_id),
+        )
+        .await;
+    }
+
+    // --- 1. forced TLS tunnel.
+    let mut alice_cfg = ClientConfig::new(ws_with_path(&env2.ws), alice_token.clone());
+    alice_cfg.media_path = MediaPathPolicy::TlsOnly;
+    alice_cfg.heartbeat_interval = Duration::from_millis(500);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    let alice = Client::new(alice_cfg).unwrap();
+    alice.connect().unwrap();
+    let Event::SessionReady(session) =
+        wait_for(&alice, "alice session", Duration::from_secs(10), |e| {
+            matches!(e, Event::SessionReady(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        session.media_tls,
+        "node 2 does not offer the TLS media tunnel (media.tls_tunnel_port): {session:?}"
+    );
+    wait_for(&alice, "alice tls", Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            Event::MediaPathChanged {
+                path: MediaPath::Tls,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(alice.state(), ConnectionState::MediaBound);
+    assert_eq!(alice.media_path(), Some(MediaPath::Tls));
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tls"
+    );
+    join(&alice, &bob, channel, alice_id, bob_id).await;
+    check_audio(&alice, &bob, "tls-only").await;
+    let stats = alice.stats();
+    assert_eq!(stats.media_path, Some(MediaPath::Tls), "{stats:?}");
+    assert!(stats.media.rtt_samples > 0, "{stats:?}");
+    assert_eq!(stats.media.heartbeats_lost_consecutive, 0, "{stats:?}");
+    assert_eq!(stats.media.uplink_dropped, 0, "{stats:?}");
+    assert!(
+        stats.media.bad_auth == 0 && stats.media.replayed == 0,
+        "{stats:?}"
+    );
+    alice.disconnect();
+    wait_for(
+        &bob,
+        "alice gone",
+        Duration::from_secs(10),
+        |e| matches!(e, Event::ParticipantLeft { user_id, .. } if *user_id == alice_id),
+    )
+    .await;
+
+    if std::env::var("AURIX_E2E_SUDO_IPTABLES").is_err() {
+        eprintln!("AURIX_E2E_SUDO_IPTABLES not set; skipping the blocked-UDP part");
+        bob.disconnect();
+        return;
+    }
+
+    // --- 2. Auto with UDP to Alice's node dropped by the host firewall: TLS wins over the WebSocket.
+    let mut block = UdpBlock::new(udp2);
+    block.block();
+    let proxy = Proxy::start(ws_upstream(&env2.ws)).await;
+    let mut alice_cfg = ClientConfig::new(ws_url_via(&proxy, &ws_with_path(&env2.ws)), alice_token);
+    alice_cfg.heartbeat_interval = Duration::from_millis(500);
+    alice_cfg.udp_fallback_lost_heartbeats = 3;
+    alice_cfg.udp_reprobe_interval = Duration::from_secs(3);
+    alice_cfg.reconnect.initial_delay = Duration::from_millis(200);
+    alice_cfg.dsp = DspConfig::BYPASS;
+    let alice = Client::new(alice_cfg).unwrap();
+    let t0 = Instant::now();
+    alice.connect().unwrap();
+    let Event::MediaPathChanged { path, reason } =
+        wait_for(&alice, "fallback at bind", Duration::from_secs(20), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!("fell back to {path:?} after {:?}: {reason}", t0.elapsed());
+    assert_eq!(path, MediaPath::Tls, "{reason}");
+    assert!(reason.contains("bind failed"), "{reason}");
+    let session = alice.session().unwrap();
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tls"
+    );
+    join(&alice, &bob, channel, alice_id, bob_id).await;
+    check_audio(&alice, &bob, "auto→tls").await;
+
+    // UDP comes back: the re-probe moves the media off the TLS tunnel.
+    block.unblock();
+    let t0 = Instant::now();
+    wait_for(&alice, "back to UDP", Duration::from_secs(20), |e| {
+        matches!(
+            e,
+            Event::MediaPathChanged {
+                path: MediaPath::Udp,
+                ..
+            }
+        )
+    })
+    .await;
+    eprintln!("moved back to UDP after {:?}", t0.elapsed());
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "udp"
+    );
+    check_audio(&alice, &bob, "reprobed-udp").await;
+
+    // UDP dies mid-session: unanswered heartbeats push the media onto the TLS tunnel again.
+    block.block();
+    let t0 = Instant::now();
+    let Event::MediaPathChanged { path, reason } =
+        wait_for(&alice, "heartbeat fallback", Duration::from_secs(20), |e| {
+            matches!(e, Event::MediaPathChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    eprintln!(
+        "heartbeat fallback to {path:?} after {:?}: {reason}",
+        t0.elapsed()
+    );
+    assert_eq!(path, MediaPath::Tls, "{reason}");
+    assert!(reason.contains("heartbeats unanswered"), "{reason}");
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tls"
+    );
+    check_audio(&alice, &bob, "heartbeat→tls").await;
+
+    // Control-plane drop while on TLS: the resume comes back on a fresh TLS link.
+    proxy.kill();
+    wait_for(&alice, "recovering", Duration::from_secs(15), |e| {
+        matches!(e, Event::Recovering { .. })
+    })
+    .await;
+    let recovered = wait_for(&alice, "recovered", Duration::from_secs(15), |e| {
+        matches!(e, Event::Recovered { .. })
+    })
+    .await;
+    assert!(
+        matches!(recovered, Event::Recovered { resumed: true, .. }),
+        "{recovered:?}"
+    );
+    let after = alice.session().unwrap();
+    assert_eq!(after.session_id, session.session_id);
+    assert_eq!(alice.media_path(), Some(MediaPath::Tls));
+    assert_eq!(
+        session_media_path(&env2, &http, &session.session_id.to_string()).await,
+        "tls"
+    );
+    check_audio(&alice, &bob, "resumed-tls").await;
+    let stats = alice.stats();
+    assert_eq!(stats.media.bad_auth, 0, "{stats:?}");
+    assert_eq!(stats.media.replayed, 0, "{stats:?}");
+
+    block.unblock();
+    alice.disconnect();
+    bob.disconnect();
+}
+
 /// Reads one plain (label-free or exact-label) sample from a node's `/metrics`; a series that
 /// has not been touched yet reads as zero.
 async fn metric(http: &reqwest::Client, url: &str, name: &str) -> f64 {
@@ -1135,7 +1382,8 @@ async fn metric(http: &reqwest::Client, url: &str, name: &str) -> f64 {
 /// 4. `QuicOnly` binds on the QUIC node and is refused by the node without QUIC; `quic = false`
 ///    keeps `Auto` on UDP against the QUIC node.
 /// 5. With `AURIX_E2E_SUDO_IPTABLES=1` the host drops UDP from Alice's node: the QUIC session
-///    falls back to the tunnel mid-session and moves back to QUIC when the block lifts.
+///    falls back to the WebSocket tunnel mid-session (`tls_tunnel = false` keeps the TLS tunnel
+///    out of the way) and moves back to QUIC when the block lifts.
 ///
 /// `AURIX_E2E_METRICS` (e.g. `http://127.0.0.1:4040/metrics`) enables the node-side counter
 /// checks.
@@ -1215,6 +1463,8 @@ async fn native_client_prefers_quic_migrates_and_falls_back() {
     alice_cfg.udp_reprobe_interval = Duration::from_secs(3);
     alice_cfg.reconnect.initial_delay = Duration::from_millis(200);
     alice_cfg.dsp = DspConfig::BYPASS;
+    // Step 5 checks the QUIC → WebSocket tunnel hand-over; the TLS tunnel has its own test.
+    alice_cfg.tls_tunnel = false;
     let alice = Client::new(alice_cfg).unwrap();
     alice.connect().unwrap();
     let Event::SessionReady(session) =

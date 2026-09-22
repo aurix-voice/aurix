@@ -131,6 +131,21 @@ async fn main() -> anyhow::Result<()> {
                     .zip(config.media.quic_key_path.clone()),
                 server_name: config.media.quic_server_name.clone(),
             },
+            tls_tunnel: aurix_media::tls::TlsTunnelOptions {
+                enabled: config.media.tls_tunnel_port != 0,
+                port: config.media.tls_tunnel_port,
+                advertise: config.media.tls_tunnel_endpoints(),
+                queue_packets: config.media.tls_tunnel_queue_packets,
+                max_connections: if config.media.tls_tunnel_max_connections == 0 {
+                    config.media.max_participants_per_node as usize * 2
+                } else {
+                    config.media.tls_tunnel_max_connections
+                },
+                bind_timeout: std::time::Duration::from_millis(
+                    config.media.tls_tunnel_bind_timeout_ms,
+                ),
+                idle_timeout: std::time::Duration::from_millis(config.media.quic_idle_timeout_ms),
+            },
             downlink_mix: config.media.downlink_mix,
             webrtc_participant_streams: config.media.webrtc_participant_streams,
             mos_alert: aurix_media::quality::MosAlertPolicy {

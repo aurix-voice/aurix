@@ -58,6 +58,9 @@ pub struct ClientConfig {
     /// `Auto` only: try QUIC before raw UDP when the node offers it. Off, `Auto` behaves as
     /// before QUIC existed (UDP → tunnel); `QuicOnly` ignores this switch.
     pub quic: bool,
+    /// `Auto` only: when neither QUIC nor UDP binds, try the node's dedicated TLS tunnel port
+    /// (normally 443) before the WebSocket tunnel. `TlsOnly` ignores this switch.
+    pub tls_tunnel: bool,
     /// `Auto` only: unanswered heartbeats in a row on QUIC/UDP before media moves to the
     /// tunnel (with the default 5 s heartbeat, 3 ≈ 15 s of silence). A QUIC connection the
     /// node closed or that timed out moves at the next heartbeat regardless.
@@ -116,6 +119,7 @@ impl ClientConfig {
             heartbeat_interval: Duration::from_secs(5),
             media_path: MediaPathPolicy::Auto,
             quic: true,
+            tls_tunnel: true,
             udp_fallback_lost_heartbeats: 3,
             udp_reprobe_interval: Duration::from_secs(30),
             encoder: EncoderSettings::default(),
