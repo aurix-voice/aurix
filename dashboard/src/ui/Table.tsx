@@ -3,8 +3,10 @@ import { isValidElement, type ReactNode } from "react";
 
 import { useT } from "@/i18n";
 import { cn } from "@/lib/cn";
+import { PAGE_SIZES } from "@/lib/usePageSize";
 
 import { Button } from "./Button";
+import { NativeSelect } from "./Input";
 import { QueryError } from "./Page";
 import { EmptyState, Skeleton } from "./Primitives";
 
@@ -203,6 +205,8 @@ export function Pager({
   hasNext,
   total,
   totalLabel,
+  pageSize,
+  onPageSize,
   className,
 }: {
   page?: number;
@@ -212,6 +216,9 @@ export function Pager({
   hasNext: boolean;
   total?: number;
   totalLabel?: ReactNode;
+  /** Rows per page; renders a selector when `onPageSize` is given. */
+  pageSize?: number;
+  onPageSize?: (n: number) => void;
   className?: string;
 }) {
   const t = useT();
@@ -219,6 +226,24 @@ export function Pager({
     <div className={cn("flex items-center justify-between gap-3 px-3 py-2 border-t border-border text-xs text-fg-muted", className)}>
       <span>{totalLabel ?? (total !== undefined ? t("common.total", { n: total }) : null)}</span>
       <div className="flex items-center gap-1">
+        {pageSize !== undefined && onPageSize ? (
+          <label className="mr-3 inline-flex items-center gap-1.5 whitespace-nowrap">
+            <span>{t("common.perPage")}</span>
+            <NativeSelect
+              aria-label={t("common.perPage")}
+              data-testid="page-size"
+              className="h-7 w-[4.25rem] pl-2 text-xs"
+              value={String(pageSize)}
+              onChange={(e) => onPageSize(Number(e.target.value))}
+            >
+              {PAGE_SIZES.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </NativeSelect>
+          </label>
+        ) : null}
         {page !== undefined && pages !== undefined ? <span className="tabular mr-2">{t("common.page", { page, pages })}</span> : null}
         <Button variant="ghost" size="icon" className="h-7 w-7" disabled={!hasPrev} onClick={() => onPage(-1)} aria-label={t("common.previous")}>
           <ChevronLeft className="size-4" />

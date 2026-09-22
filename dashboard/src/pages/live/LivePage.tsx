@@ -10,6 +10,7 @@ import { EventFeed } from "@/components/EventFeed";
 import { useI18n } from "@/i18n";
 import { fmtNumber, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { usePageSize } from "@/lib/usePageSize";
 import { RequireApp } from "@/shell/Guards";
 import { Button } from "@/ui/Button";
 import { FormDialog } from "@/ui/Dialog";
@@ -24,7 +25,6 @@ import { ChannelFlags, ChannelTypeBadge } from "./ChannelBadges";
 import { ChannelActionDialogs, useChannelMenuItems, type ChannelAction } from "./ChannelActions";
 import { CHANNEL_TYPES, ChannelConfigForm, configProblems, parseConfigJson, type ConfigMode } from "./ChannelConfigForm";
 
-const PER_PAGE = 50;
 type Scope = "active" | "all";
 
 export default function LivePage() {
@@ -42,11 +42,12 @@ function LiveChannels() {
   const [type, setType] = useState<T.ChannelType | "">("");
   const [q, setQ] = useState("");
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = usePageSize("live-channels");
   const [sort, setSort] = useState<SortState | null>({ key: "participants", dir: "desc" });
   const [creating, setCreating] = useState(false);
   const [target, setTarget] = useState<{ channel: T.Channel; action: ChannelAction } | null>(null);
 
-  const channels = useChannelsQuery({ page, per_page: PER_PAGE, active_only: scope === "active" });
+  const channels = useChannelsQuery({ page, per_page: perPage, active_only: scope === "active" });
   const snapshot = useEventSnapshotQuery();
 
   const rows = useMemo(() => {
@@ -122,7 +123,7 @@ function LiveChannels() {
   ];
 
   const total = channels.data?.total ?? 0;
-  const pages = Math.max(1, Math.ceil(total / PER_PAGE));
+  const pages = Math.max(1, Math.ceil(total / perPage));
 
   return (
     <>
@@ -217,7 +218,21 @@ function LiveChannels() {
               sort={sort}
               onSortChange={setSort}
               onRowClick={(c) => void navigate({ to: "/live/$channelId", params: { channelId: c.id }, search: {} })}
-              footer={<Pager page={page} pages={pages} hasPrev={page > 1} hasNext={page < pages} onPage={(d) => setPage((p) => p + d)} total={total} />}
+              footer={
+                <Pager
+                  page={page}
+                  pages={pages}
+                  hasPrev={page > 1}
+                  hasNext={page < pages}
+                  onPage={(d) => setPage((p) => p + d)}
+                  pageSize={perPage}
+                  onPageSize={(n) => {
+                    setPerPage(n);
+                    setPage(1);
+                  }}
+                  total={total}
+                />
+              }
             />
           </Card>
         }

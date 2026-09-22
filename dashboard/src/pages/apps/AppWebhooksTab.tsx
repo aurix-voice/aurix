@@ -19,6 +19,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtDateTime, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { usePageSize } from "@/lib/usePageSize";
 import { Button } from "@/ui/Button";
 import { ConfirmDialog, Dialog, FormDialog } from "@/ui/Dialog";
 import { Checkbox, Input, Textarea } from "@/ui/Input";
@@ -76,7 +77,6 @@ function DeliveryStatus({ status }: { status: string }) {
   );
 }
 
-const PAGE = 25;
 type DeliveryFilter = "all" | "failed" | "retrying" | "delivered" | "pending";
 
 function DeliveriesDialog({ appId, webhook, onClose }: { appId: string; webhook: T.Webhook | null; onClose: () => void }) {
@@ -86,8 +86,9 @@ function DeliveriesDialog({ appId, webhook, onClose }: { appId: string; webhook:
   const now = useNow();
   const [filter, setFilter] = useState<DeliveryFilter>("all");
   const [offset, setOffset] = useState(0);
+  const [perPage, setPerPage] = usePageSize("webhook-deliveries");
   const [payload, setPayload] = useState<T.WebhookDelivery | null>(null);
-  const q = useWebhookDeliveriesQuery(appId, webhook?.id ?? null, { status: filter === "all" ? undefined : filter, limit: PAGE, offset });
+  const q = useWebhookDeliveriesQuery(appId, webhook?.id ?? null, { status: filter === "all" ? undefined : filter, limit: perPage, offset });
   const retry = useRetryDeliveryMutation(appId);
   const canWrite = canApp("webhooks:write");
 
@@ -175,7 +176,18 @@ function DeliveriesDialog({ appId, webhook, onClose }: { appId: string; webhook:
     >
       <div className="flex flex-col -mx-5 -mb-4">
         <Toolbar
-          end={<Pager onPage={(dir) => setOffset((o) => Math.max(0, o + dir * PAGE))} hasPrev={offset > 0} hasNext={(rows?.length ?? 0) === PAGE} />}
+          end={
+            <Pager
+              onPage={(dir) => setOffset((o) => Math.max(0, o + dir * perPage))}
+              hasPrev={offset > 0}
+              hasNext={(rows?.length ?? 0) === perPage}
+              pageSize={perPage}
+              onPageSize={(n) => {
+                setPerPage(n);
+                setOffset(0);
+              }}
+            />
+          }
         >
           <Segmented
             size="sm"

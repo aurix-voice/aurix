@@ -27,6 +27,9 @@ released together.
   `Ingress` or Traefik `IngressRoute`, NetworkPolicy egress to the node). CI job `dashboard`
   runs typecheck / lint / unit tests / build and a Playwright suite against a live node through
   the freshly built image; the release workflow publishes, signs and attests the image.
+  Every paginated table (live channels, applications, webhook deliveries, moderation events /
+  incidents / bans / users, stored chat, recordings, audit log) has a rows-per-page selector
+  (10 / 25 / 50 / 100, default 25) remembered per table in the browser.
 * Stored text chat grows edits, deletions, reactions and search (migration 18): `ChatEdit` /
   `ChatDelete` (author within `chat.edit_window_secs`, channel moderators may delete) fan out
   `ChatMessageUpdated` — a deletion is a tombstone that keeps the message id and position and

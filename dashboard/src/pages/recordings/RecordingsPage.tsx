@@ -7,6 +7,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtBytes, fmtDateTime, fmtDuration, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { usePageSize } from "@/lib/usePageSize";
 import { Forbidden, RequireApp } from "@/shell/Guards";
 import { Button } from "@/ui/Button";
 import { Input, NativeSelect } from "@/ui/Input";
@@ -21,14 +22,13 @@ import { filterRecordings, isInFlight, mixdownCandidates, RECORDING_KINDS, RECOR
 import { RecordingDetail } from "./RecordingDetail";
 import { RecordingKindBadge, RecordingStatusBadge, useRecordingsSearch } from "./shared";
 
-const PER_PAGE = 50;
-
 function Recordings() {
   const { t, locale } = useI18n();
   const { canApp } = useAuth();
   const now = useNow(30_000);
   const { id, channel, go } = useRecordingsSearch();
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = usePageSize("recordings");
   const [channelInput, setChannelInput] = useState(channel ?? "");
   const [syncedChannel, setSyncedChannel] = useState(channel);
   if (channel !== syncedChannel) {
@@ -49,7 +49,7 @@ function Recordings() {
     return (cid: string) => m.get(cid) ?? null;
   }, [channels.data]);
 
-  const list = useRecordingsQuery({ channel_id: channel ?? undefined, page, per_page: PER_PAGE }, (d) => (d?.some(isInFlight) ? 5_000 : 30_000));
+  const list = useRecordingsQuery({ channel_id: channel ?? undefined, page, per_page: perPage }, (d) => (d?.some(isInFlight) ? 5_000 : 30_000));
   const all = useMemo(() => list.data ?? [], [list.data]);
   const rows = useMemo(() => filterRecordings(all, filter), [all, filter]);
 
@@ -140,8 +140,13 @@ function Recordings() {
           <Pager
             page={page}
             hasPrev={page > 1}
-            hasNext={all.length >= PER_PAGE}
+            hasNext={all.length >= perPage}
             onPage={(d) => setPage((p) => Math.max(1, p + d))}
+            pageSize={perPage}
+            onPageSize={(n) => {
+              setPerPage(n);
+              setPage(1);
+            }}
             total={rows.length}
             totalLabel={t("common.count.items", { n: rows.length })}
           />

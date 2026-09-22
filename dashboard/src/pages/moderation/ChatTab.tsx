@@ -7,6 +7,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/cn";
 import { fmtDateTime, fmtTime, shortId } from "@/lib/format";
+import { PAGE_SIZES, usePageSize } from "@/lib/usePageSize";
 import { Button } from "@/ui/Button";
 import { ConfirmDialog } from "@/ui/Dialog";
 import { Input, NativeSelect, Textarea } from "@/ui/Input";
@@ -19,7 +20,9 @@ import { UserRef, useModSearch } from "./shared";
 import { SYSTEM_USER } from "./model";
 import { isUuid, UserPicker } from "./UserPicker";
 
-const LIMIT = 50;
+/** Server default for `chat.history_page_max`; larger requests are clamped there. */
+const CHAT_PAGE_MAX = 50;
+
 type Kind = "channel" | "user";
 /** Nil UUID: sender of REST system messages and `deleted_by` of API deletions. */
 
@@ -37,6 +40,8 @@ export function ChatTab() {
   const [from, setFrom] = useState("");
   const [q, setQ] = useState("");
   const [cursor, setCursor] = useState<{ before?: string; after?: string }>({});
+  const [storedLimit, setLimit] = usePageSize("chat");
+  const limit = Math.min(storedLimit, CHAT_PAGE_MAX);
   const [deleting, setDeleting] = useState<T.ChatMessage | null>(null);
   const [compose, setCompose] = useState("");
   const [composeName, setComposeName] = useState("");
@@ -51,7 +56,7 @@ export function ChatTab() {
   }, [kind, channelId, userId, peer]);
 
   const searching = q.trim() !== "";
-  const page = useChatPageQuery({ target, q, before: cursor.before, after: cursor.after, fromUserId: isUuid(from) ? from.trim() : undefined, limit: LIMIT });
+  const page = useChatPageQuery({ target, q, before: cursor.before, after: cursor.after, fromUserId: isUuid(from) ? from.trim() : undefined, limit });
   const del = useDeleteMessageMutation();
   const sendChannel = useSendSystemMessageMutation();
   const sendDirect = useSendDirectMessageMutation();
@@ -181,13 +186,31 @@ export function ChatTab() {
               <Button size="xs" variant="ghost" disabled={!page.data?.next_before} onClick={() => setCursor({ before: page.data?.next_before })}>
                 <ChevronUp className="size-3.5" /> {t("moderation.chat.older")}
               </Button>
-              <span className="text-[12px] text-fg-muted">
-                {t("common.count.items", { n: messages.length })}
-                {cursor.before || cursor.after ? (
-                  <button type="button" className="ml-2 underline-offset-2 hover:underline" onClick={() => setCursor({})}>
-                    {t("moderation.chat.latest")}
-                  </button>
-                ) : null}
+              <span className="inline-flex items-center gap-2 text-[12px] text-fg-muted">
+                <span>
+                  {t("common.count.items", { n: messages.length })}
+                  {cursor.before || cursor.after ? (
+                    <button type="button" className="ml-2 underline-offset-2 hover:underline" onClick={() => setCursor({})}>
+                      {t("moderation.chat.latest")}
+                    </button>
+                  ) : null}
+                </span>
+                <NativeSelect
+                  aria-label={t("common.perPage")}
+                  data-testid="page-size"
+                  className="h-6 w-[4rem] pl-2 text-[12px]"
+                  value={String(limit)}
+                  onChange={(e) => {
+                    setLimit(Number(e.target.value));
+                    setCursor({});
+                  }}
+                >
+                  {PAGE_SIZES.filter((n) => n <= CHAT_PAGE_MAX).map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </NativeSelect>
               </span>
               <Button size="xs" variant="ghost" disabled={searching || !page.data?.next_after} onClick={() => setCursor({ after: page.data?.next_after })}>
                 {t("moderation.chat.newer")} <ChevronDown className="size-3.5" />

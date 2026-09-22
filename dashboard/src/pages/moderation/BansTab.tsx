@@ -7,6 +7,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtDateTime, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { usePageSize } from "@/lib/usePageSize";
 import { Button } from "@/ui/Button";
 import { ConfirmDialog } from "@/ui/Dialog";
 import { Checkbox } from "@/ui/Input";
@@ -19,8 +20,6 @@ import { BanDialog } from "./BanDialog";
 import { UserRef, useModSearch } from "./shared";
 import { banState } from "./model";
 import { isUuid, UserPicker } from "./UserPicker";
-
-const PER_PAGE = 50;
 
 export function BanStateBadge({ ban, now }: { ban: T.Ban; now: number }) {
   const { t } = useI18n();
@@ -53,12 +52,13 @@ export function BansTab() {
   const [userFilter, setUserFilter] = useState(userFromUrl ?? "");
   const [showInactive, setShowInactive] = useState(false);
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = usePageSize("bans");
   const [creating, setCreating] = useState(false);
   const [revoking, setRevoking] = useState<T.Ban | null>(null);
   const revoke = useRevokeBanMutation();
 
   const userId = isUuid(userFilter) ? userFilter.trim() : undefined;
-  const bans = useBansQuery({ user_id: userId, page, per_page: PER_PAGE });
+  const bans = useBansQuery({ user_id: userId, page, per_page: perPage });
   const rows = useMemo(() => (bans.data ?? []).filter((b) => showInactive || banState(b, now) === "active"), [bans.data, showInactive, now]);
 
   const columns: Column<T.Ban>[] = [
@@ -163,8 +163,13 @@ export function BansTab() {
             <Pager
               page={page}
               hasPrev={page > 1}
-              hasNext={(bans.data?.length ?? 0) >= PER_PAGE}
+              hasNext={(bans.data?.length ?? 0) >= perPage}
               onPage={(d) => setPage((p) => Math.max(1, p + d))}
+              pageSize={perPage}
+              onPageSize={(n) => {
+                setPerPage(n);
+                setPage(1);
+              }}
               total={rows.length}
               totalLabel={t("common.count.items", { n: rows.length })}
             />

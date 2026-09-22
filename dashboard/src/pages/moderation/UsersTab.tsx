@@ -17,6 +17,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtDateTime, fmtMinutes, fmtRelative, shortId } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { usePageSize } from "@/lib/usePageSize";
 import { Button } from "@/ui/Button";
 import { ConfirmDialog, FormDialog } from "@/ui/Dialog";
 import { Checkbox, Input } from "@/ui/Input";
@@ -29,15 +30,14 @@ import { BanDialog } from "./BanDialog";
 import { RiskBadge, UserRef, useModSearch } from "./shared";
 import { isUuid, UserPicker } from "./UserPicker";
 
-const PER_PAGE = 50;
-
 export function UsersTab() {
   const { t, locale } = useI18n();
   const now = useNow(30_000);
   const { user: selected, go } = useModSearch();
   const [q, setQ] = useState("");
   const [page, setPage] = useState(1);
-  const users = useUsersQuery({ q: q.trim() || undefined, page, per_page: PER_PAGE });
+  const [perPage, setPerPage] = usePageSize("users");
+  const users = useUsersQuery({ q: q.trim() || undefined, page, per_page: perPage });
   const rows = users.data ?? [];
 
   const columns: Column<T.User>[] = [
@@ -107,8 +107,13 @@ export function UsersTab() {
               <Pager
                 page={page}
                 hasPrev={page > 1}
-                hasNext={rows.length >= PER_PAGE}
+                hasNext={rows.length >= perPage}
                 onPage={(d) => setPage((p) => Math.max(1, p + d))}
+                pageSize={perPage}
+                onPageSize={(n) => {
+                  setPerPage(n);
+                  setPage(1);
+                }}
                 total={rows.length}
                 totalLabel={t("common.count.items", { n: rows.length })}
               />

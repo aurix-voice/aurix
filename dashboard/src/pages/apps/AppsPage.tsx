@@ -8,6 +8,7 @@ import { useAppScope } from "@/api/scope";
 import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtDate, fmtDateTime, fmtNumber } from "@/lib/format";
+import { PAGE_SIZES, usePageSize } from "@/lib/usePageSize";
 import { Button } from "@/ui/Button";
 import { FormDialog } from "@/ui/Dialog";
 import { Input } from "@/ui/Input";
@@ -18,8 +19,6 @@ import { useToast } from "@/ui/Toast";
 
 import { AppFormFields, EMPTY_APP_FORM, parseLimit, type AppFormValues } from "./AppForm";
 import { SecretReveal } from "./SecretReveal";
-
-const APPS_PAGE_SIZE = 25;
 
 function limitText(locale: "en" | "ru", v: number | undefined, unlimitedLabel: string): string {
   if (v === undefined || v === null) return "—";
@@ -38,6 +37,7 @@ export default function AppsPage() {
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<SortState | null>({ key: "created", dir: "desc" });
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = usePageSize("apps");
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState<AppFormValues>(EMPTY_APP_FORM);
   const [created, setCreated] = useState<T.CreatedApp | null>(null);
@@ -123,9 +123,9 @@ export default function AppsPage() {
     const list = (apps.data ?? []).filter((a) => !q || a.name.toLowerCase().includes(q) || a.id.startsWith(q) || (a.description ?? "").toLowerCase().includes(q));
     return sortRows(list, columns, sort);
   }, [apps.data, search, columns, sort]);
-  const pages = Math.max(1, Math.ceil(rows.length / APPS_PAGE_SIZE));
+  const pages = Math.max(1, Math.ceil(rows.length / perPage));
   const current = Math.min(page, pages);
-  const pageRows = useMemo(() => rows.slice((current - 1) * APPS_PAGE_SIZE, current * APPS_PAGE_SIZE), [rows, current]);
+  const pageRows = useMemo(() => rows.slice((current - 1) * perPage, current * perPage), [rows, current, perPage]);
 
   const submit = async () => {
     const name = form.name.trim();
@@ -195,7 +195,23 @@ export default function AppsPage() {
           }}
           selectedKey={scopeId}
           onRowClick={(a) => void navigate({ to: "/apps/$appId", params: { appId: a.id }, search: {} })}
-          footer={rows.length > APPS_PAGE_SIZE ? <Pager page={current} pages={pages} hasPrev={current > 1} hasNext={current < pages} onPage={(d) => setPage(current + d)} total={rows.length} /> : undefined}
+          footer={
+            rows.length > PAGE_SIZES[0] ? (
+              <Pager
+                page={current}
+                pages={pages}
+                hasPrev={current > 1}
+                hasNext={current < pages}
+                onPage={(d) => setPage(current + d)}
+                pageSize={perPage}
+                onPageSize={(n) => {
+                  setPerPage(n);
+                  setPage(1);
+                }}
+                total={rows.length}
+              />
+            ) : undefined
+          }
           empty={
             <EmptyState
               compact

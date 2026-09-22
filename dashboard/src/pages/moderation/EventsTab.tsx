@@ -7,6 +7,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtDateTime, fmtRelative } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
+import { usePageSize } from "@/lib/usePageSize";
 import { Button } from "@/ui/Button";
 import { FormDialog } from "@/ui/Dialog";
 import { Input, NativeSelect, Textarea } from "@/ui/Input";
@@ -20,7 +21,6 @@ import { EventDetail } from "./EventDetail";
 import { ChannelRef, type EVENT_STATUSES, EventTypeBadge, isSafetyType, StatusBadge, UserRef, useEventTypeLabel, useModSearch } from "./shared";
 import { isUuid, UserPicker } from "./UserPicker";
 
-const PER_PAGE = 50;
 type StatusFilter = "" | (typeof EVENT_STATUSES)[number];
 
 /**
@@ -39,11 +39,12 @@ export function EventsTab({ mode }: { mode: "events" | "incidents" }) {
   const [source, setSource] = useState<"" | T.SafetySource>("");
   const [userFilter, setUserFilter] = useState(userFilterFromUrl ?? "");
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = usePageSize("moderation-events");
   const [reporting, setReporting] = useState(false);
 
   const userId = isUuid(userFilter) ? userFilter.trim() : undefined;
-  const events = useModerationEventsQuery({ status: status || undefined, page, per_page: PER_PAGE }, mode === "events");
-  const incidents = useSafetyIncidentsQuery({ status: status || undefined, source: source || undefined, user_id: userId, page, per_page: PER_PAGE }, mode === "incidents");
+  const events = useModerationEventsQuery({ status: status || undefined, page, per_page: perPage }, mode === "events");
+  const incidents = useSafetyIncidentsQuery({ status: status || undefined, source: source || undefined, user_id: userId, page, per_page: perPage }, mode === "incidents");
   const query = mode === "events" ? events : incidents;
 
   const rows = useMemo(() => {
@@ -176,8 +177,13 @@ export function EventsTab({ mode }: { mode: "events" | "incidents" }) {
               <Pager
                 page={page}
                 hasPrev={page > 1}
-                hasNext={(query.data?.length ?? 0) >= PER_PAGE}
+                hasNext={(query.data?.length ?? 0) >= perPage}
                 onPage={(d) => setPage((p) => Math.max(1, p + d))}
+                pageSize={perPage}
+                onPageSize={(n) => {
+                  setPerPage(n);
+                  setPage(1);
+                }}
                 total={rows.length}
                 totalLabel={t("common.count.items", { n: rows.length })}
               />

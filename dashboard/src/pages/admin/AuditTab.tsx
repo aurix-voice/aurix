@@ -7,6 +7,7 @@ import { useAppScope } from "@/api/scope";
 import { useAuth } from "@/auth/AuthProvider";
 import { useI18n } from "@/i18n";
 import { fmtDateTime, fmtDateTimeShort } from "@/lib/format";
+import { usePageSize } from "@/lib/usePageSize";
 import { Dialog } from "@/ui/Dialog";
 import { Input, NativeSelect } from "@/ui/Input";
 import { Segmented } from "@/ui/Menu";
@@ -15,8 +16,6 @@ import { Badge, Callout, Card, CodeBlock, CopyButton, EmptyState, IdChip, KV, Mo
 import { DataTable, Pager, type Column } from "@/ui/Table";
 
 import { auditActions, chainLinks, chainSummary, detailsPreview, filterAudit, type ChainLink } from "./model";
-
-const PER_PAGE = 50;
 
 function ChainIcon({ link }: { link: ChainLink | undefined }) {
   const { t } = useI18n();
@@ -65,12 +64,13 @@ export function AuditTab() {
   const [scope, setScope] = useState<AuditScope>(platformOk ? "platform" : "app");
   const effectiveScope: AuditScope = scope === "platform" && !platformOk ? "app" : scope === "app" && !appOk ? "platform" : scope;
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = usePageSize("audit");
   const [action, setAction] = useState("");
   const [actor, setActor] = useState("");
   const [target, setTarget] = useState("");
   const [selected, setSelected] = useState<T.AuditLogEntry | null>(null);
 
-  const query = useAuditLogQuery(effectiveScope, { page, per_page: PER_PAGE });
+  const query = useAuditLogQuery(effectiveScope, { page, per_page: perPage });
   const entries = useMemo(() => query.data ?? [], [query.data]);
   const links = useMemo(() => chainLinks(entries), [entries]);
   const summary = useMemo(() => chainSummary(links), [links]);
@@ -176,8 +176,13 @@ export function AuditTab() {
             <Pager
               page={page}
               hasPrev={page > 1}
-              hasNext={entries.length >= PER_PAGE}
+              hasNext={entries.length >= perPage}
               onPage={(d) => setPage((p) => Math.max(1, p + d))}
+              pageSize={perPage}
+              onPageSize={(n) => {
+                setPerPage(n);
+                setPage(1);
+              }}
               total={rows.length}
               totalLabel={t("common.count.items", { n: rows.length })}
             />
