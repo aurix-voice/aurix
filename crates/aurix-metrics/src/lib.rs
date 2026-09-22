@@ -422,7 +422,7 @@ pub static NOISE_SUPPRESSION_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
-/// `path` is `opus` (decode → denoise → re-encode) or `pcmu` (denoised inside the transcode);
+/// `path` is `opus` (decode → denoise → re-encode) or `g711` (PCMU/PCMA, denoised inside the transcode);
 /// `outcome` is `ok`, `passthrough` (a frame the model cannot take: TOC-only or shorter than
 /// 10 ms, forwarded as it came), `skipped` (a channel policy asked for it but `max_sessions`
 /// are busy) or `error` (decode/encode failed, original forwarded).

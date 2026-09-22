@@ -192,7 +192,7 @@ bitrate = 32000     # Opus bitrate of the re-encoded uplink (6000–128000)
 * **Cost.** One Opus decode, one model pass (~1 % of a core) and one Opus encode per frame of
   every cleaned Opus session; a PCMU session only adds the model pass to its existing
   transcode. `max_sessions` caps it per node; `aurix_noise_suppression_sessions` and
-  `aurix_noise_suppression_frames_total{path=opus|pcmu, outcome=ok|repeated|passthrough|skipped|error}`
+  `aurix_noise_suppression_frames_total{path=opus|g711, outcome=ok|repeated|passthrough|skipped|error}`
   show what it is doing. The re-encode is a second lossy pass (`bitrate` is the quality knob),
   which is why it is off by default and per-session opt-in.
 

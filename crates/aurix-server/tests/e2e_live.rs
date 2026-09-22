@@ -7406,7 +7406,7 @@ async fn server_noise_suppression_is_opt_in_bounded_and_skips_e2ee_and_stereo() 
                 .unwrap_or_else(|| panic!("{prefix} missing in metrics"))
         };
         assert!(sample("aurix_noise_suppression_sessions ") >= 1.0);
-        for path in ["opus", "pcmu"] {
+        for path in ["opus", "g711"] {
             assert!(
                 sample(&format!(
                     "aurix_noise_suppression_frames_total{{outcome=\"ok\",path=\"{path}\"}}"
