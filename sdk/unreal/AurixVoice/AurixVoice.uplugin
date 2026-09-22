@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
   "Version": 1,
-  "VersionName": "1.2.0",
+  "VersionName": "1.3.0",
   "FriendlyName": "Aurix Voice",
   "Description": "Self-hosted game voice chat (Aurix): encrypted native AURX audio over QUIC/UDP (WebSocket tunnel fallback), WebSocket control plane, Opus with FEC/DRED, capture DSP, per-participant sound waves for engine spatialization, group E2EE, priority speakers, text chat, moderation, transcripts, translation and TTS. Wraps the aurix-client C ABI; the AurixVoiceSamples module adds Blueprint-ready lobby and proximity components.",
   "Category": "Audio",

@@ -33,7 +33,7 @@ verified.
 package subfolder and (optionally) a tag:
 
 ```
-https://github.com/aurix-voice/aurix.git?path=sdk/unity#v1.2.0
+https://github.com/aurix-voice/aurix.git?path=sdk/unity#v1.3.0
 ```
 
 or add it to `Packages/manifest.json`:
@@ -41,7 +41,7 @@ or add it to `Packages/manifest.json`:
 ```json
 {
   "dependencies": {
-    "com.aurix.voice": "https://github.com/aurix-voice/aurix.git?path=sdk/unity#v1.2.0"
+    "com.aurix.voice": "https://github.com/aurix-voice/aurix.git?path=sdk/unity#v1.3.0"
   }
 }
 ```

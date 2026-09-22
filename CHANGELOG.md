@@ -11,6 +11,12 @@ released together.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-19
+
+Operator dashboard, richer stored chat, node drain, admin delegation and lossy-link protection
+for listeners. Database migrations 18 and 19 are additive; nodes of 1.2 and 1.3 may share a fleet
+during a rolling upgrade.
+
 ### Added
 
 * **Operator dashboard** (`dashboard/`): a separate Vite + React + TypeScript SPA over the admin
@@ -59,6 +65,16 @@ released together.
   superadmin → `*`). An API key in the request still takes precedence; unknown or deactivated
   applications are `404`. Audit and moderation actors record the administrator. This is the
   access path for the operator dashboard so keys never reach a browser.
+* `NetworkQuality.receivers_loss_percent` — the worst downlink loss any local receiver of a
+  session's audio reported over its last interval. The node pushes a `NetworkQuality` as soon as
+  the loss the sender has to protect against crosses the 3 % / 10 % tiers, and the native, Unity,
+  Unreal and Godot clients pick their FEC/DRED loss profile from the higher of the uplink loss
+  and this value, so a listener on a lossy link gets redundancy from the talker. Old nodes and
+  payloads without the field read back `0`.
+* `tools/netem/shape.sh` and `crates/aurix-client/tests/netem_live.rs`: a repeatable lossy-WAN
+  and network-migration E2E on Linux netem (loss, jitter, reordering per direction; QUIC
+  migration under delay and loss) with quantitative MOS / recovery / profile assertions, run in
+  CI.
 
 ### Fixed
 
@@ -72,17 +88,6 @@ released together.
   `is_priority` and the membership `id`, so participants hosted on another node are no longer
   anonymous to operators; `GET /v1/analytics/usage` totals now include the raw quality
   counters the OpenAPI schema already declared.
-
-* `NetworkQuality.receivers_loss_percent` — the worst downlink loss any local receiver of a
-  session's audio reported over its last interval. The node pushes a `NetworkQuality` as soon as
-  the loss the sender has to protect against crosses the 3 % / 10 % tiers, and the native, Unity,
-  Unreal and Godot clients pick their FEC/DRED loss profile from the higher of the uplink loss
-  and this value, so a listener on a lossy link gets redundancy from the talker. Old nodes and
-  payloads without the field read back `0`.
-* `tools/netem/shape.sh` and `crates/aurix-client/tests/netem_live.rs`: a repeatable lossy-WAN
-  and network-migration E2E on Linux netem (loss, jitter, reordering per direction; QUIC
-  migration under delay and loss) with quantitative MOS / recovery / profile assertions, run in
-  CI.
 
 ## [1.2.0] - 2026-09-19
 
@@ -188,5 +193,6 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/aurix-voice/aurix/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/aurix-voice/aurix/releases/tag/v1.2.0

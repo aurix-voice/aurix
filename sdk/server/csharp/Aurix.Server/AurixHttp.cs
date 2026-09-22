@@ -79,7 +79,7 @@ public sealed record RawResponse(int Status, string ContentType, IReadOnlyDictio
 /// </summary>
 public abstract class AurixHttp : IDisposable
 {
-    public const string SdkVersion = "1.2.0";
+    public const string SdkVersion = "1.3.0";
 
     internal static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
