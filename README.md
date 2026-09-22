@@ -995,14 +995,20 @@ directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regard
   addresses are dropped.
   `media.cascade_peers` remains as an optional static allow-list (e.g. for nodes not in the
   registry) and `media.cascade_discovery=false` returns to fully static full-mesh mode. Node
-  addresses must be reachable between nodes on `media.port + 1`/UDP (the `media.external_ip` you
-  register is what peers dial).
+  addresses must be reachable between nodes on `media.port + 1` (the `media.external_ip` you
+  register is what peers dial) — UDP normally; a peer that stops answering UDP probes is reached
+  over **TCP on the same port** (`media.cascade_tcp_fallback`, same sealed envelopes, bounded
+  queues, back to UDP as soon as it answers again).
 * **Inter-regional backbone.** `media.cascade_topology = "region_tree"` (default) keeps
   in-region nodes on direct one-hop links but routes cross-region audio through one
-  deterministically elected hub per region (origin → hub → hub → node, ≤ 3 hops, one copy per
-  WAN link, hop-capped and never forwarded back to its ingress). `media.cascade_relay_only = true`
-  runs a node as a pure hub (no clients, `503` on `/ws`, never selected for failover) next to
-  your backbone; `"mesh"` is the previous full mesh. See
+  deterministically elected hub per region (origin → hub → hub → node, one copy per WAN link,
+  hop-capped at 5 and never forwarded back to its ingress). Hubs are ranked by the **measured
+  link table** every node publishes (`media_node_links`: per-peer RTT and UDP/TCP from 1 s
+  probes; `GET /v1/nodes/links`, `aurix node links`): reach-everyone first, relay-only next,
+  lowest RTT, then a channel hash; hubs that cannot reach each other are joined through a core
+  hub and a region whose hosts cannot reach each other becomes a star around its hub.
+  `media.cascade_relay_only = true` runs a node as a pure hub (no clients, `503` on `/ws`, never
+  selected for failover) next to your backbone; `"mesh"` is the previous full mesh. See
   [Scaling](docs/src/operations/scaling.md#topology-mesh-or-region-tree).
 * Put the API/WS behind a load balancer; UDP media must reach the node the session was created on
   (`media_addr` in `SessionInitAck` already points there).
@@ -1159,9 +1165,11 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
   translator voice, not the speaker's).
 * Live audio streams are per participant (no server-side mix) and node-local; the node does not
   buffer them across a consumer outage beyond `recording.live.queue_frames`.
-* Cascade is a two-level tree: direct links inside a region, one deterministic hub per region
-  between regions (`media.cascade_topology`); hubs are picked from the node registry, not by
-  measured RTT, and nodes must reach each other directly on `media.port + 1`/UDP.
+* Cascade plans on measured RTT and reachability, not bandwidth or loss: hubs per region
+  (plus a core hub / in-region star where a link is blocked, ≤ 5 hops) are elected per channel
+  from the link table, hub duty is spread by a channel hash rather than balanced by load, and
+  the inter-node TCP fallback is plain TCP carrying the same `cascade_secret`-sealed envelopes
+  (no TLS layer, TCP head-of-line blocking under loss).
 * Cross-node failover needs Redis (session mirrors); Sentinel and Cluster are both supported,
   but sharded Pub/Sub needs Redis 7 (`redis.sharded_pubsub = false` on older clusters), and the
   chaos suite exercises the cluster on one host only.

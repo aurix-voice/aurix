@@ -151,6 +151,16 @@ public static class GetRecordingTranscriptFormat
 }
 
 /// <summary>
+/// Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
+/// </summary>
+public static class MediaNodeLinkTransport
+{
+    public const string Udp = "udp";
+    public const string Tcp = "tcp";
+    public static readonly IReadOnlyList<string> All = new[] { Udp, Tcp };
+}
+
+/// <summary>
 /// Widest audio bandwidth participants may encode (4/6/8/12/20 kHz).
 /// </summary>
 public static class OpusBandwidth
@@ -2412,6 +2422,42 @@ public sealed record MediaNode
 
     [JsonPropertyName("location")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public GeoLocation? Location { get; init; }
+}
+
+/// <summary>
+/// One measured cascade link, as published by `node_id`.
+/// </summary>
+public sealed record MediaNodeLink
+{
+    /// <summary>
+    /// Node that measured the link.
+    /// </summary>
+    [JsonPropertyName("node_id")]
+    public required string NodeId { get; init; }
+
+    /// <summary>
+    /// Peer the measurement is towards.
+    /// </summary>
+    [JsonPropertyName("peer_id")]
+    public required string PeerId { get; init; }
+
+    /// <summary>
+    /// Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
+    /// </summary>
+    [JsonPropertyName("transport")]
+    public required string Transport { get; init; }
+
+    /// <summary>
+    /// Smoothed round-trip time of cascade probes in milliseconds.
+    /// </summary>
+    [JsonPropertyName("rtt_ms")]
+    public required long RttMs { get; init; }
+
+    /// <summary>
+    /// When `node_id` last published this link.
+    /// </summary>
+    [JsonPropertyName("measured_at")]
+    public required string MeasuredAt { get; init; }
 }
 
 public sealed record MixdownRecordingsRequest

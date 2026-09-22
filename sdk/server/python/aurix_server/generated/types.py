@@ -52,6 +52,10 @@ ExportUsageScope_VALUES: List[ExportUsageScope] = ["app", "channels"]
 GetRecordingTranscriptFormat = Literal["json", "srt", "vtt"]
 GetRecordingTranscriptFormat_VALUES: List[GetRecordingTranscriptFormat] = ["json", "srt", "vtt"]
 
+MediaNodeLinkTransport = Literal["udp", "tcp"]
+"""Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked."""
+MediaNodeLinkTransport_VALUES: List[MediaNodeLinkTransport] = ["udp", "tcp"]
+
 OpusBandwidth = Literal["narrowband", "mediumband", "wideband", "superwideband", "fullband"]
 """Widest audio bandwidth participants may encode (4/6/8/12/20 kHz)."""
 OpusBandwidth_VALUES: List[OpusBandwidth] = ["narrowband", "mediumband", "wideband", "superwideband", "fullband"]
@@ -1100,6 +1104,18 @@ MediaNode = TypedDict(
         "location": NotRequired[Optional["GeoLocation"]],
     },
 )
+
+MediaNodeLink = TypedDict(
+    "MediaNodeLink",
+    {
+        "node_id": str,  # Node that measured the link.
+        "peer_id": str,  # Peer the measurement is towards.
+        "transport": "MediaNodeLinkTransport",  # Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
+        "rtt_ms": int,  # Smoothed round-trip time of cascade probes in milliseconds.
+        "measured_at": str,  # When `node_id` last published this link.
+    },
+)
+"""One measured cascade link, as published by `node_id`."""
 
 MixdownRecordingsRequest = TypedDict(
     "MixdownRecordingsRequest",

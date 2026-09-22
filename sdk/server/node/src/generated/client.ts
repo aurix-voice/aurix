@@ -380,6 +380,23 @@ export class AurixClient extends AurixHttp {
   }
 
   /**
+   * Measured cascade links
+   *
+   * Every node probes its cascade peers (UDP first, TCP fallback when UDP stops answering) and
+   * publishes the links it confirmed. One row per `(node_id, peer_id)` as seen from `node_id`; a
+   * pair missing in both directions while both nodes publish tables is unreachable. The
+   * `region_tree` topology planner ranks hubs by these RTTs and routes around unreachable pairs.
+   * Rows older than a few `media.cascade_discovery_interval_ms` periods are stale (the node stopped
+   * publishing).
+   *
+   * `GET /v1/nodes/links`
+   * Auth: AdminToken.
+   */
+  listNodeLinks(options?: RequestOptions): Promise<T.MediaNodeLink[]> {
+    return this.json<T.MediaNodeLink[]>("GET", "/v1/nodes/links", { ...options });
+  }
+
+  /**
    * Drain a node (maintenance)
    *
    * Marks the node as draining, fleet-wide and persistently (survives restarts and heartbeats) until

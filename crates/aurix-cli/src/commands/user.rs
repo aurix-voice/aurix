@@ -189,6 +189,8 @@ pub struct NodeArgs {
 enum NodeCmd {
     /// Media nodes with load and regions.
     List,
+    /// Measured cascade links between nodes: transport (udp/tcp), RTT, age (admin).
+    Links,
     /// Best endpoint for a player (`GET /v1/me/regions` semantics via API key).
     Endpoint {
         #[arg(long)]
@@ -209,6 +211,7 @@ enum NodeCmd {
 pub async fn nodes(ctx: &Ctx, args: NodeArgs) -> anyhow::Result<()> {
     match args.cmd {
         NodeCmd::List => ctx.print(&ctx.api.get("/v1/nodes", &[], Auth::Admin).await?),
+        NodeCmd::Links => ctx.print(&ctx.api.get("/v1/nodes/links", &[], Auth::Admin).await?),
         NodeCmd::Drain { node_id, reason } => ctx.print(
             &ctx.api
                 .post(

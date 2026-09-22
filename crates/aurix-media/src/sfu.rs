@@ -1,5 +1,5 @@
 use crate::audio_pipeline::AudioAnalysisPipeline;
-use crate::cascade::CascadeRelay;
+use crate::cascade::{CascadeOptions, CascadeRelay};
 use crate::channel::MediaChannel;
 use crate::mix::MixHub;
 use crate::mixer::MixerConfig;
@@ -83,6 +83,7 @@ pub struct SfuOptions {
     pub session_timeout_secs: u64,
     pub cascade_secret: Option<String>,
     pub cascade_peers: Vec<String>,
+    pub cascade: CascadeOptions,
     /// Public addresses of the media socket (IPv4 and/or IPv6 with the media port), used as
     /// WebRTC ICE host candidates and for `SessionInitAck.media_addrs`. Empty: the bound
     /// address itself (single-host development).
@@ -123,6 +124,7 @@ impl Default for SfuOptions {
             session_timeout_secs: 60,
             cascade_secret: None,
             cascade_peers: Vec::new(),
+            cascade: CascadeOptions::default(),
             advertised_addrs: Vec::new(),
             downlink_bitrate: 32_000,
             mixer_decoder_complexity: 5,
@@ -354,10 +356,19 @@ impl SfuNode {
                 self.node_id,
                 &secret,
                 &self.options.cascade_peers,
+                self.options.cascade,
             )
             .await
             {
-                Ok(cascade) => self.cascade = Some(Arc::new(cascade)),
+                Ok(cascade) => {
+                    cascade.set_advertised(
+                        advertised
+                            .iter()
+                            .map(|a| SocketAddr::new(a.ip(), a.port().wrapping_add(1)))
+                            .collect(),
+                    );
+                    self.cascade = Some(Arc::new(cascade));
+                }
                 Err(e) => {
                     return Err(AurixError::InvalidConfiguration(format!(
                         "Cascade relay init failed: {e}"
@@ -1202,6 +1213,9 @@ impl SfuNode {
         }
         if let Some(quic) = &self.quic {
             quic.shutdown();
+        }
+        if let Some(cascade) = &self.cascade {
+            cascade.shutdown();
         }
         n
     }

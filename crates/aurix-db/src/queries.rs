@@ -2861,6 +2861,82 @@ pub async fn delete_media_node(pool: &DbPool, node_id: Uuid) -> Result<(), sqlx:
     Ok(())
 }
 
+// ── Cascade link measurements ──
+
+/// Replaces the link table of `node_id` with `links` (`(peer_id, transport, rtt_ms)`): peers
+/// that are no longer confirmed disappear, and `media_nodes.links_reported_at` is stamped even
+/// when the node confirms nobody. Peers that left the registry meanwhile are skipped.
+pub async fn replace_media_node_links(
+    pool: &DbPool,
+    node_id: Uuid,
+    links: &[(Uuid, &str, i32)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let keep: Vec<Uuid> = links.iter().map(|(peer, _, _)| *peer).collect();
+    sqlx::query("DELETE FROM media_node_links WHERE node_id = $1 AND NOT (peer_id = ANY($2))")
+        .bind(node_id)
+        .bind(&keep)
+        .execute(&mut *tx)
+        .await?;
+    for (peer, transport, rtt_ms) in links {
+        sqlx::query(
+            r#"INSERT INTO media_node_links (node_id, peer_id, transport, rtt_ms, measured_at)
+               SELECT $1, $2, $3, $4, NOW()
+               WHERE EXISTS (SELECT 1 FROM media_nodes WHERE id = $2)
+               ON CONFLICT (node_id, peer_id) DO UPDATE SET
+                 transport = EXCLUDED.transport, rtt_ms = EXCLUDED.rtt_ms,
+                 measured_at = EXCLUDED.measured_at"#,
+        )
+        .bind(node_id)
+        .bind(peer)
+        .bind(transport)
+        .bind(rtt_ms)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE media_nodes SET links_reported_at = NOW() WHERE id = $1")
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// Links measured within the last `max_age_secs` seconds, fleet-wide, plus the ids of the
+/// nodes that published a link table in that window (`(links, reporters)`).
+pub async fn fresh_media_node_links(
+    pool: &DbPool,
+    max_age_secs: i64,
+) -> Result<(Vec<MediaNodeLinkRow>, Vec<Uuid>), sqlx::Error> {
+    let links = sqlx::query_as::<_, MediaNodeLinkRow>(
+        r#"SELECT node_id, peer_id, transport, rtt_ms, measured_at
+           FROM media_node_links
+           WHERE measured_at > NOW() - make_interval(secs => $1)
+           ORDER BY node_id, peer_id"#,
+    )
+    .bind(max_age_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    let reporters: Vec<(Uuid,)> = sqlx::query_as(
+        r#"SELECT id FROM media_nodes
+           WHERE links_reported_at > NOW() - make_interval(secs => $1)
+           ORDER BY id"#,
+    )
+    .bind(max_age_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok((links, reporters.into_iter().map(|(id,)| id).collect()))
+}
+
+/// Every stored link (any age) with the reporting node's freshness, for the operator API.
+pub async fn list_media_node_links(pool: &DbPool) -> Result<Vec<MediaNodeLinkRow>, sqlx::Error> {
+    sqlx::query_as::<_, MediaNodeLinkRow>(
+        r#"SELECT node_id, peer_id, transport, rtt_ms, measured_at
+           FROM media_node_links ORDER BY node_id, peer_id"#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 // ── Audit Log Queries ──
 
 pub async fn insert_audit_log(pool: &DbPool, entry: &AuditLogRow) -> Result<(), sqlx::Error> {

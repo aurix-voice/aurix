@@ -77,6 +77,7 @@ aurix admin login --email ops@example.com --save     # JWT saved for the profile
 aurix app create --name MyGame --key-out ~/.config/aurix/mygame.api-key   # first API key, written once (0600)
 aurix node list                                      # fleet with load and regions (operator token)
 aurix node drain <node-id> --reason "kernel update"  # stop fresh admission; players already there stay
+aurix node links                                     # measured cascade links: transport udp/tcp, RTT, age
 aurix node undrain <node-id>
 aurix node config                                    # effective configuration of the node you talk to, secrets masked
 ```

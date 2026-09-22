@@ -106,6 +106,7 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::admin_rotate_app_key),
         )
         .route("/v1/nodes", get(handlers::list_media_nodes))
+        .route("/v1/nodes/links", get(handlers::list_media_node_links))
         .route("/v1/nodes/:node_id/drain", post(handlers::drain_media_node))
         .route(
             "/v1/nodes/:node_id/undrain",

@@ -46,6 +46,10 @@ export const ExportUsageScopeValues: readonly ExportUsageScope[] = ["app", "chan
 export type GetRecordingTranscriptFormat = "json" | "srt" | "vtt";
 export const GetRecordingTranscriptFormatValues: readonly GetRecordingTranscriptFormat[] = ["json", "srt", "vtt"] as const;
 
+/** Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked. */
+export type MediaNodeLinkTransport = "udp" | "tcp";
+export const MediaNodeLinkTransportValues: readonly MediaNodeLinkTransport[] = ["udp", "tcp"] as const;
+
 /** Widest audio bandwidth participants may encode (4/6/8/12/20 kHz). */
 export type OpusBandwidth = "narrowband" | "mediumband" | "wideband" | "superwideband" | "fullband";
 export const OpusBandwidthValues: readonly OpusBandwidth[] = ["narrowband", "mediumband", "wideband", "superwideband", "fullband"] as const;
@@ -1099,6 +1103,20 @@ export interface MediaNode {
   ws_url?: string | null;
   api_url?: string | null;
   location?: GeoLocation | null;
+}
+
+/** One measured cascade link, as published by `node_id`. */
+export interface MediaNodeLink {
+  /** Node that measured the link. */
+  node_id: string;
+  /** Peer the measurement is towards. */
+  peer_id: string;
+  /** Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked. */
+  transport: MediaNodeLinkTransport;
+  /** Smoothed round-trip time of cascade probes in milliseconds. */
+  rtt_ms: number;
+  /** When `node_id` last published this link. */
+  measured_at: string;
 }
 
 export interface MixdownRecordingsRequest {

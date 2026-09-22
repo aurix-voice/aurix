@@ -10,17 +10,24 @@
 //!   * `mesh` — every hosting node sends its participants' audio directly to every other
 //!     hosting node (one hop);
 //!   * `region_tree` — hosting nodes in the same region still talk directly, but traffic
-//!     between regions goes through exactly one *hub* per region
+//!     between regions goes through one *hub* per region
 //!     (origin → own hub → remote hub → hosting node, at most [`MAX_RELAY_HOPS`] hops).
-//!     Hubs are chosen deterministically per channel (`relay_only` nodes first, then hosting
-//!     nodes, tie-broken by a channel/node hash so hub duty spreads across the region), so
-//!     every node computes the same tree from the same registry snapshot, and only hubs need
-//!     inter-regional cascade reachability.
+//!     Hubs are chosen deterministically per channel from the registry *and* the measured
+//!     link table every node publishes (`media_node_links`): nodes that reach everyone they
+//!     must talk to first, `relay_only` nodes next, then the lowest RTT, tie-broken by a
+//!     channel/node hash so hub duty spreads across the region. Two hubs that do not reach
+//!     each other (or reach each other much slower than through a third hub) are joined via a
+//!     *core* hub — one more level in the tree — and a region whose hosts cannot reach each
+//!     other becomes a star around its hub. Every node computes the same tree from the same
+//!     snapshot, and only hubs need inter-regional cascade reachability.
 //!
 //! Reconciliation runs periodically and immediately after remote `ParticipantJoined` /
 //! `ParticipantLeft` / `SessionMigrated` / `NodeHealthChanged` events, so a channel spanning
 //! two nodes starts relaying within one event round-trip rather than a full interval.
 
+use crate::cascade_links::{
+    LinkCost, LinkMatrix, RANK_BUCKET_MS, RELAY_GAIN_MS, UNCONFIRMED_LINK_MS,
+};
 use crate::event_bus::{EventBus, ServerEvent};
 use crate::node_manager::NodeManager;
 use aurix_common::addr::canonical;
@@ -47,6 +54,8 @@ pub struct CascadeTopology {
     mode: CascadeTopologyMode,
     cascade: Arc<CascadeRelay>,
     sfu: Arc<RwLock<SfuNode>>,
+    /// Reconciliation period; link rows older than a few periods are ignored.
+    interval: Duration,
 }
 
 /// A remote node as the planner sees it: reachable cascade endpoint plus placement metadata.
@@ -65,93 +74,241 @@ pub struct LocalNode {
     pub relay_only: bool,
 }
 
-/// Deterministic per-channel ranking of hub candidates: relay-only nodes first, then a
-/// channel/node hash so different channels pick different hubs within a region.
-fn hub_rank(channel: &ChannelId, node: MediaNodeId, relay_only: bool) -> (bool, u128, MediaNodeId) {
-    let mix = (channel.0.as_u128() ^ node.0.as_u128())
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835);
-    (!relay_only, mix, node)
+/// Channel/node mix used for deterministic tie-breaking (spreads hub duty across a region).
+fn channel_node_mix(channel: &ChannelId, node: MediaNodeId) -> u128 {
+    (channel.0.as_u128() ^ node.0.as_u128()).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835)
+}
+
+/// `(has unconfirmed link, !relay_only, RTT buckets, channel/node hash, id)` — lower wins.
+type HubRank = (bool, bool, u32, u128, MediaNodeId);
+
+/// Deterministic per-channel ranking of hub candidates: candidates that reach every node
+/// they would have to talk to first, then relay-only nodes, then the lowest summed
+/// (bucketed) RTT towards the region's hosts and the other regions, then a channel/node hash
+/// so different channels pick different hubs when links are equal.
+fn hub_rank(
+    channel: &ChannelId,
+    node: MediaNodeId,
+    relay_only: bool,
+    reach: &[LinkCost],
+) -> HubRank {
+    let unconfirmed = reach.iter().any(|c| c.is_unconfirmed());
+    let bucket = reach.iter().map(|c| c.ms() / RANK_BUCKET_MS).sum();
+    (
+        unconfirmed,
+        !relay_only,
+        bucket,
+        channel_node_mix(channel, node),
+        node,
+    )
+}
+
+/// Fleet-wide plan of one channel in `region_tree` mode, identical on every node that sees the
+/// same registry and link snapshot. [`plan_region_tree`] projects it onto one node's route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionTreePlan {
+    /// region → hosting nodes (only reachable ones).
+    pub hosting_by_region: BTreeMap<Region, BTreeSet<MediaNodeId>>,
+    /// region → elected hub (a relay-only node or one of the hosts).
+    pub hubs: BTreeMap<Region, MediaNodeId>,
+    /// Regions whose hosts do not all reach each other: in-region traffic goes via the hub.
+    pub star_regions: BTreeSet<Region>,
+    /// `(from_hub, to_hub)` → intermediate core hub carrying that direction.
+    pub relays: BTreeMap<(MediaNodeId, MediaNodeId), MediaNodeId>,
+}
+
+impl RegionTreePlan {
+    pub fn compute(
+        channel: &ChannelId,
+        local: LocalNode,
+        hosting: &HashSet<MediaNodeId>,
+        peers: &HashMap<MediaNodeId, PeerNode>,
+        links: &LinkMatrix,
+    ) -> Self {
+        let mut hosting_by_region: BTreeMap<Region, BTreeSet<MediaNodeId>> = BTreeMap::new();
+        for id in hosting {
+            let region = if *id == local.id {
+                local.region
+            } else if let Some(p) = peers.get(id) {
+                p.region
+            } else {
+                continue;
+            };
+            hosting_by_region.entry(region).or_default().insert(*id);
+        }
+        let relay_only_in = |region: Region| -> Vec<MediaNodeId> {
+            let mut v: Vec<MediaNodeId> = peers
+                .iter()
+                .filter(|(_, p)| p.relay_only && p.region == region)
+                .map(|(id, _)| *id)
+                .collect();
+            if local.relay_only && local.region == region {
+                v.push(local.id);
+            }
+            v.sort_unstable();
+            v
+        };
+        // Everything that may act as a region's hub: its relay nodes plus its hosts.
+        let candidates_of: BTreeMap<Region, Vec<(MediaNodeId, bool)>> = hosting_by_region
+            .iter()
+            .map(|(region, hosts)| {
+                let mut c: Vec<(MediaNodeId, bool)> = relay_only_in(*region)
+                    .into_iter()
+                    .map(|id| (id, true))
+                    .collect();
+                c.extend(hosts.iter().map(|id| (*id, false)));
+                (*region, c)
+            })
+            .collect();
+
+        let mut hubs: BTreeMap<Region, MediaNodeId> = BTreeMap::new();
+        for (region, candidates) in &candidates_of {
+            let hosts = &hosting_by_region[region];
+            let mut best: Option<(HubRank, MediaNodeId)> = None;
+            for (id, relay_only) in candidates {
+                let mut reach: Vec<LinkCost> = hosts
+                    .iter()
+                    .filter(|h| *h != id)
+                    .map(|h| links.cost(*id, *h))
+                    .collect();
+                for (other, others) in &candidates_of {
+                    if other == region {
+                        continue;
+                    }
+                    let nearest = others
+                        .iter()
+                        .map(|(n, _)| links.cost(*id, *n))
+                        .min_by_key(|c| c.ms())
+                        .unwrap_or(LinkCost::Unknown);
+                    reach.push(nearest);
+                }
+                let rank = hub_rank(channel, *id, *relay_only, &reach);
+                if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                    best = Some((rank, *id));
+                }
+            }
+            if let Some((_, id)) = best {
+                hubs.insert(*region, id);
+            }
+        }
+
+        // In-region star when two hosts (neither being the hub) cannot reach each other.
+        let mut star_regions = BTreeSet::new();
+        for (region, hosts) in &hosting_by_region {
+            let hub = hubs.get(region);
+            let others: Vec<MediaNodeId> =
+                hosts.iter().copied().filter(|h| Some(h) != hub).collect();
+            let blocked = others.iter().enumerate().any(|(i, a)| {
+                others[i + 1..]
+                    .iter()
+                    .any(|b| links.cost(*a, *b).is_unconfirmed())
+            });
+            if blocked {
+                star_regions.insert(*region);
+            }
+        }
+
+        // Core hubs reach every other hub; they may carry traffic between two hubs that do not
+        // reach each other (or reach each other much slower than via the core hub).
+        let hub_ids: Vec<MediaNodeId> = hubs.values().copied().collect();
+        let core: Vec<MediaNodeId> = hub_ids
+            .iter()
+            .copied()
+            .filter(|c| {
+                hub_ids
+                    .iter()
+                    .all(|z| z == c || !links.cost(*c, *z).is_unconfirmed())
+            })
+            .collect();
+        let mut relays = BTreeMap::new();
+        for x in &hub_ids {
+            if core.contains(x) {
+                continue;
+            }
+            for z in &hub_ids {
+                if z == x {
+                    continue;
+                }
+                let direct = links.cost(*x, *z);
+                let budget = if direct.is_unconfirmed() {
+                    UNCONFIRMED_LINK_MS
+                } else {
+                    direct.ms().saturating_sub(RELAY_GAIN_MS)
+                };
+                let via = core
+                    .iter()
+                    .filter(|c| *c != z)
+                    .map(|c| {
+                        let sum = links
+                            .cost(*x, *c)
+                            .ms()
+                            .saturating_add(links.cost(*c, *z).ms());
+                        (sum, channel_node_mix(channel, *c), *c)
+                    })
+                    .filter(|(sum, _, _)| *sum < budget)
+                    .min();
+                if let Some((_, _, c)) = via {
+                    relays.insert((*x, *z), c);
+                }
+            }
+            // A core hub that carries some of x's traffic already receives x's packet
+            // directly, so x must not reach *it* through yet another relay (duplicate).
+            let used: Vec<MediaNodeId> = hub_ids
+                .iter()
+                .filter_map(|z| relays.get(&(*x, *z)).copied())
+                .collect();
+            for c in used {
+                relays.remove(&(*x, c));
+            }
+        }
+        Self {
+            hosting_by_region,
+            hubs,
+            star_regions,
+            relays,
+        }
+    }
+
+    /// Hub `from` sends a packet bound for hub `to` to this node (either `to` or its relay).
+    pub fn next_hub(&self, from: MediaNodeId, to: MediaNodeId) -> MediaNodeId {
+        self.relays.get(&(from, to)).copied().unwrap_or(to)
+    }
 }
 
 /// Plans this node's [`ChannelRoute`] for `channel` in `region_tree` mode.
 ///
 /// * `hosting` — nodes with live participants of the channel (may include `local.id`);
-/// * `peers` — reachable healthy remote nodes (hosting or not; relay-only hubs are here too).
+/// * `peers` — reachable healthy remote nodes (hosting or not; relay-only hubs are here too);
+/// * `links` — fresh link measurements (empty ⇒ pre-measurement behaviour).
 ///
-/// Hosting nodes without a reachable peer entry are ignored (same as in mesh mode). With a
-/// single region the result is a plain mesh among the hosting nodes. Otherwise one hub per
-/// region is elected; the local node's route is:
-/// * as a hosting node: `origin` = other hosting nodes of its region + its region's hub
-///   (or, if it *is* the hub, the other regions' hubs);
-/// * as its region's hub: forward in-region ingress to the other regions' hubs, and remote
-///   hubs' ingress to the in-region hosting nodes (never back to the ingress peer).
+/// Hosting nodes without a reachable peer entry are ignored (same as in mesh mode). One hub per
+/// region is elected ([`hub_rank`]). Inside a region hosts talk directly, unless two of them do
+/// not reach each other — then the region is a star around its hub. Between regions the hubs
+/// talk directly, unless a pair does not reach each other (or is much slower than a two-hop
+/// path): then a *core* hub, one that reaches every hub, carries that direction. The local
+/// node's route is:
+/// * as a hosting node: `origin` = its in-region peers (or just the hub in a star region) plus
+///   its region's hub — or, if it *is* the hub, the other regions' hubs / their relays;
+/// * as its region's hub: forward in-region ingress to the other regions (and, in a star, to the
+///   other in-region hosts), and remote-hub ingress to the in-region hosts plus the hubs it
+///   relays for — never back to the ingress peer, and at most [`MAX_RELAY_HOPS`] hops:
+///   host → hub → core hub → hub → host.
 pub fn plan_region_tree(
     channel: &ChannelId,
     local: LocalNode,
     hosting: &HashSet<MediaNodeId>,
     peers: &HashMap<MediaNodeId, PeerNode>,
+    links: &LinkMatrix,
 ) -> ChannelRoute {
+    let plan = RegionTreePlan::compute(channel, local, hosting, peers, links);
     let local_hosts = hosting.contains(&local.id);
-    // region → hosting nodes (remote ones must be reachable).
-    let mut hosting_by_region: BTreeMap<Region, BTreeSet<MediaNodeId>> = BTreeMap::new();
-    for id in hosting {
-        let region = if *id == local.id {
-            local.region
-        } else if let Some(p) = peers.get(id) {
-            p.region
-        } else {
-            continue;
-        };
-        hosting_by_region.entry(region).or_default().insert(*id);
-    }
     let addr_of = |id: MediaNodeId| peers.get(&id).map(|p| p.addr);
+    let local_hub = plan.hubs.get(&local.region).copied();
+    let local_is_hub = local_hub == Some(local.id);
+    let star = plan.star_regions.contains(&local.region);
 
-    if hosting_by_region.len() <= 1 {
-        if !local_hosts {
-            return ChannelRoute::default();
-        }
-        let mesh: Vec<SocketAddr> = hosting_by_region
-            .values()
-            .flatten()
-            .filter(|id| **id != local.id)
-            .filter_map(|id| addr_of(*id))
-            .collect();
-        return ChannelRoute::mesh(&mesh);
-    }
-
-    // One hub per region: relay-only nodes of the region first, then its hosting nodes.
-    let mut hubs: BTreeMap<Region, MediaNodeId> = BTreeMap::new();
-    for (region, hosts) in &hosting_by_region {
-        let mut best: Option<((bool, u128, MediaNodeId), MediaNodeId)> = None;
-        let mut consider = |id: MediaNodeId, relay_only: bool| {
-            let rank = hub_rank(channel, id, relay_only);
-            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
-                best = Some((rank, id));
-            }
-        };
-        for (id, p) in peers {
-            if p.relay_only && p.region == *region {
-                consider(*id, true);
-            }
-        }
-        if local.relay_only && local.region == *region {
-            consider(local.id, true);
-        }
-        for id in hosts {
-            consider(*id, false);
-        }
-        if let Some((_, id)) = best {
-            hubs.insert(*region, id);
-        }
-    }
-    let local_is_hub = hubs.get(&local.region) == Some(&local.id);
-    let mut remote_hubs: Vec<SocketAddr> = hubs
-        .iter()
-        .filter(|(region, _)| **region != local.region)
-        .filter_map(|(_, id)| addr_of(*id))
-        .collect();
-    remote_hubs.sort_unstable();
-    let mut in_region_hosts: Vec<SocketAddr> = hosting_by_region
+    let mut in_region_hosts: Vec<SocketAddr> = plan
+        .hosting_by_region
         .get(&local.region)
         .into_iter()
         .flatten()
@@ -160,30 +317,77 @@ pub fn plan_region_tree(
         .collect();
     in_region_hosts.sort_unstable();
 
+    // Where this hub sends the traffic of its own region: each remote hub, or its relay.
+    let mut cross_targets: Vec<SocketAddr> = Vec::new();
+    // Remote hubs whose ingress this hub carries on to a third hub.
+    let mut relayed_for: BTreeMap<SocketAddr, Vec<SocketAddr>> = BTreeMap::new();
+    if local_is_hub {
+        for (region, hub) in &plan.hubs {
+            if *region == local.region {
+                continue;
+            }
+            if let Some(a) = addr_of(plan.next_hub(local.id, *hub)) {
+                cross_targets.push(a);
+            }
+            let Some(from) = addr_of(*hub) else { continue };
+            for (other_region, z) in &plan.hubs {
+                if other_region == region || *other_region == local.region {
+                    continue;
+                }
+                if plan.relays.get(&(*hub, *z)) == Some(&local.id) {
+                    if let Some(a) = addr_of(*z) {
+                        relayed_for.entry(from).or_default().push(a);
+                    }
+                }
+            }
+        }
+        cross_targets.sort_unstable();
+        cross_targets.dedup();
+    }
+
     let mut route = ChannelRoute::default();
     if local_hosts {
-        route.origin.extend(in_region_hosts.iter().copied());
         if local_is_hub {
-            route.origin.extend(remote_hubs.iter().copied());
-        } else if let Some(hub) = hubs.get(&local.region).and_then(|id| addr_of(*id)) {
-            if !route.origin.contains(&hub) {
-                route.origin.push(hub);
+            route.origin.extend(in_region_hosts.iter().copied());
+            route.origin.extend(cross_targets.iter().copied());
+        } else {
+            if !star {
+                route.origin.extend(in_region_hosts.iter().copied());
+            }
+            // A relay-only hub only matters once traffic has to be forwarded somewhere.
+            if star || plan.hubs.len() > 1 {
+                if let Some(hub) = local_hub.and_then(addr_of) {
+                    route.origin.push(hub);
+                }
             }
         }
     }
     if local_is_hub {
         for src in &in_region_hosts {
-            route.forward.insert(*src, remote_hubs.clone());
+            let mut targets = cross_targets.clone();
+            if star {
+                targets.extend(in_region_hosts.iter().copied().filter(|a| a != src));
+            }
+            route.forward.insert(*src, targets);
         }
-        for src in &remote_hubs {
-            route.forward.insert(*src, in_region_hosts.clone());
+        for (region, hub) in &plan.hubs {
+            if *region == local.region {
+                continue;
+            }
+            let Some(from) = addr_of(*hub) else { continue };
+            let mut targets = in_region_hosts.clone();
+            targets.extend(relayed_for.remove(&from).into_iter().flatten());
+            route.forward.insert(from, targets);
         }
     }
     route.origin.sort_unstable();
     route.origin.dedup();
     for targets in route.forward.values_mut() {
         targets.sort_unstable();
+        targets.dedup();
+        targets.retain(|t| peers.values().any(|p| p.addr == *t));
     }
+    route.forward.retain(|_, t| !t.is_empty());
     route
 }
 
@@ -239,6 +443,7 @@ impl CascadeTopology {
         mode: CascadeTopologyMode,
         cascade: Arc<CascadeRelay>,
         sfu: Arc<RwLock<SfuNode>>,
+        interval: Duration,
     ) -> Self {
         Self {
             pool,
@@ -247,7 +452,56 @@ impl CascadeTopology {
             mode,
             cascade,
             sfu,
+            interval: interval.max(Duration::from_millis(500)),
         }
+    }
+
+    /// Link rows older than this are stale: three missed publications plus the probe window.
+    pub fn link_max_age(&self) -> Duration {
+        (self.interval * 3 + self.cascade.link_max_age()).max(Duration::from_secs(10))
+    }
+
+    /// Publishes what this node's relay measured towards registry peers and loads the fresh
+    /// fleet-wide link matrix (empty when the database is unavailable — pre-measurement rules).
+    async fn sync_links(&self, peers: &HashMap<MediaNodeId, PeerNode>) -> LinkMatrix {
+        let by_addr: HashMap<SocketAddr, MediaNodeId> =
+            peers.iter().map(|(id, p)| (p.addr, *id)).collect();
+        let reports = self.cascade.link_reports();
+        let rows: Vec<(uuid::Uuid, &str, i32)> = reports
+            .iter()
+            .filter_map(|r| {
+                let id = by_addr.get(&r.peer)?;
+                Some((
+                    id.0,
+                    r.transport?.as_str(),
+                    i32::try_from(r.rtt_ms?).unwrap_or(i32::MAX),
+                ))
+            })
+            .collect();
+        if let Err(e) =
+            aurix_db::queries::replace_media_node_links(&self.pool, self.local.id.0, &rows).await
+        {
+            warn!("Cannot publish cascade link measurements: {}", e);
+        }
+        let max_age = self.link_max_age().as_secs() as i64;
+        let mut matrix = LinkMatrix::new();
+        match aurix_db::queries::fresh_media_node_links(&self.pool, max_age).await {
+            Ok((links, reporters)) => {
+                for id in reporters {
+                    matrix.reporter(MediaNodeId::from_uuid(id));
+                }
+                for l in links {
+                    matrix.report(
+                        MediaNodeId::from_uuid(l.node_id),
+                        MediaNodeId::from_uuid(l.peer_id),
+                        u32::try_from(l.rtt_ms).unwrap_or(0),
+                        l.transport == "tcp",
+                    );
+                }
+            }
+            Err(e) => warn!("Cannot load cascade link measurements: {}", e),
+        }
+        matrix
     }
 
     /// Healthy remote nodes with a reachable cascade endpoint, keyed by node id.
@@ -286,6 +540,7 @@ impl CascadeTopology {
         let peers = self.peer_nodes().await;
         self.cascade
             .set_dynamic_peers(peers.values().map(|p| p.addr).collect::<HashSet<_>>());
+        let links = self.sync_links(&peers).await;
 
         let local_channels: Vec<ChannelId> = self.sfu.read().channel_ids();
         let rows = match self.mode {
@@ -338,7 +593,9 @@ impl CascadeTopology {
                         .collect();
                     ChannelRoute::mesh(&mesh)
                 }
-                CascadeTopologyMode::RegionTree => plan_region_tree(channel, local, hosts, &peers),
+                CascadeTopologyMode::RegionTree => {
+                    plan_region_tree(channel, local, hosts, &peers, &links)
+                }
             };
             // Hand-configured peers (outside the registry) always receive the channels this
             // node hosts, exactly as before auto-discovery existed.
@@ -508,6 +765,7 @@ mod tests {
 
     struct Fleet {
         nodes: Vec<(MediaNodeId, PeerNode)>,
+        links: LinkMatrix,
     }
 
     impl Fleet {
@@ -526,7 +784,23 @@ mod tests {
                     )
                 })
                 .collect();
-            Self { nodes }
+            Self {
+                nodes,
+                links: LinkMatrix::new(),
+            }
+        }
+
+        /// Both `i` and `j` measured each other at `rtt_ms` (over UDP unless `tcp`).
+        fn link(&mut self, i: usize, j: usize, rtt_ms: u32, tcp: bool) {
+            self.links.report(self.id(i), self.id(j), rtt_ms, tcp);
+            self.links.report(self.id(j), self.id(i), rtt_ms, tcp);
+        }
+
+        /// Every node publishes a link table; pairs without a `link` are unconfirmed.
+        fn all_report(&mut self) {
+            for (id, _) in &self.nodes {
+                self.links.reporter(*id);
+            }
         }
 
         fn id(&self, i: usize) -> MediaNodeId {
@@ -556,7 +830,7 @@ mod tests {
                 .map(|j| self.nodes[*j])
                 .collect();
             let hosting: HashSet<MediaNodeId> = hosting.iter().map(|j| self.id(*j)).collect();
-            plan_region_tree(channel, local, &hosting, &peers)
+            plan_region_tree(channel, local, &hosting, &peers, &self.links)
         }
 
         /// Every alive node plans independently; then each hosting node originates one packet
@@ -609,7 +883,7 @@ mod tests {
         }
     }
 
-    use Region::{AsiaPacific, EuWest, UsEast};
+    use Region::{AsiaPacific, EuWest, SouthAmerica, UsEast};
 
     /// Every other *hosting* node gets exactly one copy; relay-only nodes may see it too.
     fn assert_exactly_once(
@@ -812,5 +1086,305 @@ mod tests {
             );
         }
         assert!(eu_hubs.len() > 1, "hub duty must not pin to one node");
+    }
+
+    // ── measured links ──
+
+    fn hops_to(sim: &HashMap<usize, Vec<(usize, u8)>>, origin: usize, target: usize) -> u8 {
+        sim[&origin]
+            .iter()
+            .find(|(i, _)| *i == target)
+            .map(|(_, h)| *h)
+            .unwrap_or_else(|| panic!("{origin} → {target} not delivered"))
+    }
+
+    #[test]
+    fn measured_rtt_elects_the_hub_closest_to_the_other_regions() {
+        let mut fleet = Fleet::new(&[
+            (EuWest, false),
+            (EuWest, false),
+            (EuWest, false),
+            (UsEast, false),
+        ]);
+        let all = [0, 1, 2, 3];
+        fleet.all_report();
+        fleet.link(0, 1, 8, false);
+        fleet.link(0, 2, 9, false);
+        fleet.link(1, 2, 7, false);
+        fleet.link(1, 3, 40, false);
+        fleet.link(0, 3, 120, false);
+        fleet.link(2, 3, 130, false);
+        for _ in 0..32 {
+            let ch = ChannelId::new();
+            let hubs: Vec<usize> = [0, 1, 2]
+                .into_iter()
+                .filter(|i| fleet.plan(&ch, *i, &all, &all).is_hub())
+                .collect();
+            assert_eq!(
+                hubs,
+                vec![1],
+                "the EU node 40 ms from the US must be the hub"
+            );
+            assert_exactly_once(&fleet, &fleet.simulate(&ch, &all, &all), &all, &all);
+        }
+        // A TCP-only link is charged its penalty: node 1 falls behind node 0 (50 vs 40+100).
+        fleet.link(1, 3, 40, true);
+        fleet.link(0, 3, 50, false);
+        let ch = ChannelId::new();
+        assert!(fleet.plan(&ch, 0, &all, &all).is_hub());
+        // Jitter inside one RTT bucket does not re-elect on its own: 49 vs 45 ms tie.
+        fleet.link(1, 3, 45, false);
+        fleet.link(0, 3, 49, false);
+        let stable: HashSet<usize> = (0..32)
+            .map(|_| {
+                let ch = ChannelId::new();
+                [0, 1, 2]
+                    .into_iter()
+                    .find(|i| fleet.plan(&ch, *i, &all, &all).is_hub())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            stable.len(),
+            2,
+            "equal buckets fall back to the channel hash spread"
+        );
+        assert!(!stable.contains(&2));
+    }
+
+    #[test]
+    fn candidates_that_cannot_reach_their_hosts_lose_even_when_relay_only() {
+        // EU relay node 2 is cut off from host 1; host 0 reaches everyone and becomes hub.
+        let mut fleet = Fleet::new(&[
+            (EuWest, false),
+            (EuWest, false),
+            (EuWest, true),
+            (UsEast, false),
+        ]);
+        let all = [0, 1, 2, 3];
+        let hosting = [0, 1, 3];
+        fleet.all_report();
+        fleet.link(0, 1, 5, false);
+        fleet.link(0, 2, 5, false);
+        fleet.link(0, 3, 60, false);
+        fleet.link(1, 3, 95, false);
+        fleet.link(2, 3, 50, false);
+        let ch = ChannelId::new();
+        assert!(fleet.plan(&ch, 0, &hosting, &all).is_hub());
+        assert!(fleet.plan(&ch, 2, &hosting, &all).is_empty());
+        assert_exactly_once(&fleet, &fleet.simulate(&ch, &hosting, &all), &hosting, &all);
+        // Once the relay node reaches host 1 too, it is preferred again.
+        fleet.link(1, 2, 6, false);
+        assert!(fleet.plan(&ch, 2, &hosting, &all).is_hub());
+    }
+
+    #[test]
+    fn hosts_that_do_not_reach_each_other_use_the_hub_as_an_in_region_star() {
+        let mut fleet = Fleet::new(&[
+            (EuWest, false),
+            (EuWest, false),
+            (EuWest, false),
+            (EuWest, true),
+        ]);
+        let all = [0, 1, 2, 3];
+        let hosting = [0, 1, 2];
+        fleet.all_report();
+        fleet.link(0, 3, 4, false);
+        fleet.link(1, 3, 4, false);
+        fleet.link(2, 3, 4, false);
+        fleet.link(0, 2, 3, false);
+        fleet.link(1, 2, 3, false);
+        // 0 and 1 never confirmed each other: everything goes through the relay hub.
+        let ch = ChannelId::new();
+        let r0 = fleet.plan(&ch, 0, &hosting, &all);
+        assert_eq!(r0.origin, vec![fleet.addr(3)]);
+        assert!(!r0.is_hub());
+        let hub = fleet.plan(&ch, 3, &hosting, &all);
+        assert!(hub.is_hub() && hub.origin.is_empty());
+        assert_eq!(
+            hub.forward[&fleet.addr(0)],
+            vec![fleet.addr(1), fleet.addr(2)]
+        );
+        let sim = fleet.simulate(&ch, &hosting, &all);
+        assert_exactly_once(&fleet, &sim, &hosting, &all);
+        assert_eq!(hops_to(&sim, 0, 1), 2);
+        // With a single region and working links the relay node is not involved at all.
+        fleet.link(0, 1, 3, false);
+        let r0 = fleet.plan(&ch, 0, &hosting, &all);
+        assert_eq!(r0.origin, vec![fleet.addr(1), fleet.addr(2)]);
+        assert!(fleet.plan(&ch, 3, &hosting, &all).is_empty());
+        // A node that does not publish measurements is assumed reachable (legacy nodes).
+        let mut legacy = Fleet::new(&[(EuWest, false), (EuWest, false), (EuWest, true)]);
+        legacy.links.reporter(legacy.id(0));
+        legacy.links.reporter(legacy.id(2));
+        assert_eq!(
+            legacy.plan(&ch, 0, &[0, 1], &[0, 1, 2]).origin,
+            vec![legacy.addr(1)]
+        );
+    }
+
+    #[test]
+    fn hubs_that_do_not_reach_each_other_relay_through_a_core_hub() {
+        // Three regions, each a host behind a relay-only hub; the EU and APAC hubs are cut off
+        // from each other, the US hub reaches both.
+        let mut fleet = Fleet::new(&[
+            (EuWest, false),
+            (EuWest, true),
+            (UsEast, false),
+            (UsEast, true),
+            (AsiaPacific, false),
+            (AsiaPacific, true),
+        ]);
+        let all = [0, 1, 2, 3, 4, 5];
+        let hosting = [0, 2, 4];
+        fleet.all_report();
+        fleet.link(0, 1, 5, false);
+        fleet.link(2, 3, 5, false);
+        fleet.link(4, 5, 5, false);
+        fleet.link(1, 3, 80, false);
+        fleet.link(3, 5, 100, false);
+        let ch = ChannelId::new();
+        let eu = fleet.plan(&ch, 1, &hosting, &all);
+        assert!(eu.is_hub());
+        assert_eq!(
+            eu.forward[&fleet.addr(0)],
+            vec![fleet.addr(3)],
+            "EU ingress goes to the US core hub only"
+        );
+        let us = fleet.plan(&ch, 3, &hosting, &all);
+        assert_eq!(
+            us.forward[&fleet.addr(1)],
+            vec![fleet.addr(2), fleet.addr(5)],
+            "the core hub delivers locally and carries EU traffic on to APAC"
+        );
+        assert_eq!(
+            us.forward[&fleet.addr(5)],
+            vec![fleet.addr(1), fleet.addr(2)]
+        );
+        assert_eq!(
+            us.forward[&fleet.addr(2)],
+            vec![fleet.addr(1), fleet.addr(5)]
+        );
+        let apac = fleet.plan(&ch, 5, &hosting, &all);
+        assert_eq!(
+            apac.forward[&fleet.addr(3)],
+            vec![fleet.addr(4)],
+            "relayed traffic is not forwarded any further"
+        );
+        let sim = fleet.simulate(&ch, &hosting, &all);
+        assert_exactly_once(&fleet, &sim, &hosting, &all);
+        assert_eq!(hops_to(&sim, 0, 4), 4);
+        assert_eq!(hops_to(&sim, 4, 0), 4);
+        assert_eq!(hops_to(&sim, 0, 2), 3);
+        assert!(sim.values().flatten().all(|(_, h)| *h <= MAX_RELAY_HOPS));
+
+        // A fourth region the EU hub cannot reach keeps EU a non-core hub; its direct APAC
+        // link now exists but is much slower than via the US core hub (300 > 80 + 100 + margin),
+        // so it is bypassed …
+        fleet.nodes.push((
+            MediaNodeId::new(),
+            PeerNode {
+                addr: "10.0.0.7:9001".parse().unwrap(),
+                region: SouthAmerica,
+                relay_only: false,
+            },
+        ));
+        fleet.links.reporter(fleet.id(6));
+        fleet.link(6, 3, 120, false);
+        fleet.link(6, 5, 100, false);
+        let all = [0, 1, 2, 3, 4, 5, 6];
+        let hosting = [0, 2, 4, 6];
+        fleet.link(1, 5, 300, false);
+        let sim = fleet.simulate(&ch, &hosting, &all);
+        assert_exactly_once(&fleet, &sim, &hosting, &all);
+        assert_eq!(hops_to(&sim, 0, 4), 4);
+        assert_eq!(hops_to(&sim, 0, 6), 3, "EU → US core → SA host");
+        // … while a direct link that is nearly as fast is used as before.
+        fleet.link(1, 5, 170, false);
+        let sim = fleet.simulate(&ch, &hosting, &all);
+        assert_exactly_once(&fleet, &sim, &hosting, &all);
+        assert_eq!(hops_to(&sim, 0, 4), 3);
+        assert!(fleet.plan(&ch, 3, &hosting, &all).forward[&fleet.addr(1)]
+            .iter()
+            .all(|a| *a != fleet.addr(5)));
+        // Core hubs (reaching every hub) always send directly, so relayed traffic is never
+        // forwarded twice: the US hub reaches EU, APAC and SA itself.
+        let us = fleet.plan(&ch, 3, &hosting, &all);
+        assert_eq!(
+            us.forward[&fleet.addr(2)],
+            vec![fleet.addr(1), fleet.addr(5), fleet.addr(6)]
+        );
+    }
+
+    /// Random fleets (regions, relay nodes, hosting sets, partial/unconfirmed/TCP links):
+    /// every plan delivers exactly once within the hop cap and never back to the ingress.
+    #[test]
+    fn random_fleets_and_link_tables_always_deliver_exactly_once() {
+        let mut seed: u64 = 0x5EED_CA5C_ADE0_0001;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let regions = [EuWest, UsEast, AsiaPacific, SouthAmerica];
+        for _ in 0..400 {
+            let n = 2 + next(7) as usize;
+            let spec: Vec<(Region, bool)> = (0..n)
+                .map(|_| (regions[next(4) as usize], next(4) == 0))
+                .collect();
+            let mut fleet = Fleet::new(&spec);
+            let all: Vec<usize> = (0..n).collect();
+            let hosting: Vec<usize> = all
+                .iter()
+                .copied()
+                .filter(|i| !spec[*i].1 && next(4) != 0)
+                .collect();
+            for i in 0..n {
+                if next(5) != 0 {
+                    fleet.links.reporter(fleet.id(i));
+                }
+            }
+            for i in 0..n {
+                for j in i + 1..n {
+                    match next(5) {
+                        0 => {}
+                        1 => fleet.link(i, j, 5 + next(300) as u32, true),
+                        _ => fleet.link(i, j, 5 + next(300) as u32, false),
+                    }
+                }
+            }
+            let ch = ChannelId::new();
+            let sim = fleet.simulate(&ch, &hosting, &all);
+            assert_exactly_once(&fleet, &sim, &hosting, &all);
+            for i in &all {
+                let route = fleet.plan(&ch, *i, &hosting, &all);
+                assert!(!route.origin.contains(&fleet.addr(*i)));
+                for (src, targets) in &route.forward {
+                    assert!(!targets.contains(src));
+                    assert!(!targets.contains(&fleet.addr(*i)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_core_hub_cut_off_hubs_still_try_the_direct_link() {
+        let mut fleet = Fleet::new(&[(EuWest, false), (UsEast, false), (AsiaPacific, false)]);
+        let all = [0, 1, 2];
+        fleet.all_report();
+        fleet.link(0, 1, 80, false);
+        // 1–2 and 0–2 unconfirmed: nobody reaches APAC, so APAC keeps the legacy direct rule.
+        let ch = ChannelId::new();
+        let sim = fleet.simulate(&ch, &all, &all);
+        assert_exactly_once(&fleet, &sim, &all, &all);
+        assert!(sim.values().flatten().all(|(_, h)| *h == 1));
+        // Same snapshot on every node → identical plans.
+        for i in all {
+            assert_eq!(
+                fleet.plan(&ch, i, &all, &all),
+                fleet.plan(&ch, i, &all, &all)
+            );
+        }
     }
 }

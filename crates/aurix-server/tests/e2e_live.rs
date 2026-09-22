@@ -1430,6 +1430,18 @@ async fn audio_seqs_from(to: &Player, ssrc: u32, payload: &Bytes) -> Vec<u32> {
 
 /// `seqs` is one burst of `expected` consecutive per-sender sequence numbers (the origin node
 /// renumbers a sender's audio once; the cascade preserves it), allowing two lost packets.
+/// One AURX heartbeat from a listen-only player so the node's media session does not time out
+/// during long scenarios; shares the player's uplink sequence with its audio.
+async fn keepalive(p: &Player, seq: &mut u32) {
+    let mut hb = AurixPacket::heartbeat(p.ssrc, *seq * 960);
+    hb.header.sequence = *seq;
+    *seq += 1;
+    p.udp
+        .send_to(&hb.seal(&p.keys), p.media_addr)
+        .await
+        .unwrap();
+}
+
 fn assert_burst(seqs: &[u32], expected: usize, what: &str) {
     let (min, max) = (
         seqs.iter().copied().min().unwrap_or(0),
@@ -1449,13 +1461,64 @@ fn metric_sum(body: &str, name: &str, label: &str) -> f64 {
         .sum()
 }
 
+/// Host firewall rules (`sudo -n iptables`) dropping every UDP datagram to and from a cascade
+/// port; removed on drop.
+struct CascadeUdpBlock {
+    port: u16,
+    active: bool,
+}
+
+impl CascadeUdpBlock {
+    fn new(port: u16) -> Self {
+        Self {
+            port,
+            active: false,
+        }
+    }
+
+    fn iptables(action: &str, port: u16) -> bool {
+        ["--dport", "--sport"].iter().all(|dir| {
+            std::process::Command::new("sudo")
+                .args(["-n", "iptables", action, "INPUT", "-p", "udp", dir])
+                .arg(port.to_string())
+                .args(["-j", "DROP"])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    fn block(&mut self) {
+        if !self.active {
+            assert!(Self::iptables("-A", self.port), "iptables -A failed");
+            self.active = true;
+        }
+    }
+
+    fn unblock(&mut self) {
+        if self.active {
+            assert!(Self::iptables("-D", self.port), "iptables -D failed");
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for CascadeUdpBlock {
+    fn drop(&mut self) {
+        if self.active {
+            Self::iptables("-D", self.port);
+        }
+    }
+}
+
 /// Region-tree cascade over four nodes: nodes 1 and 2 (`us_east`) and node 3 (`eu_west`) host
 /// players, node 4 (`eu_west`) is a `cascade_relay_only` hub. Given by `AURIX_E2E_API3` /
 /// `AURIX_E2E_WS3`, `AURIX_E2E_WS4` and `AURIX_E2E_METRICS4`. Alice (node 1) talks to Carol
 /// (node 2, same region — direct) and Bob (node 3 — via the `us_east` hub and the relay-only
 /// `eu_west` hub, 3 hops); every packet arrives exactly once, the hub is never offered to
-/// clients, and — with `AURIX_E2E_NODE4_STOP` — losing the hub re-elects node 3 as the
-/// `eu_west` hub and cross-region audio recovers.
+/// clients; with `AURIX_E2E_SUDO_IPTABLES` + `AURIX_E2E_UDP4` the hub's cascade UDP is
+/// firewalled and the tree keeps delivering over the authenticated TCP fallback (link table
+/// and metrics say `tcp`, then back to `udp`); and — with `AURIX_E2E_NODE4_STOP` — losing the
+/// hub re-elects node 3 as the `eu_west` hub and cross-region audio recovers.
 #[tokio::test]
 #[ignore = "requires four Aurix nodes in two regions with a relay-only hub; see docs/operations/scaling.md"]
 async fn region_tree_relays_through_hub_exactly_once_and_survives_hub_loss() {
@@ -1645,6 +1708,7 @@ async fn region_tree_relays_through_hub_exactly_once_and_survives_hub_loss() {
     assert_burst(&to_bob, 30, "Bob (other region, via two hubs)");
     let bob_payload = Bytes::from_static(&[0xFC, 2, 7, 1, 8, 2, 8]);
     let mut bob_seq = 5000u32;
+    let mut carol_seq = 7000u32;
     send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
     bob_seq += 10;
     let back_a = audio_seqs_from(&alice, bob.ssrc, &bob_payload).await;
@@ -1692,6 +1756,158 @@ async fn region_tree_relays_through_hub_exactly_once_and_survives_hub_loss() {
         eprintln!("AURIX_E2E_METRICS4 not set; skipping hub metric checks");
     }
 
+    // Blocked UDP towards the hub: with `AURIX_E2E_SUDO_IPTABLES=1` and `AURIX_E2E_UDP4` (the
+    // hub's media port; its cascade port is `+ 1`) the host drops every UDP datagram to and
+    // from the hub's cascade socket. The peers' probes go unanswered, the links switch to the
+    // authenticated TCP fallback, the shared link table says `tcp`, cross-region audio keeps
+    // flowing exactly once — and everything moves back to UDP once the block lifts.
+    if let (Ok(_), Ok(udp4)) = (
+        std::env::var("AURIX_E2E_SUDO_IPTABLES"),
+        std::env::var("AURIX_E2E_UDP4"),
+    ) {
+        let cascade_port: u16 = udp4.parse::<u16>().expect("AURIX_E2E_UDP4") + 1;
+        let admin = std::env::var("AURIX_E2E_ADMIN_TOKEN").ok();
+        let hub_links = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter()
+                .filter(|r| {
+                    hub_id.as_deref().is_some_and(|h| {
+                        r["node_id"].as_str() == Some(h) || r["peer_id"].as_str() == Some(h)
+                    })
+                })
+                .map(|r| r["transport"].as_str().unwrap_or("?").to_string())
+                .collect()
+        };
+        let fetch_links = |admin: &str| {
+            let req = http
+                .get(format!("{}/v1/nodes/links", env.api))
+                .bearer_auth(admin);
+            async move {
+                req.send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json::<Vec<serde_json::Value>>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let wait_links = |admin: &str, transport: &'static str, budget: Duration| {
+            let admin = admin.to_string();
+            async move {
+                let deadline = tokio::time::Instant::now() + budget;
+                loop {
+                    let rows = fetch_links(&admin).await;
+                    let transports = hub_links(&rows);
+                    if transports.len() >= 2 && transports.iter().all(|t| t == transport) {
+                        return rows;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "hub links never all reported as {transport}: {rows:?}"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
+        if let Some(admin) = admin.as_deref() {
+            let rows = wait_links(admin, "udp", Duration::from_secs(20)).await;
+            let rtts: Vec<i64> = rows.iter().filter_map(|r| r["rtt_ms"].as_i64()).collect();
+            assert!(
+                rtts.iter().all(|r| (0..1000).contains(r)),
+                "loopback RTTs must be measured, not fabricated: {rows:?}"
+            );
+        }
+
+        let mut block = CascadeUdpBlock::new(cascade_port);
+        block.block();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let mut recovered = false;
+        while tokio::time::Instant::now() < deadline {
+            keepalive(&carol, &mut carol_seq).await;
+            keepalive(&bob, &mut bob_seq).await;
+            while bob.recv_udp().await.is_some() {}
+            send_audio(&alice, channel_id, seq, &payload).await;
+            seq += 10;
+            let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+            if to_bob.len() >= 8 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "cross-region audio did not recover over the TCP cascade fallback"
+        );
+        while carol.recv_udp().await.is_some() {}
+        while bob.recv_udp().await.is_some() {}
+        for _ in 0..2 {
+            send_audio(&alice, channel_id, seq, &payload).await;
+            seq += 10;
+        }
+        let to_carol = audio_seqs_from(&carol, alice.ssrc, &payload).await;
+        let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+        assert_burst(&to_carol, 20, "Carol with the hub's UDP blocked");
+        assert_burst(&to_bob, 20, "Bob over the TCP cascade fallback");
+        send_audio(&bob, channel_id, bob_seq, &bob_payload).await;
+        bob_seq += 10;
+        let back_a = audio_seqs_from(&alice, bob.ssrc, &bob_payload).await;
+        assert!(
+            back_a.len() >= 8,
+            "Alice got {} packets from Bob over TCP",
+            back_a.len()
+        );
+        keepalive(&carol, &mut carol_seq).await;
+        keepalive(&bob, &mut bob_seq).await;
+        if let Some(admin) = admin.as_deref() {
+            wait_links(admin, "tcp", Duration::from_secs(30)).await;
+        }
+        if let Ok(metrics4) = std::env::var("AURIX_E2E_METRICS4") {
+            let body = http
+                .get(&metrics4)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(
+                metric_sum(&body, "aurix_cascade_links", "transport=\"tcp\"") >= 1.0,
+                "hub reports no TCP link:\n{body}"
+            );
+            assert_eq!(
+                metric_sum(&body, "aurix_cascade_links", "transport=\"udp\""),
+                0.0,
+                "hub still counts a UDP link while blocked:\n{body}"
+            );
+        }
+
+        block.unblock();
+        keepalive(&carol, &mut carol_seq).await;
+        keepalive(&bob, &mut bob_seq).await;
+        if let Some(admin) = admin.as_deref() {
+            wait_links(admin, "udp", Duration::from_secs(45)).await;
+        } else {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        }
+        keepalive(&carol, &mut carol_seq).await;
+        keepalive(&bob, &mut bob_seq).await;
+        while carol.recv_udp().await.is_some() {}
+        while bob.recv_udp().await.is_some() {}
+        for _ in 0..2 {
+            send_audio(&alice, channel_id, seq, &payload).await;
+            seq += 10;
+        }
+        let to_carol = audio_seqs_from(&carol, alice.ssrc, &payload).await;
+        let to_bob = audio_seqs_from(&bob, alice.ssrc, &payload).await;
+        assert_burst(&to_carol, 20, "Carol after the block lifted");
+        assert_burst(&to_bob, 20, "Bob back on UDP");
+    } else {
+        eprintln!(
+            "AURIX_E2E_SUDO_IPTABLES/AURIX_E2E_UDP4 not set; skipping the blocked-UDP hub scenario"
+        );
+    }
+
     // Hub loss: kill node 4. Node 3 becomes its own region's hub once the registry marks node
     // 4 unhealthy, and Alice ↔ Bob audio recovers without anyone re-joining.
     if let Ok(stop) = std::env::var("AURIX_E2E_NODE4_STOP") {
@@ -1705,6 +1921,8 @@ async fn region_tree_relays_through_hub_exactly_once_and_survives_hub_loss() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         let mut recovered = false;
         while tokio::time::Instant::now() < deadline {
+            keepalive(&carol, &mut carol_seq).await;
+            keepalive(&bob, &mut bob_seq).await;
             while bob.recv_udp().await.is_some() {}
             send_audio(&alice, channel_id, seq, &payload).await;
             seq += 10;

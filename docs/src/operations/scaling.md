@@ -126,21 +126,34 @@ always receive every channel the node hosts, whatever the topology below says.
   reachability to each other.
 * `region_tree` (default) — hosting nodes in the same region still talk directly, but traffic
   between regions goes through exactly one **hub per region**: origin → own region's hub →
-  remote region's hub → hosting nodes there (at most 3 node-to-node hops, typically 2–3; hub
-  to hub is a single WAN hop). Each inter-regional link carries one copy of each stream no
-  matter how many nodes host the channel in the destination region, and only the hubs need
-  cross-region reachability on `media.port + 1`/UDP — in-region nodes only need to reach each
-  other and their hub.
+  remote region's hub → hosting nodes there (typically 2–3 node-to-node hops; hub to hub is a
+  single WAN hop). Each inter-regional link carries one copy of each stream no matter how many
+  nodes host the channel in the destination region, and only the hubs need cross-region
+  reachability on `media.port + 1` — in-region nodes only need to reach each other and their
+  hub. Where a pair of nodes cannot talk directly the tree grows a level (below).
 
-Hubs are elected **per channel** and deterministically from the same registry snapshot every
-node sees: relay-only nodes of the region first, then the region's hosting nodes, tie-broken by
-a channel/node hash so hub duty spreads across a region instead of pinning to one node. There
-is no coordination protocol; every node plans only its own part of the tree (whom it sends its
-participants' audio to, and which ingress peer's packets it forwards where), and a hub forwards
-a packet only to the edges of that ingress — never back to where it came from. Re-forwarded
-envelopes carry a hop byte ([`RelayHop`](../api/aurx.md#flags)) and a node never forwards an
-envelope whose count reached the cap, so a stale or inconsistent plan during a reconciliation
-window cannot loop traffic; the per-peer anti-replay window still applies at every hop and
+Hubs are elected **per channel** and deterministically from the same registry *and link*
+snapshot every node sees ([measured links](#measured-links-rtt-and-the-tcp-fallback)):
+candidates that reach every node they would have to talk to first, then the region's
+relay-only nodes, then the lowest summed RTT towards the region's hosts and the other regions
+(in 25 ms buckets, TCP-only links count +100 ms, unmeasured links 150 ms), tie-broken by a
+channel/node hash so hub duty spreads across a region instead of pinning to one node. Two
+things make the tree deeper than one hub per region when the links demand it:
+
+* **Core hub.** When two regions' hubs do not reach each other — or reach each other slower
+  than through a third hub by more than 30 ms — that direction goes through a *core* hub (the
+  hub that reaches every hub with the lowest detour), one more level: host → hub → core hub →
+  hub → host.
+* **In-region star.** When two hosting nodes of the same region do not reach each other, that
+  region's in-region traffic goes through its hub as well instead of the direct one-hop link.
+
+There is no coordination protocol; every node plans only its own part of the tree (whom it
+sends its participants' audio to, and which ingress peer's packets it forwards where), and a
+hub forwards a packet only to the edges of that ingress — never back to where it came from.
+Re-forwarded envelopes carry a hop byte ([`RelayHop`](../api/aurx.md#flags)) and a node never
+forwards an envelope whose count reached the cap (`MAX_RELAY_HOPS` = 5), so a stale or
+inconsistent plan during a reconciliation window cannot loop traffic; the per-peer anti-replay
+window still applies at every hop and
 the envelope is re-sealed hop by hop under the same `cascade_secret` (original sender, SSRC,
 audio level and E2EE payload are preserved; receiver preferences are still applied only on the
 node that hosts the receiver). A mesh node and a tree node can share a cluster while you roll
@@ -163,9 +176,39 @@ sent as an origin, re-forwarded as a hub, or refused to re-forward because the h
 reached (`hop_limit` staying at zero is the healthy state); `aurix_cascade_hub_channels` is the
 number of channels this node currently hubs.
 
-Not covered: the planner knows regions, health and address families, not measured RTT or link
-cost — a region is one hub set, there is no multi-level tree inside a region, and the hop cap
-means a channel is never relayed through more than two hubs.
+### Measured links, RTT and the TCP fallback
+
+Every node pings each registry peer on the cascade port every
+`media.cascade_probe_interval_ms` (1000) — a sealed `Heartbeat` ping/pong inside the same
+`cascade_secret` envelope as media — and keeps a smoothed RTT per peer and transport. The
+result is published to `media_node_links` (one row per `(node, peer)`: `transport`, `rtt_ms`,
+`measured_at`) on every reconciliation pass and read back as the fleet-wide link matrix the
+planner above ranks hubs with. Rows older than three passes plus the probe window are ignored;
+a link is *confirmed* when either side measured it (the worse direction wins), *unconfirmed*
+when both nodes publish tables but neither heard the other (blocked — the planner routes
+around it), and *unknown* when a node has not published yet (a node predating link probes, or
+just started — treated as an average 150 ms link so mixed fleets keep working).
+`GET /v1/nodes/links` (`nodes:read`) / `aurix node links` show the table.
+
+When a peer misses three UDP probes in a row and `media.cascade_tcp_fallback = true` (default),
+the node dials the peer's cascade port over **TCP** (same port number, length-prefixed frames of
+the very same sealed envelopes — nothing is decrypted or re-keyed, so client E2EE and the
+relay authentication are untouched) and moves that peer's envelopes onto the TCP link while
+UDP keeps being probed; as soon as UDP answers again the link switches back and the idle TCP
+connection is closed after 30 s. Inbound TCP connections must open with a sealed `Hello` from an
+allowed peer within 5 s (bounded to 1024 connections, 60 s idle), every frame passes the same
+per-peer anti-replay window as UDP, and each outbound link has a bounded queue (256 frames):
+a stalled peer drops its own audio (`aurix_cascade_tcp_dropped_total`) and never blocks the
+SFU. `aurix_cascade_links{transport="udp"|"tcp"|"unconfirmed"}` counts peers by the transport
+currently used towards them — `tcp` staying at zero is the healthy state; a non-zero value
+names a firewall between two nodes that should be opened for UDP, the fallback is there so audio
+keeps flowing meanwhile (TCP head-of-line blocking under loss, like the client tunnel). The
+link table feeds the planner too: a TCP-only pair is ranked 100 ms worse, so a hub whose UDP is
+blocked loses the election to one that is reachable, and a channel takes the detour through a
+core hub or an in-region star rather than a blocked direct link.
+
+Not covered: the planner knows RTT and reachability, not link bandwidth or loss, and it plans
+per channel — there is no fleet-wide balancing of hub duty by load beyond the hash spread.
 
 ## Regions
 

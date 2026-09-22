@@ -399,6 +399,16 @@ pub struct MediaNodeRow {
     pub registered_at: DateTime<Utc>,
 }
 
+/// One measured cascade link as published by `node_id` (see `media_node_links`).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MediaNodeLinkRow {
+    pub node_id: Uuid,
+    pub peer_id: Uuid,
+    pub transport: String,
+    pub rtt_ms: i32,
+    pub measured_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct AuditLogRow {
     pub id: Uuid,

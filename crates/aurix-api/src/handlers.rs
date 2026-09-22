@@ -2368,6 +2368,17 @@ pub async fn list_media_nodes(
     to_json(state.control.nodes.get_all_nodes())
 }
 
+/// Measured cascade links as every node published them (`media_node_links`): who reaches
+/// whom, over which transport, at what RTT, and how old the measurement is.
+pub async fn list_media_node_links(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AdminContext>,
+) -> JsonResult {
+    admin.require(AdminPermission::NodesRead)?;
+    let rows = aurix_db::queries::list_media_node_links(&state.control.pool).await?;
+    to_json(rows)
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct DrainNodeRequest {
     #[serde(default)]

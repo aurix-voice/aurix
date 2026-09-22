@@ -144,12 +144,16 @@ the chapter that explains the boundary.
   per node. `audience.max_speakers` is enforced when a speaker joins — nobody is demoted once
   admitted — and `max_streams` ranks by receiver gains and sender-reported level, not by
   server-side voice analysis ([Large channels](features/channels.md#large-channels-and-audiences)).
-* **Cascade trees are region-deep only.** `region_tree` elects one hub per region per channel
-  from registry metadata (region, health, address family, `relay_only`) — not from measured RTT
-  or link cost — and caps a path at 3 hops (origin → hub → hub → node); there is no multi-level
-  tree inside a region and no per-link bandwidth awareness. Hub loss drops cross-region audio
-  for the affected channels until the next reconciliation pass (≤ `cascade_discovery_interval_ms`
-  plus the health timeout) ([Scaling](operations/scaling.md#topology-mesh-or-region-tree)).
+* **Cascade plans on RTT and reachability, not bandwidth.** `region_tree` elects hubs per
+  channel from the registry and the measured link table (RTT, UDP/TCP, blocked pairs) and grows
+  a core-hub level or an in-region star where a direct link is blocked, capped at
+  `MAX_RELAY_HOPS` = 5; it does not know link bandwidth or loss and does not balance hub duty by
+  load beyond the channel hash spread. The TCP fallback between nodes carries the same sealed
+  envelopes over a plain TCP connection (no TLS layer — confidentiality and peer authentication
+  come from `cascade_secret`) and has TCP head-of-line blocking under loss. Hub loss drops
+  cross-region audio for the affected channels until the next reconciliation pass
+  (≤ `cascade_discovery_interval_ms` plus the health timeout)
+  ([Scaling](operations/scaling.md#measured-links-rtt-and-the-tcp-fallback)).
 * **Positional audio is server-side attenuation, panning and radius scoping** from
   client-reported positions; the server does no occlusion, reverb or HRTF, and the ambient mix ranks by
   reported loudness only (no server-side voice-activity analysis of the payload). Directional panning applies to native and WebRTC

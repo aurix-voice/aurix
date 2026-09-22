@@ -25,6 +25,25 @@ released together.
   job now runs both the Sentinel and the Cluster fleet. Key layout is compatible with existing
   standalone/Sentinel deployments only after all nodes restart on this version (session and
   user keys changed names; in-flight mirrors of older nodes are not read).
+* **Cascade: measured links, deeper trees, TCP fallback.** Every node pings its cascade peers
+  (`media.cascade_probe_interval_ms`, 1 s; sealed `Heartbeat` ping/pong on the cascade port),
+  publishes the smoothed RTT and transport per peer to the new `media_node_links` table
+  (migration `20240101000020`) and reads the fleet-wide link matrix back on every
+  reconciliation pass. `region_tree` hubs are now ranked by it — candidates that reach every
+  node they must talk to first, relay-only next, lowest RTT, then the channel hash — and the
+  tree grows a level where links are blocked: a *core hub* joins two hubs that do not reach
+  each other (or only much slower), and a region whose hosts do not reach each other becomes a
+  star around its hub; the hop cap is `MAX_RELAY_HOPS` = 5. A peer that misses three UDP probes
+  is reached over **TCP on the same cascade port** (`media.cascade_tcp_fallback`, default on):
+  length-prefixed frames of the very same sealed envelopes, `Hello`-authenticated inbound
+  connections, per-peer anti-replay, bounded queues (drops counted in
+  `aurix_cascade_tcp_dropped_total`), back to UDP as soon as it answers. New
+  `GET /v1/nodes/links` (`nodes:read`) / `aurix node links` and
+  `aurix_cascade_links{transport}` expose the table. Nodes without link probes keep working in
+  a mixed fleet (their links count as unmeasured, and they still drop envelopes deeper than
+  their own 3-hop cap, so upgrade hubs first). Live E2E now blocks UDP between the hubs
+  with `iptables` (`AURIX_E2E_SUDO_IPTABLES=1`) and checks audio, table and metrics through the
+  fallback and back.
 
 ## [1.4.0] - 2026-09-22
 

@@ -125,6 +125,14 @@ const (
 	GetRecordingTranscriptFormatVtt  GetRecordingTranscriptFormat = "vtt"
 )
 
+// Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
+type MediaNodeLinkTransport string
+
+const (
+	MediaNodeLinkTransportUDP MediaNodeLinkTransport = "udp"
+	MediaNodeLinkTransportTCP MediaNodeLinkTransport = "tcp"
+)
+
 // Widest audio bandwidth participants may encode (4/6/8/12/20 kHz).
 type OpusBandwidth string
 
@@ -1250,6 +1258,20 @@ type MediaNode struct {
 	WSURL    *string      `json:"ws_url,omitempty"`
 	APIURL   *string      `json:"api_url,omitempty"`
 	Location *GeoLocation `json:"location,omitempty"`
+}
+
+// One measured cascade link, as published by `node_id`.
+type MediaNodeLink struct {
+	// Node that measured the link.
+	NodeID string `json:"node_id"`
+	// Peer the measurement is towards.
+	PeerID string `json:"peer_id"`
+	// Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
+	Transport MediaNodeLinkTransport `json:"transport"`
+	// Smoothed round-trip time of cascade probes in milliseconds.
+	RTTMs int64 `json:"rtt_ms"`
+	// When `node_id` last published this link.
+	MeasuredAt string `json:"measured_at"`
 }
 
 // MixdownRecordingsRequest is the `MixdownRecordingsRequest` schema.

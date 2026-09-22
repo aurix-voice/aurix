@@ -489,6 +489,25 @@ public sealed partial class AurixClient : AurixHttp
     }
 
     /// <summary>
+    /// Measured cascade links
+    ///
+    /// Every node probes its cascade peers (UDP first, TCP fallback when UDP stops answering) and
+    /// publishes the links it confirmed. One row per `(node_id, peer_id)` as seen from `node_id`; a
+    /// pair missing in both directions while both nodes publish tables is unreachable. The
+    /// `region_tree` topology planner ranks hubs by these RTTs and routes around unreachable pairs.
+    /// Rows older than a few `media.cascade_discovery_interval_ms` periods are stale (the node stopped
+    /// publishing).
+    ///
+    /// `GET /v1/nodes/links`
+    /// Auth: AdminToken.
+    /// </summary>
+    public Task<List<MediaNodeLink>> ListNodeLinksAsync(RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<List<MediaNodeLink>>("/v1/nodes/links", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
     /// Drain a node (maintenance)
     ///
     /// Marks the node as draining, fleet-wide and persistently (survives restarts and heartbeats) until

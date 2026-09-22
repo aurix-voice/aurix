@@ -1,6 +1,7 @@
 pub mod ambient;
 pub mod audio_pipeline;
 pub mod cascade;
+pub mod cascade_link;
 pub mod channel;
 pub mod mix;
 pub mod mixer;

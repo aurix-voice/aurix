@@ -682,9 +682,11 @@ impl AurixPacket {
 }
 
 /// Most node-to-node hops a client packet may take through the cascade: origin node →
-/// regional hub (1) → remote hub (2) → hosting node (3). A node never re-forwards an envelope
-/// whose hop count already reached this, so an inconsistent topology cannot loop traffic.
-pub const MAX_RELAY_HOPS: u8 = 3;
+/// regional hub (1) → up to three hub-to-hub hops along the inter-regional relay tree (4) →
+/// hosting node (5). A node never re-forwards an envelope whose hop count already reached
+/// this, so an inconsistent topology cannot loop traffic. Nodes before 1.5 accepted at most
+/// 3 hops (hub → remote hub was always direct); they drop deeper envelopes.
+pub const MAX_RELAY_HOPS: u8 = 5;
 /// High bit of the hop byte, so it can never be mistaken for a packet version by a node that
 /// does not understand the `RelayHop` flag.
 pub const RELAY_HOP_MARK: u8 = 0x80;
@@ -2094,7 +2096,7 @@ mod tests {
         let mut legacy_view = got.clone();
         legacy_view.header.clear_flag(PacketFlags::RelayHop);
         assert!(legacy_view.relay_inner().is_err());
-        assert_eq!(MAX_RELAY_HOPS, 3);
+        assert_eq!(MAX_RELAY_HOPS, 5);
     }
 
     #[test]

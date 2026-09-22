@@ -101,6 +101,12 @@ async fn main() -> anyhow::Result<()> {
             session_timeout_secs: config.media.session_timeout_secs,
             cascade_secret: config.media.cascade_secret.clone(),
             cascade_peers: config.media.cascade_peers.clone(),
+            cascade: aurix_media::cascade::CascadeOptions {
+                tcp_fallback: config.media.cascade_tcp_fallback,
+                probe_interval: std::time::Duration::from_millis(
+                    config.media.cascade_probe_interval_ms,
+                ),
+            },
             advertised_addrs,
             downlink_bitrate: config.media.default_bitrate,
             mixer_decoder_complexity: config.media.mixer_decoder_complexity,
@@ -557,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
             config.media.cascade_topology,
             cascade,
             sfu.clone(),
+            std::time::Duration::from_millis(config.media.cascade_discovery_interval_ms),
         ));
         let events = control.events.clone();
         let interval = std::time::Duration::from_millis(config.media.cascade_discovery_interval_ms);

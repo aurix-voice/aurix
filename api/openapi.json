@@ -1586,6 +1586,43 @@
         "x-aurix-admin-permission": "nodes:read"
       }
     },
+    "/v1/nodes/links": {
+      "get": {
+        "tags": [
+          "Applications"
+        ],
+        "summary": "Measured cascade links",
+        "operationId": "listNodeLinks",
+        "description": "Every node probes its cascade peers (UDP first, TCP fallback when UDP stops answering) and publishes the links it confirmed. One row per `(node_id, peer_id)` as seen from `node_id`; a pair missing in both directions while both nodes publish tables is unreachable. The `region_tree` topology planner ranks hubs by these RTTs and routes around unreachable pairs. Rows older than a few `media.cascade_discovery_interval_ms` periods are stale (the node stopped publishing).",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MediaNodeLink"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "security": [
+          {
+            "AdminToken": []
+          }
+        ],
+        "x-aurix-admin-permission": "nodes:read"
+      }
+    },
     "/v1/nodes/{node_id}/drain": {
       "post": {
         "tags": [
@@ -10372,6 +10409,47 @@
           "healthy",
           "version",
           "last_heartbeat"
+        ]
+      },
+      "MediaNodeLink": {
+        "type": "object",
+        "description": "One measured cascade link, as published by `node_id`.",
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Node that measured the link."
+          },
+          "peer_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Peer the measurement is towards."
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "udp",
+              "tcp"
+            ],
+            "description": "Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked."
+          },
+          "rtt_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Smoothed round-trip time of cascade probes in milliseconds."
+          },
+          "measured_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When `node_id` last published this link."
+          }
+        },
+        "required": [
+          "node_id",
+          "peer_id",
+          "transport",
+          "rtt_ms",
+          "measured_at"
         ]
       },
       "ModerationEvent": {

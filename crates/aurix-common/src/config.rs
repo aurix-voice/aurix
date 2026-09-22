@@ -178,6 +178,9 @@ impl AurixConfig {
                 );
             }
         }
+        if !(100..=30_000).contains(&self.media.cascade_probe_interval_ms) {
+            anyhow::bail!("media.cascade_probe_interval_ms must be within 100..=30000");
+        }
         validate_families(
             "media",
             &self.media.host,
@@ -1603,6 +1606,14 @@ pub struct MediaConfig {
     /// traffic between regions. Requires `cascade_secret`.
     #[serde(default)]
     pub cascade_relay_only: bool,
+    /// Open TCP fallback links to peers that stop answering UDP probes (same cascade port,
+    /// same sealed envelopes) and accept them from peers; the link registry records which
+    /// transport each pair uses so hubs and relay paths avoid blocked links.
+    #[serde(default = "default_true")]
+    pub cascade_tcp_fallback: bool,
+    /// How often (ms) every cascade peer is pinged to measure RTT and detect blocked UDP.
+    #[serde(default = "default_cascade_probe_interval_ms")]
+    pub cascade_probe_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -1621,6 +1632,10 @@ fn default_true() -> bool {
 }
 fn default_cascade_discovery_interval_ms() -> u64 {
     3000
+}
+
+fn default_cascade_probe_interval_ms() -> u64 {
+    1000
 }
 fn default_speaking_timeout_ms() -> u64 {
     400
@@ -1714,6 +1729,8 @@ impl Default for MediaConfig {
             cascade_discovery_interval_ms: 3000,
             cascade_topology: CascadeTopologyMode::RegionTree,
             cascade_relay_only: false,
+            cascade_tcp_fallback: true,
+            cascade_probe_interval_ms: default_cascade_probe_interval_ms(),
         }
     }
 }

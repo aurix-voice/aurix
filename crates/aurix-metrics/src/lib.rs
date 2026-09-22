@@ -530,6 +530,29 @@ pub static CASCADE_HUB_CHANNELS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Cascade peers by the transport their envelopes currently take: `udp`, `tcp` (UDP to that
+/// peer is blocked, the TCP fallback link answers) or `unconfirmed` (the peer answered no probe
+/// recently — a node predating link probes, or unreachable; envelopes go out over UDP as a
+/// best effort).
+pub static CASCADE_LINKS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aurix_cascade_links",
+        "Cascade peers by the transport currently used towards them",
+        &["transport"]
+    )
+    .unwrap()
+});
+
+/// Envelopes dropped because a peer's TCP fallback link was not connected or its bounded
+/// send queue was full (backpressure: audio is never buffered without limit).
+pub static CASCADE_TCP_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "aurix_cascade_tcp_dropped_total",
+        "Cascade envelopes dropped by a disconnected or congested TCP fallback link"
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
     let _ = &*PCMU_FRAMES;
     let _ = &*PCMU_SESSIONS;

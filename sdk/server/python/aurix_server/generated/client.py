@@ -355,6 +355,22 @@ class AurixClient(BaseClient):
         """
         return self._json("GET", "/v1/nodes", options=options)  # type: ignore[no-any-return]
 
+    def list_node_links(self, *, options: Optional[RequestOptions] = None) -> List["T.MediaNodeLink"]:
+        """Measured cascade links
+
+
+        Every node probes its cascade peers (UDP first, TCP fallback when UDP stops answering) and
+        publishes the links it confirmed. One row per `(node_id, peer_id)` as seen from `node_id`; a
+        pair missing in both directions while both nodes publish tables is unreachable. The
+        `region_tree` topology planner ranks hubs by these RTTs and routes around unreachable pairs.
+        Rows older than a few `media.cascade_discovery_interval_ms` periods are stale (the node stopped
+        publishing).
+
+        `GET /v1/nodes/links`
+        Auth: AdminToken.
+        """
+        return self._json("GET", "/v1/nodes/links", options=options)  # type: ignore[no-any-return]
+
     def drain_node(self, node_id: str, body: Optional["T.DrainNodeRequest"] = None, *, options: Optional[RequestOptions] = None) -> "T.MediaNode":
         """Drain a node (maintenance)
 
@@ -1911,6 +1927,22 @@ class AsyncAurixClient:
         Auth: AdminToken.
         """
         return await self._run(self.sync.list_nodes, options=options)  # type: ignore[no-any-return]
+
+    async def list_node_links(self, *, options: Optional[RequestOptions] = None) -> List["T.MediaNodeLink"]:
+        """Measured cascade links
+
+
+        Every node probes its cascade peers (UDP first, TCP fallback when UDP stops answering) and
+        publishes the links it confirmed. One row per `(node_id, peer_id)` as seen from `node_id`; a
+        pair missing in both directions while both nodes publish tables is unreachable. The
+        `region_tree` topology planner ranks hubs by these RTTs and routes around unreachable pairs.
+        Rows older than a few `media.cascade_discovery_interval_ms` periods are stale (the node stopped
+        publishing).
+
+        `GET /v1/nodes/links`
+        Auth: AdminToken.
+        """
+        return await self._run(self.sync.list_node_links, options=options)  # type: ignore[no-any-return]
 
     async def drain_node(self, node_id: str, body: Optional["T.DrainNodeRequest"] = None, *, options: Optional[RequestOptions] = None) -> "T.MediaNode":
         """Drain a node (maintenance)
