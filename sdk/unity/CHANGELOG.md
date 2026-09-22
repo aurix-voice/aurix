@@ -8,6 +8,13 @@ server version it ships with (the repository is versioned as one unit).
 
 Nothing yet.
 
+## [1.4.0] — 2026-09-22
+
+### Changed
+
+- The package is now explicitly licensed under Apache-2.0 (`LICENSE.md` in the package root); no
+  code changes. Repository-wide licence layout: server AGPL-3.0-only, SDKs Apache-2.0.
+
 ## [1.3.0] — 2026-09-19
 
 ### Added

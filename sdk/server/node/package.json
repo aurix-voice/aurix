@@ -1,6 +1,6 @@
 {
   "name": "@aurix/server-sdk",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Server-side (backend) SDK for the Aurix voice platform REST API: token issuance, channels, moderation, webhooks, SSE. Generated from api/openapi.json.",
   "license": "Apache-2.0",
   "type": "module",

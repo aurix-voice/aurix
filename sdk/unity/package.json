@@ -1,6 +1,6 @@
 {
   "name": "com.aurix.voice",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "displayName": "Aurix Voice SDK",
   "description": "Game voice client for the Aurix Voice Platform: native AURX media (QUIC/UDP/WebSocket tunnel) with the WebSocket control plane on desktop, mobile and .NET servers, and the same IAurixVoiceClient API over browser WebRTC in Unity WebGL players. Opus, E2EE, per-participant spatial audio, chat, transcripts, TTS, quality stats.",
   "unity": "2021.3",

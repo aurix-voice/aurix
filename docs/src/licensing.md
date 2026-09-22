@@ -58,8 +58,10 @@ assignment; see [Contributing](https://github.com/aurix-voice/aurix/blob/main/CO
 
 ## History
 
-Releases up to and including `v1.3.0` were published entirely under Apache-2.0 and remain
-available under that licence. AGPL-3.0-only applies to the server-side parts from the first
-commit after `v1.3.0`.
+`v1.4.0` is the first release under this layout. The earlier `v1.2.0` and `v1.3.0` releases were
+published entirely under Apache-2.0 and have been withdrawn (release pages, tags and container
+images removed); copies obtained under Apache-2.0 before the withdrawal keep that licence, and the
+repository history up to the licence change still carries the Apache-2.0 `LICENSE`. AGPL-3.0-only
+applies to the server-side parts from the licence change onwards.
 
 This page explains the layout; it is not legal advice.

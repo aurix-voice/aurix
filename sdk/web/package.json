@@ -1,6 +1,6 @@
 {
   "name": "@aurix/web-sdk",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Browser SDK for the Aurix voice platform (WebSocket control + WebRTC media).",
   "license": "Apache-2.0",
   "type": "module",

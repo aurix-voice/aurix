@@ -30,7 +30,7 @@ aws_region      = "eu-central-1"
 aurix_region    = "eu_central"
 location        = { latitude = 50.11, longitude = 8.68 }
 node_count      = 2
-image           = "ghcr.io/aurix-voice/aurix-server:1.3.0"
+image           = "ghcr.io/aurix-voice/aurix-server:1.4.0"
 domain          = "voice.example.com"
 route53_zone_id = "Z0123456789ABCDEFGHIJ"
 cors_origins    = ["https://game.example.com"]

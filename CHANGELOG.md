@@ -11,6 +11,11 @@ released together.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-22
+
+Licence change only — no protocol, API or database changes. Functionally identical to 1.3.0;
+nodes of 1.3 and 1.4 may share a fleet.
+
 ### Changed
 
 * **Licensing.** The server side — `aurix-server` and the media, TURN, control, database, auth,
@@ -21,9 +26,13 @@ released together.
   SDKs and token-server examples, the OpenAPI contract, documentation and deployment examples.
   The map is `REUSE.toml` (checked by `reuse lint` in CI) and explained in `LICENSING.md`; every
   package carries its own `LICENSE`, the client core ships `NOTICE`, container images are labelled
-  `AGPL-3.0-only`. Releases up to `v1.3.0` remain Apache-2.0 throughout.
+  `AGPL-3.0-only`. The Apache-2.0-era releases `v1.2.0` and `v1.3.0` were withdrawn (release pages,
+  tags and container images); 1.4.0 is the first release under the new layout.
 * **Contributions** require a Developer Certificate of Origin sign-off (`git commit -s`); pull
   requests are checked by `tools/release/check_dco.py`. No CLA. See `CONTRIBUTING.md`.
+* **Dashboard** shows a "Source" link to the repository the build came from (`AURIX_SOURCE_URL` at
+  build time, default `https://github.com/aurix-voice/aurix`) — the convenient place for an AGPL
+  §13 source offer when a modified dashboard is deployed.
 
 ## [1.3.0] - 2026-09-19
 
@@ -207,6 +216,7 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.3.0...HEAD
-[1.3.0]: https://github.com/aurix-voice/aurix/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/aurix-voice/aurix/releases/tag/v1.2.0
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/aurix-voice/aurix/compare/872f918...v1.4.0
+[1.3.0]: https://github.com/aurix-voice/aurix/compare/31eb7a5...872f918
+[1.2.0]: https://github.com/aurix-voice/aurix/tree/31eb7a5

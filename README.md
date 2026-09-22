@@ -1202,6 +1202,7 @@ what it means for a game, an operator or a fork:
   documentation and the deployment examples. Closed-source and commercial games are unaffected by
   the AGPL.
 
-Releases up to `v1.3.0` were Apache-2.0 throughout and stay that way. Contributions are accepted
+`v1.4.0` is the first release under this layout; the withdrawn `v1.2.0` / `v1.3.0` releases were
+Apache-2.0 throughout (see [`LICENSING.md`](LICENSING.md)). Contributions are accepted
 with a [DCO](https://developercertificate.org/) sign-off (`git commit -s`), no CLA — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
