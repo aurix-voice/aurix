@@ -235,6 +235,14 @@ pub enum ServerEvent {
         frames_dropped: u64,
         timestamp: DateTime<Utc>,
     },
+    /// An operator asked (through any node of the fleet) to stop a live stream owned by
+    /// `node`; that node closes it and emits `LiveStreamStopped`. Node-scoped.
+    LiveStreamStopRequested {
+        app_id: AppId,
+        stream_id: uuid::Uuid,
+        node: MediaNodeId,
+        reason: String,
+    },
     /// A participant answered a recording/stream consent prompt on a node that does not host
     /// the capture (cascaded channel); the hosting node applies it. Node-scoped.
     RecordingConsentGiven {
@@ -421,6 +429,7 @@ impl ServerEvent {
             | Self::RecordingProcessed { app_id, .. }
             | Self::LiveStreamStarted { app_id, .. }
             | Self::LiveStreamStopped { app_id, .. }
+            | Self::LiveStreamStopRequested { app_id, .. }
             | Self::RecordingConsentGiven { app_id, .. }
             | Self::UserBlockChanged { app_id, .. }
             | Self::ChatMessage { app_id, .. }
@@ -498,6 +507,7 @@ impl ServerEvent {
             | Self::SessionMigrated { .. }
             | Self::AppDeactivated { .. }
             | Self::RecordingConsentGiven { .. }
+            | Self::LiveStreamStopRequested { .. }
             | Self::ParticipantPositions { .. }
             | Self::E2eeRelay { .. }
             | Self::TtsAnnouncement { .. } => return None,

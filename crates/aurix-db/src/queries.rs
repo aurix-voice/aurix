@@ -2775,7 +2775,12 @@ pub async fn remote_nodes_for_channels(
            WHERE m.channel_id = ANY($1)
              AND m.left_at IS NULL
              AND s.disconnected_at IS NULL
-             AND s.media_node_id <> $2"#,
+             AND s.media_node_id <> $2
+           UNION
+           SELECT ls.channel_id, ls.node_id
+           FROM live_streams ls
+           JOIN media_nodes n ON n.id = ls.node_id AND n.healthy
+           WHERE ls.channel_id = ANY($1) AND ls.node_id <> $2"#,
     )
     .bind(channel_ids)
     .bind(local_node)
@@ -2784,8 +2789,9 @@ pub async fn remote_nodes_for_channels(
 }
 
 /// `(channel_id, media_node_id)` pairs for every channel that currently has live memberships
-/// on more than one node — including nodes this node does not share a channel with. Drives
-/// the `region_tree` cascade topology, where a hub forwards channels it does not host.
+/// (or live streams) on more than one node — including nodes this node does not share a
+/// channel with. Drives the `region_tree` cascade topology, where a hub forwards channels it
+/// does not host.
 pub async fn multi_node_channel_hosts(pool: &DbPool) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
     sqlx::query_as::<_, (Uuid, Uuid)>(
         r#"WITH live AS (
@@ -2793,6 +2799,10 @@ pub async fn multi_node_channel_hosts(pool: &DbPool) -> Result<Vec<(Uuid, Uuid)>
                FROM channel_memberships m
                JOIN sessions s ON s.id = m.session_id
                WHERE m.left_at IS NULL AND s.disconnected_at IS NULL
+               UNION
+               SELECT ls.channel_id, ls.node_id
+               FROM live_streams ls
+               JOIN media_nodes n ON n.id = ls.node_id AND n.healthy
            )
            SELECT channel_id, media_node_id FROM live
            WHERE channel_id IN (
@@ -2952,6 +2962,107 @@ pub async fn list_media_node_links(pool: &DbPool) -> Result<Vec<MediaNodeLinkRow
         r#"SELECT node_id, peer_id, transport, rtt_ms, measured_at
            FROM media_node_links ORDER BY node_id, peer_id"#,
     )
+    .fetch_all(pool)
+    .await
+}
+
+// ── Live stream directory ──
+
+/// Publishes (or refreshes) one live stream owned by `row.node_id`.
+pub async fn upsert_live_stream(pool: &DbPool, row: &LiveStreamRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO live_streams (id, node_id, app_id, channel_id, mode, format, mix, state,
+                users, label, push_url, started_at, updated_at, frames_sent, frames_dropped,
+                reconnects, consent)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, $15, $16
+           WHERE EXISTS (SELECT 1 FROM media_nodes WHERE id = $2)
+           ON CONFLICT (id) DO UPDATE SET
+             state = EXCLUDED.state, updated_at = EXCLUDED.updated_at,
+             frames_sent = EXCLUDED.frames_sent, frames_dropped = EXCLUDED.frames_dropped,
+             reconnects = EXCLUDED.reconnects, consent = EXCLUDED.consent"#,
+    )
+    .bind(row.id)
+    .bind(row.node_id)
+    .bind(row.app_id)
+    .bind(row.channel_id)
+    .bind(&row.mode)
+    .bind(&row.format)
+    .bind(row.mix)
+    .bind(&row.state)
+    .bind(&row.users)
+    .bind(&row.label)
+    .bind(&row.push_url)
+    .bind(row.started_at)
+    .bind(row.frames_sent)
+    .bind(row.frames_dropped)
+    .bind(row.reconnects)
+    .bind(&row.consent)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_live_stream(pool: &DbPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM live_streams WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Drops every stream a node published except `keep` (the streams it still owns).
+pub async fn prune_live_streams(
+    pool: &DbPool,
+    node_id: Uuid,
+    keep: &[Uuid],
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM live_streams WHERE node_id = $1 AND NOT (id = ANY($2))")
+        .bind(node_id)
+        .bind(keep)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Drops the directory entries of a node that left the fleet.
+pub async fn delete_node_live_streams(pool: &DbPool, node_id: Uuid) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM live_streams WHERE node_id = $1")
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn get_live_stream(
+    pool: &DbPool,
+    app_id: Uuid,
+    id: Uuid,
+) -> Result<Option<LiveStreamRow>, sqlx::Error> {
+    sqlx::query_as::<_, LiveStreamRow>("SELECT * FROM live_streams WHERE app_id = $1 AND id = $2")
+        .bind(app_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Streams of `app_id` published by nodes other than `exclude_node`, optionally for one
+/// channel.
+pub async fn list_remote_live_streams(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Option<Uuid>,
+    exclude_node: Uuid,
+) -> Result<Vec<LiveStreamRow>, sqlx::Error> {
+    sqlx::query_as::<_, LiveStreamRow>(
+        r#"SELECT ls.* FROM live_streams ls
+           JOIN media_nodes n ON n.id = ls.node_id AND n.healthy
+           WHERE ls.app_id = $1 AND ls.node_id <> $2
+             AND ($3::uuid IS NULL OR ls.channel_id = $3)
+           ORDER BY ls.started_at"#,
+    )
+    .bind(app_id)
+    .bind(exclude_node)
+    .bind(channel_id)
     .fetch_all(pool)
     .await
 }

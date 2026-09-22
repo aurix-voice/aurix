@@ -1,11 +1,31 @@
 //! Real-time audio streaming of a channel to an operator-controlled service.
 //!
-//! A *live stream* is a node-local tap on the authenticated, non-E2EE Opus packets of one
-//! channel. Frames are either pulled by the operator over a WebSocket on this node
-//! (`GET /v1/channels/:id/audio/stream`) or pushed by the node to an operator WebSocket
-//! endpoint (`POST /v1/channels/:id/audio/streams`). Nothing is written to disk; the same
-//! consent rules as for stored recordings apply, and a participant's frames are never
-//! emitted before that participant accepted.
+//! A *live stream* is a tap on the authenticated, non-E2EE Opus packets of one channel,
+//! owned by the node that accepted the request. Frames are either pulled by the operator
+//! over a WebSocket on that node (`GET /v1/channels/:id/audio/streams/pull`) or pushed by the
+//! node to an operator WebSocket endpoint (`POST /v1/channels/:id/audio/streams`). Nothing is
+//! written to disk; the same consent rules as for stored recordings apply, and a
+//! participant's frames are never emitted before that participant accepted.
+//!
+//! The owning node need not host any participant of the channel: the cascade forwards the
+//! channel's audio to every node with a live stream on it (the stream is registered in the
+//! `live_streams` table, which the topology planner treats like a hosting node), so a stream
+//! can be opened through any node of the fleet.
+//!
+//! Two shapes of stream:
+//!
+//! * per participant (default): every Opus packet is forwarded (or decoded to PCM) with the
+//!   sender's user id and SSRC;
+//! * mixed (`mix = true`): the node decodes the consenting participants, sums them on a
+//!   20 ms clock through Opus' soft clipper and emits **one** mono track (re-encoded Opus or
+//!   PCM) with a nil user id and SSRC 0 — the channel as a listener would hear it, minus
+//!   E2EE audio (which the server cannot decode) and non-consenting participants.
+//!
+//! Consumer outages: while a push target is unreachable the most recent
+//! `recording.live.outage_buffer_ms` of frames are held and replayed after the reconnect; a
+//! pull consumer that drops off keeps its stream alive for the same window and may resume it
+//! (`…/streams/:id/pull`), receiving the buffered frames first. Everything beyond the window
+//! is dropped and accounted like a slow consumer.
 //!
 //! Wire format (both directions of transport, one WebSocket message per frame):
 //!
@@ -18,10 +38,10 @@
 //!  2     u8   flags: bit0 = timestamp gap since previous frame of this participant,
 //!                     bit1 = first frame of this participant
 //!  3     u8   reserved (0)
-//!  4..8  u32  SSRC of the participant on this node
+//!  4..8  u32  SSRC of the participant on this node (0 for a mixed stream)
 //!  8..12 u32  RTP timestamp (48 kHz clock)
 //! 12..20 u64  server receive time, Unix milliseconds
-//! 20..36 [16] participant user id (RFC 4122 byte order)
+//! 20..36 [16] participant user id (RFC 4122 byte order; nil for a mixed stream)
 //! 36..   payload
 //! ```
 //!
@@ -38,10 +58,10 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
@@ -64,6 +84,16 @@ const MAX_PCM_SAMPLES: usize = 5760;
 const MAX_PUSH_HEADERS: usize = 8;
 const MAX_PUSH_HEADER_LEN: usize = 1024;
 const MAX_PUSH_BACKOFF: Duration = Duration::from_secs(30);
+/// Mixed streams: frames a talker may queue ahead of the mix clock (120 ms of jitter).
+const MIX_QUEUE_FRAMES: usize = 6;
+/// Mixed streams: consecutive missing frames of a talker concealed by the decoder.
+const MIX_PLC_FRAMES: u64 = 3;
+/// Mixed streams: silence frames emitted after the last talker before the track pauses.
+const MIX_HANGOVER_TICKS: u64 = 25;
+/// Mixed streams: an idle talker's decoder is reclaimed after this many ticks (30 s).
+const MIX_TALKER_IDLE_TICKS: u64 = 1500;
+/// Mixed streams: time between two mix frames.
+pub const MIX_TICK: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +142,8 @@ impl StreamMode {
 pub enum StreamState {
     Streaming,
     Connecting,
+    /// Push: the target is being re-dialled; pull: the consumer dropped off and the stream
+    /// waits for it to resume. Frames are buffered up to `outage_buffer_ms`.
     Reconnecting,
 }
 
@@ -123,6 +155,8 @@ pub struct StreamSpec {
     pub users: Option<Vec<UserId>>,
     /// Free-form operator label (≤ 128 chars), echoed in status and events.
     pub label: Option<String>,
+    /// One server-side mixed track instead of per-participant frames.
+    pub mix: bool,
 }
 
 /// Push target. Header values may carry credentials and are never echoed back.
@@ -160,6 +194,16 @@ pub enum ControlFrame {
         consent_required: bool,
         label: Option<String>,
         started_at: DateTime<Utc>,
+        /// Frames carry one mixed track (nil user id, SSRC 0) instead of per-participant audio.
+        #[serde(default)]
+        mix: bool,
+        /// Node that owns the stream.
+        #[serde(default)]
+        node_id: Option<Uuid>,
+        /// 0 on the first connection of a consumer; incremented for every push reconnect
+        /// or pull resume, so a consumer can tell a replayed `hello` from a new stream.
+        #[serde(default)]
+        reconnects: u32,
     },
     Participant {
         user_id: UserId,
@@ -194,14 +238,18 @@ impl Outgoing {
 }
 
 /// Operator-visible status of a stream. Push header values are never included and the
-/// URL is reduced to scheme/host/path.
-#[derive(Debug, Clone, Serialize)]
+/// URL is reduced to scheme/host/path. For a stream owned by another node this is the
+/// status that node last published to the fleet directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveStreamInfo {
     pub id: Uuid,
     pub app_id: Uuid,
     pub channel_id: ChannelId,
+    /// Node that owns the stream (its media tap and consumer connection).
+    pub node_id: Uuid,
     pub mode: StreamMode,
     pub format: StreamFormat,
+    pub mix: bool,
     pub state: StreamState,
     pub users: Option<Vec<UserId>>,
     pub label: Option<String>,
@@ -229,6 +277,210 @@ struct Talker {
     decoder: Option<opus::Decoder>,
 }
 
+struct MixTalker {
+    decoder: opus::Decoder,
+    /// Decoded 20 ms frames waiting for the mix clock (oldest first).
+    queue: VecDeque<Vec<i16>>,
+    fed_tick: u64,
+    concealed: u64,
+}
+
+/// Server-side mix of one stream: consenting talkers are decoded as their packets arrive and
+/// summed on a 20 ms clock ([`LiveStreams::mix_tick`]). The RTP clock advances every tick, so
+/// the pause of a silent channel shows up as a timestamp gap (and the `gap` flag) on the next
+/// frame rather than as a stream of silence.
+struct Mixer {
+    format: StreamFormat,
+    encoder: Option<opus::Encoder>,
+    clip: opus::SoftClip,
+    talkers: HashMap<UserId, MixTalker>,
+    tick: u64,
+    rtp_timestamp: u32,
+    last_active_tick: Option<u64>,
+    started: bool,
+    gap: bool,
+    acc: Vec<f32>,
+    pcm: Vec<i16>,
+    packet: Vec<u8>,
+    /// Talker frames discarded because they ran ahead of the mix clock (stats only).
+    overruns: u64,
+}
+
+impl Mixer {
+    fn new(format: StreamFormat, bitrate: u32) -> Result<Self> {
+        let encoder = match format {
+            StreamFormat::PcmS16le => None,
+            StreamFormat::Opus => {
+                let mut enc =
+                    opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                        .map_err(|e| AurixError::Recording(format!("mix encoder: {e}")))?;
+                enc.set_bitrate(opus::Bitrate::Bits(bitrate as i32))
+                    .map_err(|e| AurixError::Recording(format!("mix encoder bitrate: {e}")))?;
+                let _ = enc.set_inband_fec(true);
+                let _ = enc.set_packet_loss_perc(5);
+                Some(enc)
+            }
+        };
+        Ok(Self {
+            format,
+            encoder,
+            clip: opus::SoftClip::new(opus::Channels::Mono),
+            talkers: HashMap::new(),
+            tick: 0,
+            rtp_timestamp: rand::random(),
+            last_active_tick: None,
+            started: false,
+            gap: false,
+            acc: vec![0.0; FRAME_SAMPLES as usize],
+            pcm: vec![0; MAX_PCM_SAMPLES],
+            packet: vec![0; 1500],
+            overruns: 0,
+        })
+    }
+
+    /// Decode one packet of `user` into their queue. Returns `false` when the packet could
+    /// not be decoded (the talker keeps its state).
+    fn feed(&mut self, user: UserId, payload: &[u8]) -> bool {
+        let tick = self.tick;
+        let talker = match self.talkers.entry(user) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let Ok(decoder) = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) else {
+                    return false;
+                };
+                v.insert(MixTalker {
+                    decoder,
+                    queue: VecDeque::with_capacity(MIX_QUEUE_FRAMES),
+                    fed_tick: tick,
+                    concealed: 0,
+                })
+            }
+        };
+        let n = match talker.decoder.decode(payload, &mut self.pcm, false) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        talker.fed_tick = tick;
+        talker.concealed = 0;
+        // Packets may carry 10/40/60 ms; the mix clock works in 20 ms frames.
+        let frame = FRAME_SAMPLES as usize;
+        let mut start = 0;
+        while start < n {
+            let end = (start + frame).min(n);
+            let mut chunk = self.pcm[start..end].to_vec();
+            chunk.resize(frame, 0);
+            if talker.queue.len() >= MIX_QUEUE_FRAMES {
+                talker.queue.pop_front();
+                self.overruns += 1;
+            }
+            talker.queue.push_back(chunk);
+            start = end;
+        }
+        true
+    }
+
+    fn remove(&mut self, user: &UserId) {
+        self.talkers.remove(user);
+    }
+
+    /// Advance the clock by one frame and produce the mixed frame, or `None` while the
+    /// channel is silent (after the hangover).
+    fn tick(&mut self, now_ms: u64) -> Option<Vec<u8>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let ts = self.rtp_timestamp;
+        self.rtp_timestamp = ts.wrapping_add(FRAME_SAMPLES);
+        self.acc.fill(0.0);
+        let mut any = false;
+        let frame = FRAME_SAMPLES as usize;
+        let pcm = &mut self.pcm[..frame];
+        self.talkers
+            .retain(|_, t| tick.saturating_sub(t.fed_tick) <= MIX_TALKER_IDLE_TICKS);
+        for talker in self.talkers.values_mut() {
+            let contributed = match talker.queue.pop_front() {
+                Some(chunk) => {
+                    pcm.copy_from_slice(&chunk);
+                    true
+                }
+                None => {
+                    let recent = tick.saturating_sub(talker.fed_tick) <= MIX_PLC_FRAMES;
+                    if recent
+                        && talker.concealed < MIX_PLC_FRAMES
+                        && talker.decoder.decode(&[], pcm, false).is_ok()
+                    {
+                        talker.concealed += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if contributed {
+                any = true;
+                for (a, s) in self.acc.iter_mut().zip(pcm.iter()) {
+                    *a += f32::from(*s) / 32_768.0;
+                }
+            }
+        }
+        if any {
+            self.last_active_tick = Some(tick);
+        }
+        let active = self
+            .last_active_tick
+            .is_some_and(|t| tick - t <= MIX_HANGOVER_TICKS);
+        if !active {
+            self.gap = self.started;
+            return None;
+        }
+        self.clip.apply(&mut self.acc);
+        for (o, a) in pcm.iter_mut().zip(self.acc.iter()) {
+            *o = (a * 32_767.0).round().clamp(-32_768.0, 32_767.0) as i16;
+        }
+        let body: &[u8] = match self.encoder.as_mut() {
+            None => {
+                self.packet.clear();
+                self.packet.extend(pcm.iter().flat_map(|s| s.to_le_bytes()));
+                &self.packet
+            }
+            Some(enc) => {
+                self.packet.resize(1500, 0);
+                match enc.encode(pcm, &mut self.packet) {
+                    Ok(n) => &self.packet[..n],
+                    Err(e) => {
+                        warn!("Live mix: opus encode failed: {e}");
+                        return None;
+                    }
+                }
+            }
+        };
+        let mut flags = 0u8;
+        if !self.started {
+            flags |= FLAG_FIRST;
+        }
+        if self.gap {
+            flags |= FLAG_GAP;
+        }
+        self.started = true;
+        self.gap = false;
+        Some(encode_frame(
+            self.format.codec_byte(),
+            flags,
+            0,
+            ts,
+            now_ms,
+            &UserId(Uuid::nil()),
+            body,
+        ))
+    }
+}
+
+/// A pull stream whose consumer dropped off: a task holds the receiver, keeps the most recent
+/// frames and hands both back on resume (or closes the stream when the window expires).
+struct Parked {
+    stop: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<Option<(mpsc::Receiver<Outgoing>, Vec<Outgoing>)>>,
+}
+
 struct Tap {
     id: Uuid,
     app_id: Uuid,
@@ -245,6 +497,8 @@ struct Tap {
     tx: mpsc::Sender<Outgoing>,
     consent: HashMap<UserId, RecordingConsent>,
     talkers: HashMap<UserId, Talker>,
+    mixer: Option<Arc<Mutex<Mixer>>>,
+    parked: Option<Parked>,
     frames_sent: u64,
     frames_dropped: u64,
     /// Drops not yet announced to the consumer with a `dropped` frame.
@@ -253,13 +507,15 @@ struct Tap {
 }
 
 impl Tap {
-    fn info(&self) -> LiveStreamInfo {
+    fn info(&self, node_id: Uuid) -> LiveStreamInfo {
         LiveStreamInfo {
             id: self.id,
             app_id: self.app_id,
             channel_id: self.channel_id,
+            node_id,
             mode: self.mode,
             format: self.format,
+            mix: self.mixer.is_some(),
             state: self.state,
             users: self.users_order.clone(),
             label: self.label.clone(),
@@ -274,6 +530,37 @@ impl Tap {
 
     fn wants_user(&self, user_id: &UserId) -> bool {
         self.users.as_ref().is_none_or(|u| u.contains(user_id))
+    }
+
+    fn hello(&self, node_id: Uuid, consent_required: bool) -> ControlFrame {
+        ControlFrame::Hello {
+            stream_id: self.id,
+            app_id: self.app_id,
+            channel_id: self.channel_id,
+            format: self.format,
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+            frame_ms: 20,
+            frame_version: FRAME_VERSION,
+            users: self.users_order.clone(),
+            consent_required,
+            label: self.label.clone(),
+            started_at: self.started_at,
+            mix: self.mixer.is_some(),
+            node_id: Some(node_id),
+            reconnects: self.reconnects,
+        }
+    }
+
+    /// Announce drops the consumer has not heard about yet, leaving room for the frame
+    /// that follows.
+    fn announce_drops(&mut self) {
+        if self.unannounced_drops > 0 && self.tx.capacity() > 1 {
+            let frames = self.unannounced_drops;
+            if self.control(ControlFrame::Dropped { frames }) {
+                self.unannounced_drops = 0;
+            }
+        }
     }
 
     /// Non-blocking enqueue. Audio is dropped when the queue is full; control frames evict
@@ -331,6 +618,7 @@ pub struct LiveStreams {
     require_consent: bool,
     production: bool,
     max_recording_duration_secs: u64,
+    node_id: Uuid,
     reg: Mutex<Registry>,
     notices: mpsc::UnboundedSender<LiveNotice>,
     notice_rx: Mutex<Option<mpsc::UnboundedReceiver<LiveNotice>>>,
@@ -342,6 +630,7 @@ impl LiveStreams {
         require_consent: bool,
         production: bool,
         max_recording_duration_secs: u64,
+        node_id: Uuid,
     ) -> Self {
         let (notices, notice_rx) = mpsc::unbounded_channel();
         Self {
@@ -349,6 +638,7 @@ impl LiveStreams {
             require_consent,
             production,
             max_recording_duration_secs,
+            node_id,
             reg: Mutex::new(Registry::default()),
             notices,
             notice_rx: Mutex::new(Some(notice_rx)),
@@ -361,6 +651,15 @@ impl LiveStreams {
 
     pub fn config(&self) -> &LiveStreamConfig {
         &self.cfg
+    }
+
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
+    /// Whether disconnected consumers are waited for (`recording.live.outage_buffer_ms > 0`).
+    pub fn outage_buffering(&self) -> bool {
+        self.cfg.outage_buffer_frames() > 0
     }
 
     /// The lifecycle notice receiver; may be taken once (by the server binary).
@@ -405,6 +704,11 @@ impl LiveStreams {
                 "PCM streams are disabled (recording.live.allow_pcm)".into(),
             ));
         }
+        if spec.mix && self.cfg.max_mix_streams == 0 {
+            return Err(AurixError::Validation(
+                "Mixed streams are disabled (recording.live.max_mix_streams)".into(),
+            ));
+        }
         if let Some(users) = &spec.users {
             if users.is_empty() || users.len() > 256 {
                 return Err(AurixError::Validation(
@@ -441,6 +745,11 @@ impl LiveStreams {
         };
         let deadline =
             (duration_limit > 0).then(|| now + chrono::Duration::seconds(duration_limit as i64));
+        let mixer = spec
+            .mix
+            .then(|| Mixer::new(spec.format, self.cfg.mix_bitrate))
+            .transpose()?
+            .map(|m| Arc::new(Mutex::new(m)));
         let mut tap = Tap {
             id,
             app_id: app_id.0,
@@ -460,6 +769,8 @@ impl LiveStreams {
             tx,
             consent: HashMap::new(),
             talkers: HashMap::new(),
+            mixer,
+            parked: None,
             frames_sent: 0,
             frames_dropped: 0,
             unannounced_drops: 0,
@@ -481,28 +792,30 @@ impl LiveStreams {
                     in_app
                 )));
             }
-            tap.control(ControlFrame::Hello {
-                stream_id: id,
-                app_id: app_id.0,
-                channel_id,
-                format: spec.format,
-                sample_rate: SAMPLE_RATE,
-                channels: 1,
-                frame_ms: 20,
-                frame_version: FRAME_VERSION,
-                users: spec.users.clone(),
-                consent_required: self.require_consent,
-                label: spec.label.clone(),
-                started_at: now,
-            });
-            let info = tap.info();
+            if spec.mix {
+                let mixing = reg.by_id.values().filter(|t| t.mixer.is_some()).count();
+                if mixing >= self.cfg.max_mix_streams as usize {
+                    return Err(AurixError::Conflict(format!(
+                        "Node already runs {} mixed live streams (recording.live.max_mix_streams)",
+                        mixing
+                    )));
+                }
+            }
+            let hello = tap.hello(self.node_id, self.require_consent);
+            tap.control(hello);
+            let info = tap.info(self.node_id);
             reg.by_channel.entry(channel_id).or_default().push(id);
             reg.by_id.insert(id, tap);
             info
         };
         info!(
-            "Live stream {} opened: {:?}/{:?} for channel {} (app {})",
-            id, mode, spec.format, channel_id, app_id.0
+            "Live stream {} opened: {:?}/{:?}{} for channel {} (app {})",
+            id,
+            mode,
+            spec.format,
+            if spec.mix { " mixed" } else { "" },
+            channel_id,
+            app_id.0
         );
         let _ = self.notices.send(LiveNotice::Opened(info.clone()));
         Ok((info, StreamReceiver { id, rx }))
@@ -524,7 +837,13 @@ impl LiveStreams {
             frames_sent: tap.frames_sent,
             frames_dropped: tap.frames_dropped,
         });
-        let info = tap.info();
+        if let Some(parked) = tap.parked.take() {
+            // The parked drain task ends on its own once `tx` is dropped below; the stop
+            // signal only shortens the wait.
+            let _ = parked.stop.send(());
+            parked.handle.abort();
+        }
+        let info = tap.info(self.node_id);
         info!(
             "Live stream {} closed ({reason}): {} frames sent, {} dropped",
             id, info.frames_sent, info.frames_dropped
@@ -541,7 +860,7 @@ impl LiveStreams {
         reg.by_id
             .get(&id)
             .filter(|t| t.app_id == app_id.0)
-            .map(Tap::info)
+            .map(|t| t.info(self.node_id))
     }
 
     pub fn list(&self, app_id: AppId, channel_id: Option<ChannelId>) -> Vec<LiveStreamInfo> {
@@ -550,10 +869,21 @@ impl LiveStreams {
             .by_id
             .values()
             .filter(|t| t.app_id == app_id.0 && channel_id.is_none_or(|c| c == t.channel_id))
-            .map(Tap::info)
+            .map(|t| t.info(self.node_id))
             .collect();
         v.sort_by_key(|i| i.started_at);
         v
+    }
+
+    /// Status of every stream on this node (all tenants; for the fleet directory).
+    pub fn list_all(&self) -> Vec<LiveStreamInfo> {
+        let reg = self.reg.lock();
+        reg.by_id.values().map(|t| t.info(self.node_id)).collect()
+    }
+
+    /// Channels with at least one stream on this node.
+    pub fn channels(&self) -> Vec<ChannelId> {
+        self.reg.lock().by_channel.keys().copied().collect()
     }
 
     /// Ids of streams on `channel_id` (any tenant; used for client disclosure).
@@ -599,6 +929,9 @@ impl LiveStreams {
         let ssrc = tap.talkers.get(&user_id).map_or(0, |t| t.ssrc);
         if consent == RecordingConsent::Declined {
             tap.talkers.remove(&user_id);
+            if let Some(m) = &tap.mixer {
+                m.lock().remove(&user_id);
+            }
         }
         tap.control(ControlFrame::Participant {
             user_id,
@@ -627,6 +960,7 @@ impl LiveStreams {
         };
         let now_ms = Utc::now().timestamp_millis().max(0) as u64;
         let require_consent = self.require_consent;
+        let mut mix_jobs: Vec<Arc<Mutex<Mixer>>> = Vec::new();
         for id in ids {
             let Some(tap) = reg.by_id.get_mut(&id) else {
                 continue;
@@ -653,9 +987,9 @@ impl LiveStreams {
                 }
                 None => {
                     flags |= FLAG_FIRST;
-                    let decoder = match tap.format {
-                        StreamFormat::Opus => None,
-                        StreamFormat::PcmS16le => {
+                    let decoder = match (tap.format, tap.mixer.is_some()) {
+                        (StreamFormat::Opus, _) | (_, true) => None,
+                        (StreamFormat::PcmS16le, false) => {
                             match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) {
                                 Ok(d) => Some(d),
                                 Err(e) => {
@@ -685,6 +1019,10 @@ impl LiveStreams {
                 }
             }
             talker.last_ts = Some(rtp_timestamp);
+            if let Some(mixer) = &tap.mixer {
+                mix_jobs.push(mixer.clone());
+                continue;
+            }
             let body: Vec<u8> = match talker.decoder.as_mut() {
                 None => payload.to_vec(),
                 Some(dec) => {
@@ -710,13 +1048,53 @@ impl LiveStreams {
                 &user_id,
                 &body,
             );
-            if tap.unannounced_drops > 0 && tap.tx.capacity() > 1 {
-                let frames = tap.unannounced_drops;
-                if tap.control(ControlFrame::Dropped { frames }) {
-                    tap.unannounced_drops = 0;
-                }
-            }
+            tap.announce_drops();
             tap.enqueue(Outgoing::Audio(Bytes::from(frame)));
+        }
+        drop(reg);
+        // Decoding for mixed streams happens outside the registry lock so it never stalls
+        // the other streams' hot path.
+        for mixer in mix_jobs {
+            mixer.lock().feed(user_id, payload);
+        }
+    }
+
+    /// Advance every mixed stream by one 20 ms frame. Driven by [`Self::run_mixer`] (or
+    /// directly by tests).
+    pub fn mix_tick(&self) {
+        let mixers: Vec<(Uuid, Arc<Mutex<Mixer>>)> = self
+            .reg
+            .lock()
+            .by_id
+            .values()
+            .filter_map(|t| t.mixer.as_ref().map(|m| (t.id, m.clone())))
+            .collect();
+        if mixers.is_empty() {
+            return;
+        }
+        let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+        for (id, mixer) in mixers {
+            let Some(frame) = mixer.lock().tick(now_ms) else {
+                continue;
+            };
+            let mut reg = self.reg.lock();
+            if let Some(tap) = reg.by_id.get_mut(&id) {
+                tap.announce_drops();
+                tap.enqueue(Outgoing::Audio(Bytes::from(frame)));
+            }
+        }
+    }
+
+    /// The mix clock: one [`Self::mix_tick`] every 20 ms until `cancel` fires.
+    pub async fn run_mixer(self: Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
+        let mut interval = tokio::time::interval(MIX_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = cancel.cancelled() => return,
+            }
+            self.mix_tick();
         }
     }
 
@@ -730,6 +1108,9 @@ impl LiveStreams {
             let Some(tap) = reg.by_id.get_mut(&id) else {
                 continue;
             };
+            if let Some(m) = &tap.mixer {
+                m.lock().remove(&user_id);
+            }
             let Some(t) = tap.talkers.remove(&user_id) else {
                 continue;
             };
@@ -748,6 +1129,9 @@ impl LiveStreams {
         for tap in reg.by_id.values_mut() {
             tap.consent.remove(&user_id);
             tap.talkers.remove(&user_id);
+            if let Some(m) = &tap.mixer {
+                m.lock().remove(&user_id);
+            }
         }
     }
 
@@ -804,6 +1188,140 @@ impl LiveStreams {
         }
     }
 
+    /// Frames lost while the consumer was away (outage buffer overflow). `announced` frames
+    /// were already reported to the consumer with a `dropped` frame.
+    fn note_outage_drops(&self, id: Uuid, frames: u64, announced: bool) {
+        if frames == 0 {
+            return;
+        }
+        if let Some(tap) = self.reg.lock().by_id.get_mut(&id) {
+            tap.frames_dropped += frames;
+            tap.frames_sent = tap.frames_sent.saturating_sub(frames);
+            if !announced {
+                tap.unannounced_drops += frames;
+            }
+        }
+    }
+
+    fn hello_for(&self, id: Uuid) -> Option<ControlFrame> {
+        self.reg
+            .lock()
+            .by_id
+            .get(&id)
+            .map(|t| t.hello(self.node_id, self.require_consent))
+    }
+
+    /// The pull consumer of `receiver`'s stream went away. With outage buffering the stream
+    /// stays registered as `reconnecting`, its most recent frames are kept and the receiver
+    /// is parked until [`Self::resume_pull`] or the window expires (`consumer_timeout`);
+    /// without it the stream is closed with `reason` (and its final status returned).
+    pub fn detach_pull(
+        self: &Arc<Self>,
+        receiver: StreamReceiver,
+        reason: &str,
+    ) -> Option<LiveStreamInfo> {
+        let id = receiver.id;
+        let capacity = self.cfg.outage_buffer_frames();
+        if capacity == 0 {
+            return self.close(None, id, reason);
+        }
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let window = Duration::from_millis(self.cfg.outage_buffer_ms);
+        let this = self.clone();
+        let mut rx = receiver.rx;
+        let handle = tokio::spawn(async move {
+            let mut backlog = Backlog::new(capacity);
+            let deadline = tokio::time::sleep(window);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    item = rx.recv() => match item {
+                        None => return None,
+                        Some(out) => backlog.push(out),
+                    },
+                    _ = &mut stop_rx => {
+                        this.note_outage_drops(id, backlog.dropped, false);
+                        return Some((rx, backlog.into_items()));
+                    }
+                    _ = &mut deadline => {
+                        this.close(None, id, "consumer_timeout");
+                        return None;
+                    }
+                }
+            }
+        });
+        let mut reg = self.reg.lock();
+        match reg.by_id.get_mut(&id) {
+            Some(tap) if tap.mode == StreamMode::Pull => {
+                tap.state = StreamState::Reconnecting;
+                tap.parked = Some(Parked {
+                    stop: stop_tx,
+                    handle,
+                });
+                info!(
+                    "Live stream {} consumer {reason}; holding {} ms for a resume",
+                    id, self.cfg.outage_buffer_ms
+                );
+            }
+            _ => handle.abort(),
+        }
+        None
+    }
+
+    /// Reattach a consumer to a parked pull stream of `app_id`. Returns the receiver plus the
+    /// frames to send first: a fresh `hello`, the control frames and the audio buffered while
+    /// the consumer was away. Refused while the previous consumer is still connected.
+    pub async fn resume_pull(
+        &self,
+        app_id: AppId,
+        id: Uuid,
+    ) -> Result<(LiveStreamInfo, StreamReceiver, Vec<Outgoing>)> {
+        let parked = {
+            let mut reg = self.reg.lock();
+            let tap = reg
+                .by_id
+                .get_mut(&id)
+                .filter(|t| t.app_id == app_id.0)
+                .ok_or_else(|| AurixError::NotFound("Live stream not found".into()))?;
+            if tap.mode != StreamMode::Pull {
+                return Err(AurixError::Conflict(
+                    "Only pull streams can be resumed".into(),
+                ));
+            }
+            tap.parked.take().ok_or_else(|| {
+                AurixError::Conflict("The stream's consumer is still connected".into())
+            })?
+        };
+        let _ = parked.stop.send(());
+        let Some((rx, backlog)) = parked.handle.await.ok().flatten() else {
+            return Err(AurixError::NotFound("Live stream not found".into()));
+        };
+        let mut reg = self.reg.lock();
+        let tap = reg
+            .by_id
+            .get_mut(&id)
+            .ok_or_else(|| AurixError::NotFound("Live stream not found".into()))?;
+        tap.state = StreamState::Streaming;
+        tap.reconnects += 1;
+        let mut replay = Vec::with_capacity(backlog.len() + 2);
+        replay.push(Outgoing::Control(
+            tap.hello(self.node_id, self.require_consent),
+        ));
+        if tap.unannounced_drops > 0 {
+            replay.push(Outgoing::Control(ControlFrame::Dropped {
+                frames: tap.unannounced_drops,
+            }));
+            tap.unannounced_drops = 0;
+        }
+        replay.extend(backlog);
+        info!(
+            "Live stream {} resumed by its consumer ({} buffered frames)",
+            id,
+            replay.len() - 1
+        );
+        Ok((tap.info(self.node_id), StreamReceiver { id, rx }, replay))
+    }
+
     /// Validate operator-supplied push headers (name/value syntax, count, size, and no
     /// hop-by-hop / handshake headers).
     pub fn validate_push_headers(headers: &[(String, String)]) -> Result<()> {
@@ -856,9 +1374,9 @@ impl LiveStreams {
         let id = receiver.id;
         let mut rx = receiver.rx;
         let mut attempt: u32 = 0;
-        // The `hello` frame must reach every (re)connected consumer, so it is re-sent on
-        // reconnect instead of being consumed from the queue.
-        let mut hello: Option<Message> = None;
+        // Frames produced while the target is down are kept here (most recent
+        // `outage_buffer_ms`) and replayed after the reconnect.
+        let mut backlog = Backlog::new(self.cfg.outage_buffer_frames());
         loop {
             if !self.is_active(&id) {
                 return;
@@ -877,30 +1395,52 @@ impl LiveStreams {
                         while rx.try_recv().is_ok() {}
                         return;
                     }
-                    tokio::time::sleep(backoff(attempt)).await;
+                    if !backlog.fill_for(backoff(attempt), &mut rx).await {
+                        return;
+                    }
                     continue;
                 }
             };
             self.set_state(id, StreamState::Streaming, attempt > 0);
             let (mut sink, mut source) = ws.split();
-            if let Some(h) = &hello {
-                if sink.send(h.clone()).await.is_err() {
-                    self.set_state(id, StreamState::Reconnecting, false);
-                    attempt = 1;
-                    continue;
+            // Every (re)connected consumer starts with a `hello` describing the stream as it
+            // is now (the queued one from `open` is skipped below), then a `dropped` frame for
+            // what the outage buffer could not hold, then the buffered frames.
+            let Some(hello) = self.hello_for(id) else {
+                return;
+            };
+            let mut opening = vec![Outgoing::Control(hello)];
+            let lost = backlog.dropped;
+            if lost > 0 {
+                opening.push(Outgoing::Control(ControlFrame::Dropped { frames: lost }));
+            }
+            opening.extend(backlog.take_items());
+            self.note_outage_drops(id, lost, true);
+            let mut replay_failed = None;
+            for out in opening {
+                if let Err(e) = sink.send(out.into_ws_message()).await {
+                    replay_failed = Some(e.to_string());
+                    break;
                 }
+            }
+            if let Some(reason) = replay_failed {
+                warn!("Live stream {} push replay failed: {reason}", id);
+                self.set_state(id, StreamState::Reconnecting, false);
+                attempt = 1;
+                if !backlog.fill_for(backoff(attempt), &mut rx).await {
+                    return;
+                }
+                continue;
             }
             let outcome = loop {
                 tokio::select! {
                     item = rx.recv() => match item {
                         None => break PushOutcome::Finished,
                         Some(out) => {
-                            let is_hello = matches!(out, Outgoing::Control(ControlFrame::Hello { .. }));
-                            let msg = out.into_ws_message();
-                            if is_hello {
-                                hello = Some(msg.clone());
+                            if matches!(out, Outgoing::Control(ControlFrame::Hello { .. })) {
+                                continue;
                             }
-                            if let Err(e) = sink.send(msg).await {
+                            if let Err(e) = sink.send(out.into_ws_message()).await {
                                 break PushOutcome::Lost(e.to_string());
                             }
                         }
@@ -925,7 +1465,9 @@ impl LiveStreams {
                     warn!("Live stream {} push connection lost: {reason}", id);
                     self.set_state(id, StreamState::Reconnecting, false);
                     attempt = 1;
-                    tokio::time::sleep(backoff(attempt)).await;
+                    if !backlog.fill_for(backoff(attempt), &mut rx).await {
+                        return;
+                    }
                 }
             }
         }
@@ -991,6 +1533,103 @@ impl LiveStreams {
 enum PushOutcome {
     Finished,
     Lost(String),
+}
+
+/// Frames kept for a consumer that is away, in their original order: the most recent
+/// `capacity` audio frames plus the control frames of the period (bounded separately; they are
+/// few and cheap). Audio beyond the capacity is dropped oldest-first and counted.
+struct Backlog {
+    capacity: usize,
+    items: VecDeque<Outgoing>,
+    audio: usize,
+    control: usize,
+    dropped: u64,
+}
+
+const BACKLOG_CONTROL_FRAMES: usize = 256;
+
+impl Backlog {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            items: VecDeque::with_capacity(capacity.min(4096)),
+            audio: 0,
+            control: 0,
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, out: Outgoing) {
+        match out {
+            // The stream's own `hello`/`end` are produced by the consumer side; `dropped`
+            // counts are folded into ours.
+            Outgoing::Control(ControlFrame::Hello { .. }) => {}
+            Outgoing::Control(ControlFrame::End { .. }) => {}
+            Outgoing::Control(ControlFrame::Dropped { frames }) => self.dropped += frames,
+            Outgoing::Control(c) => {
+                if self.control >= BACKLOG_CONTROL_FRAMES {
+                    self.evict(|o| matches!(o, Outgoing::Control(_)));
+                    self.control -= 1;
+                }
+                self.control += 1;
+                self.items.push_back(Outgoing::Control(c));
+            }
+            Outgoing::Audio(b) => {
+                if self.capacity == 0 {
+                    self.dropped += 1;
+                    return;
+                }
+                if self.audio >= self.capacity {
+                    self.evict(|o| matches!(o, Outgoing::Audio(_)));
+                    self.audio -= 1;
+                    self.dropped += 1;
+                }
+                self.audio += 1;
+                self.items.push_back(Outgoing::Audio(b));
+            }
+        }
+    }
+
+    /// Remove the oldest item matching `kind` (control frames are rare, so the scan for the
+    /// oldest audio frame stops almost immediately).
+    fn evict(&mut self, kind: impl Fn(&Outgoing) -> bool) {
+        if let Some(pos) = self.items.iter().position(kind) {
+            self.items.remove(pos);
+        }
+    }
+
+    /// Buffered frames in send order and a reset buffer.
+    fn take_items(&mut self) -> Vec<Outgoing> {
+        let items = self.drain_items();
+        self.dropped = 0;
+        items
+    }
+
+    fn into_items(mut self) -> Vec<Outgoing> {
+        self.drain_items()
+    }
+
+    fn drain_items(&mut self) -> Vec<Outgoing> {
+        self.audio = 0;
+        self.control = 0;
+        self.items.drain(..).collect()
+    }
+
+    /// Buffer everything the stream produces for `wait` (a reconnect backoff). Returns
+    /// `false` when the stream was closed meanwhile (the sender side is gone).
+    async fn fill_for(&mut self, wait: Duration, rx: &mut mpsc::Receiver<Outgoing>) -> bool {
+        let deadline = tokio::time::sleep(wait);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                item = rx.recv() => match item {
+                    None => return false,
+                    Some(out) => self.push(out),
+                },
+                _ = &mut deadline => return true,
+            }
+        }
+    }
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -1122,7 +1761,7 @@ mod tests {
 
     #[test]
     fn consent_gates_frames_and_disclosure_order() {
-        let live = LiveStreams::new(cfg(64), true, false, 0);
+        let live = LiveStreams::new(cfg(64), true, false, 0, Uuid::nil());
         let app = AppId(Uuid::new_v4());
         let ch = ChannelId(Uuid::new_v4());
         let alice = UserId(Uuid::new_v4());
@@ -1200,7 +1839,7 @@ mod tests {
 
     #[test]
     fn no_consent_required_streams_immediately_and_filters_users() {
-        let live = LiveStreams::new(cfg(64), false, false, 0);
+        let live = LiveStreams::new(cfg(64), false, false, 0, Uuid::nil());
         let app = AppId(Uuid::new_v4());
         let ch = ChannelId(Uuid::new_v4());
         let alice = UserId(Uuid::new_v4());
@@ -1240,6 +1879,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         );
         let app_a = AppId(Uuid::new_v4());
         let app_b = AppId(Uuid::new_v4());
@@ -1289,7 +1929,7 @@ mod tests {
 
     #[test]
     fn slow_consumer_drops_and_announces() {
-        let live = LiveStreams::new(cfg(16), false, false, 0);
+        let live = LiveStreams::new(cfg(16), false, false, 0, Uuid::nil());
         let app = AppId(Uuid::new_v4());
         let ch = ChannelId(Uuid::new_v4());
         let alice = UserId(Uuid::new_v4());
@@ -1315,7 +1955,7 @@ mod tests {
 
     #[test]
     fn pcm_format_decodes_to_s16le() {
-        let live = LiveStreams::new(cfg(64), false, false, 0);
+        let live = LiveStreams::new(cfg(64), false, false, 0, Uuid::nil());
         let app = AppId(Uuid::new_v4());
         let ch = ChannelId(Uuid::new_v4());
         let alice = UserId(Uuid::new_v4());
@@ -1348,6 +1988,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         );
         let spec = StreamSpec {
             format: StreamFormat::PcmS16le,
@@ -1363,7 +2004,7 @@ mod tests {
             ),
             Err(AurixError::Validation(_))
         ));
-        let off = LiveStreams::new(LiveStreamConfig::default(), false, false, 0);
+        let off = LiveStreams::new(LiveStreamConfig::default(), false, false, 0, Uuid::nil());
         assert!(matches!(
             off.open(
                 AppId(Uuid::new_v4()),
@@ -1378,7 +2019,7 @@ mod tests {
 
     #[test]
     fn push_url_policy() {
-        let prod = LiveStreams::new(cfg(64), false, true, 0);
+        let prod = LiveStreams::new(cfg(64), false, true, 0, Uuid::nil());
         assert!(prod.validate_push_url("ws://example.com/in").is_err());
         assert!(prod.validate_push_url("wss://127.0.0.1/in").is_err());
         assert!(prod
@@ -1388,7 +2029,7 @@ mod tests {
         assert!(prod
             .validate_push_url("wss://example.com/in?token=x")
             .is_ok());
-        let dev = LiveStreams::new(cfg(64), false, false, 0);
+        let dev = LiveStreams::new(cfg(64), false, false, 0, Uuid::nil());
         assert!(dev.validate_push_url("ws://127.0.0.1:9000/in").is_ok());
         let strict = LiveStreams::new(
             LiveStreamConfig {
@@ -1398,6 +2039,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         );
         assert!(strict.validate_push_url("ws://10.0.0.1/in").is_err());
         let off = LiveStreams::new(
@@ -1408,6 +2050,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         );
         assert!(matches!(
             off.validate_push_url("wss://example.com/in"),
@@ -1445,6 +2088,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         );
         let app = AppId(Uuid::new_v4());
         let (info, _r) = live
@@ -1536,6 +2180,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         ));
         let (port, mut frames, mut auth) = ws_receiver(2).await;
         let raw = format!("ws://127.0.0.1:{port}/ingest?x=1");
@@ -1646,6 +2291,7 @@ mod tests {
             false,
             false,
             0,
+            Uuid::nil(),
         ));
         // A bound-but-not-listening port refuses immediately.
         let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1682,5 +2328,435 @@ mod tests {
             notices.try_recv(),
             Ok(LiveNotice::Closed { reason, .. }) if reason == "push_unreachable"
         ));
+    }
+
+    fn opus_tone(enc: &mut opus::Encoder, amplitude: f32, phase: &mut f32) -> Vec<u8> {
+        let mut pcm = vec![0i16; FRAME_SAMPLES as usize];
+        for s in pcm.iter_mut() {
+            *s = (amplitude * (*phase).sin() * 32_767.0) as i16;
+            *phase += 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32;
+        }
+        let mut out = vec![0u8; 1500];
+        let n = enc.encode(&pcm, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    fn tone_encoder() -> opus::Encoder {
+        let mut enc =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        enc.set_bitrate(opus::Bitrate::Bits(64_000)).unwrap();
+        enc
+    }
+
+    fn pcm_peak(frame: &[u8]) -> i16 {
+        let d = decode_frame(frame).unwrap();
+        d.payload
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c).unsigned_abs())
+            .max()
+            .unwrap_or(0)
+            .min(i16::MAX as u16) as i16
+    }
+
+    fn mixed_frames(
+        live: &LiveStreams,
+        rx: &mut mpsc::Receiver<Outgoing>,
+        ticks: u32,
+    ) -> Vec<Vec<u8>> {
+        for _ in 0..ticks {
+            live.mix_tick();
+        }
+        audio_frames(&drain(rx))
+    }
+
+    #[test]
+    fn mixed_stream_sums_consenting_talkers_and_stays_silent_otherwise() {
+        let live = LiveStreams::new(
+            LiveStreamConfig {
+                allow_pcm: true,
+                ..cfg(256)
+            },
+            true,
+            false,
+            0,
+            Uuid::nil(),
+        );
+        let app = AppId(Uuid::new_v4());
+        let ch = ChannelId(Uuid::new_v4());
+        let alice = UserId(Uuid::new_v4());
+        let bob = UserId(Uuid::new_v4());
+        let carol = UserId(Uuid::new_v4());
+        let spec = StreamSpec {
+            format: StreamFormat::PcmS16le,
+            users: Some(vec![alice, bob]),
+            mix: true,
+            ..StreamSpec::default()
+        };
+        let (info, mut r) = live.open(app, ch, spec, StreamMode::Pull, None).unwrap();
+        assert!(info.mix);
+        assert!(matches!(
+            drain(&mut r.rx).as_slice(),
+            [Outgoing::Control(ControlFrame::Hello { mix: true, .. })]
+        ));
+
+        // Silent channel: the clock runs, no frames are produced.
+        assert!(mixed_frames(&live, &mut r.rx, 10).is_empty());
+
+        let mut enc_a = tone_encoder();
+        let mut enc_b = tone_encoder();
+        let mut enc_c = tone_encoder();
+        let (mut pa, mut pb, mut pc) = (0.0f32, 0.0f32, 0.0f32);
+        let mut ts = 0u32;
+        // One 20 ms step of the channel: the listed talkers send a packet, the clock ticks.
+        let mut step =
+            |live: &LiveStreams, rx: &mut mpsc::Receiver<Outgoing>, a: bool, b: bool, c: bool| {
+                ts += 960;
+                if a {
+                    live.on_audio(ch, alice, 1, ts, &opus_tone(&mut enc_a, 0.5, &mut pa));
+                }
+                if b {
+                    live.on_audio(ch, bob, 2, ts, &opus_tone(&mut enc_b, 0.5, &mut pb));
+                }
+                if c {
+                    live.on_audio(ch, carol, 3, ts, &opus_tone(&mut enc_c, 0.9, &mut pc));
+                }
+                mixed_frames(live, rx, 1)
+            };
+
+        // Pending consent: audio is not mixed.
+        for _ in 0..3 {
+            assert!(step(&live, &mut r.rx, true, false, false).is_empty());
+        }
+
+        // Alice alone: mixed frames are hers (user id nil, ssrc 0, first flag).
+        live.set_consent(app, info.id, alice, RecordingConsent::Accepted)
+            .unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..8 {
+            frames.extend(step(&live, &mut r.rx, true, false, false));
+        }
+        assert_eq!(frames.len(), 8);
+        let d = decode_frame(&frames[0]).unwrap();
+        assert_eq!(d.user_id, UserId(Uuid::nil()));
+        assert_eq!(d.ssrc, 0);
+        assert_eq!(d.flags & FLAG_FIRST, FLAG_FIRST);
+        assert_eq!(d.payload.len(), FRAME_SAMPLES as usize * 2);
+        assert_eq!(decode_frame(&frames[1]).unwrap().flags, 0);
+        // The decoder joined mid-stream (the pending packets were never decoded) and needs a
+        // few frames to converge; measure a settled one, expect ~0.5 full scale.
+        let solo = pcm_peak(&frames[7]);
+        assert!((12_000..=20_000).contains(&solo), "solo peak {solo}");
+
+        // Alice + Bob: louder than Alice alone. Carol is not selected and never counts.
+        live.set_consent(app, info.id, bob, RecordingConsent::Accepted)
+            .unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..8 {
+            frames.extend(step(&live, &mut r.rx, true, true, true));
+        }
+        assert_eq!(frames.len(), 8);
+        let duo = pcm_peak(&frames[7]);
+        assert!(duo > solo + 4_000, "duo peak {duo} vs solo {solo}");
+        assert!(!live.get(app, info.id).unwrap().consent.contains_key(&carol));
+
+        // Bob leaves: his queue is dropped, the mix continues with Alice alone.
+        live.on_participant_left(ch, bob);
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.extend(step(&live, &mut r.rx, true, false, false));
+        }
+        assert_eq!(frames.len(), 3);
+        assert!(pcm_peak(&frames[2]) < duo - 4_000);
+
+        // A garbage packet is ignored without breaking the talker.
+        live.on_audio(ch, alice, 1, 1, &[0xFF, 0x00, 0x11, 0x22]);
+        let frames = step(&live, &mut r.rx, true, false, false);
+        assert_eq!(frames.len(), 1);
+        assert!(pcm_peak(&frames[0]) > 8_000);
+
+        // After the hangover the stream pauses; the next frame carries the gap flag.
+        let hangover = mixed_frames(
+            &live,
+            &mut r.rx,
+            (MIX_HANGOVER_TICKS + MIX_PLC_FRAMES) as u32 + 5,
+        );
+        assert!(hangover.len() <= (MIX_HANGOVER_TICKS + MIX_PLC_FRAMES) as usize + 1);
+        assert!(mixed_frames(&live, &mut r.rx, 5).is_empty());
+        let frames = step(&live, &mut r.rx, true, false, false);
+        assert_eq!(decode_frame(&frames[0]).unwrap().flags & FLAG_GAP, FLAG_GAP);
+    }
+
+    #[test]
+    fn mixed_stream_clips_softly_and_encodes_opus() {
+        let live = LiveStreams::new(cfg(256), false, false, 0, Uuid::nil());
+        let app = AppId(Uuid::new_v4());
+        let ch = ChannelId(Uuid::new_v4());
+        let spec = StreamSpec {
+            mix: true,
+            ..StreamSpec::default()
+        };
+        let (_info, mut r) = live.open(app, ch, spec, StreamMode::Pull, None).unwrap();
+        drain(&mut r.rx);
+        let users: Vec<UserId> = (0..4).map(|_| UserId(Uuid::new_v4())).collect();
+        let mut encs: Vec<opus::Encoder> = users.iter().map(|_| tone_encoder()).collect();
+        let mut phases = vec![0.0f32; users.len()];
+        for i in 0..4u32 {
+            for (k, u) in users.iter().enumerate() {
+                let pkt = opus_tone(&mut encs[k], 0.9, &mut phases[k]);
+                live.on_audio(ch, *u, k as u32 + 1, i * 960, &pkt);
+            }
+        }
+        let frames = mixed_frames(&live, &mut r.rx, 4);
+        assert_eq!(frames.len(), 4);
+        let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+        let mut pcm = vec![0i16; MAX_PCM_SAMPLES];
+        for f in &frames {
+            let d = decode_frame(f).unwrap();
+            assert_eq!(d.codec, CODEC_OPUS);
+            let n = dec.decode(d.payload, &mut pcm, false).unwrap();
+            assert_eq!(n, FRAME_SAMPLES as usize);
+        }
+        // Four talkers at 0.9 sum to 3.6 full scale before clipping; the decoded frame is
+        // loud but never wrapped (a wrap would show up as a sign flip between neighbours).
+        let last = &pcm[..FRAME_SAMPLES as usize];
+        let peak = last.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!(peak > 20_000, "peak {peak}");
+        let wraps = last
+            .windows(2)
+            .filter(|w| (i32::from(w[0]) - i32::from(w[1])).abs() > 40_000)
+            .count();
+        assert_eq!(wraps, 0);
+    }
+
+    #[test]
+    fn mixed_stream_limits() {
+        let live = LiveStreams::new(
+            LiveStreamConfig {
+                max_mix_streams: 1,
+                max_per_channel: 4,
+                max_per_app: 8,
+                ..cfg(64)
+            },
+            false,
+            false,
+            0,
+            Uuid::nil(),
+        );
+        let app = AppId(Uuid::new_v4());
+        let ch = ChannelId(Uuid::new_v4());
+        let spec = StreamSpec {
+            mix: true,
+            ..StreamSpec::default()
+        };
+        let (a, _ra) = live
+            .open(app, ch, spec.clone(), StreamMode::Pull, None)
+            .unwrap();
+        assert!(matches!(
+            live.open(app, ch, spec.clone(), StreamMode::Pull, None),
+            Err(AurixError::Conflict(_))
+        ));
+        // Per-participant streams are not counted against the mixer cap.
+        live.open(app, ch, StreamSpec::default(), StreamMode::Pull, None)
+            .unwrap();
+        live.close(Some(app), a.id, "test").unwrap();
+        live.open(app, ch, spec, StreamMode::Pull, None).unwrap();
+
+        let off = LiveStreams::new(
+            LiveStreamConfig {
+                max_mix_streams: 0,
+                ..cfg(64)
+            },
+            false,
+            false,
+            0,
+            Uuid::nil(),
+        );
+        assert!(matches!(
+            off.open(
+                app,
+                ch,
+                StreamSpec {
+                    mix: true,
+                    ..StreamSpec::default()
+                },
+                StreamMode::Pull,
+                None
+            ),
+            Err(AurixError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn backlog_keeps_order_and_bounds() {
+        let mut b = Backlog::new(3);
+        let user = UserId(Uuid::new_v4());
+        let ctl = |ev| {
+            Outgoing::Control(ControlFrame::Participant {
+                user_id: user,
+                ssrc: 1,
+                event: ev,
+                consent: None,
+            })
+        };
+        b.push(ctl(ParticipantEvent::AudioStarted));
+        for i in 0..5u8 {
+            b.push(Outgoing::Audio(Bytes::from(vec![i])));
+        }
+        b.push(ctl(ParticipantEvent::Left));
+        b.push(Outgoing::Control(ControlFrame::Dropped { frames: 4 }));
+        b.push(Outgoing::Control(ControlFrame::Hello {
+            stream_id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            channel_id: ChannelId(Uuid::nil()),
+            format: StreamFormat::Opus,
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+            frame_ms: 20,
+            frame_version: FRAME_VERSION,
+            users: None,
+            consent_required: false,
+            label: None,
+            started_at: Utc::now(),
+            mix: false,
+            node_id: None,
+            reconnects: 0,
+        }));
+        assert_eq!(b.dropped, 2 + 4);
+        let items = b.take_items();
+        assert_eq!(b.dropped, 0);
+        assert_eq!(items.len(), 5);
+        assert!(matches!(
+            items[0],
+            Outgoing::Control(ControlFrame::Participant {
+                event: ParticipantEvent::AudioStarted,
+                ..
+            })
+        ));
+        assert_eq!(audio_frames(&items), vec![vec![2], vec![3], vec![4]]);
+        assert!(matches!(
+            items[4],
+            Outgoing::Control(ControlFrame::Participant {
+                event: ParticipantEvent::Left,
+                ..
+            })
+        ));
+
+        // Control frames are bounded on their own and never evict audio.
+        let mut b = Backlog::new(2);
+        b.push(Outgoing::Audio(Bytes::from_static(b"a")));
+        for _ in 0..BACKLOG_CONTROL_FRAMES + 10 {
+            b.push(ctl(ParticipantEvent::AudioStarted));
+        }
+        b.push(Outgoing::Audio(Bytes::from_static(b"b")));
+        let items = b.into_items();
+        assert_eq!(items.len(), BACKLOG_CONTROL_FRAMES + 2);
+        assert_eq!(audio_frames(&items), vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn pull_outage_buffers_and_resumes_with_drop_accounting() {
+        let live = Arc::new(LiveStreams::new(
+            LiveStreamConfig {
+                outage_buffer_ms: 100,
+                ..cfg(64)
+            },
+            false,
+            false,
+            0,
+            Uuid::nil(),
+        ));
+        // 100 ms window = 5 frames of buffer.
+        assert_eq!(live.cfg.outage_buffer_frames(), 5);
+        let app = AppId(Uuid::new_v4());
+        let other = AppId(Uuid::new_v4());
+        let ch = ChannelId(Uuid::new_v4());
+        let alice = UserId(Uuid::new_v4());
+        let (info, mut r) = live
+            .open(app, ch, StreamSpec::default(), StreamMode::Pull, None)
+            .unwrap();
+        drain(&mut r.rx);
+        live.on_audio(ch, alice, 1, 0, &opus_silence());
+        assert_eq!(audio_frames(&drain(&mut r.rx)).len(), 1);
+
+        // While connected a resume is refused; another tenant never sees the stream.
+        assert!(matches!(
+            live.resume_pull(app, info.id).await,
+            Err(AurixError::Conflict(_))
+        ));
+        assert!(matches!(
+            live.resume_pull(other, info.id).await,
+            Err(AurixError::NotFound(_))
+        ));
+
+        // The consumer drops: the stream is parked, not closed.
+        assert!(live.detach_pull(r, "consumer_disconnected").is_none());
+        let parked = live.get(app, info.id).unwrap();
+        assert_eq!(parked.state, StreamState::Reconnecting);
+        assert!(live.wants_channel(&ch));
+
+        // Eight frames arrive while nobody listens: five are kept, three are dropped.
+        for i in 1..=8u32 {
+            live.on_audio(ch, alice, 1, i * 960, &opus_silence());
+        }
+        tokio::task::yield_now().await;
+        // Let the parking task observe the frames.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (resumed, mut r2, replay) = live.resume_pull(app, info.id).await.unwrap();
+        assert_eq!(resumed.state, StreamState::Streaming);
+        assert_eq!(resumed.reconnects, 1);
+        assert_eq!(resumed.frames_dropped, 3);
+        assert_eq!(resumed.frames_sent, 1 + 5);
+        assert!(matches!(
+            replay[0],
+            Outgoing::Control(ControlFrame::Hello { reconnects: 1, .. })
+        ));
+        assert!(matches!(
+            replay[1],
+            Outgoing::Control(ControlFrame::Dropped { frames: 3 })
+        ));
+        let frames = audio_frames(&replay);
+        assert_eq!(frames.len(), 5);
+        assert_eq!(decode_frame(&frames[0]).unwrap().rtp_timestamp, 4 * 960);
+        assert_eq!(decode_frame(&frames[4]).unwrap().rtp_timestamp, 8 * 960);
+
+        // Live frames continue on the fresh receiver.
+        live.on_audio(ch, alice, 1, 9 * 960, &opus_silence());
+        assert_eq!(audio_frames(&drain(&mut r2.rx)).len(), 1);
+
+        // A second outage that outlives the window closes the stream.
+        assert!(live.detach_pull(r2, "consumer_disconnected").is_none());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(live.get(app, info.id).is_none());
+        assert!(!live.wants_channel(&ch));
+        assert!(matches!(
+            live.resume_pull(app, info.id).await,
+            Err(AurixError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn pull_without_outage_buffer_closes_on_detach() {
+        let live = Arc::new(LiveStreams::new(
+            LiveStreamConfig {
+                outage_buffer_ms: 0,
+                ..cfg(64)
+            },
+            false,
+            false,
+            0,
+            Uuid::nil(),
+        ));
+        let app = AppId(Uuid::new_v4());
+        let ch = ChannelId(Uuid::new_v4());
+        let (info, r) = live
+            .open(app, ch, StreamSpec::default(), StreamMode::Pull, None)
+            .unwrap();
+        let closed = live.detach_pull(r, "consumer_disconnected").unwrap();
+        assert_eq!(closed.id, info.id);
+        assert!(live.get(app, info.id).is_none());
     }
 }

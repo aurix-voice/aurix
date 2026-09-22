@@ -34,4 +34,5 @@ sqlx = { workspace = true }
 ipnetwork = { workspace = true }
 rand = { workspace = true }
 futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 url = { workspace = true }

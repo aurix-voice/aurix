@@ -498,22 +498,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(rec) = recording.clone().filter(|r| r.live().enabled()) {
-        // Lifecycle notices → tenant events (webhooks/SSE, WS disclosure to channel members).
+        // Lifecycle notices → tenant events (webhooks/SSE, WS disclosure to channel members),
+        // fleet directory upkeep and release of the channel pin taken when the stream opened.
         if let Some(mut notices) = rec.live().take_notices() {
             let events = control.events.clone();
             let cancel = shutdown.clone();
+            let pool = control.pool.clone();
+            let sfu = sfu.clone();
             tasks.spawn(async move {
                 loop {
                     let notice = tokio::select! {
                         n = notices.recv() => match n { Some(n) => n, None => return },
                         _ = cancel.cancelled() => return,
                     };
+                    match &notice {
+                        aurix_recording::live::LiveNotice::Opened(info) => {
+                            aurix_recording::live_directory::publish(&pool, info).await;
+                        }
+                        aurix_recording::live::LiveNotice::Closed { info, .. } => {
+                            sfu.read().unpin_channel(&info.channel_id);
+                            aurix_recording::live_directory::remove(&pool, info.id).await;
+                        }
+                    }
                     events.publish(live_stream_event(notice));
                 }
             });
         }
+        tasks.spawn(rec.live().clone().run_mixer(shutdown.clone()));
         let cancel = shutdown.clone();
+        let pool = control.pool.clone();
         tasks.spawn(async move {
+            aurix_recording::live_directory::sync(&pool, rec.live()).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
@@ -521,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
                     _ = cancel.cancelled() => return,
                 }
                 rec.live().enforce_duration_limit();
+                aurix_recording::live_directory::sync(&pool, rec.live()).await;
             }
         });
     }

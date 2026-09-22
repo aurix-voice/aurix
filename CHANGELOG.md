@@ -131,6 +131,22 @@ released together.
   `OnParticipantRoleChanged` / `IsWaitingToSpeak` (Unity, Unreal), `participant_role_changed` /
   `is_waiting_to_speak` (Godot) and `AurixEventParticipantRoleChanged` /
   `waiting_to_speak` (C ABI) in the SDKs.
+* **Live audio streams: server-side mix, outage buffering, fleet-wide access.** `mix=true`
+  (pull query parameter / `CreateStreamRequest.mix`) turns a stream into one server-side mix of
+  the selected, consenting, non-E2EE talkers — one 20 ms frame per tick with an all-zero user id
+  and SSRC 0, Opus at `recording.live.mix_bitrate` (64 kbit/s) or PCM, soft-clipped, with limited
+  concealment while a talker's packets are late; at most `recording.live.max_mix_streams` (16)
+  mixers per node (`409` beyond, `0` disables). A stream now survives its consumer:
+  `recording.live.outage_buffer_ms` (10 s, ≤ 5 min, `0` = off) of frames are kept in order while
+  a pull consumer is away (`state: reconnecting`) or a push target is re-dialled, and replayed on
+  reconnect after a fresh `hello` (`reconnects` bumped) and a `dropped` frame if the window
+  overflowed; past the window the stream ends. Streams belong to the fleet: ownership and status
+  live in the new `live_streams` table (migration 22, `node_id` on `LiveStream` and in `hello`),
+  so `GET /v1/audio/streams`, `GET`/`DELETE …/audio/streams/{id}` (`202` when the stop is
+  forwarded to the owner) and `pull?resume=<id>` (relayed to the owner with the caller's
+  credentials) work on every node, a node that hosts none of the channel's participants may
+  own its stream (it pins the channel so the cascade relays the audio to it), and rows of a
+  vanished node are pruned with it. Tenant scoping applies to every remote view.
 
 ### Fixed
 

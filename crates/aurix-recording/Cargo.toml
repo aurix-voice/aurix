@@ -23,6 +23,7 @@ base64 = { workspace = true }
 crc32fast = { workspace = true }
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
+tokio-util = { workspace = true }
 opus = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

@@ -2,9 +2,10 @@
 
 Both features take audio *off* the media path on the node that hosts the participant. Neither
 ever sees end-to-end-encrypted frames (`E2EE` flag / insertable-streams payloads) — the node
-cannot read them. Both are **node-local**: start them on the node the participant is connected
-to (the node id is part of the sessions returned by `GET /v1/users/{user_id}`), or use push
-streams, which do not depend on where the operator connects.
+cannot read them. Recordings are **node-local**: start them on the node the participant is
+connected to (the node id is part of the sessions returned by `GET /v1/users/{user_id}`). Live
+streams may be opened on any node — the node that opens one becomes its owner, receives the
+channel's audio through the cascade, and the fleet lists, stops and resumes it from every node.
 
 ## File recordings
 
@@ -157,10 +158,11 @@ The socket carries JSON text frames for control and binary frames for audio:
 
 ```json
 {"type":"hello","stream_id":"…","channel_id":"…","format":"opus","sample_rate":48000,
- "channels":1,"frame_ms":20,"frame_version":1,"users":null,"consent_required":true}
+ "channels":1,"frame_ms":20,"frame_version":1,"users":null,"consent_required":true,
+ "mix":false,"node_id":"…","reconnects":0}
 {"type":"participant","user_id":"…","ssrc":123,"event":"audio_started|consent|left","consent":"accepted"}
 {"type":"dropped","frames":12}
-{"type":"end","reason":"consumer_disconnected|operator|duration_limit|channel_stopped|push_unreachable|shutdown","frames_sent":0,"frames_dropped":0}
+{"type":"end","reason":"consumer_disconnected|consumer_timeout|operator|duration_limit|channel_stopped|push_unreachable|shutdown","frames_sent":0,"frames_dropped":0}
 ```
 
 Binary frame (36-byte header, big-endian, then the payload; `aurix_recording::live::decode_frame`
@@ -175,8 +177,13 @@ is the reference parser):
 `opus` forwards each participant's packets untouched (one 20 ms frame each; the `gap` flag
 marks a hole in the RTP timeline so a decoder can run PLC); `pcm_s16le` decodes on the node —
 mono 48 kHz, 960 samples per frame — with one Opus decoder per active talker
-(`recording.live.allow_pcm = false` disables it). Streams are **per participant, not mixed**;
-mixing, transcoding and container formats are your side's job.
+(`recording.live.allow_pcm = false` disables it). By default streams are **per participant**;
+`mix=true` (query parameter or request field) gives **one server-side mix of the channel**: one
+20 ms frame per tick with an all-zero `user id` and `ssrc` 0, Opus at `recording.live.mix_bitrate`
+or PCM, soft-clipped, with limited concealment while a talker's packets are late and a short
+hang-over after the last talker stops. Only selected, consenting, non-E2EE talkers enter the mix.
+A node runs at most `recording.live.max_mix_streams` mixers (one Opus decoder per talker plus one
+encoder each; `409` beyond). Transcoding and container formats remain your side's job.
 
 ### Semantics
 
@@ -185,13 +192,27 @@ mixing, transcoding and container formats are your side's job.
   `RecordingConsentResponse`; only `accepted` participants' frames leave the node, `declined`
   ones never do, and the consumer sees each decision as a `participant` control frame. This
   works across cascaded nodes (the decision is relayed to the node hosting the stream).
-* **Streams are node-local.** Open them against a node that hosts participants of the channel
-  (`409` otherwise); participants on other nodes of a cascaded channel are included through the
-  relay. Behind a load balancer, pin the operator connection to one node or use push.
-* **Backpressure never reaches players.** Each stream buffers `recording.live.queue_frames`
-  frames; a slow consumer loses the oldest ones and gets a `dropped` count, the media path is not
-  blocked. `max_per_channel` / `max_per_app` bound the number of streams per node,
-  `max_duration_secs` (and always `recording.max_recording_duration_secs`) their length.
+* **Streams belong to the fleet.** The node a stream is opened on owns it (`node_id` in `hello`
+  and in the REST view) — even when it hosts none of the channel's participants: it pins the
+  channel so the cascade relays their audio to it, and releases the pin when the stream ends.
+  Ownership and status live in PostgreSQL, so `GET /v1/audio/streams`, `GET`/`DELETE
+  …/audio/streams/:sid` and `pull?resume=<sid>` work on every node: a stop on another node is
+  answered `202` and forwarded to the owner over the control plane, a resume on another node is
+  relayed to the owner with the caller's credentials (the owner authorises it). Rows of a node
+  that vanished are pruned when the node is reaped. Keep `recording.live.enabled` on across the
+  fleet; a node with it off answers `400` for all of this.
+* **Outages are bridged.** While a pull consumer is away or a push target is being re-dialled
+  the owner keeps the last `recording.live.outage_buffer_ms` (default 10 s, at most 5 min) of
+  frames, `state: reconnecting`, and replays them on reconnect: a fresh `hello` with a bumped
+  `reconnects`, a `dropped` frame if the window overflowed, then the backlog in its original
+  order (participant events included), then live frames. `0` disables the buffer (a pull
+  stream ends at once with `consumer_disconnected`); past the window the stream ends with
+  `consumer_timeout` / `push_unreachable`.
+* **Backpressure never reaches players.** Towards a connected consumer each stream queues
+  `recording.live.queue_frames` frames; a slow consumer loses the oldest ones and gets a
+  `dropped` count, the media path is not blocked. `max_per_channel` / `max_per_app` bound the
+  number of streams per node, `max_duration_secs` (and always
+  `recording.max_recording_duration_secs`) their length.
 * **Lifecycle** is announced as `audio_stream.started|stopped` (webhooks/SSE, with the end
   reason and frame counters, without URLs or headers), written to the audit log, and shown to
   players like a recording (`RecordingNotification` with `live: true`). Streams end with the

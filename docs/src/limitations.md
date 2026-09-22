@@ -183,13 +183,15 @@ the chapter that explains the boundary.
 
 ## Server behaviour
 
-* **Node-local resources.** Session statistics, live audio streams and live media state live
-  on the node that hosts the session; the fleet-wide views are webhooks/SSE, the database and
-  metrics ([Scaling](operations/scaling.md)). Failover moves a *session* to another node (same
-  id/SSRC, new media key) from its Redis mirror; a per-participant recording file or live
-  stream on the old node is finalised at that point and continues on the new node only if
-  that node records/streams the channel. Failover needs Redis — without it a resume elsewhere
-  is a fresh session ([High availability](operations/high-availability.md)).
+* **Node-local resources.** Session statistics and live media state live on the node that
+  hosts the session; the fleet-wide views are webhooks/SSE, the database and metrics
+  ([Scaling](operations/scaling.md)). Live audio streams are owned by one node but reachable
+  from every node (directory in PostgreSQL). Failover moves a *session* to another node (same
+  id/SSRC, new media key) from its Redis mirror; a per-participant recording file on the old
+  node is finalised at that point and continues on the new node only if that node records the
+  channel, while a live stream keeps running on its owner and picks the session up again through
+  the cascade. Failover needs Redis — without it a resume elsewhere is a fresh session
+  ([High availability](operations/high-availability.md)).
 * **Usage metering is exact for CCU and minutes, eventual for counters.** CCU, session and
   participant minutes are derived from lifecycle intervals in PostgreSQL and survive node loss;
   media-byte, chat, TTS and STT counters are flushed per node every `usage.flush_interval_secs`
@@ -212,9 +214,11 @@ the chapter that explains the boundary.
   `redis.sharded_pubsub = false` and the event bus falls back to classic Pub/Sub, which the
   cluster broadcasts to every node. Cluster mode is a compatibility feature, not a latency one;
   no benchmark claims a faster voice path with it.
-* **Live audio streams are per participant**, not mixed, and are dropped (counted) when the
-  consumer falls behind `recording.live.queue_frames`; no buffering across a consumer outage
-  ([Recordings and live streams](features/recordings.md)).
+* **Live audio streams** are dropped (counted) when a connected consumer falls behind
+  `recording.live.queue_frames`, survive a consumer outage only for `recording.live.outage_buffer_ms`
+  (≤ 5 min, in memory on the owner node — a node restart ends them), and the server-side mix
+  (`mix=true`) is mono, decodes every talker on the owner node (`max_mix_streams` per node) and
+  cannot include E2EE talkers ([Recordings and live streams](features/recordings.md)).
 * **Recordings are captured per participant** as Ogg/Opus; a channel file is a post-hoc
   mixdown (Ogg/Opus or WAV only — no MP3/AAC/FLAC, no video containers) rendered on the node
   that receives the request, which must reach every source track (local disk or object

@@ -39,8 +39,8 @@ the [CLI](../backend/cli.md). Combine with a rolling restart: drain, wait for
 
 A session is anchored to the node that accepted its **WebSocket**: `SessionInitAck.media_addr`
 points to that node's `media.external_ip:media.port`, its media key lives in that node's SFU, and
-node-local resources (WebRTC peer connection, recordings, live audio streams, per-session REST
-stats) are served there. Consequences:
+node-local resources (WebRTC peer connection, recordings, per-session REST stats) are served
+there. Consequences:
 
 * Put the REST API and the WebSocket behind an ordinary L7 load balancer — no sticky sessions
   are required for the API. A WebSocket stays on the node it landed on; a **resume** is
@@ -53,11 +53,13 @@ stats) are served there. Consequences:
   three.
 * UDP media must reach the node directly (`media.external_ip`), not through the balancer.
 * REST calls that touch live media are node-local: `GET /v1/sessions/{id}/stats` answers `404`
-  for a session hosted elsewhere, live-stream routes answer `409` when the channel's media is
-  on another node, and a recording follows the participant's node. `GET
+  for a session hosted elsewhere and a recording follows the participant's node. `GET
   /v1/channels/{id}/participants` reports `live_on_this_node`, `GET /v1/nodes` gives each node's
   address — an operator tool retries against the right node or relies on webhooks/SSE, which
-  are fleet-wide.
+  are fleet-wide. Live audio streams are the exception: a stream is owned by the node that
+  opened it (the cascade relays the channel's audio there), and every node lists, inspects,
+  stops (`202` when forwarded to the owner) and resumes (`pull?resume=<id>`) any stream of the
+  tenant ([Recordings and live streams](../features/recordings.md)).
 
 ## Cross-node events
 

@@ -675,6 +675,8 @@ impl CascadeTopology {
                 | ServerEvent::ChannelDestroyed { .. }
                 | ServerEvent::SessionMigrated { .. }
                 | ServerEvent::NodeHealthChanged { .. }
+                | ServerEvent::LiveStreamStarted { .. }
+                | ServerEvent::LiveStreamStopped { .. }
         )
     }
 }

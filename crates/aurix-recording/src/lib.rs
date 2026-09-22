@@ -1,4 +1,5 @@
 pub mod live;
+pub mod live_directory;
 pub mod mixdown;
 pub mod ogg;
 pub mod processing;
@@ -236,6 +237,7 @@ impl RecordingService {
             config.require_consent,
             production,
             config.max_recording_duration_secs,
+            node_id,
         ));
         let jobs = Jobs::new(
             config.processing.max_concurrent,

@@ -4,7 +4,7 @@
     "title": "Aurix Voice Platform API",
     "version": "1.4.0",
     "summary": "Self-hosted low-latency game voice: control-plane REST API",
-    "description": "REST control plane of the Aurix voice platform. Real-time media never crosses this API: players talk to a node\nover the WebSocket control plane (`/ws`, see the *WebSocket protocol* chapter of the docs) and stream audio over\nnative AURX/UDP or WebRTC.\n\n## Authentication\n\n| Caller | Credential | Routes |\n|---|---|---|\n| Your game backend | **API key** — `X-API-Key: aurx_…` or `Authorization: Bearer aurx_…` | everything under `/v1/*` except `/v1/me/*`, `/v1/webrtc/*`, `/v1/apps*`, `/v1/nodes*` |\n| Player (game client) | **Session JWT** from `POST /v1/tokens` — `Authorization: Bearer <jwt>` | `/v1/me/*`, `/v1/webrtc/offer`, the WebSocket |\n| Operator | **Admin JWT** from `POST /admin/login` (password) or `GET /admin/oidc/login` (SSO) — `Authorization: Bearer <jwt>` | `/admin/*`, `/v1/apps*`, `/v1/nodes*` |\n| Operator, on one application | **Admin JWT** + `X-Aurix-App: <app_id>` | every API-key route, with the API permissions of the administrator's role (table below) |\n| First run | `X-Bootstrap-Token` (or no admins yet) | `POST /admin/setup` |\n\nEvery API-key and player route is scoped to the **application (tenant) of the credential**; ids from other\napplications behave as if they did not exist (`404`). API keys carry a permission list — each operation\ndocuments what it needs in `x-aurix-permissions` (`*` grants everything). Admin operations document the\nadministrator permission they need in `x-aurix-admin-permission`; roles grant permissions cumulatively:\n\n| Role | Admin permissions |\n|---|---|\n| `viewer` | `apps:read`, `nodes:read`, `analytics:read` |\n| `moderator` | + `audit:read`, `moderation:read` |\n| `admin` | + `apps:write`, `keys:rotate`, `nodes:drain`, `config:read` |\n| `superadmin` | + `apps:delete`, `retention:run`, `admins:manage` |\n\nWith `X-Aurix-App` an administrator acts on one application over the API-key routes (the operator\ndashboard works this way; API keys never leave the backend). The role maps to API permissions:\n\n| Role | API permissions with `X-Aurix-App` |\n|---|---|\n| `viewer` | `channels:read`, `users:read`, `analytics:read`, `events:read`, `webhooks:read`, `recordings:read`, `audio_streams:read` |\n| `moderator` | + `moderation:read`, `moderation:write`, `chat:read`, `chat:write`, `audit:read`, `users:write` |\n| `admin` | + `channels:write`, `webhooks:write`, `recordings:write`, `audio_streams:write`, `keys:manage`, `tokens:issue`, `turn:issue`, `tts:write`, `users:export` |\n| `superadmin` | `*` |\n\nAudit entries and moderation actions performed this way name the administrator id as the actor.\n\nAdmin tokens are checked against the account on every request: deactivation, a role change, a password\nchange or *sign out everywhere* invalidate the tokens issued before it.\n\nKnown permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read`, `channels:write`, `users:read`, `users:write`, `users:erase`, `users:export`, `moderation:read`, `moderation:write`, `recordings:read`, `recordings:write`, `audio_streams:read`, `audio_streams:write`, `chat:read`, `chat:write`, `tts:write`, `keys:manage`, `analytics:read`, `audit:read`, `webhooks:read`, `webhooks:write`, `events:read`.\n\n## Errors\n\nNon-2xx responses use one envelope: `{\"error\": {\"code\": \"…\", \"message\": \"…\"}}`. Codes map to statuses as\nfollows: authentication → `401`; missing permission, action-token, ban or server-mute refusals → `403`;\nunknown or foreign-tenant ids (and chat/TTS when disabled) → `404`; quota, channel-full and other conflicts →\n`409`; validation → `400`; a chat message rejected by the filter → `422`; rate limit (per IP or per key, fleet-wide) → `429`\n(`Retry-After` is set); features not configured on this deployment → `501`; speech-provider failures → `502`;\nno media node available → `503`; provider timeouts → `504`.\n\n## Conventions\n\n* Identifiers are UUIDs, timestamps are RFC 3339 in UTC.\n* Lists that paginate take `page` (from 1) and `per_page` and return `{data, page, per_page, total}` unless\n  documented otherwise.\n* Some resources are **node-local** (session stats, live audio streams): behind a load balancer, address the\n  node that hosts the session/channel (it is listed in `GET /v1/users/{user_id}`).\n* Secrets (API keys, webhook secrets, TURN passwords) appear exactly once, in the response that creates them.\n",
+    "description": "REST control plane of the Aurix voice platform. Real-time media never crosses this API: players talk to a node\nover the WebSocket control plane (`/ws`, see the *WebSocket protocol* chapter of the docs) and stream audio over\nnative AURX/UDP or WebRTC.\n\n## Authentication\n\n| Caller | Credential | Routes |\n|---|---|---|\n| Your game backend | **API key** — `X-API-Key: aurx_…` or `Authorization: Bearer aurx_…` | everything under `/v1/*` except `/v1/me/*`, `/v1/webrtc/*`, `/v1/apps*`, `/v1/nodes*` |\n| Player (game client) | **Session JWT** from `POST /v1/tokens` — `Authorization: Bearer <jwt>` | `/v1/me/*`, `/v1/webrtc/offer`, the WebSocket |\n| Operator | **Admin JWT** from `POST /admin/login` (password) or `GET /admin/oidc/login` (SSO) — `Authorization: Bearer <jwt>` | `/admin/*`, `/v1/apps*`, `/v1/nodes*` |\n| Operator, on one application | **Admin JWT** + `X-Aurix-App: <app_id>` | every API-key route, with the API permissions of the administrator's role (table below) |\n| First run | `X-Bootstrap-Token` (or no admins yet) | `POST /admin/setup` |\n\nEvery API-key and player route is scoped to the **application (tenant) of the credential**; ids from other\napplications behave as if they did not exist (`404`). API keys carry a permission list — each operation\ndocuments what it needs in `x-aurix-permissions` (`*` grants everything). Admin operations document the\nadministrator permission they need in `x-aurix-admin-permission`; roles grant permissions cumulatively:\n\n| Role | Admin permissions |\n|---|---|\n| `viewer` | `apps:read`, `nodes:read`, `analytics:read` |\n| `moderator` | + `audit:read`, `moderation:read` |\n| `admin` | + `apps:write`, `keys:rotate`, `nodes:drain`, `config:read` |\n| `superadmin` | + `apps:delete`, `retention:run`, `admins:manage` |\n\nWith `X-Aurix-App` an administrator acts on one application over the API-key routes (the operator\ndashboard works this way; API keys never leave the backend). The role maps to API permissions:\n\n| Role | API permissions with `X-Aurix-App` |\n|---|---|\n| `viewer` | `channels:read`, `users:read`, `analytics:read`, `events:read`, `webhooks:read`, `recordings:read`, `audio_streams:read` |\n| `moderator` | + `moderation:read`, `moderation:write`, `chat:read`, `chat:write`, `audit:read`, `users:write` |\n| `admin` | + `channels:write`, `webhooks:write`, `recordings:write`, `audio_streams:write`, `keys:manage`, `tokens:issue`, `turn:issue`, `tts:write`, `users:export` |\n| `superadmin` | `*` |\n\nAudit entries and moderation actions performed this way name the administrator id as the actor.\n\nAdmin tokens are checked against the account on every request: deactivation, a role change, a password\nchange or *sign out everywhere* invalidate the tokens issued before it.\n\nKnown permissions: `*`, `tokens:issue`, `turn:issue`, `channels:read`, `channels:write`, `users:read`, `users:write`, `users:erase`, `users:export`, `moderation:read`, `moderation:write`, `recordings:read`, `recordings:write`, `audio_streams:read`, `audio_streams:write`, `chat:read`, `chat:write`, `tts:write`, `keys:manage`, `analytics:read`, `audit:read`, `webhooks:read`, `webhooks:write`, `events:read`.\n\n## Errors\n\nNon-2xx responses use one envelope: `{\"error\": {\"code\": \"…\", \"message\": \"…\"}}`. Codes map to statuses as\nfollows: authentication → `401`; missing permission, action-token, ban or server-mute refusals → `403`;\nunknown or foreign-tenant ids (and chat/TTS when disabled) → `404`; quota, channel-full and other conflicts →\n`409`; validation → `400`; a chat message rejected by the filter → `422`; rate limit (per IP or per key, fleet-wide) → `429`\n(`Retry-After` is set); features not configured on this deployment → `501`; speech-provider failures → `502`;\nno media node available → `503`; provider timeouts → `504`.\n\n## Conventions\n\n* Identifiers are UUIDs, timestamps are RFC 3339 in UTC.\n* Lists that paginate take `page` (from 1) and `per_page` and return `{data, page, per_page, total}` unless\n  documented otherwise.\n* Session stats are **node-local**: behind a load balancer, address the node that hosts the session (it is\n  listed in `GET /v1/users/{user_id}`). Live audio streams are owned by one node but listed, inspected,\n  stopped and resumed from every node.\n* Secrets (API keys, webhook secrets, TURN passwords) appear exactly once, in the response that creates them.\n",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -5661,7 +5661,8 @@
         ],
         "x-aurix-permissions": [
           "audio_streams:read"
-        ]
+        ],
+        "description": "Streams of the tenant across the whole fleet: this node's live status plus the directory entries of streams owned by other nodes."
       }
     },
     "/v1/channels/{channel_id}/audio/streams": {
@@ -5671,7 +5672,7 @@
         ],
         "summary": "Start a push stream",
         "operationId": "createStream",
-        "description": "Aurix connects to your WebSocket endpoint and pushes per-participant Opus or PCM frames (36-byte binary header) plus JSON control frames. Streams are node-local: address the node that hosts participants of the channel (`409` otherwise).",
+        "description": "Aurix connects to your WebSocket endpoint and pushes per-participant Opus or PCM frames (36-byte binary header) plus JSON control frames, or one server-side mix (`mix: true`). Any node of the fleet can create the stream: the node pins the channel so the cascade forwards every participant's audio to it, and publishes the stream to the fleet directory.",
         "parameters": [
           {
             "name": "channel_id",
@@ -5797,7 +5798,8 @@
         ],
         "x-aurix-permissions": [
           "audio_streams:read"
-        ]
+        ],
+        "description": "Streams of the tenant across the whole fleet: this node's live status plus the directory entries of streams owned by other nodes."
       }
     },
     "/v1/channels/{channel_id}/audio/streams/pull": {
@@ -5807,7 +5809,7 @@
         ],
         "summary": "Open a pull stream (WebSocket upgrade)",
         "operationId": "pullStream",
-        "description": "Not a plain HTTP call: upgrade to WebSocket with the API key in `X-API-Key` / `Authorization`. Frames flow once the socket is open and the stream ends when it closes. Streams are node-local: address the node that hosts participants of the channel (`409` otherwise).",
+        "description": "Not a plain HTTP call: upgrade to WebSocket with the API key in `X-API-Key` / `Authorization`. Frames flow once the socket is open. When the socket closes the stream is kept for `recording.live.outage_buffer_ms` (`state: reconnecting`, frames buffered up to that window) so the consumer can reconnect with `?resume=<stream id>`: it gets a fresh `hello`, a `dropped` frame if the buffer overflowed, the buffered frames, then live frames. The resume may reach any node of the fleet (a load balancer in front): a node that does not own the stream relays the socket to the owner with the caller's credentials.",
         "parameters": [
           {
             "name": "channel_id",
@@ -5839,6 +5841,24 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "mix",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "One server-side mix of the selected participants instead of per-participant frames."
+          },
+          {
+            "name": "resume",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Re-attach to a pull stream whose consumer disconnected (within `recording.live.outage_buffer_ms`). The other query options are ignored: the stream keeps its format, users and mix."
           }
         ],
         "responses": {
@@ -5977,6 +5997,16 @@
               }
             }
           },
+          "202": {
+            "description": "Stop requested from the owner node; last published state of the stream",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveStream"
+                }
+              }
+            }
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -6000,7 +6030,8 @@
         ],
         "x-aurix-permissions": [
           "audio_streams:write"
-        ]
+        ],
+        "description": "A stream owned by this node is closed synchronously (`200`, final counters). A stream owned by another node is asked to stop through the control plane (`202`, its last published status); it disappears from the directory once that node has closed it."
       }
     },
     "/v1/webhooks": {
@@ -9783,6 +9814,11 @@
               "string",
               "null"
             ]
+          },
+          "mix": {
+            "type": "boolean",
+            "default": false,
+            "description": "One server-side mix of the selected participants (20 ms frames, `user_id` all-zero, `ssrc` 0) instead of per-participant frames. Consent gating applies per talker and E2EE audio is never mixed (it never reaches the server in clear). Concurrent mixed streams per node are capped by `recording.live.max_mix_streams` (`409`)."
           }
         },
         "required": [
@@ -10224,11 +10260,20 @@
             "type": "string",
             "format": "uuid"
           },
+          "node_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Node that owns the stream (pins the channel, taps and mixes the audio, serves the pull socket). Streams of every node of the fleet are listed; `DELETE` on another node's stream is forwarded (`202`)."
+          },
           "mode": {
             "$ref": "#/components/schemas/StreamMode"
           },
           "format": {
             "$ref": "#/components/schemas/StreamFormat"
+          },
+          "mix": {
+            "type": "boolean",
+            "description": "`true`: one server-side mix; `false`: per-participant frames."
           },
           "state": {
             "$ref": "#/components/schemas/StreamState"
@@ -10291,7 +10336,9 @@
           "frames_sent",
           "frames_dropped",
           "reconnects",
-          "consent"
+          "consent",
+          "node_id",
+          "mix"
         ]
       },
       "MediaNode": {
@@ -10780,7 +10827,11 @@
           },
           "speaker_admission": {
             "type": "string",
-            "enum": ["reject", "wait", "demote"],
+            "enum": [
+              "reject",
+              "wait",
+              "demote"
+            ],
             "default": "reject",
             "description": "Policy for a member with a speaking grant when every `max_speakers` slot is held. `reject`: the join fails (`channel_full`). `wait`: the member joins as an effective listener (`ChannelJoinAck.waiting_to_speak`) and gets a slot when one frees, in order: priority speakers and moderators first, then by waiting time. `demote`: like `wait`, but a plain speaker silent for `demote_idle_ms` yields its slot to a waiting member that is trying to speak (a joining priority speaker, moderator or administrator takes the least recently active plain speaker's slot at once). Priority speakers, moderators and administrators are never demoted; the persisted grant is never changed, only the effective role (`RoleChanged` / `participant.role_changed`)."
           },
@@ -11309,7 +11360,8 @@
           "connecting",
           "streaming",
           "reconnecting"
-        ]
+        ],
+        "description": "`reconnecting`: push — the target is being re-dialled; pull — the consumer disconnected and the stream is kept for `recording.live.outage_buffer_ms` (frames buffered) until it resumes."
       },
       "SweepReport": {
         "type": "object",

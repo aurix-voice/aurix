@@ -66,6 +66,7 @@ jobs:
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
           AURIX__RECORDING__ENABLED: "true"
           AURIX__RECORDING__STORAGE_PATH: ${{ runner.temp }}/recordings
+          AURIX__RECORDING__LIVE__ENABLED: "true"
           AURIX__SERVER__SESSION_RESUME_GRACE_SECS: "4"
           AURIX__CHAT__PERSIST: "true"
           AURIX__MEDIA__MAX_CHANNELS_PER_SESSION: "4"
@@ -87,7 +88,9 @@ jobs:
       - name: Run second node (cascade peer without QUIC)
         env:
           AURIX__TURN__ENABLED: "false"
-          AURIX__RECORDING__ENABLED: "false"
+          AURIX__RECORDING__ENABLED: "true"
+          AURIX__RECORDING__STORAGE_PATH: ${{ runner.temp }}/recordings-node2
+          AURIX__RECORDING__LIVE__ENABLED: "true"
           AURIX__SERVER__EXTERNAL_URL: http://127.0.0.1:8120
           AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
           AURIX__MEDIA__QUIC: "false"

@@ -60,9 +60,11 @@ server, or if the versions drift.
 
 ## Conventions worth knowing
 
-* **Node-local resources.** Session statistics and live audio streams live on the node hosting
-  the session/channel. Behind a load balancer address that node directly (its address is part of
-  the user's session information) or expect `404`/`409 CONFLICT` from other nodes.
+* **Node-local resources.** Session statistics live on the node hosting the session. Behind a
+  load balancer address that node directly (its address is part of the user's session
+  information) or expect `404` from other nodes. Live audio streams are the exception: they are
+  owned by one node (`node_id`) but listed, read, stopped (`202` when forwarded to the owner) and
+  resumed from every node.
 * **Rate limits.** `429` carries `Retry-After`. Limits are per client IP (`rate_limiting.requests_per_second`
   / `burst_size`) and per API key (the key's own `rate_limit`, requests per minute, `0` = unlimited; set at
   creation or with `PATCH /v1/api-keys/{key_id}`). With Redis the buckets are shared by every node, so the

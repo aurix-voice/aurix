@@ -1568,6 +1568,18 @@ impl WsState {
                         });
                     }
                 }
+                ServerEvent::LiveStreamStopRequested {
+                    app_id,
+                    stream_id,
+                    node,
+                    reason,
+                } => {
+                    if node == self.control.node_id {
+                        if let Some(rec) = self.recording.as_ref() {
+                            rec.live().close(Some(app_id), stream_id, &reason);
+                        }
+                    }
+                }
                 ServerEvent::LiveStreamStopped {
                     channel_id,
                     stream_id,
@@ -1585,7 +1597,9 @@ impl WsState {
                         None,
                     );
                 }
-                ServerEvent::ChannelDestroyed { channel_id, .. } => {
+                ServerEvent::ChannelDestroyed {
+                    app_id, channel_id, ..
+                } => {
                     let members: Vec<SessionId> = self
                         .channel_members
                         .get(&channel_id)
@@ -1595,6 +1609,11 @@ impl WsState {
                         self.leave_channel_full(sid, channel_id, "channel_destroyed")
                             .await;
                         self.mirror_session(sid).await;
+                    }
+                    if let Some(rec) = self.recording.clone() {
+                        tokio::spawn(async move {
+                            rec.stop_channel(app_id, &channel_id).await;
+                        });
                     }
                 }
                 _ => {}

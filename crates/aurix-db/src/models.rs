@@ -414,6 +414,28 @@ pub struct MediaNodeLinkRow {
     pub measured_at: DateTime<Utc>,
 }
 
+/// One live audio stream as published by its owning node (see `live_streams`).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LiveStreamRow {
+    pub id: Uuid,
+    pub node_id: Uuid,
+    pub app_id: Uuid,
+    pub channel_id: Uuid,
+    pub mode: String,
+    pub format: String,
+    pub mix: bool,
+    pub state: String,
+    pub users: Option<serde_json::Value>,
+    pub label: Option<String>,
+    pub push_url: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub frames_sent: i64,
+    pub frames_dropped: i64,
+    pub reconnects: i32,
+    pub consent: serde_json::Value,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct AuditLogRow {
     pub id: Uuid,

@@ -610,6 +610,12 @@ impl AurixConfig {
             if self.recording.live.connect_timeout_ms < 100 {
                 anyhow::bail!("recording.live.connect_timeout_ms must be >= 100");
             }
+            if self.recording.live.outage_buffer_ms > 300_000 {
+                anyhow::bail!("recording.live.outage_buffer_ms must be <= 300000 (5 min)");
+            }
+            if !(6_000..=510_000).contains(&self.recording.live.mix_bitrate) {
+                anyhow::bail!("recording.live.mix_bitrate must be within 6000..=510000");
+            }
         }
         if self.recording.enabled && self.recording.processing.enabled {
             let p = &self.recording.processing;
@@ -2107,8 +2113,9 @@ pub struct LiveStreamConfig {
     /// Concurrent live streams per application on one node.
     #[serde(default = "default_live_max_per_app")]
     pub max_per_app: u32,
-    /// Frames buffered per stream while the consumer is slow; older frames are dropped (and the
-    /// consumer told how many) rather than stalling the media path. 20 ms per frame per talker.
+    /// Frames queued per stream towards a connected but slow consumer; older frames are dropped
+    /// (and the consumer told how many) rather than stalling the media path. 20 ms per frame per
+    /// talker (one frame per 20 ms for `mix=true`).
     #[serde(default = "default_live_queue_frames")]
     pub queue_frames: usize,
     /// Hard stop for a live stream (0 = only `recording.max_recording_duration_secs` applies).
@@ -2131,6 +2138,20 @@ pub struct LiveStreamConfig {
     /// Reconnect attempts (exponential backoff from 1 s) before a push stream is given up.
     #[serde(default = "default_live_max_reconnects")]
     pub max_reconnects: u32,
+    /// How long a stream survives without its consumer: a push stream keeps the most recent
+    /// frames of this window while it reconnects and replays them; a pull consumer that drops
+    /// off may reopen the same stream id within this window (`…/streams/pull?resume={id}`, on
+    /// any node of the fleet) and receives what it missed. 0 disables both (frames are lost
+    /// while the consumer is away).
+    #[serde(default = "default_live_outage_buffer_ms")]
+    pub outage_buffer_ms: u64,
+    /// Concurrent server-side mixed streams (`mix=true`) per node; each costs one Opus decoder
+    /// per active talker plus one encoder. 0 disables mixed streams.
+    #[serde(default = "default_live_max_mix_streams")]
+    pub max_mix_streams: u32,
+    /// Opus bitrate of mixed `opus` streams.
+    #[serde(default = "default_live_mix_bitrate")]
+    pub mix_bitrate: u32,
 }
 
 fn default_live_max_per_channel() -> u32 {
@@ -2148,6 +2169,15 @@ fn default_live_connect_timeout_ms() -> u64 {
 fn default_live_max_reconnects() -> u32 {
     5
 }
+fn default_live_outage_buffer_ms() -> u64 {
+    10_000
+}
+fn default_live_max_mix_streams() -> u32 {
+    16
+}
+fn default_live_mix_bitrate() -> u32 {
+    64_000
+}
 
 impl Default for LiveStreamConfig {
     fn default() -> Self {
@@ -2163,6 +2193,9 @@ impl Default for LiveStreamConfig {
             require_tls: None,
             connect_timeout_ms: default_live_connect_timeout_ms(),
             max_reconnects: default_live_max_reconnects(),
+            outage_buffer_ms: default_live_outage_buffer_ms(),
+            max_mix_streams: default_live_max_mix_streams(),
+            mix_bitrate: default_live_mix_bitrate(),
         }
     }
 }
@@ -2174,6 +2207,11 @@ impl LiveStreamConfig {
 
     pub fn tls_required(&self, production: bool) -> bool {
         self.require_tls.unwrap_or(production)
+    }
+
+    /// Frames (20 ms each) the outage buffer of one stream may hold.
+    pub fn outage_buffer_frames(&self) -> usize {
+        (self.outage_buffer_ms / 20) as usize
     }
 }
 

@@ -336,6 +336,9 @@ impl SessionManager {
         )
         .await
         .map_err(|e| AurixError::Database(format!("Lost-node session cleanup: {e}")))?;
+        aurix_db::queries::delete_node_live_streams(&self.pool, media_node_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("Lost-node live stream cleanup: {e}")))?;
         Ok(ReapedState {
             sessions,
             memberships,

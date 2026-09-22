@@ -123,6 +123,10 @@ export const StreamFormatValues: readonly StreamFormat[] = ["opus", "pcm_s16le"]
 export type StreamMode = "pull" | "push";
 export const StreamModeValues: readonly StreamMode[] = ["pull", "push"] as const;
 
+/**
+ * `reconnecting`: push — the target is being re-dialled; pull — the consumer disconnected and the
+ * stream is kept for `recording.live.outage_buffer_ms` (frames buffered) until it resumes.
+ */
 export type StreamState = "connecting" | "streaming" | "reconnecting";
 export const StreamStateValues: readonly StreamState[] = ["connecting", "streaming", "reconnecting"] as const;
 
@@ -787,6 +791,13 @@ export interface CreateStreamRequest {
   format?: StreamFormat;
   users?: string[] | null;
   label?: string | null;
+  /**
+   * One server-side mix of the selected participants (20 ms frames, `user_id` all-zero, `ssrc` 0)
+   * instead of per-participant frames. Consent gating applies per talker and E2EE audio is never
+   * mixed (it never reaches the server in clear). Concurrent mixed streams per node are capped by
+   * `recording.live.max_mix_streams` (`409`).
+   */
+  mix?: boolean;
 }
 
 export interface CreateWebhookRequest {
@@ -1085,8 +1096,16 @@ export interface LiveStream {
   id: string;
   app_id: string;
   channel_id: string;
+  /**
+   * Node that owns the stream (pins the channel, taps and mixes the audio, serves the pull socket).
+   * Streams of every node of the fleet are listed; `DELETE` on another node's stream is forwarded
+   * (`202`).
+   */
+  node_id: string;
   mode: StreamMode;
   format: StreamFormat;
+  /** `true`: one server-side mix; `false`: per-participant frames. */
+  mix: boolean;
   state: StreamState;
   /** `null` = every participant. */
   users?: string[] | null;

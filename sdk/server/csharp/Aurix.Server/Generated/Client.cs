@@ -1541,6 +1541,9 @@ public sealed partial class AurixClient : AurixHttp
     /// <summary>
     /// Live streams of this application on this node
     ///
+    /// Streams of the tenant across the whole fleet: this node's live status plus the directory entries
+    /// of streams owned by other nodes.
+    ///
     /// `GET /v1/audio/streams`
     /// Auth: ApiKeyHeader | ApiKeyBearer.
     /// Permissions: audio_streams:read.
@@ -1553,6 +1556,9 @@ public sealed partial class AurixClient : AurixHttp
 
     /// <summary>
     /// Live streams of a channel on this node
+    ///
+    /// Streams of the tenant across the whole fleet: this node's live status plus the directory entries
+    /// of streams owned by other nodes.
     ///
     /// `GET /v1/channels/{channel_id}/audio/streams`
     /// Auth: ApiKeyHeader | ApiKeyBearer.
@@ -1568,8 +1574,9 @@ public sealed partial class AurixClient : AurixHttp
     /// Start a push stream
     ///
     /// Aurix connects to your WebSocket endpoint and pushes per-participant Opus or PCM frames (36-byte
-    /// binary header) plus JSON control frames. Streams are node-local: address the node that hosts
-    /// participants of the channel (`409` otherwise).
+    /// binary header) plus JSON control frames, or one server-side mix (`mix: true`). Any node of the
+    /// fleet can create the stream: the node pins the channel so the cascade forwards every
+    /// participant's audio to it, and publishes the stream to the fleet directory.
     ///
     /// `POST /v1/channels/{channel_id}/audio/streams`
     /// Auth: ApiKeyHeader | ApiKeyBearer.
@@ -1596,6 +1603,10 @@ public sealed partial class AurixClient : AurixHttp
 
     /// <summary>
     /// Stop a live stream
+    ///
+    /// A stream owned by this node is closed synchronously (`200`, final counters). A stream owned by
+    /// another node is asked to stop through the control plane (`202`, its last published status); it
+    /// disappears from the directory once that node has closed it.
     ///
     /// `DELETE /v1/channels/{channel_id}/audio/streams/{stream_id}`
     /// Auth: ApiKeyHeader | ApiKeyBearer.

@@ -194,16 +194,23 @@ max_recording_duration_secs = 7200
 retention_days = 90
 encryption_enabled = false
 
-# Real-time audio out of the node (independent of file recording; works with `enabled = false`
+# Real-time audio out of the fleet (independent of file recording; works with `enabled = false`
 # above). Consent rules follow `require_consent`. Pull: an operator connects to
-# `GET /v1/channels/:id/audio/streams/pull`; push: `POST /v1/channels/:id/audio/streams` makes
-# the node dial an operator WebSocket. Push URLs must be wss:// and public in production
-# (`require_tls` / `allow_private_urls` override).
+# `GET /v1/channels/:id/audio/streams/pull` (`?mix=true` for one server-side mix of the channel
+# instead of per-participant frames); push: `POST /v1/channels/:id/audio/streams` makes the node
+# dial an operator WebSocket. Push URLs must be wss:// and public in production (`require_tls` /
+# `allow_private_urls` override). Streams are owned by the node that opened them but listed,
+# read, stopped and resumed (`pull?resume=<id>`) from every node; while the consumer is away the
+# owner keeps the last `outage_buffer_ms` of frames (0 = drop them). `max_mix_streams` mixers
+# per node (0 = no mixing), each one Opus decoder per talker plus one encoder at `mix_bitrate`.
 [recording.live]
 enabled = false
 max_per_channel = 4
 max_per_app = 64
 queue_frames = 512
+outage_buffer_ms = 10000
+max_mix_streams = 16
+mix_bitrate = 64000
 max_duration_secs = 0
 allow_pcm = true
 push_enabled = true

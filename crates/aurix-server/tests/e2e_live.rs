@@ -9048,12 +9048,28 @@ async fn live_audio_streams_pull_push_consent_and_isolation() {
         .await;
     }
 
-    // Closing the pull socket ends that stream too.
+    // Closing the pull socket parks that stream for `recording.live.outage_buffer_ms` (a resume
+    // would pick it up); with nobody coming back it ends when the window expires.
     pull.close(None).await.unwrap();
+    let parked: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(parked["state"], "reconnecting", "{parked}");
     let stopped = sse
-        .expect_stream("audio_stream.stopped", stream_id, Duration::from_secs(5))
+        .expect_stream("audio_stream.stopped", stream_id, Duration::from_secs(20))
         .await;
-    assert_eq!(stopped["data"]["reason"], "consumer_disconnected");
+    assert_eq!(stopped["data"]["reason"], "consumer_timeout");
     let list: serde_json::Value = http
         .get(format!(
             "{}/v1/channels/{channel_id}/audio/streams",
@@ -9073,14 +9089,17 @@ async fn live_audio_streams_pull_push_consent_and_isolation() {
     }
 }
 
-/// Live streams are node-local, but a cascaded channel is not: with Bob on node 1 and Alice
-/// on node 2, a pull stream opened on node 1 must receive Alice's relayed frames once her
-/// consent — given through node 2's control WebSocket — has been handed over the bus to the
-/// node hosting the stream. Opening a stream on a node that hosts none of the participants is
-/// refused with 409 instead of silently producing an empty stream.
+/// Live streams belong to the fleet, not to a node. With Alice on node 2 only, node 1 owns a
+/// server-side mix of the channel: it pins the channel so the cascade relays Alice's frames to
+/// it, gates them on her consent (given through node 2's control WebSocket), and emits one
+/// nil-user mixed track. Node 2 lists and reads the stream from the fleet directory for its
+/// tenant only, a consumer that drops off resumes through node 2 (relayed to the owner) with
+/// the frames buffered meanwhile, and `DELETE` on node 2 stops the stream on node 1.
 #[tokio::test]
 #[ignore = "requires two running Aurix nodes; see README (Scaling)"]
-async fn live_audio_stream_follows_cascaded_participants() {
+async fn live_audio_streams_across_nodes_mix_and_resume() {
+    use aurix_recording::live::{ControlFrame, ParticipantEvent};
+
     let Some(env) = env() else {
         eprintln!("AURIX_E2E_API_KEY not set; skipping");
         return;
@@ -9095,57 +9114,41 @@ async fn live_audio_stream_follows_cascaded_participants() {
         api_key: env.api_key.clone(),
     };
     let http = reqwest::Client::new();
-    let probe = http
-        .get(format!("{}/v1/audio/streams", env.api))
-        .header("x-api-key", &env.api_key)
-        .send()
-        .await
-        .unwrap();
-    if probe.status() == 400 {
-        eprintln!("recording.live.enabled is false on this server; skipping");
-        return;
+    for node in [&env, &env2] {
+        let probe = http
+            .get(format!("{}/v1/audio/streams", node.api))
+            .header("x-api-key", &node.api_key)
+            .send()
+            .await
+            .unwrap();
+        if probe.status() == 400 {
+            eprintln!("recording.live.enabled is false on {}; skipping", node.api);
+            return;
+        }
+        assert_eq!(probe.status(), 200, "{}", probe.text().await.unwrap());
     }
 
     let channel_id = create_channel(&env, &http).await;
     let (tok_a, uid_a) = issue_token(&env2, &http, "xlive-alice", "Alice", channel_id).await;
-    let (tok_b, _) = issue_token(&env, &http, "xlive-bob", "Bob", channel_id).await;
     let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
     let mut alice = connect(&env2, "alice", tok_a).await;
     join(&mut alice, channel_id).await;
     bind_media(&mut alice).await;
     drain_ws(&mut alice).await;
 
-    // Only Alice (node 2) is in the channel: node 1 refuses to open a stream it cannot feed.
-    let r = http
-        .post(format!(
-            "{}/v1/channels/{channel_id}/audio/streams",
-            env.api
-        ))
-        .header("x-api-key", &env.api_key)
-        .json(&serde_json::json!({"url": "wss://example.invalid/sink"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 409, "{}", r.text().await.unwrap());
-
-    let mut bob = connect(&env, "bob", tok_b).await;
-    assert_ne!(
-        alice.media_addr.port(),
-        bob.media_addr.port(),
-        "players must land on different nodes"
-    );
-    join(&mut bob, channel_id).await;
-    bind_media(&mut bob).await;
-    drain_ws(&mut bob).await;
-    drain_ws(&mut alice).await;
-
-    let mut pull = open_pull(&env, &env.api_key, channel_id, "").await;
+    // Node 1 hosts nobody from the channel and still owns a mixed stream of it.
+    let mut pull = open_pull(&env, &env.api_key, channel_id, "?mix=true").await;
     let (ctl, _) = collect_stream(&mut pull, Duration::from_millis(500)).await;
-    let stream_id = match ctl.first() {
-        Some(aurix_recording::live::ControlFrame::Hello { stream_id, .. }) => *stream_id,
-        other => panic!("expected hello, got {other:?}"),
+    let (stream_id, owner) = match ctl.first() {
+        Some(ControlFrame::Hello {
+            stream_id,
+            mix: true,
+            node_id: Some(node_id),
+            reconnects: 0,
+            ..
+        }) => (*stream_id, *node_id),
+        other => panic!("expected a mixed hello with the owner node, got {other:?}"),
     };
-    // Alice, on the other node, is told about the capture too.
     expect_within(
         &mut alice,
         "live RecordingNotification on the remote node",
@@ -9156,7 +9159,7 @@ async fn live_audio_stream_follows_cascaded_participants() {
     )
     .await;
 
-    let tone = opus_tone(440.0, 400);
+    let tone = opus_tone(440.0, 1200);
     stream_frames(&alice, channel_id, 1, &tone[..5], false).await;
     let (_, audio) = collect_stream(&mut pull, Duration::from_millis(400)).await;
     assert!(audio.is_empty(), "relayed frames leaked before consent");
@@ -9169,29 +9172,175 @@ async fn live_audio_stream_follows_cascaded_participants() {
         .await;
     let (ctl, _) = collect_stream(&mut pull, Duration::from_secs(3)).await;
     assert!(
-        ctl.iter().any(|c| matches!(c, aurix_recording::live::ControlFrame::Participant { user_id, consent: Some(RecordingConsent::Accepted), .. } if *user_id == uid_a)),
-        "consent relayed from node 2 reaches the hosting node: {ctl:?}"
+        ctl.iter().any(|c| matches!(c, ControlFrame::Participant { user_id, consent: Some(RecordingConsent::Accepted), .. } if *user_id == uid_a)),
+        "consent relayed from node 2 reaches the owner: {ctl:?}"
     );
 
-    stream_frames(&alice, channel_id, 10, &tone[5..15], false).await;
-    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(500)).await;
-    let from_alice = audio.iter().filter(|a| a.0 == uid_a).count();
+    stream_frames(&alice, channel_id, 10, &tone[5..25], false).await;
+    let (_, audio) = collect_stream(&mut pull, Duration::from_millis(800)).await;
     assert!(
-        from_alice >= 8,
-        "expected Alice's relayed Opus frames, got {from_alice}"
+        audio.len() >= 12,
+        "expected mixed frames of Alice's relayed audio, got {}",
+        audio.len()
     );
+    assert!(
+        audio
+            .iter()
+            .all(|a| a.0 == UserId::from_uuid(uuid::Uuid::nil())),
+        "a mixed stream carries one nil-user track"
+    );
+
+    // The fleet directory: node 2 sees node 1's stream for the same tenant only.
+    let listed: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams",
+            env2.api
+        ))
+        .header("x-api-key", &env2.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = listed["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == stream_id.to_string())
+        .unwrap_or_else(|| panic!("node 2 must list node 1's stream: {listed}"));
+    assert_eq!(entry["node_id"], owner.to_string(), "{entry}");
+    assert_eq!(entry["mix"], true, "{entry}");
+    assert_eq!(entry["state"], "streaming", "{entry}");
+    let r = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+            env2.api
+        ))
+        .header("x-api-key", &env2.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let r = http
+            .get(format!(
+                "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+                env2.api
+            ))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "another tenant must not see the stream");
+        let r = http
+            .delete(format!(
+                "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+                env2.api
+            ))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "another tenant must not stop the stream");
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation check");
+    }
+
+    // Consumer outage: frames sent meanwhile are buffered; the resume lands on node 2 (as it
+    // would behind a load balancer) and is relayed to the owner.
+    pull.close(None).await.ok();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stream_frames(&alice, channel_id, 30, &tone[25..45], false).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut resumed = open_pull(
+        &env2,
+        &env2.api_key,
+        channel_id,
+        &format!("?resume={stream_id}"),
+    )
+    .await;
+    let (ctl, audio) = collect_stream(&mut resumed, Duration::from_secs(2)).await;
+    assert!(
+        matches!(
+            ctl.first(),
+            Some(ControlFrame::Hello { stream_id: id, mix: true, reconnects: 1, .. }) if *id == stream_id
+        ),
+        "resume must start with a fresh hello of the same stream: {ctl:?}"
+    );
+    assert!(
+        audio.len() >= 12,
+        "frames of the outage must be replayed, got {}",
+        audio.len()
+    );
+    let info: serde_json::Value = http
+        .get(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+            env.api
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["reconnects"], 1, "{info}");
+    assert_eq!(info["state"], "streaming", "{info}");
 
     // Alice leaving on node 2 ends her participant state on node 1's stream.
     alice
         .send(&ControlMessage::ChannelLeave { channel_id })
         .await;
-    let (ctl, _) = collect_stream(&mut pull, Duration::from_secs(3)).await;
+    let (ctl, _) = collect_stream(&mut resumed, Duration::from_secs(3)).await;
     assert!(
-        ctl.iter().any(|c| matches!(c, aurix_recording::live::ControlFrame::Participant { user_id, event: aurix_recording::live::ParticipantEvent::Left, .. } if *user_id == uid_a)),
+        ctl.iter().any(|c| matches!(c, ControlFrame::Participant { user_id, event: ParticipantEvent::Left, .. } if *user_id == uid_a)),
         "participant-left from the remote node: {ctl:?}"
     );
-    pull.close(None).await.ok();
-    bob.send(&ControlMessage::ChannelLeave { channel_id }).await;
+
+    // Stopping through node 2 is forwarded to the owner and ends the relayed socket.
+    let r = http
+        .delete(format!(
+            "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+            env2.api
+        ))
+        .header("x-api-key", &env2.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202, "{}", r.text().await.unwrap());
+    let (ctl, _) = collect_stream(&mut resumed, Duration::from_secs(5)).await;
+    assert!(
+        ctl.iter()
+            .any(|c| matches!(c, ControlFrame::End { reason, .. } if reason == "operator")),
+        "the owner must end the stream on the forwarded stop: {ctl:?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = http
+            .get(format!(
+                "{}/v1/channels/{channel_id}/audio/streams/{stream_id}",
+                env2.api
+            ))
+            .header("x-api-key", &env2.api_key)
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 404 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stopped stream must leave the fleet directory (last status {})",
+            r.status()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let _ = alice.ws.close(None).await;
 }
 
 // ── Network quality ──

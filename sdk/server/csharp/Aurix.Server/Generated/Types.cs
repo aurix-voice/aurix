@@ -338,7 +338,8 @@ public static class StreamMode
 }
 
 /// <summary>
-/// Known values of the `StreamState` enum (fields typed as string stay forward compatible).
+/// `reconnecting`: push — the target is being re-dialled; pull — the consumer disconnected and the
+/// stream is kept for `recording.live.outage_buffer_ms` (frames buffered) until it resumes.
 /// </summary>
 public static class StreamState
 {
@@ -1739,6 +1740,15 @@ public sealed record CreateStreamRequest
 
     [JsonPropertyName("label")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Label { get; init; }
+
+    /// <summary>
+    /// One server-side mix of the selected participants (20 ms frames, `user_id` all-zero, `ssrc` 0)
+    /// instead of per-participant frames. Consent gating applies per talker and E2EE audio is never
+    /// mixed (it never reaches the server in clear). Concurrent mixed streams per node are capped by
+    /// `recording.live.max_mix_streams` (`409`).
+    /// </summary>
+    [JsonPropertyName("mix")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Mix { get; init; }
 }
 
 public sealed record CreateWebhookRequest
@@ -2340,11 +2350,25 @@ public sealed record LiveStream
     [JsonPropertyName("channel_id")]
     public required string ChannelId { get; init; }
 
+    /// <summary>
+    /// Node that owns the stream (pins the channel, taps and mixes the audio, serves the pull socket).
+    /// Streams of every node of the fleet are listed; `DELETE` on another node's stream is forwarded
+    /// (`202`).
+    /// </summary>
+    [JsonPropertyName("node_id")]
+    public required string NodeId { get; init; }
+
     [JsonPropertyName("mode")]
     public required string Mode { get; init; }
 
     [JsonPropertyName("format")]
     public required string Format { get; init; }
+
+    /// <summary>
+    /// `true`: one server-side mix; `false`: per-participant frames.
+    /// </summary>
+    [JsonPropertyName("mix")]
+    public required bool Mix { get; init; }
 
     [JsonPropertyName("state")]
     public required string State { get; init; }

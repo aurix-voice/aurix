@@ -282,7 +282,8 @@ const (
 	StreamModePush StreamMode = "push"
 )
 
-// StreamState enumerates the values accepted by the API.
+// `reconnecting`: push — the target is being re-dialled; pull — the consumer disconnected and the
+// stream is kept for `recording.live.outage_buffer_ms` (frames buffered) until it resumes.
 type StreamState string
 
 const (
@@ -933,6 +934,11 @@ type CreateStreamRequest struct {
 	Format  *StreamFormat     `json:"format,omitempty"`
 	Users   []string          `json:"users,omitempty"`
 	Label   *string           `json:"label,omitempty"`
+	// One server-side mix of the selected participants (20 ms frames, `user_id` all-zero, `ssrc` 0)
+	// instead of per-participant frames. Consent gating applies per talker and E2EE audio is never
+	// mixed (it never reaches the server in clear). Concurrent mixed streams per node are capped by
+	// `recording.live.max_mix_streams` (`409`).
+	Mix *bool `json:"mix,omitempty"`
 }
 
 // CreateWebhookRequest is the `CreateWebhookRequest` schema.
@@ -1241,12 +1247,18 @@ type LiveParticipant struct {
 
 // LiveStream is the `LiveStream` schema.
 type LiveStream struct {
-	ID        string       `json:"id"`
-	AppID     string       `json:"app_id"`
-	ChannelID string       `json:"channel_id"`
-	Mode      StreamMode   `json:"mode"`
-	Format    StreamFormat `json:"format"`
-	State     StreamState  `json:"state"`
+	ID        string `json:"id"`
+	AppID     string `json:"app_id"`
+	ChannelID string `json:"channel_id"`
+	// Node that owns the stream (pins the channel, taps and mixes the audio, serves the pull socket).
+	// Streams of every node of the fleet are listed; `DELETE` on another node's stream is forwarded
+	// (`202`).
+	NodeID string       `json:"node_id"`
+	Mode   StreamMode   `json:"mode"`
+	Format StreamFormat `json:"format"`
+	// `true`: one server-side mix; `false`: per-participant frames.
+	Mix   bool        `json:"mix"`
+	State StreamState `json:"state"`
 	// `null` = every participant.
 	Users []string `json:"users,omitempty"`
 	Label *string  `json:"label,omitempty"`

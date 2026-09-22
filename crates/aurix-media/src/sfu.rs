@@ -165,6 +165,9 @@ pub struct SfuNode {
     options: SfuOptions,
     channels: Arc<DashMap<ChannelId, Arc<MediaChannel>>>,
     channels_by_hash: Arc<DashMap<u32, ChannelId>>,
+    /// Channels kept registered without local participants (live streams opened on this
+    /// node for a channel hosted elsewhere): pin count per channel.
+    pinned_channels: Arc<DashMap<ChannelId, u32>>,
     sessions_by_id: Arc<DashMap<SessionId, Arc<MediaSession>>>,
     sessions_by_addr: Arc<DashMap<SocketAddr, Arc<MediaSession>>>,
     sessions_by_user: Arc<DashMap<UserId, Arc<MediaSession>>>,
@@ -202,6 +205,7 @@ impl SfuNode {
             options,
             channels: Arc::new(DashMap::new()),
             channels_by_hash: Arc::new(DashMap::new()),
+            pinned_channels: Arc::new(DashMap::new()),
             sessions_by_id: Arc::new(DashMap::new()),
             sessions_by_addr: Arc::new(DashMap::new()),
             sessions_by_user: Arc::new(DashMap::new()),
@@ -889,7 +893,7 @@ impl SfuNode {
         if let Some(ref pipeline) = self.audio_pipeline {
             pipeline.participant_left(&channel, session.user_id);
         }
-        if channel.is_empty() {
+        if channel.is_empty() && !self.pinned_channels.contains_key(channel_id) {
             self.channels.remove(channel_id);
             self.channels_by_hash.remove(&channel_id_hash(channel_id));
             if let Some(ref cascade) = self.cascade {
@@ -898,6 +902,87 @@ impl SfuNode {
             aurix_metrics::ACTIVE_CHANNELS.dec();
         }
         left
+    }
+
+    /// Keeps `channel_id` registered on this node while no local participant is in it, so
+    /// audio cascaded from the nodes hosting it is accepted and reaches this node's audio
+    /// sinks (live streams). Counted: every `pin_channel` needs one `unpin_channel`.
+    pub fn pin_channel(
+        &self,
+        channel_id: ChannelId,
+        app_id: AppId,
+        config: ChannelConfig,
+    ) -> Result<()> {
+        if !self.channels.contains_key(&channel_id)
+            && self.channels.len() as u32 >= self.options.max_channels
+        {
+            return Err(AurixError::MediaNodeUnavailable(
+                "Node channel capacity reached".into(),
+            ));
+        }
+        let hash = channel_id_hash(&channel_id);
+        if let Some(existing) = self.channels_by_hash.get(&hash) {
+            if *existing.value() != channel_id {
+                return Err(AurixError::Internal(
+                    "Channel id hash collision on this node".into(),
+                ));
+            }
+        }
+        let mut is_new = false;
+        let channel = self
+            .channels
+            .entry(channel_id)
+            .or_insert_with(|| {
+                is_new = true;
+                Arc::new(MediaChannel::new(channel_id, app_id, config))
+            })
+            .value()
+            .clone();
+        if channel.app_id != app_id {
+            return Err(AurixError::AuthorizationDenied(
+                "Channel belongs to a different application".into(),
+            ));
+        }
+        *self.pinned_channels.entry(channel_id).or_insert(0) += 1;
+        if is_new {
+            self.channels_by_hash.insert(hash, channel_id);
+            if let Some(ref cascade) = self.cascade {
+                cascade.add_all_peers(channel_id);
+            }
+            aurix_metrics::ACTIVE_CHANNELS.inc();
+        }
+        Ok(())
+    }
+
+    /// Releases one `pin_channel`; the channel is dropped once nobody pins it and no local
+    /// participant is left.
+    pub fn unpin_channel(&self, channel_id: &ChannelId) {
+        let released = match self.pinned_channels.get_mut(channel_id) {
+            Some(mut count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => return,
+        };
+        if !released {
+            return;
+        }
+        self.pinned_channels.remove(channel_id);
+        let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else {
+            return;
+        };
+        if channel.is_empty() {
+            self.channels.remove(channel_id);
+            self.channels_by_hash.remove(&channel_id_hash(channel_id));
+            if let Some(ref cascade) = self.cascade {
+                cascade.remove_channel(channel_id);
+            }
+            aurix_metrics::ACTIVE_CHANNELS.dec();
+        }
+    }
+
+    pub fn is_channel_pinned(&self, channel_id: &ChannelId) -> bool {
+        self.pinned_channels.contains_key(channel_id)
     }
 
     pub fn destroy_session(&self, session_id: &SessionId) -> Result<()> {
@@ -1315,6 +1400,7 @@ impl SfuNode {
         let sessions_by_addr = self.sessions_by_addr.clone();
         let channels = self.channels.clone();
         let channels_by_hash = self.channels_by_hash.clone();
+        let pinned = self.pinned_channels.clone();
         let count = self.active_participant_count.clone();
         let webrtc = self.webrtc_manager.clone();
         let sink = self.audio_sink.clone();
@@ -1343,7 +1429,7 @@ impl SfuNode {
                             if let Some(ref sink) = sink {
                                 sink.on_participant_left(ch_id, session.user_id);
                             }
-                            if channel.is_empty() {
+                            if channel.is_empty() && !pinned.contains_key(&ch_id) {
                                 channels.remove(&ch_id);
                                 channels_by_hash.remove(&channel_id_hash(&ch_id));
                                 aurix_metrics::ACTIVE_CHANNELS.dec();

@@ -107,6 +107,7 @@ StreamMode = Literal["pull", "push"]
 StreamMode_VALUES: List[StreamMode] = ["pull", "push"]
 
 StreamState = Literal["connecting", "streaming", "reconnecting"]
+"""`reconnecting`: push — the target is being re-dialled; pull — the consumer disconnected and the stream is kept for `recording.live.outage_buffer_ms` (frames buffered) until it resumes."""
 StreamState_VALUES: List[StreamState] = ["connecting", "streaming", "reconnecting"]
 
 UsageExportScope = Literal["app", "channels", "fleet"]
@@ -725,6 +726,7 @@ CreateStreamRequest = TypedDict(
         "format": NotRequired["StreamFormat"],
         "users": NotRequired[Optional[List[str]]],
         "label": NotRequired[Optional[str]],
+        "mix": NotRequired[bool],  # One server-side mix of the selected participants (20 ms frames, `user_id` all-zero, `ssrc` 0) instead of per-participant frames. Consent gating applies per talker and E2EE audio is never mixed (it never reaches the server in clear). Concurrent mixed streams per node are capped by `recording.live.max_mix_streams` (`409`).
     },
 )
 
@@ -1069,8 +1071,10 @@ LiveStream = TypedDict(
         "id": str,
         "app_id": str,
         "channel_id": str,
+        "node_id": str,  # Node that owns the stream (pins the channel, taps and mixes the audio, serves the pull socket). Streams of every node of the fleet are listed; `DELETE` on another node's stream is forwarded (`202`).
         "mode": "StreamMode",
         "format": "StreamFormat",
+        "mix": bool,  # `true`: one server-side mix; `false`: per-participant frames.
         "state": "StreamState",
         "users": NotRequired[Optional[List[str]]],  # `null` = every participant.
         "label": NotRequired[Optional[str]],
