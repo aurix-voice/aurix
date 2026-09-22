@@ -314,10 +314,12 @@ pub struct MediaSession {
     /// Wall-clock ms of the last audio packet, used for the speaking timeout.
     pub last_audio_at_ms: AtomicI64,
     /// Latest sender-reported audio level (`-dBov`, `AUDIO_LEVEL_SILENCE` when unknown/quiet)
-    /// and when it was measured; `energy_reported` is the last level sent in `ChannelEnergy`.
+    /// and when it was measured; `energy_reported` is the last level sent in `ChannelEnergy`
+    /// and `energy_reported_at_ms` when that report was taken.
     pub audio_level: AtomicU8,
     pub audio_level_at_ms: AtomicI64,
     pub energy_reported: AtomicU8,
+    pub energy_reported_at_ms: AtomicI64,
     pub last_heartbeat: RwLock<DateTime<Utc>>,
     pub quality: RwLock<QualityMetrics>,
     /// Uplink bitrate (kbit/s) the server last asked this client to use via `BitrateCommand`;
@@ -385,6 +387,7 @@ impl MediaSession {
             audio_level: AtomicU8::new(AUDIO_LEVEL_SILENCE),
             audio_level_at_ms: AtomicI64::new(0),
             energy_reported: AtomicU8::new(AUDIO_LEVEL_SILENCE),
+            energy_reported_at_ms: AtomicI64::new(0),
             last_heartbeat: RwLock::new(Utc::now()),
             quality: RwLock::new(QualityMetrics {
                 rtt_ms: 0.0,
@@ -792,10 +795,20 @@ impl MediaSession {
     }
 
     /// Level to include in the next `ChannelEnergy` report, if it moved enough since the last
-    /// one (>= `min_step` dB, or any transition to/from silence).
+    /// one (>= `min_step` dB, or any transition to/from silence). A level measured after the
+    /// last report counts as current even if it has since gone stale, so a burst shorter than
+    /// the report period is still reported once before decaying to silence.
     pub fn take_energy_report(&self, stale_ms: i64, min_step: u8) -> Option<u8> {
-        let current = self.current_audio_level(stale_ms);
+        let now = Utc::now().timestamp_millis();
+        let measured_at = self.audio_level_at_ms.load(Ordering::Relaxed);
+        let reported_at = self.energy_reported_at_ms.load(Ordering::Relaxed);
+        let current = if measured_at > reported_at || now - measured_at <= stale_ms {
+            self.audio_level.load(Ordering::Relaxed)
+        } else {
+            AUDIO_LEVEL_SILENCE
+        };
         let reported = self.energy_reported.load(Ordering::Relaxed);
+        self.energy_reported_at_ms.store(now, Ordering::Relaxed);
         if current == reported {
             return None;
         }
@@ -1061,6 +1074,13 @@ mod tests {
         s.record_audio_level(Some(AUDIO_LEVEL_SILENCE), 0.0);
         assert_eq!(s.take_energy_report(1000, 3), Some(AUDIO_LEVEL_SILENCE));
         s.reset_energy_report();
+        assert_eq!(s.take_energy_report(1000, 3), None);
+        // A burst that went stale before the reporter ran is still reported once, then decays.
+        s.record_audio_level(Some(12), 0.0);
+        s.audio_level_at_ms.fetch_sub(5000, Ordering::Relaxed);
+        s.energy_reported_at_ms.fetch_sub(6000, Ordering::Relaxed);
+        assert_eq!(s.take_energy_report(1000, 3), Some(12));
+        assert_eq!(s.take_energy_report(1000, 3), Some(AUDIO_LEVEL_SILENCE));
         assert_eq!(s.take_energy_report(1000, 3), None);
     }
 
