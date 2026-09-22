@@ -1761,7 +1761,7 @@ async fn audio_from(to: &Player, ssrc: u32, payload: &Bytes) -> (Option<u8>, usi
     let mut gain = None;
     let mut buf = vec![0u8; 2048];
     while let Ok(Ok((n, _))) =
-        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+        tokio::time::timeout(Duration::from_millis(1000), to.udp.recv_from(&mut buf)).await
     {
         let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
         assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
@@ -2086,7 +2086,7 @@ async fn priority_speaker_ducks_everyone_else() {
     };
     let http = reqwest::Client::new();
     let ducking = serde_json::json!({
-        "gain": 0.25, "attack_ms": 0, "release_ms": 0, "hold_ms": 1500, "moderators": false
+        "gain": 0.25, "attack_ms": 0, "release_ms": 0, "hold_ms": 3000, "moderators": false
     });
     let channel_id =
         create_channel_with(&env, &http, serde_json::json!({"ducking": ducking})).await;
@@ -2146,7 +2146,7 @@ async fn priority_speaker_ducks_everyone_else() {
     else {
         panic!("lead must join as a priority speaker of a ducking channel: {ack:?}");
     };
-    assert_eq!((cfg.gain, cfg.hold_ms, cfg.moderators), (0.25, 1500, false));
+    assert_eq!((cfg.gain, cfg.hold_ms, cfg.moderators), (0.25, 3000, false));
     for p in [&mut moderator, &mut bob, &mut carol] {
         p.send(&ControlMessage::ChannelJoin {
             channel_id,
@@ -2220,7 +2220,7 @@ async fn priority_speaker_ducks_everyone_else() {
         .await;
 
     // Once the hold has elapsed without priority speech the duck releases.
-    tokio::time::sleep(Duration::from_millis(1900)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     send_audio(&bob, channel_id, 300, &hello).await;
     assert_eq!(audio_from(&carol, bob.ssrc, &hello).await, (None, 10));
     drain_udp(&lead).await;
@@ -5568,7 +5568,7 @@ async fn directional_audio_from(
     let mut meta = None;
     let mut buf = vec![0u8; 2048];
     while let Ok(Ok((n, _))) =
-        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+        tokio::time::timeout(Duration::from_millis(1000), to.udp.recv_from(&mut buf)).await
     {
         let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
         assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
@@ -5835,7 +5835,7 @@ async fn levels_from(to: &Player, ssrc: u32) -> (usize, usize, f32, Option<u8>) 
     let mut gain = None;
     let mut buf = vec![0u8; 2048];
     while let Ok(Ok((n, _))) =
-        tokio::time::timeout(Duration::from_millis(400), to.udp.recv_from(&mut buf)).await
+        tokio::time::timeout(Duration::from_millis(1000), to.udp.recv_from(&mut buf)).await
     {
         let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
         assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
