@@ -21,17 +21,21 @@ namespace Aurix.Transport
         Udp,
         /// <summary>The same sealed packets as binary frames on the control WebSocket (TCP; head-of-line blocking under loss).</summary>
         Tunnel,
+        /// <summary>The same sealed packets as length-prefixed frames on the node's dedicated TLS tunnel (TCP, normally port 443).</summary>
+        Tls,
     }
 
     /// <summary>How <see cref="AurixVoiceClient"/> picks the media path.</summary>
     public enum MediaPathPolicy
     {
-        /// <summary>UDP first; fall back to the tunnel when UDP does not bind or its heartbeats die, re-probe UDP periodically.</summary>
+        /// <summary>UDP first; fall back to the TLS tunnel, then the WebSocket tunnel, when UDP does not bind or its heartbeats die; re-probe UDP periodically.</summary>
         Auto,
         /// <summary>UDP or nothing (the pre-1.3 behaviour).</summary>
         UdpOnly,
         /// <summary>Always tunnel through the control WebSocket (testing, or networks known to drop UDP).</summary>
         TunnelOnly,
+        /// <summary>Always use the node's TLS media tunnel (fails when the node does not advertise one).</summary>
+        TlsOnly,
     }
 
     /// <summary>
@@ -104,8 +108,9 @@ namespace Aurix.Transport
     /// the server with the same keys, opened here and replay-checked per remote SSRC before
     /// being exposed. Only the initial <c>SessionBind</c> is signed without encryption.
     /// The packets travel either as UDP datagrams (<see cref="MediaTransport(IPEndPoint, Guid, uint, byte[], uint)"/>)
-    /// or, byte for byte the same, as binary frames on an <see cref="IMediaTunnel"/>
-    /// (<see cref="OverTunnel"/>) when UDP is blocked.
+    /// or, byte for byte the same, as frames on an <see cref="IMediaTunnel"/> when UDP is blocked: the
+    /// node's dedicated TLS tunnel (<see cref="OverTls"/>, usually port 443) or the control WebSocket
+    /// (<see cref="OverTunnel"/>).
     /// </summary>
     public sealed class MediaTransport : IDisposable
     {
@@ -115,6 +120,7 @@ namespace Aurix.Transport
         private readonly UdpClient _udp;
         private readonly IPEndPoint _server;
         private readonly IMediaTunnel _tunnel;
+        private readonly bool _ownsTunnel;
         private readonly MediaKeys _keys;
         private readonly uint _ssrc;
         private readonly Guid _sessionId;
@@ -153,9 +159,13 @@ namespace Aurix.Transport
         /// <summary>Uplink packets dropped because the tunnel's send queue was full (always 0 on UDP).</summary>
         public long UplinkDropped => Interlocked.Read(ref _uplinkDropped);
         /// <summary>The link this transport uses.</summary>
-        public MediaPath Path => _tunnel != null ? MediaPath.Tunnel : MediaPath.Udp;
-        /// <summary>Local UDP socket address (null on the tunnel, which has no socket of its own).</summary>
-        public IPEndPoint LocalEndPoint => _udp?.Client?.LocalEndPoint as IPEndPoint;
+        public MediaPath Path => _tunnel is TlsMediaTunnel ? MediaPath.Tls : _tunnel != null ? MediaPath.Tunnel : MediaPath.Udp;
+        /// <summary>Local socket address (null on the WebSocket tunnel, which has no socket of its own).</summary>
+        public IPEndPoint LocalEndPoint => _tunnel is TlsMediaTunnel tls ? tls.LocalEndPoint : _udp?.Client?.LocalEndPoint as IPEndPoint;
+        /// <summary>The TLS tunnel behind a <see cref="MediaPath.Tls"/> transport (null otherwise).</summary>
+        public TlsMediaTunnel TlsTunnel => _tunnel as TlsMediaTunnel;
+        /// <summary>True once a TLS tunnel transport lost its connection (the caller should fall back or rebind).</summary>
+        public bool IsClosed => _tunnel is TlsMediaTunnel tls && tls.IsClosed;
         /// <summary>Round-trip time of the last heartbeat, in milliseconds (0 until the first ack).</summary>
         public float LastRttMs { get; private set; }
         /// <summary>Heartbeat RTT statistics over the life of this transport (all 0 until the first ack).</summary>
@@ -196,9 +206,10 @@ namespace Aurix.Transport
             _udp.Client.ReceiveBufferSize = 1 << 20;
         }
 
-        private MediaTransport(IMediaTunnel tunnel, Guid sessionId, uint ssrc, byte[] mediaKey, SequenceCounter sequence)
+        private MediaTransport(IMediaTunnel tunnel, bool ownsTunnel, Guid sessionId, uint ssrc, byte[] mediaKey, SequenceCounter sequence)
         {
             _tunnel = tunnel ?? throw new ArgumentNullException(nameof(tunnel));
+            _ownsTunnel = ownsTunnel;
             _sessionId = sessionId;
             _ssrc = ssrc;
             _seq = sequence ?? throw new ArgumentNullException(nameof(sequence));
@@ -212,7 +223,14 @@ namespace Aurix.Transport
         /// WebSocket) instead of UDP. The node must advertise <c>SessionInitAck.media_tunnel</c>.
         /// </summary>
         public static MediaTransport OverTunnel(IMediaTunnel tunnel, Guid sessionId, uint ssrc, byte[] mediaKey, SequenceCounter sequence = null) =>
-            new MediaTransport(tunnel, sessionId, ssrc, mediaKey, sequence ?? new SequenceCounter());
+            new MediaTransport(tunnel, false, sessionId, ssrc, mediaKey, sequence ?? new SequenceCounter());
+
+        /// <summary>
+        /// Transport over the node's dedicated TLS tunnel (<see cref="TlsMediaTunnel.ConnectAsync"/>); the
+        /// transport takes ownership of <paramref name="tunnel"/> and closes it on <see cref="Dispose"/>.
+        /// </summary>
+        public static MediaTransport OverTls(TlsMediaTunnel tunnel, Guid sessionId, uint ssrc, byte[] mediaKey, SequenceCounter sequence = null) =>
+            new MediaTransport(tunnel, true, sessionId, ssrc, mediaKey, sequence ?? new SequenceCounter());
 
         /// <summary>Resolve <c>host:port</c> as delivered in <c>SessionInitAck.media_addr</c> (IPv4 preferred for host names).</summary>
         public static async Task<IPEndPoint> ResolveAsync(string mediaAddr)
@@ -311,9 +329,28 @@ namespace Aurix.Transport
                 _bindAck = ack;
                 // A bind's timestamp must be newer than the previous one the server accepted.
                 if (i > 0) await Task.Delay(2, ct).ConfigureAwait(false);
-                if (!_tunnel.TrySendMedia(BindPacket())) throw new IOException("media tunnel is closed");
-                var done = await Task.WhenAny(ack.Task, Task.Delay(timeoutMs, ct)).ConfigureAwait(false);
-                if (done != ack.Task) continue;
+                if (IsClosed || !_tunnel.TrySendMedia(BindPacket())) throw new IOException("media tunnel is closed");
+                Task done;
+                if (_tunnel is TlsMediaTunnel tls)
+                {
+                    // A TLS link that dies mid-bind fails the attempt at once instead of at the timeout.
+                    Action<string> onClosed = _ => ack.TrySetResult(false);
+                    tls.Closed += onClosed;
+                    try
+                    {
+                        if (tls.IsClosed) ack.TrySetResult(false);
+                        done = await Task.WhenAny(ack.Task, Task.Delay(timeoutMs, ct)).ConfigureAwait(false);
+                    }
+                    finally { tls.Closed -= onClosed; }
+                    if (done == ack.Task && !ack.Task.Result) { _bindAck = null; throw new IOException("media tunnel closed during bind: " + tls.CloseReason); }
+                }
+                else
+                    done = await Task.WhenAny(ack.Task, Task.Delay(timeoutMs, ct)).ConfigureAwait(false);
+                if (done != ack.Task)
+                {
+                    if (IsClosed) { _bindAck = null; throw new IOException("media tunnel closed during bind: " + TlsTunnel?.CloseReason); }
+                    continue;
+                }
                 _bindAck = null;
                 if (first)
                 {
@@ -571,6 +608,7 @@ namespace Aurix.Transport
             _disposed = true;
             _cts?.Cancel();
             if (_tunnel != null) _tunnel.MediaReceived -= OnTunnelFrame;
+            if (_ownsTunnel && _tunnel is IDisposable owned) owned.Dispose();
             _udp?.Dispose();
             _cts?.Dispose();
             _keys.Dispose();

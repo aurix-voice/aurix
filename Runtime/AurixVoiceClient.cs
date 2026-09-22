@@ -126,6 +126,11 @@ namespace Aurix
         /// <summary>The node accepts AURX media as binary frames on the control WebSocket (UDP fallback).</summary>
         public bool MediaTunnel;
         /// <summary>
+        /// The node runs a dedicated TLS media tunnel (normally on port 443) for the same sealed packets;
+        /// null when it does not. Preferred over <see cref="MediaTunnel"/> when UDP is blocked.
+        /// </summary>
+        public TlsTunnelInfo TlsTunnel;
+        /// <summary>
         /// The node can deliver one server-mixed stream per channel
         /// (<see cref="AurixVoiceClient.SetDownlinkModeAsync"/> with <see cref="DownlinkMode.Mixed"/>).
         /// </summary>
@@ -237,6 +242,8 @@ namespace Aurix
         private uint _lastMediaSequence;
         /// <summary>UDP failed to bind or its heartbeats died at least until here: Auto sessions opened before go straight to the tunnel.</summary>
         private DateTime? _udpBlockedUntil;
+        /// <summary>The TLS tunnel failed (connect, pin, bind or heartbeats) at least until here: Auto skips it meanwhile.</summary>
+        private DateTime? _tlsBlockedUntil;
         /// <summary>Address family of the last UDP candidate that answered a <c>SessionBind</c>; tried first next time.</summary>
         private System.Net.Sockets.AddressFamily? _udpFamilyHint;
         private DateTime _nextUdpProbe = DateTime.MaxValue;
@@ -259,13 +266,18 @@ namespace Aurix
         public MediaTransport Media => _media;
         /// <summary>
         /// How the native media reaches the node: <see cref="MediaPathPolicy.Auto"/> (default) uses UDP and
-        /// falls back to the same sealed packets as binary frames on the control WebSocket when UDP does not
-        /// bind (2 × 1 s) or <see cref="UdpFallbackLostHeartbeats"/> heartbeats go unanswered, re-probing UDP
-        /// every <see cref="UdpReprobeInterval"/> while tunnelled. The tunnel is TCP: expect more latency under
-        /// loss (head-of-line blocking), but voice keeps working where only 443 gets through. Applies to the
-        /// next bind (connect / reconnect / fallback).
+        /// falls back to the same sealed packets over TCP when UDP does not bind (2 × 1 s) or
+        /// <see cref="UdpFallbackLostHeartbeats"/> heartbeats go unanswered: first the node's dedicated TLS
+        /// tunnel (usually port 443, when advertised and <see cref="TlsTunnel"/> is on), then binary frames on
+        /// the control WebSocket. UDP is re-probed every <see cref="UdpReprobeInterval"/> while tunnelled.
+        /// Tunnels are TCP: expect more latency under loss (head-of-line blocking), but voice keeps working
+        /// where only 443 gets through. Applies to the next bind (connect / reconnect / fallback).
         /// </summary>
         public MediaPathPolicy MediaPathPolicy { get; set; } = MediaPathPolicy.Auto;
+        /// <summary>Let <see cref="MediaPathPolicy.Auto"/> use the node's TLS media tunnel (default on).</summary>
+        public bool TlsTunnel { get; set; } = true;
+        /// <summary>Connect + handshake budget for one TLS tunnel endpoint.</summary>
+        public TimeSpan TlsConnectTimeout { get; set; } = TimeSpan.FromSeconds(5);
         /// <summary>Consecutive unanswered UDP heartbeats (every <see cref="MediaHeartbeatInterval"/>) before Auto moves to the tunnel; 0 disables.</summary>
         public int UdpFallbackLostHeartbeats { get; set; } = 3;
         /// <summary>How often a tunnelled Auto session tries UDP again (and moves back when it answers); zero disables.</summary>
@@ -999,6 +1011,7 @@ namespace Aurix
                     Endpoint = url,
                     Failover = failover,
                     MediaTunnel = ack.Bool("media_tunnel"),
+                    TlsTunnel = ack.TlsTunnel(),
                     DownlinkMix = ack.Bool("downlink_mix"),
                     Translation = ack.Translation(),
                 };
@@ -1059,15 +1072,20 @@ namespace Aurix
                     media = await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
                     reason = "tunnel-only policy";
                     break;
+                case MediaPathPolicy.TlsOnly:
+                    if (info.TlsTunnel == null) throw new InvalidOperationException("media path is TLS-only but the node offers no TLS media tunnel");
+                    media = await BindTlsAsync(info, seq, ct).ConfigureAwait(false);
+                    reason = "TLS-only policy";
+                    break;
                 default:
-                    if (!info.MediaTunnel)
+                    if (!info.MediaTunnel && !TlsOffered(info))
                     {
                         media = await BindUdpAsync(info, seq, 5, 500, ct).ConfigureAwait(false);
                         reason = "UDP bound";
                     }
                     else if (_udpBlockedUntil.HasValue && _udpBlockedUntil.Value > DateTime.UtcNow)
                     {
-                        media = await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
+                        media = await BindFallbackAsync(control, info, seq, ct).ConfigureAwait(false);
                         reason = "UDP was blocked before this session";
                     }
                     else
@@ -1080,7 +1098,7 @@ namespace Aurix
                         catch (Exception e) when (!(e is OperationCanceledException))
                         {
                             MarkUdpBlocked();
-                            media = await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
+                            media = await BindFallbackAsync(control, info, seq, ct).ConfigureAwait(false);
                             reason = $"UDP bind failed: {e.Message}";
                         }
                     }
@@ -1089,10 +1107,60 @@ namespace Aurix
             _media = media;
             _lossWindow.Reset();
             if (_muted) media.SendMuteState(true);
-            if (media.Path == MediaPath.Tunnel) _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
+            if (media.Path != MediaPath.Udp) _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
             SetState(VoiceConnectionState.MediaBound);
             var path = media.Path;
             Post(() => OnMediaPathChanged?.Invoke(path, reason));
+        }
+
+        private bool TlsOffered(SessionInfo info) => TlsTunnel && info.TlsTunnel != null;
+        private bool TlsBlocked => _tlsBlockedUntil.HasValue && _tlsBlockedUntil.Value > DateTime.UtcNow;
+
+        /// <summary>
+        /// The Auto fallbacks in order: the TLS tunnel (when offered and not known blocked), then the
+        /// WebSocket tunnel. A TLS failure is remembered like a UDP one so the next bind skips it.
+        /// </summary>
+        private async Task<MediaTransport> BindFallbackAsync(ControlChannel control, SessionInfo info, SequenceCounter seq, CancellationToken ct)
+        {
+            if (TlsOffered(info) && !TlsBlocked)
+            {
+                try { return await BindTlsAsync(info, seq, ct).ConfigureAwait(false); }
+                catch (Exception e) when (!(e is OperationCanceledException))
+                {
+                    MarkTlsBlocked();
+                    if (!info.MediaTunnel) throw;
+                }
+            }
+            if (!info.MediaTunnel) throw new InvalidOperationException("UDP is blocked, the TLS tunnel failed and the node offers no WebSocket tunnel");
+            return await BindTunnelAsync(control, info, seq, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Connect the pinned TLS tunnel to the advertised endpoints one after another and bind the session over it.</summary>
+        private async Task<MediaTransport> BindTlsAsync(SessionInfo info, SequenceCounter seq, CancellationToken ct)
+        {
+            var tls = info.TlsTunnel ?? throw new InvalidOperationException("the node offers no TLS media tunnel");
+            var candidates = await MediaTransport.ResolveCandidatesAsync(null, tls.Addrs).ConfigureAwait(false);
+            Exception last = null;
+            foreach (var endpoint in candidates)
+            {
+                ct.ThrowIfCancellationRequested();
+                TlsMediaTunnel link;
+                try { link = await TlsMediaTunnel.ConnectAsync(endpoint, tls.ServerName, tls.CertSha256, TlsConnectTimeout, ct).ConfigureAwait(false); }
+                catch (Exception e) when (!(e is OperationCanceledException)) { last = e; continue; }
+                var media = MediaTransport.OverTls(link, info.SessionId, info.Ssrc, _mediaKey, seq);
+                media.HeartbeatInterval = MediaHeartbeatInterval;
+                try
+                {
+                    await media.BindAsync(ct, 2, 3000).ConfigureAwait(false);
+                    return media;
+                }
+                catch (Exception e) when (!(e is OperationCanceledException))
+                {
+                    media.Dispose();
+                    last = e;
+                }
+            }
+            throw last ?? new InvalidOperationException("no TLS tunnel endpoint advertised");
         }
 
         /// <summary>
@@ -1149,6 +1217,12 @@ namespace Aurix
             _udpBlockedUntil = DateTime.UtcNow + memory;
         }
 
+        private void MarkTlsBlocked()
+        {
+            var memory = UdpReprobeInterval > TimeSpan.Zero ? UdpReprobeInterval : TimeSpan.FromSeconds(60);
+            _tlsBlockedUntil = DateTime.UtcNow + memory;
+        }
+
         /// <summary>
         /// Called from <see cref="Update"/>: move a UDP session whose heartbeats died onto the tunnel, or
         /// try UDP again from a tunnelled one. At most one switch runs at a time.
@@ -1156,7 +1230,8 @@ namespace Aurix
         private void DriveMediaPath(MediaTransport media, ControlChannel control)
         {
             var session = Session;
-            if (session == null || !session.MediaTunnel || MediaPathPolicy != MediaPathPolicy.Auto || _pathSwitchActive != 0) return;
+            if (session == null || MediaPathPolicy != MediaPathPolicy.Auto || _pathSwitchActive != 0) return;
+            if (!session.MediaTunnel && !TlsOffered(session)) return;
             var ct = _cts;
             if (ct == null || ct.IsCancellationRequested) return;
             if (media.Path == MediaPath.Udp)
@@ -1165,6 +1240,12 @@ namespace Aurix
                 if (UdpFallbackLostHeartbeats <= 0 || lost < UdpFallbackLostHeartbeats) return;
                 if (Interlocked.CompareExchange(ref _pathSwitchActive, 1, 0) != 0) return;
                 _ = FallBackToTunnelAsync(media, control, session, $"{lost} UDP heartbeats unanswered", ct.Token);
+            }
+            else if (media.Path == MediaPath.Tls && (media.IsClosed || (UdpFallbackLostHeartbeats > 0 && media.HeartbeatsLostConsecutive >= UdpFallbackLostHeartbeats)))
+            {
+                if (Interlocked.CompareExchange(ref _pathSwitchActive, 1, 0) != 0) return;
+                var why = media.IsClosed ? $"TLS tunnel closed: {media.TlsTunnel?.CloseReason}" : $"{media.HeartbeatsLostConsecutive} TLS tunnel heartbeats unanswered";
+                _ = LeaveTlsAsync(media, control, session, why, ct.Token);
             }
             else if (UdpReprobeInterval > TimeSpan.Zero && DateTime.UtcNow >= _nextUdpProbe)
             {
@@ -1175,11 +1256,9 @@ namespace Aurix
 
         private async Task FallBackToTunnelAsync(MediaTransport udp, ControlChannel control, SessionInfo session, string reason, CancellationToken ct)
         {
-            MediaTransport tunnel = null;
             try
             {
-                tunnel = await BindTunnelAsync(control, session, udp.Sequence, ct).ConfigureAwait(false);
-                var bound = tunnel;
+                var bound = await BindFallbackAsync(control, session, udp.Sequence, ct).ConfigureAwait(false);
                 Post(() =>
                 {
                     if (!ReferenceEquals(_media, udp) || !ReferenceEquals(_control, control)) { bound.Dispose(); return; }
@@ -1187,14 +1266,14 @@ namespace Aurix
                     udp.Dispose();
                     MarkUdpBlocked();
                     _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
-                    OnMediaPathChanged?.Invoke(MediaPath.Tunnel, reason);
+                    OnMediaPathChanged?.Invoke(bound.Path, reason);
                 });
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
             catch (Exception e)
             {
                 // Neither link works: treat the connection as lost so the regular reconnect takes over.
-                Post(() => { if (ReferenceEquals(_media, udp)) ForceReconnect($"{reason}; tunnel bind failed: {e.Message}"); });
+                Post(() => { if (ReferenceEquals(_media, udp)) ForceReconnect($"{reason}; fallback bind failed: {e.Message}"); });
             }
             finally
             {
@@ -1202,6 +1281,45 @@ namespace Aurix
             }
         }
 
+        /// <summary>A TLS-tunnelled session lost its link: try UDP once (it may be back), then the WebSocket tunnel, else reconnect.</summary>
+        private async Task LeaveTlsAsync(MediaTransport tls, ControlChannel control, SessionInfo session, string reason, CancellationToken ct)
+        {
+            try
+            {
+                MarkTlsBlocked();
+                MediaTransport next;
+                try { next = await BindUdpAsync(session, tls.Sequence, 1, 1500, ct).ConfigureAwait(false); _udpBlockedUntil = null; }
+                catch (Exception e) when (!(e is OperationCanceledException))
+                {
+                    if (!session.MediaTunnel) throw new InvalidOperationException($"UDP still blocked ({e.Message}) and the node offers no WebSocket tunnel");
+                    next = await BindTunnelAsync(control, session, tls.Sequence, ct).ConfigureAwait(false);
+                }
+                var bound = next;
+                Post(() =>
+                {
+                    if (!ReferenceEquals(_media, tls) || !ReferenceEquals(_control, control)) { bound.Dispose(); return; }
+                    _media = bound;
+                    tls.Dispose();
+                    _nextUdpProbe = DateTime.UtcNow + UdpReprobeInterval;
+                    OnMediaPathChanged?.Invoke(bound.Path, reason);
+                });
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            catch (Exception e)
+            {
+                Post(() => { if (ReferenceEquals(_media, tls)) ForceReconnect($"{reason}; fallback bind failed: {e.Message}"); });
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _pathSwitchActive, 0);
+            }
+        }
+
+        /// <summary>
+        /// From a tunnelled session (TLS or WebSocket): try UDP again and move back when it answers. A
+        /// WebSocket-tunnelled session also retries the TLS tunnel when UDP stays blocked, so the better
+        /// TCP path is used once it becomes reachable.
+        /// </summary>
         private async Task ReprobeUdpAsync(MediaTransport tunnel, SessionInfo session, CancellationToken ct)
         {
             try
@@ -1220,7 +1338,10 @@ namespace Aurix
                     catch (Exception r) when (!(r is OperationCanceledException))
                     {
                         Post(() => { if (ReferenceEquals(_media, tunnel)) ForceReconnect($"media tunnel lost after a UDP probe: {r.Message}"); });
+                        return;
                     }
+                    if (tunnel.Path == MediaPath.Tunnel && TlsOffered(session) && !TlsBlocked)
+                        await UpgradeToTlsAsync(tunnel, session, ct).ConfigureAwait(false);
                     return;
                 }
                 Post(() =>
@@ -1237,6 +1358,30 @@ namespace Aurix
             {
                 Interlocked.Exchange(ref _pathSwitchActive, 0);
             }
+        }
+
+        private async Task UpgradeToTlsAsync(MediaTransport tunnel, SessionInfo session, CancellationToken ct)
+        {
+            MediaTransport tls;
+            try { tls = await BindTlsAsync(session, tunnel.Sequence, ct).ConfigureAwait(false); }
+            catch (Exception e) when (!(e is OperationCanceledException))
+            {
+                MarkTlsBlocked();
+                try { await tunnel.ReclaimAsync(ct).ConfigureAwait(false); }
+                catch (Exception r) when (!(r is OperationCanceledException))
+                {
+                    Post(() => { if (ReferenceEquals(_media, tunnel)) ForceReconnect($"media tunnel lost after a TLS probe: {r.Message} ({e.Message})"); });
+                }
+                return;
+            }
+            Post(() =>
+            {
+                if (!ReferenceEquals(_media, tunnel)) { tls.Dispose(); return; }
+                _media = tls;
+                tunnel.Dispose();
+                _tlsBlockedUntil = null;
+                OnMediaPathChanged?.Invoke(MediaPath.Tls, "TLS tunnel re-probe answered");
+            });
         }
 
         /// <summary>

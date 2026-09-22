@@ -76,7 +76,8 @@ namespace Aurix.Demo
             if (Get(opt, "scenario", "audio") == "prefs") return await PrefsScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "chat") return await ChatScenario(ws, channelId, tokenA, tokenB);
             if (Get(opt, "scenario", "audio") == "pcmu") return await PcmuScenario(ws, channelId, tokenA, tokenB);
-            if (Get(opt, "scenario", "audio") == "tunnel") return await TunnelScenario(ws, channelId, tokenA, tokenB, opt.ContainsKey("udp-block"));
+            if (Get(opt, "scenario", "audio") == "tunnel") return await TunnelScenario(ws, channelId, tokenA, tokenB, opt.ContainsKey("udp-block"), MediaPath.Tunnel);
+            if (Get(opt, "scenario", "audio") == "tls") return await TunnelScenario(ws, channelId, tokenA, tokenB, opt.ContainsKey("udp-block"), MediaPath.Tls);
             if (Get(opt, "scenario", "audio") == "transmission")
             {
                 if (string.IsNullOrEmpty(apiKey)) { Console.Error.WriteLine("the transmission scenario needs --api-key (second channel + multi-channel tokens)"); return 2; }
@@ -560,16 +561,19 @@ namespace Aurix.Demo
         }
 
         /// <summary>
-        /// Media over the control WebSocket instead of UDP: alice is forced onto the tunnel while bob
+        /// Media over TCP instead of UDP — the control WebSocket (<paramref name="tunnel"/> =
+        /// <see cref="MediaPath.Tunnel"/>) or the node's dedicated TLS tunnel (<see cref="MediaPath.Tls"/>,
+        /// needs <c>media.tls_tunnel_port</c> on the node): alice is forced onto the tunnel while bob
         /// stays on UDP, audio flows both ways, a resume keeps the tunnel, and with <c>--udp-block</c>
         /// (needs passwordless <c>sudo iptables</c>) a third client in Auto mode meets a UDP black hole:
-        /// falls back at bind, returns to UDP when the re-probe answers, falls back again when the
-        /// heartbeats die mid-session.
+        /// falls back at bind (to the TLS tunnel when the node offers one, else the WebSocket), returns to
+        /// UDP when the re-probe answers, falls back again when the heartbeats die mid-session.
         /// </summary>
-        private static async Task<int> TunnelScenario(string ws, Guid channelId, string tokenA, string tokenB, bool udpBlock)
+        private static async Task<int> TunnelScenario(string ws, Guid channelId, string tokenA, string tokenB, bool udpBlock, MediaPath tunnel)
         {
             var log = new List<string>();
-            var alice = new AurixVoiceClient(ws, tokenA) { MediaPathPolicy = MediaPathPolicy.TunnelOnly, MediaHeartbeatInterval = TimeSpan.FromSeconds(1) };
+            bool tls = tunnel == MediaPath.Tls;
+            var alice = new AurixVoiceClient(ws, tokenA) { MediaPathPolicy = tls ? MediaPathPolicy.TlsOnly : MediaPathPolicy.TunnelOnly, MediaHeartbeatInterval = TimeSpan.FromSeconds(1) };
             var bob = new AurixVoiceClient(ws, tokenB);
             Hook(alice, "alice", log);
             Hook(bob, "bob", log);
@@ -598,26 +602,29 @@ namespace Aurix.Demo
             await bob.JoinChannelAsync(channelId);
             var hash = AurixVoiceClient.ChannelHash(channelId);
 
-            Check(a.MediaTunnel, "node advertises media_tunnel in SessionInitAck");
-            Check(alice.ActiveMediaPath == MediaPath.Tunnel, $"alice (TunnelOnly) is on {alice.ActiveMediaPath}");
+            if (tls) Check(a.TlsTunnel != null, $"node advertises tls_tunnel in SessionInitAck ({(a.TlsTunnel == null ? "none" : string.Join(",", a.TlsTunnel.Addrs) + " pin " + a.TlsTunnel.CertSha256.Substring(0, 12) + "…")})");
+            else Check(a.MediaTunnel, "node advertises media_tunnel in SessionInitAck");
+            Check(alice.ActiveMediaPath == tunnel, $"alice ({alice.MediaPathPolicy}) is on {alice.ActiveMediaPath}");
+            if (tls) Check(alice.Media.TlsTunnel != null && alice.Media.TlsTunnel.Protocol == System.Security.Authentication.SslProtocols.Tls13, $"TLS link negotiated {alice.Media.TlsTunnel?.Protocol} with pinned certificate");
             Check(bob.ActiveMediaPath == MediaPath.Udp, $"bob (Auto) is on {bob.ActiveMediaPath}");
             (MediaPath, string) firstPath; lock (paths) firstPath = paths.Count > 0 ? paths[0] : default;
-            Check(firstPath.Item1 == MediaPath.Tunnel && firstPath.Item2 == "tunnel-only policy", $"OnMediaPathChanged: {firstPath}");
+            Check(firstPath.Item1 == tunnel && firstPath.Item2 == (tls ? "TLS-only policy" : "tunnel-only policy"), $"OnMediaPathChanged: {firstPath}");
 
             var (aliceRms, bobRms) = await Exchange(alice, bob, hash, 60);
             Check(aliceRms > 0.15 && aliceRms < 0.27, $"alice hears bob over the tunnel: RMS {aliceRms:F3} (expect ≈0.21)");
             Check(bobRms > 0.15 && bobRms < 0.27, $"bob hears alice's tunnelled uplink over UDP: RMS {bobRms:F3} (expect ≈0.21)");
             var stats = alice.GetStats();
-            Check(stats.MediaPath == MediaPath.Tunnel && stats.UplinkDropped == 0 && stats.BadAuth == 0 && stats.Replayed == 0,
+            Check(stats.MediaPath == tunnel && stats.UplinkDropped == 0 && stats.BadAuth == 0 && stats.Replayed == 0,
                 $"stats: path={stats.MediaPath} uplinkDropped={stats.UplinkDropped} badAuth={stats.BadAuth} replayed={stats.Replayed}");
-            Check(stats.RttMs > 0 && alice.Media.HeartbeatAcks > 0, $"tunnel heartbeats answered: {alice.Media.HeartbeatAcks} acks, RTT {stats.RttMs:F1} ms");
+            // RTT is measured with millisecond ticks, so a loopback round trip legitimately reads 0 ms.
+            Check(alice.Media.HeartbeatAcks > 0 && alice.Media.Rtt.Samples > 0, $"tunnel heartbeats answered: {alice.Media.HeartbeatAcks} acks, RTT {stats.RttMs:F1} ms over {alice.Media.Rtt.Samples} samples");
 
             // Resume while tunnelled: the new control socket carries the media again, sequence numbers continue.
             uint seqBefore = alice.Media.CurrentSequence;
             alice.ForceReconnect("tunnel resume");
             bool back = await WaitState(alice, VoiceConnectionState.MediaBound, TimeSpan.FromSeconds(10));
             Check(back && alice.Session.Resumed && alice.Session.SessionId == a.SessionId, $"resumed same session over a new socket (back={back} resumed={alice.Session?.Resumed})");
-            Check(alice.ActiveMediaPath == MediaPath.Tunnel, $"still tunnelled after the resume ({alice.ActiveMediaPath})");
+            Check(alice.ActiveMediaPath == tunnel, $"still tunnelled after the resume ({alice.ActiveMediaPath})");
             await Task.Delay(200);
             var (aliceRms2, bobRms2) = await Exchange(alice, bob, hash, 40);
             Check(aliceRms2 > 0.15 && bobRms2 > 0.15, $"audio after the resume: alice {aliceRms2:F3} bob {bobRms2:F3}");
@@ -637,6 +644,7 @@ namespace Aurix.Demo
                     MediaHeartbeatInterval = TimeSpan.FromMilliseconds(500),
                     UdpFallbackLostHeartbeats = 3,
                     UdpReprobeInterval = TimeSpan.FromSeconds(3),
+                    TlsTunnel = tls,
                 };
                 var carolPaths = new List<(MediaPath, string)>();
                 carol.OnMediaPathChanged += (p, why) => { lock (carolPaths) carolPaths.Add((p, why)); Add(log, $"carol: media path {p} ({why})"); };
@@ -655,7 +663,7 @@ namespace Aurix.Demo
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 await carol.ConnectAsync();
                 await carol.JoinChannelAsync(channelId);
-                var atBind = await WaitPath(0, MediaPath.Tunnel, TimeSpan.FromSeconds(5));
+                var atBind = await WaitPath(0, tunnel, TimeSpan.FromSeconds(8));
                 Check(atBind != null && atBind.Value.Item2.StartsWith("UDP bind failed"), $"Auto fell back at bind in {sw.ElapsedMilliseconds} ms: {atBind}");
                 var (carolRms, bobRms3) = await Exchange(carol, bob, hash, 50);
                 Check(carolRms > 0.15 && bobRms3 > 0.15, $"audio through the black hole: carol {carolRms:F3} bob {bobRms3:F3}");
@@ -673,7 +681,7 @@ namespace Aurix.Demo
                 Console.WriteLine("UDP black-holed mid-session: waiting for the heartbeat fallback");
                 sw.Restart();
                 lock (carolPaths) seen = carolPaths.Count;
-                var onLoss = await WaitPath(seen, MediaPath.Tunnel, TimeSpan.FromSeconds(10));
+                var onLoss = await WaitPath(seen, tunnel, TimeSpan.FromSeconds(10));
                 Check(onLoss != null && onLoss.Value.Item2.Contains("heartbeats unanswered"), $"heartbeat fallback in {sw.ElapsedMilliseconds} ms: {onLoss}");
                 var (carolRms3, bobRms5) = await Exchange(carol, bob, hash, 50);
                 Check(carolRms3 > 0.15 && bobRms5 > 0.15, $"audio after the mid-session fallback: carol {carolRms3:F3} bob {bobRms5:F3}");

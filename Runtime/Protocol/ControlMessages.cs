@@ -631,6 +631,23 @@ namespace Aurix.Protocol
             return new TranslationInfo { Speech = MiniJson.GetBool(o, "speech", false), Languages = languages };
         }
 
+        /// <summary>
+        /// Typed view of <c>SessionInitAck.tls_tunnel</c>; null when the node runs no TLS media tunnel or the
+        /// advertisement is unusable (no endpoints or no certificate pin).
+        /// </summary>
+        public Transport.TlsTunnelInfo TlsTunnel()
+        {
+            var o = MiniJson.AsObject(Data != null && Data.TryGetValue("tls_tunnel", out var v) ? v : null);
+            if (o == null) return null;
+            var addrs = new List<string>();
+            if (o.TryGetValue("addrs", out var av) && MiniJson.AsArray(av) is List<object> arr)
+                foreach (var item in arr)
+                    if (item is string s && s.Length > 0 && !addrs.Contains(s)) addrs.Add(s);
+            var pin = MiniJson.GetString(o, "cert_sha256");
+            if (addrs.Count == 0 || string.IsNullOrEmpty(pin)) return null;
+            return new Transport.TlsTunnelInfo { Addrs = addrs, CertSha256 = pin, ServerName = MiniJson.GetString(o, "server_name") };
+        }
+
         /// <summary>Typed view of a <c>TranslationChanged</c> payload.</summary>
         public TranslationPrefs TranslationPrefs()
         {
