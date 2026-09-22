@@ -141,7 +141,7 @@ namespace Aurix.WebGL
         public event Action<int> OnE2eeKeyRotated;
         public event Action<ChatMessage> OnChatMessage;
         public event Action<ChatReadMarker> OnChatReadMarker;
-        public event Action<int, bool> OnChatInboxSynced;
+        public event Action<int, bool, bool> OnChatInboxSynced;
         public event Action<ChatMessage> OnChatMessageUpdated;
         public event Action<ChatReactionChange> OnChatReactionChanged;
         public event Action<Guid, Guid, bool> OnParticipantTyping;
@@ -1109,7 +1109,7 @@ namespace Aurix.WebGL
                     return;
                 }
                 case "chatInboxSynced":
-                    OnChatInboxSynced?.Invoke((int)MiniJson.GetNumber(e, "delivered"), MiniJson.GetBool(e, "truncated"));
+                    OnChatInboxSynced?.Invoke((int)MiniJson.GetNumber(e, "delivered"), MiniJson.GetBool(e, "truncated"), MiniJson.GetBool(e, "perDevice"));
                     return;
                 case "chatMessageUpdated":
                 {

@@ -51,7 +51,7 @@ namespace Aurix
         event Action<Guid?> OnChannelFocusChanged;
         event Action<ChatMessage> OnChatMessage;
         event Action<ChatReadMarker> OnChatReadMarker;
-        event Action<int, bool> OnChatInboxSynced;
+        event Action<int, bool, bool> OnChatInboxSynced;
         event Action<ChatMessage> OnChatMessageUpdated;
         event Action<ChatReactionChange> OnChatReactionChanged;
         event Action<Guid, Guid, bool> OnParticipantTyping;

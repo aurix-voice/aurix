@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using Aurix.Audio;
 using Aurix.Protocol;
+using Aurix.Transport;
 using Xunit;
 
 namespace Aurix.Voice.Tests
@@ -501,6 +502,18 @@ namespace Aurix.Voice.Tests
             var synced = ControlMessage.Parse("{\"type\":\"ChatInboxSynced\",\"data\":{\"delivered\":3,\"truncated\":false}}");
             Assert.Equal(3, (int)synced.Num("delivered"));
             Assert.False(synced.Bool("truncated"));
+            Assert.False(synced.Bool("per_device"));
+            Assert.True(ControlMessage.Parse("{\"type\":\"ChatInboxSynced\",\"data\":{\"delivered\":0,\"truncated\":false,\"per_device\":true}}").Bool("per_device"));
+
+            // `ChatAck` carries only the id: the server takes the timestamp from its own row.
+            Assert.Equal(
+                "{\"type\":\"ChatAck\",\"data\":{\"message_id\":\"" + msg + "\"}}",
+                ControlMessage.ChatAck(msg));
+            Assert.True(ControlMessage.IsValidDeviceId("phone-1.A_~"));
+            Assert.False(ControlMessage.IsValidDeviceId(""));
+            Assert.False(ControlMessage.IsValidDeviceId("bad id"));
+            Assert.False(ControlMessage.IsValidDeviceId(new string('x', 129)));
+            Assert.Equal("device.", ControlChannel.DeviceSubprotocolPrefix);
         }
 
         [Fact]
