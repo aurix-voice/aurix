@@ -52,7 +52,8 @@ action token decides them at join time. A grant with `speak: false` makes the me
       "text_radius": 20.0
     },
     "ambient": { "max_voices": 4, "ambient_gain": 0.15 },
-    "audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 0, "max_streams": 0 },
+    "audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 0,
+                  "speaker_admission": "reject", "demote_idle_ms": 3000, "max_streams": 0 },
     "ducking": { "gain": 0.25, "attack_ms": 60, "release_ms": 400, "hold_ms": 250, "moderators": false }
   }
 }
@@ -334,7 +335,8 @@ three things hold: most members are listeners, listeners do not flood presence, 
 receiver hears a bounded number of voices. `ChannelConfig.audience` controls all three:
 
 ```json
-"audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 8, "max_streams": 4 }
+"audience": { "hide_listeners": true, "mix_for_listeners": true, "max_speakers": 8,
+              "speaker_admission": "demote", "demote_idle_ms": 3000, "max_streams": 4 }
 ```
 
 * **Listeners.** A member whose grant has `speak: false` joins with `ChannelRole::Listener`
@@ -353,10 +355,31 @@ receiver hears a bounded number of voices. `ChannelConfig.audience` controls all
   hear at most `media.webrtc_participant_streams` speakers on
   [dedicated tracks](#per-participant-tracks-for-browsers) next to it.
 * **`max_speakers`** (`0` = no separate limit) caps how many members that *may* speak the
-  channel admits; the next speaker join fails with `CHANNEL_FULL` while listeners keep
-  joining up to `max_participants`. Counted over the members a node knows of (its own plus
-  those learned through the cascade), so the cap is approximate across nodes for a few
-  hundred milliseconds after a join.
+  channel lets speak at once; listeners keep joining up to `max_participants`. Counted over
+  the members a node knows of (its own plus those learned through the cascade), so the cap is
+  approximate across nodes for a few hundred milliseconds after a join. What happens to a
+  joiner with a speaking grant once every slot is held is **`speaker_admission`**:
+  * `reject` (default) — the join fails with `CHANNEL_FULL`.
+  * `wait` — the member joins as an **effective listener**: `ChannelJoinAck.role = "listener"`
+    and `waiting_to_speak: true`, its audio is dropped, and it gets its granted role back
+    (`RoleChanged { reason: "speaker_admitted" }`) as soon as a slot frees — when a speaker
+    leaves (on any node), is demoted, or the cap is raised. Waiting members are served
+    priority speakers and moderators first, then in order of arrival.
+  * `demote` — like `wait`, but slots also rotate by activity: while a waiting member is
+    trying to speak (the node keeps dropping its frames), a **plain speaker that has been
+    silent for `demote_idle_ms`** (default 3 s, since joining if it never spoke) yields its
+    slot — the longest silent first, the quietest among equals. A joining **priority speaker,
+    moderator or administrator** takes the least recently active plain speaker's slot at once.
+    Priority speakers, moderators and administrators are never demoted themselves.
+
+  Demotion changes only the *effective* role: the membership's persisted grant stays what the
+  token / REST grant said (`waiting_to_speak` on the roster row says which members hold a grant
+  without a slot), so a demoted speaker is admitted again automatically, and a moderator that
+  is waiting still moderates. The member itself and everyone who sees it get `RoleChanged`
+  (`participant.role_changed` for webhooks / SSE); in channels with `hide_listeners` the
+  others see a demotion as `ParticipantLeft` and an admission as `ParticipantJoined`, since a
+  waiting member is hidden like any listener. SDKs surface it as `waitingToSpeak` /
+  `IsWaitingToSpeak` and a `participantRoleChanged` event.
 * **`max_streams`** (`0` = unlimited) bounds the concurrent voices *one receiver* hears. The
   ranking is per receiver and uses what that receiver would actually hear — delivery gain
   after local mute, block, volume, focus, distance attenuation and ambient dimming, times the

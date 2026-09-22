@@ -883,8 +883,15 @@ pub struct AudienceConfig {
     pub mix_for_listeners: bool,
     /// Members that may speak (`speak: true`) the channel admits at once, `0` = no separate
     /// limit (only `max_participants`). Counted over the members this node knows of (its own
-    /// and those learned through the cascade).
+    /// and those learned through the cascade). What happens to a joiner with a speaking grant
+    /// once the slots are taken is `speaker_admission`.
     pub max_speakers: u32,
+    /// Policy for a member with a speaking grant when every `max_speakers` slot is held.
+    pub speaker_admission: SpeakerAdmission,
+    /// `speaker_admission = "demote"`: a speaker is idle, and so may be demoted, once it has
+    /// sent no audible audio for this long (since joining if it never spoke). Priority
+    /// speakers, moderators and administrators are never demoted.
+    pub demote_idle_ms: u32,
     /// Concurrent voices a receiver hears at once, `0` = unlimited. Speakers are ranked per
     /// receiver by what *that* receiver would hear (distance, volume, focus, ambient slot ×
     /// the sender's reported level); holders keep their slot while they talk, the rest are
@@ -899,6 +906,8 @@ impl Default for AudienceConfig {
             hide_listeners: true,
             mix_for_listeners: true,
             max_speakers: 0,
+            speaker_admission: SpeakerAdmission::Reject,
+            demote_idle_ms: DEFAULT_DEMOTE_IDLE_MS,
             max_streams: 0,
         }
     }
@@ -909,8 +918,35 @@ impl AudienceConfig {
         if self.max_speakers > max_participants {
             return Err("audience.max_speakers must not exceed max_participants".into());
         }
+        if self.demote_idle_ms > MAX_DEMOTE_IDLE_MS {
+            return Err(format!(
+                "audience.demote_idle_ms must not exceed {MAX_DEMOTE_IDLE_MS}"
+            ));
+        }
         Ok(())
     }
+}
+
+pub const DEFAULT_DEMOTE_IDLE_MS: u32 = 3_000;
+pub const MAX_DEMOTE_IDLE_MS: u32 = 600_000;
+
+/// What a channel does with a joiner whose grant allows speaking while all
+/// `AudienceConfig::max_speakers` slots are held. The member's grant is never changed: a
+/// member admitted as a listener keeps its speaking grant and is promoted as soon as a slot
+/// frees (`RoleChanged`, reason `speaker_admitted`), in priority order then arrival order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerAdmission {
+    /// The join fails with `CHANNEL_FULL`.
+    #[default]
+    Reject,
+    /// The joiner enters as a listener and waits for a slot.
+    Wait,
+    /// The joiner takes the slot of the longest-idle non-priority speaker (idle for at least
+    /// `demote_idle_ms`, quietest first among equals), who becomes a waiting listener
+    /// (`RoleChanged`, reason `speaker_demoted`); with no idle speaker the joiner waits. While
+    /// members wait, a speaker that goes idle yields its slot to them the same way.
+    Demote,
 }
 
 /// Priority speaker ducking ([`ChannelConfig::ducking`]). Priority members are those whose

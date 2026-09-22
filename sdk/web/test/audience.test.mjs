@@ -31,6 +31,7 @@ test('listener join ack exposes role, total count and hidden listeners', () => {
   const info = channelInfoFromJoinAck(msg.data);
   assert.deepEqual(info, {
     role: 'listener',
+    waitingToSpeak: false,
     participantCount: 1843,
     hiddenListeners: true,
     transcription: true,
@@ -50,6 +51,7 @@ test('legacy join ack without audience fields defaults to a visible speaker', ()
   const info = channelInfoFromJoinAck(msg.data);
   assert.deepEqual(info, {
     role: 'speaker',
+    waitingToSpeak: false,
     participantCount: 3,
     hiddenListeners: false,
     transcription: false,

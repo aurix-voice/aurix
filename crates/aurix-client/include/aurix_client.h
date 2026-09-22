@@ -501,6 +501,13 @@ typedef enum AurixEventType {
    * `aurix_client_search_chat`, newest match first.
    */
   AURIX_EVENT_CHAT_SEARCH_RESULT = 49,
+  /**
+   * `channel_id`, `user_id`, `aurix_event_role` = the member's effective role now,
+   * `flag` = it gained a speaker slot (`false`: lost one — `AurixRoleListener` until the
+   * server promotes it again). Speaker-slot admission (`audience.max_speakers`); the
+   * member's grant is unchanged. For our own user `aurix_client_channel_info` follows.
+   */
+  AURIX_EVENT_PARTICIPANT_ROLE_CHANGED = 50,
 } AurixEventType;
 
 /**
@@ -1225,6 +1232,11 @@ typedef struct AurixChannelInfo {
    * Priority-speaker ducking the server applies (`enabled == false`: off).
    */
   struct AurixDucking ducking;
+  /**
+   * Our grant allows speaking but every speaker slot is taken: `role` is
+   * `AurixRoleListener` until an `AurixEventParticipantRoleChanged` promotes us.
+   */
+  bool waiting_to_speak;
 } AurixChannelInfo;
 
 /**
@@ -1924,6 +1936,12 @@ bool aurix_client_channel_info(const struct AurixClient *client,
  * (defaults for other events).
  */
 struct AurixChannelInfo aurix_event_channel_info(const struct AurixEvent *event);
+
+/**
+ * `ParticipantRoleChanged` only: the member's effective role now (`AurixRoleListener` for
+ * other events).
+ */
+enum AurixRole aurix_event_role(const struct AurixEvent *event);
 
 /**
  * `DuckingChanged` only: the channel's ducking depth and timings (disabled for other events).

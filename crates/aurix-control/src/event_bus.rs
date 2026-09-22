@@ -94,6 +94,18 @@ pub enum ServerEvent {
         changed_by: UserId,
         timestamp: DateTime<Utc>,
     },
+    /// A member's effective channel role changed at runtime: it lost its speaker slot
+    /// (`audience.speaker_admission = "demote"`) or got one back after waiting. The grant
+    /// is unchanged. Nodes hosting other members of the channel update their remote roster.
+    RoleChanged {
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        session_id: SessionId,
+        role: ChannelRole,
+        reason: aurix_common::protocol::RoleChangeReason,
+        timestamp: DateTime<Utc>,
+    },
     UserBanned {
         app_id: AppId,
         user_id: UserId,
@@ -396,6 +408,7 @@ impl ServerEvent {
             | Self::UserMuted { app_id, .. }
             | Self::UserUnmuted { app_id, .. }
             | Self::PriorityChanged { app_id, .. }
+            | Self::RoleChanged { app_id, .. }
             | Self::UserBanned { app_id, .. }
             | Self::UserDeleted { app_id, .. }
             | Self::UserKicked { app_id, .. }
@@ -455,6 +468,7 @@ impl ServerEvent {
             Self::UserMuted { .. } => "participant.muted",
             Self::UserUnmuted { .. } => "participant.unmuted",
             Self::PriorityChanged { .. } => "participant.priority_changed",
+            Self::RoleChanged { .. } => "participant.role_changed",
             Self::UserBanned { .. } => "user.banned",
             Self::UserDeleted { .. } => "user.deleted",
             Self::UserKicked { .. } => "participant.kicked",
@@ -502,6 +516,7 @@ impl ServerEvent {
         "participant.muted",
         "participant.unmuted",
         "participant.priority_changed",
+        "participant.role_changed",
         "participant.kicked",
         "user.banned",
         "user.deleted",

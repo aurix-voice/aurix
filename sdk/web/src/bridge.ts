@@ -352,6 +352,8 @@ export class AurixBridge {
         return null;
       case 'isPriority':
         return c.isPriority(str(a, 'channelId'));
+      case 'isWaitingToSpeak':
+        return c.isWaitingToSpeak(str(a, 'channelId'));
       case 'channelDucking':
         return c.getChannelDucking(str(a, 'channelId')) ?? null;
       case 'isDuckingActive':
@@ -576,6 +578,9 @@ export class AurixBridge {
     on('participantStreams', (streams) => q({ type: 'participantStreams', streams: participantStreamsEvent(streams) }));
     on('participantPriorityChanged', (channelId, userId, priority) =>
       q({ type: 'participantPriorityChanged', channelId, userId, priority }),
+    );
+    on('participantRoleChanged', (channelId, userId, role, admitted) =>
+      q({ type: 'participantRoleChanged', channelId, userId, role, admitted }),
     );
     on('duckingChanged', (channelId, active, config) => q({ type: 'duckingChanged', channelId, active, config }));
     if (visemes) {

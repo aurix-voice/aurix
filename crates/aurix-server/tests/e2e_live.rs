@@ -11664,6 +11664,353 @@ async fn audience_channels_hide_listeners_mix_their_downlink_and_cap_speakers() 
     assert_ne!(uid_l, uid_n);
 }
 
+/// Waits for the `RoleChanged` about `who` in `ch` and returns `(role, reason)`.
+async fn expect_role_change(
+    p: &mut Player,
+    ch: ChannelId,
+    who: UserId,
+) -> (
+    aurix_common::types::ChannelRole,
+    aurix_common::protocol::RoleChangeReason,
+) {
+    let m = expect_within(p, "RoleChanged", Duration::from_secs(5), |m| {
+        matches!(m, ControlMessage::RoleChanged { channel_id, user_id, .. }
+            if *channel_id == ch && *user_id == who)
+    })
+    .await;
+    let ControlMessage::RoleChanged { role, reason, .. } = m else {
+        unreachable!()
+    };
+    (role, reason)
+}
+
+/// Joins and returns `(role, waiting_to_speak)` from the ack.
+async fn join_ack_waiting(
+    p: &mut Player,
+    channel_id: ChannelId,
+) -> (aurix_common::types::ChannelRole, bool) {
+    let tok = p.token.clone();
+    p.send(&ControlMessage::ChannelJoin {
+        channel_id,
+        token: tok,
+    })
+    .await;
+    let ack = p
+        .expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { channel_id: c, .. } if *c == channel_id)
+        })
+        .await;
+    let ControlMessage::ChannelJoinAck {
+        role,
+        waiting_to_speak,
+        ..
+    } = ack
+    else {
+        unreachable!()
+    };
+    (role, waiting_to_speak)
+}
+
+/// Speaker admission beyond the join-time refusal. `speaker_admission = "wait"`: the third
+/// speaker (on the far node when there is one, so the cap counts across the cascade) joins as
+/// an effective listener with `waiting_to_speak`, the roster shows it as a listener, its
+/// frames are dropped, and it is promoted with `RoleChanged` — heard by itself and the rest —
+/// as soon as a speaker leaves. `speaker_admission = "demote"`: a joiner takes the slot of a
+/// speaker that has been silent for `demote_idle_ms`, a demoted member trying to speak gets
+/// the slot back from a speaker that went idle in turn, and a moderator holds its slot however
+/// long it is silent. The persisted grant is untouched throughout: the REST membership keeps
+/// `role = speaker` and only `waiting_to_speak` flips.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn speaker_admission_waits_promotes_and_demotes_idle_speakers() {
+    use aurix_common::protocol::RoleChangeReason;
+    use aurix_common::types::ChannelRole;
+
+    let Some(base) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let (env, _) = isolated_env(&base, &http, "admission").await;
+    let env2 = std::env::var("AURIX_E2E_WS2").ok().map(|ws| Env {
+        api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+        ws,
+        api_key: env.api_key.clone(),
+    });
+    let far_env = env2.as_ref().unwrap_or(&env);
+    let membership = |ch: ChannelId, user: UserId| {
+        let http = http.clone();
+        let env = env.clone();
+        async move {
+            let rows: serde_json::Value = http
+                .get(format!("{}/v1/channels/{ch}/participants", env.api))
+                .header("x-api-key", &env.api_key)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            rows["memberships"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["user_id"] == user.to_string())
+                .cloned()
+                .unwrap_or_else(|| panic!("{user} not in the roster of {ch}: {rows}"))
+        }
+    };
+
+    // ── wait: a full channel admits the speaker as a waiting listener ──
+    let stage = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "channel_type": "team",
+            "audience": {"hide_listeners": false, "mix_for_listeners": false,
+                         "max_speakers": 2, "speaker_admission": "wait"}
+        }),
+    )
+    .await;
+    let (tok_a, uid_a) = issue_token(&env, &http, "adm:alice", "Alice", stage).await;
+    let (tok_b, uid_b) = issue_token(&env, &http, "adm:bob", "Bob", stage).await;
+    let (tok_c, uid_c) = issue_token(far_env, &http, "adm:carol", "Carol", stage).await;
+    let uid_a = UserId::from_uuid(uid_a.parse().unwrap());
+    let uid_b = UserId::from_uuid(uid_b.parse().unwrap());
+    let uid_c = UserId::from_uuid(uid_c.parse().unwrap());
+    let mut alice = connect(&env, "alice", tok_a).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    let mut carol = connect(far_env, "carol", tok_c).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        bind_media(p).await;
+    }
+
+    assert_eq!(
+        join_ack_waiting(&mut alice, stage).await,
+        (ChannelRole::Speaker, false)
+    );
+    assert_eq!(
+        join_ack_waiting(&mut bob, stage).await,
+        (ChannelRole::Speaker, false)
+    );
+    expect_presence(&mut alice, stage, uid_b, true).await;
+    // Carol's node must know both speakers before her join counts them.
+    if env2.is_some() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        join_ack_waiting(&mut carol, stage).await,
+        (ChannelRole::Listener, true),
+        "third speaker waits for a slot"
+    );
+    let joined = expect_within(
+        &mut alice,
+        "ParticipantJoined",
+        Duration::from_secs(5),
+        |m| {
+            matches!(m, ControlMessage::ParticipantJoined { channel_id, user_id, .. }
+            if *channel_id == stage && *user_id == uid_c)
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            joined,
+            ControlMessage::ParticipantJoined {
+                role: ChannelRole::Listener,
+                ..
+            }
+        ),
+        "the roster shows the waiting speaker as a listener: {joined:?}"
+    );
+    expect_presence(&mut bob, stage, uid_c, true).await;
+    let row = membership(stage, uid_c).await;
+    assert_eq!(row["role"], "speaker", "the grant is untouched: {row}");
+    assert_eq!(row["waiting_to_speak"], true, "{row}");
+
+    // Her frames go nowhere while she waits.
+    let junk = Bytes::from_static(b"waiting-mic");
+    let (_, heard) = tokio::join!(
+        send_audio(&carol, stage, 1, &junk),
+        audio_from(&alice, carol.ssrc, &junk)
+    );
+    assert_eq!(heard.1, 0, "a waiting speaker's frames are dropped");
+
+    // Bob leaves: Carol is promoted, everyone learns about it.
+    bob.send(&ControlMessage::ChannelLeave { channel_id: stage })
+        .await;
+    assert_eq!(
+        expect_role_change(&mut carol, stage, uid_c).await,
+        (ChannelRole::Speaker, RoleChangeReason::SpeakerAdmitted)
+    );
+    assert_eq!(
+        expect_role_change(&mut alice, stage, uid_c).await,
+        (ChannelRole::Speaker, RoleChangeReason::SpeakerAdmitted)
+    );
+    let row = membership(stage, uid_c).await;
+    assert_eq!(row["role"], "speaker", "{row}");
+    assert_eq!(row["waiting_to_speak"], false, "{row}");
+    drain_udp(&alice).await;
+    let (_, heard) = tokio::join!(
+        send_audio(&carol, stage, 100, &junk),
+        audio_from(&alice, carol.ssrc, &junk)
+    );
+    assert!(heard.1 >= 5, "Alice hears the promoted speaker: {heard:?}");
+
+    // ── demote: idle speakers yield their slot, moderators never do ──
+    let arena = create_channel_with(
+        &env,
+        &http,
+        serde_json::json!({
+            "channel_type": "team",
+            "audience": {"hide_listeners": false, "mix_for_listeners": false, "max_speakers": 1,
+                         "speaker_admission": "demote", "demote_idle_ms": 600}
+        }),
+    )
+    .await;
+    let (tok_d, uid_d) = issue_token(&env, &http, "adm:dave", "Dave", arena).await;
+    let (tok_e, uid_e) = issue_token(&env, &http, "adm:erin", "Erin", arena).await;
+    let (tok_m, uid_m) = issue_token_grants(
+        &env,
+        &http,
+        "adm:mod",
+        "Mod",
+        vec![serde_json::json!({
+            "channel_id": arena, "join": true, "speak": true, "receive": true, "moderate": true
+        })],
+    )
+    .await;
+    let uid_d = UserId::from_uuid(uid_d.parse().unwrap());
+    let uid_e = UserId::from_uuid(uid_e.parse().unwrap());
+    let uid_m = UserId::from_uuid(uid_m.parse().unwrap());
+    let mut dave = connect(&env, "dave", tok_d).await;
+    let mut erin = connect(&env, "erin", tok_e).await;
+    let mut moderator = connect(&env, "mod", tok_m).await;
+    for p in [&mut dave, &mut erin, &mut moderator] {
+        bind_media(p).await;
+    }
+
+    assert_eq!(
+        join_ack_waiting(&mut dave, arena).await,
+        (ChannelRole::Speaker, false)
+    );
+    // Dave never speaks; once idle, a joiner takes his slot at join time.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        join_ack_waiting(&mut erin, arena).await,
+        (ChannelRole::Speaker, false),
+        "the joiner takes the idle speaker's slot"
+    );
+    assert_eq!(
+        expect_role_change(&mut dave, arena, uid_d).await,
+        (ChannelRole::Listener, RoleChangeReason::SpeakerDemoted)
+    );
+    assert_eq!(
+        expect_role_change(&mut erin, arena, uid_d).await,
+        (ChannelRole::Listener, RoleChangeReason::SpeakerDemoted)
+    );
+    let row = membership(arena, uid_d).await;
+    assert_eq!(row["role"], "speaker", "the grant survives demotion: {row}");
+    assert_eq!(row["waiting_to_speak"], true, "{row}");
+
+    // Erin stays silent too; Dave trying to speak gets the slot back — no frame of his leaks
+    // before the swap.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mic = Bytes::from_static(b"demoted-mic");
+    let (_, heard) = tokio::join!(
+        async {
+            for round in 0..6u32 {
+                send_audio(&dave, arena, 1 + round * 10, &mic).await;
+            }
+        },
+        audio_from(&erin, dave.ssrc, &mic)
+    );
+    assert_eq!(
+        expect_role_change(&mut dave, arena, uid_d).await,
+        (ChannelRole::Speaker, RoleChangeReason::SpeakerAdmitted)
+    );
+    assert_eq!(
+        expect_role_change(&mut erin, arena, uid_e).await,
+        (ChannelRole::Listener, RoleChangeReason::SpeakerDemoted)
+    );
+    assert!(
+        heard.1 >= 5,
+        "Erin hears Dave once he holds the slot again: {heard:?}"
+    );
+    let row = membership(arena, uid_e).await;
+    assert_eq!(row["role"], "speaker", "{row}");
+    assert_eq!(row["waiting_to_speak"], true, "{row}");
+
+    // A moderator joining preempts the idle plain speaker at once and keeps the slot however
+    // long it is silent, whoever tries to speak.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        join_ack_waiting(&mut moderator, arena).await,
+        (ChannelRole::Moderator, false)
+    );
+    assert_eq!(
+        expect_role_change(&mut dave, arena, uid_d).await,
+        (ChannelRole::Listener, RoleChangeReason::SpeakerDemoted)
+    );
+    assert_eq!(
+        expect_role_change(&mut moderator, arena, uid_d).await,
+        (ChannelRole::Listener, RoleChangeReason::SpeakerDemoted)
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    drain_udp(&moderator).await;
+    let (_, heard) = tokio::join!(
+        async {
+            for round in 0..6u32 {
+                send_audio(&erin, arena, 100 + round * 10, &mic).await;
+            }
+        },
+        audio_from(&moderator, erin.ssrc, &mic)
+    );
+    assert_eq!(
+        heard.1, 0,
+        "a moderator is never demoted for a plain speaker"
+    );
+    assert_none_matching(
+        &mut moderator,
+        Duration::from_millis(500),
+        "no role change while the moderator holds the only slot",
+        |m| matches!(m, ControlMessage::RoleChanged { channel_id, .. } if *channel_id == arena),
+    )
+    .await;
+    let row = membership(arena, uid_m).await;
+    assert_eq!(row["role"], "moderator", "{row}");
+    assert_eq!(row["waiting_to_speak"], false, "{row}");
+
+    // The moderator leaves: the slot goes to a waiting member, and the other keeps waiting.
+    moderator
+        .send(&ControlMessage::ChannelLeave { channel_id: arena })
+        .await;
+    let admitted = expect_within(&mut dave, "RoleChanged", Duration::from_secs(5), |m| {
+        matches!(
+            m,
+            ControlMessage::RoleChanged {
+                channel_id,
+                reason: RoleChangeReason::SpeakerAdmitted,
+                ..
+            } if *channel_id == arena
+        )
+    })
+    .await;
+    let ControlMessage::RoleChanged {
+        user_id: winner, ..
+    } = admitted
+    else {
+        unreachable!()
+    };
+    assert!(winner == uid_d || winner == uid_e, "{winner}");
+    let loser = if winner == uid_d { uid_e } else { uid_d };
+    assert_eq!(membership(arena, winner).await["waiting_to_speak"], false);
+    assert_eq!(membership(arena, loser).await["waiting_to_speak"], true);
+    assert_ne!(uid_a, uid_b);
+}
+
 /// Cross-node failover. Alice (node 1) loses her WebSocket and reconnects to node 2 with her
 /// resume credential: node 2 adopts the session from the Redis mirror — same session id and
 /// SSRC, fresh media key on node 2's media port, channel membership restored, `migrated`

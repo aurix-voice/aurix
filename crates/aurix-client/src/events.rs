@@ -155,6 +155,9 @@ pub enum Event {
         ducking: Option<DuckingConfig>,
         /// We are a priority speaker in this channel.
         priority: bool,
+        /// Our grant allows speaking but every `max_speakers` slot is taken: `role` is
+        /// `Listener` until a `ParticipantRoleChanged` promotes us.
+        waiting_to_speak: bool,
     },
     ChannelLeft {
         channel_id: ChannelId,
@@ -178,6 +181,14 @@ pub enum Event {
         channel_id: ChannelId,
         user_id: UserId,
         priority: bool,
+    },
+    /// A member (possibly us) gained (`admitted`) or lost a speaker slot: `role` is its
+    /// effective role now (`Listener` while demoted / waiting). The grant is unchanged.
+    ParticipantRoleChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        role: ChannelRole,
+        admitted: bool,
     },
     /// Game-audio hook: another member's priority speech started (`active`) or stopped
     /// ducking `channel_id`. Lower the game's music/SFX bus by `config.gain` with the

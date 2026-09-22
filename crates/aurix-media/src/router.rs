@@ -104,6 +104,13 @@ pub enum MediaEvent {
         session_id: SessionId,
         streams: Vec<aurix_common::protocol::ParticipantStream>,
     },
+    /// Speaker slots of a channel changed hands (`audience.speaker_admission`): idle
+    /// speakers were demoted and/or waiting members admitted.
+    RolesChanged {
+        app_id: AppId,
+        channel_id: ChannelId,
+        changes: Vec<crate::channel::RoleChange>,
+    },
 }
 
 /// Where an uplink packet came from.
@@ -638,7 +645,13 @@ impl PacketRouter {
             Some(c) => c.value().clone(),
             None => return Err(AurixError::ChannelNotFound(channel_id.to_string())),
         };
-        if channel.app_id != sender.app_id || !channel.can_transmit(&sender.user_id) {
+        if channel.app_id != sender.app_id {
+            return Err(AurixError::AuthorizationDenied(
+                "Sender may not transmit in this channel".into(),
+            ));
+        }
+        if !channel.can_transmit(&sender.user_id) {
+            channel.note_speak_attempt(&sender.user_id);
             return Err(AurixError::AuthorizationDenied(
                 "Sender may not transmit in this channel".into(),
             ));
@@ -757,6 +770,7 @@ impl PacketRouter {
                 None => continue,
             };
             if !channel.can_transmit(&sender.user_id) {
+                channel.note_speak_attempt(&sender.user_id);
                 continue;
             }
             if channel.is_e2ee() && !e2ee {
@@ -864,6 +878,7 @@ impl PacketRouter {
                 ));
             }
             if !channel.can_transmit(&sender.user_id) {
+                channel.note_speak_attempt(&sender.user_id);
                 return Err(AurixError::AuthorizationDenied(
                     "Sender may not transmit in this channel".into(),
                 ));

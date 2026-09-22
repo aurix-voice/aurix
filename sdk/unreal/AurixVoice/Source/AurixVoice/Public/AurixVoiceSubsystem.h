@@ -64,6 +64,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixE2eePeerKey, FGuid, UserId,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixE2eePeerDecryptable, FGuid, UserId, bool, bDecryptable);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixE2eeKeyRotated, int32, Generation);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantPriorityChanged, FGuid, ChannelId, FGuid, UserId, bool, bPriority);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixParticipantRoleChanged, FGuid, ChannelId, FGuid, UserId, EAurixRole, Role, bool, bAdmitted);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixDuckingChanged, FGuid, ChannelId, bool, bActive, const FAurixDucking&, Ducking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixConnectionEnded, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixRawEvent, const FString&, Json);
@@ -161,6 +162,10 @@ public:
 	/** Whether this session may transmit in the channel (false for listeners and unknown channels). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
 	bool CanSpeakIn(FGuid ChannelId) const;
+
+	/** Whether we hold a speaking grant but wait for an `audience.max_speakers` slot (false for unknown channels). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool IsWaitingToSpeak(FGuid ChannelId) const;
 
 	/** Owner of an SSRC (microphone or its TTS voice) across joined channels. */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
@@ -646,6 +651,12 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantSpeaking OnParticipantSpeaking;
 	/** A member (possibly us) became or stopped being a priority speaker. */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantPriorityChanged OnParticipantPriorityChanged;
+	/**
+	 * A member's (possibly our) effective role changed under `audience.speaker_admission`: bAdmitted
+	 * = it got its granted role (a speaker slot) back, otherwise an idle speaker slot was taken from
+	 * it and its audio is dropped meanwhile. The grant itself is unchanged.
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantRoleChanged OnParticipantRoleChanged;
 	/**
 	 * Game-audio hook: another member's priority speech started (bActive) or stopped ducking
 	 * the channel — fade your music / SFX bus to Ducking.Gain over AttackMs and back over

@@ -1,7 +1,7 @@
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::{CascadeOptions, CascadeRelay};
 use crate::cert::MediaCert;
-use crate::channel::MediaChannel;
+use crate::channel::{Admission, JoinHints, MediaChannel, RoleChange};
 use crate::mix::MixHub;
 use crate::mixer::MixerConfig;
 use crate::quality::{MosAlertPolicy, QualityTick};
@@ -60,6 +60,16 @@ pub struct ChannelLeft {
     /// The leaver was a hidden listener (`audience.hide_listeners`): nobody saw them join,
     /// so nobody is told they left.
     pub hidden: bool,
+    /// Waiting members that got the speaker slot the leaver freed.
+    pub admitted: Vec<RoleChange>,
+}
+
+/// Outcome of [`SfuNode::join_channel`].
+#[derive(Debug, Clone)]
+pub struct ChannelJoined {
+    /// The channel's other members hosted on this node.
+    pub existing: Vec<Arc<MediaSession>>,
+    pub admission: Admission,
 }
 
 /// Media-plane tunables taken from `MediaConfig`.
@@ -858,6 +868,7 @@ impl SfuNode {
             focus_reset,
             roster_observers: None,
             hidden: false,
+            admitted: Vec::new(),
         };
         let Some(channel) = self.channels.get(channel_id).map(|c| c.value().clone()) else {
             return left;
@@ -865,6 +876,7 @@ impl SfuNode {
         left.hidden = channel.is_hidden_listener(&session.user_id);
         left.roster_observers = channel.observers_of(&session.user_id);
         channel.remove_participant(&session.user_id);
+        left.admitted = channel.admit_waiting();
         if let Some(ref router) = self.router {
             router.forget_pcmu_downlinks(Some(session.ssrc), Some(channel_id_hash(channel_id)));
             if let Some(hub) = router.mix_hub() {
@@ -954,7 +966,18 @@ impl SfuNode {
         channel_id: ChannelId,
         config: ChannelConfig,
         role: ChannelRole,
-    ) -> Result<Vec<Arc<MediaSession>>> {
+    ) -> Result<ChannelJoined> {
+        self.join_channel_with(session_id, channel_id, config, role, JoinHints::default())
+    }
+
+    pub fn join_channel_with(
+        &self,
+        session_id: &SessionId,
+        channel_id: ChannelId,
+        config: ChannelConfig,
+        role: ChannelRole,
+        hints: JoinHints,
+    ) -> Result<ChannelJoined> {
         let session = self
             .get_session(session_id)
             .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
@@ -991,7 +1014,7 @@ impl SfuNode {
                 "Channel belongs to a different application".into(),
             ));
         }
-        channel.add_participant(session.clone(), role)?;
+        let admission = channel.add_participant_with(session.clone(), role, hints)?;
         session.join_channel(channel_id);
         if is_new {
             self.channels_by_hash.insert(hash, channel_id);
@@ -1005,13 +1028,17 @@ impl SfuNode {
             peer.reset_energy_report();
         }
         info!(
-            "User {} joined channel {} as {:?} (now {} participants)",
+            "User {} joined channel {} as {:?} (effective {:?}, now {} participants)",
             session.user_id,
             channel_id,
             role,
+            admission.role,
             channel.participant_count()
         );
-        Ok(existing)
+        Ok(ChannelJoined {
+            existing,
+            admission,
+        })
     }
 
     fn check_session_channel_limits(
@@ -1168,12 +1195,27 @@ impl SfuNode {
         channel_id: &ChannelId,
         app_id: &AppId,
         config: ChannelConfig,
-    ) -> Option<Vec<Arc<MediaSession>>> {
+    ) -> Option<(Vec<Arc<MediaSession>>, Vec<RoleChange>)> {
         let channel = self
             .get_channel(channel_id)
             .filter(|c| c.app_id == *app_id)?;
         channel.update_config(config);
-        Some(channel.get_all_participants())
+        Some((channel.get_all_participants(), channel.admit_waiting()))
+    }
+
+    /// Speaker slots freed by remote members leaving (or demoted there) go to local waiting
+    /// members. Returns the members admitted.
+    pub fn admit_waiting(&self, channel_id: &ChannelId) -> Vec<RoleChange> {
+        self.get_channel(channel_id)
+            .map(|c| c.admit_waiting())
+            .unwrap_or_default()
+    }
+
+    /// Updates the effective role of a member hosted on another node.
+    pub fn set_remote_role(&self, channel_id: &ChannelId, user_id: &UserId, role: ChannelRole) {
+        if let Some(channel) = self.get_channel(channel_id) {
+            channel.set_remote_role(user_id, role);
+        }
     }
     /// Encoder policy for one sender: the merge over every channel the session is in.
     pub fn session_audio_policy(&self, session: &MediaSession) -> AudioPolicy {
@@ -1344,6 +1386,7 @@ impl SfuNode {
 
     fn start_speaking_timeout(&self) {
         let sessions = self.sessions_by_id.clone();
+        let channels = self.channels.clone();
         let events = self.events.clone();
         let timeout_ms = self.options.speaking_timeout_ms as i64;
         tokio::spawn(async move {
@@ -1361,6 +1404,21 @@ impl SfuNode {
                         user_id: s.user_id,
                         channels: s.get_channels(),
                         speaking: false,
+                    });
+                }
+                let rotations: Vec<(Arc<MediaChannel>, Vec<RoleChange>)> = channels
+                    .iter()
+                    .map(|e| e.value().clone())
+                    .filter_map(|c| {
+                        let changes = c.rotate_idle_speakers();
+                        (!changes.is_empty()).then_some((c, changes))
+                    })
+                    .collect();
+                for (channel, changes) in rotations {
+                    let _ = events.send(MediaEvent::RolesChanged {
+                        app_id: channel.app_id,
+                        channel_id: channel.channel_id,
+                        changes,
                     });
                 }
             }

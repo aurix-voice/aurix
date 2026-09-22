@@ -159,6 +159,9 @@ public:
     /// `AURIX_EVENT_CHANNEL_JOINED` only: this session's role, the member count (all nodes,
     /// hidden listeners included) and the roster policy.
     AurixChannelInfo channel_info() const { return aurix_event_channel_info(ev_); }
+    /// `AURIX_EVENT_PARTICIPANT_ROLE_CHANGED` only: the member's effective role now (`flag()`
+    /// says whether it gained or lost its speaker slot); `AURIX_ROLE_LISTENER` for other events.
+    AurixRole role() const { return aurix_event_role(ev_); }
     /// `AURIX_EVENT_DUCKING_CHANGED` only: depth and timings for the game's own audio bus
     /// (`flag()` says whether ducking just started or stopped).
     AurixDucking ducking() const { return aurix_event_ducking(ev_); }
@@ -296,6 +299,12 @@ public:
     bool can_speak_in(const Uuid& channel) const {
         AurixChannelInfo info;
         return aurix_client_channel_info(c_, &channel.raw, &info) && info.role != AURIX_ROLE_LISTENER;
+    }
+    /// Whether we hold a speaking grant in `channel` but wait for an `audience.max_speakers`
+    /// slot (false for unknown channels).
+    bool waiting_to_speak(const Uuid& channel) const {
+        AurixChannelInfo info;
+        return aurix_client_channel_info(c_, &channel.raw, &info) && info.waiting_to_speak;
     }
     std::vector<AurixParticipant> participants(const Uuid& channel) const {
         std::vector<AurixParticipant> buf(32);

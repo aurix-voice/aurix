@@ -829,7 +829,7 @@ async fn channel_config_updates_apply_live_and_merge_per_sender() {
     edited.bitrate = 16_000;
     edited.min_bitrate = 6_000;
     edited.channel_type = ChannelType::Positional;
-    let affected = sfu
+    let (affected, _) = sfu
         .update_channel_config(&voice, &app, edited.clone())
         .expect("channel is live on this node");
     let ids: std::collections::HashSet<_> = affected.iter().map(|s| s.session_id).collect();

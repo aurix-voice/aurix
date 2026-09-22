@@ -1604,6 +1604,11 @@ pub enum AurixEventType {
     /// `next_before`) + `aurix_event_chat_history_message`: answer to
     /// `aurix_client_search_chat`, newest match first.
     AurixEventChatSearchResult = 49,
+    /// `channel_id`, `user_id`, `aurix_event_role` = the member's effective role now,
+    /// `flag` = it gained a speaker slot (`false`: lost one — `AurixRoleListener` until the
+    /// server promotes it again). Speaker-slot admission (`audience.max_speakers`); the
+    /// member's grant is unchanged. For our own user `aurix_client_channel_info` follows.
+    AurixEventParticipantRoleChanged = 50,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1992,6 +1997,7 @@ impl AurixEvent {
             Event::ParticipantLeft { .. } => T::AurixEventParticipantLeft,
             Event::ParticipantMuteChanged { .. } => T::AurixEventParticipantMuteChanged,
             Event::ParticipantPriorityChanged { .. } => T::AurixEventParticipantPriorityChanged,
+            Event::ParticipantRoleChanged { .. } => T::AurixEventParticipantRoleChanged,
             Event::DuckingChanged { .. } => T::AurixEventDuckingChanged,
             Event::ParticipantSpeaking { .. } => T::AurixEventParticipantSpeaking,
             Event::ChannelEnergy { .. } => T::AurixEventChannelEnergy,
@@ -2168,6 +2174,7 @@ pub unsafe extern "C" fn aurix_event_channel_id(event: *const AurixEvent) -> Aur
         | Event::ParticipantLeft { channel_id, .. }
         | Event::ParticipantMuteChanged { channel_id, .. }
         | Event::ParticipantPriorityChanged { channel_id, .. }
+        | Event::ParticipantRoleChanged { channel_id, .. }
         | Event::DuckingChanged { channel_id, .. }
         | Event::ParticipantSpeaking { channel_id, .. }
         | Event::ChannelEnergy { channel_id, .. }
@@ -2203,6 +2210,7 @@ pub unsafe extern "C" fn aurix_event_user_id(event: *const AurixEvent) -> AurixU
         Event::ParticipantLeft { user_id, .. }
         | Event::ParticipantMuteChanged { user_id, .. }
         | Event::ParticipantPriorityChanged { user_id, .. }
+        | Event::ParticipantRoleChanged { user_id, .. }
         | Event::ParticipantSpeaking { user_id, .. }
         | Event::UserBlockChanged { user_id, .. }
         | Event::ModerationApplied { user_id, .. }
@@ -2251,6 +2259,7 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
         Some(Event::ChannelJoined { transcription, .. }) => *transcription,
         Some(Event::ParticipantMuteChanged { muted, .. }) => *muted,
         Some(Event::ParticipantPriorityChanged { priority, .. }) => *priority,
+        Some(Event::ParticipantRoleChanged { admitted, .. }) => *admitted,
         Some(Event::DuckingChanged { active, .. }) => *active,
         Some(Event::ParticipantSpeaking { speaking, .. }) => *speaking,
         Some(Event::LocalSpeaking(s)) => *s,
@@ -2892,6 +2901,9 @@ pub struct AurixChannelInfo {
     pub priority: bool,
     /// Priority-speaker ducking the server applies (`enabled == false`: off).
     pub ducking: AurixDucking,
+    /// Our grant allows speaking but every speaker slot is taken: `role` is
+    /// `AurixRoleListener` until an `AurixEventParticipantRoleChanged` promotes us.
+    pub waiting_to_speak: bool,
 }
 
 /// Priority-speaker ducking (`ChannelConfig.ducking`): while a priority speaker talks, every
@@ -2935,6 +2947,7 @@ impl Default for AurixChannelInfo {
             transcription: false,
             safety_voice: false,
             priority: false,
+            waiting_to_speak: false,
             ducking: AurixDucking::default(),
         }
     }
@@ -2963,6 +2976,7 @@ pub unsafe extern "C" fn aurix_client_channel_info(
                         transcription: c.channel_transcribes(id),
                         safety_voice: c.channel_monitored(id),
                         priority: c.is_priority(id),
+                        waiting_to_speak: c.is_waiting_to_speak(id),
                         ducking: c.channel_ducking(id).into(),
                     };
                     true
@@ -2987,6 +3001,7 @@ pub unsafe extern "C" fn aurix_event_channel_info(event: *const AurixEvent) -> A
             safety_voice,
             ducking,
             priority,
+            waiting_to_speak,
             ..
         }) => AurixChannelInfo {
             role: (*role).into(),
@@ -2995,9 +3010,20 @@ pub unsafe extern "C" fn aurix_event_channel_info(event: *const AurixEvent) -> A
             transcription: *transcription,
             safety_voice: *safety_voice,
             priority: *priority,
+            waiting_to_speak: *waiting_to_speak,
             ducking: (*ducking).into(),
         },
         _ => AurixChannelInfo::default(),
+    }
+}
+
+/// `ParticipantRoleChanged` only: the member's effective role now (`AurixRoleListener` for
+/// other events).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_event_role(event: *const AurixEvent) -> AurixRole {
+    match self::event(event).map(|e| &e.event) {
+        Some(Event::ParticipantRoleChanged { role, .. }) => (*role).into(),
+        _ => AurixRole::AurixRoleListener,
     }
 }
 
@@ -6383,6 +6409,7 @@ mod tests {
             hidden_listeners: true,
             ducking: None,
             priority: false,
+            waiting_to_speak: false,
         })));
         let other = Box::into_raw(Box::new(AurixEvent::new(Event::ChannelLeft { channel_id })));
         unsafe {

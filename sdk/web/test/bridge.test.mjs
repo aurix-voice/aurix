@@ -312,11 +312,13 @@ test('priority/ducking, voice effects and visemes are mapped; viseme frames are 
 
   const cfg = { gain: 0.3, attackMs: 40, releaseMs: 300, holdMs: 200, moderators: true };
   client.emit('participantPriorityChanged', 'raid', 'bob', true);
+  client.emit('participantRoleChanged', 'raid', 'bob', 'listener', false);
   client.emit('duckingChanged', 'raid', true, cfg);
   client.emit('participantVisemes', 'alice', { dominant: 'OH', mouthOpen: 0.5, sequence: 9 });
   client.emit('localVisemes', { dominant: 'E', mouthOpen: 0.2, sequence: 1 });
   assert.deepEqual(drain(bridge, handle), [
     { type: 'participantPriorityChanged', channelId: 'raid', userId: 'bob', priority: true },
+    { type: 'participantRoleChanged', channelId: 'raid', userId: 'bob', role: 'listener', admitted: false },
     { type: 'duckingChanged', channelId: 'raid', active: true, config: cfg },
   ]);
 

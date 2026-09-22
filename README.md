@@ -972,8 +972,11 @@ A channel with thousands of members costs what its *speakers* cost. `ChannelConf
 member whose grant says `speak: false` joins as a **listener** (`ChannelJoinAck.role`): the node
 drops its audio, it takes no `max_speakers` slot, and with `hide_listeners` it is absent from
 rosters and presence events while still counted in `ChannelJoinAck.participant_count`
-(`hidden_listeners: true` tells the client the roster is partial). `max_speakers` refuses further
-speaking joins with `CHANNEL_FULL`. `max_streams` caps how many voices *each receiver* hears:
+(`hidden_listeners: true` tells the client the roster is partial). `max_speakers` caps who
+speaks at once; `speaker_admission` says what a further speaker gets — `reject` (`CHANNEL_FULL`),
+`wait` (joins as an effective listener, `waiting_to_speak`, admitted when a slot frees) or
+`demote` (idle plain speakers yield their slot to members trying to speak; priority speakers,
+moderators and administrators are never demoted; `RoleChanged` tells everyone). `max_streams` caps how many voices *each receiver* hears:
 the ranking is receiver-specific — its mutes, blocks, volumes, focus, positional attenuation and
 the sender-reported level — with sticky slots and stale-voice cleanup, so a cap of 4 means "the
 4 voices this player should hear", not a channel-wide list; it applies before per-speaker
@@ -1224,8 +1227,9 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
   WebTransport sessions have no 0-RTT or migration.
 * Server-side mixing for native clients bypasses E2EE frames (they stay per-speaker), costs the
   node one Opus decode per selected speaker plus one stereo encode per mixer, and is capped at
-  `MAX_MIXERS` (8192) per node; a channel's speaker admission (`max_speakers`) is enforced at
-  join time, not by demoting active speakers.
+  `MAX_MIXERS` (8192) per node; speaker demotion (`speaker_admission = "demote"`) goes by
+  silence and sender-reported level, not by server-side voice analysis, and the speaker count is
+  per node plus what the cascade has propagated.
 * The Unreal plugin has not been compiled against a real engine install yet (none is available
   in the development environment); the first build in your project is the verification step.
   The protocol is documented in `crates/aurix-common/src/protocol.rs`.

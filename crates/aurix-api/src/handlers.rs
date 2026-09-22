@@ -822,6 +822,7 @@ pub async fn get_channel_participants(
                 "is_muted": m.is_muted,
                 "is_server_muted": m.is_server_muted,
                 "is_priority": m.is_priority,
+                "waiting_to_speak": m.waiting_to_speak,
                 "ssrc": m.ssrc,
                 "joined_at": m.joined_at,
             })

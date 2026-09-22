@@ -1159,12 +1159,12 @@ pub async fn add_channel_member(
     m: &ChannelMembershipRow,
 ) -> Result<ChannelMembershipRow, sqlx::Error> {
     sqlx::query_as::<_, ChannelMembershipRow>(
-        r#"INSERT INTO channel_memberships (id, channel_id, user_id, session_id, role, is_muted, is_server_muted, is_priority, ssrc, joined_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *"#
+        r#"INSERT INTO channel_memberships (id, channel_id, user_id, session_id, role, is_muted, is_server_muted, is_priority, waiting_to_speak, ssrc, joined_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *"#
     )
     .bind(m.id).bind(m.channel_id).bind(m.user_id).bind(m.session_id)
     .bind(&m.role).bind(m.is_muted).bind(m.is_server_muted).bind(m.is_priority)
-    .bind(m.ssrc).bind(m.joined_at)
+    .bind(m.waiting_to_speak).bind(m.ssrc).bind(m.joined_at)
     .fetch_one(pool).await
 }
 
@@ -1240,7 +1240,7 @@ pub async fn get_channel_roster(
 ) -> Result<Vec<ChannelRosterRow>, sqlx::Error> {
     sqlx::query_as::<_, ChannelRosterRow>(
         r#"SELECT m.user_id, m.session_id, s.media_node_id, u.display_name, m.role,
-                  m.is_muted, m.is_server_muted, m.is_priority, m.ssrc
+                  m.is_muted, m.is_server_muted, m.is_priority, m.waiting_to_speak, m.ssrc
            FROM channel_memberships m
            JOIN channels c ON c.id = m.channel_id
            JOIN sessions s ON s.id = m.session_id
@@ -1285,6 +1285,25 @@ pub async fn set_membership_priority(
            WHERE c.id = m.channel_id AND c.app_id = $1 AND m.channel_id = $2 AND m.user_id = $3 AND m.left_at IS NULL"#
     )
     .bind(app_id).bind(channel_id).bind(user_id).bind(priority)
+    .execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
+/// Marks the user's open memberships in the channel as holding (or waiting for) a speaker
+/// slot.
+pub async fn set_membership_waiting_to_speak(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+    user_id: Uuid,
+    waiting: bool,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE channel_memberships m SET waiting_to_speak = $4
+           FROM channels c
+           WHERE c.id = m.channel_id AND c.app_id = $1 AND m.channel_id = $2 AND m.user_id = $3 AND m.left_at IS NULL"#
+    )
+    .bind(app_id).bind(channel_id).bind(user_id).bind(waiting)
     .execute(pool).await?;
     Ok(r.rows_affected())
 }

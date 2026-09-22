@@ -460,8 +460,18 @@ export interface ChannelScope {
  * metadata). Older servers omit the fields; the defaults below then apply.
  */
 export interface ChannelInfo {
-  /** Our role; `listener` means receive-only — `unmute()` / speaking has no effect there. */
+  /**
+   * Our *effective* role; `listener` means receive-only — `unmute()` / speaking has no effect
+   * there. Under `audience.speaker_admission` it may differ from the grant: see
+   * {@link ChannelInfo.waitingToSpeak}.
+   */
   role: ChannelRole;
+  /**
+   * We hold a speaking grant but every `audience.max_speakers` slot is taken (or an idle
+   * speaker slot was taken from us); `role` is `listener` until the server admits us again,
+   * which {@link AurixEvents.participantRoleChanged} reports.
+   */
+  waitingToSpeak: boolean;
   /**
    * Members across all nodes, including listeners hidden from the roster by
    * `ChannelConfig.audience.hide_listeners` (so it may exceed the roster size).
@@ -535,6 +545,7 @@ export function channelInfoFromJoinAck(
 ): ChannelInfo {
   const info: ChannelInfo = {
     role: d.role ?? 'speaker',
+    waitingToSpeak: d.waiting_to_speak === true,
     participantCount:
       typeof d.participant_count === 'number' ? d.participant_count : d.participants.length,
     hiddenListeners: d.hidden_listeners === true,
@@ -833,6 +844,19 @@ export interface AurixEvents {
    * are updated before the event fires.
    */
   participantPriorityChanged: (channelId: string, userId: string, priority: boolean) => void;
+  /**
+   * A member's *effective* role changed under `audience.speaker_admission` — including this
+   * user's: `admitted` is `true` when it got its granted role (a speaker slot) back, `false`
+   * when an idle speaker slot was taken from it (its audio is dropped meanwhile). The grant
+   * itself is unchanged. `Participant.role` / `ChannelInfo.role` / `.waitingToSpeak` are
+   * updated before the event fires.
+   */
+  participantRoleChanged: (
+    channelId: string,
+    userId: string,
+    role: ChannelRole,
+    admitted: boolean,
+  ) => void;
   /**
    * Game-audio ducking hook: another member's priority speech started (`true`) or stopped
    * (`false`, after the channel's `holdMs`) ducking `channelId`. Fires on transitions only;
@@ -2982,6 +3006,14 @@ export class AurixClient {
     return info !== undefined && info.role !== 'listener';
   }
 
+  /**
+   * Whether we hold a speaking grant in `channelId` but wait for an `audience.max_speakers`
+   * slot (see {@link ChannelInfo.waitingToSpeak}); `false` for channels we have not joined.
+   */
+  isWaitingToSpeak(channelId: string): boolean {
+    return this.channelInfos.get(channelId)?.waitingToSpeak === true;
+  }
+
   /** Whether this client currently receives `transcript` events (default `true`). */
   get transcriptsEnabled(): boolean {
     return this.wantTranscripts;
@@ -3893,6 +3925,28 @@ export class AurixClient {
             this.refreshDucking(d.channel_id);
           }
         }
+        return;
+      }
+      case 'RoleChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'RoleChanged' }>).data;
+        if (!this.channels.has(d.channel_id)) return;
+        const p = this.channels.get(d.channel_id)?.get(d.user_id);
+        if (p) p.role = d.role;
+        if (d.user_id === this.userId) {
+          const info = this.channelInfos.get(d.channel_id);
+          if (info) {
+            info.role = d.role;
+            info.waitingToSpeak = d.role === 'listener';
+          }
+        }
+        this.renderParticipants();
+        this.emit(
+          'participantRoleChanged',
+          d.channel_id,
+          d.user_id,
+          d.role,
+          d.reason === 'speaker_admitted',
+        );
         return;
       }
       case 'PriorityChanged': {

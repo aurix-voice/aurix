@@ -58,6 +58,7 @@ signal participant_left(channel_id: String, user_id: String)
 signal participant_mute_changed(channel_id: String, user_id: String, muted: bool, server_muted: bool)
 signal participant_speaking(channel_id: String, user_id: String, speaking: bool)
 signal participant_priority_changed(channel_id: String, user_id: String, priority: bool)
+signal participant_role_changed(channel_id: String, user_id: String, role: int, admitted: bool)
 signal ducking_changed(channel_id: String, active: bool, ducking: Dictionary)
 signal channel_energy(channel_id: String, levels: Dictionary)
 signal local_speaking(speaking: bool)
@@ -354,6 +355,10 @@ func get_channel_info(channel_id: String) -> Dictionary:
 
 func can_speak_in(channel_id: String) -> bool:
 	return _value(_invoke("canSpeakIn", {"channelId": channel_id}), false) == true
+
+
+func is_waiting_to_speak(channel_id: String) -> bool:
+	return _value(_invoke("isWaitingToSpeak", {"channelId": channel_id}), false) == true
 
 
 func channel_transcribes(channel_id: String) -> bool:
@@ -1129,6 +1134,17 @@ func _dispatch(e: Dictionary) -> void:
 			var priority: bool = e.get("priority", false) == true
 			_patch(channel_id, user_id, "priority", priority)
 			participant_priority_changed.emit(channel_id, user_id, priority)
+		"participantRoleChanged":
+			var channel_id := _str(e.get("channelId"))
+			var user_id := _str(e.get("userId"))
+			var role := _role(e.get("role", "speaker"))
+			var admitted: bool = e.get("admitted", false) == true
+			_patch(channel_id, user_id, "role", role)
+			if _channel_info.has(channel_id) and user_id == _str(_session.get("user_id")):
+				var info: Dictionary = _channel_info[channel_id]
+				info["role"] = role
+				info["waiting_to_speak"] = role == ROLE_LISTENER
+			participant_role_changed.emit(channel_id, user_id, role, admitted)
 		"duckingChanged":
 			ducking_changed.emit(_str(e.get("channelId")), e.get("active", false) == true, _ducking(e.get("config")))
 		"participantStreams":
@@ -1476,6 +1492,7 @@ static func _channel_info_dict(v: Variant) -> Dictionary:
 		"transcription": c.get("transcription", false) == true,
 		"safety_voice": c.get("safetyVoice", false) == true,
 		"priority": c.get("priority", false) == true,
+		"waiting_to_speak": c.get("waitingToSpeak", false) == true,
 		"ducking": _ducking(c.get("ducking")),
 	}
 

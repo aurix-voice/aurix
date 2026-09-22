@@ -154,9 +154,13 @@ the chapter that explains the boundary.
 * **The native server mix is per hop, not end-to-end.** `E2ee` frames cannot enter a mix and
   keep arriving as separate streams even in `mixed` downlink mode; a mix costs the node one Opus
   decode per selected speaker plus one stereo encode per mixer, capped at `MAX_MIXERS` (8192)
-  per node. `audience.max_speakers` is enforced when a speaker joins — nobody is demoted once
-  admitted — and `max_streams` ranks by receiver gains and sender-reported level, not by
-  server-side voice analysis ([Large channels](features/channels.md#large-channels-and-audiences)).
+  per node. `audience.max_speakers` with `speaker_admission = "demote"` rotates slots on
+  *silence* (`demote_idle_ms` without an audible frame) and on the level the sender reports, not
+  on server-side voice analysis, and only among plain speakers (priority speakers, moderators and
+  administrators are never demoted); the count is per node plus what the cascade has propagated,
+  so two nodes admitting the last slot within the propagation delay can briefly exceed the cap.
+  `max_streams` likewise ranks by receiver gains and sender-reported level
+  ([Large channels](features/channels.md#large-channels-and-audiences)).
 * **Cascade plans on RTT and reachability, not bandwidth.** `region_tree` elects hubs per
   channel from the registry and the measured link table (RTT, UDP/TCP, blocked pairs) and grows
   a core-hub level or an in-region star where a direct link is blocked, capped at

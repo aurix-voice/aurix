@@ -44,6 +44,7 @@ namespace Aurix
         event Action<Guid, string> OnKicked;
         event Action<Guid, bool> OnUserBlockChanged;
         event Action<Guid, Guid, bool> OnParticipantPriorityChanged;
+        event Action<Guid, Guid, ChannelRole, bool> OnParticipantRoleChanged;
         event Action<Guid, bool, DuckingConfig> OnDuckingChanged;
         event Action<TransmissionMode> OnTransmissionChanged;
         event Action<Guid?> OnChannelFocusChanged;
@@ -105,6 +106,7 @@ namespace Aurix
         ChannelInfo? GetChannelInfo(Guid channelId);
         ChannelScope? GetChannelScope(Guid channelId);
         bool CanSpeakIn(Guid channelId);
+        bool IsWaitingToSpeak(Guid channelId);
         bool IsChannelTranscribed(Guid channelId);
         bool IsChannelMonitored(Guid channelId);
         Task SetTranscriptsAsync(bool enabled, CancellationToken ct = default);

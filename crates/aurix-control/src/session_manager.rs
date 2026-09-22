@@ -149,6 +149,7 @@ impl SessionManager {
         .map_err(|e| AurixError::Database(format!("Session quality query failed: {e}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_channel_membership(
         &self,
         channel_id: ChannelId,
@@ -157,6 +158,7 @@ impl SessionManager {
         role: ChannelRole,
         ssrc: u32,
         priority: bool,
+        waiting_to_speak: bool,
     ) -> Result<ChannelMembershipRow> {
         let row = ChannelMembershipRow {
             id: Uuid::now_v7(),
@@ -167,6 +169,7 @@ impl SessionManager {
             is_muted: false,
             is_server_muted: false,
             is_priority: priority,
+            waiting_to_speak,
             ssrc: ssrc as i64,
             joined_at: Utc::now(),
             left_at: None,
@@ -204,6 +207,25 @@ impl SessionManager {
         )
         .await
         .map_err(|e| AurixError::Database(format!("Membership priority update failed: {e}")))
+    }
+
+    /// Persists whether the user's open memberships in the channel wait for a speaker slot.
+    pub async fn set_membership_waiting_to_speak(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        waiting: bool,
+    ) -> Result<u64> {
+        aurix_db::queries::set_membership_waiting_to_speak(
+            &self.pool,
+            app_id.0,
+            channel_id.0,
+            user_id.0,
+            waiting,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Membership admission update failed: {e}")))
     }
 
     pub async fn remove_user_from_channel(

@@ -80,6 +80,10 @@ pub struct ChannelMembershipRow {
     pub is_server_muted: bool,
     #[sqlx(default)]
     pub is_priority: bool,
+    /// The grant in `role` allows speaking but the member holds no speaker slot
+    /// (`AudienceConfig::speaker_admission`).
+    #[sqlx(default)]
+    pub waiting_to_speak: bool,
     pub ssrc: i64,
     pub joined_at: DateTime<Utc>,
     pub left_at: Option<DateTime<Utc>>,
@@ -95,6 +99,7 @@ pub struct ChannelRosterRow {
     pub is_muted: bool,
     pub is_server_muted: bool,
     pub is_priority: bool,
+    pub waiting_to_speak: bool,
     pub ssrc: i64,
 }
 

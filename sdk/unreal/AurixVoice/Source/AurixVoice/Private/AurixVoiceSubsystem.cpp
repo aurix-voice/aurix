@@ -123,6 +123,7 @@ FAurixChannelInfo ToChannelInfo(const AurixChannelInfo& I)
 	Out.bTranscription = I.transcription;
 	Out.bSafetyVoice = I.safety_voice;
 	Out.bPriority = I.priority;
+	Out.bWaitingToSpeak = I.waiting_to_speak;
 	Out.Ducking = ToDucking(I.ducking);
 	return Out;
 }
@@ -964,6 +965,11 @@ bool UAurixVoiceSubsystem::GetChannelInfo(FGuid ChannelId, FAurixChannelInfo& Ou
 bool UAurixVoiceSubsystem::CanSpeakIn(FGuid ChannelId) const
 {
 	return Native && Native->Client.can_speak_in(ToUuid(ChannelId));
+}
+
+bool UAurixVoiceSubsystem::IsWaitingToSpeak(FGuid ChannelId) const
+{
+	return Native && Native->Client.waiting_to_speak(ToUuid(ChannelId));
 }
 
 bool UAurixVoiceSubsystem::GetUserForSsrc(int64 Ssrc, FGuid& OutUserId) const
@@ -2018,6 +2024,10 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_PARTICIPANT_PRIORITY_CHANGED:
 		OnParticipantPriorityChanged.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_PARTICIPANT_ROLE_CHANGED:
+		OnParticipantRoleChanged.Broadcast(ChannelId, UserId, ToRole(aurix_event_role(Raw)), aurix_event_flag(Raw));
 		break;
 
 	case AURIX_EVENT_DUCKING_CHANGED:

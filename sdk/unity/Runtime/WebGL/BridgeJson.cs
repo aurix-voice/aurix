@@ -139,6 +139,7 @@ namespace Aurix.WebGL
             return new ChannelInfo
             {
                 Role = ControlMessage.ParseRole(MiniJson.GetString(o, "role")),
+                WaitingToSpeak = MiniJson.GetBool(o, "waitingToSpeak"),
                 ParticipantCount = MiniJson.GetUInt32(o, "participantCount"),
                 HiddenListeners = MiniJson.GetBool(o, "hiddenListeners"),
                 Transcription = MiniJson.GetBool(o, "transcription"),

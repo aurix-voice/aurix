@@ -88,6 +88,7 @@ inline Dictionary channel_info_to_dict(const AurixChannelInfo& c) {
     d["transcription"] = c.transcription;
     d["safety_voice"] = c.safety_voice;
     d["priority"] = c.priority;
+    d["waiting_to_speak"] = c.waiting_to_speak;
     d["ducking"] = ducking_to_dict(c.ducking);
     return d;
 }

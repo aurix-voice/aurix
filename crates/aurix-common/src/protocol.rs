@@ -981,6 +981,11 @@ pub enum ControlMessage {
         /// You are a priority speaker in this channel.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         priority: bool,
+        /// Your grant allows speaking but every `audience.max_speakers` slot is held
+        /// (`speaker_admission` `wait`/`demote`): you are a listener until a `RoleChanged`
+        /// with reason `speaker_admitted` promotes you.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        waiting_to_speak: bool,
     },
     /// Server→client: an operator changed the channel's audio settings while you are in it.
     /// Carries the current priority-speaker `ducking` as well (`None`: off) so clients that
@@ -1026,6 +1031,16 @@ pub enum ControlMessage {
         channel_id: ChannelId,
         user_id: UserId,
         priority: bool,
+    },
+    /// Server→client: a member's effective role in the channel changed at runtime (speaker
+    /// slot admission, `audience.speaker_admission`). The member's grant is unchanged; a
+    /// demoted member is receive-only until admitted again. In channels hiding listeners,
+    /// other members see the transition as `ParticipantLeft` / `ParticipantJoined` instead.
+    RoleChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        role: ChannelRole,
+        reason: RoleChangeReason,
     },
     MuteStateChanged {
         channel_id: ChannelId,
@@ -1841,6 +1856,17 @@ pub struct UserPosition {
 
 fn default_participant_role() -> ChannelRole {
     ChannelRole::Speaker
+}
+
+/// Why a member's effective channel role changed (`ControlMessage::RoleChanged`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleChangeReason {
+    /// The member lost its speaker slot to another member (`speaker_admission = "demote"`)
+    /// and waits, as a listener, for the next free slot.
+    SpeakerDemoted,
+    /// A slot freed and the member, waiting with a speaking grant, got it back.
+    SpeakerAdmitted,
 }
 
 fn default_true() -> bool {

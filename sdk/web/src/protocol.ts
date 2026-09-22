@@ -328,8 +328,13 @@ export type ServerMessage =
         roster_radius?: number;
         /** Channel text reaches only members within this distance; absent = whole channel. */
         text_radius?: number;
-        /** Your role; `listener` = receive-only (absent on older servers = `speaker`). */
+        /** Your effective role; `listener` = receive-only (absent on older servers = `speaker`). */
         role?: ChannelRole;
+        /**
+         * You hold a speaking grant but every `audience.max_speakers` slot is taken; `role` is
+         * `listener` until a `RoleChanged` admits you.
+         */
+        waiting_to_speak?: boolean;
         /** Members across all nodes, including listeners hidden from `participants`. */
         participant_count?: number;
         /** Listeners are hidden from presence in this channel (`audience.hide_listeners`). */
@@ -360,6 +365,15 @@ export type ServerMessage =
     }
   | { type: 'ParticipantLeft'; data: { channel_id: string; user_id: string } }
   | { type: 'PriorityChanged'; data: { channel_id: string; user_id: string; priority: boolean } }
+  | {
+      type: 'RoleChanged';
+      data: {
+        channel_id: string;
+        user_id: string;
+        role: ChannelRole;
+        reason: 'speaker_demoted' | 'speaker_admitted';
+      };
+    }
   | {
       type: 'MuteStateChanged';
       data: { channel_id: string; user_id: string; muted: boolean; server_muted: boolean };

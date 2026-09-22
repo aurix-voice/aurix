@@ -344,6 +344,19 @@ namespace Aurix.Voice.Tests
             Assert.Equal(new[] { (Channel, Bob, true) }, priorityEvents);
             Assert.True(client.FindByUser(Bob).IsPriority);
 
+            var roleEvents = new List<(Guid, Guid, ChannelRole, bool)>();
+            client.OnParticipantRoleChanged += (c, u, r, a) => roleEvents.Add((c, u, r, a));
+            bridge.Emit("participantRoleChanged", ("channelId", Channel.ToString()), ("userId", Bob.ToString()), ("role", "listener"), ("admitted", false));
+            client.Update();
+            Assert.Equal(new[] { (Channel, Bob, ChannelRole.Listener, false) }, roleEvents);
+            Assert.Equal(ChannelRole.Listener, client.FindByUser(Bob).Role);
+            bridge.Replies["isWaitingToSpeak"] = (_, __) => "{\"ok\":true,\"value\":true}";
+            Assert.True(client.IsWaitingToSpeak(Channel));
+            Assert.Equal(Channel.ToString(), MiniJson.GetString(bridge.Last("isWaitingToSpeak").args, "channelId"));
+            bridge.Replies["channelInfo"] = (_, __) => "{\"ok\":true,\"value\":{\"role\":\"listener\",\"waitingToSpeak\":true,\"participantCount\":3,\"hiddenListeners\":false,\"transcription\":false,\"safetyVoice\":false,\"priority\":false}}";
+            var waitingInfo = client.GetChannelInfo(Channel);
+            Assert.True(waitingInfo.HasValue && waitingInfo.Value.WaitingToSpeak && waitingInfo.Value.Role == ChannelRole.Listener);
+
             bridge.Replies["isPriority"] = (_, __) => "{\"ok\":true,\"value\":true}";
             Assert.True(client.IsPriority(Channel));
             bridge.Replies["isDuckingActive"] = (_, __) => "{\"ok\":true,\"value\":true}";

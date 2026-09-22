@@ -1,6 +1,7 @@
 use crate::session::MediaSession;
 use aurix_common::error::AurixError;
 use aurix_common::types::*;
+use chrono::Utc;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::collections::HashSet;
@@ -10,6 +11,10 @@ use std::time::{Duration, Instant};
 
 /// A sender-reported level older than this no longer describes the frame being routed.
 const AMBIENT_LEVEL_STALE_MS: i64 = 500;
+
+/// A waiting member counts as wanting to speak while its last dropped uplink frame is at
+/// most this old (`speaker_admission = "demote"` rotation).
+const SPEAK_ATTEMPT_FRESH_MS: i64 = 1_000;
 
 /// How one receiver should hear a sender's frame: gain after channel routing, positional
 /// attenuation and the receiver's own preferences, plus where the sender is relative to the
@@ -75,11 +80,75 @@ pub struct RosterChange {
     pub visible: bool,
 }
 
+/// Outcome of [`MediaChannel::add_participant`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    /// The effective role the member entered with (`Listener` while it waits for a
+    /// speaker slot its grant entitles it to).
+    pub role: ChannelRole,
+    /// Whether the member is waiting for a speaker slot.
+    pub waiting: bool,
+    /// Speaker demoted to make room for the joiner (`speaker_admission = "demote"`).
+    pub demoted: Option<RoleChange>,
+}
+
+/// What the control plane knows about a joiner beyond its role.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JoinHints {
+    /// The grant makes the joiner a priority speaker (always gets a slot under
+    /// `speaker_admission = "demote"`, like moderators and administrators).
+    pub priority: bool,
+    /// Speakers on other nodes the channel has not learned about yet (the first local
+    /// joiner of a channel already live elsewhere); counted against `max_speakers`.
+    pub remote_speakers: u32,
+}
+
+/// One local member's effective role changed at runtime (speaker-slot admission).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleChange {
+    pub user_id: UserId,
+    pub session_id: SessionId,
+    pub role: ChannelRole,
+    /// Local members to tell (`None`: every member). A demotion lists those who saw the
+    /// member before it, an admission those who see it now (`roster_radius` scoping).
+    pub observers: Option<Vec<UserId>>,
+}
+
+/// Effective role of a local member next to the role its grant carries, with the
+/// bookkeeping the speaker-slot admission needs.
+#[derive(Debug, Clone, Copy)]
+struct LocalRole {
+    role: ChannelRole,
+    granted: ChannelRole,
+    /// When the member got its current speaker slot (join or admission), Unix ms.
+    slot_since_ms: i64,
+    /// Set while the member holds a speaking grant but no slot.
+    waiting_since: Option<Instant>,
+    /// Last uplink frame dropped because the member was waiting, Unix ms.
+    speak_attempt_ms: i64,
+}
+
+impl LocalRole {
+    fn wants_slot(&self) -> bool {
+        self.waiting_since.is_some() && self.granted.can_speak()
+    }
+}
+
 fn pair(a: UserId, b: UserId) -> (UserId, UserId) {
     if a.0 <= b.0 {
         (a, b)
     } else {
         (b, a)
+    }
+}
+
+/// Silence a speaker must have shown before it yields its slot to `privileged` (priority
+/// speakers, moderators, administrators) or ordinary waiting members.
+fn demote_idle_for(privileged: bool, audience: &AudienceConfig) -> i64 {
+    if privileged {
+        0
+    } else {
+        audience.demote_idle_ms as i64
     }
 }
 
@@ -162,7 +231,7 @@ pub struct MediaChannel {
     /// Current configuration; operator edits are applied live via [`MediaChannel::update_config`].
     config: RwLock<ChannelConfig>,
     participants: DashMap<UserId, Arc<MediaSession>>,
-    participant_roles: DashMap<UserId, ChannelRole>,
+    participant_roles: DashMap<UserId, LocalRole>,
     /// Local members that are priority speakers (grant or runtime promotion).
     priority: DashMap<UserId, ()>,
     ducking: Mutex<DuckEnvelope>,
@@ -170,6 +239,9 @@ pub struct MediaChannel {
     participant_count: AtomicU32,
     /// Local members whose role may speak (`audience.max_speakers` admission).
     local_speakers: AtomicU32,
+    /// Serializes speaker-slot decisions (admission, demotion, promotion) so two joins
+    /// cannot both take the last slot or demote the same speaker.
+    admission: Mutex<()>,
     /// Members hosted on other nodes of the cascade.
     remote: DashMap<UserId, RemoteParticipant>,
     /// Poses of local and remote members (remote ones arrive over the event bus).
@@ -193,6 +265,7 @@ impl MediaChannel {
             ssrc_map: DashMap::new(),
             participant_count: AtomicU32::new(0),
             local_speakers: AtomicU32::new(0),
+            admission: Mutex::new(()),
             remote: DashMap::new(),
             positions: DashMap::new(),
             visible: RwLock::new(HashSet::new()),
@@ -222,7 +295,19 @@ impl MediaChannel {
         &self,
         session: Arc<MediaSession>,
         role: ChannelRole,
-    ) -> Result<(), AurixError> {
+    ) -> Result<Admission, AurixError> {
+        self.add_participant_with(session, role, JoinHints::default())
+    }
+
+    /// Adds a local member with the role its grant carries. Whether it may actually speak
+    /// right away depends on `audience.max_speakers` / `speaker_admission`; the returned
+    /// [`Admission`] says what happened.
+    pub fn add_participant_with(
+        &self,
+        session: Arc<MediaSession>,
+        role: ChannelRole,
+        hints: JoinHints,
+    ) -> Result<Admission, AurixError> {
         if session.app_id != self.app_id {
             return Err(AurixError::AuthorizationDenied(
                 "Session belongs to a different application".into(),
@@ -233,34 +318,10 @@ impl MediaChannel {
             self.remove_participant(&session.user_id);
         }
         // Reserve a slot atomically so concurrent joins cannot exceed max_participants.
-        let (max, max_speakers) = {
+        let (max, audience) = {
             let cfg = self.config.read();
-            (
-                cfg.max_participants,
-                cfg.audience.map(|a| a.max_speakers).unwrap_or(0),
-            )
+            (cfg.max_participants, cfg.audience.unwrap_or_default())
         };
-        // Speaker slots are reserved the same way (remote speakers count against the cap
-        // as last seen; two nodes admitting the last slot at once is bounded by the
-        // cascade's propagation delay).
-        if role.can_speak() {
-            let remote_speakers = self.remote.iter().filter(|r| r.role.can_speak()).count() as u32;
-            let reserved =
-                self.local_speakers
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                        if max_speakers > 0 && c.saturating_add(remote_speakers) >= max_speakers {
-                            None
-                        } else {
-                            Some(c + 1)
-                        }
-                    });
-            if reserved.is_err() {
-                return Err(AurixError::ChannelFull(format!(
-                    "Channel {} has no speaker slot left ({max_speakers} speakers)",
-                    self.channel_id
-                )));
-            }
-        }
         let reserved =
             self.participant_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
@@ -271,28 +332,277 @@ impl MediaChannel {
                     }
                 });
         if reserved.is_err() {
-            if role.can_speak() {
-                self.local_speakers.fetch_sub(1, Ordering::AcqRel);
-            }
             return Err(AurixError::ChannelFull(format!(
                 "Channel {} full ({}/{})",
                 self.channel_id, max, max
             )));
         }
+        let now_ms = Utc::now().timestamp_millis();
+        let mut local = LocalRole {
+            role,
+            granted: role,
+            slot_since_ms: now_ms,
+            waiting_since: None,
+            speak_attempt_ms: 0,
+        };
+        let mut demoted = None;
+        // Speaker slots are handed out under the admission lock (remote speakers count
+        // against the cap as last seen; two nodes admitting the last slot at once is bounded
+        // by the cascade's propagation delay).
+        if role.can_speak() {
+            let _slots = self.admission.lock();
+            let max_speakers = audience.max_speakers;
+            let remote = if self.remote.is_empty() {
+                hints.remote_speakers
+            } else {
+                self.remote_speakers_except(&session.user_id)
+            };
+            let held = self.local_speakers.load(Ordering::Acquire) + remote;
+            if max_speakers > 0 && held >= max_speakers {
+                let idle_victim = match audience.speaker_admission {
+                    SpeakerAdmission::Reject => {
+                        self.participant_count.fetch_sub(1, Ordering::AcqRel);
+                        return Err(AurixError::ChannelFull(format!(
+                            "Channel {} has no speaker slot left ({max_speakers} speakers)",
+                            self.channel_id
+                        )));
+                    }
+                    SpeakerAdmission::Wait => None,
+                    SpeakerAdmission::Demote => self.idle_speaker(
+                        now_ms,
+                        demote_idle_for(hints.priority || role.can_moderate(), &audience),
+                    ),
+                };
+                match idle_victim {
+                    Some(victim) => {
+                        demoted = self.demote_locked_announced(&victim);
+                    }
+                    None => {
+                        local.role = ChannelRole::Listener;
+                        local.waiting_since = Some(Instant::now());
+                    }
+                }
+            }
+            if local.role.can_speak() {
+                self.local_speakers.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         self.ssrc_map.insert(session.ssrc, session.user_id);
-        self.participant_roles.insert(session.user_id, role);
-        self.priority.remove(&session.user_id);
+        self.participant_roles.insert(session.user_id, local);
+        if hints.priority {
+            self.priority.insert(session.user_id, ());
+        } else {
+            self.priority.remove(&session.user_id);
+        }
         self.remote.remove(&session.user_id);
         self.participants.insert(session.user_id, session);
-        Ok(())
+        Ok(Admission {
+            role: local.role,
+            waiting: local.waiting_since.is_some(),
+            demoted,
+        })
+    }
+
+    fn remote_speakers_except(&self, user_id: &UserId) -> u32 {
+        self.remote
+            .iter()
+            .filter(|r| r.key() != user_id && r.role.can_speak())
+            .count() as u32
+    }
+
+    /// The local speaker to demote, if any: a plain speaker (moderators, administrators and
+    /// priority speakers are exempt) silent for at least `idle_ms` since its last audible
+    /// frame or since it got the slot — the longest silent first, the quietest among equals,
+    /// then by id. Caller holds the admission lock.
+    fn idle_speaker(&self, now_ms: i64, idle_ms: i64) -> Option<UserId> {
+        self.participant_roles
+            .iter()
+            .filter(|e| e.value().role == ChannelRole::Speaker)
+            .filter(|e| !self.priority.contains_key(e.key()))
+            .filter_map(|e| {
+                let session = self.participants.get(e.key())?;
+                let last = session
+                    .last_audio_at_ms
+                    .load(Ordering::Relaxed)
+                    .max(e.value().slot_since_ms);
+                let idle = now_ms - last;
+                (idle >= idle_ms).then(|| {
+                    (
+                        idle,
+                        session.current_audio_level(AMBIENT_LEVEL_STALE_MS),
+                        *e.key(),
+                    )
+                })
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2 .0.cmp(&a.2 .0)))
+            .map(|(_, _, uid)| uid)
+    }
+
+    /// Takes the speaker slot away from a local speaker (caller holds the admission lock).
+    fn demote_locked(&self, user_id: &UserId) {
+        if let Some(mut r) = self.participant_roles.get_mut(user_id) {
+            if r.role.can_speak() {
+                self.local_speakers.fetch_sub(1, Ordering::AcqRel);
+            }
+            r.role = ChannelRole::Listener;
+            r.waiting_since = Some(Instant::now());
+            r.speak_attempt_ms = 0;
+        }
+    }
+
+    /// Gives a waiting local member its granted role (caller holds the admission lock).
+    fn admit_locked(&self, user_id: &UserId, now_ms: i64) {
+        if let Some(mut r) = self.participant_roles.get_mut(user_id) {
+            if !r.role.can_speak() && r.granted.can_speak() {
+                self.local_speakers.fetch_add(1, Ordering::AcqRel);
+            }
+            r.role = r.granted;
+            r.slot_since_ms = now_ms;
+            r.waiting_since = None;
+            r.speak_attempt_ms = 0;
+        }
+    }
+
+    /// Local members waiting for a speaker slot, in admission order: priority speakers and
+    /// moderators first, then by how long they have waited, then by id. Caller holds the
+    /// admission lock.
+    fn waiting_queue(&self, wanting_only: bool, now_ms: i64) -> Vec<UserId> {
+        let mut queue: Vec<(bool, Instant, UserId)> = self
+            .participant_roles
+            .iter()
+            .filter(|e| e.value().wants_slot())
+            .filter(|e| {
+                !wanting_only || now_ms - e.value().speak_attempt_ms <= SPEAK_ATTEMPT_FRESH_MS
+            })
+            .map(|e| {
+                (
+                    !(self.priority.contains_key(e.key()) || e.value().granted.can_moderate()),
+                    e.value().waiting_since.unwrap_or_else(Instant::now),
+                    *e.key(),
+                )
+            })
+            .collect();
+        queue.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2 .0.cmp(&b.2 .0)));
+        queue.into_iter().map(|(_, _, uid)| uid).collect()
+    }
+
+    fn role_change(&self, user_id: &UserId, observers: Option<Vec<UserId>>) -> Option<RoleChange> {
+        let session = self.participants.get(user_id)?;
+        Some(RoleChange {
+            user_id: *user_id,
+            session_id: session.session_id,
+            role: self.get_role(user_id),
+            observers,
+        })
+    }
+
+    /// Demotes `victim` and describes the change (caller holds the admission lock).
+    fn demote_locked_announced(&self, victim: &UserId) -> Option<RoleChange> {
+        let observers = self.observers_of(victim);
+        self.demote_locked(victim);
+        self.role_change(victim, observers)
+    }
+
+    fn admit_locked_announced(&self, user_id: &UserId, now_ms: i64) -> Option<RoleChange> {
+        self.admit_locked(user_id, now_ms);
+        let observers = self.observers_of(user_id);
+        self.role_change(user_id, observers)
+    }
+
+    /// Hands free speaker slots to waiting local members (after a speaker left, a remote
+    /// speaker went away or the cap was raised). Returns the members admitted.
+    pub fn admit_waiting(&self) -> Vec<RoleChange> {
+        let _slots = self.admission.lock();
+        let max_speakers = self
+            .config
+            .read()
+            .audience
+            .map(|a| a.max_speakers)
+            .unwrap_or(0);
+        let now_ms = Utc::now().timestamp_millis();
+        let queue = self.waiting_queue(false, now_ms);
+        let mut admitted = Vec::new();
+        for uid in queue {
+            if max_speakers > 0 && self.speaker_count() >= max_speakers {
+                break;
+            }
+            admitted.extend(self.admit_locked_announced(&uid, now_ms));
+        }
+        admitted
+    }
+
+    /// `speaker_admission = "demote"`: while members that are trying to speak wait for a slot,
+    /// idle speakers yield theirs. Returns the changes in pairs (demoted, then admitted).
+    pub fn rotate_idle_speakers(&self) -> Vec<RoleChange> {
+        let Some(audience) = self.config.read().audience else {
+            return Vec::new();
+        };
+        if audience.speaker_admission != SpeakerAdmission::Demote || audience.max_speakers == 0 {
+            return Vec::new();
+        }
+        let _slots = self.admission.lock();
+        let now_ms = Utc::now().timestamp_millis();
+        let mut changes = Vec::new();
+        for waiting in self.waiting_queue(true, now_ms) {
+            if self.speaker_count() < audience.max_speakers {
+                changes.extend(self.admit_locked_announced(&waiting, now_ms));
+                continue;
+            }
+            let privileged = self.priority.contains_key(&waiting)
+                || self
+                    .participant_roles
+                    .get(&waiting)
+                    .is_some_and(|r| r.granted.can_moderate());
+            let Some(victim) = self.idle_speaker(now_ms, demote_idle_for(privileged, &audience))
+            else {
+                break;
+            };
+            changes.extend(self.demote_locked_announced(&victim));
+            changes.extend(self.admit_locked_announced(&waiting, now_ms));
+        }
+        changes
+    }
+
+    /// Records that a waiting member tried to send audio (the frame was dropped); such
+    /// members are the ones an idle speaker yields to.
+    pub fn note_speak_attempt(&self, user_id: &UserId) {
+        if let Some(mut r) = self.participant_roles.get_mut(user_id) {
+            if r.wants_slot() {
+                r.speak_attempt_ms = Utc::now().timestamp_millis();
+            }
+        }
+    }
+
+    /// Whether a local member holds a speaking grant but no speaker slot.
+    pub fn is_waiting_to_speak(&self, user_id: &UserId) -> bool {
+        self.participant_roles
+            .get(user_id)
+            .is_some_and(|r| r.wants_slot())
+    }
+
+    /// The role a local member's grant carries (its effective role is [`MediaChannel::get_role`]).
+    pub fn granted_role(&self, user_id: &UserId) -> Option<ChannelRole> {
+        self.participant_roles.get(user_id).map(|r| r.granted)
+    }
+
+    /// Updates the effective role of a member hosted on another node. Returns `false` when
+    /// they are unknown here.
+    pub fn set_remote_role(&self, user_id: &UserId, role: ChannelRole) -> bool {
+        match self.remote.get_mut(user_id) {
+            Some(mut r) => {
+                r.role = role;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn remove_participant(&self, user_id: &UserId) -> Option<Arc<MediaSession>> {
         if let Some((_, session)) = self.participants.remove(user_id) {
             self.ssrc_map.remove(&session.ssrc);
             self.priority.remove(user_id);
-            if let Some((_, role)) = self.participant_roles.remove(user_id) {
-                if role.can_speak() {
+            if let Some((_, local)) = self.participant_roles.remove(user_id) {
+                if local.role.can_speak() {
                     self.local_speakers.fetch_sub(1, Ordering::AcqRel);
                 }
             }
@@ -430,7 +740,7 @@ impl MediaChannel {
     /// Role of a current member, local or remote (`None`: not in the channel).
     pub fn member_role(&self, user_id: &UserId) -> Option<ChannelRole> {
         if let Some(r) = self.participant_roles.get(user_id) {
-            return Some(*r.value());
+            return Some(r.value().role);
         }
         self.remote.get(user_id).map(|r| r.role)
     }
@@ -887,7 +1197,7 @@ impl MediaChannel {
     pub fn get_role(&self, user_id: &UserId) -> ChannelRole {
         self.participant_roles
             .get(user_id)
-            .map(|r| *r.value())
+            .map(|r| r.value().role)
             .unwrap_or(ChannelRole::Listener)
     }
 
@@ -2282,5 +2592,357 @@ mod tests {
             hears(&remote.get_receivers_for_audio(6), &listener),
             Some(0.25)
         );
+    }
+
+    fn capped(app: AppId, max_speakers: u32, admission: SpeakerAdmission) -> MediaChannel {
+        MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                audience: Some(AudienceConfig {
+                    hide_listeners: false,
+                    max_speakers,
+                    speaker_admission: admission,
+                    demote_idle_ms: 50,
+                    ..AudienceConfig::default()
+                }),
+                ..ChannelConfig::default()
+            },
+        )
+    }
+
+    fn remote(role: ChannelRole) -> RemoteParticipant {
+        RemoteParticipant {
+            session_id: SessionId::new(),
+            display_name: "remote".into(),
+            ssrc: 900,
+            role,
+            is_muted: false,
+            is_priority: false,
+        }
+    }
+
+    fn speak(session: &MediaSession, level: u8) {
+        session.record_audio_level(Some(level), 0.0);
+    }
+
+    #[test]
+    fn speaker_cap_rejects_waits_or_admits_by_policy() {
+        let app = AppId::new();
+        for admission in [SpeakerAdmission::Reject, SpeakerAdmission::Wait] {
+            let ch = capped(app, 1, admission);
+            let first = session(app, 1);
+            let second = session(app, 2);
+            let listener = session(app, 3);
+            let a = ch
+                .add_participant(first.clone(), ChannelRole::Speaker)
+                .unwrap();
+            assert_eq!(
+                (a.role, a.waiting, a.demoted),
+                (ChannelRole::Speaker, false, None)
+            );
+            // Listeners never compete for speaker slots.
+            let l = ch
+                .add_participant(listener.clone(), ChannelRole::Listener)
+                .unwrap();
+            assert!(!l.waiting);
+            match admission {
+                SpeakerAdmission::Reject => {
+                    assert!(matches!(
+                        ch.add_participant(second.clone(), ChannelRole::Speaker),
+                        Err(AurixError::ChannelFull(_))
+                    ));
+                    // A refused join leaves the participant count untouched.
+                    assert_eq!(ch.participant_count(), 2);
+                }
+                _ => {
+                    let a = ch
+                        .add_participant(second.clone(), ChannelRole::Speaker)
+                        .unwrap();
+                    assert_eq!((a.role, a.waiting), (ChannelRole::Listener, true));
+                    assert_eq!(ch.get_role(&second.user_id), ChannelRole::Listener);
+                    assert_eq!(ch.granted_role(&second.user_id), Some(ChannelRole::Speaker));
+                    assert!(ch.is_waiting_to_speak(&second.user_id));
+                    assert!(!ch.can_transmit(&second.user_id));
+                    assert_eq!(ch.speaker_count(), 1);
+                    assert_eq!(ch.participant_count(), 3);
+                    // Nothing to rotate in `wait` mode however hard the newcomer tries.
+                    ch.note_speak_attempt(&second.user_id);
+                    std::thread::sleep(Duration::from_millis(60));
+                    assert!(ch.rotate_idle_speakers().is_empty());
+                    // The slot goes to the waiting member when the holder leaves.
+                    ch.remove_participant(&first.user_id);
+                    let admitted = ch.admit_waiting();
+                    assert_eq!(admitted.len(), 1);
+                    assert_eq!(admitted[0].user_id, second.user_id);
+                    assert_eq!(admitted[0].session_id, second.session_id);
+                    assert_eq!(admitted[0].role, ChannelRole::Speaker);
+                    assert!(admitted[0].observers.is_none());
+                    assert!(ch.can_transmit(&second.user_id));
+                    assert!(!ch.is_waiting_to_speak(&second.user_id));
+                    assert_eq!(ch.speaker_count(), 1);
+                    assert!(ch.admit_waiting().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unlimited_speakers_never_wait() {
+        let app = AppId::new();
+        let ch = capped(app, 0, SpeakerAdmission::Demote);
+        for i in 1..=5 {
+            let a = ch
+                .add_participant(session(app, i), ChannelRole::Speaker)
+                .unwrap();
+            assert!(!a.waiting && a.demoted.is_none());
+        }
+        assert_eq!(ch.speaker_count(), 5);
+        assert!(ch.rotate_idle_speakers().is_empty());
+        assert!(ch.admit_waiting().is_empty());
+    }
+
+    #[test]
+    fn demote_mode_takes_the_slot_of_the_idlest_quietest_plain_speaker() {
+        let app = AppId::new();
+        let ch = capped(app, 3, SpeakerAdmission::Demote);
+        let talker = session(app, 1);
+        let quiet = session(app, 2);
+        let loud = session(app, 3);
+        for s in [&talker, &quiet, &loud] {
+            ch.add_participant(s.clone(), ChannelRole::Speaker).unwrap();
+        }
+        // quiet and loud last spoke at the same instant (level bytes: higher = quieter);
+        // the talker keeps talking.
+        speak(&quiet, 100);
+        speak(&loud, 20);
+        let spoke_at = Utc::now().timestamp_millis();
+        quiet.last_audio_at_ms.store(spoke_at, Ordering::Relaxed);
+        loud.last_audio_at_ms.store(spoke_at, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(60));
+        speak(&talker, 10);
+        let newcomer = session(app, 4);
+        let a = ch
+            .add_participant(newcomer.clone(), ChannelRole::Speaker)
+            .unwrap();
+        assert_eq!((a.role, a.waiting), (ChannelRole::Speaker, false));
+        let demoted = a.demoted.expect("an idle speaker yields");
+        // Among the two idle speakers the quieter (higher level byte) one goes first.
+        assert_eq!(demoted.user_id, quiet.user_id);
+        assert_eq!(demoted.role, ChannelRole::Listener);
+        assert_eq!(ch.get_role(&quiet.user_id), ChannelRole::Listener);
+        assert_eq!(ch.granted_role(&quiet.user_id), Some(ChannelRole::Speaker));
+        assert!(ch.is_waiting_to_speak(&quiet.user_id));
+        assert!(!ch.can_transmit(&quiet.user_id));
+        assert!(ch.can_transmit(&newcomer.user_id));
+        assert_eq!(ch.speaker_count(), 3);
+        assert_eq!(ch.participant_count(), 4);
+
+        // The demoted member gets a slot back as soon as it tries to speak while another
+        // speaker has gone idle (the newcomer is fresh, loud is idle).
+        ch.note_speak_attempt(&quiet.user_id);
+        speak(&talker, 10);
+        speak(&newcomer, 10);
+        let changes = ch.rotate_idle_speakers();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            (changes[0].user_id, changes[0].role),
+            (loud.user_id, ChannelRole::Listener)
+        );
+        assert_eq!(
+            (changes[1].user_id, changes[1].role),
+            (quiet.user_id, ChannelRole::Speaker)
+        );
+        assert_eq!(ch.speaker_count(), 3);
+        // Without a fresh attempt nobody rotates, however idle the holders are.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(ch.rotate_idle_speakers().is_empty());
+    }
+
+    #[test]
+    fn demotion_spares_priority_speakers_moderators_and_administrators() {
+        let app = AppId::new();
+        let ch = capped(app, 3, SpeakerAdmission::Demote);
+        let moderator = session(app, 1);
+        let admin = session(app, 2);
+        let priority = session(app, 3);
+        ch.add_participant(moderator.clone(), ChannelRole::Moderator)
+            .unwrap();
+        ch.add_participant(admin.clone(), ChannelRole::Administrator)
+            .unwrap();
+        ch.add_participant_with(
+            priority.clone(),
+            ChannelRole::Speaker,
+            JoinHints {
+                priority: true,
+                remote_speakers: 0,
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let newcomer = session(app, 4);
+        let a = ch
+            .add_participant(newcomer.clone(), ChannelRole::Speaker)
+            .unwrap();
+        assert_eq!(
+            (a.role, a.waiting, a.demoted),
+            (ChannelRole::Listener, true, None)
+        );
+        ch.note_speak_attempt(&newcomer.user_id);
+        assert!(ch.rotate_idle_speakers().is_empty());
+        for s in [&moderator, &admin, &priority] {
+            assert!(ch.can_transmit(&s.user_id));
+        }
+        assert_eq!(ch.speaker_count(), 3);
+    }
+
+    #[test]
+    fn privileged_joiners_preempt_the_least_active_speaker_at_once() {
+        let app = AppId::new();
+        let ch = capped(app, 2, SpeakerAdmission::Demote);
+        let active = session(app, 1);
+        let idle = session(app, 2);
+        ch.add_participant(active.clone(), ChannelRole::Speaker)
+            .unwrap();
+        ch.add_participant(idle.clone(), ChannelRole::Speaker)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        speak(&active, 10);
+        // Neither speaker has been idle for `demote_idle_ms`: a plain joiner waits ...
+        let plain = session(app, 3);
+        let a = ch
+            .add_participant(plain.clone(), ChannelRole::Speaker)
+            .unwrap();
+        assert!(a.waiting && a.demoted.is_none());
+        // ... a moderator takes the less recently active speaker's slot right away ...
+        let moderator = session(app, 4);
+        let a = ch
+            .add_participant(moderator.clone(), ChannelRole::Moderator)
+            .unwrap();
+        assert_eq!(a.role, ChannelRole::Moderator);
+        assert_eq!(a.demoted.map(|d| d.user_id), Some(idle.user_id));
+        // ... and so does a priority speaker (the moderator itself is exempt).
+        let vip = session(app, 5);
+        let a = ch
+            .add_participant_with(
+                vip.clone(),
+                ChannelRole::Speaker,
+                JoinHints {
+                    priority: true,
+                    remote_speakers: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(a.role, ChannelRole::Speaker);
+        assert_eq!(a.demoted.map(|d| d.user_id), Some(active.user_id));
+        assert_eq!(ch.speaker_count(), 2);
+        // Freed slots go to privileged waiters first, then by waiting time.
+        ch.remove_participant(&vip.user_id);
+        ch.remove_participant(&moderator.user_id);
+        let admitted: Vec<UserId> = ch.admit_waiting().into_iter().map(|c| c.user_id).collect();
+        assert_eq!(admitted, vec![plain.user_id, idle.user_id]);
+        assert_eq!(ch.speaker_count(), 2);
+        assert!(ch.is_waiting_to_speak(&active.user_id));
+    }
+
+    #[test]
+    fn remote_speakers_count_against_the_cap() {
+        let app = AppId::new();
+        let ch = capped(app, 2, SpeakerAdmission::Wait);
+        let far = UserId::new();
+        ch.add_remote(far, remote(ChannelRole::Speaker));
+        ch.add_remote(UserId::new(), remote(ChannelRole::Listener));
+        let a = session(app, 1);
+        let b = session(app, 2);
+        assert!(
+            !ch.add_participant(a.clone(), ChannelRole::Speaker)
+                .unwrap()
+                .waiting
+        );
+        assert!(
+            ch.add_participant(b.clone(), ChannelRole::Speaker)
+                .unwrap()
+                .waiting
+        );
+        assert_eq!(ch.speaker_count(), 2);
+        // The remote speaker is demoted on its node: its slot frees here.
+        assert!(ch.set_remote_role(&far, ChannelRole::Listener));
+        assert_eq!(ch.admit_waiting().len(), 1);
+        assert!(ch.can_transmit(&b.user_id));
+        // A channel not yet live here counts the speakers the caller learned from the fleet.
+        let fresh = capped(app, 1, SpeakerAdmission::Wait);
+        let c = session(app, 3);
+        let admission = fresh
+            .add_participant_with(
+                c,
+                ChannelRole::Speaker,
+                JoinHints {
+                    priority: false,
+                    remote_speakers: 1,
+                },
+            )
+            .unwrap();
+        assert!(admission.waiting);
+    }
+
+    #[test]
+    fn concurrent_joins_never_exceed_the_speaker_cap() {
+        let app = AppId::new();
+        let ch = Arc::new(capped(app, 4, SpeakerAdmission::Wait));
+        let handles: Vec<_> = (1..=32u32)
+            .map(|i| {
+                let ch = ch.clone();
+                std::thread::spawn(move || {
+                    ch.add_participant(session(app, i), ChannelRole::Speaker)
+                        .unwrap()
+                        .waiting
+                })
+            })
+            .collect();
+        let waiting = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|w| *w)
+            .count();
+        assert_eq!(waiting, 28);
+        assert_eq!(ch.speaker_count(), 4);
+        assert_eq!(ch.participant_count(), 32);
+    }
+
+    #[test]
+    fn raising_the_cap_admits_waiting_members_and_hidden_channels_scope_observers() {
+        let app = AppId::new();
+        let ch = MediaChannel::new(
+            ChannelId::new(),
+            app,
+            ChannelConfig {
+                audience: Some(AudienceConfig {
+                    hide_listeners: true,
+                    max_speakers: 1,
+                    speaker_admission: SpeakerAdmission::Wait,
+                    ..AudienceConfig::default()
+                }),
+                ..ChannelConfig::default()
+            },
+        );
+        let holder = session(app, 1);
+        let waiting = session(app, 2);
+        ch.add_participant(holder.clone(), ChannelRole::Speaker)
+            .unwrap();
+        ch.add_participant(waiting.clone(), ChannelRole::Speaker)
+            .unwrap();
+        // A waiting speaker is a listener for presence purposes too.
+        assert!(ch.is_hidden_listener(&waiting.user_id));
+        let mut cfg = ch.config.read().clone();
+        cfg.audience = Some(AudienceConfig {
+            max_speakers: 2,
+            ..cfg.audience.unwrap()
+        });
+        ch.update_config(cfg);
+        let admitted = ch.admit_waiting();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].user_id, waiting.user_id);
+        assert!(!ch.is_hidden_listener(&waiting.user_id));
+        assert_eq!(ch.speaker_count(), 2);
     }
 }

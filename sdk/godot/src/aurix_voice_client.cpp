@@ -247,6 +247,11 @@ bool AurixVoiceClient::can_speak_in(const String& channel_id) const {
     return client_ && uuid_from_string(channel_id, channel) && client_.can_speak_in(aurix::Uuid(channel));
 }
 
+bool AurixVoiceClient::is_waiting_to_speak(const String& channel_id) const {
+    AurixUuid channel;
+    return client_ && uuid_from_string(channel_id, channel) && client_.waiting_to_speak(aurix::Uuid(channel));
+}
+
 bool AurixVoiceClient::channel_transcribes(const String& channel_id) const {
     AurixUuid channel;
     return client_ && uuid_from_string(channel_id, channel) && client_.channel_transcribes(aurix::Uuid(channel));
@@ -986,6 +991,9 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     case AURIX_EVENT_PARTICIPANT_PRIORITY_CHANGED:
         emit_signal("participant_priority_changed", channel, user, ev.flag());
         break;
+    case AURIX_EVENT_PARTICIPANT_ROLE_CHANGED:
+        emit_signal("participant_role_changed", channel, user, static_cast<int>(ev.role()), ev.flag());
+        break;
     case AURIX_EVENT_DUCKING_CHANGED:
         emit_signal("ducking_changed", channel, ev.flag(), ducking_to_dict(ev.ducking()));
         break;
@@ -1215,6 +1223,7 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_participants", "channel_id"), &AurixVoiceClient::get_participants);
     ClassDB::bind_method(D_METHOD("get_channel_info", "channel_id"), &AurixVoiceClient::get_channel_info);
     ClassDB::bind_method(D_METHOD("can_speak_in", "channel_id"), &AurixVoiceClient::can_speak_in);
+    ClassDB::bind_method(D_METHOD("is_waiting_to_speak", "channel_id"), &AurixVoiceClient::is_waiting_to_speak);
     ClassDB::bind_method(D_METHOD("channel_transcribes", "channel_id"), &AurixVoiceClient::channel_transcribes);
     ClassDB::bind_method(D_METHOD("channel_monitored", "channel_id"), &AurixVoiceClient::channel_monitored);
     ClassDB::bind_method(D_METHOD("get_channel_scope", "channel_id"), &AurixVoiceClient::get_channel_scope);
@@ -1327,6 +1336,8 @@ void AurixVoiceClient::_bind_methods() {
                           PropertyInfo(Variant::BOOL, "speaking")));
     ADD_SIGNAL(MethodInfo("participant_priority_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
                           PropertyInfo(Variant::BOOL, "priority")));
+    ADD_SIGNAL(MethodInfo("participant_role_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
+                          PropertyInfo(Variant::INT, "role"), PropertyInfo(Variant::BOOL, "admitted")));
     ADD_SIGNAL(MethodInfo("ducking_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::BOOL, "active"),
                           PropertyInfo(Variant::DICTIONARY, "ducking")));
     ADD_SIGNAL(MethodInfo("channel_energy", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::DICTIONARY, "levels")));

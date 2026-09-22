@@ -29,6 +29,10 @@ AdminRole = Literal["viewer", "moderator", "admin", "superadmin"]
 """Administrator role. Each role includes the permissions of the ones before it."""
 AdminRole_VALUES: List[AdminRole] = ["viewer", "moderator", "admin", "superadmin"]
 
+AudienceConfigSpeakerAdmission = Literal["reject", "wait", "demote"]
+"""Policy for a member with a speaking grant when every `max_speakers` slot is held. `reject`: the join fails (`channel_full`). `wait`: the member joins as an effective listener (`ChannelJoinAck.waiting_to_speak`) and gets a slot when one frees, in order: priority speakers and moderators first, then by waiting time. `demote`: like `wait`, but a plain speaker silent for `demote_idle_ms` yields its slot to a waiting member that is trying to speak (a joining priority speaker, moderator or administrator takes the least recently active plain speaker's slot at once). Priority speakers, moderators and administrators are never demoted; the persisted grant is never changed, only the effective role (`RoleChanged` / `participant.role_changed`)."""
+AudienceConfigSpeakerAdmission_VALUES: List[AudienceConfigSpeakerAdmission] = ["reject", "wait", "demote"]
+
 AudioCodec = Literal["opus"]
 AudioCodec_VALUES: List[AudioCodec] = ["opus"]
 
@@ -154,6 +158,7 @@ ActiveMember = TypedDict(
         "is_muted": NotRequired[bool],
         "is_server_muted": NotRequired[bool],
         "is_priority": NotRequired[bool],
+        "waiting_to_speak": NotRequired[bool],  # The grant in `role` allows speaking but the member holds no `audience.max_speakers` slot (`speaker_admission` = `wait` / `demote`); it is an effective listener until `participant.role_changed` admits it.
         "ssrc": NotRequired[int],
         "joined_at": NotRequired[str],
     },
@@ -345,7 +350,9 @@ AudienceConfig = TypedDict(
     {
         "hide_listeners": NotRequired[bool],  # Receive-only members (role `listener`) are absent from the roster and presence notifications of other members; `ChannelJoinAck.participant_count` still carries the real headcount.
         "mix_for_listeners": NotRequired[bool],  # Native listeners receive one server-mixed stream (`DownlinkMode.mixed`) whatever their own downlink mode. Browsers are always mixed.
-        "max_speakers": NotRequired[int],  # Members that may speak the channel admits at once; `0` = only `max_participants` applies. Must not exceed `max_participants`.
+        "max_speakers": NotRequired[int],  # Members that may speak (`speak: true`) the channel admits at once; `0` = only `max_participants` applies. Must not exceed `max_participants`. Counted over the members the node knows of (its own and those learned through the cascade). What happens to a joiner with a speaking grant once the slots are held is `speaker_admission`.
+        "speaker_admission": NotRequired["AudienceConfigSpeakerAdmission"],  # Policy for a member with a speaking grant when every `max_speakers` slot is held. `reject`: the join fails (`channel_full`). `wait`: the member joins as an effective listener (`ChannelJoinAck.waiting_to_speak`) and gets a slot when one frees, in order: priority speakers and moderators first, then by waiting time. `demote`: like `wait`, but a plain speaker silent for `demote_idle_ms` yields its slot to a waiting member that is trying to speak (a joining priority speaker, moderator or administrator takes the least recently active plain speaker's slot at once). Priority speakers, moderators and administrators are never demoted; the persisted grant is never changed, only the effective role (`RoleChanged` / `participant.role_changed`).
+        "demote_idle_ms": NotRequired[int],  # `speaker_admission = demote`: a speaker is idle, and so may be demoted, once it has sent no audible audio for this long (since joining if it never spoke).
         "max_streams": NotRequired[int],  # Concurrent voices a receiver hears at once (`0` = unlimited), ranked per receiver by delivery gain × sender level with sticky slots; bounds the streams a native client decodes, the tracks a browser receives and the voices a server mix decodes.
     },
 )

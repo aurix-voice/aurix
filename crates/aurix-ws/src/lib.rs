@@ -27,8 +27,8 @@ use aurix_common::e2ee;
 use aurix_common::error::AurixError;
 use aurix_common::protocol::{
     decode_audio_level, ChatMessage, ControlMessage, LocalMute, ParticipantBrief,
-    ParticipantEnergy, ParticipantVolume, Transcript, TranscriptOriginal, TransmissionMode,
-    TtsDestination, UserPosition,
+    ParticipantEnergy, ParticipantVolume, RoleChangeReason, Transcript, TranscriptOriginal,
+    TransmissionMode, TtsDestination, UserPosition,
 };
 use aurix_common::types::*;
 use aurix_control::chat::{Actor, Conversation, OutgoingMessage, SearchQuery, SYSTEM_USER};
@@ -39,7 +39,9 @@ use aurix_control::{
     MirroredPrefs, ParticipantSpeak, ServerEvent, SessionMirror, TakeoverRefused,
     TranslationService, MIGRATION_SEQUENCE_GAP,
 };
-use aurix_media::channel::{MediaChannel, RemoteParticipant, RosterChange, RosterEntry};
+use aurix_media::channel::{
+    JoinHints, MediaChannel, RemoteParticipant, RoleChange, RosterChange, RosterEntry,
+};
 use aurix_media::session::{Transport, MAX_PARTICIPANT_GAIN};
 use aurix_media::tunnel::MediaTunnel;
 use aurix_media::{MediaEvent, SfuNode};
@@ -503,6 +505,162 @@ impl WsState {
         }
     }
 
+    /// Tells the local members that see `user_id` about its new effective role. Channels
+    /// hiding listeners show a demotion as a leave and an admission as a join instead, since
+    /// the member is (or was) invisible to them.
+    #[allow(clippy::too_many_arguments)]
+    fn notify_role_observers(
+        &self,
+        app_id: AppId,
+        channel_id: &ChannelId,
+        channel: &MediaChannel,
+        user_id: UserId,
+        role: ChannelRole,
+        reason: RoleChangeReason,
+        observers: Option<Vec<UserId>>,
+    ) {
+        let msg = if !channel.hides_listeners() {
+            ControlMessage::RoleChanged {
+                channel_id: *channel_id,
+                user_id,
+                role,
+                reason,
+            }
+        } else if role.can_speak() {
+            let Some(entry) = channel.roster_entry(&user_id) else {
+                return;
+            };
+            ControlMessage::ParticipantJoined {
+                channel_id: *channel_id,
+                user_id,
+                display_name: entry.display_name,
+                ssrc: entry.ssrc,
+                role,
+                is_muted: entry.is_muted,
+                is_priority: entry.is_priority,
+            }
+        } else {
+            ControlMessage::ParticipantLeft {
+                channel_id: *channel_id,
+                user_id,
+            }
+        };
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return;
+        };
+        match observers {
+            Some(observers) => {
+                for observer in observers {
+                    if observer != user_id {
+                        self.send_to_member(app_id, channel_id, &observer, &json);
+                    }
+                }
+            }
+            None => {
+                let Some(members) = self.channel_members.get(channel_id) else {
+                    return;
+                };
+                for sid in members.iter() {
+                    let Some(conn) = self.connections.get(&sid) else {
+                        continue;
+                    };
+                    if conn.app_id != app_id || conn.user_id == user_id {
+                        continue;
+                    }
+                    let _ = conn.tx.try_send(json.clone());
+                }
+            }
+        }
+    }
+
+    /// Applies speaker-slot changes of local members: the member learns its effective role,
+    /// the members that see it are told, the membership row records whether it waits, and
+    /// the fleet gets a `participant.role_changed`.
+    async fn apply_role_changes(
+        &self,
+        app_id: AppId,
+        channel_id: ChannelId,
+        changes: Vec<RoleChange>,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        let Some(channel) = self.sfu.read().get_channel(&channel_id) else {
+            return;
+        };
+        for change in changes {
+            let reason = if change.role.can_speak() {
+                RoleChangeReason::SpeakerAdmitted
+            } else {
+                RoleChangeReason::SpeakerDemoted
+            };
+            self.send_to_session(
+                &change.session_id,
+                &ControlMessage::RoleChanged {
+                    channel_id,
+                    user_id: change.user_id,
+                    role: change.role,
+                    reason,
+                },
+            );
+            self.notify_role_observers(
+                app_id,
+                &channel_id,
+                &channel,
+                change.user_id,
+                change.role,
+                reason,
+                change.observers,
+            );
+            if let Err(e) = self
+                .control
+                .sessions
+                .set_membership_waiting_to_speak(
+                    app_id,
+                    channel_id,
+                    change.user_id,
+                    !change.role.can_speak(),
+                )
+                .await
+            {
+                warn!("membership admission update failed: {e}");
+            }
+            self.control.events.publish(ServerEvent::RoleChanged {
+                app_id,
+                channel_id,
+                user_id: change.user_id,
+                session_id: change.session_id,
+                role: change.role,
+                reason,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+    }
+
+    /// Speakers hosted on other nodes that a channel not yet live here would have to count
+    /// against `max_speakers`.
+    async fn remote_speaker_count(&self, app_id: AppId, channel_id: ChannelId) -> u32 {
+        match self
+            .control
+            .sessions
+            .get_channel_roster(app_id, channel_id)
+            .await
+        {
+            Ok(rows) => rows
+                .iter()
+                .filter(|row| {
+                    row.media_node_id != self.control.node_id.0
+                        && !row.waiting_to_speak
+                        && parse_role(&row.role).can_speak()
+                })
+                .count() as u32,
+            Err(e) => {
+                warn!("channel roster lookup failed: {e}");
+                0
+            }
+        }
+    }
+
     /// Applies poses to the SFU (audio routing, text range, roster radius), notifies roster
     /// transitions and forwards each mover's position to the local members that see them.
     fn apply_positions(
@@ -620,13 +778,18 @@ impl WsState {
                 continue;
             }
             added_remote = true;
+            let role = if row.waiting_to_speak {
+                ChannelRole::Listener
+            } else {
+                parse_role(&row.role)
+            };
             changes.extend(channel.add_remote(
                 user_id,
                 RemoteParticipant {
                     session_id,
                     display_name: row.display_name,
                     ssrc: row.ssrc as u32,
-                    role: parse_role(&row.role),
+                    role,
                     is_muted: row.is_muted || row.is_server_muted,
                     is_priority: row.is_priority,
                 },
@@ -933,9 +1096,14 @@ impl WsState {
                     if let Some(channel) = &channel {
                         if channel.is_remote(&user_id) {
                             let hidden = hidden || channel.is_hidden_listener(&user_id);
+                            let freed_slot = channel.role_of(&user_id).can_speak();
                             // Remote members leave the roster of whoever saw them; local
                             // leavers were announced by `leave_channel_full`.
                             let observers = channel.remove_remote(&user_id);
+                            if freed_slot {
+                                let admitted = channel.admit_waiting();
+                                self.apply_role_changes(app_id, channel_id, admitted).await;
+                            }
                             if hidden {
                                 continue;
                             }
@@ -1041,6 +1209,51 @@ impl WsState {
                         None,
                     );
                 }
+                ServerEvent::RoleChanged {
+                    app_id,
+                    channel_id,
+                    user_id,
+                    session_id,
+                    role,
+                    reason,
+                    ..
+                } => {
+                    // Local members were told by `apply_role_changes`; this is a member on
+                    // another node whose slot count and roster entry change here.
+                    if self.connections.contains_key(&session_id) {
+                        continue;
+                    }
+                    let Some(channel) = self.sfu.read().get_channel(&channel_id) else {
+                        continue;
+                    };
+                    if channel.app_id != app_id || !channel.is_remote(&user_id) {
+                        continue;
+                    }
+                    let observers = if role.can_speak() {
+                        None
+                    } else {
+                        channel.observers_of(&user_id)
+                    };
+                    channel.set_remote_role(&user_id, role);
+                    let observers = if role.can_speak() {
+                        channel.observers_of(&user_id)
+                    } else {
+                        observers
+                    };
+                    self.notify_role_observers(
+                        app_id,
+                        &channel_id,
+                        &channel,
+                        user_id,
+                        role,
+                        reason,
+                        observers,
+                    );
+                    if !role.can_speak() {
+                        let admitted = channel.admit_waiting();
+                        self.apply_role_changes(app_id, channel_id, admitted).await;
+                    }
+                }
                 ServerEvent::UserBlockChanged {
                     app_id,
                     user_id,
@@ -1062,7 +1275,7 @@ impl WsState {
                         self.sfu
                             .read()
                             .update_channel_config(&channel_id, &app_id, config);
-                    if updated.is_some() {
+                    if let Some((_, admitted)) = updated {
                         self.broadcast_channel_in_app(
                             app_id,
                             &channel_id,
@@ -1072,6 +1285,7 @@ impl WsState {
                                 ducking,
                             },
                         );
+                        self.apply_role_changes(app_id, channel_id, admitted).await;
                     }
                 }
                 ServerEvent::ChatMessage {
@@ -2048,6 +2262,13 @@ impl WsState {
                         &ControlMessage::ParticipantStreams { streams },
                     );
                 }
+                MediaEvent::RolesChanged {
+                    app_id,
+                    channel_id,
+                    changes,
+                } => {
+                    self.apply_role_changes(app_id, channel_id, changes).await;
+                }
                 MediaEvent::MuteChanged {
                     session_id,
                     user_id,
@@ -2111,6 +2332,8 @@ impl WsState {
                 }
             }
         }
+        self.apply_role_changes(app_id, channel_id, left.admitted)
+            .await;
         if left.transmission_reset {
             send_msg(
                 &tx,
@@ -2660,20 +2883,32 @@ async fn restore_channel(
             return false;
         }
     };
-    let joined = state
-        .sfu
-        .read()
-        .join_channel(&session_id, channel_id, config, channel.role);
-    if let Err(e) = joined {
-        warn!("channel {channel_id} not restored for {session_id}: {e}");
-        close_open_membership("restore_failed").await;
-        return false;
-    }
-    if channel.priority {
-        if let Some(c) = state.sfu.read().get_channel(&channel_id) {
-            c.set_priority(&user_id, true);
+    let remote_speakers = if config.audience.is_some_and(|a| a.max_speakers > 0)
+        && channel.role.can_speak()
+        && state.sfu.read().get_channel(&channel_id).is_none()
+    {
+        state.remote_speaker_count(app_id, channel_id).await
+    } else {
+        0
+    };
+    let joined = state.sfu.read().join_channel_with(
+        &session_id,
+        channel_id,
+        config,
+        channel.role,
+        JoinHints {
+            priority: channel.priority,
+            remote_speakers,
+        },
+    );
+    let admission = match joined {
+        Ok(joined) => joined.admission,
+        Err(e) => {
+            warn!("channel {channel_id} not restored for {session_id}: {e}");
+            close_open_membership("restore_failed").await;
+            return false;
         }
-    }
+    };
     let ssrc = state
         .connections
         .get(&session_id)
@@ -2690,6 +2925,7 @@ async fn restore_channel(
                 channel.role,
                 ssrc,
                 channel.priority,
+                admission.waiting,
             )
             .await
         {
@@ -2721,6 +2957,30 @@ async fn restore_channel(
         let _ = redis.add_user_channel(user_id, channel_id).await;
     }
     state.sync_remote_members(app_id, channel_id).await;
+    if admission.waiting {
+        state.send_to_session(
+            &session_id,
+            &ControlMessage::RoleChanged {
+                channel_id,
+                user_id,
+                role: admission.role,
+                reason: RoleChangeReason::SpeakerDemoted,
+            },
+        );
+    }
+    if open {
+        if let Err(e) = state
+            .control
+            .sessions
+            .set_membership_waiting_to_speak(app_id, channel_id, user_id, admission.waiting)
+            .await
+        {
+            warn!("membership admission update failed for {session_id} in {channel_id}: {e}");
+        }
+    }
+    state
+        .apply_role_changes(app_id, channel_id, admission.demoted.into_iter().collect())
+        .await;
     if !open {
         state
             .control
@@ -2732,7 +2992,7 @@ async fn restore_channel(
                 session_id,
                 display_name: token.display_name.clone(),
                 ssrc,
-                role: channel.role,
+                role: admission.role,
                 is_priority: channel.priority,
                 timestamp: chrono::Utc::now(),
             });
@@ -2956,6 +3216,9 @@ fn channel_join_ack(
     let priority = channel
         .as_ref()
         .is_some_and(|c| c.has_priority_flag(user_id));
+    let waiting_to_speak = channel
+        .as_ref()
+        .is_some_and(|c| c.is_waiting_to_speak(user_id));
     ControlMessage::ChannelJoinAck {
         channel_id: *channel_id,
         participants,
@@ -2970,6 +3233,7 @@ fn channel_join_ack(
         positional,
         ducking,
         priority,
+        waiting_to_speak,
     }
 }
 
@@ -3952,12 +4216,29 @@ async fn handle_control_message(
                     return send_error(tx, e.error_code(), &e.public_message()).await;
                 }
             }
+            let remote_speakers = if config.audience.is_some_and(|a| a.max_speakers > 0)
+                && role.can_speak()
+                && state.sfu.read().get_channel(&channel_id).is_none()
+            {
+                state.remote_speaker_count(token.app_id, channel_id).await
+            } else {
+                0
+            };
             let join_result = {
                 let sfu = state.sfu.read();
-                sfu.join_channel(&session_id, channel_id, config, role)
+                sfu.join_channel_with(
+                    &session_id,
+                    channel_id,
+                    config,
+                    role,
+                    JoinHints {
+                        priority,
+                        remote_speakers,
+                    },
+                )
             };
-            let existing = match join_result {
-                Ok(existing) => existing,
+            let joined = match join_result {
+                Ok(joined) => joined,
                 Err(e) => {
                     if resolved.created {
                         state.control.release_ad_hoc(token.app_id, channel_id).await;
@@ -3965,11 +4246,7 @@ async fn handle_control_message(
                     return send_error(tx, e.error_code(), &e.public_message()).await;
                 }
             };
-            if priority {
-                if let Some(channel) = state.sfu.read().get_channel(&channel_id) {
-                    channel.set_priority(&token.user_id, true);
-                }
-            }
+            let admission = joined.admission;
             let ssrc = state
                 .connections
                 .get(&session_id)
@@ -3978,7 +4255,15 @@ async fn handle_control_message(
             if let Err(e) = state
                 .control
                 .sessions
-                .add_channel_membership(channel_id, token.user_id, session_id, role, ssrc, priority)
+                .add_channel_membership(
+                    channel_id,
+                    token.user_id,
+                    session_id,
+                    role,
+                    ssrc,
+                    priority,
+                    admission.waiting,
+                )
                 .await
             {
                 warn!("membership persistence failed: {e}");
@@ -4029,13 +4314,19 @@ async fn handle_control_message(
                 let _ = redis.add_user_channel(token.user_id, channel_id).await;
                 let _ = redis.incr_channel_participants(channel_id).await;
             }
-            drop(existing);
             state.sync_remote_members(token.app_id, channel_id).await;
             send_msg(
                 tx,
                 &channel_join_ack(state, &session_id, &token.user_id, &channel_id),
             )
             .await;
+            state
+                .apply_role_changes(
+                    token.app_id,
+                    channel_id,
+                    admission.demoted.into_iter().collect(),
+                )
+                .await;
             // Active recordings in the channel must be disclosed to the newcomer.
             if let Some(rec) = &state.recording {
                 for capture in rec.active_in_channel(&channel_id) {
@@ -4066,7 +4357,7 @@ async fn handle_control_message(
                         .get(&session_id)
                         .map(|c| c.ssrc)
                         .unwrap_or(0),
-                    role,
+                    role: admission.role,
                     is_priority: priority,
                     timestamp: chrono::Utc::now(),
                 });
@@ -4971,7 +5262,7 @@ async fn handle_control_message(
             });
         }
 
-        ControlMessage::PriorityChanged { .. } => {}
+        ControlMessage::PriorityChanged { .. } | ControlMessage::RoleChanged { .. } => {}
 
         ControlMessage::E2eeHello {
             channel_id,

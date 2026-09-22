@@ -224,6 +224,7 @@ public:
     Array get_participants(const String& channel_id) const;
     Dictionary get_channel_info(const String& channel_id) const;
     bool can_speak_in(const String& channel_id) const;
+    bool is_waiting_to_speak(const String& channel_id) const;
     bool channel_transcribes(const String& channel_id) const;
     bool channel_monitored(const String& channel_id) const;
     Dictionary get_channel_scope(const String& channel_id) const;

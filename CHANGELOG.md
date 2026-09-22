@@ -112,6 +112,25 @@ released together.
   256 incoming buffered datagrams, 500 ms max age) and WebCrypto backlogs after a main-thread
   stall are bounded and dropped (counted in `packetsDroppedLocally`) instead of piling up
   behind heartbeats.
+* **Speaker admission at `audience.max_speakers`.** `audience.speaker_admission` decides what
+  happens to a joiner with a speaking grant once every slot is held: `reject` (the previous
+  behaviour, `channel_full`), `wait` (joins as an effective listener, `ChannelJoinAck.
+  waiting_to_speak`, gets a slot when one frees — priority speakers and moderators first, then by
+  waiting time) or `demote` (like `wait`, plus a plain speaker silent for
+  `audience.demote_idle_ms`, default 3 s, yields its slot to a waiting member that is trying to
+  speak — longest idle first, quietest on a tie; a joining priority speaker, moderator or
+  administrator takes the least recently active plain speaker's slot at once). Priority
+  speakers, moderators and administrators are never demoted; the persisted grant never changes,
+  only the effective role, so a demoted member is a listener for the router (frames dropped),
+  the roster and the mixer until it is admitted again. Remote speakers count against the cap
+  across the cascade and role changes travel between nodes. New `RoleChanged` control message
+  (`reason` = `speaker_demoted` / `speaker_admitted`; channels with `hide_listeners` show it as
+  a leave/join to the members that see the user), `participant.role_changed` webhook/SSE
+  event, `waiting_to_speak` on `GET /v1/channels/{id}/participants` memberships (migration 21),
+  and `participantRoleChanged` / `waitingToSpeak` (Web, `AurixBridge` hosts),
+  `OnParticipantRoleChanged` / `IsWaitingToSpeak` (Unity, Unreal), `participant_role_changed` /
+  `is_waiting_to_speak` (Godot) and `AurixEventParticipantRoleChanged` /
+  `waiting_to_speak` (C ABI) in the SDKs.
 
 ### Fixed
 

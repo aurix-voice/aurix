@@ -186,3 +186,30 @@ test('hold_ms delays the release, leaving the channel drops it at once, moderato
   assert.equal(client.isDuckingActive('c2'), false);
   assert.deepEqual(game.at(-1), ['c2', false]);
 });
+
+test('speaker admission: join ack waiting flag and RoleChanged update the effective role', async () => {
+  const { client, sock } = await connected();
+  const events = [];
+  client.on('participantRoleChanged', (...a) => events.push(a));
+  await joined(client, sock, 'stage', [brief('me', 7), brief('alice', 8)], { role: 'listener', waiting_to_speak: true });
+  assert.equal(client.channelInfo('stage').role, 'listener');
+  assert.equal(client.isWaitingToSpeak('stage'), true);
+  assert.equal(client.canSpeakIn('stage'), false);
+
+  sock.receive({ type: 'RoleChanged', data: { channel_id: 'stage', user_id: 'alice', role: 'listener', reason: 'speaker_demoted' } });
+  assert.equal(client.participants('stage').find((p) => p.userId === 'alice').role, 'listener');
+  sock.receive({ type: 'RoleChanged', data: { channel_id: 'stage', user_id: 'me', role: 'speaker', reason: 'speaker_admitted' } });
+  assert.equal(client.channelInfo('stage').role, 'speaker');
+  assert.equal(client.isWaitingToSpeak('stage'), false);
+  assert.equal(client.canSpeakIn('stage'), true);
+  sock.receive({ type: 'RoleChanged', data: { channel_id: 'nowhere', user_id: 'me', role: 'speaker', reason: 'speaker_admitted' } });
+  assert.deepEqual(events, [
+    ['stage', 'alice', 'listener', false],
+    ['stage', 'me', 'speaker', true],
+  ]);
+  assert.equal(client.isWaitingToSpeak('nowhere'), false);
+
+  // Plain joins are never waiting.
+  await joined(client, sock, 'plain', [brief('me', 7)]);
+  assert.equal(client.isWaitingToSpeak('plain'), false);
+});

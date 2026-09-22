@@ -175,7 +175,7 @@ func _init() -> void:
 	# Signals declared on the node.
 	for sig in ["state_changed", "session_ready", "media_bound", "channel_joined", "channel_left",
 			"participant_joined", "participant_left", "participant_speaking", "participant_mute_changed",
-			"participant_priority_changed", "ducking_changed",
+			"participant_priority_changed", "participant_role_changed", "ducking_changed",
 			"channel_energy", "local_speaking", "chat_message", "participant_typing", "transcript", "tts_status",
 			"recovering", "recovered", "failed_to_recover", "network_quality", "media_path_changed",
 			"downlink_mode_changed", "endpoint_changed", "chat_history", "chat_read_marker",

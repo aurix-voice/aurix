@@ -8414,6 +8414,10 @@
           "is_priority": {
             "type": "boolean"
           },
+          "waiting_to_speak": {
+            "type": "boolean",
+            "description": "The grant in `role` allows speaking but the member holds no `audience.max_speakers` slot (`speaker_admission` = `wait` / `demote`); it is an effective listener until `participant.role_changed` admits it."
+          },
           "ssrc": {
             "type": "integer",
             "format": "int64"
@@ -10772,7 +10776,20 @@
             "type": "integer",
             "minimum": 0,
             "default": 0,
-            "description": "Members that may speak the channel admits at once; `0` = only `max_participants` applies. Must not exceed `max_participants`."
+            "description": "Members that may speak (`speak: true`) the channel admits at once; `0` = only `max_participants` applies. Must not exceed `max_participants`. Counted over the members the node knows of (its own and those learned through the cascade). What happens to a joiner with a speaking grant once the slots are held is `speaker_admission`."
+          },
+          "speaker_admission": {
+            "type": "string",
+            "enum": ["reject", "wait", "demote"],
+            "default": "reject",
+            "description": "Policy for a member with a speaking grant when every `max_speakers` slot is held. `reject`: the join fails (`channel_full`). `wait`: the member joins as an effective listener (`ChannelJoinAck.waiting_to_speak`) and gets a slot when one frees, in order: priority speakers and moderators first, then by waiting time. `demote`: like `wait`, but a plain speaker silent for `demote_idle_ms` yields its slot to a waiting member that is trying to speak (a joining priority speaker, moderator or administrator takes the least recently active plain speaker's slot at once). Priority speakers, moderators and administrators are never demoted; the persisted grant is never changed, only the effective role (`RoleChanged` / `participant.role_changed`)."
+          },
+          "demote_idle_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 600000,
+            "default": 3000,
+            "description": "`speaker_admission = demote`: a speaker is idle, and so may be demoted, once it has sent no audible audio for this long (since joining if it never spoke)."
           },
           "max_streams": {
             "type": "integer",

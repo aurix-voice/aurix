@@ -19,6 +19,19 @@ export const AdminPermissionValues: readonly AdminPermission[] = ["apps:read", "
 export type AdminRole = "viewer" | "moderator" | "admin" | "superadmin";
 export const AdminRoleValues: readonly AdminRole[] = ["viewer", "moderator", "admin", "superadmin"] as const;
 
+/**
+ * Policy for a member with a speaking grant when every `max_speakers` slot is held. `reject`: the
+ * join fails (`channel_full`). `wait`: the member joins as an effective listener
+ * (`ChannelJoinAck.waiting_to_speak`) and gets a slot when one frees, in order: priority speakers
+ * and moderators first, then by waiting time. `demote`: like `wait`, but a plain speaker silent
+ * for `demote_idle_ms` yields its slot to a waiting member that is trying to speak (a joining
+ * priority speaker, moderator or administrator takes the least recently active plain speaker's
+ * slot at once). Priority speakers, moderators and administrators are never demoted; the persisted
+ * grant is never changed, only the effective role (`RoleChanged` / `participant.role_changed`).
+ */
+export type AudienceConfigSpeakerAdmission = "reject" | "wait" | "demote";
+export const AudienceConfigSpeakerAdmissionValues: readonly AudienceConfigSpeakerAdmission[] = ["reject", "wait", "demote"] as const;
+
 export type AudioCodec = "opus";
 export const AudioCodecValues: readonly AudioCodec[] = ["opus"] as const;
 
@@ -163,6 +176,12 @@ export interface ActiveMember {
   is_muted?: boolean;
   is_server_muted?: boolean;
   is_priority?: boolean;
+  /**
+   * The grant in `role` allows speaking but the member holds no `audience.max_speakers` slot
+   * (`speaker_admission` = `wait` / `demote`); it is an effective listener until
+   * `participant.role_changed` admits it.
+   */
+  waiting_to_speak?: boolean;
   ssrc?: number;
   joined_at?: string;
 }
@@ -347,10 +366,28 @@ export interface AudienceConfig {
    */
   mix_for_listeners?: boolean;
   /**
-   * Members that may speak the channel admits at once; `0` = only `max_participants` applies. Must
-   * not exceed `max_participants`.
+   * Members that may speak (`speak: true`) the channel admits at once; `0` = only `max_participants`
+   * applies. Must not exceed `max_participants`. Counted over the members the node knows of (its own
+   * and those learned through the cascade). What happens to a joiner with a speaking grant once the
+   * slots are held is `speaker_admission`.
    */
   max_speakers?: number;
+  /**
+   * Policy for a member with a speaking grant when every `max_speakers` slot is held. `reject`: the
+   * join fails (`channel_full`). `wait`: the member joins as an effective listener
+   * (`ChannelJoinAck.waiting_to_speak`) and gets a slot when one frees, in order: priority speakers
+   * and moderators first, then by waiting time. `demote`: like `wait`, but a plain speaker silent
+   * for `demote_idle_ms` yields its slot to a waiting member that is trying to speak (a joining
+   * priority speaker, moderator or administrator takes the least recently active plain speaker's
+   * slot at once). Priority speakers, moderators and administrators are never demoted; the persisted
+   * grant is never changed, only the effective role (`RoleChanged` / `participant.role_changed`).
+   */
+  speaker_admission?: AudienceConfigSpeakerAdmission;
+  /**
+   * `speaker_admission = demote`: a speaker is idle, and so may be demoted, once it has sent no
+   * audible audio for this long (since joining if it never spoke).
+   */
+  demote_idle_ms?: number;
   /**
    * Concurrent voices a receiver hears at once (`0` = unlimited), ranked per receiver by delivery
    * gain × sender level with sticky slots; bounds the streams a native client decodes, the tracks a

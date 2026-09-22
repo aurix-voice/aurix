@@ -19,8 +19,8 @@
 
 use aurix_common::e2ee;
 use aurix_common::protocol::{
-    channel_id_hash, ControlMessage, ParticipantBrief, QuicInfo, TlsTunnelInfo, TransmissionMode,
-    TtsDestination, TtsState, UserPosition,
+    channel_id_hash, ControlMessage, ParticipantBrief, QuicInfo, RoleChangeReason, TlsTunnelInfo,
+    TransmissionMode, TtsDestination, TtsState, UserPosition,
 };
 use aurix_common::types::{
     quality, ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode,
@@ -216,6 +216,9 @@ struct ChannelState {
     ducking: Option<DuckingConfig>,
     /// We are a priority speaker here.
     priority: bool,
+    /// Our grant allows speaking but every speaker slot is taken (`Listener` for now; the
+    /// server promotes us with `ParticipantRoleChanged` once a slot frees).
+    waiting_to_speak: bool,
     /// Another member's priority speech is currently ducking the channel (game-audio hook).
     duck_active: bool,
 }
@@ -1536,6 +1539,17 @@ impl Client {
     /// This session's role in a joined channel (`None` until the join is acked).
     pub fn channel_role(&self, channel_id: ChannelId) -> Option<ChannelRole> {
         self.inner.channels.lock().get(&channel_id).map(|c| c.role)
+    }
+
+    /// Whether our speaking grant in `channel_id` currently has no speaker slot
+    /// (`audience.max_speakers` reached): we are an effective listener until the server
+    /// promotes us. False for unknown channels.
+    pub fn is_waiting_to_speak(&self, channel_id: ChannelId) -> bool {
+        self.inner
+            .channels
+            .lock()
+            .get(&channel_id)
+            .is_some_and(|c| c.waiting_to_speak)
     }
 
     /// Whether this session may transmit in `channel_id` (false for listeners and unknown
@@ -3826,6 +3840,7 @@ async fn handle_message(
             hidden_listeners,
             ducking,
             priority,
+            waiting_to_speak,
             ..
         } => {
             let scope = ChannelScope {
@@ -3862,6 +3877,7 @@ async fn handle_message(
                         participants: roster,
                         ducking,
                         priority,
+                        waiting_to_speak,
                         duck_active: false,
                     },
                 )
@@ -3889,6 +3905,7 @@ async fn handle_message(
                     hidden_listeners,
                     ducking,
                     priority,
+                    waiting_to_speak,
                 });
             }
             inner.refresh_ducking(channel_id);
@@ -4023,6 +4040,39 @@ async fn handle_message(
                 priority,
             });
             inner.refresh_ducking(channel_id);
+        }
+        ControlMessage::RoleChanged {
+            channel_id,
+            user_id,
+            role,
+            reason,
+        } => {
+            let ours = inner.identity.lock().user_id == Some(user_id);
+            let known = {
+                let mut channels = inner.channels.lock();
+                match channels.get_mut(&channel_id) {
+                    Some(c) => {
+                        if ours {
+                            c.role = role;
+                            c.waiting_to_speak = !role.can_speak();
+                        }
+                        if let Some(p) = c.participants.get_mut(&user_id) {
+                            p.role = role;
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if known {
+                inner.emit(Event::ParticipantRoleChanged {
+                    channel_id,
+                    user_id,
+                    role,
+                    admitted: reason == RoleChangeReason::SpeakerAdmitted,
+                });
+                inner.refresh_ducking(channel_id);
+            }
         }
         ControlMessage::SpeakingStateChanged {
             channel_id,
@@ -4570,6 +4620,7 @@ mod tests {
                 participants: HashMap::new(),
                 ducking: None,
                 priority: false,
+                waiting_to_speak: false,
                 duck_active: false,
             },
         )

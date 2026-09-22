@@ -400,9 +400,19 @@ struct AURIXVOICE_API FAurixChannelInfo
 {
 	GENERATED_BODY()
 
-	/** Our role; Listener means receive-only (the grant had `speak: false`), whatever the channel type. */
+	/**
+	 * Our effective role; Listener means receive-only (the grant had `speak: false`, or every
+	 * `audience.max_speakers` slot is taken — see bWaitingToSpeak), whatever the channel type.
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	EAurixRole Role = EAurixRole::Listener;
+
+	/**
+	 * We hold a speaking grant but wait for an `audience.max_speakers` slot (or an idle slot was
+	 * taken from us); Role is Listener until OnParticipantRoleChanged admits us again.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bWaitingToSpeak = false;
 
 	/** Members across all nodes, including listeners hidden from GetParticipants. */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
