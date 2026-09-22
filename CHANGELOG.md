@@ -13,8 +13,8 @@ released together.
 
 ## [1.4.0] - 2026-09-22
 
-Licence change only — no protocol, API or database changes. Functionally identical to 1.3.0;
-nodes of 1.3 and 1.4 may share a fleet.
+Licence change plus one media fix — no protocol, API or database changes. Nodes of 1.3 and 1.4
+may share a fleet.
 
 ### Changed
 
@@ -33,6 +33,13 @@ nodes of 1.3 and 1.4 may share a fleet.
 * **Dashboard** shows a "Source" link to the repository the build came from (`AURIX_SOURCE_URL` at
   build time, default `https://github.com/aurix-voice/aurix`) — the convenient place for an AGPL
   §13 source offer when a modified dashboard is deployed.
+
+### Fixed
+
+* **`ChannelEnergy` could skip a short burst.** A participant who spoke for less than
+  `media.energy_interval_ms` and went quiet before the reporter tick (which can run late on a loaded
+  node) was never reported above silence, so listeners saw `SpeakingStateChanged` without a matching
+  level. Levels measured since the last report are now reported once before decaying.
 
 ## [1.3.0] - 2026-09-19
 
