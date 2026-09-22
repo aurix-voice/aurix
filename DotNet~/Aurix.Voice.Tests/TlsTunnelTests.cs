@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -220,11 +221,16 @@ namespace Aurix.Voice.Tests
             }, p => p != null);
             Assert.NotNull(pkt);
             Assert.Equal(Ssrc, pkt.Header.Ssrc);
-            Assert.Equal(1u, pkt.Header.Sequence);
+            Assert.True(pkt.Header.Sequence >= 1, "sequence numbers start at 1");
             Assert.Equal(0x1111u, pkt.Header.ChannelIdHash);
             Assert.Equal((byte)42, pkt.TakeAudioLevel());
             Assert.Equal(frame, pkt.Payload);
-            Assert.Equal(1, media.PacketsSent);
+            // Heartbeats share the sequence space and the sent counter with audio, so only the
+            // audio count is exact; every sealed packet the node saw was counted as sent.
+            var uplink = node.Uplink.Where(p => p.Header.Type != PacketType.SessionBind).ToArray();
+            Assert.Equal(1, uplink.Count(p => p.Header.Type == PacketType.Audio));
+            Assert.True(media.PacketsSent >= uplink.Length, "sent counter covers every delivered packet");
+            for (int i = 1; i < uplink.Length; i++) Assert.True(uplink[i - 1].Header.Sequence < uplink[i].Header.Sequence, "sequence is strictly increasing");
 
             await node.Deliver(AurxPacket.Audio(1, 960, 0x2222, 0x1111, new byte[] { 1, 2, 3 }));
             await node.Deliver(AurxPacket.Audio(1, 960, 0x2222, 0x1111, new byte[] { 1, 2, 3 })); // replay
