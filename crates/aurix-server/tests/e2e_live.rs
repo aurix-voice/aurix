@@ -14345,6 +14345,7 @@ async fn usage_analytics_export_and_per_app_quotas() {
         let ready = t["peak_sessions"].as_i64().unwrap_or(0) >= 2
             && t["participant_minutes"].as_f64().unwrap_or(0.0) > 0.0
             && t["media_bytes_in"].as_i64().unwrap_or(0) > 0
+            && t["media_bytes_out"].as_i64().unwrap_or(0) > 0
             && t["chat_messages"].as_i64().unwrap_or(0) >= 3;
         ready.then_some(u)
     })
