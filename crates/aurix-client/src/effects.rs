@@ -1509,9 +1509,10 @@ mod tests {
                     "{preset:?} ({channels}ch) went silent: {level}"
                 );
                 // 25 frames = 500 ms of audio. A smoke check against pathological cost, not a
-                // benchmark: debug builds on shared CI runners (macOS x64) need the 2× headroom.
+                // benchmark: debug builds on shared CI runners (macOS x64 has been seen at
+                // 2.3× real time) need the 4× headroom.
                 assert!(
-                    elapsed < std::time::Duration::from_millis(1000),
+                    elapsed < std::time::Duration::from_millis(2000),
                     "{preset:?} ({channels}ch) took {elapsed:?} for 500 ms of audio"
                 );
                 chain.reset();

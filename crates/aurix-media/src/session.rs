@@ -1111,7 +1111,13 @@ impl MediaSession {
                     1
                 } else if frames < 0 {
                     if packets < 0 && frames >= -(MAX_FORWARDED_GAP_FRAMES as i32) {
-                        return last.seq.wrapping_sub(frames.unsigned_abs());
+                        if let Some(slot) = last.seq.checked_sub(frames.unsigned_abs()) {
+                            return slot;
+                        }
+                        // Late for a slot before the stream's first number (the sender's
+                        // first frames arrived out of order): a fresh number, not a wrap
+                        // to u32::MAX that would put receivers' replay windows out of reach.
+                        return self.sequence.fetch_add(1, Ordering::Relaxed);
                     }
                     1
                 } else if frames > MAX_FORWARDED_GAP_FRAMES as i32 {
@@ -1479,5 +1485,23 @@ mod tests {
             12
         );
         assert_eq!(s.audio_sequence(), 13);
+    }
+
+    #[test]
+    fn forwarded_audio_sequence_never_wraps_when_the_first_frames_are_reordered() {
+        let s = session();
+        let ts = |frame: u32| frame * AUDIO_FRAME_TS as u32;
+        // The second frame overtakes the first on a jittery uplink.
+        assert_eq!(s.next_audio_sequence(11, ts(1)), 0);
+        let late = s.next_audio_sequence(10, ts(0));
+        assert!(late < 64, "late first frame got {late}, not a u32 wrap");
+        assert_eq!(late, 1);
+        // The clock stayed on the newer frame: no phantom gap for what follows.
+        assert_eq!(s.next_audio_sequence(12, ts(2)), 2);
+        assert_eq!(s.next_audio_sequence(13, ts(3)), 3);
+        // Once numbers exist for the slot, a late frame still takes it.
+        assert_eq!(s.next_audio_sequence(15, ts(5)), 5);
+        assert_eq!(s.next_audio_sequence(14, ts(4)), 4);
+        assert_eq!(s.audio_sequence(), 6);
     }
 }

@@ -180,6 +180,11 @@ released together.
   `packetsDiscarded` described one arbitrary track — often an idle one. The counters now add up
   across all audio tracks; `jitterMs` is the worst track that carried packets and
   `jitterBufferDelayMs` the emitted-weighted mean.
+* **A speaker's first frames arriving out of order muted them for the whole session.** The
+  forwarded per-sender audio sequence gave a frame that overtook its predecessor on a jittery
+  uplink the slot "before" the stream's first number, i.e. it wrapped to `u32::MAX`; native
+  receivers moved their anti-replay window there and rejected every following frame as a
+  replay (`replayed` climbing, no audio). Such a frame now takes the next fresh number.
 
 ## [1.4.0] - 2026-09-22
 
