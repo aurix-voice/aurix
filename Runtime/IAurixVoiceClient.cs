@@ -26,6 +26,7 @@ namespace Aurix
         TransmissionMode Transmission { get; }
         Guid? FocusChannel { get; }
         bool TranscriptsEnabled { get; }
+        bool ServerNoiseSuppression { get; }
         TranslationPrefs TranslationPrefs { get; }
         NetworkQuality? LastNetworkQuality { get; }
 
@@ -56,6 +57,7 @@ namespace Aurix
         event Action<Guid, Guid, bool> OnParticipantTyping;
         event Action<Transcript> OnTranscript;
         event Action<TranslationPrefs> OnTranslationChanged;
+        event Action<bool> OnServerNoiseSuppressionChanged;
         event Action<TtsStatus> OnTtsStatus;
         event Action<string, string> OnServerError;
         event Action<string> OnDisconnected;
@@ -110,6 +112,7 @@ namespace Aurix
         bool IsChannelTranscribed(Guid channelId);
         bool IsChannelMonitored(Guid channelId);
         Task SetTranscriptsAsync(bool enabled, CancellationToken ct = default);
+        Task SetServerNoiseSuppressionAsync(bool enabled, CancellationToken ct = default);
         Task SetTranslationAsync(string language, string spokenLanguage = null, bool speech = false, CancellationToken ct = default);
 
         Task<ChatMessage> SendMessageAsync(Guid channelId, string text, object metadata = null, string clientRef = null, CancellationToken ct = default);

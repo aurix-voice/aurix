@@ -304,6 +304,13 @@ namespace Aurix.Voice.Tests
             Assert.Empty(empty.LocalMutes);
             Assert.Empty(empty.Volumes);
             Assert.Equal(TransmissionMode.All, empty.Transmission);
+            Assert.False(empty.NoiseSuppression);
+
+            // Node-side denoising: request + the mirrored flag on a resumed session.
+            Assert.Equal("{\"type\":\"SetNoiseSuppression\",\"data\":{\"enabled\":true}}", ControlMessage.SetNoiseSuppression(true));
+            var denoised = ControlMessage.Parse("{\"type\":\"ReceiverPreferences\",\"data\":{\"noise_suppression\":true}}").ReceiverPreferences();
+            Assert.True(denoised.NoiseSuppression);
+            Assert.True(ControlMessage.Parse("{\"type\":\"NoiseSuppressionChanged\",\"data\":{\"enabled\":true}}").Bool("enabled"));
             Assert.Null(empty.FocusChannel);
         }
 

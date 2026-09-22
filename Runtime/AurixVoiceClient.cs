@@ -143,6 +143,12 @@ namespace Aurix
         /// </summary>
         public bool DownlinkMix;
         /// <summary>
+        /// The node can denoise this session's uplink on request
+        /// (<see cref="AurixVoiceClient.SetServerNoiseSuppressionAsync"/>); false when the operator has not
+        /// enabled <c>media.noise_suppression</c>.
+        /// </summary>
+        public bool NoiseSuppression;
+        /// <summary>
         /// The node translates transcripts on request (<see cref="AurixVoiceClient.SetTranslationAsync"/>);
         /// null when the operator has not configured translation.
         /// </summary>
@@ -228,6 +234,8 @@ namespace Aurix
         private AudioCodec _activeCodec = AudioCodec.Opus;
         private DownlinkMode _preferredDownlink = DownlinkMode.Streams;
         private DownlinkMode _activeDownlink = DownlinkMode.Streams;
+        private bool _preferredServerNoiseSuppression;
+        private bool _activeServerNoiseSuppression;
         private readonly HashSet<Guid> _transcribedChannels = new HashSet<Guid>();
         private readonly HashSet<Guid> _monitoredChannels = new HashSet<Guid>();
         private readonly Dictionary<Guid, ChannelScope> _channelScopes = new Dictionary<Guid, ChannelScope>();
@@ -805,6 +813,12 @@ namespace Aurix
         /// </summary>
         public event Action<DownlinkMode> OnDownlinkModeChanged;
         /// <summary>
+        /// The node started (true) or stopped denoising this session's uplink on its request
+        /// (<see cref="SetServerNoiseSuppressionAsync"/>; false again on a fresh session, before the request
+        /// is replayed).
+        /// </summary>
+        public event Action<bool> OnServerNoiseSuppressionChanged;
+        /// <summary>
         /// The media moved to another link (path, reason): on every bind, when UDP fell back to the
         /// WebSocket tunnel, and when a UDP re-probe brought it back. Purely informational — audio,
         /// sequence numbers and the session continue.
@@ -1028,6 +1042,7 @@ namespace Aurix
                     MediaTunnel = ack.Bool("media_tunnel"),
                     TlsTunnel = ack.TlsTunnel(),
                     DownlinkMix = ack.Bool("downlink_mix"),
+                    NoiseSuppression = ack.Bool("noise_suppression"),
                     Translation = ack.Translation(),
                 };
                 _mediaKey = Convert.FromBase64String(ack.Str("media_key") ?? throw new InvalidOperationException("SessionInitAck without media_key"));
@@ -2190,6 +2205,30 @@ namespace Aurix
         /// <summary>Mode requested with <see cref="SetDownlinkModeAsync"/>; re-requested after a fresh reconnect.</summary>
         public DownlinkMode PreferredDownlinkMode { get { lock (_channels) return _preferredDownlink; } }
 
+        /// <summary>Whether the node currently denoises this session's uplink on its request (server-acknowledged).</summary>
+        public bool ServerNoiseSuppression { get { lock (_channels) return _activeServerNoiseSuppression; } }
+
+        /// <summary>
+        /// Have the node run its noise suppressor over this session's uplink before anyone hears it — for a
+        /// build that runs no capture DSP of its own (do not stack the two). Never applies to end-to-end
+        /// encrypted frames or stereo channels. Needs <see cref="SessionInfo.NoiseSuppression"/>; otherwise the
+        /// request fails with <see cref="OnServerError"/> <c>NOISE_SUPPRESSION_UNAVAILABLE</c> (also when the
+        /// node's session budget is spent). Takes effect on <see cref="OnServerNoiseSuppressionChanged"/>.
+        /// Client-held: survives reconnects.
+        /// </summary>
+        public Task SetServerNoiseSuppressionAsync(bool enabled, CancellationToken ct = default)
+        {
+            bool send;
+            lock (_channels)
+            {
+                _preferredServerNoiseSuppression = enabled;
+                send = enabled != _activeServerNoiseSuppression;
+            }
+            var control = _control;
+            if (control == null || !control.IsOpen || !send) return Task.CompletedTask;
+            return control.SendAsync(ControlMessage.SetNoiseSuppression(enabled), ct);
+        }
+
         /// <summary>
         /// <see cref="DownlinkMode.Mixed"/>: the node decodes every speaker we may hear, applies our mutes,
         /// volumes, focus and positional gains and sends one stereo Opus stream per channel
@@ -2332,8 +2371,9 @@ namespace Aurix
             bool wantTranscripts;
             AudioCodec codec;
             DownlinkMode downlink;
+            bool serverNoiseSuppression;
             TranslationPrefs translation;
-            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; downlink = _preferredDownlink; translation = _translation; }
+            lock (_channels) { wantTranscripts = _wantTranscripts; codec = _preferredCodec; downlink = _preferredDownlink; serverNoiseSuppression = _preferredServerNoiseSuppression; translation = _translation; }
             if (!wantTranscripts)
                 await control.SendAsync(ControlMessage.SetTranscripts(false), ct).ConfigureAwait(false);
             if (translation.Language != null || translation.SpokenLanguage != null)
@@ -2344,6 +2384,9 @@ namespace Aurix
             // Likewise per-speaker streams; the server confirms with DownlinkModeChanged.
             if (downlink != DownlinkMode.Streams)
                 await control.SendAsync(ControlMessage.SetDownlinkMode(downlink), ct).ConfigureAwait(false);
+            // And node-side denoising; the server confirms with NoiseSuppressionChanged.
+            if (serverNoiseSuppression)
+                await control.SendAsync(ControlMessage.SetNoiseSuppression(true), ct).ConfigureAwait(false);
         }
 
         /// <summary>Channel-scoped mutes, a <c>Single</c> target and the focus need membership, so they are (re-)sent after each successful join.</summary>
@@ -2716,7 +2759,9 @@ namespace Aurix
             FailPendingChat(new OperationCanceledException("disconnected"));
             DropAllDucking();
             ResetLocalVoice();
-            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; _activeDownlink = DownlinkMode.Streams; }
+            bool denoiseWasActive;
+            lock (_channels) { _channels.Clear(); _bySsrc.Clear(); _joinedChannels.Clear(); _activeCodec = AudioCodec.Opus; _activeDownlink = DownlinkMode.Streams; denoiseWasActive = _activeServerNoiseSuppression; _activeServerNoiseSuppression = false; }
+            if (denoiseWasActive) OnServerNoiseSuppressionChanged?.Invoke(false);
             E2eeReset();
         }
 
@@ -3129,15 +3174,17 @@ namespace Aurix
                         lock (_channels) { _transmission = prefs.Transmission; _focusChannel = prefs.FocusChannel; }
                     // The codec is authoritative either way: a fresh session reports Opus and our replay of a
                     // PCMU preference is answered by AudioCodecChanged afterwards.
-                    bool codecChanged, downlinkChanged;
+                    bool codecChanged, downlinkChanged, denoiseChanged;
                     lock (_channels)
                     {
                         codecChanged = _activeCodec != prefs.Codec; _activeCodec = prefs.Codec;
                         downlinkChanged = _activeDownlink != prefs.Downlink; _activeDownlink = prefs.Downlink;
+                        denoiseChanged = _activeServerNoiseSuppression != prefs.NoiseSuppression; _activeServerNoiseSuppression = prefs.NoiseSuppression;
                     }
                     OnReceiverPreferences?.Invoke(prefs);
                     if (codecChanged) OnAudioCodecChanged?.Invoke(prefs.Codec);
                     if (downlinkChanged) OnDownlinkModeChanged?.Invoke(prefs.Downlink);
+                    if (denoiseChanged) OnServerNoiseSuppressionChanged?.Invoke(prefs.NoiseSuppression);
                     break;
                 }
                 case "AudioCodecChanged":
@@ -3152,6 +3199,14 @@ namespace Aurix
                     var mode = m.DownlinkMode();
                     lock (_channels) _activeDownlink = mode;
                     OnDownlinkModeChanged?.Invoke(mode);
+                    break;
+                }
+                case "NoiseSuppressionChanged":
+                {
+                    var enabled = m.Bool("enabled");
+                    bool changed;
+                    lock (_channels) { changed = _activeServerNoiseSuppression != enabled; _activeServerNoiseSuppression = enabled; }
+                    if (changed) OnServerNoiseSuppressionChanged?.Invoke(enabled);
                     break;
                 }
                 case "TransmissionChanged":

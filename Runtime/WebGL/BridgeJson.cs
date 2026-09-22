@@ -70,6 +70,7 @@ namespace Aurix.WebGL
                 Failover = failover,
                 MediaTunnel = false,
                 DownlinkMix = false,
+                NoiseSuppression = MiniJson.GetBool(o, "noiseSuppression"),
                 Translation = Translation(Obj(o, "translation")),
             };
         }
