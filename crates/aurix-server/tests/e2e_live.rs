@@ -110,10 +110,16 @@ impl Player {
     }
 
     async fn recv(&mut self) -> ControlMessage {
+        self.recv_for("a WS message").await
+    }
+
+    /// The live E2E suite runs ~40 tests against one debug-build node in parallel; a
+    /// single control message can take well over a second to arrive on a loaded runner.
+    async fn recv_for(&mut self, what: &str) -> ControlMessage {
         loop {
-            let m = tokio::time::timeout(Duration::from_secs(5), self.ws.next())
+            let m = tokio::time::timeout(Duration::from_secs(15), self.ws.next())
                 .await
-                .unwrap_or_else(|_| panic!("{}: timed out waiting for a WS message", self.name))
+                .unwrap_or_else(|_| panic!("{}: timed out waiting for {what}", self.name))
                 .expect("ws closed")
                 .expect("ws error");
             match m {
@@ -150,7 +156,7 @@ impl Player {
         pred: F,
     ) -> ControlMessage {
         for _ in 0..20 {
-            let m = self.recv().await;
+            let m = self.recv_for(what).await;
             if pred(&m) {
                 return m;
             }
@@ -263,7 +269,7 @@ async fn connect_with(
         .await
         .expect("ws connect");
     // The server authenticates on upgrade and assigns the session id itself.
-    let ack = tokio::time::timeout(Duration::from_secs(5), ws.next())
+    let ack = tokio::time::timeout(Duration::from_secs(15), ws.next())
         .await
         .expect("SessionInitAck timeout")
         .unwrap()
