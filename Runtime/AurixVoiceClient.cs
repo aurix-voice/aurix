@@ -2179,9 +2179,11 @@ namespace Aurix
         public AudioCodec PreferredAudioCodec { get { lock (_channels) return _preferredCodec; } }
 
         /// <summary>
-        /// Negotiate the session codec: <see cref="AudioCodec.Pcmu"/> (G.711 μ-law, 8 kHz, 64 kbit/s, no Opus
-        /// needed on this device) or back to <see cref="AudioCodec.Opus"/>. Session-wide, not per channel: the
-        /// server transcodes at the edge, so other participants keep hearing Opus. Keep encoding with
+        /// Negotiate the session codec: <see cref="AudioCodec.Pcmu"/> / <see cref="AudioCodec.Pcma"/> (G.711,
+        /// 8 kHz, 64 kbit/s, no Opus needed on this device) or back to <see cref="AudioCodec.Opus"/>. Session-wide,
+        /// not per channel: in plaintext channels the server transcodes at the edge, so other participants keep
+        /// hearing Opus; in end-to-end encrypted channels the sealed G.711 frames reach every member as they are
+        /// (the SDK decodes them with a <see cref="G711Codec"/>). Keep encoding with
         /// <see cref="AudioCodec"/> until <see cref="OnAudioCodecChanged"/> confirms the switch; the request fails
         /// with <see cref="OnServerError"/> <c>CODEC_NOT_AVAILABLE</c> when the node disables the fallback
         /// (<c>media.pcmu_fallback = false</c>). Client-held: survives reconnects.
@@ -2464,8 +2466,8 @@ namespace Aurix
 
         /// <summary>
         /// Hand one frame to the transport for a channel, sealing it once (<paramref name="sealedFrame"/> is
-        /// reused across encrypted targets) when the channel is end-to-end encrypted. Only Opus goes to
-        /// encrypted channels: a μ-law frame would need the server to transcode it, so it is not sent.
+        /// reused across encrypted targets) when the channel is end-to-end encrypted. The codec flag stays on
+        /// the sealed packet: the node cannot transcode what it cannot open, so members decode the codec named.
         /// </summary>
         private bool SendToTarget(MediaTransport media, uint channelHash, bool encrypted, uint ts, AudioCodec codec, byte[] frame, int length, byte? level, ref byte[] sealedFrame)
         {
@@ -2474,10 +2476,9 @@ namespace Aurix
                 media.SendAudio(channelHash, ts, codec, frame, length, level);
                 return true;
             }
-            if (codec != AudioCodec.Opus) return false;
             if (sealedFrame == null)
                 lock (_e2ee) sealedFrame = _e2ee.Encrypt(frame, 0, length < 0 ? frame.Length : length);
-            media.SendAudioE2ee(channelHash, ts, sealedFrame, level);
+            media.SendAudioE2ee(channelHash, ts, sealedFrame, level, codec);
             Interlocked.Increment(ref _framesE2ee);
             return true;
         }

@@ -129,6 +129,93 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void AlawMatchesTheServerReferenceVectors()
+        {
+            Assert.Equal(0xD5, G711.AlawEncode(0));
+            Assert.Equal(0x55, G711.AlawEncode(-1));
+            Assert.Equal(0xAA, G711.AlawEncode(32767));
+            Assert.Equal(0x2A, G711.AlawEncode(-32768));
+            Assert.Equal(0xFA, G711.AlawEncode(1000));
+            Assert.Equal(8, G711.AlawDecode(0xD5));
+            Assert.Equal(-8, G711.AlawDecode(0x55));
+            Assert.Equal(32256, G711.AlawDecode(0xAA));
+            Assert.Equal(-32256, G711.AlawDecode(0x2A));
+            Assert.Equal(1008, G711.AlawDecode(0xFA));
+            Assert.Equal(0xD5, G711.Silence(AudioCodec.Pcma));
+            Assert.Equal(0xFF, G711.Silence(AudioCodec.Pcmu));
+            // Every A-law code point survives decode → encode.
+            for (int b = 0; b < 256; b++) Assert.Equal((byte)b, G711.AlawEncode(G711.AlawDecode((byte)b)));
+            // Segment-aware round-trip error bound (the step doubles per segment).
+            for (int s = -32768; s < 32768; s += 97)
+            {
+                int back = G711.AlawDecode(G711.AlawEncode((short)s));
+                Assert.InRange(Math.Abs(back - s), 0, Math.Abs(s) / 32 + 8);
+            }
+            Assert.True(AudioCodec.Pcma.IsG711());
+            Assert.True(AudioCodec.Pcmu.IsG711());
+            Assert.False(AudioCodec.Opus.IsG711());
+        }
+
+        [Fact]
+        public void G711CodecSpeaksBothLawsAndTheMixerPicksTheDecoderFromTheFrameCodec()
+        {
+            foreach (var law in new[] { AudioCodec.Pcmu, AudioCodec.Pcma })
+            {
+                var enc = new G711Codec(law);
+                var dec = new G711Codec(law);
+                var frame = new float[AudioFormat.FrameSamples];
+                var coded = new byte[G711.FrameSamples];
+                var back = new float[AudioFormat.FrameSamples];
+                double energy = 0;
+                for (int f = 0; f < 10; f++)
+                {
+                    for (int i = 0; i < frame.Length; i++) frame[i] = 0.4f * MathF.Sin(2f * MathF.PI * 440f * (f * frame.Length + i) / AudioFormat.SampleRate);
+                    Assert.Equal(G711.FrameSamples, enc.Encode(frame, AudioFormat.FrameSamples, coded));
+                    Assert.Equal(AudioFormat.FrameSamples, dec.Decode(coded, back, AudioFormat.FrameSamples));
+                    if (f >= 2) foreach (var s in back) energy += s * s;
+                }
+                double rms = Math.Sqrt(energy / (8 * AudioFormat.FrameSamples));
+                Assert.InRange(rms, 0.4 / Math.Sqrt(2) * 0.8, 0.4 / Math.Sqrt(2) * 1.2);
+            }
+            Assert.Throws<ArgumentException>(() => new G711Codec(AudioCodec.Opus));
+
+            // A-law DC next to μ-law DC: each stream is decoded with its own law.
+            var mixer = new RemoteMixer(() => new ConstantCodec());
+            var mu = new byte[G711.FrameSamples];
+            var a = new byte[G711.FrameSamples];
+            Array.Fill(mu, G711.UlawEncode(8192));
+            Array.Fill(a, G711.AlawEncode(8192));
+            for (uint seq = 0; seq < 12; seq++) mixer.Push(0xB0B, seq, 1f, null, AudioCodec.Pcmu, mu);
+            for (uint seq = 0; seq < 12; seq++) mixer.Push(0xA1, seq, 1f, null, AudioCodec.Pcma, a);
+            var mono = new float[AudioFormat.FrameSamples];
+            for (int i = 0; i < 4; i++) { Array.Clear(mono, 0, mono.Length); mixer.Mix(mono, 1); }
+            Assert.InRange(mono[mono.Length - 1], 0.5f - 0.02f, 0.5f + 0.02f);
+            // Feeding A-law bytes as μ-law would not land on +0.25.
+            Assert.NotInRange(G711.UlawDecode(G711.AlawEncode(8192)) / 32768f, 0.24f, 0.26f);
+        }
+
+        [Fact]
+        public void PcmaFramesAreFlaggedOnTheWireAndSealedFramesKeepTheCodecFlag()
+        {
+            Assert.Equal((ushort)0x0010, (ushort)PacketFlags.Pcma);
+            Assert.Equal(PacketFlags.Pcma, AurxPacket.CodecFlag(AudioCodec.Pcma));
+            Assert.Equal(PacketFlags.Pcmu, AurxPacket.CodecFlag(AudioCodec.Pcmu));
+            Assert.Equal(PacketFlags.None, AurxPacket.CodecFlag(AudioCodec.Opus));
+            Assert.Equal(AudioCodec.Pcma, AurxPacket.CodecOf(PacketFlags.Pcma | PacketFlags.E2ee | PacketFlags.Energy));
+            Assert.Equal(AudioCodec.Pcmu, AurxPacket.CodecOf(PacketFlags.Pcmu | PacketFlags.E2ee));
+            Assert.Equal(AudioCodec.Opus, AurxPacket.CodecOf(PacketFlags.E2ee));
+            var pkt = AurxPacket.Audio(1, 960, 7, 0xC0FFEE, new byte[G711.FrameSamples]);
+            pkt.Header.Flags |= PacketFlags.Pcma | PacketFlags.E2ee;
+            Assert.True(AurxPacket.TryDecode(pkt.Encode(), out var decoded, out var err), err);
+            Assert.Equal(AudioCodec.Pcma, AurxPacket.CodecOf(decoded.Header.Flags));
+            Assert.Equal(PacketFlags.E2ee, decoded.Header.Flags & PacketFlags.E2ee);
+
+            Assert.Equal("{\"type\":\"SetAudioCodec\",\"data\":{\"codec\":\"pcma\"}}", ControlMessage.SetAudioCodec(AudioCodec.Pcma));
+            Assert.Equal(AudioCodec.Pcma, ControlMessage.Parse("{\"type\":\"AudioCodecChanged\",\"data\":{\"codec\":\"pcma\"}}").AudioCodec());
+            Assert.Equal(AudioCodec.Pcma, ControlMessage.Parse("{\"type\":\"ReceiverPreferences\",\"data\":{\"codec\":\"pcma\"}}").ReceiverPreferences().Codec);
+        }
+
+        [Fact]
         public void PcmuFramesAreFlaggedOnTheWireAndNegotiatedOverControl()
         {
             var pkt = AurxPacket.Audio(1, 960, 7, 0xC0FFEE, new byte[G711.FrameSamples]);

@@ -351,8 +351,9 @@ namespace Aurix.Audio
 
         /// <summary>
         /// Queue a verified frame of either codec (<see cref="Transport.IncomingAudio.Codec"/>). After
-        /// this session negotiates PCMU every downlink frame arrives as μ-law and is decoded by a
-        /// <see cref="PcmuCodec"/>; a codec change on a stream swaps its decoder and refills the jitter buffer.
+        /// this session negotiates G.711 every downlink frame arrives as μ-law / A-law (and so do the opened
+        /// frames of a G.711 sender in an end-to-end encrypted channel) and is decoded by a
+        /// <see cref="G711Codec"/>; a codec change on a stream swaps its decoder and refills the jitter buffer.
         /// </summary>
         public void Push(uint ssrc, uint seq, float volume, Protocol.Direction? direction, AudioCodec codec, byte[] payload)
             => Push(ssrc, seq, volume, direction, codec, false, payload);
@@ -432,7 +433,7 @@ namespace Aurix.Audio
 
         private void Attach(Stream s, AudioCodec codec, bool mixed, bool stereo)
         {
-            var decoder = codec == AudioCodec.Pcmu ? new PcmuCodec()
+            var decoder = codec.IsG711() ? new G711Codec(codec)
                 : stereo && _stereoDecoderFactory != null ? _stereoDecoderFactory()
                 : _decoderFactory();
             s.Decoder = decoder;
