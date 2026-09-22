@@ -31,6 +31,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTr
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioCodecChanged, EAurixAudioCodec, Codec);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixDownlinkModeChanged, EAurixDownlinkMode, Mode);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixServerNoiseSuppressionChanged, bool, bEnabled);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixMediaPathChanged, EAurixMediaPath, Path, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixUserBlockChanged, FGuid, UserId, bool, bBlocked);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixRecording, FGuid, ChannelId, FGuid, RecordingId, bool, bActive, FGuid, InitiatedBy);
@@ -464,6 +465,20 @@ public:
 	EAurixDownlinkMode GetDownlinkMode() const;
 
 	/**
+	 * Let the node denoise our uplink before anyone hears it — for builds that run no capture
+	 * DSP of their own (FAurixDspConfig; do not stack the two). Never touches end-to-end
+	 * encrypted frames or stereo channels. Needs FAurixSessionInfo::bNoiseSuppression (otherwise
+	 * OnError NOISE_SUPPRESSION_UNAVAILABLE, also when the node's session budget is spent);
+	 * applied on OnServerNoiseSuppressionChanged.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Preferences")
+	bool SetServerNoiseSuppression(bool bEnabled);
+
+	/** Whether the node currently denoises our uplink on our request. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Preferences")
+	bool IsServerNoiseSuppressionEnabled() const;
+
+	/**
 	 * Link the media uses right now: QUIC, UDP, the WebSocket tunnel (native links blocked —
 	 * expect higher latency under packet loss) or None before the first OnMediaBound.
 	 */
@@ -670,6 +685,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelFocusChanged OnChannelFocusChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioCodecChanged OnAudioCodecChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixDownlinkModeChanged OnDownlinkModeChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixServerNoiseSuppressionChanged OnServerNoiseSuppressionChanged;
 	/** Media moved between UDP and the WebSocket tunnel (also fires after every OnMediaBound). */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixMediaPathChanged OnMediaPathChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixUserBlockChanged OnUserBlockChanged;

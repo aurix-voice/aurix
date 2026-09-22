@@ -1250,6 +1250,17 @@ public sealed record ChannelConfig
     [JsonPropertyName("stereo")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Stereo { get; init; }
 
+    /// <summary>
+    /// The node denoises every participant's uplink into this channel (RNNoise-class model, mono
+    /// speech) before it reaches receivers, recording, STT and the cascade — for clients that run no
+    /// capture DSP. Needs `media.noise_suppression.enabled` on the node; when it is off or
+    /// `max_sessions` are busy the frames pass uncleaned
+    /// (`aurix_noise_suppression_frames_total{outcome="skipped"}`). Rejected together with `stereo` or
+    /// `e2ee`.
+    /// </summary>
+    [JsonPropertyName("noise_suppression")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? NoiseSuppression { get; init; }
+
     [JsonPropertyName("recording_enabled")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? RecordingEnabled { get; init; }
 

@@ -21,7 +21,7 @@ Immediately after the upgrade the server sends
   "media_addrs":["203.0.113.10:10000","[2001:db8::10]:10000"],
   "media_key":"<base64, 32 bytes>","resume_token":"…","resume_grace_ms":30000,"resumed":false,
   "migrated":false,"failover":["wss://eu2.voice.example.com/ws","wss://eu3.voice.example.com/ws"],
-  "media_tunnel":true,"downlink_mix":true,"webrtc_participant_streams":16,"unfocused_channel_gain":0.3,
+  "media_tunnel":true,"downlink_mix":true,"noise_suppression":false,"webrtc_participant_streams":16,"unfocused_channel_gain":0.3,
   "quic":{"cert_sha256":"<hex, 64 chars>","server_name":"aurix-media"},
   "translation":{"speech":true,"languages":["en","de","fr"]}}}
 ```
@@ -37,7 +37,9 @@ messages, binary frames are always media; `quic` (absent when the node does not 
 carries the certificate hash a native client pins and the SNI it presents to reach the
 [QUIC media path](aurx.md#quic-aurx-datagrams-with-0-rtt-resume-and-connection-migration) on
 `media_addr`; `downlink_mix` says native sessions may ask for a
-[server-mixed downlink](../features/channels.md#server-mix-for-native-clients); `translation`
+[server-mixed downlink](../features/channels.md#server-mix-for-native-clients);
+`noise_suppression` (absent/`false` on nodes without it) that the session may ask the node to
+[denoise its uplink](../features/channels.md#server-side-noise-suppression); `translation`
 (absent when the node does not translate) lists the target languages listeners may request with
 `SetTranslation` and whether translations can also be spoken to them
 ([live translation](../features/speech.md#live-translation)); `webrtc_participant_streams`
@@ -96,6 +98,7 @@ See [High availability](../operations/high-availability.md#cross-node-session-fa
 | — | `RoleChanged { channel_id, user_id, role, reason }` | a member's *effective* role changed under `audience.speaker_admission`: `speaker_demoted` (an idle speaker yielded its slot, it is now an effective `listener` and its audio is dropped) or `speaker_admitted` (it got its granted role back); the grant itself never changes. Sent to the member and to everyone who sees it; channels with `hide_listeners` send `ParticipantLeft` / `ParticipantJoined` to the others instead ([audiences](../features/channels.md#large-channels-and-audiences)) |
 | `SetParticipantMute { user_id, channel_id?, muted }`, `SetParticipantVolume { user_id, volume }`, `SetUserBlock { user_id, blocked }` | `ReceiverPreferences {…, codec, downlink}` on session start, `UserBlockChanged` | receiver-local preferences, enforced server-side |
 | `SetAudioCodec { codec }` | `AudioCodecChanged { codec }` | native AURX only; `codec` = `opus` (default) / `pcmu` — G.711 fallback transcoded by the node, see [codecs](../features/channels.md#codecs-opus-and-the-pcmu-fallback); `CODEC_NOT_AVAILABLE` when `media.pcmu_fallback` is off or the session is WebRTC |
+| `SetNoiseSuppression { enabled }` | `NoiseSuppressionChanged { enabled }` | ask the node to denoise this session's uplink (Opus or PCMU) before it enters its channels — see [server-side noise suppression](../features/channels.md#server-side-noise-suppression); `SessionInitAck.noise_suppression` says whether the node offers it, `NOISE_SUPPRESSION_UNAVAILABLE` (503) when it is off or `media.noise_suppression.max_sessions` are busy; kept across resume/failover (`ReceiverPreferences.noise_suppression`); never applied to `E2ee` frames or frames into stereo channels |
 | `SetDownlinkMode { mode }` | `DownlinkModeChanged { mode }` | native AURX only; `mode` = `streams` (default, one stream per speaker) / `mixed` (one server-mixed stereo stream per channel, `PacketFlags::Mixed`), see [server mix](../features/channels.md#server-mix-for-native-clients); `VALIDATION_ERROR` when `media.downlink_mix` is off or the session is WebRTC; frames already in flight may still be of the previous kind |
 | `SetParticipantStreams { pinned }` | `ParticipantStreams { streams: [{ mid, user_id? }] }` | WebRTC only, see [per-participant tracks](../features/channels.md#per-participant-tracks-for-browsers); `streams` is the full current layout of the browser's dedicated tracks (SDP `mid` → who is forwarded on it, `null` = idle), sent once the tracks are negotiated and whenever it changes; `pinned` names users that keep a track while audible (at most `webrtc_participant_streams`, else `VALIDATION_ERROR`); `VALIDATION_ERROR` on a native session |
 | `SetTransmission { mode }`, `SetChannelFocus { channel_id? }` | `TransmissionChanged`, `ChannelFocusChanged` | `mode` = `none` / `single { channel_id }` / `all`; server resets both when the target channel is left |

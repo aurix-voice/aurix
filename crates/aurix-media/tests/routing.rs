@@ -2538,3 +2538,249 @@ async fn ipv4_only_sfu_advertises_ipv4_only() {
         &["203.0.113.7:10000".parse::<SocketAddr>().unwrap()]
     );
 }
+
+/// Deterministic stationary rumble (white noise through a one-pole low-pass), 20 ms Opus frames.
+struct RumbleSource {
+    seed: u64,
+    y: f32,
+    enc: opus::Encoder,
+}
+
+impl RumbleSource {
+    fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            y: 0.0,
+            enc: opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap(),
+        }
+    }
+
+    fn frame(&mut self) -> Vec<u8> {
+        let pcm: Vec<i16> = (0..960)
+            .map(|_| {
+                self.seed = self
+                    .seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let white = ((self.seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+                self.y = 0.95 * self.y + 0.05 * white;
+                (self.y * 6.0 * 3000.0) as i16
+            })
+            .collect();
+        let mut out = vec![0u8; 1275];
+        let n = self.enc.encode(&pcm, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+}
+
+fn opus_rms(dec: &mut opus::Decoder, payload: &[u8]) -> f64 {
+    let mut pcm = vec![0i16; 5760];
+    let n = dec.decode(payload, &mut pcm, false).unwrap();
+    (pcm[..n].iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / n.max(1) as f64).sqrt()
+}
+
+/// Server-side denoising: an opted-in (or channel-forced) mono Opus uplink is cleaned once
+/// before fan-out, E2EE and stereo frames are never touched, `max_sessions` bounds who gets a
+/// denoiser (explicit requests fail, channel policies fall back to forwarding as-is), and a
+/// disabled node refuses requests while still forwarding everything.
+#[tokio::test]
+async fn server_side_noise_suppression_cleans_only_eligible_uplinks() {
+    use aurix_common::config::NoiseSuppressionConfig;
+    use aurix_common::AurixError;
+
+    let (sfu, addr) = start_sfu_with(SfuOptions {
+        noise_suppression: NoiseSuppressionConfig {
+            enabled: true,
+            max_sessions: 1,
+            ..NoiseSuppressionConfig::default()
+        },
+        ..SfuOptions::default()
+    })
+    .await;
+    assert!(sfu.noise_suppression_enabled());
+    let app = AppId::new();
+    let team = ChannelId::new();
+    let forced = ChannelId::new();
+    let stereo = ChannelId::new();
+    let sealed = ChannelId::new();
+    let s_a = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "alice".into())
+        .unwrap();
+    let s_b = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "bob".into())
+        .unwrap();
+    let s_c = sfu
+        .create_session(SessionId::new(), UserId::new(), app, "carol".into())
+        .unwrap();
+    let configs = [
+        (team, ChannelConfig::default()),
+        (
+            forced,
+            ChannelConfig {
+                noise_suppression: true,
+                ..ChannelConfig::default()
+            },
+        ),
+        (
+            stereo,
+            ChannelConfig {
+                stereo: true,
+                ..ChannelConfig::default()
+            },
+        ),
+        (
+            sealed,
+            ChannelConfig {
+                e2ee: true,
+                ..ChannelConfig::default()
+            },
+        ),
+    ];
+    for s in [&s_a, &s_b, &s_c] {
+        for (ch, cfg) in &configs {
+            sfu.join_channel(&s.session_id, *ch, cfg.clone(), ChannelRole::Speaker)
+                .unwrap();
+        }
+        s.set_e2ee_capable(true);
+    }
+    let mut a = Client::new(s_a.clone()).await;
+    let mut b = Client::new(s_b.clone()).await;
+    let mut c = Client::new(s_c.clone()).await;
+    a.bind(addr).await;
+    b.bind(addr).await;
+    c.bind(addr).await;
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut raw_dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut src = RumbleSource::new(0x5eed);
+
+    // Without a request the frame is forwarded byte-for-byte.
+    let raw = src.frame();
+    a.send_audio(addr, &team, &raw).await;
+    let got = b.recv().await.expect("plain forward");
+    assert_eq!(&got.payload[..], &raw[..]);
+    assert!(!s_a.noise_suppression());
+
+    // Alice opts in: the same rumble arrives re-encoded and, once the model settles, quieter.
+    sfu.set_noise_suppression(&s_a.session_id, true).unwrap();
+    assert!(s_a.noise_suppression());
+    let (mut before, mut after) = (0.0, 0.0);
+    for i in 0..120 {
+        let raw = src.frame();
+        a.send_audio(addr, &team, &raw).await;
+        let got = b.recv().await.expect("cleaned forward");
+        assert_eq!(got.header.ssrc, s_a.ssrc);
+        assert!(!got.header.has_flag(PacketFlags::Pcmu));
+        assert_ne!(&got.payload[..], &raw[..], "frame {i} must be re-encoded");
+        assert_eq!(
+            dec.get_nb_samples(&got.payload).unwrap(),
+            960,
+            "frame duration is preserved"
+        );
+        if i >= 80 {
+            before += opus_rms(&mut raw_dec, &raw);
+            after += opus_rms(&mut dec, &got.payload);
+        }
+    }
+    assert!(after < before * 0.5, "{before:.0} -> {after:.0}");
+
+    // One slot on this node: Bob's explicit request is refused, Alice keeps hers.
+    assert!(matches!(
+        sfu.set_noise_suppression(&s_b.session_id, true),
+        Err(AurixError::NoiseSuppressionUnavailable(_))
+    ));
+    assert!(!s_b.noise_suppression());
+    assert!(s_a.noise_suppression());
+    // Turning it off is always allowed and idempotent.
+    sfu.set_noise_suppression(&s_b.session_id, false).unwrap();
+
+    // A channel that requires denoising cannot get a denoiser for Carol while the slot is
+    // busy: her frames go through as they came (never dropped).
+    let raw = src.frame();
+    c.send_audio(addr, &forced, &raw).await;
+    let got = a.recv().await.expect("forced channel, pool full");
+    assert_eq!(&got.payload[..], &raw[..]);
+    assert!(b.recv().await.is_some());
+
+    // Stereo (music) channels are never denoised, even for an opted-in sender.
+    let raw = src.frame();
+    a.send_audio(addr, &stereo, &raw).await;
+    let got = b.recv().await.expect("stereo forward");
+    assert_eq!(&got.payload[..], &raw[..]);
+    assert!(c.recv().await.is_some());
+
+    // E2EE frames are opaque to the node: forwarded untouched with the flag intact.
+    let seq = a.next_seq();
+    let mut pkt = AurixPacket::audio(
+        seq,
+        seq * 960,
+        s_a.ssrc,
+        channel_id_hash(&sealed),
+        Bytes::from_static(b"sealed-by-the-client"),
+    );
+    pkt.header.flags |= PacketFlags::E2ee as u16;
+    a.sock.send_to(&pkt.seal(&s_a.keys), addr).await.unwrap();
+    let got = b.recv().await.expect("e2ee forward");
+    assert!(got.header.has_flag(PacketFlags::E2ee));
+    assert_eq!(&got.payload[..], b"sealed-by-the-client");
+    assert!(c.recv().await.is_some());
+
+    // Alice releases her slot; the channel policy now claims it for Carol.
+    sfu.set_noise_suppression(&s_a.session_id, false).unwrap();
+    assert!(!s_a.noise_suppression());
+    let raw = src.frame();
+    a.send_audio(addr, &team, &raw).await;
+    assert_eq!(
+        &b.recv().await.expect("alice plain again").payload[..],
+        &raw[..]
+    );
+    assert!(c.recv().await.is_some());
+    let raw = src.frame();
+    c.send_audio(addr, &forced, &raw).await;
+    let got = a.recv().await.expect("forced channel, slot free");
+    assert_ne!(&got.payload[..], &raw[..], "channel policy denoises Carol");
+    assert_eq!(dec.get_nb_samples(&got.payload).unwrap(), 960);
+    assert!(b.recv().await.is_some());
+    // ... but Carol's uplink into a plain channel is left alone.
+    let raw = src.frame();
+    c.send_audio(addr, &team, &raw).await;
+    assert_eq!(&a.recv().await.expect("carol plain").payload[..], &raw[..]);
+    assert!(b.recv().await.is_some());
+
+    // A node with the feature off refuses requests and ignores channel policies.
+    let (off, off_addr) = start_sfu().await;
+    assert!(!off.noise_suppression_enabled());
+    let s_x = off
+        .create_session(SessionId::new(), UserId::new(), app, "x".into())
+        .unwrap();
+    let s_y = off
+        .create_session(SessionId::new(), UserId::new(), app, "y".into())
+        .unwrap();
+    let forced_cfg = ChannelConfig {
+        noise_suppression: true,
+        ..ChannelConfig::default()
+    };
+    for s in [&s_x, &s_y] {
+        off.join_channel(
+            &s.session_id,
+            forced,
+            forced_cfg.clone(),
+            ChannelRole::Speaker,
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        off.set_noise_suppression(&s_x.session_id, true),
+        Err(AurixError::NoiseSuppressionUnavailable(_))
+    ));
+    let mut x = Client::new(s_x.clone()).await;
+    let mut y = Client::new(s_y.clone()).await;
+    x.bind(off_addr).await;
+    y.bind(off_addr).await;
+    let raw = src.frame();
+    x.send_audio(off_addr, &forced, &raw).await;
+    assert_eq!(
+        &y.recv().await.expect("disabled node forwards").payload[..],
+        &raw[..]
+    );
+}

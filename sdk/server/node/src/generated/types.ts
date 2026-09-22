@@ -550,6 +550,15 @@ export interface ChannelConfig {
    * this is on are written with a 2-channel OpusHead.
    */
   stereo?: boolean;
+  /**
+   * The node denoises every participant's uplink into this channel (RNNoise-class model, mono
+   * speech) before it reaches receivers, recording, STT and the cascade — for clients that run no
+   * capture DSP. Needs `media.noise_suppression.enabled` on the node; when it is off or
+   * `max_sessions` are busy the frames pass uncleaned
+   * (`aurix_noise_suppression_frames_total{outcome="skipped"}`). Rejected together with `stereo` or
+   * `e2ee`.
+   */
+  noise_suppression?: boolean;
   recording_enabled?: boolean;
   /** Transcribe speech (when `[stt]` is configured on the node) and deliver `Transcript` events. */
   transcription?: boolean;

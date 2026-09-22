@@ -228,6 +228,14 @@ stops capture, unbinds the sound waves and only then destroys the client.
   playback switch codec inside the native core, nothing changes in the bridge. Refused with
   `CODEC_NOT_AVAILABLE` when the node runs `media.pcmu_fallback = false`.
 
+* **Server-side noise suppression:** `SetServerNoiseSuppression(true)` asks the node to denoise
+  this session's uplink itself (for a PCMU device or any build that turned the client DSP off);
+  `OnServerNoiseSuppressionChanged` / `IsServerNoiseSuppressionEnabled()` report what the node
+  holds, `FAurixSessionInfo.bNoiseSuppression` whether the node offers it at all. Refused with
+  `NOISE_SUPPRESSION_UNAVAILABLE` when `media.noise_suppression` is off or its `max_sessions`
+  are busy; the preference is kept and re-sent after a reconnect. Never applied to E2EE frames
+  or stereo channels.
+
 * **Stereo uplink:** `FAurixEncoderSettings.bStereo` encodes the first two capture channels as
   L/R (a mono device is duplicated) for music / broadcast sources; honoured only while the joined
   channels' policy has `FAurixAudioPolicy.bStereo` (`ChannelConfig.stereo`), otherwise the core

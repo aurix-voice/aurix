@@ -2,6 +2,7 @@ use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::{CascadeOptions, CascadeRelay};
 use crate::cert::MediaCert;
 use crate::channel::{Admission, JoinHints, MediaChannel, RoleChange};
+use crate::denoise::{DenoisePool, UplinkDenoiser};
 use crate::mix::MixHub;
 use crate::mixer::MixerConfig;
 use crate::quality::{MosAlertPolicy, QualityTick};
@@ -13,6 +14,7 @@ use crate::transport::bind_media_socket;
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{WebRtcManager, WebRtcMediaEvent};
 use crate::webtransport::{WebTransportLink, WebTransportOptions, WebTransportServer};
+use aurix_common::config::NoiseSuppressionConfig;
 use aurix_common::crypto::CryptoProvider;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{channel_id_hash, QuicInfo, TlsTunnelInfo, WebTransportInfo};
@@ -124,6 +126,8 @@ pub struct SfuOptions {
     /// Per-participant WebRTC downlink tracks a browser may negotiate
     /// (see `MediaConfig::webrtc_participant_streams`).
     pub webrtc_participant_streams: u32,
+    /// Node-side denoising of uplinks (see `MediaConfig::noise_suppression`).
+    pub noise_suppression: NoiseSuppressionConfig,
 }
 
 impl Default for SfuOptions {
@@ -155,6 +159,7 @@ impl Default for SfuOptions {
             webtransport: WebTransportOptions::default(),
             downlink_mix: true,
             webrtc_participant_streams: 16,
+            noise_suppression: NoiseSuppressionConfig::default(),
         }
     }
 }
@@ -175,6 +180,7 @@ pub struct SfuNode {
     active_participant_count: Arc<AtomicU32>,
     webrtc_manager: Option<Arc<WebRtcManager>>,
     router: Option<Arc<PacketRouter>>,
+    denoise: Arc<DenoisePool>,
     quic: Option<Arc<QuicServer>>,
     tls_tunnel: Option<Arc<TlsTunnelServer>>,
     webtransport: Option<Arc<WebTransportServer>>,
@@ -199,10 +205,12 @@ impl SfuNode {
 
     pub fn new(node_id: MediaNodeId, region: Region, options: SfuOptions) -> Self {
         let (events, _) = broadcast::channel(4096);
+        let denoise = DenoisePool::new(options.noise_suppression.clone());
         Self {
             node_id,
             region,
             options,
+            denoise,
             channels: Arc::new(DashMap::new()),
             channels_by_hash: Arc::new(DashMap::new()),
             pinned_channels: Arc::new(DashMap::new()),
@@ -450,6 +458,7 @@ impl SfuNode {
             self.options
                 .downlink_mix
                 .then(|| MixHub::new(socket.clone(), self.mixer_config())),
+            self.denoise.clone(),
         ));
 
         // WebRTC media events -> router
@@ -1207,6 +1216,44 @@ impl SfuNode {
     /// Whether this node serves server-mixed downlinks (`SessionInitAck.downlink_mix`).
     pub fn downlink_mix_enabled(&self) -> bool {
         self.options.downlink_mix
+    }
+
+    /// Whether this node denoises uplinks on request (`SessionInitAck.noise_suppression`).
+    pub fn noise_suppression_enabled(&self) -> bool {
+        self.denoise.enabled()
+    }
+
+    /// `SetNoiseSuppression`: the client asks the node to clean its uplink (or stops asking).
+    /// Fails when the node's denoiser is disabled or `media.noise_suppression.max_sessions`
+    /// are busy. Channels with `noise_suppression = true` are cleaned regardless of this.
+    pub fn set_noise_suppression(&self, session_id: &SessionId, enabled: bool) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| AurixError::SessionNotFound(session_id.to_string()))?;
+        if !enabled {
+            session.set_noise_suppression(None);
+            return Ok(());
+        }
+        if session.noise_suppression() {
+            return Ok(());
+        }
+        if !self.denoise.enabled() {
+            return Err(AurixError::NoiseSuppressionUnavailable(
+                "server-side noise suppression is disabled on this node".into(),
+            ));
+        }
+        // A channel policy may already hold the slot for this session: keep its state.
+        let existing = session.denoiser.lock().take();
+        let denoiser = match existing.or_else(|| UplinkDenoiser::acquire(&self.denoise)) {
+            Some(d) => d,
+            None => {
+                return Err(AurixError::NoiseSuppressionUnavailable(
+                    "the node is denoising as many sessions as it can right now".into(),
+                ))
+            }
+        };
+        session.set_noise_suppression(Some(denoiser));
+        Ok(())
     }
 
     /// Per-participant WebRTC downlink tracks a browser may negotiate

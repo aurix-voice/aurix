@@ -40,6 +40,7 @@ namespace Aurix.WebGL
         private bool _muted;
         private bool _wantTranscripts;
         private TranslationPrefs _translation = new TranslationPrefs();
+        private bool _activeServerNoiseSuppression;
         private TransmissionMode _transmission = TransmissionMode.All;
         private Guid? _focus;
         private Guid _userId;
@@ -94,6 +95,7 @@ namespace Aurix.WebGL
         public TransmissionMode Transmission { get { lock (_channels) return _transmission; } }
         public Guid? FocusChannel { get { lock (_channels) return _focus; } }
         public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
+        public bool ServerNoiseSuppression { get { lock (_channels) return _activeServerNoiseSuppression; } }
         public TranslationPrefs TranslationPrefs { get { lock (_channels) return _translation.Clone(); } }
         public NetworkQuality? LastNetworkQuality => _quality;
         /// <summary>Whether the browser client exists (created by the first connect, destroyed by <see cref="Dispose"/>).</summary>
@@ -145,6 +147,7 @@ namespace Aurix.WebGL
         public event Action<Guid, Guid, bool> OnParticipantTyping;
         public event Action<Transcript> OnTranscript;
         public event Action<TranslationPrefs> OnTranslationChanged;
+        public event Action<bool> OnServerNoiseSuppressionChanged;
         public event Action<TtsStatus> OnTtsStatus;
         public event Action<string, string> OnServerError;
         public event Action<string> OnDisconnected;
@@ -325,6 +328,9 @@ namespace Aurix.WebGL
             lock (_channels) _wantTranscripts = enabled;
             return Sync("setTranscripts", new Dictionary<string, object> { { "enabled", enabled } });
         }
+
+        public Task SetServerNoiseSuppressionAsync(bool enabled, CancellationToken ct = default) =>
+            Sync("setServerNoiseSuppression", new Dictionary<string, object> { { "enabled", enabled } });
 
         public Task SetTranslationAsync(string language, string spokenLanguage = null, bool speech = false, CancellationToken ct = default)
         {
@@ -1124,6 +1130,13 @@ namespace Aurix.WebGL
                 {
                     var t = BridgeJson.Transcript(BridgeJson.Obj(e, "transcript"));
                     if (t != null) OnTranscript?.Invoke(t);
+                    return;
+                }
+                case "serverNoiseSuppressionChanged":
+                {
+                    var enabled = MiniJson.GetBool(e, "enabled");
+                    lock (_channels) _activeServerNoiseSuppression = enabled;
+                    OnServerNoiseSuppressionChanged?.Invoke(enabled);
                     return;
                 }
                 case "translationChanged":

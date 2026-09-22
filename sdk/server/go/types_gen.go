@@ -704,7 +704,14 @@ type ChannelConfig struct {
 	// clients as `audio.stereo`. Off: clients encode mono. The SFU forwards either; stereo receivers
 	// keep the image, mono receivers and server-side recording/STT downmix. Recordings started while
 	// this is on are written with a 2-channel OpusHead.
-	Stereo           *bool `json:"stereo,omitempty"`
+	Stereo *bool `json:"stereo,omitempty"`
+	// The node denoises every participant's uplink into this channel (RNNoise-class model, mono
+	// speech) before it reaches receivers, recording, STT and the cascade — for clients that run no
+	// capture DSP. Needs `media.noise_suppression.enabled` on the node; when it is off or
+	// `max_sessions` are busy the frames pass uncleaned
+	// (`aurix_noise_suppression_frames_total{outcome="skipped"}`). Rejected together with `stereo` or
+	// `e2ee`.
+	NoiseSuppression *bool `json:"noise_suppression,omitempty"`
 	RecordingEnabled *bool `json:"recording_enabled,omitempty"`
 	// Transcribe speech (when `[stt]` is configured on the node) and deliver `Transcript` events.
 	Transcription *bool `json:"transcription,omitempty"`

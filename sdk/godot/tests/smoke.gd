@@ -168,6 +168,8 @@ func _init() -> void:
 	_check(int(client.get_decoder_settings()["complexity"]) == 7, "decoder complexity round-trips")
 	_check(client.get_audio_codec() == AurixVoiceClient.CODEC_OPUS, "default codec opus")
 	_check(client.get_downlink_mode() == AurixVoiceClient.DOWNLINK_STREAMS, "default downlink streams")
+	_check(client.get_server_noise_suppression() == false, "server noise suppression off by default")
+	_check(client.set_server_noise_suppression(true) == AurixVoiceClient.RESULT_NOT_CONNECTED, "set_server_noise_suppression without client → NOT_CONNECTED")
 
 	# Malformed ids are rejected before the native client is involved (even when it exists).
 	_check(client.update_transforms("00000000-0000-4000-8000-000000000001", {"not-a-uuid": Transform3D()}) == AurixVoiceClient.RESULT_NOT_CONNECTED, "update_transforms without client → NOT_CONNECTED")
@@ -183,7 +185,8 @@ func _init() -> void:
 			"recording", "audio_policy_changed", "audio_codec_changed", "disconnected", "server_error",
 			"transmission_changed", "channel_focus_changed", "user_block_changed", "moderation_applied",
 			"positions", "rejoin_failed", "bitrate_changed", "chat_read_markers", "loss_profile_changed",
-			"chat_message_updated", "chat_reaction_changed", "chat_search_result"]:
+			"chat_message_updated", "chat_reaction_changed", "chat_search_result",
+			"server_noise_suppression_changed"]:
 		_check(client.has_signal(sig), "signal %s" % sig)
 
 	# Region discovery helper.

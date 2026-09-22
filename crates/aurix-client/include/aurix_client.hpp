@@ -474,6 +474,11 @@ public:
     /// channels); needs `AurixSessionInfo.downlink_mix`. Acked by `AURIX_EVENT_DOWNLINK_MODE_CHANGED`.
     AurixResult set_downlink_mode(AurixDownlinkMode mode) { return aurix_client_set_downlink_mode(c_, mode); }
     AurixDownlinkMode downlink_mode() const { return aurix_client_downlink_mode(c_); }
+    /// Node-side noise suppression of our uplink (for clients without their own capture DSP);
+    /// needs `AurixSessionInfo.noise_suppression`. Acked by
+    /// `AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED` (`flag`).
+    AurixResult set_server_noise_suppression(bool enabled) { return aurix_client_set_server_noise_suppression(c_, enabled); }
+    bool server_noise_suppression() const { return aurix_client_server_noise_suppression(c_); }
     /// Link the media currently uses (QUIC, UDP, the TLS tunnel or the WebSocket tunnel); `AURIX_MEDIA_NONE` before bind.
     AurixMediaPath media_path() const { return aurix_client_media_path(c_); }
     /// The device's network changed: migrate a QUIC link in place / re-announce a UDP one.

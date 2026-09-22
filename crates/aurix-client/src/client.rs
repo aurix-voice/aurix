@@ -186,6 +186,10 @@ struct Prefs {
     downlink: DownlinkMode,
     /// Downlink mode the server acknowledged.
     active_downlink: DownlinkMode,
+    /// Server-side denoising the app asked for; replayed on a fresh session.
+    noise_suppression: bool,
+    /// Server-side denoising the server acknowledged.
+    active_noise_suppression: bool,
     /// `(user, channel or None = everywhere)` → muted.
     local_mutes: HashMap<(UserId, Option<ChannelId>), bool>,
     volumes: HashMap<UserId, f32>,
@@ -1536,6 +1540,24 @@ impl Client {
         self.inner.prefs.lock().active_downlink
     }
 
+    /// Asks the node to run its noise suppressor over this session's uplink before anyone
+    /// hears it — for a client that does no capture DSP of its own (see `DspConfig`; do not
+    /// stack the two). Never applies to end-to-end encrypted frames or stereo channels.
+    /// Requires `media.noise_suppression` on the node (`SessionInfo::noise_suppression`,
+    /// otherwise `ServerError` `NOISE_SUPPRESSION_UNAVAILABLE`, also when its session budget
+    /// is spent); takes effect on `NoiseSuppressionChanged`.
+    pub fn set_server_noise_suppression(&self, enabled: bool) -> Result<()> {
+        self.inner.prefs.lock().noise_suppression = enabled;
+        self.send_cmd(Command::Send(ControlMessage::SetNoiseSuppression {
+            enabled,
+        }))
+    }
+
+    /// Whether the node currently denoises this session's uplink on its request.
+    pub fn server_noise_suppression(&self) -> bool {
+        self.inner.prefs.lock().active_noise_suppression
+    }
+
     /// This session's role in a joined channel (`None` until the join is acked).
     pub fn channel_role(&self, channel_id: ChannelId) -> Option<ChannelRole> {
         self.inner.channels.lock().get(&channel_id).map(|c| c.role)
@@ -2298,6 +2320,7 @@ async fn session(
         media_quic: ack.quic.is_some(),
         media_tls: ack.tls_tunnel.is_some(),
         downlink_mix: ack.downlink_mix,
+        noise_suppression: ack.noise_suppression,
         migrated: ack.migrated,
         endpoint: url.to_string(),
         failover: ack.failover.clone(),
@@ -2426,6 +2449,13 @@ async fn session(
         };
         if stale_downlink {
             inner.emit(Event::DownlinkModeChanged(DownlinkMode::Streams));
+        }
+        let stale_denoise = {
+            let mut prefs = inner.prefs.lock();
+            std::mem::replace(&mut prefs.active_noise_suppression, false)
+        };
+        if stale_denoise {
+            inner.emit(Event::NoiseSuppressionChanged(false));
         }
         // Global preferences first; channel-scoped ones follow each re-join ack.
         let msgs = replay_global_prefs(&inner.prefs.lock());
@@ -3238,6 +3268,9 @@ fn replay_global_prefs(prefs: &Prefs) -> Vec<ControlMessage> {
         msgs.push(ControlMessage::SetDownlinkMode {
             mode: prefs.downlink,
         });
+    }
+    if prefs.noise_suppression {
+        msgs.push(ControlMessage::SetNoiseSuppression { enabled: true });
     }
     msgs
 }
@@ -4127,6 +4160,7 @@ async fn handle_message(
             volumes,
             codec,
             downlink,
+            noise_suppression,
             ..
         } => {
             let mut prefs = inner.prefs.lock();
@@ -4136,6 +4170,8 @@ async fn handle_message(
             prefs.active_codec = codec;
             let downlink_changed = prefs.active_downlink != downlink;
             prefs.active_downlink = downlink;
+            let denoise_changed = prefs.active_noise_suppression != noise_suppression;
+            prefs.active_noise_suppression = noise_suppression;
             for m in local_mutes {
                 prefs.local_mutes.insert((m.user_id, m.channel_id), true);
             }
@@ -4149,6 +4185,9 @@ async fn handle_message(
             }
             if downlink_changed {
                 inner.emit(Event::DownlinkModeChanged(downlink));
+            }
+            if denoise_changed {
+                inner.emit(Event::NoiseSuppressionChanged(noise_suppression));
             }
             inner.emit(Event::TransmissionChanged(transmission));
             inner.emit(Event::ChannelFocusChanged(focus_channel));
@@ -4169,6 +4208,15 @@ async fn handle_message(
             };
             if changed {
                 inner.emit(Event::DownlinkModeChanged(mode));
+            }
+        }
+        ControlMessage::NoiseSuppressionChanged { enabled } => {
+            let changed = {
+                let mut prefs = inner.prefs.lock();
+                std::mem::replace(&mut prefs.active_noise_suppression, enabled) != enabled
+            };
+            if changed {
+                inner.emit(Event::NoiseSuppressionChanged(enabled));
             }
         }
         ControlMessage::ChannelFocusChanged { channel_id } => {
@@ -4480,6 +4528,7 @@ async fn handle_message(
         | ControlMessage::SetChannelFocus { .. }
         | ControlMessage::SetAudioCodec { .. }
         | ControlMessage::SetDownlinkMode { .. }
+        | ControlMessage::SetNoiseSuppression { .. }
         | ControlMessage::OcclusionUpdate { .. }
         | ControlMessage::ReverbZoneUpdate { .. }
         | ControlMessage::QualityReport { .. }

@@ -247,6 +247,7 @@ export type ClientMessage =
       };
     }
   | { type: 'SetTranscripts'; data: { enabled: boolean } }
+  | { type: 'SetNoiseSuppression'; data: { enabled: boolean } }
   | {
       type: 'SetTranslation';
       data: { language?: string | null; spoken_language?: string | null; speech: boolean };
@@ -302,6 +303,8 @@ export type ServerMessage =
         failover?: string[];
         /** The node translates transcripts on request; absent when translation is not configured. */
         translation?: TranslationInfoWire;
+        /** The node can denoise this session's uplink on request (`SetNoiseSuppression`). */
+        noise_suppression?: boolean;
         /** Per-participant WebRTC downlink tracks the node serves at most (absent / 0 = mixed only). */
         webrtc_participant_streams?: number;
         /** Gain the node applies to voices of unfocused channels; the browser mirrors it on per-participant tracks. */
@@ -445,6 +448,7 @@ export type ServerMessage =
       type: 'TranslationChanged';
       data: { language?: string | null; spoken_language?: string | null; speech?: boolean };
     }
+  | { type: 'NoiseSuppressionChanged'; data: { enabled: boolean } }
   | {
       type: 'TtsStatus';
       data: {
@@ -464,6 +468,8 @@ export type ServerMessage =
         /** Absent on servers predating transmission policies (= `all`). */
         transmission?: TransmissionModeWire;
         focus_channel?: string | null;
+        /** The node denoises this session's uplink (`SetNoiseSuppression`). */
+        noise_suppression?: boolean;
       };
     }
   | {

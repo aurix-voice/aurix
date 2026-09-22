@@ -196,6 +196,8 @@ namespace Aurix.Protocol
         public Aurix.Audio.AudioCodec Codec = Aurix.Audio.AudioCodec.Opus;
         /// <summary>How channel audio reaches this session (<see cref="DownlinkMode.Streams"/> unless requested).</summary>
         public DownlinkMode Downlink = DownlinkMode.Streams;
+        /// <summary>The node denoises this session's uplink (<c>SetNoiseSuppression</c>).</summary>
+        public bool NoiseSuppression;
     }
 
     /// <summary>
@@ -555,6 +557,7 @@ namespace Aurix.Protocol
             prefs.FocusChannel = MiniJson.GetGuid(Data, "focus_channel");
             prefs.Codec = AudioCodecFromWire(MiniJson.GetString(Data, "codec"));
             prefs.Downlink = DownlinkModeFromWire(MiniJson.GetString(Data, "downlink"));
+            prefs.NoiseSuppression = MiniJson.GetBool(Data, "noise_suppression");
             return prefs;
         }
 
@@ -1056,6 +1059,9 @@ namespace Aurix.Protocol
 
         public static string SetDownlinkMode(DownlinkMode mode) =>
             Serialize("SetDownlinkMode", new Dictionary<string, object> { { "mode", DownlinkModeToWire(mode) } });
+
+        public static string SetNoiseSuppression(bool enabled) =>
+            Serialize("SetNoiseSuppression", new Dictionary<string, object> { { "enabled", enabled } });
 
         public static string TtsSpeak(Guid? channelId, string text, string voice, TtsDestination destination, string clientRef)
         {

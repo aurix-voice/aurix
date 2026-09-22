@@ -515,6 +515,13 @@ pub struct ChannelConfig {
     /// classify → incidents). Independent of `transcription`: transcripts are not delivered to
     /// participants unless that is set too. Never applies to end-to-end encrypted media.
     pub safety_voice: bool,
+    /// The node denoises every uplink into this channel (RNNoise-class, see
+    /// `media.noise_suppression`) before it is forwarded, recorded, mixed or transcribed —
+    /// for channels whose clients run no capture DSP. Costs the node a decode + encode per
+    /// speaker; sessions beyond the node's `max_sessions` are forwarded uncleaned. Excluded
+    /// by `e2ee` (the node cannot decode) and `stereo` (a mono speech model).
+    #[serde(default)]
+    pub noise_suppression: bool,
     /// End-to-end encryption: participants encrypt their frames with sender keys they exchange
     /// among themselves (`crate::e2ee`); the node relays the key exchange and the frames but
     /// cannot decode them. Excludes everything that needs the node to hear the audio:
@@ -549,6 +556,7 @@ impl Default for ChannelConfig {
             recording_enabled: false,
             transcription: false,
             safety_voice: false,
+            noise_suppression: false,
             e2ee: false,
             whisper_target: None,
             command_speakers: None,
@@ -605,6 +613,9 @@ impl ChannelConfig {
         if let Some(d) = &self.ducking {
             d.validate()?;
         }
+        if self.noise_suppression && self.stereo {
+            return Err("noise_suppression requires a mono channel (stereo = false)".into());
+        }
         if self.e2ee {
             if self.recording_enabled {
                 return Err("e2ee channels cannot be recorded".into());
@@ -619,6 +630,9 @@ impl ChannelConfig {
             }
             if self.audience.is_some_and(|a| a.mix_for_listeners) {
                 return Err("e2ee channels cannot mix for listeners".into());
+            }
+            if self.noise_suppression {
+                return Err("e2ee channels cannot be denoised by the node".into());
             }
             if self.channel_type == ChannelType::Echo {
                 return Err("echo channels cannot be end-to-end encrypted".into());

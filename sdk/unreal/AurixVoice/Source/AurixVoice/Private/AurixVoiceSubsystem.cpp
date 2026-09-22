@@ -277,6 +277,7 @@ FAurixSessionInfo ToSession(const AurixSessionInfo& S)
 	Out.bMediaQuic = S.media_quic;
 	Out.bMediaTls = S.media_tls;
 	Out.bDownlinkMix = S.downlink_mix;
+	Out.bNoiseSuppression = S.noise_suppression;
 	Out.bTranslation = S.translation;
 	Out.bTranslationSpeech = S.translation_speech;
 	Out.bMigrated = S.migrated;
@@ -1542,6 +1543,16 @@ EAurixDownlinkMode UAurixVoiceSubsystem::GetDownlinkMode() const
 	return Native ? ToDownlinkMode(Native->Client.downlink_mode()) : EAurixDownlinkMode::Streams;
 }
 
+bool UAurixVoiceSubsystem::SetServerNoiseSuppression(bool bEnabled)
+{
+	return Native && Check(Native->Client.set_server_noise_suppression(bEnabled), TEXT("set_server_noise_suppression"));
+}
+
+bool UAurixVoiceSubsystem::IsServerNoiseSuppressionEnabled() const
+{
+	return Native && Native->Client.server_noise_suppression();
+}
+
 EAurixMediaPath UAurixVoiceSubsystem::GetMediaPath() const
 {
 	return Native ? ToMediaPath(Native->Client.media_path()) : EAurixMediaPath::None;
@@ -2072,6 +2083,10 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_DOWNLINK_MODE_CHANGED:
 		OnDownlinkModeChanged.Broadcast(ToDownlinkMode(aurix_event_downlink_mode(Raw)));
+		break;
+
+	case AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED:
+		OnServerNoiseSuppressionChanged.Broadcast(aurix_event_flag(Raw));
 		break;
 
 	case AURIX_EVENT_MEDIA_PATH_CHANGED:

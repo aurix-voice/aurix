@@ -496,6 +496,25 @@ mode. C: `AurixChannelInfo` (`role`, `participant_count`, `hidden_listeners`, `t
 `downlink_mode`; Unreal `GetChannelInfo`, `CanSpeakIn`, `SetDownlinkMode`, `GetDownlinkMode`,
 `OnDownlinkModeChanged`.
 
+## Server-side noise suppression
+
+The capture DSP above is the default place for noise suppression; a client that cannot run it
+(PCMU device, a build with `noise_suppression = false`, a bot feeding raw audio) can ask the
+node to do it: `client.set_server_noise_suppression(true)` sends `SetNoiseSuppression`,
+`Event::NoiseSuppressionChanged(enabled)` confirms what the node holds and
+`client.server_noise_suppression()` reports it. `SessionInfo::noise_suppression` says whether
+the node offers it (`media.noise_suppression.enabled`); the request fails with
+`NOISE_SUPPRESSION_UNAVAILABLE` when it does not or all of its `max_sessions` are busy. The
+preference is kept across reconnects — replayed after a resume/failover, re-sent for a fresh
+session (the active state resets to `false` and the event fires again when the node confirms).
+The node never cleans E2EE frames or frames into stereo channels; both DSPs on at once is
+harmless but pointless ([server-side noise suppression](../features/channels.md#server-side-noise-suppression)).
+C: `aurix_client_set_server_noise_suppression` / `aurix_client_server_noise_suppression`,
+`AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED` + `aurix_event_flag`,
+`AurixSessionInfo.noise_suppression`; C++ `set_server_noise_suppression` /
+`server_noise_suppression`; Unreal `SetServerNoiseSuppression` / `IsServerNoiseSuppressionEnabled`
+/ `OnServerNoiseSuppressionChanged` / `FAurixSessionInfo.bNoiseSuppression`.
+
 ## End-to-end encryption
 
 `ClientConfig::e2ee` (default `true`) announces the E2EE capability on connect and makes the

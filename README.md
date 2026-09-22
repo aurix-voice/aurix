@@ -847,6 +847,20 @@ older SDKs) get libopus' downmix. Recordings of a stereo channel carry a 2-chann
 The capture DSP is a voice chain and is bypassed for stereo frames; browsers are opened with a
 2-channel track and voice processing off. PCMU stays mono.
 
+**Server-side noise suppression (opt-in).** Capture DSP runs on the client, but for devices that
+cannot (PCMU handsets, embedded boards, bots feeding raw microphone audio) a node with
+`media.noise_suppression.enabled = true` denoises a session's uplink itself: the same
+RNNoise-class model as the native core (`nnnoiseless`, pure Rust) over the decoded Opus or the
+PCMU transcode, re-encoded at `noise_suppression.bitrate` before the frame reaches receivers,
+recording, STT, server mixes and the cascade. A client asks with `SetNoiseSuppression`
+(`SessionInitAck.noise_suppression` advertises it, `NOISE_SUPPRESSION_UNAVAILABLE` when the node
+is off or `max_sessions` are busy; the preference survives resume and failover), or a channel
+with `noise_suppression: true` cleans every uplink into it. E2EE frames and frames into stereo
+channels are never touched; a frame sent to several channels is cleaned once. `level` = `high` /
+`moderate` / `low`; metrics `aurix_noise_suppression_sessions`,
+`aurix_noise_suppression_frames_total{path,outcome}`. All SDKs expose
+`setServerNoiseSuppression` + a changed event ([channels](docs/src/features/channels.md#server-side-noise-suppression)).
+
 **Per-participant PCM for engine spatialization.** Native, Unity and Unreal clients can pull
 each talker's decoded voice separately — unpanned, microphone + TTS, per-participant volume /
 server gain / master volume applied — and let the game engine do HRTF, occlusion, reverb and
@@ -1205,7 +1219,11 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
 ## Limitations
 
 * Native TLS uses rustls with PEM files; ACME/auto-renewal is left to your proxy.
-* No SIP/PSTN gateway, no server-side noise suppression (the native core / SDKs do it on the client).
+* No SIP/PSTN gateway. Noise suppression runs on the client by default (native core / SDKs);
+  the server-side option (`media.noise_suppression`) is mono speech only — E2EE frames and stereo
+  channels are never cleaned, a channel that requires it forwards uncleaned frames when the
+  node is off or full, and the re-encode is a second lossy Opus pass. No server-side echo
+  cancellation or AGC.
 * Text chat is deliberately "lite": channel/directed messages and typing, no attachments or
   threads. History, offline delivery of directed messages, read markers, edits / deletions,
   reactions and full-text search exist only with `chat.persist = true`, and offline replay is

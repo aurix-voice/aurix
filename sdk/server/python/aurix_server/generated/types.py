@@ -499,6 +499,7 @@ ChannelConfig = TypedDict(
         "audience": NotRequired[Optional["AudienceConfig"]],  # Large-channel / audience mode: hidden listeners, server mix for listeners, speaker admission cap, per-receiver stream cap. Absent/`null` (default): plain channel.
         "audio_profile": NotRequired["AudioProfile"],
         "stereo": NotRequired[bool],  # Participants may send two-channel (stereo) Opus (music, DJ, broadcast sources); delivered to clients as `audio.stereo`. Off: clients encode mono. The SFU forwards either; stereo receivers keep the image, mono receivers and server-side recording/STT downmix. Recordings started while this is on are written with a 2-channel OpusHead.
+        "noise_suppression": NotRequired[bool],  # The node denoises every participant's uplink into this channel (RNNoise-class model, mono speech) before it reaches receivers, recording, STT and the cascade — for clients that run no capture DSP. Needs `media.noise_suppression.enabled` on the node; when it is off or `max_sessions` are busy the frames pass uncleaned (`aurix_noise_suppression_frames_total{outcome="skipped"}`). Rejected together with `stereo` or `e2ee`.
         "recording_enabled": NotRequired[bool],
         "transcription": NotRequired[bool],  # Transcribe speech (when `[stt]` is configured on the node) and deliver `Transcript` events.
         "safety_voice": NotRequired[bool],  # Send the speakers' transcripts to the `[safety]` classifier (requires `[stt]`); disclosed to clients as `ChannelJoinAck.safety_voice`. Independent of `transcription`.

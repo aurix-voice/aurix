@@ -48,6 +48,8 @@ pub struct SessionAck {
     pub tls_tunnel: Option<TlsTunnelInfo>,
     /// The node offers server-side mixed downlink (`SetDownlinkMode`).
     pub downlink_mix: bool,
+    /// The node can denoise this session's uplink on request (`SetNoiseSuppression`).
+    pub noise_suppression: bool,
     /// Resumed on a different node than the one that opened the session.
     pub migrated: bool,
     /// Public WebSocket URLs of other healthy nodes to try when this one stops answering.
@@ -205,6 +207,7 @@ impl ControlConnection {
                     quic,
                     tls_tunnel,
                     downlink_mix,
+                    noise_suppression,
                     migrated,
                     failover,
                     translation,
@@ -229,6 +232,7 @@ impl ControlConnection {
                         quic,
                         tls_tunnel,
                         downlink_mix,
+                        noise_suppression,
                         migrated,
                         failover,
                         translation,

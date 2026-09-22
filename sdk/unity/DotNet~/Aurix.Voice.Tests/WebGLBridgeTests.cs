@@ -712,6 +712,31 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public async Task ServerNoiseSuppressionRoundTripsThroughTheBridge()
+        {
+            var (client, bridge) = NewClient();
+            await Connect(client, bridge);
+            Assert.False(client.Session.NoiseSuppression);
+            Assert.False(client.ServerNoiseSuppression);
+
+            await client.SetServerNoiseSuppressionAsync(true);
+            var call = bridge.Last("setServerNoiseSuppression");
+            Assert.True(MiniJson.GetBool(call.args, "enabled"));
+
+            var seen = new List<bool>();
+            client.OnServerNoiseSuppressionChanged += e => seen.Add(e);
+            bridge.Emit("serverNoiseSuppressionChanged", ("enabled", true));
+            client.Update();
+            Assert.Equal(new[] { true }, seen);
+            Assert.True(client.ServerNoiseSuppression);
+
+            bridge.Emit("serverNoiseSuppressionChanged", ("enabled", false));
+            client.Update();
+            Assert.Equal(new[] { true, false }, seen);
+            Assert.False(client.ServerNoiseSuppression);
+        }
+
+        [Fact]
         public async Task ChatCallsAndEventsUseTheSharedTypes()
         {
             var (client, bridge) = NewClient();

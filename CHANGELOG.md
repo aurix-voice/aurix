@@ -147,6 +147,30 @@ released together.
   credentials) work on every node, a node that hosts none of the channel's participants may
   own its stream (it pins the channel so the cascade relays the audio to it), and rows of a
   vanished node are pruned with it. Tenant scoping applies to every remote view.
+* **Server-side noise suppression (opt-in).** `[media.noise_suppression]` (`enabled = false`,
+  `level = high | moderate | low`, `max_sessions = 256`, `bitrate = 32000`) lets a node denoise
+  a session's uplink itself for clients that run no capture DSP: the RNNoise-class model of the
+  native core (`nnnoiseless`, pure Rust, 48 kHz mono, 10 ms blocks) over the decoded Opus
+  frame, re-encoded at `bitrate` with the same duration and in-band FEC, or inside the PCMU
+  transcode where the samples are already PCM — before the frame reaches receivers, recording,
+  transcription, the server mixes and the cascade. A session asks with the new
+  `SetNoiseSuppression { enabled }` control message and gets `NoiseSuppressionChanged`
+  (`SessionInitAck.noise_suppression` advertises the option, `NOISE_SUPPRESSION_UNAVAILABLE`
+  / 503 when it is off or `max_sessions` are busy; kept in `ReceiverPreferences.noise_suppression`
+  across resume/failover), or a channel sets `ChannelConfig.noise_suppression = true` to clean
+  every uplink into it — rejected together with `stereo` or `e2ee`, and when the node cannot
+  honour it the frames pass uncleaned. E2EE frames and frames into stereo channels are never
+  decoded; a frame a native client sends to several channels is cleaned once and the result
+  reused. Metrics `aurix_noise_suppression_sessions`,
+  `aurix_noise_suppression_frames_total{path,outcome}`. SDKs: `setServerNoiseSuppression` /
+  `serverNoiseSuppression` / `serverNoiseSuppressionChanged` + `sessionInfo.noiseSuppression`
+  (Web, `AurixBridge` hosts), `SetServerNoiseSuppressionAsync` / `ServerNoiseSuppression` /
+  `OnServerNoiseSuppressionChanged` (Unity native + WebGL), `set_server_noise_suppression` /
+  `server_noise_suppression` + `Event::NoiseSuppressionChanged` (native core;
+  `aurix_client_set_server_noise_suppression`, `AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED`,
+  `AurixSessionInfo.noise_suppression` in the C ABI / C++), `SetServerNoiseSuppression` /
+  `IsServerNoiseSuppressionEnabled` / `OnServerNoiseSuppressionChanged` (Unreal),
+  `set_server_noise_suppression` / `server_noise_suppression_changed` (Godot native + Web).
 
 ### Fixed
 

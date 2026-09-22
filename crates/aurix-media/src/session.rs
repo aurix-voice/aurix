@@ -328,6 +328,11 @@ pub struct MediaSession {
     pub downlink_mode: RwLock<DownlinkMode>,
     /// μ-law → Opus encoder state while `codec == Pcmu`.
     pub pcmu_uplink: Mutex<Option<crate::transcode::PcmuUplink>>,
+    /// The client asked the node to denoise its uplink (`SetNoiseSuppression`); a channel
+    /// policy (`ChannelConfig::noise_suppression`) cleans it regardless.
+    pub noise_suppression: AtomicBool,
+    /// Denoiser state (and its pool slot) while the uplink is being cleaned for either reason.
+    pub denoiser: Mutex<Option<crate::denoise::UplinkDenoiser>>,
     /// Cocktail-party slot table of this receiver (`ChannelConfig::ambient`).
     pub ambient: Mutex<crate::ambient::AmbientState>,
     /// Per-speaker stream slots of this receiver (`ChannelConfig::audience.max_streams`),
@@ -409,6 +414,8 @@ impl MediaSession {
             codec: RwLock::new(AudioCodec::Opus),
             downlink_mode: RwLock::new(DownlinkMode::Streams),
             pcmu_uplink: Mutex::new(None),
+            noise_suppression: AtomicBool::new(false),
+            denoiser: Mutex::new(None),
             ambient: Mutex::new(crate::ambient::AmbientState::default()),
             stream_cap: Mutex::new(crate::ambient::AmbientState::default()),
             sequence: AtomicU32::new(0),
@@ -764,6 +771,20 @@ impl MediaSession {
 
     pub fn downlink_mode(&self) -> DownlinkMode {
         *self.downlink_mode.read()
+    }
+
+    /// Whether the client asked for node-side denoising of its uplink.
+    pub fn noise_suppression(&self) -> bool {
+        self.noise_suppression.load(Ordering::Relaxed)
+    }
+
+    /// Turns the client's request on (`denoiser` carries the reserved slot) or off; off drops
+    /// the state unless a channel policy still needs it, which the router re-arms on the next
+    /// frame.
+    pub fn set_noise_suppression(&self, denoiser: Option<crate::denoise::UplinkDenoiser>) {
+        self.noise_suppression
+            .store(denoiser.is_some(), Ordering::Relaxed);
+        *self.denoiser.lock() = denoiser;
     }
 
     /// Only native AURX sessions choose; browsers always get the WebRTC mix.

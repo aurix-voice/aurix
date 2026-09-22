@@ -29,11 +29,12 @@ use tracing::{debug, warn};
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::CascadeRelay;
 use crate::channel::{MediaChannel, Mix};
+use crate::denoise::{Cleaned, DenoisePool, UplinkDenoiser};
 use crate::mix::MixHub;
 use crate::quic::QuicLink;
 use crate::session::{MediaEndpoint, MediaSession, Transport};
 use crate::tls::TlsLink;
-use crate::transcode::{PcmuDownlink, PcmuUplink};
+use crate::transcode::{PcmuDownlink, PcmuUplink, Transcoded};
 use crate::tunnel::MediaTunnel;
 use crate::webrtc::{ForwardMedia, WebRtcManager};
 use crate::webtransport::WebTransportLink;
@@ -159,6 +160,8 @@ pub struct PacketRouter {
     /// Server-side mixers for native receivers in `DownlinkMode::Mixed`
     /// (`None`: `media.downlink_mix = false`, everyone gets per-speaker streams).
     mix: Option<Arc<MixHub>>,
+    /// Budget of uplinks the node denoises (`media.noise_suppression`).
+    denoise: Arc<DenoisePool>,
 }
 
 impl PacketRouter {
@@ -174,6 +177,7 @@ impl PacketRouter {
         speaking_energy_threshold: f32,
         events: broadcast::Sender<MediaEvent>,
         mix: Option<Arc<MixHub>>,
+        denoise: Arc<DenoisePool>,
     ) -> Self {
         Self {
             shared,
@@ -187,12 +191,18 @@ impl PacketRouter {
             events,
             pcmu_downlinks: DashMap::new(),
             mix,
+            denoise,
         }
     }
 
     /// Server-side downlink mixers of this node, if enabled.
     pub fn mix_hub(&self) -> Option<&Arc<MixHub>> {
         self.mix.as_ref()
+    }
+
+    /// The node's uplink denoiser budget.
+    pub fn denoise_pool(&self) -> &Arc<DenoisePool> {
+        &self.denoise
     }
 
     pub async fn route_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
@@ -668,6 +678,12 @@ impl PacketRouter {
             ));
         }
 
+        // Node-side denoising: an encrypted frame cannot be, a frame into a stereo channel is
+        // not (the model is mono speech); a PCMU frame is cleaned inside its transcode below.
+        let denoise = !packet.header.has_flag(PacketFlags::E2ee)
+            && !channel.is_stereo()
+            && self.arm_denoiser(sender, channel.requires_noise_suppression());
+
         // A PCMU uplink enters the channel as Opus so recording, transcription, cascade and
         // Opus receivers never see μ-law; PCMU receivers get it re-encoded in `deliver`.
         let transcoded;
@@ -684,7 +700,13 @@ impl PacketRouter {
                     "PCMU frame from a session that did not negotiate pcmu".into(),
                 ));
             }
-            transcoded = self.transcode_pcmu_uplink(sender, packet)?;
+            transcoded = self.transcode_pcmu_uplink(sender, packet, denoise)?;
+            &transcoded
+        } else if let Some(cleaned) = denoise
+            .then(|| self.denoise_opus(sender, packet.header.timestamp, &packet.payload))
+            .flatten()
+        {
+            transcoded = AurixPacket::new(packet.header.clone(), cleaned);
             &transcoded
         } else {
             packet
@@ -764,6 +786,20 @@ impl PacketRouter {
                     .get(c)
                     .is_some_and(|ch| ch.value().is_e2ee())
             });
+        // Cleaned once, before the per-channel copies; never when the frame is encrypted
+        // end-to-end or any target channel is stereo (the model is mono speech).
+        let (stereo, required) = channels.iter().fold((false, false), |(s, r), c| {
+            match self.shared.channels.get(c) {
+                Some(ch) => (s || ch.is_stereo(), r || ch.requires_noise_suppression()),
+                None => (s, r),
+            }
+        });
+        let payload = if !e2ee && !stereo && self.arm_denoiser(sender, required) {
+            self.denoise_opus(sender, rtp_time, &payload)
+                .map_or(payload, |cleaned| cleaned.to_vec())
+        } else {
+            payload
+        };
         for channel_id in channels {
             let channel = match self.shared.channels.get(&channel_id) {
                 Some(c) => c.value().clone(),
@@ -994,26 +1030,117 @@ impl PacketRouter {
         Ok(channel)
     }
 
+    /// Makes sure `sender` holds denoiser state when its uplink is to be cleaned — because the
+    /// client asked or `required` by the channel — and drops it once neither the client nor
+    /// any of the sender's channels wants it any more. `false` when the frame is to be
+    /// forwarded as it came (including a channel requirement the node cannot honour right
+    /// now: denoiser disabled or `max_sessions` busy).
+    fn arm_denoiser(&self, sender: &Arc<MediaSession>, required: bool) -> bool {
+        let requested = sender.noise_suppression();
+        if !requested && !required {
+            let mut denoiser = sender.denoiser.lock();
+            if denoiser.is_some() && !self.any_channel_requires_denoise(sender) {
+                *denoiser = None;
+            }
+            return false;
+        }
+        let mut denoiser = sender.denoiser.lock();
+        if denoiser.is_some() {
+            return true;
+        }
+        match UplinkDenoiser::acquire(&self.denoise) {
+            Some(d) => {
+                *denoiser = Some(d);
+                true
+            }
+            None => {
+                let path = if sender.codec() == AudioCodec::Pcmu {
+                    "pcmu"
+                } else {
+                    "opus"
+                };
+                aurix_metrics::NOISE_SUPPRESSION_FRAMES
+                    .with_label_values(&[path, "skipped"])
+                    .inc();
+                false
+            }
+        }
+    }
+
+    fn any_channel_requires_denoise(&self, sender: &Arc<MediaSession>) -> bool {
+        sender.channels.read().iter().any(|c| {
+            self.shared
+                .channels
+                .get(c)
+                .is_some_and(|ch| ch.value().requires_noise_suppression())
+        })
+    }
+
+    /// The cleaned copy of an Opus uplink frame; `None` when it is forwarded as it came — the
+    /// cleaner cannot take it (see [`Cleaned`]) or failed on it. `timestamp` lets the copies a
+    /// native client sends to each of its channels share one pass.
+    fn denoise_opus(
+        &self,
+        sender: &Arc<MediaSession>,
+        timestamp: u32,
+        payload: &[u8],
+    ) -> Option<Bytes> {
+        let mut denoiser = sender.denoiser.lock();
+        let denoiser = denoiser.as_mut()?;
+        let (outcome, cleaned) = match denoiser.clean_opus(timestamp, payload) {
+            Ok(Cleaned::Opus(bytes)) => ("ok", Some(bytes)),
+            Ok(Cleaned::Passthrough) => ("passthrough", None),
+            Ok(Cleaned::Repeated(bytes)) => ("repeated", bytes),
+            Err(e) => {
+                debug!(session = %sender.session_id, error = %e, "uplink denoise failed");
+                ("error", None)
+            }
+        };
+        aurix_metrics::NOISE_SUPPRESSION_FRAMES
+            .with_label_values(&["opus", outcome])
+            .inc();
+        cleaned
+    }
+
     fn transcode_pcmu_uplink(
         &self,
         sender: &Arc<MediaSession>,
         packet: &AurixPacket,
+        denoise: bool,
     ) -> Result<AurixPacket> {
         let mut slot = sender.pcmu_uplink.lock();
         let uplink = match slot.as_mut() {
             Some(u) => u,
             None => slot.insert(PcmuUplink::new()?),
         };
-        let opus = match uplink.transcode(&packet.payload) {
-            Ok(o) => o,
-            Err(e) => {
-                aurix_metrics::PCMU_FRAMES
-                    .with_label_values(&["uplink", "error"])
-                    .inc();
-                aurix_metrics::PACKETS_DROPPED.inc();
-                return Err(e);
-            }
-        };
+        let mut denoiser = sender.denoiser.lock();
+        let narrowband = denoise
+            .then(|| denoiser.as_mut())
+            .flatten()
+            .map(|d| d.narrowband());
+        let cleaned = narrowband.is_some();
+        let (opus, outcome) =
+            match uplink.transcode(packet.header.timestamp, &packet.payload, narrowband) {
+                Ok(Transcoded::Fresh(o)) => (o, "ok"),
+                Ok(Transcoded::Repeated(o)) => (o, "repeated"),
+                Err(e) => {
+                    if cleaned {
+                        aurix_metrics::NOISE_SUPPRESSION_FRAMES
+                            .with_label_values(&["pcmu", "error"])
+                            .inc();
+                    }
+                    aurix_metrics::PCMU_FRAMES
+                        .with_label_values(&["uplink", "error"])
+                        .inc();
+                    aurix_metrics::PACKETS_DROPPED.inc();
+                    return Err(e);
+                }
+            };
+        if cleaned {
+            aurix_metrics::NOISE_SUPPRESSION_FRAMES
+                .with_label_values(&["pcmu", outcome])
+                .inc();
+        }
         aurix_metrics::PCMU_FRAMES
             .with_label_values(&["uplink", "ok"])
             .inc();

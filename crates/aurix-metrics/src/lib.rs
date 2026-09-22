@@ -411,6 +411,28 @@ pub static PCMU_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Sessions holding a slot of the node's uplink denoiser (`media.noise_suppression`).
+pub static NOISE_SUPPRESSION_SESSIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_noise_suppression_sessions",
+        "Sessions whose uplink the node is currently denoising"
+    )
+    .unwrap()
+});
+
+/// `path` is `opus` (decode → denoise → re-encode) or `pcmu` (denoised inside the transcode);
+/// `outcome` is `ok`, `passthrough` (a frame the model cannot take: TOC-only or shorter than
+/// 10 ms, forwarded as it came), `skipped` (a channel policy asked for it but `max_sessions`
+/// are busy) or `error` (decode/encode failed, original forwarded).
+pub static NOISE_SUPPRESSION_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_noise_suppression_frames_total",
+        "Uplink frames handled by the node's noise suppressor",
+        &["path", "outcome"]
+    )
+    .unwrap()
+});
+
 /// `direction` is `uplink` (client → node over the WebSocket) or `downlink`; `outcome` is
 /// `sent`/`received`, `dropped` (downlink queue full or connection gone) or `rejected`
 /// (uplink frame that failed decoding or authentication).
@@ -645,6 +667,8 @@ pub static CASCADE_TCP_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
 pub fn gather_metrics() -> String {
     let _ = &*PCMU_FRAMES;
     let _ = &*PCMU_SESSIONS;
+    let _ = &*NOISE_SUPPRESSION_SESSIONS;
+    let _ = &*NOISE_SUPPRESSION_FRAMES;
     let _ = &*TUNNEL_PACKETS;
     let _ = &*TUNNEL_SESSIONS;
     let _ = &*QUIC_PACKETS;

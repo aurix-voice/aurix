@@ -293,6 +293,8 @@ public:
     AudioCodec get_audio_codec() const;
     int set_downlink_mode(DownlinkMode mode);
     DownlinkMode get_downlink_mode() const;
+    int set_server_noise_suppression(bool enabled);
+    bool get_server_noise_suppression() const;
     int set_transcripts(bool enabled);
     int set_translation(const String& language, const String& spoken_language, bool speech);
     int update_positions(const String& channel_id, const Array& positions);

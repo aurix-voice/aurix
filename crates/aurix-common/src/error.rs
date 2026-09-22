@@ -140,6 +140,10 @@ pub enum AurixError {
     /// The content-safety classifier failed.
     #[error("Safety classifier failed: {0}")]
     Safety(String),
+
+    /// Node-side noise suppression is disabled here or its session budget is spent.
+    #[error("Noise suppression unavailable: {0}")]
+    NoiseSuppressionUnavailable(String),
 }
 
 impl AurixError {
@@ -218,6 +222,7 @@ impl AurixError {
             Self::TranslationDisabled => 404,
             Self::Translation(_) => 502,
             Self::Safety(_) => 502,
+            Self::NoiseSuppressionUnavailable(_) => 503,
             _ => 500,
         }
     }
@@ -266,6 +271,7 @@ impl AurixError {
             Self::TranslationDisabled => "TRANSLATION_DISABLED",
             Self::Translation(_) => "TRANSLATION_ERROR",
             Self::Safety(_) => "SAFETY_ERROR",
+            Self::NoiseSuppressionUnavailable(_) => "NOISE_SUPPRESSION_UNAVAILABLE",
         }
     }
 }

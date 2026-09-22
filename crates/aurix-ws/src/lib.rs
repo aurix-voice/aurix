@@ -859,6 +859,7 @@ impl WsState {
             focus: prefs.focus(),
             codec: session.codec(),
             downlink: session.downlink_mode(),
+            noise_suppression: session.noise_suppression(),
             muted: session.is_muted.load(Ordering::Relaxed),
             transcripts: conn.transcripts,
             translation: conn.translation.language.clone(),
@@ -2816,6 +2817,9 @@ async fn adopt_mirrored_session(
             .read()
             .set_downlink_mode(&session_id, DownlinkMode::Mixed);
     }
+    if mirror.prefs.noise_suppression {
+        let _ = state.sfu.read().set_noise_suppression(&session_id, true);
+    }
     state.mirror_session(session_id).await;
     state.control.events.publish(ServerEvent::SessionMigrated {
         app_id: token.app_id,
@@ -3144,6 +3148,7 @@ fn receiver_preferences(state: &WsState, session_id: &SessionId) -> Option<Contr
         focus_channel: prefs.focus(),
         codec: session.codec(),
         downlink: session.downlink_mode(),
+        noise_suppression: session.noise_suppression(),
     })
 }
 
@@ -3383,6 +3388,7 @@ async fn handle_ws_connection(
             _ => None,
         },
         downlink_mix: state.sfu.read().downlink_mix_enabled(),
+        noise_suppression: state.sfu.read().noise_suppression_enabled(),
         webrtc_participant_streams: state.sfu.read().webrtc_participant_streams(),
         unfocused_channel_gain: Some(state.sfu.read().unfocused_channel_gain()),
         migrated: attached.migrated,
@@ -3591,6 +3597,7 @@ fn touches_mirror(msg: &ControlMessage) -> bool {
             | ControlMessage::SetChannelFocus { .. }
             | ControlMessage::SetAudioCodec { .. }
             | ControlMessage::SetDownlinkMode { .. }
+            | ControlMessage::SetNoiseSuppression { .. }
             | ControlMessage::MuteStateChanged { .. }
             | ControlMessage::SetTranscripts { .. }
             | ControlMessage::SetTranslation { .. }
@@ -4571,6 +4578,14 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetNoiseSuppression { enabled } => {
+            let result = state.sfu.read().set_noise_suppression(&session_id, enabled);
+            match result {
+                Ok(()) => send_msg(tx, &ControlMessage::NoiseSuppressionChanged { enabled }).await,
+                Err(e) => return send_error(tx, e.error_code(), &e.public_message()).await,
+            }
+        }
+
         ControlMessage::SetUserBlock { user_id, blocked } => {
             if user_id == token.user_id {
                 return send_error(tx, "VALIDATION_ERROR", "Cannot block yourself").await;
@@ -5380,6 +5395,7 @@ async fn handle_control_message(
         | ControlMessage::ChannelFocusChanged { .. }
         | ControlMessage::AudioCodecChanged { .. }
         | ControlMessage::DownlinkModeChanged { .. }
+        | ControlMessage::NoiseSuppressionChanged { .. }
         | ControlMessage::TranslationChanged { .. }
         | ControlMessage::BitrateCommand { .. }
         | ControlMessage::NetworkQuality { .. }

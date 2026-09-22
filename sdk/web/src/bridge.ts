@@ -365,6 +365,11 @@ export class AurixBridge {
         return null;
       case 'transcriptsEnabled':
         return c.transcriptsEnabled;
+      case 'setServerNoiseSuppression':
+        c.setServerNoiseSuppression(bool(a, 'enabled'));
+        return null;
+      case 'serverNoiseSuppression':
+        return c.serverNoiseSuppression;
       case 'setTranslation': {
         const spokenLanguage = optString(a, 'spokenLanguage');
         c.setTranslation(optString(a, 'language'), {
@@ -605,6 +610,7 @@ export class AurixBridge {
     on('participantTyping', (channelId, userId, typing) => q({ type: 'participantTyping', channelId, userId, typing }));
     on('transcript', (transcript) => q({ type: 'transcript', transcript }));
     on('translationChanged', (prefs) => q({ type: 'translationChanged', prefs }));
+    on('serverNoiseSuppressionChanged', (enabled) => q({ type: 'serverNoiseSuppressionChanged', enabled }));
     on('ttsStatus', (status) => q({ type: 'ttsStatus', status }));
     on('serverError', (code, message) => q({ type: 'serverError', code, message }));
     on('error', (error) => q({ type: 'error', error: errorInfo(error) }));

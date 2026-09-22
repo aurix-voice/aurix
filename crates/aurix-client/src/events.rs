@@ -106,6 +106,9 @@ pub struct SessionInfo {
     /// The node can deliver one server-mixed stream per channel instead of one stream per
     /// speaker (`Client::set_downlink_mode`).
     pub downlink_mix: bool,
+    /// The node can denoise this session's uplink on request
+    /// (`Client::set_server_noise_suppression`).
+    pub noise_suppression: bool,
     /// The session was resumed on a different node than the one that opened it: same session
     /// id and SSRC, but a new media key and endpoint (the client rebinds transparently).
     pub migrated: bool,
@@ -220,6 +223,9 @@ pub enum Event {
     /// The server acknowledged a downlink mode (`Client::set_downlink_mode`); a fresh
     /// session starts in `Streams` and the requested mode is re-applied automatically.
     DownlinkModeChanged(DownlinkMode),
+    /// The server acknowledged `Client::set_server_noise_suppression`; a fresh session
+    /// starts without it and the request is re-applied automatically.
+    NoiseSuppressionChanged(bool),
     /// The server applied `Client::set_translation` (tags normalised); a fresh session starts
     /// without translation and the requested preferences are re-applied automatically.
     TranslationChanged {

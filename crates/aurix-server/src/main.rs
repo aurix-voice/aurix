@@ -172,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
             },
             downlink_mix: config.media.downlink_mix,
             webrtc_participant_streams: config.media.webrtc_participant_streams,
+            noise_suppression: config.media.noise_suppression.clone(),
             mos_alert: aurix_media::quality::MosAlertPolicy {
                 threshold: config.quality.mos_alert_threshold,
                 periods: config.quality.mos_alert_periods,

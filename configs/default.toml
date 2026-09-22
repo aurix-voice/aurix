@@ -169,6 +169,21 @@ mixer_decoder_complexity = 5
 # and mix them itself; speakers beyond the negotiated tracks stay in the mixed track. 0 = mixed only.
 webrtc_participant_streams = 16
 
+# Server-side noise suppression (opt-in per session with `SetNoiseSuppression`, or forced by a
+# channel with `noise_suppression = true`) for clients that run no capture DSP of their own:
+# the node decodes the session's Opus uplink, runs an RNNoise-class model (48 kHz mono, pure
+# Rust) and re-encodes it at `bitrate` before the frame reaches receivers, recording, STT, the
+# server mixes and the cascade; a PCMU uplink is cleaned inside its transcode. Never applied to
+# end-to-end encrypted frames or frames into stereo channels. Costs one decode + model pass +
+# encode per frame of each cleaned Opus session; `max_sessions` (1–65536) bounds it per node —
+# further requests get NOISE_SUPPRESSION_UNAVAILABLE, channel-forced frames pass uncleaned.
+# `level`: high (model output), moderate (75 %), low (50 % — keeps some room tone).
+[media.noise_suppression]
+enabled = false
+level = "high"
+max_sessions = 256
+bitrate = 32000
+
 [turn]
 enabled = false
 host = "0.0.0.0"

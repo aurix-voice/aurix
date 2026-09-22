@@ -508,6 +508,12 @@ typedef enum AurixEventType {
    * member's grant is unchanged. For our own user `aurix_client_channel_info` follows.
    */
   AURIX_EVENT_PARTICIPANT_ROLE_CHANGED = 50,
+  /**
+   * `flag` = the server now denoises this session's uplink on its request
+   * (`aurix_client_set_server_noise_suppression`); a fresh session reports `false` and
+   * the request is re-applied.
+   */
+  AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED = 51,
 } AurixEventType;
 
 /**
@@ -929,6 +935,11 @@ typedef struct AurixSessionInfo {
    * (`aurix_client_set_downlink_mode`).
    */
   bool downlink_mix;
+  /**
+   * The node can denoise this session's uplink on request
+   * (`aurix_client_set_server_noise_suppression`).
+   */
+  bool noise_suppression;
   /**
    * The latest (re)connect resumed the session on a *different* node (same session id
    * and SSRC, new media key/endpoint). See `aurix_client_endpoint`.
@@ -2336,6 +2347,22 @@ enum AurixResult aurix_client_set_downlink_mode(struct AurixClient *client,
  * Downlink mode the server acknowledged.
  */
 enum AurixDownlinkMode aurix_client_downlink_mode(const struct AurixClient *client);
+
+/**
+ * Ask the node to run its noise suppressor over this session's uplink before anyone hears
+ * it — for a client that does no capture DSP of its own (`AurixDspConfig`; do not stack the
+ * two). Never applies to end-to-end encrypted frames or stereo channels. Requires
+ * `media.noise_suppression` on the node (`AurixSessionInfo.noise_suppression`, otherwise
+ * `ServerError` `NOISE_SUPPRESSION_UNAVAILABLE`, also when its session budget is spent);
+ * takes effect on `AurixEventServerNoiseSuppressionChanged`.
+ */
+enum AurixResult aurix_client_set_server_noise_suppression(struct AurixClient *client,
+                                                           bool enabled);
+
+/**
+ * Whether the node currently denoises this session's uplink on its request.
+ */
+bool aurix_client_server_noise_suppression(const struct AurixClient *client);
 
 enum AurixResult aurix_client_set_transcripts(struct AurixClient *client, bool enabled);
 

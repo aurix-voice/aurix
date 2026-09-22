@@ -35,11 +35,17 @@ the chapter that explains the boundary.
   against a live node and the built image in CI, not yet by an operator pilot; the supported
   pairing is dashboard and node of the same minor version
   ([Operator dashboard](operations/dashboard.md)).
-* **No SIP/PSTN gateway**, no server-side noise suppression or echo cancellation — that runs
-  on the client: browsers via `getUserMedia` constraints, the native core / Unity / Unreal via
-  the built-in capture DSP ([Native core](sdk/native.md#capture-dsp-echo-cancellation-noise-suppression-agc)).
-  The DSP is a pure-Rust implementation (frequency-domain AEC, RNNoise-derived NS); it has unit
-  and ABI coverage but no field tuning on a fleet of real devices yet.
+* **No SIP/PSTN gateway.** Capture DSP runs on the client by default: browsers via
+  `getUserMedia` constraints, the native core / Unity / Unreal via the built-in capture DSP
+  ([Native core](sdk/native.md#capture-dsp-echo-cancellation-noise-suppression-agc)) — a
+  pure-Rust implementation (frequency-domain AEC, RNNoise-derived NS) with unit and ABI coverage
+  but no field tuning on a fleet of real devices yet. The **server-side noise suppression**
+  option ([`media.noise_suppression`](features/channels.md#server-side-noise-suppression), off
+  by default) is mono speech only: end-to-end encrypted frames and frames into stereo channels
+  are never cleaned, a channel that requires it forwards *uncleaned* frames when the node has
+  it disabled or all `max_sessions` are busy (counted as `skipped`), the cleaned Opus is a
+  second lossy encode at `noise_suppression.bitrate`, and there is no server-side echo
+  cancellation or AGC.
 * **No speech or translation models ship with Aurix.** STT/TTS talk to OpenAI-compatible HTTP
   endpoints you host, live translation to a LibreTranslate- or OpenAI-chat-compatible server;
   transcripts and translations are delivered live and never stored server-side

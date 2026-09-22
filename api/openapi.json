@@ -9230,6 +9230,11 @@
             "default": false,
             "description": "Participants may send two-channel (stereo) Opus (music, DJ, broadcast sources); delivered to clients as `audio.stereo`. Off: clients encode mono. The SFU forwards either; stereo receivers keep the image, mono receivers and server-side recording/STT downmix. Recordings started while this is on are written with a 2-channel OpusHead."
           },
+          "noise_suppression": {
+            "type": "boolean",
+            "default": false,
+            "description": "The node denoises every participant's uplink into this channel (RNNoise-class model, mono speech) before it reaches receivers, recording, STT and the cascade — for clients that run no capture DSP. Needs `media.noise_suppression.enabled` on the node; when it is off or `max_sessions` are busy the frames pass uncleaned (`aurix_noise_suppression_frames_total{outcome=\"skipped\"}`). Rejected together with `stereo` or `e2ee`."
+          },
           "recording_enabled": {
             "type": "boolean",
             "default": false

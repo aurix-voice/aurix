@@ -79,6 +79,8 @@ jobs:
           AURIX__MEDIA__CASCADE_SECRET: ci-only-cascade-secret-0123456789abcdef
           AURIX__MEDIA__CASCADE_DISCOVERY_INTERVAL_MS: "2000"
           AURIX__MEDIA__TLS_TUNNEL_PORT: "10443"
+          AURIX__MEDIA__NOISE_SUPPRESSION__ENABLED: "true"
+          AURIX__MEDIA__NOISE_SUPPRESSION__MAX_SESSIONS: "2"
           AURIX__TRACING__LOG_FORMAT: text
           RUST_LOG: info,aurix_media::quic=debug
         run: |
@@ -142,6 +144,7 @@ jobs:
           AURIX_E2E_API_KEY: ${{ steps.bootstrap.outputs.key }}
           AURIX_E2E_API_KEY2: ${{ steps.bootstrap.outputs.key2 }}
           AURIX_E2E_ADMIN_TOKEN: ${{ steps.bootstrap.outputs.admin_token }}
+          AURIX_E2E_METRICS: http://127.0.0.1:4040/metrics
           AURIX_E2E_MAX_CHANNELS: "4"
           AURIX_E2E_REPORTS_PER_MINUTE: "3"
         run: cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture

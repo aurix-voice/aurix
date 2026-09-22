@@ -4,6 +4,7 @@ pub mod cascade;
 pub mod cascade_link;
 pub mod cert;
 pub mod channel;
+pub mod denoise;
 pub mod mix;
 pub mod mixer;
 pub mod quality;

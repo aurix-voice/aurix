@@ -37,6 +37,7 @@ action token decides them at join time. A grant with `speak: false` makes the me
     "complexity": null,
     "audio_profile": "voice",
     "stereo": false,
+    "noise_suppression": false,
     "recording_enabled": false,
     "transcription": false,
     "safety_voice": false,
@@ -70,6 +71,10 @@ action token decides them at join time. A grant with `speak: false` makes the me
 * `stereo` (default `false`) lets participants send **two-channel Opus** — music, DJ and
   broadcast sources; see [Stereo and music uplinks](#stereo-and-music-uplinks). Off, every
   SDK encodes mono whatever the app asked for.
+* `noise_suppression` (default `false`) makes the node **denoise every uplink into the
+  channel** before anyone hears it; see [Server-side noise suppression](#server-side-noise-suppression).
+  Rejected together with `stereo` (the model is mono speech) or `e2ee` (the node cannot decode
+  the frames).
 * `e2ee` (default `false`) makes the channel **end-to-end encrypted**: members seal their Opus
   frames with sender keys the node never sees, only sessions that announced the capability may
   join (`E2EE_REQUIRED`), and everything that needs the node to hear the audio (recording,
@@ -136,6 +141,58 @@ instead of an Opus encoder/decoder — for devices where Opus does not fit the C
 
 SDKs: Unity `client.SetAudioCodecAsync(AudioCodec.Pcmu)` / `AurixVoiceBehaviour.PreferredCodec`,
 native `aurix_client_set_audio_codec`, Unreal `SetAudioCodec` ([overview](../sdk/overview.md)).
+
+## Server-side noise suppression
+
+Capture DSP belongs on the client — the native core, Unity and Unreal run an RNNoise-derived
+suppressor next to AEC/AGC, browsers get the `getUserMedia` one — and the node forwards Opus
+without decoding it. For clients that cannot run DSP (PCMU devices, embedded boards, a bot
+piping raw microphone audio) the node can do it **as an option**: `media.noise_suppression`
+runs the same RNNoise-class model (`nnnoiseless`, pure Rust) over a session's uplink before the
+frame enters the channel, so receivers, recording, transcription, the server mixes and the
+cascade all get the cleaned audio.
+
+```toml
+[media.noise_suppression]
+enabled = false     # off by default: the node advertises it in SessionInitAck.noise_suppression
+level = "high"      # low | moderate | high — how much of the model's output replaces the input
+max_sessions = 256  # sessions cleaned at once per node (bounds CPU)
+bitrate = 32000     # Opus bitrate of the re-encoded uplink (6000–128000)
+```
+
+* **Who asks.** A client sends `SetNoiseSuppression { enabled }` over the control connection
+  and gets `NoiseSuppressionChanged { enabled }` when the node holds a slot for it, or
+  `NOISE_SUPPRESSION_UNAVAILABLE` when the node runs `enabled = false` or all `max_sessions`
+  are busy. The preference survives resume and failover (`ReceiverPreferences.noise_suppression`)
+  and is replayed by the SDKs after a reconnect. Alternatively a channel with
+  `noise_suppression: true` makes the node clean *every* participant's uplink into it without
+  a client request; when the node cannot (disabled or full) those frames pass **uncleaned** and
+  are counted as `outcome="skipped"` — a channel requirement never mutes anyone.
+* **What is cleaned.** An Opus uplink is decoded to 48 kHz mono, run through the model in 10 ms
+  blocks and re-encoded with the node's encoder — same frame duration, `bitrate`, in-band FEC on;
+  2.5/5 ms and TOC-only (DTX) packets pass through. A PCMU uplink is cleaned inside its
+  transcode, where the μ-law samples are already PCM (8 → 48 kHz and back). A native client in
+  several channels sends each frame once per channel; the node cleans it once and reuses the
+  result for the copies. **Never cleaned:** `E2ee` frames (the node cannot decode them; a
+  session that asked for suppression in an encrypted channel simply keeps sending sealed
+  frames) and frames into `stereo` channels (the model is mono speech — music goes through
+  untouched). Levels: `high` replaces the input with the model output, `moderate` mixes 75 %,
+  `low` 50 % (keeps room tone for players who dislike the "processed" sound).
+* **Cost.** One Opus decode, one model pass (~1 % of a core) and one Opus encode per frame of
+  every cleaned Opus session; a PCMU session only adds the model pass to its existing
+  transcode. `max_sessions` caps it per node; `aurix_noise_suppression_sessions` and
+  `aurix_noise_suppression_frames_total{path=opus|pcmu, outcome=ok|repeated|passthrough|skipped|error}`
+  show what it is doing. The re-encode is a second lossy pass (`bitrate` is the quality knob),
+  which is why it is off by default and per-session opt-in.
+
+SDKs: Web `client.setServerNoiseSuppression(true)` / `serverNoiseSuppression` /
+`serverNoiseSuppressionChanged`, Unity `SetServerNoiseSuppressionAsync` / `ServerNoiseSuppression`
+/ `OnServerNoiseSuppressionChanged`, native `aurix_client_set_server_noise_suppression` /
+`aurix_client_server_noise_suppression` (event `ServerNoiseSuppressionChanged`), Unreal
+`SetServerNoiseSuppression` / `IsServerNoiseSuppressionEnabled`, Godot
+`set_server_noise_suppression` / `get_server_noise_suppression` /
+`server_noise_suppression_changed`; `SessionInfo.noise_suppression` tells whether the node
+offers it.
 
 ## Stereo and music uplinks
 

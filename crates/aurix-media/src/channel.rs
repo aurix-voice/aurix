@@ -798,6 +798,16 @@ impl MediaChannel {
         self.config.read().e2ee
     }
 
+    /// Senders may encode two channels (`ChannelConfig::stereo`).
+    pub fn is_stereo(&self) -> bool {
+        self.config.read().stereo
+    }
+
+    /// Uplinks into this channel are denoised by the node (`ChannelConfig::noise_suppression`).
+    pub fn requires_noise_suppression(&self) -> bool {
+        self.config.read().noise_suppression
+    }
+
     /// The per-receiver stream cap (`audience.max_streams`) as a slot table configuration:
     /// `max_streams` slots, losers silenced.
     fn stream_cap(&self) -> Option<AmbientConfig> {

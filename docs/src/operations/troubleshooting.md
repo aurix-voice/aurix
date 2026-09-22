@@ -71,6 +71,7 @@ carries a stable `code` — the table at the end maps codes to causes.
 | `USER_BANNED`, `USER_MUTED`, `USER_OFFLINE` | moderation state; direct chat to a user without a live session |
 | `CHAT_DISABLED`, `MESSAGE_BLOCKED`, `VALIDATION_ERROR` | chat off, filter webhook blocked the text (fail-closed by default), size/field validation |
 | `RATE_LIMIT_EXCEEDED` | per-IP / per-key / per-session limits (`[rate_limiting]`, `[chat]`, `[tts]`) |
+| `NOISE_SUPPRESSION_UNAVAILABLE` | `SetNoiseSuppression { enabled: true }` on a node with `media.noise_suppression.enabled = false`, or with all `max_sessions` slots busy (`aurix_noise_suppression_sessions`); the SDKs keep the preference and retry it after a reconnect ([server-side noise suppression](../features/channels.md#server-side-noise-suppression)) |
 | `CODEC_NOT_AVAILABLE` | `SetAudioCodec` for a codec the node does not allow: `media.pcmu_fallback = false`, or the session is WebRTC (browsers negotiate Opus in SDP) |
 | `INVALID_CONFIG` | feature disabled on the node (recording, live streams, STT/TTS) or misconfigured request against it |
 | `CONFLICT` | retention sweep already running, live stream on another node, duplicate resource |

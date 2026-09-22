@@ -1354,6 +1354,9 @@ pub struct AurixSessionInfo {
     /// The node can deliver one server-mixed stream per channel
     /// (`aurix_client_set_downlink_mode`).
     pub downlink_mix: bool,
+    /// The node can denoise this session's uplink on request
+    /// (`aurix_client_set_server_noise_suppression`).
+    pub noise_suppression: bool,
     /// The latest (re)connect resumed the session on a *different* node (same session id
     /// and SSRC, new media key/endpoint). See `aurix_client_endpoint`.
     pub migrated: bool,
@@ -1389,6 +1392,7 @@ pub unsafe extern "C" fn aurix_client_session(
                 user_id: c.user_id().map(|u| u.0).unwrap_or(Uuid::nil()).into(),
                 media_tunnel: s.media_tunnel,
                 downlink_mix: s.downlink_mix,
+                noise_suppression: s.noise_suppression,
                 migrated: s.migrated,
                 translation: s.translation.is_some(),
                 translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
@@ -1609,6 +1613,10 @@ pub enum AurixEventType {
     /// server promotes it again). Speaker-slot admission (`audience.max_speakers`); the
     /// member's grant is unchanged. For our own user `aurix_client_channel_info` follows.
     AurixEventParticipantRoleChanged = 50,
+    /// `flag` = the server now denoises this session's uplink on its request
+    /// (`aurix_client_set_server_noise_suppression`); a fresh session reports `false` and
+    /// the request is re-applied.
+    AurixEventServerNoiseSuppressionChanged = 51,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -2006,6 +2014,7 @@ impl AurixEvent {
             Event::ChannelFocusChanged(_) => T::AurixEventChannelFocusChanged,
             Event::AudioCodecChanged(_) => T::AurixEventAudioCodecChanged,
             Event::DownlinkModeChanged(_) => T::AurixEventDownlinkModeChanged,
+            Event::NoiseSuppressionChanged(_) => T::AurixEventServerNoiseSuppressionChanged,
             Event::TranslationChanged { .. } => T::AurixEventTranslationChanged,
             Event::EndpointChanged { .. } => T::AurixEventEndpointChanged,
             Event::UserBlockChanged { .. } => T::AurixEventUserBlockChanged,
@@ -2270,6 +2279,7 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
         Some(Event::ChatInboxSynced { truncated, .. }) => *truncated,
         Some(Event::ChatReactionChanged { added, .. }) => *added,
         Some(Event::E2eePeerDecryptable { decryptable, .. }) => *decryptable,
+        Some(Event::NoiseSuppressionChanged(enabled)) => *enabled,
         _ => false,
     }
 }
@@ -2417,6 +2427,7 @@ pub unsafe extern "C" fn aurix_event_session(
                 user_id: zero(),
                 media_tunnel: s.media_tunnel,
                 downlink_mix: s.downlink_mix,
+                noise_suppression: s.noise_suppression,
                 migrated: s.migrated,
                 translation: s.translation.is_some(),
                 translation_speech: s.translation.as_ref().is_some_and(|t| t.speech),
@@ -4068,6 +4079,31 @@ pub unsafe extern "C" fn aurix_client_downlink_mode(
     self::client(client)
         .map(|c| c.downlink_mode().into())
         .unwrap_or(AurixDownlinkMode::AurixDownlinkStreams)
+}
+
+/// Ask the node to run its noise suppressor over this session's uplink before anyone hears
+/// it — for a client that does no capture DSP of its own (`AurixDspConfig`; do not stack the
+/// two). Never applies to end-to-end encrypted frames or stereo channels. Requires
+/// `media.noise_suppression` on the node (`AurixSessionInfo.noise_suppression`, otherwise
+/// `ServerError` `NOISE_SUPPRESSION_UNAVAILABLE`, also when its session budget is spent);
+/// takes effect on `AurixEventServerNoiseSuppressionChanged`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_server_noise_suppression(
+    client: *mut AurixClient,
+    enabled: bool,
+) -> AurixResult {
+    match self::client(client) {
+        Ok(c) => ok(c.set_server_noise_suppression(enabled)),
+        Err(r) => r,
+    }
+}
+
+/// Whether the node currently denoises this session's uplink on its request.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_server_noise_suppression(client: *const AurixClient) -> bool {
+    self::client(client)
+        .map(|c| c.server_noise_suppression())
+        .unwrap_or(false)
 }
 
 #[no_mangle]

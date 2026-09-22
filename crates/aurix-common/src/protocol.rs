@@ -878,6 +878,10 @@ pub enum ControlMessage {
         /// (`SetDownlinkMode { mode: "mixed" }`, `ChannelConfig.audience.mix_for_listeners`).
         #[serde(default)]
         downlink_mix: bool,
+        /// The node can denoise this session's uplink on request (`SetNoiseSuppression`,
+        /// `media.noise_suppression`) — for clients that run no capture DSP of their own.
+        #[serde(default)]
+        noise_suppression: bool,
         /// Per-participant WebRTC downlink tracks this node serves a browser at most, on top
         /// of the mixed track (see `ParticipantStreams`). `0`: browsers get the mix only.
         #[serde(default)]
@@ -1091,6 +1095,9 @@ pub enum ControlMessage {
         /// otherwise).
         #[serde(default)]
         downlink: DownlinkMode,
+        /// The node denoises this session's uplink (`SetNoiseSuppression`).
+        #[serde(default)]
+        noise_suppression: bool,
     },
     /// Client→server (native AURX only): switch this session's own audio frames to `codec`.
     /// With `pcmu` the client sends G.711 μ-law frames flagged `PacketFlags::Pcmu` and receives
@@ -1115,6 +1122,24 @@ pub enum ControlMessage {
     /// previous kind.
     DownlinkModeChanged {
         mode: DownlinkMode,
+    },
+    /// Client→server: have the node run its noise suppressor (RNNoise-class,
+    /// `media.noise_suppression`) on this session's uplink before the audio reaches any
+    /// channel — for clients without capture DSP (a bare microphone, a console port, a very
+    /// weak device). Opus frames are decoded, cleaned and re-encoded by the node (same frame
+    /// duration and flags, the node's bitrate and in-band FEC); PCMU frames are cleaned inside
+    /// their transcode. Frames into end-to-end encrypted or stereo channels are left as they
+    /// are — the node cannot decode the former and the model is mono. Rejected with
+    /// `NOISE_SUPPRESSION_UNAVAILABLE` when the node disables it or has no capacity left
+    /// (`max_sessions`).
+    SetNoiseSuppression {
+        enabled: bool,
+    },
+    /// Server→client: ack of `SetNoiseSuppression` — the session's own request; a channel
+    /// policy that denoises its uplinks regardless (`ChannelConfig.noise_suppression`) is not
+    /// reported here.
+    NoiseSuppressionChanged {
+        enabled: bool,
     },
     /// Client→server (WebRTC only): participants that must keep their own downlink track
     /// while they are heard (never displaced by another speaker when every track is busy).

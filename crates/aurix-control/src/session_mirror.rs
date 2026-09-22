@@ -41,6 +41,9 @@ pub struct MirroredPrefs {
     pub codec: AudioCodec,
     #[serde(default)]
     pub downlink: DownlinkMode,
+    /// The client asked the node to denoise its uplink (`SetNoiseSuppression`).
+    #[serde(default)]
+    pub noise_suppression: bool,
     #[serde(default)]
     pub muted: bool,
     #[serde(default = "default_true")]
@@ -67,6 +70,7 @@ impl Default for MirroredPrefs {
             focus: None,
             codec: AudioCodec::default(),
             downlink: DownlinkMode::default(),
+            noise_suppression: false,
             muted: false,
             transcripts: true,
             translation: None,

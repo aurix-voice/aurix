@@ -50,6 +50,7 @@ inline Dictionary session_to_dict(const AurixSessionInfo& s) {
     d["media_quic"] = s.media_quic;
     d["media_tls"] = s.media_tls;
     d["downlink_mix"] = s.downlink_mix;
+    d["noise_suppression"] = s.noise_suppression;
     d["translation"] = s.translation;
     d["translation_speech"] = s.translation_speech;
     return d;

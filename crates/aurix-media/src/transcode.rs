@@ -21,6 +21,25 @@ pub struct PcmuUplink {
     encoder: opus::Encoder,
     pcm: Vec<i16>,
     out: Vec<u8>,
+    /// The last frame transcoded, `(timestamp, cleaned, input, output)`: a client in several
+    /// channels sends the same frame once per channel and the copies share one encode.
+    last: Option<(u32, bool, Vec<u8>, Bytes)>,
+}
+
+/// Outcome of [`PcmuUplink::transcode`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Transcoded {
+    Fresh(Bytes),
+    /// The same frame again (another channel's copy): the earlier output.
+    Repeated(Bytes),
+}
+
+impl Transcoded {
+    pub fn into_bytes(self) -> Bytes {
+        match self {
+            Transcoded::Fresh(b) | Transcoded::Repeated(b) => b,
+        }
+    }
 }
 
 impl std::fmt::Debug for PcmuUplink {
@@ -46,11 +65,19 @@ impl PcmuUplink {
             encoder,
             pcm: Vec::with_capacity(480),
             out: vec![0u8; 1275],
+            last: None,
         })
     }
 
-    /// Encode one μ-law frame (10/20/40/60 ms) to Opus.
-    pub fn transcode(&mut self, ulaw: &[u8]) -> Result<Bytes> {
+    /// Encode one μ-law frame (10/20/40/60 ms) to Opus, denoising the PCM in between when the
+    /// session's uplink is cleaned by the node. A repeat of the previous frame (same
+    /// `timestamp`, bytes and cleaning) gets the previous output.
+    pub fn transcode(
+        &mut self,
+        timestamp: u32,
+        ulaw: &[u8],
+        denoiser: Option<&mut crate::denoise::NarrowbandDenoiser>,
+    ) -> Result<Transcoded> {
         if !PCMU_FRAME_SIZES.contains(&ulaw.len()) {
             return Err(AurixError::Codec(format!(
                 "pcmu frame of {} bytes (expected one of {:?})",
@@ -58,13 +85,24 @@ impl PcmuUplink {
                 PCMU_FRAME_SIZES
             )));
         }
+        let cleaned = denoiser.is_some();
+        if let Some((ts, c, input, output)) = &self.last {
+            if *ts == timestamp && *c == cleaned && input == ulaw {
+                return Ok(Transcoded::Repeated(output.clone()));
+            }
+        }
         self.pcm.clear();
         g711::decode(ulaw, &mut self.pcm);
+        if let Some(denoiser) = denoiser {
+            denoiser.process(&mut self.pcm)?;
+        }
         let n = self
             .encoder
             .encode(&self.pcm, &mut self.out)
             .map_err(|e| AurixError::Codec(format!("pcmu uplink encode: {e}")))?;
-        Ok(Bytes::copy_from_slice(&self.out[..n]))
+        let opus = Bytes::copy_from_slice(&self.out[..n]);
+        self.last = Some((timestamp, cleaned, ulaw.to_vec(), opus.clone()));
+        Ok(Transcoded::Fresh(opus))
     }
 }
 
@@ -134,10 +172,33 @@ mod tests {
     #[test]
     fn uplink_rejects_odd_frame_sizes() {
         let mut up = PcmuUplink::new().unwrap();
-        assert!(up.transcode(&[0xFF; 159]).is_err());
-        assert!(up.transcode(&[]).is_err());
-        assert!(up.transcode(&[0xFF; 160]).is_ok());
-        assert!(up.transcode(&[0xFF; 480]).is_ok());
+        assert!(up.transcode(0, &[0xFF; 159], None).is_err());
+        assert!(up.transcode(0, &[], None).is_err());
+        assert!(up.transcode(0, &[0xFF; 160], None).is_ok());
+        assert!(up.transcode(160, &[0xFF; 480], None).is_ok());
+    }
+
+    #[test]
+    fn uplink_reuses_the_encode_for_a_repeated_frame() {
+        let mut up = PcmuUplink::new().unwrap();
+        let frame = [0x55u8; 160];
+        let Transcoded::Fresh(first) = up.transcode(160, &frame, None).unwrap() else {
+            panic!("first frame is fresh");
+        };
+        assert_eq!(
+            up.transcode(160, &frame, None).unwrap(),
+            Transcoded::Repeated(first)
+        );
+        // A different timestamp, or a different cleaning decision, is a new frame.
+        assert!(matches!(
+            up.transcode(320, &frame, None).unwrap(),
+            Transcoded::Fresh(_)
+        ));
+        let mut nb = crate::denoise::NarrowbandDenoiser::new(Default::default());
+        assert!(matches!(
+            up.transcode(320, &frame, Some(&mut nb)).unwrap(),
+            Transcoded::Fresh(_)
+        ));
     }
 
     #[test]
@@ -149,7 +210,7 @@ mod tests {
         let mut down = PcmuDownlink::new().unwrap();
         let mut back = Vec::new();
         for frame in ulaw.chunks(PCMU_FRAME_SAMPLES) {
-            let opus = up.transcode(frame).unwrap();
+            let opus = up.transcode(0, frame, None).unwrap().into_bytes();
             assert!(!opus.is_empty() && opus.len() < 100, "{} bytes", opus.len());
             let out = down.transcode(&opus).unwrap();
             assert_eq!(out.len(), PCMU_FRAME_SAMPLES);

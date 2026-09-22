@@ -621,6 +621,10 @@ struct AURIXVOICE_API FAurixSessionInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bDownlinkMix = false;
 
+	/** The node can denoise our uplink on request (SetServerNoiseSuppression). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bNoiseSuppression = false;
+
 	/** The node translates transcripts on request (SetTranslation). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bTranslation = false;

@@ -93,6 +93,7 @@ signal chat_message_updated(message: Dictionary)
 signal chat_reaction_changed(change: Dictionary)
 signal chat_search_result(request_id: int, channel_id: String, user_id: String, query: String, messages: Array, next_before: String)
 signal translation_changed(translation: Dictionary)
+signal server_noise_suppression_changed(enabled: bool)
 
 # --- browser-only signals
 ## `SdkStatus` transitions while `aurix-web-sdk.js` loads.
@@ -163,6 +164,7 @@ var _transmission_channel := ""
 var _focus := ""
 var _quality: Dictionary = {}
 var _translation: Dictionary = {"language": "", "spoken_language": "", "speech": false}
+var _server_noise_suppression := false
 var _audio_policy: Dictionary = {}
 
 
@@ -552,6 +554,16 @@ func set_channel_focus(channel_id: String) -> int:
 
 func set_transcripts(enabled: bool) -> int:
 	return _result(_invoke("setTranscripts", {"enabled": enabled}))
+
+
+## Node-side denoising of our uplink (needs `session.noise_suppression`); acked by
+## `server_noise_suppression_changed`.
+func set_server_noise_suppression(enabled: bool) -> int:
+	return _result(_invoke("setServerNoiseSuppression", {"enabled": enabled}))
+
+
+func get_server_noise_suppression() -> bool:
+	return _server_noise_suppression
 
 
 func set_translation(language: String, spoken_language := "", speech := false) -> int:
@@ -1206,6 +1218,9 @@ func _dispatch(e: Dictionary) -> void:
 					"speech": (prefs as Dictionary).get("speech", false) == true,
 				}
 				translation_changed.emit(_translation.duplicate())
+		"serverNoiseSuppressionChanged":
+			_server_noise_suppression = e.get("enabled", false) == true
+			server_noise_suppression_changed.emit(_server_noise_suppression)
 		"ttsStatus":
 			var s := _tts(e.get("status"))
 			if not s.is_empty():
@@ -1364,6 +1379,7 @@ func _apply_session(info: Variant) -> void:
 		"media_webrtc": true,
 		"media_webtransport": i.get("webTransport") is Dictionary,
 		"downlink_mix": true,
+		"noise_suppression": i.get("noiseSuppression", false) == true,
 		"participant_stream_cap": int(i.get("participantStreamCap", 0)),
 		"translation": false,
 		"translation_speech": false,

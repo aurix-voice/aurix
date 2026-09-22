@@ -181,7 +181,10 @@ echo canceller the final scene mix as reference when you route game audio yourse
 
 `set_transmission(TRANSMIT_ALL | TRANSMIT_NONE | TRANSMIT_SINGLE, channel_id)`,
 `set_channel_focus(channel_id)`, `set_audio_codec(CODEC_OPUS | CODEC_PCMU)`,
-`set_downlink_mode(DOWNLINK_STREAMS | DOWNLINK_MIXED)`, `set_transcripts(enabled)`,
+`set_downlink_mode(DOWNLINK_STREAMS | DOWNLINK_MIXED)`, `set_server_noise_suppression(enabled)` /
+`get_server_noise_suppression()` (signal `server_noise_suppression_changed`; the node denoises
+this session's uplink — `session_info.noise_suppression` says whether it offers that),
+`set_transcripts(enabled)`,
 `set_translation(language, spoken_language, speech)`, `respond_recording_consent(recording_id, accepted)`,
 `send_control_json(json)` (forward-compatible escape hatch).
 

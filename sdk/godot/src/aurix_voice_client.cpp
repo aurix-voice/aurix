@@ -691,6 +691,12 @@ int AurixVoiceClient::set_downlink_mode(DownlinkMode mode) {
 AurixVoiceClient::DownlinkMode AurixVoiceClient::get_downlink_mode() const {
     return client_ ? static_cast<DownlinkMode>(client_.downlink_mode()) : DOWNLINK_STREAMS;
 }
+int AurixVoiceClient::set_server_noise_suppression(bool enabled) {
+    return client_ ? client_.set_server_noise_suppression(enabled) : AURIX_NOT_CONNECTED;
+}
+bool AurixVoiceClient::get_server_noise_suppression() const {
+    return client_ && client_.server_noise_suppression();
+}
 int AurixVoiceClient::set_transcripts(bool enabled) { return client_ ? client_.set_transcripts(enabled) : AURIX_NOT_CONNECTED; }
 
 int AurixVoiceClient::set_translation(const String& language, const String& spoken_language, bool speech) {
@@ -1091,6 +1097,9 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     case AURIX_EVENT_DOWNLINK_MODE_CHANGED:
         emit_signal("downlink_mode_changed", static_cast<int>(ev.downlink_mode()));
         break;
+    case AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED:
+        emit_signal("server_noise_suppression_changed", ev.flag());
+        break;
     case AURIX_EVENT_ENDPOINT_CHANGED:
         emit_signal("endpoint_changed", gstr(ev.message()));
         break;
@@ -1288,6 +1297,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_audio_codec"), &AurixVoiceClient::get_audio_codec);
     ClassDB::bind_method(D_METHOD("set_downlink_mode", "mode"), &AurixVoiceClient::set_downlink_mode);
     ClassDB::bind_method(D_METHOD("get_downlink_mode"), &AurixVoiceClient::get_downlink_mode);
+    ClassDB::bind_method(D_METHOD("set_server_noise_suppression", "enabled"), &AurixVoiceClient::set_server_noise_suppression);
+    ClassDB::bind_method(D_METHOD("get_server_noise_suppression"), &AurixVoiceClient::get_server_noise_suppression);
     ClassDB::bind_method(D_METHOD("set_transcripts", "enabled"), &AurixVoiceClient::set_transcripts);
     ClassDB::bind_method(D_METHOD("set_translation", "language", "spoken_language", "speech"), &AurixVoiceClient::set_translation, DEFVAL(String()), DEFVAL(false));
     ClassDB::bind_method(D_METHOD("update_positions", "channel_id", "positions"), &AurixVoiceClient::update_positions);
@@ -1372,6 +1383,7 @@ void AurixVoiceClient::_bind_methods() {
     ADD_SIGNAL(MethodInfo("loss_profile_changed", PropertyInfo(Variant::INT, "profile"), PropertyInfo(Variant::INT, "uplink_loss_percent")));
     ADD_SIGNAL(MethodInfo("media_path_changed", PropertyInfo(Variant::INT, "path"), PropertyInfo(Variant::STRING, "reason")));
     ADD_SIGNAL(MethodInfo("downlink_mode_changed", PropertyInfo(Variant::INT, "mode")));
+    ADD_SIGNAL(MethodInfo("server_noise_suppression_changed", PropertyInfo(Variant::BOOL, "enabled")));
     ADD_SIGNAL(MethodInfo("endpoint_changed", PropertyInfo(Variant::STRING, "ws_url")));
     ADD_SIGNAL(MethodInfo("chat_history", PropertyInfo(Variant::INT, "request_id"), PropertyInfo(Variant::STRING, "channel_id"),
                           PropertyInfo(Variant::STRING, "user_id"), PropertyInfo(Variant::ARRAY, "messages"),

@@ -99,6 +99,7 @@ struct Player {
     migrated: bool,
     failover: Vec<String>,
     translation: Option<aurix_common::protocol::TranslationInfo>,
+    noise_suppression: bool,
 }
 
 impl Player {
@@ -305,6 +306,7 @@ async fn connect_with(
         migrated,
         failover,
         translation,
+        noise_suppression,
         ..
     } = msg
     else {
@@ -345,6 +347,7 @@ async fn connect_with(
         migrated,
         failover,
         translation,
+        noise_suppression,
     }
 }
 
@@ -6326,6 +6329,413 @@ async fn pcmu_fallback_is_negotiated_per_session_and_transcoded() {
     for p in [&mut alice, &mut bob] {
         p.send(&ControlMessage::ChannelLeave { channel_id: team })
             .await;
+    }
+}
+
+// ── Server-side noise suppression ──
+
+/// Deterministic stationary rumble (white noise through a one-pole low-pass), the kind of
+/// fan / HVAC floor an RNNoise-class model removes; the suite cannot judge speech quality,
+/// only that the floor drops.
+struct Rumble {
+    seed: u64,
+    y: f32,
+}
+
+impl Rumble {
+    fn new(seed: u64) -> Self {
+        Self { seed, y: 0.0 }
+    }
+
+    fn pcm(&mut self, len: usize) -> Vec<i16> {
+        (0..len)
+            .map(|_| {
+                self.seed = self
+                    .seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let white = ((self.seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+                self.y = 0.95 * self.y + 0.05 * white;
+                (self.y * 6.0 * 3000.0) as i16
+            })
+            .collect()
+    }
+
+    /// 20 ms Opus frames at 48 kHz.
+    fn opus(&mut self, ms: u32) -> Vec<Bytes> {
+        let mut enc = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+            .expect("opus encoder");
+        let mut buf = vec![0u8; 1500];
+        (0..ms / 20)
+            .map(|_| {
+                let n = enc.encode(&self.pcm(960), &mut buf).unwrap();
+                Bytes::copy_from_slice(&buf[..n])
+            })
+            .collect()
+    }
+
+    /// 20 ms μ-law frames at 8 kHz.
+    fn ulaw(&mut self, ms: u32) -> Vec<Bytes> {
+        use aurix_common::g711::PCMU_FRAME_SAMPLES;
+        (0..ms / 20)
+            .map(|_| {
+                let mut out = Vec::new();
+                aurix_common::g711::encode(&self.pcm(PCMU_FRAME_SAMPLES), &mut out);
+                Bytes::from(out)
+            })
+            .collect()
+    }
+}
+
+/// Downlink frames of `ssrc` at `to`: `(frames, pcmu frames, rms of the last `tail` frames)`.
+/// The denoiser's recurrent state needs a moment to settle, so the head of a burst is not
+/// representative.
+async fn tail_rms_from(to: &Player, ssrc: u32, tail: usize) -> (usize, usize, f32) {
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+    let mut pcm48 = vec![0i16; 5760];
+    let mut per_frame: Vec<f64> = Vec::new();
+    let mut pcmu = 0;
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(1000), to.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).expect("bad AURX packet");
+        assert!(p.open(&to.keys), "{}: downlink must verify", to.name);
+        if p.header.packet_type != PacketType::Audio || p.header.ssrc != ssrc {
+            continue;
+        }
+        let body = if p.header.has_flag(PacketFlags::VolumeAttenuated) {
+            &p.payload[1..]
+        } else {
+            &p.payload[..]
+        };
+        let energy = if p.header.has_flag(PacketFlags::Pcmu) {
+            pcmu += 1;
+            let mut pcm8 = Vec::new();
+            aurix_common::g711::decode(body, &mut pcm8);
+            pcm8.iter()
+                .map(|&s| (s as f64 / 32768.0).powi(2))
+                .sum::<f64>()
+                / pcm8.len().max(1) as f64
+        } else {
+            let n = dec.decode(body, &mut pcm48, false).expect("opus downlink");
+            pcm48[..n]
+                .iter()
+                .map(|&s| (s as f64 / 32768.0).powi(2))
+                .sum::<f64>()
+                / n.max(1) as f64
+        };
+        per_frame.push(energy);
+    }
+    let frames = per_frame.len();
+    let tail: Vec<f64> = per_frame.into_iter().rev().take(tail).collect();
+    let rms = if tail.is_empty() {
+        0.0
+    } else {
+        (tail.iter().sum::<f64>() / tail.len() as f64).sqrt() as f32
+    };
+    (frames, pcmu, rms)
+}
+
+/// Sends `SetNoiseSuppression` and returns the node's answer: the confirmed state, or the
+/// error code it refused with.
+async fn request_noise_suppression(p: &mut Player, enabled: bool) -> Result<bool, String> {
+    p.send(&ControlMessage::SetNoiseSuppression { enabled })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let m = tokio::time::timeout_at(deadline, p.recv_for("NoiseSuppressionChanged"))
+            .await
+            .unwrap_or_else(|_| panic!("{}: no answer to SetNoiseSuppression", p.name));
+        match m {
+            ControlMessage::NoiseSuppressionChanged { enabled } => return Ok(enabled),
+            ControlMessage::Error { code, .. } => return Err(code),
+            _ => {}
+        }
+    }
+}
+
+/// Server-side denoising is a per-node opt-in: the node advertises it in the ack, cleans an
+/// Opus or PCMU uplink once the session asks (or the channel requires it), leaves stereo and
+/// E2EE audio alone, bounds the denoised sessions by `media.noise_suppression.max_sessions`
+/// (the CI node runs with 2), keeps the request across a resume, exposes it in metrics, and
+/// refuses it where the feature is off (the second CI node).
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn server_noise_suppression_is_opt_in_bounded_and_skips_e2ee_and_stereo() {
+    let Some(base) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let (env, _app_id) = isolated_env(&base, &http, "noise_suppression").await;
+
+    // Channel policy validation: denoising needs mono, non-E2EE audio.
+    for bad in [
+        serde_json::json!({"noise_suppression": true, "stereo": true}),
+        serde_json::json!({"noise_suppression": true, "e2ee": true}),
+    ] {
+        let r = http
+            .post(format!("{}/v1/channels", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&serde_json::json!({"name": "e2e-ns-bad", "config": bad}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+
+    let team = create_channel(&env, &http).await;
+    let forced =
+        create_channel_with(&env, &http, serde_json::json!({"noise_suppression": true})).await;
+    let stereo = create_channel_with(&env, &http, serde_json::json!({"stereo": true})).await;
+    let channels = [team, forced, stereo];
+    let (tok_a, _) = issue_token_for(&env, &http, "ns:alice", "Alice", &channels).await;
+    let (tok_b, _) = issue_token_for(&env, &http, "ns:bob", "Bob", &channels).await;
+    let mut alice = connect(&env, "alice", tok_a.clone()).await;
+    let mut bob = connect(&env, "bob", tok_b).await;
+    assert!(
+        alice.noise_suppression && bob.noise_suppression,
+        "the CI node advertises server-side noise suppression"
+    );
+    for p in [&mut alice, &mut bob] {
+        let prefs = p
+            .expect("ReceiverPreferences", |m| {
+                matches!(m, ControlMessage::ReceiverPreferences { .. })
+            })
+            .await;
+        if let ControlMessage::ReceiverPreferences {
+            noise_suppression, ..
+        } = prefs
+        {
+            assert!(!noise_suppression, "off until the session asks");
+        }
+        bind_media(p).await;
+        for ch in channels {
+            join(p, ch).await;
+        }
+    }
+    for _ in 0..3 {
+        alice
+            .expect("ParticipantJoined(Bob)", |m| {
+                matches!(m, ControlMessage::ParticipantJoined { display_name, .. } if display_name == "Bob")
+            })
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut rumble = Rumble::new(0x5eed);
+
+    // Baseline: without a request the rumble reaches Bob as Alice sent it.
+    stream_frames(&alice, team, 1, &rumble.opus(2000), false).await;
+    let (frames, _, raw_rms) = tail_rms_from(&bob, alice.ssrc, 50).await;
+    assert!(frames >= 80, "Bob got {frames} raw frames");
+    assert!(raw_rms > 0.02, "rumble is audible: {raw_rms}");
+
+    // Alice asks: the floor drops well below the raw level once the model has settled.
+    assert_eq!(request_noise_suppression(&mut alice, true).await, Ok(true));
+    stream_frames(&alice, team, 200, &rumble.opus(3000), false).await;
+    let (frames, pcmu, clean_rms) = tail_rms_from(&bob, alice.ssrc, 50).await;
+    assert!(frames >= 120, "Bob got {frames} cleaned frames");
+    assert_eq!(pcmu, 0);
+    assert!(
+        clean_rms < raw_rms * 0.5,
+        "denoised floor {clean_rms} vs raw {raw_rms}"
+    );
+
+    // The stereo (music) channel is never denoised, even for an opted-in sender.
+    stream_frames(&alice, stereo, 400, &rumble.opus(2000), false).await;
+    let (frames, _, stereo_rms) = tail_rms_from(&bob, alice.ssrc, 50).await;
+    assert!(frames >= 80, "Bob got {frames} stereo frames");
+    assert!(
+        stereo_rms > raw_rms * 0.7,
+        "stereo channel left alone: {stereo_rms} vs raw {raw_rms}"
+    );
+
+    // E2EE frames are opaque to the node and forwarded byte-for-byte to capable receivers.
+    for p in [&mut alice, &mut bob] {
+        p.send(&ControlMessage::E2eeHello {
+            channel_id: None,
+            user_id: None,
+            public_key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sealed = Bytes::from_static(b"sealed-by-the-client-not-opus");
+    let hash = channel_id_hash(&team);
+    for i in 0..5u32 {
+        let seq = 600 + i;
+        let mut pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, sealed.clone());
+        pkt.header.set_flag(PacketFlags::E2ee);
+        alice
+            .udp
+            .send_to(&pkt.seal(&alice.keys), alice.media_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut e2ee_frames = 0;
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(1000), bob.udp.recv_from(&mut buf)).await
+    {
+        let mut p = AurixPacket::decode(&buf[..n]).unwrap();
+        assert!(p.open(&bob.keys));
+        if p.header.packet_type != PacketType::Audio || p.header.ssrc != alice.ssrc {
+            continue;
+        }
+        assert!(p.header.has_flag(PacketFlags::E2ee), "flag survives");
+        assert_eq!(p.payload, sealed, "e2ee payload is untouched");
+        e2ee_frames += 1;
+    }
+    assert!(e2ee_frames >= 3, "Bob got {e2ee_frames} e2ee frames");
+
+    // Capacity: the CI node denoises two sessions at once. Carol takes the second slot, Dave
+    // is refused until Carol lets go; switching off is always accepted.
+    let (tok_c, _) = issue_token(&env, &http, "ns:carol", "Carol", team).await;
+    let (tok_d, _) = issue_token(&env, &http, "ns:dave", "Dave", team).await;
+    let mut carol = connect(&env, "carol", tok_c).await;
+    let mut dave = connect(&env, "dave", tok_d).await;
+    assert_eq!(request_noise_suppression(&mut carol, true).await, Ok(true));
+    assert_eq!(
+        request_noise_suppression(&mut dave, true).await,
+        Err("NOISE_SUPPRESSION_UNAVAILABLE".into())
+    );
+    assert_eq!(
+        request_noise_suppression(&mut carol, false).await,
+        Ok(false)
+    );
+    assert_eq!(request_noise_suppression(&mut dave, true).await, Ok(true));
+    assert_eq!(request_noise_suppression(&mut dave, false).await, Ok(false));
+    assert_eq!(request_noise_suppression(&mut dave, false).await, Ok(false));
+
+    // A channel that requires denoising cleans Bob's uplink without him asking.
+    stream_frames(&bob, forced, 1, &rumble.opus(3000), false).await;
+    let (frames, _, forced_rms) = tail_rms_from(&alice, bob.ssrc, 50).await;
+    assert!(frames >= 120, "Alice got {frames} forced-channel frames");
+    assert!(
+        forced_rms < raw_rms * 0.5,
+        "channel policy denoises: {forced_rms} vs raw {raw_rms}"
+    );
+    // ... while his uplink into the plain channel is left as it came.
+    stream_frames(&bob, team, 200, &rumble.opus(2000), false).await;
+    let (frames, _, plain_rms) = tail_rms_from(&alice, bob.ssrc, 50).await;
+    assert!(frames >= 80, "Alice got {frames} plain frames");
+    assert!(
+        plain_rms > raw_rms * 0.7,
+        "plain channel left alone: {plain_rms} vs raw {raw_rms}"
+    );
+
+    // PCMU: the μ-law uplink is denoised at 8 kHz on its way into the node's Opus.
+    alice
+        .send(&ControlMessage::SetAudioCodec {
+            codec: AudioCodec::Pcmu,
+        })
+        .await;
+    alice
+        .expect("AudioCodecChanged(pcmu)", |m| {
+            matches!(
+                m,
+                ControlMessage::AudioCodecChanged {
+                    codec: AudioCodec::Pcmu
+                }
+            )
+        })
+        .await;
+    assert_eq!(
+        request_noise_suppression(&mut alice, false).await,
+        Ok(false)
+    );
+    stream_pcmu(&alice, team, 700, &rumble.ulaw(2000), false).await;
+    let (frames, pcmu, raw_pcmu_rms) = tail_rms_from(&bob, alice.ssrc, 50).await;
+    assert!(frames >= 80, "Bob got {frames} transcoded frames");
+    assert_eq!(pcmu, 0, "Opus receiver never sees μ-law");
+    assert!(
+        raw_pcmu_rms > 0.02,
+        "μ-law rumble is audible: {raw_pcmu_rms}"
+    );
+    assert_eq!(request_noise_suppression(&mut alice, true).await, Ok(true));
+    stream_pcmu(&alice, team, 900, &rumble.ulaw(3000), false).await;
+    let (frames, _, clean_pcmu_rms) = tail_rms_from(&bob, alice.ssrc, 50).await;
+    assert!(frames >= 120, "Bob got {frames} denoised PCMU frames");
+    assert!(
+        clean_pcmu_rms < raw_pcmu_rms * 0.5,
+        "denoised PCMU floor {clean_pcmu_rms} vs raw {raw_pcmu_rms}"
+    );
+
+    if let Ok(metrics) = std::env::var("AURIX_E2E_METRICS") {
+        let body = http
+            .get(&metrics)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let sample = |prefix: &str| -> f64 {
+            body.lines()
+                .find(|l| l.starts_with(prefix))
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("{prefix} missing in metrics"))
+        };
+        assert!(sample("aurix_noise_suppression_sessions ") >= 1.0);
+        for path in ["opus", "pcmu"] {
+            assert!(
+                sample(&format!(
+                    "aurix_noise_suppression_frames_total{{outcome=\"ok\",path=\"{path}\"}}"
+                )) >= 100.0,
+                "{path} frames counted"
+            );
+        }
+    }
+
+    // The request survives a resume of the same session.
+    let Player {
+        session_id: sid_a,
+        resume_token,
+        ws: dead_ws,
+        ..
+    } = alice;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut alice = connect_with(&env, "alice", tok_a, Some((sid_a, &resume_token))).await;
+    assert!(alice.resumed, "expected a resumed session");
+    alice
+        .expect("ReceiverPreferences(noise_suppression)", |m| {
+            matches!(
+                m,
+                ControlMessage::ReceiverPreferences {
+                    noise_suppression: true,
+                    codec: AudioCodec::Pcmu,
+                    ..
+                }
+            )
+        })
+        .await;
+
+    // A node without the feature says so in the ack and refuses requests.
+    if let Ok(ws2) = std::env::var("AURIX_E2E_WS2") {
+        let env2 = Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8120".into()),
+            ws: ws2,
+            api_key: env.api_key.clone(),
+        };
+        let (tok_e, _) = issue_token(&env2, &http, "ns:eve", "Eve", team).await;
+        let mut eve = connect(&env2, "eve", tok_e).await;
+        assert!(!eve.noise_suppression, "node 2 runs with the feature off");
+        assert_eq!(
+            request_noise_suppression(&mut eve, true).await,
+            Err("NOISE_SUPPRESSION_UNAVAILABLE".into())
+        );
+        assert_eq!(request_noise_suppression(&mut eve, false).await, Ok(false));
+    }
+
+    for p in [&mut alice, &mut bob] {
+        for ch in channels {
+            p.send(&ControlMessage::ChannelLeave { channel_id: ch })
+                .await;
+        }
     }
 }
 

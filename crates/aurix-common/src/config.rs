@@ -290,6 +290,12 @@ impl AurixConfig {
         if self.media.mixer_decoder_complexity > 10 {
             anyhow::bail!("media.mixer_decoder_complexity must be within 0..=10");
         }
+        if !(1..=65_536).contains(&self.media.noise_suppression.max_sessions) {
+            anyhow::bail!("media.noise_suppression.max_sessions must be within 1..=65536");
+        }
+        if !(6_000..=128_000).contains(&self.media.noise_suppression.bitrate) {
+            anyhow::bail!("media.noise_suppression.bitrate must be within 6000..=128000");
+        }
         if self.redis.sentinels.is_empty() != self.redis.sentinel_master.is_none() {
             anyhow::bail!("redis.sentinels and redis.sentinel_master must be set together");
         }
@@ -1731,6 +1737,13 @@ pub struct MediaConfig {
     /// Costs CPU per concealed / enhanced frame — lower on CPU-bound nodes.
     #[serde(default = "default_mixer_decoder_complexity")]
     pub mixer_decoder_complexity: u8,
+    /// Server-side noise suppression of uplinks (see [`NoiseSuppressionConfig`]): an
+    /// RNNoise-class denoiser the node runs on a session's audio before it enters the channel,
+    /// for clients that run no capture DSP of their own (`SetNoiseSuppression`) or channels
+    /// that require it (`ChannelConfig.noise_suppression`). Never touches end-to-end
+    /// encrypted frames.
+    #[serde(default)]
+    pub noise_suppression: NoiseSuppressionConfig,
     /// Per-participant WebRTC downlink tracks a browser may negotiate on top of the mixed
     /// track (`SessionInitAck.webrtc_participant_streams`): each carries one speaker's own
     /// Opus frames so the browser can spatialize (Web Audio HRTF) and mix them itself; speakers
@@ -1849,6 +1862,76 @@ fn default_mixer_decoder_complexity() -> u8 {
     5
 }
 
+/// `[media.noise_suppression]` — the node's uplink denoiser.
+///
+/// Cleaning an Opus uplink costs the node one Opus decode, one RNNoise pass and one Opus
+/// encode per frame of that session (a PCMU uplink is cleaned inside its transcode, so only
+/// the RNNoise pass is added); `max_sessions` bounds the total. The re-encoded stream keeps
+/// the client's frame duration and packet flags but carries the node's in-band FEC instead of
+/// the client's FEC / DRED.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NoiseSuppressionConfig {
+    /// Offer the denoiser (`SessionInitAck.noise_suppression`) and honour
+    /// `ChannelConfig.noise_suppression`. Off: sessions asking for it get
+    /// `NOISE_SUPPRESSION_UNAVAILABLE`, channel policies are ignored.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How much of the denoised signal replaces the original: `low` (50 %), `moderate`
+    /// (75 %) or `high` (100 %). Lower levels keep more of the room but also more of the
+    /// noise; `high` is what the native SDK runs by default.
+    #[serde(default)]
+    pub level: NoiseSuppressionLevel,
+    /// Sessions the node denoises at once (`1..=65536`). Beyond it, `SetNoiseSuppression` is
+    /// rejected with `NOISE_SUPPRESSION_UNAVAILABLE` and channel policies leave the extra
+    /// uplinks as they arrive (`aurix_noise_suppression_frames_total{outcome="skipped"}`).
+    #[serde(default = "default_noise_suppression_max_sessions")]
+    pub max_sessions: usize,
+    /// Bitrate (bit/s, `6000..=128000`) of the re-encoded Opus uplink. Speech is transparent
+    /// at the default; channels whose policy floor is higher are unaffected because the node,
+    /// not the client, produced these frames.
+    #[serde(default = "default_noise_suppression_bitrate")]
+    pub bitrate: u32,
+}
+
+impl Default for NoiseSuppressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: NoiseSuppressionLevel::default(),
+            max_sessions: default_noise_suppression_max_sessions(),
+            bitrate: default_noise_suppression_bitrate(),
+        }
+    }
+}
+
+/// Strength of the server-side denoiser (`media.noise_suppression.level`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseSuppressionLevel {
+    Low,
+    Moderate,
+    #[default]
+    High,
+}
+
+impl NoiseSuppressionLevel {
+    /// Share of the denoised signal in the output (`0..=1`).
+    pub fn wet(self) -> f32 {
+        match self {
+            NoiseSuppressionLevel::Low => 0.5,
+            NoiseSuppressionLevel::Moderate => 0.75,
+            NoiseSuppressionLevel::High => 1.0,
+        }
+    }
+}
+
+fn default_noise_suppression_max_sessions() -> usize {
+    256
+}
+fn default_noise_suppression_bitrate() -> u32 {
+    32_000
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
@@ -1881,6 +1964,7 @@ impl Default for MediaConfig {
             media_tunnel: true,
             downlink_mix: true,
             mixer_decoder_complexity: default_mixer_decoder_complexity(),
+            noise_suppression: NoiseSuppressionConfig::default(),
             webrtc_participant_streams: default_webrtc_participant_streams(),
             tunnel_queue_packets: default_tunnel_queue_packets(),
             quic: true,

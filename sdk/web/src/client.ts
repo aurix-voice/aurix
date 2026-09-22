@@ -385,6 +385,11 @@ export interface SessionInfo {
    * operator has not configured translation.
    */
   translation?: TranslationInfo;
+  /**
+   * The node can denoise this session's uplink on request (`setServerNoiseSuppression`);
+   * `false` when the operator has not enabled `media.noise_suppression`.
+   */
+  noiseSuppression: boolean;
   /** Per-participant downlink tracks the node serves this browser at most (`0` = mixed only). */
   participantStreamCap: number;
   /** AURX-over-WebTransport endpoint of the node, when it offers one for this session. */
@@ -932,6 +937,12 @@ export interface AurixEvents {
   transcript: (transcript: Transcript) => void;
   /** The server applied (or a resumed session restored) this client's translation preference. */
   translationChanged: (prefs: TranslationPrefs) => void;
+  /**
+   * The node started (`true`) or stopped denoising this session's uplink on its request
+   * (`setServerNoiseSuppression`); a fresh session starts at `false` and the request is
+   * replayed.
+   */
+  serverNoiseSuppressionChanged: (enabled: boolean) => void;
   /** Progress of a `speak()` request (queued → playing → finished/cancelled/failed). */
   ttsStatus: (status: TtsStatus) => void;
   /**
@@ -958,6 +969,8 @@ export interface ReceiverPreferences {
   volumes: ParticipantVolume[];
   transmission: TransmissionMode;
   focusChannel: string | undefined;
+  /** The node denoises this session's uplink (`setServerNoiseSuppression`). */
+  noiseSuppression: boolean;
 }
 
 /**
@@ -1184,6 +1197,8 @@ export class AurixClient {
   private speechDone = new Map<string, Pending<TtsStatus>>();
   private speakRefCounter = 0;
   private wantTranscripts = true;
+  private wantServerNoiseSuppression = false;
+  private serverNoiseSuppressionActive = false;
   private translation: TranslationPrefs = { speech: false };
   /** Channels the server transcribes (from `ChannelJoinAck`). */
   private transcribedChannels = new Set<string>();
@@ -2689,6 +2704,9 @@ export class AurixClient {
     if (!this.wantTranscripts) {
       this.trySend({ type: 'SetTranscripts', data: { enabled: false } });
     }
+    if (this.wantServerNoiseSuppression) {
+      this.trySend({ type: 'SetNoiseSuppression', data: { enabled: true } });
+    }
     if (this.translation.language !== undefined || this.translation.spokenLanguage !== undefined) {
       this.trySend({ type: 'SetTranslation', data: this.translationWire() });
     }
@@ -2885,6 +2903,7 @@ export class AurixClient {
     this.speechDone.clear();
     this.transcribedChannels.clear();
     this.monitoredChannels.clear();
+    this.setServerNoiseSuppressionActive(false);
     this.channelScopes.clear();
     this.channelInfos.clear();
     this.channelPolicies.clear();
@@ -3028,6 +3047,24 @@ export class AurixClient {
     this.trySend({ type: 'SetTranscripts', data: { enabled } });
   }
 
+  /**
+   * Have the node run its noise suppressor over this session's uplink before anyone hears it —
+   * for a browser whose own `noiseSuppression` constraint is off or unavailable (do not stack
+   * the two). Never applies to end-to-end encrypted frames or stereo channels. Requires
+   * `SessionInfo.noiseSuppression` (otherwise the server answers with an `error`
+   * `NOISE_SUPPRESSION_UNAVAILABLE`, also when its session budget is spent); acknowledged by
+   * `serverNoiseSuppressionChanged`. Client-held: replayed on reconnect.
+   */
+  setServerNoiseSuppression(enabled: boolean): void {
+    this.wantServerNoiseSuppression = enabled;
+    this.trySend({ type: 'SetNoiseSuppression', data: { enabled } });
+  }
+
+  /** Whether the node currently denoises this session's uplink on its request. */
+  get serverNoiseSuppression(): boolean {
+    return this.serverNoiseSuppressionActive;
+  }
+
   /** Translation preference this client asked for (client-held; the server acks with `translationChanged`). */
   get translationPrefs(): TranslationPrefs {
     return { ...this.translation };
@@ -3048,6 +3085,12 @@ export class AurixClient {
       speech: options.speech === true && target !== undefined,
     };
     this.trySend({ type: 'SetTranslation', data: this.translationWire() });
+  }
+
+  private setServerNoiseSuppressionActive(enabled: boolean): void {
+    if (this.serverNoiseSuppressionActive === enabled) return;
+    this.serverNoiseSuppressionActive = enabled;
+    this.emit('serverNoiseSuppressionChanged', enabled);
   }
 
   private translationWire(): { language?: string; spoken_language?: string; speech: boolean } {
@@ -3718,6 +3761,7 @@ export class AurixClient {
           migrated: d.migrated === true,
           endpoint,
           failover: [...this.failoverEndpoints],
+          noiseSuppression: d.noise_suppression === true,
           participantStreamCap: d.webrtc_participant_streams ?? 0,
           ...(this.webTransportInfo
             ? {
@@ -4000,6 +4044,11 @@ export class AurixClient {
         this.emit('translationChanged', { ...this.translation });
         return;
       }
+      case 'NoiseSuppressionChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'NoiseSuppressionChanged' }>).data;
+        this.setServerNoiseSuppressionActive(d.enabled === true);
+        return;
+      }
       case 'ChannelFocusChanged': {
         const d = (msg as Extract<ServerMessage, { type: 'ChannelFocusChanged' }>).data;
         this.focusChannel = d.channel_id ?? undefined;
@@ -4029,6 +4078,8 @@ export class AurixClient {
           this.transmission = transmission;
           this.focusChannel = focusChannel;
         }
+        const noiseSuppression = d.noise_suppression === true;
+        this.setServerNoiseSuppressionActive(noiseSuppression);
         this.renderParticipants();
         this.emit('receiverPreferences', {
           blockedUsers: d.blocked_users,
@@ -4036,6 +4087,7 @@ export class AurixClient {
           volumes: d.volumes,
           transmission,
           focusChannel,
+          noiseSuppression,
         });
         return;
       }
