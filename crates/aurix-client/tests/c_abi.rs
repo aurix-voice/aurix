@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 mod support {
     pub mod header;
@@ -52,20 +53,27 @@ fn cdylib_path(target: &Path) -> PathBuf {
     target.join("debug").join(name)
 }
 
+/// Built once per test binary: a second concurrent `cargo build` re-uplifts the fresh cdylib
+/// (remove + hard-link), which races with the first sample's link step.
 fn ensure_cdylib(target: &Path) -> PathBuf {
-    let lib = cdylib_path(target);
-    if !lib.exists() {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let status = Command::new(cargo)
-            .args(["build", "-p", "aurix-client", "--lib"])
-            .env("CARGO_TARGET_DIR", target)
-            .current_dir(crate_dir())
-            .status()
-            .expect("run cargo build");
-        assert!(status.success(), "cargo build -p aurix-client failed");
-    }
-    assert!(lib.exists(), "cdylib not found at {}", lib.display());
-    lib
+    static CDYLIB: OnceLock<PathBuf> = OnceLock::new();
+    CDYLIB
+        .get_or_init(|| {
+            let lib = cdylib_path(target);
+            if !lib.exists() {
+                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+                let status = Command::new(cargo)
+                    .args(["build", "-p", "aurix-client", "--lib"])
+                    .env("CARGO_TARGET_DIR", target)
+                    .current_dir(crate_dir())
+                    .status()
+                    .expect("run cargo build");
+                assert!(status.success(), "cargo build -p aurix-client failed");
+            }
+            assert!(lib.exists(), "cdylib not found at {}", lib.display());
+            lib
+        })
+        .clone()
 }
 
 /// Compile `source` with `compiler` against the header and cdylib, run it against a closed
