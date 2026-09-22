@@ -41,6 +41,10 @@ class FakeClient {
     this.record('disconnect', reason);
     this.connectionState = 'disconnected';
   }
+  resumeAudio() {
+    this.record('resumeAudio');
+    return Promise.resolve(this.audioRunning ?? true);
+  }
   joinChannel(channelId, joinToken) {
     this.record('joinChannel', channelId, joinToken);
     if (joinToken === undefined && this.options.joinToken) {
@@ -462,6 +466,29 @@ test('remote audio without a document is reported, not crashed on', () => {
   const { bridge, handle, client } = make();
   client.emit('remoteStream', {});
   assert.deepEqual(drain(bridge, handle), [{ type: 'remoteAudio', playing: false, reason: 'no document' }]);
+});
+
+test('WebTransport media reports the Web Audio graph as remoteAudio (no MediaStream involved)', async () => {
+  const { bridge, handle, client } = make();
+  client.emit('mediaTransport', 'webtransport');
+  await tick();
+  assert.deepEqual(drain(bridge, handle), [
+    { type: 'mediaTransport', transport: 'webtransport' },
+    { type: 'remoteAudio', playing: true },
+  ]);
+  assert.deepEqual(client.calls.at(-1), ['resumeAudio']);
+
+  client.audioRunning = false;
+  client.emit('mediaTransport', 'webtransport');
+  await tick();
+  assert.deepEqual(drain(bridge, handle), [
+    { type: 'mediaTransport', transport: 'webtransport' },
+    { type: 'remoteAudio', playing: false, reason: 'audio context suspended (autoplay policy)' },
+  ]);
+
+  client.emit('mediaTransport', 'webrtc');
+  await tick();
+  assert.deepEqual(drain(bridge, handle), [{ type: 'mediaTransport', transport: 'webrtc' }], 'WebRTC playback is reported from remoteStream instead');
 });
 
 test('the browser bundle exposes the SDK as window.AurixWebSdk without a module system', () => {

@@ -217,7 +217,11 @@ func _run_harness_commands() -> void:
 			"resume_audio":
 				result = voice.resume_audio()
 			"stats":
+				# `get_stats()` returns the last cached sample (`{}` before the first) and asks the
+				# bridge for a fresh one, delivered through `stats`; wait for it when nothing is cached.
 				result = voice.get_stats()
+				if (result as Dictionary).is_empty():
+					result = await voice.stats
 			"quality":
 				result = voice.get_network_quality()
 			"disconnect":

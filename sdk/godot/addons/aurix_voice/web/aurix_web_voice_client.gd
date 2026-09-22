@@ -100,7 +100,7 @@ signal sdk_status_changed(status: int)
 signal remote_audio(playing: bool, reason: String)
 ## The SDK needs a fresh token (`kind` is "refresh" or "join"); answer with `provide_token`.
 signal token_requested(request_id: int, kind: String, channel_id: String)
-## Per-participant WebRTC track layout changed: Array of `{mid, user_id, live}`.
+## Per-participant slot layout changed (WebRTC tracks, or `wt:<ssrc>` slots over WebTransport): Array of `{mid, user_id, live}`.
 signal participant_streams_changed(streams: Array)
 signal participant_updated(channel_id: String, participant: Dictionary)
 signal participant_visemes(user_id: String, frame: Dictionary)
@@ -1346,6 +1346,7 @@ func _apply_session(info: Variant) -> void:
 		"media_quic": false,
 		"media_tls": false,
 		"media_webrtc": true,
+		"media_webtransport": i.get("webTransport") is Dictionary,
 		"downlink_mix": true,
 		"participant_stream_cap": int(i.get("participantStreamCap", 0)),
 		"translation": false,

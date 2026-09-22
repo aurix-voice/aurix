@@ -324,6 +324,10 @@ test('client: picks WebTransport when advertised and supported, no WebRTC negoti
   assert.equal(node.binds.length, 1);
   assert.deepEqual(errors, []);
   assert.equal(sock.sent.some((m) => m.type === 'WebRtcOffer'), false);
+  const queues = FakeWebTransport.all[0].datagrams;
+  assert.ok(queues.outgoingHighWaterMark > 1, 'browser may buffer several outgoing datagrams');
+  assert.ok(queues.incomingHighWaterMark > 1, 'browser buffers incoming datagrams while the page is busy');
+  assert.ok(queues.outgoingMaxAge > 0 && queues.incomingMaxAge > 0, 'stale datagrams expire in the browser');
   const info = client.sessionInfo;
   assert.deepEqual(info.webTransport.urls, WT.urls);
   assert.notEqual(info.webTransport.urls, WT.urls, 'advertisement is copied');
@@ -331,6 +335,21 @@ test('client: picks WebTransport when advertised and supported, no WebRTC negoti
   await settle();
   assert.notEqual(FakeWebTransport.all[0].closedWith, undefined, 'WebTransport closed on disconnect');
   assert.equal(client.mediaTransport, undefined);
+});
+
+test('client: quality reports and lastStats work without an RTCPeerConnection', async () => {
+  FakeWebTransport.node = new FakeNode(KEY, 7);
+  const { client, sock, errors } = await connectClient();
+  await until(() => client.connectionState === 'media-connected', 5000, 'media-connected');
+  assert.equal(client.lastStats, undefined);
+  await client.reportQuality();
+  const report = sock.sent.find((m) => m.type === 'QualityReport');
+  assert.ok(report, 'QualityReport sent over the control socket');
+  assert.equal(typeof report.data.rtt_ms, 'number');
+  assert.equal(typeof client.lastStats?.rttMs, 'number');
+  assert.deepEqual(errors, []);
+  client.disconnect();
+  await settle();
 });
 
 test('client: uplink goes to joined speaker channels only, mute pauses it, transmission mode routes it', async () => {
@@ -431,6 +450,9 @@ test('client: downlink frames are decoded per SSRC, placed by server gain/direct
   const { client, sock, ctx } = await connectClient();
   await until(() => client.connectionState === 'media-connected', 5000, 'media-connected');
   await joined(client, sock, CHANNEL, [brief('me', 7), brief('alice', 8), brief('bob', 9)]);
+  const layouts = [];
+  client.on('participantStreams', (s) => layouts.push(s));
+  assert.deepEqual(client.getParticipantStreams(), [], 'no slots before the first frame');
   const t = FakeWebTransport.all[0];
   const decodersBefore = FakeAudioDecoder.all.length;
   t.deliver(await node.audioPacket(8, 1, Uint8Array.from([0x78, 200]), { gain: 0.5, direction: { azimuth: -Math.PI / 2, elevation: 0 } }));
@@ -448,6 +470,16 @@ test('client: downlink frames are decoded per SSRC, placed by server gain/direct
   const players = ctx.created.filter((n) => n.kind === 'worklet:aurix-aurx-player');
   assert.equal(players.length, 2, 'one player node per SSRC on the renderer context');
   await settle();
+  assert.deepEqual(
+    client.getParticipantStreams().sort((a, b) => a.mid.localeCompare(b.mid)),
+    [
+      { mid: 'wt:8', userId: 'alice', stream: undefined, live: true },
+      { mid: 'wt:9', userId: 'bob', stream: undefined, live: true },
+    ],
+    'every rendered SSRC is a per-participant slot',
+  );
+  assert.equal(layouts.length, 2, 'one participantStreams event per new speaker');
+  assert.equal(client.isParticipantSpatialized('alice'), true, 'directional frames pan through the renderer');
   const stats = await client.getStats();
   assert.equal(stats.transport, 'webtransport');
   assert.equal(stats.packetsReceived, 3);
@@ -456,11 +488,15 @@ test('client: downlink frames are decoded per SSRC, placed by server gain/direct
   await settle();
   assert.equal(alice.state, 'closed', 'departed speaker: decoder closed');
   assert.equal(bob.state, 'configured');
+  assert.deepEqual(client.getParticipantStreams().map((s) => s.userId), ['bob'], 'departed speaker leaves the layout');
+  assert.equal(layouts.length, 3);
   t.deliver(await node.audioPacket(9, 2, Uint8Array.from([0x7c, 100])));
   await until(() => bob.decoded.length === 2, 5000, 'bob still plays');
   client.disconnect();
   await settle();
   assert.equal(bob.state, 'closed', 'disconnect closes every decoder');
+  assert.deepEqual(client.getParticipantStreams(), []);
+  assert.equal(layouts.at(-1).length, 0, 'teardown empties the layout');
 });
 
 test('client: BitrateCommand and audio policy reconfigure the WebCodecs encoder', async () => {

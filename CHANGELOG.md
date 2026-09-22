@@ -105,6 +105,13 @@ released together.
   WebRTC tabs sharing a channel, cross-transport audio, mute and E2EE. Browsers missing any of
   WebTransport datagrams, `serverCertificateHashes` (for the node-generated certificate),
   WebCrypto or WebCodecs Opus stay on WebRTC under `auto` (Chromium-based browsers have the set).
+  `getParticipantStreams()` / the `participantStreams` event list the rendered SSRC slots as
+  `{ mid: 'wt:<ssrc>', userId, stream: undefined, live: true }` (there is no `MediaStream`;
+  `AurixBridge` hosts — Unity WebGL, Godot Web — get the same layout and a `remoteAudio`
+  report for the Web Audio graph), the datagram queues are tuned for a busy page (64 outgoing /
+  256 incoming buffered datagrams, 500 ms max age) and WebCrypto backlogs after a main-thread
+  stall are bounded and dropped (counted in `packetsDroppedLocally`) instead of piling up
+  behind heartbeats.
 
 ### Fixed
 

@@ -195,9 +195,10 @@ def main() -> int:
                 f"{base}/index.html?harness=1&ws={ws_url}&api={api.url}&token={godot_token}&channel={channel}",
                 wait_until="load",
             )
-            snap = wait_for(godot, lambda s: s["state"] == 3, "Godot lobby connected + media bound (WebRTC)", 90)
+            snap = wait_for(godot, lambda s: s["state"] == 3, "Godot lobby connected + media bound", 90)
             check(snap["session"].get("user_id") == godot_uid, "session user id matches the issued token")
-            check(snap["session"].get("media_webrtc") is True and snap["session"].get("participant_stream_cap", 0) >= 1, "session reports WebRTC + stream cap")
+            check(snap["session"].get("media_webrtc") is True and snap["session"].get("participant_stream_cap", 0) >= 1, "session advertises WebRTC + stream cap")
+            expected_transport = "webtransport" if snap["session"].get("media_webtransport") else "webrtc"
             res = command(godot, "join", channel=channel)
             check(isinstance(res.get("result"), (int, float)) and res["result"] > 0, "join_channel returned a request id")
             snap = wait_for(godot, lambda s: s["channel"] == channel, "channel_joined")
@@ -238,6 +239,7 @@ def main() -> int:
             check(1 <= q.get("bars", 0) <= 5 and "mos" in q and "rtt_ms" in q, f"quality dictionary: bars={q.get('bars')} mos={q.get('mos')}")
             res = command(godot, "stats")
             check(isinstance(res.get("result"), dict) and "rtt_ms" in res["result"], "get_stats returns a snake_case dictionary")
+            check(res["result"].get("transport") == expected_transport, f"media runs over the advertised transport ({expected_transport})")
 
             res = command(godot, "mute", on=True)
             check(res.get("result") is True, "set_muted(true) reflected by is_muted")

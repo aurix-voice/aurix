@@ -119,7 +119,7 @@ destination`:
   listener frame, the speaker's `positions` entry the source, handedness converted per the
   channel's `coordinate_system`. Non-positional channels skip the panner (plain gain).
 * **layout** arrives asynchronously as the `participantStreams` event
-  (`[{ mid, userId | undefined, stream | undefined }]`) and `getParticipantStreams()`; a track
+  (`[{ mid, userId | undefined, stream | undefined, live }]`) and `getParticipantStreams()`; a track
   changes hands with a short server-side hold, and the SDK re-renders on every layout, roster,
   position, mute, block, volume and focus change. `setPinnedParticipants(ids)` keeps the given
   users on a dedicated track while audible (`RangeError` above the cap; replayed after a
@@ -192,6 +192,9 @@ WebCrypto. What changes for the page:
   of the same spatial renderer the per-participant WebRTC tracks use (HRTF / equal-power
   panning, per-participant volume, visemes, ducking), without the `webrtc_participant_streams`
   cap; server-processed streams (`Mixed` downlinks, positional stereo) are played as delivered.
+  `getParticipantStreams()` / the `participantStreams` event list these slots as
+  `{ mid: 'wt:<ssrc>', userId, stream: undefined, live: true }` (WebCodecs playback has no
+  `MediaStream`), one per SSRC heard within `webTransport.idleTimeoutMs`.
 * **The full Opus parameter set.** The channel policy applies completely — complexity, signal
   mode, application, expected loss, FEC, DTX, CBR, bitrate — and `webTransport.opus` layers
   your own overrides on top; `BitrateCommand` reconfigures the encoder live. `opus.stereo`

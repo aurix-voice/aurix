@@ -329,14 +329,19 @@ export interface E2eeOptions {
   workerUrl?: string;
 }
 
-/** One negotiated per-participant downlink track and who is on it. */
+/**
+ * One per-participant downlink slot and who is on it: a negotiated WebRTC track, or — on the
+ * WebTransport path — a remote SSRC currently rendered (`mid` = `wt:<ssrc>`, no `MediaStream`).
+ */
 export interface ParticipantStreamInfo {
-  /** SDP media id of the track (stable for the life of the peer connection). */
+  /** SDP media id of the track (stable for the life of the peer connection) or `wt:<ssrc>`. */
   mid: string;
   /** Participant currently carried; `undefined` = idle (heard in the mix, if at all). */
   userId: string | undefined;
-  /** The browser-side track, once it arrived. */
+  /** The browser-side track, once it arrived (WebRTC only; WebCodecs playback has none). */
   stream: MediaStream | undefined;
+  /** Audio is flowing on this slot: the track arrived, or datagrams for the SSRC keep coming. */
+  live: boolean;
 }
 
 export interface ReconnectPolicy {
@@ -2462,12 +2467,14 @@ export class AurixClient {
 
   /** Current layout of the per-participant tracks (see the `participantStreams` event). */
   getParticipantStreams(): ParticipantStreamInfo[] {
+    if (this.wt) {
+      return Array.from(this.wtSlots, ([ssrc, slot]) => ({ mid: wtSlotKey(ssrc), userId: slot.userId, stream: undefined, live: true }));
+    }
     const mids = new Set([...this.participantLayout.keys(), ...this.participantTracks.keys()]);
-    return Array.from(mids, (mid) => ({
-      mid,
-      userId: this.participantLayout.get(mid),
-      stream: this.participantTracks.get(mid),
-    }));
+    return Array.from(mids, (mid) => {
+      const stream = this.participantTracks.get(mid);
+      return { mid, userId: this.participantLayout.get(mid), stream, live: stream !== undefined };
+    });
   }
 
   /** The dedicated downlink stream carrying `userId` right now, if any. */
@@ -2480,6 +2487,12 @@ export class AurixClient {
 
   /** `true` when `userId`'s voice is rendered through the HRTF panner right now. */
   isParticipantSpatialized(userId: string): boolean {
+    if (this.wt) {
+      for (const [ssrc, slot] of this.wtSlots) {
+        if (slot.userId === userId) return this.renderer?.isSpatial(wtSlotKey(ssrc)) === true;
+      }
+      return false;
+    }
     for (const [mid, user] of this.participantLayout) {
       if (user === userId) return this.renderer?.isSpatial(mid) === true;
     }
@@ -3315,7 +3328,7 @@ export class AurixClient {
    * `qualityReportIntervalMs`; call it directly for an out-of-band report.
    */
   async reportQuality(): Promise<void> {
-    if (!this.pc || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!(this.pc || this.wt) || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const stats = await this.getStats();
     this.emit('stats', stats);
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
@@ -4502,7 +4515,9 @@ export class AurixClient {
     capture?.stop();
     if (this.wtIdleTimer !== undefined) clearInterval(this.wtIdleTimer);
     this.wtIdleTimer = undefined;
-    for (const ssrc of Array.from(this.wtSlots.keys())) this.removeWebTransportSlot(ssrc);
+    const hadSlots = this.wtSlots.size > 0;
+    for (const ssrc of Array.from(this.wtSlots.keys())) this.removeWebTransportSlot(ssrc, false);
+    if (hadSlots) this.emitParticipantStreams();
     const playback = this.wtPlayback;
     this.wtPlayback = undefined;
     playback?.clear();
@@ -4623,9 +4638,13 @@ export class AurixClient {
       slot = { userId: this.userForSsrc(audio.ssrc), e2ee: false, stereo: audio.mixed, lastPacketAt: now, gain: 0 };
       this.wtSlots.set(audio.ssrc, slot);
       if (this.visemesEnabledValue) void this.attachWebTransportVisemeTap(key);
+      this.emitParticipantStreams();
     }
     slot.lastPacketAt = now;
-    if (slot.userId === undefined) slot.userId = this.userForSsrc(audio.ssrc);
+    if (slot.userId === undefined) {
+      slot.userId = this.userForSsrc(audio.ssrc);
+      if (slot.userId !== undefined) this.emitParticipantStreams();
+    }
     if (audio.e2ee) {
       const group = this.e2eeGroup;
       const userId = slot.userId;
@@ -4674,12 +4693,13 @@ export class AurixClient {
     if (this.visemesEnabledValue && this.renderer === renderer) this.attachVisemeTap(key);
   }
 
-  private removeWebTransportSlot(ssrc: number): void {
+  private removeWebTransportSlot(ssrc: number, notify = true): void {
     if (!this.wtSlots.delete(ssrc)) return;
     const key = wtSlotKey(ssrc);
     this.detachVisemeTap(key);
     this.renderer?.removeTrack(key);
     this.wtPlayback?.remove(ssrc);
+    if (notify) this.emitParticipantStreams();
   }
 
   private sweepWebTransportSlots(): void {

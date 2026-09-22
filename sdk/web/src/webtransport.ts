@@ -26,6 +26,7 @@ import {
   sessionBindHeader,
   sessionBindPayload,
   type AurxHeader,
+  type AurxPacket,
   type DownlinkAudio,
 } from './aurx.js';
 import type { WebTransportInfoWire } from './protocol.js';
@@ -64,7 +65,7 @@ export interface AurxWebTransportStats {
   bytesReceived: number;
   /** Datagrams that failed to decode, authenticate or were replays. */
   packetsRejected: number;
-  /** Datagrams dropped by the browser's outgoing queue (`writable` backpressure). */
+  /** Datagrams dropped locally: outgoing-queue backpressure or a WebCrypto backlog after a main-thread stall (either direction). */
   packetsDroppedLocally: number;
   /** Smoothed heartbeat RTT in ms (`undefined` before the first ack). */
   rttMs: number | undefined;
@@ -126,6 +127,60 @@ function timeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 
 const BIND_RETRY_MS = 500;
 const REPLAY_WINDOW = 256;
+/** Audio frames allowed in flight through WebCrypto (uplink) before the oldest are dropped. */
+const MAX_PENDING_SEALS = 128;
+/** Datagrams allowed in flight through WebCrypto (downlink) before newcomers are dropped. */
+const MAX_PENDING_OPENS = 512;
+/** Datagrams the browser may hold in its outgoing queue before the newest are dropped. */
+const MAX_WRITE_BACKLOG = 64;
+/** `reader.read()` calls kept in flight so a stalled main thread drains a backlog in one task. */
+const READS_IN_FLIGHT = 16;
+/**
+ * Datagrams the browser may hand to its network layer before `write()` waits for one to leave.
+ * Chromium's default is 1: every further write then costs a renderer↔network round trip, i.e.
+ * one main-thread task per packet, which caps a page with a heavy game loop at a few dozen
+ * packets per second and queues heartbeats behind seconds of audio.
+ */
+const OUTGOING_BUFFERED_DATAGRAMS = 64;
+/** Datagrams the browser keeps for us while the main thread is busy (Chromium default: 1). */
+const INCOMING_BUFFERED_DATAGRAMS = 256;
+/** Milliseconds after which a datagram still waiting in either browser queue is discarded. */
+const DATAGRAM_MAX_AGE_MS = 500;
+
+type DatagramQueueTuning = Partial<{
+  outgoingMaxBufferedDatagrams: number;
+  incomingMaxBufferedDatagrams: number;
+  outgoingHighWaterMark: number;
+  incomingHighWaterMark: number;
+  outgoingMaxAge: number | null;
+  incomingMaxAge: number | null;
+}>;
+
+/** Best effort: browsers differ in which of the (renamed) attributes they expose and accept. */
+function tuneDatagramQueues(transport: WebTransport): void {
+  const datagrams = transport.datagrams as WebTransportDatagramDuplexStream & DatagramQueueTuning;
+  const set = (apply: () => void): void => {
+    try {
+      apply();
+    } catch {
+      // attribute missing or read-only in this browser
+    }
+  };
+  set(() => {
+    if ('outgoingMaxBufferedDatagrams' in datagrams) datagrams.outgoingMaxBufferedDatagrams = OUTGOING_BUFFERED_DATAGRAMS;
+    else datagrams.outgoingHighWaterMark = OUTGOING_BUFFERED_DATAGRAMS;
+  });
+  set(() => {
+    if ('incomingMaxBufferedDatagrams' in datagrams) datagrams.incomingMaxBufferedDatagrams = INCOMING_BUFFERED_DATAGRAMS;
+    else datagrams.incomingHighWaterMark = INCOMING_BUFFERED_DATAGRAMS;
+  });
+  set(() => {
+    datagrams.outgoingMaxAge = DATAGRAM_MAX_AGE_MS;
+  });
+  set(() => {
+    datagrams.incomingMaxAge = DATAGRAM_MAX_AGE_MS;
+  });
+}
 
 type State = 'idle' | 'connecting' | 'open' | 'closed';
 
@@ -148,10 +203,10 @@ export class AurxWebTransport {
   private readonly counters = { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, rejected: 0, droppedLocally: 0 };
   private url: string | undefined;
   private closeReason: string | undefined;
-  /** Sealed audio payloads waiting for the writer (bounded; oldest dropped). */
-  private writing = false;
   private sealChain: Promise<void> = Promise.resolve();
-  private readonly outQueue: Uint8Array[] = [];
+  private pendingSeals = 0;
+  private openChain: Promise<void> = Promise.resolve();
+  private pendingOpens = 0;
 
   constructor(
     private readonly session: WebTransportSessionKeys,
@@ -207,6 +262,7 @@ export class AurxWebTransport {
         await timeout(transport.ready, budget, `WebTransport handshake to ${url}`);
         this.transport = transport;
         this.url = url;
+        tuneDatagramQueues(transport);
         this.writer = transport.datagrams.writable.getWriter();
         void this.readLoop(transport);
         void transport.closed.then(
@@ -252,6 +308,10 @@ export class AurxWebTransport {
     }
     if (opts.e2ee) flags |= AurxFlags.E2ee;
     const header = audioHeader(this.session.ssrc, this.takeSequence(), timestamp >>> 0, channelIdHash, flags);
+    if (this.pendingSeals >= MAX_PENDING_SEALS) {
+      this.counters.droppedLocally += 1;
+      return;
+    }
     void this.sealAndSend(header, payload);
   }
 
@@ -316,7 +376,7 @@ export class AurxWebTransport {
       const unixMs = Date.now();
       const nonce = Math.floor(Math.random() * 0xffff_ffff);
       const packet = await keys.signPlain(sessionBindHeader(this.session.ssrc, unixMs, nonce), sessionBindPayload(this.session.sessionId, unixMs, nonce));
-      await this.write(packet);
+      this.write(packet);
     };
     await send();
     const retry = setInterval(() => {
@@ -357,60 +417,74 @@ export class AurxWebTransport {
     this.heartbeatSent.clear();
   }
 
-  /** Sealing is asynchronous (WebCrypto); chain it so packets leave in sequence order. */
+  /**
+   * Sealing is asynchronous (WebCrypto). Every packet starts sealing at once — so a burst of frames
+   * released after a long main-thread stall (game render loop, GC) costs one round trip, not one per
+   * frame — and only the writes are chained, so packets still leave in sequence order.
+   */
   private sealAndSend(header: AurxHeader, payload: Uint8Array): Promise<void> {
-    this.sealChain = this.sealChain.then(() => this.sealAndSendNow(header, payload));
+    const keys = this.keys;
+    if (!keys) return Promise.resolve();
+    this.pendingSeals += 1;
+    const sealed = keys.seal(header, payload).finally(() => {
+      this.pendingSeals -= 1;
+    });
+    this.sealChain = this.sealChain.then(() => this.sendSealed(sealed));
     return this.sealChain;
   }
 
-  private async sealAndSendNow(header: AurxHeader, payload: Uint8Array): Promise<void> {
-    const keys = this.keys;
-    if (!keys) return;
+  private async sendSealed(sealed: Promise<Uint8Array>): Promise<void> {
     try {
-      const packet = await keys.seal(header, payload);
-      await this.write(packet);
+      this.write(await sealed);
     } catch (e) {
       if (this.state === 'open') this.events.onError(e instanceof Error ? e : new Error(String(e)));
     }
   }
 
-  private async write(packet: Uint8Array): Promise<void> {
+  /**
+   * Hands one datagram to the browser without waiting for it to leave: awaiting each `write()` costs
+   * a main-thread task per packet, which caps the uplink at one packet per render frame when the
+   * page runs a heavy game loop. `desiredSize` bounds the browser-side backlog instead.
+   */
+  private write(packet: Uint8Array): void {
     const writer = this.writer;
     if (!writer) return;
-    if (this.writing) {
-      // The browser's outgoing datagram queue is full; keep the newest few, drop the rest.
-      this.outQueue.push(packet);
-      if (this.outQueue.length > 8) {
-        this.outQueue.shift();
-        this.counters.droppedLocally += 1;
-      }
+    const desired = writer.desiredSize;
+    if (desired !== null && desired <= -MAX_WRITE_BACKLOG) {
+      this.counters.droppedLocally += 1;
       return;
     }
-    this.writing = true;
-    try {
-      let next: Uint8Array | undefined = packet;
-      while (next) {
-        await writer.write(next as Uint8Array<ArrayBuffer>);
-        this.counters.sent += 1;
-        this.counters.bytesSent += next.length;
-        next = this.outQueue.shift();
-      }
-    } finally {
-      this.writing = false;
-    }
+    this.counters.sent += 1;
+    this.counters.bytesSent += packet.length;
+    writer.write(packet as Uint8Array<ArrayBuffer>).catch((e: unknown) => {
+      if (this.state === 'open' && this.writer === writer) this.events.onError(e instanceof Error ? e : new Error(String(e)));
+    });
   }
 
+  /**
+   * Keeps several `read()` calls pending at once: each resolution is a main-thread task, so a
+   * single outstanding read would cap the downlink at one datagram per render frame.
+   */
   private async readLoop(transport: WebTransport): Promise<void> {
     const reader = transport.datagrams.readable.getReader();
-    try {
+    let failed = false;
+    const pump = async (): Promise<void> => {
       for (;;) {
         const { value, done } = await reader.read();
-        if (done) break;
-        if (this.transport !== transport) break;
-        if (value instanceof Uint8Array) await this.onDatagram(value);
+        if (done || this.transport !== transport) return;
+        if (value instanceof Uint8Array) this.onDatagram(value);
       }
-    } catch (e) {
-      if (this.transport === transport) this.onTransportClosed(transport, `read failed (${e instanceof Error ? e.message : String(e)})`);
+    };
+    try {
+      await Promise.all(
+        Array.from({ length: READS_IN_FLIGHT }, () =>
+          pump().catch((e: unknown) => {
+            if (failed) return;
+            failed = true;
+            if (this.transport === transport) this.onTransportClosed(transport, `read failed (${e instanceof Error ? e.message : String(e)})`);
+          }),
+        ),
+      );
     } finally {
       try {
         reader.releaseLock();
@@ -420,7 +494,12 @@ export class AurxWebTransport {
     }
   }
 
-  private async onDatagram(data: Uint8Array): Promise<void> {
+  /**
+   * Authentication is asynchronous (WebCrypto): every datagram is opened as soon as it is read and
+   * the results are handled in arrival order, so a backlog after a main-thread stall drains in one
+   * round trip instead of one per packet.
+   */
+  private onDatagram(data: Uint8Array): void {
     const keys = this.keys;
     if (!keys) return;
     this.counters.bytesReceived += data.length;
@@ -429,7 +508,26 @@ export class AurxWebTransport {
       this.counters.rejected += 1;
       return;
     }
-    const packet = await keys.open(data, decoded);
+    if (this.pendingOpens >= MAX_PENDING_OPENS) {
+      this.counters.droppedLocally += 1;
+      return;
+    }
+    this.pendingOpens += 1;
+    const opened = keys.open(data, decoded).finally(() => {
+      this.pendingOpens -= 1;
+    });
+    this.openChain = this.openChain.then(async () => {
+      let packet: AurxPacket | undefined;
+      try {
+        packet = await opened;
+      } catch {
+        packet = undefined;
+      }
+      if (this.keys === keys) this.onPacket(packet);
+    });
+  }
+
+  private onPacket(packet: AurxPacket | undefined): void {
     if (!packet) {
       this.counters.rejected += 1;
       return;
@@ -513,8 +611,6 @@ export class AurxWebTransport {
         // a pending write keeps the lock; the transport close below ends it
       }
     }
-    this.outQueue.length = 0;
-    this.writing = false;
     try {
       transport.close({ closeCode: 0, reason: this.closeReason ?? 'done' });
     } catch {

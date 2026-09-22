@@ -542,6 +542,10 @@ export class AurixBridge {
     on('connectionState', (state: ConnectionState) => q({ type: 'connectionState', state }));
     on('sessionReady', (info) => q({ type: 'sessionReady', info }));
     on('remoteStream', (stream) => this.playRemote(entry, stream));
+    on('mediaTransport', (transport) => {
+      q({ type: 'mediaTransport', transport });
+      if (transport === 'webtransport') void this.reportGraphPlayback(entry);
+    });
     on('channelJoined', (channelId, participants) => q({ type: 'channelJoined', channelId, participants }));
     on('channelLeft', (channelId) => q({ type: 'channelLeft', channelId }));
     on('participantJoined', (channelId, participant) => q({ type: 'participantJoined', channelId, participant }));
@@ -640,6 +644,20 @@ export class AurixBridge {
   }
 
   /**
+   * WebTransport has no `MediaStream`: playback is the Web Audio graph (WebCodecs → worklet →
+   * spatial renderer), so its autoplay state is reported the same way the `<audio>` element's is.
+   */
+  private async reportGraphPlayback(entry: Entry): Promise<void> {
+    const playing = await entry.client.resumeAudio();
+    this.push(
+      entry,
+      playing
+        ? { type: 'remoteAudio', playing: true }
+        : { type: 'remoteAudio', playing: false, reason: 'audio context suspended (autoplay policy)' },
+    );
+  }
+
+  /**
    * Retry playback after a user gesture (autoplay policy): the mixed track's element and the
    * Web Audio graph of per-participant tracks. Resolves `true` when audio is playing.
    */
@@ -708,7 +726,7 @@ function strArray(a: Args, key: string): string[] {
 
 /** Wire form of the track layout: a `MediaStream` cannot cross a string bridge, its presence can. */
 function participantStreamsEvent(streams: ParticipantStreamInfo[]): Array<{ mid: string; userId: string | null; live: boolean }> {
-  return streams.map((s) => ({ mid: s.mid, userId: s.userId ?? null, live: s.stream !== undefined }));
+  return streams.map((s) => ({ mid: s.mid, userId: s.userId ?? null, live: s.live }));
 }
 
 function e2eeOptions(raw: NonNullable<BridgeClientOptions['e2ee']>): boolean | E2eeOptions {

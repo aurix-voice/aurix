@@ -149,14 +149,27 @@ impl Player {
         }
     }
 
-    /// Wait for a message matching `pred`, skipping others (participant/speaking events).
+    /// Wait up to 15 s for a message matching `pred`, skipping others (speaking, energy,
+    /// quality and roster events pile up on a socket the test has not drained for a while).
     async fn expect<F: Fn(&ControlMessage) -> bool>(
         &mut self,
         what: &str,
         pred: F,
     ) -> ControlMessage {
-        for _ in 0..20 {
-            let m = self.recv_for(what).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut skipped: Vec<String> = Vec::new();
+        loop {
+            let m = tokio::time::timeout_at(deadline, self.recv_for(what))
+                .await
+                .unwrap_or_else(|_| {
+                    let tail: Vec<&str> =
+                        skipped.iter().rev().take(20).map(String::as_str).collect();
+                    panic!(
+                        "{}: never received {what}; skipped {} messages, last: {tail:#?}",
+                        self.name,
+                        skipped.len()
+                    )
+                });
             if pred(&m) {
                 return m;
             }
@@ -166,8 +179,8 @@ impl Player {
                     self.name
                 );
             }
+            skipped.push(format!("{m:?}").chars().take(80).collect());
         }
-        panic!("{}: never received {what}", self.name);
     }
 
     async fn recv_udp(&self) -> Option<AurixPacket> {

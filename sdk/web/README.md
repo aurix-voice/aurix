@@ -157,7 +157,7 @@ const client = new AurixClient({
   spatialAudio: true,          // true = HRTF (default) | 'equalpower' | false (render it yourself)
 });
 client.on('participantStreams', (streams) => {
-  // [{ mid, userId | undefined, stream | undefined }] — the full layout, on every change
+  // [{ mid, userId | undefined, stream | undefined, live }] — the full layout, on every change
 });
 client.setPinnedParticipants([raidLeaderId]);   // keep them on a track while audible; RangeError above the cap
 client.isParticipantSpatialized(userId);        // true = through the HRTF panner right now
@@ -559,8 +559,9 @@ bridge.destroy(h);
 * `drain(handle)` returns the ordered event queue (one entry per client event, same names and
   payloads as `client.on(...)` — `participantStreams` is serialized as `[{mid, userId | null, live}]`,
   a `MediaStream` never crosses the string bridge), plus `result`, `tokenRequest`, `remoteAudio`
-  (playback state of the hidden `<audio>` element the bridge attaches to the mixed stream;
-  `resumeAudio` retries it and resumes the Web Audio graph after an autoplay block) and `overflow`
+  (playback state of the hidden `<audio>` element the bridge attaches to the mixed stream, or of
+  the Web Audio graph when media runs over WebTransport — see `mediaTransport`; `resumeAudio`
+  retries it and resumes the Web Audio graph after an autoplay block) and `overflow`
   (`{"dropped":N}` when the bounded queue, default 4096, wrapped). `participantStreams` /
   `spatialAudio` in the options, `setPinnedParticipants` / `pinnedParticipants` /
   `participantStreamCap` / `participantStreams` / `isParticipantSpatialized` as methods.
