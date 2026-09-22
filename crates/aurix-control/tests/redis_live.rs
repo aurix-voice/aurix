@@ -245,7 +245,15 @@ async fn cluster_shard_failover_reattaches_the_event_bus() {
         events_flow(&bus1, &mut local2, Duration::from_secs(30)).await,
         "events never resumed after the shard failover"
     );
-    assert!(node1.event_subscriber_connected() && node2.event_subscriber_connected());
+    // node1 → node2 only proves node2's subscriber; node1's re-attaches independently.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(node1.event_subscriber_connected() && node2.event_subscriber_connected()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a subscriber never re-attached after the shard failover"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let sid = SessionId::new();
     assert!(node1.write_session_mirror(&mirror(sid), 60).await.unwrap());
     assert_eq!(node2.claim_session(sid, n1, 60).await.unwrap(), Ok(()));
