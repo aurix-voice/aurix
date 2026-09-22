@@ -29,6 +29,42 @@ namespace Aurix.Voice.Tests
             (priority ? "true" : "false") + ",\"is_speaking\":" + (speaking ? "true" : "false") + "}";
 
         [Fact]
+        public void SpeakerAdmissionWaitingFlagAndRoleChangedUpdateTheEffectiveRole()
+        {
+            var me = Guid.NewGuid();
+            var alice = Guid.NewGuid();
+            var stage = Guid.NewGuid();
+            var client = new AurixVoiceClient("ws://127.0.0.1:1", TokenFor(me));
+            var roles = new List<(Guid, Guid, ChannelRole, bool)>();
+            client.OnParticipantRoleChanged += (c, u, r, a) => roles.Add((c, u, r, a));
+
+            Msg(client, "{\"type\":\"ChannelJoinAck\",\"data\":{\"channel_id\":\"" + stage + "\",\"participants\":[" +
+                Member(me, 1, role: "listener") + "," + Member(alice, 2) + "],\"role\":\"listener\",\"waiting_to_speak\":true}}");
+            var info = client.GetChannelInfo(stage);
+            Assert.True(info.HasValue);
+            Assert.Equal(ChannelRole.Listener, info.Value.Role);
+            Assert.True(info.Value.WaitingToSpeak);
+            Assert.True(client.IsWaitingToSpeak(stage));
+            Assert.False(client.CanSpeakIn(stage));
+
+            Msg(client, "{\"type\":\"RoleChanged\",\"data\":{\"channel_id\":\"" + stage + "\",\"user_id\":\"" + alice + "\",\"role\":\"listener\",\"reason\":\"speaker_demoted\"}}");
+            Assert.Contains(client.GetParticipants(stage), p => p.UserId == alice && p.Role == ChannelRole.Listener);
+            Msg(client, "{\"type\":\"RoleChanged\",\"data\":{\"channel_id\":\"" + stage + "\",\"user_id\":\"" + me + "\",\"role\":\"speaker\",\"reason\":\"speaker_admitted\"}}");
+            info = client.GetChannelInfo(stage);
+            Assert.Equal(ChannelRole.Speaker, info.Value.Role);
+            Assert.False(info.Value.WaitingToSpeak);
+            Assert.True(client.CanSpeakIn(stage));
+            Assert.False(client.IsWaitingToSpeak(stage));
+            Msg(client, "{\"type\":\"RoleChanged\",\"data\":{\"channel_id\":\"" + Guid.NewGuid() + "\",\"user_id\":\"" + me + "\",\"role\":\"speaker\",\"reason\":\"speaker_admitted\"}}");
+            Assert.Equal(new[] { (stage, alice, ChannelRole.Listener, false), (stage, me, ChannelRole.Speaker, true) }, roles);
+
+            var plain = Guid.NewGuid();
+            Msg(client, "{\"type\":\"ChannelJoinAck\",\"data\":{\"channel_id\":\"" + plain + "\",\"participants\":[" + Member(me, 1) + "]}}");
+            Assert.False(client.GetChannelInfo(plain).Value.WaitingToSpeak);
+            Assert.False(client.IsWaitingToSpeak(plain));
+        }
+
+        [Fact]
         public void DuckingConfigParsesAndClamps()
         {
             var m = ControlMessage.Parse("{\"type\":\"ChannelJoinAck\",\"data\":{\"channel_id\":\"" + Guid.NewGuid() +

@@ -60,10 +60,17 @@ namespace Aurix
     public struct ChannelInfo
     {
         /// <summary>
-        /// Our role; <see cref="ChannelRole.Listener"/> means receive-only (the grant had <c>speak: false</c>),
+        /// Our <em>effective</em> role; <see cref="ChannelRole.Listener"/> means receive-only (the grant had
+        /// <c>speak: false</c>, or every <c>audience.max_speakers</c> slot is taken — see <see cref="WaitingToSpeak"/>),
         /// whatever the channel type — the microphone is not sent there.
         /// </summary>
         public ChannelRole Role;
+        /// <summary>
+        /// We hold a speaking grant but wait for an <c>audience.max_speakers</c> slot (or an idle slot was taken
+        /// from us); <see cref="Role"/> is <see cref="ChannelRole.Listener"/> until
+        /// <see cref="AurixVoiceClient.OnParticipantRoleChanged"/> admits us again.
+        /// </summary>
+        public bool WaitingToSpeak;
         /// <summary>
         /// Members across all nodes, including listeners hidden from <see cref="AurixVoiceClient.GetParticipants"/>
         /// (<see cref="HiddenListeners"/>). A snapshot taken at join time.
@@ -733,6 +740,14 @@ namespace Aurix
         /// <see cref="SetPriorityAsync"/> or a moderator's grant. <see cref="Participant.IsPriority"/> is already updated.
         /// </summary>
         public event Action<Guid, Guid, bool> OnParticipantPriorityChanged;
+        /// <summary>
+        /// (channel, user, role, admitted): a member's <em>effective</em> role changed under
+        /// <c>audience.speaker_admission</c> — including yourself: <c>admitted</c> is true when it got its granted
+        /// role (a speaker slot) back, false when an idle speaker slot was taken from it (its audio is dropped
+        /// meanwhile). The grant itself is unchanged; <see cref="Participant.Role"/> / <see cref="ChannelInfo"/> are
+        /// already updated.
+        /// </summary>
+        public event Action<Guid, Guid, ChannelRole, bool> OnParticipantRoleChanged;
         /// <summary>
         /// Another member's priority speech started (<c>true</c>) or stopped (<c>false</c>) ducking the channel —
         /// the hook to attenuate game audio with the same envelope (<see cref="DuckingConfig"/>). Fires on
@@ -2089,6 +2104,15 @@ namespace Aurix
             lock (_channels) return _channelInfos.TryGetValue(channelId, out var i) && i.CanSpeak;
         }
 
+        /// <summary>
+        /// Whether we hold a speaking grant in <paramref name="channelId"/> but wait for an
+        /// <c>audience.max_speakers</c> slot (<see cref="ChannelInfo.WaitingToSpeak"/>); false for channels not joined.
+        /// </summary>
+        public bool IsWaitingToSpeak(Guid channelId)
+        {
+            lock (_channels) return _channelInfos.TryGetValue(channelId, out var i) && i.WaitingToSpeak;
+        }
+
         /// <summary>Whether this client receives <see cref="OnTranscript"/> (default true).</summary>
         public bool TranscriptsEnabled { get { lock (_channels) return _wantTranscripts; } }
 
@@ -2862,6 +2886,7 @@ namespace Aurix
                         _channelInfos[channelId] = new ChannelInfo
                         {
                             Role = m.Has("role") ? ControlMessage.ParseRole(m.Str("role")) : ChannelRole.Speaker,
+                            WaitingToSpeak = m.Bool("waiting_to_speak"),
                             ParticipantCount = m.Has("participant_count") ? m.U32("participant_count") : (uint)roster.Count,
                             HiddenListeners = m.Bool("hidden_listeners"),
                             Transcription = m.Bool("transcription"),
@@ -2961,6 +2986,27 @@ namespace Aurix
                     p.IsSpeaking = m.Bool("speaking");
                     OnSpeaking?.Invoke(m.Id("channel_id"), p, p.IsSpeaking);
                     RefreshDucking(m.Id("channel_id"));
+                    break;
+                }
+                case "RoleChanged":
+                {
+                    var channelId = m.Id("channel_id");
+                    var userId = m.Id("user_id");
+                    var role = ControlMessage.ParseRole(m.Str("role"));
+                    bool admitted = m.Str("reason") == "speaker_admitted";
+                    var p = Lookup(channelId, userId);
+                    lock (_channels)
+                    {
+                        if (!_joinedChannels.Contains(channelId)) break;
+                        if (userId == _localUserId && _channelInfos.TryGetValue(channelId, out var info))
+                        {
+                            info.Role = role;
+                            info.WaitingToSpeak = role == ChannelRole.Listener;
+                            _channelInfos[channelId] = info;
+                        }
+                    }
+                    if (p != null) p.Role = role;
+                    OnParticipantRoleChanged?.Invoke(channelId, userId, role, admitted);
                     break;
                 }
                 case "PriorityChanged":

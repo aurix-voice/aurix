@@ -120,6 +120,7 @@ namespace Aurix.WebGL
         public event Action<ReceiverPreferences> OnReceiverPreferences;
         public event Action<Guid, bool> OnUserBlockChanged;
         public event Action<Guid, Guid, bool> OnParticipantPriorityChanged;
+        public event Action<Guid, Guid, ChannelRole, bool> OnParticipantRoleChanged;
         /// <summary>Game-audio ducking hook: a priority speaker started / stopped ducking a channel in the browser (transitions only).</summary>
         public event Action<Guid, bool, DuckingConfig> OnDuckingChanged;
         /// <summary>Only with <see cref="WebGLClientOptions.VisemeEvents"/>: a participant's mouth state, 50/s while it speaks.</summary>
@@ -312,6 +313,8 @@ namespace Aurix.WebGL
             _handle > 0 ? BridgeJson.ChannelScope(MiniJson.AsObject(Value("channelScope", Channel(channelId)))) : null;
 
         public bool CanSpeakIn(Guid channelId) => _handle > 0 && Value("canSpeakIn", Channel(channelId)) is bool b && b;
+
+        public bool IsWaitingToSpeak(Guid channelId) => _handle > 0 && Value("isWaitingToSpeak", Channel(channelId)) is bool b && b;
 
         public bool IsChannelTranscribed(Guid channelId) => _handle > 0 && Value("isChannelTranscribed", Channel(channelId)) is bool b && b;
 
@@ -1011,6 +1014,17 @@ namespace Aurix.WebGL
                     lock (_channels)
                         if (_channels.TryGetValue(channelId, out var members) && members.TryGetValue(userId, out var p)) p.IsPriority = priority;
                     OnParticipantPriorityChanged?.Invoke(channelId, userId, priority);
+                    return;
+                }
+                case "participantRoleChanged":
+                {
+                    var channelId = BridgeJson.Id(e, "channelId");
+                    var userId = BridgeJson.Id(e, "userId");
+                    var role = ControlMessage.ParseRole(MiniJson.GetString(e, "role"));
+                    bool admitted = MiniJson.GetBool(e, "admitted");
+                    lock (_channels)
+                        if (_channels.TryGetValue(channelId, out var members) && members.TryGetValue(userId, out var p)) p.Role = role;
+                    OnParticipantRoleChanged?.Invoke(channelId, userId, role, admitted);
                     return;
                 }
                 case "duckingChanged":
