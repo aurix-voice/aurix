@@ -2,7 +2,7 @@
   "name": "@aurix/dashboard",
   "version": "1.3.0",
   "description": "Operator dashboard for the Aurix voice platform (standalone SPA served by Caddy).",
-  "license": "Apache-2.0",
+  "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",
   "scripts": {

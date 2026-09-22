@@ -64,7 +64,7 @@ means implemented and covered by tests here, not "benchmarked against the vendor
 
 | | Vivox | Agora Voice | Photon Voice | Aurix |
 | --- | :-: | :-: | :-: | :-: |
-| Self-hosted / source available | – | – | – (Photon Server for Voice is a separate licence) | ✓ Apache-2.0 |
+| Self-hosted / source available | – | – | – (Photon Server for Voice is a separate licence) | ✓ AGPL-3.0 server, Apache-2.0 SDKs |
 | Positional (3D) voice | ✓ | ✓ (spatial audio extension) | via engine `AudioSource` | ✓ server attenuation + client HRTF / engine spatialization |
 | Per-participant streams for engine spatialization | – (channel mix) | ✓ | ✓ | ✓ native/Unity/Unreal/Godot PCM, browser tracks |
 | Large channels (listeners, server mix, stream caps) | ✓ | ✓ (audience role) | interest groups | ✓ |

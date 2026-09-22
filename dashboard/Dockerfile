@@ -9,7 +9,9 @@ RUN --mount=type=cache,target=/root/.npm \
     cd dashboard && npm ci --no-audit --no-fund
 COPY sdk/server/node/src sdk/server/node/src
 COPY dashboard dashboard
-RUN cd dashboard && npm run build
+# Repository of the source this image is built from (shown in the sidebar; AGPL-3.0 §13).
+ARG AURIX_SOURCE_URL=https://github.com/aurix-voice/aurix
+RUN cd dashboard && AURIX_SOURCE_URL="$AURIX_SOURCE_URL" npm run build
 
 # ---------- runtime ----------
 FROM caddy:2.11-alpine AS runtime

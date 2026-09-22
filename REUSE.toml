@@ -1,0 +1,36 @@
+# Machine-readable licence map (REUSE 3.3). `reuse lint` in CI keeps it complete; LICENSING.md
+# explains it. Later annotations win over earlier ones for a file both match.
+version = 1
+SPDX-PackageName = "Aurix"
+SPDX-PackageSupplier = "The Aurix Authors"
+SPDX-PackageDownloadLocation = "https://github.com/aurix-voice/aurix"
+
+# Default: the server and everything an operator runs — nodes, dashboard, CLI, migrations,
+# tooling, CI, deployment manifests.
+[[annotations]]
+path = "**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The Aurix Authors"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Everything a game links or ships: the native core and its C ABI, the crates it depends on,
+# every client SDK, the server SDKs and their examples, the API contract, the shared test vectors.
+[[annotations]]
+path = [
+    "crates/aurix-client/**",
+    "crates/aurix-common/**",
+    "crates/aurix-opus/**",
+    "sdk/**",
+    "api/**",
+    "tools/openapi-sdk/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The Aurix Authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Documentation and deployment examples: copy freely into your own runbooks and charts.
+[[annotations]]
+path = ["docs/**", "deploy/**", "configs/**", "*.md", "docker-compose.yml"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The Aurix Authors"
+SPDX-License-Identifier = "Apache-2.0"

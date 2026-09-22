@@ -96,9 +96,19 @@ export function Sidebar({ className, onNavigate }: { className?: string; onNavig
           );
         })}
       </nav>
-      <div className="px-5 py-3 border-t border-border text-[11px] text-fg-faint">
-        <Activity className="inline size-3 mr-1 -mt-px" aria-hidden />
-        <span className="tabular">{__DASHBOARD_VERSION__}</span>
+      <div className="px-5 py-3 border-t border-border text-[11px] text-fg-faint flex items-center justify-between">
+        <span>
+          <Activity className="inline size-3 mr-1 -mt-px" aria-hidden />
+          <span className="tabular">{__DASHBOARD_VERSION__}</span>
+        </span>
+        <a
+          href={__DASHBOARD_SOURCE_URL__}
+          target="_blank"
+          rel="noreferrer"
+          className="hover:text-fg underline-offset-4 hover:underline"
+        >
+          {t("shell.source")}
+        </a>
       </div>
     </aside>
   );

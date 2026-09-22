@@ -1,0 +1,10 @@
+Aurix
+Copyright 2026 The Aurix Authors
+
+The Aurix client SDKs (native core and C ABI, Unity, Unreal, Godot, Web, the server SDKs
+and the crates aurix-client, aurix-common and aurix-opus) are licensed under the Apache
+License, Version 2.0. The Aurix server, dashboard, CLI and tooling are licensed under the
+GNU Affero General Public License, version 3 only. See LICENSING.md for the exact map.
+
+The native core statically links libopus (Xiph.Org Foundation and contributors), used under
+the BSD-3-Clause licence: https://opus-codec.org/license/

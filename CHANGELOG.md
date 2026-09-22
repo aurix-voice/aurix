@@ -11,6 +11,20 @@ released together.
 
 ## [Unreleased]
 
+### Changed
+
+* **Licensing.** The server side — `aurix-server` and the media, TURN, control, database, auth,
+  moderation, recording and metrics crates, the operator dashboard, the `aurix` CLI, load tester,
+  fuzzing / chaos / netem harnesses, release tooling, CI and migrations — is now licensed under
+  **AGPL-3.0-only**. Everything a game links or ships stays **Apache-2.0**: `aurix-client` (native
+  core and C ABI), `aurix-common`, `aurix-opus`, the Web / Unity / Unreal / Godot SDKs, the server
+  SDKs and token-server examples, the OpenAPI contract, documentation and deployment examples.
+  The map is `REUSE.toml` (checked by `reuse lint` in CI) and explained in `LICENSING.md`; every
+  package carries its own `LICENSE`, the client core ships `NOTICE`, container images are labelled
+  `AGPL-3.0-only`. Releases up to `v1.3.0` remain Apache-2.0 throughout.
+* **Contributions** require a Developer Certificate of Origin sign-off (`git commit -s`); pull
+  requests are checked by `tools/release/check_dco.py`. No CLA. See `CONTRIBUTING.md`.
+
 ## [1.3.0] - 2026-09-19
 
 Operator dashboard, richer stored chat, node drain, admin delegation and lossy-link protection

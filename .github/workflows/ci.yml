@@ -335,6 +335,18 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  licensing:
+    name: REUSE licence map + DCO
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: fsfe/reuse-action@v6
+      - name: Developer Certificate of Origin (pull requests)
+        if: github.event_name == 'pull_request'
+        run: python3 tools/release/check_dco.py "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
   fuzz:
     name: fuzz (corpus replay + libFuzzer smoke)
     runs-on: ubuntu-latest

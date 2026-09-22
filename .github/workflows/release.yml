@@ -97,7 +97,7 @@ jobs:
           mkdir -p "dist/$name/bin"
           cp target/release/aurix-server target/release/aurix target/release/aurix-loadtest "dist/$name/bin/"
           cp -r configs migrations "dist/$name/"
-          cp README.md LICENSE CHANGELOG.md SECURITY.md "dist/$name/"
+          cp README.md LICENSE LICENSING.md CHANGELOG.md SECURITY.md "dist/$name/"
           "dist/$name/bin/aurix" --version
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
@@ -160,7 +160,7 @@ jobs:
           mkdir -p "dist/$core"
           cp -r "$tp/include" "dist/$core/include"
           cp -r "$tp/lib/${{ matrix.platform }}" "dist/$core/lib"
-          cp LICENSE "dist/$core/"
+          cp crates/aurix-client/LICENSE NOTICE "dist/$core/"
           cli="aurix-cli-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$cli"
           if [ "${{ runner.os }}" = Windows ]; then
@@ -218,7 +218,6 @@ jobs:
       - name: Godot addon (source; native libraries are built per platform with sdk/godot/scripts/build_native.sh)
         run: |
           (cd sdk/godot/addons && zip -qr "../../../dist/aurix-godot-addon-${VERSION}.zip" aurix_voice -x 'aurix_voice/bin/*')
-          cp LICENSE dist/ && (cd dist && zip -q "aurix-godot-addon-${VERSION}.zip" LICENSE && rm LICENSE)
       - name: Node server SDK
         working-directory: sdk/server/node
         run: |
@@ -269,7 +268,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp LICENSE sdk/unreal/AurixVoice/
           (cd sdk/unreal && zip -qr "../../dist/AurixVoice-unreal-${VERSION}.zip" AurixVoice -x '*/Binaries/*' '*/Intermediate/*')
           ls -la dist
       - uses: actions/upload-artifact@v4
@@ -315,7 +313,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=aurix-server
             org.opencontainers.image.version=${{ needs.verify.outputs.version }}
-            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha,scope=release-${{ matrix.slug }}
           cache-to: type=gha,mode=max,scope=release-${{ matrix.slug }}
           provenance: mode=max
@@ -459,7 +457,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=aurix-dashboard
             org.opencontainers.image.version=${{ needs.verify.outputs.version }}
-            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha,scope=release-dashboard
           cache-to: type=gha,mode=max,scope=release-dashboard
           provenance: mode=max

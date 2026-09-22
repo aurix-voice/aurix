@@ -3,7 +3,7 @@ name = "aurix-client"
 description = "Aurix native voice client core: AURX v2 media over UDP, WebSocket control plane, Opus, jitter buffer and a stable C ABI for engine integrations"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 rust-version.workspace = true
 publish.workspace = true
 

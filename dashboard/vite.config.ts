@@ -15,6 +15,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {
     __DASHBOARD_VERSION__: JSON.stringify(`v${pkg.version}`),
+    // Where the source of *this* build lives (AGPL-3.0 §13): a modified deployment points it at its
+    // own repository with AURIX_SOURCE_URL at build time.
+    __DASHBOARD_SOURCE_URL__: JSON.stringify(process.env.AURIX_SOURCE_URL ?? "https://github.com/aurix-voice/aurix"),
   },
   resolve: {
     alias: {

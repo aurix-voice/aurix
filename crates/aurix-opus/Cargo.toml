@@ -3,7 +3,7 @@ name = "aurix-opus"
 description = "Safe libopus 1.6 bindings for Aurix: encoder/decoder with in-band FEC, Deep REDundancy (DRED), deep PLC and OSCE speech enhancement"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 rust-version.workspace = true
 publish.workspace = true
 

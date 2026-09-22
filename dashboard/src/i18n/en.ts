@@ -7,6 +7,7 @@ export const en = {
   // ---- common
   "app.name": "Aurix",
   "app.tagline": "Operator dashboard",
+  "shell.source": "Source",
   "common.loading": "Loading…",
   "common.error": "Something went wrong",
   "common.retry": "Retry",

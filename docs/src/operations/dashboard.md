@@ -52,6 +52,11 @@ file system; `/data` (ACME state), `/config` and `/tmp` are the only writable pa
 | `DASHBOARD_TRUSTED_PROXIES` | `private_ranges` | proxies whose `X-Forwarded-*` headers are trusted (Caddy syntax: `private_ranges` or CIDRs) |
 | `DASHBOARD_HEALTHCHECK_URL` | `http://127.0.0.1:<port>/-/healthz` | overrides the image `HEALTHCHECK` target |
 
+One build argument: `AURIX_SOURCE_URL` (default `https://github.com/aurix-voice/aurix`) is the
+repository linked as "Source" in the sidebar. A deployment that runs a **modified** dashboard or
+server sets it to its own repository — that is the AGPL-3.0 §13 source offer for network users
+([Licensing](../licensing.md)).
+
 ## Docker Compose
 
 `docker-compose.yml` ships a `dashboard` service built from the repository (`aurix-dashboard:local`)

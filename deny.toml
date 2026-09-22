@@ -16,6 +16,9 @@ ignore = []
 
 [licenses]
 version = 2
+# Workspace crates are `publish = false`; their own licences (AGPL-3.0-only for the server,
+# Apache-2.0 for the client core) are mapped in REUSE.toml and are not third-party policy.
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",

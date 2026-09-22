@@ -61,6 +61,7 @@
 - [Модель угроз](ru/threat-model.md)
 - [Миграция с Vivox / Agora / Photon Voice](ru/migration.md)
 - [Ограничения и не-цели](ru/limitations.md)
+- [Лицензии](ru/licensing.md)
 
 # Operations
 
@@ -78,3 +79,4 @@
 
 - [Development and load testing](operations/development.md)
 - [Limitations](limitations.md)
+- [Licensing](licensing.md)

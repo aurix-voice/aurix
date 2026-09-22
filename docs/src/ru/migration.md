@@ -61,7 +61,7 @@
 
 | | Vivox | Agora Voice | Photon Voice | Aurix |
 | --- | :-: | :-: | :-: | :-: |
-| Self-hosted / исходники | – | – | – (Photon Server for Voice — отдельная лицензия) | ✓ Apache-2.0 |
+| Self-hosted / исходники | – | – | – (Photon Server for Voice — отдельная лицензия) | ✓ сервер AGPL-3.0, SDK Apache-2.0 |
 | Позиционный (3D) голос | ✓ | ✓ (расширение spatial audio) | через `AudioSource` движка | ✓ серверное затухание + HRTF в клиенте / спатиализация движком |
 | Потоки на участника для спатиализации движком | – (микс канала) | ✓ | ✓ | ✓ PCM в native/Unity/Unreal/Godot, треки в браузере |
 | Большие каналы (слушатели, серверный микс, лимит потоков) | ✓ | ✓ (роль audience) | interest groups | ✓ |

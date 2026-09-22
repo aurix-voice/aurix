@@ -14,6 +14,7 @@ function pl(count: number, one: string, few: string, many: string): string {
 export const ru: Messages = {
   "app.name": "Aurix",
   "app.tagline": "Панель оператора",
+  "shell.source": "Исходники",
   "common.loading": "Загрузка…",
   "common.error": "Что-то пошло не так",
   "common.retry": "Повторить",

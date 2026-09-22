@@ -11,6 +11,7 @@
 | [Модель угроз](threat-model.md) | [Threat model](../concepts/threat-model.md) |
 | [Миграция с Vivox, Agora и Photon Voice](migration.md) | [Migration guides](../migration/README.md) |
 | [Ограничения и не-цели](limitations.md) | [Limitations](../limitations.md) |
+| [Лицензии](licensing.md) | [Licensing](../licensing.md) |
 
 Имена API, полей конфигурации, команд и событий намеренно оставлены английскими — они совпадают
 с кодом, OpenAPI-контрактом и остальной книгой.

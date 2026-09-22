@@ -1191,4 +1191,17 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
 
 ## License
 
-Apache-2.0
+Two licences along one boundary — see [`LICENSING.md`](LICENSING.md) for the exact map and
+what it means for a game, an operator or a fork:
+
+* **AGPL-3.0-only** for everything an operator runs: the server node, dashboard, CLI, tooling,
+  migrations and CI. Run it freely at any scale; if you modify the server and serve users over a
+  network, offer them your modified source.
+* **Apache-2.0** for everything a game links or ships: the native core and C ABI, `aurix-common`,
+  `aurix-opus`, the Web / Unity / Unreal / Godot SDKs, the server SDKs, the OpenAPI contract, the
+  documentation and the deployment examples. Closed-source and commercial games are unaffected by
+  the AGPL.
+
+Releases up to `v1.3.0` were Apache-2.0 throughout and stay that way. Contributions are accepted
+with a [DCO](https://developercertificate.org/) sign-off (`git commit -s`), no CLA — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
