@@ -744,6 +744,11 @@ pub struct AurixClientConfig {
     /// (normally 443) before the WebSocket tunnel (default true); `AurixMediaPathTlsOnly`
     /// ignores this switch.
     pub tls_tunnel: bool,
+    /// Stable id of this installation (`[A-Za-z0-9._~-]{1,128}`, e.g. a UUID persisted on
+    /// first run; NULL = none, borrowed; copied). Keys the server's per-device cursor of
+    /// directed chat messages: each reaches this device exactly once and is acknowledged
+    /// automatically. Without it the user-wide read-marker backlog is replayed.
+    pub device_id: *const c_char,
 }
 
 #[no_mangle]
@@ -779,6 +784,7 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         loss_adaptation: d.loss_adaptation.into(),
         quic: d.quic,
         tls_tunnel: d.tls_tunnel,
+        device_id: ptr::null(),
     };
 }
 
@@ -1065,6 +1071,15 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
     cfg.loss_adaptation = c.loss_adaptation.into();
     cfg.quic = c.quic;
     cfg.tls_tunnel = c.tls_tunnel;
+    cfg.device_id = unsafe { opt_cstr_arg(c.device_id, "device_id")? };
+    if cfg
+        .device_id
+        .as_deref()
+        .is_some_and(|d| !crate::control::valid_device_id(d))
+    {
+        set_error("device_id must be 1-128 characters of A-Z a-z 0-9 . _ ~ -");
+        return Err(AurixResult::AurixInvalidArgument);
+    }
     Ok(cfg)
 }
 
@@ -2290,11 +2305,13 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
 
 /// Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`,
 /// `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`, `migrated`
-/// for `Recovered`.
+/// for `Recovered`, `per_device` (replay followed this device's own cursor) for
+/// `ChatInboxSynced`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_flag2(event: *const AurixEvent) -> bool {
     match self::event(event).map(|e| &e.event) {
         Some(Event::ChannelJoined { safety_voice, .. }) => *safety_voice,
+        Some(Event::ChatInboxSynced { per_device, .. }) => *per_device,
         Some(Event::ParticipantMuteChanged { server_muted, .. }) => *server_muted,
         Some(Event::Recording { live, .. }) => *live,
         Some(Event::Recovered { migrated, .. }) => *migrated,

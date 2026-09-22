@@ -14,6 +14,7 @@ pub mod safety;
 pub mod session_manager;
 pub mod session_mirror;
 pub mod speech;
+pub mod transcripts;
 pub mod translation;
 pub mod usage;
 pub mod user_lifecycle;
@@ -21,7 +22,9 @@ pub mod webhooks;
 
 pub use action_tokens::{ActionTokenService, PendingClaim};
 pub use block_manager::{BlockManager, MAX_BLOCKS_PER_USER};
-pub use chat::{ChatService, OutgoingMessage, SYSTEM_USER};
+pub use chat::{
+    validate_device_id, ChatDeviceCursor, ChatService, InboxReplay, OutgoingMessage, SYSTEM_USER,
+};
 pub use event_bus::{EventBus, ServerEvent};
 pub use limits::{Backend as LimitBackend, FleetLimiter, Limit, Scope as LimitScope, Throttled};
 pub use node_manager::{NodeManager, SelectionHint};
@@ -32,6 +35,7 @@ pub use session_mirror::{
     MirroredChannel, MirroredPrefs, SessionMirror, TakeoverRefused, MIGRATION_SEQUENCE_GAP,
 };
 pub use speech::{ParticipantSpeak, SpeechService};
+pub use transcripts::{StoredTranscript, StoredTranslation, TranscriptPage, TranscriptStore};
 pub use translation::{ListenerTranslation, TranslationService};
 pub use usage::{AppLimits, QuotaState, UsageService};
 pub use user_lifecycle::{DeleteUserRequest, RetentionService, UserLifecycle};

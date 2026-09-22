@@ -47,7 +47,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatMessageUpdated, int64, Re
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatReactionChanged, const FAurixChatReactionChange&, Change);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChatReadMarkerChanged, const FAurixReadMarker&, Marker);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixChatReadMarkersReceived, FGuid, ChannelId, FGuid, PeerUserId, const TArray<FAurixReadMarker>&, Markers, int32, UnreadCount);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChatInboxSynced, int32, Delivered, bool, bTruncated);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixChatInboxSynced, int32, Delivered, bool, bTruncated, bool, bPerDevice);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantTyping, FGuid, ChannelId, FGuid, UserId, bool, bTyping);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixTranscriptReceived, const FAurixTranscript&, Transcript);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixTranslationChanged, const FString&, Language, const FString&, SpokenLanguage, bool, bSpeech);

@@ -191,7 +191,9 @@ this session's uplink — `session_info.noise_suppression` says whether it offer
 Chat: `send_chat`, `send_direct_chat`, `set_typing`, `channel_history` / `direct_history`
 (keyset cursors), `mark_channel_read` / `mark_direct_read`, `channel_read_markers` /
 `direct_read_markers`; signals `chat_message`, `participant_typing`, `chat_history`,
-`chat_read_marker(s)`, `chat_inbox_synced`. Moderation: `moderate(channel, user, action,
+`chat_read_marker(s)`, `chat_inbox_synced(delivered, truncated, per_device)`; set `device_id`
+before `connect_to_server` for the exactly-once per-device queue of directed messages (acknowledged
+automatically). Moderation: `moderate(channel, user, action,
 action_token, reason)`. Speech: `speak(text, channel, destination, voice)`, `cancel_speech`,
 signals `transcript` and `tts_status`.
 

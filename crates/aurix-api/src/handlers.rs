@@ -1061,6 +1061,129 @@ fn publish_block_change(
 
 // ── Text chat ──
 
+// ── Stored transcripts (stt.persist) ──
+
+#[derive(Deserialize)]
+pub struct TranscriptListQuery {
+    /// Page cursor from an earlier response (`next_before`): older transcripts only.
+    pub before: Option<String>,
+    /// Page cursor (`next_after`): newer transcripts only. With neither, the newest page.
+    pub after: Option<String>,
+    /// Page size, 1..=200 (default 50).
+    pub limit: Option<u32>,
+    /// `GET /v1/channels/{id}/transcripts` only: one speaker's transcripts.
+    pub user_id: Option<Uuid>,
+}
+
+pub async fn list_channel_transcripts(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TranscriptListQuery>,
+) -> JsonResult {
+    ctx.require("transcripts:read")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let page = state
+        .control
+        .transcripts
+        .list_channel(
+            ctx.app_id,
+            channel_id,
+            query.user_id.map(UserId::from_uuid),
+            query.before.as_deref(),
+            query.after.as_deref(),
+            query.limit,
+        )
+        .await?;
+    to_json(page)
+}
+
+pub async fn list_user_transcripts(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<TranscriptListQuery>,
+) -> JsonResult {
+    ctx.require("transcripts:read")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let page = state
+        .control
+        .transcripts
+        .list_user(
+            ctx.app_id,
+            user_id,
+            query.before.as_deref(),
+            query.after.as_deref(),
+            query.limit,
+        )
+        .await?;
+    to_json(page)
+}
+
+pub async fn delete_channel_transcripts(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(channel_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("transcripts:write")?;
+    let channel_id = ChannelId::from_uuid(channel_id);
+    state
+        .control
+        .channels
+        .require_channel(ctx.app_id, channel_id)
+        .await?;
+    let deleted = state
+        .control
+        .transcripts
+        .delete_channel(ctx.app_id, channel_id)
+        .await?;
+    state.control.audit.log(
+        Some(ctx.app_id),
+        ctx.actor(),
+        AuditAction::TranscriptsDeleted,
+        "channel",
+        &channel_id.to_string(),
+        serde_json::json!({"deleted": deleted}),
+        client_ip_string(ip),
+    );
+    Ok(Json(serde_json::json!({"deleted": deleted})))
+}
+
+pub async fn delete_transcript(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ip: Option<Extension<ClientIp>>,
+    Path(transcript_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("transcripts:write")?;
+    state
+        .control
+        .transcripts
+        .delete(ctx.app_id, transcript_id)
+        .await?;
+    state.control.audit.log(
+        Some(ctx.app_id),
+        ctx.actor(),
+        AuditAction::TranscriptsDeleted,
+        "transcript",
+        &transcript_id.to_string(),
+        serde_json::json!({"deleted": 1}),
+        client_ip_string(ip),
+    );
+    Ok(Json(
+        serde_json::json!({"deleted": true, "id": transcript_id}),
+    ))
+}
+
+// ── Text chat ──
+
 #[derive(Deserialize)]
 pub struct ChatHistoryQuery {
     /// Page cursor from an earlier response (`next_before`): older messages only.
@@ -1436,6 +1559,41 @@ pub async fn put_user_read_marker(
         "unread_count": unread_count,
         "moved": moved.is_some(),
     })))
+}
+
+/// `GET /v1/users/{id}/chat-devices`: the user's devices with a directed-message delivery
+/// cursor (`ChatAck`), most recently active first.
+pub async fn list_user_chat_devices(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(user_id): Path<Uuid>,
+) -> JsonResult {
+    ctx.require("chat:read")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    let devices = state.control.chat.list_devices(ctx.app_id, user_id).await?;
+    Ok(Json(serde_json::json!({ "devices": devices })))
+}
+
+/// `DELETE /v1/users/{id}/chat-devices/{device_id}`: forgets a device's cursor (a lost or
+/// reinstalled device); on its next connect it gets the user-wide unread backlog again.
+pub async fn delete_user_chat_device(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path((user_id, device_id)): Path<(Uuid, String)>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    ctx.require("chat:write")?;
+    let user_id = UserId::from_uuid(user_id);
+    require_user(&state, ctx.app_id, user_id).await?;
+    if !state
+        .control
+        .chat
+        .forget_device(ctx.app_id, user_id, &device_id)
+        .await?
+    {
+        return Err(AurixError::NotFound("Device not found".into()).into());
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `GET /v1/channels/{id}/read-markers`: reading positions of everyone who read in the channel.
@@ -2493,6 +2651,8 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "chat:read",
     "chat:write",
     "tts:write",
+    "transcripts:read",
+    "transcripts:write",
     "keys:manage",
     "analytics:read",
     "audit:read",

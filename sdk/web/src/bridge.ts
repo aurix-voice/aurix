@@ -76,6 +76,8 @@ export interface BridgeClientOptions {
    * the base64 32-byte secret exported earlier by `e2eeIdentitySecret`.
    */
   e2ee?: boolean | { identity?: string; transform?: 'auto' | E2eeTransformApi; workerUrl?: string };
+  /** Stable installation id for the per-device chat delivery cursor (see `AurixClientOptions.deviceId`). */
+  deviceId?: string;
   /** Local lip-sync analysis from the start (see `AurixClientOptions.visemes`). */
   visemes?: boolean;
   /**
@@ -161,6 +163,7 @@ export class AurixBridge {
     if (raw.participantStreams !== undefined) options.participantStreams = raw.participantStreams;
     if (raw.spatialAudio !== undefined) options.spatialAudio = raw.spatialAudio;
     if (raw.e2ee !== undefined) options.e2ee = e2eeOptions(raw.e2ee);
+    if (raw.deviceId !== undefined && raw.deviceId !== null && raw.deviceId !== '') options.deviceId = raw.deviceId;
     if (raw.visemes !== undefined) options.visemes = raw.visemes;
     if (raw.voiceEffects !== undefined) options.voiceEffects = raw.voiceEffects;
     if (raw.refreshToken) options.refreshToken = () => this.requestToken(entry, 'refresh', undefined);
@@ -606,7 +609,9 @@ export class AurixBridge {
     on('chatReadMarker', (marker) => q({ type: 'chatReadMarker', marker }));
     on('chatMessageUpdated', (message) => q({ type: 'chatMessageUpdated', message }));
     on('chatReactionChanged', (change) => q({ type: 'chatReactionChanged', change }));
-    on('chatInboxSynced', (delivered, truncated) => q({ type: 'chatInboxSynced', delivered, truncated }));
+    on('chatInboxSynced', (delivered, truncated, perDevice) =>
+      q({ type: 'chatInboxSynced', delivered, truncated, perDevice }),
+    );
     on('participantTyping', (channelId, userId, typing) => q({ type: 'participantTyping', channelId, userId, typing }));
     on('transcript', (transcript) => q({ type: 'transcript', transcript }));
     on('translationChanged', (prefs) => q({ type: 'translationChanged', prefs }));

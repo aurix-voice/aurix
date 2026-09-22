@@ -38,6 +38,7 @@ namespace Aurix.Transport
         public const string AurixSubprotocol = "aurix";
         public const string BearerSubprotocolPrefix = "bearer.";
         public const string ResumeSubprotocolPrefix = "resume.";
+        public const string DeviceSubprotocolPrefix = "device.";
         /// <summary>Outbound media frames waiting for the socket; beyond this they are dropped.</summary>
         public const int MediaQueueLength = 64;
 
@@ -64,13 +65,17 @@ namespace Aurix.Transport
         /// Optional <c>&lt;session_id&gt;.&lt;resume_token&gt;</c> from a previous <c>SessionInitAck</c>; the
         /// server reattaches that session instead of creating a new one if it is still within its grace period.
         /// </param>
-        public async Task ConnectAsync(Uri wsUrl, string jwt, CancellationToken ct, string resume = null)
+        /// <param name="device">
+        /// Optional installation id (<c>[A-Za-z0-9._~-]{1,128}</c>) keying the server's per-device chat delivery cursor.
+        /// </param>
+        public async Task ConnectAsync(Uri wsUrl, string jwt, CancellationToken ct, string resume = null, string device = null)
         {
             if (_ws != null) throw new InvalidOperationException("already connected");
             var ws = new ClientWebSocket();
             ws.Options.AddSubProtocol(AurixSubprotocol);
             ws.Options.AddSubProtocol(BearerSubprotocolPrefix + jwt);
             if (!string.IsNullOrEmpty(resume)) ws.Options.AddSubProtocol(ResumeSubprotocolPrefix + resume);
+            if (!string.IsNullOrEmpty(device)) ws.Options.AddSubProtocol(DeviceSubprotocolPrefix + device);
             ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
             await ws.ConnectAsync(wsUrl, ct).ConfigureAwait(false);
             _ws = ws;

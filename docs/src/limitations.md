@@ -9,9 +9,10 @@ the chapter that explains the boundary.
   in this channel", no attachments or threads. Text chat is a channel/direct message with
   typing indicators; with `chat.persist` a deployment also gets paged history, directed
   messages queued for offline users, read markers, edits / tombstone deletions, reactions and
-  PostgreSQL full-text search (exact words, no stemming), but replay is per user (read-marker
-  driven, one live session per user and node), not an exactly-once per-device queue
-  ([Text chat](features/chat.md)).
+  PostgreSQL full-text search (exact words, no stemming); directed messages reach a device that
+  identifies itself (`X-Aurix-Device`) exactly once via an acknowledged per-device cursor, while
+  anonymous connections fall back to the user-wide read-marker replay
+  ([Text chat](features/chat.md#exactly-once-per-device)).
 * **No console SDKs.** PlayStation/Xbox/Switch SDKs are under NDA and cannot ship in an
   open-source repository. The native core exposes a C ABI so a console port is an integration
   task, not a protocol one — the [porting guide](sdk/consoles.md) lists what the platform layer
@@ -48,8 +49,9 @@ the chapter that explains the boundary.
   cancellation or AGC.
 * **No speech or translation models ship with Aurix.** STT/TTS talk to OpenAI-compatible HTTP
   endpoints you host, live translation to a LibreTranslate- or OpenAI-chat-compatible server;
-  transcripts and translations are delivered live and never stored server-side
-  ([Speech](features/speech.md)). Translation is **caption-first**: the translated text follows
+  transcripts and translations are delivered live and stored only with `stt.persist = true`
+  (plain rows in PostgreSQL, no full-text search, swept by `stt.retention_days`;
+  [Speech](features/speech.md)). Translation is **caption-first**: the translated text follows
   the original by the STT segment plus the provider's latency (seconds, not milliseconds), the
   spoken translation is a synthesized voice on a channel-level translator SSRC — not the
   speaker's voice — and word timings are dropped from translated segments. Each node

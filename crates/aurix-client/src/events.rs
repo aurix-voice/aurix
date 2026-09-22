@@ -335,9 +335,12 @@ pub enum Event {
     /// Sent once after connecting, after the directed messages that arrived while this user
     /// was offline were replayed as `ChatMessage { message.offline: true }`. `truncated`: older
     /// unread ones exist beyond the server's replay limit (page them with `chat_history`).
+    /// `per_device`: the replay followed this device's own acknowledged cursor
+    /// (`ClientConfig::device_id`) rather than the user-wide read markers.
     ChatInboxSynced {
         delivered: u32,
         truncated: bool,
+        per_device: bool,
     },
     Transcript(Transcript),
     /// A member of an end-to-end encrypted channel announced its identity key. Show the

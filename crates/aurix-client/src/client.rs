@@ -677,6 +677,16 @@ struct Pending {
     active_moderation: Option<(ModerationRequest, Instant)>,
     moderation_queue: VecDeque<Command>,
     tracked: HashMap<String, TrackedRequest>,
+    /// Automatic `ChatAck` bookkeeping for the current socket (`ClientConfig::device_id`).
+    inbox: InboxAck,
+}
+
+/// Directed messages are acknowledged one by one once the on-connect replay is over; the
+/// replay itself is acknowledged with a single `ChatAck` for its newest message.
+#[derive(Default)]
+struct InboxAck {
+    synced: bool,
+    newest: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
 }
 
 enum Exit {
@@ -2033,6 +2043,7 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
             &url,
             &cfg.token,
             resume.as_ref().map(|(s, t)| (*s, t.as_str())),
+            cfg.device_id.as_deref(),
             cfg.request_timeout,
         );
         let connected = tokio::select! {
@@ -2055,6 +2066,7 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         match connected {
             Ok((conn, ack)) => {
                 attempt = 0;
+                pending.inbox = InboxAck::default();
                 {
                     let mut ep = inner.endpoints.lock();
                     if ep.active != url {
@@ -3832,6 +3844,10 @@ fn refresh_audio_policy(inner: &Inner) {
     inner.emit(Event::AudioPolicyChanged(merged));
 }
 
+fn chat_ack((_, message_id): (chrono::DateTime<chrono::Utc>, uuid::Uuid)) -> ControlMessage {
+    ControlMessage::ChatAck { message_id }
+}
+
 async fn handle_message(
     inner: &Inner,
     cfg: &ClientConfig,
@@ -4329,6 +4345,19 @@ async fn handle_message(
                     pending.tracked.remove(r);
                 }
             }
+            let mine = cfg.device_id.is_some()
+                && message.to_user_id.is_some()
+                && message.to_user_id == inner.identity.lock().user_id;
+            if mine {
+                let cursor = (message.sent_at, message.id);
+                if pending.inbox.synced {
+                    if conn.send(&chat_ack(cursor)).await.is_err() {
+                        return Some(Exit::Dropped("chat ack failed".into()));
+                    }
+                } else if pending.inbox.newest.is_none_or(|n| n < cursor) {
+                    pending.inbox.newest = Some(cursor);
+                }
+            }
             inner.emit(Event::ChatMessage {
                 request_id,
                 message,
@@ -4421,10 +4450,20 @@ async fn handle_message(
         ControlMessage::ChatInboxSynced {
             delivered,
             truncated,
-        } => inner.emit(Event::ChatInboxSynced {
-            delivered,
-            truncated,
-        }),
+            per_device,
+        } => {
+            pending.inbox.synced = true;
+            if let Some(cursor) = pending.inbox.newest.take() {
+                if cfg.device_id.is_some() && conn.send(&chat_ack(cursor)).await.is_err() {
+                    return Some(Exit::Dropped("chat ack failed".into()));
+                }
+            }
+            inner.emit(Event::ChatInboxSynced {
+                delivered,
+                truncated,
+                per_device,
+            });
+        }
         ControlMessage::ParticipantTyping {
             channel_id,
             user_id,
@@ -4535,6 +4574,7 @@ async fn handle_message(
         | ControlMessage::ModerateParticipant { .. }
         | ControlMessage::ChatSend { .. }
         | ControlMessage::ChatSendDirect { .. }
+        | ControlMessage::ChatAck { .. }
         | ControlMessage::ChatTyping { .. }
         | ControlMessage::ChatHistory { .. }
         | ControlMessage::ChatMarkRead { .. }

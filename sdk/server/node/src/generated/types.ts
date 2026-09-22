@@ -678,6 +678,19 @@ export interface ChannelUsageTotals2 {
   stt_audio_ms: number;
 }
 
+/**
+ * A device's standing in the user's directed-message queue: everything at or before
+ * `(message_sent_at, message_id)` has reached the device (`ChatAck`). `updated_at` is the last
+ * acknowledgement.
+ */
+export interface ChatDeviceCursor {
+  device_id: string;
+  message_id: string;
+  message_sent_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
 /** One page of chat history, newest first. */
 export interface ChatHistoryPage {
   messages: ChatMessage[];
@@ -846,9 +859,19 @@ export interface DeleteChannelResponse {
   deleted?: boolean;
 }
 
+export interface DeleteChannelTranscriptsResponse {
+  /** Transcripts removed. */
+  deleted: number;
+}
+
 export interface DeleteRecordingResponse {
   deleted?: boolean;
   id?: string;
+}
+
+export interface DeleteTranscriptResponse {
+  deleted: boolean;
+  id: string;
 }
 
 export interface DrainNodeRequest {
@@ -1075,6 +1098,10 @@ export interface ListChannelStreamsResponse {
 
 export interface ListStreamsResponse {
   streams: LiveStream[];
+}
+
+export interface ListUserChatDevicesResponse {
+  devices: ChatDeviceCursor[];
 }
 
 export interface ListUserReadMarkersResponseVariant1 {
@@ -1743,6 +1770,48 @@ export interface StartRecordingRequest {
   session_id?: string | null;
 }
 
+/**
+ * One live transcript as it was delivered to the channel (same `id` as the `Transcript` event),
+ * with the translations made of it.
+ */
+export interface StoredTranscript {
+  id: string;
+  channel_id: string;
+  /** Speaker. */
+  user_id: string;
+  /** Recognised text in the speaker's language. */
+  text: string;
+  /** Detected or configured source language; absent when the provider did not report one. */
+  language?: string;
+  /** When the speech segment began. */
+  started_at: string;
+  /** Audio length of the segment. */
+  duration_ms: number;
+  /** Word timings relative to `started_at` (only with `stt.include_words`). */
+  words?: StoredTranscriptWord[];
+  translations: StoredTranslation[];
+  /** Node that transcribed the segment. */
+  node_id?: string;
+  created_at: string;
+}
+
+export interface StoredTranscriptWord {
+  word: string;
+  start_ms: number;
+  end_ms: number;
+}
+
+/**
+ * A machine translation of the transcript into `language`, as it was pushed to listeners of that
+ * language.
+ */
+export interface StoredTranslation {
+  /** Target language (BCP 47 / ISO 639-1). */
+  language: string;
+  text: string;
+  created_at: string;
+}
+
 /** Rows removed by the retention sweep, per rule. */
 export interface SweepReport {
   sessions?: number;
@@ -1781,6 +1850,21 @@ export interface TokenResponse {
 export interface TokensRevoked {
   tokens_revoked: boolean;
   updated?: boolean;
+}
+
+/** One page of stored transcripts, newest first. */
+export interface TranscriptPage {
+  transcripts: StoredTranscript[];
+  /**
+   * Cursor of the oldest transcript on the page; pass as `before` to get older ones. Absent when the
+   * page reached the oldest transcript.
+   */
+  next_before?: string;
+  /**
+   * Cursor of the newest transcript on the page; pass as `after` to get newer ones. Absent when the
+   * page reached the present.
+   */
+  next_after?: string;
 }
 
 export interface TranscriptSegment {
@@ -2052,6 +2136,9 @@ export interface UserErasureCounts {
   moderation_events?: number;
   bans?: number;
   users?: number;
+  transcripts?: number;
+  /** Per-device chat delivery cursors removed with the user. */
+  chat_device_cursors?: number;
 }
 
 export interface UserExport {
@@ -2066,8 +2153,12 @@ export interface UserExport {
   bans?: Ban[];
   moderation?: UserExportModeration;
   recordings?: Recording[];
+  /** Stored live transcripts the user spoke, with their translations (`stt.persist`). */
+  transcripts?: StoredTranscript[];
   /** Collections cut at 10 000 rows. */
   truncated?: string[];
+  /** The user's chat devices with their delivery cursors (`chat.persist`). */
+  chat_devices?: ChatDeviceCursor[];
 }
 
 export interface UserExportBlocks {
@@ -2458,4 +2549,42 @@ export interface SearchUserMessagesQuery {
 export interface RemoveMessageReactionQuery {
   /** The user whose reaction is removed. */
   user_id: string;
+}
+
+/** Query parameters of `listChannelTranscripts`. */
+export interface ListChannelTranscriptsQuery {
+  /**
+   * Only transcripts older than this cursor. Opaque keyset cursor (`(started_at, id)`, URL-safe
+   * base64) taken from a previous page's `next_before` / `next_after`; equal timestamps never skip
+   * or repeat a row. Invalid cursors are `400`.
+   */
+  before?: string;
+  /**
+   * Only transcripts newer than this cursor (walk forward from a known position). Opaque keyset
+   * cursor (`(started_at, id)`, URL-safe base64) taken from a previous page's `next_before` /
+   * `next_after`; equal timestamps never skip or repeat a row. Invalid cursors are `400`.
+   */
+  after?: string;
+  /** Page size, 1..=200 (default 50). */
+  limit?: number;
+  /** Only this speaker's transcripts. */
+  user_id?: string;
+}
+
+/** Query parameters of `listUserTranscripts`. */
+export interface ListUserTranscriptsQuery {
+  /**
+   * Only transcripts older than this cursor. Opaque keyset cursor (`(started_at, id)`, URL-safe
+   * base64) taken from a previous page's `next_before` / `next_after`; equal timestamps never skip
+   * or repeat a row. Invalid cursors are `400`.
+   */
+  before?: string;
+  /**
+   * Only transcripts newer than this cursor (walk forward from a known position). Opaque keyset
+   * cursor (`(started_at, id)`, URL-safe base64) taken from a previous page's `next_before` /
+   * `next_after`; equal timestamps never skip or repeat a row. Invalid cursors are `400`.
+   */
+  after?: string;
+  /** Page size, 1..=200 (default 50). */
+  limit?: number;
 }

@@ -1510,6 +1510,29 @@ public sealed record ChannelUsageTotals2
 }
 
 /// <summary>
+/// A device's standing in the user's directed-message queue: everything at or before
+/// `(message_sent_at, message_id)` has reached the device (`ChatAck`). `updated_at` is the last
+/// acknowledgement.
+/// </summary>
+public sealed record ChatDeviceCursor
+{
+    [JsonPropertyName("device_id")]
+    public required string DeviceId { get; init; }
+
+    [JsonPropertyName("message_id")]
+    public required string MessageId { get; init; }
+
+    [JsonPropertyName("message_sent_at")]
+    public required string MessageSentAt { get; init; }
+
+    [JsonPropertyName("created_at")]
+    public required string CreatedAt { get; init; }
+
+    [JsonPropertyName("updated_at")]
+    public required string UpdatedAt { get; init; }
+}
+
+/// <summary>
 /// One page of chat history, newest first.
 /// </summary>
 public sealed record ChatHistoryPage
@@ -1835,6 +1858,15 @@ public sealed record DeleteChannelResponse
     public bool? Deleted { get; init; }
 }
 
+public sealed record DeleteChannelTranscriptsResponse
+{
+    /// <summary>
+    /// Transcripts removed.
+    /// </summary>
+    [JsonPropertyName("deleted")]
+    public required long Deleted { get; init; }
+}
+
 public sealed record DeleteRecordingResponse
 {
     [JsonPropertyName("deleted")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -1842,6 +1874,15 @@ public sealed record DeleteRecordingResponse
 
     [JsonPropertyName("id")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Id { get; init; }
+}
+
+public sealed record DeleteTranscriptResponse
+{
+    [JsonPropertyName("deleted")]
+    public required bool Deleted { get; init; }
+
+    [JsonPropertyName("id")]
+    public required string Id { get; init; }
 }
 
 public sealed record DrainNodeRequest
@@ -2300,6 +2341,12 @@ public sealed record ListStreamsResponse
 {
     [JsonPropertyName("streams")]
     public required List<LiveStream> Streams { get; init; }
+}
+
+public sealed record ListUserChatDevicesResponse
+{
+    [JsonPropertyName("devices")]
+    public required List<ChatDeviceCursor> Devices { get; init; }
 }
 
 public sealed record ListUserReadMarkersResponseVariant1
@@ -3743,6 +3790,98 @@ public sealed record StartRecordingRequest
 }
 
 /// <summary>
+/// One live transcript as it was delivered to the channel (same `id` as the `Transcript` event),
+/// with the translations made of it.
+/// </summary>
+public sealed record StoredTranscript
+{
+    [JsonPropertyName("id")]
+    public required string Id { get; init; }
+
+    [JsonPropertyName("channel_id")]
+    public required string ChannelId { get; init; }
+
+    /// <summary>
+    /// Speaker.
+    /// </summary>
+    [JsonPropertyName("user_id")]
+    public required string UserId { get; init; }
+
+    /// <summary>
+    /// Recognised text in the speaker's language.
+    /// </summary>
+    [JsonPropertyName("text")]
+    public required string Text { get; init; }
+
+    /// <summary>
+    /// Detected or configured source language; absent when the provider did not report one.
+    /// </summary>
+    [JsonPropertyName("language")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Language { get; init; }
+
+    /// <summary>
+    /// When the speech segment began.
+    /// </summary>
+    [JsonPropertyName("started_at")]
+    public required string StartedAt { get; init; }
+
+    /// <summary>
+    /// Audio length of the segment.
+    /// </summary>
+    [JsonPropertyName("duration_ms")]
+    public required long DurationMs { get; init; }
+
+    /// <summary>
+    /// Word timings relative to `started_at` (only with `stt.include_words`).
+    /// </summary>
+    [JsonPropertyName("words")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<StoredTranscriptWord>? Words { get; init; }
+
+    [JsonPropertyName("translations")]
+    public required List<StoredTranslation> Translations { get; init; }
+
+    /// <summary>
+    /// Node that transcribed the segment.
+    /// </summary>
+    [JsonPropertyName("node_id")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NodeId { get; init; }
+
+    [JsonPropertyName("created_at")]
+    public required string CreatedAt { get; init; }
+}
+
+public sealed record StoredTranscriptWord
+{
+    [JsonPropertyName("word")]
+    public required string Word { get; init; }
+
+    [JsonPropertyName("start_ms")]
+    public required long StartMs { get; init; }
+
+    [JsonPropertyName("end_ms")]
+    public required long EndMs { get; init; }
+}
+
+/// <summary>
+/// A machine translation of the transcript into `language`, as it was pushed to listeners of that
+/// language.
+/// </summary>
+public sealed record StoredTranslation
+{
+    /// <summary>
+    /// Target language (BCP 47 / ISO 639-1).
+    /// </summary>
+    [JsonPropertyName("language")]
+    public required string Language { get; init; }
+
+    [JsonPropertyName("text")]
+    public required string Text { get; init; }
+
+    [JsonPropertyName("created_at")]
+    public required string CreatedAt { get; init; }
+}
+
+/// <summary>
 /// Rows removed by the retention sweep, per rule.
 /// </summary>
 public sealed record SweepReport
@@ -3820,6 +3959,29 @@ public sealed record TokensRevoked
 
     [JsonPropertyName("updated")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Updated { get; init; }
+}
+
+/// <summary>
+/// One page of stored transcripts, newest first.
+/// </summary>
+public sealed record TranscriptPage
+{
+    [JsonPropertyName("transcripts")]
+    public required List<StoredTranscript> Transcripts { get; init; }
+
+    /// <summary>
+    /// Cursor of the oldest transcript on the page; pass as `before` to get older ones. Absent when the
+    /// page reached the oldest transcript.
+    /// </summary>
+    [JsonPropertyName("next_before")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NextBefore { get; init; }
+
+    /// <summary>
+    /// Cursor of the newest transcript on the page; pass as `after` to get newer ones. Absent when the
+    /// page reached the present.
+    /// </summary>
+    [JsonPropertyName("next_after")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NextAfter { get; init; }
 }
 
 public sealed record TranscriptSegment
@@ -4431,6 +4593,15 @@ public sealed record UserErasureCounts
 
     [JsonPropertyName("users")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? Users { get; init; }
+
+    [JsonPropertyName("transcripts")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? Transcripts { get; init; }
+
+    /// <summary>
+    /// Per-device chat delivery cursors removed with the user.
+    /// </summary>
+    [JsonPropertyName("chat_device_cursors")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? ChatDeviceCursors { get; init; }
 }
 
 public sealed record UserExport
@@ -4469,10 +4640,22 @@ public sealed record UserExport
     public List<Recording>? Recordings { get; init; }
 
     /// <summary>
+    /// Stored live transcripts the user spoke, with their translations (`stt.persist`).
+    /// </summary>
+    [JsonPropertyName("transcripts")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<StoredTranscript>? Transcripts { get; init; }
+
+    /// <summary>
     /// Collections cut at 10 000 rows.
     /// </summary>
     [JsonPropertyName("truncated")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<string>? Truncated { get; init; }
+
+    /// <summary>
+    /// The user's chat devices with their delivery cursors (`chat.persist`).
+    /// </summary>
+    [JsonPropertyName("chat_devices")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ChatDeviceCursor>? ChatDevices { get; init; }
 }
 
 public sealed record UserExportBlocks
@@ -5028,4 +5211,50 @@ public sealed record RemoveMessageReactionQuery
     /// The user whose reaction is removed.
     /// </summary>
     public string? UserId { get; init; }
+}
+
+/// <summary>Query parameters of <c>listChannelTranscripts</c>.</summary>
+public sealed record ListChannelTranscriptsQuery
+{
+    /// <summary>
+    /// Only transcripts older than this cursor. Opaque keyset cursor (`(started_at, id)`, URL-safe
+    /// base64) taken from a previous page's `next_before` / `next_after`; equal timestamps never skip
+    /// or repeat a row. Invalid cursors are `400`.
+    /// </summary>
+    public string? Before { get; init; }
+    /// <summary>
+    /// Only transcripts newer than this cursor (walk forward from a known position). Opaque keyset
+    /// cursor (`(started_at, id)`, URL-safe base64) taken from a previous page's `next_before` /
+    /// `next_after`; equal timestamps never skip or repeat a row. Invalid cursors are `400`.
+    /// </summary>
+    public string? After { get; init; }
+    /// <summary>
+    /// Page size, 1..=200 (default 50).
+    /// </summary>
+    public long? Limit { get; init; }
+    /// <summary>
+    /// Only this speaker's transcripts.
+    /// </summary>
+    public string? UserId { get; init; }
+}
+
+/// <summary>Query parameters of <c>listUserTranscripts</c>.</summary>
+public sealed record ListUserTranscriptsQuery
+{
+    /// <summary>
+    /// Only transcripts older than this cursor. Opaque keyset cursor (`(started_at, id)`, URL-safe
+    /// base64) taken from a previous page's `next_before` / `next_after`; equal timestamps never skip
+    /// or repeat a row. Invalid cursors are `400`.
+    /// </summary>
+    public string? Before { get; init; }
+    /// <summary>
+    /// Only transcripts newer than this cursor (walk forward from a known position). Opaque keyset
+    /// cursor (`(started_at, id)`, URL-safe base64) taken from a previous page's `next_before` /
+    /// `next_after`; equal timestamps never skip or repeat a row. Invalid cursors are `400`.
+    /// </summary>
+    public string? After { get; init; }
+    /// <summary>
+    /// Page size, 1..=200 (default 50).
+    /// </summary>
+    public long? Limit { get; init; }
 }

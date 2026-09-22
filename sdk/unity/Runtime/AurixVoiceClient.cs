@@ -333,6 +333,25 @@ namespace Aurix
         public NetworkQuality? LastNetworkQuality => _serverQuality;
         public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(10);
         /// <summary>
+        /// Stable id of this installation (<c>[A-Za-z0-9._~-]{1,128}</c>, e.g. a GUID persisted on first run).
+        /// Sent on connect so the server keeps a per-device cursor of directed chat messages: each is replayed
+        /// to this device exactly once and acknowledged automatically (<c>ChatAck</c>) after
+        /// <see cref="OnChatMessage"/>. Null: the user-wide read-marker backlog is replayed on every connect.
+        /// Set before <see cref="ConnectAsync"/>.
+        /// </summary>
+        public string DeviceId
+        {
+            get => _deviceId;
+            set
+            {
+                if (value != null && !ControlMessage.IsValidDeviceId(value)) throw new ArgumentException("DeviceId must be 1-128 characters of A-Z a-z 0-9 . _ ~ -", nameof(value));
+                _deviceId = value;
+            }
+        }
+        private string _deviceId;
+        private bool _inboxSynced;
+        private ChatMessage _inboxNewest;
+        /// <summary>
         /// Reconnect automatically after an unexpected connection loss, resuming the same session when
         /// the server still holds it (see <see cref="ResumeGrace"/>) and re-joining channels otherwise.
         /// Never triggers after <see cref="DisconnectAsync"/> or a server-initiated <c>SessionClose</c>.
@@ -837,10 +856,11 @@ namespace Aurix
         /// <summary>
         /// Once per connection, after the directed messages that arrived while this user was offline were
         /// replayed through <see cref="OnChatMessage"/> with <see cref="ChatMessage.Offline"/>. <c>(delivered,
-        /// truncated)</c>: <c>truncated</c> means older unread ones exist beyond the server's replay limit —
-        /// page them with <see cref="HistoryAsync"/>.
+        /// truncated, perDevice)</c>: <c>truncated</c> means older unread ones exist beyond the server's replay
+        /// limit — page them with <see cref="HistoryAsync"/>; <c>perDevice</c> means the replay followed this
+        /// device's own acknowledged cursor (<see cref="DeviceId"/>) rather than the user-wide read markers.
         /// </summary>
-        public event Action<int, bool> OnChatInboxSynced;
+        public event Action<int, bool, bool> OnChatInboxSynced;
         /// <summary>
         /// A message this client can see was edited or deleted (the full message: check
         /// <see cref="ChatMessage.IsEdited"/> / <see cref="ChatMessage.IsDeleted"/>). Own mutations are raised
@@ -1009,7 +1029,9 @@ namespace Aurix
             control.Received += CompletePendingSpeak;
             try
             {
-                await control.ConnectAsync(new Uri(url), _token, ct, resume).ConfigureAwait(false);
+                _inboxSynced = false;
+                _inboxNewest = null;
+                await control.ConnectAsync(new Uri(url), _token, ct, resume, _deviceId).ConfigureAwait(false);
                 ControlMessage ack;
                 while (true)
                 {
@@ -2004,6 +2026,30 @@ namespace Aurix
         {
             EnsureConnected();
             return _control.SendAsync(ControlMessage.ChatMarkRead(null, userId, messageId), ct);
+        }
+
+        /// <summary>
+        /// Automatic <c>ChatAck</c> (<see cref="DeviceId"/>): the on-connect replay is acknowledged once, by its
+        /// newest message after <c>ChatInboxSynced</c>; every later directed message individually.
+        /// </summary>
+        private void AckDirected(ChatMessage chat)
+        {
+            if (_deviceId == null || !chat.ToUserId.HasValue || chat.ToUserId.Value != LocalUserId) return;
+            if (_inboxSynced)
+            {
+                SendAck(chat);
+                return;
+            }
+            var n = _inboxNewest;
+            if (n == null || n.SentAt < chat.SentAt || (n.SentAt == chat.SentAt && string.CompareOrdinal(n.Id.ToString(), chat.Id.ToString()) < 0))
+                _inboxNewest = chat;
+        }
+
+        private void SendAck(ChatMessage chat)
+        {
+            var control = _control;
+            if (control == null || !control.IsOpen) return;
+            _ = control.SendAsync(ControlMessage.ChatAck(chat.Id));
         }
 
         /// <summary>Read markers and this user's unread count of a joined channel.</summary>
@@ -3237,7 +3283,11 @@ namespace Aurix
                 case "ChatMessageReceived":
                 {
                     var chat = m.ChatMessage();
-                    if (chat != null) OnChatMessage?.Invoke(chat);
+                    if (chat != null)
+                    {
+                        OnChatMessage?.Invoke(chat);
+                        AckDirected(chat);
+                    }
                     break;
                 }
                 case "ParticipantTyping":
@@ -3250,8 +3300,14 @@ namespace Aurix
                     break;
                 }
                 case "ChatInboxSynced":
-                    OnChatInboxSynced?.Invoke((int)m.Num("delivered"), m.Bool("truncated"));
+                {
+                    _inboxSynced = true;
+                    var newest = _inboxNewest;
+                    _inboxNewest = null;
+                    if (newest != null && _deviceId != null) SendAck(newest);
+                    OnChatInboxSynced?.Invoke((int)m.Num("delivered"), m.Bool("truncated"), m.Bool("per_device"));
                     break;
+                }
                 case "ChatMessageUpdated":
                 {
                     var chat = m.ChatMessage();

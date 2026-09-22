@@ -71,6 +71,7 @@ async fn user(pool: &DbPool, app_id: Uuid, name: &str) -> Uuid {
         .id
 }
 
+#[derive(Clone)]
 struct Msg {
     id: Uuid,
     sent_at: DateTime<Utc>,
@@ -1102,4 +1103,246 @@ async fn edits_tombstones_reactions_and_search() {
     cleanup(&pool, &[app_id, other_app]).await;
     assert_eq!(count(&pool, "chat_messages", app_id).await, 0);
     assert_eq!(count(&pool, "chat_reactions", app_id).await, 0);
+}
+
+/// Per-device delivery cursors: created by the first acknowledgement of a directed message
+/// addressed to the user (channel messages, other users' messages, unknown ids and other
+/// tenants never create or move one), ordered by `(sent_at, id)` so equal timestamps resolve
+/// by id, forward-only (older acks only refresh `updated_at`), tombstones still count, the
+/// replay after a cursor is exactly the newer directed messages, the sweep drops idle devices
+/// only, and erasing the user takes the cursors along.
+#[tokio::test]
+#[ignore = "requires PostgreSQL (AURIX_E2E_DATABASE_URL)"]
+async fn per_device_cursors() {
+    let Some(pool) = pool().await else {
+        eprintln!("AURIX_E2E_DATABASE_URL not set; skipping");
+        return;
+    };
+    let app_id = app(&pool, "devices").await;
+    let other_app = app(&pool, "devices-other").await;
+    let alice = user(&pool, app_id, "alice").await;
+    let bob = user(&pool, app_id, "bob").await;
+    let carol = user(&pool, app_id, "carol").await;
+    let stranger = user(&pool, other_app, "stranger").await;
+    let channel = Uuid::new_v4();
+    let base = DateTime::<Utc>::from_timestamp(Utc::now().timestamp() - 600, 0).unwrap();
+
+    // Bob → Alice: d0 < d1 == d2 (same second, ordered by id) < d3; Bob → Carol; a channel message.
+    let d0 = insert(&pool, app_id, None, bob, Some(alice), "d0", base, true).await;
+    let mut same = [
+        insert(
+            &pool,
+            app_id,
+            None,
+            bob,
+            Some(alice),
+            "d1",
+            base + Duration::seconds(1),
+            true,
+        )
+        .await,
+        insert(
+            &pool,
+            app_id,
+            None,
+            bob,
+            Some(alice),
+            "d2",
+            base + Duration::seconds(1),
+            true,
+        )
+        .await,
+    ];
+    same.sort_by_key(|m| m.id);
+    let (d1, d2) = (same[0].clone(), same[1].clone());
+    let d3 = insert(
+        &pool,
+        app_id,
+        None,
+        bob,
+        Some(alice),
+        "d3",
+        base + Duration::seconds(2),
+        false,
+    )
+    .await;
+    let to_carol = insert(&pool, app_id, None, bob, Some(carol), "c0", base, true).await;
+    let in_channel = insert(&pool, app_id, Some(channel), bob, None, "hi", base, false).await;
+    let foreign = insert(
+        &pool,
+        other_app,
+        None,
+        stranger,
+        Some(stranger),
+        "x",
+        base,
+        true,
+    )
+    .await;
+    let advance = |user: Uuid, device: &'static str, message: Uuid| {
+        let pool = pool.clone();
+        async move {
+            queries::advance_chat_device_cursor(&pool, app_id, user, device, message)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Nothing that is not a directed message to Alice creates a cursor.
+    for (why, id) in [
+        ("unknown", Uuid::new_v4()),
+        ("channel message", in_channel.id),
+        ("carol's message", to_carol.id),
+        ("other tenant", foreign.id),
+    ] {
+        assert!(advance(alice, "phone", id).await.is_none(), "{why}");
+    }
+    assert!(
+        queries::get_chat_device_cursor(&pool, app_id, alice, "phone")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // First ack creates the cursor at that message with the message's own timestamp.
+    let c = advance(alice, "phone", d1.id).await.expect("d1 is alice's");
+    assert_eq!((c.message_id, c.message_sent_at), (d1.id, d1.sent_at));
+    let created = c.created_at;
+    // Same timestamp, larger id: moves forward.
+    let c = advance(alice, "phone", d2.id).await.unwrap();
+    assert_eq!((c.message_id, c.message_sent_at), (d2.id, d2.sent_at));
+    // Older acknowledgements keep the cursor but refresh `updated_at`.
+    let before = queries::get_chat_device_cursor(&pool, app_id, alice, "phone")
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    for older in [d1.id, d0.id] {
+        let c = advance(alice, "phone", older).await.unwrap();
+        assert_eq!((c.message_id, c.message_sent_at), (d2.id, d2.sent_at));
+        assert!(c.updated_at > before.updated_at, "activity is recorded");
+        assert_eq!(c.created_at, created);
+    }
+    // A tombstone is still acknowledgeable (the client saw the deletion).
+    queries::delete_chat_message(&pool, app_id, d3.id, bob)
+        .await
+        .unwrap()
+        .expect("d3 exists");
+    let c = advance(alice, "phone", d3.id).await.unwrap();
+    assert_eq!(c.message_id, d3.id);
+
+    // Devices are independent; the replay after a cursor is exactly what is newer.
+    let c = advance(alice, "pc", d0.id).await.unwrap();
+    assert_eq!(c.message_id, d0.id);
+    let after_pc = queries::list_direct_messages_after(
+        &pool,
+        app_id,
+        alice,
+        Some(MessageCursor {
+            sent_at: c.message_sent_at,
+            id: c.message_id,
+        }),
+        None,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after_pc.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![d1.id, d2.id],
+        "d0 acked, d3 is a tombstone"
+    );
+    let phone = queries::get_chat_device_cursor(&pool, app_id, alice, "phone")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(queries::list_direct_messages_after(
+        &pool,
+        app_id,
+        alice,
+        Some(MessageCursor {
+            sent_at: phone.message_sent_at,
+            id: phone.message_id,
+        }),
+        None,
+        50,
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    // Same device id under another user or tenant is a different cursor.
+    assert!(
+        queries::get_chat_device_cursor(&pool, app_id, carol, "phone")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        queries::get_chat_device_cursor(&pool, other_app, alice, "phone")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let devices = queries::list_chat_device_cursors(&pool, app_id, alice)
+        .await
+        .unwrap();
+    assert_eq!(
+        devices
+            .iter()
+            .map(|d| d.device_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pc", "phone"],
+        "most recently active first"
+    );
+
+    // Retention: only idle devices are swept.
+    sqlx::query(
+        "UPDATE chat_device_cursors SET updated_at = NOW() - INTERVAL '100 days' \
+         WHERE app_id = $1 AND device_id = 'phone'",
+    )
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let swept = queries::delete_chat_device_cursors_before(&pool, Utc::now() - Duration::days(90))
+        .await
+        .unwrap();
+    assert!(swept >= 1);
+    assert!(
+        queries::get_chat_device_cursor(&pool, app_id, alice, "phone")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(queries::get_chat_device_cursor(&pool, app_id, alice, "pc")
+        .await
+        .unwrap()
+        .is_some());
+    // Forgetting a device is idempotent.
+    assert!(
+        queries::delete_chat_device_cursor(&pool, app_id, alice, "pc")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !queries::delete_chat_device_cursor(&pool, app_id, alice, "pc")
+            .await
+            .unwrap()
+    );
+
+    // Erasure removes the cursors with the user.
+    advance(alice, "pc", d3.id).await.unwrap();
+    advance(alice, "tablet", d0.id).await.unwrap();
+    let counts = queries::erase_user(&pool, app_id, alice, false)
+        .await
+        .unwrap()
+        .expect("alice exists");
+    assert_eq!(counts.chat_device_cursors, 2);
+    assert!(queries::list_chat_device_cursors(&pool, app_id, alice)
+        .await
+        .unwrap()
+        .is_empty());
+
+    cleanup(&pool, &[app_id, other_app]).await;
+    assert_eq!(count(&pool, "chat_device_cursors", app_id).await, 0);
 }

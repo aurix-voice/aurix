@@ -190,6 +190,38 @@ released together.
   `AURIX_CODEC_PCMA` in the C ABI / C++ / Unreal `EAurixAudioCodec::Pcma` / Godot `CODEC_PCMA`;
   `g711.ts` A-law/μ-law decoding for E2EE frames in the Web SDK.
 
+* **Stored transcripts (`stt.persist`).** With `stt.persist = true` every live transcript a node
+  delivers (`Transcript` / `channel.transcript`) is written to the new `transcripts` table
+  (migration `20240101000023`) under the event's own `id`, and each machine translation the
+  fleet pushes to listeners hangs off it in `transcript_translations` (one row per target
+  language, first node to translate wins) — E2EE channels are still never transcribed, so
+  nothing of them is stored. Storage never gates delivery: a failed or slow (> 2 s) insert is
+  logged and the caption still goes out. New REST: `GET /v1/channels/{id}/transcripts?user_id=&before=&after=&limit=`
+  and `GET /v1/users/{id}/transcripts` (keyset pages, newest first, translations inlined;
+  `transcripts:read`), `DELETE /v1/channels/{id}/transcripts` and `DELETE /v1/transcripts/{id}`
+  (`transcripts:write`, audited as `transcripts_deleted`); moderators get `transcripts:read`,
+  admins `transcripts:write` through `X-Aurix-App`. Rows are swept after `stt.retention_days`
+  (30; 0 = keep), erased with the user (`UserErasureCounts.transcripts`) and included in the
+  user data export (`UserExport.transcripts`). Server SDKs and the CLI gain the operations.
+
+* **Exactly-once per-device delivery of directed chat messages.** A client that identifies its
+  installation on the WebSocket handshake (`X-Aurix-Device: <id>`, sub-protocol `device.<id>` or
+  `?device=`; `[A-Za-z0-9._~-]{1,128}`, `400` otherwise; kept across resume and cross-node
+  takeover) gets its own delivery cursor in the new `chat_device_cursors` table (migration
+  `20240101000024`, keyed by application, user and device). The device confirms delivery with
+  `ChatAck { message_id }`; the server takes `sent_at` from the stored row (never from the
+  client), accepts only stored directed messages addressed to that user (`NOT_FOUND` otherwise)
+  and moves the cursor forward only. On connect a device with a cursor is replayed exactly the
+  directed messages newer than it, from any node; `ChatInboxSynced` gains `per_device` (`true`
+  for a cursor-driven replay, `false` for the read-marker replay that anonymous connections and
+  first-time devices still get). Cursors idle for `chat.device_cursor_max_age_days` (90; `0` =
+  keep) are swept, listed / forgotten over `GET /v1/users/{id}/chat-devices` and `DELETE
+  /v1/users/{id}/chat-devices/{device_id}` (`chat:read` / `chat:write`, `ChatDeviceCursor`),
+  exported with the user (`UserExport.chat_devices`) and erased with them
+  (`UserErasureCounts.chat_device_cursors`). Every SDK takes the id (`deviceId` / `DeviceId` /
+  `device_id`) and acknowledges automatically — the replay once by its newest message after
+  `ChatInboxSynced`, live directed messages one by one — after the message reached your code.
+
 ### Fixed
 
 * **Web SDK `getStats()` with per-participant tracks.** The WebRTC snapshot took whichever

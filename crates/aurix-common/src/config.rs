@@ -384,6 +384,9 @@ impl AurixConfig {
             if self.chat.unread_count_cap == 0 {
                 anyhow::bail!("chat.unread_count_cap must be > 0");
             }
+            if self.chat.device_cursor_max_age_days > 3660 {
+                anyhow::bail!("chat.device_cursor_max_age_days must be within 0..=3660");
+            }
             if self.chat.reactions_per_message > 200 {
                 anyhow::bail!("chat.reactions_per_message must be within 0..=200");
             }
@@ -459,6 +462,9 @@ impl AurixConfig {
             }
             if self.stt.max_concurrent_requests == 0 {
                 anyhow::bail!("stt.max_concurrent_requests must be > 0");
+            }
+            if self.stt.retention_days > 3660 {
+                anyhow::bail!("stt.retention_days must be within 0..=3660");
             }
         }
         if self.tts.enabled {
@@ -2472,6 +2478,10 @@ pub struct ChatConfig {
     /// Directed messages older than this are not replayed on connect (`0` = retention only).
     #[serde(default = "default_chat_offline_max_age_hours")]
     pub offline_max_age_hours: u32,
+    /// Days after which the delivery cursor of a device that acknowledged nothing is dropped
+    /// (the device then starts over from the read-marker backlog); `0` = keep forever.
+    #[serde(default = "default_chat_device_cursor_max_age_days")]
+    pub device_cursor_max_age_days: u32,
     /// Largest history page a client or the REST API may request.
     #[serde(default = "default_chat_history_page_max")]
     pub history_page_max: u32,
@@ -2509,6 +2519,9 @@ fn default_chat_offline_max_messages() -> u32 {
 }
 fn default_chat_offline_max_age_hours() -> u32 {
     0
+}
+fn default_chat_device_cursor_max_age_days() -> u32 {
+    90
 }
 fn default_chat_history_page_max() -> u32 {
     200
@@ -2558,6 +2571,7 @@ impl Default for ChatConfig {
             offline_delivery: true,
             offline_max_messages: default_chat_offline_max_messages(),
             offline_max_age_hours: default_chat_offline_max_age_hours(),
+            device_cursor_max_age_days: default_chat_device_cursor_max_age_days(),
             history_page_max: default_chat_history_page_max(),
             unread_count_cap: default_chat_unread_count_cap(),
             read_receipts: true,
@@ -2748,7 +2762,7 @@ impl Default for RetentionConfig {
 /// Speech-to-text: server-side transcription of channel audio through an OpenAI-compatible
 /// `/v1/audio/transcriptions` endpoint (whisper.cpp server, faster-whisper, vLLM, …).
 /// Transcripts are delivered live to the participants of channels created with
-/// `transcription: true`; nothing is stored.
+/// `transcription: true`; they are stored only with `persist = true`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SttConfig {
@@ -2773,6 +2787,14 @@ pub struct SttConfig {
     pub max_concurrent_requests: u32,
     /// Include word timings (when the provider returns them) in the client event.
     pub include_words: bool,
+    /// Store every delivered transcript (and the translations made of it) in the database
+    /// (`transcripts` / `transcript_translations`), readable through
+    /// `GET /v1/channels/{id}/transcripts` and `GET /v1/users/{id}/transcripts`, included in a
+    /// user's export and removed with the user. Off: transcripts exist only in flight.
+    pub persist: bool,
+    /// Stored transcripts older than this are deleted (hourly sweep); `0` keeps them until the
+    /// user is erased.
+    pub retention_days: u32,
 }
 
 impl Default for SttConfig {
@@ -2789,6 +2811,8 @@ impl Default for SttConfig {
             timeout_ms: 15_000,
             max_concurrent_requests: 8,
             include_words: false,
+            persist: false,
+            retention_days: 30,
         }
     }
 }
@@ -3397,5 +3421,44 @@ mod tests {
         cfg.redis.cluster.push("  ".into());
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn stt_persistence_defaults_off_and_bounds_retention() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default");
+        let cfg = AurixConfig::load(Some(path)).expect("load default.toml");
+        assert!(!cfg.stt.persist, "transcripts are ephemeral by default");
+        assert_eq!(cfg.stt.retention_days, 30);
+        assert_eq!(
+            (
+                SttConfig::default().persist,
+                SttConfig::default().retention_days
+            ),
+            (false, 30)
+        );
+
+        let mut cfg = dev_config();
+        cfg.stt.enabled = true;
+        cfg.stt.endpoint = Some("http://whisper:8000".into());
+        cfg.stt.persist = true;
+        cfg.stt.retention_days = 0;
+        assert!(cfg.validate().is_ok(), "0 = keep forever");
+        cfg.stt.retention_days = 3660;
+        assert!(cfg.validate().is_ok());
+        cfg.stt.retention_days = 3661;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("stt.retention_days"), "{err}");
+
+        let toml: SttConfig = toml::from_str(
+            r#"
+            enabled = true
+            endpoint = "http://whisper:8000"
+            persist = true
+            retention_days = 7
+            "#,
+        )
+        .unwrap();
+        assert!(toml.persist);
+        assert_eq!(toml.retention_days, 7);
     }
 }

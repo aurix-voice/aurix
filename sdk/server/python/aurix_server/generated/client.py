@@ -1488,6 +1488,35 @@ class AurixClient(BaseClient):
         """
         return self._json("GET", f"/v1/channels/{_p(channel_id)}/read-markers", options=options)  # type: ignore[no-any-return]
 
+    def list_user_chat_devices(self, user_id: str, *, options: Optional[RequestOptions] = None) -> "T.ListUserChatDevicesResponse":
+        """Chat devices of a user
+
+
+        The user's devices that acknowledged directed messages (`ChatAck` over a connection identified
+        with `X-Aurix-Device`), most recently active first, each with its delivery cursor. Directed
+        messages newer than a device's cursor are replayed to that device (and only that device) on its
+        next connect, on any node. Requires `chat.persist = true` (otherwise `404`).
+
+        `GET /v1/users/{user_id}/chat-devices`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return self._json("GET", f"/v1/users/{_p(user_id)}/chat-devices", options=options)  # type: ignore[no-any-return]
+
+    def delete_user_chat_device(self, user_id: str, device_id: str, *, options: Optional[RequestOptions] = None) -> None:
+        """Forget a chat device
+
+
+        Drops the device's delivery cursor (a lost or reinstalled device). On its next connect the
+        device is new again and receives the user-wide unread backlog instead of its own queue. Cursors
+        idle for `chat.device_cursor_max_age_days` are dropped automatically.
+
+        `DELETE /v1/users/{user_id}/chat-devices/{device_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        self._json("DELETE", f"/v1/users/{_p(user_id)}/chat-devices/{_p(device_id)}", options=options)
+
     def search_channel_messages(self, channel_id: str, *, q: str, from_user_id: Optional[str] = None, before: Optional[str] = None, limit: Optional[int] = None, options: Optional[RequestOptions] = None) -> "T.ChatHistoryPage":
         """Search channel messages
 
@@ -1585,6 +1614,66 @@ class AurixClient(BaseClient):
         Permissions: chat:write.
         """
         return self._json("DELETE", f"/v1/messages/{_p(message_id)}/reactions/{_p(reaction)}", query={"user_id": user_id}, options=options)  # type: ignore[no-any-return]
+
+    def list_channel_transcripts(self, channel_id: str, *, before: Optional[str] = None, after: Optional[str] = None, limit: Optional[int] = None, user_id: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.TranscriptPage":
+        """Stored transcripts of a channel
+
+
+        Requires `stt.persist = true` on the deployment (otherwise `404`). Every transcript the node
+        delivered live (`Transcript` event / `channel.transcript`) is stored with the translations the
+        fleet made of it; end-to-end encrypted channels are never transcribed and therefore never
+        stored. Pages are newest first; follow `next_before` to older transcripts and `next_after` to
+        newer ones (absent when there is nothing more in that direction). Rows expire after
+        `stt.retention_days` and are removed with the user.
+
+        `GET /v1/channels/{channel_id}/transcripts`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:read.
+        """
+        return self._json("GET", f"/v1/channels/{_p(channel_id)}/transcripts", query={"before": before, "after": after, "limit": limit, "user_id": user_id}, options=options)  # type: ignore[no-any-return]
+
+    def delete_channel_transcripts(self, channel_id: str, *, options: Optional[RequestOptions] = None) -> "T.DeleteChannelTranscriptsResponse":
+        """Delete every stored transcript of a channel
+
+
+        Removes the channel's stored transcripts and their translations (audited). Requires `stt.persist
+        = true` (otherwise `404`).
+
+        `DELETE /v1/channels/{channel_id}/transcripts`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:write.
+        """
+        return self._json("DELETE", f"/v1/channels/{_p(channel_id)}/transcripts", options=options)  # type: ignore[no-any-return]
+
+    def list_user_transcripts(self, user_id: str, *, before: Optional[str] = None, after: Optional[str] = None, limit: Optional[int] = None, options: Optional[RequestOptions] = None) -> "T.TranscriptPage":
+        """Stored transcripts of a user
+
+
+        Everything the user said across the application's channels. Requires `stt.persist = true` on the
+        deployment (otherwise `404`). Every transcript the node delivered live (`Transcript` event /
+        `channel.transcript`) is stored with the translations the fleet made of it; end-to-end encrypted
+        channels are never transcribed and therefore never stored. Pages are newest first; follow
+        `next_before` to older transcripts and `next_after` to newer ones (absent when there is nothing
+        more in that direction). Rows expire after `stt.retention_days` and are removed with the user.
+
+        `GET /v1/users/{user_id}/transcripts`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:read.
+        """
+        return self._json("GET", f"/v1/users/{_p(user_id)}/transcripts", query={"before": before, "after": after, "limit": limit}, options=options)  # type: ignore[no-any-return]
+
+    def delete_transcript(self, transcript_id: str, *, options: Optional[RequestOptions] = None) -> "T.DeleteTranscriptResponse":
+        """Delete a stored transcript
+
+
+        Removes one stored transcript with its translations (audited). Unknown or foreign-tenant ids are
+        `404`.
+
+        `DELETE /v1/transcripts/{transcript_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:write.
+        """
+        return self._json("DELETE", f"/v1/transcripts/{_p(transcript_id)}", options=options)  # type: ignore[no-any-return]
 
 
 class AsyncAurixClient:
@@ -3072,6 +3161,35 @@ class AsyncAurixClient:
         """
         return await self._run(self.sync.list_channel_read_markers, channel_id, options=options)  # type: ignore[no-any-return]
 
+    async def list_user_chat_devices(self, user_id: str, *, options: Optional[RequestOptions] = None) -> "T.ListUserChatDevicesResponse":
+        """Chat devices of a user
+
+
+        The user's devices that acknowledged directed messages (`ChatAck` over a connection identified
+        with `X-Aurix-Device`), most recently active first, each with its delivery cursor. Directed
+        messages newer than a device's cursor are replayed to that device (and only that device) on its
+        next connect, on any node. Requires `chat.persist = true` (otherwise `404`).
+
+        `GET /v1/users/{user_id}/chat-devices`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:read.
+        """
+        return await self._run(self.sync.list_user_chat_devices, user_id, options=options)  # type: ignore[no-any-return]
+
+    async def delete_user_chat_device(self, user_id: str, device_id: str, *, options: Optional[RequestOptions] = None) -> None:
+        """Forget a chat device
+
+
+        Drops the device's delivery cursor (a lost or reinstalled device). On its next connect the
+        device is new again and receives the user-wide unread backlog instead of its own queue. Cursors
+        idle for `chat.device_cursor_max_age_days` are dropped automatically.
+
+        `DELETE /v1/users/{user_id}/chat-devices/{device_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: chat:write.
+        """
+        return await self._run(self.sync.delete_user_chat_device, user_id, device_id, options=options)  # type: ignore[no-any-return]
+
     async def search_channel_messages(self, channel_id: str, *, q: str, from_user_id: Optional[str] = None, before: Optional[str] = None, limit: Optional[int] = None, options: Optional[RequestOptions] = None) -> "T.ChatHistoryPage":
         """Search channel messages
 
@@ -3169,3 +3287,63 @@ class AsyncAurixClient:
         Permissions: chat:write.
         """
         return await self._run(self.sync.remove_message_reaction, message_id, reaction, user_id=user_id, options=options)  # type: ignore[no-any-return]
+
+    async def list_channel_transcripts(self, channel_id: str, *, before: Optional[str] = None, after: Optional[str] = None, limit: Optional[int] = None, user_id: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.TranscriptPage":
+        """Stored transcripts of a channel
+
+
+        Requires `stt.persist = true` on the deployment (otherwise `404`). Every transcript the node
+        delivered live (`Transcript` event / `channel.transcript`) is stored with the translations the
+        fleet made of it; end-to-end encrypted channels are never transcribed and therefore never
+        stored. Pages are newest first; follow `next_before` to older transcripts and `next_after` to
+        newer ones (absent when there is nothing more in that direction). Rows expire after
+        `stt.retention_days` and are removed with the user.
+
+        `GET /v1/channels/{channel_id}/transcripts`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:read.
+        """
+        return await self._run(self.sync.list_channel_transcripts, channel_id, before=before, after=after, limit=limit, user_id=user_id, options=options)  # type: ignore[no-any-return]
+
+    async def delete_channel_transcripts(self, channel_id: str, *, options: Optional[RequestOptions] = None) -> "T.DeleteChannelTranscriptsResponse":
+        """Delete every stored transcript of a channel
+
+
+        Removes the channel's stored transcripts and their translations (audited). Requires `stt.persist
+        = true` (otherwise `404`).
+
+        `DELETE /v1/channels/{channel_id}/transcripts`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:write.
+        """
+        return await self._run(self.sync.delete_channel_transcripts, channel_id, options=options)  # type: ignore[no-any-return]
+
+    async def list_user_transcripts(self, user_id: str, *, before: Optional[str] = None, after: Optional[str] = None, limit: Optional[int] = None, options: Optional[RequestOptions] = None) -> "T.TranscriptPage":
+        """Stored transcripts of a user
+
+
+        Everything the user said across the application's channels. Requires `stt.persist = true` on the
+        deployment (otherwise `404`). Every transcript the node delivered live (`Transcript` event /
+        `channel.transcript`) is stored with the translations the fleet made of it; end-to-end encrypted
+        channels are never transcribed and therefore never stored. Pages are newest first; follow
+        `next_before` to older transcripts and `next_after` to newer ones (absent when there is nothing
+        more in that direction). Rows expire after `stt.retention_days` and are removed with the user.
+
+        `GET /v1/users/{user_id}/transcripts`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:read.
+        """
+        return await self._run(self.sync.list_user_transcripts, user_id, before=before, after=after, limit=limit, options=options)  # type: ignore[no-any-return]
+
+    async def delete_transcript(self, transcript_id: str, *, options: Optional[RequestOptions] = None) -> "T.DeleteTranscriptResponse":
+        """Delete a stored transcript
+
+
+        Removes one stored transcript with its translations (audited). Unknown or foreign-tenant ids are
+        `404`.
+
+        `DELETE /v1/transcripts/{transcript_id}`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        Permissions: transcripts:write.
+        """
+        return await self._run(self.sync.delete_transcript, transcript_id, options=options)  # type: ignore[no-any-return]

@@ -186,6 +186,20 @@ namespace Aurix.Voice.Tests
         }
 
         [Fact]
+        public void DeviceIdReachesTheBridgeAndIsValidated()
+        {
+            var (client, bridge) = NewClient();
+            Assert.False(client.Options.ToBridge("a", "w", "t", false, false).ContainsKey("deviceId"));
+            client.Options.DeviceId = "phone-1";
+            _ = client.ConnectAsync();
+            Assert.Equal("phone-1", MiniJson.GetString(bridge.CreateOptions, "deviceId"));
+
+            var (bad, _) = NewClient();
+            bad.Options.DeviceId = "bad id";
+            Assert.Throws<ArgumentException>(() => bad.Options.ToBridge("a", "w", "t", false, false));
+        }
+
+        [Fact]
         public async Task E2eeCallsAndEventsUseTheSharedTypes()
         {
             var (client, bridge) = NewClient();

@@ -566,6 +566,15 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Security")
 	FString E2eeIdentityHex;
 
+	/**
+	 * Stable id of this installation ([A-Za-z0-9._~-]{1,128}, e.g. a GUID persisted on first run).
+	 * The server keeps a per-device cursor of directed chat messages: each reaches this device
+	 * exactly once and is acknowledged automatically. Empty: the user-wide read-marker backlog is
+	 * replayed instead.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Chat")
+	FString DeviceId;
+
 	/** Open the microphone (AudioCapture) as soon as the session is ready. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	bool bAutoStartCapture = true;

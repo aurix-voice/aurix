@@ -248,10 +248,12 @@ export type {
 export {
   AURIX_SUBPROTOCOL,
   BEARER_SUBPROTOCOL_PREFIX,
+  DEVICE_SUBPROTOCOL_PREFIX,
   MAX_PARTICIPANT_VOLUME,
   RESUME_SUBPROTOCOL_PREFIX,
   SYNTH_SSRC_FLAG,
   SYSTEM_USER_ID,
+  isValidDeviceId,
   parseServerMessage,
 } from './protocol.js';
 export {

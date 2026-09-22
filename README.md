@@ -217,7 +217,9 @@ curl -X POST localhost:8080/v1/moderation/kick-all -H "x-api-key: $KEY" -H 'cont
    database; mutes/volumes are replayed by the SDKs), the blocker gets `UserBlockChanged` acks.
 7. **Text chat**: `ChatSend { channel_id, text, metadata?, client_ref? }` to a channel you
    are a member of, `ChatSendDirect { user_id, … }` to a user of the same application (live-only
-   by default; with `chat.persist` an offline recipient gets it queued and replayed on connect,
+   by default; with `chat.persist` an offline recipient gets it queued and replayed on connect —
+   exactly once per device when the connection carries `X-Aurix-Device` and the SDK's automatic
+   `ChatAck { message_id }` advances the device's cursor —
    and `ChatHistory` / `ChatMarkRead` / `ChatReadMarkers` give cursor-paged history, read markers
    and unread counts, `ChatEdit` / `ChatDelete` / `ChatReact` / `ChatSearch` edit or tombstone
    your own messages, react and search — see [Text chat](docs/src/features/chat.md)),
@@ -1229,11 +1231,13 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
   cancellation or AGC.
 * Text chat is deliberately "lite": channel/directed messages and typing, no attachments or
   threads. History, offline delivery of directed messages, read markers, edits / deletions,
-  reactions and full-text search exist only with `chat.persist = true`, and offline replay is
-  per user (read-marker driven), not an exactly-once per-device queue.
+  reactions and full-text search exist only with `chat.persist = true`; offline replay is
+  exactly-once per device only for connections that send a device id (`X-Aurix-Device`), anonymous
+  ones get the user-wide read-marker replay.
 * STT/TTS, live translation and the content-safety classifier talk to HTTP servers you host
   (OpenAI-compatible, LibreTranslate-compatible); no speech, translation or moderation model
-  ships with Aurix, transcripts and translations are not stored server-side, and translation is
+  ships with Aurix, transcripts and translations are stored only with `stt.persist = true`
+  (no full-text search), and translation is
   caption-first (seconds of provider latency; the spoken translation is a synthesized
   translator voice, not the speaker's).
 * A live-stream consumer that stays away longer than `recording.live.outage_buffer_ms` (≤ 5 min)

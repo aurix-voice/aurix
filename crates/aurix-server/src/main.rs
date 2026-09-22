@@ -215,6 +215,8 @@ async fn main() -> anyhow::Result<()> {
             info!("Voice content safety enabled for channels with `safety_voice`");
         }
         let events = control.events.clone();
+        let transcripts = control.transcripts.clone();
+        let persist = transcripts.enabled();
         let include_words = config.stt.include_words;
         pipeline.set_stt_callback(move |seg| {
             if seg.safety {
@@ -246,23 +248,39 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 Vec::new()
             };
-            events.publish(aurix_control::ServerEvent::Transcript {
-                app_id: seg.app_id,
-                transcript: aurix_common::protocol::Transcript {
-                    id: uuid::Uuid::new_v4(),
-                    channel_id: seg.channel_id,
-                    user_id: seg.user_id,
-                    text: seg.result.text,
-                    language: Some(seg.result.language).filter(|l| !l.is_empty()),
-                    started_at: seg.started_at,
-                    duration_ms: seg.audio_ms,
-                    words,
-                    original: None,
-                },
-            });
+            let app_id = seg.app_id;
+            let transcript = aurix_common::protocol::Transcript {
+                id: uuid::Uuid::new_v4(),
+                channel_id: seg.channel_id,
+                user_id: seg.user_id,
+                text: seg.result.text,
+                language: Some(seg.result.language).filter(|l| !l.is_empty()),
+                started_at: seg.started_at,
+                duration_ms: seg.audio_ms,
+                words,
+                original: None,
+            };
+            if transcripts.enabled() {
+                // The row must exist before any node stores a translation of it: store
+                // (bounded, failures logged), then publish.
+                let (store, events) = (transcripts.clone(), events.clone());
+                tokio::spawn(async move {
+                    store.store(app_id, &transcript).await;
+                    events.publish(aurix_control::ServerEvent::Transcript { app_id, transcript });
+                });
+            } else {
+                events.publish(aurix_control::ServerEvent::Transcript { app_id, transcript });
+            }
         });
         sfu.set_audio_pipeline(Arc::new(pipeline));
-        info!("Speech-to-text enabled");
+        if persist {
+            info!(
+                retention_days = config.stt.retention_days,
+                "Speech-to-text enabled, transcripts are stored"
+            );
+        } else {
+            info!("Speech-to-text enabled");
+        }
     }
 
     let recording = if config.recording.enabled || config.recording.live.enabled {

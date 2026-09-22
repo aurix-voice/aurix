@@ -278,6 +278,13 @@ pub async fn erase_user(
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    let chat_device_cursors = delete_user_rows(
+        &mut tx,
+        "DELETE FROM chat_device_cursors WHERE app_id = $1 AND user_id = $2",
+        app_id,
+        user_id,
+    )
+    .await?;
     sqlx::query("DELETE FROM chat_reactions WHERE app_id = $1 AND user_id = $2")
         .bind(app_id)
         .bind(user_id)
@@ -293,6 +300,13 @@ pub async fn erase_user(
     let recordings = delete_user_rows(
         &mut tx,
         "DELETE FROM recordings WHERE app_id = $1 AND user_id = $2",
+        app_id,
+        user_id,
+    )
+    .await?;
+    let transcripts = delete_user_rows(
+        &mut tx,
+        "DELETE FROM transcripts WHERE app_id = $1 AND user_id = $2",
         app_id,
         user_id,
     )
@@ -344,8 +358,10 @@ pub async fn erase_user(
         channel_memberships,
         sessions,
         chat_messages,
+        chat_device_cursors,
         user_blocks,
         recordings,
+        transcripts,
         moderation_events,
         bans,
         users,
@@ -2405,6 +2421,338 @@ pub async fn delete_chat_messages_before(
         .bind(cutoff)
         .execute(pool)
         .await?;
+    Ok(r.rows_affected())
+}
+
+// ── Chat device cursors ──
+
+/// Directed messages to `user_id` newer than `after` (all of them when `None`) that are not
+/// deleted and, if set, not older than `min_sent_at`: the newest `limit`, returned oldest
+/// first. Read markers play no part — this is a device's own delivery queue.
+pub async fn list_direct_messages_after(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    after: Option<MessageCursor>,
+    min_sent_at: Option<DateTime<Utc>>,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(
+        r#"SELECT m.* FROM (
+             SELECT m.* FROM chat_messages m
+             WHERE m.app_id = $1 AND m.to_user_id = $2 AND m.deleted_at IS NULL
+               AND ($3::timestamptz IS NULL OR (m.sent_at, m.id) > ($3, $4::uuid))
+               AND ($5::timestamptz IS NULL OR m.sent_at >= $5)
+             ORDER BY m.sent_at DESC, m.id DESC LIMIT $6
+           ) m ORDER BY m.sent_at ASC, m.id ASC"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(after.map(|c| c.sent_at))
+    .bind(after.map(|c| c.id).unwrap_or(Uuid::nil()))
+    .bind(min_sent_at)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_chat_device_cursor(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<Option<ChatDeviceCursorRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatDeviceCursorRow>(
+        "SELECT * FROM chat_device_cursors WHERE app_id = $1 AND user_id = $2 AND device_id = $3",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Moves a device's cursor forward to `message` (creating it on first use); returns the
+/// stored row when the cursor now sits at `message`, `None` when it was already further
+/// ahead. Every acknowledgement refreshes `updated_at` so an active device is never swept.
+/// Moves `device_id`'s cursor to the directed message `message_id` if that message is addressed
+/// to `user_id` (tombstones included) and lies past the cursor; older acknowledgements only
+/// refresh `updated_at`. `None` when there is no such message for the user.
+pub async fn advance_chat_device_cursor(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    device_id: &str,
+    message_id: Uuid,
+) -> Result<Option<ChatDeviceCursorRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatDeviceCursorRow>(
+        r#"INSERT INTO chat_device_cursors
+             (app_id, user_id, device_id, message_id, message_sent_at)
+           SELECT m.app_id, m.to_user_id, $3, m.id, m.sent_at FROM chat_messages m
+            WHERE m.app_id = $1 AND m.to_user_id = $2 AND m.id = $4
+           ON CONFLICT (app_id, user_id, device_id) DO UPDATE
+             SET message_id = CASE
+                   WHEN (chat_device_cursors.message_sent_at, chat_device_cursors.message_id)
+                        < (EXCLUDED.message_sent_at, EXCLUDED.message_id)
+                   THEN EXCLUDED.message_id ELSE chat_device_cursors.message_id END,
+                 message_sent_at = GREATEST(chat_device_cursors.message_sent_at,
+                                            EXCLUDED.message_sent_at),
+                 updated_at = NOW()
+           RETURNING *"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(device_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_chat_device_cursors(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<ChatDeviceCursorRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatDeviceCursorRow>(
+        "SELECT * FROM chat_device_cursors WHERE app_id = $1 AND user_id = $2 \
+         ORDER BY updated_at DESC, device_id",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_chat_device_cursor(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "DELETE FROM chat_device_cursors WHERE app_id = $1 AND user_id = $2 AND device_id = $3",
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(device_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Drops cursors of devices that have not acknowledged anything since `cutoff`.
+pub async fn delete_chat_device_cursors_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM chat_device_cursors WHERE updated_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+// ── Webhook Queries ──
+
+// ── Transcript Queries (stt.persist) ──
+
+/// Stores a delivered live transcript. Idempotent on `id` (a resumed node may replay).
+pub async fn insert_transcript(pool: &DbPool, t: &TranscriptRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO transcripts
+             (id, app_id, channel_id, user_id, text, language, started_at, duration_ms, words, node_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           ON CONFLICT (id) DO NOTHING"#,
+    )
+    .bind(t.id)
+    .bind(t.app_id)
+    .bind(t.channel_id)
+    .bind(t.user_id)
+    .bind(&t.text)
+    .bind(&t.language)
+    .bind(t.started_at)
+    .bind(t.duration_ms)
+    .bind(&t.words)
+    .bind(t.node_id)
+    .bind(t.created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stores a translation of transcript `transcript_id` into `language`; the first writer wins
+/// (every node translates the same segment for its own listeners). `false` when the transcript
+/// row does not exist (not persisted, or already swept).
+pub async fn insert_transcript_translation(
+    pool: &DbPool,
+    app_id: Uuid,
+    transcript_id: Uuid,
+    language: &str,
+    text: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        r#"INSERT INTO transcript_translations (transcript_id, language, text)
+           SELECT id, $3, $4 FROM transcripts WHERE id = $2 AND app_id = $1
+           ON CONFLICT (transcript_id, language) DO NOTHING"#,
+    )
+    .bind(app_id)
+    .bind(transcript_id)
+    .bind(language)
+    .bind(text)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+fn transcript_page_order(forward: bool) -> &'static str {
+    if forward {
+        "started_at ASC, id ASC"
+    } else {
+        "started_at DESC, id DESC"
+    }
+}
+
+/// Page of a channel's stored transcripts strictly between the cursors (`before` = older
+/// than, `after` = newer than), optionally of one speaker; `forward` orders oldest first.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_channel_transcripts(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+    user_id: Option<Uuid>,
+    before: Option<TranscriptCursor>,
+    after: Option<TranscriptCursor>,
+    forward: bool,
+    limit: i64,
+) -> Result<Vec<TranscriptRow>, sqlx::Error> {
+    sqlx::query_as::<_, TranscriptRow>(&format!(
+        r#"SELECT * FROM transcripts
+           WHERE app_id = $1 AND channel_id = $2
+             AND ($3::uuid IS NULL OR user_id = $3)
+             AND ($4::timestamptz IS NULL OR (started_at, id) < ($4, $5::uuid))
+             AND ($6::timestamptz IS NULL OR (started_at, id) > ($6, $7::uuid))
+           ORDER BY {} LIMIT $8"#,
+        transcript_page_order(forward)
+    ))
+    .bind(app_id)
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(before.map(|c| c.started_at))
+    .bind(before.map(|c| c.id))
+    .bind(after.map(|c| c.started_at))
+    .bind(after.map(|c| c.id))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Page of everything one user said (all channels), see [`list_channel_transcripts`].
+pub async fn list_user_transcripts(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    before: Option<TranscriptCursor>,
+    after: Option<TranscriptCursor>,
+    forward: bool,
+    limit: i64,
+) -> Result<Vec<TranscriptRow>, sqlx::Error> {
+    sqlx::query_as::<_, TranscriptRow>(&format!(
+        r#"SELECT * FROM transcripts
+           WHERE app_id = $1 AND user_id = $2
+             AND ($3::timestamptz IS NULL OR (started_at, id) < ($3, $4::uuid))
+             AND ($5::timestamptz IS NULL OR (started_at, id) > ($5, $6::uuid))
+           ORDER BY {} LIMIT $7"#,
+        transcript_page_order(forward)
+    ))
+    .bind(app_id)
+    .bind(user_id)
+    .bind(before.map(|c| c.started_at))
+    .bind(before.map(|c| c.id))
+    .bind(after.map(|c| c.started_at))
+    .bind(after.map(|c| c.id))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Translations of the given transcripts, in `(transcript_id, language)` order.
+pub async fn list_transcript_translations(
+    pool: &DbPool,
+    transcript_ids: &[Uuid],
+) -> Result<Vec<TranscriptTranslationRow>, sqlx::Error> {
+    if transcript_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, TranscriptTranslationRow>(
+        r#"SELECT * FROM transcript_translations WHERE transcript_id = ANY($1)
+           ORDER BY transcript_id, language"#,
+    )
+    .bind(transcript_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Newest `limit` transcripts of a user for the data export.
+pub async fn export_user_transcripts(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<TranscriptRow>, sqlx::Error> {
+    sqlx::query_as::<_, TranscriptRow>(
+        r#"SELECT * FROM transcripts WHERE app_id = $1 AND user_id = $2
+           ORDER BY started_at DESC, id DESC LIMIT $3"#,
+    )
+    .bind(app_id)
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Deletes one stored transcript (translations cascade); `false` when it does not exist in
+/// `app_id`.
+pub async fn delete_transcript(
+    pool: &DbPool,
+    app_id: Uuid,
+    transcript_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM transcripts WHERE app_id = $1 AND id = $2")
+        .bind(app_id)
+        .bind(transcript_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Deletes every stored transcript of a channel; returns the row count.
+pub async fn delete_channel_transcripts(
+    pool: &DbPool,
+    app_id: Uuid,
+    channel_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM transcripts WHERE app_id = $1 AND channel_id = $2")
+        .bind(app_id)
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// Retention sweep: removes transcripts that started before `cutoff`, `batch` at a time.
+pub async fn delete_transcripts_before(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"DELETE FROM transcripts WHERE id IN
+             (SELECT id FROM transcripts WHERE started_at < $1 ORDER BY started_at LIMIT $2)"#,
+    )
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
     Ok(r.rows_affected())
 }
 

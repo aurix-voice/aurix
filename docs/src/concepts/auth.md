@@ -40,6 +40,7 @@ enforced on top of the per-IP limit — see
 | `recordings:read` / `recordings:write` | list / download — start, stop, delete |
 | `audio_streams:read` / `audio_streams:write` | list / inspect live streams — pull, push, stop |
 | `chat:read` / `chat:write` | stored message history — system / directed messages |
+| `transcripts:read` / `transcripts:write` | stored live transcripts (`stt.persist`) — delete them |
 | `tts:write` | `POST /v1/channels/:id/tts` |
 | `keys:manage` | API key CRUD |
 | `analytics:read` | `GET /v1/analytics*` — series, channel usage, quota state, export ([Usage analytics](../operations/usage-analytics.md)) |
@@ -90,8 +91,8 @@ browser.
 | Role | API permissions with `X-Aurix-App` |
 | --- | --- |
 | `viewer` | `channels:read`, `users:read`, `analytics:read`, `events:read`, `webhooks:read`, `recordings:read`, `audio_streams:read` |
-| `moderator` | + `moderation:read`, `moderation:write`, `chat:read`, `chat:write`, `audit:read`, `users:write` |
-| `admin` | + `channels:write`, `webhooks:write`, `recordings:write`, `audio_streams:write`, `keys:manage`, `tokens:issue`, `turn:issue`, `tts:write`, `users:export` |
+| `moderator` | + `moderation:read`, `moderation:write`, `chat:read`, `chat:write`, `transcripts:read`, `audit:read`, `users:write` |
+| `admin` | + `channels:write`, `webhooks:write`, `recordings:write`, `audio_streams:write`, `keys:manage`, `tokens:issue`, `turn:issue`, `tts:write`, `transcripts:write`, `users:export` |
 | `superadmin` | `*` (including `users:erase`) |
 
 Audit-log entries and moderation events record the administrator's id as the actor. An API key

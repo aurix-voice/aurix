@@ -302,6 +302,7 @@ retention_days = 30
 offline_delivery = true
 offline_max_messages = 200      # newest unread directed messages replayed on connect (1..=5000)
 offline_max_age_hours = 0       # 0 = replay anything within retention_days
+device_cursor_max_age_days = 90 # forget the per-device delivery cursor (ChatAck) of a device idle this long (0 = never, max 3660)
 history_page_max = 200          # largest history page a client / REST caller may ask for
 unread_count_cap = 1000         # unread counters saturate here
 read_receipts = true            # share read markers with channel members / the direct peer
@@ -366,7 +367,8 @@ persist_interval_secs = 60
 [stt]
 # Speech-to-text of channels created with `transcription = true` (OpenAI-compatible
 # `/v1/audio/transcriptions`, e.g. faster-whisper-server). Transcripts are pushed to the
-# channel members as `Transcript` and to webhooks/SSE as `channel.transcript`; nothing is stored.
+# channel members as `Transcript` and to webhooks/SSE as `channel.transcript`; nothing is stored
+# unless `persist = true`.
 enabled = false
 # endpoint = "http://whisper:8000"
 # api_key = "…"            # AURIX__STT__API_KEY
@@ -378,6 +380,12 @@ min_segment_ms = 400
 timeout_ms = 15000
 max_concurrent_requests = 8
 include_words = false
+# Store every delivered transcript (and the translations made of it) in PostgreSQL for
+# `GET /v1/channels/{id}/transcripts` / `GET /v1/users/{id}/transcripts`, the user export and
+# erasure. E2EE channels are never transcribed, so nothing of them is stored.
+persist = false
+# Days a stored transcript is kept (0 = forever, max 3660); only with `persist = true`.
+retention_days = 30
 [tts]
 # Text-to-speech through an OpenAI-compatible `/v1/audio/speech` endpoint returning WAV
 # (Piper/OpenedAI-Speech, Kokoro-FastAPI, …); the server Opus-encodes the result and plays it

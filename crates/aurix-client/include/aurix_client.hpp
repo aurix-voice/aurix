@@ -188,6 +188,9 @@ private:
 struct Config {
     std::string ws_url;
     std::string token;
+    /// Stable installation id (`[A-Za-z0-9._~-]{1,128}`) for the per-device chat delivery
+    /// cursor; empty = none (see `AurixClientConfig::device_id`).
+    std::string device_id;
     AurixClientConfig raw;
 
     Config(std::string url, std::string tok) : ws_url(std::move(url)), token(std::move(tok)) {
@@ -217,6 +220,7 @@ public:
         AurixClientConfig raw = cfg.raw;
         raw.ws_url = cfg.ws_url.c_str();
         raw.token = cfg.token.c_str();
+        raw.device_id = cfg.device_id.empty() ? nullptr : cfg.device_id.c_str();
         Client c;
         c.c_ = aurix_client_create(&raw);
         return c;

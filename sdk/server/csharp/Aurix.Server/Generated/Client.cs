@@ -2027,6 +2027,41 @@ public sealed partial class AurixClient : AurixHttp
     }
 
     /// <summary>
+    /// Chat devices of a user
+    ///
+    /// The user's devices that acknowledged directed messages (`ChatAck` over a connection identified
+    /// with `X-Aurix-Device`), most recently active first, each with its delivery cursor. Directed
+    /// messages newer than a device's cursor are replayed to that device (and only that device) on its
+    /// next connect, on any node. Requires `chat.persist = true` (otherwise `404`).
+    ///
+    /// `GET /v1/users/{user_id}/chat-devices`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:read.
+    /// </summary>
+    public Task<ListUserChatDevicesResponse> ListUserChatDevicesAsync(string userId, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<ListUserChatDevicesResponse>("/v1/users/" + Uri.EscapeDataString(userId) + "/chat-devices", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Forget a chat device
+    ///
+    /// Drops the device's delivery cursor (a lost or reinstalled device). On its next connect the
+    /// device is new again and receives the user-wide unread backlog instead of its own queue. Cursors
+    /// idle for `chat.device_cursor_max_age_days` are dropped automatically.
+    ///
+    /// `DELETE /v1/users/{user_id}/chat-devices/{device_id}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: chat:write.
+    /// </summary>
+    public Task DeleteUserChatDeviceAsync(string userId, string deviceId, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync("/v1/users/" + Uri.EscapeDataString(userId) + "/chat-devices/" + Uri.EscapeDataString(deviceId), HttpMethod.Delete, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
     /// Search channel messages
     ///
     /// Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
@@ -2162,6 +2197,91 @@ public sealed partial class AurixClient : AurixHttp
             if (query.UserId is not null) q["user_id"] = query.UserId;
         }
         return SendJsonAsync<ReactionChange>("/v1/messages/" + Uri.EscapeDataString(messageId) + "/reactions/" + Uri.EscapeDataString(reaction), HttpMethod.Delete, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Stored transcripts of a channel
+    ///
+    /// Requires `stt.persist = true` on the deployment (otherwise `404`). Every transcript the node
+    /// delivered live (`Transcript` event / `channel.transcript`) is stored with the translations the
+    /// fleet made of it; end-to-end encrypted channels are never transcribed and therefore never
+    /// stored. Pages are newest first; follow `next_before` to older transcripts and `next_after` to
+    /// newer ones (absent when there is nothing more in that direction). Rows expire after
+    /// `stt.retention_days` and are removed with the user.
+    ///
+    /// `GET /v1/channels/{channel_id}/transcripts`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: transcripts:read.
+    /// </summary>
+    public Task<TranscriptPage> ListChannelTranscriptsAsync(string channelId, ListChannelTranscriptsQuery? query = null, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        var q = new Dictionary<string, string>();
+        if (query is not null)
+        {
+            if (query.Before is not null) q["before"] = query.Before;
+            if (query.After is not null) q["after"] = query.After;
+            if (query.Limit is not null) q["limit"] = query.Limit.Value.ToString(CultureInfo.InvariantCulture);
+            if (query.UserId is not null) q["user_id"] = query.UserId;
+        }
+        return SendJsonAsync<TranscriptPage>("/v1/channels/" + Uri.EscapeDataString(channelId) + "/transcripts", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Delete every stored transcript of a channel
+    ///
+    /// Removes the channel's stored transcripts and their translations (audited). Requires `stt.persist
+    /// = true` (otherwise `404`).
+    ///
+    /// `DELETE /v1/channels/{channel_id}/transcripts`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: transcripts:write.
+    /// </summary>
+    public Task<DeleteChannelTranscriptsResponse> DeleteChannelTranscriptsAsync(string channelId, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<DeleteChannelTranscriptsResponse>("/v1/channels/" + Uri.EscapeDataString(channelId) + "/transcripts", HttpMethod.Delete, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Stored transcripts of a user
+    ///
+    /// Everything the user said across the application's channels. Requires `stt.persist = true` on the
+    /// deployment (otherwise `404`). Every transcript the node delivered live (`Transcript` event /
+    /// `channel.transcript`) is stored with the translations the fleet made of it; end-to-end encrypted
+    /// channels are never transcribed and therefore never stored. Pages are newest first; follow
+    /// `next_before` to older transcripts and `next_after` to newer ones (absent when there is nothing
+    /// more in that direction). Rows expire after `stt.retention_days` and are removed with the user.
+    ///
+    /// `GET /v1/users/{user_id}/transcripts`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: transcripts:read.
+    /// </summary>
+    public Task<TranscriptPage> ListUserTranscriptsAsync(string userId, ListUserTranscriptsQuery? query = null, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        var q = new Dictionary<string, string>();
+        if (query is not null)
+        {
+            if (query.Before is not null) q["before"] = query.Before;
+            if (query.After is not null) q["after"] = query.After;
+            if (query.Limit is not null) q["limit"] = query.Limit.Value.ToString(CultureInfo.InvariantCulture);
+        }
+        return SendJsonAsync<TranscriptPage>("/v1/users/" + Uri.EscapeDataString(userId) + "/transcripts", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Delete a stored transcript
+    ///
+    /// Removes one stored transcript with its translations (audited). Unknown or foreign-tenant ids are
+    /// `404`.
+    ///
+    /// `DELETE /v1/transcripts/{transcript_id}`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// Permissions: transcripts:write.
+    /// </summary>
+    public Task<DeleteTranscriptResponse> DeleteTranscriptAsync(string transcriptId, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync<DeleteTranscriptResponse>("/v1/transcripts/" + Uri.EscapeDataString(transcriptId), HttpMethod.Delete, q, null, options, cancellationToken);
     }
 
 }

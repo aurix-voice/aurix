@@ -636,8 +636,13 @@ client.OnChatInboxSynced += (delivered, truncated) => ui.InboxReady(); // after 
 ```
 
 Directed messages that waited for you arrive after connect as ordinary `OnChatMessage` with
-`Offline = true` (oldest first), then `OnChatInboxSynced`; every device replays what is still
-unread, so dedupe by `Id` and call `MarkDirectReadAsync` once the user has seen them.
+`Offline = true` (oldest first), then `OnChatInboxSynced(delivered, truncated, perDevice)`. Set
+`client.DeviceId` (a random installation id stored on first run, `[A-Za-z0-9._~-]{1,128}`) before
+connecting and the server keeps a per-device cursor: each directed message reaches this device
+exactly once (also across reconnects to other nodes), the SDK acknowledges automatically
+(`ChatAck`) after `OnChatMessage` returned, and `perDevice` is `true`. Without a `DeviceId` every
+device replays what is still unread, so dedupe by `Id` and call `MarkDirectReadAsync` once the
+user has seen them.
 
 The tasks complete with the server-stamped message (`Id`, `SentAt`) and otherwise throw
 `InvalidOperationException("<CODE>: <message>")`: `AUTH_DENIED` (not a member, or a block between

@@ -108,6 +108,7 @@ pub fn admin_api_permissions(role: AdminRole) -> serde_json::Value {
         "moderation:write",
         "chat:read",
         "chat:write",
+        "transcripts:read",
         "audit:read",
         "users:write",
     ];
@@ -120,6 +121,7 @@ pub fn admin_api_permissions(role: AdminRole) -> serde_json::Value {
         "tokens:issue",
         "turn:issue",
         "tts:write",
+        "transcripts:write",
         "users:export",
     ];
     if role >= AdminRole::Superadmin {
@@ -384,12 +386,15 @@ mod tests {
         assert!(moderator.has("channels:read"));
         assert!(moderator.has("moderation:write"));
         assert!(moderator.has("chat:read"));
+        assert!(moderator.has("transcripts:read"));
+        assert!(!moderator.has("transcripts:write"));
         assert!(!moderator.has("channels:write"));
         assert!(!moderator.has("webhooks:write"));
         assert!(!moderator.has("users:erase"));
         let admin = perms(AdminRole::Admin);
         assert!(admin.has("webhooks:write"));
         assert!(admin.has("keys:manage"));
+        assert!(admin.has("transcripts:write"));
         assert!(!admin.has("users:erase"));
         let superadmin = perms(AdminRole::Superadmin);
         assert!(superadmin.has("users:erase"));

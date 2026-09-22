@@ -184,6 +184,8 @@ public:
     bool get_quic_enabled() const;
     void set_tls_tunnel_enabled(bool enabled);
     bool get_tls_tunnel_enabled() const;
+    void set_device_id(const String& device_id);
+    String get_device_id() const;
     void set_auto_capture(bool enabled);
     bool get_auto_capture() const;
     void set_auto_playback(bool enabled);
@@ -344,6 +346,7 @@ private:
     AurixClientConfig config_{};
     bool dsp_bypass_ = false;
     bool visemes_enabled_ = false;
+    String device_id_;
     int64_t client_generation_ = 0;
     bool auto_capture_ = true;
     bool auto_playback_ = true;

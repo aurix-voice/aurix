@@ -14,8 +14,8 @@ use aurix_common::rate_limit::RateLimiter;
 use aurix_common::types::{AppId, ChannelId, SessionId, UserId};
 use aurix_common::usage::{UsageMeter, UsageMetric};
 use aurix_db::models::{
-    ChatConversation, ChatMessageRow, ChatReactionRow, ChatReadMarkerRow, ChatSearchScope,
-    MessageCursor, ReactionAdd,
+    ChatConversation, ChatDeviceCursorRow, ChatMessageRow, ChatReactionRow, ChatReadMarkerRow,
+    ChatSearchScope, MessageCursor, ReactionAdd,
 };
 use aurix_db::DbPool;
 use chrono::{SubsecRound, Utc};
@@ -255,6 +255,7 @@ pub struct ChatService {
     filters: Vec<Arc<dyn TextFilter>>,
     flood: RateLimiter,
     searches: RateLimiter,
+    acks: RateLimiter,
     typing: DashMap<(SessionId, ChannelId), Instant>,
     usage: Option<Arc<UsageMeter>>,
 }
@@ -300,6 +301,8 @@ impl ChatService {
         // `searches_per_minute` sustained (refill N/s, cost 60 per search) with the same burst.
         let per_minute = cfg.searches_per_minute.max(1);
         let searches = RateLimiter::new(per_minute, per_minute.saturating_mul(60));
+        // One ack per delivered directed message: a whole replay may be acknowledged at once.
+        let acks = RateLimiter::new(20, cfg.offline_max_messages.max(50));
         Self {
             cfg,
             pool,
@@ -307,6 +310,7 @@ impl ChatService {
             filters,
             flood,
             searches,
+            acks,
             typing: DashMap::new(),
             usage: None,
         }
@@ -1215,9 +1219,133 @@ impl ChatService {
         Ok((rows.into_iter().map(row_to_message).collect(), truncated))
     }
 
-    /// Hourly sweep of stored messages older than `chat.retention_days`.
+    /// What a connecting device gets replayed. Devices that identify themselves and have
+    /// acknowledged before (`ChatAck`) get everything directed to the user since their cursor
+    /// (`per_device`), whether or not another device has read it; a device without a cursor —
+    /// or an anonymous connection — gets the user-wide unread backlog (`offline_backlog`).
+    pub async fn device_backlog(
+        &self,
+        app_id: AppId,
+        user_id: UserId,
+        device_id: Option<&str>,
+    ) -> Result<InboxReplay> {
+        if !self.offline_delivery() {
+            return Ok(InboxReplay::default());
+        }
+        let cursor = match device_id {
+            Some(device) => {
+                aurix_db::queries::get_chat_device_cursor(&self.pool, app_id.0, user_id.0, device)
+                    .await
+                    .map_err(|e| AurixError::Database(format!("chat_device_cursors query: {e}")))?
+            }
+            None => None,
+        };
+        let Some(cursor) = cursor else {
+            let (messages, truncated) = self.offline_backlog(app_id, user_id).await?;
+            return Ok(InboxReplay {
+                messages,
+                truncated,
+                per_device: false,
+            });
+        };
+        let min_sent_at = (self.cfg.offline_max_age_hours > 0)
+            .then(|| Utc::now() - chrono::Duration::hours(self.cfg.offline_max_age_hours as i64));
+        let limit = i64::from(self.cfg.offline_max_messages);
+        let mut rows = aurix_db::queries::list_direct_messages_after(
+            &self.pool,
+            app_id.0,
+            user_id.0,
+            Some(MessageCursor {
+                sent_at: cursor.message_sent_at,
+                id: cursor.message_id,
+            }),
+            min_sent_at,
+            limit + 1,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("chat_messages device queue query: {e}")))?;
+        let truncated = rows.len() > limit as usize;
+        if truncated {
+            rows.remove(0);
+        }
+        Ok(InboxReplay {
+            messages: rows
+                .into_iter()
+                .map(|r| ChatMessage {
+                    offline: true,
+                    ..row_to_message(r)
+                })
+                .collect(),
+            truncated,
+            per_device: true,
+        })
+    }
+
+    /// `ChatAck`: `device_id` of `user_id` has stored the directed message `message_id`, which
+    /// must be addressed to that user. Only ever moves the device's cursor forward;
+    /// acknowledging something older is a no-op.
+    pub async fn ack(
+        &self,
+        app_id: AppId,
+        user_id: UserId,
+        session_id: SessionId,
+        device_id: &str,
+        message_id: uuid::Uuid,
+    ) -> Result<()> {
+        if !self.offline_delivery() {
+            return Err(AurixError::Validation(
+                "Offline chat delivery is not enabled (chat.persist / chat.offline_delivery)"
+                    .into(),
+            ));
+        }
+        validate_device_id(device_id)?;
+        if !self.acks.check(&session_id.to_string()) {
+            return Err(AurixError::RateLimitExceeded(
+                "Too many chat acknowledgements".into(),
+            ));
+        }
+        aurix_db::queries::advance_chat_device_cursor(
+            &self.pool, app_id.0, user_id.0, device_id, message_id,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("chat_device_cursors upsert: {e}")))?
+        .map(|_| ())
+        .ok_or_else(|| AurixError::NotFound("Message not found".into()))
+    }
+
+    /// Devices of `user_id` with a delivery cursor, most recently active first.
+    pub async fn list_devices(
+        &self,
+        app_id: AppId,
+        user_id: UserId,
+    ) -> Result<Vec<ChatDeviceCursor>> {
+        self.ensure_history()?;
+        let rows = aurix_db::queries::list_chat_device_cursors(&self.pool, app_id.0, user_id.0)
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_device_cursors query: {e}")))?;
+        Ok(rows.into_iter().map(row_to_device_cursor).collect())
+    }
+
+    /// Drops a device's cursor: on its next connect it is treated as new (read-marker backlog).
+    pub async fn forget_device(
+        &self,
+        app_id: AppId,
+        user_id: UserId,
+        device_id: &str,
+    ) -> Result<bool> {
+        self.ensure_history()?;
+        validate_device_id(device_id)?;
+        aurix_db::queries::delete_chat_device_cursor(&self.pool, app_id.0, user_id.0, device_id)
+            .await
+            .map_err(|e| AurixError::Database(format!("chat_device_cursors delete: {e}")))
+    }
+
+    /// Hourly sweep of stored messages older than `chat.retention_days` and of device cursors
+    /// idle for longer than `chat.device_cursor_max_age_days`.
     pub fn start_retention_sweep(self: &Arc<Self>) {
-        if !self.persists() || self.cfg.retention_days == 0 {
+        if !self.persists()
+            || (self.cfg.retention_days == 0 && self.cfg.device_cursor_max_age_days == 0)
+        {
             return;
         }
         let svc = self.clone();
@@ -1225,14 +1353,76 @@ impl ChatService {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                let cutoff = Utc::now() - chrono::Duration::days(svc.cfg.retention_days as i64);
-                match aurix_db::queries::delete_chat_messages_before(&svc.pool, cutoff).await {
-                    Ok(n) if n > 0 => info!("Deleted {n} expired chat messages"),
-                    Ok(_) => {}
-                    Err(e) => warn!("Chat retention sweep failed: {e}"),
+                if svc.cfg.retention_days > 0 {
+                    let cutoff = Utc::now() - chrono::Duration::days(svc.cfg.retention_days as i64);
+                    match aurix_db::queries::delete_chat_messages_before(&svc.pool, cutoff).await {
+                        Ok(n) if n > 0 => info!("Deleted {n} expired chat messages"),
+                        Ok(_) => {}
+                        Err(e) => warn!("Chat retention sweep failed: {e}"),
+                    }
+                }
+                if svc.cfg.device_cursor_max_age_days > 0 {
+                    let cutoff = Utc::now()
+                        - chrono::Duration::days(svc.cfg.device_cursor_max_age_days as i64);
+                    match aurix_db::queries::delete_chat_device_cursors_before(&svc.pool, cutoff)
+                        .await
+                    {
+                        Ok(n) if n > 0 => info!("Dropped {n} idle chat device cursors"),
+                        Ok(_) => {}
+                        Err(e) => warn!("Chat device cursor sweep failed: {e}"),
+                    }
                 }
             }
         });
+    }
+}
+
+/// Result of the on-connect replay of directed messages.
+#[derive(Debug, Default)]
+pub struct InboxReplay {
+    pub messages: Vec<ChatMessage>,
+    pub truncated: bool,
+    /// Came from the device's own `ChatAck` cursor rather than the user-wide read markers.
+    pub per_device: bool,
+}
+
+/// A device's standing in the directed-message queue (REST view of `chat_device_cursors`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatDeviceCursor {
+    pub device_id: String,
+    pub message_id: uuid::Uuid,
+    pub message_sent_at: chrono::DateTime<Utc>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+/// Longest accepted device id.
+pub const DEVICE_ID_MAX_LEN: usize = 128;
+
+/// Device ids are opaque client-chosen tokens: 1–128 characters of `A-Z a-z 0-9 . _ ~ -`, so
+/// they fit in a WebSocket sub-protocol name and in URL paths unescaped.
+pub fn validate_device_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= DEVICE_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(AurixError::Validation(
+            "Device id must be 1-128 characters of A-Z a-z 0-9 . _ ~ -".into(),
+        ))
+    }
+}
+
+fn row_to_device_cursor(r: ChatDeviceCursorRow) -> ChatDeviceCursor {
+    ChatDeviceCursor {
+        device_id: r.device_id,
+        message_id: r.message_id,
+        message_sent_at: r.message_sent_at,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
     }
 }
 

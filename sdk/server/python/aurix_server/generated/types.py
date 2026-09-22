@@ -625,6 +625,18 @@ ChannelUsageTotals2 = TypedDict(
     },
 )
 
+ChatDeviceCursor = TypedDict(
+    "ChatDeviceCursor",
+    {
+        "device_id": str,
+        "message_id": str,
+        "message_sent_at": str,
+        "created_at": str,
+        "updated_at": str,
+    },
+)
+"""A device's standing in the user's directed-message queue: everything at or before `(message_sent_at, message_id)` has reached the device (`ChatAck`). `updated_at` is the last acknowledgement."""
+
 ChatHistoryPage = TypedDict(
     "ChatHistoryPage",
     {
@@ -776,11 +788,26 @@ DeleteChannelResponse = TypedDict(
     },
 )
 
+DeleteChannelTranscriptsResponse = TypedDict(
+    "DeleteChannelTranscriptsResponse",
+    {
+        "deleted": int,  # Transcripts removed.
+    },
+)
+
 DeleteRecordingResponse = TypedDict(
     "DeleteRecordingResponse",
     {
         "deleted": NotRequired[bool],
         "id": NotRequired[str],
+    },
+)
+
+DeleteTranscriptResponse = TypedDict(
+    "DeleteTranscriptResponse",
+    {
+        "deleted": bool,
+        "id": str,
     },
 )
 
@@ -1027,6 +1054,13 @@ ListStreamsResponse = TypedDict(
     "ListStreamsResponse",
     {
         "streams": List["LiveStream"],
+    },
+)
+
+ListUserChatDevicesResponse = TypedDict(
+    "ListUserChatDevicesResponse",
+    {
+        "devices": List["ChatDeviceCursor"],
     },
 )
 
@@ -1689,6 +1723,43 @@ StartRecordingRequest = TypedDict(
     },
 )
 
+StoredTranscript = TypedDict(
+    "StoredTranscript",
+    {
+        "id": str,
+        "channel_id": str,
+        "user_id": str,  # Speaker.
+        "text": str,  # Recognised text in the speaker's language.
+        "language": NotRequired[str],  # Detected or configured source language; absent when the provider did not report one.
+        "started_at": str,  # When the speech segment began.
+        "duration_ms": int,  # Audio length of the segment.
+        "words": NotRequired[List["StoredTranscriptWord"]],  # Word timings relative to `started_at` (only with `stt.include_words`).
+        "translations": List["StoredTranslation"],
+        "node_id": NotRequired[str],  # Node that transcribed the segment.
+        "created_at": str,
+    },
+)
+"""One live transcript as it was delivered to the channel (same `id` as the `Transcript` event), with the translations made of it."""
+
+StoredTranscriptWord = TypedDict(
+    "StoredTranscriptWord",
+    {
+        "word": str,
+        "start_ms": int,
+        "end_ms": int,
+    },
+)
+
+StoredTranslation = TypedDict(
+    "StoredTranslation",
+    {
+        "language": str,  # Target language (BCP 47 / ISO 639-1).
+        "text": str,
+        "created_at": str,
+    },
+)
+"""A machine translation of the transcript into `language`, as it was pushed to listeners of that language."""
+
 SweepReport = TypedDict(
     "SweepReport",
     {
@@ -1736,6 +1807,16 @@ TokensRevoked = TypedDict(
         "updated": NotRequired[bool],
     },
 )
+
+TranscriptPage = TypedDict(
+    "TranscriptPage",
+    {
+        "transcripts": List["StoredTranscript"],
+        "next_before": NotRequired[str],  # Cursor of the oldest transcript on the page; pass as `before` to get older ones. Absent when the page reached the oldest transcript.
+        "next_after": NotRequired[str],  # Cursor of the newest transcript on the page; pass as `after` to get newer ones. Absent when the page reached the present.
+    },
+)
+"""One page of stored transcripts, newest first."""
 
 TranscriptSegment = TypedDict(
     "TranscriptSegment",
@@ -2007,6 +2088,8 @@ UserErasureCounts = TypedDict(
         "moderation_events": NotRequired[int],
         "bans": NotRequired[int],
         "users": NotRequired[int],
+        "transcripts": NotRequired[int],
+        "chat_device_cursors": NotRequired[int],  # Per-device chat delivery cursors removed with the user.
     },
 )
 
@@ -2024,7 +2107,9 @@ UserExport = TypedDict(
         "bans": NotRequired[List["Ban"]],
         "moderation": NotRequired["UserExportModeration"],
         "recordings": NotRequired[List["Recording"]],
+        "transcripts": NotRequired[List["StoredTranscript"]],  # Stored live transcripts the user spoke, with their translations (`stt.persist`).
         "truncated": NotRequired[List[str]],  # Collections cut at 10 000 rows.
+        "chat_devices": NotRequired[List["ChatDeviceCursor"]],  # The user's chat devices with their delivery cursors (`chat.persist`).
     },
 )
 
@@ -2383,3 +2468,24 @@ RemoveMessageReactionQuery = TypedDict(
     },
 )
 """Query parameters of `removeMessageReaction`."""
+
+ListChannelTranscriptsQuery = TypedDict(
+    "ListChannelTranscriptsQuery",
+    {
+        "before": NotRequired[str],
+        "after": NotRequired[str],
+        "limit": NotRequired[int],
+        "user_id": NotRequired[str],
+    },
+)
+"""Query parameters of `listChannelTranscripts`."""
+
+ListUserTranscriptsQuery = TypedDict(
+    "ListUserTranscriptsQuery",
+    {
+        "before": NotRequired[str],
+        "after": NotRequired[str],
+        "limit": NotRequired[int],
+    },
+)
+"""Query parameters of `listUserTranscripts`."""

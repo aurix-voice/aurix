@@ -272,6 +272,47 @@ impl MessageCursor {
     }
 }
 
+/// One stored live transcript (`stt.persist = true`), see migration 23.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct TranscriptRow {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub channel_id: Uuid,
+    pub user_id: Uuid,
+    pub text: String,
+    pub language: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub duration_ms: i32,
+    pub words: Option<serde_json::Value>,
+    pub node_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A machine translation of a stored transcript into `language`.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct TranscriptTranslationRow {
+    pub transcript_id: Uuid,
+    pub language: String,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Keyset position in a transcript list (`started_at`, then `id`), newest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptCursor {
+    pub started_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+impl TranscriptCursor {
+    pub fn of(t: &TranscriptRow) -> Self {
+        Self {
+            started_at: t.started_at,
+            id: t.id,
+        }
+    }
+}
+
 /// Which stored conversation a read marker or history page refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatConversation {
@@ -304,6 +345,18 @@ pub struct ChatReadMarkerRow {
     pub message_id: Uuid,
     pub message_sent_at: DateTime<Utc>,
     pub read_at: DateTime<Utc>,
+}
+
+/// How far one device of a user has acknowledged its directed-message queue.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ChatDeviceCursorRow {
+    pub app_id: Uuid,
+    pub user_id: Uuid,
+    pub device_id: String,
+    pub message_id: Uuid,
+    pub message_sent_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -457,9 +510,14 @@ pub struct UserErasureCounts {
     pub channel_memberships: u64,
     pub sessions: u64,
     pub chat_messages: u64,
+    /// Per-device chat delivery cursors (`chat_device_cursors`).
+    #[serde(default)]
+    pub chat_device_cursors: u64,
     pub user_blocks: u64,
     /// Rows the recording service had not already removed together with their files.
     pub recordings: u64,
+    /// Stored live transcripts the user spoke (`stt.persist`); their translations cascade.
+    pub transcripts: u64,
     pub moderation_events: u64,
     pub bans: u64,
     pub users: u64,

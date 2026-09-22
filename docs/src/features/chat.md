@@ -86,6 +86,7 @@ persist = true
 offline_delivery = true        # queue directed messages for users without a live session
 offline_max_messages = 200     # newest unread ones replayed on connect (older stay in history)
 offline_max_age_hours = 0      # 0 = anything within retention_days
+device_cursor_max_age_days = 90 # forget the delivery cursor of a device idle this long (0 = never)
 history_page_max = 200         # hard cap on a page
 unread_count_cap = 1000        # unread counters saturate here
 read_receipts = true           # channel members / the direct peer see each other's markers
@@ -125,14 +126,47 @@ messages are never queued: they are history plus live fan-out.
 When the recipient connects (fresh, resumed or migrated), right after `SessionInitAck`, the
 node replays the directed messages that are still **unread** — newer than the recipient's read
 marker for that sender — oldest first as ordinary `ChatMessageReceived {message}` with
-`offline: true`, then sends `ChatInboxSynced {delivered, truncated}`. At most
+`offline: true`, then sends `ChatInboxSynced {delivered, truncated, per_device}`. At most
 `offline_max_messages` (the newest) are replayed and nothing older than `offline_max_age_hours`;
-`truncated` says older unread messages exist and can be paged with `ChatHistory`. Replay is driven
-by read markers, not by a per-device queue: a second device, or a reconnect before the user read
-anything, sees the same messages again — dedupe by `message.id` and advance the marker with
-`ChatMarkRead` once the user has actually seen them. Aurix keeps one live session per user and
-node, so "another device" means another node in practice. Everything is in PostgreSQL, so the
-recipient may connect to any node.
+`truncated` says older unread messages exist and can be paged with `ChatHistory`. Everything is
+in PostgreSQL, so the recipient may connect to any node.
+
+Without a device id (below) replay is driven by the user's **read markers**: a second device, or a
+reconnect before the user read anything, sees the same messages again — dedupe by `message.id`
+and advance the marker with `ChatMarkRead` once the user has actually seen them
+(`per_device: false`).
+
+### Exactly once per device
+
+A client that identifies its installation gets its own **delivery queue**: every directed message
+reaches that device exactly once, whatever the user does on other devices, and a reconnect (to any
+node) resumes where the device left off. The device id is an opaque string of 1–128 characters
+from `A-Z a-z 0-9 . _ ~ -` chosen by the client (a random id generated on first run and stored
+locally; never the user id) and sent with the WebSocket handshake — header `X-Aurix-Device: <id>`,
+or for browsers the sub-protocol `device.<id>`, or the query `?device=<id>` as a fallback; a
+malformed id is refused before the upgrade (`400`). The id belongs to the connection, so a
+[resumed](../api/websocket.md#resume) or migrated session keeps it.
+
+The device confirms delivery with `ChatAck { message_id }`; the SDKs send it automatically once the
+message has been handed to your code. The server looks the message up — it must be a stored
+directed message **addressed to this user** of this application, otherwise `NOT_FOUND`; a
+client-supplied timestamp is never trusted — and stores the newest acknowledged `(sent_at, id)` as
+the device's cursor in `chat_device_cursors` (keyed by application, user and device). The cursor
+only moves forward: acknowledging an older message is idempotent, and a tombstone can still be
+acknowledged. On connect a device **with** a cursor is replayed exactly the directed messages newer
+than it (`per_device: true`; `offline_max_messages` / `offline_max_age_hours` still cap the
+replay and `truncated` is set beyond them); the SDKs then acknowledge the newest replayed message
+once, and every live directed message individually. A device **without** a cursor — first
+connect, a forgotten device, or one idle longer than `chat.device_cursor_max_age_days` (90; `0` =
+keep forever) — is new and gets the user-wide unread backlog described above once, after which
+its own cursor exists. Cursors are private to the device: read markers, channel messages and
+messages to other users never move them, and they are never shared with peers.
+
+Operators see and manage them over REST (`chat:read` / `chat:write`): `GET
+/v1/users/{user_id}/chat-devices` lists a user's devices (most recently active first, with the
+cursor), `DELETE /v1/users/{user_id}/chat-devices/{device_id}` forgets one (a lost or reinstalled
+device starts over with the unread backlog; `404` for an unknown device). Cursors are part of the
+user data export (`chat_devices`) and are erased with the user.
 
 ### Read markers and unread counts
 
@@ -273,7 +307,8 @@ searches_per_minute = 30       # per session
 | edit / delete | `editMessage(messageId, text, {metadata})`, `deleteMessage(messageId)` → the updated `ChatMessage` | `EditMessageAsync`, `DeleteMessageAsync` → `ChatMessage` | `aurix_client_edit_chat`, `aurix_client_delete_chat` → `AURIX_EVENT_CHAT_MESSAGE_UPDATED` with the request id; Unreal `EditChat` / `DeleteChat` → `OnChatMessageUpdated`; Godot `edit_chat` / `delete_chat` → `chat_message_updated` |
 | reactions | `react(messageId, reaction, add)` | `ReactAsync(messageId, reaction, add)` | `aurix_client_react_chat`; Unreal `ReactChat`; Godot `react_chat` |
 | search | `search({channelId} \| {userId} \| {}, query, {fromUserId, before, limit})` → `{messages, nextBefore?}` | `SearchAsync(channelId, query, …)`, `SearchDirectAsync(userId?, query, …)` → `ChatHistoryPage` | `aurix_client_search_chat` → `AURIX_EVENT_CHAT_SEARCH_RESULT` (same accessors as history); Unreal `SearchChannelChat` / `SearchDirectChat` → `OnChatSearchResult`; Godot `search_channel_chat` / `search_direct_chat` → `chat_search_result` |
-| events | `chatMessage` (`message.offline`), `chatMessageUpdated` (`editedAt` / `deletedAt`, `reactions`), `chatReactionChanged`, `chatReadMarker`, `chatInboxSynced`, `participantTyping` | `OnChatMessage` (`Offline`), `OnChatMessageUpdated`, `OnChatReactionChanged`, `OnChatReadMarker`, `OnChatInboxSynced`, `OnParticipantTyping` | `AURIX_EVENT_CHAT_MESSAGE` (`offline`), `AURIX_EVENT_CHAT_MESSAGE_UPDATED`, `AURIX_EVENT_CHAT_REACTION_CHANGED` (`aurix_event_reaction`), `AURIX_EVENT_CHAT_READ_MARKER`, `AURIX_EVENT_CHAT_INBOX_SYNCED`, `AURIX_EVENT_PARTICIPANT_TYPING`; Unreal `OnChatMessage`, `OnChatMessageUpdated`, `OnChatReactionChanged`, `OnChatReadMarker`, `OnChatInboxSynced`; Godot signals of the same names in `snake_case` |
+| events | `chatMessage` (`message.offline`), `chatMessageUpdated` (`editedAt` / `deletedAt`, `reactions`), `chatReactionChanged`, `chatReadMarker`, `chatInboxSynced(delivered, truncated, perDevice)`, `participantTyping` | `OnChatMessage` (`Offline`), `OnChatMessageUpdated`, `OnChatReactionChanged`, `OnChatReadMarker`, `OnChatInboxSynced(delivered, truncated, perDevice)`, `OnParticipantTyping` | `AURIX_EVENT_CHAT_MESSAGE` (`offline`), `AURIX_EVENT_CHAT_MESSAGE_UPDATED`, `AURIX_EVENT_CHAT_REACTION_CHANGED` (`aurix_event_reaction`), `AURIX_EVENT_CHAT_READ_MARKER`, `AURIX_EVENT_CHAT_INBOX_SYNCED` (`per_device`), `AURIX_EVENT_PARTICIPANT_TYPING`; Unreal `OnChatMessage`, `OnChatMessageUpdated`, `OnChatReactionChanged`, `OnChatReadMarker`, `OnChatInboxSynced`; Godot signals of the same names in `snake_case` |
+| device id (exactly-once queue) | `AurixClientOptions.deviceId` | `AurixVoiceClient.DeviceId` / `WebGLClientOptions.DeviceId` | `AurixClientConfig.device_id`; Unreal `FAurixClientConfig.DeviceId`; Godot `device_id` — `ChatAck` is automatic everywhere |
 
 Exact names are in the SDK chapters; the quick-start sample scenes for [Web](../sdk/web.md) and
 [Unity](../sdk/unity.md) include a chat panel.

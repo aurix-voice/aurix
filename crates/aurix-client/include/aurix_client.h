@@ -907,6 +907,13 @@ typedef struct AurixClientConfig {
    * ignores this switch.
    */
   bool tls_tunnel;
+  /**
+   * Stable id of this installation (`[A-Za-z0-9._~-]{1,128}`, e.g. a UUID persisted on
+   * first run; NULL = none, borrowed; copied). Keys the server's per-device cursor of
+   * directed chat messages: each reaches this device exactly once and is acknowledged
+   * automatically. Without it the user-wide read-marker backlog is replayed.
+   */
+  const char *device_id;
 } AurixClientConfig;
 
 /**
@@ -1787,7 +1794,8 @@ bool aurix_event_flag(const struct AurixEvent *event);
 /**
  * Secondary boolean: `server_muted` for `ParticipantMuteChanged`, `live` for `Recording`,
  * `safety_voice` (content-safety monitoring, disclose it) for `ChannelJoined`, `migrated`
- * for `Recovered`.
+ * for `Recovered`, `per_device` (replay followed this device's own cursor) for
+ * `ChatInboxSynced`.
  */
 bool aurix_event_flag2(const struct AurixEvent *event);
 

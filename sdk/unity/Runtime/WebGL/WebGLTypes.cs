@@ -62,6 +62,12 @@ namespace Aurix.WebGL
         /// <summary>Serve the E2EE transform worker from this URL instead of a <c>blob:</c> URL (CSP without <c>worker-src blob:</c>).</summary>
         public string E2eeWorkerUrl;
         /// <summary>
+        /// Stable id of this installation (<c>[A-Za-z0-9._~-]{1,128}</c>, e.g. a GUID kept in <c>PlayerPrefs</c>). The server
+        /// keeps a per-device cursor of directed chat messages: each reaches this device exactly once and is acknowledged
+        /// automatically. Null: the user-wide read-marker backlog is replayed on every connect.
+        /// </summary>
+        public string DeviceId;
+        /// <summary>
         /// Push <see cref="AurixWebGLVoiceClient.OnParticipantVisemes"/> / <see cref="AurixWebGLVoiceClient.OnLocalVisemes"/>
         /// (50 events/s per analysed voice) while lip-sync is on. Off by default — poll
         /// <see cref="AurixWebGLVoiceClient.GetParticipantVisemes"/> once per rendered frame instead.
@@ -128,6 +134,11 @@ namespace Aurix.WebGL
                 o["e2ee"] = e2ee;
             }
             if (!string.IsNullOrEmpty(IceServersJson)) o["iceServers"] = Protocol.MiniJson.Parse(IceServersJson);
+            if (!string.IsNullOrEmpty(DeviceId))
+            {
+                if (!Protocol.ControlMessage.IsValidDeviceId(DeviceId)) throw new ArgumentException("DeviceId must be 1-128 characters of A-Z a-z 0-9 . _ ~ -", nameof(DeviceId));
+                o["deviceId"] = DeviceId;
+            }
             if (!string.IsNullOrEmpty(InputDeviceId)) o["inputDeviceId"] = InputDeviceId;
             if (Reconnect != null)
                 o["reconnect"] = new Dictionary<string, object>

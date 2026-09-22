@@ -1605,6 +1605,37 @@ export class AurixClient extends AurixHttp {
   }
 
   /**
+   * Chat devices of a user
+   *
+   * The user's devices that acknowledged directed messages (`ChatAck` over a connection identified
+   * with `X-Aurix-Device`), most recently active first, each with its delivery cursor. Directed
+   * messages newer than a device's cursor are replayed to that device (and only that device) on its
+   * next connect, on any node. Requires `chat.persist = true` (otherwise `404`).
+   *
+   * `GET /v1/users/{user_id}/chat-devices`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:read.
+   */
+  listUserChatDevices(userId: string, options?: RequestOptions): Promise<T.ListUserChatDevicesResponse> {
+    return this.json<T.ListUserChatDevicesResponse>("GET", `/v1/users/${encodeURIComponent(userId)}/chat-devices`, { ...options });
+  }
+
+  /**
+   * Forget a chat device
+   *
+   * Drops the device's delivery cursor (a lost or reinstalled device). On its next connect the
+   * device is new again and receives the user-wide unread backlog instead of its own queue. Cursors
+   * idle for `chat.device_cursor_max_age_days` are dropped automatically.
+   *
+   * `DELETE /v1/users/{user_id}/chat-devices/{device_id}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: chat:write.
+   */
+  deleteUserChatDevice(userId: string, deviceId: string, options?: RequestOptions): Promise<void> {
+    return this.json<void>("DELETE", `/v1/users/${encodeURIComponent(userId)}/chat-devices/${encodeURIComponent(deviceId)}`, { ...options });
+  }
+
+  /**
    * Search channel messages
    *
    * Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
@@ -1707,6 +1738,70 @@ export class AurixClient extends AurixHttp {
    */
   removeMessageReaction(messageId: string, reaction: string, query: T.RemoveMessageReactionQuery, options?: RequestOptions): Promise<T.ReactionChange> {
     return this.json<T.ReactionChange>("DELETE", `/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reaction)}`, { query, ...options });
+  }
+
+  /**
+   * Stored transcripts of a channel
+   *
+   * Requires `stt.persist = true` on the deployment (otherwise `404`). Every transcript the node
+   * delivered live (`Transcript` event / `channel.transcript`) is stored with the translations the
+   * fleet made of it; end-to-end encrypted channels are never transcribed and therefore never
+   * stored. Pages are newest first; follow `next_before` to older transcripts and `next_after` to
+   * newer ones (absent when there is nothing more in that direction). Rows expire after
+   * `stt.retention_days` and are removed with the user.
+   *
+   * `GET /v1/channels/{channel_id}/transcripts`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: transcripts:read.
+   */
+  listChannelTranscripts(channelId: string, query?: T.ListChannelTranscriptsQuery, options?: RequestOptions): Promise<T.TranscriptPage> {
+    return this.json<T.TranscriptPage>("GET", `/v1/channels/${encodeURIComponent(channelId)}/transcripts`, { query, ...options });
+  }
+
+  /**
+   * Delete every stored transcript of a channel
+   *
+   * Removes the channel's stored transcripts and their translations (audited). Requires `stt.persist
+   * = true` (otherwise `404`).
+   *
+   * `DELETE /v1/channels/{channel_id}/transcripts`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: transcripts:write.
+   */
+  deleteChannelTranscripts(channelId: string, options?: RequestOptions): Promise<T.DeleteChannelTranscriptsResponse> {
+    return this.json<T.DeleteChannelTranscriptsResponse>("DELETE", `/v1/channels/${encodeURIComponent(channelId)}/transcripts`, { ...options });
+  }
+
+  /**
+   * Stored transcripts of a user
+   *
+   * Everything the user said across the application's channels. Requires `stt.persist = true` on the
+   * deployment (otherwise `404`). Every transcript the node delivered live (`Transcript` event /
+   * `channel.transcript`) is stored with the translations the fleet made of it; end-to-end encrypted
+   * channels are never transcribed and therefore never stored. Pages are newest first; follow
+   * `next_before` to older transcripts and `next_after` to newer ones (absent when there is nothing
+   * more in that direction). Rows expire after `stt.retention_days` and are removed with the user.
+   *
+   * `GET /v1/users/{user_id}/transcripts`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: transcripts:read.
+   */
+  listUserTranscripts(userId: string, query?: T.ListUserTranscriptsQuery, options?: RequestOptions): Promise<T.TranscriptPage> {
+    return this.json<T.TranscriptPage>("GET", `/v1/users/${encodeURIComponent(userId)}/transcripts`, { query, ...options });
+  }
+
+  /**
+   * Delete a stored transcript
+   *
+   * Removes one stored transcript with its translations (audited). Unknown or foreign-tenant ids are
+   * `404`.
+   *
+   * `DELETE /v1/transcripts/{transcript_id}`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   * Permissions: transcripts:write.
+   */
+  deleteTranscript(transcriptId: string, options?: RequestOptions): Promise<T.DeleteTranscriptResponse> {
+    return this.json<T.DeleteTranscriptResponse>("DELETE", `/v1/transcripts/${encodeURIComponent(transcriptId)}`, { ...options });
   }
 
 }

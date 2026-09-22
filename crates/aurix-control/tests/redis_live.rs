@@ -289,6 +289,7 @@ fn mirror(session_id: SessionId) -> SessionMirror {
         resume_hash: SessionMirror::resume_hash_hex(&[7u8; 32]),
         ip: "127.0.0.1".into(),
         user_agent: None,
+        device_id: None,
         channels: Vec::new(),
         prefs: MirroredPrefs::default(),
         updated_at: 0,

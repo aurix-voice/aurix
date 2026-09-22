@@ -74,6 +74,8 @@ const BEARER_SUBPROTOCOL_PREFIX: &str = "bearer.";
 /// Sub-protocol prefix carrying `<session_id>.<resume_token>` for session resume.
 const RESUME_SUBPROTOCOL_PREFIX: &str = "resume.";
 const RESUME_HEADER: &str = "x-aurix-resume";
+const DEVICE_SUBPROTOCOL_PREFIX: &str = "device.";
+const DEVICE_HEADER: &str = "x-aurix-device";
 const AURIX_SUBPROTOCOL: &str = "aurix";
 /// Queued on a connection's outbound channel to make its send loop close the socket.
 const CLOSE_SENTINEL: &str = "";
@@ -102,6 +104,8 @@ pub struct ConnectionInfo {
     pub priority_grants: Vec<ChannelId>,
     pub ip: String,
     pub user_agent: Option<String>,
+    /// Client-chosen device id from the handshake; keys the per-device chat delivery cursor.
+    pub device_id: Option<String>,
     resume_token_hash: [u8; 32],
     /// Set while the socket is gone and the session waits for the client to resume.
     detached_since: Option<Instant>,
@@ -876,6 +880,7 @@ impl WsState {
             resume_hash: SessionMirror::resume_hash_hex(&conn.resume_token_hash),
             ip: conn.ip.clone(),
             user_agent: conn.user_agent.clone(),
+            device_id: conn.device_id.clone(),
             channels,
             prefs: mirrored,
             updated_at: chrono::Utc::now().timestamp_millis(),
@@ -2061,6 +2066,14 @@ impl WsState {
                     payload.language = Some(target.clone());
                     payload.words = Vec::new();
                     speak = true;
+                    if self.control.transcripts.enabled() {
+                        let store = self.control.transcripts.clone();
+                        let (id, target, text) =
+                            (transcript.id, target.clone(), payload.text.clone());
+                        tokio::spawn(async move {
+                            store.store_translation(app_id, id, &target, &text).await;
+                        });
+                    }
                 }
             }
             let Ok(json) = serde_json::to_string(&ControlMessage::Transcript {
@@ -2415,12 +2428,16 @@ pub struct WsQuery {
     pub token: Option<String>,
     /// `<session_id>.<resume_token>` fallback for clients that cannot set headers/sub-protocols.
     pub resume: Option<String>,
+    /// Device id fallback (see `X-Aurix-Device`) for clients that cannot set headers/sub-protocols.
+    pub device: Option<String>,
 }
 
 struct WsCredentials {
     token: String,
     echo_subprotocol: bool,
     resume: Option<(SessionId, String)>,
+    /// Unvalidated device id; `ws_handler` rejects malformed ones.
+    device: Option<String>,
 }
 
 fn parse_resume(value: &str) -> Option<(SessionId, String)> {
@@ -2442,6 +2459,10 @@ fn extract_ws_credentials(headers: &HeaderMap, query: &WsQuery) -> Option<WsCred
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
+    let mut device = headers
+        .get(DEVICE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let mut echo_subprotocol = false;
     if let Some(protocols) = headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
@@ -2456,6 +2477,8 @@ fn extract_ws_credentials(headers: &HeaderMap, query: &WsQuery) -> Option<WsCred
                 if resume.is_none() {
                     resume = parse_resume(r);
                 }
+            } else if let Some(d) = p.strip_prefix(DEVICE_SUBPROTOCOL_PREFIX) {
+                device.get_or_insert_with(|| d.to_string());
             }
         }
     }
@@ -2463,10 +2486,12 @@ fn extract_ws_credentials(headers: &HeaderMap, query: &WsQuery) -> Option<WsCred
     if resume.is_none() {
         resume = query.resume.as_deref().and_then(parse_resume);
     }
+    let device = device.or_else(|| query.device.clone());
     Some(WsCredentials {
         token,
         echo_subprotocol,
         resume,
+        device,
     })
 }
 
@@ -2495,6 +2520,13 @@ pub async fn ws_handler(
     let Some(creds) = extract_ws_credentials(&headers, &query) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    if creds
+        .device
+        .as_deref()
+        .is_some_and(|d| aurix_control::validate_device_id(d).is_err())
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let ip = peer_ip(&state, &headers, peer.map(|p| p.0));
     let (validated, one_time) = match state
         .control
@@ -2570,7 +2602,16 @@ pub async fn ws_handler(
         ws
     };
     ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, state, validated, ip, user_agent, resume, takeover)
+        handle_ws_connection(
+            socket,
+            state,
+            validated,
+            ip,
+            user_agent,
+            creds.device,
+            resume,
+            takeover,
+        )
     })
 }
 
@@ -2787,6 +2828,7 @@ async fn adopt_mirrored_session(
             priority_grants: Vec::new(),
             ip: ip.to_string(),
             user_agent: user_agent.map(str::to_string),
+            device_id: mirror.device_id.clone(),
             resume_token_hash: resume_hash,
             detached_since: None,
             generation: 0,
@@ -3108,6 +3150,7 @@ async fn open_session(
             priority_grants: Vec::new(),
             ip: ip.to_string(),
             user_agent: user_agent.map(str::to_string),
+            device_id: None,
             resume_token_hash: resume_hash,
             detached_since: None,
             generation: 0,
@@ -3261,12 +3304,14 @@ fn channel_join_ack(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_connection(
     socket: WebSocket,
     state: WsState,
     token: ValidatedToken,
     ip: IpAddr,
     user_agent: Option<String>,
+    device: Option<String>,
     resume: Option<SessionId>,
     takeover: Option<TakeoverCandidate>,
 ) {
@@ -3432,7 +3477,24 @@ async fn handle_ws_connection(
             }
         }
     }
-    replay_offline_inbox(&state, &tx, session_id, token.app_id, token.user_id).await;
+    let device = match state.connections.get_mut(&session_id) {
+        Some(mut conn) => {
+            if device.is_some() {
+                conn.device_id = device;
+            }
+            conn.device_id.clone()
+        }
+        None => device,
+    };
+    replay_offline_inbox(
+        &state,
+        &tx,
+        session_id,
+        token.app_id,
+        token.user_id,
+        device.as_deref(),
+    )
+    .await;
     aurix_metrics::WS_CONNECTIONS.inc();
     info!(
         "WS session {} {} for user {} ({})",
@@ -3974,28 +4036,35 @@ fn visible_participants(state: &WsState, channel_id: &ChannelId, observer: &User
         .unwrap_or_default()
 }
 
-/// Directed messages that arrived while the user was offline: replayed oldest-first into
-/// this connection (plain `ChatMessageReceived` with `offline: true`), followed by
-/// `ChatInboxSynced`. Read markers decide what is "new", so every device replays until the
-/// user reads (`ChatMarkRead`); duplicate `id`s are the client's dedupe key.
+/// Directed messages this connection has not seen yet: replayed oldest-first (plain
+/// `ChatMessageReceived` with `offline: true`), followed by `ChatInboxSynced`. A device with
+/// a `ChatAck` cursor gets exactly what is newer than the cursor; a connection without one
+/// gets the user-wide unread backlog, where read markers decide what is "new" and duplicate
+/// `id`s are the client's dedupe key.
 async fn replay_offline_inbox(
     state: &WsState,
     tx: &mpsc::Sender<String>,
     session_id: SessionId,
     app_id: AppId,
     user_id: UserId,
+    device_id: Option<&str>,
 ) {
     let chat = &state.control.chat;
     if !chat.offline_delivery() {
         return;
     }
-    let (messages, truncated) = match chat.offline_backlog(app_id, user_id).await {
+    let replay = match chat.device_backlog(app_id, user_id, device_id).await {
         Ok(b) => b,
         Err(e) => {
             warn!("offline chat backlog for {user_id}: {e}");
             return;
         }
     };
+    let aurix_control::InboxReplay {
+        messages,
+        truncated,
+        per_device,
+    } = replay;
     let mut delivered = 0u32;
     for message in messages {
         let blocked = state
@@ -4014,6 +4083,7 @@ async fn replay_offline_inbox(
         &ControlMessage::ChatInboxSynced {
             delivered,
             truncated,
+            per_device,
         },
     )
     .await;
@@ -5091,6 +5161,28 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::ChatAck { message_id } => {
+            let device = state
+                .connections
+                .get(&session_id)
+                .and_then(|c| c.device_id.clone());
+            let result = match device {
+                Some(device) => {
+                    state
+                        .control
+                        .chat
+                        .ack(token.app_id, token.user_id, session_id, &device, message_id)
+                        .await
+                }
+                None => Err(AurixError::Validation(
+                    "ChatAck needs a device id on the connection (X-Aurix-Device)".into(),
+                )),
+            };
+            if let Err(e) = result {
+                send_error(tx, e.error_code(), &e.public_message()).await;
+            }
+        }
+
         ControlMessage::ChatMarkRead {
             channel_id,
             user_id,
@@ -5577,6 +5669,7 @@ mod tests {
             priority_grants: vec![],
             ip: "127.0.0.1".into(),
             user_agent: None,
+            device_id: None,
             resume_token_hash: token.hash,
             detached_since: Some(Instant::now()),
             generation: 1,
@@ -5679,11 +5772,13 @@ mod tests {
         let query = WsQuery {
             token: Some("JWT2".into()),
             resume: Some(format!("{sid}.query")),
+            device: Some("query-dev".into()),
         };
         let c = extract_ws_credentials(&headers, &query).unwrap();
         assert_eq!(c.token, "JWT1");
         assert!(c.echo_subprotocol);
         assert_eq!(c.resume.as_ref().unwrap().1, "sub");
+        assert_eq!(c.device.as_deref(), Some("query-dev"));
 
         headers.insert(RESUME_HEADER, format!("{sid}.header").parse().unwrap());
         let c = extract_ws_credentials(&headers, &query).unwrap();
@@ -5695,5 +5790,32 @@ mod tests {
         assert_eq!(c.resume.as_ref().unwrap().1, "query");
 
         assert!(extract_ws_credentials(&HeaderMap::new(), &WsQuery::default()).is_none());
+    }
+
+    #[test]
+    fn ws_device_prefers_header_then_subprotocol_then_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            "aurix, bearer.JWT, device.sub-dev".parse().unwrap(),
+        );
+        let query = WsQuery {
+            token: None,
+            resume: None,
+            device: Some("query-dev".into()),
+        };
+        let c = extract_ws_credentials(&headers, &query).unwrap();
+        assert_eq!(c.device.as_deref(), Some("sub-dev"));
+
+        headers.insert(DEVICE_HEADER, "header-dev".parse().unwrap());
+        let c = extract_ws_credentials(&headers, &query).unwrap();
+        assert_eq!(c.device.as_deref(), Some("header-dev"));
+
+        let query = WsQuery {
+            token: Some("JWT".into()),
+            ..WsQuery::default()
+        };
+        let c = extract_ws_credentials(&HeaderMap::new(), &query).unwrap();
+        assert_eq!(c.device, None);
     }
 }

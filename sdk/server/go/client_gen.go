@@ -2246,6 +2246,39 @@ func (c *Client) ListChannelReadMarkers(ctx context.Context, channelID string, o
 	return &out, nil
 }
 
+// ListUserChatDevices — Chat devices of a user
+//
+// The user's devices that acknowledged directed messages (`ChatAck` over a connection identified
+// with `X-Aurix-Device`), most recently active first, each with its delivery cursor. Directed
+// messages newer than a device's cursor are replayed to that device (and only that device) on its
+// next connect, on any node. Requires `chat.persist = true` (otherwise `404`).
+//
+// `GET /v1/users/{user_id}/chat-devices`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:read.
+func (c *Client) ListUserChatDevices(ctx context.Context, userID string, opts ...RequestOption) (*ListUserChatDevicesResponse, error) {
+	var q url.Values
+	var out ListUserChatDevicesResponse
+	if err := c.doJSON(ctx, "GET", "/v1/users/"+url.PathEscape(userID)+"/chat-devices", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteUserChatDevice — Forget a chat device
+//
+// Drops the device's delivery cursor (a lost or reinstalled device). On its next connect the
+// device is new again and receives the user-wide unread backlog instead of its own queue. Cursors
+// idle for `chat.device_cursor_max_age_days` are dropped automatically.
+//
+// `DELETE /v1/users/{user_id}/chat-devices/{device_id}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: chat:write.
+func (c *Client) DeleteUserChatDevice(ctx context.Context, userID string, deviceID string, opts ...RequestOption) error {
+	var q url.Values
+	return c.doJSON(ctx, "DELETE", "/v1/users/"+url.PathEscape(userID)+"/chat-devices/"+url.PathEscape(deviceID), q, nil, nil, opts)
+}
+
 // SearchChannelMessages — Search channel messages
 //
 // Full-text search over stored messages (`chat.persist = true`, `chat.search = true`; otherwise
@@ -2403,6 +2436,107 @@ func (c *Client) RemoveMessageReaction(ctx context.Context, messageID string, re
 	}
 	var out ReactionChange
 	if err := c.doJSON(ctx, "DELETE", "/v1/messages/"+url.PathEscape(messageID)+"/reactions/"+url.PathEscape(reaction), q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListChannelTranscripts — Stored transcripts of a channel
+//
+// Requires `stt.persist = true` on the deployment (otherwise `404`). Every transcript the node
+// delivered live (`Transcript` event / `channel.transcript`) is stored with the translations the
+// fleet made of it; end-to-end encrypted channels are never transcribed and therefore never
+// stored. Pages are newest first; follow `next_before` to older transcripts and `next_after` to
+// newer ones (absent when there is nothing more in that direction). Rows expire after
+// `stt.retention_days` and are removed with the user.
+//
+// `GET /v1/channels/{channel_id}/transcripts`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: transcripts:read.
+func (c *Client) ListChannelTranscripts(ctx context.Context, channelID string, query *ListChannelTranscriptsQuery, opts ...RequestOption) (*TranscriptPage, error) {
+	q := url.Values{}
+	if query != nil {
+		if query.Before != nil {
+			q.Set("before", *query.Before)
+		}
+		if query.After != nil {
+			q.Set("after", *query.After)
+		}
+		if query.Limit != nil {
+			q.Set("limit", strconv.FormatInt(*query.Limit, 10))
+		}
+		if query.UserID != nil {
+			q.Set("user_id", *query.UserID)
+		}
+	}
+	var out TranscriptPage
+	if err := c.doJSON(ctx, "GET", "/v1/channels/"+url.PathEscape(channelID)+"/transcripts", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteChannelTranscripts — Delete every stored transcript of a channel
+//
+// Removes the channel's stored transcripts and their translations (audited). Requires `stt.persist
+// = true` (otherwise `404`).
+//
+// `DELETE /v1/channels/{channel_id}/transcripts`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: transcripts:write.
+func (c *Client) DeleteChannelTranscripts(ctx context.Context, channelID string, opts ...RequestOption) (*DeleteChannelTranscriptsResponse, error) {
+	var q url.Values
+	var out DeleteChannelTranscriptsResponse
+	if err := c.doJSON(ctx, "DELETE", "/v1/channels/"+url.PathEscape(channelID)+"/transcripts", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListUserTranscripts — Stored transcripts of a user
+//
+// Everything the user said across the application's channels. Requires `stt.persist = true` on the
+// deployment (otherwise `404`). Every transcript the node delivered live (`Transcript` event /
+// `channel.transcript`) is stored with the translations the fleet made of it; end-to-end encrypted
+// channels are never transcribed and therefore never stored. Pages are newest first; follow
+// `next_before` to older transcripts and `next_after` to newer ones (absent when there is nothing
+// more in that direction). Rows expire after `stt.retention_days` and are removed with the user.
+//
+// `GET /v1/users/{user_id}/transcripts`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: transcripts:read.
+func (c *Client) ListUserTranscripts(ctx context.Context, userID string, query *ListUserTranscriptsQuery, opts ...RequestOption) (*TranscriptPage, error) {
+	q := url.Values{}
+	if query != nil {
+		if query.Before != nil {
+			q.Set("before", *query.Before)
+		}
+		if query.After != nil {
+			q.Set("after", *query.After)
+		}
+		if query.Limit != nil {
+			q.Set("limit", strconv.FormatInt(*query.Limit, 10))
+		}
+	}
+	var out TranscriptPage
+	if err := c.doJSON(ctx, "GET", "/v1/users/"+url.PathEscape(userID)+"/transcripts", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteTranscript — Delete a stored transcript
+//
+// Removes one stored transcript with its translations (audited). Unknown or foreign-tenant ids are
+// `404`.
+//
+// `DELETE /v1/transcripts/{transcript_id}`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+// Permissions: transcripts:write.
+func (c *Client) DeleteTranscript(ctx context.Context, transcriptID string, opts ...RequestOption) (*DeleteTranscriptResponse, error) {
+	var q url.Values
+	var out DeleteTranscriptResponse
+	if err := c.doJSON(ctx, "DELETE", "/v1/transcripts/"+url.PathEscape(transcriptID), q, nil, &out, opts); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -1,6 +1,8 @@
 import {
   AURIX_SUBPROTOCOL,
   BEARER_SUBPROTOCOL_PREFIX,
+  DEVICE_SUBPROTOCOL_PREFIX,
+  isValidDeviceId,
   MAX_PARTICIPANT_VOLUME,
   RESUME_SUBPROTOCOL_PREFIX,
   parseServerMessage,
@@ -196,6 +198,14 @@ export interface AurixClientOptions {
    * `auth.require_action_tokens`. Without it, `token` itself authorises the join.
    */
   joinToken?: (channelId: string) => Promise<string>;
+  /**
+   * Stable id of this installation (`[A-Za-z0-9._~-]{1,128}`, e.g. a UUID kept in
+   * `localStorage`). Sent on connect so the server keeps a per-device cursor of directed chat
+   * messages: each is replayed to this device exactly once and acknowledged automatically
+   * (`ChatAck`) once delivered to `chatMessage`. Unset: the user-wide read-marker backlog is
+   * replayed on every connect instead.
+   */
+  deviceId?: string;
   /**
    * Fetch TURN credentials from `GET /v1/me/turn-credentials` and add them to the ICE
    * configuration. Defaults to `true`; failures are non-fatal (host/STUN only).
@@ -924,8 +934,10 @@ export interface AurixEvents {
    * Once per connection, after the directed messages that arrived while this user was
    * offline were replayed as `chatMessage` events with `offline: true`. `truncated`: older
    * unread ones exist beyond the server's replay limit — page them with `history`.
+   * `perDevice`: the replay followed this device's own acknowledged cursor
+   * (`AurixClientOptions.deviceId`) rather than the user-wide read markers.
    */
-  chatInboxSynced: (delivered: number, truncated: boolean) => void;
+  chatInboxSynced: (delivered: number, truncated: boolean, perDevice: boolean) => void;
   /** Another member of `channelId` started/stopped typing (never this client's own state). */
   participantTyping: (channelId: string, userId: string, typing: boolean) => void;
   /**
@@ -1244,6 +1256,9 @@ export class AurixClient {
   private closedByUser = false;
   private readonly reconnectPolicy: ReconnectPolicy;
   private resumeToken: string | undefined;
+  /** Automatic `ChatAck`: the on-connect replay is acknowledged once (its newest message). */
+  private inboxSynced = false;
+  private inboxNewest: { sentAt: string; id: string } | undefined;
   private resumeGraceMs = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
@@ -1294,6 +1309,9 @@ export class AurixClient {
     this.reconnectPolicy = { ...DEFAULT_RECONNECT, ...(options.reconnect ?? {}) };
     this.activeEndpoint = options.wsUrl;
     this.userId = decodeJwtSubject(options.token);
+    if (options.deviceId !== undefined && !isValidDeviceId(options.deviceId)) {
+      throw new Error('deviceId must be 1-128 characters of A-Z a-z 0-9 . _ ~ -');
+    }
     if (options.inputGain !== undefined) this.inputGainValue = checkInputGain(options.inputGain);
     this.inputDeviceIdValue = options.inputDeviceId;
     this.visemesEnabledValue = options.visemes === true;
@@ -3467,6 +3485,9 @@ export class AurixClient {
       if (this.session && this.resumeToken) {
         protocols.push(`${RESUME_SUBPROTOCOL_PREFIX}${this.session.sessionId}.${this.resumeToken}`);
       }
+      if (this.opts.deviceId !== undefined) protocols.push(`${DEVICE_SUBPROTOCOL_PREFIX}${this.opts.deviceId}`);
+      this.inboxSynced = false;
+      this.inboxNewest = undefined;
       const ws = new WebSocket(url, protocols);
       this.ws = ws;
       const timer = setTimeout(() => {
@@ -4195,6 +4216,7 @@ export class AurixClient {
           }
         }
         this.emit('chatMessage', message);
+        this.ackDirected(d.message);
         return;
       }
       case 'ChatMessageUpdated': {
@@ -4268,7 +4290,13 @@ export class AurixClient {
       }
       case 'ChatInboxSynced': {
         const d = (msg as Extract<ServerMessage, { type: 'ChatInboxSynced' }>).data;
-        this.emit('chatInboxSynced', d.delivered, d.truncated);
+        this.inboxSynced = true;
+        const newest = this.inboxNewest;
+        this.inboxNewest = undefined;
+        if (newest && this.opts.deviceId !== undefined) {
+          this.trySend({ type: 'ChatAck', data: { message_id: newest.id } });
+        }
+        this.emit('chatInboxSynced', d.delivered, d.truncated, d.per_device === true);
         return;
       }
       case 'ParticipantTyping': {
@@ -4936,6 +4964,19 @@ export class AurixClient {
 
   private requireOpen(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('not connected');
+  }
+
+  /** Acknowledge a directed message addressed to this user (per-device cursor, `deviceId`). */
+  private ackDirected(w: ChatMessageWire): void {
+    if (this.opts.deviceId === undefined || w.to_user_id == null || w.to_user_id !== this.userId) return;
+    if (this.inboxSynced) {
+      this.trySend({ type: 'ChatAck', data: { message_id: w.id } });
+      return;
+    }
+    const n = this.inboxNewest;
+    if (!n || n.sentAt < w.sent_at || (n.sentAt === w.sent_at && n.id < w.id)) {
+      this.inboxNewest = { sentAt: w.sent_at, id: w.id };
+    }
   }
 
   private toChatMessage(w: ChatMessageWire): ChatMessage {

@@ -1496,12 +1496,27 @@ pub enum ControlMessage {
         markers: Vec<ChatReadMarker>,
         unread_count: u32,
     },
+    /// Client → server: this device has durably received the directed message `message_id`
+    /// (a `ChatMessageReceived` addressed to the user; anything else is `NOT_FOUND`). Requires
+    /// the connection to have identified itself with a device id (`X-Aurix-Device` header,
+    /// `device.<id>` sub-protocol or `?device=` query, `[A-Za-z0-9._~-]{1,128}`): the server
+    /// keeps one cursor per `(user, device)` and replays only what is newer than it on the
+    /// device's next connect, on any node — every directed message reaches every device exactly
+    /// once. Cursors only move forward; SDKs send this automatically for each stored directed
+    /// message.
+    ChatAck {
+        message_id: uuid::Uuid,
+    },
     /// Server → client after `SessionInitAck`: the replay of directed messages that were
     /// queued while the user was offline (`ChatMessageReceived` with `offline: true`) is
     /// complete. `truncated` means older unread ones were left for `ChatHistory`.
+    /// `per_device` is set when the replay came from this device's own `ChatAck` cursor
+    /// (rather than the user-wide read markers, which is what a device without a cursor gets).
     ChatInboxSynced {
         delivered: u32,
         truncated: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        per_device: bool,
     },
     /// Client → server: this session is (no longer) composing a message in `channel_id`.
     ChatTyping {

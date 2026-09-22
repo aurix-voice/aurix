@@ -983,6 +983,21 @@ namespace Aurix.Protocol
             return Serialize("ChatHistory", d);
         }
 
+        /// <summary>A directed message reached this device durably (advances the per-device delivery cursor).</summary>
+        public static string ChatAck(Guid messageId) =>
+            Serialize("ChatAck", new Dictionary<string, object> { { "message_id", messageId } });
+
+        /// <summary>Whether <paramref name="id"/> is a valid device id: 1-128 characters of <c>A-Z a-z 0-9 . _ ~ -</c>.</summary>
+        public static bool IsValidDeviceId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length > 128) return false;
+            foreach (var c in id)
+            {
+                if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') && c != '.' && c != '_' && c != '~' && c != '-') return false;
+            }
+            return true;
+        }
+
         public static string ChatMarkRead(Guid? channelId, Guid? userId, Guid messageId)
         {
             var d = Scope(channelId, userId);

@@ -208,3 +208,62 @@ test('search sends the scope + query and pages through next_before', async () =>
   client.disconnect();
   await assert.rejects(pending);
 });
+
+const jwtFor = (userId) => `h.${Buffer.from(JSON.stringify({ sub: userId })).toString('base64url')}.s`;
+const ME = '00000000-0000-0000-0000-00000000aaaa';
+const directed = (id, sentAt, extra = {}) =>
+  wire({ id, channel_id: undefined, to_user_id: ME, from_user_id: 'u1', sent_at: sentAt, ...extra });
+
+test('deviceId travels as the device.<id> sub-protocol and is validated', async () => {
+  const { client, sock } = await connected({ deviceId: 'phone-1' });
+  assert.ok(sock.protocols.includes('device.phone-1'));
+  client.disconnect();
+  const { client: plain, sock: plainSock } = await connected();
+  assert.ok(!plainSock.protocols.some((p) => p.startsWith('device.')));
+  plain.disconnect();
+  await assert.rejects(connected({ deviceId: 'bad id!' }), /deviceId/);
+  await assert.rejects(connected({ deviceId: 'x'.repeat(129) }), /deviceId/);
+});
+
+test('with deviceId, the replay is acknowledged once by its newest message and later directed messages one by one', async () => {
+  const { client, sock } = await connected({ deviceId: 'phone-1', token: jwtFor(ME) });
+  const received = [];
+  const synced = [];
+  client.on('chatMessage', (m) => received.push(m));
+  client.on('chatInboxSynced', (delivered, truncated, perDevice) => synced.push({ delivered, truncated, perDevice }));
+
+  const newest = '00000000-0000-0000-0000-000000000003';
+  sock.receive({ type: 'ChatMessageReceived', data: { message: directed('00000000-0000-0000-0000-000000000001', '2024-05-06T07:08:09.000001Z', { offline: true }) } });
+  sock.receive({ type: 'ChatMessageReceived', data: { message: directed(newest, '2024-05-06T07:08:10.000002Z', { offline: true }) } });
+  sock.receive({ type: 'ChatMessageReceived', data: { message: directed('00000000-0000-0000-0000-000000000002', '2024-05-06T07:08:10.000002Z', { offline: true }) } });
+  assert.equal(sock.sent.filter((m) => m.type === 'ChatAck').length, 0);
+  sock.receive({ type: 'ChatInboxSynced', data: { delivered: 3, truncated: false, per_device: true } });
+  let acks = sock.sent.filter((m) => m.type === 'ChatAck');
+  assert.equal(acks.length, 1);
+  assert.deepEqual(acks[0].data, { message_id: newest });
+  assert.deepEqual(synced, [{ delivered: 3, truncated: false, perDevice: true }]);
+  assert.equal(received.length, 3);
+  assert.ok(received.every((m) => m.offline));
+
+  // Live directed message: acknowledged individually (the server takes the timestamp from its row).
+  sock.receive({ type: 'ChatMessageReceived', data: { message: directed('00000000-0000-0000-0000-000000000004', '2024-05-06T07:09:00.123456Z') } });
+  // Channel message and our own echo of a directed message are not acknowledged.
+  sock.receive({ type: 'ChatMessageReceived', data: { message: wire({ id: '00000000-0000-0000-0000-000000000005' }) } });
+  sock.receive({ type: 'ChatMessageReceived', data: { message: wire({ id: '00000000-0000-0000-0000-000000000006', channel_id: undefined, from_user_id: ME, to_user_id: 'u1' }) } });
+  acks = sock.sent.filter((m) => m.type === 'ChatAck');
+  assert.equal(acks.length, 2);
+  assert.deepEqual(acks[1].data, { message_id: '00000000-0000-0000-0000-000000000004' });
+  client.disconnect();
+});
+
+test('without deviceId nothing is acknowledged and the legacy sync reports perDevice=false', async () => {
+  const { client, sock } = await connected({ token: jwtFor(ME) });
+  const synced = [];
+  client.on('chatInboxSynced', (...a) => synced.push(a));
+  sock.receive({ type: 'ChatMessageReceived', data: { message: directed('00000000-0000-0000-0000-000000000001', '2024-05-06T07:08:09Z', { offline: true }) } });
+  sock.receive({ type: 'ChatInboxSynced', data: { delivered: 1, truncated: true } });
+  sock.receive({ type: 'ChatMessageReceived', data: { message: directed('00000000-0000-0000-0000-000000000002', '2024-05-06T07:08:19Z') } });
+  assert.equal(sock.sent.filter((m) => m.type === 'ChatAck').length, 0);
+  assert.deepEqual(synced, [[1, true, false]]);
+  client.disconnect();
+});

@@ -19,6 +19,8 @@ min_segment_ms = 400        # drop shorter fragments
 timeout_ms = 15000
 max_concurrent_requests = 8
 include_words = false       # forward word-level timings if the provider returns them
+persist = false             # keep delivered transcripts + translations in PostgreSQL
+retention_days = 30         # sweep stored transcripts after this many days (0 = keep)
 
 [tts]
 enabled = false
@@ -58,8 +60,42 @@ and zero gain suppress captions too — on every node. Clients opt out/in with
 `SetTranscripts {enabled}` (Web `setTranscripts()`, Unity `SetTranscriptsAsync()`, native
 `aurix_client_set_transcripts`); the `ChannelJoinAck.transcription` flag tells them whether a
 channel is captioned. Game servers get the same segments as `channel.transcript`
-(webhooks / SSE, only when explicitly subscribed). Transcripts are **ephemeral** — the server
-stores nothing; keep them yourself if your policy requires it.
+(webhooks / SSE, only when explicitly subscribed). Transcripts are **ephemeral by default** —
+the server stores nothing; keep them yourself, or turn on [`stt.persist`](#stored-transcripts).
+
+### Stored transcripts
+
+`stt.persist = true` writes every transcript a node delivers to PostgreSQL (`transcripts`, one
+row per `Transcript` event under the same `id`) together with the machine translations the
+fleet made of it (`transcript_translations`, one row per target language — whichever node
+translated the segment first). Only what was delivered is stored: channels without
+`transcription`, `safety_voice`-only segments and end-to-end encrypted channels (which the node
+cannot read) leave nothing behind. The row is written (bounded to 2 s) before the caption is
+pushed, so a translation made on any node finds its source; a failed or slow insert is logged
+and the caption still goes out.
+
+Operators read them back newest first with the same keyset cursors as chat history
+(`transcripts:read`):
+
+```http
+GET /v1/channels/{channel_id}/transcripts?user_id=&before=&after=&limit=50
+GET /v1/users/{user_id}/transcripts?before=&after=&limit=50
+```
+
+```json
+{"transcripts":[{"id":"…","channel_id":"…","user_id":"…","text":"push left","language":"en",
+  "started_at":"…","duration_ms":1840,"words":[…],
+  "translations":[{"language":"de","text":"nach links drücken","created_at":"…"}],
+  "node_id":"…","created_at":"…"}],
+ "next_before":"…"}
+```
+
+`DELETE /v1/channels/{id}/transcripts` and `DELETE /v1/transcripts/{id}` (`transcripts:write`)
+remove rows on request (audited as `transcripts_deleted`); `stt.retention_days` (30, `0` =
+keep) sweeps old rows hourly; erasing a user (`DELETE /v1/users/{id}`) removes everything they
+said (`UserErasureCounts.transcripts`) and the data export lists it (`UserExport.transcripts`).
+Through `X-Aurix-App`, moderators hold `transcripts:read` and admins `transcripts:write`. There is
+no full-text search over stored transcripts; export them to your own index if you need one.
 
 ## Text-to-speech
 
@@ -162,7 +198,9 @@ the **original** transcript instead (never marked as translated); results are ca
 `max_languages_per_channel` in one channel the most-requested languages win and the rest fall
 back to the original. `aurix_translations_total{outcome="ok"|"cached"|"error"|"busy"|"skipped"}`
 and `aurix_translation_latency_seconds` count it all. Provider keys stay on the node; translated
-text is as ephemeral as the transcripts it comes from.
+text is as ephemeral as the transcripts it comes from — with `stt.persist` each translation is
+stored next to its source segment and listed as `translations[]` of the
+[stored transcript](#stored-transcripts).
 
 ## Voice effects
 

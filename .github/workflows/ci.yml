@@ -253,6 +253,7 @@ jobs:
           AURIX__STT__API_KEY: ci-only-speech-token
           AURIX__STT__SEGMENT_SECS: "1.5"
           AURIX__STT__INCLUDE_WORDS: "true"
+          AURIX__STT__PERSIST: "true"
           AURIX__TTS__ENABLED: "true"
           AURIX__TTS__ENDPOINT: http://127.0.0.1:18790
           AURIX__TTS__API_KEY: ci-only-speech-token
@@ -285,6 +286,8 @@ jobs:
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8100/ready && break; sleep 1; done
           curl -fsS http://127.0.0.1:8100/ready
           cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture speech_transcripts content_safety recording_mixdown live_translation
+          # Translates too, which would skew live_translation's node-wide counters if run alongside it.
+          cargo test --locked -p aurix-server --test e2e_live -- --ignored --nocapture stored_transcripts
       - name: E2E (admin SSO against the mock OIDC provider + administrator lifecycle)
         env:
           AURIX__TURN__ENABLED: "false"

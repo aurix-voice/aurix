@@ -184,6 +184,18 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::search_user_messages),
         )
         .route(
+            "/v1/channels/:channel_id/transcripts",
+            get(handlers::list_channel_transcripts).delete(handlers::delete_channel_transcripts),
+        )
+        .route(
+            "/v1/users/:user_id/transcripts",
+            get(handlers::list_user_transcripts),
+        )
+        .route(
+            "/v1/transcripts/:transcript_id",
+            delete(handlers::delete_transcript),
+        )
+        .route(
             "/v1/messages/:message_id",
             get(handlers::get_message)
                 .patch(handlers::edit_message)
@@ -200,6 +212,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/v1/channels/:channel_id/read-markers",
             get(handlers::list_channel_read_markers),
+        )
+        .route(
+            "/v1/users/:user_id/chat-devices",
+            get(handlers::list_user_chat_devices),
+        )
+        .route(
+            "/v1/users/:user_id/chat-devices/:device_id",
+            delete(handlers::delete_user_chat_device),
         )
         .route(
             "/v1/channels/:channel_id/tts",

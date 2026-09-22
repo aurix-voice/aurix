@@ -12,14 +12,15 @@
 
 use crate::event_bus::{EventBus, ServerEvent};
 use crate::redis_store::RedisStore;
+use crate::transcripts::{join_translations, StoredTranscript};
 use aurix_common::audit::AuditLogger;
 use aurix_common::config::RetentionConfig;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::sink::UserMediaPurger;
 use aurix_common::types::{AppId, AuditAction, UserId};
 use aurix_db::models::{
-    BanRow, ChannelMembershipRow, ChatMessageRow, ModerationEventRow, RecordingRow, SessionRow,
-    UserErasureCounts, UserRow,
+    BanRow, ChannelMembershipRow, ChatDeviceCursorRow, ChatMessageRow, ModerationEventRow,
+    RecordingRow, SessionRow, UserErasureCounts, UserRow,
 };
 use aurix_db::{DbError, DbPool};
 use chrono::{DateTime, Utc};
@@ -80,10 +81,16 @@ pub struct UserExport {
     pub sessions: Vec<SessionRow>,
     pub channel_memberships: Vec<ChannelMembershipRow>,
     pub chat_messages: Vec<ChatMessageRow>,
+    /// Per-device delivery cursors of the directed-message queue (`chat.offline_delivery`).
+    #[serde(default)]
+    pub chat_devices: Vec<ChatDeviceCursorRow>,
     pub blocks: UserBlocks,
     pub bans: Vec<BanRow>,
     pub moderation: UserModerationExport,
     pub recordings: Vec<RecordingRow>,
+    /// Stored live transcripts the user spoke, with their translations (`stt.persist`).
+    #[serde(default)]
+    pub transcripts: Vec<StoredTranscript>,
     /// Collections cut at [`EXPORT_LIMIT`] rows (newest first).
     pub truncated: Vec<&'static str>,
 }
@@ -223,6 +230,9 @@ impl UserLifecycle {
             .await
             .map_err(db)?;
         track("chat_messages", chat_messages.len());
+        let chat_devices = aurix_db::queries::list_chat_device_cursors(pool, a, u)
+            .await
+            .map_err(db)?;
         let blocking = aurix_db::queries::list_user_blocks(pool, a, u)
             .await
             .map_err(db)?
@@ -253,6 +263,15 @@ impl UserLifecycle {
             .await
             .map_err(db)?;
         track("recordings", recordings.len());
+        let transcript_rows = aurix_db::queries::export_user_transcripts(pool, a, u, EXPORT_LIMIT)
+            .await
+            .map_err(db)?;
+        track("transcripts", transcript_rows.len());
+        let ids: Vec<uuid::Uuid> = transcript_rows.iter().map(|r| r.id).collect();
+        let translations = aurix_db::queries::list_transcript_translations(pool, &ids)
+            .await
+            .map_err(db)?;
+        let transcripts = join_translations(transcript_rows, translations);
 
         self.audit.log(
             Some(app_id),
@@ -271,6 +290,7 @@ impl UserLifecycle {
             sessions,
             channel_memberships,
             chat_messages,
+            chat_devices,
             blocks: UserBlocks {
                 blocking,
                 blocked_by,
@@ -281,6 +301,7 @@ impl UserLifecycle {
                 reported_by_user,
             },
             recordings,
+            transcripts,
             truncated,
         }))
     }

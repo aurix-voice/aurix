@@ -279,6 +279,67 @@ async fn connect_with(
         req.headers_mut()
             .insert("x-aurix-resume", format!("{sid}.{tok}").parse().unwrap());
     }
+    connect_request(req, name, token).await
+}
+
+/// How a client presents its device id on the WebSocket handshake.
+#[derive(Clone, Copy)]
+enum DeviceVia {
+    Header,
+    Subprotocol,
+    Query,
+}
+
+/// Connects as a device (`X-Aurix-Device` header, `device.<id>` sub-protocol or `?device=`).
+async fn connect_device(
+    env: &Env,
+    name: &'static str,
+    token: String,
+    device: &str,
+    via: DeviceVia,
+) -> Player {
+    let url = match via {
+        DeviceVia::Query => format!("{}/ws?device={device}", env.ws),
+        _ => format!("{}/ws", env.ws),
+    };
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    match via {
+        DeviceVia::Header => {
+            req.headers_mut()
+                .insert("x-aurix-device", device.parse().unwrap());
+        }
+        DeviceVia::Subprotocol => {
+            req.headers_mut().insert(
+                "sec-websocket-protocol",
+                format!("aurix, device.{device}").parse().unwrap(),
+            );
+        }
+        DeviceVia::Query => {}
+    }
+    connect_request(req, name, token).await
+}
+
+/// Handshake status for a connection the server refuses before the upgrade.
+async fn connect_status(env: &Env, token: &str, device: &str) -> u16 {
+    let mut req = format!("{}/ws", env.ws).into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    req.headers_mut()
+        .insert("x-aurix-device", device.parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Ok(_) => 101,
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
+        Err(e) => panic!("unexpected handshake failure: {e}"),
+    }
+}
+
+async fn connect_request(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    name: &'static str,
+    token: String,
+) -> Player {
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws connect");
@@ -3717,6 +3778,14 @@ async fn expect_marker(p: &mut Player, what: &str) -> aurix_common::protocol::Ch
 /// Drains the offline replay after `SessionInitAck`: the queued messages (all `offline`) in
 /// arrival order, then `ChatInboxSynced`.
 async fn expect_inbox(p: &mut Player) -> (Vec<aurix_common::protocol::ChatMessage>, u32, bool) {
+    let (messages, delivered, truncated, _) = expect_inbox_full(p).await;
+    (messages, delivered, truncated)
+}
+
+/// `expect_inbox` plus the `per_device` flag of the sync marker.
+async fn expect_inbox_full(
+    p: &mut Player,
+) -> (Vec<aurix_common::protocol::ChatMessage>, u32, bool, bool) {
     let mut messages = Vec::new();
     loop {
         match p.recv().await {
@@ -3727,7 +3796,8 @@ async fn expect_inbox(p: &mut Player) -> (Vec<aurix_common::protocol::ChatMessag
             ControlMessage::ChatInboxSynced {
                 delivered,
                 truncated,
-            } => return (messages, delivered, truncated),
+                per_device,
+            } => return (messages, delivered, truncated, per_device),
             ControlMessage::NetworkQuality { .. } | ControlMessage::ReceiverPreferences { .. } => {}
             other => panic!("{}: unexpected during inbox replay: {other:?}", p.name),
         }
@@ -4666,6 +4736,476 @@ async fn assert_no_chat_change(p: &mut Player, why: &str) {
             p.name
         );
     }
+}
+
+/// The device's cursor in `GET /v1/users/{id}/chat-devices`, if it has one.
+async fn device_cursor(
+    env: &Env,
+    http: &reqwest::Client,
+    user_id: UserId,
+    device: &str,
+) -> Option<uuid::Uuid> {
+    let v: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/chat-devices", env.api, user_id))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["device_id"] == device)
+        .map(|d| d["message_id"].as_str().unwrap().parse().unwrap())
+}
+
+/// `ChatAck` has no reply on success: the cursor becomes visible over REST shortly after.
+async fn wait_cursor(
+    env: &Env,
+    http: &reqwest::Client,
+    user_id: UserId,
+    device: &str,
+    expected: uuid::Uuid,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let got = device_cursor(env, http, user_id, device).await;
+        if got == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{device}: cursor never reached {expected} (last {got:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Exactly-once directed-message delivery per device: a connection that identifies itself
+/// (`X-Aurix-Device` / `device.<id>` / `?device=`) gets its own cursor, advanced by `ChatAck`
+/// against the message table (client timestamps are not trusted), shared by every node, and
+/// replayed independently of the user's other devices; connections without a device id keep
+/// the read-marker backlog. Operators list/forget devices over REST; erasure and export cover
+/// the cursors.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with chat.persist = true; see the e2e job in .github/workflows/ci.yml"]
+async fn chat_per_device_offline_queue() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let channel_id = create_channel(&env, &http).await;
+    if !chat_persists(&env, &http, channel_id).await {
+        eprintln!("chat.persist is off on this server; skipping");
+        return;
+    }
+    let two_nodes = std::env::var("AURIX_E2E_WS2").is_ok();
+    let env2 = match std::env::var("AURIX_E2E_WS2") {
+        Ok(ws2) => Env {
+            api: std::env::var("AURIX_E2E_API2").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
+            ws: ws2,
+            api_key: env.api_key.clone(),
+        },
+        Err(_) => {
+            eprintln!("AURIX_E2E_WS2 not set; running on one node");
+            Env {
+                api: env.api.clone(),
+                ws: env.ws.clone(),
+                api_key: env.api_key.clone(),
+            }
+        }
+    };
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ext = |who: &str| format!("e2e:dev-{who}-{run}");
+    let (tok_e, _) = issue_token(&env, &http, &ext("erin"), "Erin", channel_id).await;
+    let (tok_f, uid_f) = issue_token(&env, &http, &ext("frank"), "Frank", channel_id).await;
+    let (_, uid_g) = issue_token(&env, &http, &ext("gina"), "Gina", channel_id).await;
+    let uid_f = UserId::from_uuid(uid_f.parse().unwrap());
+    let uid_g = UserId::from_uuid(uid_g.parse().unwrap());
+    let dev_phone = format!("phone-{run}");
+    let dev_pc = format!("pc.{run}~1");
+
+    // Malformed device ids are refused on the handshake.
+    for bad in ["bad id!", &"x".repeat(129), "sl/ash"] {
+        assert_eq!(
+            connect_status(&env, &tok_f, bad).await,
+            400,
+            "device id {bad:?}"
+        );
+    }
+
+    let mut erin = connect(&env, "erin", tok_e).await;
+    expect_inbox(&mut erin).await;
+    join(&mut erin, channel_id).await;
+    let mut queued = Vec::new();
+    for i in 0..3 {
+        erin.send(&ControlMessage::ChatSendDirect {
+            user_id: uid_f,
+            text: format!("dev dm {i}"),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+        let echo = expect_chat(&mut erin, "queued echo").await;
+        assert!(echo.offline);
+        queued.push(echo);
+    }
+    erin.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_g,
+        text: "for gina".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    let foreign = expect_chat(&mut erin, "gina's queued echo").await;
+    erin.send(&ControlMessage::ChatSend {
+        channel_id,
+        text: "channel talk".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    let channel_msg = expect_chat(&mut erin, "channel echo").await;
+
+    // First contact of the phone (other node, header): no cursor yet, so it gets the
+    // user-wide read-marker backlog and the sync marker says so.
+    let mut phone =
+        connect_device(&env2, "phone", tok_f.clone(), &dev_phone, DeviceVia::Header).await;
+    let (inbox, delivered, truncated, per_device) = expect_inbox_full(&mut phone).await;
+    assert_eq!(
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+        queued.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    assert_eq!((delivered, truncated, per_device), (3, false, false));
+    assert!(
+        device_cursor(&env, &http, uid_f, &dev_phone)
+            .await
+            .is_none(),
+        "no cursor before the first ack"
+    );
+    // Only directed messages addressed to this user move the cursor.
+    for (what, id) in [
+        ("unknown message", uuid::Uuid::new_v4()),
+        ("channel message", channel_msg.id),
+        ("somebody else's DM", foreign.id),
+    ] {
+        phone
+            .send(&ControlMessage::ChatAck { message_id: id })
+            .await;
+        expect_error(&mut phone, what, "NOT_FOUND").await;
+    }
+    phone
+        .send(&ControlMessage::ChatAck {
+            message_id: queued[2].id,
+        })
+        .await;
+    wait_cursor(&env, &http, uid_f, &dev_phone, queued[2].id).await;
+    // Acknowledging something older is a silent no-op.
+    phone
+        .send(&ControlMessage::ChatAck {
+            message_id: queued[0].id,
+        })
+        .await;
+    assert_silent(&mut phone, "older acks are a no-op").await;
+    assert_eq!(
+        device_cursor(&env, &http, uid_f, &dev_phone).await,
+        Some(queued[2].id)
+    );
+
+    // The PC (sub-protocol) is a new device: the phone's ack does not affect it.
+    let mut pc = connect_device(&env, "pc", tok_f.clone(), &dev_pc, DeviceVia::Subprotocol).await;
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut pc).await;
+    assert_eq!(inbox.len(), 3);
+    assert_eq!((delivered, per_device), (3, false));
+    pc.send(&ControlMessage::ChatAck {
+        message_id: queued[0].id,
+    })
+    .await;
+    wait_cursor(&env, &http, uid_f, &dev_pc, queued[0].id).await;
+
+    // The phone comes back on the other node (query fallback): the cursor lives in PostgreSQL,
+    // so nothing is replayed twice.
+    let mut phone =
+        connect_device(&env, "phone2", tok_f.clone(), &dev_phone, DeviceVia::Query).await;
+    let (inbox, delivered, truncated, per_device) = expect_inbox_full(&mut phone).await;
+    assert!(inbox.is_empty(), "{inbox:?}");
+    assert_eq!((delivered, truncated, per_device), (0, false, true));
+    // The PC gets exactly what lies past its own cursor.
+    let mut pc = connect_device(&env2, "pc2", tok_f.clone(), &dev_pc, DeviceVia::Header).await;
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut pc).await;
+    assert_eq!(
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![queued[1].id, queued[2].id]
+    );
+    assert_eq!((delivered, per_device), (2, true));
+    pc.send(&ControlMessage::ChatAck {
+        message_id: queued[2].id,
+    })
+    .await;
+    wait_cursor(&env, &http, uid_f, &dev_pc, queued[2].id).await;
+
+    // Live delivery while online is unchanged; only the device that acks stops seeing it.
+    // (One live session per user and node: on a single node the PC replaced the phone.)
+    let mut phone_live = two_nodes.then_some(phone);
+    erin.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_f,
+        text: "dev dm live".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    let live = expect_chat(&mut erin, "live echo").await;
+    assert!(!live.offline);
+    for p in [&mut pc].into_iter().chain(phone_live.iter_mut()) {
+        let m = expect_chat(p, "live DM").await;
+        assert_eq!(m.id, live.id);
+        assert!(!m.offline);
+    }
+    pc.send(&ControlMessage::ChatAck {
+        message_id: live.id,
+    })
+    .await;
+    wait_cursor(&env, &http, uid_f, &dev_pc, live.id).await;
+    drop(phone_live);
+    let mut phone = connect_device(
+        &env2,
+        "phone3",
+        tok_f.clone(),
+        &dev_phone,
+        DeviceVia::Header,
+    )
+    .await;
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut phone).await;
+    assert_eq!(
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![live.id]
+    );
+    assert_eq!((delivered, per_device), (1, true));
+    let mut pc = connect_device(&env, "pc3", tok_f.clone(), &dev_pc, DeviceVia::Subprotocol).await;
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut pc).await;
+    assert!(inbox.is_empty(), "{inbox:?}");
+    assert_eq!((delivered, per_device), (0, true));
+    drop(phone);
+
+    // The device survives a resume: the PC's socket dies, the client resumes the session
+    // without repeating the device id, and the replay/acks are still the PC's.
+    let Player {
+        session_id: sid_pc,
+        resume_token: resume_pc,
+        ws: dead_ws,
+        ..
+    } = pc;
+    drop(dead_ws);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut pc = connect_with(
+        &env,
+        "pc-resumed",
+        tok_f.clone(),
+        Some((sid_pc, &resume_pc)),
+    )
+    .await;
+    assert!(pc.resumed, "expected resumed session");
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut pc).await;
+    assert!(inbox.is_empty(), "{inbox:?}");
+    assert_eq!(
+        (delivered, per_device),
+        (0, true),
+        "device kept across resume"
+    );
+    erin.send(&ControlMessage::ChatSendDirect {
+        user_id: uid_f,
+        text: "dev dm after resume".into(),
+        metadata: None,
+        client_ref: None,
+    })
+    .await;
+    let mut last = expect_chat(&mut erin, "resumed echo").await;
+    assert_eq!(expect_chat(&mut pc, "DM after resume").await.id, last.id);
+    pc.send(&ControlMessage::ChatAck {
+        message_id: last.id,
+    })
+    .await;
+    wait_cursor(&env, &http, uid_f, &dev_pc, last.id).await;
+    // ... and a cross-node takeover: the session mirror carries the device id.
+    if two_nodes {
+        let Player {
+            session_id: sid_pc,
+            resume_token: resume_pc,
+            ws: dead_ws,
+            ..
+        } = pc;
+        drop(dead_ws);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pc = connect_with(&env2, "pc@node2", tok_f.clone(), Some((sid_pc, &resume_pc))).await;
+        assert!(
+            pc.resumed && pc.migrated,
+            "node 2 must adopt the mirrored session"
+        );
+        let (inbox, delivered, _, per_device) = expect_inbox_full(&mut pc).await;
+        assert!(inbox.is_empty(), "{inbox:?}");
+        assert_eq!(
+            (delivered, per_device),
+            (0, true),
+            "device kept across takeover"
+        );
+        erin.send(&ControlMessage::ChatSendDirect {
+            user_id: uid_f,
+            text: "dev dm after takeover".into(),
+            metadata: None,
+            client_ref: None,
+        })
+        .await;
+        last = expect_chat(&mut erin, "migrated echo").await;
+        assert_eq!(expect_chat(&mut pc, "DM after takeover").await.id, last.id);
+        pc.send(&ControlMessage::ChatAck {
+            message_id: last.id,
+        })
+        .await;
+        wait_cursor(&env, &http, uid_f, &dev_pc, last.id).await;
+    }
+    pc.ws.close(None).await.unwrap();
+    drop(pc);
+
+    // Without a device id the legacy user-wide replay applies (only messages queued while
+    // the user was offline; the live one was delivered) and acks are refused.
+    let mut legacy = connect(&env2, "frank-legacy", tok_f.clone()).await;
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut legacy).await;
+    assert_eq!(
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+        queued.iter().map(|m| m.id).collect::<Vec<_>>(),
+        "frank never moved a read marker"
+    );
+    assert_eq!((delivered, per_device), (3, false));
+    legacy
+        .send(&ControlMessage::ChatAck {
+            message_id: live.id,
+        })
+        .await;
+    expect_error(&mut legacy, "ack without a device id", "VALIDATION_ERROR").await;
+
+    // REST: devices with their cursors, most recently active first; export covers them.
+    let v: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/chat-devices", env.api, uid_f))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let devices = v["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2, "{v}");
+    assert_eq!(devices[0]["device_id"], dev_pc);
+    assert_eq!(devices[0]["message_id"], serde_json::json!(last.id));
+    assert_eq!(devices[1]["device_id"], dev_phone);
+    assert_eq!(devices[1]["message_id"], serde_json::json!(queued[2].id));
+    assert_eq!(
+        devices[0]["message_sent_at"],
+        serde_json::json!(last.sent_at),
+        "the timestamp is the message's own"
+    );
+    let export: serde_json::Value = http
+        .get(format!("{}/v1/users/{}/export", env.api, uid_f))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        export["chat_devices"].as_array().map(|a| a.len()),
+        Some(2),
+        "{export}"
+    );
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let r = http
+            .get(format!("{}/v1/users/{}/chat-devices", env.api, uid_f))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign tenant cannot list devices");
+        let r = http
+            .delete(format!(
+                "{}/v1/users/{}/chat-devices/{}",
+                env.api, uid_f, dev_pc
+            ))
+            .header("x-api-key", &api_key2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign tenant cannot forget devices");
+        assert_eq!(
+            device_cursor(&env, &http, uid_f, &dev_pc).await,
+            Some(last.id)
+        );
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+    for (device, status) in [
+        ("bad%20id", 400),
+        ("never-seen", 404),
+        (dev_pc.as_str(), 204),
+    ] {
+        let r = http
+            .delete(format!(
+                "{}/v1/users/{}/chat-devices/{device}",
+                env.api, uid_f
+            ))
+            .header("x-api-key", &env.api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "forget {device}");
+    }
+    let r = http
+        .delete(format!(
+            "{}/v1/users/{}/chat-devices/{}",
+            env.api, uid_f, dev_pc
+        ))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "forgetting twice");
+    assert!(device_cursor(&env, &http, uid_f, &dev_pc).await.is_none());
+    assert_eq!(
+        device_cursor(&env, &http, uid_f, &dev_phone).await,
+        Some(queued[2].id)
+    );
+    // A forgotten device is new again: read-marker backlog, until its next ack.
+    let mut pc = connect_device(&env, "pc4", tok_f.clone(), &dev_pc, DeviceVia::Header).await;
+    let (inbox, delivered, _, per_device) = expect_inbox_full(&mut pc).await;
+    assert_eq!((inbox.len(), delivered, per_device), (3, 3, false));
+    drop(pc);
+    drop(legacy);
+
+    // Erasing the user takes the cursors with it.
+    http.delete(format!("{}/v1/users/{}", env.api, uid_f))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let r = http
+        .get(format!("{}/v1/users/{}/chat-devices", env.api, uid_f))
+        .header("x-api-key", &env.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
 }
 
 async fn expect_error_ref(p: &mut Player, what: &str, code: &str, client_ref: &str) {
@@ -15810,6 +16350,383 @@ async fn translation_counters(http: &reqwest::Client) -> Option<HashMap<String, 
             })
             .collect(),
     )
+}
+
+/// Stored transcripts (`stt.persist = true` on the node behind `AURIX_E2E_API`, mock STT and
+/// translation provider): every delivered live transcript is listed by channel and by speaker
+/// under the id the clients saw, with the fleet's translations attached; keyset paging by
+/// `before` / `after` and the speaker filter; `transcripts:read` / `transcripts:write` and
+/// tenant scoping; E2EE frames leave no row; the user export carries them; single, channel
+/// and user deletion remove them and are audited. Skips when the node does not persist.
+#[tokio::test]
+#[ignore = "requires a running Aurix server with STT/translation pointed at examples/mock_speech.rs and stt.persist = true"]
+async fn stored_transcripts_listing_paging_and_deletion() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let spoken = create_channel_with(&env, &http, serde_json::json!({"transcription": true})).await;
+    let list = format!("/v1/channels/{spoken}/transcripts");
+    let (status, body) = tenant_get(&env, &http, &list).await;
+    if status == 404 && body["error"]["code"] == "NOT_FOUND" {
+        eprintln!("node runs with stt.persist = false; skipping (set AURIX__STT__PERSIST=true)");
+        return;
+    }
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["transcripts"], serde_json::json!([]), "{body}");
+    assert!(
+        body["next_before"].is_null() && body["next_after"].is_null(),
+        "{body}"
+    );
+
+    // Fresh users per run: the per-user listing spans channels, so a reused external id would
+    // surface segments from earlier runs against the same database.
+    let run = uuid::Uuid::new_v4();
+    let mut players = Vec::new();
+    for name in ["alice", "bob", "carol"] {
+        let (tok, uid) = issue_token(&env, &http, &format!("st:{name}:{run}"), name, spoken).await;
+        let mut p = connect(&env, name, tok).await;
+        bind_media(&mut p).await;
+        let tok = p.token.clone();
+        p.send(&ControlMessage::ChannelJoin {
+            channel_id: spoken,
+            token: tok,
+        })
+        .await;
+        p.expect("ChannelJoinAck", |m| {
+            matches!(m, ControlMessage::ChannelJoinAck { channel_id, .. } if *channel_id == spoken)
+        })
+        .await;
+        players.push((p, UserId::from_uuid(uid.parse().unwrap())));
+    }
+    let [(mut alice, uid_a), (mut bob, _), (mut carol, uid_c)] =
+        <[_; 3]>::try_from(players).ok().unwrap();
+    let translates = bob
+        .translation
+        .as_ref()
+        .is_some_and(|i| i.languages.iter().any(|l| l == "de"));
+    if translates {
+        assert_eq!(
+            set_translation(&mut bob, Some("de"), None, false).await.0,
+            Some("de".into())
+        );
+    } else {
+        eprintln!("translation (de) not offered by the node; skipping translation persistence");
+    }
+    for p in [&mut alice, &mut bob, &mut carol] {
+        drain_ws(p).await;
+    }
+
+    // ── three segments, two speakers ──
+    stream_frames(&alice, spoken, 1, &opus_tone(440.0, 1_600), false).await;
+    let t1 = expect_transcript(&mut alice, spoken, uid_a).await;
+    if translates {
+        let tb = expect_transcript(&mut bob, spoken, uid_a).await;
+        assert_eq!((tb.id, tb.language.as_deref()), (t1.id, Some("de")));
+    }
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    stream_frames(&carol, spoken, 1, &opus_tone(880.0, 1_600), false).await;
+    let t2 = expect_transcript(&mut alice, spoken, uid_c).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    stream_frames(&alice, spoken, 1_000, &opus_tone(660.0, 1_600), false).await;
+    let t3 = expect_transcript(&mut alice, spoken, uid_a).await;
+    assert!(t1.started_at < t2.started_at && t2.started_at < t3.started_at);
+    for p in [&mut alice, &mut bob, &mut carol] {
+        drain_ws(p).await;
+    }
+
+    // Rows are written before the live event; translations land asynchronously.
+    let ids = |page: &serde_json::Value| -> Vec<String> {
+        page["transcripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let expected: Vec<String> = [t3.id, t2.id, t1.id]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let page = loop {
+        let (status, page) = tenant_get(&env, &http, &list).await;
+        assert_eq!(status, 200, "{page}");
+        let settled = ids(&page) == expected
+            && (!translates
+                || page["transcripts"][2]["translations"]
+                    .as_array()
+                    .is_some_and(|t| !t.is_empty()));
+        if settled {
+            break page;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stored transcripts did not settle: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let stored1 = &page["transcripts"][2];
+    assert_eq!(stored1["channel_id"], spoken.to_string(), "{stored1}");
+    assert_eq!(stored1["user_id"], uid_a.to_string());
+    assert_eq!(stored1["text"], t1.text);
+    assert_eq!(stored1["language"], "en");
+    assert_eq!(stored1["duration_ms"], t1.duration_ms);
+    assert_eq!(
+        stored1["words"].as_array().map(|w| w.len()),
+        Some(t1.words.len()),
+        "word timings are stored as delivered: {stored1}"
+    );
+    assert!(stored1["node_id"].is_string(), "{stored1}");
+    if translates {
+        let tr = stored1["translations"].as_array().unwrap();
+        assert_eq!(tr.len(), 1, "one target language in play: {stored1}");
+        assert_eq!(tr[0]["language"], "de");
+        assert_eq!(tr[0]["text"], format!("[de] {}", t1.text));
+    } else {
+        assert_eq!(stored1["translations"], serde_json::json!([]));
+    }
+    assert_eq!(page["transcripts"][1]["user_id"], uid_c.to_string());
+    assert!(
+        page["next_before"].is_null() && page["next_after"].is_null(),
+        "{page}"
+    );
+
+    // ── keyset paging: newest first, one at a time, then forward again ──
+    let (_, p1) = tenant_get(&env, &http, &format!("{list}?limit=1")).await;
+    assert_eq!(ids(&p1), expected[..1], "{p1}");
+    let older = p1["next_before"].as_str().expect("more pages").to_string();
+    assert!(p1["next_after"].is_null());
+    let (_, p2) = tenant_get(&env, &http, &format!("{list}?limit=1&before={older}")).await;
+    assert_eq!(ids(&p2), expected[1..2], "{p2}");
+    assert!(p2["next_after"].is_string(), "a newer page exists: {p2}");
+    let older = p2["next_before"].as_str().unwrap().to_string();
+    let (_, p3) = tenant_get(&env, &http, &format!("{list}?limit=1&before={older}")).await;
+    assert_eq!(ids(&p3), expected[2..], "{p3}");
+    assert!(p3["next_before"].is_null(), "oldest reached: {p3}");
+    let newer = p3["next_after"].as_str().unwrap().to_string();
+    let (_, fwd) = tenant_get(&env, &http, &format!("{list}?limit=5&after={newer}")).await;
+    assert_eq!(
+        ids(&fwd),
+        expected[..2],
+        "forward pages keep newest-first order: {fwd}"
+    );
+    assert!(fwd["next_after"].is_null(), "{fwd}");
+    assert!(fwd["next_before"].is_string(), "{fwd}");
+    let (status, bad) = tenant_get(&env, &http, &format!("{list}?before=not-a-cursor")).await;
+    assert_eq!(
+        (status, bad["error"]["code"].as_str()),
+        (400, Some("VALIDATION_ERROR")),
+        "{bad}"
+    );
+
+    // ── speaker filter and the per-user listing agree ──
+    let (_, only_a) = tenant_get(&env, &http, &format!("{list}?user_id={uid_a}")).await;
+    assert_eq!(ids(&only_a), vec![expected[0].clone(), expected[2].clone()]);
+    let (status, by_user) =
+        tenant_get(&env, &http, &format!("/v1/users/{uid_a}/transcripts")).await;
+    assert_eq!(status, 200, "{by_user}");
+    assert_eq!(ids(&by_user), ids(&only_a));
+    let (_, by_carol) = tenant_get(
+        &env,
+        &http,
+        &format!("/v1/users/{uid_c}/transcripts?limit=1"),
+    )
+    .await;
+    assert_eq!(ids(&by_carol), expected[1..2]);
+
+    // ── E2EE frames are never transcribed, so nothing is stored either ──
+    stream_frames(&alice, spoken, 2_000, &opus_tone(550.0, 1_600), true).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    for p in [&mut alice, &mut bob, &mut carol] {
+        assert_no_transcript(p, Duration::from_millis(400), "e2ee").await;
+    }
+    let (_, page) = tenant_get(&env, &http, &list).await;
+    assert_eq!(ids(&page), expected, "e2ee frames left no row: {page}");
+
+    // ── permissions: read vs write keys ──
+    let scoped = |perms: serde_json::Value| {
+        let env = env.clone();
+        let http = http.clone();
+        async move {
+            let key: serde_json::Value = http
+                .post(format!("{}/v1/api-keys", env.api))
+                .header("x-api-key", &env.api_key)
+                .json(&serde_json::json!({"name": "transcripts-scope", "permissions": perms}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            Env {
+                api_key: key["key"].as_str().unwrap().to_string(),
+                ..env
+            }
+        }
+    };
+    let reader = scoped(serde_json::json!(["transcripts:read"])).await;
+    let none = scoped(serde_json::json!(["channels:read"])).await;
+    assert_eq!(tenant_get(&reader, &http, &list).await.0, 200);
+    assert_eq!(
+        tenant_get(&reader, &http, &format!("/v1/users/{uid_a}/transcripts"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(tenant_get(&none, &http, &list).await.0, 403);
+    assert_eq!(
+        tenant_get(&none, &http, &format!("/v1/users/{uid_a}/transcripts"))
+            .await
+            .0,
+        403
+    );
+    let delete = |env: &Env, path: String| {
+        let env = env.clone();
+        let http = http.clone();
+        async move {
+            let resp = http
+                .delete(format!("{}{path}", env.api))
+                .header("x-api-key", &env.api_key)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            (
+                status,
+                resp.json::<serde_json::Value>()
+                    .await
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        }
+    };
+    assert_eq!(
+        delete(&reader, format!("/v1/transcripts/{}", t1.id))
+            .await
+            .0,
+        403,
+        "transcripts:read cannot delete"
+    );
+    assert_eq!(delete(&reader, list.clone()).await.0, 403);
+
+    // ── tenant isolation ──
+    if let Ok(api_key2) = std::env::var("AURIX_E2E_API_KEY2") {
+        let other = Env {
+            api_key: api_key2,
+            ..env.clone()
+        };
+        assert_eq!(tenant_get(&other, &http, &list).await.0, 404);
+        assert_eq!(
+            tenant_get(&other, &http, &format!("/v1/users/{uid_a}/transcripts"))
+                .await
+                .0,
+            404
+        );
+        assert_eq!(
+            delete(&other, format!("/v1/transcripts/{}", t1.id)).await.0,
+            404
+        );
+        assert_eq!(delete(&other, list.clone()).await.0, 404);
+        let (_, page) = tenant_get(&env, &http, &list).await;
+        assert_eq!(ids(&page), expected, "the other tenant deleted nothing");
+    } else {
+        eprintln!("AURIX_E2E_API_KEY2 not set; skipping tenant-isolation checks");
+    }
+
+    // ── the user export carries what the user said, translations included ──
+    let (status, export) = tenant_get(&env, &http, &format!("/v1/users/{uid_a}/export")).await;
+    assert_eq!(status, 200, "{export}");
+    let exported = export["transcripts"].as_array().unwrap();
+    let mut exported_ids: Vec<&str> = exported.iter().map(|t| t["id"].as_str().unwrap()).collect();
+    exported_ids.sort_unstable();
+    let mut want = vec![t1.id.to_string(), t3.id.to_string()];
+    want.sort();
+    assert_eq!(exported_ids, want, "{export}");
+    if translates {
+        let first = exported
+            .iter()
+            .find(|t| t["id"] == t1.id.to_string())
+            .unwrap();
+        assert_eq!(first["translations"][0]["language"], "de", "{first}");
+    }
+    assert!(
+        !export["truncated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "transcripts"),
+        "{export}"
+    );
+
+    // ── deletion: one row, then a user, then the channel; each audited ──
+    let (status, gone) = delete(&env, format!("/v1/transcripts/{}", t1.id)).await;
+    assert_eq!(
+        (status, gone["deleted"].as_bool()),
+        (200, Some(true)),
+        "{gone}"
+    );
+    assert_eq!(
+        delete(&env, format!("/v1/transcripts/{}", t1.id)).await.0,
+        404,
+        "already gone"
+    );
+    let (_, page) = tenant_get(&env, &http, &list).await;
+    assert_eq!(ids(&page), expected[..2], "{page}");
+
+    let (status, erased) = delete(&env, format!("/v1/users/{uid_c}")).await;
+    assert_eq!(status, 200, "{erased}");
+    assert_eq!(
+        erased["rows_removed"]["transcripts"], 1,
+        "carol's segment goes with her: {erased}"
+    );
+    let (_, page) = tenant_get(&env, &http, &list).await;
+    assert_eq!(ids(&page), expected[..1], "{page}");
+    assert_eq!(
+        tenant_get(&env, &http, &format!("/v1/users/{uid_c}/transcripts"))
+            .await
+            .0,
+        404,
+        "a deleted user has no listing"
+    );
+
+    let (status, wiped) = delete(&env, list.clone()).await;
+    assert_eq!(
+        (status, wiped["deleted"].as_u64()),
+        (200, Some(1)),
+        "{wiped}"
+    );
+    let (_, page) = tenant_get(&env, &http, &list).await;
+    assert_eq!(page["transcripts"], serde_json::json!([]), "{page}");
+    let (_, by_user) = tenant_get(&env, &http, &format!("/v1/users/{uid_a}/transcripts")).await;
+    assert_eq!(by_user["transcripts"], serde_json::json!([]), "{by_user}");
+
+    let (status, audit) = tenant_get(&env, &http, "/v1/audit-log?per_page=100").await;
+    assert_eq!(status, 200, "{audit}");
+    let deletions: Vec<(&str, &str)> = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "transcripts_deleted")
+        .map(|e| {
+            (
+                e["target_type"].as_str().unwrap(),
+                e["target_id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let t1_id = t1.id.to_string();
+    let spoken_id = spoken.to_string();
+    assert!(
+        deletions.contains(&("transcript", t1_id.as_str())),
+        "single deletion audited: {deletions:?}"
+    );
+    assert!(
+        deletions.contains(&("channel", spoken_id.as_str())),
+        "channel deletion audited: {deletions:?}"
+    );
 }
 
 /// A tenant call authenticated as an administrator acting on one application

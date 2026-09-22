@@ -88,7 +88,7 @@ signal endpoint_changed(ws_url: String)
 signal chat_history(request_id: int, channel_id: String, user_id: String, messages: Array, next_before: String, next_after: String)
 signal chat_read_marker(marker: Dictionary)
 signal chat_read_markers(channel_id: String, user_id: String, unread: int, markers: Array)
-signal chat_inbox_synced(delivered: int, truncated: bool)
+signal chat_inbox_synced(delivered: int, truncated: bool, per_device: bool)
 signal chat_message_updated(message: Dictionary)
 signal chat_reaction_changed(change: Dictionary)
 signal chat_search_result(request_id: int, channel_id: String, user_id: String, query: String, messages: Array, next_before: String)
@@ -137,6 +137,10 @@ signal events_dropped(count: int)
 @export var visemes := false
 ## Group E2EE (Insertable Streams). The browser refuses to join `e2ee` channels without it.
 @export var e2ee := false
+## Stable id of this installation (`[A-Za-z0-9._~-]{1,128}`, e.g. a UUID saved in `user://`). The
+## server keeps a per-device cursor of directed chat messages: each reaches this device exactly once
+## and is acknowledged automatically. Empty: the user-wide read-marker backlog is replayed instead.
+@export var device_id := ""
 @export_group("Events")
 @export_range(16, 65536) var max_queued_events := 1024
 ## Forward every raw control message as `raw_event` (type 0, JSON).
@@ -854,6 +858,8 @@ func _create_and_connect(ws_url: String, token: String) -> int:
 		"visemeEvents": visemes,
 		"e2ee": e2ee,
 	}
+	if device_id != "":
+		options["deviceId"] = device_id
 	match spatial_audio:
 		SPATIAL_EQUAL_POWER:
 			options["spatialAudio"] = "equalpower"
@@ -1194,7 +1200,7 @@ func _dispatch(e: Dictionary) -> void:
 			if not marker.is_empty():
 				chat_read_marker.emit(marker)
 		"chatInboxSynced":
-			chat_inbox_synced.emit(int(e.get("delivered", 0)), e.get("truncated", false) == true)
+			chat_inbox_synced.emit(int(e.get("delivered", 0)), e.get("truncated", false) == true, e.get("perDevice", false) == true)
 		"chatMessageUpdated":
 			var m := _chat_message(e.get("message"))
 			if not m.is_empty():

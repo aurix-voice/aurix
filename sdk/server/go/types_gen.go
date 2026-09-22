@@ -832,6 +832,17 @@ type ChannelUsageTotals2 struct {
 	STTAudioMs         int64   `json:"stt_audio_ms"`
 }
 
+// A device's standing in the user's directed-message queue: everything at or before
+// `(message_sent_at, message_id)` has reached the device (`ChatAck`). `updated_at` is the last
+// acknowledgement.
+type ChatDeviceCursor struct {
+	DeviceID      string `json:"device_id"`
+	MessageID     string `json:"message_id"`
+	MessageSentAt string `json:"message_sent_at"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
 // One page of chat history, newest first.
 type ChatHistoryPage struct {
 	Messages []ChatMessage `json:"messages"`
@@ -988,10 +999,22 @@ type DeleteChannelResponse struct {
 	Deleted *bool `json:"deleted,omitempty"`
 }
 
+// DeleteChannelTranscriptsResponse is the `DeleteChannelTranscriptsResponse` schema.
+type DeleteChannelTranscriptsResponse struct {
+	// Transcripts removed.
+	Deleted int64 `json:"deleted"`
+}
+
 // DeleteRecordingResponse is the `DeleteRecordingResponse` schema.
 type DeleteRecordingResponse struct {
 	Deleted *bool   `json:"deleted,omitempty"`
 	ID      *string `json:"id,omitempty"`
+}
+
+// DeleteTranscriptResponse is the `DeleteTranscriptResponse` schema.
+type DeleteTranscriptResponse struct {
+	Deleted bool   `json:"deleted"`
+	ID      string `json:"id"`
 }
 
 // DrainNodeRequest is the `DrainNodeRequest` schema.
@@ -1222,6 +1245,11 @@ type ListChannelStreamsResponse struct {
 // ListStreamsResponse is the `ListStreamsResponse` schema.
 type ListStreamsResponse struct {
 	Streams []LiveStream `json:"streams"`
+}
+
+// ListUserChatDevicesResponse is the `ListUserChatDevicesResponse` schema.
+type ListUserChatDevicesResponse struct {
+	Devices []ChatDeviceCursor `json:"devices"`
 }
 
 // ListUserReadMarkersResponseVariant1 is the `ListUserReadMarkersResponseVariant1` schema.
@@ -1884,6 +1912,45 @@ type StartRecordingRequest struct {
 	SessionID *string `json:"session_id,omitempty"`
 }
 
+// One live transcript as it was delivered to the channel (same `id` as the `Transcript` event),
+// with the translations made of it.
+type StoredTranscript struct {
+	ID        string `json:"id"`
+	ChannelID string `json:"channel_id"`
+	// Speaker.
+	UserID string `json:"user_id"`
+	// Recognised text in the speaker's language.
+	Text string `json:"text"`
+	// Detected or configured source language; absent when the provider did not report one.
+	Language *string `json:"language,omitempty"`
+	// When the speech segment began.
+	StartedAt string `json:"started_at"`
+	// Audio length of the segment.
+	DurationMs int64 `json:"duration_ms"`
+	// Word timings relative to `started_at` (only with `stt.include_words`).
+	Words        []StoredTranscriptWord `json:"words,omitempty"`
+	Translations []StoredTranslation    `json:"translations"`
+	// Node that transcribed the segment.
+	NodeID    *string `json:"node_id,omitempty"`
+	CreatedAt string  `json:"created_at"`
+}
+
+// StoredTranscriptWord is the `StoredTranscriptWord` schema.
+type StoredTranscriptWord struct {
+	Word    string `json:"word"`
+	StartMs int64  `json:"start_ms"`
+	EndMs   int64  `json:"end_ms"`
+}
+
+// A machine translation of the transcript into `language`, as it was pushed to listeners of that
+// language.
+type StoredTranslation struct {
+	// Target language (BCP 47 / ISO 639-1).
+	Language  string `json:"language"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+}
+
 // Rows removed by the retention sweep, per rule.
 type SweepReport struct {
 	Sessions         *int64 `json:"sessions,omitempty"`
@@ -1924,6 +1991,17 @@ type TokenResponse struct {
 type TokensRevoked struct {
 	TokensRevoked bool  `json:"tokens_revoked"`
 	Updated       *bool `json:"updated,omitempty"`
+}
+
+// One page of stored transcripts, newest first.
+type TranscriptPage struct {
+	Transcripts []StoredTranscript `json:"transcripts"`
+	// Cursor of the oldest transcript on the page; pass as `before` to get older ones. Absent when the
+	// page reached the oldest transcript.
+	NextBefore *string `json:"next_before,omitempty"`
+	// Cursor of the newest transcript on the page; pass as `after` to get newer ones. Absent when the
+	// page reached the present.
+	NextAfter *string `json:"next_after,omitempty"`
 }
 
 // TranscriptSegment is the `TranscriptSegment` schema.
@@ -2194,6 +2272,9 @@ type UserErasureCounts struct {
 	ModerationEvents   *int64 `json:"moderation_events,omitempty"`
 	Bans               *int64 `json:"bans,omitempty"`
 	Users              *int64 `json:"users,omitempty"`
+	Transcripts        *int64 `json:"transcripts,omitempty"`
+	// Per-device chat delivery cursors removed with the user.
+	ChatDeviceCursors *int64 `json:"chat_device_cursors,omitempty"`
 }
 
 // UserExport is the `UserExport` schema.
@@ -2209,8 +2290,12 @@ type UserExport struct {
 	Bans               []Ban                 `json:"bans,omitempty"`
 	Moderation         *UserExportModeration `json:"moderation,omitempty"`
 	Recordings         []Recording           `json:"recordings,omitempty"`
+	// Stored live transcripts the user spoke, with their translations (`stt.persist`).
+	Transcripts []StoredTranscript `json:"transcripts,omitempty"`
 	// Collections cut at 10 000 rows.
 	Truncated []string `json:"truncated,omitempty"`
+	// The user's chat devices with their delivery cursors (`chat.persist`).
+	ChatDevices []ChatDeviceCursor `json:"chat_devices,omitempty"`
 }
 
 // UserExportBlocks is the `UserExportBlocks` schema.
@@ -2567,4 +2652,34 @@ type SearchUserMessagesQuery struct {
 type RemoveMessageReactionQuery struct {
 	// The user whose reaction is removed.
 	UserID *string
+}
+
+// ListChannelTranscriptsQuery holds the query parameters of `listChannelTranscripts`.
+type ListChannelTranscriptsQuery struct {
+	// Only transcripts older than this cursor. Opaque keyset cursor (`(started_at, id)`, URL-safe
+	// base64) taken from a previous page's `next_before` / `next_after`; equal timestamps never skip
+	// or repeat a row. Invalid cursors are `400`.
+	Before *string
+	// Only transcripts newer than this cursor (walk forward from a known position). Opaque keyset
+	// cursor (`(started_at, id)`, URL-safe base64) taken from a previous page's `next_before` /
+	// `next_after`; equal timestamps never skip or repeat a row. Invalid cursors are `400`.
+	After *string
+	// Page size, 1..=200 (default 50).
+	Limit *int64
+	// Only this speaker's transcripts.
+	UserID *string
+}
+
+// ListUserTranscriptsQuery holds the query parameters of `listUserTranscripts`.
+type ListUserTranscriptsQuery struct {
+	// Only transcripts older than this cursor. Opaque keyset cursor (`(started_at, id)`, URL-safe
+	// base64) taken from a previous page's `next_before` / `next_after`; equal timestamps never skip
+	// or repeat a row. Invalid cursors are `400`.
+	Before *string
+	// Only transcripts newer than this cursor (walk forward from a known position). Opaque keyset
+	// cursor (`(started_at, id)`, URL-safe base64) taken from a previous page's `next_before` /
+	// `next_after`; equal timestamps never skip or repeat a row. Invalid cursors are `400`.
+	After *string
+	// Page size, 1..=200 (default 50).
+	Limit *int64
 }

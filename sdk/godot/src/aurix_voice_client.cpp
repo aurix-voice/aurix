@@ -79,6 +79,8 @@ void AurixVoiceClient::set_quic_enabled(bool enabled) { config_.quic = enabled; 
 bool AurixVoiceClient::get_quic_enabled() const { return config_.quic; }
 void AurixVoiceClient::set_tls_tunnel_enabled(bool enabled) { config_.tls_tunnel = enabled; }
 bool AurixVoiceClient::get_tls_tunnel_enabled() const { return config_.tls_tunnel; }
+void AurixVoiceClient::set_device_id(const String& device_id) { device_id_ = device_id; }
+String AurixVoiceClient::get_device_id() const { return device_id_; }
 void AurixVoiceClient::set_auto_capture(bool enabled) { auto_capture_ = enabled; }
 bool AurixVoiceClient::get_auto_capture() const { return auto_capture_; }
 void AurixVoiceClient::set_auto_playback(bool enabled) { auto_playback_ = enabled; }
@@ -121,6 +123,7 @@ int AurixVoiceClient::connect_to_server(const String& ws_url, const String& toke
     disconnect_from_server();
     aurix::Config cfg(ws_url.utf8().get_data(), token.utf8().get_data());
     cfg.raw = config_;
+    cfg.device_id = device_id_.utf8().get_data();
     client_ = aurix::Client::create(cfg);
     ++client_generation_;
     if (!client_) {
@@ -1124,7 +1127,7 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
         break;
     }
     case AURIX_EVENT_CHAT_INBOX_SYNCED:
-        emit_signal("chat_inbox_synced", static_cast<int64_t>(ev.number()), ev.flag());
+        emit_signal("chat_inbox_synced", static_cast<int64_t>(ev.number()), ev.flag(), ev.flag2());
         break;
     case AURIX_EVENT_CHAT_MESSAGE_UPDATED: {
         AurixChatMessage m;
@@ -1175,6 +1178,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_quic_enabled"), &AurixVoiceClient::get_quic_enabled);
     ClassDB::bind_method(D_METHOD("set_tls_tunnel_enabled", "enabled"), &AurixVoiceClient::set_tls_tunnel_enabled);
     ClassDB::bind_method(D_METHOD("get_tls_tunnel_enabled"), &AurixVoiceClient::get_tls_tunnel_enabled);
+    ClassDB::bind_method(D_METHOD("set_device_id", "device_id"), &AurixVoiceClient::set_device_id);
+    ClassDB::bind_method(D_METHOD("get_device_id"), &AurixVoiceClient::get_device_id);
     ClassDB::bind_method(D_METHOD("set_auto_capture", "enabled"), &AurixVoiceClient::set_auto_capture);
     ClassDB::bind_method(D_METHOD("get_auto_capture"), &AurixVoiceClient::get_auto_capture);
     ClassDB::bind_method(D_METHOD("set_auto_playback", "enabled"), &AurixVoiceClient::set_auto_playback);
@@ -1201,6 +1206,7 @@ void AurixVoiceClient::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::INT, "media_path_policy", PROPERTY_HINT_ENUM, "Auto,UDP Only,Tunnel Only,QUIC Only,TLS Only"), "set_media_path_policy", "get_media_path_policy");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "quic"), "set_quic_enabled", "get_quic_enabled");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tls_tunnel"), "set_tls_tunnel_enabled", "get_tls_tunnel_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "device_id"), "set_device_id", "get_device_id");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_capture"), "set_auto_capture", "get_auto_capture");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_playback"), "set_auto_playback", "get_auto_playback");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_buffer_seconds", PROPERTY_HINT_RANGE, "0.02,1.0,0.01"), "set_playback_buffer_seconds", "get_playback_buffer_seconds");
@@ -1391,7 +1397,7 @@ void AurixVoiceClient::_bind_methods() {
     ADD_SIGNAL(MethodInfo("chat_read_marker", PropertyInfo(Variant::DICTIONARY, "marker")));
     ADD_SIGNAL(MethodInfo("chat_read_markers", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
                           PropertyInfo(Variant::INT, "unread"), PropertyInfo(Variant::ARRAY, "markers")));
-    ADD_SIGNAL(MethodInfo("chat_inbox_synced", PropertyInfo(Variant::INT, "delivered"), PropertyInfo(Variant::BOOL, "truncated")));
+    ADD_SIGNAL(MethodInfo("chat_inbox_synced", PropertyInfo(Variant::INT, "delivered"), PropertyInfo(Variant::BOOL, "truncated"), PropertyInfo(Variant::BOOL, "per_device")));
     ADD_SIGNAL(MethodInfo("chat_message_updated", PropertyInfo(Variant::DICTIONARY, "message")));
     ADD_SIGNAL(MethodInfo("chat_reaction_changed", PropertyInfo(Variant::DICTIONARY, "change")));
     ADD_SIGNAL(MethodInfo("chat_search_result", PropertyInfo(Variant::INT, "request_id"), PropertyInfo(Variant::STRING, "channel_id"),

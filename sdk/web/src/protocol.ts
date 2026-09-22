@@ -226,6 +226,7 @@ export type ClientMessage =
         client_ref?: string;
       };
     }
+  | { type: 'ChatAck'; data: { message_id: string } }
   | { type: 'ChatMarkRead'; data: { channel_id?: string; user_id?: string; message_id: string } }
   | { type: 'ChatReadMarkers'; data: { channel_id?: string; user_id?: string } }
   | {
@@ -440,7 +441,7 @@ export type ServerMessage =
         unread_count: number;
       };
     }
-  | { type: 'ChatInboxSynced'; data: { delivered: number; truncated: boolean } }
+  | { type: 'ChatInboxSynced'; data: { delivered: number; truncated: boolean; per_device?: boolean } }
   | { type: 'ParticipantTyping'; data: { channel_id: string; user_id: string; typing: boolean } }
   | { type: 'ChannelEnergy'; data: { channel_id: string; levels: ParticipantEnergy[] } }
   | { type: 'Transcript'; data: { transcript: TranscriptWire } }
@@ -551,6 +552,13 @@ export const AURIX_SUBPROTOCOL = 'aurix';
 export const BEARER_SUBPROTOCOL_PREFIX = 'bearer.';
 /** `resume.<session_id>.<resume_token>` sub-protocol carries the resume credential. */
 export const RESUME_SUBPROTOCOL_PREFIX = 'resume.';
+/** `device.<device_id>` sub-protocol identifies the installation (per-device chat cursor). */
+export const DEVICE_SUBPROTOCOL_PREFIX = 'device.';
+
+/** Device ids travel in a sub-protocol name: 1-128 characters of `A-Z a-z 0-9 . _ ~ -`. */
+export function isValidDeviceId(id: string): boolean {
+  return /^[A-Za-z0-9._~-]{1,128}$/.test(id);
+}
 
 export function parseServerMessage(raw: string): ServerMessage | UnknownMessage {
   const value: unknown = JSON.parse(raw);

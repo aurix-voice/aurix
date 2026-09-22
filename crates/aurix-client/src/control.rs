@@ -24,6 +24,7 @@ use crate::error::{ClientError, Result};
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const RESUME_HEADER: &str = "x-aurix-resume";
+const DEVICE_HEADER: &str = "x-aurix-device";
 
 /// `SessionInitAck` with the media key already decoded.
 #[derive(Debug, Clone)]
@@ -139,6 +140,15 @@ pub struct ControlConnection {
     stream: SplitStream<WsStream>,
 }
 
+/// Device ids travel in a header / sub-protocol name / URL path: a conservative alphabet.
+pub fn valid_device_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+}
+
 /// One frame from the server: JSON control (text) or a sealed AURX packet (binary).
 #[derive(Debug)]
 pub enum Inbound {
@@ -150,11 +160,13 @@ impl ControlConnection {
     /// Open the WebSocket, authenticate and wait for `SessionInitAck`.
     ///
     /// `resume` is `(session_id, resume_token)` of a detached session; the server falls back to
-    /// a fresh session when the claim fails (reported as `resumed == false`).
+    /// a fresh session when the claim fails (reported as `resumed == false`). `device` keys the
+    /// per-device chat delivery cursor (`ClientConfig::device_id`).
     pub async fn connect(
         ws_url: &str,
         token: &str,
         resume: Option<(SessionId, &str)>,
+        device: Option<&str>,
         timeout: Duration,
     ) -> Result<(Self, SessionAck)> {
         validate_ws_url(ws_url)?;
@@ -176,6 +188,17 @@ impl ControlConnection {
                 RESUME_HEADER,
                 HeaderValue::from_str(&format!("{}.{tok}", sid.0))
                     .map_err(|_| ClientError::InvalidArgument("resume token invalid".into()))?,
+            );
+        }
+        if let Some(device) = device {
+            if !valid_device_id(device) {
+                return Err(ClientError::InvalidArgument(
+                    "device_id must be 1-128 characters of A-Z a-z 0-9 . _ ~ -".into(),
+                ));
+            }
+            headers.insert(
+                DEVICE_HEADER,
+                HeaderValue::from_str(device).expect("validated"),
             );
         }
         let connect = tokio_tungstenite::connect_async(request);

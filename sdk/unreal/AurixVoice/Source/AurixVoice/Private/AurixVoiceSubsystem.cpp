@@ -754,6 +754,7 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	ActiveSettings = Settings;
 
 	aurix::Config Cfg(ToUtf8(Settings.WebSocketUrl), ToUtf8(Settings.Token));
+	Cfg.device_id = ToUtf8(Settings.DeviceId);
 	Cfg.raw.auto_reconnect = Settings.bAutoReconnect;
 	Cfg.raw.reconnect_max_attempts = static_cast<uint32_t>(FMath::Max(0, Settings.ReconnectMaxAttempts));
 	Cfg.raw.reconnect_initial_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectInitialDelayMs));
@@ -2203,7 +2204,7 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 	}
 
 	case AURIX_EVENT_CHAT_INBOX_SYNCED:
-		OnChatInboxSynced.Broadcast(static_cast<int32>(aurix_event_number(Raw)), aurix_event_flag(Raw));
+		OnChatInboxSynced.Broadcast(static_cast<int32>(aurix_event_number(Raw)), aurix_event_flag(Raw), aurix_event_flag2(Raw));
 		break;
 
 	case AURIX_EVENT_PARTICIPANT_TYPING:

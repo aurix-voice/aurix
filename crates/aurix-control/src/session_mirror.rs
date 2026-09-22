@@ -102,6 +102,9 @@ pub struct SessionMirror {
     pub ip: String,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Chat device id of the connection (per-device delivery cursor), kept across takeover.
+    #[serde(default)]
+    pub device_id: Option<String>,
     #[serde(default)]
     pub channels: Vec<MirroredChannel>,
     #[serde(default)]
@@ -165,6 +168,7 @@ mod tests {
             resume_hash: SessionMirror::resume_hash_hex(&hash),
             ip: "127.0.0.1".into(),
             user_agent: None,
+            device_id: None,
             channels: vec![],
             prefs: MirroredPrefs::default(),
             updated_at: 0,

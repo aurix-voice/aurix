@@ -99,6 +99,8 @@ export type AppPermission =
   | "moderation:write"
   | "chat:read"
   | "chat:write"
+  | "transcripts:read"
+  | "transcripts:write"
   | "audit:read"
   | "keys:manage"
   | "tokens:issue"
@@ -106,8 +108,8 @@ export type AppPermission =
   | "tts:write";
 
 const VIEWER_APP_PERMS: readonly AppPermission[] = ["channels:read", "users:read", "analytics:read", "events:read", "webhooks:read", "recordings:read", "audio_streams:read"];
-const MODERATOR_APP_PERMS: readonly AppPermission[] = ["moderation:read", "moderation:write", "chat:read", "chat:write", "audit:read", "users:write"];
-const ADMIN_APP_PERMS: readonly AppPermission[] = ["channels:write", "webhooks:write", "recordings:write", "audio_streams:write", "keys:manage", "tokens:issue", "turn:issue", "tts:write", "users:export"];
+const MODERATOR_APP_PERMS: readonly AppPermission[] = ["moderation:read", "moderation:write", "chat:read", "chat:write", "transcripts:read", "audit:read", "users:write"];
+const ADMIN_APP_PERMS: readonly AppPermission[] = ["channels:write", "webhooks:write", "recordings:write", "audio_streams:write", "keys:manage", "tokens:issue", "turn:issue", "tts:write", "transcripts:write", "users:export"];
 
 export const ALL_APP_PERMISSIONS: readonly AppPermission[] = [...VIEWER_APP_PERMS, ...MODERATOR_APP_PERMS, ...ADMIN_APP_PERMS].sort();
 

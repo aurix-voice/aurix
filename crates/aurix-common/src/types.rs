@@ -1824,6 +1824,7 @@ pub enum AuditAction {
     RetentionSweep,
     NodeDrained,
     NodeUndrained,
+    TranscriptsDeleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

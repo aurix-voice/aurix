@@ -9,6 +9,7 @@ use crate::redis_store::RedisStore;
 use crate::safety::SafetyService;
 use crate::session_manager::SessionManager;
 use crate::speech::SpeechService;
+use crate::transcripts::TranscriptStore;
 use crate::translation::TranslationService;
 use crate::usage::UsageService;
 use crate::user_lifecycle::{RetentionService, UserLifecycle};
@@ -42,6 +43,8 @@ pub struct ControlPlane {
     pub safety: Arc<SafetyService>,
     pub speech: Arc<SpeechService>,
     pub translation: Arc<TranslationService>,
+    /// Stored live transcripts (`stt.persist`); every method is a no-op / `404` when off.
+    pub transcripts: Arc<TranscriptStore>,
     pub webhooks: Arc<WebhookService>,
     pub users: Arc<UserLifecycle>,
     pub retention: Arc<RetentionService>,
@@ -217,6 +220,12 @@ impl ControlPlane {
             config.translation.clone(),
             speech.enabled(),
         ));
+        let transcripts = Arc::new(TranscriptStore::new(
+            config.stt.clone(),
+            pool.clone(),
+            node_id,
+        ));
+        transcripts.start_retention_sweep();
         let webhooks = Arc::new(WebhookService::new(
             config.webhooks.clone(),
             config.is_production(),
@@ -263,6 +272,7 @@ impl ControlPlane {
             safety,
             speech,
             translation,
+            transcripts,
             webhooks,
             users,
             retention,

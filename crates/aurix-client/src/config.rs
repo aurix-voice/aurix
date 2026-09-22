@@ -105,6 +105,11 @@ pub struct ClientConfig {
     pub e2ee_identity: Option<[u8; 32]>,
     /// Number of tokio worker threads for the control plane (1 is plenty).
     pub worker_threads: usize,
+    /// Stable id of this installation (`[A-Za-z0-9._~-]{1,128}`, e.g. a UUID persisted on
+    /// first run). Sent on connect so the server keeps a per-device cursor of directed chat
+    /// messages: each is replayed to this device exactly once and acknowledged automatically
+    /// (`ChatAck`). `None` — the user-wide read-marker backlog is replayed instead.
+    pub device_id: Option<String>,
 }
 
 impl ClientConfig {
@@ -134,6 +139,7 @@ impl ClientConfig {
             e2ee: true,
             e2ee_identity: None,
             worker_threads: 1,
+            device_id: None,
         }
     }
 }
