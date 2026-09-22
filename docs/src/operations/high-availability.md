@@ -122,11 +122,39 @@ without the other).
 
 ### Redis Cluster
 
-**Not supported.** The node uses a non-cluster client (no `MOVED`/`ASK` handling), the
-ownership compare-and-set touches `session:{id}:node` and `session:{id}:mirror` in one Lua
-script without hash tags (a cluster answers `CROSSSLOT`), and the event bus uses classic
-Pub/Sub. Use Sentinel or a managed HA endpoint; cluster mode is not exercised by the test
-suite.
+```toml
+[redis]
+cluster = ["rediss://:password@node-1:6379", "rediss://:password@node-2:6379", "rediss://:password@node-3:6379"]
+sharded_pubsub = true      # default; false = classic PUBLISH/SUBSCRIBE (Redis < 7)
+pool_size = 20
+```
+
+`cluster` is a list of seed URLs (any subset of the nodes; the client discovers the rest from
+`CLUSTER SLOTS`). Credentials, database and TLS mode come from the seed URLs; `url` is ignored
+and `sentinels` is rejected alongside `cluster`. The node uses a slot-aware client (`MOVED`/
+`ASK` redirects, topology refresh on failover, 5 s connect / 2 s response timeouts, three
+retries) and every multi-key operation is same-slot by construction: session keys are
+hash-tagged as `session:{<id>}:node` / `session:{<id>}:mirror`, per-user keys as
+`user:{<id>}:*`, so the ownership compare-and-set Lua scripts and the multi-key `DEL`s never
+hit `CROSSSLOT`. Rate limiters, token buckets, counters and one-time token claims are
+single-key and spread over all shards.
+
+Cross-node events travel over **sharded Pub/Sub** (`SSUBSCRIBE`/`SPUBLISH`, Redis 7+, RESP3)
+on the channel `{aurix}:events`, so they stay on one shard and are not broadcast to every node
+of the cluster the way classic Pub/Sub is. Set `sharded_pubsub = false` for a Redis 6 cluster
+or a proxy without RESP3 push support. When the master owning that slot dies the server sends
+a disconnect / `sunsubscribe` push, the node marks its subscriber detached (`/ready` → 503),
+rebuilds the connection with backoff and re-subscribes once the replica is promoted — a few
+seconds with `cluster-node-timeout` at its default. `aurix_redis_failovers_total` is a Sentinel
+counter and stays flat in cluster mode: `/ready` flapping and the `Redis Cluster Pub/Sub
+subscriber` log lines are the signals.
+
+Cluster mode is not a latency win — Redis is not the media path — it removes a deployment
+restriction (managed Redis with cluster mode and no Sentinel) and spreads the keyspace and the
+event fan-out over several masters. Sentinel or a managed HA endpoint remain the simplest
+choice for most fleets. The chaos harness runs the same scenarios against a six-node cluster
+(`AURIX_CHAOS_REDIS=cluster tools/chaos/run.sh`), including a kill of the master holding the
+event slot.
 
 ### Behaviour while Redis is down
 

@@ -127,8 +127,8 @@ impl ControlPlane {
             Ok(source) => match RedisStore::connect(source, node_id).await {
                 Ok(store) => {
                     tracing::info!(
-                        master = %store.master_addr(),
-                        sentinel = store.is_sentinel(),
+                        endpoint = %store.master_addr(),
+                        backend = store.backend(),
                         "Redis connected"
                     );
                     let store = Arc::new(store);

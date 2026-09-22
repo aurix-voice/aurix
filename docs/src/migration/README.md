@@ -46,7 +46,7 @@ You are now the provider. Concretely that means running (or paying someone to ru
   ([Deployment](../operations/deployment.md), [Scaling out](../operations/scaling.md));
 * TURN for players behind symmetric NAT — the built-in `[turn]` or your own
   ([Deployment → Network and firewall](../operations/deployment.md#network-and-firewall));
-* HA for the control plane — Redis Sentinel and PostgreSQL replicas
+* HA for the control plane — Redis Sentinel or Cluster and PostgreSQL replicas
   ([High availability](../operations/high-availability.md));
 * metrics and alerts ([Backups and observability](../operations/observability.md));
 * upgrades ([Releases and versioning](../operations/releases.md)).

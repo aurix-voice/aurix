@@ -66,7 +66,7 @@ webhook-subscription invalidation, `user.deleted`, `SessionMigrated`) are publis
 origin node id; a node never re-applies its own events. Redis also holds one-time token claims
 (`jti`), session→node mapping and session mirrors for failover, node liveness beacons, global
 mutes and distributed rate limits. Without Redis a single node works; a fleet does not. Redis
-Sentinel is supported, Redis Cluster is not — see [High availability](high-availability.md#redis).
+Sentinel and Redis Cluster are both supported — see [High availability](high-availability.md#redis).
 
 ## Fleet-wide rate limits
 

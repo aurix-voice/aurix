@@ -11,6 +11,21 @@ released together.
 
 ## [Unreleased]
 
+### Added
+
+* **Redis Cluster.** `redis.cluster = ["redis://…", …]` (env `AURIX__REDIS__CLUSTER`, exclusive
+  with Sentinel) runs the control plane against a Redis Cluster: slot-aware client with
+  `MOVED`/`ASK` handling and topology refresh, hash-tagged session (`session:{id}:*`) and user
+  (`user:{id}:*`) keys so the ownership CAS scripts and multi-key `DEL`s stay same-slot, and
+  cross-node events over sharded Pub/Sub (`SSUBSCRIBE`/`SPUBLISH`, Redis 7 / RESP3) with
+  `redis.sharded_pubsub = false` as the classic fallback. Losing the master that owns the event
+  slot detaches the subscriber (`/ready` → 503) until the replica is promoted and the node
+  re-subscribes. Live tests (`AURIX_E2E_REDIS_CLUSTER`) and the chaos harness
+  (`AURIX_CHAOS_REDIS=cluster`, six-node cluster, shard kill under load) cover it; the CI `chaos`
+  job now runs both the Sentinel and the Cluster fleet. Key layout is compatible with existing
+  standalone/Sentinel deployments only after all nodes restart on this version (session and
+  user keys changed names; in-flight mirrors of older nodes are not read).
+
 ## [1.4.0] - 2026-09-22
 
 Licence change plus one media fix — no protocol, API or database changes. Nodes of 1.3 and 1.4

@@ -185,9 +185,11 @@
   алертов флота предполагают достаточно одновременных сессий, чтобы перцентили имели смысл, и
   требуют настройки ниже нескольких десятков. Агрегаты качества есть на приложение, не на канал
   ([Network quality](../features/quality.md)).
-* **Redis Sentinel — да, Redis Cluster — нет.** Захват владения — многоключевой Lua-скрипт без
-  hash-тегов, а шина событий — классический Pub/Sub; направляйте флот на набор Sentinel или
-  managed-эндпоинт со стабильным адресом.
+* **Redis Cluster требует Redis 7 для sharded Pub/Sub.** `redis.cluster` работает с Redis 7+
+  (`SSUBSCRIBE`, RESP3); на кластерах Redis 6 или прокси без RESP3 поставьте
+  `redis.sharded_pubsub = false` — шина событий перейдёт на классический Pub/Sub, который
+  кластер рассылает на все ноды. Режим кластера — про совместимость, а не про задержку; никаких
+  бенчмарков «голос быстрее с кластером» нет.
 * **Live-аудиопотоки — на участника**, не микшированные, и дропаются (с подсчётом), когда
   потребитель отстаёт больше `recording.live.queue_frames`; буферизации через простой потребителя
   нет ([Recordings and live streams](../features/recordings.md)).
@@ -288,7 +290,7 @@
   Google в CI не подключался — имена claims и форматы групп вашего провайдера проверяйте первыми
   ([Administrator accounts and SSO](../operations/admin-sso.md)).
 * **Chaos-тесты идут на одном хосте.** Harness `tools/chaos/` убивает ноду, переключает Redis
-  через Sentinel, останавливает и запускает PostgreSQL и проверяет изоляцию — но всё (обе ноды,
+  через Sentinel (или убивает мастер шарда Redis Cluster), останавливает и запускает PostgreSQL и проверяет изоляцию — но всё (обе ноды,
   Sentinel'ы, PostgreSQL) живёт на одной машине и одном loopback. Сетевые разделения между
   хостами, split-brain кворума Sentinel между ЦОД, promotion реплики PostgreSQL и задержка
   межрегионального failover не проверяются ([High availability](../operations/high-availability.md)).

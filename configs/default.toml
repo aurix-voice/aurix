@@ -28,6 +28,10 @@ pool_size = 20
 # password/db/TLS mode for the resolved master.
 # sentinels = ["redis://sentinel-1:26379", "redis://sentinel-2:26379", "redis://sentinel-3:26379"]
 # sentinel_master = "aurix"
+# Redis Cluster (exclusive with Sentinel): seed URLs carry credentials/db/TLS, `url` is ignored.
+# Cross-node events use sharded Pub/Sub (Redis 7+); set sharded_pubsub = false for older clusters.
+# cluster = ["redis://node-1:6379", "redis://node-2:6379", "redis://node-3:6379"]
+# sharded_pubsub = true
 
 [auth]
 jwt_secret = "change-me-in-production-this-is-not-secure-32bytes!"

@@ -90,8 +90,7 @@ async fn store_at(url: String) -> Arc<RedisStore> {
     let cfg = RedisConfig {
         url,
         pool_size: 1,
-        sentinels: Vec::new(),
-        sentinel_master: None,
+        ..RedisConfig::default()
     };
     let source = RedisSource::open(&cfg)
         .await

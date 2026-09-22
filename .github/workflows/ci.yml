@@ -386,9 +386,13 @@ jobs:
           if-no-files-found: ignore
 
   chaos:
-    name: chaos / HA (node kill, Redis Sentinel failover, PostgreSQL restart)
+    name: chaos / HA (${{ matrix.redis }}: node kill, Redis failover, PostgreSQL restart)
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: [sentinel, cluster]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -396,18 +400,25 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake jq
       - run: cargo build --locked --bin aurix-server
       - run: cargo test --locked -p aurix-server --test e2e_live --no-run
-      # Two aurix-server processes on the runner + PostgreSQL, a Redis master/replica pair and
-      # three Sentinels in host-network containers (tools/chaos/docker-compose.yml). Every
-      # scenario reuses the live E2E tests; the harness only injects the faults and asserts the
-      # fleet-level signals (reaper counter, Sentinel master switch, /ready flapping). Single
-      # host, loopback only: real network partitions and cross-region latency are not covered.
+      - if: matrix.redis == 'cluster'
+        run: cargo test --locked -p aurix-control --test redis_live --no-run
+      # Two aurix-server processes on the runner + PostgreSQL and either a Redis master/replica
+      # pair with three Sentinels (tools/chaos/docker-compose.yml) or a six-node Redis Cluster
+      # (docker-compose.cluster.yml) in host-network containers. Every scenario reuses the live
+      # E2E tests; the harness only injects the faults and asserts the fleet-level signals
+      # (reaper counter, Sentinel master switch / cluster slot promotion, /ready flapping).
+      # Single host, loopback only: real network partitions and cross-region latency are not
+      # covered.
       - name: Chaos scenarios
         run: tools/chaos/run.sh
+        env:
+          AURIX_CHAOS_REDIS: ${{ matrix.redis }}
       - name: Node logs
         if: failure()
         run: |
           for f in target/chaos/node*.log; do echo "::group::$f"; tail -n 300 "$f"; echo "::endgroup::"; done
           docker compose -f tools/chaos/docker-compose.yml logs --tail 100 || true
+          docker compose -f tools/chaos/docker-compose.cluster.yml logs --tail 100 || true
 
   native-core:
     name: native core (${{ matrix.name }})

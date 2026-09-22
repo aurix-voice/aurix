@@ -1,31 +1,273 @@
 //! Redis fencing primitives behind cross-node failover, against a real Redis
-//! (`AURIX_E2E_REDIS_URL`, e.g. `redis://127.0.0.1:6379/15`). Three "nodes" share one server;
-//! every key carries a fresh session id so runs do not interfere.
+//! (`AURIX_E2E_REDIS_URL`, e.g. `redis://127.0.0.1:6379/15`) or a real Redis Cluster
+//! (`AURIX_E2E_REDIS_CLUSTER`, comma-separated seed URLs; takes precedence). Three "nodes"
+//! share one server; every key carries a fresh session id so runs do not interfere. Against a
+//! cluster the same tests prove that no multi-key script or command crosses a slot.
 
 use aurix_common::config::{RateLimitConfig, RedisConfig};
 use aurix_common::redis_pool::RedisSource;
-use aurix_common::types::{AppId, MediaNodeId, SessionId, UserId};
+use aurix_common::types::{AppId, ChannelId, MediaNodeId, SessionId, UserId};
 use aurix_control::{
-    FleetLimiter, Limit, LimitBackend, LimitScope, MirroredPrefs, RedisStore, SessionMirror,
-    TakeoverRefused,
+    EventBus, FleetLimiter, Limit, LimitBackend, LimitScope, MirroredPrefs, RedisStore,
+    ServerEvent, SessionMirror, TakeoverRefused,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn store(node: MediaNodeId) -> Option<RedisStore> {
-    let url = std::env::var("AURIX_E2E_REDIS_URL").ok()?;
-    let cfg = RedisConfig {
-        url,
+fn redis_config() -> Option<RedisConfig> {
+    let base = RedisConfig {
         pool_size: 2,
-        sentinels: Vec::new(),
-        sentinel_master: None,
+        ..RedisConfig::default()
     };
+    if let Ok(seeds) = std::env::var("AURIX_E2E_REDIS_CLUSTER") {
+        return Some(RedisConfig {
+            cluster: seeds
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            sharded_pubsub: std::env::var("AURIX_E2E_REDIS_SHARDED_PUBSUB")
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(true),
+            ..base
+        });
+    }
+    Some(RedisConfig {
+        url: std::env::var("AURIX_E2E_REDIS_URL").ok()?,
+        ..base
+    })
+}
+
+async fn store(node: MediaNodeId) -> Option<RedisStore> {
+    let cfg = redis_config()?;
     let source = RedisSource::open(&cfg).await.expect("redis");
     Some(
         RedisStore::connect(source, node)
             .await
             .expect("redis store"),
     )
+}
+
+/// Events published on one node's bus arrive on the other node's bus and never on the
+/// publisher's own bus a second time; the subscriber's readiness flag follows the attach.
+#[tokio::test]
+#[ignore = "requires Redis (AURIX_E2E_REDIS_URL)"]
+async fn events_replicate_between_nodes() {
+    let (n1, n2) = (MediaNodeId::new(), MediaNodeId::new());
+    let Some(node1) = store(n1).await else {
+        eprintln!("AURIX_E2E_REDIS_URL not set; skipping");
+        return;
+    };
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(store(n2).await.unwrap());
+    let bus1 = Arc::new(EventBus::new(64));
+    let bus2 = Arc::new(EventBus::new(64));
+    let mut local1 = bus1.subscribe();
+    let mut local2 = bus2.subscribe();
+    assert!(
+        node1.event_subscriber_connected(),
+        "never started: nothing to miss"
+    );
+    node1.start_event_replication(bus1.clone());
+    node2.start_event_replication(bus2.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(node1.event_subscriber_connected() && node2.event_subscriber_connected()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscribers never attached"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A subscription confirmation can still be in flight on the server side; publish until the
+    // peer hears us.
+    let probe = AppId::new();
+    let heard = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            bus1.publish(ServerEvent::WebhooksChanged { app_id: probe });
+            match tokio::time::timeout(Duration::from_millis(300), local2.recv()).await {
+                Ok(Ok(ServerEvent::WebhooksChanged { app_id })) if app_id == probe => break,
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => panic!("bus2 closed: {e}"),
+                Err(_) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(heard.is_ok(), "node 2 never received node 1's event");
+    // A remote-only event shows up on node 1 exactly once, and node 2 sees its own publish once
+    // (local delivery) with no echo through Redis. Only the probe is counted: other tests share
+    // the event channel.
+    let probe = AppId::new();
+    bus2.publish(ServerEvent::WebhooksChanged { app_id: probe });
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match local1.recv().await.unwrap() {
+                ServerEvent::WebhooksChanged { app_id } if app_id == probe => break,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+    assert!(first.is_ok(), "node 1 receives node 2's event");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count_probe(&mut local1, probe), 0, "event delivered twice");
+    assert_eq!(
+        count_probe(&mut local2, probe),
+        1,
+        "node 2 gets its own event locally once, never echoed back through Redis"
+    );
+}
+
+fn count_probe(rx: &mut tokio::sync::broadcast::Receiver<ServerEvent>, probe: AppId) -> usize {
+    let mut n = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, ServerEvent::WebhooksChanged { app_id } if app_id == probe) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Per-user keys are dropped in one multi-key `DEL`; on a cluster this only works because they
+/// share the user's hash tag.
+#[tokio::test]
+#[ignore = "requires Redis (AURIX_E2E_REDIS_URL)"]
+async fn user_keys_share_a_slot() {
+    let Some(node1) = store(MediaNodeId::new()).await else {
+        eprintln!("AURIX_E2E_REDIS_URL not set; skipping");
+        return;
+    };
+    let user = UserId::new();
+    let channel = ChannelId::new();
+    node1.set_global_mute(user, true).await.unwrap();
+    node1.add_user_channel(user, channel).await.unwrap();
+    assert!(node1.is_globally_muted(user).await.unwrap());
+    assert_eq!(node1.get_user_channels(user).await.unwrap(), vec![channel]);
+    node1.forget_user(user).await.unwrap();
+    assert!(!node1.is_globally_muted(user).await.unwrap());
+    assert!(node1.get_user_channels(user).await.unwrap().is_empty());
+}
+
+/// Publishes `WebhooksChanged` events on `from` until one of them reaches `to`, or `budget`
+/// runs out. Returns whether the peer heard us.
+async fn events_flow(
+    from: &EventBus,
+    to: &mut tokio::sync::broadcast::Receiver<ServerEvent>,
+    budget: Duration,
+) -> bool {
+    let probe = AppId::new();
+    tokio::time::timeout(budget, async {
+        loop {
+            from.publish(ServerEvent::WebhooksChanged { app_id: probe });
+            let wait = tokio::time::sleep(Duration::from_millis(300));
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    _ = &mut wait => break,
+                    r = to.recv() => match r {
+                        Ok(ServerEvent::WebhooksChanged { app_id }) if app_id == probe => return,
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(e) => panic!("bus closed: {e}"),
+                    },
+                }
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Redis Cluster shard failover under the event bus. Needs the cluster and two hooks that
+/// take the shard's `host:port`: `AURIX_E2E_REDIS_CLUSTER_KILL` (SIGKILL that node) and
+/// `AURIX_E2E_REDIS_CLUSTER_START` (bring it back). After the master holding the event
+/// channel's slot dies, both nodes' subscribers re-attach to the promoted replica, events flow
+/// again, and the fencing scripts still work on the moved slot.
+#[tokio::test]
+#[ignore = "requires a Redis Cluster and AURIX_E2E_REDIS_CLUSTER_KILL/_START hooks"]
+async fn cluster_shard_failover_reattaches_the_event_bus() {
+    let (Ok(kill), Ok(start)) = (
+        std::env::var("AURIX_E2E_REDIS_CLUSTER_KILL"),
+        std::env::var("AURIX_E2E_REDIS_CLUSTER_START"),
+    ) else {
+        eprintln!("AURIX_E2E_REDIS_CLUSTER_KILL/_START not set; skipping");
+        return;
+    };
+    let (n1, n2) = (MediaNodeId::new(), MediaNodeId::new());
+    let node1 = Arc::new(store(n1).await.expect("AURIX_E2E_REDIS_CLUSTER"));
+    let node2 = Arc::new(store(n2).await.unwrap());
+    assert!(
+        node1.is_cluster(),
+        "this scenario needs AURIX_E2E_REDIS_CLUSTER"
+    );
+    let bus1 = Arc::new(EventBus::new(256));
+    let bus2 = Arc::new(EventBus::new(256));
+    let mut local2 = bus2.subscribe();
+    node1.start_event_replication(bus1.clone());
+    node2.start_event_replication(bus2.clone());
+    assert!(
+        events_flow(&bus1, &mut local2, Duration::from_secs(10)).await,
+        "baseline: events never flowed"
+    );
+    let shard = node1
+        .event_shard_master()
+        .await
+        .unwrap()
+        .expect("event channel has a master");
+    eprintln!("event channel lives on {shard}; killing it");
+    let run = |hook: &str| {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{hook} {shard}"))
+            .status()
+            .expect("hook runs");
+        assert!(status.success(), "hook {hook:?} failed: {status}");
+    };
+    run(&kill);
+
+    // The cluster needs cluster-node-timeout (+ election) to promote the replica; the moved
+    // slot must then serve the fencing scripts and both subscribers must have re-attached.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let promoted = loop {
+        if let Ok(Some(owner)) = node1.event_shard_master().await {
+            if owner != shard {
+                break owner;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cluster never promoted a replica for the event slot"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    eprintln!("slot promoted to {promoted}");
+    assert!(
+        events_flow(&bus1, &mut local2, Duration::from_secs(30)).await,
+        "events never resumed after the shard failover"
+    );
+    assert!(node1.event_subscriber_connected() && node2.event_subscriber_connected());
+    let sid = SessionId::new();
+    assert!(node1.write_session_mirror(&mirror(sid), 60).await.unwrap());
+    assert_eq!(node2.claim_session(sid, n1, 60).await.unwrap(), Ok(()));
+    assert_eq!(node1.get_session_node(sid).await.unwrap(), Some(n2));
+    assert!(node2.delete_session_mirror(sid).await.unwrap());
+
+    eprintln!("bringing {shard} back; it must rejoin as a replica");
+    run(&start);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let owner = node1.event_shard_master().await;
+        if let Ok(Some(owner)) = owner {
+            assert_eq!(owner, promoted, "old master took the slot back");
+        }
+        if events_flow(&bus2, &mut bus1.subscribe(), Duration::from_secs(3)).await {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "events do not flow after the old master rejoined"
+        );
+    }
 }
 
 fn mirror(session_id: SessionId) -> SessionMirror {
@@ -212,7 +454,8 @@ async fn fleet_limiter_throttles_across_nodes() {
         "the other node sees the same empty bucket"
     );
     // Other subjects and scopes are untouched.
-    assert!(l2.check(LimitScope::Report, "someone-else").await.is_ok());
+    let someone_else = UserId::new().to_string();
+    assert!(l2.check(LimitScope::Report, &someone_else).await.is_ok());
     assert!(l2.check(LimitScope::Block, &user).await.is_ok());
 
     // Per-key budgets: the caller passes the key's own limit; 0 tokens left refuses on any node.

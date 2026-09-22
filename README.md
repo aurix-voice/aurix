@@ -426,6 +426,7 @@ Set `AURIX__SERVER__ENVIRONMENT=production` for strict validation. Key settings:
 |---|---|
 | `AURIX__DATABASE__URL`, `AURIX__REDIS__URL` | Redis is optional for a single node but required for multi-node events / distributed rate limits |
 | `AURIX__REDIS__SENTINELS`, `AURIX__REDIS__SENTINEL_MASTER` | Redis Sentinel mode (comma-separated sentinel URLs + master name; `REDIS__URL` then only supplies credentials/db/TLS) |
+| `AURIX__REDIS__CLUSTER`, `AURIX__REDIS__SHARDED_PUBSUB` | Redis Cluster mode (comma-separated seed URLs carrying credentials/db/TLS; `REDIS__URL` ignored, exclusive with Sentinel); sharded Pub/Sub on by default, `false` for Redis < 7 |
 | `AURIX__CLUSTER__SESSION_MIRROR`, `AURIX__CLUSTER__SESSION_MIRROR_TTL_SECS`, `AURIX__CLUSTER__NODE_LOST_AFTER_SECS`, `AURIX__CLUSTER__FAILOVER_ENDPOINTS` | cross-node failover: mirror sessions in Redis (default on, TTL 180), reap nodes silent for 30 s, advertise 3 failover nodes per session |
 | `AURIX__AUTH__JWT_SECRET` | ≥ 32 random bytes; or `AURIX__AUTH__JWT_PUBLIC_KEY_PATH` for RS256 |
 | `AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN` | allows `/admin/setup` after the first admin exists; unset after use |
@@ -1019,9 +1020,10 @@ directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regard
   key/endpoint; the downlink sequence jumps forward so receivers' replay windows and jitter
   buffers carry on), ownership is fenced with an atomic Redis claim, a `SessionMigrated` fleet event updates
   rosters and cascade routes, and a node silent for `cluster.node_lost_after_secs` is reaped by
-  the fleet (`node_lost`) while its mirrors stay usable. Redis Sentinel is supported
-  (`redis.sentinels` + `redis.sentinel_master`, master changes followed at runtime); Redis
-  Cluster is not. Details, PostgreSQL HA, outage behaviour:
+  the fleet (`node_lost`) while its mirrors stay usable. Redis Sentinel (`redis.sentinels` +
+  `redis.sentinel_master`, master changes followed at runtime) and Redis Cluster
+  (`redis.cluster` seed list, hash-tagged keys, sharded Pub/Sub with a classic fallback) are
+  both supported. Details, PostgreSQL HA, outage behaviour:
   [docs/src/operations/high-availability.md](docs/src/operations/high-availability.md).
 * **Kubernetes / cloud.** `deploy/helm/aurix` deploys a regional pool as a host-network
   `StatefulSet` (per-pod public IP for UDP media/TURN, per-pod hostname for discovery and resume,
@@ -1139,7 +1141,7 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
 | Threat model + reporting | [`docs/src/concepts/threat-model.md`](docs/src/concepts/threat-model.md), [`SECURITY.md`](SECURITY.md) | what Aurix defends (tenant isolation, auth boundaries, E2EE confidentiality from the node, membership/rate limits) and what it explicitly does not (volumetric DDoS, a malicious operator in non-E2EE channels, cheating clients); private-report process, scope, supported versions |
 | Fuzzing | [`fuzz/`](fuzz) | 12 libFuzzer targets for every network-facing parser (AURX, RTP, STUN/TURN, control JSON, E2EE frames, Opus, Ogg, WAV, live frames, webhook signatures, remote mixer, text parsers); the committed corpus (seeds + `regress_*`) replays on stable in `cargo test`, nightly + ASan smoke in CI |
 | Releases | [`CHANGELOG.md`](CHANGELOG.md), [`docs/src/operations/releases.md`](docs/src/operations/releases.md), [`.github/workflows/release.yml`](.github/workflows/release.yml) | one SemVer number across server, SDKs and chart (`tools/release/check_versions.py`), tag-driven workflow: binaries per platform, SDK packages, container images, SHA-256 checksums, CycloneDX SBOMs, Sigstore keyless signatures and build-provenance attestations |
-| Chaos / HA | [`tools/chaos/`](tools/chaos) | Docker Compose fleet (PostgreSQL, Redis master/replica, three Sentinels, two nodes): node SIGKILL with cross-node resume, Redis Sentinel failover, PostgreSQL stop/start with readiness recovery, stale-node reaper, tenant/session isolation — reusing the live E2E suite; CI `chaos` job |
+| Chaos / HA | [`tools/chaos/`](tools/chaos) | Docker Compose fleet (PostgreSQL, Redis master/replica + three Sentinels or a six-node Redis Cluster, two nodes): node SIGKILL with cross-node resume, Redis Sentinel failover / Cluster shard failover, PostgreSQL stop/start with readiness recovery, stale-node reaper, tenant/session isolation — reusing the live E2E suite; CI `chaos` job |
 | Migration | [`docs/src/migration/`](docs/src/migration) | Vivox, Agora and Photon Voice → Aurix: credential boundary, channel/grant mapping, API-by-API tables, staged migration plan; key chapters also [in Russian](docs/src/ru/README.md) |
 
 ## Limitations
@@ -1160,8 +1162,9 @@ Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aur
 * Cascade is a two-level tree: direct links inside a region, one deterministic hub per region
   between regions (`media.cascade_topology`); hubs are picked from the node registry, not by
   measured RTT, and nodes must reach each other directly on `media.port + 1`/UDP.
-* Cross-node failover needs Redis (session mirrors); Redis Sentinel is supported, Redis Cluster
-  is not (multi-key Lua + classic Pub/Sub).
+* Cross-node failover needs Redis (session mirrors); Sentinel and Cluster are both supported,
+  but sharded Pub/Sub needs Redis 7 (`redis.sharded_pubsub = false` on older clusters), and the
+  chaos suite exercises the cluster on one host only.
 * Browsers cannot set Opus complexity, signal mode, VBR mode or expected loss — only the
   bitrate ceiling, FEC, DTX, max bandwidth and CBR that WebRTC exposes; the native, Unity and
   Unreal SDKs have the full set.

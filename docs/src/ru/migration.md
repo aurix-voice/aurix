@@ -44,7 +44,7 @@
   ([Deployment](../operations/deployment.md), [Scaling out](../operations/scaling.md));
 * TURN для игроков за симметричным NAT — встроенный `[turn]` или свой
   ([Deployment → Network and firewall](../operations/deployment.md#network-and-firewall));
-* HA control plane — Redis Sentinel и реплики PostgreSQL
+* HA control plane — Redis Sentinel или Cluster и реплики PostgreSQL
   ([High availability](../operations/high-availability.md));
 * метрики и алерты ([Backups and observability](../operations/observability.md));
 * обновления ([Releases and versioning](../operations/releases.md)).

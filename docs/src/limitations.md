@@ -186,9 +186,11 @@ the chapter that explains the boundary.
   fleet alert rules assume enough concurrent sessions to make percentiles meaningful and
   need tuning below a few dozen. Quality aggregates exist per application, not per channel
   ([Network quality](features/quality.md)).
-* **Redis Sentinel yes, Redis Cluster no.** The ownership claim is a multi-key Lua script
-  without hash tags and the event bus is classic Pub/Sub; point the fleet at a Sentinel set or
-  a managed endpoint with a stable address.
+* **Redis Cluster needs Redis 7 for sharded Pub/Sub.** `redis.cluster` works with Redis 7+
+  (`SSUBSCRIBE`, RESP3); on Redis 6 clusters or RESP2-only proxies set
+  `redis.sharded_pubsub = false` and the event bus falls back to classic Pub/Sub, which the
+  cluster broadcasts to every node. Cluster mode is a compatibility feature, not a latency one;
+  no benchmark claims a faster voice path with it.
 * **Live audio streams are per participant**, not mixed, and are dropped (counted) when the
   consumer falls behind `recording.live.queue_frames`; no buffering across a consumer outage
   ([Recordings and live streams](features/recordings.md)).
@@ -296,7 +298,7 @@ the chapter that explains the boundary.
   Google tenant has been wired up in CI — claim names and group formats of your provider are
   the thing to verify first ([Administrator accounts and SSO](operations/admin-sso.md)).
 * **Chaos runs on one host.** The `tools/chaos/` harness kills a node, fails Redis over through
-  Sentinel, stops and starts PostgreSQL and checks isolation — but everything (both nodes, the
+  Sentinel (or kills a Redis Cluster shard master), stops and starts PostgreSQL and checks isolation — but everything (both nodes, the
   Sentinels, PostgreSQL) shares one machine and one loopback network. Network partitions between
   hosts, split-brain Sentinel quorums across data centres, PostgreSQL replica promotion and
   cross-region failover latency are not exercised ([High availability](operations/high-availability.md)).

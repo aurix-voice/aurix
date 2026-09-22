@@ -1,0 +1,73 @@
+# Redis Cluster variant of the chaos backing services (tools/chaos/run.sh cluster): one
+# PostgreSQL plus six Redis 7 nodes (three masters, one replica each) on the host network at
+# 127.0.0.1:7000-7005 (cluster bus on 17000-17005). The harness runs `redis-cli --cluster create`
+# once the containers are healthy; nothing here is persisted.
+name: aurix-chaos-cluster
+
+x-redis: &redis
+  image: redis:7-alpine
+  network_mode: host
+  healthcheck:
+    test: ["CMD-SHELL", "redis-cli -p $$REDIS_PORT ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aurix-chaos-postgres
+    network_mode: host
+    environment:
+      POSTGRES_USER: aurix
+      POSTGRES_PASSWORD: aurix-chaos
+      POSTGRES_DB: aurix
+      PGPORT: "5433"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5433 -U aurix -d aurix"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-0:
+    <<: *redis
+    container_name: aurix-chaos-redis-0
+    environment: { REDIS_PORT: "7000" }
+    command: ["redis-server", "--port", "7000", "--cluster-enabled", "yes",
+              "--cluster-announce-ip", "127.0.0.1", "--cluster-node-timeout", "3000", "--cluster-replica-validity-factor", "0",
+              "--save", "", "--appendonly", "no"]
+  redis-1:
+    <<: *redis
+    container_name: aurix-chaos-redis-1
+    environment: { REDIS_PORT: "7001" }
+    command: ["redis-server", "--port", "7001", "--cluster-enabled", "yes",
+              "--cluster-announce-ip", "127.0.0.1", "--cluster-node-timeout", "3000", "--cluster-replica-validity-factor", "0",
+              "--save", "", "--appendonly", "no"]
+  redis-2:
+    <<: *redis
+    container_name: aurix-chaos-redis-2
+    environment: { REDIS_PORT: "7002" }
+    command: ["redis-server", "--port", "7002", "--cluster-enabled", "yes",
+              "--cluster-announce-ip", "127.0.0.1", "--cluster-node-timeout", "3000", "--cluster-replica-validity-factor", "0",
+              "--save", "", "--appendonly", "no"]
+  redis-3:
+    <<: *redis
+    container_name: aurix-chaos-redis-3
+    environment: { REDIS_PORT: "7003" }
+    command: ["redis-server", "--port", "7003", "--cluster-enabled", "yes",
+              "--cluster-announce-ip", "127.0.0.1", "--cluster-node-timeout", "3000", "--cluster-replica-validity-factor", "0",
+              "--save", "", "--appendonly", "no"]
+  redis-4:
+    <<: *redis
+    container_name: aurix-chaos-redis-4
+    environment: { REDIS_PORT: "7004" }
+    command: ["redis-server", "--port", "7004", "--cluster-enabled", "yes",
+              "--cluster-announce-ip", "127.0.0.1", "--cluster-node-timeout", "3000", "--cluster-replica-validity-factor", "0",
+              "--save", "", "--appendonly", "no"]
+  redis-5:
+    <<: *redis
+    container_name: aurix-chaos-redis-5
+    environment: { REDIS_PORT: "7005" }
+    command: ["redis-server", "--port", "7005", "--cluster-enabled", "yes",
+              "--cluster-announce-ip", "127.0.0.1", "--cluster-node-timeout", "3000", "--cluster-replica-validity-factor", "0",
+              "--save", "", "--appendonly", "no"]

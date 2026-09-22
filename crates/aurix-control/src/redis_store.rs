@@ -2,23 +2,90 @@ use aurix_common::error::{AurixError, Result};
 use aurix_common::redis_pool::RedisSource;
 use aurix_common::types::*;
 use futures_util::StreamExt;
-use redis::AsyncCommands;
+use redis::aio::ConnectionLike;
+use redis::{AsyncCommands, PushKind};
 use std::sync::Arc;
 
-use crate::event_bus::{EventBus, EventEnvelope};
+use crate::event_bus::{EventBus, EventEnvelope, ServerEvent};
 use crate::session_mirror::{SessionMirror, TakeoverRefused};
 use std::time::Duration;
 
-const EVENT_CHANNEL: &str = "aurix:events";
+/// Cross-node event channel. The hash tag pins it to one slot so that, on a cluster with
+/// sharded Pub/Sub, publishers and subscribers meet on the same shard.
+const EVENT_CHANNEL: &str = "{aurix}:events";
 const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often a Sentinel-backed store re-asks the sentinels who the master is.
 const SENTINEL_POLL: Duration = Duration::from_secs(5);
 
-/// The master the store currently talks to. Swapped as a whole on a Sentinel failover.
+/// The Redis the store currently talks to. Swapped as a whole on a Sentinel failover; a
+/// cluster connection routes and re-routes by itself.
 #[derive(Clone)]
-struct Handle {
-    client: redis::Client,
-    manager: redis::aio::ConnectionManager,
+enum Handle {
+    Single {
+        client: redis::Client,
+        manager: redis::aio::ConnectionManager,
+    },
+    Cluster(redis::cluster_async::ClusterConnection),
+}
+
+/// One command sink for both backends so every operation below is written once.
+#[derive(Clone)]
+pub enum Conn {
+    Single(redis::aio::ConnectionManager),
+    Cluster(redis::cluster_async::ClusterConnection),
+}
+
+impl ConnectionLike for Conn {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        match self {
+            Self::Single(c) => c.req_packed_command(cmd),
+            Self::Cluster(c) => c.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        match self {
+            Self::Single(c) => c.req_packed_commands(cmd, offset, count),
+            Self::Cluster(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Self::Single(c) => c.get_db(),
+            Self::Cluster(c) => c.get_db(),
+        }
+    }
+}
+
+// ── Key layout ──
+//
+// Keys that one Lua script or one multi-key command touches together share a hash tag
+// (`{…}`), so they land in the same Redis Cluster slot and never answer `CROSSSLOT`. Keys
+// used on their own are untagged; the cluster spreads them over its shards.
+
+fn session_owner_key(session_id: SessionId) -> String {
+    format!("session:{{{session_id}}}:node")
+}
+
+fn session_mirror_key(session_id: SessionId) -> String {
+    format!("session:{{{session_id}}}:mirror")
+}
+
+fn user_channels_key(user_id: UserId) -> String {
+    format!("user:{{{user_id}}}:channels")
+}
+
+fn user_server_muted_key(user_id: UserId) -> String {
+    format!("user:{{{user_id}}}:server_muted")
 }
 
 /// Redis-backed distributed state for cross-node coordination.
@@ -37,8 +104,12 @@ pub struct RedisStore {
 
 impl RedisStore {
     pub async fn connect(source: RedisSource, node_id: MediaNodeId) -> Result<Self> {
-        let client = source.resolve().await?;
-        let handle = Self::open_handle(client).await?;
+        let handle = if source.is_cluster() {
+            Handle::Cluster(source.cluster_connection().await?)
+        } else {
+            let client = source.resolve().await?;
+            Self::open_handle(client).await?
+        };
         let (generation, _) = tokio::sync::watch::channel(0);
         let store = Self {
             source,
@@ -59,7 +130,7 @@ impl RedisStore {
         .await
         .map_err(|_| AurixError::Redis("Connection timed out".into()))?
         .map_err(|e| AurixError::Redis(format!("Connection failed: {e}")))?;
-        Ok(Handle { client, manager })
+        Ok(Handle::Single { client, manager })
     }
 
     pub fn node_id(&self) -> MediaNodeId {
@@ -70,6 +141,19 @@ impl RedisStore {
         self.source.is_sentinel()
     }
 
+    pub fn is_cluster(&self) -> bool {
+        self.source.is_cluster()
+    }
+
+    /// `direct`, `sentinel` or `cluster`, for logs and health output.
+    pub fn backend(&self) -> &'static str {
+        match &self.source {
+            RedisSource::Direct(_) => "direct",
+            RedisSource::Sentinel { .. } => "sentinel",
+            RedisSource::Cluster { .. } => "cluster",
+        }
+    }
+
     /// Whether cross-node events currently reach this node. `true` when replication was never
     /// started (nothing to receive), otherwise only while the Pub/Sub subscriber is attached.
     pub fn event_subscriber_connected(&self) -> bool {
@@ -77,14 +161,13 @@ impl RedisStore {
         !self.subscriber_started.load(Ordering::Acquire) || self.subscribed.load(Ordering::Acquire)
     }
 
-    /// Address of the master currently in use (`host:port`), for logs and health output.
+    /// Address of the master currently in use (`host:port`), or the cluster seeds, for logs
+    /// and health output.
     pub fn master_addr(&self) -> String {
-        self.handle
-            .load()
-            .client
-            .get_connection_info()
-            .addr
-            .to_string()
+        match &**self.handle.load() {
+            Handle::Single { client, .. } => client.get_connection_info().addr.to_string(),
+            Handle::Cluster(_) => self.source.describe(),
+        }
     }
 
     /// With Sentinel: follows master switches. Re-resolves the master periodically and after
@@ -126,8 +209,11 @@ impl RedisStore {
     }
 
     /// A pooled, auto-reconnecting connection handle (cheap to clone).
-    async fn conn(&self) -> Result<redis::aio::ConnectionManager> {
-        Ok(self.handle.load().manager.clone())
+    async fn conn(&self) -> Result<Conn> {
+        Ok(match &**self.handle.load() {
+            Handle::Single { manager, .. } => Conn::Single(manager.clone()),
+            Handle::Cluster(conn) => Conn::Cluster(conn.clone()),
+        })
     }
 
     /// Bound a Redis operation so a stalled broker cannot hang request handlers.
@@ -176,15 +262,21 @@ impl RedisStore {
     pub fn start_event_subscriber(self: &Arc<Self>, local_bus: Arc<EventBus>) {
         use std::sync::atomic::Ordering;
         self.subscriber_started.store(true, Ordering::Release);
+        if self.source.is_cluster() {
+            self.start_cluster_event_subscriber(local_bus);
+            return;
+        }
         let handle = self.handle.load_full();
         let mut generation = self.generation.subscribe();
         let source = self.source.clone();
         let self_id = self.node_id;
         let store = self.clone();
         tokio::spawn(async move {
-            let mut seen: std::collections::VecDeque<uuid::Uuid> =
-                std::collections::VecDeque::with_capacity(4096);
-            let mut client = handle.client.clone();
+            let mut seen = SeenEvents::default();
+            let mut client = match &*handle {
+                Handle::Single { client, .. } => client.clone(),
+                Handle::Cluster(_) => unreachable!("cluster handled above"),
+            };
             loop {
                 generation.mark_unchanged();
                 match client.get_async_pubsub().await {
@@ -213,18 +305,9 @@ impl RedisStore {
                             let Ok(payload) = msg.get_payload::<String>() else {
                                 continue;
                             };
-                            let Ok(env) = serde_json::from_str::<EventEnvelope>(&payload) else {
-                                tracing::debug!("ignoring malformed cross-node event");
-                                continue;
-                            };
-                            if env.origin == self_id || seen.contains(&env.id) {
-                                continue;
+                            if let Some(event) = seen.accept(&payload, self_id) {
+                                local_bus.deliver_remote(event);
                             }
-                            if seen.len() == 4096 {
-                                seen.pop_front();
-                            }
-                            seen.push_back(env.id);
-                            local_bus.deliver_remote(env.event);
                         }
                         store.subscribed.store(false, Ordering::Release);
                         tracing::warn!("Redis Pub/Sub subscriber disconnected");
@@ -238,6 +321,83 @@ impl RedisStore {
                 if let Ok(next) = source.resolve().await {
                     client = next;
                 }
+            }
+        });
+    }
+
+    /// Cluster variant of the subscriber: a RESP3 connection whose pushes arrive on a channel.
+    /// The subscription is routed to the shard owning the event channel's slot; when a node
+    /// connection drops (`PushKind::Disconnection`) or the server kicks us off the channel
+    /// (`sunsubscribe` while a promoted replica re-adds the slot) the whole connection is
+    /// rebuilt and re-subscribed, which lands on the new master once the cluster re-elects.
+    /// An idle subscriber would otherwise never notice the loss.
+    fn start_cluster_event_subscriber(self: &Arc<Self>, local_bus: Arc<EventBus>) {
+        use std::sync::atomic::Ordering;
+        let source = self.source.clone();
+        let sharded = source.sharded_pubsub();
+        let self_id = self.node_id;
+        let store = self.clone();
+        let mut generation = self.generation.subscribe();
+        tokio::spawn(async move {
+            let mut seen = SeenEvents::default();
+            loop {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<redis::PushInfo>();
+                let mut conn = match source.cluster_pubsub_connection(tx).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Redis Cluster Pub/Sub connection failed: {e}");
+                        Self::backoff(&mut generation, Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+                let subscribed = if sharded {
+                    conn.ssubscribe(EVENT_CHANNEL).await
+                } else {
+                    conn.subscribe(EVENT_CHANNEL).await
+                };
+                if let Err(e) = subscribed {
+                    tracing::error!(
+                        "Redis Cluster {}subscribe failed: {e}",
+                        if sharded { "s" } else { "" }
+                    );
+                    Self::backoff(&mut generation, Duration::from_secs(2)).await;
+                    continue;
+                }
+                tracing::info!(sharded, "Redis Cluster Pub/Sub subscriber connected");
+                store.subscribed.store(true, Ordering::Release);
+                let mut dropped = false;
+                while let Some(push) = rx.recv().await {
+                    match push.kind {
+                        PushKind::Message | PushKind::SMessage => {
+                            let Some(msg) = redis::Msg::from_push_info(push) else {
+                                continue;
+                            };
+                            let Ok(payload) = msg.get_payload::<String>() else {
+                                continue;
+                            };
+                            if let Some(event) = seen.accept(&payload, self_id) {
+                                local_bus.deliver_remote(event);
+                            }
+                        }
+                        // A promoted replica re-adds its slots and kicks every sharded
+                        // subscriber with an unsolicited `sunsubscribe`; treat it like a drop.
+                        PushKind::Disconnection
+                        | PushKind::SUnsubscribe
+                        | PushKind::Unsubscribe => {
+                            dropped = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                store.subscribed.store(false, Ordering::Release);
+                if dropped {
+                    tracing::warn!("Redis Cluster node connection dropped; re-subscribing");
+                } else {
+                    tracing::warn!("Redis Cluster Pub/Sub subscriber closed; reconnecting");
+                }
+                drop(conn);
+                Self::backoff(&mut generation, Duration::from_secs(1)).await;
             }
         });
     }
@@ -264,7 +424,7 @@ impl RedisStore {
         node_id: MediaNodeId,
     ) -> Result<()> {
         let mut conn = self.conn().await?;
-        let key = format!("session:{}:node", session_id);
+        let key = session_owner_key(session_id);
         Self::with_timeout(
             conn.set_ex::<_, _, ()>(&key, node_id.0.to_string(), 120),
             "set_session_node",
@@ -276,7 +436,7 @@ impl RedisStore {
     /// Look up which node a session is on.
     pub async fn get_session_node(&self, session_id: SessionId) -> Result<Option<MediaNodeId>> {
         let mut conn = self.conn().await?;
-        let key = format!("session:{}:node", session_id);
+        let key = session_owner_key(session_id);
         let val: Option<String> = Self::with_timeout(conn.get(&key), "get_session_node").await?;
         Ok(val
             .and_then(|s| uuid::Uuid::parse_str(&s).ok())
@@ -285,8 +445,8 @@ impl RedisStore {
 
     // ── Session mirror (cross-node resume) ──
     //
-    // `session:{id}:node`   owner, refreshed with the mirror; the fence.
-    // `session:{id}:mirror` JSON `SessionMirror`; only the owner writes it.
+    // `session:{<id>}:node`   owner, refreshed with the mirror; the fence.
+    // `session:{<id>}:mirror` JSON `SessionMirror`; only the owner writes it.
     // Both carry the same TTL so a dead node's session stays adoptable for exactly
     // `cluster.session_mirror_ttl_secs` and then disappears together with its locator.
 
@@ -301,8 +461,8 @@ impl RedisStore {
         let json = serde_json::to_string(mirror)
             .map_err(|e| AurixError::Internal(format!("mirror encode: {e}")))?;
         let mut conn = self.conn().await?;
-        let owner_key = format!("session:{}:node", mirror.session_id);
-        let mirror_key = format!("session:{}:mirror", mirror.session_id);
+        let owner_key = session_owner_key(mirror.session_id);
+        let mirror_key = session_mirror_key(mirror.session_id);
         let script = redis::Script::new(
             r#"
             local owner = redis.call('GET', KEYS[1])
@@ -328,7 +488,7 @@ impl RedisStore {
 
     pub async fn get_session_mirror(&self, session_id: SessionId) -> Result<Option<SessionMirror>> {
         let mut conn = self.conn().await?;
-        let key = format!("session:{}:mirror", session_id);
+        let key = session_mirror_key(session_id);
         let raw: Option<String> = Self::with_timeout(conn.get(&key), "get_session_mirror").await?;
         Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
     }
@@ -343,8 +503,8 @@ impl RedisStore {
         ttl_secs: u64,
     ) -> Result<std::result::Result<(), TakeoverRefused>> {
         let mut conn = self.conn().await?;
-        let owner_key = format!("session:{}:node", session_id);
-        let mirror_key = format!("session:{}:mirror", session_id);
+        let owner_key = session_owner_key(session_id);
+        let mirror_key = session_mirror_key(session_id);
         let script = redis::Script::new(
             r#"
             if redis.call('EXISTS', KEYS[2]) == 0 then return -1 end
@@ -387,8 +547,8 @@ impl RedisStore {
         previous: Option<MediaNodeId>,
     ) -> Result<bool> {
         let mut conn = self.conn().await?;
-        let owner_key = format!("session:{}:node", session_id);
-        let mirror_key = format!("session:{}:mirror", session_id);
+        let owner_key = session_owner_key(session_id);
+        let mirror_key = session_mirror_key(session_id);
         let script = redis::Script::new(
             r#"
             local owner = redis.call('GET', KEYS[1])
@@ -447,7 +607,7 @@ impl RedisStore {
     /// Record which channels a user is in (for cross-node queries).
     pub async fn add_user_channel(&self, user_id: UserId, channel_id: ChannelId) -> Result<()> {
         let mut conn = self.conn().await?;
-        let key = format!("user:{}:channels", user_id);
+        let key = user_channels_key(user_id);
         Self::with_timeout(
             conn.sadd::<_, _, ()>(&key, channel_id.0.to_string()),
             "add_user_channel",
@@ -459,7 +619,7 @@ impl RedisStore {
 
     pub async fn remove_user_channel(&self, user_id: UserId, channel_id: ChannelId) -> Result<()> {
         let mut conn = self.conn().await?;
-        let key = format!("user:{}:channels", user_id);
+        let key = user_channels_key(user_id);
         Self::with_timeout(
             conn.srem::<_, _, ()>(&key, channel_id.0.to_string()),
             "remove_user_channel",
@@ -470,7 +630,7 @@ impl RedisStore {
 
     pub async fn get_user_channels(&self, user_id: UserId) -> Result<Vec<ChannelId>> {
         let mut conn = self.conn().await?;
-        let key = format!("user:{}:channels", user_id);
+        let key = user_channels_key(user_id);
         let members: Vec<String> =
             Self::with_timeout(conn.smembers(&key), "get_user_channels").await?;
         Ok(members
@@ -496,14 +656,71 @@ impl RedisStore {
         Ok(count.max(0))
     }
 
-    /// Publish an event to all nodes via Redis pub/sub.
+    /// Publish an event to all nodes via Redis Pub/Sub (sharded on a cluster when
+    /// `redis.sharded_pubsub` is on, so it stays on the channel's shard instead of crossing
+    /// the cluster bus).
     pub async fn publish_event(&self, event_json: &str) -> Result<()> {
         let mut conn = self.conn().await?;
-        Self::with_timeout(
-            conn.publish::<_, _, ()>(EVENT_CHANNEL, event_json),
-            "publish",
+        if self.source.sharded_pubsub() {
+            Self::with_timeout(
+                redis::cmd("SPUBLISH")
+                    .arg(EVENT_CHANNEL)
+                    .arg(event_json)
+                    .query_async::<()>(&mut conn),
+                "spublish",
+            )
+            .await
+        } else {
+            Self::with_timeout(
+                conn.publish::<_, _, ()>(EVENT_CHANNEL, event_json),
+                "publish",
+            )
+            .await
+        }
+    }
+
+    /// Cluster only: `host:port` of the master currently serving the event channel's slot
+    /// (`None` on a single Redis). Diagnostics: this is the shard whose loss interrupts
+    /// cross-node events until the cluster promotes its replica.
+    pub async fn event_shard_master(&self) -> Result<Option<String>> {
+        if !self.is_cluster() {
+            return Ok(None);
+        }
+        let mut conn = self.conn().await?;
+        let slot: i64 = Self::with_timeout(
+            redis::cmd("CLUSTER")
+                .arg("KEYSLOT")
+                .arg(EVENT_CHANNEL)
+                .query_async(&mut conn),
+            "cluster keyslot",
         )
-        .await
+        .await?;
+        let ranges: Vec<Vec<redis::Value>> = Self::with_timeout(
+            redis::cmd("CLUSTER").arg("SLOTS").query_async(&mut conn),
+            "cluster slots",
+        )
+        .await?;
+        for range in ranges {
+            let (Some(redis::Value::Int(start)), Some(redis::Value::Int(end)), Some(master)) =
+                (range.first(), range.get(1), range.get(2))
+            else {
+                continue;
+            };
+            if !(*start..=*end).contains(&slot) {
+                continue;
+            }
+            let (host, port): (String, u16) = match master {
+                redis::Value::Array(parts) if parts.len() >= 2 => (
+                    redis::from_redis_value(&parts[0])
+                        .map_err(|e| AurixError::Redis(format!("cluster slots host: {e}")))?,
+                    redis::from_redis_value(&parts[1])
+                        .map_err(|e| AurixError::Redis(format!("cluster slots port: {e}")))?,
+                ),
+                _ => continue,
+            };
+            return Ok(Some(format!("{host}:{port}")));
+        }
+        Ok(None)
     }
 
     /// Distributed rate limiting: check if a key exceeds the limit using Redis INCR + EXPIRE.
@@ -605,7 +822,7 @@ impl RedisStore {
     /// Global server-mute: set flag in Redis so all nodes can enforce it.
     pub async fn set_global_mute(&self, user_id: UserId, muted: bool) -> Result<()> {
         let mut conn = self.conn().await?;
-        let key = format!("user:{}:server_muted", user_id);
+        let key = user_server_muted_key(user_id);
         if muted {
             Self::with_timeout(conn.set_ex::<_, _, ()>(&key, "1", 86400), "set_global_mute")
                 .await?;
@@ -617,7 +834,7 @@ impl RedisStore {
 
     pub async fn is_globally_muted(&self, user_id: UserId) -> Result<bool> {
         let mut conn = self.conn().await?;
-        let key = format!("user:{}:server_muted", user_id);
+        let key = user_server_muted_key(user_id);
         let val: Option<String> = Self::with_timeout(conn.get(&key), "is_globally_muted").await?;
         Ok(val.is_some())
     }
@@ -625,11 +842,34 @@ impl RedisStore {
     /// Drops every per-user key (user erasure).
     pub async fn forget_user(&self, user_id: UserId) -> Result<()> {
         let mut conn = self.conn().await?;
-        let keys = [
-            format!("user:{}:server_muted", user_id),
-            format!("user:{}:channels", user_id),
-        ];
+        let keys = [user_server_muted_key(user_id), user_channels_key(user_id)];
         Self::with_timeout(conn.del::<_, ()>(&keys[..]), "forget_user").await?;
         Ok(())
+    }
+}
+
+/// Envelope decoding plus a bounded window of recently seen event ids, so an event that
+/// arrives twice (a re-subscription overlapping a publish, a duplicated push) is delivered once.
+#[derive(Default)]
+struct SeenEvents {
+    ids: std::collections::VecDeque<uuid::Uuid>,
+}
+
+impl SeenEvents {
+    const WINDOW: usize = 4096;
+
+    fn accept(&mut self, payload: &str, self_id: MediaNodeId) -> Option<ServerEvent> {
+        let Ok(env) = serde_json::from_str::<EventEnvelope>(payload) else {
+            tracing::debug!("ignoring malformed cross-node event");
+            return None;
+        };
+        if env.origin == self_id || self.ids.contains(&env.id) {
+            return None;
+        }
+        if self.ids.len() == Self::WINDOW {
+            self.ids.pop_front();
+        }
+        self.ids.push_back(env.id);
+        Some(env.event)
     }
 }

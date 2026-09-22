@@ -56,6 +56,7 @@ impl AurixConfig {
                 .with_list_parse_key("server.trusted_proxies")
                 .with_list_parse_key("media.cascade_peers")
                 .with_list_parse_key("redis.sentinels")
+                .with_list_parse_key("redis.cluster")
                 .with_list_parse_key("webhooks.retry_delays_secs")
                 .with_list_parse_key("tts.voices")
                 .with_list_parse_key("translation.languages")
@@ -81,6 +82,8 @@ impl AurixConfig {
         clean(&mut self.server.cors_origins);
         clean(&mut self.server.trusted_proxies);
         clean(&mut self.media.cascade_peers);
+        clean(&mut self.redis.sentinels);
+        clean(&mut self.redis.cluster);
         for opt in [
             &mut self.server.external_ws_url,
             &mut self.media.external_ip,
@@ -241,6 +244,12 @@ impl AurixConfig {
         }
         if self.redis.sentinels.is_empty() != self.redis.sentinel_master.is_none() {
             anyhow::bail!("redis.sentinels and redis.sentinel_master must be set together");
+        }
+        if !self.redis.cluster.is_empty() && !self.redis.sentinels.is_empty() {
+            anyhow::bail!("redis.cluster and redis.sentinels are mutually exclusive");
+        }
+        if self.redis.cluster.iter().any(|s| s.trim().is_empty()) {
+            anyhow::bail!("redis.cluster entries must be non-empty URLs");
         }
         if !(10..=600).contains(&self.cluster.node_lost_after_secs) {
             anyhow::bail!("cluster.node_lost_after_secs must be within 10..=600");
@@ -985,7 +994,7 @@ impl Default for DatabaseConfig {
 pub struct RedisConfig {
     /// `redis://[:password@]host:port/db` (`rediss://` for TLS). With Sentinel this URL only
     /// supplies the credentials, database and TLS mode used for the resolved master; its host
-    /// is ignored.
+    /// is ignored. With Redis Cluster it is ignored entirely (seed URLs carry everything).
     pub url: String,
     pub pool_size: u32,
     /// Redis Sentinel endpoints (`redis://sentinel-1:26379`, …). When set, the node asks the
@@ -996,6 +1005,18 @@ pub struct RedisConfig {
     /// Name of the monitored master set (`sentinel monitor <name> …`).
     #[serde(default)]
     pub sentinel_master: Option<String>,
+    /// Redis Cluster seed nodes (`redis://[:password@]node-1:6379`, …; `rediss://` for TLS).
+    /// When set, the node talks to the cluster with slot-aware routing (`MOVED`/`ASK`
+    /// handling, topology refresh) instead of a single master; mutually exclusive with
+    /// `sentinels`. Every key a single Lua script touches carries the same hash tag, so no
+    /// operation crosses a slot.
+    #[serde(default)]
+    pub cluster: Vec<String>,
+    /// Cluster only: replicate cross-node events with sharded Pub/Sub (`SPUBLISH`/`SSUBSCRIBE`,
+    /// Redis 7+) so the event channel lives on one shard instead of being broadcast over the
+    /// cluster bus to every node. `false` falls back to classic Pub/Sub (Redis 6 clusters).
+    #[serde(default = "default_true")]
+    pub sharded_pubsub: bool,
 }
 
 impl Default for RedisConfig {
@@ -1005,6 +1026,8 @@ impl Default for RedisConfig {
             pool_size: 20,
             sentinels: Vec::new(),
             sentinel_master: None,
+            cluster: Vec::new(),
+            sharded_pubsub: true,
         }
     }
 }
@@ -3015,16 +3038,47 @@ mod tests {
             "10.0.0.0/8, 192.168.0.0/16",
         );
         std::env::set_var("AURIX__TRANSLATION__LANGUAGES", "de, fr,pt-BR");
+        std::env::set_var(
+            "AURIX__REDIS__CLUSTER",
+            "redis://127.0.0.1:7000, redis://127.0.0.1:7001",
+        );
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default");
         let cfg = AurixConfig::load(Some(path)).expect("load with env overrides");
         std::env::remove_var("AURIX__SERVER__CORS_ORIGINS");
         std::env::remove_var("AURIX__SERVER__TRUSTED_PROXIES");
         std::env::remove_var("AURIX__TRANSLATION__LANGUAGES");
+        std::env::remove_var("AURIX__REDIS__CLUSTER");
         assert_eq!(
             cfg.server.cors_origins,
             vec!["https://a.example", "https://b.example"]
         );
         assert_eq!(cfg.server.trusted_proxies.len(), 2);
         assert_eq!(cfg.translation.languages, vec!["de", "fr", "pt-BR"]);
+        assert_eq!(
+            cfg.redis.cluster,
+            vec!["redis://127.0.0.1:7000", "redis://127.0.0.1:7001"]
+        );
+        assert!(cfg.redis.sharded_pubsub, "sharded Pub/Sub is the default");
+    }
+
+    #[test]
+    fn redis_backends_are_exclusive() {
+        let mut cfg = AurixConfig::default();
+        cfg.redis.sentinels = vec!["redis://sentinel-1:26379".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sentinel_master"), "{err}");
+        cfg.redis.sentinel_master = Some("aurix".into());
+        assert!(cfg.validate().is_ok());
+
+        cfg.redis.cluster = vec!["redis://node-1:6379".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+
+        cfg.redis.sentinels.clear();
+        cfg.redis.sentinel_master = None;
+        assert!(cfg.validate().is_ok());
+        cfg.redis.cluster.push("  ".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("non-empty"), "{err}");
     }
 }

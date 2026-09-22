@@ -18,16 +18,26 @@
 #                     write-heavy scenario (session resume, persistent cross-mute) passes
 #   isolation         tenant / session isolation after all of the above (second API key, admin)
 #
+# With AURIX_CHAOS_REDIS=cluster the Sentinel pair is replaced by a six-node Redis Cluster
+# (docker-compose.cluster.yml, three masters + one replica each) and `redis-failover` becomes a
+# shard failover: the control-plane live tests (crates/aurix-control/tests/redis_live.rs) prove
+# the hash-tagged session mirrors, fleet limiters and sharded Pub/Sub on a real cluster and kill
+# the master holding the event slot mid-test; then the harness kills the (new) event-slot master
+# under the running nodes, which must go not-ready, re-attach to the promoted replica and pass
+# the cross-node scenarios again before the dead master rejoins as a replica.
+#
 # Usage:
 #   tools/chaos/run.sh              # everything: up, nodes, all scenarios, down
 #   tools/chaos/run.sh up nodes     # just the topology (then poke at it yourself)
 #   tools/chaos/run.sh node-kill    # one scenario against an already running topology
 #   tools/chaos/run.sh down
+#   AURIX_CHAOS_REDIS=cluster tools/chaos/run.sh
 #
 # Environment:
 #   AURIX_CHAOS_BIN   aurix-server binary (default target/debug/aurix-server; built if missing)
 #   AURIX_CHAOS_DIR   state directory: logs, pids, credentials (default target/chaos)
 #   AURIX_CHAOS_KEEP  1 = leave the topology running after `all`
+#   AURIX_CHAOS_REDIS sentinel (default) | cluster
 #
 # All secrets used here (bootstrap token, cascade secret, Postgres password) are throw-away,
 # loopback-only values that exist only for the lifetime of the run; the API keys the harness
@@ -38,11 +48,19 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HERE="$ROOT/tools/chaos"
 STATE="${AURIX_CHAOS_DIR:-$ROOT/target/chaos}"
 BIN="${AURIX_CHAOS_BIN:-$ROOT/target/debug/aurix-server}"
-COMPOSE=(docker compose -f "$HERE/docker-compose.yml")
+REDIS_MODE="${AURIX_CHAOS_REDIS:-sentinel}"
+case $REDIS_MODE in
+  sentinel) COMPOSE=(docker compose -f "$HERE/docker-compose.yml") ;;
+  cluster) COMPOSE=(docker compose -f "$HERE/docker-compose.cluster.yml") ;;
+  *) echo "AURIX_CHAOS_REDIS must be sentinel or cluster" >&2; exit 1 ;;
+esac
 
 PG_URL="postgres://aurix:aurix-chaos@127.0.0.1:5433/aurix"
 SENTINELS="redis://127.0.0.1:26380,redis://127.0.0.1:26381,redis://127.0.0.1:26382"
 SENTINEL_CLI=(docker exec aurix-chaos-sentinel-1 redis-cli -p 26380)
+CLUSTER_PORTS=(7000 7001 7002 7003 7004 7005)
+CLUSTER_SEEDS="redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002"
+EVENT_CHANNEL='{aurix}:events'
 
 API1=http://127.0.0.1:8180  WS1=ws://127.0.0.1:8181  METRICS1=http://127.0.0.1:9180/metrics
 API2=http://127.0.0.1:8190  WS2=ws://127.0.0.1:8191  METRICS2=http://127.0.0.1:9190/metrics
@@ -100,9 +118,60 @@ container_for_port() {
   case $1 in
     6380) echo aurix-chaos-redis-a ;;
     6381) echo aurix-chaos-redis-b ;;
+    700[0-5]) echo "aurix-chaos-redis-$(( $1 - 7000 ))" ;;
     *) fail "unknown Redis port $1" ;;
   esac
 }
+
+# ── Redis Cluster helpers (host:port everywhere, as CLUSTER SLOTS reports them) ──────────────
+
+cluster_cli() { # <port> <redis-cli args...>  — through that node's own container
+  local port=$1; shift
+  docker exec "$(container_for_port "$port")" redis-cli -p "$port" "$@"
+}
+
+cluster_live_port() { # first cluster node that answers (never assume a particular one is up)
+  local p
+  for p in "${CLUSTER_PORTS[@]}"; do
+    [ "$(cluster_cli "$p" PING 2>/dev/null | tr -d '\r')" = PONG ] && { echo "$p"; return; }
+  done
+  return 1
+}
+
+cluster_state_ok() {
+  local p; p=$(cluster_live_port) || return 1
+  [ "$(cluster_cli "$p" CLUSTER INFO 2>/dev/null | tr -d '\r' | awk -F: '$1 == "cluster_state" { print $2 }')" = ok ]
+}
+
+cluster_role() { # <port>
+  cluster_cli "$1" ROLE 2>/dev/null | head -1 | tr -d '\r'
+}
+
+cluster_is_replica() { [ "$(cluster_role "$1")" = "slave" ]; }
+
+# The master serving the slot of the cross-node event channel: the shard whose death cuts the
+# fleet's Pub/Sub until its replica is promoted.
+cluster_event_master() {
+  local p slot
+  p=$(cluster_live_port) || return 1
+  slot=$(cluster_cli "$p" CLUSTER KEYSLOT "$EVENT_CHANNEL" | tr -d '\r')
+  # CLUSTER SLOTS entries are [start, end, master[ip, port, id], replica...].
+  cluster_cli "$p" --json CLUSTER SLOTS \
+    | jq -r --argjson slot "$slot" \
+        '.[] | select(.[0] <= $slot and .[1] >= $slot) | .[2] | "\(.[0]):\(.[1])"'
+}
+
+cluster_event_master_changed_from() { [ "$(cluster_event_master)" != "$1" ]; }
+
+cluster_create() {
+  local p nodes=()
+  for p in "${CLUSTER_PORTS[@]}"; do nodes+=("127.0.0.1:$p"); done
+  cluster_cli 7000 --cluster create "${nodes[@]}" --cluster-replicas 1 --cluster-yes >/dev/null
+}
+
+# Hooks the control-plane failover test calls (AURIX_E2E_REDIS_CLUSTER_KILL / _START <host:port>).
+hook_kill_redis() { docker kill --signal=KILL "$(container_for_port "${1##*:}")" >/dev/null; }
+hook_start_redis() { docker start "$(container_for_port "${1##*:}")" >/dev/null; }
 
 pid_file() { echo "$STATE/node$1.pid"; }
 
@@ -141,11 +210,32 @@ e2e() { # <test-name...>  — runs the named live E2E tests against the chaos fl
 cmd_up() {
   mkdir -p "$STATE"
   chmod 700 "$STATE"
+  if [ "$REDIS_MODE" = cluster ]; then
+    log "starting PostgreSQL and six Redis Cluster nodes"
+    "${COMPOSE[@]}" up -d --wait
+    if ! cluster_state_ok; then
+      log "bootstrapping the cluster (3 masters, 1 replica each)"
+      cluster_create
+    fi
+    wait_for "cluster_state:ok" 60 cluster_state_ok
+    log "Redis Cluster is up; event channel on $(cluster_event_master)"
+    return
+  fi
   log "starting PostgreSQL, Redis master/replica and 3 Sentinels"
   "${COMPOSE[@]}" up -d --wait
   wait_for "Sentinel master" 30 sentinel_has_master
   wait_for "replica synced" 30 redis_is_replica 6381
   log "Redis master is 127.0.0.1:$(sentinel_master_port), replica on 6381"
+}
+
+redis_env() { # env assignments for the configured Redis backend
+  if [ "$REDIS_MODE" = cluster ]; then
+    echo "AURIX__REDIS__CLUSTER=$CLUSTER_SEEDS"
+  else
+    echo "AURIX__REDIS__URL=redis://127.0.0.1:6380"
+    echo "AURIX__REDIS__SENTINELS=$SENTINELS"
+    echo "AURIX__REDIS__SENTINEL_MASTER=aurix"
+  fi
 }
 
 start_node() { # <1|2>
@@ -159,13 +249,13 @@ start_node() { # <1|2>
   [ -x "$BIN" ] || { log "building aurix-server"; (cd "$ROOT" && cargo build --locked --bin aurix-server); }
   log "starting node $n (api $api, ws $ws, media $media)"
   mkdir -p "$STATE/recordings-$n"
+  local redis_env=()
+  mapfile -t redis_env < <(redis_env)
   (
     cd "$ROOT"
     env AURIX__DATABASE__URL="$PG_URL" \
         AURIX__DATABASE__CONNECT_TIMEOUT_SECS=5 \
-        AURIX__REDIS__URL=redis://127.0.0.1:6380 \
-        AURIX__REDIS__SENTINELS="$SENTINELS" \
-        AURIX__REDIS__SENTINEL_MASTER=aurix \
+        "${redis_env[@]}" \
         AURIX__SERVER__NODE_ID="$id" \
         AURIX__SERVER__API_PORT="$api" AURIX__SERVER__WS_PORT="$ws" \
         AURIX__SERVER__EXTERNAL_URL="http://127.0.0.1:$api" \
@@ -278,6 +368,10 @@ cmd_node_kill() {
 }
 
 cmd_redis_failover() {
+  if [ "$REDIS_MODE" = cluster ]; then
+    cmd_cluster_failover
+    return
+  fi
   log "scenario: Redis Sentinel failover (SIGKILL the master)"
   local old_port old_container f1 f2
   old_port=$(sentinel_master_port)
@@ -299,6 +393,38 @@ cmd_redis_failover() {
   docker start "$old_container" >/dev/null
   wait_for "old master rejoined as replica" 60 redis_is_replica "$old_port"
   [ "$(sentinel_master_port)" != "$old_port" ] || fail "old master took the role back"
+}
+
+cmd_cluster_failover() {
+  log "scenario: Redis Cluster shard failover"
+  # 1. Control plane on a real cluster: same-slot Lua scripts, fleet limiters, sharded Pub/Sub,
+  #    and the event-slot master killed mid-test (the test drives the kill/start hooks itself).
+  log "control-plane live tests against the cluster (incl. shard kill)"
+  (
+    cd "$ROOT"
+    env AURIX_E2E_REDIS_CLUSTER="$CLUSTER_SEEDS" \
+        AURIX_E2E_REDIS_CLUSTER_KILL="$HERE/run.sh hook-kill-redis" \
+        AURIX_E2E_REDIS_CLUSTER_START="$HERE/run.sh hook-start-redis" \
+        cargo test --locked -p aurix-control --test redis_live -- --ignored --test-threads=1
+  )
+  wait_for "cluster_state:ok after the control-plane run" 60 cluster_state_ok
+  # 2. The same failover under the running fleet.
+  local old old_port
+  old=$(cluster_event_master); old_port=${old##*:}
+  log "killing the event-slot master $old ($(container_for_port "$old_port"))"
+  docker kill --signal=KILL "$(container_for_port "$old_port")" >/dev/null
+  wait_for "cluster to promote the replica" 60 cluster_event_master_changed_from "$old"
+  log "event slot moved to $(cluster_event_master)"
+  wait_for "node 1 /ready" 45 ready "$API1"
+  wait_for "node 2 /ready" 45 ready "$API2"
+  # Cross-node Pub/Sub (cascade discovery, roster events) and the Redis-backed fleet rate
+  # limiter must work with the slot on the promoted replica.
+  e2e two_nodes_auto_cascade_relays_audio fleet_rate_limits_hold_across_nodes
+  log "bringing $old back; it must rejoin as a replica"
+  docker start "$(container_for_port "$old_port")" >/dev/null
+  wait_for "old master rejoined as replica" 60 cluster_is_replica "$old_port"
+  [ "$(cluster_event_master)" != "$old" ] || fail "old master took the slot back"
+  wait_for "cluster_state:ok" 30 cluster_state_ok
 }
 
 cmd_postgres_restart() {
@@ -342,6 +468,10 @@ if [ $# -eq 0 ]; then
   cmd_all
   exit 0
 fi
+case $1 in
+  hook-kill-redis) hook_kill_redis "$2"; exit 0 ;;
+  hook-start-redis) hook_start_redis "$2"; exit 0 ;;
+esac
 for cmd in "$@"; do
   case $cmd in
     all) cmd_all ;;
