@@ -386,7 +386,7 @@ jobs:
           if-no-files-found: ignore
 
   chaos:
-    name: chaos / HA (${{ matrix.redis }}: node kill, Redis failover, PostgreSQL restart)
+    name: "chaos / HA (${{ matrix.redis }}: node kill, Redis failover, PostgreSQL restart)"
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
