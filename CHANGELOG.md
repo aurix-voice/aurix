@@ -8,6 +8,17 @@ server version it ships with (the repository is versioned as one unit).
 
 Nothing yet.
 
+## [1.3.0] — 2026-09-19
+
+### Added
+
+- Stored chat: `EditMessageAsync`, `DeleteMessageAsync`, `ReactAsync`, `SearchAsync` /
+  `SearchDirectAsync`, `OnChatMessageUpdated` / `OnChatReactionChanged` on both the native and
+  the WebGL client (`ChatMessage.Reactions`, tombstones for deleted messages).
+- `NetworkQuality.ReceiversLossPercent` / `ProtectLossPercent`: the loss profile (FEC / DRED)
+  now protects the uplink against the higher of the uplink loss and the worst downlink loss a
+  receiver of this client reports, so listeners on lossy links get redundancy from the talker.
+
 ## [1.2.0] — 2026-09-19
 
 First tagged release of the package (versioned together with the server). Everything below
