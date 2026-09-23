@@ -32,8 +32,26 @@ released together.
   playing", strict CSP), frontend on `@aurix/web-sdk`, `deploy/run.sh` for PostgreSQL + Redis +
   node + Caddy + optional ngrok. CI builds and tests all three parts.
 
+* **Web SDK: adaptive playout buffer for the AURX paths (WebTransport, WebSocket tunnel).**
+  The per-speaker playout queue used to prime a fixed 40 ms and play silence on every underrun.
+  It now re-targets on each packet from the interarrival jitter estimate and the (slowly
+  decaying) peak late arrival, 40–240 ms (gaps longer than the deepest buffer are a stream
+  pause, not jitter), grows immediately after an underrun and shortens a queue that stays
+  above target one pitch period at a time by overlap-add (WSOLA-style); missing frames are concealed from history
+  (pitch repetition with fade-out) and the return to real audio is crossfaded. New
+  `AurxPlaybackStats.targetDelayMs` / `depthMs` / `concealedSamples` / `trimmedSamples`;
+  `ClientStats.jitter` and `concealedSamples` on these paths are now measured rather than
+  derived from the underrun count. Exported `playoutTargetFrames`, `AURX_PLAYOUT_MIN_FRAMES`,
+  `AURX_PLAYOUT_MAX_FRAMES`.
+
 ### Fixed
 
+* **Web SDK: WebSocket-tunnel media death now resumes the session immediately.** When the
+  tunnel's heartbeats went unanswered the SDK tried to rebind media over the same control
+  socket — which was the dead TCP connection itself — and only the control keepalive (~37 s)
+  or the browser's closing handshake eventually ended it. The socket is now dropped as soon as
+  the media path is declared dead and the session resumes on a fresh one; the stale socket's
+  late `onclose` is ignored. The keepalive timeout takes the same path.
 * **Web SDK: AudioWorklet / worker sources after minification.** The AURX playback/capture
   worklet, the voice-effects and viseme worklets and the E2EE worker were serialised with
   `Function.prototype.toString()` and then *called by their original name*; a bundler that

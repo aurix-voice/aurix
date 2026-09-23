@@ -241,3 +241,40 @@ test('client: the tunnel is rebound on the new socket after a reconnect', async 
   assert.ok(!errors.some((e) => /media closed/.test(e.message)), 'the socket loss is a reconnect, not a media-path failure');
   client.disconnect();
 });
+
+test('client: a tunnel whose heartbeats go unanswered drops the control socket and resumes on a new one at once', async () => {
+  const node = new FakeNode(KEY, 7);
+  const { client, sock, errors } = await connectClient(
+    { transport: 'websocket', reconnect: { initialDelayMs: 1, maxDelayMs: 1, jitter: 0 }, webTransport: { connectTimeoutMs: 500, heartbeatIntervalMs: 10, heartbeatLossLimit: 3 } },
+    {},
+    node,
+  );
+  await until(() => client.connectionState === 'media-connected', 5000, 'media-connected');
+  await until(() => node.heartbeats.length >= 1, 5000, 'first heartbeat answered');
+  // The TCP connection dies under the browser's feet: nothing comes back, and a close() from our
+  // side never completes its closing handshake (no onclose).
+  node.answerHeartbeats = false;
+  let closeCalls = 0;
+  sock.close = () => {
+    closeCalls++;
+  };
+  const states = [];
+  client.on('connectionState', (s) => states.push(s));
+  await until(() => FakeSocket.last !== sock, 5000, 'new socket without waiting for onclose');
+  assert.equal(closeCalls, 1, 'the dead socket was told to close');
+  assert.ok(states.includes('reconnecting'), `went through reconnecting: ${states}`);
+  assert.equal(node.binds.length, 1, 'no rebind attempt over the dead socket');
+  const sock2 = FakeSocket.last;
+  attachNode(sock2, node);
+  node.answerHeartbeats = true;
+  sock2.receive(ack({ session_id: SESSION, media_key: KEY_B64, media_tunnel: true, resumed: true }));
+  await until(() => node.binds.length === 2, 5000, 'rebind over the new socket');
+  await until(() => client.connectionState === 'media-connected' && client.mediaTransport === 'websocket', 5000, 'media back');
+  // The old socket's late onclose (if the browser ever delivers it) is ignored.
+  sock.onclose?.({ code: 1006, reason: 'late' });
+  await settle();
+  assert.equal(client.connectionState, 'media-connected');
+  assert.equal(FakeSocket.last, sock2, 'no second reconnect from the stale socket');
+  assert.ok(errors.some((e) => /heartbeat/.test(e.message)), 'the dead path is reported');
+  client.disconnect();
+});

@@ -141,7 +141,9 @@ export interface ClientStats {
    * Media path the counters describe: WebRTC (`RTCPeerConnection.getStats()`) or AURX over
    * WebTransport / the WebSocket tunnel (the SDK's own counters: `iceRttMs` is then the
    * heartbeat RTT, `packetsDiscarded` the packets that failed authentication / replay,
-   * `concealedSamples` the playout underruns × 960). Absent without media.
+   * `jitterMs` the interarrival jitter of downlink frames, `concealedSamples` the samples the
+   * playout filled by concealment, `jitterBufferDelayMs` the adaptive playout target). Absent
+   * without media.
    */
   transport?: 'webrtc' | 'webtransport' | 'websocket';
 }

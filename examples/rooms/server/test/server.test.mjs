@@ -225,6 +225,13 @@ test("bot endpoints need the shared secret; status is fanned out over SSE", asyn
   assert.equal(card.bot.track.title, "Sweep 20 Hz – 20 kHz");
   assert.equal(card.bot.room, "lounge");
 
+  // A bot in another room neither replaces the stage status nor reaches its SSE listeners.
+  const other = await (await api("POST", "/api/rooms", { title: "Meter", profile: "music" })).json();
+  const otherStatus = { room: other.slug, track: { title: "Reference tone", kind: "signal" }, position: 0 };
+  assert.equal((await api("PUT", "/api/bot/status", otherStatus, auth)).status, 204);
+  assert.equal((await (await api("GET", "/api/rooms/lounge")).json()).bot.track.title, "Sweep 20 Hz – 20 kHz");
+  assert.equal((await (await api("GET", `/api/rooms/${other.slug}`)).json()).bot.track.title, "Reference tone");
+
   assert.equal((await api("PUT", "/api/bot/status", { room: "nope-1" }, auth)).status, 400);
 });
 

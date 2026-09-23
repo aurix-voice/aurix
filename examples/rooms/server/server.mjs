@@ -275,7 +275,7 @@ export class RoomsService {
     this.cfg = cfg;
     this.aurix = aurix;
     this.store = new RoomStore(cfg.stateFile);
-    this.bot = { status: undefined, updatedAt: 0 };
+    this.bots = new Map();
     this.sseClients = new Set();
     this.joinLimiter = new RateLimiter(30, 60_000);
     this.createLimiter = new RateLimiter(5, 60_000);
@@ -370,9 +370,9 @@ export class RoomsService {
   }
 
   botStatusFor(slug) {
-    const { status, updatedAt } = this.bot;
-    if (!status || status.room !== slug || Date.now() - updatedAt > BOT_STALE_MS) return null;
-    return status;
+    const entry = this.bots.get(slug);
+    if (!entry || Date.now() - entry.updatedAt > BOT_STALE_MS) return null;
+    return entry.status;
   }
 
   async roomCard(room) {
@@ -410,9 +410,11 @@ export class RoomsService {
   }
 
   setBotStatus(status) {
-    this.bot = { status, updatedAt: Date.now() };
+    this.bots.set(status.room, { status, updatedAt: Date.now() });
     const frame = `event: bot\ndata: ${JSON.stringify(status)}\n\n`;
-    for (const res of this.sseClients) res.write(frame);
+    for (const res of this.sseClients) {
+      if (res.botRoom === status.room) res.write(frame);
+    }
   }
 
   // -- request handling ------------------------------------------------------------------------
@@ -472,7 +474,8 @@ export class RoomsService {
         "x-accel-buffering": "no",
         ...SECURITY_HEADERS,
       });
-      res.write(`retry: 3000\nevent: bot\ndata: ${JSON.stringify(this.botStatusFor(url.searchParams.get("room") ?? this.cfg.stageSlug))}\n\n`);
+      res.botRoom = url.searchParams.get("room") ?? this.cfg.stageSlug;
+      res.write(`retry: 3000\nevent: bot\ndata: ${JSON.stringify(this.botStatusFor(res.botRoom))}\n\n`);
       this.sseClients.add(res);
       const ping = setInterval(() => res.write(": ping\n\n"), 20_000);
       req.on("close", () => {

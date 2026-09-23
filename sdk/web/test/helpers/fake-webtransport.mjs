@@ -217,6 +217,8 @@ export class FakeNode {
     this.keys = undefined;
     this.binds = [];
     this.heartbeats = [];
+    /** When false the node swallows heartbeats (a path that went dead one way). */
+    this.answerHeartbeats = true;
     this.audio = [];
     this.rejected = 0;
     this.sequence = 0;
@@ -244,6 +246,7 @@ export class FakeNode {
         return;
       case AurxPacketType.Heartbeat:
         this.heartbeats.push(packet.header.timestamp);
+        if (!this.answerHeartbeats) return;
         transport.deliver(
           await this.seal({ packetType: AurxPacketType.HeartbeatAck, flags: 0, sequence: this.nextSequence(), timestamp: packet.header.timestamp, ssrc: this.ssrc, channelIdHash: 0 }, new Uint8Array(0)),
         );

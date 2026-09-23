@@ -247,8 +247,26 @@ starts there. It moves to the tunnel only after WebRTC failed on this network: I
 reached `connected` within `webRtcConnectTimeoutMs` (10 s, `0` disables the timer) after the
 answer, or the connection later reported `failed`. From then on the session stays on the tunnel
 (WebRTC is not retried) until `disconnect()`; a control-socket drop rebinds the tunnel on the
-reconnected socket, sequence counter carried over. `'websocket'` requires the offer (`connect()`
-rejects otherwise); `'webrtc'` / `'webtransport'` never use it.
+reconnected socket, sequence counter carried over. When the tunnel's own heartbeats go
+unanswered (`heartbeatLossLimit`) the SDK does not wait for the slower control keepalive or for
+the browser's closing handshake: the socket is dropped on the spot and the session resumes on a
+fresh one. `'websocket'` requires the offer (`connect()` rejects otherwise); `'webrtc'` /
+`'webtransport'` never use it.
+
+### Playout buffer (WebTransport and WebSocket tunnel)
+
+Decoded audio of every speaker goes through an adaptive playout buffer in the AudioWorklet. It
+starts at 40 ms and re-targets on every packet from an RFC 3550-style interarrival jitter
+estimate and the peak late arrival (which decays slowly), between 40 and 240 ms; a gap longer
+than the deepest buffer counts as a pause of the stream rather than jitter. An underrun raises
+the target by one frame at once; a queue that sits above target for ~2 s is shortened one pitch
+period at a time by overlap-adding neighbouring periods (WSOLA-style, ~100 ms apart), so the
+extra latency drains within a second or two without an audible skip. A frame that has not
+arrived is concealed from the last 40 ms of history (pitch repetition, fading out over 60 ms)
+and the return to real audio is crossfaded, instead of inserting silence.
+`ClientStats.jitter`, `concealedSamples` and the E-model MOS in
+`QualitySnapshot` reflect these measurements; `AurxPlaybackStats` exposes `targetDelayMs`,
+`depthMs`, `concealedSamples` and `trimmedSamples`.
 
 ```ts
 const client = new AurixClient({ transport: 'websocket' /* behind an HTTP-only tunnel */ });

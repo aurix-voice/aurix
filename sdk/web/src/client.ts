@@ -104,7 +104,6 @@ import {
 } from './opus.js';
 import { channelIdHash, opusPacketIsStereo, type AurxDirection, type DownlinkAudio } from './aurx.js';
 import {
-  AURX_FRAME_SAMPLES,
   AurxCapture,
   AurxPlayback,
   opusConfigFor,
@@ -3560,6 +3559,27 @@ export class AurixClient {
 
   // ── Internals: reconnect ──
 
+  /**
+   * Give up on a socket the browser still considers open: detach it (its late `onclose` is
+   * ignored), close it, and start the reconnect without waiting for a closing handshake that a
+   * dead TCP connection will never complete.
+   */
+  private dropSocket(cause: string): void {
+    const ws = this.ws;
+    if (!ws || this.closedByUser || this.pendingInit) return;
+    this.ws = undefined;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    try {
+      ws.close(4001, cause.slice(0, 120));
+    } catch {
+      // Already closing.
+    }
+    this.wsTunnel?.close(cause);
+    this.onConnectionLost(cause);
+  }
+
   private onConnectionLost(cause: string): void {
     this.stopPing();
     this.failPending('connection lost');
@@ -4789,6 +4809,13 @@ export class AurixClient {
   private onWebTransportClosed(kind: 'webtransport' | 'websocket', reason: string): void {
     if (this.closedByUser || !this.ws) return;
     this.emit('error', new Error(`${kind === 'websocket' ? 'WebSocket tunnel' : 'WebTransport'} media closed: ${reason}`));
+    // The tunnel shares the control socket: unanswered media heartbeats mean the TCP connection
+    // itself is gone (a mobile network change, a proxy dropping the stream); rebinding over it
+    // would only wait for the slower control keepalive, so resume on a fresh socket right away.
+    if (kind === 'websocket' && /heartbeat/.test(reason)) {
+      this.dropSocket(`media heartbeat timeout (${reason})`);
+      return;
+    }
     this.pc?.close();
     this.pc = undefined;
     this.stopWebTransportMedia();
@@ -4957,11 +4984,14 @@ export class AurixClient {
     const playback = this.wtPlayback?.stats;
     const input: RtcStatsInput = {
       inbound: {
+        jitter: (playback?.jitterMs ?? 0) / 1000,
         packetsReceived: s.audioPacketsReceived,
         packetsLost: s.audioPacketsLost,
         bytesReceived: s.bytesReceived,
         packetsDiscarded: s.packetsRejected + (playback?.framesDropped ?? 0),
-        concealedSamples: (playback?.underruns ?? 0) * AURX_FRAME_SAMPLES,
+        concealedSamples: playback?.concealedSamples ?? 0,
+        jitterBufferDelay: ((playback?.targetDelayMs ?? 0) / 1000) * (playback?.framesDecoded ?? 0),
+        jitterBufferEmittedCount: playback?.framesDecoded ?? 0,
       },
       outbound: { packetsSent: s.packetsSent, bytesSent: s.bytesSent },
     };
@@ -5028,7 +5058,7 @@ export class AurixClient {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       // Two missed pongs: the TCP connection is probably dead without the browser noticing.
       if (performance.now() - this.lastPongAt > 2.5 * this.opts.pingIntervalMs) {
-        ws.close(4001, 'keepalive timeout');
+        this.dropSocket('keepalive timeout');
         return;
       }
       const nonce = this.pingNonce++;
