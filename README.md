@@ -1110,20 +1110,26 @@ directly. Media (UDP) is protected by AURX v2 encryption+HMAC / DTLS-SRTP regard
 
 ### Backup & restore
 
-Everything durable lives in PostgreSQL and (optionally) the recording store.
+Everything durable lives in PostgreSQL and (optionally) the recording store; Redis is rebuilt by
+the nodes and needs no backup.
 
 ```bash
-docker compose exec db pg_dump -U "$POSTGRES_USER" -Fc aurix > aurix-$(date +%F).dump
-docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < aurix-2025-01-01.dump
+export AURIX_DATABASE_URL=postgres://aurix:…@db:5432/aurix
+tools/backup/run.sh backup  --out /backups --recordings /var/lib/aurix/recordings   # dump + files + manifest
+tools/backup/run.sh verify  /backups/20260923T020000Z                                # restore drill into a scratch database
+tools/backup/run.sh restore /backups/20260923T020000Z --database-url "$AURIX_DATABASE_URL" --recordings /var/lib/aurix/recordings
 ```
 
-Recordings: back up the `recordings` volume (or use S3 with versioning). Backups outlive user
-erasure (see above) — keep their retention in line with your privacy commitments. If recording encryption
-is enabled, the key (`AURIX__RECORDING__ENCRYPTION_KEY`) **must** be backed up separately — files
-are unreadable without it. Redis holds only ephemeral state and needs no backup.
-
-Migrations are embedded in the binary and applied at start when `database.run_migrations = true`
-(default); the server refuses to start if the schema is behind the compiled migrations.
+The dump is taken in one snapshot while nodes keep writing; the manifest records the schema
+version and every table's row count from that same snapshot, and `verify` restores into a
+throw-away database and compares them, so a backup is only "good" once it has been restored.
+Secrets are not in the dump — `auth.jwt_secret`, `recording.encryption_key` (encrypted
+recordings are unreadable without it), `media.cascade_secret`, TLS keys — back them up from your
+secret store. Backups outlive user erasure (see above); keep their retention in line with your
+privacy commitments. After a restore run `aurix doctor`: it reports the restored schema against
+the binary (pending migrations run at start-up or via `aurix-server --migrate-only`; a backup
+from a newer build must not be served by an older one — there is no rollback of migrations).
+Full procedure, PITR and schedules: [Backup and restore](docs/src/operations/backup-restore.md).
 
 ### Observability
 

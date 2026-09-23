@@ -46,7 +46,7 @@
   ([Deployment → Network and firewall](../operations/deployment.md#network-and-firewall));
 * HA control plane — Redis Sentinel или Cluster и реплики PostgreSQL
   ([High availability](../operations/high-availability.md));
-* метрики и алерты ([Backups and observability](../operations/observability.md));
+* метрики и алерты ([Observability](../operations/observability.md));
 * обновления ([Releases and versioning](../operations/releases.md)).
 
 В Aurix есть CI с chaos-набором (убийство ноды, failover Redis Sentinel, рестарт PostgreSQL),

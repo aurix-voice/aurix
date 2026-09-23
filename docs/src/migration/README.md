@@ -48,7 +48,7 @@ You are now the provider. Concretely that means running (or paying someone to ru
   ([Deployment → Network and firewall](../operations/deployment.md#network-and-firewall));
 * HA for the control plane — Redis Sentinel or Cluster and PostgreSQL replicas
   ([High availability](../operations/high-availability.md));
-* metrics and alerts ([Backups and observability](../operations/observability.md));
+* metrics and alerts ([Observability](../operations/observability.md));
 * upgrades ([Releases and versioning](../operations/releases.md)).
 
 Aurix ships CI for a chaos suite (node kill, Redis Sentinel failover, PostgreSQL restart), fuzzed

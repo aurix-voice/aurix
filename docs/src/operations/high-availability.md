@@ -236,7 +236,9 @@ start. For controlled roll-outs set `run_migrations = false` and run
 
 Take a daily base backup plus continuous WAL archiving (pgBackRest, WAL-G, or the managed
 provider's PITR) so you can restore to a point in time; `pg_dump` alone is sufficient only for
-small deployments (see [Backups and observability](observability.md)). Recordings and the
+small deployments. `tools/backup/run.sh` produces a self-describing dump (manifest with
+snapshot-consistent row counts and migration rows), proves it restores (`verify`) and restores
+it — the full procedure is in [Backup and restore](backup-restore.md). Recordings and the
 recording encryption key are backed up separately. Before restoring, stop all nodes: the
 session/membership rows in a backup are stale by definition and are cleaned up as nodes start
 (`recover_node_state`) — no manual cleanup is needed, but nodes that are still running would

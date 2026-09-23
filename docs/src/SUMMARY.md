@@ -71,7 +71,8 @@
 - [Usage analytics and quotas](operations/usage-analytics.md)
 - [Scaling out](operations/scaling.md)
 - [High availability](operations/high-availability.md)
-- [Backups and observability](operations/observability.md)
+- [Backup and restore](operations/backup-restore.md)
+- [Observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
 - [Releases and versioning](operations/releases.md)
 

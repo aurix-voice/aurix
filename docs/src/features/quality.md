@@ -155,7 +155,7 @@ also `404`.
 ## Prometheus
 
 The node exports aggregate counterparts on `/metrics` (see
-[Backups and observability](../operations/observability.md)): packet/byte counters,
+[Observability](../operations/observability.md)): packet/byte counters,
 `aurix_packets_dropped_total`, `aurix_packet_loss_rate`, session/participant/channel
 gauges, `aurix_api_request_duration_seconds` per route, and the quality distributions:
 `aurix_session_mos` (histogram, one observation per rated session per period),

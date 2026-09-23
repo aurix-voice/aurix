@@ -19,6 +19,7 @@ migration state — with secrets scrubbed ([CLI](../backend/cli.md#preflight-on-
 | `media.external_ip must be set in production` | the public IP clients send UDP to (`AURIX_PUBLIC_IP` in Compose) |
 | `database.url uses the development default credentials` | set real PostgreSQL credentials |
 | `Database schema is behind the compiled migrations` | `database.run_migrations = true` or run `aurix-server --migrate-only` once |
+| `migration 2024… was previously applied but is missing in the resolved migrations` | the database (or a restored backup) was written by a newer build; deploy that version or newer — migrations do not roll back ([Backup and restore](backup-restore.md#restoring-a-fleet)) |
 | `retention.tombstones_days` rejected | it must cover the longest token lifetime (`auth.token_ttl_secs`, action TTLs) |
 | `stt.enabled requires stt.endpoint` / `tts.default_voice must be one of tts.voices` | complete the `[stt]` / `[tts]` blocks or disable them |
 

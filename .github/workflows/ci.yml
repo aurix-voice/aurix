@@ -183,6 +183,37 @@ jobs:
               || { echo "doctor check $id is not ok"; jq --arg id "$id" '.checks[] | select(.id == $id)' doctor.json; exit 1; }
           done
           ! grep -q ci-only-turn-secret doctor.json
+      # Backup of the database the E2E suites just filled (nodes still writing), restore drill
+      # into a throw-away database, real restore into an empty one, doctor against the restored
+      # schema, and the "older backup, newer binary" case surfacing as pending migrations.
+      - name: backup / restore drill / restore (tools/backup/run.sh)
+        env:
+          AURIX_DATABASE_URL: postgres://aurix:aurix@127.0.0.1:5432/aurix
+          AURIX_BACKUP_PG_TOOLS: docker exec -i ${{ job.services.postgres.id }}
+          RECORDINGS: ${{ runner.temp }}/recordings
+        run: |
+          set -euo pipefail
+          test -n "$(ls -A "$RECORDINGS")"
+          DIR=$(tools/backup/run.sh backup --out target/backups --recordings "$RECORDINGS" --label ci)
+          jq -e '.format == 1 and .tables.users > 0 and .tables.user_tombstones > 0 and .tables.recordings > 0
+                 and .schema.latest > 0 and (.schema.migrations | all(.success)) and .recordings.files > 0' "$DIR/manifest.json"
+          if grep -q 'aurix:aurix@' "$DIR/manifest.json"; then echo "password leaked into the manifest"; exit 1; fi
+          tools/backup/run.sh verify "$DIR"
+          docker exec -i "${{ job.services.postgres.id }}" psql -U aurix -qc 'CREATE DATABASE aurix_restored'
+          RESTORED=postgres://aurix:aurix@127.0.0.1:5432/aurix_restored
+          mkdir -p "$RUNNER_TEMP/recordings-restored"
+          tools/backup/run.sh restore "$DIR" --database-url "$RESTORED" --recordings "$RUNNER_TEMP/recordings-restored"
+          diff -r "$RECORDINGS" "$RUNNER_TEMP/recordings-restored"
+          AURIX__DATABASE__URL=$RESTORED ./target/debug/aurix -o json doctor --skip-probes > restored.json || true
+          jq -e '.checks[] | select(.id == "postgres") | .status == "ok"' restored.json
+          jq -e '.checks[] | select(.id == "migrations") | .status == "ok"' restored.json
+          docker exec -i "${{ job.services.postgres.id }}" psql -U aurix -d aurix_restored -qc \
+            'DELETE FROM _sqlx_migrations WHERE version = (SELECT max(version) FROM _sqlx_migrations)'
+          AURIX__DATABASE__URL=$RESTORED ./target/debug/aurix -o json doctor --skip-probes > older.json || true
+          jq -e '.checks[] | select(.id == "migrations") | ((.status == "warn") and (.hints | any(test("pending migration"))))' older.json
+          if tools/backup/run.sh restore "$DIR" --database-url "$RESTORED"; then echo "restore into a non-empty database must be refused"; exit 1; fi
+          tools/backup/run.sh restore "$DIR" --database-url "$RESTORED" --force
+          jq -e '.checks[] | select(.id == "migrations") | .status == "ok"' <(AURIX__DATABASE__URL=$RESTORED ./target/debug/aurix -o json doctor --skip-probes || true)
       - name: E2E (native client core)
         env:
           AURIX_E2E_API: http://127.0.0.1:8080

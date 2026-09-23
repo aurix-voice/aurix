@@ -27,6 +27,23 @@ released together.
   `--skip-probes`; URL passwords and every secret configuration value are scrubbed from the
   report. Runs in CI against the E2E node and in the chaos harness (`doctor` scenario, Sentinel
   and Cluster) ([CLI](docs/src/backend/cli.md)).
+* **Backup, restore drill, restore.** `tools/backup/run.sh backup | verify | restore`:
+  `backup` exports a `REPEATABLE READ` snapshot, hands it to `pg_dump --snapshot` (custom
+  format, no owners/privileges) and counts every table *in that snapshot*, so the manifest
+  (`manifest.json`: schema version and `_sqlx_migrations` rows, per-table row counts, SHA-256
+  and size of the dump and of the optional recordings tarball, masked source URL) describes the
+  dump exactly even while nodes write; `verify` restores into a throw-away database
+  (`aurix_restore_drill_…`, dropped afterwards, also on failure), compares row counts and
+  migration rows with the manifest and exits non-zero on any difference or checksum mismatch;
+  `restore` refuses non-empty targets without `--force`, restores in one transaction with
+  `--exit-on-error`, runs the same comparison and unpacks the recordings. Client tools can run
+  inside the database container (`AURIX_BACKUP_PG_TOOLS="docker compose exec -T db"`). CI backs
+  up the live-E2E database under load, drills it, restores it, runs `aurix doctor` against the
+  result and checks that an older backup surfaces as pending migrations. New chapter
+  [Backup and restore](docs/src/operations/backup-restore.md): what is durable, the secrets
+  the dump does not contain, the restore procedure (stop nodes → secrets → restore → doctor →
+  one node → fleet), version skew in both directions (no rollback of migrations), PITR,
+  privacy of backups, schedules.
 * **Soak harness.** `tools/soak/run.sh` + the `aurix-soak` bot runner keep the two-node chaos
   topology under real native clients (`aurix-client`: SessionBind, join, Opus over QUIC/UDP/TLS,
   resume, failover, token refresh) for hours while node kills, Redis failover, PostgreSQL

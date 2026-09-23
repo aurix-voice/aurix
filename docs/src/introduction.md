@@ -34,7 +34,7 @@ Vivox / Agora / Photon Voice that you run on your own infrastructure.
 | integrate a game backend | [Tenancy, credentials and permissions](concepts/auth.md), [REST API and OpenAPI](api/rest.md), [Webhooks and the event stream](api/webhooks-sse.md) |
 | integrate a game client | [Client SDKs](sdk/overview.md) — Web, Unity, native / Unreal, Godot; [consoles](sdk/consoles.md), [Flutter / React Native](sdk/mobile-frameworks.md) |
 | implement your own client | [WebSocket control plane](api/websocket.md), [Native AURX media](api/aurx.md) |
-| operate it in production | [Deployment and configuration](operations/deployment.md), [Scaling out](operations/scaling.md), [Backups and observability](operations/observability.md) |
+| operate it in production | [Deployment and configuration](operations/deployment.md), [Scaling out](operations/scaling.md), [Backup and restore](operations/backup-restore.md), [Observability](operations/observability.md) |
 
 The machine-readable REST contract is `api/openapi.json` in the repository, also served by every
 node at `GET /openapi.json` and browsable [here](api/reference.html). The full WebSocket message

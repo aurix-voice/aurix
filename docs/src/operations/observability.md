@@ -1,4 +1,4 @@
-# Backups and observability
+# Observability
 
 ## What is durable
 
@@ -6,21 +6,8 @@ Everything durable lives in **PostgreSQL** and, if enabled, the **recording stor
 volume or S3). Redis holds only ephemeral state (events, one-time token claims, session→node
 mapping and session mirrors, node liveness, rate limits, global mutes) and needs no backup —
 after a Redis loss, clients reconnect and state rebuilds. Failover, Sentinel and PostgreSQL HA
-are covered in [High availability](high-availability.md).
-
-```bash
-docker compose exec db pg_dump -U "$POSTGRES_USER" -Fc aurix > aurix-$(date +%F).dump
-docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d aurix --clean < aurix-2025-01-01.dump
-```
-
-* Recordings: back up the `recordings` volume, or use S3 with versioning. If recording
-  encryption is on, `AURIX__RECORDING__ENCRYPTION_KEY` **must** be backed up separately — files
-  are unreadable without it (see [Recordings](../features/recordings.md)).
-* Backups outlive user erasure (`DELETE /v1/users/{id}`): keep backup retention in line with
-  your privacy commitments, and note that tombstones in a restored database still block tokens
-  issued before the erasure.
-* Migrations are embedded and applied on start (`database.run_migrations = true`), or
-  explicitly with `aurix-server --migrate-only`.
+are covered in [High availability](high-availability.md); what to back up, the restore drill
+and the restore procedure in [Backup and restore](backup-restore.md) (`tools/backup/run.sh`).
 
 ## Metrics
 
