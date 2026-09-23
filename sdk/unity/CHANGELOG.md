@@ -8,6 +8,26 @@ server version it ships with (the repository is versioned as one unit).
 
 Nothing yet.
 
+## [1.5.0] — 2026-09-22
+
+### Added
+
+- `MediaPathPolicy.Auto` now orders UDP → TLS tunnel → WebSocket tunnel; `MediaPath.Tls` dials the
+  node's dedicated TLS media tunnel (pinned certificate, normally port 443) when UDP is blocked.
+  WebGL rides the Web SDK's WebTransport path with automatic WebRTC fallback.
+- Speaker admission: `ChannelInfo.WaitingToSpeak` / `IsWaitingToSpeak` and
+  `OnParticipantRoleChanged` for channels with `speaker_admission = wait | demote`.
+- `SetServerNoiseSuppressionAsync` / `OnServerNoiseSuppressionChanged` — opt into the node's uplink
+  denoiser.
+- `AudioCodec.Pcma` (G.711 A-law) next to PCMU, including end-to-end encrypted G.711 frames.
+- `AurixVoiceClient.DeviceId`: identifies the installation on the handshake; directed chat
+  messages are then replayed exactly once per device and acknowledged automatically
+  (`ChatAck`); `OnChatInboxSynced` gains the `perDevice` argument.
+
+### Changed
+
+- `ChatAck` no longer carries a client timestamp; the server takes it from the stored message.
+
 ## [1.4.0] — 2026-09-22
 
 ### Changed

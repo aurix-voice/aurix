@@ -11,6 +11,17 @@ released together.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-22
+
+Feature release: the roadmap items behind the former "limitations" list — Redis Cluster,
+RTT-measured multi-level cascade with TCP fallback, a TLS media tunnel and WebTransport for
+strict firewalls, speaker demotion, server-side live-stream mixing with outage buffering,
+opt-in server-side noise suppression, PCMA, stored transcripts and exactly-once per-device chat
+delivery. Migrations `20240101000021` … `20240101000024` are applied on start; the protocol and
+REST additions are backwards compatible with 1.4 clients and SDKs, but the Redis key layout
+changed (restart every node on this version before relying on cross-node failover) and the
+`aurix_noise_suppression_frames_total` path label for G.711 is `g711` (was `pcmu`).
+
 ### Added
 
 * **Redis Cluster.** `redis.cluster = ["redis://…", …]` (env `AURIX__REDIS__CLUSTER`, exclusive
@@ -448,7 +459,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/aurix-voice/aurix/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/aurix-voice/aurix/compare/872f918...v1.4.0
 [1.3.0]: https://github.com/aurix-voice/aurix/compare/31eb7a5...872f918
 [1.2.0]: https://github.com/aurix-voice/aurix/tree/31eb7a5

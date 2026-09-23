@@ -9,7 +9,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>CS1591</NoWarn>
     <PackageId>Aurix.Server</PackageId>
-    <Version>1.4.0</Version>
+    <Version>1.5.0</Version>
     <Authors>Aurix contributors</Authors>
     <Description>Server-side (game backend) SDK for the Aurix voice platform REST API: token issuance, channels, moderation, analytics, webhooks and the SSE event stream. Generated from api/openapi.json.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
