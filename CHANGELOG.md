@@ -69,9 +69,33 @@ released together.
   `tools/observability/check.py` (CI, with `promtool check rules`) fails when a rule or panel
   references a metric or label the node does not register
   ([Observability](docs/src/operations/observability.md)).
+* **Load generator for every media path, measured capacity.** `aurix-loadtest --transport
+  udp | quic | tls | webtransport | tunnel` drives 1000+ sessions over UDP, QUIC and the TLS
+  tunnel through the native client core, over WebTransport like a browser and over the
+  WebSocket tunnel; `--opus` sends real Opus frames, `--mix` / `--noise-suppression` request the
+  server mix and server-side denoising through the real control messages (acknowledgements and
+  refusals are counted), `--listen-only` gives listeners listen-only grants (shared mixer /
+  audience shape), repeated `--ws` + `--metrics` spread the sessions over several nodes so the
+  channels cascade, `--warmup-ms` waits for cascade discovery. The JSON report carries a
+  `run_id`, the configuration, per-node before/after Prometheus deltas (packets, transport,
+  mixer, noise-suppression and cascade counters, CPU seconds, RSS, fds) and the generator's own
+  cost. Completed reference runs — five transports, noise suppression, shared-mixer and
+  mix + denoise at the host limit, two-node cascade over UDP and over the TCP fallback — with
+  exact commands and conditions are in
+  [Development and load testing](docs/src/operations/development.md#reference-runs-160); the
+  [Capacity](docs/src/operations/scaling.md#capacity) section is derived from them.
 
 ### Fixed
 
+* Cascade: a node's envelope counter is taken by whichever receive worker seals a frame, so
+  frames reach the wire slightly out of counter order; under load the 64-packet anti-replay
+  window rejected the stragglers as `Replayed cascade packet` (168 of 5.4 M frames in a two-node
+  TCP-fallback load test). Cascade links now use a 4096-packet window (`WideReplayWindow`);
+  client sessions keep the 64-packet window.
+* WebTransport: the endpoint socket was bound with the OS default buffers instead of asking for
+  the 4 MiB media socket buffers the UDP/QUIC endpoint uses; with 1000 sessions it lost ~11 % of
+  downlink datagrams. It now requests the same buffers — the kernel caps them at
+  `net.core.rmem_max` / `wmem_max`, so raise those (the load test used 16 MiB) as for UDP.
 * Native TLS tunnel (`aurix-client`): the close reason is published before the closed flag, so a
   reader that observes the link closed never sees an empty reason.
 * Web SDK WebTransport: `close()` records the reason and state before tearing the transport down,

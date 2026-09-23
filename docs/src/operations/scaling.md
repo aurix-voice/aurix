@@ -244,9 +244,24 @@ cascade — with WAN latency between the nodes, so let players of one party land
 ## Capacity
 
 A node's cost is dominated by the SFU fan-out (`speakers × (members − 1)` sealed packets per
-frame). Reference numbers from the [load test](development.md#load-testing): 1000 sessions /
-100 channels / 2 speakers → 90k pps out at ~0.4 core; 2000 sessions / 4 speakers → 360k pps at
-~1.4 cores, 70 MB RSS. Tune `media.rx_workers` (UDP receive workers), the kernel receive buffers
-(`net.core.rmem_max`, watch `Udp: RcvbufErrors` in `/proc/net/snmp`) and `ulimit -n` on the
-host. `media.max_participants_per_node` / `max_channels_per_node` cap a node and feed the load
-factor used by the registry (`available` = healthy and below 90 % of capacity).
+frame) and by whatever the node decodes. Measured on one 8 vCPU host with the
+[load generator](development.md#reference-runs-160) at 1000 sessions / 100 channels × 10 /
+2 speakers (10k frames/s in, 90k out), all 100 % delivered unless noted:
+
+| path | server CPU | RSS | note |
+|---|---|---|---|
+| UDP | 0.43 core | 159 MiB | baseline |
+| QUIC / TLS tunnel / WebTransport / WS tunnel | 0.80 / 0.60 / 0.85 / 0.53 core | 165–171 MiB | encrypted transports cost 1.4–2× UDP for the same frames |
+| + server noise suppression (200 uplinks) | 3.50 cores | 235 MiB | ~15 ms CPU per second of audio per denoised uplink |
+| server mix, audience shape (100 shared + 200 private mixers) | 4.97 cores | 230 MiB | 99.98 % delivered; a team shape (1000 private mixers) does not fit this host |
+| server mix + noise suppression | 7.73 cores | 307 MiB | 93.6 % delivered — saturated, over the limit |
+| cascade, 2 nodes, UDP or TCP fallback | 0.25 core per node | 69–274 MiB | half the fan-out per node; the forwarding hop itself adds no measurable CPU |
+
+Rule of thumb from those runs: the per-stream path is cheap (~5–9 µs of CPU per delivered frame,
+network-bound long before CPU-bound), each denoised uplink costs ~1.5 % of a core, each mixer
+roughly one decoder per speaker plus one encoder per downlink. Keep the node's sum well below its
+core count and give listeners `speak: false` grants so a mixed channel needs one shared mixer,
+not one per member. Tune `media.rx_workers` (UDP receive workers), the kernel socket buffers
+(`net.core.rmem_max` / `wmem_max` ≥ 4 MiB, watch `Udp: RcvbufErrors` in `/proc/net/snmp`) and
+`ulimit -n` on the host. `media.max_participants_per_node` / `max_channels_per_node` cap a node
+and feed the load factor used by the registry (`available` = healthy and below 90 % of capacity).

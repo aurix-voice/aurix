@@ -120,33 +120,118 @@ silence them:
 ## Load testing
 
 `aurix-loadtest` behaves like real native clients: it creates channels and player tokens through
-the REST API, opens one WebSocket per session, performs an authenticated `SessionBind`, joins
-channels and streams sealed AURX audio from the configured speakers while every member decrypts
-its own downlink — nothing bypasses production validation.
+the REST API, opens one WebSocket per session, performs an authenticated `SessionBind` over the
+chosen media path, joins channels and streams sealed AURX audio from the configured speakers
+while every member opens its own downlink — nothing bypasses production validation. UDP, QUIC and
+the TLS tunnel go through the native client core (`aurix-client`, the same code every native SDK
+ships), WebTransport through a WebTransport client the way a browser connects, and `tunnel` sends
+AURX as binary frames on the control WebSocket.
 
 ```bash
 cargo build --release -p aurix-server -p aurix-loadtest
 AURIX_LOADTEST_API_KEY=aurx_... ./target/release/aurix-loadtest \
   --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081 --metrics http://127.0.0.1:4040/metrics \
-  --sessions 1000 --channels 100 --speakers 2 --pps 50 --duration 30 \
-  [--payload 80] [--setup-concurrency 64] [--json]
+  --transport udp|quic|tls|webtransport|tunnel \
+  --sessions 1000 --channels 100 --speakers 2 --pps 50 --duration 60 \
+  [--opus [--opus-bitrate 32000]] [--mix] [--noise-suppression] [--listen-only] \
+  [--payload 80] [--setup-concurrency 64] [--warmup-ms 1000] [--json]
 ```
 
-The report contains session setup success and latency, packets sent vs. delivered
-(`expected = speakers × (members − 1) × frames`), bad-auth count, one-way latency percentiles
-(a timestamp is embedded in every payload), control-plane message counts, and a before/after
-diff of the server's Prometheus counters (packets, CPU seconds, RSS).
+* `--opus` replaces the synthetic payload with a bank of real Opus frames (speech-like signal,
+  encoded once at `--opus-bitrate`); `--mix` and `--noise-suppression` imply it because the node
+  decodes those frames.
+* `--mix` makes every session ask for the server-mixed downlink (`SetDownlinkMode`), and
+  `--noise-suppression` makes every speaker ask for uplink denoising (`SetNoiseSuppression`);
+  the report counts the acknowledgements and refusals (`NOISE_SUPPRESSION_UNAVAILABLE`).
+* `--listen-only` gives the non-speaking members a listen-only grant. It changes nothing for the
+  per-stream path, but a server mix then serves them from one shared mixer per channel (an
+  audience) instead of one private mixer per receiver (a team where everyone may speak).
+* Repeating `--ws` spreads sessions over several nodes so that every channel has members on
+  every node — the nodes cascade. Pass one `--metrics` per node; `--warmup-ms` gives the cascade
+  time to discover the channel before the speakers start.
+
+The JSON report (`--json`, logs go to stderr) has a reproducible `run_id`, the configuration,
+setup counts and timings, packets sent vs. delivered (`expected = speakers × (members − 1) ×
+frames` per stream; with `--mix`, one mixed frame per hearing member per frame), one-way latency
+percentiles (a timestamp is embedded in every synthetic payload — a mixed frame is a new encode, so
+mixed runs report no latency), replay / bad-auth counts, the generator's own CPU and RSS, and per
+node a before/after diff of the Prometheus counters (`aurix_packets_*`, transport, mixer, noise
+suppression and cascade counters, gauges after the run, process CPU seconds, RSS, fds).
 
 Practicalities: the load-generator host needs `ulimit -n ≥ 2 × sessions`; kernel-side drops show
-in `/proc/net/snmp` (`Udp: RcvbufErrors`) — raise `net.core.rmem_max` and `media.rx_workers` on the
-server side. Run the generator on a separate host for numbers you intend to publish.
+in `/proc/net/snmp` (`Udp: RcvbufErrors`) — raise `net.core.rmem_max` / `wmem_max` to at least
+the node's 4 MiB media socket buffers and `media.rx_workers` on the server side. Setting up 1000
+sessions opens ~1000 short-lived DB transactions: size `database.max_connections` and
+PostgreSQL's `max_connections` for that or lower `--setup-concurrency`. Run the generator on a
+separate host for numbers you intend to publish.
 
-Reference run (release build, 8 vCPU host shared with the load generator, PostgreSQL + Redis):
+### Reference runs (1.6.0)
 
-| scenario | in / out pps | delivered | one-way p50 / p99 | server CPU | RSS |
-|---|---|---|---|---|---|
-| 1000 sessions, 100 channels × 10, 2 speakers | 10k / 90k | 100 % | 2.5 / 4.8 ms | ~0.4 core | 48 MB |
-| 2000 sessions, 200 channels × 10, 4 speakers | 40k / 360k | 99.8 % | 2.1 / 4.8 ms | ~1.4 cores | 70 MB |
+All runs below: release build of `main` after v1.5.0 (Rust 1.98, libopus 1.6 bundled), one 8 vCPU
+host (Intel Xeon Platinum 8559C) shared by the node(s), PostgreSQL 16 and Redis 7 in containers
+and the load generator; `net.core.rmem_max = wmem_max = 16 MiB`, `ulimit -n 65536`,
+`database.max_connections = 40` per node, otherwise `configs/default.toml` (`rx_workers = 0`, auto from the CPU count,
+`mixer_decoder_complexity = 5`, noise suppression `level = "high"`, `max_sessions = 1024`).
+Every run: **1000 sessions, 100 channels × 10 members, 2 speakers per channel, 50 pps per
+speaker (20 ms frames), 60 s of streaming** — 10 000 packets/s uplink, 90 000 packets/s downlink
+on the per-stream path. Server CPU is the node's `process_cpu_seconds_total` delta divided by the
+streaming time; RSS is `process_resident_memory_bytes` after the run. Payload is an 80-byte
+synthetic frame unless a row says Opus (real 32 kbit/s Opus frames, ~78 bytes). Every row is a
+single completed run of the command shown (common flags: `--sessions 1000 --channels 100
+--speakers 2 --duration 60 --setup-concurrency 64`), setup 1000/1000 in every one.
+
+**Media paths, one node** (`--transport …`):
+
+| transport | delivered | one-way p50 / p99 / max | server CPU | RSS |
+|---|---|---|---|---|
+| `udp` | 5 400 000 / 5 400 000 (100 %) | 1.55 / 2.85 / 5.1 ms | 0.43 core | 159 MiB |
+| `quic` | 100 % | 2.05 / 3.85 / 23.7 ms | 0.80 core | 165 MiB |
+| `tls` (TLS tunnel) | 100 % | 1.75 / 3.25 / 8.7 ms | 0.60 core | 165 MiB |
+| `webtransport` | 100 % | 2.85 / 5.35 / 14.0 ms | 0.85 core | 171 MiB |
+| `tunnel` (WebSocket) | 100 % | 2.05 / 20.65 / 48.8 ms | 0.53 core | 171 MiB |
+
+QUIC setup took 3.6 s for the 1000 handshakes (max 3.06 s for one session) against ~0.7 s for the
+others; the encrypted transports cost roughly 1.4–2× the UDP CPU for the same traffic. The
+WebSocket tunnel's p99 is the head-of-line blocking of one TCP stream per session under 90k
+frames/s on a shared host, not a steady offset.
+
+**Processing, one node** (`--transport udp`, Opus payload):
+
+| scenario | delivered | one-way p50 / p99 / max | server CPU | RSS |
+|---|---|---|---|---|
+| `--noise-suppression` (200 denoised uplinks, 600 000 frames `outcome="ok"`) | 100 % | 6.95 / 10.95 / 14.8 ms | 3.50 cores | 235 MiB |
+| `--mix --listen-only` (100 shared mixers for 800 listeners + a private one per speaker; 1000 mixed downlinks at 50 pps) | 2 999 484 / 3 000 000 (99.98 %) | — | 4.97 cores | 230 MiB |
+| `--mix --noise-suppression --listen-only` | 2 807 640 / 3 000 000 (93.6 %) | — | 7.73 cores | 307 MiB |
+
+Noise suppression is ~15 ms of CPU per second of audio per uplink (RNNoise + Opus decode and
+re-encode) and adds ~5 ms of one-way latency. A server mix costs one Opus decoder per speaker
+per mixer plus one encoder per mixed downlink; the audience shape keeps that at
+`channels + speakers` mixers, whereas the same 1000 sessions with everyone allowed to speak need
+~1000 private mixers and did not fit this host (34 % delivered at 7.75 cores — the reason for
+`--listen-only` and for keeping `speak: false` in the grants of members who only listen). The
+combined row saturated the 8 vCPUs (7.73 cores) and is listed as the observed behaviour at the
+limit, not as a supported configuration; size a node so that the sum stays well below the core
+count, and watch `aurix_downlink_mix_frames_total{outcome!="sent"}` and
+`aurix_noise_suppression_frames_total{outcome="skipped"}`.
+
+**Cascade, two nodes on one host** (`--ws ws://node1 --ws ws://node2 --metrics … --metrics …
+--warmup-ms 3000`; each channel has 5 members on each node, so every uplink frame crosses the
+inter-node link once):
+
+| scenario | delivered | one-way p50 / p99 / max | CPU per node | RSS node 1 / node 2 |
+|---|---|---|---|---|
+| cascade over UDP (`aurix_cascade_links{transport="udp"} = 1`) | 5 400 000 / 5 400 000 (100 %) | 1.05 / 2.05 / 4.1 ms | 0.25 core | 274 / 69 MiB |
+| cascade over the TCP fallback (`cascade_tcp_fallback = true`, inter-node UDP dropped by the firewall, `aurix_cascade_links{transport="tcp"} = 1`) | 100 % | 1.25 / 2.45 / 4.6 ms | 0.25 core | 71 / 69 MiB |
+
+Each node received 300 000 uplink frames and sent 2 700 000 to its own members; every uplink
+frame was forwarded once (5 000 frames/s in each direction over the inter-node link,
+`aurix_cascade_forwarded_total{role="origin"} = 300 000` per node). The
+TCP fallback adds ~0.2 ms on loopback; on a WAN it adds the head-of-line blocking of one TCP
+connection per peer under loss, which is why it is a fallback. The first TCP run of this series
+dropped 168 of 5.4 M frames as `Replayed cascade packet`: the envelope counter is taken by
+whichever receive worker seals the frame, so frames reach the wire slightly out of counter order
+and the 64-packet anti-replay window rejected the stragglers — cascade links now use a 4096-packet
+window, and the row above is the rerun after that fix.
 
 ## Soak testing
 

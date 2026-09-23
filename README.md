@@ -1169,33 +1169,45 @@ is compiled from bundled sources and linked statically, no system `libopus` is u
 
 `aurix-loadtest` is a reproducible load generator that behaves like real native clients: it
 creates channels and tokens through the REST API (API key required), opens one WebSocket per
-session, performs an authenticated `SessionBind` over UDP, joins channels and then streams
-sealed (encrypted + authenticated) AURX audio from the configured speakers while every member
-opens the downlink with its own session keys (nothing bypasses production validation).
+session, performs an authenticated `SessionBind` over the chosen media path — UDP, QUIC, the TLS
+tunnel (through the native client core), WebTransport (as a browser does) or the WebSocket
+tunnel — joins channels and streams sealed AURX audio from the configured speakers while every
+member opens its downlink with its own session keys (nothing bypasses production validation).
+`--opus` sends real Opus frames, `--mix` requests the server-mixed downlink, `--noise-suppression`
+server-side denoising, `--listen-only` gives listeners listen-only grants (audience shape), and
+repeating `--ws` spreads the sessions over several nodes so they cascade.
 
 ```bash
 cargo build --release -p aurix-server -p aurix-loadtest
 ./target/release/aurix-loadtest \
-  --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081 --metrics http://127.0.0.1:9090/metrics \
+  --api http://127.0.0.1:8080 --ws ws://127.0.0.1:8081 --metrics http://127.0.0.1:4040/metrics \
   --api-key aurx_...            # or AURIX_LOADTEST_API_KEY
-  --sessions 1000 --channels 100 --speakers 2 --pps 50 --duration 30 [--json]
+  --transport udp|quic|tls|webtransport|tunnel \
+  --sessions 1000 --channels 100 --speakers 2 --pps 50 --duration 60 [--json]
 ```
 
-The report contains session setup success/latency, packets sent vs. delivered (`expected =
-speakers × (members − 1) × frames`), bad-auth count, one-way latency percentiles (a timestamp is
-embedded in every payload), control-plane message counts and a before/after diff of the server’s
-Prometheus counters (`packets_*`, CPU seconds, RSS). Kernel-side drops show up in
-`/proc/net/snmp` → `Udp: RcvbufErrors`; the loadgen host needs `ulimit -n` ≥ 2 × sessions.
+The JSON report contains setup success/latency, packets sent vs. delivered, one-way latency
+percentiles, replay/bad-auth counts, mix and noise-suppression acknowledgements and, per node, a
+before/after diff of the Prometheus counters (packets, transport, mixer, noise suppression,
+cascade, CPU seconds, RSS, fds).
 
-Reference run (release build, 8 vCPU host shared with the load generator, PostgreSQL + Redis):
+Reference runs (release build, one 8 vCPU host shared with PostgreSQL, Redis and the generator;
+1000 sessions / 100 channels × 10 / 2 speakers / 60 s = 10k frames/s in, 90k out; every row a
+completed run, exact commands and conditions in the
+[book](docs/src/operations/development.md#reference-runs-160)):
 
-| scenario | in / out pps | delivered | one-way p50 / p99 | server CPU | RSS |
-|---|---|---|---|---|---|
-| 1000 sessions, 100 channels × 10, 2 speakers | 10k / 90k | 100 % | 2.5 / 4.8 ms | ~0.4 core | 48 MB |
-| 2000 sessions, 200 channels × 10, 4 speakers | 40k / 360k | 99.8 % | 2.1 / 4.8 ms | ~1.4 cores | 70 MB |
-
-The second scenario delivered only 79 % (p99 13.6 ms, 167k `RcvbufErrors`) before the SFU used
-parallel receive workers and non-blocking sends; that is what `media.rx_workers` controls.
+| scenario | delivered | one-way p50 / p99 | server CPU | RSS |
+|---|---|---|---|---|
+| UDP | 100 % | 1.55 / 2.85 ms | 0.43 core | 159 MiB |
+| QUIC | 100 % | 2.05 / 3.85 ms | 0.80 core | 165 MiB |
+| TLS tunnel | 100 % | 1.75 / 3.25 ms | 0.60 core | 165 MiB |
+| WebTransport | 100 % | 2.85 / 5.35 ms | 0.85 core | 171 MiB |
+| WebSocket tunnel | 100 % | 2.05 / 20.65 ms | 0.53 core | 171 MiB |
+| UDP + server noise suppression (200 uplinks) | 100 % | 6.95 / 10.95 ms | 3.50 cores | 235 MiB |
+| UDP + server mix, audience shape (100 shared mixers) | 99.98 % | — | 4.97 cores | 230 MiB |
+| UDP + server mix + noise suppression | 93.6 % (saturated) | — | 7.73 cores | 307 MiB |
+| two nodes, cascade over UDP | 100 % | 1.05 / 2.05 ms | 0.25 core / node | 274 + 69 MiB |
+| two nodes, cascade TCP fallback (inter-node UDP blocked) | 100 % | 1.25 / 2.45 ms | 0.25 core / node | 71 + 69 MiB |
 
 ## Client SDKs
 

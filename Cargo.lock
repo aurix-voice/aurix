@@ -488,12 +488,15 @@ name = "aurix-loadtest"
 version = "1.5.0"
 dependencies = [
  "anyhow",
+ "aurix-client",
  "aurix-common",
+ "aurix-opus",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
  "futures-util",
+ "hex",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -503,6 +506,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wtransport",
 ]
 
 [[package]]

@@ -764,6 +764,83 @@ impl ReplayWindow {
     }
 }
 
+/// Anti-replay window for aggregated links (cascade envelopes): the 64-bit counter is taken
+/// by whichever receive worker seals the frame, so frames reach the wire slightly out of
+/// counter order and a 64-packet window would reject legitimate frames on a busy link.
+/// Same acceptance rule as [`ReplayWindow`] over `WIDE_REPLAY_WINDOW` counters.
+#[derive(Debug, Clone)]
+pub struct WideReplayWindow {
+    highest: u64,
+    bitmap: [u64; WIDE_REPLAY_WORDS],
+    initialized: bool,
+}
+
+const WIDE_REPLAY_WORDS: usize = 64;
+/// Width of [`WideReplayWindow`] in counters (4096).
+pub const WIDE_REPLAY_WINDOW: u64 = (WIDE_REPLAY_WORDS as u64) * 64;
+
+impl Default for WideReplayWindow {
+    fn default() -> Self {
+        Self {
+            highest: 0,
+            bitmap: [0; WIDE_REPLAY_WORDS],
+            initialized: false,
+        }
+    }
+}
+
+impl WideReplayWindow {
+    fn bit(&self, delta: u64) -> (usize, u64) {
+        ((delta / 64) as usize, 1u64 << (delta % 64))
+    }
+
+    fn shift_left(&mut self, by: u64) {
+        if by >= WIDE_REPLAY_WINDOW {
+            self.bitmap = [0; WIDE_REPLAY_WORDS];
+            return;
+        }
+        let words = (by / 64) as usize;
+        let bits = by % 64;
+        for i in (0..WIDE_REPLAY_WORDS).rev() {
+            let mut v = 0u64;
+            if i >= words {
+                v = self.bitmap[i - words] << bits;
+                if bits > 0 && i > words {
+                    v |= self.bitmap[i - words - 1] >> (64 - bits);
+                }
+            }
+            self.bitmap[i] = v;
+        }
+    }
+
+    /// Returns true and records the counter if it is fresh; false for replays / too-old frames.
+    pub fn check_and_update_u64(&mut self, seq: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            self.highest = seq;
+            self.bitmap = [0; WIDE_REPLAY_WORDS];
+            self.bitmap[0] = 1;
+            return true;
+        }
+        if seq > self.highest {
+            self.shift_left(seq - self.highest);
+            self.bitmap[0] |= 1;
+            self.highest = seq;
+            return true;
+        }
+        let delta = self.highest - seq;
+        if delta >= WIDE_REPLAY_WINDOW {
+            return false;
+        }
+        let (word, mask) = self.bit(delta);
+        if self.bitmap[word] & mask != 0 {
+            return false;
+        }
+        self.bitmap[word] |= mask;
+        true
+    }
+}
+
 pub fn channel_id_hash(id: &ChannelId) -> u32 {
     crc32fast::hash(id.0.as_bytes())
 }
@@ -2331,6 +2408,34 @@ mod tests {
         assert!(!w.check_and_update(100));
         assert!(w.check_and_update(150));
         assert!(!w.check_and_update(150));
+    }
+
+    #[test]
+    fn wide_replay_window_tolerates_deep_reordering() {
+        let mut w = WideReplayWindow::default();
+        assert!(w.check_and_update_u64(10_000));
+        assert!(!w.check_and_update_u64(10_000));
+        // Deeper than the 64-packet client window, well inside the wide one.
+        assert!(w.check_and_update_u64(13_000));
+        assert!(w.check_and_update_u64(12_800));
+        assert!(!w.check_and_update_u64(12_800));
+        assert!(w.check_and_update_u64(13_000 - 4_095));
+        assert!(!w.check_and_update_u64(13_000 - 4_096));
+        assert!(!w.check_and_update_u64(10_000));
+        // Shifting by whole words and by more than the window keeps the bitmap consistent.
+        assert!(w.check_and_update_u64(13_128));
+        assert!(w.check_and_update_u64(13_001));
+        assert!(!w.check_and_update_u64(13_000));
+        assert!(w.check_and_update_u64(100_000));
+        assert!(!w.check_and_update_u64(13_128));
+        assert!(w.check_and_update_u64(100_000 - 4_000));
+        for seq in (100_000 - 4_000 + 1)..100_000 {
+            assert!(w.check_and_update_u64(seq), "{seq}");
+        }
+        assert!(w.check_and_update_u64(100_001));
+        for seq in (100_000 - 4_000)..=100_000 {
+            assert!(!w.check_and_update_u64(seq), "{seq}");
+        }
     }
 
     #[test]

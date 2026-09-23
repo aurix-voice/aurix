@@ -22,6 +22,7 @@
 //! expires; nothing here talks to a CA (no ACME).
 
 use crate::cert::MediaCert;
+use crate::transport::MEDIA_SOCKET_BUFFER_BYTES;
 use aurix_common::protocol::{WebTransportInfo, MAX_PACKET_SIZE, WEBTRANSPORT_PATH};
 use aurix_common::types::SessionId;
 use aurix_common::{AurixError, Result};
@@ -265,14 +266,17 @@ impl std::fmt::Debug for WebTransportServer {
 impl WebTransportServer {
     /// Binds the endpoint on `bind` (the media bind address with `options.port`). Browsers are
     /// told to connect to `options.advertise`, or — when that is empty — to `fallback_hosts`
-    /// (the node's advertised media addresses) with the port the endpoint actually got.
+    /// (the node's advertised media addresses) with the port the endpoint actually got. The
+    /// socket gets the media socket's buffers: one endpoint receives every browser's datagrams
+    /// and ACKs, and the OS default (~200 KiB) overflows in the hundreds of sessions.
     pub fn bind(
         bind: SocketAddr,
         fallback_hosts: &[SocketAddr],
         options: WebTransportOptions,
     ) -> Result<Arc<Self>> {
-        let (socket, _family) = aurix_common::net::bind_udp_std(bind, true, 0)
-            .map_err(|e| AurixError::Transport(format!("WebTransport endpoint {bind}: {e}")))?;
+        let (socket, _family) =
+            aurix_common::net::bind_udp_std(bind, true, MEDIA_SOCKET_BUFFER_BYTES)
+                .map_err(|e| AurixError::Transport(format!("WebTransport endpoint {bind}: {e}")))?;
         let local_addr = socket
             .local_addr()
             .map_err(|e| AurixError::Transport(format!("WebTransport endpoint: {e}")))?;

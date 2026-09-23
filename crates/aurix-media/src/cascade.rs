@@ -29,7 +29,7 @@ use crate::transport::{bind_media_socket, MediaSocket};
 use aurix_common::crypto::MediaKeys;
 use aurix_common::error::{AurixError, Result};
 use aurix_common::protocol::{
-    channel_id_hash, AurixPacket, PacketFlags, PacketType, ReplayWindow, HEADER_SIZE,
+    channel_id_hash, AurixPacket, PacketFlags, PacketType, WideReplayWindow, HEADER_SIZE,
     MAX_RELAY_HOPS, MAX_RELAY_PACKET_SIZE,
 };
 use aurix_common::types::*;
@@ -132,7 +132,7 @@ pub struct CascadeRelay {
     /// `channel_id_hash` -> channel for the routes above (envelopes only carry the hash).
     routes_by_hash: Arc<DashMap<u32, ChannelId>>,
     /// Peers we accept relayed traffic from, each with its own anti-replay window.
-    allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>>,
+    allowed_peers: Arc<DashMap<SocketAddr, Mutex<WideReplayWindow>>>,
     /// Peers from static configuration; never removed by discovery.
     static_peers: HashSet<SocketAddr>,
     /// Peers currently known through discovery (healthy nodes from the registry).
@@ -204,7 +204,8 @@ impl CascadeRelay {
             ));
         }
         let local_addr = socket.local_addr();
-        let allowed_peers: Arc<DashMap<SocketAddr, Mutex<ReplayWindow>>> = Arc::new(DashMap::new());
+        let allowed_peers: Arc<DashMap<SocketAddr, Mutex<WideReplayWindow>>> =
+            Arc::new(DashMap::new());
         let mut static_peers = HashSet::new();
         for p in peers {
             let addr: SocketAddr = p.parse().map(aurix_common::addr::canonical).map_err(|_| {
@@ -215,7 +216,7 @@ impl CascadeRelay {
                     "cascade peer {p} is not reachable from the cascade socket bound to {local_addr}"
                 )));
             }
-            allowed_peers.insert(addr, Mutex::new(ReplayWindow::default()));
+            allowed_peers.insert(addr, Mutex::new(WideReplayWindow::default()));
             static_peers.insert(addr);
         }
         let tcp_listener = if options.tcp_fallback {
@@ -335,7 +336,7 @@ impl CascadeRelay {
         for added in peers.difference(&current) {
             self.allowed_peers
                 .entry(*added)
-                .or_insert_with(|| Mutex::new(ReplayWindow::default()));
+                .or_insert_with(|| Mutex::new(WideReplayWindow::default()));
             self.links.entry(*added).or_default();
             info!("Cascade peer discovered: {}", added);
         }
