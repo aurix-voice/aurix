@@ -666,7 +666,68 @@ pub static CASCADE_TCP_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Speaker-slot admission in channels with `audience.max_speakers`: `rejected` (mode
+/// `reject`, the join failed), `waited` (the member entered as a listener and waits for a
+/// slot), `demoted` (an idle speaker yielded its slot) and `admitted` (a waiting member got
+/// its slot).
+pub static SPEAKER_SLOT_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_speaker_slot_events_total",
+        "Speaker-slot admission decisions in channels with a speaker cap",
+        &["event"]
+    )
+    .unwrap()
+});
+
+/// Live audio streams this node owns, by `mode` (`pull` / `push`).
+pub static LIVE_STREAMS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aurix_live_streams",
+        "Open live audio streams owned by this node",
+        &["mode"]
+    )
+    .unwrap()
+});
+
+/// Live streams whose consumer is away (pull: waiting for `resume`; push: the target is being
+/// re-dialled) and whose frames go to the outage buffer.
+pub static LIVE_STREAMS_RECONNECTING: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "aurix_live_streams_reconnecting",
+        "Live streams buffering for a consumer that is currently away"
+    )
+    .unwrap()
+});
+
+/// `outcome` is `sent` (queued for the consumer) or `dropped` (slow consumer, or outage
+/// buffer overflow while the consumer was away).
+pub static LIVE_STREAM_FRAMES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_live_stream_frames_total",
+        "Audio frames produced for live stream consumers",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// `reason` is the close reason reported to the consumer in the `end` frame: `operator`,
+/// `channel_stopped`, `duration_limit`, `consumer_disconnected` (pull without an outage
+/// buffer), `consumer_timeout`, `push_unreachable`, `server_shutdown`.
+pub static LIVE_STREAMS_CLOSED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_live_streams_closed_total",
+        "Live streams closed, by reason",
+        &["reason"]
+    )
+    .unwrap()
+});
+
 pub fn gather_metrics() -> String {
+    let _ = &*SPEAKER_SLOT_EVENTS;
+    let _ = &*LIVE_STREAMS;
+    let _ = &*LIVE_STREAMS_RECONNECTING;
+    let _ = &*LIVE_STREAM_FRAMES;
+    let _ = &*LIVE_STREAMS_CLOSED;
     let _ = &*G711_FRAMES;
     let _ = &*G711_SESSIONS;
     let _ = &*NOISE_SUPPRESSION_SESSIONS;

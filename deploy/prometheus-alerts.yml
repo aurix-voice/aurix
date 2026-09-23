@@ -1,12 +1,22 @@
-# Voice-quality alerting for a fleet of Aurix nodes. Every rule works on fleet-wide
-# distributions only (`aurix_session_mos` is one observation per rated session per
-# `media.quality_interval_ms`); the metrics carry no session or user labels, so use
-# `GET /v1/analytics/sessions` (or the `quality.alert` webhook) to find *who* had a bad call.
+# Alerting for a fleet of Aurix nodes: voice quality (group `aurix-quality`), the media
+# transports (`aurix-transports`: QUIC, TLS tunnel, WebTransport, WebSocket tunnel), server-side
+# audio processing (`aurix-processing`: noise suppression, downlink mix, live streams, speaker
+# slots) and the inter-node cascade (`aurix-cascade`). Metric names, labels and label values are
+# the ones documented in docs/src/operations/observability.md.
+#
+# Quality rules work on fleet-wide distributions only (`aurix_session_mos` is one observation
+# per rated session per `media.quality_interval_ms`); the metrics carry no session or user
+# labels, so use `GET /v1/analytics/sessions` (or the `quality.alert` webhook) to find *who*
+# had a bad call.
 #
 # `min_rated` guards: with a handful of sessions a single bad link moves every percentile,
 # so the fleet rules require a floor of ratings per interval. Tune the thresholds to the
 # fleet: 3.1 MOS matches the default `quality.mos_alert_threshold`; 3.6 is "fair" on the
 # E-model scale (4.3 is the Opus ceiling).
+#
+# Transport rules are per node (`instance`): a failing transport is almost always one node's
+# certificate, firewall or connection cap, not the fleet. Ratios are guarded by a floor of
+# events so an idle node with one failed handshake does not page anyone.
 groups:
   - name: aurix-quality
     rules:
@@ -108,3 +118,341 @@ groups:
             One node's mean MOS trails the fleet mean by more than half a point: a saturated or
             badly placed node, not the players. Compare its media path metrics before
             draining it.
+
+  - name: aurix-transports
+    rules:
+      # ── QUIC (native clients) ──
+      - alert: AurixQuicHandshakesFailing
+        expr: |
+          sum by (instance) (rate(aurix_quic_handshakes_total{outcome="failed"}[10m]))
+            / clamp_min(sum by (instance) (rate(aurix_quic_handshakes_total[10m])), 0.001) > 0.2
+            and sum by (instance) (rate(aurix_quic_handshakes_total[10m])) * 600 > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }}: {{ $value | humanizePercentage }} of QUIC handshakes fail"
+          description: >-
+            Clients reach the QUIC port but the handshake does not complete. Usual causes: a
+            renewed certificate whose pin the clients do not have yet (they pin the hash from
+            SessionInitAck.quic), a TLS-terminating proxy in front of the UDP port, or clock skew.
+            `aurix doctor` on the node compares the served certificate with the file on disk.
+
+      - alert: AurixQuicConnectionCapReached
+        expr: sum by (instance) (increase(aurix_quic_handshakes_total{outcome="refused"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} refuses QUIC connections (media.quic_max_connections)"
+          description: >-
+            {{ $value | printf "%.0f" }} QUIC connections were refused in 5 minutes because the node
+            is at its connection cap; those clients fall back to the TLS tunnel or WebSocket.
+            Raise `media.quic_max_connections` (default 2 × max_participants_per_node) or add nodes.
+
+      - alert: AurixQuicDownlinkDrops
+        expr: |
+          sum by (instance) (rate(aurix_quic_packets_total{direction="downlink",outcome="dropped"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_quic_packets_total{direction="downlink"}[5m])), 0.001) > 0.02
+            and sum by (instance) (rate(aurix_quic_packets_total{direction="downlink"}[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} drops {{ $value | humanizePercentage }} of QUIC downlink datagrams"
+          description: >-
+            Downlink datagrams are dropped when a connection's bounded queue
+            (`media.quic_queue_packets`) is full — the node cannot write to the socket fast enough
+            (CPU, NIC, congestion) or clients have gone away without closing. Compare with
+            aurix_node_cpu_usage and the UDP path's aurix_packets_dropped_total.
+
+      # ── TLS media tunnel (native clients behind strict firewalls) ──
+      - alert: AurixTlsTunnelHandshakesFailing
+        expr: |
+          sum by (instance) (rate(aurix_tls_tunnel_handshakes_total{outcome=~"failed|unbound"}[10m]))
+            / clamp_min(sum by (instance) (rate(aurix_tls_tunnel_handshakes_total[10m])), 0.001) > 0.2
+            and sum by (instance) (rate(aurix_tls_tunnel_handshakes_total[10m])) * 600 > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }}: {{ $value | humanizePercentage }} of TLS tunnel connections fail or never bind"
+          description: >-
+            `failed` is a TLS handshake error or wrong ALPN (a proxy terminating TLS instead of
+            passing it through by SNI, a scanner, a certificate the clients do not pin);
+            `unbound` is a connection that never sent an authenticated SessionBind within
+            `media.tls_tunnel_bind_timeout_ms` (port scans, or clients with a stale session token).
+
+      - alert: AurixTlsTunnelConnectionCapReached
+        expr: sum by (instance) (increase(aurix_tls_tunnel_handshakes_total{outcome="refused"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} refuses TLS tunnel connections (media.tls_tunnel_max_connections)"
+          description: >-
+            {{ $value | printf "%.0f" }} TLS tunnel connections were refused in 5 minutes. The
+            tunnel is the last resort before WebSocket for clients whose UDP is blocked, so a
+            full cap means those players end up on the WebSocket tunnel or cannot connect.
+
+      - alert: AurixTlsTunnelDownlinkDrops
+        expr: |
+          sum by (instance) (rate(aurix_tls_tunnel_packets_total{direction="downlink",outcome="dropped"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_tls_tunnel_packets_total{direction="downlink"}[5m])), 0.001) > 0.02
+            and sum by (instance) (rate(aurix_tls_tunnel_packets_total{direction="downlink"}[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} drops {{ $value | humanizePercentage }} of TLS tunnel downlink packets"
+          description: >-
+            Per-connection queues (`media.tls_tunnel_queue_packets`) overflow: TCP receivers on
+            lossy links stall and the node drops rather than buffers audio. A few slow players
+            are normal; a node-wide ratio above 2% points at the node or its uplink.
+
+      - alert: AurixTlsTunnelMalformedFrames
+        expr: sum by (instance) (rate(aurix_tls_tunnel_packets_total{outcome="malformed"}[5m])) * 300 > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} closes TLS tunnel connections on malformed framing"
+          description: >-
+            {{ $value | printf "%.0f" }} framing violations in 5 minutes. Legitimate SDKs never
+            produce these; expect a proxy that rewrites the stream, an outdated client build or
+            a probe. Connections are closed on the first bad frame.
+
+      # ── WebTransport (browsers) ──
+      - alert: AurixWebTransportHandshakesFailing
+        expr: |
+          sum by (instance) (rate(aurix_webtransport_handshakes_total{outcome=~"failed|unbound"}[10m]))
+            / clamp_min(sum by (instance) (rate(aurix_webtransport_handshakes_total[10m])), 0.001) > 0.2
+            and sum by (instance) (rate(aurix_webtransport_handshakes_total[10m])) * 600 > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }}: {{ $value | humanizePercentage }} of WebTransport sessions fail or never bind"
+          description: >-
+            Browsers pin the short-lived WebTransport certificate hash from SessionInitAck; a
+            hash that no longer matches the served certificate (rotation raced a page load, a
+            proxy on the UDP port) fails the handshake. `unbound` sessions never sent an
+            authenticated SessionBind (`media.webtransport_bind_timeout_ms`). The Web SDK
+            falls back to WebRTC on failure, so players notice this as higher latency, not silence.
+
+      - alert: AurixWebTransportConnectionCapReached
+        expr: sum by (instance) (increase(aurix_webtransport_handshakes_total{outcome="refused"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} refuses WebTransport sessions (media.webtransport_max_connections)"
+          description: >-
+            {{ $value | printf "%.0f" }} WebTransport sessions were refused in 5 minutes; the
+            browsers fell back to WebRTC. Raise `media.webtransport_max_connections` or add nodes.
+
+      - alert: AurixWebTransportDownlinkDrops
+        expr: |
+          sum by (instance) (rate(aurix_webtransport_packets_total{direction="downlink",outcome="dropped"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_webtransport_packets_total{direction="downlink"}[5m])), 0.001) > 0.02
+            and sum by (instance) (rate(aurix_webtransport_packets_total{direction="downlink"}[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} drops {{ $value | humanizePercentage }} of WebTransport downlink datagrams"
+          description: >-
+            Datagrams are dropped when a session's buffer (`media.webtransport_queue_packets`)
+            is full, the datagram is too large for the path or the browser is gone. Node-wide
+            ratios above 2% mean the node, not individual browsers.
+
+      - alert: AurixWebTransportCertRotationFailed
+        expr: sum by (instance) (increase(aurix_webtransport_cert_rotations_total{outcome="failed"}[1h])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} could not rotate its WebTransport certificate"
+          description: >-
+            WebTransport serves a short-lived certificate (`media.webtransport_cert_days`, at most
+            14 days) whose hash the browsers pin. When rotation fails the current certificate
+            keeps working until it expires, then every new browser session on this node fails
+            the handshake (WebRTC fallback still works). Check the node log and disk/clock, and
+            `aurix doctor` for the days left on the served certificate.
+
+      # ── WebSocket media tunnel (last-resort fallback) ──
+      - alert: AurixWsTunnelDownlinkDrops
+        expr: |
+          sum by (instance) (rate(aurix_tunnel_packets_total{direction="downlink",outcome="dropped"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_tunnel_packets_total{direction="downlink"}[5m])), 0.001) > 0.02
+            and sum by (instance) (rate(aurix_tunnel_packets_total{direction="downlink"}[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} drops {{ $value | humanizePercentage }} of WebSocket tunnel downlink frames"
+          description: >-
+            The WebSocket tunnel shares the control connection; drops (`media.tunnel_queue_packets`)
+            mean players on it hear gaps. Many players on this path at once also suggests UDP,
+            QUIC and the TLS tunnel are unreachable from their networks — see aurix_tunnel_sessions
+            against aurix_active_sessions.
+
+      - alert: AurixRejectedUplinkPackets
+        expr: |
+          sum by (instance) (
+              rate(aurix_quic_packets_total{direction="uplink",outcome="rejected"}[5m])
+            + rate(aurix_tls_tunnel_packets_total{direction="uplink",outcome="rejected"}[5m])
+            + rate(aurix_webtransport_packets_total{direction="uplink",outcome="rejected"}[5m])
+            + rate(aurix_tunnel_packets_total{direction="uplink",outcome="rejected"}[5m])
+          ) * 300 > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} rejects {{ $value | printf \"%.0f\" }} uplink packets per 5 minutes"
+          description: >-
+            Rejected uplink packets failed decoding or authentication (wrong session key, replay,
+            garbage). Sustained volumes are a client with a stale key after a failover, a replayed
+            capture or an abusive sender; the sealed AURX layer drops them before any routing.
+
+  - name: aurix-processing
+    rules:
+      - alert: AurixNoiseSuppressionPoolFull
+        expr: sum by (instance) (rate(aurix_noise_suppression_frames_total{outcome="skipped"}[5m])) * 300 > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }}: noise suppression pool is full, channel frames pass uncleaned"
+          description: >-
+            {{ $value | printf "%.0f" }} frames of channels with `noise_suppression = true` were
+            forwarded as-is in 5 minutes because the node has `media.noise_suppression.max_sessions`
+            denoisers busy (aurix_noise_suppression_sessions). Sessions that asked for it
+            themselves get NOISE_SUPPRESSION_UNAVAILABLE instead. Raise the pool (each denoiser
+            costs one Opus decode + RNNoise + encode per 20 ms) or add nodes.
+
+      - alert: AurixNoiseSuppressionErrors
+        expr: |
+          sum by (instance) (rate(aurix_noise_suppression_frames_total{outcome="error"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_noise_suppression_frames_total[5m])), 0.001) > 0.01
+            and sum by (instance) (rate(aurix_noise_suppression_frames_total[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }}: {{ $value | humanizePercentage }} of denoised frames fail"
+          description: >-
+            Decode/re-encode errors in the server-side denoiser; the frame is forwarded
+            unchanged. Above a percent this is a client sending frames the node cannot decode
+            (unsupported Opus mode/bandwidth) — check the `path` label (opus vs g711).
+
+      - alert: AurixDownlinkMixFramesDropped
+        expr: |
+          sum by (instance) (rate(aurix_downlink_mix_frames_total{outcome=~"dropped|failed"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_downlink_mix_frames_total[5m])), 0.001) > 0.02
+            and sum by (instance) (rate(aurix_downlink_mix_frames_total[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} loses {{ $value | humanizePercentage }} of server-mixed downlink frames"
+          description: >-
+            The 20 ms mix tickers (aurix_downlink_mixers, shared per channel and private per
+            receiver) miss deadlines or fail to encode: the node is CPU-bound. Every listener on
+            `downlink_mode = mixed` of the affected channels hears the gap. Lower
+            `max_participants_per_node`, prefer per-speaker downlink for small channels, or add nodes.
+
+      - alert: AurixLiveStreamFramesDropped
+        expr: |
+          sum by (instance) (rate(aurix_live_stream_frames_total{outcome="dropped"}[5m]))
+            / clamp_min(sum by (instance) (rate(aurix_live_stream_frames_total[5m])), 0.001) > 0.05
+            and sum by (instance) (rate(aurix_live_stream_frames_total[5m])) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} drops {{ $value | humanizePercentage }} of live stream frames"
+          description: >-
+            Live stream consumers (pull WebSockets, push targets) do not keep up, or a consumer
+            was away longer than `recording.live.outage_buffer_ms` holds. The media path never
+            blocks on a consumer, so the drops are on the consumer side; the stream's `dropped`
+            control frames and GET /v1/audio/streams carry the per-stream counts.
+
+      - alert: AurixLiveStreamsStuckReconnecting
+        expr: sum by (instance) (aurix_live_streams_reconnecting) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} has {{ $value }} live streams whose consumer is away"
+          description: >-
+            A pull consumer dropped off without `resume`, or a push target is unreachable, for
+            longer than 5 minutes; frames are buffered up to `recording.live.outage_buffer_ms`
+            and the stream is closed (`consumer_timeout` / `push_unreachable`) when the window
+            expires. Check the consumer side (recorder, bot, ingest endpoint).
+
+      - alert: AurixLiveStreamsLostConsumers
+        expr: |
+          sum by (instance) (increase(aurix_live_streams_closed_total{reason=~"consumer_timeout|push_unreachable"}[30m])) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} closed {{ $value | printf \"%.0f\" }} live streams because the consumer never came back"
+          description: >-
+            Streams ended with `consumer_timeout` or `push_unreachable` in the last 30 minutes;
+            the audio of those channels was not delivered after the outage window. A flapping
+            ingest service or a firewall between the node and the push target is the usual cause.
+
+      - alert: AurixSpeakerSlotsRejecting
+        expr: sum(rate(aurix_speaker_slot_events_total{event="rejected"}[10m])) * 600 > 50
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} joins in 10 minutes were rejected for lack of a speaker slot"
+          description: >-
+            Channels with `audience.max_speakers` and `speaker_admission = "reject"` turned away
+            players who hold a speaking grant. If that is not intended, switch those channels to
+            `wait` (join as listener, slot when free) or `demote` (idle speakers yield) —
+            aurix_speaker_slot_events_total{event="waited"|"demoted"|"admitted"} shows the
+            slot rotation those modes produce.
+
+  - name: aurix-cascade
+    rules:
+      - alert: AurixCascadeLinksUnconfirmed
+        expr: sum by (instance) (aurix_cascade_links{transport="unconfirmed"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} has {{ $value }} cascade peers that answer no probe"
+          description: >-
+            Neither the UDP nor the TCP probe to these peers came back within the probe window;
+            envelopes still go out over UDP as a best effort, so cross-node audio for shared
+            channels may be one-directional or missing. Check the cascade UDP port
+            (`media.port + 1`) and the TCP fallback port between the nodes, and
+            GET /v1/nodes/links for the pairwise RTT/transport table.
+
+      - alert: AurixCascadeTcpFallbackActive
+        expr: sum by (instance) (aurix_cascade_links{transport="tcp"}) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Node {{ $labels.instance }} relays to {{ $value }} peers over the TCP fallback"
+          description: >-
+            UDP between these nodes has been blocked for 15 minutes; the cascade runs over the
+            framed TCP/TLS link instead (`media.cascade_tcp_fallback`). It works but adds
+            head-of-line blocking on loss. Restore UDP between the nodes or accept the trade-off.
+
+      - alert: AurixCascadeTcpDrops
+        expr: sum by (instance) (rate(aurix_cascade_tcp_dropped_total[5m])) * 300 > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} dropped {{ $value | printf \"%.0f\" }} cascade envelopes on TCP fallback links"
+          description: >-
+            The TCP fallback link to a peer is disconnected (reconnecting) or its bounded send
+            queue is full: the inter-node path cannot carry the channel's traffic and audio
+            between the two nodes' players is lost. Look at the RTT/loss of that link
+            (GET /v1/nodes/links) and whether the peer is up.

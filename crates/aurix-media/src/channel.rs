@@ -362,6 +362,9 @@ impl MediaChannel {
                 let idle_victim = match audience.speaker_admission {
                     SpeakerAdmission::Reject => {
                         self.participant_count.fetch_sub(1, Ordering::AcqRel);
+                        aurix_metrics::SPEAKER_SLOT_EVENTS
+                            .with_label_values(&["rejected"])
+                            .inc();
                         return Err(AurixError::ChannelFull(format!(
                             "Channel {} has no speaker slot left ({max_speakers} speakers)",
                             self.channel_id
@@ -380,6 +383,9 @@ impl MediaChannel {
                     None => {
                         local.role = ChannelRole::Listener;
                         local.waiting_since = Some(Instant::now());
+                        aurix_metrics::SPEAKER_SLOT_EVENTS
+                            .with_label_values(&["waited"])
+                            .inc();
                     }
                 }
             }
@@ -443,6 +449,9 @@ impl MediaChannel {
         if let Some(mut r) = self.participant_roles.get_mut(user_id) {
             if r.role.can_speak() {
                 self.local_speakers.fetch_sub(1, Ordering::AcqRel);
+                aurix_metrics::SPEAKER_SLOT_EVENTS
+                    .with_label_values(&["demoted"])
+                    .inc();
             }
             r.role = ChannelRole::Listener;
             r.waiting_since = Some(Instant::now());
@@ -455,6 +464,9 @@ impl MediaChannel {
         if let Some(mut r) = self.participant_roles.get_mut(user_id) {
             if !r.role.can_speak() && r.granted.can_speak() {
                 self.local_speakers.fetch_add(1, Ordering::AcqRel);
+                aurix_metrics::SPEAKER_SLOT_EVENTS
+                    .with_label_values(&["admitted"])
+                    .inc();
             }
             r.role = r.granted;
             r.slot_since_ms = now_ms;

@@ -53,6 +53,22 @@ released together.
   leftover sessions are asserted; JSONL report + summary. Nightly 90 min run in the `Soak`
   workflow, longer runs by dispatch or on a dedicated host
   ([Development and load testing](docs/src/operations/development.md)).
+* **Alerts and dashboard for the 1.5 media paths.** `deploy/prometheus-alerts.yml` gained the
+  `aurix-transports`, `aurix-processing` and `aurix-cascade` groups (23 rules): QUIC / TLS
+  tunnel / WebTransport handshakes failing or never binding, connection caps reached, downlink
+  drops and malformed frames per transport, a failed WebTransport certificate rotation,
+  rejected uplink packets, the noise-suppression pool full or erroring, server-mix frames
+  dropped, live streams dropping frames / stuck reconnecting / losing their consumer, speaker
+  slots rejecting joins, cascade peers unconfirmed, the cascade TCP fallback active and
+  dropping. New Grafana dashboard `deploy/grafana/dashboards/aurix-media-paths.json` (sessions
+  per transport, handshake outcomes and failure ratios, packet and drop ratios, certificate
+  rotations, noise suppression, downlink mixers, speaker slots, live streams, cascade links).
+  New metrics: `aurix_speaker_slot_events_total{event}` (`rejected` / `waited` / `demoted` /
+  `admitted`), `aurix_live_streams{mode}`, `aurix_live_streams_reconnecting`,
+  `aurix_live_stream_frames_total{outcome}`, `aurix_live_streams_closed_total{reason}`.
+  `tools/observability/check.py` (CI, with `promtool check rules`) fails when a rule or panel
+  references a metric or label the node does not register
+  ([Observability](docs/src/operations/observability.md)).
 
 ### Fixed
 

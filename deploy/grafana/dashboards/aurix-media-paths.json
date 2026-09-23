@@ -1,0 +1,1099 @@
+{
+  "title": "Aurix Voice — Media paths",
+  "uid": "aurix-media-paths",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": [
+    "aurix"
+  ],
+  "description": "Fallback transports (QUIC, TLS tunnel, WebTransport, WebSocket tunnel), server-side processing (noise suppression, downlink mix, speaker slots), live audio streams and the inter-node cascade. Pairs with the aurix-transports / aurix-processing / aurix-cascade alert groups in deploy/prometheus-alerts.yml.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Sessions by media path",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Sessions by transport",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "description": "Media sessions bound to each transport. Native clients try UDP → QUIC → TLS tunnel → WebSocket; browsers WebTransport → WebRTC. A growing tunnel share means UDP is blocked for those players (or the QUIC/WebTransport ports are unreachable).",
+      "targets": [
+        {
+          "expr": "sum(aurix_active_sessions) - sum(aurix_quic_sessions) - sum(aurix_tls_tunnel_sessions) - sum(aurix_webtransport_sessions) - sum(aurix_tunnel_sessions)",
+          "legendFormat": "udp / webrtc",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aurix_quic_sessions)",
+          "legendFormat": "quic",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(aurix_webtransport_sessions)",
+          "legendFormat": "webtransport",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(aurix_tls_tunnel_sessions)",
+          "legendFormat": "tls tunnel",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(aurix_tunnel_sessions)",
+          "legendFormat": "ws tunnel",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Open connections (transport level)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Connections accepted at the transport layer, bound or not. Connections that stay above sessions for long are clients that never sent an authenticated SessionBind (bind timeout closes them).",
+      "targets": [
+        {
+          "expr": "sum(aurix_quic_connections)",
+          "legendFormat": "quic",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aurix_webtransport_connections)",
+          "legendFormat": "webtransport",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(aurix_tls_tunnel_connections)",
+          "legendFormat": "tls tunnel",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "QUIC sessions",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_quic_sessions)",
+          "refId": "A"
+        }
+      ],
+      "description": "Sessions on QUIC datagrams."
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "WebTransport sessions",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_webtransport_sessions)",
+          "refId": "A"
+        }
+      ],
+      "description": "Browser sessions on WebTransport (HTTP/3 datagrams)."
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "TLS tunnel sessions",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_tls_tunnel_sessions)",
+          "refId": "A"
+        }
+      ],
+      "description": "Native sessions on the dedicated TLS media tunnel (TCP 443)."
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "WS tunnel sessions",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_tunnel_sessions)",
+          "refId": "A"
+        }
+      ],
+      "description": "Sessions carrying media inside the control WebSocket (last resort)."
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Cascade peers on TCP",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_cascade_links{transport=\"tcp\"})",
+          "refId": "A"
+        }
+      ],
+      "description": "Peer nodes reached over the TCP fallback because UDP between the nodes is blocked."
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Cascade peers unconfirmed",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(aurix_cascade_links{transport=\"unconfirmed\"})",
+          "refId": "A"
+        }
+      ],
+      "description": "Peer nodes that answered no probe recently — envelopes go out over UDP as a best effort."
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Handshakes",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "QUIC handshakes/s by outcome",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "accepted / accepted_0rtt (early data before the handshake completed) / refused (media.quic_max_connections) / failed (TLS error, wrong pin, proxy on the port).",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(aurix_quic_handshakes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "TLS tunnel handshakes/s by outcome",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "accepted / refused (media.tls_tunnel_max_connections) / failed (TLS or ALPN error) / unbound (no authenticated SessionBind within media.tls_tunnel_bind_timeout_ms).",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(aurix_tls_tunnel_handshakes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "WebTransport handshakes/s by outcome",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "accepted / refused (media.webtransport_max_connections) / failed (QUIC or HTTP/3 error, stale certificate pin) / not_found (wrong path) / unbound (no SessionBind within media.webtransport_bind_timeout_ms).",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(aurix_webtransport_handshakes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Handshake failure ratio by node",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0
+        }
+      },
+      "description": "Share of transport handshakes that failed or never bound, per node (the Aurix*HandshakesFailing alerts fire above 20% with enough attempts). One node standing out is a certificate, firewall or proxy problem on that node.",
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(aurix_quic_handshakes_total{outcome=\"failed\"}[10m])) / clamp_min(sum by (instance) (rate(aurix_quic_handshakes_total[10m])), 0.001)",
+          "legendFormat": "quic {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (instance) (rate(aurix_tls_tunnel_handshakes_total{outcome=~\"failed|unbound\"}[10m])) / clamp_min(sum by (instance) (rate(aurix_tls_tunnel_handshakes_total[10m])), 0.001)",
+          "legendFormat": "tls {{instance}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (instance) (rate(aurix_webtransport_handshakes_total{outcome=~\"failed|unbound\"}[10m])) / clamp_min(sum by (instance) (rate(aurix_webtransport_handshakes_total[10m])), 0.001)",
+          "legendFormat": "wt {{instance}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "WebTransport certificate rotations & QUIC migrations",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "WebTransport serves a short-lived certificate (media.webtransport_cert_days) whose hash browsers pin; a failed rotation becomes a handshake outage once the current certificate expires. QUIC migrations are clients changing address (Wi-Fi ↔ cellular) without reconnecting.",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(aurix_webtransport_cert_rotations_total[1h]))",
+          "legendFormat": "cert rotation {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aurix_quic_migrations_total[$__rate_interval]))",
+          "legendFormat": "quic migrations/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Packets on the fallback transports",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "QUIC datagrams/s",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "uplink received/rejected (decode or authentication failure); downlink sent/dropped (per-connection queue media.quic_queue_packets full or connection gone).",
+      "targets": [
+        {
+          "expr": "sum by (direction, outcome) (rate(aurix_quic_packets_total[$__rate_interval]))",
+          "legendFormat": "{{direction}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "TLS tunnel packets/s",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "uplink received/rejected/malformed (framing violation — connection closed); downlink sent/dropped (media.tls_tunnel_queue_packets).",
+      "targets": [
+        {
+          "expr": "sum by (direction, outcome) (rate(aurix_tls_tunnel_packets_total[$__rate_interval]))",
+          "legendFormat": "{{direction}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "WebTransport datagrams/s",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "uplink received/rejected/malformed (not an AURX packet); downlink sent/dropped (media.webtransport_queue_packets full, oversized for the path or browser gone).",
+      "targets": [
+        {
+          "expr": "sum by (direction, outcome) (rate(aurix_webtransport_packets_total[$__rate_interval]))",
+          "legendFormat": "{{direction}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Downlink drop ratio by transport",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 0.2,
+          "min": 0
+        }
+      },
+      "description": "Dropped share of downlink packets per transport (alerts fire above 2% for 10 minutes). Isolated slow players drop a little; a fleet-wide ratio is the nodes.",
+      "targets": [
+        {
+          "expr": "sum(rate(aurix_quic_packets_total{direction=\"downlink\",outcome=\"dropped\"}[$__rate_interval])) / clamp_min(sum(rate(aurix_quic_packets_total{direction=\"downlink\"}[$__rate_interval])), 0.001)",
+          "legendFormat": "quic",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aurix_tls_tunnel_packets_total{direction=\"downlink\",outcome=\"dropped\"}[$__rate_interval])) / clamp_min(sum(rate(aurix_tls_tunnel_packets_total{direction=\"downlink\"}[$__rate_interval])), 0.001)",
+          "legendFormat": "tls tunnel",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(aurix_webtransport_packets_total{direction=\"downlink\",outcome=\"dropped\"}[$__rate_interval])) / clamp_min(sum(rate(aurix_webtransport_packets_total{direction=\"downlink\"}[$__rate_interval])), 0.001)",
+          "legendFormat": "webtransport",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(aurix_tunnel_packets_total{direction=\"downlink\",outcome=\"dropped\"}[$__rate_interval])) / clamp_min(sum(rate(aurix_tunnel_packets_total{direction=\"downlink\"}[$__rate_interval])), 0.001)",
+          "legendFormat": "ws tunnel",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Rejected & malformed uplink/s",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Packets that failed AURX decoding or authentication (stale session key after a failover, replay, garbage) and framing violations. Legitimate SDKs produce none in steady state.",
+      "targets": [
+        {
+          "expr": "sum(rate(aurix_quic_packets_total{direction=\"uplink\",outcome=\"rejected\"}[$__rate_interval]))",
+          "legendFormat": "quic rejected",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aurix_tls_tunnel_packets_total{direction=\"uplink\",outcome=\"rejected\"}[$__rate_interval]))",
+          "legendFormat": "tls rejected",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(aurix_tls_tunnel_packets_total{outcome=\"malformed\"}[$__rate_interval]))",
+          "legendFormat": "tls malformed",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(aurix_webtransport_packets_total{direction=\"uplink\",outcome=\"rejected\"}[$__rate_interval]))",
+          "legendFormat": "wt rejected",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(rate(aurix_webtransport_packets_total{outcome=\"malformed\"}[$__rate_interval]))",
+          "legendFormat": "wt malformed",
+          "refId": "E"
+        },
+        {
+          "expr": "sum(rate(aurix_tunnel_packets_total{direction=\"uplink\",outcome=\"rejected\"}[$__rate_interval]))",
+          "legendFormat": "ws rejected",
+          "refId": "F"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "row",
+      "title": "Server-side audio processing",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Noise suppression: active denoisers",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Denoisers in use per node against media.noise_suppression.max_sessions. Each one costs an Opus decode + RNNoise + re-encode every 20 ms (PCMU/PCMA are cleaned inside their transcode).",
+      "targets": [
+        {
+          "expr": "sum by (instance) (aurix_noise_suppression_sessions)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Noise suppression: frames/s by path & outcome",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "path opus / g711. outcome ok (cleaned), passthrough (nothing to change), repeated (PLC frame reused), error (decode/encode failed, frame forwarded as-is), skipped (pool full — channel-requested cleaning not applied).",
+      "targets": [
+        {
+          "expr": "sum by (path, outcome) (rate(aurix_noise_suppression_frames_total[$__rate_interval]))",
+          "legendFormat": "{{path}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Downlink mixers & mix frames/s",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Server mix for listeners on downlink_mode = mixed: shared (one per channel) and private (per receiver with own prefs) 20 ms tickers, and the frames they produced — sent / dropped (ticker late) / failed (encode). Drops and failures mean the node is CPU-bound.",
+      "targets": [
+        {
+          "expr": "sum by (kind) (aurix_downlink_mixers)",
+          "legendFormat": "mixers {{kind}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (outcome) (rate(aurix_downlink_mix_frames_total[$__rate_interval]))",
+          "legendFormat": "frames {{outcome}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Speaker-slot events/min",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Channels with audience.max_speakers: rejected (mode reject — join refused), waited (joined as listener, waiting for a slot), demoted (idle speaker yielded its slot), admitted (a waiting member got a slot).",
+      "targets": [
+        {
+          "expr": "sum by (event) (rate(aurix_speaker_slot_events_total[$__rate_interval])) * 60",
+          "legendFormat": "{{event}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Stream cap withheld packets/s & G.711 transcodes/s",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Per-speaker packets withheld by audience.max_streams (the receiver hears the top-N speakers only) and PCMU/PCMA ↔ Opus transcodes on the node.",
+      "targets": [
+        {
+          "expr": "sum(rate(aurix_streams_capped_total[$__rate_interval]))",
+          "legendFormat": "capped packets",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (codec, direction) (rate(aurix_g711_frames_total{outcome=\"ok\"}[$__rate_interval]))",
+          "legendFormat": "g711 {{codec}} {{direction}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(aurix_g711_frames_total{outcome=\"error\"}[$__rate_interval]))",
+          "legendFormat": "g711 errors",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Live audio streams",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Open live streams",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Streams owned by this fleet's nodes: pull (operator holds a WebSocket) and push (node dials the target). reconnecting = consumer away, frames held in the outage buffer (recording.live.outage_buffer_ms).",
+      "targets": [
+        {
+          "expr": "sum by (mode) (aurix_live_streams)",
+          "legendFormat": "{{mode}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aurix_live_streams_reconnecting)",
+          "legendFormat": "reconnecting",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Live stream frames/s",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "sent = queued for the consumer; dropped = consumer too slow or outage buffer overflowed. The media path never blocks on a consumer.",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(aurix_live_stream_frames_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Live streams closed/h by reason",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "operator (stop request), channel_stopped, duration_limit, consumer_disconnected (pull without outage buffer), consumer_timeout (pull consumer never resumed), push_unreachable (push target down past the outage window), server_shutdown.",
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(aurix_live_streams_closed_total[1h]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "row",
+      "title": "Cascade between nodes",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 73
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Cascade links by transport",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 74
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "description": "Peer nodes by the transport their envelopes take: udp (normal), tcp (UDP between the nodes blocked — framed TCP/TLS fallback, media.cascade_tcp_fallback), unconfirmed (no probe answered recently). GET /v1/nodes/links has the pairwise table.",
+      "targets": [
+        {
+          "expr": "sum by (transport) (aurix_cascade_links)",
+          "legendFormat": "{{transport}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Cascade envelopes/s forwarded",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 74
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "origin = locally received client packets sent to peers; hub = envelopes re-forwarded along the relay tree; hop_limit = dropped after MAX_RELAY_HOPS. hub channels = channels this fleet relays for as tree hubs.",
+      "targets": [
+        {
+          "expr": "sum by (role) (rate(aurix_cascade_forwarded_total[$__rate_interval]))",
+          "legendFormat": "{{role}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(aurix_cascade_hub_channels)",
+          "legendFormat": "hub channels",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Cascade TCP fallback drops/s by node",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 74
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Envelopes dropped because a peer's TCP fallback link was disconnected or its bounded queue was full — audio between the two nodes' players is lost while this is non-zero.",
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(aurix_cascade_tcp_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

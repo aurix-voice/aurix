@@ -585,6 +585,7 @@ dependencies = [
  "async-trait",
  "aurix-common",
  "aurix-db",
+ "aurix-metrics",
  "aurix-opus",
  "base64 0.22.1",
  "bytes",

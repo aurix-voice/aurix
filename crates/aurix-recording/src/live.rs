@@ -507,6 +507,12 @@ struct Tap {
 }
 
 impl Tap {
+    /// Moves the stream to `state`, keeping the reconnecting gauge in step.
+    fn set_state(&mut self, state: StreamState) {
+        track_state(Some(self.state), Some(state));
+        self.state = state;
+    }
+
     fn info(&self, node_id: Uuid) -> LiveStreamInfo {
         LiveStreamInfo {
             id: self.id,
@@ -571,12 +577,20 @@ impl Tap {
             Ok(()) => {
                 if is_audio {
                     self.frames_sent += 1;
+                    aurix_metrics::LIVE_STREAM_FRAMES
+                        .with_label_values(&["sent"])
+                        .inc();
                 }
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.frames_dropped += 1;
                 self.unannounced_drops += 1;
+                if is_audio {
+                    aurix_metrics::LIVE_STREAM_FRAMES
+                        .with_label_values(&["dropped"])
+                        .inc();
+                }
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -585,6 +599,17 @@ impl Tap {
 
     fn control(&mut self, frame: ControlFrame) -> bool {
         self.enqueue(Outgoing::Control(frame))
+    }
+}
+
+/// Adjusts `aurix_live_streams_reconnecting` for a transition from `from` to `to` (`None`:
+/// the stream did not exist / was closed).
+fn track_state(from: Option<StreamState>, to: Option<StreamState>) {
+    let reconnecting = |s: Option<StreamState>| s == Some(StreamState::Reconnecting);
+    match (reconnecting(from), reconnecting(to)) {
+        (false, true) => aurix_metrics::LIVE_STREAMS_RECONNECTING.inc(),
+        (true, false) => aurix_metrics::LIVE_STREAMS_RECONNECTING.dec(),
+        _ => {}
     }
 }
 
@@ -804,6 +829,10 @@ impl LiveStreams {
             let hello = tap.hello(self.node_id, self.require_consent);
             tap.control(hello);
             let info = tap.info(self.node_id);
+            aurix_metrics::LIVE_STREAMS
+                .with_label_values(&[mode.as_str()])
+                .inc();
+            track_state(None, Some(tap.state));
             reg.by_channel.entry(channel_id).or_default().push(id);
             reg.by_id.insert(id, tap);
             info
@@ -832,6 +861,13 @@ impl LiveStreams {
             }
         };
         let mut tap = tap?;
+        aurix_metrics::LIVE_STREAMS
+            .with_label_values(&[tap.mode.as_str()])
+            .dec();
+        aurix_metrics::LIVE_STREAMS_CLOSED
+            .with_label_values(&[reason])
+            .inc();
+        track_state(Some(tap.state), None);
         tap.control(ControlFrame::End {
             reason: reason.to_string(),
             frames_sent: tap.frames_sent,
@@ -1181,7 +1217,7 @@ impl LiveStreams {
 
     fn set_state(&self, id: Uuid, state: StreamState, count_reconnect: bool) {
         if let Some(tap) = self.reg.lock().by_id.get_mut(&id) {
-            tap.state = state;
+            tap.set_state(state);
             if count_reconnect {
                 tap.reconnects += 1;
             }
@@ -1194,6 +1230,9 @@ impl LiveStreams {
         if frames == 0 {
             return;
         }
+        aurix_metrics::LIVE_STREAM_FRAMES
+            .with_label_values(&["dropped"])
+            .inc_by(frames);
         if let Some(tap) = self.reg.lock().by_id.get_mut(&id) {
             tap.frames_dropped += frames;
             tap.frames_sent = tap.frames_sent.saturating_sub(frames);
@@ -1253,7 +1292,7 @@ impl LiveStreams {
         let mut reg = self.reg.lock();
         match reg.by_id.get_mut(&id) {
             Some(tap) if tap.mode == StreamMode::Pull => {
-                tap.state = StreamState::Reconnecting;
+                tap.set_state(StreamState::Reconnecting);
                 tap.parked = Some(Parked {
                     stop: stop_tx,
                     handle,
@@ -1301,7 +1340,7 @@ impl LiveStreams {
             .by_id
             .get_mut(&id)
             .ok_or_else(|| AurixError::NotFound("Live stream not found".into()))?;
-        tap.state = StreamState::Streaming;
+        tap.set_state(StreamState::Streaming);
         tap.reconnects += 1;
         let mut replay = Vec::with_capacity(backlog.len() + 2);
         replay.push(Outgoing::Control(
@@ -2758,5 +2797,61 @@ mod tests {
         let closed = live.detach_pull(r, "consumer_disconnected").unwrap();
         assert_eq!(closed.id, info.id);
         assert!(live.get(app, info.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn prometheus_counters_follow_the_stream_lifecycle() {
+        let live = Arc::new(LiveStreams::new(
+            LiveStreamConfig {
+                outage_buffer_ms: 100,
+                ..cfg(2)
+            },
+            false,
+            false,
+            0,
+            Uuid::nil(),
+        ));
+        let app = AppId(Uuid::new_v4());
+        let ch = ChannelId(Uuid::new_v4());
+        let alice = UserId(Uuid::new_v4());
+        // Counters are process-global and other tests run concurrently: assert on deltas of
+        // monotonic counters and use a reason label no other test produces.
+        let reason = format!("test_{}", Uuid::new_v4().simple());
+        let sent = aurix_metrics::LIVE_STREAM_FRAMES.with_label_values(&["sent"]);
+        let dropped = aurix_metrics::LIVE_STREAM_FRAMES.with_label_values(&["dropped"]);
+        let (sent_before, dropped_before) = (sent.get(), dropped.get());
+
+        let (info, mut r) = live
+            .open(app, ch, StreamSpec::default(), StreamMode::Pull, None)
+            .unwrap();
+        drain(&mut r.rx);
+        // The first frame also queues the `AudioStarted` control frame.
+        live.on_audio(ch, alice, 1, 0, &opus_silence());
+        assert_eq!(audio_frames(&drain(&mut r.rx)).len(), 1);
+        // Queue of 2: the third frame without a reader is dropped.
+        for i in 1..4u32 {
+            live.on_audio(ch, alice, 1, i * 960, &opus_silence());
+        }
+        assert!(sent.get() - sent_before >= 3);
+        assert!(dropped.get() - dropped_before >= 1);
+
+        // Outage: whatever does not fit the queue or the 100 ms buffer is counted dropped.
+        drain(&mut r.rx);
+        assert!(live.detach_pull(r, "consumer_disconnected").is_none());
+        for i in 4..11u32 {
+            live.on_audio(ch, alice, 1, i * 960, &opus_silence());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (resumed, _r2, _) = live.resume_pull(app, info.id).await.unwrap();
+        assert!(resumed.frames_dropped >= 3);
+        assert!(dropped.get() - dropped_before >= resumed.frames_dropped);
+
+        assert!(live.close(Some(app), info.id, &reason).is_some());
+        assert_eq!(
+            aurix_metrics::LIVE_STREAMS_CLOSED
+                .with_label_values(&[reason.as_str()])
+                .get(),
+            1
+        );
     }
 }

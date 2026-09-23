@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 aurix-common = { path = "../aurix-common" }
 aurix-db = { path = "../aurix-db" }
+aurix-metrics = { path = "../aurix-metrics" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

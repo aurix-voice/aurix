@@ -1137,8 +1137,10 @@ Full procedure, PITR and schedules: [Backup and restore](docs/src/operations/bac
   `aurix_api_requests_total{method,path,status}`, `aurix_turn_allocations`, `aurix_rate_limit_hits_total`, `aurix_rate_limit_scope_hits_total{scope,backend}`,
   `aurix_ws_sessions_detached` / `aurix_ws_sessions_resumed_total` (reconnects), …
 * Grafana dashboards: `deploy/grafana/dashboards/aurix-overview.json`, `aurix-quality.json` (MOS
-  percentiles/heatmap, bars, alerts, uplink loss/jitter, per-node outliers); Prometheus alert
-  rules: `deploy/prometheus-alerts.yml`.
+  percentiles/heatmap, bars, alerts, uplink loss/jitter, per-node outliers),
+  `aurix-media-paths.json` (QUIC / TLS tunnel / WebTransport, noise suppression, server mix, live
+  streams, cascade); Prometheus alert rules: `deploy/prometheus-alerts.yml` (quality, transports,
+  processing, cascade groups).
 * Logs: JSON (`AURIX__TRACING__LOG_FORMAT=json`), OTLP export via `AURIX__TRACING__OTLP_ENDPOINT`.
 * Every privileged action (admin login, app/key changes, bans, kicks, recording access) is written
   to `audit_log` and readable via the API.

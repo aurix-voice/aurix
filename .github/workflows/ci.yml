@@ -965,6 +965,13 @@ jobs:
           terraform fmt -check -recursive
           terraform init -backend=false -input=false
           terraform validate
+      - name: Prometheus rules + Grafana dashboards (tools/observability/check.py, promtool)
+        run: |
+          set -euo pipefail
+          pip install --quiet pyyaml
+          python3 tools/observability/check.py
+          docker run --rm -v "$PWD/deploy:/deploy:ro" --entrypoint promtool prom/prometheus:v2.53.0 \
+            check rules /deploy/prometheus-alerts.yml
 
   docker:
     name: docker build + healthcheck
