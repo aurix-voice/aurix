@@ -1,7 +1,7 @@
 {
   "name": "aurix-token-server-example",
   "private": true,
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Backend-only Aurix token server: game clients call it, it calls POST /v1/tokens with the API key.",
   "license": "Apache-2.0",
   "type": "module",

@@ -6,6 +6,10 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.6.0] — 2026-09-23
+
 ### Fixed
 
 - `TlsMediaTunnel.CloseReason` is set before `IsClosed` becomes true.

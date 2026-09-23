@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aurix-server-sdk"
-version = "1.5.0"
+version = "1.6.0"
 description = "Server-side SDK for the Aurix voice platform REST API (token issuance, channels, moderation, webhooks, SSE). Generated from api/openapi.json."
 readme = "README.md"
 license = { text = "Apache-2.0" }

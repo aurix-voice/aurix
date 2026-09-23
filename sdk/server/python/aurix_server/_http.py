@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .errors import AurixError, AurixNetworkError
 
-SDK_VERSION = "1.5.0"
+SDK_VERSION = "1.6.0"
 _IDEMPOTENT = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 _RETRY_STATUSES = frozenset({502, 503, 504})
 

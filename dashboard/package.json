@@ -1,6 +1,6 @@
 {
   "name": "@aurix/dashboard",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Operator dashboard for the Aurix voice platform (standalone SPA served by Caddy).",
   "license": "AGPL-3.0-only",
   "private": true,

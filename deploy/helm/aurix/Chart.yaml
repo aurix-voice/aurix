@@ -3,7 +3,7 @@ name: aurix
 description: Self-hosted low-latency voice for games - REST/WebSocket control plane, SFU and TURN in one binary.
 type: application
 version: 0.1.0
-appVersion: "1.5.0"
+appVersion: "1.6.0"
 kubeVersion: ">=1.25.0-0"
 keywords:
   - voice

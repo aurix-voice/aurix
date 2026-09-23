@@ -59,7 +59,7 @@ interface CallOptions extends RequestOptions {
   query?: object | undefined;
 }
 
-export const SDK_VERSION = "1.5.0";
+export const SDK_VERSION = "1.6.0";
 const RETRY_METHODS = new Set(["GET", "PUT", "DELETE", "HEAD"]);
 const RETRY_STATUSES = new Set([502, 503, 504]);
 

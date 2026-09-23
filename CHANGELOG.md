@@ -11,6 +11,16 @@ released together.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-23
+
+Hardening release: no new protocol features. `aurix doctor` preflight, verified backup/restore
+drill, a multi-hour soak harness with fault rotation, alert rules and a Grafana dashboard for the
+1.5 media paths, a load generator for every transport and processing path with measured
+reference runs, and the fixes those runs surfaced (cascade anti-replay window under load,
+WebTransport socket buffers, close-reason ordering in the SDKs). No migrations; protocol, REST,
+SDKs and the Redis key layout are unchanged from 1.5.0 — nodes and clients can be upgraded in
+any order.
+
 ### Added
 
 * **`aurix doctor`** — local preflight on the node host, no credentials needed: loads the
@@ -553,7 +563,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/aurix-voice/aurix/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/aurix-voice/aurix/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/aurix-voice/aurix/compare/872f918...v1.4.0
 [1.3.0]: https://github.com/aurix-voice/aurix/compare/31eb7a5...872f918
