@@ -139,11 +139,11 @@ export interface ClientStats {
   server?: NetworkQuality;
   /**
    * Media path the counters describe: WebRTC (`RTCPeerConnection.getStats()`) or AURX over
-   * WebTransport (the SDK's own counters: `iceRttMs` is then the heartbeat RTT,
-   * `packetsDiscarded` the datagrams that failed authentication / replay, `concealedSamples`
-   * the playout underruns × 960). Absent without media.
+   * WebTransport / the WebSocket tunnel (the SDK's own counters: `iceRttMs` is then the
+   * heartbeat RTT, `packetsDiscarded` the packets that failed authentication / replay,
+   * `concealedSamples` the playout underruns × 960). Absent without media.
    */
-  transport?: 'webrtc' | 'webtransport';
+  transport?: 'webrtc' | 'webtransport' | 'websocket';
 }
 
 /** Per-period loss from cumulative `packetsLost`/`packetsReceived` counters. */

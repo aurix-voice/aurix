@@ -480,7 +480,7 @@ browser's Opus implementation. Voice channels stay mono whatever the client asks
 ```ts
 const client = new AurixClient({
   // ...
-  transport: 'auto',            // 'auto' (default) | 'webrtc' | 'webtransport'
+  transport: 'auto',            // 'auto' (default) | 'webrtc' | 'webtransport' | 'websocket'
   webTransport: {
     connectTimeoutMs: 4000,
     heartbeatIntervalMs: 2000,
@@ -488,7 +488,7 @@ const client = new AurixClient({
     opus: { complexity: 10, signal: 'voice', expectedLossPct: 5 },
   },
 });
-client.on('mediaTransport', (t) => console.log('media over', t)); // 'webtransport' | 'webrtc'
+client.on('mediaTransport', (t) => console.log('media over', t)); // 'webtransport' | 'webrtc' | 'websocket'
 console.log(client.mediaTransport, client.sessionInfo?.webTransport, (await client.getStats()).transport);
 ```
 
@@ -505,6 +505,16 @@ when all fail (the failure is aggregated in the `error` event); `webtransport` r
 `connect()` instead of falling back; `webrtc` never attempts it. The port is HTTP/3 over UDP
 (usually 443) and must reach the node directly — Caddy/Traefik do not proxy WebTransport, and a
 UDP-blocked browser ends up on WebRTC over TURN.
+
+When even TURN is out of reach (HTTP-only reverse proxies, `cloudflared`/`ngrok`-style tunnels,
+strict corporate proxies) the same sealed AURX packets travel as **binary frames on the control
+WebSocket** — the node's `media_tunnel`, which native SDKs already use when UDP is blocked.
+`transport: 'websocket'` selects it outright; `'auto'` falls back to it only after WebRTC has
+failed on this network (ICE not `connected` within `webRtcConnectTimeoutMs`, default 10 s, or an
+ICE `failed`), because a single TCP stream suffers head-of-line blocking under loss. The
+pipeline is the WebTransport one (WebCodecs Opus, per-speaker slots, E2EE in the page,
+heartbeats, `webTransport.*` options); the tunnel survives control-socket reconnects with its
+sequence counter intact.
 
 ## How it maps to the server
 

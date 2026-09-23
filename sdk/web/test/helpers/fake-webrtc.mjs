@@ -12,10 +12,18 @@ export class FakeSocket {
     this.protocols = protocols;
     this.readyState = FakeSocket.OPEN;
     this.sent = [];
+    this.binary = [];
+    this.bufferedAmount = 0;
     FakeSocket.last = this;
     queueMicrotask(() => this.onopen?.({}));
   }
   send(data) {
+    if (typeof data !== 'string') {
+      const bytes = data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(data);
+      this.binary.push(bytes);
+      this.onbinary?.(bytes);
+      return;
+    }
     const msg = JSON.parse(data);
     this.sent.push(msg);
     this.onsent?.(msg);
@@ -27,6 +35,10 @@ export class FakeSocket {
   }
   receive(msg) {
     this.onmessage?.({ data: JSON.stringify(msg) });
+  }
+  receiveBinary(bytes) {
+    const copy = new Uint8Array(bytes);
+    this.onmessage?.({ data: copy.buffer });
   }
 }
 

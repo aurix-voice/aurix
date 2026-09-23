@@ -168,6 +168,10 @@ export {
   supportsAurxAudio,
 } from './aurx-audio.js';
 export type { AurxCaptureFrame, AurxOpusConfig, AurxPlaybackStats } from './aurx-audio.js';
+export { AurxLink } from './aurx-link.js';
+export type { AurxLinkEvents, AurxLinkOptions, AurxLinkStats, AurxSessionKeys } from './aurx-link.js';
+export { AurxWebSocketTunnel } from './ws-tunnel.js';
+export type { AurxWebSocketTunnelEvents, AurxWebSocketTunnelOptions, AurxWebSocketTunnelStats, TunnelSocket } from './ws-tunnel.js';
 export { AurxWebTransport, certificateHashes, detectWebTransportSupport } from './webtransport.js';
 export type {
   AurxWebTransportEvents,

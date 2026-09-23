@@ -306,6 +306,11 @@ export type ServerMessage =
         translation?: TranslationInfoWire;
         /** The node can denoise this session's uplink on request (`SetNoiseSuppression`). */
         noise_suppression?: boolean;
+        /**
+         * This very WebSocket also accepts sealed AURX media as binary frames (same `SessionBind`
+         * and per-packet authentication as UDP) — the `'websocket'` media path.
+         */
+        media_tunnel?: boolean;
         /** Per-participant WebRTC downlink tracks the node serves at most (absent / 0 = mixed only). */
         webrtc_participant_streams?: number;
         /** Gain the node applies to voices of unfocused channels; the browser mirrors it on per-participant tracks. */

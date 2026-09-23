@@ -112,7 +112,9 @@ import {
   type AurxCaptureFrame,
   type AurxOpusConfig,
 } from './aurx-audio.js';
-import { AurxWebTransport, detectWebTransportSupport, type AurxWebTransportOptions } from './webtransport.js';
+import type { AurxLink, AurxLinkOptions } from './aurx-link.js';
+import { AurxWebTransport, detectWebTransportSupport } from './webtransport.js';
+import { AurxWebSocketTunnel } from './ws-tunnel.js';
 
 /** `SessionInitAck.media_key` length: the AURX master key. */
 const AURX_MEDIA_KEY_BYTES = 32;
@@ -291,16 +293,26 @@ export interface AurixClientOptions {
    * Media path. `'auto'` (default) carries AURX over WebTransport (HTTP/3 datagrams sealed
    * with the session key, Opus via WebCodecs) when the node advertises it and the browser has
    * WebTransport + WebCodecs, and negotiates WebRTC otherwise or when the WebTransport
-   * connection fails. `'webrtc'` never tries WebTransport; `'webtransport'` requires it
-   * (`connect()` fails instead of falling back).
+   * connection fails. When WebRTC fails too (ICE never connects within
+   * `webRtcConnectTimeoutMs`, or the connection drops) and the node advertises its WebSocket
+   * media tunnel (`SessionInitAck.media_tunnel`), the session moves to `'websocket'`: sealed
+   * AURX packets as binary frames on the control WebSocket — the path that works wherever
+   * signalling does (HTTP-only proxies, tunnels without UDP), at the cost of TCP head-of-line
+   * blocking. `'webrtc'` never tries WebTransport; `'webtransport'` and `'websocket'` require
+   * that path (`connect()` fails instead of falling back).
    */
   transport?: MediaTransportPreference;
-  /** Tuning of the WebTransport media path (ignored on WebRTC). */
+  /** Tuning of the WebTransport and WebSocket media paths (ignored on WebRTC). */
   webTransport?: WebTransportClientOptions;
+  /**
+   * How long WebRTC may stay unconnected after the answer before it counts as failed (ms);
+   * `0` disables the timer (the browser's own ICE failure is then the only trigger). Default 10000.
+   */
+  webRtcConnectTimeoutMs?: number;
 }
 
 /** The media path a session ended up on. */
-export type MediaTransport = 'webrtc' | 'webtransport';
+export type MediaTransport = 'webrtc' | 'webtransport' | 'websocket';
 export type MediaTransportPreference = 'auto' | MediaTransport;
 
 export interface WebTransportClientOptions {
@@ -1281,8 +1293,13 @@ export class AurixClient {
   /** Session media key (`SessionInitAck.media_key`); seals AURX datagrams. */
   private mediaKey: Uint8Array | undefined;
   private webTransportInfo: WebTransportInfoWire | undefined;
+  private mediaTunnelOffered = false;
   private mediaTransportValue: MediaTransport | undefined;
-  private wt: AurxWebTransport | undefined;
+  /** The AURX link of the WebTransport or WebSocket media path (`undefined` on WebRTC). */
+  private wt: AurxLink | undefined;
+  private wsTunnel: AurxWebSocketTunnel | undefined;
+  private webRtcFailed = false;
+  private webRtcConnectTimer: ReturnType<typeof setTimeout> | undefined;
   private wtCapture: AurxCapture | undefined;
   private wtPlayback: AurxPlayback | undefined;
   /** Downlink streams by SSRC: the participant they belong to and their last render inputs. */
@@ -2824,8 +2841,10 @@ export class AurixClient {
     this.clearParticipantTracks();
     this.stopWebTransportMedia();
     this.wtNextSequence = undefined;
+    this.webRtcFailed = false;
     this.mediaKey = undefined;
     this.webTransportInfo = undefined;
+    this.mediaTunnelOffered = false;
     if (this.renderer && this.opts.audioContext === undefined) {
       void this.renderer.close();
       this.renderer = undefined;
@@ -3489,6 +3508,7 @@ export class AurixClient {
       this.inboxSynced = false;
       this.inboxNewest = undefined;
       const ws = new WebSocket(url, protocols);
+      ws.binaryType = 'arraybuffer';
       this.ws = ws;
       const timer = setTimeout(() => {
         this.pendingInit = undefined;
@@ -3498,7 +3518,10 @@ export class AurixClient {
       this.pendingInit = { resolve, reject, timer, url };
 
       ws.onmessage = (ev) => {
-        if (typeof ev.data !== 'string') return;
+        if (typeof ev.data !== 'string') {
+          if (this.ws === ws && ev.data instanceof ArrayBuffer) this.wsTunnel?.onFrame(ev.data);
+          return;
+        }
         let msg: ServerMessage | UnknownMessage;
         try {
           msg = parseServerMessage(ev.data);
@@ -3522,6 +3545,8 @@ export class AurixClient {
         const wasCurrent = this.ws === ws;
         if (wasCurrent) this.ws = undefined;
         const cause = `websocket closed (${ev.code}${ev.reason ? `: ${ev.reason}` : ''})`;
+        // The tunnel dies with its socket; the reconnect below rebinds it on the next one.
+        if (wasCurrent) this.wsTunnel?.close(cause);
         const initWasPending = this.pendingInit !== undefined;
         this.rejectPending(this.pendingInit, cause);
         this.pendingInit = undefined;
@@ -3774,6 +3799,7 @@ export class AurixClient {
         this.failoverEndpoints = (d.failover ?? []).filter((u) => u !== endpoint);
         this.mediaKey = d.media_key ? base64ToBytes(d.media_key) : undefined;
         this.webTransportInfo = webTransportAdvertised(d.webtransport) ? d.webtransport : undefined;
+        this.mediaTunnelOffered = d.media_tunnel === true;
         const info: SessionInfo = {
           sessionId: d.session_id,
           userId: this.userId ?? '',
@@ -4371,11 +4397,17 @@ export class AurixClient {
     this.setState('media-connecting');
     const sent = await this.openLocalMedia();
     const preference = this.opts.transport ?? 'auto';
+    if (preference === 'websocket') {
+      const blocker = this.webSocketBlocker();
+      if (blocker !== undefined) throw new Error(`WebSocket media tunnel unavailable: ${blocker}`);
+      await this.startAurxMedia(sent, 'websocket');
+      return;
+    }
     if (preference !== 'webrtc') {
       const blocker = this.webTransportBlocker();
       if (blocker === undefined) {
         try {
-          await this.startWebTransportMedia(sent);
+          await this.startAurxMedia(sent, 'webtransport');
           return;
         } catch (e) {
           this.stopWebTransportMedia();
@@ -4388,8 +4420,48 @@ export class AurixClient {
         throw new Error(`WebTransport unavailable: ${blocker}`);
       }
     }
+    if (preference === 'auto' && this.webRtcFailed && this.webSocketBlocker() === undefined) {
+      await this.startAurxMedia(sent, 'websocket');
+      return;
+    }
     if (this.e2eeGroup && this.e2eeApi === undefined) this.dropE2ee('no encoded-frame API for WebRTC');
-    await this.startWebRtcMedia(sent);
+    try {
+      await this.startWebRtcMedia(sent);
+    } catch (e) {
+      if (this.closedByUser || !this.ws || preference !== 'auto' || this.webSocketBlocker() !== undefined) throw e;
+      const err = e instanceof Error ? e : new Error(String(e));
+      this.emit('error', new Error(`WebRTC negotiation failed, falling back to the WebSocket tunnel: ${err.message}`));
+      this.webRtcFailed = true;
+      this.pc?.close();
+      this.pc = undefined;
+      this.clearParticipantTracks();
+      await this.startAurxMedia(sent, 'websocket');
+    }
+  }
+
+  /**
+   * WebRTC never connected or dropped: negotiate media again for the same session — in `'auto'`
+   * over the WebSocket tunnel when the node offers one, since a path that failed once here is
+   * likely blocked (ICE cannot reach the node's UDP port through this network).
+   */
+  private onWebRtcFailed(pc: RTCPeerConnection, cause: string): void {
+    if (this.pc !== pc) return;
+    this.clearWebRtcConnectTimer();
+    this.emit('error', new Error(cause));
+    this.webRtcFailed = true;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.opts.autoReconnect) {
+      void this.restoreMedia(false).catch((e: unknown) => {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+        this.teardown('media renegotiation failed', 'failed');
+      });
+    } else if (this.state !== 'reconnecting') {
+      this.setState('failed');
+    }
+  }
+
+  private clearWebRtcConnectTimer(): void {
+    if (this.webRtcConnectTimer !== undefined) clearTimeout(this.webRtcConnectTimer);
+    this.webRtcConnectTimer = undefined;
   }
 
   /** Microphone, gain pipeline, meter and device watching — shared by both media paths. */
@@ -4432,6 +4504,7 @@ export class AurixClient {
     if (this.e2eeGroup && this.e2eeApi === 'streams') pcConfig.encodedInsertableStreams = true;
     const pc = new RTCPeerConnection(pcConfig);
     this.pc = pc;
+    this.clearWebRtcConnectTimer();
     this.mediaTransportValue = 'webrtc';
     this.lossWindow.reset();
     this.startQualityTimer();
@@ -4467,6 +4540,8 @@ export class AurixClient {
       if (this.pc !== pc) return;
       switch (pc.connectionState) {
         case 'connected':
+          this.clearWebRtcConnectTimer();
+          this.webRtcFailed = false;
           if (this.state === 'connected' || this.state === 'media-connecting') {
             this.setState('media-connected');
             this.emit('mediaTransport', 'webrtc');
@@ -4475,15 +4550,7 @@ export class AurixClient {
         case 'failed':
           // ICE gave up while the control channel may still be fine: negotiate a new
           // transport for the same session (the server replaces the old one).
-          this.emit('error', new Error('WebRTC connection failed'));
-          if (this.ws && this.ws.readyState === WebSocket.OPEN && this.opts.autoReconnect) {
-            void this.restoreMedia(false).catch((e: unknown) => {
-              this.emit('error', e instanceof Error ? e : new Error(String(e)));
-              this.teardown('media renegotiation failed', 'failed');
-            });
-          } else if (this.state !== 'reconnecting') {
-            this.setState('failed');
-          }
+          this.onWebRtcFailed(pc, 'WebRTC connection failed');
           break;
         case 'disconnected':
           if (this.state === 'media-connected') this.setState('connected');
@@ -4513,6 +4580,15 @@ export class AurixClient {
     await this.applySenderPreferences(pc);
     if (this.pc === pc && extra > 0 && this.pinnedParticipants.length > 0) {
       this.trySend({ type: 'SetParticipantStreams', data: { pinned: [...this.pinnedParticipants] } });
+    }
+    const connectBudget = this.opts.webRtcConnectTimeoutMs ?? 10_000;
+    if (this.pc === pc && connectBudget > 0 && pc.connectionState !== 'connected') {
+      this.webRtcConnectTimer = setTimeout(() => {
+        this.webRtcConnectTimer = undefined;
+        if (this.pc === pc && pc.connectionState !== 'connected') {
+          this.onWebRtcFailed(pc, `WebRTC did not connect within ${connectBudget} ms (${pc.connectionState}/${pc.iceConnectionState})`);
+        }
+      }, connectBudget);
     }
   }
 
@@ -4574,11 +4650,26 @@ export class AurixClient {
     return this.opts.transport !== 'webrtc' && this.webTransportBlocker() === undefined;
   }
 
-  private async startWebTransportMedia(sent: MediaStream): Promise<void> {
+  /** Why this session cannot carry AURX over its control WebSocket right now (`undefined` = it can). */
+  private webSocketBlocker(): string | undefined {
+    if (!this.mediaTunnelOffered) return 'the node does not offer the WebSocket media tunnel';
+    if (!this.mediaKey || this.mediaKey.length !== AURX_MEDIA_KEY_BYTES) return 'no session media key';
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 'the control WebSocket is not open';
+    const support = detectWebTransportSupport();
+    if (!support.crypto) return 'WebCrypto is unavailable (insecure context?)';
+    if (!supportsAurxAudio()) return 'WebCodecs Opus / AudioWorklet are unavailable here';
+    return undefined;
+  }
+
+  /** Bring up the AURX media path (`webtransport` or `websocket`): playback, link, capture. */
+  private async startAurxMedia(sent: MediaStream, kind: 'webtransport' | 'websocket'): Promise<void> {
     const info = this.webTransportInfo;
     const session = this.session;
     const key = this.mediaKey;
-    if (!info || !session || !key) throw new Error('WebTransport is not offered for this session');
+    const ws = this.ws;
+    if (!session || !key) throw new Error(`${kind} is not offered for this session`);
+    if (kind === 'webtransport' && !info) throw new Error('WebTransport is not offered for this session');
+    if (kind === 'websocket' && (!ws || ws.readyState !== WebSocket.OPEN)) throw new Error('the control WebSocket is not open');
     const renderer = this.ensureRenderer();
     const ctx = renderer ? workletContext(renderer.context) : undefined;
     if (!renderer || !ctx) throw new Error('Web Audio is unavailable');
@@ -4589,32 +4680,40 @@ export class AurixClient {
     if (this.wtPlayback !== playback) throw new Error('media torn down');
 
     const o = this.opts.webTransport ?? {};
-    const options: AurxWebTransportOptions = {};
+    const options: AurxLinkOptions = {};
     if (o.connectTimeoutMs !== undefined) options.connectTimeoutMs = o.connectTimeoutMs;
     if (o.heartbeatIntervalMs !== undefined) options.heartbeatIntervalMs = o.heartbeatIntervalMs;
     if (o.heartbeatLossLimit !== undefined) options.heartbeatLossLimit = o.heartbeatLossLimit;
     if (this.wtNextSequence !== undefined) options.startSequence = this.wtNextSequence;
-    const transport = new AurxWebTransport(
-      { sessionId: session.sessionId, ssrc: session.ssrc, masterKey: key },
-      {
-        onAudio: (audio) => {
-          if (this.wt === transport) this.onWebTransportAudio(audio);
-        },
-        onBitrate: (bps) => {
-          if (this.wt === transport) this.onWebTransportBitrate(bps);
-        },
-        onClosed: (reason) => {
-          if (this.wt === transport) this.onWebTransportClosed(reason);
-        },
-        onError: (e) => {
-          if (this.wt === transport) this.emit('error', e);
-        },
+    const keys = { sessionId: session.sessionId, ssrc: session.ssrc, masterKey: key };
+    let transport: AurxLink | undefined;
+    const events = {
+      onAudio: (audio: DownlinkAudio) => {
+        if (this.wt === transport) this.onWebTransportAudio(audio);
       },
-      options,
-    );
-    this.wt = transport;
-    await transport.connect(info);
-    if (this.wt !== transport) throw new Error('media torn down');
+      onBitrate: (bps: number) => {
+        if (this.wt === transport) this.onWebTransportBitrate(bps);
+      },
+      onClosed: (reason: string) => {
+        if (this.wt === transport) this.onWebTransportClosed(kind, reason);
+      },
+      onError: (e: Error) => {
+        if (this.wt === transport) this.emit('error', e);
+      },
+    };
+    if (kind === 'webtransport' && info) {
+      const wt = new AurxWebTransport(keys, events, options);
+      transport = wt;
+      this.wt = wt;
+      await wt.connect(info);
+    } else if (ws) {
+      const tunnel = new AurxWebSocketTunnel(keys, events, ws, options);
+      transport = tunnel;
+      this.wt = tunnel;
+      this.wsTunnel = tunnel;
+      await tunnel.connect();
+    }
+    if (!transport || this.wt !== transport) throw new Error('media torn down');
 
     const capture = new AurxCapture(
       (frame) => {
@@ -4629,17 +4728,19 @@ export class AurixClient {
     await capture.start(sent, this.webTransportOpusConfig());
     if (this.wt !== transport || this.wtCapture !== capture) throw new Error('media torn down');
 
-    this.mediaTransportValue = 'webtransport';
+    this.mediaTransportValue = kind;
     this.lossWindow.reset();
     this.startQualityTimer();
     this.wtIdleTimer = setInterval(() => this.sweepWebTransportSlots(), 1_000);
     if (this.state === 'connected' || this.state === 'media-connecting') this.setState('media-connected');
-    this.emit('mediaTransport', 'webtransport');
+    this.emit('mediaTransport', kind);
   }
 
+  /** Tear down the AURX media path (WebTransport or WebSocket tunnel) and its audio pipeline. */
   private stopWebTransportMedia(): void {
     const transport = this.wt;
     this.wt = undefined;
+    this.wsTunnel = undefined;
     if (transport) {
       this.wtNextSequence = transport.nextSequence;
       transport.close();
@@ -4657,7 +4758,7 @@ export class AurixClient {
     playback?.clear();
     this.wtUserBySsrc.clear();
     this.wtDecryptQueue = Promise.resolve();
-    if (this.mediaTransportValue === 'webtransport') this.mediaTransportValue = undefined;
+    if (this.mediaTransportValue === 'webtransport' || this.mediaTransportValue === 'websocket') this.mediaTransportValue = undefined;
   }
 
   /** Encoder settings: channel policy → `opus` browser options → `webTransport.opus` overrides. */
@@ -4685,9 +4786,9 @@ export class AurixClient {
     this.emit('bitrate', Math.round(bps / 1000), 'server', 0);
   }
 
-  private onWebTransportClosed(reason: string): void {
+  private onWebTransportClosed(kind: 'webtransport' | 'websocket', reason: string): void {
     if (this.closedByUser || !this.ws) return;
-    this.emit('error', new Error(`WebTransport media closed: ${reason}`));
+    this.emit('error', new Error(`${kind === 'websocket' ? 'WebSocket tunnel' : 'WebTransport'} media closed: ${reason}`));
     this.pc?.close();
     this.pc = undefined;
     this.stopWebTransportMedia();
@@ -4851,7 +4952,7 @@ export class AurixClient {
     }
   }
 
-  private webTransportStats(transport: AurxWebTransport): ClientStats {
+  private webTransportStats(transport: AurxLink): ClientStats {
     const s = transport.stats();
     const playback = this.wtPlayback?.stats;
     const input: RtcStatsInput = {
@@ -4866,7 +4967,7 @@ export class AurixClient {
     };
     if (s.rttMs !== undefined) input.iceRttSeconds = s.rttMs / 1000;
     const out = assembleClientStats(this.rtt, input, this.lossWindow, this.serverQuality);
-    out.transport = 'webtransport';
+    out.transport = this.mediaTransportValue === 'websocket' ? 'websocket' : 'webtransport';
     return out;
   }
 

@@ -554,7 +554,7 @@ export class AurixBridge {
     on('remoteStream', (stream) => this.playRemote(entry, stream));
     on('mediaTransport', (transport) => {
       q({ type: 'mediaTransport', transport });
-      if (transport === 'webtransport') void this.reportGraphPlayback(entry);
+      if (transport !== 'webrtc') void this.reportGraphPlayback(entry);
     });
     on('channelJoined', (channelId, participants) => q({ type: 'channelJoined', channelId, participants }));
     on('channelLeft', (channelId) => q({ type: 'channelLeft', channelId }));

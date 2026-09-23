@@ -11,6 +11,20 @@ released together.
 
 ## [Unreleased]
 
+### Added
+
+* **Web SDK: `transport: 'websocket'`** — AURX media as binary frames on the control WebSocket
+  (the node's `media_tunnel`, until now used by the native SDKs only): the browser path for
+  networks where neither UDP (WebTransport, WebRTC host candidates) nor TURN gets through —
+  HTTP-only reverse proxies and tunnels. Same WebCodecs Opus pipeline, per-speaker slots, E2EE
+  in the page, heartbeats and stats as the WebTransport path; `'auto'` still prefers
+  WebTransport, then WebRTC, and moves to the tunnel only after WebRTC failed on this network
+  (new `webRtcConnectTimeoutMs`, default 10 s, or an ICE `failed`). `SessionInitAck.media_tunnel`
+  is now read; `ClientStats.transport` / the `mediaTransport` event may report `'websocket'`.
+  Internally the AURX session logic (`SessionBind`, seal/open, heartbeats, anti-replay, loss
+  accounting) moved from `AurxWebTransport` into the shared `AurxLink`; `AurxWebTransport`'s
+  public API is unchanged.
+
 ## [1.6.0] - 2026-09-23
 
 Hardening release: no new protocol features. `aurix doctor` preflight, verified backup/restore

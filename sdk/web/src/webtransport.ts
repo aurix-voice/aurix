@@ -9,81 +9,21 @@
  * CA carries no pins and is verified by the browser like any HTTPS server.
  */
 
-import {
-  AURX_AUTH_TAG_SIZE,
-  AURX_HEADER_SIZE,
-  AURX_MAX_PACKET_SIZE,
-  AurxFlags,
-  AurxKeys,
-  AurxPacketType,
-  ReplayWindow,
-  SequenceLoss,
-  audioHeader,
-  audioLevelByte,
-  decodePacket,
-  heartbeatHeader,
-  parseDownlinkAudio,
-  sessionBindHeader,
-  sessionBindPayload,
-  type AurxHeader,
-  type AurxPacket,
-  type DownlinkAudio,
-} from './aurx.js';
+import { AurxLink, timeout, type AurxLinkEvents, type AurxLinkOptions, type AurxLinkStats, type AurxSessionKeys } from './aurx-link.js';
 import type { WebTransportInfoWire } from './protocol.js';
 
-export interface WebTransportSessionKeys {
-  sessionId: string;
-  ssrc: number;
-  /** 32-byte AURX master key (`media_key`). */
-  masterKey: Uint8Array;
-}
+export type WebTransportSessionKeys = AurxSessionKeys;
 
-export interface AurxWebTransportOptions {
-  /** Handshake + bind budget per URL (ms). Default 6000. */
-  connectTimeoutMs?: number;
-  /** Heartbeat interval (ms), 0 disables heartbeats (no RTT probe, no dead-path detection). Default 2000. */
-  heartbeatIntervalMs?: number;
-  /** Consecutive unanswered heartbeats before the path counts as dead. Default 5. */
-  heartbeatLossLimit?: number;
-  /**
-   * First uplink sequence to use. A resumed session must continue where its previous path
-   * stopped (`nextSequence` of the old transport): the node keeps one anti-replay window per
-   * session across paths. Default: random.
-   */
-  startSequence?: number;
+export interface AurxWebTransportOptions extends AurxLinkOptions {
   /** Test seam: the `WebTransport` constructor to use. */
   webTransport?: WebTransportConstructor;
 }
 
 export type WebTransportConstructor = new (url: string, options?: WebTransportOptions) => WebTransport;
 
-export interface AurxWebTransportStats {
-  url: string | undefined;
-  packetsSent: number;
-  packetsReceived: number;
-  bytesSent: number;
-  bytesReceived: number;
-  /** Datagrams that failed to decode, authenticate or were replays. */
-  packetsRejected: number;
-  /** Datagrams dropped locally: outgoing-queue backpressure or a WebCrypto backlog after a main-thread stall (either direction). */
-  packetsDroppedLocally: number;
-  /** Smoothed heartbeat RTT in ms (`undefined` before the first ack). */
-  rttMs: number | undefined;
-  /** Audio packets received / missing from the senders' sequences, cumulative over the path. */
-  audioPacketsReceived: number;
-  audioPacketsLost: number;
-  heartbeatsMissed: number;
-  maxDatagramSize: number | undefined;
-}
+export type AurxWebTransportStats = AurxLinkStats;
 
-export interface AurxWebTransportEvents {
-  onAudio: (audio: DownlinkAudio) => void;
-  /** A `BitrateCommand` from the server (target bitrate in bps). */
-  onBitrate: (targetBps: number) => void;
-  /** The path is gone (server close, network, heartbeat loss); `reason` is diagnostic. */
-  onClosed: (reason: string) => void;
-  onError: (error: Error) => void;
-}
+export type AurxWebTransportEvents = AurxLinkEvents;
 
 export interface WebTransportSupport {
   ok: boolean;
@@ -115,22 +55,6 @@ export function certificateHashes(info: WebTransportInfoWire): WebTransportHash[
   return pins.map((h) => ({ algorithm: 'sha-256', value: hexBytes(h) as Uint8Array<ArrayBuffer> }));
 }
 
-function timeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const t = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
-  });
-  return Promise.race([p, t]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-}
-
-const BIND_RETRY_MS = 500;
-const REPLAY_WINDOW = 256;
-/** Audio frames allowed in flight through WebCrypto (uplink) before the oldest are dropped. */
-const MAX_PENDING_SEALS = 128;
-/** Datagrams allowed in flight through WebCrypto (downlink) before newcomers are dropped. */
-const MAX_PENDING_OPENS = 512;
 /** Datagrams the browser may hold in its outgoing queue before the newest are dropped. */
 const MAX_WRITE_BACKLOG = 64;
 /** `reader.read()` calls kept in flight so a stalled main thread drains a backlog in one task. */
@@ -182,51 +106,18 @@ function tuneDatagramQueues(transport: WebTransport): void {
   });
 }
 
-type State = 'idle' | 'connecting' | 'open' | 'closed';
-
 /** One WebTransport session carrying one AURX media session. */
-export class AurxWebTransport {
-  private state: State = 'idle';
+export class AurxWebTransport extends AurxLink {
   private transport: WebTransport | undefined;
   private writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
-  private keys: AurxKeys | undefined;
-  private sequence: number;
-  private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-  private heartbeatSeq = 0;
-  private heartbeatSent = new Map<number, number>();
-  private heartbeatsMissed = 0;
-  private rtt: number | undefined;
-  private bindAck: ((ok: boolean) => void) | undefined;
-  private readonly replay = new Map<number, ReplayWindow>();
-  private readonly loss = new Map<number, SequenceLoss>();
-  private forgottenLoss = { received: 0, lost: 0 };
-  private readonly counters = { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, rejected: 0, droppedLocally: 0 };
   private url: string | undefined;
-  private closeReason: string | undefined;
-  private sealChain: Promise<void> = Promise.resolve();
-  private pendingSeals = 0;
-  private openChain: Promise<void> = Promise.resolve();
-  private pendingOpens = 0;
 
-  constructor(
-    private readonly session: WebTransportSessionKeys,
-    private readonly events: AurxWebTransportEvents,
-    private readonly options: AurxWebTransportOptions = {},
-  ) {
-    this.sequence = (options.startSequence ?? Math.floor(Math.random() * 0x7fff_ffff)) >>> 0;
-  }
-
-  get isOpen(): boolean {
-    return this.state === 'open';
+  constructor(session: WebTransportSessionKeys, events: AurxWebTransportEvents, private readonly wtOptions: AurxWebTransportOptions = {}) {
+    super(session, events, wtOptions);
   }
 
   get connectedUrl(): string | undefined {
     return this.url;
-  }
-
-  /** Sequence the next uplink packet would use (carry it over to a reconnecting transport). */
-  get nextSequence(): number {
-    return (this.sequence + 1) >>> 0;
   }
 
   /**
@@ -236,7 +127,7 @@ export class AurxWebTransport {
   async connect(info: WebTransportInfoWire): Promise<void> {
     if (this.state !== 'idle') throw new Error(`WebTransport connect in state ${this.state}`);
     this.state = 'connecting';
-    const ctor = this.options.webTransport ?? (globalThis as { WebTransport?: WebTransportConstructor }).WebTransport;
+    const ctor = this.wtOptions.webTransport ?? (globalThis as { WebTransport?: WebTransportConstructor }).WebTransport;
     if (typeof ctor !== 'function') {
       this.state = 'closed';
       throw new Error('WebTransport is not available in this browser');
@@ -245,7 +136,7 @@ export class AurxWebTransport {
       this.state = 'closed';
       throw new Error('the node advertises no WebTransport URL');
     }
-    this.keys = await AurxKeys.derive(this.session.masterKey);
+    await this.deriveKeys();
     const hashes = certificateHashes(info);
     const budget = this.options.connectTimeoutMs ?? 6000;
     const errors: string[] = [];
@@ -276,7 +167,7 @@ export class AurxWebTransport {
         return;
       } catch (e) {
         errors.push(`${url}: ${e instanceof Error ? e.message : String(e)}`);
-        this.bindAck?.(false);
+        this.abortBind();
         this.transport = undefined;
         this.url = undefined;
         this.dropTransport(transport);
@@ -287,158 +178,8 @@ export class AurxWebTransport {
     throw new Error(`WebTransport media path unavailable: ${errors.join('; ')}`);
   }
 
-  /** Send one Opus (or E2EE-sealed) frame for the channel with `channelIdHash`. */
-  sendAudio(frame: Uint8Array, channelIdHash: number, timestamp: number, opts: { energy?: number; e2ee?: boolean } = {}): void {
-    if (this.state !== 'open' || !this.keys) return;
-    const limit = Math.min(AURX_MAX_PACKET_SIZE, this.transport?.datagrams.maxDatagramSize ?? AURX_MAX_PACKET_SIZE) - (AURX_HEADER_SIZE + AURX_AUTH_TAG_SIZE + 1);
-    if (frame.length === 0) return;
-    if (frame.length > limit) {
-      this.counters.droppedLocally += 1;
-      return;
-    }
-    let flags = 0;
-    let payload: Uint8Array;
-    if (opts.energy !== undefined) {
-      flags |= AurxFlags.Energy;
-      payload = new Uint8Array(1 + frame.length);
-      payload[0] = audioLevelByte(opts.energy);
-      payload.set(frame, 1);
-    } else {
-      payload = frame;
-    }
-    if (opts.e2ee) flags |= AurxFlags.E2ee;
-    const header = audioHeader(this.session.ssrc, this.takeSequence(), timestamp >>> 0, channelIdHash, flags);
-    if (this.pendingSeals >= MAX_PENDING_SEALS) {
-      this.counters.droppedLocally += 1;
-      return;
-    }
-    void this.sealAndSend(header, payload);
-  }
-
-  stats(): AurxWebTransportStats {
-    let received = this.forgottenLoss.received;
-    let lost = this.forgottenLoss.lost;
-    for (const l of this.loss.values()) {
-      received += l.received;
-      lost += l.lost;
-    }
-    return {
-      url: this.url,
-      packetsSent: this.counters.sent,
-      packetsReceived: this.counters.received,
-      bytesSent: this.counters.bytesSent,
-      bytesReceived: this.counters.bytesReceived,
-      packetsRejected: this.counters.rejected,
-      packetsDroppedLocally: this.counters.droppedLocally,
-      rttMs: this.rtt,
-      audioPacketsReceived: received,
-      audioPacketsLost: lost,
-      heartbeatsMissed: this.heartbeatsMissed,
-      maxDatagramSize: this.transport?.datagrams.maxDatagramSize,
-    };
-  }
-
-  /** Forget the per-SSRC state of a participant who left. */
-  forgetSsrc(ssrc: number): void {
-    this.replay.delete(ssrc);
-    const l = this.loss.get(ssrc);
-    if (l) {
-      this.forgottenLoss.received += l.received;
-      this.forgottenLoss.lost += l.lost;
-      this.loss.delete(ssrc);
-    }
-  }
-
-  close(reason = 'closed by client'): void {
-    if (this.state === 'closed') return;
-    this.closeReason = reason;
-    this.state = 'closed';
-    this.stopHeartbeats();
-    this.bindAck?.(false);
-    this.bindAck = undefined;
-    const t = this.transport;
-    this.transport = undefined;
-    if (t) this.dropTransport(t);
-  }
-
-  private takeSequence(): number {
-    this.sequence = (this.sequence + 1) >>> 0;
-    return this.sequence;
-  }
-
-  private async bind(): Promise<void> {
-    const keys = this.keys;
-    if (!keys) throw new Error('no keys');
-    const acked = new Promise<boolean>((resolve) => {
-      this.bindAck = resolve;
-    });
-    const send = async (): Promise<void> => {
-      const unixMs = Date.now();
-      const nonce = Math.floor(Math.random() * 0xffff_ffff);
-      const packet = await keys.signPlain(sessionBindHeader(this.session.ssrc, unixMs, nonce), sessionBindPayload(this.session.sessionId, unixMs, nonce));
-      this.write(packet);
-    };
-    await send();
-    const retry = setInterval(() => {
-      void send().catch(() => undefined);
-    }, BIND_RETRY_MS);
-    try {
-      const ok = await acked;
-      if (!ok) throw new Error(this.closeReason ?? 'bind aborted');
-    } finally {
-      clearInterval(retry);
-      this.bindAck = undefined;
-    }
-  }
-
-  private startHeartbeats(): void {
-    this.stopHeartbeats();
-    const interval = this.options.heartbeatIntervalMs ?? 2000;
-    const limit = this.options.heartbeatLossLimit ?? 5;
-    if (interval <= 0) return;
-    this.heartbeatTimer = setInterval(() => {
-      if (this.state !== 'open') return;
-      const outstanding = this.heartbeatSent.size;
-      if (outstanding >= limit) {
-        this.heartbeatsMissed = outstanding;
-        this.fail(`no heartbeat answer for ${outstanding} intervals`);
-        return;
-      }
-      this.heartbeatSeq = (this.heartbeatSeq + 1) >>> 0;
-      const ts = this.heartbeatSeq;
-      this.heartbeatSent.set(ts, performance.now());
-      void this.sealAndSend(heartbeatHeader(this.session.ssrc, this.takeSequence(), ts), new Uint8Array(0));
-    }, interval);
-  }
-
-  private stopHeartbeats(): void {
-    if (this.heartbeatTimer !== undefined) clearInterval(this.heartbeatTimer);
-    this.heartbeatTimer = undefined;
-    this.heartbeatSent.clear();
-  }
-
-  /**
-   * Sealing is asynchronous (WebCrypto). Every packet starts sealing at once — so a burst of frames
-   * released after a long main-thread stall (game render loop, GC) costs one round trip, not one per
-   * frame — and only the writes are chained, so packets still leave in sequence order.
-   */
-  private sealAndSend(header: AurxHeader, payload: Uint8Array): Promise<void> {
-    const keys = this.keys;
-    if (!keys) return Promise.resolve();
-    this.pendingSeals += 1;
-    const sealed = keys.seal(header, payload).finally(() => {
-      this.pendingSeals -= 1;
-    });
-    this.sealChain = this.sealChain.then(() => this.sendSealed(sealed));
-    return this.sealChain;
-  }
-
-  private async sendSealed(sealed: Promise<Uint8Array>): Promise<void> {
-    try {
-      this.write(await sealed);
-    } catch (e) {
-      if (this.state === 'open') this.events.onError(e instanceof Error ? e : new Error(String(e)));
-    }
+  protected carrierMaxPacketSize(): number | undefined {
+    return this.transport?.datagrams.maxDatagramSize;
   }
 
   /**
@@ -446,19 +187,21 @@ export class AurxWebTransport {
    * a main-thread task per packet, which caps the uplink at one packet per render frame when the
    * page runs a heavy game loop. `desiredSize` bounds the browser-side backlog instead.
    */
-  private write(packet: Uint8Array): void {
+  protected carrierWrite(packet: Uint8Array): boolean {
     const writer = this.writer;
-    if (!writer) return;
+    if (!writer) return false;
     const desired = writer.desiredSize;
-    if (desired !== null && desired <= -MAX_WRITE_BACKLOG) {
-      this.counters.droppedLocally += 1;
-      return;
-    }
-    this.counters.sent += 1;
-    this.counters.bytesSent += packet.length;
+    if (desired !== null && desired <= -MAX_WRITE_BACKLOG) return false;
     writer.write(packet as Uint8Array<ArrayBuffer>).catch((e: unknown) => {
       if (this.state === 'open' && this.writer === writer) this.events.onError(e instanceof Error ? e : new Error(String(e)));
     });
+    return true;
+  }
+
+  protected carrierClose(): void {
+    const t = this.transport;
+    this.transport = undefined;
+    if (t) this.dropTransport(t);
   }
 
   /**
@@ -472,7 +215,7 @@ export class AurxWebTransport {
       for (;;) {
         const { value, done } = await reader.read();
         if (done || this.transport !== transport) return;
-        if (value instanceof Uint8Array) this.onDatagram(value);
+        if (value instanceof Uint8Array) this.onCarrierPacket(value);
       }
     };
     try {
@@ -494,111 +237,9 @@ export class AurxWebTransport {
     }
   }
 
-  /**
-   * Authentication is asynchronous (WebCrypto): every datagram is opened as soon as it is read and
-   * the results are handled in arrival order, so a backlog after a main-thread stall drains in one
-   * round trip instead of one per packet.
-   */
-  private onDatagram(data: Uint8Array): void {
-    const keys = this.keys;
-    if (!keys) return;
-    this.counters.bytesReceived += data.length;
-    const decoded = decodePacket(data);
-    if (!decoded) {
-      this.counters.rejected += 1;
-      return;
-    }
-    if (this.pendingOpens >= MAX_PENDING_OPENS) {
-      this.counters.droppedLocally += 1;
-      return;
-    }
-    this.pendingOpens += 1;
-    const opened = keys.open(data, decoded).finally(() => {
-      this.pendingOpens -= 1;
-    });
-    this.openChain = this.openChain.then(async () => {
-      let packet: AurxPacket | undefined;
-      try {
-        packet = await opened;
-      } catch {
-        packet = undefined;
-      }
-      if (this.keys === keys) this.onPacket(packet);
-    });
-  }
-
-  private onPacket(packet: AurxPacket | undefined): void {
-    if (!packet) {
-      this.counters.rejected += 1;
-      return;
-    }
-    const h = packet.header;
-    let window = this.replay.get(h.ssrc);
-    if (!window) {
-      window = new ReplayWindow(REPLAY_WINDOW);
-      this.replay.set(h.ssrc, window);
-    }
-    if (h.packetType === AurxPacketType.Audio || h.packetType === AurxPacketType.AudioFec) {
-      if (!window.accept(h.sequence)) {
-        this.counters.rejected += 1;
-        return;
-      }
-    }
-    this.counters.received += 1;
-    switch (h.packetType) {
-      case AurxPacketType.SessionBindAck:
-        this.bindAck?.(true);
-        return;
-      case AurxPacketType.HeartbeatAck: {
-        const sent = this.heartbeatSent.get(h.timestamp);
-        if (sent !== undefined) {
-          const sample = performance.now() - sent;
-          this.rtt = this.rtt === undefined ? sample : this.rtt * 0.8 + sample * 0.2;
-          for (const ts of Array.from(this.heartbeatSent.keys())) if (ts <= h.timestamp) this.heartbeatSent.delete(ts);
-        }
-        this.heartbeatsMissed = 0;
-        return;
-      }
-      case AurxPacketType.Audio: {
-        const audio = parseDownlinkAudio(packet);
-        if (!audio) {
-          this.counters.rejected += 1;
-          return;
-        }
-        let loss = this.loss.get(h.ssrc);
-        if (!loss) {
-          loss = new SequenceLoss();
-          this.loss.set(h.ssrc, loss);
-        }
-        loss.observe(h.sequence);
-        this.events.onAudio(audio);
-        return;
-      }
-      case AurxPacketType.BitrateCommand: {
-        if (packet.payload.length >= 4) {
-          const v = new DataView(packet.payload.buffer, packet.payload.byteOffset, packet.payload.byteLength);
-          this.events.onBitrate(v.getUint32(0));
-        }
-        return;
-      }
-      case AurxPacketType.SessionClose:
-        this.fail('session closed by the server');
-        return;
-      default:
-        return;
-    }
-  }
-
   private onTransportClosed(transport: WebTransport, reason: string): void {
     if (this.transport !== transport) return;
     this.fail(reason);
-  }
-
-  private fail(reason: string): void {
-    if (this.state === 'closed') return;
-    const wasOpen = this.state === 'open';
-    this.close(reason);
-    if (wasOpen) this.events.onClosed(reason);
   }
 
   private dropTransport(transport: WebTransport): void {

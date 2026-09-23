@@ -96,7 +96,7 @@ to them as it does to the REST calls. Details on the server side: [Regions](../o
 | Lip-sync (visemes) | `AurixClient.supportsVisemes()`, `setVisemes(bool)`, `visemesEnabled`, `getParticipantVisemes(userId)` / `getLocalVisemes()` → `VisemeFrame { weights[9], dominant, mouthOpen, energy, confidence, sequence }`, `participantVisemes(userId, frame)` / `localVisemes(frame)` events | analysed in the page from decoded (decrypted) audio — participants on a dedicated per-participant track only, the mixed track cannot be split; nothing leaves the browser; see [visemes](../features/speech.md#visemes-lip-sync) |
 | Priority speakers / ducking | `setPriority(channelId, priority, userId?)`, `isPriority(channelId)`, `Participant.priority`, `channelInfo(id).priority` / `.ducking`, `getChannelDucking(id)`, `isDuckingActive(id)`, `participantPriorityChanged(channelId, userId, priority)`, `duckingChanged(channelId, active, config)` | the node ducks the mixed track; the SDK applies the same envelope to its per-participant tracks from the priority members' speaking state; `duckingChanged` is the hook for game audio — see [priority speakers](../features/channels.md#priority-speakers-and-ducking) |
 | Stats / quality | `getStats()` → `ClientStats`, `stats`, `networkQuality`, `client.networkQuality`, `qualityReportIntervalMs`, `bitrate` | see [Network quality](../features/quality.md) |
-| Media path | `transport: 'auto' \| 'webrtc' \| 'webtransport'`, `webTransport: {connectTimeoutMs, heartbeatIntervalMs, heartbeatLossLimit, opus, idleTimeoutMs}`, `client.mediaTransport`, `mediaTransport` event, `sessionInfo.webTransport`, `ClientStats.transport` | see [WebTransport](#webtransport-aurx-datagrams-without-webrtc) |
+| Media path | `transport: 'auto' \| 'webrtc' \| 'webtransport' \| 'websocket'`, `webTransport: {connectTimeoutMs, heartbeatIntervalMs, heartbeatLossLimit, opus, idleTimeoutMs}`, `webRtcConnectTimeoutMs`, `client.mediaTransport`, `mediaTransport` event, `sessionInfo.webTransport`, `ClientStats.transport` | see [WebTransport](#webtransport-aurx-datagrams-without-webrtc) and the [WebSocket tunnel](#websocket-tunnel-the-path-of-last-resort) |
 | Opus controls | `opus: {maxBitrateBps, fec, dtx, maxBandwidth, cbr, followChannelPolicy}`, `setOpusOptions()`, `audioPolicy` / `channelAudioPolicy(id)`, `opusPreferences`, `negotiatedOpus`, `renegotiateMedia()`, `audioPolicy` event | see [Opus in the browser](#opus-in-the-browser) |
 | Errors | rejected promises carry `Error('<CODE>: <message>')`; unsolicited server errors arrive as `serverError` | codes listed in [Errors](../concepts/auth.md#errors) |
 
@@ -215,7 +215,7 @@ const client = new AurixClient({
     opus: { complexity: 10, signal: 'voice', expectedLossPct: 5 },
   },
 });
-client.on('mediaTransport', (t) => console.log('media over', t)); // 'webtransport' | 'webrtc'
+client.on('mediaTransport', (t) => console.log('media over', t)); // 'webtransport' | 'webrtc' | 'websocket'
 console.log(client.mediaTransport, (await client.getStats()).transport);
 ```
 
@@ -233,12 +233,35 @@ short-lived certificate arrives as `certSha256` (current and next hash) and is p
 forward WebTransport, so the node's `webtransport_port` must be reachable directly over UDP; when
 it is not, `'auto'` simply lands on WebRTC (via TURN if needed).
 
+### WebSocket tunnel: the path of last resort
+
+The node accepts the same sealed AURX packets as **binary frames on the control WebSocket**
+itself when `media.media_tunnel` is on (`SessionInitAck.media_tunnel: true`) — the path the
+native SDKs take when UDP is blocked. In the browser it is `transport: 'websocket'`: no second
+connection, no UDP, no ICE; voice gets through wherever signalling does — HTTP-only reverse
+proxies, corporate proxies, `cloudflared`/`ngrok`-style tunnels. Everything else is the
+WebTransport path (WebCodecs Opus, per-speaker slots, E2EE in the page, heartbeats, the same
+`webTransport` options). The price is TCP: one lost segment stalls every frame behind it, so the
+jitter buffer works harder and `ClientStats.rtt` grows under loss — which is why `'auto'` never
+starts there. It moves to the tunnel only after WebRTC failed on this network: ICE never
+reached `connected` within `webRtcConnectTimeoutMs` (10 s, `0` disables the timer) after the
+answer, or the connection later reported `failed`. From then on the session stays on the tunnel
+(WebRTC is not retried) until `disconnect()`; a control-socket drop rebinds the tunnel on the
+reconnected socket, sequence counter carried over. `'websocket'` requires the offer (`connect()`
+rejects otherwise); `'webrtc'` / `'webtransport'` never use it.
+
+```ts
+const client = new AurixClient({ transport: 'websocket' /* behind an HTTP-only tunnel */ });
+client.on('mediaTransport', (t) => t); // 'webtransport' | 'webrtc' | 'websocket'
+```
+
 ## How it maps to the server
 
 | SDK | server |
 |---|---|
 | `new WebSocket(wsUrl, ['aurix', 'bearer.<jwt>'])` | JWT authenticated at upgrade; `SessionInitAck` carries `session_id` / `ssrc` |
 | `connect()` → WebTransport session at `SessionInitAck.webtransport.urls[i]`, first datagram `SessionBind` (when `transport` allows and the browser can) | `webtransport::WebTransportServer` accepts `/aurix`, binds the session on the authenticated `SessionBind`, then routes each datagram as a native AURX packet (`MediaBound.transport = "webtransport"`) |
+| `transport: 'websocket'` (or `'auto'` after a WebRTC failure) → `SessionBind` as a binary frame on the control socket | `SessionInitAck.media_tunnel`; `SfuNode::open_tunnel` + `route_tunnel_packet`, the node's downlink comes back as binary frames (`MediaBound.transport = "tunnel"`) |
 | `connect()` → `WebRtcOffer` (1 `sendrecv` + N `recvonly` audio m-lines) | `SfuNode::attach_webrtc` (str0m, ICE-lite, host candidate = `media.external_ip:media.port`); first m-line = server mix, the rest per-participant tracks up to `media.webrtc_participant_streams` |
 | `setPinnedParticipants()` → `SetParticipantStreams {pinned}` | `ParticipantStreams {streams: [{mid, user_id}]}` on negotiation and every layout change |
 | `GET /v1/me/turn-credentials` (optional) | time-limited TURN credentials for the browser's relay candidates |

@@ -134,8 +134,10 @@ remain the JSON control plane. The node advertises support with `SessionInitAck.
 * **Cost.** TCP retransmission means head-of-line blocking under loss: the jitter buffer sees
   bursts instead of gaps, latency rises. Treat the tunnel as a fallback — every SDK tries UDP
   first, falls back after a failed bind or `udp_fallback_lost_heartbeats` unanswered heartbeats,
-  and re-probes UDP every `udp_reprobe_interval` while tunnelled. WebRTC clients are unaffected
-  (they have ICE/TURN for the same problem).
+  and re-probes UDP every `udp_reprobe_interval` while tunnelled. The Web SDK reaches the same
+  tunnel with `transport: 'websocket'` (or under `'auto'` once WebRTC has failed) — a browser
+  session on the tunnel is a native AURX session to the router, exactly like one on
+  WebTransport; WebRTC sessions cannot open a tunnel (`open_tunnel` rejects them).
 
 Metrics: `aurix_tunnel_sessions`, `aurix_tunnel_packets_total{direction,outcome}`.
 

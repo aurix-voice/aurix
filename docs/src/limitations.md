@@ -129,8 +129,11 @@ the chapter that explains the boundary.
   is a UDP path too — it shares the media port and is blocked by the same firewalls. There is no
   TURN for native clients; the TLS tunnel's certificate is the QUIC one, pinned by hash (a proxy
   in front must pass TLS through, not terminate it), and renewing a PEM pair is the operator's
-  job (no ACME). Browsers have no TCP fallback for AURX — the [WebTransport](api/aurx.md#webtransport-aurx-datagrams-for-browsers)
-  endpoint is HTTP/3 only, so a browser behind a UDP-blocking firewall lands on WebRTC over TURN.
+  job (no ACME). In the browser the [WebTransport](api/aurx.md#webtransport-aurx-datagrams-for-browsers)
+  endpoint is HTTP/3 only; a browser behind a UDP-blocking firewall lands on WebRTC over TURN,
+  and only when that fails too (or with `transport: 'websocket'`) on the same control-WebSocket
+  tunnel ([Web SDK](sdk/web.md#websocket-tunnel-the-path-of-last-resort)) — with the same TCP
+  caveats, and no automatic return to WebRTC/WebTransport within the session.
 * **QUIC and WebTransport are datagram-only.** Native QUIC is for native clients (the Unity C#
   transport keeps UDP/TLS/tunnel; QUIC reaches Unity only through the native core), browsers use
   the separate WebTransport endpoint (`media.webtransport_port` — ordinary HTTP reverse proxies
