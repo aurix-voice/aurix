@@ -191,9 +191,11 @@ What is asserted, and what fails the run (exit code 1, the reason in `violations
 * **each hook**: the command succeeds and every bot is healthy again within `--recover-within`
   (120 s) after it ends; per-bot `Recovering → Recovered` times are recorded;
 * **resources**: median RSS and open-fd count of each node over the last quarter of the run vs.
-  the first quarter (after warm-up) grow by less than `--max-rss-growth` (25 %), same for the
-  bot process; `aurix_active_sessions` / `aurix_active_participants` return to zero once the
-  bots leave.
+  the first quarter grow by less than `--max-rss-growth` (25 %), same for the bot process. The
+  baseline starts after the first hook has ended: the first failover allocates state that then
+  stays resident (TLS/QUIC client, failover endpoint, the second node's tables) — a one-off
+  step, not a leak — so a run needs at least 8 steady intervals after that point to be judged;
+  `aurix_active_sessions` / `aurix_active_participants` return to zero once the bots leave.
 
 `target/soak/report.jsonl` has one row per report interval (`kind: "interval"`: fleet
 aggregates, per-node samples from Prometheus — RSS, fds, CPU seconds, sessions, cascade link

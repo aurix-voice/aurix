@@ -1179,6 +1179,22 @@ fn growth(samples: &[f64]) -> Option<f64> {
     Some(last / first - 1.0)
 }
 
+/// Steady intervals the resource (RSS / fd) growth is judged on. The first hook exercises code
+/// paths that allocate lazily and then stay resident — TLS/QUIC client state, the failover
+/// endpoint, a second node's session tables — so the baseline starts after it has ended. A run
+/// too short to leave `growth` enough samples after that point reports no growth figure rather
+/// than a spurious one.
+fn resource_samples<'a>(steady: &[&'a IntervalRow], chaos: &[ChaosRow]) -> Vec<&'a IntervalRow> {
+    let Some(first_hook_end) = chaos.iter().map(|c| c.ended_at).reduce(f64::min) else {
+        return steady.to_vec();
+    };
+    steady
+        .iter()
+        .copied()
+        .filter(|r| r.at >= first_hook_end)
+        .collect()
+}
+
 fn verdict(
     shared: &Shared,
     state: &State,
@@ -1188,15 +1204,16 @@ fn verdict(
     let args = &shared.args;
     let mut violations = state.violations.clone();
     let steady: Vec<&IntervalRow> = state.intervals.iter().filter(|r| r.steady).collect();
+    let resource = resource_samples(&steady, &state.chaos);
     let node_count = args.metrics.len();
     let mut node_rss_growth = Vec::with_capacity(node_count);
     let mut node_fds_growth = Vec::with_capacity(node_count);
     for i in 0..node_count {
-        let rss: Vec<f64> = steady
+        let rss: Vec<f64> = resource
             .iter()
             .filter_map(|r| r.nodes.get(i).filter(|n| n.up).and_then(|n| n.rss_bytes))
             .collect();
-        let fds: Vec<f64> = steady
+        let fds: Vec<f64> = resource
             .iter()
             .filter_map(|r| r.nodes.get(i).filter(|n| n.up).and_then(|n| n.open_fds))
             .collect();
@@ -1223,9 +1240,9 @@ fn verdict(
         node_rss_growth.push(g_rss);
         node_fds_growth.push(g_fds);
     }
-    let self_rss: Vec<f64> = steady.iter().filter_map(|r| r.self_rss_bytes).collect();
+    let self_rss: Vec<f64> = resource.iter().filter_map(|r| r.self_rss_bytes).collect();
     let self_rss_growth = growth(&self_rss);
-    let self_fds: Vec<f64> = steady.iter().filter_map(|r| r.self_open_fds).collect();
+    let self_fds: Vec<f64> = resource.iter().filter_map(|r| r.self_open_fds).collect();
     let self_fds_growth = growth(&self_fds);
     if let Some(g) = self_fds_growth {
         if g > args.max_rss_growth {
@@ -1524,5 +1541,78 @@ mod tests {
         assert!(growth(&flat).unwrap().abs() < 1e-9);
         let rising: Vec<f64> = (0..12).map(|i| 100.0 + 10.0 * i as f64).collect();
         assert!((growth(&rising).unwrap() - (200.0 / 110.0 - 1.0)).abs() < 1e-9);
+    }
+
+    fn interval(at: f64, rss: f64) -> IntervalRow {
+        IntervalRow {
+            kind: "interval",
+            at,
+            elapsed_secs: at,
+            steady: true,
+            bots_bound: 0,
+            bots_joined: 0,
+            bots_hearing_ok: 0,
+            hearing_min: 1.0,
+            hearing_mean: 1.0,
+            loss_max_percent: 0.0,
+            rtt_max_ms: 0.0,
+            mos_min: 4.4,
+            frames_lost: 0,
+            underruns: 0,
+            replayed: 0,
+            reconnects: 0,
+            recovery_ms_max: 0,
+            failovers: 0,
+            hard_reconnects: 0,
+            request_failures: 0,
+            server_errors: 0,
+            paths: BTreeMap::new(),
+            nodes: Vec::new(),
+            self_rss_bytes: Some(rss),
+            self_open_fds: Some(80.0),
+            bots: Vec::new(),
+            violations: Vec::new(),
+        }
+    }
+
+    fn hook(ended_at: f64) -> ChaosRow {
+        ChaosRow {
+            kind: "chaos",
+            name: "kill".into(),
+            started_at: ended_at - 5.0,
+            ended_at,
+            exit_ok: true,
+            output_tail: String::new(),
+            recovered_in_secs: Some(1.0),
+            recovered: true,
+            unhealthy_after: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resource_baseline_starts_after_the_first_hook() {
+        // 21 MB before the first hook, a one-off step to 33 MB right after it, flat afterwards.
+        let rows: Vec<IntervalRow> = (0..24)
+            .map(|i| interval(i as f64, if i < 9 { 21e6 } else { 33e6 }))
+            .collect();
+        let steady: Vec<&IntervalRow> = rows.iter().collect();
+        let all: Vec<f64> = steady.iter().filter_map(|r| r.self_rss_bytes).collect();
+        assert!(
+            growth(&all).unwrap() > 0.25,
+            "the step alone trips the budget"
+        );
+
+        let judged = resource_samples(&steady, &[hook(20.0), hook(8.5)]);
+        assert_eq!(judged.len(), 15);
+        assert!(judged.iter().all(|r| r.at >= 8.5));
+        let rss: Vec<f64> = judged.iter().filter_map(|r| r.self_rss_bytes).collect();
+        assert!(growth(&rss).unwrap().abs() < 1e-9);
+
+        // No hook yet: every steady interval counts.
+        assert_eq!(resource_samples(&steady, &[]).len(), 24);
+        // Too short after the first hook: no verdict instead of a spurious one.
+        let short = resource_samples(&steady, &[hook(20.0)]);
+        let rss: Vec<f64> = short.iter().filter_map(|r| r.self_rss_bytes).collect();
+        assert_eq!(growth(&rss), None);
     }
 }
