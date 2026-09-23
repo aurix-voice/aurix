@@ -296,7 +296,7 @@ function aurxWorkletMain(scope: AudioWorkletScope): void {
 }
 
 export function aurxWorkletSource(): string {
-  return `'use strict';\n${aurxWorkletMain.toString()}\naurxWorkletMain(globalThis);\n`;
+  return `'use strict';\n(${aurxWorkletMain.toString()})(globalThis);\n`;
 }
 
 const loadedContexts = new WeakSet<BaseAudioContext>();

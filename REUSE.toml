@@ -23,6 +23,7 @@ path = [
     "sdk/**",
     "api/**",
     "tools/openapi-sdk/**",
+    "examples/**",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 The Aurix Authors"

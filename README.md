@@ -1227,6 +1227,7 @@ All SDKs authenticate with the per-user JWT from `POST /v1/tokens`; API keys sta
 |---|---|---|
 | Server SDKs (Node, Python, Go, C#) | [`sdk/server`](sdk/server) | typed clients generated from `api/openapi.json` (`python3 tools/openapi-sdk/generate.py --check` guards drift) with hand-written transports: retries with `Retry-After`, structured errors, API-key / operator / bootstrap credentials, webhook signature verification, SSE iterator |
 | Token servers | [`sdk/server/examples/token-server`](sdk/server/examples/token-server) | the same backend in all four languages: your game session → `POST /voice/token` → `POST /v1/tokens` with the API key → allowlisted `{token, user_id, expires_at, endpoint}` to the client; the key never reaches the client, identity is never taken from the request body |
+| Rooms demo | [`examples/rooms`](examples/rooms) | a complete voice-conference app on one node — link-joinable rooms, a Lounge with a native bot playing music/readings/test signals, chat, speaking rings, live quality, phone layout; Node backend on the server SDK, Vite frontend on the Web SDK, Rust bot on `aurix-client`, `deploy/run.sh` for the whole stack |
 | `aurix` CLI | [`crates/aurix-cli`](crates/aurix-cli) | profiles that reference (never store) secrets, `token issue`, channel/user/moderation/webhook/analytics/recording/admin commands, `events tail`, `diagnose`, and `aurix api <operationId>` for every operation of the embedded contract |
 
 Docs: [Server SDKs and token servers](docs/src/backend/server-sdks.md), [The aurix CLI](docs/src/backend/cli.md).

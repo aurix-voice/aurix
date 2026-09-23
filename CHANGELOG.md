@@ -24,6 +24,23 @@ released together.
   Internally the AURX session logic (`SessionBind`, seal/open, heartbeats, anti-replay, loss
   accounting) moved from `AurxWebTransport` into the shared `AurxLink`; `AurxWebTransport`'s
   public API is unchanged.
+* **Rooms demo** (`examples/rooms`) — a complete voice-conference app on one node: link-joinable
+  rooms, a pinned Lounge with a native bot (`aurix-client`) playing stereo music, readings, a
+  field recording and generated test signals, chat with `!np` / `!next` / `!list`, speaking
+  rings, per-participant mute, live RTT/loss/jitter/transport, RU/EN, phone layout. Backend on
+  `@aurix/server-sdk` (rooms ⇄ `rooms/<slug>` channels, one-channel session tokens, SSE "now
+  playing", strict CSP), frontend on `@aurix/web-sdk`, `deploy/run.sh` for PostgreSQL + Redis +
+  node + Caddy + optional ngrok. CI builds and tests all three parts.
+
+### Fixed
+
+* **Web SDK: AudioWorklet / worker sources after minification.** The AURX playback/capture
+  worklet, the voice-effects and viseme worklets and the E2EE worker were serialised with
+  `Function.prototype.toString()` and then *called by their original name*; a bundler that
+  renames identifiers (any production Vite/Rollup/esbuild build) produced a module that failed
+  with `ReferenceError` and `The node name 'aurix-aurx-capture' is not defined`. The serialised
+  function is now invoked as an expression; a test mangles the compiled SDK and evaluates every
+  generated source.
 
 ## [1.6.0] - 2026-09-23
 

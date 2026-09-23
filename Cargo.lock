@@ -614,6 +614,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurix-rooms-bot"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "aurix-client",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aurix-server"
 version = "1.6.0"
 dependencies = [

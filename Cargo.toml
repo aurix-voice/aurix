@@ -18,6 +18,7 @@ members = [
     "crates/aurix-soak",
     "crates/aurix-client",
     "crates/aurix-opus",
+    "examples/rooms/bot",
 ]
 # libFuzzer harnesses live in their own workspace (cargo-fuzz layout); `fuzz/tests/corpus.rs`
 # replays the committed corpus on stable.

@@ -401,7 +401,7 @@ export const VISEME_PROCESSOR = 'aurix-visemes';
 
 /** JavaScript source of the worklet module (self-contained; served from a `blob:` URL). */
 export function visemeWorkletSource(): string {
-  return `'use strict';\n${VisemeAnalyzer.toString()}\n${visemeWorkletMain.toString()}\nvisemeWorkletMain(globalThis);\n`;
+  return `'use strict';\n${VisemeAnalyzer.toString()}\n(${visemeWorkletMain.toString()})(globalThis);\n`;
 }
 
 /** Whether this browser can run the viseme worklet. */

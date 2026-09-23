@@ -801,9 +801,8 @@ export function voiceEffectsWorkletSource(): string {
     StaticStage,
     ReverbStage,
     VoiceEffectChain,
-    voiceEffectsWorkletMain,
   ];
-  return `'use strict';\n${units.map((u) => u.toString()).join('\n')}\nvoiceEffectsWorkletMain(globalThis);\n`;
+  return `'use strict';\n${units.map((u) => u.toString()).join('\n')}\n(${voiceEffectsWorkletMain.toString()})(globalThis);\n`;
 }
 
 /** Whether this browser can run the effects worklet. */

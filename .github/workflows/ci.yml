@@ -711,6 +711,32 @@ jobs:
         working-directory: sdk/server/examples/token-server/csharp
       # the aurix CLI (crates/aurix-cli, embedded contract + integration tests) is covered by `lint` and `test`
 
+  rooms-demo:
+    name: Rooms demo (backend tests + frontend build against the in-tree SDKs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            sdk/server/node/package-lock.json
+            sdk/web/package-lock.json
+            examples/rooms/server/package-lock.json
+            examples/rooms/web/package-lock.json
+      - name: "Build the in-tree SDKs the demo links (file: dependencies)"
+        run: |
+          (cd sdk/server/node && npm ci && npm run build)
+          (cd sdk/web && npm ci && npm run build)
+      - name: Backend (rooms ⇄ channels, tokens, bot status, restart reconciliation)
+        run: npm ci && npm test
+        working-directory: examples/rooms/server
+      - name: Frontend (typecheck + production build — the minified Web SDK worklets must load)
+        run: npm ci && npm run check && npm run build
+        working-directory: examples/rooms/web
+      # the bot (examples/rooms/bot) is a workspace member: fmt/clippy/test run in `lint` and `test`
+
   godot:
     name: Godot GDExtension (build + headless smoke)
     runs-on: ubuntu-latest

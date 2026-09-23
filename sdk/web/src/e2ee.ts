@@ -664,8 +664,8 @@ export function e2eeWorkerMain(scope: WorkerScope): FrameCrypto {
 
 /** JavaScript source of the transform worker (self-contained; served from a `blob:` URL). */
 export function e2eeWorkerSource(): string {
-  const units = [E2eeSenderKey, E2eeReplayState, E2eePeerKeys, FrameCrypto, e2eeWorkerMain];
-  return `'use strict';\n${units.map((u) => u.toString()).join('\n')}\ne2eeWorkerMain(self);\n`;
+  const units = [E2eeSenderKey, E2eeReplayState, E2eePeerKeys, FrameCrypto];
+  return `'use strict';\n${units.map((u) => u.toString()).join('\n')}\n(${e2eeWorkerMain.toString()})(self);\n`;
 }
 
 // ── Group state machine ──────────────────────────────────────────────────────────────────

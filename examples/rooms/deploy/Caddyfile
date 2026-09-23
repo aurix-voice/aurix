@@ -1,0 +1,45 @@
+# One origin for the whole demo. TLS is terminated in front (ngrok / cloudflared / a Caddy with a
+# real domain), so this listener speaks plain HTTP. Browsers reach the Aurix node only through
+# `/v1/*` (public REST: tokens are minted by the Rooms backend, the SDK fetches regions/stats) and
+# `/ws` (control + media WebSocket); everything else — including the built frontend — is the Rooms
+# backend. `/admin/*` and `/metrics` stay unexposed.
+{
+	auto_https off
+	admin off
+	servers {
+		# the tunnel agent / edge in front connects from this host: keep its X-Forwarded-* headers
+		trusted_proxies static private_ranges
+	}
+}
+
+:{$ROOMS_PROXY_PORT:8000} {
+	# never buffer the SSE stream (text/event-stream) behind a compressor
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/javascript*
+			header Content-Type application/javascript*
+			header Content-Type application/json*
+			header Content-Type application/manifest+json*
+			header Content-Type image/svg+xml*
+			header Content-Type text/plain*
+		}
+	}
+
+	@ws path /ws
+	handle @ws {
+		reverse_proxy {$AURIX_WS_UPSTREAM:127.0.0.1:8081}
+	}
+
+	@node path /v1/* /health
+	handle @node {
+		reverse_proxy {$AURIX_UPSTREAM:127.0.0.1:8080}
+	}
+
+	handle {
+		reverse_proxy {$ROOMS_UPSTREAM:127.0.0.1:8090} {
+			flush_interval -1
+		}
+	}
+}
