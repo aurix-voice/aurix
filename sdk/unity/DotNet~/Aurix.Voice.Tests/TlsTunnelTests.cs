@@ -271,9 +271,9 @@ namespace Aurix.Voice.Tests
                 using var node = new FakeTlsNode(Key);
                 var link = await TlsMediaTunnel.ConnectAsync(node.EndPoint, "aurix-media", node.Fingerprint, Timeout, CancellationToken.None);
                 string reason = null;
-                link.Closed += r => reason = r;
+                link.Closed += r => Volatile.Write(ref reason, r);
                 await node.DeliverRaw(bad);
-                await Eventually(() => link.IsClosed, c => c);
+                reason = await Eventually(() => Volatile.Read(ref reason), r => r != null);
                 Assert.True(link.IsClosed);
                 Assert.Contains("frame", reason);
                 Assert.False(link.TrySendMedia(new byte[] { 1 }));

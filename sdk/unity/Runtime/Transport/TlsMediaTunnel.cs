@@ -245,8 +245,8 @@ namespace Aurix.Transport
 
         private void Close(string reason)
         {
-            if (Interlocked.Exchange(ref _closed, 1) != 0) return;
-            Volatile.Write(ref _closeReason, reason);
+            if (Interlocked.CompareExchange(ref _closeReason, reason, null) != null) return;
+            Volatile.Write(ref _closed, 1);
             _cts.Cancel();
             try { _outbox.CompleteAdding(); } catch (ObjectDisposedException) { }
             try { _ssl.Dispose(); } catch (Exception) { }

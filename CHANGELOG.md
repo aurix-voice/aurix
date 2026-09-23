@@ -11,6 +11,11 @@ released together.
 
 ## [Unreleased]
 
+### Fixed
+
+* Unity native TLS tunnel: `TlsMediaTunnel.CloseReason` is now set before `IsClosed` flips, so an
+  observer that sees the link closed always sees why (the `Closed` event still fires last).
+
 ## [1.5.0] - 2026-09-23
 
 Feature release: the roadmap items behind the former "limitations" list — Redis Cluster,
