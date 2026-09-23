@@ -8,7 +8,7 @@ server version it ships with (the repository is versioned as one unit).
 
 Nothing yet.
 
-## [1.5.0] — 2026-09-22
+## [1.5.0] — 2026-09-23
 
 ### Added
 

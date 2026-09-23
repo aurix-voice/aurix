@@ -11,7 +11,7 @@ released together.
 
 ## [Unreleased]
 
-## [1.5.0] - 2026-09-22
+## [1.5.0] - 2026-09-23
 
 Feature release: the roadmap items behind the former "limitations" list — Redis Cluster,
 RTT-measured multi-level cascade with TCP fallback, a TLS media tunnel and WebTransport for
