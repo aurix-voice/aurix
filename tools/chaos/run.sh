@@ -39,6 +39,10 @@
 #   AURIX_CHAOS_KEEP  1 = leave the topology running after `all`
 #   AURIX_CHAOS_REDIS sentinel (default) | cluster
 #
+# tools/soak/run.sh sources this file for the topology and the failure primitives (nothing runs
+# on `source`; the dispatch at the bottom only fires when executed directly). NODE_EXTRA_ENV
+# may hold additional `AURIX__…=…` assignments for every node started by start_node.
+#
 # All secrets used here (bootstrap token, cascade secret, Postgres password) are throw-away,
 # loopback-only values that exist only for the lifetime of the run; the API keys the harness
 # creates are written to $AURIX_CHAOS_DIR with mode 0600 and never printed.
@@ -72,6 +76,7 @@ ADMIN_EMAIL=chaos@example.com
 ADMIN_PASSWORD=chaos-admin-password-0123456789
 REPORTS_PER_MINUTE=3
 E2E_EXTRA_ENV=()
+NODE_EXTRA_ENV=()
 
 log()  { printf '\033[1;36m[chaos]\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[1;31m[chaos] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -276,6 +281,7 @@ start_node() { # <1|2>
         AURIX__RATE_LIMITING__REPORTS_PER_MINUTE=$REPORTS_PER_MINUTE \
         AURIX__AUTH__ADMIN_BOOTSTRAP_TOKEN="$BOOTSTRAP_TOKEN" \
         AURIX__TRACING__LOG_FORMAT=text \
+        "${NODE_EXTRA_ENV[@]}" \
         nohup "$BIN" >>"$STATE/node$n.log" 2>&1 &
     echo $! >"$(pid_file "$n")"
   )
@@ -463,6 +469,8 @@ cmd_all() {
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────────────────────────────
+
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 if [ $# -eq 0 ]; then
   cmd_all

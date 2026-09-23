@@ -15,6 +15,7 @@ members = [
     "crates/aurix-server",
     "crates/aurix-cli",
     "crates/aurix-loadtest",
+    "crates/aurix-soak",
     "crates/aurix-client",
     "crates/aurix-opus",
 ]

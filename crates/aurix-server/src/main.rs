@@ -495,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                     let sfu = sfu.read();
                     aurix_metrics::ACTIVE_SESSIONS.set(sfu.active_participants() as i64);
                     aurix_metrics::ACTIVE_CHANNELS.set(sfu.active_channels() as i64);
+                    aurix_metrics::ACTIVE_PARTICIPANTS.set(sfu.active_channel_memberships() as i64);
                     advertise(sfu.node_info(
                         &node_address,
                         config.media.port,

@@ -648,6 +648,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurix-soak"
+version = "1.5.0"
+dependencies = [
+ "anyhow",
+ "aurix-client",
+ "aurix-common",
+ "clap",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "aurix-turn"
 version = "1.5.0"
 dependencies = [

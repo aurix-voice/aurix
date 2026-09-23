@@ -148,6 +148,64 @@ Reference run (release build, 8 vCPU host shared with the load generator, Postgr
 | 1000 sessions, 100 channels × 10, 2 speakers | 10k / 90k | 100 % | 2.5 / 4.8 ms | ~0.4 core | 48 MB |
 | 2000 sessions, 200 channels × 10, 4 speakers | 40k / 360k | 99.8 % | 2.1 / 4.8 ms | ~1.4 cores | 70 MB |
 
+## Soak testing
+
+`tools/soak/run.sh` keeps a two-node fleet under real clients for hours while faults are
+injected in rotation. It reuses the chaos topology (`tools/chaos/`: PostgreSQL and Redis
+Sentinel or Cluster in host-network containers, two `aurix-server` processes on loopback) and
+drives it with `aurix-soak`, a bot runner built on the native client core (`aurix-client`):
+every bot performs the full `SessionBind`, joins a channel, the speakers stream Opus over the
+chosen media path and the listeners pull the mixed output — reconnect, resume, cross-node
+failover, path fallback, token refresh and the loss profile are the production code paths.
+
+```bash
+cargo build --release --bin aurix-server --bin aurix-soak
+AURIX_CHAOS_BIN=target/release/aurix-server AURIX_SOAK_BIN=target/release/aurix-soak \
+AURIX_SOAK_DURATION=24h AURIX_SOAK_CLIENTS=32 AURIX_SOAK_CHANNELS=8 tools/soak/run.sh
+
+AURIX_SOAK_DURATION=30m AURIX_SOAK_HOOKS=node-kill-2,udp-blackhole-1 tools/soak/run.sh   # shorter, chosen faults
+tools/soak/run.sh soak    # bots only, against a fleet started earlier with AURIX_SOAK_KEEP=1
+tools/soak/run.sh down    # stop nodes and containers
+```
+
+Every `AURIX_SOAK_CHAOS_EVERY` (10 min) one hook from the rotation runs — `node-kill-2`
+(SIGKILL of node 2, the clients on it resume on node 1, the node comes back after the reaper
+window), `redis-failover` (Sentinel `failover` or a shard master kill), `node-kill-1`,
+`postgres-restart` (`docker stop`/`start`), `udp-blackhole-1` (`iptables` drops UDP to node 1's
+media port for `AURIX_SOAK_BLACKHOLE_SECS`, so its clients fall back to the TLS tunnel and
+return to UDP/QUIC when the rule is removed), `netem-2` (`tools/netem/shape.sh` puts
+`AURIX_SOAK_NETEM` — by default 8 % loss, 40 ± 15 ms delay, 25 % reordering, both directions —
+on node 2's media port for the same length, so the loss profile, FEC/DRED and the jitter buffer
+have to carry the audio without a path change). The two network hooks need passwordless `sudo`
+for `iptables`/`tc` and are skipped without it. Nodes are started with a 30 s resume grace and
+short player tokens (`AURIX_SOAK_TOKEN_TTL`, 15 min) so the bots refresh them several times
+per hour.
+
+What is asserted, and what fails the run (exit code 1, the reason in `violations`):
+
+* **steady state** (intervals at least `--chaos-settle` after the last hook and after the
+  warm-up): every bot `MediaBound` and joined, every listener hears its speakers in at least
+  `--min-hearing` (97 %) of the 200 ms windows, at most `--max-loss` (2 %) on any downlink, no
+  hard reconnects (a resume that had to become a fresh session), no `bad_auth`/replay counts,
+  both `/metrics` endpoints answering;
+* **each hook**: the command succeeds and every bot is healthy again within `--recover-within`
+  (120 s) after it ends; per-bot `Recovering → Recovered` times are recorded;
+* **resources**: median RSS and open-fd count of each node over the last quarter of the run vs.
+  the first quarter (after warm-up) grow by less than `--max-rss-growth` (25 %), same for the
+  bot process; `aurix_active_sessions` / `aurix_active_participants` return to zero once the
+  bots leave.
+
+`target/soak/report.jsonl` has one row per report interval (`kind: "interval"`: fleet
+aggregates, per-node samples from Prometheus — RSS, fds, CPU seconds, sessions, cascade link
+transports — and one `bots[]` entry per client with state, media path, hearing ratio, loss,
+RTT, jitter, MOS, recovery counters) and one per hook (`kind: "chaos"`: exit status, output
+tail, recovery time, bots still unhealthy). `summary.json` is the verdict. The `Soak`
+workflow (`.github/workflows/soak.yml`) runs a 90 min rotation nightly on a hosted runner and
+can be dispatched with a longer duration; 24–72 h runs belong on a dedicated machine, where
+the time budget of hosted runners (6 h) does not apply. Like the chaos harness it is one host
+and one loopback: real partitions, cross-region RTT and NAT are still out of scope
+([Limitations](../limitations.md)).
+
 ## Building the book
 
 ```bash

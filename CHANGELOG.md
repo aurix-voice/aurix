@@ -11,8 +11,26 @@ released together.
 
 ## [Unreleased]
 
+### Added
+
+* **Soak harness.** `tools/soak/run.sh` + the `aurix-soak` bot runner keep the two-node chaos
+  topology under real native clients (`aurix-client`: SessionBind, join, Opus over QUIC/UDP/TLS,
+  resume, failover, token refresh) for hours while node kills, Redis failover, PostgreSQL
+  restarts, a UDP blackhole (→ TLS tunnel fallback and back) and a netem loss/delay/reorder
+  window run in rotation. Hearing ratio,
+  loss, replay/auth counters, recovery time per fault, node/harness RSS and fd growth and
+  leftover sessions are asserted; JSONL report + summary. Nightly 90 min run in the `Soak`
+  workflow, longer runs by dispatch or on a dedicated host
+  ([Development and load testing](docs/src/operations/development.md)).
+
 ### Fixed
 
+* Native TLS tunnel (`aurix-client`): the close reason is published before the closed flag, so a
+  reader that observes the link closed never sees an empty reason.
+* Web SDK WebTransport: `close()` records the reason and state before tearing the transport down,
+  so `onClose`/state observers see a consistent pair.
+* `aurix_active_participants` was registered but never updated; it now reports the number of
+  channel memberships on the node.
 * Unity native TLS tunnel: `TlsMediaTunnel.CloseReason` is now set before `IsClosed` flips, so an
   observer that sees the link closed always sees why (the `Closed` event still fires last).
 

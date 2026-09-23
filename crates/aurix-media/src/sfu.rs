@@ -1400,6 +1400,13 @@ impl SfuNode {
     pub fn active_channels(&self) -> u32 {
         self.channels.len() as u32
     }
+    /// Sum of channel memberships on this node (a session in two channels counts twice).
+    pub fn active_channel_memberships(&self) -> u64 {
+        self.channels
+            .iter()
+            .map(|c| u64::from(c.value().participant_count()))
+            .sum()
+    }
     pub fn channel_ids(&self) -> Vec<ChannelId> {
         self.channels.iter().map(|e| *e.key()).collect()
     }

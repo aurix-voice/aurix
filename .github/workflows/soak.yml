@@ -1,0 +1,63 @@
+name: Soak
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Total run time (aurix-soak duration syntax, e.g. 90m, 4h)"
+        default: "90m"
+      clients:
+        description: "Number of bots"
+        default: "16"
+      redis:
+        description: "Redis backend"
+        type: choice
+        options: [sentinel, cluster]
+        default: sentinel
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: "soak (${{ inputs.duration || '90m' }}, ${{ inputs.redis || 'sentinel' }})"
+    runs-on: ubuntu-latest
+    # Hosted runners cap a job at 6 h; the run itself is bounded by AURIX_SOAK_DURATION.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake jq
+      - run: cargo build --locked --release --bin aurix-server --bin aurix-soak
+      # Same topology as the chaos job (two nodes on loopback, PostgreSQL + Redis in host-network
+      # containers), but instead of the E2E suite the real native client core runs as bots for
+      # hours while tools/soak/run.sh kills nodes, fails Redis over, restarts PostgreSQL and
+      # blackholes UDP / shapes it with netem in rotation. Budgets (hearing, loss, recovery time, RSS/fd growth,
+      # leftover sessions) are asserted by aurix-soak; see tools/soak/run.sh.
+      - name: Soak
+        run: tools/soak/run.sh
+        env:
+          AURIX_CHAOS_REDIS: ${{ inputs.redis || 'sentinel' }}
+          AURIX_CHAOS_BIN: ${{ github.workspace }}/target/release/aurix-server
+          AURIX_SOAK_BIN: ${{ github.workspace }}/target/release/aurix-soak
+          AURIX_SOAK_DURATION: ${{ inputs.duration || '90m' }}
+          AURIX_SOAK_CLIENTS: ${{ inputs.clients || '16' }}
+          AURIX_SOAK_CHAOS_EVERY: 8m
+          AURIX_SOAK_CHAOS_FIRST: 4m
+      - name: Report
+        if: always()
+        run: |
+          [ -f target/soak/summary.json ] && jq . target/soak/summary.json || true
+          for f in target/soak/node*.log; do echo "::group::$f"; tail -n 300 "$f"; echo "::endgroup::"; done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ inputs.redis || 'sentinel' }}-${{ github.run_id }}
+          path: |
+            target/soak/report.jsonl
+            target/soak/summary.json
+            target/soak/node*.log
+          if-no-files-found: ignore
