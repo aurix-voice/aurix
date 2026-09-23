@@ -163,6 +163,26 @@ jobs:
         env:
           AURIX_E2E_DATABASE_URL: postgres://aurix:aurix@127.0.0.1:5432/aurix
         run: cargo test --locked -p aurix-db -- --ignored --nocapture
+      # Same listener-shaping environment as node 1, so doctor sees the running node, expects
+      # every configured listener bound and handshakes QUIC / the TLS tunnel against it.
+      - name: aurix doctor against node 1
+        env:
+          AURIX__TURN__ENABLED: "true"
+          AURIX__TURN__AUTH_SECRET: ci-only-turn-secret-0123456789abcdefghijklmno
+          AURIX__SERVER__EXTERNAL_URL: http://127.0.0.1:8080
+          AURIX__MEDIA__EXTERNAL_IP: 127.0.0.1
+          AURIX__MEDIA__CASCADE_SECRET: ci-only-cascade-secret-0123456789abcdef
+          AURIX__MEDIA__TLS_TUNNEL_PORT: "10443"
+        run: |
+          set -euo pipefail
+          ./target/debug/aurix doctor
+          ./target/debug/aurix -o json doctor > doctor.json
+          jq -e '.ok and .mode == "running"' doctor.json
+          for id in node port.api port.ws port.media port.tls_tunnel port.turn_udp redis postgres migrations probe.quic probe.tls_tunnel; do
+            jq -e --arg id "$id" '.checks[] | select(.id == $id) | .status == "ok"' doctor.json > /dev/null \
+              || { echo "doctor check $id is not ok"; jq --arg id "$id" '.checks[] | select(.id == $id)' doctor.json; exit 1; }
+          done
+          ! grep -q ci-only-turn-secret doctor.json
       - name: E2E (native client core)
         env:
           AURIX_E2E_API: http://127.0.0.1:8080

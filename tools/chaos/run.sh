@@ -7,6 +7,8 @@
 # (crates/aurix-server/tests/e2e_live.rs) prove the fleet keeps working:
 #
 #   baseline          two nodes, auto-cascade audio + fleet-wide rate limits (sanity)
+#   doctor            `aurix doctor` with node 1's environment: running node, bound listeners,
+#                     Redis in the configured mode, PostgreSQL + migrations, QUIC handshake
 #   node-kill         SIGKILL node 2 mid-session: registry marks it stale, the reaper closes its
 #                     rows, the player resumes on node 1 with the same session id / SSRC, node 2
 #                     is restarted and rejoins the fleet
@@ -35,6 +37,7 @@
 #
 # Environment:
 #   AURIX_CHAOS_BIN   aurix-server binary (default target/debug/aurix-server; built if missing)
+#   AURIX_CHAOS_CLI   aurix CLI binary for the doctor scenario (default target/debug/aurix)
 #   AURIX_CHAOS_DIR   state directory: logs, pids, credentials (default target/chaos)
 #   AURIX_CHAOS_KEEP  1 = leave the topology running after `all`
 #   AURIX_CHAOS_REDIS sentinel (default) | cluster
@@ -335,6 +338,44 @@ cmd_down() {
   rm -f "$STATE/admin-token" "$STATE/api-key" "$STATE/api-key2"
 }
 
+# `aurix doctor` with node 1's listener-shaping environment: it must recognise the running
+# node, see every configured listener bound, PING Redis in the configured mode (sentinel or
+# cluster), reach PostgreSQL with current migrations and handshake QUIC — without printing
+# the database password.
+cmd_doctor() {
+  local cli="${AURIX_CHAOS_CLI:-$ROOT/target/debug/aurix}" report="$STATE/doctor.json"
+  [ -x "$cli" ] || { log "building aurix CLI"; (cd "$ROOT" && cargo build --locked --bin aurix); }
+  log "scenario: aurix doctor against node 1 ($REDIS_MODE)"
+  local redis_env=()
+  mapfile -t redis_env < <(redis_env)
+  (
+    cd "$ROOT"
+    export AURIX__DATABASE__URL="$PG_URL" "${redis_env[@]}" \
+      AURIX__SERVER__NODE_ID="$NODE1_ID" \
+      AURIX__SERVER__API_PORT=8180 AURIX__SERVER__WS_PORT=8181 \
+      AURIX__SERVER__EXTERNAL_URL="http://127.0.0.1:8180" \
+      AURIX__SERVER__EXTERNAL_WS_URL="ws://127.0.0.1:8181/ws" \
+      AURIX__MEDIA__PORT=10110 AURIX__MEDIA__EXTERNAL_IP=127.0.0.1 \
+      AURIX__MEDIA__CASCADE_SECRET="$CASCADE_SECRET" \
+      AURIX__METRICS__PORT=9180 AURIX__TURN__ENABLED=false
+    "$cli" doctor
+    "$cli" -o json doctor >"$report"
+  )
+  jq -e '.ok and .mode == "running"' "$report" >/dev/null || fail "doctor did not pass against the running node"
+  local id
+  for id in node port.api port.ws port.media port.cascade port.cascade_tcp redis postgres migrations probe.quic; do
+    jq -e --arg id "$id" '.checks[] | select(.id == $id) | .status == "ok"' "$report" >/dev/null \
+      || fail "doctor check $id is not ok: $(jq -c --arg id "$id" '.checks[] | select(.id == $id)' "$report")"
+  done
+  jq -e --arg mode "$REDIS_MODE" '.checks[] | select(.id == "redis") | .details.mode == $mode' "$report" >/dev/null \
+    || fail "doctor reported the wrong Redis mode: $(jq -c '.checks[] | select(.id == "redis")' "$report")"
+  local pg_password="${PG_URL#*://*:}"; pg_password="${pg_password%%@*}"
+  if [ -n "$pg_password" ] && grep -qF "$pg_password" "$report"; then
+    fail "doctor leaked the PostgreSQL password into its report"
+  fi
+  log "doctor: $(jq -r '"\(.counts.ok) ok, \(.counts.warn) warn, \(.counts.fail) fail; redis \(.checks[] | select(.id == "redis") | .summary)"' "$report")"
+}
+
 # ── scenarios ────────────────────────────────────────────────────────────────────────────────
 
 cmd_baseline() {
@@ -460,6 +501,7 @@ cmd_all() {
   cmd_nodes
   cmd_bootstrap
   cmd_baseline
+  cmd_doctor
   cmd_node_kill
   cmd_redis_failover
   cmd_postgres_restart
@@ -487,6 +529,7 @@ for cmd in "$@"; do
     nodes) cmd_nodes ;;
     bootstrap) cmd_bootstrap ;;
     baseline) cmd_baseline ;;
+    doctor) cmd_doctor ;;
     node-kill) cmd_node_kill ;;
     redis-failover) cmd_redis_failover ;;
     postgres-restart) cmd_postgres_restart ;;
@@ -494,6 +537,6 @@ for cmd in "$@"; do
     down) cmd_down ;;
     hook-stop-node2) hook_stop_node2 ;;
     hook-start-node2) hook_start_node2 ;;
-    *) fail "unknown command '$cmd' (all|up|nodes|bootstrap|baseline|node-kill|redis-failover|postgres-restart|isolation|down)" ;;
+    *) fail "unknown command '$cmd' (all|up|nodes|bootstrap|baseline|doctor|node-kill|redis-failover|postgres-restart|isolation|down)" ;;
   esac
 done

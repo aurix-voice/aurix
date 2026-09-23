@@ -4,6 +4,7 @@ pub mod api;
 pub mod channel;
 pub mod config;
 pub mod diagnose;
+pub mod doctor;
 pub mod moderate;
 pub mod token;
 pub mod user;
@@ -39,6 +40,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Config management must work without a resolvable profile.
     if let Command::Config(args) = &cli.command {
         return config::run(args, &file, &out);
+    }
+    // Local preflight: node configuration, not an API profile.
+    if let Command::Doctor(args) = &cli.command {
+        return doctor::run(args, &out).await;
     }
 
     let resolved = cfg::resolve(
@@ -91,6 +96,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::App(a) => admin::apps(&ctx, a).await,
         Command::Api(a) => api::run(&ctx, a).await,
         Command::Diagnose(a) => diagnose::run(&ctx, a).await,
+        Command::Doctor(_) => unreachable!("handled before profile resolution"),
     }
 }
 

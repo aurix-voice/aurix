@@ -11,12 +11,17 @@ name = "aurix"
 path = "src/main.rs"
 
 [dependencies]
-aurix-common = { path = "../aurix-common" }
+aurix-common = { path = "../aurix-common", features = ["quic"] }
+aurix-db = { path = "../aurix-db" }
 clap = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+quinn = { workspace = true }
+sqlx = { workspace = true }
+x509-parser = "0.18"
 uuid = { workspace = true }
 chrono = { workspace = true }
 base64 = { workspace = true }
@@ -29,3 +34,5 @@ toml = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }

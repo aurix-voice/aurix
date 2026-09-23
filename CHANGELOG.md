@@ -13,6 +13,20 @@ released together.
 
 ### Added
 
+* **`aurix doctor`** — local preflight on the node host, no credentials needed: loads the
+  configuration exactly like the node (`configs/default` + file + `AURIX__*`), runs the node's
+  validation plus a production-mode preview, checks every configured TCP/UDP listener (free
+  before start, all bound while a node is running — detected via `/health`), parses the
+  API/media/WebTransport certificate pairs (chain, key, permissions, expiry, SAN vs
+  `quic_server_name`, ≤ 14-day WebTransport validity, SHA-256 pin), handshakes QUIC, the TLS
+  tunnel and WebTransport against a running node and compares the *served* certificate with
+  the configured one, opens Redis in the configured mode (direct / Sentinel / Cluster) and
+  `PING`s, connects to PostgreSQL and reports migration state (applied, pending, checksum
+  drift, failed rows, versions from a newer build) **without running anything**. Human or
+  `-o json` output, exit `2` on failure, `--strict` for warnings, `--skip-remote` /
+  `--skip-probes`; URL passwords and every secret configuration value are scrubbed from the
+  report. Runs in CI against the E2E node and in the chaos harness (`doctor` scenario, Sentinel
+  and Cluster) ([CLI](docs/src/backend/cli.md)).
 * **Soak harness.** `tools/soak/run.sh` + the `aurix-soak` bot runner keep the two-node chaos
   topology under real native clients (`aurix-client`: SessionBind, join, Opus over QUIC/UDP/TLS,
   resume, failover, token refresh) for hours while node kills, Redis failover, PostgreSQL

@@ -97,6 +97,8 @@ pub enum Command {
     Api(commands::api::Args),
     /// Connectivity, auth and contract diagnostics.
     Diagnose(commands::diagnose::Args),
+    /// Local node preflight: configuration, ports, certificates, Redis, PostgreSQL, migrations.
+    Doctor(commands::doctor::Args),
 }
 
 #[tokio::main]

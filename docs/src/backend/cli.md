@@ -123,6 +123,65 @@ credential resolved from (never the value), and `hints` — a rejected API key o
 operator token, a node that is up but not ready, a contract mismatch, a clock skew large
 enough to break token and webhook-signature tolerances.
 
+## Preflight on the node host: `aurix doctor`
+
+`diagnose` talks to a node over its API; `doctor` runs *on the node's host* against the node's
+configuration and needs no profile or credentials. Run it before the first start, after every
+configuration change and when a node refuses to come up:
+
+```sh
+cd /opt/aurix                       # the node's working directory (configs/default.toml is here)
+aurix doctor                        # configs/default + AURIX__* env, like the node itself
+aurix doctor -c /etc/aurix/node.toml
+aurix doctor --skip-remote          # no Redis / PostgreSQL connections (air-gapped preflight)
+aurix doctor --skip-probes          # no QUIC / TLS tunnel / WebTransport handshakes
+aurix doctor --strict               # warnings fail too (CI, production promotion)
+aurix -o json doctor --field checks # machine-readable report
+```
+
+What it checks, in order:
+
+* **config** — the file loads, `AURIX__*` overrides apply and the node's own validation passes;
+  **production** previews what `environment = "production"` would additionally reject
+  (placeholder secrets, `*` CORS, …) while you are still in development; **endpoints** —
+  `external_url` / `external_ws_url` / `media.external_ip` are set to something other machines
+  can reach.
+* **node** — `GET /health` on `server.api_port`. With no node the run is a *preflight*: every
+  configured TCP/UDP listener (API, WS, metrics, media, cascade UDP/TCP, TLS tunnel,
+  WebTransport, TURN) must be **free**, and a port that is already taken names the offender
+  class (another process vs. a privileged port vs. a host that is not local). With a node
+  running the same ports must all be **in use** — a free one means that listener failed to
+  start, and the node log says why.
+* **cert.\*** — the configured PEM pairs for the API/WS (`server.tls_*`), the media
+  certificate shared by QUIC and the TLS tunnel (`media.quic_*`) and the optional WebTransport
+  certificate: parseable chain, matching private key, key file permissions, validity window
+  (warning inside 14 days of expiry), `quic_server_name` among the SAN/CN, and for
+  WebTransport the ≤ 14-day validity browsers accept for `serverCertificateHashes`. The SHA-256
+  fingerprint clients pin is in the details.
+* **probe.\*** — with a node running: a real QUIC handshake on the media port, a TLS handshake
+  on the tunnel port and an HTTP/3 handshake on the WebTransport port; the certificate each
+  listener *serves* is compared with the configured file, so a node restarted with an old
+  certificate (or a foreign process on the port) is caught. This proves the transport is
+  reachable from this host, not that media flows — that needs a session.
+* **redis** — `RedisSource` is opened exactly as the node does (direct, Sentinel with master
+  discovery, or Cluster with `CLUSTER INFO`), then `PING`; the report shows the mode that
+  actually came up and, for Cluster, whether sharded Pub/Sub is available.
+* **postgres** / **migrations** — a plain connection (`SELECT version()`), then the
+  `_sqlx_migrations` table is compared with the migrations embedded in this binary: applied,
+  pending, checksum drift, rows left `success = false` by an interrupted run, and versions
+  from a *newer* build (the database was already migrated by a later node). **Doctor never
+  runs a migration**; with `database.run_migrations = true` a pending set is a warning ("the
+  node will apply them"), otherwise a failure.
+
+Exit code `0` when nothing failed (`2` with `--strict` if anything warned), `2` on any
+failure. Secrets never appear in the output: URL passwords are replaced with `***`, and the
+values of every secret configuration key are scrubbed from summaries, hints and error
+messages before printing — including inside connection errors quoted from a driver.
+
+Doctor reads the configuration the same way the node does, so run it from the node's working
+directory (where `configs/default.toml` lives) with the same environment. In the Docker image
+that is `docker exec <node> aurix doctor`.
+
 ## Limitations
 
 * The CLI is a REST client. It does not join channels or send audio; use a client SDK or the

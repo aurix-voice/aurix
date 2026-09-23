@@ -4,6 +4,12 @@ Start with `GET /ready`, the node's logs (`tracing.log_level = debug` or
 `RUST_LOG=aurix_ws=debug,aurix_media=debug,info`) and `/metrics`. Every REST/WebSocket error
 carries a stable `code` — the table at the end maps codes to causes.
 
+On the node's host, `aurix doctor` (run from the node's working directory with the same
+environment) covers the first two tables below in one pass: configuration and production
+preview, listener ports free or bound, certificate pairs and pins, a QUIC / TLS tunnel /
+WebTransport handshake against the running node, Redis in the configured mode, PostgreSQL and
+migration state — with secrets scrubbed ([CLI](../backend/cli.md#preflight-on-the-node-host-aurix-doctor)).
+
 ## The server does not start
 
 | symptom | cause / fix |

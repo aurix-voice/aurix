@@ -337,20 +337,27 @@ version = "1.5.0"
 dependencies = [
  "anyhow",
  "aurix-common",
+ "aurix-db",
  "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
  "hex",
  "hmac",
+ "quinn",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "subtle",
+ "time",
  "tokio",
+ "tokio-rustls",
  "toml 0.8.23",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
