@@ -71,6 +71,43 @@ const INCOMING_BUFFERED_DATAGRAMS = 256;
 /** Milliseconds after which a datagram still waiting in either browser queue is discarded. */
 const DATAGRAM_MAX_AGE_MS = 500;
 
+/**
+ * Chromium (through at least 153) keeps one internal promise per datagram handed to the network
+ * service and, once `outgoingMaxBufferedDatagrams` is raised above 1, resolves `write()` early
+ * without marking that promise handled; closing the session rejects every still-in-flight one
+ * with `WebTransportError("The session is closed.")` (source `session`) that no script can
+ * observe, so the page sees `unhandledrejection` events it cannot attribute. Those are swallowed
+ * for a short window after an Aurix session ends; nothing else is touched.
+ */
+const SESSION_CLOSE_NOISE_MS = 3000;
+const SESSION_CLOSED_MESSAGE = 'The session is closed.';
+let lastSessionCloseAt = -Infinity;
+let noiseFilterInstalled = false;
+
+function isSessionCloseNoise(reason: unknown): boolean {
+  if (typeof reason !== 'object' || reason === null) return false;
+  const ctor = (globalThis as { WebTransportError?: new (...args: never[]) => object }).WebTransportError;
+  if (typeof ctor !== 'function' || !(reason instanceof ctor)) return false;
+  const err = reason as { source?: string; message?: string };
+  return err.source === 'session' && err.message === SESSION_CLOSED_MESSAGE;
+}
+
+function onUnhandledRejection(event: PromiseRejectionEvent): void {
+  if (performance.now() - lastSessionCloseAt > SESSION_CLOSE_NOISE_MS) return;
+  if (isSessionCloseNoise(event.reason)) event.preventDefault();
+}
+
+function noteSessionClose(): void {
+  lastSessionCloseAt = performance.now();
+  if (noiseFilterInstalled) return;
+  const target = globalThis as {
+    addEventListener?: (type: string, listener: (event: PromiseRejectionEvent) => void) => void;
+  };
+  if (typeof target.addEventListener !== 'function') return;
+  target.addEventListener('unhandledrejection', onUnhandledRejection);
+  noiseFilterInstalled = true;
+}
+
 type DatagramQueueTuning = Partial<{
   outgoingMaxBufferedDatagrams: number;
   incomingMaxBufferedDatagrams: number;
@@ -239,6 +276,7 @@ export class AurxWebTransport extends AurxLink {
 
   private onTransportClosed(transport: WebTransport, reason: string): void {
     if (this.transport !== transport) return;
+    noteSessionClose();
     this.fail(reason);
   }
 
@@ -252,6 +290,7 @@ export class AurxWebTransport extends AurxLink {
         // a pending write keeps the lock; the transport close below ends it
       }
     }
+    noteSessionClose();
     try {
       transport.close({ closeCode: 0, reason: this.closeReason ?? 'done' });
     } catch {

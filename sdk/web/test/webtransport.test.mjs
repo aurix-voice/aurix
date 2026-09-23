@@ -249,6 +249,60 @@ test('server SessionClose and a dropped connection report onClosed once', async 
   assert.match(closes[1], /network gone/);
 });
 
+test('closing swallows only Chromium\'s unobservable "The session is closed." rejections, briefly', async () => {
+  class WebTransportError extends Error {
+    constructor(message, source) {
+      super(message);
+      this.source = source;
+    }
+  }
+  const listeners = [];
+  globalThis.WebTransportError = WebTransportError;
+  globalThis.addEventListener = (type, listener) => {
+    if (type === 'unhandledrejection') listeners.push(listener);
+  };
+  try {
+    FakeWebTransport.node = new FakeNode(KEY, 7);
+    const wt = new AurxWebTransport(session(), silentEvents());
+    await wt.connect(WT);
+    wt.close();
+    assert.equal(listeners.length, 1);
+    const fire = (reason) => {
+      const event = {
+        reason,
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+      };
+      for (const l of listeners) l(event);
+      return event.defaultPrevented;
+    };
+    assert.equal(fire(new WebTransportError('The session is closed.', 'session')), true);
+    assert.equal(fire(new WebTransportError('The session is closed.', 'stream')), false);
+    assert.equal(fire(new WebTransportError('Connection lost.', 'session')), false);
+    assert.equal(fire(new Error('The session is closed.')), false);
+    assert.equal(fire('The session is closed.'), false);
+
+    const realNow = performance.now;
+    performance.now = () => realNow.call(performance) + 10_000;
+    try {
+      assert.equal(fire(new WebTransportError('The session is closed.', 'session')), false);
+    } finally {
+      performance.now = realNow;
+    }
+
+    const again = new AurxWebTransport(session(), silentEvents());
+    await again.connect(WT);
+    again.close();
+    assert.equal(listeners.length, 1);
+    assert.equal(fire(new WebTransportError('The session is closed.', 'session')), true);
+  } finally {
+    delete globalThis.WebTransportError;
+    delete globalThis.addEventListener;
+  }
+});
+
 test('BitrateCommand reaches onBitrate', async () => {
   const node = new FakeNode(KEY, 7);
   FakeWebTransport.node = node;

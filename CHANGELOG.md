@@ -52,6 +52,14 @@ released together.
   or the browser's closing handshake eventually ended it. The socket is now dropped as soon as
   the media path is declared dead and the session resumes on a fresh one; the stale socket's
   late `onclose` is ignored. The keepalive timeout takes the same path.
+* **Web SDK: no stray `unhandledrejection` when a WebTransport session closes.** Chromium keeps
+  an internal promise per datagram handed to the network service and, with
+  `outgoingMaxBufferedDatagrams` above one, resolves `write()` before it settles; closing the
+  session then rejects the still-in-flight ones with `WebTransportError("The session is
+  closed.")` that no script holds, and the page logged an uncaught error it could not attribute
+  (Godot Web / Unity WebGL error hooks saw it as a failure). Exactly that error, from source
+  `session`, is now swallowed for three seconds after an Aurix transport ends; every other
+  rejection still surfaces.
 * **Web SDK: AudioWorklet / worker sources after minification.** The AURX playback/capture
   worklet, the voice-effects and viseme worklets and the E2EE worker were serialised with
   `Function.prototype.toString()` and then *called by their original name*; a bundler that
