@@ -348,9 +348,15 @@ struct TlsClosed {
 
 impl TlsClosed {
     fn set(&self, reason: String) {
-        if !self.flag.swap(true, Ordering::Relaxed) {
-            *self.reason.lock() = Some(reason);
+        let mut slot = self.reason.lock();
+        if slot.is_none() {
+            *slot = Some(reason);
+            self.flag.store(true, Ordering::Release);
         }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
     }
 }
 
@@ -751,7 +757,7 @@ impl MediaTransport {
     pub fn is_closed(&self) -> bool {
         match &self.link {
             Link::Quic { conn, .. } => conn.close_reason().is_some(),
-            Link::Tls { closed, .. } => closed.flag.load(Ordering::Relaxed),
+            Link::Tls { closed, .. } => closed.is_closed(),
             _ => false,
         }
     }
@@ -1237,6 +1243,34 @@ mod tests {
         assert_eq!(s.rtt_max_ms, 60.0);
         assert!((s.rtt_avg_ms - 40.0).abs() < 1e-4, "{}", s.rtt_avg_ms);
         assert_eq!(s.rtt_samples, 3);
+    }
+
+    #[test]
+    fn tls_closed_reason_is_readable_once_flag_is_visible() {
+        for _ in 0..200 {
+            let closed = Arc::new(TlsClosed::default());
+            let observer = {
+                let closed = closed.clone();
+                std::thread::spawn(move || loop {
+                    if closed.is_closed() {
+                        return closed.reason.lock().clone();
+                    }
+                    std::hint::spin_loop();
+                })
+            };
+            let first = {
+                let closed = closed.clone();
+                std::thread::spawn(move || closed.set("first".into()))
+            };
+            closed.set("second".into());
+            first.join().unwrap();
+            let seen = observer.join().unwrap();
+            assert!(
+                matches!(seen.as_deref(), Some("first") | Some("second")),
+                "flag visible without a reason: {seen:?}"
+            );
+            assert_eq!(seen, closed.reason.lock().clone());
+        }
     }
 
     /// Minimal fake server: answers `SessionBind`, echoes audio back sealed for the client,

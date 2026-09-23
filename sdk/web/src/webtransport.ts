@@ -351,8 +351,8 @@ export class AurxWebTransport {
 
   close(reason = 'closed by client'): void {
     if (this.state === 'closed') return;
-    this.state = 'closed';
     this.closeReason = reason;
+    this.state = 'closed';
     this.stopHeartbeats();
     this.bindAck?.(false);
     this.bindAck = undefined;
