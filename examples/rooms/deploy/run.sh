@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # Runs the whole Rooms demo on one host: PostgreSQL + Redis (Docker), an Aurix node, the Rooms
 # backend serving the built frontend, the bot, Caddy as the single origin and — optionally — an
-# ngrok tunnel for a public HTTPS address. Everything lives under $ROOMS_STATE (default
+# HTTP tunnel for a public HTTPS address. Everything lives under $ROOMS_STATE (default
 # ~/.aurix-rooms): generated secrets, the API key, pid files and logs. Nothing is written to the
 # repository.
 #
 #   deploy/run.sh up          start (or re-attach to) every component, bootstrap the node once
 #   deploy/run.sh down        stop the processes this script started (databases stay up)
 #   deploy/run.sh status      health of every component
-#   deploy/run.sh logs <name> tail a component log: node | rooms | bot | caddy | ngrok
+#   deploy/run.sh logs <name> tail a component log: node | rooms | bot | ngrok | tunnel
 #
 # Environment:
 #   PUBLIC_ORIGIN   https://<host> the browser will use (default http://127.0.0.1:8000)
 #   NGROK_DOMAIN    start `ngrok http` on this reserved domain (needs an authenticated ngrok agent);
 #                   PUBLIC_ORIGIN defaults to https://$NGROK_DOMAIN
+#   QUICK_TUNNEL    localhost.run | cloudflared — an account-less tunnel with a random host that
+#                   changes on every start (ssh -R to localhost.run, or a cloudflared quick tunnel).
+#                   The tunnel comes up first, its host becomes PUBLIC_ORIGIN, and the node,
+#                   backend and bot are restarted when the host changed since the last `up`.
 #   ROOMS_TRANSPORT websocket | auto | webrtc | webtransport (default: websocket when a tunnel is
 #                   in front — HTTP tunnels carry no UDP — otherwise auto)
 #   AURIX_BIN / BOT_BIN   binaries (default target/release/…; built when missing)
@@ -35,8 +39,12 @@ AURIX_MEDIA_PORT=${AURIX_MEDIA_PORT:-4000}
 PG_URL=${PG_URL:-postgres://aurix:aurix@127.0.0.1:5432/aurix}
 REDIS_URL=${REDIS_URL:-redis://127.0.0.1:6379}
 NGROK_DOMAIN=${NGROK_DOMAIN:-}
+QUICK_TUNNEL=${QUICK_TUNNEL:-}
 if [ -n "$NGROK_DOMAIN" ]; then
   PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-https://$NGROK_DOMAIN}
+  ROOMS_TRANSPORT=${ROOMS_TRANSPORT:-websocket}
+elif [ -n "$QUICK_TUNNEL" ]; then
+  PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-}
   ROOMS_TRANSPORT=${ROOMS_TRANSPORT:-websocket}
 else
   PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-http://127.0.0.1:$ROOMS_PROXY_PORT}
@@ -80,6 +88,7 @@ cmd_databases() {
 }
 
 cmd_node() {
+  [ -n "$PUBLIC_ORIGIN" ] || fail "PUBLIC_ORIGIN is not known yet"
   pid_alive node && { log "node already running"; return; }
   [ -x "$AURIX_BIN" ] || { log "building aurix-server"; (cd "$ROOT" && cargo build --release --locked --bin aurix-server); }
   log "starting aurix-server (api $AURIX_API_PORT, ws $AURIX_WS_PORT)"
@@ -191,9 +200,58 @@ cmd_ngrok() {
   wait_for "tunnel" 30 curl -fsS -o /dev/null "https://$NGROK_DOMAIN/healthz"
 }
 
+# Quick tunnels get a fresh host on every start; it is only known from the agent's own output.
+start_quick_tunnel() {
+  case "$QUICK_TUNNEL" in
+    localhost.run)
+      need ssh
+      nohup ssh -T -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 \
+        -o ExitOnForwardFailure=yes -R "80:127.0.0.1:$ROOMS_PROXY_PORT" nokey@localhost.run \
+        >>"$STATE/tunnel.log" 2>&1 </dev/null &
+      echo $! >"$STATE/tunnel.pid"
+      HOST_PATTERN='https://[a-z0-9]*\.lhr\.life' ;;
+    cloudflared)
+      need cloudflared
+      nohup cloudflared tunnel --url "http://127.0.0.1:$ROOMS_PROXY_PORT" --no-autoupdate \
+        >>"$STATE/tunnel.log" 2>&1 &
+      echo $! >"$STATE/tunnel.pid"
+      HOST_PATTERN='https://[a-z0-9-]*\.trycloudflare\.com' ;;
+    *) fail "QUICK_TUNNEL must be localhost.run or cloudflared" ;;
+  esac
+}
+
+cmd_tunnel() {
+  [ -n "$QUICK_TUNNEL" ] || return 0
+  local origin_file=$STATE/public-origin previous=
+  [ -s "$origin_file" ] && previous=$(cat "$origin_file")
+  if pid_alive tunnel && [ -n "$previous" ]; then
+    log "tunnel already running → $previous"
+  else
+    log "starting $QUICK_TUNNEL quick tunnel"
+    : >"$STATE/tunnel.log"
+    start_quick_tunnel
+    local host=
+    for _ in $(seq 1 60); do
+      host=$(sed 's/\x1b\[[0-9;]*m//g' "$STATE/tunnel.log" | grep -o "$HOST_PATTERN" | head -n 1 || true)
+      [ -n "$host" ] && break
+      sleep 0.5
+    done
+    [ -n "$host" ] || fail "$QUICK_TUNNEL printed no public host, see $STATE/tunnel.log"
+    printf '%s' "$host" >"$origin_file"
+  fi
+  [ -n "$PUBLIC_ORIGIN" ] || PUBLIC_ORIGIN=$(cat "$origin_file")
+  if [ -n "$previous" ] && [ "$previous" != "$PUBLIC_ORIGIN" ]; then
+    log "public host changed ($previous → $PUBLIC_ORIGIN): restarting node, backend and bot"
+    for p in bot rooms node; do
+      if [ -f "$STATE/$p.pid" ]; then kill "$(cat "$STATE/$p.pid")" 2>/dev/null || true; rm -f "$STATE/$p.pid"; fi
+    done
+  fi
+}
+
 cmd_up() {
   mkdir -p "$STATE"
   cmd_databases
+  cmd_tunnel
   cmd_node
   cmd_bootstrap
   cmd_frontend
@@ -201,11 +259,14 @@ cmd_up() {
   cmd_caddy
   cmd_bot
   cmd_ngrok
+  if [ -n "$QUICK_TUNNEL" ]; then
+    wait_for "tunnel" 60 curl -fsS -o /dev/null "$PUBLIC_ORIGIN/healthz"
+  fi
   log "up — $PUBLIC_ORIGIN"
 }
 
 cmd_down() {
-  for p in ngrok bot rooms node; do
+  for p in ngrok tunnel bot rooms node; do
     if [ -f "$STATE/$p.pid" ]; then kill "$(cat "$STATE/$p.pid")" 2>/dev/null || true; rm -f "$STATE/$p.pid"; fi
   done
   docker rm -f $CADDY_CONTAINER >/dev/null 2>&1 || true
@@ -213,7 +274,7 @@ cmd_down() {
 }
 
 cmd_status() {
-  for p in node rooms bot ngrok; do
+  for p in node rooms bot ngrok tunnel; do
     if pid_alive "$p"; then echo "$p: running (pid $(cat "$STATE/$p.pid"))"; else echo "$p: stopped"; fi
   done
   echo "caddy: $(docker inspect -f '{{.State.Status}}' $CADDY_CONTAINER 2>/dev/null || echo stopped)"
@@ -221,10 +282,14 @@ cmd_status() {
   curl -fsS "$ROOMS/healthz" 2>/dev/null && echo || echo "rooms /healthz: FAIL"
   curl -fsS "$ROOMS/api/rooms/lounge" 2>/dev/null | jq -c '{participants, bot: (.bot // null | if . then {track: .track.title, kind: .track.kind, positionMs} else null end)}' 2>/dev/null || echo "lounge: unavailable"
   [ -n "$NGROK_DOMAIN" ] && { curl -fsS -o /dev/null "https://$NGROK_DOMAIN/healthz" && echo "public https://$NGROK_DOMAIN: ok" || echo "public: FAIL"; }
+  if [ -s "$STATE/public-origin" ] && pid_alive tunnel; then
+    local origin; origin=$(cat "$STATE/public-origin")
+    curl -fsS -o /dev/null "$origin/healthz" && echo "public $origin: ok" || echo "public $origin: FAIL"
+  fi
   true
 }
 
-cmd_logs() { tail -n "${LINES:-80}" -f "$STATE/${1:?node|rooms|bot|ngrok}.log"; }
+cmd_logs() { tail -n "${LINES:-80}" -f "$STATE/${1:?node|rooms|bot|ngrok|tunnel}.log"; }
 
 case "${1:-}" in
   up) cmd_up ;;

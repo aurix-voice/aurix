@@ -19,7 +19,7 @@ bot (native aurix-client, UDP/QUIC) ─────────▶ Aurix node
 | Backend | [`server/`](server) | rooms ⇄ Aurix channels `rooms/<slug>`, join → one-channel session token, bot session/status, SSE "now playing", static frontend, strict CSP. The API key never leaves this process. |
 | Frontend | [`web/`](web) | Vite + React + TypeScript on `@aurix/web-sdk`: lobby with mic check, room with tiles, chat, quality, autoplay unlock, reconnect states. |
 | Bot | [`bot/`](bot) | Rust binary on `aurix-client`: 48 kHz playlist (stereo music, mono speech/ambience, generated tone/sweep/stereo check/pink noise), `!np` `!next` `!list` chat commands, token refresh, resume/failover. |
-| Deploy | [`deploy/`](deploy) | `run.sh up|down|status|logs` — PostgreSQL + Redis (Docker), node, backend, bot, Caddy, optional ngrok. |
+| Deploy | [`deploy/`](deploy) | `run.sh up|down|status|logs` — PostgreSQL + Redis (Docker), node, backend, bot, Caddy, optional HTTP tunnel (ngrok, localhost.run, cloudflared). |
 
 ## Run it
 
@@ -32,11 +32,17 @@ examples/rooms/deploy/run.sh status
 ```
 
 Public address from a host without inbound connectivity (an authenticated ngrok agent and a
-reserved domain):
+reserved domain, or an account-less quick tunnel with a random host that changes on every start):
 
 ```sh
 NGROK_DOMAIN=example.ngrok-free.dev examples/rooms/deploy/run.sh up
+QUICK_TUNNEL=localhost.run examples/rooms/deploy/run.sh up    # ssh -R; prints the host at the end
+QUICK_TUNNEL=cloudflared examples/rooms/deploy/run.sh up      # cloudflared quick tunnel
 ```
+
+localhost.run passes the bot's `text/event-stream` status through unbuffered; with a cloudflared
+quick tunnel the same stream reached the browser only once the response ended, so the
+now-playing panel stays empty behind it while voice and chat work.
 
 HTTP tunnels carry no UDP, so behind one the frontend is configured with
 `transport: 'websocket'` (AURX over the control WebSocket, see the Web SDK docs). On a host with a

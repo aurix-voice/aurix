@@ -15,7 +15,9 @@ const dist = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'dist');
  * The worklet / worker sources are built from `Function.prototype.toString()`, so nothing in them
  * may refer to a module-level binding by its literal name inside a string. Simulate the mangler on
  * the compiled module: rename every declared function / class in code, leaving string and template
- * literal text alone (like a real minifier), then import the mangled module and run its source.
+ * literal text alone (like a real minifier), turn every class declaration into an anonymous class
+ * expression (`X = class {}`, as rolldown/oxc emit — its `toString()` carries no name), then
+ * import the mangled module and run its source.
  */
 function mangleModule(code) {
   const names = new Map(
@@ -77,6 +79,9 @@ function mangleModule(code) {
       out += code[i++];
     }
   }
+  out = out.replace(/\b(export\s+)?class\s+([A-Za-z_$][\w$]*)\s*(extends\s+[\w$.]+\s*)?\{/g, (m, ex, name, ext) =>
+    name === 'extends' ? m : `${ex ?? ''}var ${name} = class ${ext ?? ''}{`,
+  );
   return { code: out, names };
 }
 

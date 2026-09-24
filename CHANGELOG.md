@@ -66,7 +66,14 @@ released together.
   renames identifiers (any production Vite/Rollup/esbuild build) produced a module that failed
   with `ReferenceError` and `The node name 'aurix-aurx-capture' is not defined`. The serialised
   function is now invoked as an expression; a test mangles the compiled SDK and evaluates every
-  generated source.
+  generated source. Second half of the same bug: rolldown (Vite 7) lowers top-level classes to
+  anonymous class expressions, so serialising `E2eeSenderKey`, the effect stages and
+  `VisemeAnalyzer` one by one yielded `class{…}` statements — `SyntaxError: Unexpected token '{'`
+  at worker start, and E2EE / voice effects / visemes did not run in such a build. Every worker
+  and worklet now serialises one function that declares all of its units, so a minifier renames
+  the classes and their cross-references together; the mangling test also anonymises classes.
+  `E2eeSenderKey`, `E2eeReplayState`, `E2eePeerKeys`, `FrameCrypto`, the `*Stage` classes,
+  `VoiceEffectChain` and `VisemeAnalyzer` remain exported (as constructors with interface types).
 
 ## [1.6.0] - 2026-09-23
 

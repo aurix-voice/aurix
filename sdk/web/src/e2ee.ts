@@ -15,10 +15,9 @@
  * `BigInt` (WebCrypto X25519 is not available in every engine and raw-key import differs
  * between the ones that have it). It runs only when keys are exchanged, never per frame.
  *
- * The classes between `WORKER_UNITS_BEGIN` and `WORKER_UNITS_END` are also serialised
- * (`Function.prototype.toString`) into the worker that backs `RTCRtpScriptTransform`, so they
- * must be self-contained: no imports, no references to module-level bindings other than
- * `E2EE` (inlined as JSON) and each other.
+ * `e2eeWorkerUnits` (between `WORKER_UNITS_BEGIN` and `WORKER_UNITS_END`) is also serialised
+ * (`Function.prototype.toString`) into the worker that backs `RTCRtpScriptTransform`, so its
+ * body must be self-contained: no imports, no references to module-level bindings.
  */
 
 const E2EE = {
@@ -293,147 +292,12 @@ export class E2eeIdentity {
 
 // ── WORKER_UNITS_BEGIN ───────────────────────────────────────────────────────────────────
 
-/** Frame keys of one sender generation. */
-export class E2eeSenderKey {
-  private constructor(
-    readonly generation: number,
-    private readonly enc: CryptoKey,
-    private readonly auth: CryptoKey,
-    private readonly salt: Uint8Array,
-  ) {}
-
-  static async derive(generation: number, secret: Uint8Array): Promise<E2eeSenderKey> {
-    const subtle = globalThis.crypto.subtle;
-    const ikm = await subtle.importKey('raw', secret as Uint8Array<ArrayBuffer>, 'HKDF', false, ['deriveBits']);
-    const expand = async (info: string, len: number) =>
-      new Uint8Array(
-        await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: Uint8Array.from(info, (c) => c.charCodeAt(0)) }, ikm, len * 8),
-      );
-    const [enc, auth, salt] = await Promise.all([
-      expand('aurix-e2ee-v1 enc', 32),
-      expand('aurix-e2ee-v1 auth', 32),
-      expand('aurix-e2ee-v1 salt', 12),
-    ]);
-    const [encKey, authKey] = await Promise.all([
-      subtle.importKey('raw', enc, { name: 'AES-CTR' }, false, ['encrypt']),
-      subtle.importKey('raw', auth, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
-    ]);
-    return new E2eeSenderKey(generation & 0xff, encKey, authKey, salt);
-  }
-
-  private iv(counter: number): Uint8Array<ArrayBuffer> {
-    const iv = new Uint8Array(16);
-    iv[0] = this.generation;
-    iv[1] = (counter >>> 24) & 0xff;
-    iv[2] = (counter >>> 16) & 0xff;
-    iv[3] = (counter >>> 8) & 0xff;
-    iv[4] = counter & 0xff;
-    for (let i = 0; i < 12; i++) iv[i] = (iv[i] ?? 0) ^ (this.salt[i] ?? 0);
-    return iv;
-  }
-
-  /** Encrypts `plain` as frame number `counter` of this generation. */
-  async seal(counter: number, plain: Uint8Array): Promise<Uint8Array> {
-    const subtle = globalThis.crypto.subtle;
-    const out = new Uint8Array(plain.length + 15);
-    out[0] = this.generation;
-    out[1] = (counter >>> 24) & 0xff;
-    out[2] = (counter >>> 16) & 0xff;
-    out[3] = (counter >>> 8) & 0xff;
-    out[4] = counter & 0xff;
-    if (plain.length > 0) {
-      const ct = await subtle.encrypt({ name: 'AES-CTR', counter: this.iv(counter), length: 128 }, this.enc, plain as Uint8Array<ArrayBuffer>);
-      out.set(new Uint8Array(ct), 5);
-    }
-    const tag = new Uint8Array(await subtle.sign('HMAC', this.auth, out.subarray(0, 5 + plain.length) as Uint8Array<ArrayBuffer>));
-    out.set(tag.subarray(0, 10), 5 + plain.length);
-    return out;
-  }
-
-  /** Generation byte and counter of an encrypted frame (no authentication). */
-  static peek(frame: Uint8Array): { generation: number; counter: number } | undefined {
-    if (frame.length < 15) return undefined;
-    return {
-      generation: frame[0] ?? 0,
-      counter: ((frame[1] ?? 0) * 0x1000000 + ((frame[2] ?? 0) << 16) + ((frame[3] ?? 0) << 8) + (frame[4] ?? 0)) >>> 0,
-    };
-  }
-
-  /** Authenticates and decrypts a frame of this generation. */
-  async open(frame: Uint8Array): Promise<Uint8Array> {
-    const head = E2eeSenderKey.peek(frame);
-    if (!head) throw new Error('E2EE frame too short');
-    if (head.generation !== this.generation) throw new Error('E2EE frame generation mismatch');
-    const subtle = globalThis.crypto.subtle;
-    const body = frame.subarray(0, frame.length - 10);
-    const tag = frame.subarray(frame.length - 10);
-    const expected = new Uint8Array(await subtle.sign('HMAC', this.auth, body as Uint8Array<ArrayBuffer>));
-    if (!FrameCrypto.tagsEqual(expected.subarray(0, 10), tag)) throw new Error('E2EE frame failed authentication');
-    const ct = body.subarray(5);
-    if (ct.length === 0) return new Uint8Array(0);
-    return new Uint8Array(await subtle.encrypt({ name: 'AES-CTR', counter: this.iv(head.counter), length: 128 }, this.enc, ct as Uint8Array<ArrayBuffer>));
-  }
-}
-
-/** Anti-replay window of one received generation (bit `i` of `window`: `highest - i` seen). */
-export class E2eeReplayState {
-  private highest: number | undefined = undefined;
-  private window = 0n;
-
-  /** `true` (and records it) when `counter` was not seen before and is not too old. */
-  accept(counter: number): boolean {
-    const h = this.highest;
-    if (h === undefined) {
-      this.highest = counter;
-      this.window = 1n;
-      return true;
-    }
-    if (counter > h) {
-      const shift = counter - h;
-      this.window = shift >= 128 ? 0n : (this.window << BigInt(shift)) & ((1n << 128n) - 1n);
-      this.window |= 1n;
-      this.highest = counter;
-      return true;
-    }
-    const age = h - counter;
-    if (age >= 128) return false;
-    const bit = 1n << BigInt(age);
-    if ((this.window & bit) !== 0n) return false;
-    this.window |= bit;
-    return true;
-  }
-}
-
-/** Receiving side of one peer: its last few sender keys. */
-export class E2eePeerKeys {
-  private generations: Array<{ key: E2eeSenderKey; replay: E2eeReplayState }> = [];
-
-  insert(key: E2eeSenderKey): void {
-    this.generations = this.generations.filter((g) => g.key.generation !== key.generation);
-    this.generations.push({ key, replay: new E2eeReplayState() });
-    while (this.generations.length > 4) this.generations.shift();
-  }
-
-  get isEmpty(): boolean {
-    return this.generations.length === 0;
-  }
-
-  hasGeneration(generation: number): boolean {
-    return this.generations.some((g) => g.key.generation === generation);
-  }
-
-  /** Decrypts `frame`, rejecting unknown generations and replayed counters. */
-  async open(frame: Uint8Array): Promise<Uint8Array> {
-    const head = E2eeSenderKey.peek(frame);
-    if (!head) throw new Error('E2EE frame too short');
-    const g = this.generations.find((x) => x.key.generation === head.generation);
-    if (!g) throw new Error('no key for this E2EE generation');
-    const plain = await g.key.open(frame);
-    if (!g.replay.accept(head.counter)) throw new Error('replayed E2EE frame');
-    return plain;
-  }
-}
-
+/**
+ * Everything the transform worker needs, in one function scope. The worker script is this
+ * function's `toString()` — a minifier renames the classes and their cross-references together,
+ * whereas separately serialised top-level classes come out as anonymous `class{}` expressions
+ * whose bindings the worker never sees.
+ */
 export type E2eeMode = 'plain' | 'hold' | 'encrypt';
 
 export interface E2eeFrameStats {
@@ -443,144 +307,6 @@ export interface E2eeFrameStats {
   undecryptable: number;
   /** Uplink frames dropped while the session's encryption state was still unknown. */
   held: number;
-}
-
-/**
- * Per-frame side of the group: the local sender key + counter, every peer's sender keys and
- * the `mid → user` layout of the per-participant downlink tracks. Lives wherever the encoded
- * frames are (main thread or the transform worker) and is fed by [`E2eeGroup`].
- *
- * - `plain`: frames pass untouched (no encrypted channel joined).
- * - `hold`: uplink frames are dropped (a join is in flight and may turn out encrypted).
- * - `encrypt`: uplink frames are sealed; downlink frames are opened with their sender's key or
- *   dropped — never played back as received.
- */
-export class FrameCrypto {
-  mode: E2eeMode = 'plain';
-  private own: { key: E2eeSenderKey; counter: number } | undefined = undefined;
-  private peers = new Map<string, E2eePeerKeys>();
-  layout = new Map<string, string>();
-  readonly stats: E2eeFrameStats = { framesE2ee: 0, undecryptable: 0, held: 0 };
-  /** Called once when the frame counter of the current key reaches the rotation threshold. */
-  onRotateNeeded: (() => void) | undefined = undefined;
-  private rotateSignalled = false;
-
-  static tagsEqual(a: Uint8Array, b: Uint8Array): boolean {
-    if (a.length !== b.length) return false;
-    let diff = 0;
-    for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-    return diff === 0;
-  }
-
-  get generation(): number | undefined {
-    return this.own?.key.generation;
-  }
-
-  async setOwnKey(generation: number, secret: Uint8Array): Promise<void> {
-    const key = await E2eeSenderKey.derive(generation, secret);
-    this.own = { key, counter: 0 };
-    this.rotateSignalled = false;
-  }
-
-  async setPeerKey(userId: string, generation: number, secret: Uint8Array): Promise<void> {
-    const key = await E2eeSenderKey.derive(generation, secret);
-    let keys = this.peers.get(userId);
-    if (!keys) {
-      keys = new E2eePeerKeys();
-      this.peers.set(userId, keys);
-    }
-    keys.insert(key);
-  }
-
-  forgetPeer(userId: string): void {
-    this.peers.delete(userId);
-  }
-
-  hasKeyFor(userId: string): boolean {
-    const keys = this.peers.get(userId);
-    return keys !== undefined && !keys.isEmpty;
-  }
-
-  peerHasGeneration(userId: string, generation: number): boolean {
-    return this.peers.get(userId)?.hasGeneration(generation) ?? false;
-  }
-
-  setLayout(entries: Array<[string, string | undefined]>): void {
-    this.layout = new Map();
-    for (const [mid, user] of entries) if (user !== undefined) this.layout.set(mid, user);
-  }
-
-  /** Encrypts one of our frames. */
-  async encrypt(plain: Uint8Array): Promise<Uint8Array> {
-    const own = this.own;
-    if (!own) throw new Error('no E2EE sender key');
-    const counter = own.counter;
-    own.counter = (own.counter + 1) >>> 0;
-    if (own.counter >= 2 ** 31 && !this.rotateSignalled) {
-      this.rotateSignalled = true;
-      this.onRotateNeeded?.();
-    }
-    this.stats.framesE2ee += 1;
-    return own.key.seal(counter, plain);
-  }
-
-  /** Decrypts a frame sent by `userId`. */
-  async decrypt(userId: string, frame: Uint8Array): Promise<Uint8Array> {
-    const keys = this.peers.get(userId);
-    if (!keys) throw new Error('unknown E2EE sender');
-    return keys.open(frame);
-  }
-
-  /** Uplink: the bytes to send in place of `data`, or `undefined` to drop the frame. */
-  async transformSend(data: Uint8Array): Promise<Uint8Array | undefined> {
-    switch (this.mode) {
-      case 'plain':
-        return data;
-      case 'hold':
-        this.stats.held += 1;
-        return undefined;
-      case 'encrypt':
-        if (!this.own) {
-          this.stats.held += 1;
-          return undefined;
-        }
-        return this.encrypt(data);
-      default:
-        return undefined;
-    }
-  }
-
-  /** Downlink track `mid`: the bytes to play in place of `data`, or `undefined` to drop. */
-  async transformReceive(mid: string | null, data: Uint8Array): Promise<Uint8Array | undefined> {
-    if (this.mode !== 'encrypt') return data;
-    const user = mid === null ? undefined : this.layout.get(mid);
-    if (user === undefined) return undefined;
-    try {
-      const plain = await this.decrypt(user, data);
-      this.stats.framesE2ee += 1;
-      return plain;
-    } catch {
-      this.stats.undecryptable += 1;
-      return undefined;
-    }
-  }
-
-  /** A `TransformStream` transformer for one sender (`kind: 'sender'`) or receiver pipeline. */
-  transformer(kind: 'sender' | 'receiver', midOf: () => string | null): Transformer<RTCEncodedAudioFrame, RTCEncodedAudioFrame> {
-    return {
-      transform: async (frame, controller) => {
-        const input = new Uint8Array(frame.data);
-        const output = kind === 'sender' ? await this.transformSend(input) : await this.transformReceive(midOf(), input);
-        if (output === undefined) return;
-        if (output !== input) {
-          const buf = new ArrayBuffer(output.byteLength);
-          new Uint8Array(buf).set(output);
-          frame.data = buf;
-        }
-        controller.enqueue(frame);
-      },
-    };
-  }
 }
 
 /** Messages `E2eeGroup` posts to the transform worker (and it answers). */
@@ -606,66 +332,423 @@ interface RTCTransformerLike {
   options: { kind: 'sender' | 'receiver'; mid: string | null };
 }
 
-/** Body of the `RTCRtpScriptTransform` worker: one `FrameCrypto` fed over `postMessage`. */
-export function e2eeWorkerMain(scope: WorkerScope): FrameCrypto {
-  const frames = new FrameCrypto();
-  frames.onRotateNeeded = () => scope.postMessage({ type: 'rotate' });
-  let queue: Promise<unknown> = Promise.resolve();
-  const serial = (task: () => Promise<void> | void) => {
-    queue = queue.then(task, task);
-  };
-  scope.onmessage = (ev) => {
-    const m = ev.data;
-    switch (m.type) {
-      case 'mode':
-        serial(() => {
-          frames.mode = m.mode;
-        });
-        return;
-      case 'ownKey':
-        serial(() => frames.setOwnKey(m.generation, m.secret));
-        return;
-      case 'peerKey':
-        serial(() => frames.setPeerKey(m.userId, m.generation, m.secret));
-        return;
-      case 'forgetPeer':
-        serial(() => frames.forgetPeer(m.userId));
-        return;
-      case 'layout':
-        serial(() => frames.setLayout(m.entries));
-        return;
-      case 'stats':
-        scope.postMessage({ type: 'stats', stats: { ...frames.stats } });
-        return;
-      default:
-        return;
+/** Frame keys of one sender generation. */
+export interface E2eeSenderKey {
+  readonly generation: number;
+  /** Encrypts `plain` as frame number `counter` of this generation. */
+  seal(counter: number, plain: Uint8Array): Promise<Uint8Array>;
+  /** Authenticates and decrypts a frame of this generation. */
+  open(frame: Uint8Array): Promise<Uint8Array>;
+}
+
+export interface E2eeSenderKeyStatic {
+  derive(generation: number, secret: Uint8Array): Promise<E2eeSenderKey>;
+  /** Generation byte and counter of an encrypted frame (no authentication). */
+  peek(frame: Uint8Array): { generation: number; counter: number } | undefined;
+}
+
+/** Anti-replay window of one received generation. */
+export interface E2eeReplayState {
+  /** `true` (and records it) when `counter` was not seen before and is not too old. */
+  accept(counter: number): boolean;
+}
+
+/** Receiving side of one peer: its last few sender keys. */
+export interface E2eePeerKeys {
+  insert(key: E2eeSenderKey): void;
+  readonly isEmpty: boolean;
+  hasGeneration(generation: number): boolean;
+  /** Decrypts `frame`, rejecting unknown generations and replayed counters. */
+  open(frame: Uint8Array): Promise<Uint8Array>;
+}
+
+/**
+ * Per-frame side of the group: the local sender key + counter, every peer's sender keys and
+ * the `mid → user` layout of the per-participant downlink tracks. Lives wherever the encoded
+ * frames are (main thread or the transform worker) and is fed by [`E2eeGroup`].
+ *
+ * - `plain`: frames pass untouched (no encrypted channel joined).
+ * - `hold`: uplink frames are dropped (a join is in flight and may turn out encrypted).
+ * - `encrypt`: uplink frames are sealed; downlink frames are opened with their sender's key or
+ *   dropped — never played back as received.
+ */
+export interface FrameCrypto {
+  mode: E2eeMode;
+  layout: Map<string, string>;
+  readonly stats: E2eeFrameStats;
+  /** Called once when the frame counter of the current key reaches the rotation threshold. */
+  onRotateNeeded: (() => void) | undefined;
+  readonly generation: number | undefined;
+  setOwnKey(generation: number, secret: Uint8Array): Promise<void>;
+  setPeerKey(userId: string, generation: number, secret: Uint8Array): Promise<void>;
+  forgetPeer(userId: string): void;
+  hasKeyFor(userId: string): boolean;
+  peerHasGeneration(userId: string, generation: number): boolean;
+  setLayout(entries: Array<[string, string | undefined]>): void;
+  /** Encrypts one of our frames. */
+  encrypt(plain: Uint8Array): Promise<Uint8Array>;
+  /** Decrypts a frame sent by `userId`. */
+  decrypt(userId: string, frame: Uint8Array): Promise<Uint8Array>;
+  /** Uplink: the bytes to send in place of `data`, or `undefined` to drop the frame. */
+  transformSend(data: Uint8Array): Promise<Uint8Array | undefined>;
+  /** Downlink track `mid`: the bytes to play in place of `data`, or `undefined` to drop. */
+  transformReceive(mid: string | null, data: Uint8Array): Promise<Uint8Array | undefined>;
+  /** A `TransformStream` transformer for one sender (`kind: 'sender'`) or receiver pipeline. */
+  transformer(kind: 'sender' | 'receiver', midOf: () => string | null): Transformer<RTCEncodedAudioFrame, RTCEncodedAudioFrame>;
+}
+
+export interface FrameCryptoStatic {
+  new (): FrameCrypto;
+  tagsEqual(a: Uint8Array, b: Uint8Array): boolean;
+}
+
+interface E2eeWorkerUnits {
+  E2eeSenderKey: E2eeSenderKeyStatic;
+  E2eeReplayState: new () => E2eeReplayState;
+  E2eePeerKeys: new () => E2eePeerKeys;
+  FrameCrypto: FrameCryptoStatic;
+  /** Body of the `RTCRtpScriptTransform` worker: one `FrameCrypto` fed over `postMessage`. */
+  e2eeWorkerMain(scope: WorkerScope): FrameCrypto;
+}
+
+function e2eeWorkerUnits(scope?: WorkerScope): E2eeWorkerUnits {
+  class E2eeSenderKey {
+    private constructor(
+      readonly generation: number,
+      private readonly enc: CryptoKey,
+      private readonly auth: CryptoKey,
+      private readonly salt: Uint8Array,
+    ) {}
+
+    static async derive(generation: number, secret: Uint8Array): Promise<E2eeSenderKey> {
+      const subtle = globalThis.crypto.subtle;
+      const ikm = await subtle.importKey('raw', secret as Uint8Array<ArrayBuffer>, 'HKDF', false, ['deriveBits']);
+      const expand = async (info: string, len: number) =>
+        new Uint8Array(
+          await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: Uint8Array.from(info, (c) => c.charCodeAt(0)) }, ikm, len * 8),
+        );
+      const [enc, auth, salt] = await Promise.all([
+        expand('aurix-e2ee-v1 enc', 32),
+        expand('aurix-e2ee-v1 auth', 32),
+        expand('aurix-e2ee-v1 salt', 12),
+      ]);
+      const [encKey, authKey] = await Promise.all([
+        subtle.importKey('raw', enc, { name: 'AES-CTR' }, false, ['encrypt']),
+        subtle.importKey('raw', auth, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
+      ]);
+      return new E2eeSenderKey(generation & 0xff, encKey, authKey, salt);
     }
-  };
-  scope.onrtctransform = (ev) => {
-    const t = ev.transformer;
-    const transformer = frames.transformer(t.options.kind, () => t.options.mid);
-    // Frames wait for key material posted earlier: keep them behind the same queue.
-    void t.readable
-      .pipeThrough(
-        new TransformStream<RTCEncodedAudioFrame, RTCEncodedAudioFrame>({
-          transform: async (frame, controller) => {
-            await queue;
-            await transformer.transform?.(frame, controller);
-          },
-        }),
-      )
-      .pipeTo(t.writable)
-      .catch(() => undefined);
-  };
-  return frames;
+
+    private iv(counter: number): Uint8Array<ArrayBuffer> {
+      const iv = new Uint8Array(16);
+      iv[0] = this.generation;
+      iv[1] = (counter >>> 24) & 0xff;
+      iv[2] = (counter >>> 16) & 0xff;
+      iv[3] = (counter >>> 8) & 0xff;
+      iv[4] = counter & 0xff;
+      for (let i = 0; i < 12; i++) iv[i] = (iv[i] ?? 0) ^ (this.salt[i] ?? 0);
+      return iv;
+    }
+
+    /** Encrypts `plain` as frame number `counter` of this generation. */
+    async seal(counter: number, plain: Uint8Array): Promise<Uint8Array> {
+      const subtle = globalThis.crypto.subtle;
+      const out = new Uint8Array(plain.length + 15);
+      out[0] = this.generation;
+      out[1] = (counter >>> 24) & 0xff;
+      out[2] = (counter >>> 16) & 0xff;
+      out[3] = (counter >>> 8) & 0xff;
+      out[4] = counter & 0xff;
+      if (plain.length > 0) {
+        const ct = await subtle.encrypt({ name: 'AES-CTR', counter: this.iv(counter), length: 128 }, this.enc, plain as Uint8Array<ArrayBuffer>);
+        out.set(new Uint8Array(ct), 5);
+      }
+      const tag = new Uint8Array(await subtle.sign('HMAC', this.auth, out.subarray(0, 5 + plain.length) as Uint8Array<ArrayBuffer>));
+      out.set(tag.subarray(0, 10), 5 + plain.length);
+      return out;
+    }
+
+    /** Generation byte and counter of an encrypted frame (no authentication). */
+    static peek(frame: Uint8Array): { generation: number; counter: number } | undefined {
+      if (frame.length < 15) return undefined;
+      return {
+        generation: frame[0] ?? 0,
+        counter: ((frame[1] ?? 0) * 0x1000000 + ((frame[2] ?? 0) << 16) + ((frame[3] ?? 0) << 8) + (frame[4] ?? 0)) >>> 0,
+      };
+    }
+
+    /** Authenticates and decrypts a frame of this generation. */
+    async open(frame: Uint8Array): Promise<Uint8Array> {
+      const head = E2eeSenderKey.peek(frame);
+      if (!head) throw new Error('E2EE frame too short');
+      if (head.generation !== this.generation) throw new Error('E2EE frame generation mismatch');
+      const subtle = globalThis.crypto.subtle;
+      const body = frame.subarray(0, frame.length - 10);
+      const tag = frame.subarray(frame.length - 10);
+      const expected = new Uint8Array(await subtle.sign('HMAC', this.auth, body as Uint8Array<ArrayBuffer>));
+      if (!FrameCrypto.tagsEqual(expected.subarray(0, 10), tag)) throw new Error('E2EE frame failed authentication');
+      const ct = body.subarray(5);
+      if (ct.length === 0) return new Uint8Array(0);
+      return new Uint8Array(await subtle.encrypt({ name: 'AES-CTR', counter: this.iv(head.counter), length: 128 }, this.enc, ct as Uint8Array<ArrayBuffer>));
+    }
+  }
+
+  /** Bit `i` of `window`: `highest - i` seen. */
+  class E2eeReplayState {
+    private highest: number | undefined = undefined;
+    private window = 0n;
+
+    /** `true` (and records it) when `counter` was not seen before and is not too old. */
+    accept(counter: number): boolean {
+      const h = this.highest;
+      if (h === undefined) {
+        this.highest = counter;
+        this.window = 1n;
+        return true;
+      }
+      if (counter > h) {
+        const shift = counter - h;
+        this.window = shift >= 128 ? 0n : (this.window << BigInt(shift)) & ((1n << 128n) - 1n);
+        this.window |= 1n;
+        this.highest = counter;
+        return true;
+      }
+      const age = h - counter;
+      if (age >= 128) return false;
+      const bit = 1n << BigInt(age);
+      if ((this.window & bit) !== 0n) return false;
+      this.window |= bit;
+      return true;
+    }
+  }
+
+  class E2eePeerKeys {
+    private generations: Array<{ key: E2eeSenderKey; replay: E2eeReplayState }> = [];
+
+    insert(key: E2eeSenderKey): void {
+      this.generations = this.generations.filter((g) => g.key.generation !== key.generation);
+      this.generations.push({ key, replay: new E2eeReplayState() });
+      while (this.generations.length > 4) this.generations.shift();
+    }
+
+    get isEmpty(): boolean {
+      return this.generations.length === 0;
+    }
+
+    hasGeneration(generation: number): boolean {
+      return this.generations.some((g) => g.key.generation === generation);
+    }
+
+    /** Decrypts `frame`, rejecting unknown generations and replayed counters. */
+    async open(frame: Uint8Array): Promise<Uint8Array> {
+      const head = E2eeSenderKey.peek(frame);
+      if (!head) throw new Error('E2EE frame too short');
+      const g = this.generations.find((x) => x.key.generation === head.generation);
+      if (!g) throw new Error('no key for this E2EE generation');
+      const plain = await g.key.open(frame);
+      if (!g.replay.accept(head.counter)) throw new Error('replayed E2EE frame');
+      return plain;
+    }
+  }
+
+  /** See the `FrameCrypto` interface. */
+  class FrameCrypto {
+    mode: E2eeMode = 'plain';
+    private own: { key: E2eeSenderKey; counter: number } | undefined = undefined;
+    private peers = new Map<string, E2eePeerKeys>();
+    layout = new Map<string, string>();
+    readonly stats: E2eeFrameStats = { framesE2ee: 0, undecryptable: 0, held: 0 };
+    /** Called once when the frame counter of the current key reaches the rotation threshold. */
+    onRotateNeeded: (() => void) | undefined = undefined;
+    private rotateSignalled = false;
+
+    static tagsEqual(a: Uint8Array, b: Uint8Array): boolean {
+      if (a.length !== b.length) return false;
+      let diff = 0;
+      for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+      return diff === 0;
+    }
+
+    get generation(): number | undefined {
+      return this.own?.key.generation;
+    }
+
+    async setOwnKey(generation: number, secret: Uint8Array): Promise<void> {
+      const key = await E2eeSenderKey.derive(generation, secret);
+      this.own = { key, counter: 0 };
+      this.rotateSignalled = false;
+    }
+
+    async setPeerKey(userId: string, generation: number, secret: Uint8Array): Promise<void> {
+      const key = await E2eeSenderKey.derive(generation, secret);
+      let keys = this.peers.get(userId);
+      if (!keys) {
+        keys = new E2eePeerKeys();
+        this.peers.set(userId, keys);
+      }
+      keys.insert(key);
+    }
+
+    forgetPeer(userId: string): void {
+      this.peers.delete(userId);
+    }
+
+    hasKeyFor(userId: string): boolean {
+      const keys = this.peers.get(userId);
+      return keys !== undefined && !keys.isEmpty;
+    }
+
+    peerHasGeneration(userId: string, generation: number): boolean {
+      return this.peers.get(userId)?.hasGeneration(generation) ?? false;
+    }
+
+    setLayout(entries: Array<[string, string | undefined]>): void {
+      this.layout = new Map();
+      for (const [mid, user] of entries) if (user !== undefined) this.layout.set(mid, user);
+    }
+
+    /** Encrypts one of our frames. */
+    async encrypt(plain: Uint8Array): Promise<Uint8Array> {
+      const own = this.own;
+      if (!own) throw new Error('no E2EE sender key');
+      const counter = own.counter;
+      own.counter = (own.counter + 1) >>> 0;
+      if (own.counter >= 2 ** 31 && !this.rotateSignalled) {
+        this.rotateSignalled = true;
+        this.onRotateNeeded?.();
+      }
+      this.stats.framesE2ee += 1;
+      return own.key.seal(counter, plain);
+    }
+
+    /** Decrypts a frame sent by `userId`. */
+    async decrypt(userId: string, frame: Uint8Array): Promise<Uint8Array> {
+      const keys = this.peers.get(userId);
+      if (!keys) throw new Error('unknown E2EE sender');
+      return keys.open(frame);
+    }
+
+    /** Uplink: the bytes to send in place of `data`, or `undefined` to drop the frame. */
+    async transformSend(data: Uint8Array): Promise<Uint8Array | undefined> {
+      switch (this.mode) {
+        case 'plain':
+          return data;
+        case 'hold':
+          this.stats.held += 1;
+          return undefined;
+        case 'encrypt':
+          if (!this.own) {
+            this.stats.held += 1;
+            return undefined;
+          }
+          return this.encrypt(data);
+        default:
+          return undefined;
+      }
+    }
+
+    /** Downlink track `mid`: the bytes to play in place of `data`, or `undefined` to drop. */
+    async transformReceive(mid: string | null, data: Uint8Array): Promise<Uint8Array | undefined> {
+      if (this.mode !== 'encrypt') return data;
+      const user = mid === null ? undefined : this.layout.get(mid);
+      if (user === undefined) return undefined;
+      try {
+        const plain = await this.decrypt(user, data);
+        this.stats.framesE2ee += 1;
+        return plain;
+      } catch {
+        this.stats.undecryptable += 1;
+        return undefined;
+      }
+    }
+
+    /** A `TransformStream` transformer for one sender (`kind: 'sender'`) or receiver pipeline. */
+    transformer(kind: 'sender' | 'receiver', midOf: () => string | null): Transformer<RTCEncodedAudioFrame, RTCEncodedAudioFrame> {
+      return {
+        transform: async (frame, controller) => {
+          const input = new Uint8Array(frame.data);
+          const output = kind === 'sender' ? await this.transformSend(input) : await this.transformReceive(midOf(), input);
+          if (output === undefined) return;
+          if (output !== input) {
+            const buf = new ArrayBuffer(output.byteLength);
+            new Uint8Array(buf).set(output);
+            frame.data = buf;
+          }
+          controller.enqueue(frame);
+        },
+      };
+    }
+  }
+
+  function e2eeWorkerMain(scope: WorkerScope): FrameCrypto {
+    const frames = new FrameCrypto();
+    frames.onRotateNeeded = () => scope.postMessage({ type: 'rotate' });
+    let queue: Promise<unknown> = Promise.resolve();
+    const serial = (task: () => Promise<void> | void) => {
+      queue = queue.then(task, task);
+    };
+    scope.onmessage = (ev) => {
+      const m = ev.data;
+      switch (m.type) {
+        case 'mode':
+          serial(() => {
+            frames.mode = m.mode;
+          });
+          return;
+        case 'ownKey':
+          serial(() => frames.setOwnKey(m.generation, m.secret));
+          return;
+        case 'peerKey':
+          serial(() => frames.setPeerKey(m.userId, m.generation, m.secret));
+          return;
+        case 'forgetPeer':
+          serial(() => frames.forgetPeer(m.userId));
+          return;
+        case 'layout':
+          serial(() => frames.setLayout(m.entries));
+          return;
+        case 'stats':
+          scope.postMessage({ type: 'stats', stats: { ...frames.stats } });
+          return;
+        default:
+          return;
+      }
+    };
+    scope.onrtctransform = (ev) => {
+      const t = ev.transformer;
+      const transformer = frames.transformer(t.options.kind, () => t.options.mid);
+      // Frames wait for key material posted earlier: keep them behind the same queue.
+      void t.readable
+        .pipeThrough(
+          new TransformStream<RTCEncodedAudioFrame, RTCEncodedAudioFrame>({
+            transform: async (frame, controller) => {
+              await queue;
+              await transformer.transform?.(frame, controller);
+            },
+          }),
+        )
+        .pipeTo(t.writable)
+        .catch(() => undefined);
+    };
+    return frames;
+  }
+
+  if (scope) e2eeWorkerMain(scope);
+  return { E2eeSenderKey, E2eeReplayState, E2eePeerKeys, FrameCrypto, e2eeWorkerMain };
 }
 
 // ── WORKER_UNITS_END ─────────────────────────────────────────────────────────────────────
 
+const workerUnits = e2eeWorkerUnits();
+export const E2eeSenderKey = workerUnits.E2eeSenderKey;
+export const E2eeReplayState = workerUnits.E2eeReplayState;
+export const E2eePeerKeys = workerUnits.E2eePeerKeys;
+export const FrameCrypto = workerUnits.FrameCrypto;
+export const e2eeWorkerMain = workerUnits.e2eeWorkerMain;
+
 /** JavaScript source of the transform worker (self-contained; served from a `blob:` URL). */
 export function e2eeWorkerSource(): string {
-  const units = [E2eeSenderKey, E2eeReplayState, E2eePeerKeys, FrameCrypto];
-  return `'use strict';\n${units.map((u) => u.toString()).join('\n')}\n(${e2eeWorkerMain.toString()})(self);\n`;
+  return `'use strict';\n(${e2eeWorkerUnits.toString()})(self);\n`;
 }
 
 // ── Group state machine ──────────────────────────────────────────────────────────────────
