@@ -90,12 +90,34 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return parsed as T;
 }
 
+/**
+ * A TLS terminator that forwards plain HTTP without `X-Forwarded-Proto` (localhost.run, some
+ * edges) leaves the backend advertising `http://` / `ws://` for the page's own host; a secure
+ * page cannot open those, so the same-host URLs take the page's scheme.
+ */
+export function samePageScheme(url: string, page: Location = window.location): string {
+  if (page.protocol !== "https:") return url;
+  try {
+    const u = new URL(url);
+    if (u.host !== page.host) return url;
+    if (u.protocol === "http:") u.protocol = "https:";
+    else if (u.protocol === "ws:") u.protocol = "wss:";
+    return u.toString().replace(/\/$/, url.endsWith("/") ? "/" : "");
+  } catch {
+    return url;
+  }
+}
+
+function withPageScheme(grant: JoinGrant): JoinGrant {
+  return { ...grant, apiUrl: samePageScheme(grant.apiUrl), wsUrl: samePageScheme(grant.wsUrl) };
+}
+
 export const api = {
   config: () => request<AppConfig>("GET", "/api/config"),
   room: (slug: string) => request<RoomCard>("GET", `/api/rooms/${encodeURIComponent(slug)}`),
   createRoom: (title: string | undefined) => request<RoomCard>("POST", "/api/rooms", { title, profile: "voice" }),
   join: (slug: string, name: string, deviceId: string) =>
-    request<JoinGrant>("POST", `/api/rooms/${encodeURIComponent(slug)}/join`, { name, deviceId }),
+    request<JoinGrant>("POST", `/api/rooms/${encodeURIComponent(slug)}/join`, { name, deviceId }).then(withPageScheme),
 };
 
 /** Live "now playing" of the bot for one room; `onStatus(null)` when it is silent or gone. */

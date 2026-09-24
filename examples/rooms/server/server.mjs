@@ -54,9 +54,9 @@ export function loadConfig(env = process.env) {
     apiKey,
     /** Node WebSocket URL handed to the bot (same host, no proxy). */
     aurixWsUrl: env.AURIX_WS_URL || "ws://localhost:8081/ws",
-    /** Public URLs the browser uses; derived from the request when unset (reverse proxy in front). */
-    publicApiUrl: env.ROOMS_PUBLIC_API_URL?.replace(/\/+$/, ""),
-    publicWsUrl: env.ROOMS_PUBLIC_WS_URL,
+    /** Public URLs the browser uses; derived from the request when unset or empty (reverse proxy in front). */
+    publicApiUrl: env.ROOMS_PUBLIC_API_URL?.replace(/\/+$/, "") || undefined,
+    publicWsUrl: env.ROOMS_PUBLIC_WS_URL || undefined,
     /**
      * Media transport the browser should use. `auto` tries WebTransport → WebRTC → WebSocket;
      * behind an HTTP-only tunnel (ngrok, cloudflared) set `websocket` so nobody waits on ICE.

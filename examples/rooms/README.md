@@ -42,7 +42,11 @@ QUICK_TUNNEL=cloudflared examples/rooms/deploy/run.sh up      # cloudflared quic
 
 localhost.run passes the bot's `text/event-stream` status through unbuffered; with a cloudflared
 quick tunnel the same stream reached the browser only once the response ended, so the
-now-playing panel stays empty behind it while voice and chat work.
+now-playing panel stays empty behind it while voice and chat work. A free localhost.run tunnel
+also moves to a new host while it is running: behind a quick tunnel the backend therefore derives
+the browser's API/WS URLs from each request's forwarded host instead of a fixed
+`ROOMS_PUBLIC_*_URL`, and the frontend gives same-host URLs the page's scheme (localhost.run
+forwards plain HTTP without `X-Forwarded-Proto`). `run.sh status` prints the host that is live now.
 
 HTTP tunnels carry no UDP, so behind one the frontend is configured with
 `transport: 'websocket'` (AURX over the control WebSocket, see the Web SDK docs). On a host with a
