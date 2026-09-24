@@ -423,8 +423,9 @@ fires `stats` and sends a `QualityReport` (`rtt_ms`, `jitter_ms`, `packet_loss` 
 which drives the server's adaptive bitrate and its own `NetworkQuality` message. The server
 merges that downlink view with what the SFU measures on your uplink (sequence gaps, RFC 3550
 jitter, bitrate) and picks the worse direction: `R ≥ 80` → 5 bars, `≥ 70` → 4, `≥ 60` → 3,
-`≥ 50` → 2, else 1. `bars`/`rFactor`/`mos`/`lossPercent` describe the last period; packet/byte
-counters are cumulative for the peer connection. The same helpers (`rFactor`, `mosFromR`,
+`≥ 50` → 2, else 1. `bars`/`rFactor`/`mos`/`lossPercent` describe the last period (pooled with
+the previous ones until they cover 200 expected packets); packet/byte counters are cumulative for
+the peer connection. The same helpers (`rFactor`, `mosFromR`,
 `barsFromR`, `assembleClientStats`) are exported for HUDs that read raw stats themselves.
 
 ### Opus controls (what a browser lets you set)

@@ -97,7 +97,8 @@ pub struct TransmitStats {
 
 /// Everything the network-quality UI needs, in one snapshot. Counters are lifetime totals of
 /// the session (they survive resume); `loss_percent`, `r_factor`, `mos` and `bars` describe the
-/// last quality period (one heartbeat interval, 5 s by default).
+/// last quality period (one heartbeat interval, 5 s by default; shorter heartbeats pool the
+/// most recent periods until they cover 4 s of frames).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientStats {
     pub state: Option<ConnectionState>,
@@ -107,8 +108,9 @@ pub struct ClientStats {
     pub transmit: TransmitStats,
     /// Inter-arrival jitter of downlink audio, RFC 3550 style, in milliseconds.
     pub jitter_ms: f32,
-    /// Downlink frames declared lost in the last quality period, as a percentage of frames
-    /// expected (`0..=100`).
+    /// Downlink frames declared lost in the last quality period — or, with a short heartbeat,
+    /// over the most recent periods covering at least 200 expected frames — as a percentage of
+    /// frames expected (`0..=100`).
     pub loss_percent: f32,
     /// Lifetime downlink frames concealed with PLC, discarded as late, and buffer underruns.
     pub frames_lost: u64,
@@ -149,26 +151,57 @@ pub struct ParticipantStream {
     pub active: bool,
 }
 
-/// Downlink loss over the last quality period, updated on every heartbeat tick.
+/// Downlink loss over the most recent quality periods that together cover at least
+/// [`LossWindow::MIN_EXPECTED`] expected frames, updated on every heartbeat tick. One period is
+/// enough at the default 5 s heartbeat; a 1 s heartbeat sees ~50 frames per period, where random
+/// 20 % loss reads anywhere between 10 and 30 %, so several periods are pooled instead.
 #[derive(Debug, Default)]
 struct LossWindow {
     prev_lost: u64,
     prev_received: u64,
+    /// `(lost, expected)` per period, oldest first.
+    periods: VecDeque<(u64, u64)>,
     loss_percent: f32,
 }
 
 impl LossWindow {
-    /// Advance the window with the current lifetime counters and return the period loss.
+    /// Expected frames the window spans at least (4 s of 20 ms frames).
+    const MIN_EXPECTED: u64 = 200;
+    /// Periods kept at most, however few frames each carried (a silent channel).
+    const MAX_PERIODS: usize = 16;
+
+    /// Advance the window with the current lifetime counters and return the windowed loss.
     fn advance(&mut self, lost: u64, received: u64) -> f32 {
+        if lost < self.prev_lost || received < self.prev_received {
+            // Counters restarted (fresh media session): the old periods describe another link.
+            self.periods.clear();
+        }
         let d_lost = lost.saturating_sub(self.prev_lost);
         let d_recv = received.saturating_sub(self.prev_received);
         self.prev_lost = lost;
         self.prev_received = received;
-        let expected = d_lost + d_recv;
+        self.periods.push_back((d_lost, d_lost + d_recv));
+        let (mut lost, mut expected) = self
+            .periods
+            .iter()
+            .fold((0u64, 0u64), |(l, e), &(pl, pe)| (l + pl, e + pe));
+        // Drop the oldest periods while the newer ones alone still cover the minimum.
+        while let Some(&(oldest_lost, oldest_expected)) = self.periods.front() {
+            let newer = expected - oldest_expected;
+            if self.periods.len() > 1
+                && (newer >= Self::MIN_EXPECTED || self.periods.len() > Self::MAX_PERIODS)
+            {
+                self.periods.pop_front();
+                lost -= oldest_lost;
+                expected = newer;
+            } else {
+                break;
+            }
+        }
         self.loss_percent = if expected == 0 {
             0.0
         } else {
-            (d_lost as f32 * 100.0 / expected as f32).clamp(0.0, 100.0)
+            (lost as f32 * 100.0 / expected as f32).clamp(0.0, 100.0)
         };
         self.loss_percent
     }
@@ -4679,18 +4712,40 @@ mod tests {
     }
 
     #[test]
-    fn loss_window_reports_the_last_period_only() {
+    fn loss_window_pools_periods_to_the_minimum_sample() {
         let mut w = LossWindow::default();
         assert_eq!(w.advance(0, 0), 0.0);
-        // 10 lost of 100 expected in the first period.
+        // 10 lost of 100 expected in the first period: reported as is, nothing older to pool.
         assert_eq!(w.advance(10, 90), 10.0);
-        // Nothing lost in the second period: lifetime loss stays 5 %, period loss is 0.
-        assert_eq!(w.advance(10, 190), 0.0);
+        // A clean second period: the two together make the 200-frame window → 5 %.
+        assert_eq!(w.advance(10, 190), 5.0);
+        // A clean third one: the newest two cover the minimum, the lossy period falls out.
+        assert_eq!(w.advance(10, 290), 0.0);
         // Counters reset (fresh session): never negative.
         assert_eq!(w.advance(0, 0), 0.0);
         assert_eq!(w.advance(50, 50), 50.0);
         let r = quality::r_factor(0.0, 0.0, w.loss_percent);
         assert_eq!(quality::bars_from_r(r), 1);
+    }
+
+    #[test]
+    fn loss_window_keeps_a_full_period_on_its_own() {
+        let mut w = LossWindow::default();
+        // 250-frame periods (the default 5 s heartbeat) are never pooled.
+        assert_eq!(w.advance(25, 225), 10.0);
+        assert_eq!(w.advance(25, 475), 0.0);
+        assert_eq!(w.advance(75, 675), 20.0);
+    }
+
+    #[test]
+    fn loss_window_bounds_its_history_on_a_silent_channel() {
+        let mut w = LossWindow::default();
+        for _ in 0..40 {
+            w.advance(0, 0);
+        }
+        assert!(w.periods.len() <= LossWindow::MAX_PERIODS);
+        // The first frames after silence are judged on their own, not diluted by empty periods.
+        assert_eq!(w.advance(5, 5), 50.0);
     }
 
     fn channel(hash: u32, audio: AudioPolicy) -> (ChannelId, ChannelState) {

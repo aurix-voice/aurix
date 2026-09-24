@@ -1102,10 +1102,19 @@ namespace Aurix.Voice.Tests
 
             var w = new LossWindow();
             Assert.Equal(0f, w.Advance(0, 100));
-            Assert.Equal(10f, w.Advance(10, 190)); // +10 lost, +90 received
-            Assert.Equal(0f, w.Advance(10, 290));
+            // +10 lost, +90 received: pooled with the previous clean 100 into the 200-frame window.
+            Assert.Equal(5f, w.Advance(10, 190));
+            Assert.Equal(5f, w.Advance(10, 290));
+            Assert.Equal(0f, w.Advance(10, 390));
+            // A full 250-frame period (the default heartbeat) stands on its own.
+            Assert.Equal(10f, w.Advance(35, 615));
+            // Counters restarted: never negative, old periods dropped.
+            Assert.Equal(0f, w.Advance(0, 50));
+            Assert.Equal(10f, w.Advance(10, 140));
             w.Reset();
             Assert.Equal(50f, w.Advance(1, 1));
+            for (int i = 0; i < 40; i++) w.Advance(1, 1);
+            Assert.Equal(50f, w.Advance(6, 6)); // silence does not dilute the next frames
         }
 
         [Fact]
@@ -1191,11 +1200,11 @@ namespace Aurix.Voice.Tests
             Assert.Equal(100f, s.LossPercent);
             Assert.Equal(1, s.Bars);
             Assert.Null(s.Server);
-            // … and a quiet second period is back to a clean link.
+            // … and a quiet second period does not dilute it: the window pools periods until
+            // 200 frames were expected, so nothing received means the verdict stands.
             s = client.GetStats();
-            Assert.Equal(0f, s.LossPercent);
-            Assert.Equal(5, s.Bars);
-            Assert.InRange(s.Mos, 4.3f, 4.5f);
+            Assert.Equal(100f, s.LossPercent);
+            Assert.Equal(1, s.Bars);
             Assert.Null(client.LastNetworkQuality);
         }
 

@@ -1231,7 +1231,7 @@ struct AURIXVOICE_API FAurixStats
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float JitterMs = 0.f;
 
-	/** Downlink loss over the last quality period, as a percentage (0..100). */
+	/** Downlink loss over the last quality period (pooled with the previous ones until they cover 200 expected frames), as a percentage (0..100). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float LossPercent = 0.f;
 

@@ -75,6 +75,18 @@ released together.
   `E2eeSenderKey`, `E2eeReplayState`, `E2eePeerKeys`, `FrameCrypto`, the `*Stage` classes,
   `VoiceEffectChain` and `VisemeAnalyzer` remain exported (as constructors with interface types).
 
+### Changed
+
+* **SDK `loss_percent` is measured over at least 200 expected frames.** The native core, the
+  Web SDK and the Unity C# client reported the loss of the last quality period alone; with a
+  1 s heartbeat / `getStats()` interval that is ~50 frames, where a steady 20 % random loss
+  reads anywhere between 10 and 30 % from one period to the next (the loss the client reports
+  to the node, and the node's `receivers_loss_percent`, wobbled with it). The window now pools
+  the most recent periods until they cover 200 expected frames (4 s of audio; one period at
+  the default 5 s heartbeat is unchanged), restarts on a counter reset and keeps at most 16
+  periods on a silent channel. `LossWindow.MIN_EXPECTED` / `MAX_PERIODS` are exported by the
+  Web SDK.
+
 ## [1.6.0] - 2026-09-23
 
 Hardening release: no new protocol features. `aurix doctor` preflight, verified backup/restore

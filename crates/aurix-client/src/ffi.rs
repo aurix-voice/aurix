@@ -4775,7 +4775,8 @@ pub struct AurixStats {
     pub rtt_avg_ms: f32,
     pub rtt_max_ms: f32,
     pub jitter_ms: f32,
-    /// Downlink loss over the last quality period, as a percentage (`0..=100`).
+    /// Downlink loss over the last quality period — pooled with the previous ones until they
+    /// cover 200 expected frames — as a percentage (`0..=100`).
     pub loss_percent: f32,
     /// Client-measured downlink quality; `bars` is `1..=5`.
     pub r_factor: f32,

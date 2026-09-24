@@ -1519,7 +1519,8 @@ typedef struct AurixStats {
   float rtt_max_ms;
   float jitter_ms;
   /**
-   * Downlink loss over the last quality period, as a percentage (`0..=100`).
+   * Downlink loss over the last quality period — pooled with the previous ones until they
+   * cover 200 expected frames — as a percentage (`0..=100`).
    */
   float loss_percent;
   /**

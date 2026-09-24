@@ -29,15 +29,35 @@ test('loss is a percentage of expected packets', () => {
   assert.equal(lossPercent(10, 0), 100);
 });
 
-test('loss window reports the period, not the lifetime', () => {
+test('loss window pools periods up to the minimum sample, not the lifetime', () => {
   const w = new LossWindow();
   assert.equal(w.advance(0, 100), 0);
-  assert.equal(w.advance(10, 190), 10);
-  assert.equal(w.advance(10, 290), 0);
+  // 10 lost of 100 expected: pooled with the previous clean 100 → 200 frames, 5 %
+  assert.equal(w.advance(10, 190), 5);
+  // the window is the newest 200 expected frames: the lossy period stays for one more, then falls out
+  assert.equal(w.advance(10, 290), 5);
+  assert.equal(w.advance(10, 390), 0);
+  // a full 250-frame period stands on its own
+  assert.equal(w.advance(35, 615), 10);
   // counters reset (new peer connection) must not go negative
   assert.equal(w.advance(0, 50), 0);
+  assert.equal(w.advance(10, 140), 10);
   w.reset();
   assert.equal(w.lossPercent, 0);
+});
+
+test('loss window bounds its history on a silent channel', () => {
+  const w = new LossWindow();
+  for (let i = 0; i < 40; i++) w.advance(0, 0);
+  // the first packets after silence are judged on their own, not diluted by empty periods
+  assert.equal(w.advance(5, 5), 50);
+});
+
+test('loss window at the default period reports that period only', () => {
+  const w = new LossWindow();
+  assert.equal(w.advance(0, 250), 0);
+  assert.equal(w.advance(25, 475), 10);
+  assert.equal(w.advance(25, 725), 0);
 });
 
 test('rtt tracker keeps min/avg/max', () => {

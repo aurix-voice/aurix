@@ -103,7 +103,8 @@ export function networkQualityFromWire(w: NetworkQualityWire): NetworkQuality {
 
 /**
  * One client-side statistics snapshot. Counters are cumulative for the peer connection;
- * `lossPercent`, `rFactor`, `mos` and `bars` describe the last `getStats()` period.
+ * `lossPercent`, `rFactor`, `mos` and `bars` describe the last `getStats()` period — pooled with
+ * the previous ones until they cover 200 expected packets, see {@link LossWindow}.
  */
 export interface ClientStats {
   /** Application-level round trip from `Ping`/`Pong` (ms), with session min/avg/max. */
@@ -148,26 +149,58 @@ export interface ClientStats {
   transport?: 'webrtc' | 'webtransport' | 'websocket';
 }
 
-/** Per-period loss from cumulative `packetsLost`/`packetsReceived` counters. */
+/**
+ * Loss from cumulative `packetsLost`/`packetsReceived` counters over the most recent
+ * `getStats()` periods that together cover at least {@link LossWindow.MIN_EXPECTED} expected
+ * packets. One period per second sees ~50 packets, where random 20 % loss reads anywhere between
+ * 10 and 30 %; pooling periods keeps the figure steady without going lifetime.
+ */
 export class LossWindow {
+  /** Expected packets the window spans at least (4 s of 20 ms frames). */
+  static readonly MIN_EXPECTED = 200;
+  /** Periods kept at most, however few packets each carried (a silent channel). */
+  static readonly MAX_PERIODS = 16;
   private prevLost = 0;
   private prevReceived = 0;
-  /** Loss of the last period, `0..=100`. */
+  /** `[lost, expected]` per period, oldest first. */
+  private periods: Array<[number, number]> = [];
+  /** Loss over the window, `0..=100`. */
   lossPercent = 0;
 
-  /** Advance with the current cumulative counters; returns the period loss. */
+  /** Advance with the current cumulative counters; returns the windowed loss. */
   advance(lost: number, received: number): number {
+    if (lost < this.prevLost || received < this.prevReceived) {
+      // counters restarted (new peer connection): the old periods describe another link
+      this.periods = [];
+    }
     const dLost = Math.max(0, lost - this.prevLost);
     const dRecv = Math.max(0, received - this.prevReceived);
     this.prevLost = lost;
     this.prevReceived = received;
-    this.lossPercent = lossPercent(dLost, dRecv);
+    this.periods.push([dLost, dLost + dRecv]);
+    let sumLost = 0;
+    let sumExpected = 0;
+    for (const [l, e] of this.periods) {
+      sumLost += l;
+      sumExpected += e;
+    }
+    // drop the oldest periods while the newer ones alone still cover the minimum
+    while (this.periods.length > 1) {
+      const [oldestLost, oldestExpected] = this.periods[0]!;
+      const newer = sumExpected - oldestExpected;
+      if (newer < LossWindow.MIN_EXPECTED && this.periods.length <= LossWindow.MAX_PERIODS) break;
+      this.periods.shift();
+      sumLost -= oldestLost;
+      sumExpected = newer;
+    }
+    this.lossPercent = lossPercent(sumLost, sumExpected - sumLost);
     return this.lossPercent;
   }
 
   reset(): void {
     this.prevLost = 0;
     this.prevReceived = 0;
+    this.periods = [];
     this.lossPercent = 0;
   }
 }

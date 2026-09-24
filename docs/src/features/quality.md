@@ -2,9 +2,11 @@
 
 Every SDK exposes one statistics snapshot with the same vocabulary — packets/bytes in both
 directions, RTT last/min/avg/max, downlink jitter, loss over the last period (**percent**,
-`0..=100`), frames lost / late / discarded and jitter-buffer underruns, authentication and
-replay failures, heartbeat loss, active remote streams — and the derived rating: a simplified
-E-model **R-factor** (`0..=100`), the **MOS** it maps to and **1–5 bars**:
+`0..=100`; short periods are pooled until they cover at least 200 expected frames, so a 1 s
+stats interval does not swing by ±10 points on random loss), frames lost / late / discarded and
+jitter-buffer underruns, authentication and replay failures, heartbeat loss, active remote
+streams — and the derived rating: a simplified E-model **R-factor** (`0..=100`), the **MOS** it
+maps to and **1–5 bars**:
 
 | R-factor | bars |
 |---|---|
