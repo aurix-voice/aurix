@@ -353,11 +353,11 @@ the chapter that explains the boundary.
   target runs for 30 s with ASan on nightly; longer campaigns (minutes to hours per target, as
   in the runs that found the RTP and STUN regressions in `fuzz/corpus/`) are run out of band
   and not on a schedule ([Threat model](concepts/threat-model.md)).
-* **The release workflow has not produced a public release yet.** `release.yml` is validated
-  with `actionlint`, its version/changelog checks run locally, and each build step mirrors a
-  CI job that does run — but no tag has been pushed through it, so the GHCR push, Sigstore
-  signing, attestations and the GitHub release itself are exercised only on the first tag
-  ([Releases](operations/releases.md)).
+* **Releases are built by CI, not by a human on a clean machine.** `release.yml` has produced
+  the published tags (binaries, `SHA256SUMS`, SBOMs, Sigstore signatures, GHCR images), but
+  nobody has yet reproduced an archive byte-for-byte outside GitHub's runners, and no
+  downstream (a game studio, a distro) has consumed a release — the release procedure is
+  verified by the workflow alone ([Releases](operations/releases.md)).
 
 ## Planned
 
