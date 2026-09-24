@@ -38,7 +38,16 @@ reserved domain, or an account-less quick tunnel with a random host that changes
 NGROK_DOMAIN=example.ngrok-free.dev examples/rooms/deploy/run.sh up
 QUICK_TUNNEL=localhost.run examples/rooms/deploy/run.sh up    # ssh -R; prints the host at the end
 QUICK_TUNNEL=cloudflared examples/rooms/deploy/run.sh up      # cloudflared quick tunnel
+TAILSCALE_FUNNEL=1 examples/rooms/deploy/run.sh up            # https://<host>.<tailnet>.ts.net
 ```
+
+Tailscale Funnel gives a stable address with no traffic quota and streams `text/event-stream`
+unbuffered; it needs `tailscaled` logged in on the host, the `funnel` node attribute in the
+tailnet policy (`"nodeAttrs": [{"target": ["autogroup:member"], "attr": ["funnel"]}]`) and
+HTTPS certificates enabled for the tailnet (both are one click on the link `tailscale funnel`
+prints when they are missing). Funnel terminates TLS at Tailscale and forwards plain HTTP to Caddy
+with `X-Forwarded-Proto: https`, and it only carries TCP — the same WebSocket media path as the
+other tunnels applies.
 
 localhost.run passes the bot's `text/event-stream` status through unbuffered; with a cloudflared
 quick tunnel the same stream reached the browser only once the response ended, so the

@@ -22,6 +22,10 @@
 #                   a restart — `status` prints the host that is live right now.
 #   ROOMS_TRANSPORT websocket | auto | webrtc | webtransport (default: websocket when a tunnel is
 #                   in front — HTTP tunnels carry no UDP — otherwise auto)
+#   TAILSCALE_FUNNEL=1  publish through Tailscale Funnel instead: a stable https://<host>.<tailnet>.ts.net
+#                   served by the already-running tailscaled (the node must be logged in, the tailnet
+#                   must allow the `funnel` node attribute and have HTTPS certificates enabled).
+#                   PUBLIC_ORIGIN defaults to that address; `down` turns the Funnel off again.
 #   AURIX_BIN / BOT_BIN   binaries (default target/release/…; built when missing)
 #   ROOMS_ASSETS    playlist directory (default $ROOMS_STATE/assets, fetched when missing)
 #   ROOMS_PROXY_PORT (8000) ROOMS_PORT (8090) AURIX_API_PORT (8080) AURIX_WS_PORT (8081)
@@ -42,10 +46,11 @@ PG_URL=${PG_URL:-postgres://aurix:aurix@127.0.0.1:5432/aurix}
 REDIS_URL=${REDIS_URL:-redis://127.0.0.1:6379}
 NGROK_DOMAIN=${NGROK_DOMAIN:-}
 QUICK_TUNNEL=${QUICK_TUNNEL:-}
+TAILSCALE_FUNNEL=${TAILSCALE_FUNNEL:-}
 if [ -n "$NGROK_DOMAIN" ]; then
   PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-https://$NGROK_DOMAIN}
   ROOMS_TRANSPORT=${ROOMS_TRANSPORT:-websocket}
-elif [ -n "$QUICK_TUNNEL" ]; then
+elif [ -n "$QUICK_TUNNEL" ] || [ -n "$TAILSCALE_FUNNEL" ]; then
   PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-}
   ROOMS_TRANSPORT=${ROOMS_TRANSPORT:-websocket}
 else
@@ -151,7 +156,7 @@ cmd_rooms() {
   log "starting rooms backend ($ROOMS_PORT, transport $ROOMS_TRANSPORT)"
   mkdir -p "$STATE/data"
   local public_api= public_ws=
-  if [ -z "$QUICK_TUNNEL" ]; then
+  if [ -z "$QUICK_TUNNEL" ] && [ -z "$TAILSCALE_FUNNEL" ]; then
     public_api=$PUBLIC_ORIGIN public_ws=${PUBLIC_ORIGIN/http/ws}/ws
   fi
   (
@@ -258,10 +263,36 @@ cmd_tunnel() {
   log "tunnel → $host"
 }
 
+# The node's MagicDNS name, without the trailing dot; empty when tailscaled is not logged in.
+tailscale_host() {
+  tailscale status --json 2>/dev/null |
+    jq -r '.Self.DNSName // "" | rtrimstr(".")' 2>/dev/null || true
+}
+
+# `tailscale funnel status`, or empty when tailscaled is unreachable (captured whole: `grep -q`
+# on the pipe would SIGPIPE the CLI and trip pipefail).
+funnel_status() { sudo tailscale funnel status 2>/dev/null || true; }
+
+cmd_funnel() {
+  [ -n "$TAILSCALE_FUNNEL" ] || return 0
+  need tailscale
+  local host; host=$(tailscale_host)
+  [ -n "$host" ] || fail "tailscale is not logged in on this host (tailscale up first)"
+  if ! grep -q "proxy http://127.0.0.1:$ROOMS_PROXY_PORT\$" <<<"$(funnel_status)"; then
+    log "enabling Tailscale Funnel → 127.0.0.1:$ROOMS_PROXY_PORT"
+    sudo tailscale funnel --bg "$ROOMS_PROXY_PORT" >>"$STATE/tunnel.log" 2>&1 ||
+      fail "tailscale funnel failed, see $STATE/tunnel.log (Funnel attribute / HTTPS enabled on the tailnet?)"
+  fi
+  printf 'https://%s' "$host" >"$STATE/public-origin"
+  [ -n "$PUBLIC_ORIGIN" ] || PUBLIC_ORIGIN=https://$host
+  log "funnel → $PUBLIC_ORIGIN"
+}
+
 cmd_up() {
   mkdir -p "$STATE"
   cmd_databases
   cmd_tunnel
+  cmd_funnel
   cmd_node
   cmd_bootstrap
   cmd_frontend
@@ -269,7 +300,7 @@ cmd_up() {
   cmd_caddy
   cmd_bot
   cmd_ngrok
-  if [ -n "$QUICK_TUNNEL" ]; then
+  if [ -n "$QUICK_TUNNEL" ] || [ -n "$TAILSCALE_FUNNEL" ]; then
     wait_for "tunnel" 60 curl -fsS -o /dev/null "$PUBLIC_ORIGIN/healthz"
   fi
   log "up — $PUBLIC_ORIGIN"
@@ -279,6 +310,9 @@ cmd_down() {
   for p in ngrok tunnel bot rooms node; do
     if [ -f "$STATE/$p.pid" ]; then kill "$(cat "$STATE/$p.pid")" 2>/dev/null || true; rm -f "$STATE/$p.pid"; fi
   done
+  if [ -n "$TAILSCALE_FUNNEL" ] && command -v tailscale >/dev/null 2>&1; then
+    sudo tailscale funnel --https=443 off >/dev/null 2>&1 || true
+  fi
   docker rm -f $CADDY_CONTAINER >/dev/null 2>&1 || true
   log "stopped (PostgreSQL/Redis containers left running)"
 }
@@ -297,6 +331,14 @@ cmd_status() {
     [ -n "$origin" ] && printf '%s' "$origin" >"$STATE/public-origin"
     [ -n "$origin" ] || origin=$(cat "$STATE/public-origin" 2>/dev/null || true)
     [ -n "$origin" ] && { curl -fsS -o /dev/null "$origin/healthz" && echo "public $origin: ok" || echo "public $origin: FAIL"; }
+  fi
+  if [ -n "$TAILSCALE_FUNNEL" ]; then
+    local host; host=$(tailscale_host)
+    if [ -n "$host" ] && grep -q "Funnel on" <<<"$(funnel_status)"; then
+      curl -fsS -o /dev/null "https://$host/healthz" && echo "funnel https://$host: ok" || echo "funnel https://$host: FAIL"
+    else
+      echo "funnel: off"
+    fi
   fi
   true
 }
