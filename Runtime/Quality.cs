@@ -55,28 +55,58 @@ namespace Aurix
         private static float Clamp(float v, float lo, float hi) => v < lo ? lo : v > hi ? hi : v;
     }
 
-    /// <summary>Per-period loss from cumulative lost/received counters.</summary>
+    /// <summary>
+    /// Loss from cumulative lost/received counters over the most recent periods that together cover
+    /// at least <see cref="MinExpected"/> expected frames. One period per second sees ~50 frames, where
+    /// random 20 % loss reads anywhere between 10 and 30 %; pooling periods keeps the figure steady
+    /// without going lifetime.
+    /// </summary>
     public sealed class LossWindow
     {
-        private long _prevLost, _prevReceived;
+        /// <summary>Expected frames the window spans at least (4 s of 20 ms frames).</summary>
+        public const long MinExpected = 200;
+        /// <summary>Periods kept at most, however few frames each carried (a silent channel).</summary>
+        public const int MaxPeriods = 16;
 
-        /// <summary>Loss of the last period, <c>0..100</c>.</summary>
+        private long _prevLost, _prevReceived;
+        private readonly List<long[]> _periods = new List<long[]>(); // { lost, expected }, oldest first
+
+        /// <summary>Loss over the window, <c>0..100</c>.</summary>
         public float LossPercent { get; private set; }
 
-        /// <summary>Advance with the current cumulative counters; returns the loss of the period since the previous call.</summary>
+        /// <summary>Advance with the current cumulative counters; returns the windowed loss.</summary>
         public float Advance(long lost, long received)
         {
+            if (lost < _prevLost || received < _prevReceived)
+                _periods.Clear(); // counters restarted (fresh media session)
             long dLost = Math.Max(0, lost - _prevLost);
             long dRecv = Math.Max(0, received - _prevReceived);
             _prevLost = lost;
             _prevReceived = received;
-            LossPercent = QualityModel.LossPercent(dLost, dRecv);
+            _periods.Add(new[] { dLost, dLost + dRecv });
+            long sumLost = 0, sumExpected = 0;
+            foreach (var p in _periods)
+            {
+                sumLost += p[0];
+                sumExpected += p[1];
+            }
+            // Drop the oldest periods while the newer ones alone still cover the minimum.
+            while (_periods.Count > 1)
+            {
+                long newer = sumExpected - _periods[0][1];
+                if (newer < MinExpected && _periods.Count <= MaxPeriods) break;
+                sumLost -= _periods[0][0];
+                sumExpected = newer;
+                _periods.RemoveAt(0);
+            }
+            LossPercent = QualityModel.LossPercent(sumLost, sumExpected - sumLost);
             return LossPercent;
         }
 
         public void Reset()
         {
             _prevLost = _prevReceived = 0;
+            _periods.Clear();
             LossPercent = 0f;
         }
     }
