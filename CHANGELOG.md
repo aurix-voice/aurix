@@ -13,6 +13,9 @@ released together.
 
 ### Added
 
+- Error advice as code: `AurixError::describe_code` / `is_retryable_code`, C ABI `aurix_error_describe()` / `aurix_error_retryable()`, Unity `AurixErrors.Describe/IsRetryable/IsPlayerFacing`, Unreal `DescribeError` / `IsErrorRetryable` (Blueprint), Web `describeError` / `isErrorRetryable` / `isErrorPlayerFacing` — the cookbook's "what to do" table for every wire code.
+- Unreal: capture device hot-swap — `CaptureDevicePollSeconds` (default 2) re-lists microphones; a vanished device falls back to the system default (`OnCaptureDeviceChanged`), plug/unplug fires `OnCaptureDevicesChanged`; `GetCaptureDeviceName()`.
+- Unreal: `AurixClientLibrary.tps` third-party notice for the native library (Fab/Marketplace submissions).
 - `ParticipantLeft` carries a `reason` (`left`, `timeout`, `kicked`, `banned`, `out_of_range`, `channel_closed`, `replaced`; absent from older servers = `left`). Exposed as `Event::ParticipantLeft.reason`, `aurix_event_message()` on `AURIX_EVENT_PARTICIPANT_LEFT`, Unity `OnParticipantRemoved`, Unreal `OnParticipantRemoved` (`EAurixLeaveReason`), Web `participantLeft(channelId, userId, reason)`, Godot `participant_removed`.
 - Unity: `AurixPositionalSource` — the local player's pose goes to a positional channel at a fixed rate (only when moved) and remote talkers' voices can be attached to their avatars for in-engine 3D audio; samples `NetcodeProximity` (Netcode for GameObjects) and `MirrorProximity` (Mirror).
 - Web: `pageLifecycle` option (default on) and `probeConnection(timeoutMs)` — on `visibilitychange` / `online` / `pageshow` a pending reconnect runs immediately and an open socket is pinged, so one killed while the tab was in the background is replaced at once instead of after the keepalive timeout.

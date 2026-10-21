@@ -296,3 +296,4 @@ export type {
   RegionEndpoint,
   RegionsResponse,
 } from './regions.js';
+export { describeError, isErrorPlayerFacing, isErrorRetryable } from './errors.js';

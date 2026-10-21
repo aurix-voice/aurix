@@ -778,6 +778,72 @@ bool UAurixVoiceSubsystem::IsTickable() const
 void UAurixVoiceSubsystem::Tick(float /*DeltaTime*/)
 {
 	PumpEvents();
+	PollCaptureDevices();
+}
+
+void UAurixVoiceSubsystem::PollCaptureDevices()
+{
+	if (!Native || ActiveSettings.CaptureDevicePollSeconds <= 0.f)
+	{
+		return;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (Now - LastCaptureDevicePoll < ActiveSettings.CaptureDevicePollSeconds)
+	{
+		return;
+	}
+	LastCaptureDevicePoll = Now;
+
+	TArray<FString> Devices = FAurixAudioCapture::ListDevices();
+	if (!bCaptureDevicesPrimed)
+	{
+		// First poll after Connect(): remember the list, nothing has changed yet.
+		bCaptureDevicesPrimed = true;
+		KnownCaptureDevices = MoveTemp(Devices);
+		return;
+	}
+	if (Devices == KnownCaptureDevices)
+	{
+		return;
+	}
+	KnownCaptureDevices = MoveTemp(Devices);
+	OnCaptureDevicesChanged.Broadcast(KnownCaptureDevices);
+
+	if (!IsCapturing() || bCaptureSuspended || bCaptureReleasedForMute)
+	{
+		return;
+	}
+	const FString Wanted = Capture->GetDeviceName();
+	if (!Wanted.IsEmpty() && !KnownCaptureDevices.Contains(Wanted))
+	{
+		// The chosen microphone is gone: fall back to the system default rather than capture silence.
+		UE_LOG(LogAurixVoice, Warning, TEXT("capture device '%s' disappeared, falling back to the system default"), *Wanted);
+		ActiveSettings.CaptureDeviceIndex = -1;
+		StartCapture(-1);
+		OnCaptureDeviceChanged.Broadcast(FString(), true);
+	}
+	else if (Wanted.IsEmpty())
+	{
+		// Capturing the system default: the engine binds it when the stream opens, so reopen to
+		// follow a default that may have moved to the device just plugged in (or away from the one removed).
+		StartCapture(-1);
+		OnCaptureDeviceChanged.Broadcast(FString(), false);
+	}
+}
+
+FString UAurixVoiceSubsystem::GetCaptureDeviceName() const
+{
+	return Capture && Capture->IsCapturing() ? Capture->GetDeviceName() : FString();
+}
+
+FString UAurixVoiceSubsystem::DescribeError(const FString& Code)
+{
+	return FromUtf8(aurix_error_describe(ToUtf8(Code).c_str()));
+}
+
+bool UAurixVoiceSubsystem::IsErrorRetryable(const FString& Code)
+{
+	return aurix_error_retryable(ToUtf8(Code).c_str());
 }
 
 // ---- lifecycle -----------------------------------------------------------------------------
@@ -865,6 +931,8 @@ void UAurixVoiceSubsystem::Disconnect()
 
 void UAurixVoiceSubsystem::ReleaseNative()
 {
+	bCaptureDevicesPrimed = false;
+	KnownCaptureDevices.Reset();
 	bPlaybackRequested = false;
 	if (Capture)
 	{

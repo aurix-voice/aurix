@@ -2371,6 +2371,44 @@ pub unsafe extern "C" fn aurix_event_loss_profile(event: *const AurixEvent) -> A
 
 /// Machine-readable code for failures (`RequestFailed`, `ServerError`, `RejoinFailed`);
 /// empty otherwise. Owned by the event.
+/// One-sentence explanation of a wire error code (`aurix_event_code()`, REST `error.code`) with
+/// the recommended action, in English, for logs and player-facing fallbacks. Static storage;
+/// never NULL (unknown or NULL codes get a generic sentence). Same table as the SDK cookbook.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_error_describe(code: *const c_char) -> *const c_char {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static CStr>>> = OnceLock::new();
+    let code = if code.is_null() {
+        ""
+    } else {
+        CStr::from_ptr(code).to_str().unwrap_or("")
+    };
+    let text = aurix_common::error::AurixError::describe_code(code);
+    let cache = CACHE.get_or_init(Default::default);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cache.get(text) {
+        return c.as_ptr();
+    }
+    let owned: &'static CStr = Box::leak(CString::new(text).unwrap_or_default().into_boxed_c_str());
+    cache.insert(text, owned);
+    owned.as_ptr()
+}
+
+/// Whether retrying the same request later can succeed (capacity, rate limit, node-side or
+/// transient transport failures). Authorization, validation and moderation outcomes return
+/// false. NULL = false.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_error_retryable(code: *const c_char) -> bool {
+    if code.is_null() {
+        return false;
+    }
+    CStr::from_ptr(code)
+        .to_str()
+        .map(aurix_common::error::AurixError::is_retryable_code)
+        .unwrap_or(false)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_code(event: *const AurixEvent) -> *const c_char {
     self::event(event)

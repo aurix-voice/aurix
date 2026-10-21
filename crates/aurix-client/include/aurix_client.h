@@ -1824,7 +1824,19 @@ enum AurixLossProfile aurix_event_loss_profile(const struct AurixEvent *event);
 /**
  * Machine-readable code for failures (`RequestFailed`, `ServerError`, `RejoinFailed`);
  * empty otherwise. Owned by the event.
+ * One-sentence explanation of a wire error code (`aurix_event_code()`, REST `error.code`) with
+ * the recommended action, in English, for logs and player-facing fallbacks. Static storage;
+ * never NULL (unknown or NULL codes get a generic sentence). Same table as the SDK cookbook.
  */
+const char *aurix_error_describe(const char *code);
+
+/**
+ * Whether retrying the same request later can succeed (capacity, rate limit, node-side or
+ * transient transport failures). Authorization, validation and moderation outcomes return
+ * false. NULL = false.
+ */
+bool aurix_error_retryable(const char *code);
+
 const char *aurix_event_code(const struct AurixEvent *event);
 
 /**

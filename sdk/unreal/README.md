@@ -315,6 +315,21 @@ unprobed → `bProbeFailed`. `CancelRegionDiscovery()` aborts an in-flight disco
 one cancels the previous; the subsystem cancels on shutdown. Only healthy nodes with a public
 `wss://` URL are returned; an empty array means no node is configured for discovery.
 
+### Microphone hot-swap
+
+Every `CaptureDevicePollSeconds` (default 2, 0 = off) the plugin re-lists capture devices on
+the game thread. Plug/unplug fires `OnCaptureDevicesChanged(Devices)`; if the microphone chosen
+with `StartCapture(Index)` disappears, capture falls back to the system default and
+`OnCaptureDeviceChanged("", bFellBack = true)` fires; while capturing the default, a device
+change reopens the stream so the engine follows the new default (`bFellBack = false`).
+`GetCaptureDeviceName()` tells which device is open.
+
+### Errors
+
+`DescribeError(Code)` / `IsErrorRetryable(Code)` (Blueprint-pure, static) turn the `Code` of
+`OnRequestFailed` / `OnServerError` / `OnRejoinFailed` into the cookbook's one-sentence advice
+and a retry decision — same table as `aurix_error_describe()` in the C ABI.
+
 ### Background and foreground
 
 The subsystem listens to `FCoreDelegates::ApplicationWillEnterBackgroundDelegate` / `ApplicationHasEnteredForegroundDelegate`. With `bStopCaptureInBackground` (default on) the microphone is released while the app is suspended — on mobile the OS stops delivering audio anyway and the recording indicator goes away — and reopened on return. After `ProbeAfterBackgroundSeconds` (default 5 s, 0 = never) in the background the control connection is probed on return (`NetworkChanged()`), so a socket the OS killed is replaced immediately instead of after the ping timeout. `bReleaseCaptureWhenMuted` does the same for a mute: `SetMuted(true)` releases the device (no recording indicator), `SetMuted(false)` reopens it. Session and channels survive the suspension when the server-side resume window allows; otherwise the regular reconnect re-joins them.

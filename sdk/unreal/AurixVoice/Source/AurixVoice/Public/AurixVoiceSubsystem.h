@@ -58,6 +58,10 @@ typedef void (*FAurixVoiceEffectFn)(void* UserData, float* Frame, uint32 Samples
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixTtsStatusChanged, const FAurixTtsStatus&, Status);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRequestFailed, int64, RequestId, const FString&, Code, const FString&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixServerError, const FString&, Code, const FString&, Message);
+/** The microphone being captured changed: `DeviceName` is now open (empty = system default); `bFellBack` when the chosen device disappeared. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixCaptureDeviceChanged, const FString&, DeviceName, bool, bFellBack);
+/** A capture device was plugged in or removed; `Devices` is the new list (indices for StartCapture). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixCaptureDevicesChanged, const TArray<FString>&, Devices);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRejoinFailed, FGuid, ChannelId, const FString&, Code, const FString&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixRecovering, int32, Attempt, int32, DelayMs, const FString&, Cause);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixRecovered, bool, bResumed, bool, bMigrated);
@@ -177,6 +181,21 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	static TArray<FString> GetCaptureDevices();
+
+	/** Name of the microphone currently captured (empty = system default or not capturing). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	FString GetCaptureDeviceName() const;
+
+	/**
+	 * One-sentence explanation of a wire error code (OnRequestFailed / OnServerError / OnRejoinFailed `Code`)
+	 * with the recommended action — the SDK cookbook's error table, for logs and fallback UI text.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Errors")
+	static FString DescribeError(const FString& Code);
+
+	/** Whether retrying the same request later can succeed (capacity, rate limit, node-side or transient transport failures). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Errors")
+	static bool IsErrorRetryable(const FString& Code);
 
 	/** Open the microphone (-1 = default device). Also called automatically when bAutoStartCapture is set. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
@@ -668,6 +687,8 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantRemoved OnParticipantRemoved;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantMuteChanged OnParticipantMuteChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantSpeaking OnParticipantSpeaking;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixCaptureDeviceChanged OnCaptureDeviceChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixCaptureDevicesChanged OnCaptureDevicesChanged;
 	/** A member (possibly us) became or stopped being a priority speaker. */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantPriorityChanged OnParticipantPriorityChanged;
 	/**
@@ -776,6 +797,11 @@ private:
 	/** Capture released by SetMuted(true) with bReleaseCaptureWhenMuted (reopened on unmute). */
 	bool bCaptureReleasedForMute = false;
 	double BackgroundSince = 0.0;
+	/** Device hot-swap polling (CaptureDevicePollSeconds). */
+	TArray<FString> KnownCaptureDevices;
+	bool bCaptureDevicesPrimed = false;
+	double LastCaptureDevicePoll = 0.0;
+	void PollCaptureDevices();
 	void OnEnterBackground();
 	void OnEnterForeground();
 	bool bPlaybackRequested = false;

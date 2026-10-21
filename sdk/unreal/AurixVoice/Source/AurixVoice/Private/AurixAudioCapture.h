@@ -27,10 +27,13 @@ public:
 	void Stop();
 	bool IsCapturing() const { return bCapturing; }
 	int32 GetDeviceIndex() const { return CurrentDeviceIndex; }
+	/** Name of the device opened by Start() (empty for the system default). */
+	const FString& GetDeviceName() const { return CurrentDeviceName; }
 
 private:
 	Audio::FAudioCapture Capture;
 	std::atomic<AurixClient*> Client{nullptr};
 	bool bCapturing = false;
 	int32 CurrentDeviceIndex = -1;
+	FString CurrentDeviceName;
 };

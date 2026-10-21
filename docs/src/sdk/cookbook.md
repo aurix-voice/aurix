@@ -103,6 +103,11 @@ Every SDK surfaces the same codes (REST `error.code`, WebSocket `Error { code, m
 native `aurix_last_error()`, Unity `AurixApiException`, Web `SdkError`). The table says what
 the game should do, which is what matters at 2 a.m.
 
+The table ships as code too, so you never re-type it: native `aurix_error_describe(code)` /
+`aurix_error_retryable(code)`, Unity `AurixErrors.Describe` / `IsRetryable` / `IsPlayerFacing`,
+Unreal `DescribeError` / `IsErrorRetryable` (Blueprint-pure), Web `describeError` /
+`isErrorRetryable` / `isErrorPlayerFacing`.
+
 | Code | Meaning | Do |
 |---|---|---|
 | `AUTH_FAILED`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `TOKEN_REUSED` | token missing, malformed, expired or replayed | mint a new token on your backend and reconnect (`SetToken` + the SDK's token refresher does this when configured) |

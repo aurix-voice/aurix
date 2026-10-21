@@ -67,6 +67,15 @@ bool FAurixAudioCapture::Start(AurixClient* InClient, int32 DeviceIndex)
 	}
 	bCapturing = true;
 	CurrentDeviceIndex = DeviceIndex;
+	CurrentDeviceName.Reset();
+	if (DeviceIndex >= 0)
+	{
+		const TArray<FString> Names = ListDevices();
+		if (Names.IsValidIndex(DeviceIndex))
+		{
+			CurrentDeviceName = Names[DeviceIndex];
+		}
+	}
 	return true;
 }
 
