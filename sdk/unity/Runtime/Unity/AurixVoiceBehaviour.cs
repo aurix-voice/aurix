@@ -122,6 +122,13 @@ namespace Aurix.Unity
         [Tooltip("Stop the microphone while the app is in the background and restart it on return " +
                  "(iOS suspends audio anyway; on Android this avoids recording behind the user's back).")]
         public bool StopMicrophoneInBackground = true;
+        [Tooltip("Release the microphone device while muted and reopen it on unmute. Hides the OS recording indicator " +
+                 "(iOS orange dot, Android green dot) during a mute at the cost of ~100-300 ms of warm-up on unmute.")]
+        public bool ReleaseMicrophoneWhenMuted = false;
+        [Tooltip("Downmix the voice output to mono (same signal on every channel). Turn on while a phone plays through its " +
+                 "speakerphone: many Android devices drive only one channel there, so stereo panning of positional voices " +
+                 "would drop talkers. Switch it with the speakerphone state from your audio-routing code.")]
+        public bool ForceMonoOutput = false;
         [Tooltip("After being suspended longer than this many seconds, ping the server and reconnect at once if " +
                  "it does not answer within 2 s (instead of waiting for the regular 3 × PingInterval timeout). 0 = off.")]
         public float ProbeAfterBackgroundSeconds = 2f;
@@ -521,7 +528,14 @@ namespace Aurix.Unity
             dsp?.Dispose();
         }
 
-        public void SetMuted(bool muted) => Client?.SetMuted(muted);
+        public void SetMuted(bool muted)
+        {
+            Client?.SetMuted(muted);
+            _releasedForMute = muted && ReleaseMicrophoneWhenMuted;
+            if (_releasedForMute) StopMic();
+            else if (!muted && _micClip == null) _micRetryAt = 0f; // WatchMicrophone reopens it on the next frame
+        }
+        private bool _releasedForMute;
 
         /// <summary>
         /// Negotiate the session codec at runtime (see <see cref="AurixVoiceClient.SetAudioCodecAsync"/>).
@@ -757,6 +771,7 @@ namespace Aurix.Unity
         {
             if (Client == null || !IsConnected) return;
             if (_pausedAt >= 0f && StopMicrophoneInBackground) return; // suspended: Update may still run with "Run In Background"
+            if (_releasedForMute) return; // muted with ReleaseMicrophoneWhenMuted: reopened by SetMuted(false)
             if (_micClip != null)
             {
                 if (Microphone.IsRecording(_activeDevice)) return;
@@ -947,6 +962,16 @@ namespace Aurix.Unity
             var mixer = _mixer;
             if (mixer == null || _fillFromMixer == null) return;
             _outputResampler.Process(data, channels, _outputRate, _fillFromMixer);
+            if (ForceMonoOutput && channels > 1)
+            {
+                for (int i = 0; i + channels <= data.Length; i += channels)
+                {
+                    float sum = 0f;
+                    for (int c = 0; c < channels; c++) sum += data[i + c];
+                    float mono = sum / channels;
+                    for (int c = 0; c < channels; c++) data[i + c] = mono;
+                }
+            }
         }
 
         private void OnDestroy()

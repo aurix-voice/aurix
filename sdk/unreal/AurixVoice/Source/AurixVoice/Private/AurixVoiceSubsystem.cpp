@@ -1080,6 +1080,19 @@ void UAurixVoiceSubsystem::SetMuted(bool bMuted)
 	{
 		Native->Client.set_muted(bMuted);
 	}
+	if (bMuted && ActiveSettings.bReleaseCaptureWhenMuted && IsCapturing())
+	{
+		bCaptureReleasedForMute = true;
+		StopCapture();
+	}
+	else if (!bMuted && bCaptureReleasedForMute)
+	{
+		bCaptureReleasedForMute = false;
+		if (Native)
+		{
+			StartCapture(ActiveSettings.CaptureDeviceIndex);
+		}
+	}
 }
 
 bool UAurixVoiceSubsystem::IsMuted() const
@@ -2019,7 +2032,7 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		AurixSessionInfo Info;
 		if (aurix_event_session(Raw, &Info))
 		{
-			if (ActiveSettings.bAutoStartCapture && !IsCapturing())
+			if (ActiveSettings.bAutoStartCapture && !IsCapturing() && !bCaptureReleasedForMute && !bCaptureSuspended)
 			{
 				StartCapture(ActiveSettings.CaptureDeviceIndex);
 			}

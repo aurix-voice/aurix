@@ -770,6 +770,8 @@ private:
 	FDelegateHandle EnterForegroundHandle;
 	/** Capture was open when the app went to the background (reopened on return). */
 	bool bCaptureSuspended = false;
+	/** Capture released by SetMuted(true) with bReleaseCaptureWhenMuted (reopened on unmute). */
+	bool bCaptureReleasedForMute = false;
 	double BackgroundSince = 0.0;
 	void OnEnterBackground();
 	void OnEnterForeground();

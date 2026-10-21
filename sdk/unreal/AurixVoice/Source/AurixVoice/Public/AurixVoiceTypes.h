@@ -591,6 +591,10 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	bool bStopCaptureInBackground = true;
 
+	/** Release the microphone device while muted and reopen it on unmute: hides the OS recording indicator during a mute at the cost of a short warm-up on unmute. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	bool bReleaseCaptureWhenMuted = false;
+
 	/** After at least this long in the background, probe the control connection on return so a socket the OS killed is replaced now rather than after the ping timeout. 0 = never. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Connection", meta = (ClampMin = "0"))
 	float ProbeAfterBackgroundSeconds = 5.f;
