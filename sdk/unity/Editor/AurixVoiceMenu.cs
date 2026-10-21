@@ -61,6 +61,21 @@ namespace Aurix.Editor
             {
                 report.AppendLine("  ok    " + target + ": native AURX media (QUIC/UDP with WebSocket tunnel fallback)");
             }
+
+            if (target == BuildTarget.Android)
+            {
+                report.AppendLine("  info  Android: with a custom AndroidManifest.xml add <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/> yourself — Unity only injects it when it sees a Microphone call at build time");
+            }
+            if (target != BuildTarget.WebGL && target != BuildTarget.iOS && target != BuildTarget.Android)
+            {
+                if (PlayerSettings.runInBackground) report.AppendLine("  ok    Run In Background: on — voice keeps flowing while the window is not focused");
+                else { problems++; report.AppendLine("  FIX   Run In Background is off (Player ▸ Resolution and Presentation): voice stops the moment the player alt-tabs"); }
+            }
+            var group = BuildPipeline.GetBuildTargetGroup(target);
+            if (PlayerSettings.GetScriptingBackend(group) == ScriptingImplementation.IL2CPP && PlayerSettings.GetManagedStrippingLevel(group) == ManagedStrippingLevel.High)
+            {
+                report.AppendLine("  info  IL2CPP with High managed stripping: the codec and E2EE paths use reflection-free code, but keep the package's link.xml if you see MissingMethodException at runtime");
+            }
             return problems;
         }
 

@@ -169,6 +169,13 @@ namespace UnityEditor
             public static bool decompressionFallback => false;
         }
         public static class iOS { public static string microphoneUsageDescription => ""; }
+        public static bool runInBackground => true;
+        public static ScriptingImplementation GetScriptingBackend(BuildTargetGroup g) => ScriptingImplementation.Mono2x;
+        public static ManagedStrippingLevel GetManagedStrippingLevel(BuildTargetGroup g) => ManagedStrippingLevel.Low;
     }
+    public enum BuildTargetGroup { Unknown, Standalone, iOS, Android, WebGL }
+    public enum ScriptingImplementation { Mono2x, IL2CPP }
+    public enum ManagedStrippingLevel { Disabled, Low, Medium, High }
+    public static class BuildPipeline { public static BuildTargetGroup GetBuildTargetGroup(BuildTarget t) => BuildTargetGroup.Standalone; }
 }
 #endif
