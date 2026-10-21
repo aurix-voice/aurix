@@ -1,7 +1,7 @@
 {
   "name": "aurix-rooms-server",
   "private": true,
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Aurix Rooms demo backend: rooms as Aurix channels, player tokens, bot session and status, static frontend.",
   "license": "Apache-2.0",
   "type": "module",

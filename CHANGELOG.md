@@ -11,6 +11,8 @@ released together.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-21
+
 ### Added
 
 * **Web SDK: `transport: 'websocket'`** — AURX media as binary frames on the control WebSocket
@@ -671,7 +673,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/aurix-voice/aurix/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/aurix-voice/aurix/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/aurix-voice/aurix/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/aurix-voice/aurix/compare/872f918...v1.4.0
