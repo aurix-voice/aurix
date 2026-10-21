@@ -315,6 +315,10 @@ unprobed → `bProbeFailed`. `CancelRegionDiscovery()` aborts an in-flight disco
 one cancels the previous; the subsystem cancels on shutdown. Only healthy nodes with a public
 `wss://` URL are returned; an empty array means no node is configured for discovery.
 
+### Background and foreground
+
+The subsystem listens to `FCoreDelegates::ApplicationWillEnterBackgroundDelegate` / `ApplicationHasEnteredForegroundDelegate`. With `bStopCaptureInBackground` (default on) the microphone is released while the app is suspended — on mobile the OS stops delivering audio anyway and the recording indicator goes away — and reopened on return. After `ProbeAfterBackgroundSeconds` (default 5 s, 0 = never) in the background the control connection is probed on return (`NetworkChanged()`), so a socket the OS killed is replaced immediately instead of after the ping timeout. Session and channels survive the suspension when the server-side resume window allows; otherwise the regular reconnect re-joins them.
+
 ### Events
 
 Typed delegates cover connection state, session, media binding, channel/participant roster,

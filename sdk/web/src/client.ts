@@ -258,6 +258,13 @@ export interface AurixClientOptions {
   /** Exponential backoff for reconnect attempts. */
   reconnect?: Partial<ReconnectPolicy>;
   /**
+   * React to the page lifecycle (default `true`): when the tab becomes visible again or the
+   * browser reports `online`, a pending reconnect runs immediately and an open socket is probed
+   * with a ping so one the OS silently killed in the background is replaced now rather than
+   * after the keepalive timeout. Set `false` when the host app drives this itself.
+   */
+  pageLifecycle?: boolean;
+  /**
    * How many per-participant downlink tracks to negotiate next to the mixed track (each
    * carries one participant's voice untouched; the client renders volume, mute, focus and
    * positional HRTF itself). Capped by the node's `webrtc_participant_streams`; defaults to
@@ -1320,6 +1327,7 @@ export class AurixClient {
       requestTimeoutMs: 10_000,
       qualityReportIntervalMs: 5_000,
       autoReconnect: true,
+      pageLifecycle: true,
       ...options,
     };
     this.reconnectPolicy = { ...DEFAULT_RECONNECT, ...(options.reconnect ?? {}) };
@@ -2788,6 +2796,7 @@ export class AurixClient {
     this.serverQuality = undefined;
     this.statsSnapshot = undefined;
     this.setState('connecting');
+    this.attachLifecycle();
 
     let info: SessionInfo;
     try {
@@ -2824,6 +2833,7 @@ export class AurixClient {
     this.closedByUser = true;
     this.cancelReconnect();
     this.stopPing();
+    this.detachLifecycle();
     this.failPending('disconnected');
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.session) {
@@ -2886,6 +2896,62 @@ export class AurixClient {
    * Reconnect now instead of waiting for the next scheduled attempt (e.g. when the app
    * observes that the network is back). No-op unless the client is `reconnecting`.
    */
+  /**
+   * Check the control connection right now: sends a ping and, when no pong arrives within
+   * `timeoutMs`, drops the socket so the reconnect starts immediately. Called by the page
+   * lifecycle handling (`pageLifecycle`); call it yourself after your own "app resumed" signal.
+   * While already reconnecting it skips the current backoff delay instead.
+   */
+  probeConnection(timeoutMs = 3_000): void {
+    if (this.state === 'reconnecting') {
+      this.reconnectNow();
+      return;
+    }
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN || this.probeTimer !== undefined) return;
+    const sentAt = performance.now();
+    const nonce = this.pingNonce++;
+    this.lastPingSentAt = sentAt;
+    this.trySend({ type: 'Ping', data: { nonce } });
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = undefined;
+      if (this.ws === ws && this.lastPongAt < sentAt) this.dropSocket('no pong after resume');
+    }, timeoutMs);
+  }
+
+  private probeTimer: ReturnType<typeof setTimeout> | undefined;
+  private lifecycleHandler: (() => void) | undefined;
+
+  private attachLifecycle(): void {
+    if (!this.opts.pageLifecycle || this.lifecycleHandler || typeof document === 'undefined') return;
+    const handler = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      this.probeConnection();
+    };
+    this.lifecycleHandler = handler;
+    document.addEventListener('visibilitychange', handler);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handler);
+      window.addEventListener('pageshow', handler);
+    }
+  }
+
+  private detachLifecycle(): void {
+    if (this.probeTimer !== undefined) {
+      clearTimeout(this.probeTimer);
+      this.probeTimer = undefined;
+    }
+    const handler = this.lifecycleHandler;
+    if (!handler) return;
+    this.lifecycleHandler = undefined;
+    document.removeEventListener('visibilitychange', handler);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', handler);
+      window.removeEventListener('pageshow', handler);
+    }
+  }
+
   reconnectNow(): void {
     if (this.state !== 'reconnecting' || this.reconnectTimer === undefined) return;
     clearTimeout(this.reconnectTimer);

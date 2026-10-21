@@ -11,6 +11,8 @@
 #include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/CoreDelegates.h"
 #include "GameFramework/Actor.h"
 #include "Kismet/GameplayStatics.h"
 #include "Serialization/JsonReader.h"
@@ -726,11 +728,43 @@ void UAurixVoiceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	PostLoadMapHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(this, &UAurixVoiceSubsystem::OnPostLoadMap);
+	EnterBackgroundHandle = FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddUObject(this, &UAurixVoiceSubsystem::OnEnterBackground);
+	EnterForegroundHandle = FCoreDelegates::ApplicationHasEnteredForegroundDelegate.AddUObject(this, &UAurixVoiceSubsystem::OnEnterForeground);
+}
+
+void UAurixVoiceSubsystem::OnEnterBackground()
+{
+	BackgroundSince = FPlatformTime::Seconds();
+	if (ActiveSettings.bStopCaptureInBackground && IsCapturing())
+	{
+		bCaptureSuspended = true;
+		StopCapture();
+	}
+}
+
+void UAurixVoiceSubsystem::OnEnterForeground()
+{
+	const double Away = BackgroundSince > 0.0 ? FPlatformTime::Seconds() - BackgroundSince : 0.0;
+	BackgroundSince = 0.0;
+	if (bCaptureSuspended)
+	{
+		bCaptureSuspended = false;
+		if (Native)
+		{
+			StartCapture(ActiveSettings.CaptureDeviceIndex);
+		}
+	}
+	if (ActiveSettings.ProbeAfterBackgroundSeconds > 0.f && Away >= ActiveSettings.ProbeAfterBackgroundSeconds)
+	{
+		NetworkChanged();
+	}
 }
 
 void UAurixVoiceSubsystem::Deinitialize()
 {
 	FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapHandle);
+	FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Remove(EnterBackgroundHandle);
+	FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Remove(EnterForegroundHandle);
 	CancelRegionDiscovery();
 	ReleaseNative();
 	Super::Deinitialize();

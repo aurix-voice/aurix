@@ -766,5 +766,12 @@ private:
 	TSet<FGuid> ManualClaims;
 
 	FDelegateHandle PostLoadMapHandle;
+	FDelegateHandle EnterBackgroundHandle;
+	FDelegateHandle EnterForegroundHandle;
+	/** Capture was open when the app went to the background (reopened on return). */
+	bool bCaptureSuspended = false;
+	double BackgroundSince = 0.0;
+	void OnEnterBackground();
+	void OnEnterForeground();
 	bool bPlaybackRequested = false;
 };
