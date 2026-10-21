@@ -23,6 +23,7 @@ pub mod redis_pool;
 pub mod safety;
 #[cfg(feature = "server")]
 pub mod sink;
+pub mod tls;
 #[cfg(feature = "server")]
 pub mod translate;
 #[cfg(feature = "server")]

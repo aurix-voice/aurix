@@ -598,7 +598,14 @@ async fn proxy_pull(
     };
     let upstream = match tokio::time::timeout(
         PROXY_CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
+        tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(
+                aurix_common::tls::mozilla_roots_client_config(),
+            )),
+        ),
     )
     .await
     {

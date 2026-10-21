@@ -9,6 +9,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Reserve one of `max` slots on `count`: a CAS loop so concurrent joins cannot overshoot the
+/// limit. `false` when the counter is already at `max`.
+pub(crate) fn reserve_slot(count: &AtomicU32, max: u32) -> bool {
+    let mut current = count.load(Ordering::Acquire);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match count.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// A sender-reported level older than this no longer describes the frame being routed.
 const AMBIENT_LEVEL_STALE_MS: i64 = 500;
 
@@ -322,16 +338,7 @@ impl MediaChannel {
             let cfg = self.config.read();
             (cfg.max_participants, cfg.audience.unwrap_or_default())
         };
-        let reserved =
-            self.participant_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    if c >= max {
-                        None
-                    } else {
-                        Some(c + 1)
-                    }
-                });
-        if reserved.is_err() {
+        if !reserve_slot(&self.participant_count, max) {
             return Err(AurixError::ChannelFull(format!(
                 "Channel {} full ({}/{})",
                 self.channel_id, max, max

@@ -88,7 +88,26 @@ released together.
   `E2eeSenderKey`, `E2eeReplayState`, `E2eePeerKeys`, `FrameCrypto`, the `*Stage` classes,
   `VoiceEffectChain` and `VisemeAnalyzer` remain exported (as constructors with interface types).
 
+### Security
+
+* rustls 0.23.46 (RUSTSEC-2026-0346/0347/0348/0349), rustls-webpki 0.103.16
+  (RUSTSEC-2026-0382), webpki-roots 1.0.10 (RUSTSEC-2026-0381); the unpatched webpki-roots 0.26
+  line is no longer in the dependency tree.
+
 ### Changed
+
+* **Outbound TLS trust stores.** The WebSocket clients (native core control channel, the
+  API's live-stream proxy, the recorder's live link) build their rustls configuration from
+  `aurix_common::tls::mozilla_roots_client_config()` — ring plus the bundled Mozilla roots from
+  the `webpki-roots` 1.x release the workspace pins — instead of the root bundle the WebSocket
+  crate ships (a 0.26 series with no fix for RUSTSEC-2026-0381). PostgreSQL TLS (`sslmode=` in
+  `database.url`) now trusts the operating system's certificate store (sqlx
+  `tls-rustls-ring-native-roots`): a server certificate from a public CA keeps working, a
+  private CA goes through `sslrootcert=` as before, and the bundled root list is gone from that
+  path.
+* **Builds warning-free on Rust 1.99.** Participant-slot reservation in `MediaChannel` and the
+  SFU uses an explicit compare-exchange loop (`reserve_slot`) rather than the now-deprecated
+  `AtomicU32::fetch_update`; the MSRV stays 1.88.
 
 * **SDK `loss_percent` is measured over at least 200 expected frames.** The native core, the
   Web SDK and the Unity C# client reported the loss of the last quality period alone; with a

@@ -1551,8 +1551,14 @@ impl LiveStreams {
                             .map_err(|_| AurixError::Validation("invalid header".into()))?;
                         request.headers_mut().insert(n, v);
                     }
-                    let handshake =
-                        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None);
+                    let handshake = tokio_tungstenite::client_async_tls_with_config(
+                        request,
+                        tcp,
+                        None,
+                        Some(tokio_tungstenite::Connector::Rustls(
+                            aurix_common::tls::mozilla_roots_client_config(),
+                        )),
+                    );
                     return match tokio::time::timeout(timeout, handshake).await {
                         Ok(Ok((ws, _resp))) => Ok(ws),
                         Ok(Err(e)) => {

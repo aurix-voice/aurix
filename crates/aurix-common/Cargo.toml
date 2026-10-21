@@ -46,6 +46,8 @@ bytes = { workspace = true }
 base64 = { workspace = true }
 ring = { workspace = true }
 sha2 = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 sha1 = { workspace = true }
 md-5 = { workspace = true }
 subtle = { workspace = true }

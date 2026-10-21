@@ -31,5 +31,5 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { workspace = true, features = ["__rustls-tls"] }
 async-trait = { workspace = true }

@@ -201,7 +201,10 @@ impl ControlConnection {
                 HeaderValue::from_str(device).expect("validated"),
             );
         }
-        let connect = tokio_tungstenite::connect_async(request);
+        let connector =
+            tokio_tungstenite::Connector::Rustls(aurix_common::tls::mozilla_roots_client_config());
+        let connect =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector));
         let (ws, _) = tokio::time::timeout(timeout, connect)
             .await
             .map_err(|_| ClientError::Timeout("websocket connect".into()))?

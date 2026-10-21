@@ -14,7 +14,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 aurix-common = { path = "../aurix-common", default-features = false, features = ["quic"] }
 tokio = { version = "1.36", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { workspace = true, features = ["__rustls-tls"] }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

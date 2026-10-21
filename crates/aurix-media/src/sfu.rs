@@ -1,7 +1,7 @@
 use crate::audio_pipeline::AudioAnalysisPipeline;
 use crate::cascade::{CascadeOptions, CascadeRelay};
 use crate::cert::MediaCert;
-use crate::channel::{Admission, JoinHints, MediaChannel, RoleChange};
+use crate::channel::{reserve_slot, Admission, JoinHints, MediaChannel, RoleChange};
 use crate::denoise::{DenoisePool, UplinkDenoiser};
 use crate::mix::MixHub;
 use crate::mixer::MixerConfig;
@@ -776,17 +776,7 @@ impl SfuNode {
             info!("Replaced existing session for user {}", user_id);
         }
         let max = self.options.max_participants;
-        if self
-            .active_participant_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                if c >= max {
-                    None
-                } else {
-                    Some(c + 1)
-                }
-            })
-            .is_err()
-        {
+        if !reserve_slot(&self.active_participant_count, max) {
             return Err(AurixError::MediaNodeUnavailable("Node at capacity".into()));
         }
         let mut media_key = [0u8; 32];
