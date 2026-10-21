@@ -392,6 +392,9 @@ pub enum Event {
         attempt: u32,
         delay: Duration,
         cause: String,
+        /// Time left before the client gives up (`ReconnectPolicy::deadline`), measured from
+        /// the drop; `None` when only `max_attempts` bounds the recovery.
+        deadline_in: Option<Duration>,
     },
     /// Back online. `resumed == false` means the server issued a fresh session and the
     /// previous channels were re-joined (integrations see `ChannelLeft`/`ChannelJoined`).

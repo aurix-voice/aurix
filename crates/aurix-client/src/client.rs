@@ -2055,6 +2055,7 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
     let mut resume: Option<(SessionId, String)> = None;
     let mut attempt: u32 = 0;
     let mut first = true;
+    let mut recovery_since: Option<std::time::Instant> = None;
     let mut pending = Pending::default();
     let mut cause: String;
     loop {
@@ -2099,6 +2100,7 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         match connected {
             Ok((conn, ack)) => {
                 attempt = 0;
+                recovery_since = None;
                 pending.inbox = InboxAck::default();
                 {
                     let mut ep = inner.endpoints.lock();
@@ -2188,11 +2190,31 @@ async fn run(inner: Arc<Inner>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
             return;
         }
         let delay = cfg.reconnect.delay(attempt);
+        let since = *recovery_since.get_or_insert_with(std::time::Instant::now);
+        let deadline_in = cfg
+            .reconnect
+            .deadline
+            .map(|d| d.saturating_sub(since.elapsed()));
+        if let Some(left) = deadline_in {
+            if left <= delay {
+                let reason = format!(
+                    "gave up: not back within {:.0?} ({} attempts): {cause}",
+                    cfg.reconnect.deadline.unwrap_or_default(),
+                    attempt - 1
+                );
+                inner.emit(Event::FailedToRecover {
+                    reason: reason.clone(),
+                });
+                finish(&inner, &mut pending, &reason, ConnectionState::Failed);
+                return;
+            }
+        }
         inner.set_state(ConnectionState::Reconnecting);
         inner.emit(Event::Recovering {
             attempt,
             delay,
             cause: cause.clone(),
+            deadline_in,
         });
         // Media is dead until the new session binds (a resume keeps the sequence counter).
         let old = inner.media.write().take();

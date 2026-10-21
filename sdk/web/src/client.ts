@@ -383,6 +383,12 @@ export interface ReconnectPolicy {
   jitter: number;
   /** Give up (`failedToRecover`) after this many failed attempts. Default 10. */
   maxAttempts: number;
+  /**
+   * Give up when the connection has not been back for this long since it dropped, whatever
+   * `maxAttempts` says; 0 = attempts only. Default 30000 — long enough for a Wi-Fi ↔ cellular
+   * hand-over, short enough that the game can tell the player voice is gone.
+   */
+  deadlineMs: number;
 }
 
 const DEFAULT_RECONNECT: ReconnectPolicy = {
@@ -391,6 +397,7 @@ const DEFAULT_RECONNECT: ReconnectPolicy = {
   factor: 2,
   jitter: 0.3,
   maxAttempts: 10,
+  deadlineMs: 30_000,
 };
 
 export interface SessionInfo {
@@ -1280,6 +1287,7 @@ export class AurixClient {
   private resumeGraceMs = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
+  private recoverySince = 0;
   private lastPongAt = 0;
   private activeEndpoint: string;
   private failoverEndpoints: string[] = [];
@@ -3655,6 +3663,7 @@ export class AurixClient {
       return;
     }
     this.reconnectAttempt = 0;
+    this.recoverySince = performance.now();
     this.setState('reconnecting');
     this.scheduleReconnect(cause);
   }
@@ -3668,6 +3677,10 @@ export class AurixClient {
     const attempt = this.reconnectAttempt + 1;
     const base = Math.min(policy.maxDelayMs, policy.initialDelayMs * policy.factor ** (attempt - 1));
     const delay = Math.round(base * (1 + policy.jitter * (Math.random() * 2 - 1)));
+    if (policy.deadlineMs > 0 && performance.now() - this.recoverySince + delay >= policy.deadlineMs) {
+      this.giveUp(new Error(`reconnect failed: not back within ${Math.round(policy.deadlineMs / 1000)} s, ${this.reconnectAttempt} attempts (${cause})`));
+      return;
+    }
     this.emit('recovering', attempt, delay, cause);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;

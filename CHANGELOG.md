@@ -15,6 +15,7 @@ released together.
 
 - Unity: `AurixPositionalSource` — the local player's pose goes to a positional channel at a fixed rate (only when moved) and remote talkers' voices can be attached to their avatars for in-engine 3D audio; samples `NetcodeProximity` (Netcode for GameObjects) and `MirrorProximity` (Mirror).
 - Web: `pageLifecycle` option (default on) and `probeConnection(timeoutMs)` — on `visibilitychange` / `online` / `pageshow` a pending reconnect runs immediately and an open socket is pinged, so one killed while the tab was in the background is replaced at once instead of after the keepalive timeout.
+- Recovery deadline: `ReconnectPolicy::deadline` (core, default 30 s; FFI `reconnect_deadline_ms`, Unreal `RecoveryDeadlineSeconds`, Unity `Reconnect.DeadlineSeconds`, Web `reconnect.deadlineMs`) — the client gives up by wall-clock time since the drop as well as by attempts; `Event::Recovering` carries `deadline_in`.
 - Unreal: background / foreground handling — `bStopCaptureInBackground` releases the microphone while the app is suspended and reopens it on return; `ProbeAfterBackgroundSeconds` probes the control connection after a long suspension (`NetworkChanged`).
 
 ## [1.7.0] - 2026-10-21

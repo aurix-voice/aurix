@@ -695,6 +695,8 @@ pub struct AurixClientConfig {
     pub reconnect_max_attempts: u32,
     pub reconnect_initial_delay_ms: u32,
     pub reconnect_max_delay_ms: u32,
+    /// Give up when not back within this long after the drop; 0 = attempts only. Default 30000.
+    pub reconnect_deadline_ms: u32,
     pub request_timeout_ms: u32,
     pub ping_interval_ms: u32,
     pub heartbeat_interval_ms: u32,
@@ -764,6 +766,11 @@ pub unsafe extern "C" fn aurix_client_config_default(out: *mut AurixClientConfig
         reconnect_max_attempts: d.reconnect.max_attempts,
         reconnect_initial_delay_ms: d.reconnect.initial_delay.as_millis() as u32,
         reconnect_max_delay_ms: d.reconnect.max_delay.as_millis() as u32,
+        reconnect_deadline_ms: d
+            .reconnect
+            .deadline
+            .map(|d| d.as_millis() as u32)
+            .unwrap_or(0),
         request_timeout_ms: d.request_timeout.as_millis() as u32,
         ping_interval_ms: d.ping_interval.as_millis() as u32,
         heartbeat_interval_ms: d.heartbeat_interval.as_millis() as u32,
@@ -1050,6 +1057,8 @@ fn build_config(c: &AurixClientConfig) -> Result<ClientConfig, AurixResult> {
         c.reconnect_max_delay_ms
             .max(c.reconnect_initial_delay_ms.max(50)) as u64,
     );
+    cfg.reconnect.deadline = (c.reconnect_deadline_ms > 0)
+        .then(|| Duration::from_millis(c.reconnect_deadline_ms as u64));
     cfg.request_timeout = Duration::from_millis(c.request_timeout_ms.max(500) as u64);
     cfg.ping_interval = Duration::from_millis(c.ping_interval_ms.max(1000) as u64);
     cfg.heartbeat_interval = Duration::from_millis(c.heartbeat_interval_ms.max(500) as u64);

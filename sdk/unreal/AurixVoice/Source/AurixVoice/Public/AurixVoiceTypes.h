@@ -490,6 +490,10 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Reconnect")
 	int32 ReconnectMaxDelayMs = 15000;
 
+	/** Give up when the connection has not been back for this long since it dropped, whatever ReconnectMaxAttempts says; 0 = attempts only. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Connection", meta = (ClampMin = "0"))
+	float RecoveryDeadlineSeconds = 30.f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix")
 	int32 RequestTimeoutMs = 10000;
 

@@ -13,6 +13,10 @@ pub struct ReconnectPolicy {
     /// ±fraction of the computed delay.
     pub jitter: f64,
     pub max_attempts: u32,
+    /// Give up when the connection has not been back for this long since it dropped, whatever
+    /// `max_attempts` says (`None` = attempts only). Default 30 s — long enough for a Wi-Fi ↔
+    /// cellular hand-over, short enough that the game can tell the player voice is gone.
+    pub deadline: Option<Duration>,
 }
 
 impl Default for ReconnectPolicy {
@@ -23,6 +27,7 @@ impl Default for ReconnectPolicy {
             factor: 2.0,
             jitter: 0.2,
             max_attempts: 10,
+            deadline: Some(Duration::from_secs(30)),
         }
     }
 }

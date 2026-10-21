@@ -793,6 +793,7 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 	Cfg.raw.reconnect_max_attempts = static_cast<uint32_t>(FMath::Max(0, Settings.ReconnectMaxAttempts));
 	Cfg.raw.reconnect_initial_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectInitialDelayMs));
 	Cfg.raw.reconnect_max_delay_ms = static_cast<uint32_t>(FMath::Max(1, Settings.ReconnectMaxDelayMs));
+	Cfg.raw.reconnect_deadline_ms = static_cast<uint32_t>(FMath::Max(0.f, Settings.RecoveryDeadlineSeconds) * 1000.f);
 	Cfg.raw.request_timeout_ms = static_cast<uint32_t>(FMath::Max(1, Settings.RequestTimeoutMs));
 	Cfg.raw.encoder = ToNativeEncoderSettings(Settings.Encoder);
 	Cfg.raw.dsp = ToNativeDspConfig(Settings.Dsp);

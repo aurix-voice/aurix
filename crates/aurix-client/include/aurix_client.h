@@ -828,6 +828,10 @@ typedef struct AurixClientConfig {
   uint32_t reconnect_max_attempts;
   uint32_t reconnect_initial_delay_ms;
   uint32_t reconnect_max_delay_ms;
+  /**
+   * Give up when not back within this long after the drop; 0 = attempts only. Default 30000.
+   */
+  uint32_t reconnect_deadline_ms;
   uint32_t request_timeout_ms;
   uint32_t ping_interval_ms;
   uint32_t heartbeat_interval_ms;

@@ -137,7 +137,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 
 | Feature | API |
 |---|---|
-| Reconnect / resume | `AutoReconnect`, `Reconnect` policy, `ForceReconnect()`, `OnRecovering(attempt, delay, cause)`, `OnRecovered(SessionInfo)`, `OnFailedToRecover`, `OnSessionClosed` |
+| Reconnect / resume | `AutoReconnect`, `Reconnect` policy, `ForceReconnect()`, `OnRecovering(attempt, delay, cause)`, `OnRecovered(SessionInfo)`, `OnFailedToRecover`, `OnSessionClosed`; `Reconnect.DeadlineSeconds` (default 30) gives up by wall-clock time as well as by attempts |
 | Failover | `Endpoint`, `FailoverEndpoints`, `OnEndpointChanged(url)`, `SessionInfo.Migrated`, `SessionInfo.Failover` — attempts rotate current node → advertised failover nodes; a takeover keeps session id/SSRC, new media key/endpoint |
 | Action tokens | `TokenRefresher`, `JoinTokenProvider`, `JoinChannelAsync(id, joinToken)`, `ModerateAsync(channel, user, ModerationAction, token, reason)` |
 | Local mute / volume / block | `SetParticipantMutedAsync(user, muted, channel?)`, `SetParticipantVolumeAsync(user, 0..2)`, `SetUserBlockedAsync`, `OnReceiverPreferences`, `OnUserBlockChanged` |
