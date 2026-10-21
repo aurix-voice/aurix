@@ -683,6 +683,7 @@ dependencies = [
  "aurix-client",
  "aurix-common",
  "clap",
+ "libc",
  "parking_lot",
  "reqwest",
  "serde",

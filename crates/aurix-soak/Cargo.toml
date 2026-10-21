@@ -16,6 +16,7 @@ aurix-client = { path = "../aurix-client" }
 aurix-common = { path = "../aurix-common", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
+libc = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

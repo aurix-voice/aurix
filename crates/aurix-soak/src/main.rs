@@ -1195,6 +1195,34 @@ fn resource_samples<'a>(steady: &[&'a IntervalRow], chaos: &[ChaosRow]) -> Vec<&
         .collect()
 }
 
+/// Growth of one node resource judged per load level. A node's RSS and fd count follow the
+/// sessions it hosts (every player costs a QUIC/TLS connection, jitter state, a mixer slot), and
+/// the kill hooks move all players onto the surviving node and leave the restarted one empty,
+/// so a plain first-vs-last-quarter comparison measures the redistribution, not a leak. Samples
+/// are grouped by `aurix_active_sessions` instead and each group is judged on its own timeline;
+/// the worst growth across groups with enough samples is the figure. `None` when no group has
+/// enough.
+fn node_growth(
+    resource: &[&IntervalRow],
+    node: usize,
+    value: impl Fn(&NodeSample) -> Option<f64>,
+) -> Option<f64> {
+    let mut by_load: BTreeMap<u64, Vec<f64>> = BTreeMap::new();
+    for row in resource {
+        let Some(n) = row.nodes.get(node).filter(|n| n.up) else {
+            continue;
+        };
+        let (Some(v), Some(sessions)) = (value(n), n.active_sessions) else {
+            continue;
+        };
+        by_load.entry(sessions.round() as u64).or_default().push(v);
+    }
+    by_load
+        .values()
+        .filter_map(|samples| growth(samples))
+        .reduce(f64::max)
+}
+
 fn verdict(
     shared: &Shared,
     state: &State,
@@ -1209,20 +1237,12 @@ fn verdict(
     let mut node_rss_growth = Vec::with_capacity(node_count);
     let mut node_fds_growth = Vec::with_capacity(node_count);
     for i in 0..node_count {
-        let rss: Vec<f64> = resource
-            .iter()
-            .filter_map(|r| r.nodes.get(i).filter(|n| n.up).and_then(|n| n.rss_bytes))
-            .collect();
-        let fds: Vec<f64> = resource
-            .iter()
-            .filter_map(|r| r.nodes.get(i).filter(|n| n.up).and_then(|n| n.open_fds))
-            .collect();
-        let g_rss = growth(&rss);
-        let g_fds = growth(&fds);
+        let g_rss = node_growth(&resource, i, |n| n.rss_bytes);
+        let g_fds = node_growth(&resource, i, |n| n.open_fds);
         if let Some(g) = g_rss {
             if g > args.max_rss_growth {
                 violations.push(format!(
-                    "node {i} RSS grew {:.1}% between first and last quarter (> {:.0}%)",
+                    "node {i} RSS grew {:.1}% between first and last quarter at the same session count (> {:.0}%)",
                     100.0 * g,
                     100.0 * args.max_rss_growth
                 ));
@@ -1231,7 +1251,7 @@ fn verdict(
         if let Some(g) = g_fds {
             if g > args.max_rss_growth {
                 violations.push(format!(
-                    "node {i} open fds grew {:.1}% between first and last quarter (> {:.0}%)",
+                    "node {i} open fds grew {:.1}% between first and last quarter at the same session count (> {:.0}%)",
                     100.0 * g,
                     100.0 * args.max_rss_growth
                 ));
@@ -1322,8 +1342,35 @@ fn verdict(
 
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// glibc only: keep the allocator out of the harness's own RSS figure. Every bot's QUIC
+/// endpoint callocs a ~3 MB receive buffer (quinn: max UDP payload × GRO segments × batch) that
+/// stays mostly untouched; after a failover replaces those endpoints, glibc's dynamic mmap
+/// threshold has grown past 3 MB, so the replacements are carved out of the brk heap and zeroed
+/// by hand — 16 bots × 3 MB of freshly resident pages per failover that stay resident, while
+/// the live heap is flat (heaptrack: 60 MB throughout, 0.6 MB unfreed at exit). Pinning the
+/// threshold disables the dynamic adjustment so those buffers stay mmap'd and go back to the
+/// kernel when their endpoint does; RSS then tracks live memory again, which is what the
+/// `--max-rss-growth` budget is meant to judge.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn pin_malloc_behaviour() {
+    // SAFETY: mallopt only sets allocator tunables; called before any thread is spawned.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn pin_malloc_behaviour() {}
+
+fn main() -> Result<()> {
+    pin_malloc_behaviour();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_main())
+}
+
+async fn run_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -1614,5 +1661,54 @@ mod tests {
         let short = resource_samples(&steady, &[hook(20.0)]);
         let rss: Vec<f64> = short.iter().filter_map(|r| r.self_rss_bytes).collect();
         assert_eq!(growth(&rss), None);
+    }
+
+    fn node(rss: f64, fds: f64, sessions: f64) -> NodeSample {
+        NodeSample {
+            up: true,
+            rss_bytes: Some(rss),
+            open_fds: Some(fds),
+            active_sessions: Some(sessions),
+            ..NodeSample::default()
+        }
+    }
+
+    #[test]
+    fn node_growth_is_judged_per_session_count() {
+        // Node 0 hosts 16 players, then its kill moves them to node 1 and it comes back empty:
+        // 63 MB / 48 fds at 16 sessions, 47 MB / 30 fds at 0 — a redistribution, not a leak.
+        let mut rows: Vec<IntervalRow> = (0..24)
+            .map(|i| {
+                let mut r = interval(i as f64, 30e6);
+                r.nodes = if i < 12 {
+                    vec![node(63e6, 48.0, 16.0), node(47e6, 30.0, 0.0)]
+                } else {
+                    vec![node(47e6, 30.0, 0.0), node(63e6, 48.0, 16.0)]
+                };
+                r
+            })
+            .collect();
+        let judged: Vec<&IntervalRow> = rows.iter().collect();
+        for n in 0..2 {
+            let g = node_growth(&judged, n, |n| n.rss_bytes).unwrap();
+            assert!(g.abs() < 1e-9, "node {n} rss growth {g}");
+            let g = node_growth(&judged, n, |n| n.open_fds).unwrap();
+            assert!(g.abs() < 1e-9, "node {n} fds growth {g}");
+        }
+
+        // The same node leaking 1 MB per interval at a constant load is still caught, and a
+        // node that is down or without a session figure contributes no sample.
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.nodes[0] = node(47e6 + 1e6 * i as f64, 30.0, 0.0);
+            if i % 5 == 0 {
+                r.nodes[1].up = false;
+            }
+        }
+        let judged: Vec<&IntervalRow> = rows.iter().collect();
+        assert!(node_growth(&judged, 0, |n| n.rss_bytes).unwrap() > 0.25);
+        assert!(node_growth(&judged, 1, |n| n.rss_bytes).unwrap().abs() < 1e-9);
+        // Too few samples at every load level: no verdict.
+        let few: Vec<&IntervalRow> = rows.iter().take(7).collect();
+        assert_eq!(node_growth(&few, 0, |n| n.rss_bytes), None);
     }
 }

@@ -46,6 +46,19 @@ released together.
 
 ### Fixed
 
+* **Soak: the leak budget no longer fails on load redistribution, and the harness no longer
+  mistakes glibc for a leak.** The nightly soak had been red since 1.6.0 on three resource
+  violations, none of them a leak. A node's RSS and open fds follow the sessions it hosts
+  (about 45 MB / 30 fds empty, 63 MB / 48 fds with 16 sessions), and the kill hooks move every
+  player onto the surviving node and bring the victim back empty — so the first-vs-last-quarter
+  comparison was weighing an empty node against a full one. Node samples are now grouped by
+  `aurix_active_sessions` and each group is judged on its own timeline, so a node that grows at
+  constant load is still caught. The harness's own RSS grew by ~22 MB per failover while its
+  live heap stayed flat (heaptrack: 60 MB throughout, 0.6 MB unfreed at exit): every bot's QUIC
+  endpoint callocs a ~3 MB receive buffer, and once glibc's dynamic mmap threshold had grown
+  past that size the replacements were carved out of the brk heap and zeroed by hand, leaving
+  freshly resident pages behind. The harness pins `M_MMAP_THRESHOLD` so those buffers stay
+  mmap'd and return to the kernel with their endpoint.
 * **Web SDK: WebSocket-tunnel media death now resumes the session immediately.** When the
   tunnel's heartbeats went unanswered the SDK tried to rebind media over the same control
   socket — which was the dead TCP connection itself — and only the control keepalive (~37 s)

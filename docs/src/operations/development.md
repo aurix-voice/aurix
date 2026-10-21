@@ -276,11 +276,19 @@ What is asserted, and what fails the run (exit code 1, the reason in `violations
 * **each hook**: the command succeeds and every bot is healthy again within `--recover-within`
   (120 s) after it ends; per-bot `Recovering → Recovered` times are recorded;
 * **resources**: median RSS and open-fd count of each node over the last quarter of the run vs.
-  the first quarter grow by less than `--max-rss-growth` (25 %), same for the bot process. The
-  baseline starts after the first hook has ended: the first failover allocates state that then
-  stays resident (TLS/QUIC client, failover endpoint, the second node's tables) — a one-off
-  step, not a leak — so a run needs at least 8 steady intervals after that point to be judged;
+  the first quarter grow by less than `--max-rss-growth` (25 %), same for the bot process. A
+  node's RSS and fds follow the sessions it hosts, and the kill hooks move every player onto the
+  surviving node and bring the victim back empty, so node samples are grouped by
+  `aurix_active_sessions` and each group is judged on its own timeline (the worst group is the
+  figure); the harness keeps a constant bot count and is judged as one series. The baseline
+  starts after the first hook has ended: the first failover allocates state that then stays
+  resident (TLS/QUIC client, failover endpoint, the second node's tables) — a one-off step, not
+  a leak — so a run needs at least 8 steady intervals after that point to be judged;
   `aurix_active_sessions` / `aurix_active_participants` return to zero once the bots leave.
+  On glibc the harness pins `M_MMAP_THRESHOLD` at start-up: every bot's QUIC endpoint callocs a
+  ~3 MB receive buffer, and with the default dynamic threshold the endpoints a failover replaces
+  would be carved out of the brk heap and zeroed by hand, leaving ~16 × 3 MB of resident pages
+  behind per failover while the live heap stays flat — an allocator artefact, not a leak.
 
 `target/soak/report.jsonl` has one row per report interval (`kind: "interval"`: fleet
 aggregates, per-node samples from Prometheus — RSS, fds, CPU seconds, sessions, cascade link
