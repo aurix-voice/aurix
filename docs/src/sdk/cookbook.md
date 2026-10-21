@@ -105,17 +105,18 @@ the game should do, which is what matters at 2 a.m.
 
 | Code | Meaning | Do |
 |---|---|---|
-| `authentication_failed`, `token_invalid`, `token_expired`, `token_reused` | token missing, malformed, expired or replayed | mint a new token on your backend and reconnect (`SetToken` + the SDK's token refresher does this when configured) |
-| `authorization_denied`, `action_token_required` | the grant does not allow this (speak without `speak`, moderate without `moderate`, kick without an action token) | programming error in your token server — fix the grant, do not retry |
-| `channel_not_found`, `user_not_found`, `session_not_found`, `not_found` | unknown channel / user / session / message | stale id after a leave or a resume with a fresh session — refresh the roster |
-| `channel_full`, `channel_limit_exceeded`, `quota_exceeded` | channel or app at its participant ceiling (plan limit, spend-cap ladder) | show "voice full", retry with backoff; the console shows why |
-| `user_banned`, `user_muted` | moderation decision | tell the player; no retry |
-| `rate_limit_exceeded` | too many requests / messages | back off; chat has its own anti-flood limits |
-| `conflict` | duplicate or contradictory request (already joined, ad-hoc name mismatch) | treat as success when idempotent, otherwise re-read state |
-| `validation` | malformed payload | programming error — log and fix |
-| `media_node_unavailable`, `transport` | no media node / the media path could not be established | the SDK already tried QUIC → WebRTC → WebSocket tunnel; tell the player voice is unavailable on this network |
+| `AUTH_FAILED`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `TOKEN_REUSED` | token missing, malformed, expired or replayed | mint a new token on your backend and reconnect (`SetToken` + the SDK's token refresher does this when configured) |
+| `AUTH_DENIED`, `ACTION_TOKEN_REQUIRED` | the grant does not allow this (speak without `speak`, moderate without `moderate`, kick without an action token) | programming error in your token server — fix the grant, do not retry |
+| `CHANNEL_NOT_FOUND`, `USER_NOT_FOUND`, `SESSION_NOT_FOUND`, `NOT_FOUND` | unknown channel / user / session / message | stale id after a leave or a resume with a fresh session — refresh the roster |
+| `CHANNEL_FULL`, `CHANNEL_LIMIT_EXCEEDED`, `QUOTA_EXCEEDED` | channel or app at its participant ceiling (plan limit, spend-cap ladder) | show "voice full", retry with backoff; the console shows why |
+| `USER_BANNED`, `USER_MUTED` | moderation decision | tell the player; no retry |
+| `RATE_LIMIT_EXCEEDED` | too many requests / messages | back off; chat has its own anti-flood limits |
+| `CONFLICT` | duplicate or contradictory request (already joined, ad-hoc name mismatch) | treat as success when idempotent, otherwise re-read state |
+| `VALIDATION_ERROR` | malformed payload | programming error — log and fix |
+| `E2EE_REQUIRED`, `E2EE_MIXED_CHANNELS` | the channel demands end-to-end encryption / E2EE and plaintext channels mixed in one session | enable E2EE in the client or split the sessions — configuration, not runtime |
+| `MEDIA_NODE_UNAVAILABLE`, `TRANSPORT_ERROR`, `STUN_TURN_ERROR` | no media node / the media path could not be established | the SDK already tried QUIC → WebRTC → WebSocket tunnel; tell the player voice is unavailable on this network |
 | `FailedToRecover` (SDK event) | reconnect attempts or the recovery deadline (30 s) exhausted | the client is `Failed`; call `connect()` again on the player's next action, not in a loop |
-| `timeout`, `internal`, `database`, `redis` | node-side failure | retry once after a second; if it persists it is an incident, not your bug |
+| `INTERNAL_ERROR`, `DB_ERROR`, `REDIS_ERROR`, `TIMEOUT` | node-side failure | retry once after a second; if it persists it is an incident, not your bug |
 
 Rule: anything the **player** can fix (network, "voice full") gets a message; anything the
 **developer** caused (`forbidden`, `invalid`) gets a log line and no retry; the SDK handles
