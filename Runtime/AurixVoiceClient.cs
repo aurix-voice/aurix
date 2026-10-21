@@ -24,6 +24,43 @@ namespace Aurix
         public double DeadlineSeconds = 30;
     }
 
+    /// <summary>Why a participant disappeared from a channel roster (<see cref="AurixVoiceClient.OnParticipantRemoved"/>).</summary>
+    public enum LeaveReason
+    {
+        /// <summary>Left on purpose (leave, logout, channel switch).</summary>
+        Left,
+        /// <summary>Connection dropped and the resume window expired, or the hosting node was lost.</summary>
+        Timeout,
+        /// <summary>Removed by a moderator.</summary>
+        Kicked,
+        /// <summary>Removed by a ban; cannot rejoin until it is lifted.</summary>
+        Banned,
+        /// <summary>Still in the channel, but outside your roster radius (positional channels).</summary>
+        OutOfRange,
+        /// <summary>The channel itself was destroyed.</summary>
+        ChannelClosed,
+        /// <summary>Another login of the same user took the session over.</summary>
+        Replaced,
+    }
+
+    public static class LeaveReasons
+    {
+        /// <summary>Parse the wire form (<c>left</c>, <c>timeout</c>, <c>kicked</c>, <c>banned</c>, <c>out_of_range</c>, <c>channel_closed</c>, <c>replaced</c>); unknown/empty = <see cref="LeaveReason.Left"/>.</summary>
+        public static LeaveReason Parse(string wire)
+        {
+            switch (wire)
+            {
+                case "timeout": return LeaveReason.Timeout;
+                case "kicked": return LeaveReason.Kicked;
+                case "banned": return LeaveReason.Banned;
+                case "out_of_range": return LeaveReason.OutOfRange;
+                case "channel_closed": return LeaveReason.ChannelClosed;
+                case "replaced": return LeaveReason.Replaced;
+                default: return LeaveReason.Left;
+            }
+        }
+    }
+
     public sealed class Participant
     {
         public Guid UserId;
@@ -762,6 +799,11 @@ namespace Aurix
         public event Action<Guid> OnChannelLeft;
         public event Action<Guid, Participant> OnParticipantJoined;
         public event Action<Guid, Participant> OnParticipantLeft;
+        /// <summary>
+        /// Same as <see cref="OnParticipantLeft"/> plus why they disappeared — show "kicked" / "connection lost"
+        /// / "out of range" instead of a bare "left", and skip the "left" toast for <see cref="LeaveReason.OutOfRange"/>.
+        /// </summary>
+        public event Action<Guid, Participant, LeaveReason> OnParticipantRemoved;
         public event Action<Guid, Participant> OnParticipantUpdated;
         public event Action<Guid, Participant, bool> OnSpeaking;
         /// <summary>
@@ -3067,6 +3109,7 @@ namespace Aurix
                     {
                         E2eePeerLeft(channelId, p.UserId);
                         OnParticipantLeft?.Invoke(channelId, p);
+                        OnParticipantRemoved?.Invoke(channelId, p, LeaveReasons.Parse(m.Str("reason")));
                         RefreshDucking(channelId);
                     }
                     break;

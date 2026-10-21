@@ -109,6 +109,7 @@ namespace Aurix.WebGL
         public event Action<Guid> OnChannelLeft;
         public event Action<Guid, Participant> OnParticipantJoined;
         public event Action<Guid, Participant> OnParticipantLeft;
+        public event Action<Guid, Participant, LeaveReason> OnParticipantRemoved;
         public event Action<Guid, Participant> OnParticipantUpdated;
         public event Action<Guid, Participant, bool> OnSpeaking;
         public event Action<Guid, IReadOnlyList<ParticipantEnergy>> OnChannelEnergy;
@@ -934,7 +935,9 @@ namespace Aurix.WebGL
                     Participant p = null;
                     lock (_channels)
                         if (_channels.TryGetValue(channelId, out var members) && members.TryGetValue(userId, out p)) members.Remove(userId);
-                    OnParticipantLeft?.Invoke(channelId, p ?? new Participant { UserId = userId, DisplayName = string.Empty });
+                    p ??= new Participant { UserId = userId, DisplayName = string.Empty };
+                    OnParticipantLeft?.Invoke(channelId, p);
+                    OnParticipantRemoved?.Invoke(channelId, p, LeaveReasons.Parse(MiniJson.GetString(e, "reason")));
                     return;
                 }
                 case "speaking":
