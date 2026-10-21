@@ -36,6 +36,7 @@
 
 - [Overview](sdk/overview.md)
 - [Web SDK](sdk/web.md)
+- [SDK cookbook: tokens, join order, naming, bandwidth, errors](sdk/cookbook.md)
 - [Unity SDK](sdk/unity.md)
 - [Native core and Unreal SDK](sdk/native.md)
 - [Godot SDK](sdk/godot.md)
