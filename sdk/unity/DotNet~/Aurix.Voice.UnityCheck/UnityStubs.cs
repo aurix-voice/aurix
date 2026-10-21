@@ -5,7 +5,7 @@ using System.Collections;
 namespace UnityEngine
 {
     public class Object
-    {
+    { public static void Destroy(Object o) { }
         public static implicit operator bool(Object o) => o != null;
         public static bool operator ==(Object a, Object b) => ReferenceEquals(a, b);
         public static bool operator !=(Object a, Object b) => !ReferenceEquals(a, b);
@@ -13,10 +13,11 @@ namespace UnityEngine
         public override int GetHashCode() => base.GetHashCode();
         public static T FindObjectOfType<T>() where T : Object => default;
     }
-    public class GameObject : Object { public T AddComponent<T>() where T : Component => default; }
+    public class GameObject : Object { public GameObject() { } public GameObject(string name) { } public Transform transform => null; public T AddComponent<T>() where T : Component => default; }
     public class Component : Object
     {
         public GameObject gameObject => null;
+        public Transform transform => null;
         public T GetComponent<T>() => default;
     }
     public class Behaviour : Component { }
@@ -29,7 +30,7 @@ namespace UnityEngine
     [AttributeUsage(AttributeTargets.All)] public class HeaderAttribute : Attribute { public HeaderAttribute(string s) { } }
     [AttributeUsage(AttributeTargets.All)] public class RangeAttribute : Attribute { public RangeAttribute(float a, float b) { } }
     public class AudioClip : Object { public int samples; public int channels; public int frequency; public bool GetData(float[] d, int off) => true; }
-    public class AudioSource : Behaviour { public AudioClip clip; public bool loop; public float spatialBlend; public float volume; public bool isPlaying; public void Play() { } }
+    public class AudioSource : Behaviour { public AudioClip clip; public bool loop; public float spatialBlend; public float volume; public bool isPlaying; public AudioRolloffMode rolloffMode; public float minDistance, maxDistance, dopplerLevel, spread; public bool spatialize; public UnityEngine.Audio.AudioMixerGroup outputAudioMixerGroup; public void Play() { } }
     public class AudioListener : Behaviour { }
     public class Mesh : Object { public int blendShapeCount; public int GetBlendShapeIndex(string name) => -1; }
     public class Renderer : Component { }
@@ -68,6 +69,7 @@ namespace UnityEngine
     {
         public static int Clamp(int v, int min, int max) => Math.Min(Math.Max(v, min), max);
         public static int RoundToInt(float f) => (int)Math.Round(f);
+        public static float Max(float a, float b) => Math.Max(a, b);
     }
     public static class Screen { public static int width => 1280; public static int height => 720; }
     public enum KeyCode { None, Return, V }
@@ -97,6 +99,34 @@ namespace UnityEngine
         public static void Space(float px) { }
         public static GUILayoutOption Width(float w) => new GUILayoutOption();
     }
+
+    public struct Vector3
+    {
+        public float x, y, z;
+        public Vector3(float x, float y, float z) { this.x = x; this.y = y; this.z = z; }
+        public static Vector3 forward => new Vector3(0, 0, 1);
+        public static Vector3 up => new Vector3(0, 1, 0);
+        public float magnitude => (float)Math.Sqrt(x * x + y * y + z * z);
+        public static Vector3 operator -(Vector3 a, Vector3 b) => new Vector3(a.x - b.x, a.y - b.y, a.z - b.z);
+        public static Vector3 operator *(Vector3 a, float f) => new Vector3(a.x * f, a.y * f, a.z * f);
+    }
+    public struct Quaternion
+    {
+        public static Quaternion identity => default;
+        public static float Angle(Quaternion a, Quaternion b) => 0f;
+        public static Vector3 operator *(Quaternion q, Vector3 v) => v;
+    }
+    public class Transform : Component
+    {
+        public Vector3 position; public Quaternion rotation;
+        public Vector3 forward => Vector3.forward; public Vector3 up => Vector3.up;
+        public void SetParent(Transform parent, bool worldPositionStays) { }
+    }
+    public enum AudioRolloffMode { Logarithmic, Linear, Custom }
+    public sealed class AddComponentMenuAttribute : Attribute { public AddComponentMenuAttribute(string menuName) { } }
+    public sealed class DisallowMultipleComponent : Attribute { }
+    public sealed class MinAttribute : Attribute { public MinAttribute(float min) { } }
+
 }
 
 namespace UnityEngine.Android
@@ -112,6 +142,7 @@ namespace UnityEngine.Android
 
 namespace UnityEngine.Audio
 {
+    public class AudioMixerGroup : UnityEngine.Object { }
     public class AudioMixer : Object { public bool GetFloat(string name, out float value) { value = 0f; return true; } public bool SetFloat(string name, float value) => true; }
 }
 
