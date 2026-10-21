@@ -1996,6 +1996,17 @@ FString UAurixVoiceSubsystem::FormatUuid(FGuid Guid)
 
 // ---- events --------------------------------------------------------------------------------
 
+static EAurixLeaveReason ParseLeaveReason(const FString& Wire)
+{
+	if (Wire == TEXT("timeout")) return EAurixLeaveReason::Timeout;
+	if (Wire == TEXT("kicked")) return EAurixLeaveReason::Kicked;
+	if (Wire == TEXT("banned")) return EAurixLeaveReason::Banned;
+	if (Wire == TEXT("out_of_range")) return EAurixLeaveReason::OutOfRange;
+	if (Wire == TEXT("channel_closed")) return EAurixLeaveReason::ChannelClosed;
+	if (Wire == TEXT("replaced")) return EAurixLeaveReason::Replaced;
+	return EAurixLeaveReason::Left;
+}
+
 void UAurixVoiceSubsystem::PumpEvents()
 {
 	for (int32 i = 0; i < MaxEventsPerTick && Native; ++i)
@@ -2082,6 +2093,7 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 
 	case AURIX_EVENT_PARTICIPANT_LEFT:
 		OnParticipantLeft.Broadcast(ChannelId, UserId);
+		OnParticipantRemoved.Broadcast(ChannelId, UserId, ParseLeaveReason(FromUtf8(aurix_event_message(Raw))));
 		break;
 
 	case AURIX_EVENT_PARTICIPANT_MUTE_CHANGED:

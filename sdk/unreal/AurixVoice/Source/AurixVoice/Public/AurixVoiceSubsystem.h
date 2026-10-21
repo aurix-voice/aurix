@@ -23,6 +23,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixChannelJoined, int64, Reques
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelLeft, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixParticipantJoined, FGuid, ChannelId, const FAurixParticipant&, Participant);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixParticipantLeft, FGuid, ChannelId, FGuid, UserId);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantRemoved, FGuid, ChannelId, FGuid, UserId, EAurixLeaveReason, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixParticipantMuteChanged, FGuid, ChannelId, FGuid, UserId, bool, bMuted, bool, bServerMuted);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantSpeaking, FGuid, ChannelId, FGuid, UserId, bool, bSpeaking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChannelEnergy, FGuid, ChannelId, const TArray<FAurixParticipant>&, Levels);
@@ -663,6 +664,8 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelLeft OnChannelLeft;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantJoined OnParticipantJoined;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantLeft OnParticipantLeft;
+	/** OnParticipantLeft plus why they disappeared (kicked / timeout / out of range / ...) — pick the right toast, or none for OutOfRange. */
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantRemoved OnParticipantRemoved;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantMuteChanged OnParticipantMuteChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantSpeaking OnParticipantSpeaking;
 	/** A member (possibly us) became or stopped being a priority speaker. */

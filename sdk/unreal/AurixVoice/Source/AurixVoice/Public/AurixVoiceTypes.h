@@ -19,6 +19,26 @@ enum class EAurixConnectionState : uint8
 	Failed,
 };
 
+/** Why a participant disappeared from a channel roster (OnParticipantRemoved). */
+UENUM(BlueprintType)
+enum class EAurixLeaveReason : uint8
+{
+	/** Left on purpose (leave, logout, channel switch). */
+	Left,
+	/** Connection dropped and the resume window expired, or the hosting node was lost. */
+	Timeout,
+	/** Removed by a moderator. */
+	Kicked,
+	/** Removed by a ban; cannot rejoin until it is lifted. */
+	Banned,
+	/** Still in the channel, but outside your roster radius (positional channels). */
+	OutOfRange,
+	/** The channel itself was destroyed. */
+	ChannelClosed,
+	/** Another login of the same user took the session over. */
+	Replaced,
+};
+
 UENUM(BlueprintType)
 enum class EAurixTransmissionMode : uint8
 {

@@ -27,7 +27,7 @@ const client = new AurixClient({
 
 client.on('remoteStream', (stream) => { audioEl.srcObject = stream; });
 client.on('participantJoined', (channelId, p) => roster.add(p));
-client.on('participantLeft', (channelId, p) => roster.remove(p));
+client.on('participantLeft', (channelId, userId, reason) => roster.remove(userId, reason)); // 'left' | 'timeout' | 'kicked' | 'banned' | 'out_of_range' | ...
 client.on('speaking', (channelId, userId, speaking) => roster.mark(userId, speaking));
 client.on('recording', (channelId, recordingId, active) => {
   if (active) client.respondToRecording(recordingId, 'accepted');

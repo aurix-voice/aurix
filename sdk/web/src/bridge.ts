@@ -559,7 +559,7 @@ export class AurixBridge {
     on('channelJoined', (channelId, participants) => q({ type: 'channelJoined', channelId, participants }));
     on('channelLeft', (channelId) => q({ type: 'channelLeft', channelId }));
     on('participantJoined', (channelId, participant) => q({ type: 'participantJoined', channelId, participant }));
-    on('participantLeft', (channelId, userId) => q({ type: 'participantLeft', channelId, userId }));
+    on('participantLeft', (channelId, userId, reason) => q({ type: 'participantLeft', channelId, userId, reason }));
     on('participantUpdated', (channelId, participant) => q({ type: 'participantUpdated', channelId, participant }));
     on('speaking', (channelId, userId, speaking) => q({ type: 'speaking', channelId, userId, speaking }));
     on('energy', (channelId, levels) => q({ type: 'energy', channelId, levels }));

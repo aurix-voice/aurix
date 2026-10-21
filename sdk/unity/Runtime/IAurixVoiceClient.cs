@@ -36,6 +36,8 @@ namespace Aurix
         event Action<Guid> OnChannelLeft;
         event Action<Guid, Participant> OnParticipantJoined;
         event Action<Guid, Participant> OnParticipantLeft;
+        /// <summary><see cref="OnParticipantLeft"/> with the reason (kicked / timeout / out of range / ...).</summary>
+        event Action<Guid, Participant, LeaveReason> OnParticipantRemoved;
         event Action<Guid, Participant> OnParticipantUpdated;
         event Action<Guid, Participant, bool> OnSpeaking;
         event Action<Guid, IReadOnlyList<ParticipantEnergy>> OnChannelEnergy;

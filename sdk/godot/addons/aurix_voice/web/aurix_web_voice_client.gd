@@ -55,6 +55,8 @@ signal channel_joined(request_id: int, channel_id: String, participants: Array, 
 signal channel_left(channel_id: String)
 signal participant_joined(channel_id: String, participant: Dictionary)
 signal participant_left(channel_id: String, user_id: String)
+## participant_left plus why: "left", "timeout", "kicked", "banned", "out_of_range", "channel_closed", "replaced".
+signal participant_removed(channel_id: String, user_id: String, reason: String)
 signal participant_mute_changed(channel_id: String, user_id: String, muted: bool, server_muted: bool)
 signal participant_speaking(channel_id: String, user_id: String, speaking: bool)
 signal participant_priority_changed(channel_id: String, user_id: String, priority: bool)
@@ -1089,6 +1091,8 @@ func _dispatch(e: Dictionary) -> void:
 			if _channels.has(channel_id):
 				(_channels[channel_id] as Dictionary).erase(user_id)
 			participant_left.emit(channel_id, user_id)
+			var reason := _str(e.get("reason"))
+			participant_removed.emit(channel_id, user_id, "left" if reason.is_empty() else reason)
 		"speaking":
 			var channel_id := _str(e.get("channelId"))
 			var user_id := _str(e.get("userId"))

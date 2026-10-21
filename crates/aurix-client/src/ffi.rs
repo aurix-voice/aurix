@@ -1930,6 +1930,7 @@ impl AurixEvent {
             Event::BitrateChanged { reason, .. } => message = reason.clone(),
             Event::MediaPathChanged { reason, .. } => message = reason.clone(),
             Event::EndpointChanged { url } => message = url.clone(),
+            Event::ParticipantLeft { reason, .. } => message = reason.as_str().to_owned(),
             Event::Kicked { reason, .. }
             | Event::FailedToRecover { reason }
             | Event::Disconnected { reason } => message = reason.clone(),
@@ -2378,7 +2379,8 @@ pub unsafe extern "C" fn aurix_event_code(event: *const AurixEvent) -> *const c_
 }
 
 /// Human-readable text: error message, kick/disconnect reason, bitrate reason, reconnect
-/// cause. Empty when not applicable. Owned by the event.
+/// cause, and for `ParticipantLeft` the leave reason (`left`, `timeout`, `kicked`, `banned`,
+/// `out_of_range`, `channel_closed`, `replaced`). Empty when not applicable. Owned by the event.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_message(event: *const AurixEvent) -> *const c_char {
     self::event(event)

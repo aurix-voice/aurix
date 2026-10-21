@@ -4064,6 +4064,7 @@ async fn handle_message(
         ControlMessage::ParticipantLeft {
             channel_id,
             user_id,
+            reason,
         } => {
             let ssrc = {
                 let mut channels = inner.channels.lock();
@@ -4093,6 +4094,7 @@ async fn handle_message(
                 inner.emit(Event::ParticipantLeft {
                     channel_id,
                     user_id,
+                    reason,
                 });
                 inner.refresh_ducking(channel_id);
             }

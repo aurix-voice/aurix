@@ -4,7 +4,7 @@ use aurix_common::protocol::{
 };
 use aurix_common::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, DownlinkMode, DuckingConfig,
-    NetworkQuality, SessionId, UserId,
+    LeaveReason, NetworkQuality, SessionId, UserId,
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -172,6 +172,8 @@ pub enum Event {
     ParticipantLeft {
         channel_id: ChannelId,
         user_id: UserId,
+        /// Why they disappeared (`left`, `timeout`, `kicked`, `banned`, `out_of_range`, ...).
+        reason: LeaveReason,
     },
     ParticipantMuteChanged {
         channel_id: ChannelId,

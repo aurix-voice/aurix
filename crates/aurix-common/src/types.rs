@@ -161,6 +161,61 @@ pub enum ChannelRole {
     Administrator,
 }
 
+/// Why a participant disappeared from a channel roster (`ParticipantLeft.reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaveReason {
+    /// Left on purpose (`LeaveChannel`, logout, channel switch).
+    #[default]
+    Left,
+    /// Connection dropped and the resume window expired, or the hosting node was lost.
+    Timeout,
+    /// Removed by a moderator (`Kick`).
+    Kicked,
+    /// Removed by a ban; the participant cannot rejoin until the ban is lifted.
+    Banned,
+    /// Still in the channel but outside the observer's roster radius (positional channels).
+    OutOfRange,
+    /// The channel itself was destroyed.
+    ChannelClosed,
+    /// Another login of the same user took the session over.
+    Replaced,
+}
+
+impl LeaveReason {
+    /// Classify a server-side free-text leave reason (`cleanup_connection` / `leave_channel_full`).
+    pub fn classify(reason: &str) -> Self {
+        let r = reason.to_ascii_lowercase();
+        if r.starts_with("ban") {
+            Self::Banned
+        } else if r.starts_with("kick") {
+            Self::Kicked
+        } else if r == "voluntary" || r == "left" || r == "logout" {
+            Self::Left
+        } else if r == "replaced" {
+            Self::Replaced
+        } else if r == "channel_destroyed" {
+            Self::ChannelClosed
+        } else if r == "out_of_range" {
+            Self::OutOfRange
+        } else {
+            Self::Timeout
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Timeout => "timeout",
+            Self::Kicked => "kicked",
+            Self::Banned => "banned",
+            Self::OutOfRange => "out_of_range",
+            Self::ChannelClosed => "channel_closed",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
 impl ChannelRole {
     pub fn can_speak(&self) -> bool {
         matches!(self, Self::Speaker | Self::Moderator | Self::Administrator)

@@ -500,6 +500,7 @@ impl WsState {
                 ControlMessage::ParticipantLeft {
                     channel_id: *channel_id,
                     user_id: change.subject,
+                    reason: LeaveReason::OutOfRange,
                 }
             };
             let Ok(json) = serde_json::to_string(&msg) else {
@@ -547,6 +548,7 @@ impl WsState {
             ControlMessage::ParticipantLeft {
                 channel_id: *channel_id,
                 user_id,
+                reason: LeaveReason::OutOfRange,
             }
         };
         let Ok(json) = serde_json::to_string(&msg) else {
@@ -1083,6 +1085,7 @@ impl WsState {
                     user_id,
                     session_id,
                     hidden,
+                    reason,
                     ..
                 } => {
                     // A leave for a session this node hosts *and* still has in the channel is
@@ -1117,6 +1120,7 @@ impl WsState {
                                 let msg = ControlMessage::ParticipantLeft {
                                     channel_id,
                                     user_id,
+                                    reason: LeaveReason::classify(&reason),
                                 };
                                 if let Ok(json) = serde_json::to_string(&msg) {
                                     for observer in observers {
@@ -1139,6 +1143,7 @@ impl WsState {
                         &ControlMessage::ParticipantLeft {
                             channel_id,
                             user_id,
+                            reason: LeaveReason::classify(&reason),
                         },
                         Some(&session_id),
                     );
@@ -2358,6 +2363,7 @@ impl WsState {
             let msg = ControlMessage::ParticipantLeft {
                 channel_id,
                 user_id,
+                reason: LeaveReason::classify(reason),
             };
             if let Ok(json) = serde_json::to_string(&msg) {
                 for observer in observers {

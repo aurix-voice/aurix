@@ -250,6 +250,7 @@ export type {
   TtsDestinationWire,
   TtsStateWire,
   TurnCredentials,
+  LeaveReason,
   UnknownMessage,
   UserPosition,
 } from './protocol.js';

@@ -11829,6 +11829,7 @@ async fn expect_presence(p: &mut Player, ch: ChannelId, who: UserId, joined: boo
         ControlMessage::ParticipantLeft {
             channel_id,
             user_id,
+            ..
         } => !joined && *channel_id == ch && *user_id == who,
         _ => false,
     })

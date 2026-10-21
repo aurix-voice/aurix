@@ -1,4 +1,17 @@
 /**
+ * Why a participant disappeared from a channel roster (`participantLeft`). Older servers omit
+ * it; treat a missing value as `'left'`.
+ */
+export type LeaveReason =
+  | 'left'
+  | 'timeout'
+  | 'kicked'
+  | 'banned'
+  | 'out_of_range'
+  | 'channel_closed'
+  | 'replaced';
+
+/**
  * Wire types of the Aurix WebSocket control channel.
  *
  * Mirrors `ControlMessage` in `crates/aurix-common/src/protocol.rs`
@@ -372,7 +385,7 @@ export type ServerMessage =
         is_priority?: boolean;
       };
     }
-  | { type: 'ParticipantLeft'; data: { channel_id: string; user_id: string } }
+  | { type: 'ParticipantLeft'; data: { channel_id: string; user_id: string; reason?: LeaveReason } }
   | { type: 'PriorityChanged'; data: { channel_id: string; user_id: string; priority: boolean } }
   | {
       type: 'RoleChanged';

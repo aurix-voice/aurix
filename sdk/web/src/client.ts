@@ -13,6 +13,7 @@ import {
   type ClientMessage,
   type DuckingConfigWire,
   type JsonValue,
+  type LeaveReason,
   type LocalMute,
   type ModerationAction,
   type ParticipantBrief,
@@ -822,7 +823,11 @@ export interface AurixEvents {
   channelJoined: (channelId: string, participants: Participant[]) => void;
   channelLeft: (channelId: string) => void;
   participantJoined: (channelId: string, participant: Participant) => void;
-  participantLeft: (channelId: string, userId: string) => void;
+  /**
+   * `reason` says why they disappeared: `'kicked'`, `'timeout'` (connection lost), `'out_of_range'`
+   * (positional roster radius — probably no toast), `'banned'`, `'channel_closed'`, `'replaced'`, `'left'`.
+   */
+  participantLeft: (channelId: string, userId: string, reason: LeaveReason) => void;
   participantUpdated: (channelId: string, participant: Participant) => void;
   speaking: (channelId: string, userId: string, speaking: boolean) => void;
   /**
@@ -4042,7 +4047,7 @@ export class AurixClient {
         this.webTransportRosterChanged();
         this.renderParticipant(d.user_id);
         this.e2eePeerLeft(d.channel_id, d.user_id);
-        this.emit('participantLeft', d.channel_id, d.user_id);
+        this.emit('participantLeft', d.channel_id, d.user_id, d.reason ?? 'left');
         this.refreshDucking(d.channel_id);
         return;
       }

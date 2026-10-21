@@ -1,5 +1,6 @@
 use crate::crypto::MediaKeys;
 use crate::error::{AurixError, Result};
+use crate::types::LeaveReason;
 use crate::types::{
     ActionKind, AudioCodec, AudioPolicy, ChannelId, ChannelRole, Direction, DownlinkMode,
     DuckingConfig, MediaTransportKind, Orientation3D, Position3D, PositionalConfig,
@@ -1117,9 +1118,13 @@ pub enum ControlMessage {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_priority: bool,
     },
+    /// Server→client: `user_id` is no longer in the observer's roster; `reason` says why
+    /// (absent from older servers = `left`).
     ParticipantLeft {
         channel_id: ChannelId,
         user_id: UserId,
+        #[serde(default, skip_serializing_if = "is_default_leave_reason")]
+        reason: LeaveReason,
     },
     /// Client→server: make `user_id` (yourself when omitted) a priority speaker of
     /// `channel_id`, or revoke it. Promoting or demoting another member takes a moderator
@@ -2017,6 +2022,10 @@ pub enum RoleChangeReason {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_default_leave_reason(r: &LeaveReason) -> bool {
+    *r == LeaveReason::Left
 }
 
 #[cfg(test)]

@@ -59,7 +59,7 @@ panel — no prefabs or extra packages, so it doubles as copy-paste reference co
 | Mute microphone / push-to-talk (`PushToTalkKey`) | `SetMuted(bool)` |
 | Mute speakers / volume | `SetOutputMuted(bool)` / `SetOutputVolume(float)` |
 | Quality bars, R-factor, MOS, RTT, loss | `OnNetworkQuality`, `OnStats`, `Client.GetStats()` |
-| Roster (speaking, energy, mutes) | `OnChannelJoined`, `OnParticipantJoined/Left/Updated`, `OnSpeaking`, `OnChannelEnergy` |
+| Roster (speaking, energy, mutes) | `OnChannelJoined`, `OnParticipantJoined/Left/Updated`, `OnParticipantRemoved` (with `LeaveReason`: kicked / timeout / out of range / …), `OnSpeaking`, `OnChannelEnergy` |
 | Chat | `Client.SendMessageAsync(channelId, text)`, `OnChatMessage` |
 | Log | `OnStateChanged`, `OnRecovering/OnRecovered/OnFailedToRecover`, `OnKicked`, `OnRecording`, `OnServerError` |
 

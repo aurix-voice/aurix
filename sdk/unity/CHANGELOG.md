@@ -8,6 +8,7 @@ server version it ships with (the repository is versioned as one unit).
 
 ### Added
 
+- `OnParticipantRemoved(channel, participant, LeaveReason)`: `OnParticipantLeft` plus why — `Kicked`, `Timeout` (connection lost), `Banned`, `OutOfRange` (positional roster radius), `ChannelClosed`, `Replaced`, `Left`.
 - `AurixPositionalSource`: reports the local player's pose to a positional channel at a fixed rate (only when moved) and attaches remote talkers' voices to their avatars (`AttachParticipantVoice`) — the Unity counterpart of Unreal's `AurixProximityVoiceComponent`.
 - `AurixVoiceBehaviour.ReleaseMicrophoneWhenMuted`: release the microphone device while muted (hides the OS recording indicator) and reopen it on unmute; `ForceMonoOutput`: mono downmix of the voice output for phones on speakerphone.
 - `Reconnect.DeadlineSeconds` (default 30): give up by wall-clock time since the drop as well as by attempts.

@@ -1829,7 +1829,8 @@ const char *aurix_event_code(const struct AurixEvent *event);
 
 /**
  * Human-readable text: error message, kick/disconnect reason, bitrate reason, reconnect
- * cause. Empty when not applicable. Owned by the event.
+ * cause, and for `ParticipantLeft` the leave reason (`left`, `timeout`, `kicked`, `banned`,
+ * `out_of_range`, `channel_closed`, `replaced`). Empty when not applicable. Owned by the event.
  */
 const char *aurix_event_message(const struct AurixEvent *event);
 
