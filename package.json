@@ -5,9 +5,20 @@
   "description": "Game voice client for the Aurix Voice Platform: native AURX media (QUIC/UDP/WebSocket tunnel) with the WebSocket control plane on desktop, mobile and .NET servers, and the same IAurixVoiceClient API over browser WebRTC in Unity WebGL players. Opus, E2EE, per-participant spatial audio, chat, transcripts, TTS, quality stats.",
   "unity": "2021.3",
   "type": "library",
-  "keywords": ["voice", "voip", "voice chat", "opus", "webrtc", "e2ee", "spatial audio", "aurix"],
+  "keywords": [
+    "voice",
+    "voip",
+    "voice chat",
+    "opus",
+    "webrtc",
+    "e2ee",
+    "spatial audio",
+    "aurix"
+  ],
   "license": "Apache-2.0",
-  "author": { "name": "Aurix contributors" },
+  "author": {
+    "name": "Aurix contributors"
+  },
   "documentationUrl": "https://github.com/aurix-voice/aurix/blob/main/sdk/unity/Documentation~/com.aurix.voice.md",
   "changelogUrl": "https://github.com/aurix-voice/aurix/blob/main/sdk/unity/CHANGELOG.md",
   "hideInEditor": false,
@@ -26,6 +37,16 @@
       "displayName": "WebGL quick start",
       "description": "Scene + MonoBehaviour for Unity WebGL players: the same lobby over AurixWebGLVoiceBehaviour (browser WebRTC through aurix-web-sdk.js), reads ws/api/token/channel from the page URL, autoplay unlock button. Includes a WebGL template that ships the Web SDK bundle.",
       "path": "Samples~/WebGLQuickstart"
+    },
+    {
+      "displayName": "Netcode proximity voice",
+      "description": "Netcode for GameObjects: NetcodeVoiceAvatar on the player prefab — the owner reports its pose to the positional channel (AurixPositionalSource), remote clients play that player's voice from the avatar through Unity 3D audio.",
+      "path": "Samples~/NetcodeProximity"
+    },
+    {
+      "displayName": "Mirror proximity voice",
+      "description": "Mirror: MirrorVoiceAvatar on the player prefab — the same voice-follows-the-avatar setup over SyncVar.",
+      "path": "Samples~/MirrorProximity"
     }
   ]
 }

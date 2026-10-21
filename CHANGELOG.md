@@ -6,7 +6,10 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `AurixPositionalSource`: reports the local player's pose to a positional channel at a fixed rate (only when moved) and attaches remote talkers' voices to their avatars (`AttachParticipantVoice`) — the Unity counterpart of Unreal's `AurixProximityVoiceComponent`.
+- Samples `NetcodeProximity` (Netcode for GameObjects) and `MirrorProximity` (Mirror): voice follows the networked player prefab, remote voices play from remote avatars.
 
 ## [1.6.0] — 2026-09-23
 

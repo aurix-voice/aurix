@@ -1,0 +1,14 @@
+{
+  "name": "Aurix.Samples.Mirror",
+  "rootNamespace": "Aurix.Samples",
+  "references": ["Aurix.Voice", "Mirror"],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": ["MIRROR"],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
