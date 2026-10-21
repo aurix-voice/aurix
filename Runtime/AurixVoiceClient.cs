@@ -20,6 +20,8 @@ namespace Aurix
         /// <summary>Random ±fraction applied to every delay (0.3 = ±30%).</summary>
         public double Jitter = 0.3;
         public int MaxAttempts = 10;
+        /// <summary>Give up when the connection has not been back for this long since it dropped, whatever MaxAttempts says; 0 = attempts only. Default 30 s.</summary>
+        public double DeadlineSeconds = 30;
     }
 
     public sealed class Participant
@@ -2843,9 +2845,16 @@ namespace Aurix
         private async Task ReconnectAttemptsAsync(string cause, CancellationToken ct)
         {
             Exception last = new System.IO.IOException(cause);
+            var since = DateTime.UtcNow;
+            string gaveUp = null;
             for (int attempt = 1; attempt <= Reconnect.MaxAttempts; attempt++)
             {
                 var delay = Backoff(attempt);
+                if (Reconnect.DeadlineSeconds > 0 && (DateTime.UtcNow - since + delay).TotalSeconds >= Reconnect.DeadlineSeconds)
+                {
+                    gaveUp = $"not back within {Reconnect.DeadlineSeconds:0} s, {attempt - 1} attempts";
+                    break;
+                }
                 Post(() => OnRecovering?.Invoke(attempt, delay, cause));
                 using (var skip = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
@@ -2872,7 +2881,7 @@ namespace Aurix
                 }
             }
             if (_closedByUser) return;
-            var error = new System.IO.IOException($"reconnect failed after {Reconnect.MaxAttempts} attempts ({last.Message})", last);
+            var error = new System.IO.IOException($"reconnect failed: {gaveUp ?? $"{Reconnect.MaxAttempts} attempts"} ({last.Message})", last);
             Post(() =>
             {
                 if (_closedByUser) return;
