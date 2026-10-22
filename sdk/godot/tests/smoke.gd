@@ -92,6 +92,13 @@ func _init() -> void:
 	_check(client.push_to_talk_release_delay == 0.0, "push_to_talk_release_delay clamps negatives to 0")
 	_check(client.get_input_level() == 0.0 and client.get_input_energy() == 0.0, "input meter is silent before connecting")
 	client.push_to_talk_action = &""
+	client.stop_microphone_in_background = false
+	client.probe_after_background_seconds = -5.0
+	_check(not client.stop_microphone_in_background, "stop_microphone_in_background round-trips")
+	_check(client.probe_after_background_seconds == 0.0, "probe_after_background_seconds clamps negatives to 0")
+	client.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	client.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	_check(true, "background/foreground notifications are safe before connecting")
 	client.set_output_volume(0.5)
 	client.set_output_muted(true)
 	client.set_vad(0.02, 5)

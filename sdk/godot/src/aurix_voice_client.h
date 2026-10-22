@@ -164,6 +164,7 @@ public:
 
     void _process(double delta) override;
     void _exit_tree() override;
+    void _notification(int what);
 
     // --- configuration (before connect_to_server)
     void set_auto_reconnect(bool enabled);
@@ -188,6 +189,13 @@ public:
     String get_device_id() const;
     void set_auto_capture(bool enabled);
     bool get_auto_capture() const;
+    /// Mobile lifecycle (APPLICATION_PAUSED/RESUMED, window focus on desktop): drop the microphone
+    /// while suspended and, back in the foreground after this many seconds, probe the connection so
+    /// a socket the OS silently killed is replaced now rather than after the ping timeout.
+    void set_stop_microphone_in_background(bool enabled);
+    bool get_stop_microphone_in_background() const;
+    void set_probe_after_background_seconds(double seconds);
+    double get_probe_after_background_seconds() const;
     void set_auto_playback(bool enabled);
     bool get_auto_playback() const;
     void set_playback_buffer_seconds(double seconds);
@@ -401,6 +409,10 @@ private:
     String device_id_;
     int64_t client_generation_ = 0;
     bool auto_capture_ = true;
+    bool stop_microphone_in_background_ = true;
+    double probe_after_background_seconds_ = 2.0;
+    double background_since_ = -1.0;
+    bool capture_paused_by_background_ = false;
     bool auto_playback_ = true;
     double playback_buffer_seconds_ = 0.06;
     StringName playback_bus_ = StringName("Master");

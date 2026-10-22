@@ -100,6 +100,13 @@ Everything a designer needs is on the `AurixVoiceClient` node: connection (`auto
 `vad_threshold`, `vad_hangover_frames` — applied once the session is ready; the matching
 `set_*` methods change them at runtime.
 
+Mobile lifecycle is handled by the node: on `NOTIFICATION_APPLICATION_PAUSED` (and window focus
+loss on desktop) it drops the microphone when `stop_microphone_in_background` is on (default), and
+on resume restarts capture and, if the app was away for at least `probe_after_background_seconds`
+(default 2), calls `probe_connection()` so a socket the OS silently killed is replaced at once
+instead of after the ping timeout. `network_changed()` is still yours to call from platform
+connectivity callbacks — Godot has no reachability API to poll.
+
 Push-to-talk is a property group too: `push_to_talk_action` (an InputMap action — keyboard,
 gamepad or touch, whatever the action binds), `push_to_talk_toggle` (press to start / press to
 stop instead of hold) and `push_to_talk_release_delay` (seconds the mic stays open after release,

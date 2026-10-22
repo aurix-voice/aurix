@@ -85,6 +85,10 @@ bool AurixVoiceClient::get_tls_tunnel_enabled() const { return config_.tls_tunne
 void AurixVoiceClient::set_device_id(const String& device_id) { device_id_ = device_id; }
 String AurixVoiceClient::get_device_id() const { return device_id_; }
 void AurixVoiceClient::set_auto_capture(bool enabled) { auto_capture_ = enabled; }
+void AurixVoiceClient::set_stop_microphone_in_background(bool enabled) { stop_microphone_in_background_ = enabled; }
+bool AurixVoiceClient::get_stop_microphone_in_background() const { return stop_microphone_in_background_; }
+void AurixVoiceClient::set_probe_after_background_seconds(double seconds) { probe_after_background_seconds_ = std::max(0.0, seconds); }
+double AurixVoiceClient::get_probe_after_background_seconds() const { return probe_after_background_seconds_; }
 bool AurixVoiceClient::get_auto_capture() const { return auto_capture_; }
 void AurixVoiceClient::set_auto_playback(bool enabled) { auto_playback_ = enabled; }
 bool AurixVoiceClient::get_auto_playback() const { return auto_playback_; }
@@ -1173,6 +1177,35 @@ void AurixVoiceClient::_process(double delta) {
     feed_playback();
 }
 
+void AurixVoiceClient::_notification(int what) {
+    if (Engine::get_singleton()->is_editor_hint()) return;
+    switch (what) {
+        case NOTIFICATION_APPLICATION_PAUSED:
+        case NOTIFICATION_APPLICATION_FOCUS_OUT:
+            if (background_since_ >= 0.0) return;
+            background_since_ = ptt_clock_;
+            if (stop_microphone_in_background_ && is_capturing()) {
+                capture_paused_by_background_ = true;
+                stop_capture();
+            }
+            return;
+        case NOTIFICATION_APPLICATION_RESUMED:
+        case NOTIFICATION_APPLICATION_FOCUS_IN: {
+            if (background_since_ < 0.0) return;
+            const double away = ptt_clock_ - background_since_;
+            background_since_ = -1.0;
+            if (capture_paused_by_background_) {
+                capture_paused_by_background_ = false;
+                if (client_) start_capture();
+            }
+            if (client_ && probe_after_background_seconds_ > 0.0 && away >= probe_after_background_seconds_) probe_connection(3000);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
 void AurixVoiceClient::_exit_tree() {
     disconnect_from_server();
     destroy_capture_bus();
@@ -1429,6 +1462,10 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_device_id", "device_id"), &AurixVoiceClient::set_device_id);
     ClassDB::bind_method(D_METHOD("get_device_id"), &AurixVoiceClient::get_device_id);
     ClassDB::bind_method(D_METHOD("set_auto_capture", "enabled"), &AurixVoiceClient::set_auto_capture);
+    ClassDB::bind_method(D_METHOD("set_stop_microphone_in_background", "enabled"), &AurixVoiceClient::set_stop_microphone_in_background);
+    ClassDB::bind_method(D_METHOD("get_stop_microphone_in_background"), &AurixVoiceClient::get_stop_microphone_in_background);
+    ClassDB::bind_method(D_METHOD("set_probe_after_background_seconds", "seconds"), &AurixVoiceClient::set_probe_after_background_seconds);
+    ClassDB::bind_method(D_METHOD("get_probe_after_background_seconds"), &AurixVoiceClient::get_probe_after_background_seconds);
     ClassDB::bind_method(D_METHOD("get_auto_capture"), &AurixVoiceClient::get_auto_capture);
     ClassDB::bind_method(D_METHOD("set_auto_playback", "enabled"), &AurixVoiceClient::set_auto_playback);
     ClassDB::bind_method(D_METHOD("get_auto_playback"), &AurixVoiceClient::get_auto_playback);
@@ -1775,6 +1812,8 @@ void AurixVoiceClient::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tls_tunnel"), "set_tls_tunnel_enabled", "get_tls_tunnel_enabled");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "device_id"), "set_device_id", "get_device_id");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_capture"), "set_auto_capture", "get_auto_capture");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "stop_microphone_in_background"), "set_stop_microphone_in_background", "get_stop_microphone_in_background");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "probe_after_background_seconds", PROPERTY_HINT_RANGE, "0.0,30.0,0.5"), "set_probe_after_background_seconds", "get_probe_after_background_seconds");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_playback"), "set_auto_playback", "get_auto_playback");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_buffer_seconds", PROPERTY_HINT_RANGE, "0.02,1.0,0.01"), "set_playback_buffer_seconds", "get_playback_buffer_seconds");
     ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "playback_bus"), "set_playback_bus", "get_playback_bus");
