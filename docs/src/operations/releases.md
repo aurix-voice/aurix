@@ -142,3 +142,22 @@ gh attestation verify aurix-server-1.3.0-x86_64-unknown-linux-gnu.tar.gz --repo 
   `BuildPlugin` compile against a real engine (needs the Epic container secret, see the `unreal`
   CI job).
 * Release notes beyond the changelog section — write them in `CHANGELOG.md` before tagging.
+
+## Registries
+
+Every `vX.Y.Z` tag publishes the packages below without secrets in the repository — each registry
+trusts the `release.yml` workflow of `aurix-voice/aurix` through OIDC. One-time setup per registry:
+
+| Package | Registry | One-time setup | Opt-in |
+| --- | --- | --- | --- |
+| `@aurix/web-sdk` | npm | first version published manually, then *Settings → Trusted Publisher → GitHub Actions* (`aurix-voice` / `aurix` / `release.yml`, no environment, allow `npm publish`) | always on |
+| `@aurix/server-sdk` | npm | same as above for the server package | repository variable `NPM_SERVER_SDK=true` |
+| `aurix-server-sdk` | PyPI | *Your projects → Publishing → add a pending publisher* (`aurix-voice` / `aurix` / `release.yml`); no manual first upload needed | repository variable `PUBLISH_PYPI=true` |
+| `Aurix.Server` | NuGet.org | *Trusted Publishing → new policy* (`aurix-voice` / `aurix` / `release.yml`, scope: new packages + `Aurix.*`) under your profile | repository variable `NUGET_USER=<nuget.org profile name>` |
+| `github.com/aurix-voice/aurix/sdk/server/go` | Go proxy | none — the `sdk/server/go/vX.Y.Z` tag is enough | always on |
+| `com.aurix.voice` | OpenUPM / git URL | register the package on openupm.com once (`gitTagPrefix: upm/v`); git-URL installs work immediately | always on (`upm` branch) |
+
+npm provenance requires `package.json#repository.url` to point at this repository (set for both
+npm packages). `workflow_dispatch` with `npm_publish=true` re-publishes the workspace version to
+npm if the npm step of a release failed.
+

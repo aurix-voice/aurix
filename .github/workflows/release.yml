@@ -784,7 +784,10 @@ jobs:
           set -euo pipefail
           npm install -g npm@latest >/dev/null
           tag=latest; case "$VERSION" in *-*) tag=next ;; esac
-          npm publish "./staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"
+          npm publish "./staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag" || echo "::warning title=web-sdk::already published or rejected (see above)"
+          if [ "${{ vars.NPM_SERVER_SDK }}" = "true" ]; then
+            npm publish "./staged/aurix-server-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag" || echo "::warning title=server-sdk::already published or rejected (see above)"
+          fi
 
   publish:
     name: checksums, SBOM, signatures, GitHub release
@@ -820,18 +823,38 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Publish @aurix/web-sdk to npm (OIDC trusted publishing, provenance; no token)
+      - name: Publish @aurix/web-sdk to npm (OIDC trusted publishing, provenance)
         if: needs.verify.outputs.publish == 'true'
         run: |
           set -euo pipefail
           npm install -g npm@latest >/dev/null   # trusted publishing needs npm >= 11.5.1
-          npm --version
           tag=latest; case "$VERSION" in *-*) tag=next ;; esac
-          if npm publish "./staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"; then
-            echo "::notice title=npm::@aurix/web-sdk@${VERSION} published (dist-tag ${tag})"
-          else
-            echo "::warning title=npm publish failed::Configure the trusted publisher on npmjs.com for @aurix/web-sdk (GitHub Actions: aurix-voice / aurix / release.yml, no environment). The tarball is attached to the GitHub release regardless."
-          fi
+          npm publish "./staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"
+      - name: Publish @aurix/server-sdk to npm — opt-in via repository variable NPM_SERVER_SDK=true (after the first manual publish + trusted publisher)
+        if: needs.verify.outputs.publish == 'true' && vars.NPM_SERVER_SDK == 'true'
+        run: |
+          set -euo pipefail
+          tag=latest; case "$VERSION" in *-*) tag=next ;; esac
+          npm publish "./staged/aurix-server-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"
+      - name: Stage aurix-server-sdk for PyPI — opt-in via repository variable PUBLISH_PYPI=true (pending trusted publisher on pypi.org)
+        if: needs.verify.outputs.publish == 'true' && vars.PUBLISH_PYPI == 'true'
+        run: |
+          mkdir -p pypi
+          cp staged/aurix_server_sdk-${VERSION}-py3-none-any.whl staged/aurix_server_sdk-${VERSION}.tar.gz pypi/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: needs.verify.outputs.publish == 'true' && vars.PUBLISH_PYPI == 'true'
+        with:
+          packages-dir: pypi/
+          attestations: true
+      - name: NuGet login (OIDC → short-lived API key) — opt-in via repository variable NUGET_USER (nuget.org profile name with a trusted publishing policy)
+        if: needs.verify.outputs.publish == 'true' && vars.NUGET_USER != ''
+        id: nuget_login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - name: Publish Aurix.Server to NuGet
+        if: needs.verify.outputs.publish == 'true' && vars.NUGET_USER != ''
+        run: dotnet nuget push "staged/Aurix.Server.${VERSION}.nupkg" --api-key "${{ steps.nuget_login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
       - name: Unity package branch for OpenUPM (upm = sdk/unity subtree, tag upm/v<version>)
         if: needs.verify.outputs.publish == 'true'
         run: |
