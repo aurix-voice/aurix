@@ -31,6 +31,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChannelEnergy, FGuid, Channel
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixSpeakingWhileMuted, bool, bSpeaking);
 /** A member's microphone availability changed (FAurixParticipant::bCaptureUnavailable). */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantCaptureChanged, FGuid, ChannelId, FGuid, UserId, bool, bAvailable);
+/** Audio injection started (true) or ended (false: clip finished, StopAudioInjection, disconnect). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioInjectionChanged, bool, bActive);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLocalSpeaking, bool, bSpeaking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTransmissionMode, Mode, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
@@ -193,6 +195,20 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	void SetCaptureAvailable(bool bAvailable);
+
+	/**
+	 * Play a PCM clip into your transmitting channels: mixed with the microphone (default) or instead of it.
+	 * Soundboards, voice lines, microphone tests (join an echo channel, inject, listen). Works without a
+	 * microphone too — frames are then pushed from Tick. Interleaved float PCM, any rate / up to 8 channels.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	void InjectAudio(const TArray<float>& InterleavedPcm, int32 SampleRate, int32 Channels, bool bLoop = false, float Gain = 1.f, bool bMixWithMicrophone = true);
+
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	void StopAudioInjection();
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool IsInjectingAudio() const;
 
 	/** Name of the microphone currently captured (empty = system default or not capturing). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
@@ -701,6 +717,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantSpeaking OnParticipantSpeaking;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixCaptureDeviceChanged OnCaptureDeviceChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixSpeakingWhileMuted OnSpeakingWhileMuted;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioInjectionChanged OnAudioInjectionChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantCaptureChanged OnParticipantCaptureChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixCaptureDevicesChanged OnCaptureDevicesChanged;
 	/** A member (possibly us) became or stopped being a priority speaker. */
@@ -814,6 +831,10 @@ private:
 	/** Device hot-swap polling (CaptureDevicePollSeconds). */
 	TArray<FString> KnownCaptureDevices;
 	bool bCaptureDevicesPrimed = false;
+	/** Injection without a microphone: 20 ms frames pushed from Tick. */
+	double InjectionClock = 0.0;
+	TArray<float> InjectionFrame;
+	void PumpInjection(float DeltaTime);
 	double LastCaptureDevicePoll = 0.0;
 	void PollCaptureDevices();
 	void OnEnterBackground();

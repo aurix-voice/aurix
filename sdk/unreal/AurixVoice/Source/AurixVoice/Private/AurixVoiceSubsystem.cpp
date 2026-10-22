@@ -776,10 +776,80 @@ bool UAurixVoiceSubsystem::IsTickable() const
 	return !IsTemplate() && Native.IsValid();
 }
 
-void UAurixVoiceSubsystem::Tick(float /*DeltaTime*/)
+void UAurixVoiceSubsystem::Tick(float DeltaTime)
 {
 	PumpEvents();
 	PollCaptureDevices();
+	PumpInjection(DeltaTime);
+}
+
+void UAurixVoiceSubsystem::InjectAudio(const TArray<float>& InterleavedPcm, int32 SampleRate, int32 Channels, bool bLoop, float Gain, bool bMixWithMicrophone)
+{
+	if (!Native || SampleRate <= 0 || Channels <= 0 || InterleavedPcm.Num() < Channels)
+	{
+		UE_LOG(LogAurixVoice, Warning, TEXT("InjectAudio: not connected or empty clip"));
+		return;
+	}
+	if (!Capture)
+	{
+		Capture = MakeUnique<FAurixAudioCapture>();
+	}
+	const bool bWasActive = Capture->Injector.IsActive();
+	Capture->Injector.Start(InterleavedPcm, SampleRate, Channels, bLoop, Gain, bMixWithMicrophone);
+	InjectionClock = 0.0;
+	if (!bWasActive && Capture->Injector.IsActive())
+	{
+		OnAudioInjectionChanged.Broadcast(true);
+	}
+}
+
+void UAurixVoiceSubsystem::StopAudioInjection()
+{
+	if (Capture && Capture->Injector.IsActive())
+	{
+		Capture->Injector.Stop();
+		OnAudioInjectionChanged.Broadcast(false);
+	}
+	else if (Capture)
+	{
+		Capture->Injector.Stop();
+	}
+}
+
+bool UAurixVoiceSubsystem::IsInjectingAudio() const
+{
+	return Capture && Capture->Injector.IsActive();
+}
+
+void UAurixVoiceSubsystem::PumpInjection(float DeltaTime)
+{
+	if (!Capture)
+	{
+		return;
+	}
+	FAurixAudioInjector& Injector = Capture->Injector;
+	if (Injector.IsFinished())
+	{
+		// Non-looping clip ran out on the capture thread (or below): tell the game once.
+		Injector.Stop();
+		OnAudioInjectionChanged.Broadcast(false);
+		return;
+	}
+	if (!Injector.IsActive() || !Native || IsCapturing())
+	{
+		InjectionClock = 0.0;
+		return;
+	}
+	// No microphone open: feed the clip ourselves, 20 ms at 48 kHz per step, catching up on long frames.
+	constexpr int32 Rate = 48000;
+	constexpr int32 FrameSamples = Rate / 50;
+	InjectionClock += FMath::Min(static_cast<double>(DeltaTime), 0.25);
+	while (InjectionClock >= 0.02 && Injector.IsActive())
+	{
+		InjectionClock -= 0.02;
+		Injector.Pull(InjectionFrame, FrameSamples, 1, Rate);
+		Native->Client.push_capture(InjectionFrame.GetData(), static_cast<size_t>(InjectionFrame.Num()), static_cast<uint32_t>(Rate), 1);
+	}
 }
 
 void UAurixVoiceSubsystem::PollCaptureDevices()
@@ -934,6 +1004,7 @@ void UAurixVoiceSubsystem::ReleaseNative()
 {
 	bCaptureDevicesPrimed = false;
 	KnownCaptureDevices.Reset();
+	StopAudioInjection();
 	bPlaybackRequested = false;
 	if (Capture)
 	{

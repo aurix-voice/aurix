@@ -315,6 +315,16 @@ unprobed → `bProbeFailed`. `CancelRegionDiscovery()` aborts an in-flight disco
 one cancels the previous; the subsystem cancels on shutdown. Only healthy nodes with a public
 `wss://` URL are returned; an empty array means no node is configured for discovery.
 
+### Audio injection (soundboard, voice lines, mic test)
+
+`InjectAudio(Pcm, SampleRate, Channels, bLoop, Gain, bMixWithMicrophone)` plays a float PCM
+clip into your transmitting channels — mixed with the microphone (default) or instead of it —
+and `StopAudioInjection()` ends it; `OnAudioInjectionChanged(bActive)` fires at start and when a
+non-looping clip finishes. It works with no microphone at all (frames are pushed from `Tick`),
+so a microphone test is: join an echo channel, inject a clip, listen. Decode `USoundWave` assets
+with the engine's `Audio::FSoundWavePCMLoader` / `ImportedSoundWave`, or read a WAV yourself —
+the plugin deliberately takes raw PCM so it does not depend on an asset format.
+
 ### Microphone hot-swap
 
 Every `CaptureDevicePollSeconds` (default 2, 0 = off) the plugin re-lists capture devices on
