@@ -32,6 +32,21 @@ FString UAurixVoiceBlueprintLibrary::ConnectionStateToText(EAurixConnectionState
 	return TEXT("Unknown");
 }
 
+FString UAurixVoiceBlueprintLibrary::LeaveReasonToText(EAurixLeaveReason Reason)
+{
+	switch (Reason)
+	{
+	case EAurixLeaveReason::Left: return TEXT("left");
+	case EAurixLeaveReason::Timeout: return TEXT("lost connection");
+	case EAurixLeaveReason::Kicked: return TEXT("was kicked");
+	case EAurixLeaveReason::Banned: return TEXT("was banned");
+	case EAurixLeaveReason::OutOfRange: return TEXT("went out of range");
+	case EAurixLeaveReason::ChannelClosed: return TEXT("channel closed");
+	case EAurixLeaveReason::Replaced: return TEXT("reconnected elsewhere");
+	}
+	return TEXT("left");
+}
+
 FString UAurixVoiceBlueprintLibrary::MediaPathToText(EAurixMediaPath Path)
 {
 	switch (Path)

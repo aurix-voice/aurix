@@ -29,6 +29,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Samples")
 	static FString ConnectionStateToText(EAurixConnectionState State);
 
+	/** "left" / "lost connection" / "was kicked" / … for a lobby toast. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Samples")
+	static FString LeaveReasonToText(EAurixLeaveReason Reason);
+
 	/** "QUIC" / "UDP" / "WebSocket tunnel" / "-". */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Samples")
 	static FString MediaPathToText(EAurixMediaPath Path);

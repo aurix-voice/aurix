@@ -40,6 +40,10 @@ struct AURIXVOICESAMPLES_API FAurixLobbyEntry
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bPriority = false;
 
+	/** They have no working microphone (their SDK reported it) — draw a crossed-out mic. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bCaptureUnavailable = false;
+
 	/** Last reported level 0..1 (OnChannelEnergy). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	float Energy = 0.f;
@@ -64,6 +68,10 @@ struct AURIXVOICESAMPLES_API FAurixLobbyStatus
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bMicrophoneMuted = false;
 
+	/** The VAD hears you while muted — show "you are muted". */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bSpeakingWhileMuted = false;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	EAurixMediaPath MediaPath = EAurixMediaPath::None;
 
@@ -86,6 +94,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLobbyRosterChanged, const TArr
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLobbyStatusChanged, const FAurixLobbyStatus&, Status);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixLobbyChatLine, const FString&, SenderName, const FString&, Text, bool, bDirect);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixLobbyError, const FString&, Code, const FString&, Message);
+/** Someone left the lobby channel and why (not raised for OutOfRange: that is positional-roster churn). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixLobbyPlayerLeft, const FString&, DisplayName, EAurixLeaveReason, Reason);
 
 /**
  * Party / lobby voice in one component: connect with a backend-minted token, join one channel,
@@ -140,6 +150,9 @@ public:
 	/** Request failures, server errors, kicks and a lost connection (Code = "KICKED" / "DISCONNECTED"). */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events")
 	FAurixLobbyError OnError;
+
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Samples")
+	FAurixLobbyPlayerLeft OnPlayerLeft;
 
 	/** Connect with a session JWT (or one-time login action token) fetched from your backend. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice")
@@ -199,12 +212,15 @@ private:
 	UFUNCTION() void HandleChannelJoined(int64 RequestId, FGuid Channel, const TArray<FAurixParticipant>& Participants, bool bTranscription);
 	UFUNCTION() void HandleChannelLeft(FGuid Channel);
 	UFUNCTION() void HandleParticipantJoined(FGuid Channel, const FAurixParticipant& Participant);
-	UFUNCTION() void HandleParticipantLeft(FGuid Channel, FGuid UserId);
+	UFUNCTION() void HandleParticipantRemoved(FGuid Channel, FGuid UserId, EAurixLeaveReason Reason);
+	UFUNCTION() void HandleCaptureChanged(FGuid Channel, FGuid UserId, bool bAvailable);
+	UFUNCTION() void HandleSpeakingWhileMuted(bool bSpeaking);
 	UFUNCTION() void HandleMuteChanged(FGuid Channel, FGuid UserId, bool bMuted, bool bServerMuted);
 	UFUNCTION() void HandleSpeaking(FGuid Channel, FGuid UserId, bool bSpeaking);
 	UFUNCTION() void HandlePriorityChanged(FGuid Channel, FGuid UserId, bool bPriority);
 	UFUNCTION() void HandleEnergy(FGuid Channel, const TArray<FAurixParticipant>& Levels);
 	UFUNCTION() void HandleLocalSpeaking(bool bSpeaking);
+	bool bSpeakingWhileMuted = false;
 	UFUNCTION() void HandleMediaPath(EAurixMediaPath Path, const FString& Reason);
 	UFUNCTION() void HandleNetworkQuality(const FAurixNetworkQuality& Quality);
 	UFUNCTION() void HandleEndpointChanged(const FString& Url);

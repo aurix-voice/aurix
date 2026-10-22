@@ -42,7 +42,9 @@ void UAurixVoiceLobbyComponent::Bind(UAurixVoiceSubsystem& Voice)
 	Voice.OnChannelJoined.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleChannelJoined);
 	Voice.OnChannelLeft.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleChannelLeft);
 	Voice.OnParticipantJoined.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleParticipantJoined);
-	Voice.OnParticipantLeft.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleParticipantLeft);
+	Voice.OnParticipantRemoved.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleParticipantRemoved);
+	Voice.OnParticipantCaptureChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleCaptureChanged);
+	Voice.OnSpeakingWhileMuted.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleSpeakingWhileMuted);
 	Voice.OnParticipantMuteChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleMuteChanged);
 	Voice.OnParticipantSpeaking.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleSpeaking);
 	Voice.OnParticipantPriorityChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandlePriorityChanged);
@@ -67,7 +69,9 @@ void UAurixVoiceLobbyComponent::Unbind(UAurixVoiceSubsystem& Voice)
 	Voice.OnChannelJoined.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleChannelJoined);
 	Voice.OnChannelLeft.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleChannelLeft);
 	Voice.OnParticipantJoined.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleParticipantJoined);
-	Voice.OnParticipantLeft.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleParticipantLeft);
+	Voice.OnParticipantRemoved.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleParticipantRemoved);
+	Voice.OnParticipantCaptureChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleCaptureChanged);
+	Voice.OnSpeakingWhileMuted.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleSpeakingWhileMuted);
 	Voice.OnParticipantMuteChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleMuteChanged);
 	Voice.OnParticipantSpeaking.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleSpeaking);
 	Voice.OnParticipantPriorityChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandlePriorityChanged);
@@ -256,6 +260,7 @@ FAurixLobbyStatus UAurixVoiceLobbyComponent::GetStatus() const
 	{
 		Status.State = Voice->GetConnectionState();
 		Status.bMicrophoneMuted = Voice->IsMuted();
+		Status.bSpeakingWhileMuted = bSpeakingWhileMuted;
 		Status.MediaPath = Voice->GetMediaPath();
 		Status.Endpoint = Voice->GetEndpoint();
 	}
@@ -336,6 +341,7 @@ void UAurixVoiceLobbyComponent::RebuildRoster(const TArray<FAurixParticipant>& P
 		Entry.bMuted = P.bMuted;
 		Entry.bServerMuted = P.bServerMuted;
 		Entry.bPriority = P.bPriority;
+		Entry.bCaptureUnavailable = P.bCaptureUnavailable;
 		Entry.Energy = P.Energy;
 		// Listener-local preferences survive a re-join; keep what the UI set.
 		if (const FAurixLobbyEntry* Old = Previous.FindByPredicate([&](const FAurixLobbyEntry& E) { return E.UserId == P.UserId; }))
@@ -365,6 +371,7 @@ void UAurixVoiceLobbyComponent::HandleParticipantJoined(FGuid Channel, const FAu
 		Existing->bMuted = Participant.bMuted;
 		Existing->bServerMuted = Participant.bServerMuted;
 		Existing->bPriority = Participant.bPriority;
+		Existing->bCaptureUnavailable = Participant.bCaptureUnavailable;
 	}
 	else
 	{
@@ -375,20 +382,52 @@ void UAurixVoiceLobbyComponent::HandleParticipantJoined(FGuid Channel, const FAu
 		Entry.bMuted = Participant.bMuted;
 		Entry.bServerMuted = Participant.bServerMuted;
 		Entry.bPriority = Participant.bPriority;
+		Entry.bCaptureUnavailable = Participant.bCaptureUnavailable;
 		Roster.Add(MoveTemp(Entry));
 	}
 	NotifyRoster();
 }
 
-void UAurixVoiceLobbyComponent::HandleParticipantLeft(FGuid Channel, FGuid UserId)
+void UAurixVoiceLobbyComponent::HandleParticipantRemoved(FGuid Channel, FGuid UserId, EAurixLeaveReason Reason)
 {
 	if (Channel != JoinedChannel)
 	{
 		return;
 	}
+	FString Name;
+	if (const FAurixLobbyEntry* Entry = FindEntry(UserId))
+	{
+		Name = Entry->DisplayName;
+	}
 	if (Roster.RemoveAll([&](const FAurixLobbyEntry& E) { return E.UserId == UserId; }) > 0)
 	{
 		NotifyRoster();
+		if (Reason != EAurixLeaveReason::OutOfRange)
+		{
+			OnPlayerLeft.Broadcast(Name, Reason);
+		}
+	}
+}
+
+void UAurixVoiceLobbyComponent::HandleCaptureChanged(FGuid Channel, FGuid UserId, bool bAvailable)
+{
+	if (Channel != JoinedChannel)
+	{
+		return;
+	}
+	if (FAurixLobbyEntry* Entry = FindEntry(UserId))
+	{
+		Entry->bCaptureUnavailable = !bAvailable;
+		NotifyRoster();
+	}
+}
+
+void UAurixVoiceLobbyComponent::HandleSpeakingWhileMuted(bool bSpeaking)
+{
+	if (bSpeakingWhileMuted != bSpeaking)
+	{
+		bSpeakingWhileMuted = bSpeaking;
+		NotifyStatus();
 	}
 }
 

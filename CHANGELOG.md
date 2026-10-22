@@ -13,6 +13,7 @@ released together.
 
 ### Added
 
+- Unreal lobby sample: `OnPlayerLeft(DisplayName, EAurixLeaveReason)` (silent for out-of-range churn), `bCaptureUnavailable` per roster entry, `bSpeakingWhileMuted` in the status, `LeaveReasonToText` in the Blueprint library.
 - Error helpers everywhere: core `is_player_facing_code`, C ABI `aurix_error_player_facing`, C++ `aurix::describe_error / error_retryable / error_player_facing`, Unreal `IsErrorPlayerFacing`, Godot `describe_error / is_error_retryable / is_error_player_facing`; `ReconnectNow` (Unreal) / `reconnect_now` (Godot) as the cross-SDK name of `NetworkChanged`.
 - API parity getters that Unity/Web had and the native SDKs lacked: C ABI `aurix_client_transmission` / `channel_focus` / `is_priority` / `user_id` / `is_capture_available` / `input_gain` (+ C++ wrappers), Unreal `GetTransmission` / `GetChannelFocus` / `IsPriority` / `GetUserId` / `IsCaptureAvailable` / `GetInputGain`, Godot `get_transmission` / `get_channel_focus` / `is_priority` / `get_user_id` / `is_capture_available` / `get_input_gain`; core `Client::channel_focus()`.
 - `voice_cli` example (`cargo run -p aurix-client --example voice_cli -- <ws-url> <token> [channel]`): interactive console voice client for support and QA — join/leave/mute/tx/focus/pos/vol/priority, `play file.wav` as the microphone, `record out.wav` of the remote mix, `who` (mute / speaking / priority / no-mic), `stats`, `session`, live event log (`--json`), forced reconnect. No audio device needed.
