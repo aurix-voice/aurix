@@ -275,7 +275,12 @@ public:
     String get_user_id() const;
     bool is_speaking() const;
     double get_input_level() const;
-    double get_input_energy() const;
+    void set_push_to_talk_action(const StringName& action);
+    StringName get_push_to_talk_action() const;
+    void set_push_to_talk_toggle(bool toggle);
+    bool get_push_to_talk_toggle() const;
+    void set_push_to_talk_release_delay(double seconds);
+    double get_push_to_talk_release_delay() const;
     void set_input_gain(double gain);
     /// Inspector defaults applied once the session is ready (and immediately when connected).
     void set_preferred_codec(int codec);
@@ -411,6 +416,13 @@ private:
     int preferred_downlink_ = 0;
     double input_gain_ = 1.0;
     double vad_threshold_ = 0.01;
+    StringName push_to_talk_action_;
+    bool push_to_talk_toggle_ = false;
+    double push_to_talk_release_delay_ = 0.15;
+    bool ptt_transmitting_ = false;
+    double ptt_release_at_ = -1.0;
+    double ptt_clock_ = 0.0;
+    void update_push_to_talk(double delta);
     int vad_hangover_frames_ = 15;
     std::vector<float> inject_pcm_;
     std::vector<float> inject_frame_;

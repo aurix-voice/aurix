@@ -2,6 +2,8 @@
 
 #include "aurix_conversions.h"
 
+#include <godot_cpp/classes/input.hpp>
+#include <godot_cpp/classes/input_map.hpp>
 #include <godot_cpp/classes/audio_server.hpp>
 #include <godot_cpp/classes/audio_stream_generator.hpp>
 #include <godot_cpp/classes/audio_stream_microphone.hpp>
@@ -552,8 +554,31 @@ double AurixVoiceClient::get_input_level() const {
     const uint8_t wire = client_.capture_level();   // 0 = loudest, 127 = silence
     return wire >= 127 ? 0.0 : 1.0 - static_cast<double>(wire) / 127.0;
 }
-double AurixVoiceClient::get_input_energy() const {
-    return client_ ? std::max(0.0, std::min(1.0, static_cast<double>(client_.capture_energy()))) : 0.0;
+void AurixVoiceClient::set_push_to_talk_action(const StringName& action) { push_to_talk_action_ = action; }
+StringName AurixVoiceClient::get_push_to_talk_action() const { return push_to_talk_action_; }
+void AurixVoiceClient::set_push_to_talk_toggle(bool toggle) { push_to_talk_toggle_ = toggle; }
+bool AurixVoiceClient::get_push_to_talk_toggle() const { return push_to_talk_toggle_; }
+void AurixVoiceClient::set_push_to_talk_release_delay(double seconds) { push_to_talk_release_delay_ = std::max(0.0, seconds); }
+double AurixVoiceClient::get_push_to_talk_release_delay() const { return push_to_talk_release_delay_; }
+
+// Push-to-talk from an InputMap action (keyboard, gamepad, anything bound): the microphone is
+// muted unless the action is held (or toggled on); drives set_muted so server/roster agree.
+void AurixVoiceClient::update_push_to_talk(double delta) {
+    ptt_clock_ += delta;
+    if (push_to_talk_action_ == StringName() || !client_) return;
+    Input* input = Input::get_singleton();
+    if (!input || !InputMap::get_singleton()->has_action(push_to_talk_action_)) return;
+    const bool pressed = push_to_talk_toggle_ ? input->is_action_just_pressed(push_to_talk_action_)
+                                              : input->is_action_pressed(push_to_talk_action_);
+    bool want = ptt_transmitting_;
+    if (push_to_talk_toggle_) { if (pressed) want = !want; } else want = pressed;
+    if (want) {
+        ptt_release_at_ = -1.0;
+        if (!ptt_transmitting_) { ptt_transmitting_ = true; if (is_muted()) set_muted(false); }
+    } else if (ptt_transmitting_) {
+        if (ptt_release_at_ < 0.0) ptt_release_at_ = ptt_clock_ + push_to_talk_release_delay_;
+        if (ptt_clock_ >= ptt_release_at_) { ptt_transmitting_ = false; ptt_release_at_ = -1.0; if (!is_muted()) set_muted(true); }
+    }
 }
 void AurixVoiceClient::set_input_gain(double gain) {
     input_gain_ = std::max(0.0, std::min(4.0, gain));
@@ -1131,6 +1156,7 @@ Dictionary AurixVoiceClient::get_network_quality() const {
 // ---- frame loop ------------------------------------------------------------------------------
 
 void AurixVoiceClient::_process(double delta) {
+    update_push_to_talk(delta);
     if (Engine::get_singleton()->is_editor_hint()) return;
     feed_capture();
     pump_injection(delta);
@@ -1428,6 +1454,10 @@ void AurixVoiceClient::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::INT, "max_events_per_frame"), "set_max_events_per_frame", "get_max_events_per_frame");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dsp_bypass"), "set_dsp_bypass", "get_dsp_bypass");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "visemes_enabled"), "set_visemes_enabled", "get_visemes_enabled");
+    ADD_GROUP("Push To Talk", "push_to_talk_");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "push_to_talk_action"), "set_push_to_talk_action", "get_push_to_talk_action");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "push_to_talk_toggle"), "set_push_to_talk_toggle", "get_push_to_talk_toggle");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "push_to_talk_release_delay", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_push_to_talk_release_delay", "get_push_to_talk_release_delay");
     ADD_GROUP("Audio Defaults", "");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_codec", PROPERTY_HINT_ENUM, "Opus,PCMU,PCMA"), "set_preferred_codec", "get_preferred_codec");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_downlink_mode", PROPERTY_HINT_ENUM, "Streams,Mixed"), "set_preferred_downlink_mode", "get_preferred_downlink_mode");
@@ -1491,7 +1521,12 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_user_id"), &AurixVoiceClient::get_user_id);
     ClassDB::bind_method(D_METHOD("is_speaking"), &AurixVoiceClient::is_speaking);
     ClassDB::bind_method(D_METHOD("get_input_level"), &AurixVoiceClient::get_input_level);
-    ClassDB::bind_method(D_METHOD("get_input_energy"), &AurixVoiceClient::get_input_energy);
+    ClassDB::bind_method(D_METHOD("set_push_to_talk_action", "action"), &AurixVoiceClient::set_push_to_talk_action);
+    ClassDB::bind_method(D_METHOD("get_push_to_talk_action"), &AurixVoiceClient::get_push_to_talk_action);
+    ClassDB::bind_method(D_METHOD("set_push_to_talk_toggle", "toggle"), &AurixVoiceClient::set_push_to_talk_toggle);
+    ClassDB::bind_method(D_METHOD("get_push_to_talk_toggle"), &AurixVoiceClient::get_push_to_talk_toggle);
+    ClassDB::bind_method(D_METHOD("set_push_to_talk_release_delay", "seconds"), &AurixVoiceClient::set_push_to_talk_release_delay);
+    ClassDB::bind_method(D_METHOD("get_push_to_talk_release_delay"), &AurixVoiceClient::get_push_to_talk_release_delay);
     ClassDB::bind_method(D_METHOD("set_input_gain", "gain"), &AurixVoiceClient::set_input_gain);
     ClassDB::bind_method(D_METHOD("set_preferred_codec", "codec"), &AurixVoiceClient::set_preferred_codec);
     ClassDB::bind_method(D_METHOD("get_preferred_codec"), &AurixVoiceClient::get_preferred_codec);
