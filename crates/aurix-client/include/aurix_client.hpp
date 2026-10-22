@@ -429,6 +429,10 @@ public:
     bool is_priority(const Uuid& channel) const { return aurix_client_is_priority(c_, &channel.raw); }
     bool user_id(Uuid& out) const { return aurix_client_user_id(c_, &out.raw); }
     bool is_speaking() const { return aurix_client_is_speaking(c_); }
+    /// Microphone level of the last captured frame (0 = loudest, 127 = silence; RFC 6464) — input meter.
+    uint8_t capture_level() const { return aurix_client_capture_level(c_); }
+    /// Smoothed linear RMS energy (0.0..=1.0) of the most recent captured frames.
+    float capture_energy() const { return aurix_client_capture_energy(c_); }
     void set_input_gain(float gain) { aurix_client_set_input_gain(c_, gain); }
     float input_energy() const { return aurix_client_input_energy(c_); }
     void set_vad(float threshold, std::uint32_t hangover_frames) { aurix_client_set_vad(c_, threshold, hangover_frames); }

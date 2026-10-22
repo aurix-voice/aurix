@@ -323,6 +323,10 @@ struct Inner {
     bitrate_command: Mutex<Option<(u32, u8)>>,
     muted: AtomicBool,
     local_speaking: AtomicBool,
+    /// Wire level (RFC 6464 style, 127 = silence) of the last captured frame; for input meters.
+    local_level: AtomicU8,
+    /// Smoothed linear energy of the last captured frames (`f32` bits).
+    local_energy: AtomicU32,
     speaking_while_muted: AtomicBool,
     capture_available: AtomicBool,
     channels: Mutex<HashMap<ChannelId, ChannelState>>,
@@ -786,6 +790,8 @@ impl Client {
             media: RwLock::new(None),
             muted: AtomicBool::new(false),
             local_speaking: AtomicBool::new(false),
+            local_level: AtomicU8::new(aurix_common::protocol::AUDIO_LEVEL_SILENCE),
+            local_energy: AtomicU32::new(0),
             speaking_while_muted: AtomicBool::new(false),
             capture_available: AtomicBool::new(true),
             channels: Mutex::new(HashMap::new()),
@@ -1086,6 +1092,10 @@ impl Client {
                 .rtp_ts
                 .fetch_add(FRAME_SAMPLES as u32, Ordering::Relaxed);
             let speaking = frame.speech && !muted;
+            self.inner.local_level.store(frame.level, Ordering::Relaxed);
+            self.inner
+                .local_energy
+                .store(frame.energy.to_bits(), Ordering::Relaxed);
             if self.inner.local_speaking.swap(speaking, Ordering::Relaxed) != speaking {
                 speaking_flip = Some(speaking);
             }
@@ -1387,6 +1397,18 @@ impl Client {
 
     pub fn is_speaking(&self) -> bool {
         self.inner.local_speaking.load(Ordering::Relaxed)
+    }
+
+    /// Microphone level of the last captured frame on the wire scale (`0` = loudest, `127` =
+    /// silence; RFC 6464), independent of mute. Poll it for an input meter; `capture_energy`
+    /// gives the same as smoothed linear energy.
+    pub fn capture_level(&self) -> u8 {
+        self.inner.local_level.load(Ordering::Relaxed)
+    }
+
+    /// Smoothed linear energy (RMS, `0.0..=1.0`) of the most recent captured frames.
+    pub fn capture_energy(&self) -> f32 {
+        f32::from_bits(self.inner.local_energy.load(Ordering::Relaxed))
     }
 
     /// Software microphone gain `0..=4`.

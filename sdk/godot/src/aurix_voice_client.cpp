@@ -547,6 +547,14 @@ String AurixVoiceClient::get_user_id() const {
     return client_ && client_.user_id(user) ? uuid_to_string(user.raw) : String();
 }
 bool AurixVoiceClient::is_speaking() const { return client_ && client_.is_speaking(); }
+double AurixVoiceClient::get_input_level() const {
+    if (!client_) return 0.0;
+    const uint8_t wire = client_.capture_level();   // 0 = loudest, 127 = silence
+    return wire >= 127 ? 0.0 : 1.0 - static_cast<double>(wire) / 127.0;
+}
+double AurixVoiceClient::get_input_energy() const {
+    return client_ ? std::max(0.0, std::min(1.0, static_cast<double>(client_.capture_energy()))) : 0.0;
+}
 void AurixVoiceClient::set_input_gain(double gain) {
     input_gain_ = std::max(0.0, std::min(4.0, gain));
     if (client_) client_.set_input_gain(static_cast<float>(input_gain_));
@@ -1482,6 +1490,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("is_priority", "channel_id"), &AurixVoiceClient::is_priority);
     ClassDB::bind_method(D_METHOD("get_user_id"), &AurixVoiceClient::get_user_id);
     ClassDB::bind_method(D_METHOD("is_speaking"), &AurixVoiceClient::is_speaking);
+    ClassDB::bind_method(D_METHOD("get_input_level"), &AurixVoiceClient::get_input_level);
+    ClassDB::bind_method(D_METHOD("get_input_energy"), &AurixVoiceClient::get_input_energy);
     ClassDB::bind_method(D_METHOD("set_input_gain", "gain"), &AurixVoiceClient::set_input_gain);
     ClassDB::bind_method(D_METHOD("set_preferred_codec", "codec"), &AurixVoiceClient::set_preferred_codec);
     ClassDB::bind_method(D_METHOD("get_preferred_codec"), &AurixVoiceClient::get_preferred_codec);

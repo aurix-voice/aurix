@@ -3611,6 +3611,23 @@ pub unsafe extern "C" fn aurix_client_is_speaking(client: *const AurixClient) ->
         .unwrap_or(false)
 }
 
+/// Microphone level of the last captured frame on the wire scale (0 = loudest, 127 = silence),
+/// for input meters; independent of mute. 127 when there is no client.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_capture_level(client: *const AurixClient) -> u8 {
+    self::client(client)
+        .map(|c| c.capture_level())
+        .unwrap_or(aurix_common::protocol::AUDIO_LEVEL_SILENCE)
+}
+
+/// Smoothed linear RMS energy (0.0..=1.0) of the most recent captured frames.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_capture_energy(client: *const AurixClient) -> f32 {
+    self::client(client)
+        .map(|c| c.capture_energy())
+        .unwrap_or(0.0)
+}
+
 /// Microphone software gain `0..=4`.
 #[no_mangle]
 pub unsafe extern "C" fn aurix_client_set_input_gain(client: *mut AurixClient, gain: f32) {

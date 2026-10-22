@@ -275,6 +275,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool IsSpeaking() const;
 
+	/**
+	 * Microphone level of the last captured frame for an input meter: 0.0 (silence) .. 1.0 (loudest),
+	 * derived from the wire level (RFC 6464), independent of mute. Poll from Tick or a timer.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	float GetInputLevel() const;
+
+	/** Smoothed linear RMS energy (0.0..1.0) of the most recent captured frames. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	float GetInputEnergy() const;
+
 	/** Software gain 0..4. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	void SetInputGain(float Gain);

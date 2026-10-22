@@ -2191,6 +2191,17 @@ bool aurix_client_user_id(const struct AurixClient *client, struct AurixUuid *ou
 bool aurix_client_is_speaking(const struct AurixClient *client);
 
 /**
+ * Microphone level of the last captured frame on the wire scale (0 = loudest, 127 = silence),
+ * for input meters; independent of mute. 127 when there is no client.
+ */
+uint8_t aurix_client_capture_level(const struct AurixClient *client);
+
+/**
+ * Smoothed linear RMS energy (0.0..=1.0) of the most recent captured frames.
+ */
+float aurix_client_capture_energy(const struct AurixClient *client);
+
+/**
  * Microphone software gain `0..=4`.
  */
 void aurix_client_set_input_gain(struct AurixClient *client, float gain);

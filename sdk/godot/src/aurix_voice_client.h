@@ -274,6 +274,8 @@ public:
     /// Local user id once a session exists ("" before session_ready).
     String get_user_id() const;
     bool is_speaking() const;
+    double get_input_level() const;
+    double get_input_energy() const;
     void set_input_gain(double gain);
     /// Inspector defaults applied once the session is ready (and immediately when connected).
     void set_preferred_codec(int codec);

@@ -1310,6 +1310,18 @@ bool UAurixVoiceSubsystem::IsSpeaking() const
 	return Native && Native->Client.is_speaking();
 }
 
+float UAurixVoiceSubsystem::GetInputLevel() const
+{
+	if (!Native) return 0.f;
+	const uint8 Wire = Native->Client.capture_level();   // 0 = loudest, 127 = silence
+	return Wire >= 127 ? 0.f : 1.f - static_cast<float>(Wire) / 127.f;
+}
+
+float UAurixVoiceSubsystem::GetInputEnergy() const
+{
+	return Native ? FMath::Clamp(Native->Client.capture_energy(), 0.f, 1.f) : 0.f;
+}
+
 void UAurixVoiceSubsystem::SetInputGain(float Gain)
 {
 	if (Native)
