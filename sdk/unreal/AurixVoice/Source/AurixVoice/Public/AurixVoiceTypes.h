@@ -551,6 +551,18 @@ struct AURIXVOICE_API FAurixVoiceSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
 	bool bVadGate = true;
 
+	/** Software microphone gain before VAD and encoding (1 = unity, 2 ≈ +6 dB). Same as SetInputGain. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio", meta = (ClampMin = "0.0", ClampMax = "4.0"))
+	float InputGain = 1.f;
+
+	/** Uplink codec requested once the session is ready (Opus unless you need G.711 interop). Same as SetAudioCodec. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	EAurixAudioCodec PreferredCodec = EAurixAudioCodec::Opus;
+
+	/** Downlink requested once the session is ready: one stream per speaker, or one server-mixed stream per channel. Same as SetDownlinkMode. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Audio")
+	EAurixDownlinkMode PreferredDownlinkMode = EAurixDownlinkMode::Streams;
+
 	/**
 	 * Media link: QUIC (when offered) then UDP with the TLS tunnel (port 443) and then the WebSocket
 	 * tunnel as fallbacks (default), or exactly one of them. Every link keeps the same session, SSRC, key and encryption; only

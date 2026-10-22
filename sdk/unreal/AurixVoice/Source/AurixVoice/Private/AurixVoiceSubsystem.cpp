@@ -2262,6 +2262,19 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 			{
 				StartCapture(ActiveSettings.CaptureDeviceIndex);
 			}
+			// Session-level preferences from the settings (idempotent on resume).
+			if (!FMath::IsNearlyEqual(ActiveSettings.InputGain, 1.f))
+			{
+				SetInputGain(FMath::Clamp(ActiveSettings.InputGain, 0.f, 4.f));
+			}
+			if (ActiveSettings.PreferredCodec != EAurixAudioCodec::Opus)
+			{
+				SetAudioCodec(ActiveSettings.PreferredCodec);
+			}
+			if (ActiveSettings.PreferredDownlinkMode != EAurixDownlinkMode::Streams)
+			{
+				SetDownlinkMode(ActiveSettings.PreferredDownlinkMode);
+			}
 			if (bPlaybackRequested && (!PlaybackComponent || !PlaybackComponent->IsPlaying()))
 			{
 				StartPlayback();
