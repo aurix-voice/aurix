@@ -6,6 +6,12 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+## [1.8.2] — 2026-10-22
+
+- Push-to-talk out of the box on `AurixVoiceBehaviour`: `PushToTalkKey` (legacy input) or an Input System action (keyboard / gamepad), hold or toggle, release delay; `OnPushToTalkChanged` for HUDs. The state machine is `Aurix.Audio.PushToTalkState` (engine-free, unit-tested).
+- Fixed: toggle push-to-talk could not switch off while a release delay was set; a freshly created client with push-to-talk configured started unmuted until the first press — it now starts muted.
+- `InputLevel` / `OnInputLevel` (0..1) for microphone meters.
+
 ## [1.8.1] — 2026-10-22
 
 - Version bump only (release tooling fix); no package changes since 1.8.0.
