@@ -323,6 +323,8 @@ struct Inner {
     bitrate_command: Mutex<Option<(u32, u8)>>,
     muted: AtomicBool,
     local_speaking: AtomicBool,
+    speaking_while_muted: AtomicBool,
+    capture_available: AtomicBool,
     channels: Mutex<HashMap<ChannelId, ChannelState>>,
     /// Participants rendered by the host through `pull_participant_*`, kept out of the mix.
     claimed_users: Mutex<HashSet<UserId>>,
@@ -780,6 +782,8 @@ impl Client {
             media: RwLock::new(None),
             muted: AtomicBool::new(false),
             local_speaking: AtomicBool::new(false),
+            speaking_while_muted: AtomicBool::new(false),
+            capture_available: AtomicBool::new(true),
             channels: Mutex::new(HashMap::new()),
             claimed_users: Mutex::new(HashSet::new()),
             e2ee_pending: Mutex::new(HashMap::new()),
@@ -1059,6 +1063,7 @@ impl Client {
         let vad_gate = self.inner.cfg.read().vad_gate;
         let muted = self.inner.muted.load(Ordering::Relaxed);
         let mut speaking_flip: Option<bool> = None;
+        let mut swm_flip: Option<bool> = None;
         let mut stats = TransmitStats::default();
         enc.push_f32(pcm, sample_rate, channels, |frame| {
             stats.frames_encoded += 1;
@@ -1069,6 +1074,10 @@ impl Client {
             let speaking = frame.speech && !muted;
             if self.inner.local_speaking.swap(speaking, Ordering::Relaxed) != speaking {
                 speaking_flip = Some(speaking);
+            }
+            let swm = frame.speech && muted;
+            if self.inner.speaking_while_muted.swap(swm, Ordering::Relaxed) != swm {
+                swm_flip = Some(swm);
             }
             if muted || (vad_gate && !frame.speech) || targets.is_empty() {
                 stats.frames_gated += 1;
@@ -1102,6 +1111,9 @@ impl Client {
         }
         if let Some(speaking) = speaking_flip {
             self.inner.emit(Event::LocalSpeaking(speaking));
+        }
+        if let Some(swm) = swm_flip {
+            self.inner.emit(Event::SpeakingWhileMuted(swm));
         }
     }
 
@@ -1324,7 +1336,25 @@ impl Client {
             if muted && self.inner.local_speaking.swap(false, Ordering::AcqRel) {
                 self.inner.emit(Event::LocalSpeaking(false));
             }
+            if !muted && self.inner.speaking_while_muted.swap(false, Ordering::AcqRel) {
+                self.inner.emit(Event::SpeakingWhileMuted(false));
+            }
         }
+    }
+
+    /// Tell the server (and so every roster) whether this session has a usable microphone:
+    /// call with `false` when there is no capture device, the permission was denied or the
+    /// device failed to open, and `true` once capture runs. Idempotent; re-sent after a
+    /// (re)connect.
+    pub fn set_capture_available(&self, available: bool) {
+        if self.inner.capture_available.swap(available, Ordering::AcqRel) == available {
+            return;
+        }
+        let _ = self.send_control(ControlMessage::SetCaptureAvailable { available });
+    }
+
+    pub fn is_capture_available(&self) -> bool {
+        self.inner.capture_available.load(Ordering::Relaxed)
     }
 
     pub fn is_muted(&self) -> bool {
@@ -2356,6 +2386,7 @@ fn participant_from_brief(b: &ParticipantBrief) -> Participant {
         speaking: b.is_speaking,
         energy: 0.0,
         priority: b.is_priority,
+        capture_unavailable: b.capture_unavailable,
     }
 }
 
@@ -2395,6 +2426,10 @@ async fn session(
     *inner.session.lock() = Some(info.clone());
     *resume = Some((ack.session_id, ack.resume_token.clone()));
     inner.set_state(ConnectionState::Connected);
+    if !inner.capture_available.load(Ordering::Relaxed) {
+        // A fresh session does not know this client has no microphone; tell it again.
+        let _ = conn.send(&ControlMessage::SetCaptureAvailable { available: false }).await;
+    }
     inner.emit(Event::SessionReady(info));
     if cfg.e2ee && conn.send(&e2ee_capability(inner)).await.is_err() {
         return Exit::Dropped("send failed".into());
@@ -4031,6 +4066,7 @@ async fn handle_message(
             role,
             is_muted,
             is_priority,
+            capture_unavailable,
         } => {
             let participant = Participant {
                 user_id,
@@ -4042,6 +4078,7 @@ async fn handle_message(
                 speaking: false,
                 energy: 0.0,
                 priority: is_priority,
+                capture_unavailable,
             };
             let known = {
                 let mut channels = inner.channels.lock();
@@ -4119,6 +4156,25 @@ async fn handle_message(
                 user_id,
                 muted,
                 server_muted,
+            });
+        }
+        ControlMessage::CaptureStateChanged {
+            channel_id,
+            user_id,
+            available,
+        } => {
+            if let Some(p) = inner
+                .channels
+                .lock()
+                .get_mut(&channel_id)
+                .and_then(|c| c.participants.get_mut(&user_id))
+            {
+                p.capture_unavailable = !available;
+            }
+            inner.emit(Event::ParticipantCaptureChanged {
+                channel_id,
+                user_id,
+                available,
             });
         }
         ControlMessage::PriorityChanged {
@@ -4627,6 +4683,7 @@ async fn handle_message(
         | ControlMessage::OcclusionUpdate { .. }
         | ControlMessage::ReverbZoneUpdate { .. }
         | ControlMessage::QualityReport { .. }
+        | ControlMessage::SetCaptureAvailable { .. }
         | ControlMessage::RecordingConsentResponse { .. }
         | ControlMessage::ModerateParticipant { .. }
         | ControlMessage::ChatSend { .. }

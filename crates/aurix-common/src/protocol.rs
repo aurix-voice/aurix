@@ -1117,6 +1117,8 @@ pub enum ControlMessage {
         is_muted: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_priority: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        capture_unavailable: bool,
     },
     /// Server→client: `user_id` is no longer in the observer's roster; `reason` says why
     /// (absent from older servers = `left`).
@@ -1158,6 +1160,16 @@ pub enum ControlMessage {
         user_id: UserId,
         muted: bool,
         server_muted: bool,
+    },
+    /// Client→server: this session has (`true`) / has no (`false`) usable microphone — no
+    /// device, permission denied, device open failed. Idempotent; the server tells every
+    /// channel the session is in via `CaptureStateChanged` and remembers it for rosters.
+    SetCaptureAvailable { available: bool },
+    /// Server→client: a member's microphone availability changed (see `SetCaptureAvailable`).
+    CaptureStateChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        available: bool,
     },
     /// Client→server: stop hearing `user_id` — in one channel or, with `channel_id: None`,
     /// everywhere. Affects only this session; the sender is not told.
@@ -1996,6 +2008,10 @@ pub struct ParticipantBrief {
     /// Priority speaker (`ChannelConfig.ducking`): their speech attenuates everyone else.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_priority: bool,
+    /// The member reported having no usable microphone (`SetCaptureAvailable`): show a
+    /// "no mic" badge instead of waiting for them to speak.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

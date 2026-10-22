@@ -475,6 +475,8 @@ export interface Participant {
   muted: boolean;
   serverMuted: boolean;
   speaking: boolean;
+  /** They reported having no usable microphone (`setCaptureAvailable(false)`): show a "no mic" badge. */
+  captureUnavailable: boolean;
   /** Last server-reported audio energy 0..1 (`0` when silent). */
   energy: number;
   /** Priority speaker: their speech ducks the other voices (see {@link ChannelInfo.ducking}). */
@@ -829,6 +831,8 @@ export interface AurixEvents {
    */
   participantLeft: (channelId: string, userId: string, reason: LeaveReason) => void;
   participantUpdated: (channelId: string, participant: Participant) => void;
+  /** A member's microphone availability changed (`Participant.captureUnavailable`). */
+  participantCaptureChanged: (channelId: string, participant: Participant, available: boolean) => void;
   speaking: (channelId: string, userId: string, speaking: boolean) => void;
   /**
    * Periodic audio levels (0..1) of channel members whose energy changed since the last
@@ -840,6 +844,8 @@ export interface AurixEvents {
   localEnergy: (sample: AudioLevelSample) => void;
   /** Local VAD edge: the user started (`true`) / stopped (`false`) speaking. */
   localSpeaking: (speaking: boolean) => void;
+  /** Speech detected while muted (true = started, false = stopped / unmuted): show "you are muted". */
+  speakingWhileMuted: (speaking: boolean) => void;
   /**
    * The set of audio devices changed (plugged/unplugged) while media is up; `devices` is the
    * fresh list. A removed microphone is replaced by the default one automatically.
@@ -3463,8 +3469,37 @@ export class AurixClient {
   }
 
   /** Mute/unmute the microphone locally and announce the state to channel members. */
+  private speakingWhileMutedValue = false;
+  private captureAvailableValue = true;
+
+  /** Whether this client told the server it has a usable microphone (default `true`). */
+  get captureAvailable(): boolean {
+    return this.captureAvailableValue;
+  }
+
+  /**
+   * Tell the server — and so every roster — whether this session has a usable microphone:
+   * `false` when `getUserMedia` failed (no device, permission denied), `true` once capture runs.
+   * The client does this itself for the microphone it opens; call it when you supply
+   * `localStream` yourself. Idempotent; re-sent after a reconnect.
+   */
+  setCaptureAvailable(available: boolean): void {
+    if (this.captureAvailableValue === available) return;
+    this.captureAvailableValue = available;
+    this.sendCaptureAvailability();
+  }
+
+  private sendCaptureAvailability(): void {
+    if (this.captureAvailableValue || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.send({ type: 'SetCaptureAvailable', data: { available: false } });
+  }
+
   setMuted(muted: boolean): void {
     this.muted = muted;
+    if (!muted && this.speakingWhileMutedValue) {
+      this.speakingWhileMutedValue = false;
+      this.emit('speakingWhileMuted', false);
+    }
     this.localStream?.getAudioTracks().forEach((t) => {
       t.enabled = !muted;
     });
@@ -3784,6 +3819,11 @@ export class AurixClient {
       (sample) => {
         this.emit('localEnergy', sample);
         if (sample.changed) this.emit('localSpeaking', sample.speaking);
+        const swm = sample.speaking && this.muted;
+        if (swm !== this.speakingWhileMutedValue) {
+          this.speakingWhileMutedValue = swm;
+          this.emit('speakingWhileMuted', swm);
+        }
       },
       cfg === true ? {} : cfg,
     );
@@ -3796,6 +3836,10 @@ export class AurixClient {
     this.localMeter.stop();
     this.localMeter = undefined;
     if (wasSpeaking) this.emit('localSpeaking', false);
+    if (this.speakingWhileMutedValue) {
+      this.speakingWhileMutedValue = false;
+      this.emit('speakingWhileMuted', false);
+    }
   }
 
   /** Stream the peer connection sends: the gain pipeline's output or the raw microphone. */
@@ -3981,11 +4025,13 @@ export class AurixClient {
             speaking: p.is_speaking,
             energy: 0,
             priority: p.is_priority === true,
+            captureUnavailable: p.capture_unavailable === true,
           });
         }
         if (!this.userId && this.session) {
           const me = d.participants.find((p) => p.ssrc === this.session?.ssrc);
           if (me) this.userId = me.user_id;
+          this.sendCaptureAvailability();
         }
         this.channels.set(d.channel_id, roster);
         this.webTransportRosterChanged();
@@ -4033,6 +4079,7 @@ export class AurixClient {
           speaking: false,
           energy: 0,
           priority: d.is_priority === true,
+          captureUnavailable: d.capture_unavailable === true,
         };
         roster.set(d.user_id, p);
         this.webTransportRosterChanged();
@@ -4058,6 +4105,15 @@ export class AurixClient {
         p.muted = d.muted;
         p.serverMuted = d.server_muted;
         this.emit('participantUpdated', d.channel_id, p);
+        return;
+      }
+      case 'CaptureStateChanged': {
+        const d = (msg as Extract<ServerMessage, { type: 'CaptureStateChanged' }>).data;
+        const p = this.channels.get(d.channel_id)?.get(d.user_id);
+        if (!p) return;
+        p.captureUnavailable = !d.available;
+        this.emit('participantUpdated', d.channel_id, p);
+        this.emit('participantCaptureChanged', d.channel_id, p, d.available);
         return;
       }
       case 'SpeakingStateChanged': {
@@ -4571,7 +4627,17 @@ export class AurixClient {
   /** Microphone, gain pipeline, meter and device watching — shared by both media paths. */
   private async openLocalMedia(): Promise<MediaStream> {
     if (!this.localStream) {
-      this.localStream = this.opts.localStream ?? (await this.openMicrophone());
+      if (this.opts.localStream) {
+        this.localStream = this.opts.localStream;
+      } else {
+        try {
+          this.localStream = await this.openMicrophone();
+        } catch (e) {
+          this.setCaptureAvailable(false);
+          throw e;
+        }
+        this.setCaptureAvailable(true);
+      }
       this.watchInputTrack(this.localStream);
     }
     this.localStream.getAudioTracks().forEach((t) => {

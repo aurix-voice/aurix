@@ -418,6 +418,7 @@ FAurixParticipant ToParticipant(const AurixParticipant& P)
 	Out.bSpeaking = P.speaking;
 	Out.Energy = P.energy;
 	Out.bPriority = P.priority;
+	Out.bCaptureUnavailable = P.capture_unavailable;
 	return Out;
 }
 
@@ -1118,7 +1119,18 @@ bool UAurixVoiceSubsystem::StartCapture(int32 DeviceIndex)
 		Capture = MakeUnique<FAurixAudioCapture>();
 	}
 	Native->Client.reset_capture();
-	return Capture->Start(Native->Client.raw(), DeviceIndex);
+	const bool bStarted = Capture->Start(Native->Client.raw(), DeviceIndex);
+	// Rosters show a "no mic" badge for us until a device opens.
+	aurix_client_set_capture_available(Native->Client.raw(), bStarted);
+	return bStarted;
+}
+
+void UAurixVoiceSubsystem::SetCaptureAvailable(bool bAvailable)
+{
+	if (Native)
+	{
+		aurix_client_set_capture_available(Native->Client.raw(), bAvailable);
+	}
 }
 
 void UAurixVoiceSubsystem::StopCapture()
@@ -2162,6 +2174,14 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 	case AURIX_EVENT_PARTICIPANT_LEFT:
 		OnParticipantLeft.Broadcast(ChannelId, UserId);
 		OnParticipantRemoved.Broadcast(ChannelId, UserId, ParseLeaveReason(FromUtf8(aurix_event_message(Raw))));
+		break;
+
+	case AURIX_EVENT_SPEAKING_WHILE_MUTED:
+		OnSpeakingWhileMuted.Broadcast(aurix_event_flag(Raw));
+		break;
+
+	case AURIX_EVENT_PARTICIPANT_CAPTURE_CHANGED:
+		OnParticipantCaptureChanged.Broadcast(ChannelId, UserId, aurix_event_flag(Raw));
 		break;
 
 	case AURIX_EVENT_PARTICIPANT_MUTE_CHANGED:

@@ -58,6 +58,10 @@ signal participant_left(channel_id: String, user_id: String)
 ## participant_left plus why: "left", "timeout", "kicked", "banned", "out_of_range", "channel_closed", "replaced".
 signal participant_removed(channel_id: String, user_id: String, reason: String)
 signal participant_mute_changed(channel_id: String, user_id: String, muted: bool, server_muted: bool)
+## A member's microphone availability changed (participant "capture_unavailable"); available = they have a mic again.
+signal participant_capture_changed(channel_id: String, user_id: String, available: bool)
+## Speech detected while muted (true = started, false = stopped / unmuted): show "you are muted".
+signal speaking_while_muted(speaking: bool)
 signal participant_speaking(channel_id: String, user_id: String, speaking: bool)
 signal participant_priority_changed(channel_id: String, user_id: String, priority: bool)
 signal participant_role_changed(channel_id: String, user_id: String, role: int, admitted: bool)
@@ -1085,6 +1089,14 @@ func _dispatch(e: Dictionary) -> void:
 				participant_updated.emit(channel_id, p.duplicate())
 				if previous.is_empty() or previous.get("muted") != p["muted"] or previous.get("server_muted") != p["server_muted"]:
 					participant_mute_changed.emit(channel_id, p["user_id"], p["muted"], p["server_muted"])
+		"participantCaptureChanged":
+			var channel_id := _str(e.get("channelId"))
+			var user_id := _str(e.get("userId"))
+			var available: bool = e.get("available", true) == true
+			_patch(channel_id, user_id, "capture_unavailable", not available)
+			participant_capture_changed.emit(channel_id, user_id, available)
+		"speakingWhileMuted":
+			speaking_while_muted.emit(e.get("speaking", false) == true)
 		"participantLeft":
 			var channel_id := _str(e.get("channelId"))
 			var user_id := _str(e.get("userId"))
@@ -1493,6 +1505,7 @@ static func _participant(v: Variant) -> Dictionary:
 		"speaking": p.get("speaking", false) == true,
 		"energy": float(p.get("energy", 0.0)),
 		"priority": p.get("priority", false) == true,
+		"capture_unavailable": p.get("captureUnavailable", false) == true,
 		"display_name": _str(p.get("displayName")),
 	}
 

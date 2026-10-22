@@ -71,6 +71,7 @@ pub struct RemoteParticipant {
     pub role: ChannelRole,
     pub is_muted: bool,
     pub is_priority: bool,
+    pub capture_unavailable: bool,
 }
 
 /// Presence of one channel member as seen by another (`ChannelJoinAck.participants` entry
@@ -84,6 +85,7 @@ pub struct RosterEntry {
     pub is_muted: bool,
     pub is_speaking: bool,
     pub is_priority: bool,
+    pub capture_unavailable: bool,
     pub local: bool,
 }
 
@@ -980,6 +982,7 @@ impl MediaChannel {
                     || s.is_server_muted.load(Ordering::Relaxed),
                 is_speaking: s.is_speaking.load(Ordering::Relaxed),
                 is_priority: self.priority.contains_key(&s.user_id),
+                capture_unavailable: s.capture_unavailable.load(Ordering::Relaxed),
                 local: true,
             });
         }
@@ -996,6 +999,7 @@ impl MediaChannel {
                 is_muted: r.is_muted,
                 is_speaking: false,
                 is_priority: r.is_priority,
+                capture_unavailable: r.capture_unavailable,
                 local: false,
             });
         }
@@ -1016,6 +1020,7 @@ impl MediaChannel {
                     || s.is_server_muted.load(Ordering::Relaxed),
                 is_speaking: s.is_speaking.load(Ordering::Relaxed),
                 is_priority: self.priority.contains_key(&s.user_id),
+                capture_unavailable: s.capture_unavailable.load(Ordering::Relaxed),
                 local: true,
             });
         }
@@ -1027,6 +1032,7 @@ impl MediaChannel {
             is_muted: r.is_muted,
             is_speaking: false,
             is_priority: r.is_priority,
+            capture_unavailable: r.capture_unavailable,
             local: false,
         })
     }
@@ -1883,6 +1889,7 @@ mod tests {
                 role: ChannelRole::Moderator,
                 is_muted: true,
                 is_priority: false,
+                capture_unavailable: false,
             },
         );
         assert_eq!(changes.len(), 1);
@@ -2245,6 +2252,7 @@ mod tests {
                 role: ChannelRole::Listener,
                 is_muted: false,
                 is_priority: false,
+                capture_unavailable: false,
             },
         );
 
@@ -2353,6 +2361,7 @@ mod tests {
                 role: ChannelRole::Speaker,
                 is_muted: false,
                 is_priority: false,
+                capture_unavailable: false,
             },
         );
         let admitted = Arc::new(AtomicU32::new(0));
@@ -2611,6 +2620,7 @@ mod tests {
                 role: ChannelRole::Speaker,
                 is_muted: false,
                 is_priority: true,
+                capture_unavailable: false,
             },
         );
         remote.get_receivers_for_relayed_audio(&far, Some(AUDIO_LEVEL_SILENCE));
@@ -2648,6 +2658,7 @@ mod tests {
             role,
             is_muted: false,
             is_priority: false,
+            capture_unavailable: false,
         }
     }
 

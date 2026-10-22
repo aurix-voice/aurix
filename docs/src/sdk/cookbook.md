@@ -126,3 +126,19 @@ Unreal `DescribeError` / `IsErrorRetryable` (Blueprint-pure), Web `describeError
 Rule: anything the **player** can fix (network, "voice full") gets a message; anything the
 **developer** caused (`forbidden`, `invalid`) gets a log line and no retry; the SDK handles
 the rest (reconnect, media fallback, token refresh) when you let it.
+
+## Roster hints players actually read
+
+- **No microphone**: when the built-in capture cannot open a device (none plugged in, permission
+  denied, device in use) the SDK tells the server (`SetCaptureAvailable(false)`) and every member's
+  roster entry gets `capture_unavailable` (Unity `Participant.CaptureUnavailable`, Unreal
+  `bCaptureUnavailable`, Web `captureUnavailable`). Draw a crossed-out mic instead of letting
+  teammates wonder why someone never talks. If you feed audio yourself, call `SetCaptureAvailable`
+  when your pipeline fails or recovers.
+- **You are muted**: `SpeakingWhileMuted` (Unity `AurixVoiceBehaviour.OnSpeakingWhileMuted`,
+  Unreal `OnSpeakingWhileMuted`, Web `speakingWhileMuted`, Godot `speaking_while_muted`) fires when
+  the local VAD detects speech while muted — show the hint for a few seconds, no more than once per
+  burst. It needs the microphone to stay open while muted, so it does not fire with
+  `ReleaseMicrophoneWhenMuted` / `bReleaseCaptureWhenMuted`.
+- **Why they left**: `ParticipantLeft.reason` — `kicked`, `banned`, `timeout` (connection lost),
+  `out_of_range` (positional roster radius, usually no toast), `channel_closed`, `replaced`, `left`.

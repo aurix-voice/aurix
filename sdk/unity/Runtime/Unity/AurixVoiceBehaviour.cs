@@ -290,6 +290,12 @@ namespace Aurix.Unity
         /// <summary>Local VAD edge (true = started speaking). Fired from the Unity main thread.</summary>
         public event Action<bool> OnLocalSpeaking;
         /// <summary>
+        /// Speech detected while muted (true = started, false = stopped or unmuted): show "you are muted".
+        /// Not raised while the microphone is released (<see cref="ReleaseMicrophoneWhenMuted"/>).
+        /// </summary>
+        public event Action<bool> OnSpeakingWhileMuted;
+        private bool _speakingWhileMuted;
+        /// <summary>
         /// The capture device changed: a <see cref="SetInputDevice"/> call, or the active microphone
         /// disappeared and capture fell back to the system default (<c>null</c>).
         /// </summary>
@@ -632,11 +638,13 @@ namespace Aurix.Unity
             if (_micClip == null)
             {
                 Debug.LogWarning("Aurix: Microphone.Start failed; will retry");
+                Client?.SetCaptureAvailable(false);
                 _micRetryAt = Time.unscaledTime + 1f;
                 return;
             }
             bool changed = _activeDevice != device;
             _activeDevice = device;
+            Client?.SetCaptureAvailable(true);
             _micChannels = _micClip.channels;
             _micReadPos = 0;
             Vad.Reset();
@@ -705,6 +713,7 @@ namespace Aurix.Unity
             PermissionState = MicrophonePermission.Denied;
             _micRetryAt = float.PositiveInfinity;
             Debug.LogWarning("Aurix: microphone permission denied; staying connected as a listener");
+            Client?.SetCaptureAvailable(false);
             OnMicrophonePermissionDenied?.Invoke();
         }
 
@@ -853,11 +862,20 @@ namespace Aurix.Unity
         }
 
         /// <summary>VAD, gating and encoding (with the negotiated codec) of the frame in <see cref="_mono"/>.</summary>
+        private void TrackSpeakingWhileMuted()
+        {
+            bool swm = Vad.Speaking && Client != null && Client.IsMuted;
+            if (swm == _speakingWhileMuted) return;
+            _speakingWhileMuted = swm;
+            OnSpeakingWhileMuted?.Invoke(swm);
+        }
+
         private void EncodeAndSend()
         {
             Vad.Threshold = VadThreshold;
             Vad.HangoverFrames = VadHangoverFrames;
             if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
+            TrackSpeakingWhileMuted();
             if (GateOnVad && !Vad.Speaking)
             {
                 Client.SkipFrame(AudioFormat.FrameSamples);
@@ -888,6 +906,7 @@ namespace Aurix.Unity
             Vad.Threshold = VadThreshold;
             Vad.HangoverFrames = VadHangoverFrames;
             if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
+            TrackSpeakingWhileMuted();
             if (GateOnVad && !Vad.Speaking)
             {
                 Client.SkipFrame(AudioFormat.FrameSamples);

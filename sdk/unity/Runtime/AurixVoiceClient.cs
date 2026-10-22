@@ -77,6 +77,8 @@ namespace Aurix
         /// (<see cref="ChannelInfo.Ducking"/>) and <see cref="AurixVoiceClient.OnDuckingChanged"/> fires for your game audio.
         /// </summary>
         public bool IsPriority;
+        /// <summary>They reported having no usable microphone (<see cref="AurixVoiceClient.SetCaptureAvailable"/>): show a "no mic" badge rather than waiting for them to talk.</summary>
+        public bool CaptureUnavailable;
     }
 
     /// <summary>
@@ -805,6 +807,8 @@ namespace Aurix
         /// </summary>
         public event Action<Guid, Participant, LeaveReason> OnParticipantRemoved;
         public event Action<Guid, Participant> OnParticipantUpdated;
+        /// <summary>A member's microphone availability changed (<see cref="Participant.CaptureUnavailable"/>); <c>available</c> = they have a working mic again.</summary>
+        public event Action<Guid, Participant, bool> OnParticipantCaptureChanged;
         public event Action<Guid, Participant, bool> OnSpeaking;
         /// <summary>
         /// (channel, user, priority): a member's priority-speaker state changed — including yourself, as the ack of
@@ -1124,6 +1128,7 @@ namespace Aurix
                 }
                 // Publish only now so Update() cannot drain the handshake messages from under us.
                 _control = control;
+                SendCaptureAvailability();
                 _lastPing = DateTime.UtcNow;
                 _lastPong = _lastPing;
                 _probeDeadline = DateTime.MaxValue;
@@ -1575,6 +1580,30 @@ namespace Aurix
         {
             _muted = muted;
             _media?.SendMuteState(muted);
+        }
+
+        private volatile bool _captureAvailable = true;
+
+        /// <summary>Whether this client told the server it has a usable microphone (default true).</summary>
+        public bool IsCaptureAvailable => _captureAvailable;
+
+        /// <summary>
+        /// Tell the server — and so every roster — whether this session has a usable microphone: <c>false</c> when
+        /// there is no device, the permission was denied or the device failed to open; <c>true</c> once capture runs.
+        /// Idempotent; re-sent after a reconnect. <see cref="AurixVoiceBehaviour"/> calls it for you.
+        /// </summary>
+        public void SetCaptureAvailable(bool available)
+        {
+            if (_captureAvailable == available) return;
+            _captureAvailable = available;
+            SendCaptureAvailability();
+        }
+
+        private void SendCaptureAvailability()
+        {
+            var control = _control;
+            if (control == null || _captureAvailable) return;
+            _ = control.SendAsync(ControlMessage.SetCaptureAvailable(false));
         }
 
         // ---- receiver-side controls: affect only what *this* client hears ----------------------
@@ -3011,7 +3040,7 @@ namespace Aurix
                             var p = new Participant
                             {
                                 UserId = b.UserId, DisplayName = b.DisplayName, Ssrc = b.Ssrc,
-                                Role = b.Role, IsMuted = b.IsMuted, IsSpeaking = b.IsSpeaking, IsPriority = b.IsPriority,
+                                Role = b.Role, IsMuted = b.IsMuted, IsSpeaking = b.IsSpeaking, IsPriority = b.IsPriority, CaptureUnavailable = b.CaptureUnavailable,
                             };
                             map[p.UserId] = p;
                             _bySsrc[p.Ssrc] = p;
@@ -3082,6 +3111,7 @@ namespace Aurix
                         Role = m.Has("role") ? ControlMessage.ParseRole(m.Str("role")) : ChannelRole.Speaker,
                         IsMuted = m.Bool("is_muted"),
                         IsPriority = m.Bool("is_priority"),
+                        CaptureUnavailable = m.Bool("capture_unavailable"),
                     };
                     lock (_channels)
                     {
@@ -3121,6 +3151,16 @@ namespace Aurix
                     p.IsMuted = m.Bool("muted");
                     p.IsServerMuted = m.Bool("server_muted");
                     OnParticipantUpdated?.Invoke(m.Id("channel_id"), p);
+                    break;
+                }
+                case "CaptureStateChanged":
+                {
+                    var p = Lookup(m.Id("channel_id"), m.Id("user_id"));
+                    if (p == null) break;
+                    var available = m.Bool("available");
+                    p.CaptureUnavailable = !available;
+                    OnParticipantUpdated?.Invoke(m.Id("channel_id"), p);
+                    OnParticipantCaptureChanged?.Invoke(m.Id("channel_id"), p, available);
                     break;
                 }
                 case "SpeakingStateChanged":

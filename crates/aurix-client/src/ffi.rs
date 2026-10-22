@@ -1645,6 +1645,10 @@ pub enum AurixEventType {
     /// (`aurix_client_set_server_noise_suppression`); a fresh session reports `false` and
     /// the request is re-applied.
     AurixEventServerNoiseSuppressionChanged = 51,
+    /// `aurix_event_flag`: speech detected while muted (true = started, false = stopped / unmuted).
+    AurixEventSpeakingWhileMuted = 52,
+    /// `aurix_event_channel_id` / `aurix_event_user_id`; `aurix_event_flag` = microphone available.
+    AurixEventParticipantCaptureChanged = 53,
 }
 
 /// Channel member snapshot. Also used for energy levels (only `user_id` and `energy` set).
@@ -1661,6 +1665,8 @@ pub struct AurixParticipant {
     pub energy: f32,
     /// Priority speaker (`ChannelConfig.ducking`).
     pub priority: bool,
+    /// Reported no usable microphone (`aurix_client_set_capture_available`).
+    pub capture_unavailable: bool,
     /// UTF-8, NUL-terminated, truncated to fit.
     pub display_name: [c_char; AURIX_NAME_LEN],
 }
@@ -1687,6 +1693,7 @@ fn participant_to_c(p: &crate::events::Participant) -> AurixParticipant {
         speaking: p.speaking,
         energy: p.energy,
         priority: p.priority,
+        capture_unavailable: p.capture_unavailable,
         display_name: name_buf(&p.display_name),
     }
 }
@@ -1923,6 +1930,7 @@ impl AurixEvent {
                         speaking: l.energy > 0.0,
                         energy: l.energy,
                         priority: false,
+                        capture_unavailable: false,
                         display_name: [0; AURIX_NAME_LEN],
                     })
                     .collect();
@@ -2033,6 +2041,8 @@ impl AurixEvent {
             Event::ParticipantJoined { .. } => T::AurixEventParticipantJoined,
             Event::ParticipantLeft { .. } => T::AurixEventParticipantLeft,
             Event::ParticipantMuteChanged { .. } => T::AurixEventParticipantMuteChanged,
+            Event::SpeakingWhileMuted(_) => T::AurixEventSpeakingWhileMuted,
+            Event::ParticipantCaptureChanged { .. } => T::AurixEventParticipantCaptureChanged,
             Event::ParticipantPriorityChanged { .. } => T::AurixEventParticipantPriorityChanged,
             Event::ParticipantRoleChanged { .. } => T::AurixEventParticipantRoleChanged,
             Event::DuckingChanged { .. } => T::AurixEventDuckingChanged,
@@ -2211,6 +2221,7 @@ pub unsafe extern "C" fn aurix_event_channel_id(event: *const AurixEvent) -> Aur
         | Event::ParticipantJoined { channel_id, .. }
         | Event::ParticipantLeft { channel_id, .. }
         | Event::ParticipantMuteChanged { channel_id, .. }
+        | Event::ParticipantCaptureChanged { channel_id, .. }
         | Event::ParticipantPriorityChanged { channel_id, .. }
         | Event::ParticipantRoleChanged { channel_id, .. }
         | Event::DuckingChanged { channel_id, .. }
@@ -2247,6 +2258,7 @@ pub unsafe extern "C" fn aurix_event_user_id(event: *const AurixEvent) -> AurixU
         Event::ParticipantJoined { participant, .. } => Some(participant.user_id),
         Event::ParticipantLeft { user_id, .. }
         | Event::ParticipantMuteChanged { user_id, .. }
+        | Event::ParticipantCaptureChanged { user_id, .. }
         | Event::ParticipantPriorityChanged { user_id, .. }
         | Event::ParticipantRoleChanged { user_id, .. }
         | Event::ParticipantSpeaking { user_id, .. }
@@ -2296,6 +2308,8 @@ pub unsafe extern "C" fn aurix_event_flag(event: *const AurixEvent) -> bool {
     match self::event(event).map(|e| &e.event) {
         Some(Event::ChannelJoined { transcription, .. }) => *transcription,
         Some(Event::ParticipantMuteChanged { muted, .. }) => *muted,
+        Some(Event::SpeakingWhileMuted(s)) => *s,
+        Some(Event::ParticipantCaptureChanged { available, .. }) => *available,
         Some(Event::ParticipantPriorityChanged { priority, .. }) => *priority,
         Some(Event::ParticipantRoleChanged { admitted, .. }) => *admitted,
         Some(Event::DuckingChanged { active, .. }) => *active,
@@ -3458,6 +3472,16 @@ pub unsafe extern "C" fn aurix_client_set_participant_claimed(
 pub unsafe extern "C" fn aurix_client_set_muted(client: *mut AurixClient, muted: bool) {
     if let Ok(c) = self::client(client) {
         c.set_muted(muted);
+    }
+}
+
+/// Tell the server (and every roster) whether this session has a usable microphone: `false`
+/// when there is no capture device, the permission was denied or the device failed to open;
+/// `true` once capture runs. Idempotent; re-sent after a (re)connect.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_set_capture_available(client: *mut AurixClient, available: bool) {
+    if let Ok(c) = self::client(client) {
+        c.set_capture_available(available);
     }
 }
 

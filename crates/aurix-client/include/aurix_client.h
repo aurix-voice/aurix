@@ -514,6 +514,14 @@ typedef enum AurixEventType {
    * the request is re-applied.
    */
   AURIX_EVENT_SERVER_NOISE_SUPPRESSION_CHANGED = 51,
+  /**
+   * `aurix_event_flag`: speech detected while muted (true = started, false = stopped / unmuted).
+   */
+  AURIX_EVENT_SPEAKING_WHILE_MUTED = 52,
+  /**
+   * `aurix_event_channel_id` / `aurix_event_user_id`; `aurix_event_flag` = microphone available.
+   */
+  AURIX_EVENT_PARTICIPANT_CAPTURE_CHANGED = 53,
 } AurixEventType;
 
 /**
@@ -996,6 +1004,10 @@ typedef struct AurixParticipant {
    * Priority speaker (`ChannelConfig.ducking`).
    */
   bool priority;
+  /**
+   * Reported no usable microphone (`aurix_client_set_capture_available`).
+   */
+  bool capture_unavailable;
   /**
    * UTF-8, NUL-terminated, truncated to fit.
    */
@@ -2122,6 +2134,13 @@ enum AurixResult aurix_client_set_participant_claimed(struct AurixClient *client
                                                       bool claimed);
 
 void aurix_client_set_muted(struct AurixClient *client, bool muted);
+
+/**
+ * Tell the server (and every roster) whether this session has a usable microphone: `false`
+ * when there is no capture device, the permission was denied or the device failed to open;
+ * `true` once capture runs. Idempotent; re-sent after a (re)connect.
+ */
+void aurix_client_set_capture_available(struct AurixClient *client, bool available);
 
 bool aurix_client_is_muted(const struct AurixClient *client);
 

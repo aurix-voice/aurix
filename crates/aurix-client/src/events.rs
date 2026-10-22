@@ -69,6 +69,9 @@ pub struct Participant {
     pub energy: f32,
     /// Priority speaker: their speech ducks everyone else (`ChannelConfig.ducking`).
     pub priority: bool,
+    /// They reported having no usable microphone (`Client::set_capture_available(false)`):
+    /// show a "no mic" badge rather than waiting for them to talk.
+    pub capture_unavailable: bool,
 }
 
 /// How far presence and text reach in a positional channel (`PositionalConfig.roster_radius` /
@@ -218,6 +221,15 @@ pub enum Event {
     },
     /// The local VAD flipped (only when capture runs through `push_capture`).
     LocalSpeaking(bool),
+    /// Speech detected while muted (`true` when it starts, `false` when it stops or on unmute):
+    /// show "you are muted" — only when capture runs through `push_capture` while muted.
+    SpeakingWhileMuted(bool),
+    /// A member's microphone availability changed (`Participant::capture_unavailable`).
+    ParticipantCaptureChanged {
+        channel_id: ChannelId,
+        user_id: UserId,
+        available: bool,
+    },
     TransmissionChanged(TransmissionMode),
     ChannelFocusChanged(Option<ChannelId>),
     /// The server acknowledged a session codec change; capture and playback already follow it.

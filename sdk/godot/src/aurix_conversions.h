@@ -66,6 +66,7 @@ inline Dictionary participant_to_dict(const AurixParticipant& p) {
     d["speaking"] = p.speaking;
     d["energy"] = p.energy;
     d["priority"] = p.priority;
+    d["capture_unavailable"] = p.capture_unavailable;
     d["display_name"] = cstr(p.display_name);
     return d;
 }

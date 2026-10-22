@@ -27,6 +27,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantRemoved, FGuid, 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FAurixParticipantMuteChanged, FGuid, ChannelId, FGuid, UserId, bool, bMuted, bool, bServerMuted);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantSpeaking, FGuid, ChannelId, FGuid, UserId, bool, bSpeaking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixChannelEnergy, FGuid, ChannelId, const TArray<FAurixParticipant>&, Levels);
+/** Speech detected while muted (true = started, false = stopped / unmuted): show "you are muted". */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixSpeakingWhileMuted, bool, bSpeaking);
+/** A member's microphone availability changed (FAurixParticipant::bCaptureUnavailable). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantCaptureChanged, FGuid, ChannelId, FGuid, UserId, bool, bAvailable);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLocalSpeaking, bool, bSpeaking);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTransmissionMode, Mode, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
@@ -181,6 +185,14 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	static TArray<FString> GetCaptureDevices();
+
+	/**
+	 * Tell the server (and every roster) whether this session has a usable microphone. StartCapture does
+	 * this for the built-in capture; call it yourself when you feed PushCaptureAudio (false = no device /
+	 * permission denied / open failed). Idempotent; re-sent after a reconnect.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
+	void SetCaptureAvailable(bool bAvailable);
 
 	/** Name of the microphone currently captured (empty = system default or not capturing). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
@@ -688,6 +700,8 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantMuteChanged OnParticipantMuteChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantSpeaking OnParticipantSpeaking;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixCaptureDeviceChanged OnCaptureDeviceChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixSpeakingWhileMuted OnSpeakingWhileMuted;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantCaptureChanged OnParticipantCaptureChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixCaptureDevicesChanged OnCaptureDevicesChanged;
 	/** A member (possibly us) became or stopped being a priority speaker. */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixParticipantPriorityChanged OnParticipantPriorityChanged;

@@ -317,6 +317,8 @@ pub struct MediaSession {
     pub channels: RwLock<Vec<ChannelId>>,
     pub is_muted: AtomicBool,
     pub is_server_muted: AtomicBool,
+    /// Reported by the client via `SetCaptureAvailable(false)`: no usable microphone.
+    pub capture_unavailable: AtomicBool,
     pub is_speaking: AtomicBool,
     pub prefs: RwLock<ReceiverPrefs>,
     /// Which joined channels receive this session's uplink (`All` by default).
@@ -417,6 +419,7 @@ impl MediaSession {
             channels: RwLock::new(Vec::new()),
             is_muted: AtomicBool::new(false),
             is_server_muted: AtomicBool::new(false),
+            capture_unavailable: AtomicBool::new(false),
             is_speaking: AtomicBool::new(false),
             prefs: RwLock::new(ReceiverPrefs::default()),
             transmission: RwLock::new(TransmissionMode::All),

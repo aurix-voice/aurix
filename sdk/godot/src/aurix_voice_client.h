@@ -240,6 +240,8 @@ public:
     void push_capture(const PackedVector2Array& frames, int sample_rate_hz);
     void push_capture_mono(const PackedFloat32Array& samples, int sample_rate_hz);
     void set_muted(bool muted);
+    /// Tell the server whether this session has a usable microphone (false = no device / permission denied / open failed).
+    void set_capture_available(bool available);
     bool is_muted() const;
     bool is_speaking() const;
     void set_input_gain(double gain);

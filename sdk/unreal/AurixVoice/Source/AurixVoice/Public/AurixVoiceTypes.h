@@ -726,6 +726,10 @@ struct AURIXVOICE_API FAurixParticipant
 	/** Priority speaker: their speech ducks everyone else (`ChannelConfig.ducking`). */
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bPriority = false;
+
+	/** They reported having no usable microphone (SetCaptureAvailable(false)): show a "no mic" badge. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bCaptureUnavailable = false;
 };
 
 /** One reaction on a stored message and who carries it (at most the first 20 users). */

@@ -495,6 +495,7 @@ impl WsState {
                     role: entry.role,
                     is_muted: entry.is_muted,
                     is_priority: entry.is_priority,
+                capture_unavailable: entry.capture_unavailable,
                 }
             } else {
                 ControlMessage::ParticipantLeft {
@@ -543,6 +544,7 @@ impl WsState {
                 role,
                 is_muted: entry.is_muted,
                 is_priority: entry.is_priority,
+            capture_unavailable: entry.capture_unavailable,
             }
         } else {
             ControlMessage::ParticipantLeft {
@@ -798,6 +800,7 @@ impl WsState {
                     role,
                     is_muted: row.is_muted || row.is_server_muted,
                     is_priority: row.is_priority,
+                    capture_unavailable: false,
                 },
             ));
         }
@@ -958,6 +961,7 @@ impl WsState {
                             role,
                             is_muted,
                             is_priority,
+                            capture_unavailable: false,
                         },
                     );
                 }
@@ -1049,6 +1053,7 @@ impl WsState {
                                     role,
                                     is_muted: false,
                                     is_priority,
+                                    capture_unavailable: false,
                                 },
                             );
                             self.emit_roster_changes(app_id, &channel_id, channel, changes);
@@ -1075,6 +1080,7 @@ impl WsState {
                             role,
                             is_muted: false,
                             is_priority,
+                            capture_unavailable: false,
                         },
                         Some(&session_id),
                     );
@@ -3248,6 +3254,7 @@ fn brief_from_entry(e: RosterEntry) -> ParticipantBrief {
         is_muted: e.is_muted,
         is_speaking: e.is_speaking,
         is_priority: e.is_priority,
+        capture_unavailable: e.capture_unavailable,
     }
 }
 
@@ -3667,6 +3674,7 @@ fn touches_mirror(msg: &ControlMessage) -> bool {
             | ControlMessage::SetDownlinkMode { .. }
             | ControlMessage::SetNoiseSuppression { .. }
             | ControlMessage::MuteStateChanged { .. }
+            | ControlMessage::CaptureStateChanged { .. }
             | ControlMessage::SetTranscripts { .. }
             | ControlMessage::SetTranslation { .. }
     )
@@ -4860,6 +4868,32 @@ async fn handle_control_message(
             }
         }
 
+        ControlMessage::SetCaptureAvailable { available } => {
+            let channels = {
+                let sfu = state.sfu.read();
+                match sfu.get_session(&session_id) {
+                    Some(s) => {
+                        if s.capture_unavailable.swap(!available, Ordering::Relaxed) == !available {
+                            return;
+                        }
+                        s.get_channels()
+                    }
+                    None => return,
+                }
+            };
+            for channel_id in channels {
+                state.broadcast_channel(
+                    &channel_id,
+                    &ControlMessage::CaptureStateChanged {
+                        channel_id,
+                        user_id: token.user_id,
+                        available,
+                    },
+                    None,
+                );
+            }
+        }
+
         ControlMessage::QualityReport {
             rtt_ms,
             jitter_ms,
@@ -5487,6 +5521,7 @@ async fn handle_control_message(
         | ControlMessage::ParticipantJoined { .. }
         | ControlMessage::ParticipantLeft { .. }
         | ControlMessage::SpeakingStateChanged { .. }
+        | ControlMessage::CaptureStateChanged { .. }
         | ControlMessage::UserBlockChanged { .. }
         | ControlMessage::ReceiverPreferences { .. }
         | ControlMessage::TransmissionChanged { .. }

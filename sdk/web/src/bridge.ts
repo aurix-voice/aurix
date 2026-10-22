@@ -307,6 +307,9 @@ export class AurixBridge {
         return c.audioPolicy ?? null;
 
       // Microphone / receiver preferences
+      case 'setCaptureAvailable':
+        c.setCaptureAvailable(bool(a, 'available'));
+        return undefined;
       case 'setMuted':
         c.setMuted(bool(a, 'muted'));
         return null;
@@ -565,6 +568,10 @@ export class AurixBridge {
     on('energy', (channelId, levels) => q({ type: 'energy', channelId, levels }));
     if (localEnergy) on('localEnergy', (sample) => q({ type: 'localEnergy', sample }));
     on('localSpeaking', (speaking) => q({ type: 'localSpeaking', speaking }));
+    on('speakingWhileMuted', (speaking) => q({ type: 'speakingWhileMuted', speaking }));
+    on('participantCaptureChanged', (channelId, participant, available) =>
+      q({ type: 'participantCaptureChanged', channelId, userId: participant.userId, available }),
+    );
     on('devicesChanged', (devices) => q({ type: 'devicesChanged', devices }));
     on('inputDeviceChanged', (deviceId) => q({ type: 'inputDeviceChanged', deviceId: deviceId ?? null }));
     on('audioInjection', (active) => q({ type: 'audioInjection', active }));

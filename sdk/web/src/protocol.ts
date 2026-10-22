@@ -46,6 +46,8 @@ export interface ParticipantBrief {
   role: ChannelRole;
   is_muted: boolean;
   is_speaking: boolean;
+  /** The member reported having no usable microphone (`setCaptureAvailable(false)`). */
+  capture_unavailable?: boolean;
   /** Priority speaker (`ChannelConfig.ducking`): their speech attenuates everyone else. */
   is_priority?: boolean;
 }
@@ -207,6 +209,7 @@ export type ClientMessage =
       type: 'MuteStateChanged';
       data: { channel_id: string; user_id: string; muted: boolean; server_muted: boolean };
     }
+  | { type: 'SetCaptureAvailable'; data: { available: boolean } }
   | {
       type: 'SetParticipantMute';
       data: { user_id: string; channel_id: string | null; muted: boolean };
@@ -383,6 +386,7 @@ export type ServerMessage =
         role?: ParticipantBrief['role'];
         is_muted?: boolean;
         is_priority?: boolean;
+        capture_unavailable?: boolean;
       };
     }
   | { type: 'ParticipantLeft'; data: { channel_id: string; user_id: string; reason?: LeaveReason } }
@@ -401,6 +405,7 @@ export type ServerMessage =
       data: { channel_id: string; user_id: string; muted: boolean; server_muted: boolean };
     }
   | { type: 'SpeakingStateChanged'; data: { channel_id: string; user_id: string; speaking: boolean } }
+  | { type: 'CaptureStateChanged'; data: { channel_id: string; user_id: string; available: boolean } }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   | {
       type: 'BitrateCommand';

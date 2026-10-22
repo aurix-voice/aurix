@@ -412,6 +412,7 @@ public:
         return aurix_client_set_voice_effect_callback(c_, callback, user_data);
     }
     void set_muted(bool muted) { aurix_client_set_muted(c_, muted); }
+    void set_capture_available(bool available) { aurix_client_set_capture_available(c_, available); }
     bool is_muted() const { return aurix_client_is_muted(c_); }
     bool is_speaking() const { return aurix_client_is_speaking(c_); }
     void set_input_gain(float gain) { aurix_client_set_input_gain(c_, gain); }

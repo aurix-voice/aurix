@@ -376,6 +376,7 @@ void AurixVoiceClient::push_capture_mono(const PackedFloat32Array& samples, int 
 }
 
 void AurixVoiceClient::set_muted(bool muted) { if (client_) client_.set_muted(muted); }
+void AurixVoiceClient::set_capture_available(bool available) { if (client_) client_.set_capture_available(available); }
 bool AurixVoiceClient::is_muted() const { return client_ && client_.is_muted(); }
 bool AurixVoiceClient::is_speaking() const { return client_ && client_.is_speaking(); }
 void AurixVoiceClient::set_input_gain(double gain) { if (client_) client_.set_input_gain(static_cast<float>(gain)); }
@@ -994,6 +995,12 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     case AURIX_EVENT_PARTICIPANT_MUTE_CHANGED:
         emit_signal("participant_mute_changed", channel, user, ev.flag(), ev.flag2());
         break;
+    case AURIX_EVENT_PARTICIPANT_CAPTURE_CHANGED:
+        emit_signal("participant_capture_changed", channel, user, ev.flag());
+        break;
+    case AURIX_EVENT_SPEAKING_WHILE_MUTED:
+        emit_signal("speaking_while_muted", ev.flag());
+        break;
     case AURIX_EVENT_PARTICIPANT_SPEAKING:
         emit_signal("participant_speaking", channel, user, ev.flag());
         break;
@@ -1251,6 +1258,7 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("push_capture", "frames", "sample_rate_hz"), &AurixVoiceClient::push_capture);
     ClassDB::bind_method(D_METHOD("push_capture_mono", "samples", "sample_rate_hz"), &AurixVoiceClient::push_capture_mono);
     ClassDB::bind_method(D_METHOD("set_muted", "muted"), &AurixVoiceClient::set_muted);
+    ClassDB::bind_method(D_METHOD("set_capture_available", "available"), &AurixVoiceClient::set_capture_available);
     ClassDB::bind_method(D_METHOD("is_muted"), &AurixVoiceClient::is_muted);
     ClassDB::bind_method(D_METHOD("is_speaking"), &AurixVoiceClient::is_speaking);
     ClassDB::bind_method(D_METHOD("set_input_gain", "gain"), &AurixVoiceClient::set_input_gain);
@@ -1359,6 +1367,9 @@ void AurixVoiceClient::_bind_methods() {
                           PropertyInfo(Variant::DICTIONARY, "ducking")));
     ADD_SIGNAL(MethodInfo("channel_energy", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::DICTIONARY, "levels")));
     ADD_SIGNAL(MethodInfo("local_speaking", PropertyInfo(Variant::BOOL, "speaking")));
+    ADD_SIGNAL(MethodInfo("speaking_while_muted", PropertyInfo(Variant::BOOL, "speaking")));
+    ADD_SIGNAL(MethodInfo("participant_capture_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
+                          PropertyInfo(Variant::BOOL, "available")));
     ADD_SIGNAL(MethodInfo("transmission_changed", PropertyInfo(Variant::INT, "mode"), PropertyInfo(Variant::STRING, "channel_id")));
     ADD_SIGNAL(MethodInfo("channel_focus_changed", PropertyInfo(Variant::STRING, "channel_id")));
     ADD_SIGNAL(MethodInfo("user_block_changed", PropertyInfo(Variant::STRING, "user_id"), PropertyInfo(Variant::BOOL, "blocked")));
