@@ -42,8 +42,7 @@ namespace Aurix.Editor
         [MenuItem("Aurix Voice/Voice test window", false, 3)]
         public static void Open()
         {
-            var w = GetWindow<AurixVoiceWindow>("Aurix Voice");
-            w.minSize = new Vector2(420, 520);
+            GetWindow<AurixVoiceWindow>("Aurix Voice");
         }
 
         private void OnEnable()
@@ -298,7 +297,8 @@ namespace Aurix.Editor
 
         private static string Meter(float energy)
         {
-            int n = Mathf.Clamp(Mathf.RoundToInt(Mathf.Sqrt(Mathf.Clamp01(energy)) * 10f), 0, 10);
+            double e = energy < 0f ? 0.0 : energy > 1f ? 1.0 : energy;
+            int n = Math.Min(10, Math.Max(0, (int)Math.Round(Math.Sqrt(e) * 10.0)));
             return new string('█', n) + new string('·', 10 - n);
         }
     }
