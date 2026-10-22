@@ -82,6 +82,15 @@ func join(channel_id: String) -> void:
   channel; the fingerprint / identity-persistence API and the `E2EE_*` events are not bound to
   GDScript yet (a fresh identity per session).
 
+## Inspector defaults
+
+Everything a designer needs is on the `AurixVoiceClient` node: connection (`auto_reconnect`,
+`media_path_policy`, `quic`, `tls_tunnel`), capture/playback (`auto_capture`, `auto_playback`,
+`playback_bus`, `playback_mode`, `playback_buffer_seconds`) and the *Audio Defaults* group —
+`preferred_codec` (Opus / PCMU / PCMA), `preferred_downlink_mode` (Streams / Mixed), `input_gain`,
+`vad_threshold`, `vad_hangover_frames` — applied once the session is ready; the matching
+`set_*` methods change them at runtime.
+
 ## Audio injection
 
 `inject_audio(pcm: PackedFloat32Array, sample_rate_hz, channels, loop = false, gain = 1.0,

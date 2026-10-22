@@ -475,7 +475,7 @@ void AurixVoiceClient::set_muted(bool muted) { if (client_) client_.set_muted(mu
 void AurixVoiceClient::set_capture_available(bool available) { if (client_) client_.set_capture_available(available); }
 bool AurixVoiceClient::is_muted() const { return client_ && client_.is_muted(); }
 bool AurixVoiceClient::is_capture_available() const { return !client_ || client_.is_capture_available(); }
-float AurixVoiceClient::get_input_gain() const { return client_ ? client_.input_gain() : 1.0f; }
+float AurixVoiceClient::get_input_gain() const { return client_ ? client_.input_gain() : static_cast<float>(input_gain_); }
 
 Dictionary AurixVoiceClient::get_transmission() const {
     Dictionary d;
@@ -501,7 +501,30 @@ String AurixVoiceClient::get_user_id() const {
     return client_ && client_.user_id(user) ? uuid_to_string(user.raw) : String();
 }
 bool AurixVoiceClient::is_speaking() const { return client_ && client_.is_speaking(); }
-void AurixVoiceClient::set_input_gain(double gain) { if (client_) client_.set_input_gain(static_cast<float>(gain)); }
+void AurixVoiceClient::set_input_gain(double gain) {
+    input_gain_ = std::max(0.0, std::min(4.0, gain));
+    if (client_) client_.set_input_gain(static_cast<float>(input_gain_));
+}
+void AurixVoiceClient::set_preferred_codec(int codec) {
+    preferred_codec_ = std::max(0, std::min(2, codec));
+    if (client_) set_audio_codec(static_cast<AudioCodec>(preferred_codec_));
+}
+int AurixVoiceClient::get_preferred_codec() const { return preferred_codec_; }
+void AurixVoiceClient::set_preferred_downlink_mode(int mode) {
+    preferred_downlink_ = std::max(0, std::min(1, mode));
+    if (client_) set_downlink_mode(static_cast<DownlinkMode>(preferred_downlink_));
+}
+int AurixVoiceClient::get_preferred_downlink_mode() const { return preferred_downlink_; }
+void AurixVoiceClient::set_vad_threshold(double threshold) {
+    vad_threshold_ = std::max(0.0, std::min(1.0, threshold));
+    set_vad(vad_threshold_, vad_hangover_frames_);
+}
+double AurixVoiceClient::get_vad_threshold() const { return vad_threshold_; }
+void AurixVoiceClient::set_vad_hangover_frames(int frames) {
+    vad_hangover_frames_ = std::max(0, frames);
+    set_vad(vad_threshold_, vad_hangover_frames_);
+}
+int AurixVoiceClient::get_vad_hangover_frames() const { return vad_hangover_frames_; }
 double AurixVoiceClient::get_input_energy() const { return client_ ? client_.input_energy() : 0.0; }
 void AurixVoiceClient::set_vad(double threshold, int hangover_frames) {
     if (client_) client_.set_vad(static_cast<float>(threshold), static_cast<uint32_t>(std::max(0, hangover_frames)));
@@ -1088,6 +1111,11 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
         if (ev.session(info)) {
             if (auto_capture_ && !is_capturing()) start_capture();
             if (playback_requested_ && !out_player_) start_playback();
+            // Inspector defaults (idempotent on resume).
+            if (input_gain_ != 1.0) client_.set_input_gain(static_cast<float>(input_gain_));
+            if (vad_threshold_ != 0.01 || vad_hangover_frames_ != 15) set_vad(vad_threshold_, vad_hangover_frames_);
+            if (preferred_codec_ != 0) set_audio_codec(static_cast<AudioCodec>(preferred_codec_));
+            if (preferred_downlink_ != 0) set_downlink_mode(static_cast<DownlinkMode>(preferred_downlink_));
             // The event payload carries no user id; the client snapshot does.
             AurixSessionInfo snapshot;
             if (client_.session(snapshot)) info = snapshot;
@@ -1346,6 +1374,12 @@ void AurixVoiceClient::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::INT, "max_events_per_frame"), "set_max_events_per_frame", "get_max_events_per_frame");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dsp_bypass"), "set_dsp_bypass", "get_dsp_bypass");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "visemes_enabled"), "set_visemes_enabled", "get_visemes_enabled");
+    ADD_GROUP("Audio Defaults", "");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_codec", PROPERTY_HINT_ENUM, "Opus,PCMU,PCMA"), "set_preferred_codec", "get_preferred_codec");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_downlink_mode", PROPERTY_HINT_ENUM, "Streams,Mixed"), "set_preferred_downlink_mode", "get_preferred_downlink_mode");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "input_gain", PROPERTY_HINT_RANGE, "0.0,4.0,0.05"), "set_input_gain", "get_input_gain");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vad_threshold", PROPERTY_HINT_RANGE, "0.0,1.0,0.001"), "set_vad_threshold", "get_vad_threshold");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "vad_hangover_frames", PROPERTY_HINT_RANGE, "0,100,1"), "set_vad_hangover_frames", "get_vad_hangover_frames");
 
     // lifecycle
     ClassDB::bind_method(D_METHOD("connect_to_server", "ws_url", "token"), &AurixVoiceClient::connect_to_server);
@@ -1401,6 +1435,14 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_user_id"), &AurixVoiceClient::get_user_id);
     ClassDB::bind_method(D_METHOD("is_speaking"), &AurixVoiceClient::is_speaking);
     ClassDB::bind_method(D_METHOD("set_input_gain", "gain"), &AurixVoiceClient::set_input_gain);
+    ClassDB::bind_method(D_METHOD("set_preferred_codec", "codec"), &AurixVoiceClient::set_preferred_codec);
+    ClassDB::bind_method(D_METHOD("get_preferred_codec"), &AurixVoiceClient::get_preferred_codec);
+    ClassDB::bind_method(D_METHOD("set_preferred_downlink_mode", "mode"), &AurixVoiceClient::set_preferred_downlink_mode);
+    ClassDB::bind_method(D_METHOD("get_preferred_downlink_mode"), &AurixVoiceClient::get_preferred_downlink_mode);
+    ClassDB::bind_method(D_METHOD("set_vad_threshold", "threshold"), &AurixVoiceClient::set_vad_threshold);
+    ClassDB::bind_method(D_METHOD("get_vad_threshold"), &AurixVoiceClient::get_vad_threshold);
+    ClassDB::bind_method(D_METHOD("set_vad_hangover_frames", "frames"), &AurixVoiceClient::set_vad_hangover_frames);
+    ClassDB::bind_method(D_METHOD("get_vad_hangover_frames"), &AurixVoiceClient::get_vad_hangover_frames);
     ClassDB::bind_method(D_METHOD("get_input_energy"), &AurixVoiceClient::get_input_energy);
     ClassDB::bind_method(D_METHOD("set_vad", "threshold", "hangover_frames"), &AurixVoiceClient::set_vad);
     ClassDB::bind_method(D_METHOD("set_vad_gate", "enabled"), &AurixVoiceClient::set_vad_gate);

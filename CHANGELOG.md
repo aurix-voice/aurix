@@ -13,6 +13,7 @@ released together.
 
 ### Added
 
+- Godot: inspector group *Audio Defaults* on `AurixVoiceClient` — `preferred_codec`, `preferred_downlink_mode`, `input_gain`, `vad_threshold`, `vad_hangover_frames` — set without code, applied once the session is ready (parity with the Unity behaviour / Unreal settings).
 - Unity Editor: `Aurix Voice ▸ Voice test window` — connect / join / leave / mute / reconnect against a real node without entering Play mode, roster with speaking / muted / priority / no-mic flags, quality (bars, MOS, loss, jitter, RTT) and transport stats, every event with error advice, a local microphone level test, project-setup check. URL / token / channel live in EditorPrefs (per user, never in the project).
 - Unreal `FAurixVoiceSettings`: `InputGain`, `PreferredCodec`, `PreferredDownlinkMode` (the inspector fields the Unity behaviour has) — applied once the session is ready.
 - `probe_connection(timeout)` in the core (ping now, no reply → drop and reconnect; free when the link is fine): C ABI `aurix_client_probe_connection`, Unreal `ProbeConnection`, Godot `probe_connection` — the native twin of Unity/Web `ProbeConnection()` / `probeConnection()` for "did we survive the background?" checks.

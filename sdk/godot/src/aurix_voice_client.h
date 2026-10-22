@@ -270,6 +270,15 @@ public:
     String get_user_id() const;
     bool is_speaking() const;
     void set_input_gain(double gain);
+    /// Inspector defaults applied once the session is ready (and immediately when connected).
+    void set_preferred_codec(int codec);
+    int get_preferred_codec() const;
+    void set_preferred_downlink_mode(int mode);
+    int get_preferred_downlink_mode() const;
+    void set_vad_threshold(double threshold);
+    double get_vad_threshold() const;
+    void set_vad_hangover_frames(int frames);
+    int get_vad_hangover_frames() const;
     double get_input_energy() const;
     void set_vad(double threshold, int hangover_frames);
     void set_vad_gate(bool enabled);
@@ -391,6 +400,11 @@ private:
     Ref<AudioEffectCapture> capture_effect_;
     int capture_bus_index_ = -1;
     std::vector<float> capture_scratch_;
+    int preferred_codec_ = 0;
+    int preferred_downlink_ = 0;
+    double input_gain_ = 1.0;
+    double vad_threshold_ = 0.01;
+    int vad_hangover_frames_ = 15;
     std::vector<float> inject_pcm_;
     std::vector<float> inject_frame_;
     int inject_rate_ = 48000;
