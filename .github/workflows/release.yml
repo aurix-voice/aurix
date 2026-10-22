@@ -26,7 +26,7 @@ on:
         required: false
         default: ""
       npm_publish:
-        description: "Also publish the Web SDK of this version to npm (OIDC) — for re-publishing after a failed release step"
+        description: "Re-publish the packages of this (already released) version to the registries — npm, and PyPI/NuGet when opted in"
         type: boolean
         required: false
         default: false
@@ -762,7 +762,7 @@ jobs:
   npm-only:
     # Re-publish the Web SDK of an already-released version when the npm step of `publish` failed
     # (manual dispatch with npm_publish=true). Same OIDC identity, same workflow file.
-    name: npm publish only (manual)
+    name: re-publish packages (manual)
     if: github.event_name == 'workflow_dispatch' && inputs.npm_publish
     needs: [verify, sdks]
     runs-on: ubuntu-latest
@@ -788,6 +788,23 @@ jobs:
           if [ "${{ vars.NPM_SERVER_SDK }}" = "true" ]; then
             npm publish "./staged/aurix-server-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag" || echo "::warning title=server-sdk::already published or rejected (see above)"
           fi
+      - if: vars.PUBLISH_PYPI == 'true'
+        run: |
+          mkdir -p pypi
+          cp staged/aurix_server_sdk-${VERSION}-py3-none-any.whl staged/aurix_server_sdk-${VERSION}.tar.gz pypi/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: vars.PUBLISH_PYPI == 'true'
+        with:
+          packages-dir: pypi/
+          attestations: true
+          skip-existing: true
+      - if: vars.NUGET_USER != ''
+        id: nuget_login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - if: vars.NUGET_USER != ''
+        run: dotnet nuget push "staged/Aurix.Server.${VERSION}.nupkg" --api-key "${{ steps.nuget_login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
 
   publish:
     name: checksums, SBOM, signatures, GitHub release
