@@ -1023,7 +1023,18 @@ impl ServerConfig {
     pub fn advertised_ws_url(&self, production: bool) -> Option<String> {
         if let Some(explicit) = self.external_ws_url.as_deref() {
             let trimmed = explicit.trim();
-            return (!trimmed.is_empty()).then(|| trimmed.to_string());
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Operators usually give the bare host (`wss://voice.example.com`); clients connect
+            // to exactly what is advertised, and the handler lives at `/ws`.
+            return Some(match url::Url::parse(trimmed) {
+                Ok(mut u) if u.path().is_empty() || u.path() == "/" => {
+                    u.set_path("/ws");
+                    u.to_string()
+                }
+                _ => trimmed.to_string(),
+            });
         }
         let mut url = url::Url::parse(self.external_url.trim()).ok()?;
         let scheme = match url.scheme() {

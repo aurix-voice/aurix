@@ -13,6 +13,11 @@ released together.
 
 ### Added
 
+
+### Fixed
+
+- `server.external_ws_url` given as a bare host (`wss://voice.example.com`) is advertised with the `/ws` path, so clients that connect to exactly the advertised URL no longer hit 404.
+
 - Godot: `regions_discovery_url` / `rank_regions` statics (region discovery parity with the C ABI); Node token-server example gains an Aurix Cloud mode (`AURIX_CLOUD_URL/PROJECT/TOKEN` → `POST /v1/projects/{id}/tokens`, region or coordinates hint).
 - Godot: inspector group *Audio Defaults* on `AurixVoiceClient` — `preferred_codec`, `preferred_downlink_mode`, `input_gain`, `vad_threshold`, `vad_hangover_frames` — set without code, applied once the session is ready (parity with the Unity behaviour / Unreal settings).
 - Unity Editor: `Aurix Voice ▸ Voice test window` — connect / join / leave / mute / reconnect against a real node without entering Play mode, roster with speaking / muted / priority / no-mic flags, quality (bars, MOS, loss, jitter, RTT) and transport stats, every event with error advice, a local microphone level test, project-setup check. URL / token / channel live in EditorPrefs (per user, never in the project).
