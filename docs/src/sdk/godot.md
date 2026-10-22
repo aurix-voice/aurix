@@ -100,6 +100,14 @@ Everything a designer needs is on the `AurixVoiceClient` node: connection (`auto
 `vad_threshold`, `vad_hangover_frames` — applied once the session is ready; the matching
 `set_*` methods change them at runtime.
 
+Push-to-talk is a property group too: `push_to_talk_action` (an InputMap action — keyboard,
+gamepad or touch, whatever the action binds), `push_to_talk_toggle` (press to start / press to
+stop instead of hold) and `push_to_talk_release_delay` (seconds the mic stays open after release,
+default 0.15). With an action set the node mutes itself until the action is pressed and calls
+`set_muted` for you, so the roster and the server agree. `get_input_level()` (0..1 of the last
+captured frame, independent of mute) and `get_input_energy()` feed a microphone meter from
+`_process`.
+
 ## Audio injection
 
 `inject_audio(pcm: PackedFloat32Array, sample_rate_hz, channels, loop = false, gain = 1.0,
@@ -178,10 +186,11 @@ permission and, for media over UDP/QUIC, `INTERNET`; iOS needs `NSMicrophoneUsag
 Background audio, CallKit/AudioSession routing and Android audio focus are the game's
 responsibility — the extension only pushes and pulls PCM.
 
-**Not verified here:** this repository's CI has no Android NDK or Xcode, so the mobile slices
-are neither built nor exported nor run on a device by it — the recipe above is staged and
-documented, and the first `build_native.sh --target aarch64-linux-android` on a machine with the
-NDK is the verification step ([Limitations](../limitations.md)).
+**Verification status:** the release workflow builds the Android arm64 slice (`cargo-ndk`) and
+ships it in the addon zip, so that path is exercised on every release; armv7/x86_64 Android and
+the iOS slices are build targets of `build_native.sh` only — this repository has no Xcode runner
+and ships no iOS artifacts, and none of the mobile slices is run on a device by CI
+([Limitations](../limitations.md), [Support matrix](support-matrix.md)).
 
 ## Web export: `AurixWebVoiceClient`
 
