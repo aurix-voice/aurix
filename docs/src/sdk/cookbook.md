@@ -142,3 +142,13 @@ the rest (reconnect, media fallback, token refresh) when you let it.
   `ReleaseMicrophoneWhenMuted` / `bReleaseCaptureWhenMuted`.
 - **Why they left**: `ParticipantLeft.reason` — `kicked`, `banned`, `timeout` (connection lost),
   `out_of_range` (positional roster radius, usually no toast), `channel_closed`, `replaced`, `left`.
+
+## Reproduce a player's problem without an engine
+
+`cargo run -p aurix-client --example voice_cli -- wss://voice.example.com/ws <token> [channel-uuid]`
+gives you the native core as a console: `join`, `mute on`, `tx none`, `pos <ch> x y z`,
+`play clip.wav [loop]` (a WAV is the microphone), `record out.wav` (what you would hear, 48 kHz
+stereo), `who` (mute / speaking / priority / no-mic flags), `stats`, `session`, `reconnect`
+(network-change simulation) and every event as it arrives (`--json` for machine-readable lines).
+Two instances on two tokens are a complete two-player test of a channel, a region or a token
+server — attach the `stats` output and the event log to a support ticket.

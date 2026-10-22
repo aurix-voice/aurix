@@ -1336,7 +1336,12 @@ impl Client {
             if muted && self.inner.local_speaking.swap(false, Ordering::AcqRel) {
                 self.inner.emit(Event::LocalSpeaking(false));
             }
-            if !muted && self.inner.speaking_while_muted.swap(false, Ordering::AcqRel) {
+            if !muted
+                && self
+                    .inner
+                    .speaking_while_muted
+                    .swap(false, Ordering::AcqRel)
+            {
                 self.inner.emit(Event::SpeakingWhileMuted(false));
             }
         }
@@ -1347,7 +1352,12 @@ impl Client {
     /// device failed to open, and `true` once capture runs. Idempotent; re-sent after a
     /// (re)connect.
     pub fn set_capture_available(&self, available: bool) {
-        if self.inner.capture_available.swap(available, Ordering::AcqRel) == available {
+        if self
+            .inner
+            .capture_available
+            .swap(available, Ordering::AcqRel)
+            == available
+        {
             return;
         }
         let _ = self.send_control(ControlMessage::SetCaptureAvailable { available });
@@ -2428,7 +2438,9 @@ async fn session(
     inner.set_state(ConnectionState::Connected);
     if !inner.capture_available.load(Ordering::Relaxed) {
         // A fresh session does not know this client has no microphone; tell it again.
-        let _ = conn.send(&ControlMessage::SetCaptureAvailable { available: false }).await;
+        let _ = conn
+            .send(&ControlMessage::SetCaptureAvailable { available: false })
+            .await;
     }
     inner.emit(Event::SessionReady(info));
     if cfg.e2ee && conn.send(&e2ee_capability(inner)).await.is_err() {

@@ -3479,7 +3479,10 @@ pub unsafe extern "C" fn aurix_client_set_muted(client: *mut AurixClient, muted:
 /// when there is no capture device, the permission was denied or the device failed to open;
 /// `true` once capture runs. Idempotent; re-sent after a (re)connect.
 #[no_mangle]
-pub unsafe extern "C" fn aurix_client_set_capture_available(client: *mut AurixClient, available: bool) {
+pub unsafe extern "C" fn aurix_client_set_capture_available(
+    client: *mut AurixClient,
+    available: bool,
+) {
     if let Ok(c) = self::client(client) {
         c.set_capture_available(available);
     }
