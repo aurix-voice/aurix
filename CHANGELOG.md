@@ -14,6 +14,8 @@ released together.
 ### Added
 - Unity: the push-to-talk state machine is `Aurix.Audio.PushToTalkState` (engine-free, unit-tested: hold, toggle, release delay, reset); `AurixVoiceBehaviour` exposes `PushToTalkTransmitting` and `OnPushToTalkChanged(bool)` for UI.
 - Fixed: toggle push-to-talk in Unity and Godot could not switch off while a release delay was set — the toggled-off state re-opened the microphone on the next frame.
+- Web: `attachPushToTalk` toggle mode now runs out `releaseDelayMs` on the way off, matching Unity/Godot/Unreal; the cookbook states the shared semantics.
+- Fixed: Godot inspector properties were registered before their setters/getters were bound, so `push_to_talk_*` could not be assigned from GDScript or the inspector; properties are now registered last.
 - Godot smoke test covers the `push_to_talk_*` properties and the input meter; docs for Godot/Unity list the push-to-talk and meter APIs.
 
 - Push-to-talk out of the box: Unity `AurixVoiceBehaviour.PushToTalkKey` / Input System `PushToTalkAction` (hold or toggle, release delay), Godot `push_to_talk_action` (InputMap), Web `attachPushToTalk(client, { keys, toggle, releaseDelayMs })` with `press()` for gamepads. Input level meters: core `capture_level/capture_energy` (C ABI, C++), Unreal `GetInputLevel/GetInputEnergy`, Godot `get_input_level`, Unity `InputLevel` + `OnInputLevel`.
