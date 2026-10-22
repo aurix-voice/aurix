@@ -60,6 +60,7 @@ namespace Aurix.Samples
                 : () => new ConcentusOpusCodec();
             Voice.AutoConnectOnStart = false;
             Voice.OnLocalSpeaking += speaking => Log(speaking ? "you started speaking" : "you stopped speaking");
+            Voice.OnSpeakingWhileMuted += speaking => { if (speaking) Log("you are muted — nobody hears you"); };
             Voice.OnMicrophonePermissionDenied += () => Log("microphone permission denied — listening only");
             Voice.OnInputDeviceChanged += device => Log($"microphone: {device ?? "system default"}");
         }
@@ -155,11 +156,14 @@ namespace Aurix.Samples
                 Roster(channel).Add(p);
                 Log($"{p.DisplayName} joined {Short(channel)}");
             };
-            client.OnParticipantLeft += (channel, p) =>
+            client.OnParticipantRemoved += (channel, p, reason) =>
             {
                 Roster(channel).RemoveAll(x => x.UserId == p.UserId);
-                Log($"{p.DisplayName} left {Short(channel)}");
+                // OutOfRange is positional-roster churn, not a departure — no toast for that one.
+                if (reason != LeaveReason.OutOfRange) Log($"{p.DisplayName} left {Short(channel)} ({reason})");
             };
+            client.OnParticipantCaptureChanged += (channel, p, available) =>
+                Log($"{p.DisplayName} {(available ? "has a microphone again" : "has no microphone")}");
             client.OnParticipantUpdated += (channel, p) =>
             {
                 var roster = Roster(channel);
@@ -292,7 +296,8 @@ namespace Aurix.Samples
                     if (entry.Value.Count == 0) GUILayout.Label("   nobody else here");
                     foreach (var p in entry.Value)
                     {
-                        string flags = (p.IsSpeaking ? " 🔊" : "") + (p.IsMuted ? " muted" : "") + (p.IsServerMuted ? " server-muted" : "");
+                        string flags = (p.IsSpeaking ? " 🔊" : "") + (p.IsMuted ? " muted" : "") + (p.IsServerMuted ? " server-muted" : "")
+                                       + (p.CaptureUnavailable ? " no-mic" : "");
                         GUILayout.Label($"   {p.DisplayName} {Meter(p.Energy)}{flags}  [{p.Role}]");
                     }
                 }
