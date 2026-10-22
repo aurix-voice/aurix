@@ -82,6 +82,7 @@ namespace UnityEngine
     public class GUISkin { public GUIStyle box; public GUIStyle label; }
     public static class GUI { public static bool enabled; public static GUISkin skin => new GUISkin(); }
     public class GUILayoutOption { }
+    public static class GUIUtility { public static string systemCopyBuffer; }
     public static class GUILayout
     {
         public static void BeginArea(Rect r, GUIStyle s) { }
@@ -98,6 +99,7 @@ namespace UnityEngine
         public static float HorizontalSlider(float v, float min, float max, params GUILayoutOption[] o) => v;
         public static void Space(float px) { }
         public static GUILayoutOption Width(float w) => new GUILayoutOption();
+        public static GUILayoutOption MinHeight(float h) => new GUILayoutOption();
     }
 
     public struct Vector3
@@ -177,5 +179,33 @@ namespace UnityEditor
     public enum ScriptingImplementation { Mono2x, IL2CPP }
     public enum ManagedStrippingLevel { Disabled, Low, Medium, High }
     public static class BuildPipeline { public static BuildTargetGroup GetBuildTargetGroup(BuildTarget t) => BuildTargetGroup.Standalone; }
+    public enum MessageType { None, Info, Warning, Error }
+    public class EditorWindow : ScriptableObject
+    {
+        public Vector2 minSize;
+        public static T GetWindow<T>(string title) where T : EditorWindow, new() => new T();
+        public void Repaint() { }
+    }
+    public static class EditorApplication { public static Action update; public static bool isPlaying => false; }
+    public static class EditorPrefs
+    {
+        public static string GetString(string key, string def = "") => def;
+        public static void SetString(string key, string value) { }
+    }
+    public static class EditorStyles { public static GUIStyle boldLabel => new GUIStyle(null); public static GUIStyle miniLabel => new GUIStyle(null); }
+    public static class EditorGUI { public sealed class DisabledScope : IDisposable { public DisabledScope(bool disabled) { } public void Dispose() { } } }
+    public static class EditorGUILayout
+    {
+        public static void LabelField(string s, params GUILayoutOption[] o) { }
+        public static void LabelField(string s, GUIStyle st, params GUILayoutOption[] o) { }
+        public static string TextField(string label, string s, params GUILayoutOption[] o) => s;
+        public static string PasswordField(string label, string s, params GUILayoutOption[] o) => s;
+        public static void HelpBox(string s, MessageType t) { }
+        public static void Space() { }
+        public static void BeginHorizontal(params GUILayoutOption[] o) { }
+        public static void EndHorizontal() { }
+        public static Vector2 BeginScrollView(Vector2 v, params GUILayoutOption[] o) => v;
+        public static void EndScrollView() { }
+    }
 }
 #endif

@@ -8,6 +8,7 @@ server version it ships with (the repository is versioned as one unit).
 
 ### Added
 
+- `Aurix Voice ▸ Voice test window`: connect, join, roster, quality, events and a microphone level test from the editor, without Play mode (remote audio is heard in Play mode only).
 - `Participant.CaptureUnavailable` + `OnParticipantCaptureChanged`: members with no usable microphone are flagged in every roster; `AurixVoiceClient.SetCaptureAvailable` (the behaviour reports Microphone failures / denied permission itself). `AurixVoiceBehaviour.OnSpeakingWhileMuted` for the "you are muted" hint.
 - `AurixErrors.Describe(code)` / `IsRetryable(code)` / `IsPlayerFacing(code)`: the cookbook's error table as code for `OnRequestFailed` / `OnServerError` / `AurixApiException`.
 - `OnParticipantRemoved(channel, participant, LeaveReason)`: `OnParticipantLeft` plus why — `Kicked`, `Timeout` (connection lost), `Banned`, `OutOfRange` (positional roster radius), `ChannelClosed`, `Replaced`, `Left`.
