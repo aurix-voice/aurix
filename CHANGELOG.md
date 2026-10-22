@@ -13,6 +13,7 @@ released together.
 
 ### Added
 
+- Unity Editor: `Aurix Voice ▸ Voice test window` — connect / join / leave / mute / reconnect against a real node without entering Play mode, roster with speaking / muted / priority / no-mic flags, quality (bars, MOS, loss, jitter, RTT) and transport stats, every event with error advice, a local microphone level test, project-setup check. URL / token / channel live in EditorPrefs (per user, never in the project).
 - Unreal `FAurixVoiceSettings`: `InputGain`, `PreferredCodec`, `PreferredDownlinkMode` (the inspector fields the Unity behaviour has) — applied once the session is ready.
 - `probe_connection(timeout)` in the core (ping now, no reply → drop and reconnect; free when the link is fine): C ABI `aurix_client_probe_connection`, Unreal `ProbeConnection`, Godot `probe_connection` — the native twin of Unity/Web `ProbeConnection()` / `probeConnection()` for "did we survive the background?" checks.
 - Godot GDExtension: audio injection — `inject_audio(pcm, rate, channels, loop, gain, mix_with_microphone)` / `stop_audio_injection()` / `is_injecting_audio()` + `audio_injection_changed`, mixed into the capture bus or pushed from `_process` without a microphone (parity with Unity / Unreal / Web); `start_capture` reports capture availability.
