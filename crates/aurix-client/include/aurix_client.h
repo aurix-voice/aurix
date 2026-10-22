@@ -1746,7 +1746,12 @@ enum AurixMediaPath aurix_client_media_path(const struct AurixClient *client);
  * QUIC the connection migrates to a fresh local socket in place (same session, sequence
  * counter and E2EE state; `AurixEventMediaPathChanged` follows); on UDP the session
  * re-announces itself to the node. `false` when not connected.
+ * Ping now; no reply within `timeout_ms` → drop and reconnect (see `aurix_client_network_changed`).
+ * Free when the link is fine — use it after resuming from the background.
  */
+bool aurix_client_probe_connection(const struct AurixClient *client,
+                                   uint32_t timeout_ms);
+
 bool aurix_client_network_changed(const struct AurixClient *client);
 
 /**

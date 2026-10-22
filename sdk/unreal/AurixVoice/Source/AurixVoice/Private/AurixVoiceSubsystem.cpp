@@ -1832,6 +1832,11 @@ bool UAurixVoiceSubsystem::ReconnectNow()
 	return NetworkChanged();
 }
 
+bool UAurixVoiceSubsystem::ProbeConnection(float TimeoutSeconds)
+{
+	return Native && Native->Client.probe_connection(static_cast<uint32_t>(FMath::Clamp(TimeoutSeconds, 0.1f, 60.f) * 1000.f));
+}
+
 FString UAurixVoiceSubsystem::GetEndpoint() const
 {
 	return Native ? FromUtf8(Native->Client.endpoint().c_str()) : FString();

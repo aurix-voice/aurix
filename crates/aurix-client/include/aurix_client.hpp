@@ -502,6 +502,8 @@ public:
     AurixMediaPath media_path() const { return aurix_client_media_path(c_); }
     /// The device's network changed: migrate a QUIC link in place / re-announce a UDP one.
     bool network_changed() { return aurix_client_network_changed(c_); }
+    /// Ping now; no reply within `timeout_ms` → drop and reconnect. Free when the link is fine.
+    bool probe_connection(std::uint32_t timeout_ms = 3000) { return aurix_client_probe_connection(c_, timeout_ms); }
     AurixResult set_transcripts(bool enabled) { return aurix_client_set_transcripts(c_, enabled); }
     /// Ask for transcripts translated into `language` (BCP-47, `nullptr` = off), optionally
     /// declaring the language you speak and requesting private TTS of the translation.

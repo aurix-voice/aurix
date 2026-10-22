@@ -641,6 +641,10 @@ impl Inner {
 }
 
 enum Command {
+    /// Ping now and treat a missing reply within `timeout` as a dropped connection.
+    Probe {
+        timeout: Duration,
+    },
     Join {
         channel_id: ChannelId,
         token: Option<String>,
@@ -907,6 +911,16 @@ impl Client {
     /// The control WebSocket is left to its own reconnect. Emits `MediaPathChanged` on QUIC.
     pub fn network_changed(&self) -> Result<()> {
         self.send_cmd(Command::NetworkChanged)
+    }
+
+    /// Ping the server now and, if nothing comes back within `timeout`, drop the connection
+    /// and reconnect (same path as a detected network change). For "did we survive the
+    /// background / a suspend?" checks when the OS gives no network-change signal. Unlike
+    /// `network_changed` it costs nothing when the link is fine.
+    pub fn probe_connection(&self, timeout: Duration) -> Result<()> {
+        self.send_cmd(Command::Probe {
+            timeout: timeout.max(Duration::from_millis(100)),
+        })
     }
 
     pub fn session(&self) -> Option<SessionInfo> {
@@ -2305,6 +2319,7 @@ async fn wait_for_disconnect(
             None => return "client dropped".into(),
             Some(Command::Disconnect { reason }) => return reason,
             Some(Command::NetworkChanged) => {}
+            Some(Command::Probe { .. }) => {}
             Some(Command::Join {
                 channel_id,
                 token,
@@ -2605,6 +2620,7 @@ async fn session(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut requests = tokio::time::interval(REQUEST_TICK);
     let mut last_rx = Instant::now();
+    let mut probe_sent: Option<Instant> = None;
     let mut ping_nonce: u64 = rand::random();
     let reprobe_enabled = cfg.media_path == MediaPathPolicy::Auto
         && links.fallback_offered()
@@ -2665,6 +2681,14 @@ async fn session(
                         conn.close(ack.session_id, &reason).await;
                         return Exit::UserClose(reason);
                     }
+                    Some(Command::Probe { timeout }) => {
+                        ping_nonce = ping_nonce.wrapping_add(1);
+                        if conn.send(&ControlMessage::Ping { nonce: ping_nonce }).await.is_err() {
+                            return Exit::Dropped("probe ping failed".into());
+                        }
+                        probe_sent = Some(Instant::now());
+                        ping.reset_at(tokio::time::Instant::now() + timeout);
+                    }
                     Some(Command::NetworkChanged) => match media.path() {
                         MediaPath::Quic => match media.rebind() {
                             Ok(local) => {
@@ -2687,6 +2711,11 @@ async fn session(
                 }
             }
             _ = ping.tick() => {
+                if let Some(sent) = probe_sent.take() {
+                    if last_rx < sent {
+                        return Exit::Dropped("probe: no reply from the server".into());
+                    }
+                }
                 if last_rx.elapsed() > cfg.ping_interval * 3 {
                     return Exit::Dropped("control connection timed out".into());
                 }
@@ -3587,7 +3616,7 @@ async fn handle_command(
             pending.moderation_queue.push_back(cmd);
             pump_joins(inner, cfg, conn, pending).await
         }
-        Command::Disconnect { .. } | Command::NetworkChanged => Ok(()),
+        Command::Disconnect { .. } | Command::NetworkChanged | Command::Probe { .. } => Ok(()),
     }
 }
 

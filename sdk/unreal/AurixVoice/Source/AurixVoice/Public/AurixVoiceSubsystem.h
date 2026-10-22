@@ -573,6 +573,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Session")
 	bool ReconnectNow();
 
+	/**
+	 * Ping the server now; no reply within TimeoutSeconds → drop and reconnect. Free when the link is fine —
+	 * the plugin calls it after returning from the background (ProbeAfterBackgroundSeconds); call it yourself
+	 * after a level load or when the player reports "nobody hears me".
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Session")
+	bool ProbeConnection(float TimeoutSeconds = 3.f);
+
 	/** WebSocket URL of the node serving the session (the configured URL until a failover moved it). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Connection")
 	FString GetEndpoint() const;

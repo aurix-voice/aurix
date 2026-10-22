@@ -13,6 +13,7 @@ released together.
 
 ### Added
 
+- `probe_connection(timeout)` in the core (ping now, no reply → drop and reconnect; free when the link is fine): C ABI `aurix_client_probe_connection`, Unreal `ProbeConnection`, Godot `probe_connection` — the native twin of Unity/Web `ProbeConnection()` / `probeConnection()` for "did we survive the background?" checks.
 - Godot GDExtension: audio injection — `inject_audio(pcm, rate, channels, loop, gain, mix_with_microphone)` / `stop_audio_injection()` / `is_injecting_audio()` + `audio_injection_changed`, mixed into the capture bus or pushed from `_process` without a microphone (parity with Unity / Unreal / Web); `start_capture` reports capture availability.
 - Unreal lobby sample: `OnPlayerLeft(DisplayName, EAurixLeaveReason)` (silent for out-of-range churn), `bCaptureUnavailable` per roster entry, `bSpeakingWhileMuted` in the status, `LeaveReasonToText` in the Blueprint library.
 - Error helpers everywhere: core `is_player_facing_code`, C ABI `aurix_error_player_facing`, C++ `aurix::describe_error / error_retryable / error_player_facing`, Unreal `IsErrorPlayerFacing`, Godot `describe_error / is_error_retryable / is_error_player_facing`; `ReconnectNow` (Unreal) / `reconnect_now` (Godot) as the cross-SDK name of `NetworkChanged`.

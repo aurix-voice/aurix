@@ -219,6 +219,8 @@ public:
     bool network_changed();
     /// Same as network_changed — the name the Unity/Web SDKs use.
     bool reconnect_now();
+    /// Ping now; no reply within timeout_ms → drop and reconnect. Free when the link is fine (use after resuming).
+    bool probe_connection(int timeout_ms = 3000);
     /// Cookbook advice for a wire error code ("what to do"); "" for unknown codes.
     static String describe_error(const String& code);
     static bool is_error_retryable(const String& code);

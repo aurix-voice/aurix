@@ -1499,6 +1499,21 @@ pub unsafe extern "C" fn aurix_client_media_path(client: *const AurixClient) -> 
 /// QUIC the connection migrates to a fresh local socket in place (same session, sequence
 /// counter and E2EE state; `AurixEventMediaPathChanged` follows); on UDP the session
 /// re-announces itself to the node. `false` when not connected.
+/// Ping now; no reply within `timeout_ms` → drop and reconnect (see `aurix_client_network_changed`).
+/// Free when the link is fine — use it after resuming from the background.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_probe_connection(
+    client: *const AurixClient,
+    timeout_ms: u32,
+) -> bool {
+    match self::client(client) {
+        Ok(c) => c
+            .probe_connection(std::time::Duration::from_millis(u64::from(timeout_ms)))
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_client_network_changed(client: *const AurixClient) -> bool {
     match self::client(client) {

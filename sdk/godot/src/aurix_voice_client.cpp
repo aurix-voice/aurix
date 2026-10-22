@@ -192,6 +192,7 @@ AurixVoiceClient::MediaPath AurixVoiceClient::get_media_path() const {
 
 bool AurixVoiceClient::network_changed() { return client_ && client_.network_changed(); }
 bool AurixVoiceClient::reconnect_now() { return network_changed(); }
+bool AurixVoiceClient::probe_connection(int timeout_ms) { return client_ && client_.probe_connection(static_cast<uint32_t>(timeout_ms < 100 ? 100 : timeout_ms)); }
 String AurixVoiceClient::describe_error(const String& code) { return String::utf8(aurix::describe_error(code.utf8().get_data()).c_str()); }
 bool AurixVoiceClient::is_error_retryable(const String& code) { return aurix::error_retryable(code.utf8().get_data()); }
 bool AurixVoiceClient::is_error_player_facing(const String& code) { return aurix::error_player_facing(code.utf8().get_data()); }
@@ -1359,6 +1360,7 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_media_path"), &AurixVoiceClient::get_media_path);
     ClassDB::bind_method(D_METHOD("network_changed"), &AurixVoiceClient::network_changed);
     ClassDB::bind_method(D_METHOD("reconnect_now"), &AurixVoiceClient::reconnect_now);
+    ClassDB::bind_method(D_METHOD("probe_connection", "timeout_ms"), &AurixVoiceClient::probe_connection, DEFVAL(3000));
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("describe_error", "code"), &AurixVoiceClient::describe_error);
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("is_error_retryable", "code"), &AurixVoiceClient::is_error_retryable);
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("is_error_player_facing", "code"), &AurixVoiceClient::is_error_player_facing);
