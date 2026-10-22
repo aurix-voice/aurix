@@ -11,6 +11,10 @@ released together.
 
 ## [Unreleased]
 
+### Fixed
+
+- Web and Node SDK `package.json` carry `repository` (url + directory) — npm provenance verification requires it; `release.yml` gained a manual `npm_publish` dispatch to re-publish an already released version.
+
 ## [1.8.1] - 2026-10-22
 
 ### Fixed

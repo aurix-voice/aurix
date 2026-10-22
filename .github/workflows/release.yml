@@ -25,6 +25,11 @@ on:
         description: "Version to dry-run (defaults to the workspace version)"
         required: false
         default: ""
+      npm_publish:
+        description: "Also publish the Web SDK of this version to npm (OIDC) — for re-publishing after a failed release step"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -753,6 +758,33 @@ jobs:
           name: dist-dashboard-image-sbom
           path: "*.image.cdx.json"
           if-no-files-found: error
+
+  npm-only:
+    # Re-publish the Web SDK of an already-released version when the npm step of `publish` failed
+    # (manual dispatch with npm_publish=true). Same OIDC identity, same workflow file.
+    name: npm publish only (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.npm_publish
+    needs: [verify, sdks]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-sdks
+          path: staged
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: |
+          set -euo pipefail
+          npm install -g npm@latest >/dev/null
+          tag=latest; case "$VERSION" in *-*) tag=next ;; esac
+          npm publish "./staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"
 
   publish:
     name: checksums, SBOM, signatures, GitHub release

@@ -1,6 +1,15 @@
 {
   "name": "@aurix/web-sdk",
   "version": "1.8.1",
+  "bugs": {
+    "url": "https://github.com/aurix-voice/aurix/issues"
+  },
+  "homepage": "https://github.com/aurix-voice/aurix/tree/main/sdk/web",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aurix-voice/aurix.git",
+    "directory": "sdk/web"
+  },
   "description": "Browser SDK for the Aurix voice platform (WebSocket control + WebRTC media).",
   "license": "Apache-2.0",
   "type": "module",
@@ -13,7 +22,10 @@
     },
     "./bundle": "./dist/aurix-web-sdk.js"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle.mjs",
     "bundle": "node scripts/bundle.mjs",
@@ -24,5 +36,7 @@
   "devDependencies": {
     "typescript": "~5.9.3"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

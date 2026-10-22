@@ -1,6 +1,15 @@
 {
   "name": "@aurix/server-sdk",
   "version": "1.8.1",
+  "bugs": {
+    "url": "https://github.com/aurix-voice/aurix/issues"
+  },
+  "homepage": "https://github.com/aurix-voice/aurix/tree/main/sdk/server/node",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aurix-voice/aurix.git",
+    "directory": "sdk/server/node"
+  },
   "description": "Server-side (backend) SDK for the Aurix voice platform REST API: token issuance, channels, moderation, webhooks, SSE. Generated from api/openapi.json.",
   "license": "Apache-2.0",
   "type": "module",
