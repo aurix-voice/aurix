@@ -1438,35 +1438,6 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_visemes_enabled", "enabled"), &AurixVoiceClient::set_visemes_enabled);
     ClassDB::bind_method(D_METHOD("get_visemes_enabled"), &AurixVoiceClient::get_visemes_enabled);
 
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_reconnect"), "set_auto_reconnect", "get_auto_reconnect");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "reconnect_max_attempts"), "set_reconnect_max_attempts", "get_reconnect_max_attempts");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "request_timeout_ms"), "set_request_timeout_ms", "get_request_timeout_ms");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "jitter_target_frames"), "set_jitter_target_frames", "get_jitter_target_frames");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vad_gate"), "set_vad_gate_enabled", "get_vad_gate_enabled");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_channel_policy"), "set_follow_channel_policy", "get_follow_channel_policy");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "media_path_policy", PROPERTY_HINT_ENUM, "Auto,UDP Only,Tunnel Only,QUIC Only,TLS Only"), "set_media_path_policy", "get_media_path_policy");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "quic"), "set_quic_enabled", "get_quic_enabled");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tls_tunnel"), "set_tls_tunnel_enabled", "get_tls_tunnel_enabled");
-    ADD_PROPERTY(PropertyInfo(Variant::STRING, "device_id"), "set_device_id", "get_device_id");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_capture"), "set_auto_capture", "get_auto_capture");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_playback"), "set_auto_playback", "get_auto_playback");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_buffer_seconds", PROPERTY_HINT_RANGE, "0.02,1.0,0.01"), "set_playback_buffer_seconds", "get_playback_buffer_seconds");
-    ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "playback_bus"), "set_playback_bus", "get_playback_bus");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "playback_mode", PROPERTY_HINT_ENUM, "Mixed,Per Participant,Per Participant Only"), "set_playback_mode", "get_playback_mode");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "max_events_per_frame"), "set_max_events_per_frame", "get_max_events_per_frame");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dsp_bypass"), "set_dsp_bypass", "get_dsp_bypass");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "visemes_enabled"), "set_visemes_enabled", "get_visemes_enabled");
-    ADD_GROUP("Push To Talk", "push_to_talk_");
-    ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "push_to_talk_action"), "set_push_to_talk_action", "get_push_to_talk_action");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "push_to_talk_toggle"), "set_push_to_talk_toggle", "get_push_to_talk_toggle");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "push_to_talk_release_delay", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_push_to_talk_release_delay", "get_push_to_talk_release_delay");
-    ADD_GROUP("Audio Defaults", "");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_codec", PROPERTY_HINT_ENUM, "Opus,PCMU,PCMA"), "set_preferred_codec", "get_preferred_codec");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_downlink_mode", PROPERTY_HINT_ENUM, "Streams,Mixed"), "set_preferred_downlink_mode", "get_preferred_downlink_mode");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "input_gain", PROPERTY_HINT_RANGE, "0.0,4.0,0.05"), "set_input_gain", "get_input_gain");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vad_threshold", PROPERTY_HINT_RANGE, "0.0,1.0,0.001"), "set_vad_threshold", "get_vad_threshold");
-    ADD_PROPERTY(PropertyInfo(Variant::INT, "vad_hangover_frames", PROPERTY_HINT_RANGE, "0,100,1"), "set_vad_hangover_frames", "get_vad_hangover_frames");
-
     // lifecycle
     ClassDB::bind_method(D_METHOD("connect_to_server", "ws_url", "token"), &AurixVoiceClient::connect_to_server);
     ClassDB::bind_method(D_METHOD("disconnect_from_server"), &AurixVoiceClient::disconnect_from_server);
@@ -1783,6 +1754,37 @@ void AurixVoiceClient::_bind_methods() {
     BIND_ENUM_CONSTANT(VISEME_IH);
     BIND_ENUM_CONSTANT(VISEME_OH);
     BIND_ENUM_CONSTANT(VISEME_OU);
+
+    // Properties last: godot-cpp resolves setter/getter names at registration, so every bound
+    // method above must exist first.
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_reconnect"), "set_auto_reconnect", "get_auto_reconnect");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "reconnect_max_attempts"), "set_reconnect_max_attempts", "get_reconnect_max_attempts");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "request_timeout_ms"), "set_request_timeout_ms", "get_request_timeout_ms");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "jitter_target_frames"), "set_jitter_target_frames", "get_jitter_target_frames");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "vad_gate"), "set_vad_gate_enabled", "get_vad_gate_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_channel_policy"), "set_follow_channel_policy", "get_follow_channel_policy");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "media_path_policy", PROPERTY_HINT_ENUM, "Auto,UDP Only,Tunnel Only,QUIC Only,TLS Only"), "set_media_path_policy", "get_media_path_policy");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "quic"), "set_quic_enabled", "get_quic_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tls_tunnel"), "set_tls_tunnel_enabled", "get_tls_tunnel_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "device_id"), "set_device_id", "get_device_id");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_capture"), "set_auto_capture", "get_auto_capture");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_playback"), "set_auto_playback", "get_auto_playback");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_buffer_seconds", PROPERTY_HINT_RANGE, "0.02,1.0,0.01"), "set_playback_buffer_seconds", "get_playback_buffer_seconds");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "playback_bus"), "set_playback_bus", "get_playback_bus");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "playback_mode", PROPERTY_HINT_ENUM, "Mixed,Per Participant,Per Participant Only"), "set_playback_mode", "get_playback_mode");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "max_events_per_frame"), "set_max_events_per_frame", "get_max_events_per_frame");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dsp_bypass"), "set_dsp_bypass", "get_dsp_bypass");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "visemes_enabled"), "set_visemes_enabled", "get_visemes_enabled");
+    ADD_GROUP("Push To Talk", "push_to_talk_");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "push_to_talk_action"), "set_push_to_talk_action", "get_push_to_talk_action");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "push_to_talk_toggle"), "set_push_to_talk_toggle", "get_push_to_talk_toggle");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "push_to_talk_release_delay", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_push_to_talk_release_delay", "get_push_to_talk_release_delay");
+    ADD_GROUP("Audio Defaults", "");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_codec", PROPERTY_HINT_ENUM, "Opus,PCMU,PCMA"), "set_preferred_codec", "get_preferred_codec");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "preferred_downlink_mode", PROPERTY_HINT_ENUM, "Streams,Mixed"), "set_preferred_downlink_mode", "get_preferred_downlink_mode");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "input_gain", PROPERTY_HINT_RANGE, "0.0,4.0,0.05"), "set_input_gain", "get_input_gain");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vad_threshold", PROPERTY_HINT_RANGE, "0.0,1.0,0.001"), "set_vad_threshold", "get_vad_threshold");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "vad_hangover_frames", PROPERTY_HINT_RANGE, "0,100,1"), "set_vad_hangover_frames", "get_vad_hangover_frames");
 }
 
 }  // namespace godot
