@@ -13,7 +13,7 @@ released together.
 
 ### Added
 
-- Release publishes `@aurix/web-sdk` to npm (with provenance, when `NPM_TOKEN` is configured), pushes the Unity package as the `upm` branch + `upm/v<version>` tag for OpenUPM / git-URL installs, and — with the Epic-linked container access — attaches an engine-compiled Unreal plugin (`RunUAT BuildPlugin -Rocket`, Linux) next to the source zip.
+- Release publishes `@aurix/web-sdk` to npm through OIDC trusted publishing (no token in the repository, provenance attached), pushes the Unity package as the `upm` branch + `upm/v<version>` tag for OpenUPM / git-URL installs, and — with the Epic-linked container access — attaches an engine-compiled Unreal plugin (`RunUAT BuildPlugin -Rocket`, Linux) next to the source zip.
 - Releases now ship the native core for Android (arm64-v8a / armeabi-v7a / x86_64, `aurix-client-<version>-android.tar.gz`), the Unreal plugin with Android support (`AurixClientLibrary` APL, `SupportedTargetPlatforms` + Android) and a prebuilt Godot addon (`aurix-godot-addon-<version>.zip` with GDExtension binaries for Linux x86_64/arm64, Windows, macOS universal and Android arm64); the source-only Godot zip is now `-source.zip`.
 - `GET /health` reports cascade peers (`cascade.peers[]` with transport and RTT, `cascade.connected`) and a new gauge `aurix_cascade_peers{transport}` so a node that cannot reach its peers is visible without reading logs; retention docs gained a disk-footprint table and a production baseline.
 

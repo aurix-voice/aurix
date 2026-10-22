@@ -786,20 +786,20 @@ jobs:
       - uses: actions/setup-node@v4
         if: needs.verify.outputs.publish == 'true'
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Publish @aurix/web-sdk to npm (with provenance; skipped without NPM_TOKEN)
+      - name: Publish @aurix/web-sdk to npm (OIDC trusted publishing, provenance; no token)
         if: needs.verify.outputs.publish == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::notice title=npm publish skipped::NPM_TOKEN is not set; aurix-web-sdk-${VERSION}.tgz is attached to the release instead."
-            exit 0
-          fi
+          npm install -g npm@latest >/dev/null   # trusted publishing needs npm >= 11.5.1
+          npm --version
           tag=latest; case "$VERSION" in *-*) tag=next ;; esac
-          npm publish "staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"
+          if npm publish "staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"; then
+            echo "::notice title=npm::@aurix/web-sdk@${VERSION} published (dist-tag ${tag})"
+          else
+            echo "::warning title=npm publish failed::Configure the trusted publisher on npmjs.com for @aurix/web-sdk (GitHub Actions: aurix-voice / aurix / release.yml, no environment). The tarball is attached to the GitHub release regardless."
+          fi
       - name: Unity package branch for OpenUPM (upm = sdk/unity subtree, tag upm/v<version>)
         if: needs.verify.outputs.publish == 'true'
         run: |
