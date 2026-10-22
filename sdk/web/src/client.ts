@@ -3869,8 +3869,14 @@ export class AurixClient {
       if (this.localStream !== stream || (!this.pc && !this.wt) || stream === this.opts.localStream) return;
       this.inputDeviceIdValue = undefined;
       void this.openMicrophone()
-        .then((s) => this.adoptLocalStream(s))
-        .catch((e: unknown) => this.emit('error', e instanceof Error ? e : new Error(String(e))));
+        .then((s) => {
+          this.setCaptureAvailable(true);
+          this.adoptLocalStream(s);
+        })
+        .catch((e: unknown) => {
+          this.setCaptureAvailable(false);
+          this.emit('error', e instanceof Error ? e : new Error(String(e)));
+        });
     });
   }
 
