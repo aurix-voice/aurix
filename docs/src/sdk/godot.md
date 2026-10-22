@@ -102,6 +102,10 @@ microphone (frames are pushed from `_process`), `stop_audio_injection()` ends it
   `banned`, `out_of_range`, `channel_closed`, `replaced`).
 - `get_transmission()`, `get_channel_focus()`, `is_priority(channel_id)`, `get_user_id()`,
   `is_capture_available()`, `get_input_gain()` read back what you set.
+- `probe_connection(timeout_ms = 3000)`: ping now, reconnect only if no reply — free when the
+  link is fine (after resuming, after a scene change). `reconnect_now()` drops unconditionally.
+- `AurixVoiceClient.describe_error(code)` / `is_error_retryable(code)` /
+  `is_error_player_facing(code)` (static): the cookbook's "what to do" for a wire error code.
 
 ## Threading, memory, lifetime
 

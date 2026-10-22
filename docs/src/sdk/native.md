@@ -364,6 +364,12 @@ The core cannot see your audio device, so it takes two hints and turns them into
 `aurix_error_describe(code)` / `aurix_error_retryable(code)` turn a wire error code into the
 "what to do" advice from the [cookbook](cookbook.md#error-codes).
 
+`aurix_client_probe_connection(client, timeout_ms)` pings now and drops the connection only when
+no reply arrives in time — the cheap "are we still connected?" check after a resume
+(`aurix_client_network_changed` reconnects unconditionally). `aurix_error_player_facing(code)`
+says whether the player can do something about an error (full channel, ban, their network) or it
+is a developer-side bug.
+
 For support and QA, `cargo run -p aurix-client --example voice_cli -- <ws-url> <token> [channel]`
 is the core as a console: join, mute, move, play a WAV as the microphone, record the mix, print
 every event and the stats — no engine, no audio device.

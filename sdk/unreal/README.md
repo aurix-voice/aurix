@@ -354,6 +354,12 @@ and a retry decision — same table as `aurix_error_describe()` in the C ABI.
 
 ### Background and foreground
 
+`ProbeConnection(TimeoutSeconds = 3)` pings the server now and reconnects only if nothing comes
+back in time — free when the link is fine, so call it after a level load or when a player says
+"nobody hears me". `ReconnectNow()` (= `NetworkChanged()`) drops and reconnects unconditionally.
+`FAurixVoiceSettings` also carries `InputGain`, `PreferredCodec` and `PreferredDownlinkMode`,
+applied once the session is ready.
+
 The subsystem listens to `FCoreDelegates::ApplicationWillEnterBackgroundDelegate` / `ApplicationHasEnteredForegroundDelegate`. With `bStopCaptureInBackground` (default on) the microphone is released while the app is suspended — on mobile the OS stops delivering audio anyway and the recording indicator goes away — and reopened on return. After `ProbeAfterBackgroundSeconds` (default 5 s, 0 = never) in the background the control connection is probed on return (`NetworkChanged()`), so a socket the OS killed is replaced immediately instead of after the ping timeout. `bReleaseCaptureWhenMuted` does the same for a mute: `SetMuted(true)` releases the device (no recording indicator), `SetMuted(false)` reopens it. Session and channels survive the suspension when the server-side resume window allows; otherwise the regular reconnect re-joins them.
 
 ### Events
