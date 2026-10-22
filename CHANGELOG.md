@@ -6,6 +6,10 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-10-22
+
+- Version bump only (release tooling fix); no package changes since 1.8.0.
+
 ## [1.8.0] — 2026-10-22
 
 ### Added
