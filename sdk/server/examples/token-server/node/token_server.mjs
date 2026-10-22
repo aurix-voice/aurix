@@ -35,6 +35,44 @@ export function loadConfig(env = process.env) {
     region,
     port: Number(env.PORT || 3000),
     allowDevLogin: env.ALLOW_DEV_LOGIN === "1",
+    // Aurix Cloud, several regions: let the control plane pick the region's backend.
+    // Set all three; the cell key above is then unused.
+    cloud: env.AURIX_CLOUD_URL && env.AURIX_CLOUD_PROJECT && env.AURIX_CLOUD_TOKEN
+      ? { url: env.AURIX_CLOUD_URL.replace(/\/$/, ""), project: env.AURIX_CLOUD_PROJECT, token: env.AURIX_CLOUD_TOKEN }
+      : null,
+  };
+}
+
+/**
+ * Multi-region projects on Aurix Cloud: `POST /v1/projects/{id}/tokens` mints the token on the
+ * cell that serves the player best — explicit `region` (e.g. the match's shard), the player's
+ * coordinates, or the country the CDN put on the request — and returns that cell's nearest node.
+ * The token server holds one organisation API token and no cell keys or addresses.
+ */
+export async function issueVoiceTokenViaCloud(cloud, player, matchId, hint = {}, fetchImpl = fetch) {
+  const res = await fetchImpl(`${cloud.url}/v1/projects/${cloud.project}/tokens`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${cloud.token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      external_id: player.playerId,
+      display_name: player.displayName,
+      channels: [{ ad_hoc: { name: `match-${matchId}`, channel_type: "team" }, join: true, speak: true, receive: true }],
+      ...(hint.region ? { region: hint.region } : {}),
+      ...(hint.latitude != null && hint.longitude != null ? { latitude: hint.latitude, longitude: hint.longitude } : {}),
+    }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(body?.error?.message || `cloud ${res.status}`);
+    err.status = res.status === 403 && body?.error?.code === "plan_limit" ? 503 : res.status >= 500 ? 502 : res.status;
+    throw err;
+  }
+  return {
+    token: body.token,
+    user_id: body.user_id,
+    expires_at: body.expires_at,
+    endpoint: body.endpoint ? { ws_url: body.endpoint.ws_url, region: body.endpoint.region, probe_url: body.endpoint.probe_url } : null,
+    region: body.region,
   };
 }
 
@@ -140,8 +178,15 @@ export function createTokenServer(cfg, aurix = new AurixClient({ baseUrl: cfg.au
       if (req.method === "POST" && req.url === "/voice/token") {
         const player = authenticatePlayer(cfg.sessionSecret, req.headers.authorization);
         if (!player) return send(res, 401, { error: "not logged in" });
-        const { match_id } = await readJson(req);
+        const { match_id, region, latitude, longitude } = await readJson(req);
         if (typeof match_id !== "string" || !playerMayJoin(player, match_id)) return send(res, 403, { error: "not allowed to join this match" });
+        if (cfg.cloud) {
+          // Pass the shard's region when the match is pinned to one; otherwise the player's
+          // coordinates if the client sent them; otherwise the cloud falls back to the request
+          // country (behind Cloudflare/CloudFront) or the home region.
+          const hint = typeof region === "string" ? { region } : { latitude: Number(latitude), longitude: Number(longitude) };
+          return send(res, 200, await issueVoiceTokenViaCloud(cfg.cloud, player, match_id, hint));
+        }
         return send(res, 200, await issueVoiceToken(aurix, player, match_id, cfg.region));
       }
 

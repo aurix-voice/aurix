@@ -10,6 +10,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -196,6 +197,51 @@ bool AurixVoiceClient::probe_connection(int timeout_ms) { return client_ && clie
 String AurixVoiceClient::describe_error(const String& code) { return String::utf8(aurix::describe_error(code.utf8().get_data()).c_str()); }
 bool AurixVoiceClient::is_error_retryable(const String& code) { return aurix::error_retryable(code.utf8().get_data()); }
 bool AurixVoiceClient::is_error_player_facing(const String& code) { return aurix::error_player_facing(code.utf8().get_data()); }
+
+String AurixVoiceClient::regions_discovery_url(const String& api_url, const String& preferred_region, double latitude, double longitude) {
+    const bool has_loc = !std::isnan(latitude) && !std::isnan(longitude);
+    CharString api = api_url.utf8();
+    CharString pref = preferred_region.utf8();
+    char buf[1024];
+    size_t n = aurix_regions_discovery_url(api.get_data(), preferred_region.is_empty() ? nullptr : pref.get_data(), has_loc, latitude, longitude, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return String();
+    return String::utf8(buf, static_cast<int>(n));
+}
+
+Array AurixVoiceClient::rank_regions(const String& regions_json, const Dictionary& rtt_ms_by_region, const String& preferred_region, double rtt_tolerance_ms) {
+    Array out;
+    CharString json = regions_json.utf8();
+    AurixRegionList* list = aurix_regions_parse(json.get_data());
+    if (!list) return out;
+    size_t len = aurix_regions_len(list);
+    for (size_t i = 0; i < len; i++) {
+        AurixRegionEndpoint ep;
+        if (!aurix_regions_get(list, i, &ep)) continue;
+        String region = String::utf8(ep.region);
+        if (rtt_ms_by_region.has(region)) {
+            aurix_regions_set_rtt(list, i, static_cast<double>(rtt_ms_by_region[region]));
+        }
+    }
+    CharString pref = preferred_region.utf8();
+    aurix_regions_rank(list, preferred_region.is_empty() ? nullptr : pref.get_data(), rtt_tolerance_ms);
+    len = aurix_regions_len(list);
+    for (size_t i = 0; i < len; i++) {
+        AurixRegionEndpoint ep;
+        if (!aurix_regions_get(list, i, &ep)) continue;
+        Dictionary d;
+        d["region"] = String::utf8(ep.region);
+        d["ws_url"] = String::utf8(ep.ws_url);
+        d["probe_url"] = String::utf8(ep.probe_url);
+        d["nodes"] = static_cast<int>(ep.nodes);
+        d["load_factor"] = static_cast<double>(ep.load_factor);
+        if (ep.has_distance) d["distance_km"] = ep.distance_km;
+        if (ep.has_rtt) d["rtt_ms"] = ep.rtt_ms;
+        d["probe_failed"] = ep.probe_failed;
+        out.push_back(d);
+    }
+    aurix_regions_free(list);
+    return out;
+}
 
 String AurixVoiceClient::get_last_error() const { return String::utf8(aurix::last_error().c_str()); }
 
@@ -1398,6 +1444,8 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("describe_error", "code"), &AurixVoiceClient::describe_error);
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("is_error_retryable", "code"), &AurixVoiceClient::is_error_retryable);
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("is_error_player_facing", "code"), &AurixVoiceClient::is_error_player_facing);
+    ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("regions_discovery_url", "api_url", "preferred_region", "latitude", "longitude"), &AurixVoiceClient::regions_discovery_url, DEFVAL(String()), DEFVAL(NAN), DEFVAL(NAN));
+    ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("rank_regions", "regions_json", "rtt_ms_by_region", "preferred_region", "rtt_tolerance_ms"), &AurixVoiceClient::rank_regions, DEFVAL(String()), DEFVAL(0.0));
     ClassDB::bind_method(D_METHOD("get_last_error"), &AurixVoiceClient::get_last_error);
     ClassDB::bind_static_method("AurixVoiceClient", D_METHOD("get_native_version"), &AurixVoiceClient::get_native_version);
 

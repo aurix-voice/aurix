@@ -82,6 +82,15 @@ func join(channel_id: String) -> void:
   channel; the fingerprint / identity-persistence API and the `E2EE_*` events are not bound to
   GDScript yet (a fresh identity per session).
 
+## Region discovery
+
+Static helpers mirror the C ABI: `AurixVoiceClient.regions_discovery_url(api_url, preferred_region, latitude, longitude)`
+builds the `GET /v1/me/regions` URL (send it with `HTTPRequest` and the player's token), and
+`AurixVoiceClient.rank_regions(body, rtt_ms_by_region, preferred_region, rtt_tolerance_ms)` returns the regions
+best-first after you add the RTTs you measured against each entry's `probe_url`; connect to
+`result[0].ws_url`. On Aurix Cloud the token server can do the choice instead
+(`POST /v1/projects/{id}/tokens` returns `endpoint`).
+
 ## Inspector defaults
 
 Everything a designer needs is on the `AurixVoiceClient` node: connection (`auto_reconnect`,

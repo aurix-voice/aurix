@@ -226,6 +226,11 @@ public:
     static bool is_error_retryable(const String& code);
     /// The player can do something about it (full channel, ban, their network) vs a developer-side bug.
     static bool is_error_player_facing(const String& code);
+    /// Region discovery helpers (parity with the C ABI `aurix_regions_*`): build the
+    /// `GET /v1/me/regions` URL, then feed the body and the RTTs you measured (e.g. with
+    /// HTTPRequest against each entry's `probe_url`) to `rank_regions`; entry 0 is the pick.
+    static String regions_discovery_url(const String& api_url, const String& preferred_region, double latitude, double longitude);
+    static Array rank_regions(const String& regions_json, const Dictionary& rtt_ms_by_region, const String& preferred_region, double rtt_tolerance_ms);
     String get_last_error() const;
     static String get_native_version();
 
