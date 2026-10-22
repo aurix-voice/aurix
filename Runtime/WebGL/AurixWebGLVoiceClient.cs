@@ -160,6 +160,8 @@ namespace Aurix.WebGL
         public event Action<string> OnSessionClosed;
         /// <summary>Local voice activity from the browser meter (<see cref="WebGLClientOptions.LocalVoiceActivity"/>).</summary>
         public event Action<bool> OnLocalSpeaking;
+        /// <summary>Speech detected while muted (true = started, false = stopped / unmuted): show "you are muted". Same as <c>AurixVoiceBehaviour.OnSpeakingWhileMuted</c> on native platforms.</summary>
+        public event Action<bool> OnSpeakingWhileMuted;
         /// <summary>
         /// Remote audio playback state: <c>(false, reason)</c> when the browser refused to start the hidden
         /// audio element (autoplay policy) — call <see cref="ResumeAudioAsync"/> from a user gesture.
@@ -1188,6 +1190,9 @@ namespace Aurix.WebGL
                     return;
                 case "error":
                     OnError?.Invoke(BridgeJson.Error(e, "browser client error"));
+                    return;
+                case "speakingWhileMuted":
+                    OnSpeakingWhileMuted?.Invoke(MiniJson.GetBool(e, "speaking"));
                     return;
                 case "localSpeaking":
                     OnLocalSpeaking?.Invoke(MiniJson.GetBool(e, "speaking"));
