@@ -180,7 +180,7 @@ namespace UnityEditor
     public enum ManagedStrippingLevel { Disabled, Low, Medium, High }
     public static class BuildPipeline { public static BuildTargetGroup GetBuildTargetGroup(BuildTarget t) => BuildTargetGroup.Standalone; }
     public enum MessageType { None, Info, Warning, Error }
-    public class EditorWindow : ScriptableObject
+    public class EditorWindow : Object
     {
         public Vector2 minSize;
         public static T GetWindow<T>(string title) where T : EditorWindow, new() => new T();
