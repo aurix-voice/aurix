@@ -2423,6 +2423,19 @@ pub unsafe extern "C" fn aurix_error_retryable(code: *const c_char) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the player can do something about the error (full channel, ban, their network)
+/// rather than it being a developer-side bug — pick the audience of the UI text.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_error_player_facing(code: *const c_char) -> bool {
+    if code.is_null() {
+        return false;
+    }
+    CStr::from_ptr(code)
+        .to_str()
+        .map(aurix_common::error::AurixError::is_player_facing_code)
+        .unwrap_or(false)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_event_code(event: *const AurixEvent) -> *const c_char {
     self::event(event)

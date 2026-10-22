@@ -1849,6 +1849,12 @@ const char *aurix_error_describe(const char *code);
  */
 bool aurix_error_retryable(const char *code);
 
+/**
+ * Whether the player can do something about the error (full channel, ban, their network)
+ * rather than it being a developer-side bug — pick the audience of the UI text.
+ */
+bool aurix_error_player_facing(const char *code);
+
 const char *aurix_event_code(const struct AurixEvent *event);
 
 /**

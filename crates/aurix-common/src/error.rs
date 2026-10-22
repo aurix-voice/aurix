@@ -332,6 +332,25 @@ impl AurixError {
 
     /// Whether retrying the same request later can succeed (capacity, rate limit, node-side or
     /// transient failures). Authorization, validation and moderation outcomes are not retryable.
+    /// Whether the player can do something about it (full channel, ban, their network) as
+    /// opposed to a developer-side bug (bad token, missing grant, stale id) — pick the UI text
+    /// audience; the cookbook's error table.
+    pub fn is_player_facing_code(code: &str) -> bool {
+        matches!(
+            code,
+            "CHANNEL_FULL"
+                | "CHANNEL_LIMIT_EXCEEDED"
+                | "QUOTA_EXCEEDED"
+                | "USER_BANNED"
+                | "USER_MUTED"
+                | "MEDIA_NODE_UNAVAILABLE"
+                | "TRANSPORT_ERROR"
+                | "STUN_TURN_ERROR"
+                | "MESSAGE_BLOCKED"
+                | "USER_OFFLINE"
+        )
+    }
+
     pub fn is_retryable_code(code: &str) -> bool {
         matches!(
             code,

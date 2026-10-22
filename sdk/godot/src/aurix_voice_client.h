@@ -217,6 +217,13 @@ public:
     /// The device's network changed: a QUIC link migrates in place, a UDP link re-announces the
     /// session. `false` when not connected.
     bool network_changed();
+    /// Same as network_changed — the name the Unity/Web SDKs use.
+    bool reconnect_now();
+    /// Cookbook advice for a wire error code ("what to do"); "" for unknown codes.
+    static String describe_error(const String& code);
+    static bool is_error_retryable(const String& code);
+    /// The player can do something about it (full channel, ban, their network) vs a developer-side bug.
+    static bool is_error_player_facing(const String& code);
     String get_last_error() const;
     static String get_native_version();
 

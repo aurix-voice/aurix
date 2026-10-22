@@ -917,6 +917,11 @@ bool UAurixVoiceSubsystem::IsErrorRetryable(const FString& Code)
 	return aurix_error_retryable(ToUtf8(Code).c_str());
 }
 
+bool UAurixVoiceSubsystem::IsErrorPlayerFacing(const FString& Code)
+{
+	return aurix_error_player_facing(ToUtf8(Code).c_str());
+}
+
 // ---- lifecycle -----------------------------------------------------------------------------
 
 bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
@@ -1820,6 +1825,11 @@ EAurixMediaPath UAurixVoiceSubsystem::GetMediaPath() const
 bool UAurixVoiceSubsystem::NetworkChanged()
 {
 	return Native && Native->Client.network_changed();
+}
+
+bool UAurixVoiceSubsystem::ReconnectNow()
+{
+	return NetworkChanged();
 }
 
 FString UAurixVoiceSubsystem::GetEndpoint() const

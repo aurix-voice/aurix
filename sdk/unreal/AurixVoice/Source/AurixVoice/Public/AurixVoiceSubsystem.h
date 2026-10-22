@@ -225,6 +225,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Errors")
 	static bool IsErrorRetryable(const FString& Code);
 
+	/** Whether the player can do something about it (full channel, ban, their network) rather than it being a developer-side bug. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Errors")
+	static bool IsErrorPlayerFacing(const FString& Code);
+
 	/** Open the microphone (-1 = default device). Also called automatically when bAutoStartCapture is set. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
 	bool StartCapture(int32 DeviceIndex = -1);
@@ -564,6 +568,10 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Connection")
 	bool NetworkChanged();
+
+	/** Same as NetworkChanged — the name the Unity/Web SDKs use: drop the transport and reconnect right now. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Session")
+	bool ReconnectNow();
 
 	/** WebSocket URL of the node serving the session (the configured URL until a failover moved it). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Connection")

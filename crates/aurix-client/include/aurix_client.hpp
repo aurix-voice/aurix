@@ -60,6 +60,11 @@ inline std::string last_error() {
     return e ? std::string(e) : std::string();
 }
 
+/// Cookbook advice for a wire error code ("what to do"); empty for unknown codes.
+inline std::string describe_error(const char* code) { const char* s = aurix_error_describe(code); return s ? s : ""; }
+inline bool error_retryable(const char* code) { return aurix_error_retryable(code); }
+inline bool error_player_facing(const char* code) { return aurix_error_player_facing(code); }
+
 inline std::string version() {
     const char* v = aurix_version();
     return v ? std::string(v) : std::string();
