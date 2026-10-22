@@ -6,6 +6,8 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-10-22
+
 ### Added
 
 - `Aurix Voice ▸ Voice test window`: connect, join, roster, quality, events and a microphone level test from the editor, without Play mode (remote audio is heard in Play mode only).
