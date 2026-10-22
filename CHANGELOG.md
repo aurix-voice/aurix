@@ -12,6 +12,7 @@ released together.
 ## [Unreleased]
 
 ### Added
+- Docs: reference runs on the 1.8.1 build — a concurrency ramp 1000 → 8000 sessions on one 8 vCPU node (5000 participants at 2.68 cores, 100 % delivered, p99 8.65 ms; 8000 saturated the shared host at 82.6 %), noise suppression and mix re-measured without regression; the capacity section and the cloud sizing page quote the measured 5000-per-node figure. `--noise-suppression` runs need `media.noise_suppression.enabled = true` on the node — it is off by default and the node refuses the request otherwise.
 - Unity: the push-to-talk state machine is `Aurix.Audio.PushToTalkState` (engine-free, unit-tested: hold, toggle, release delay, reset); `AurixVoiceBehaviour` exposes `PushToTalkTransmitting` and `OnPushToTalkChanged(bool)` for UI.
 - Fixed: toggle push-to-talk in Unity and Godot could not switch off while a release delay was set — the toggled-off state re-opened the microphone on the next frame.
 - Web: `attachPushToTalk` toggle mode now runs out `releaseDelayMs` on the way off, matching Unity/Godot/Unreal; the cookbook states the shared semantics.

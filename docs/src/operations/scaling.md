@@ -257,6 +257,15 @@ frame) and by whatever the node decodes. Measured on one 8 vCPU host with the
 | server mix + noise suppression | 7.73 cores | 307 MiB | 93.6 % delivered — saturated, over the limit |
 | cascade, 2 nodes, UDP or TCP fallback | 0.25 core per node | 69–274 MiB | half the fan-out per node; the forwarding hop itself adds no measurable CPU |
 
+The same shape ramped on one node (re-run on `main` after v1.8.1, another 8 vCPU host —
+[reference runs (1.8.1)](development.md#reference-runs-181)): 1000 participants → 0.57 core /
+99 MiB, 2000 → 1.10 / 132, 3000 → 1.65 / 168, **5000 → 2.68 cores / 238 MiB, 100 % delivered,
+p99 8.65 ms** (50k frames/s in, 450k out). Node CPU is linear at ~0.55 core per 1000 forwarding
+participants with ~27 KiB of RSS per session; at 8000 the shared measurement host (node, load
+generator and databases together) saturated and delivery fell to 82.6 %, so 5000 is the measured
+per-node figure and anything above it is extrapolation until a run with the generator on a
+separate host.
+
 Rule of thumb from those runs: the per-stream path is cheap (~5–9 µs of CPU per delivered frame,
 network-bound long before CPU-bound), each denoised uplink costs ~1.5 % of a core, each mixer
 roughly one decoder per speaker plus one encoder per downlink. Keep the node's sum well below its

@@ -1209,6 +1209,11 @@ completed run, exact commands and conditions in the
 | two nodes, cascade over UDP | 100 % | 1.05 / 2.05 ms | 0.25 core / node | 274 + 69 MiB |
 | two nodes, cascade TCP fallback (inter-node UDP blocked) | 100 % | 1.25 / 2.45 ms | 0.25 core / node | 71 + 69 MiB |
 
+Ramped on the 1.8.1 build (another 8 vCPU host, same shape, UDP): 2000 participants → 1.10 cores,
+3000 → 1.65, **5000 → 2.68 cores, 238 MiB, 100 % delivered, p99 8.65 ms** (50k frames/s in,
+450k out); at 8000 the shared measurement host saturated (82.6 % delivered), so 5000 per node is
+the measured figure ([details](docs/src/operations/development.md#reference-runs-181)).
+
 ## Client SDKs
 
 | SDK | Path | Media path | Verified by |

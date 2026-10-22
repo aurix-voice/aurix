@@ -233,6 +233,47 @@ whichever receive worker seals the frame, so frames reach the wire slightly out 
 and the 64-packet anti-replay window rejected the stragglers — cascade links now use a 4096-packet
 window, and the row above is the rerun after that fix.
 
+### Reference runs (1.8.1)
+
+Same method, re-run on `main` after v1.8.1 (release build, Rust 1.98) on a different 8 vCPU VM
+(generic "Intel Xeon Processor" CPUID, 31 GiB) with the same setup: PostgreSQL 16 and Redis 7 in
+containers and the load generator on the same host, `net.core.rmem_max = wmem_max = 16 MiB`,
+`ulimit -n 65536`, `database.max_connections = 40`, otherwise `configs/default.toml`. Absolute
+CPU is not comparable 1:1 with the 1.6.0 host (different CPU); the point of this series is the
+**concurrency ramp on one node** — the shape stays at 10 members per channel with 2 speakers at
+50 pps and the number of sessions grows (`--transport udp`, synthetic 80-byte payload, 60 s):
+
+| sessions / channels | frames/s in → out | delivered | one-way p50 / p99 / max | server CPU | RSS | open fds |
+|---|---|---|---|---|---|---|
+| 1000 / 100 | 10k → 90k | 100 % | 1.55 / 3.45 / 12.3 ms | 0.57 core | 99 MiB | 1 076 |
+| 2000 / 200 | 20k → 180k | 100 % | 2.55 / 4.95 / 8.0 ms | 1.10 cores | 132 MiB | 2 071 |
+| 3000 / 300 | 30k → 270k | 100 % | 2.45 / 5.75 / 12.0 ms | 1.65 cores | 168 MiB | 3 076 |
+| 5000 / 500 | 50k → 450k | 27 000 000 / 27 000 000 (100 %) | 3.35 / 8.65 / 16.6 ms | 2.68 cores | 238 MiB | 5 074 |
+| 8000 / 800 | 80k → 720k | 35 701 443 / 43 200 000 (82.6 %) | 127.9 / 436.4 / 704.4 ms | 4.05 cores | 360 MiB | 8 075 |
+
+Setup took 3.4 s for 5000 sessions and 5.4 s for 8000, none failed. Node CPU is linear:
+~0.55 core per 1000 participants in this shape, 5.4–6.1 µs per frame in or out, ~27 KiB of RSS
+per session. The 8000 row is the **host's** limit, not the node's: the node used 4 of the 8 cores
+while the generator took 2.8 (167 CPU-seconds in 60 s) next to PostgreSQL and Redis, the kernel
+counted ~850 000 `Udp: RcvbufErrors` over the run and one-way latency went from milliseconds to
+hundreds of milliseconds — queuing on a saturated box (`uplink_dropped = 0` and
+`packets_dropped = 0` on the node). Measuring one node past 5000 needs the generator on another
+host; until then **5000 forwarding participants on 8 vCPUs with 100 % delivery and ~5 cores of
+headroom** is the measured figure, and anything above it is extrapolation.
+
+Processing on this build (1000 sessions, Opus payload, as in the 1.6.0 table):
+
+| scenario | delivered | one-way p50 / p99 / max | server CPU | RSS |
+|---|---|---|---|---|
+| `--noise-suppression` (200 denoised uplinks, 600 000 frames `outcome="ok"`) | 100 % | 8.05 / 13.55 / 60.0 ms | 3.75 cores | 154 MiB |
+| `--mix --listen-only` (100 shared + 200 private mixers, 1000 mixed downlinks) | 3 000 032 / 3 000 000 (100 %) | — | 4.93 cores | 277 MiB |
+
+Within noise of the 1.6.0 rows (3.50 / 4.97 cores) on a different CPU — no regression through
+1.7 and 1.8. One gotcha: `[media.noise_suppression] enabled` is `false` in `configs/default.toml`,
+and a node with it off *refuses* the request on every uplink — the report then shows
+`noise_suppression_refused = 200`, `noise_suppression_enabled = 0` and measures plain forwarding.
+Start the node with `AURIX__MEDIA__NOISE_SUPPRESSION__ENABLED=true` for that row.
+
 ## Soak testing
 
 `tools/soak/run.sh` keeps a two-node fleet under real clients for hours while faults are
