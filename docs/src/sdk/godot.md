@@ -82,6 +82,18 @@ func join(channel_id: String) -> void:
   channel; the fingerprint / identity-persistence API and the `E2EE_*` events are not bound to
   GDScript yet (a fresh identity per session).
 
+## Diagnostics
+
+- `participant_capture_changed(channel_id, user_id, available)` and the `capture_unavailable`
+  key of every participant dictionary: the member has no working microphone (their SDK reported
+  it); call `set_capture_available(false)` yourself when your own capture fails and `true` when
+  it recovers — the built-in `start_capture` does it for you.
+- `speaking_while_muted(speaking)`: the local VAD hears speech while muted — show "you are muted".
+- `participant_removed` / `participant_left` carry a reason (`left`, `timeout`, `kicked`,
+  `banned`, `out_of_range`, `channel_closed`, `replaced`).
+- `get_transmission()`, `get_channel_focus()`, `is_priority(channel_id)`, `get_user_id()`,
+  `is_capture_available()`, `get_input_gain()` read back what you set.
+
 ## Threading, memory, lifetime
 
 The core runs its own tokio runtime (`worker_threads`, 1 by default); the extension touches it

@@ -347,6 +347,27 @@ reconnect, `set_visemes(false)`). `aurix_client::visemes::VisemeAnalyzer` (`push
 Unreal: `SetVisemesEnabled` / `AreVisemesEnabled` / `GetParticipantVisemes` / `GetLocalVisemes`;
 Godot: `set_visemes_enabled`, `get_participant_visemes`, `get_local_visemes`.
 
+## Microphone diagnostics
+
+The core cannot see your audio device, so it takes two hints and turns them into roster state:
+
+- `aurix_client_set_capture_available(client, false)` when no device opens (none, permission
+  denied, open failed) and `true` once capture runs. The server keeps it per session, every
+  `AurixParticipant.capture_unavailable` reflects it, and `AURIX_EVENT_PARTICIPANT_CAPTURE_CHANGED`
+  (`aurix_event_flag` = available) fires on change. Re-sent after a reconnect; read back with
+  `aurix_client_is_capture_available`.
+- `AURIX_EVENT_SPEAKING_WHILE_MUTED` (`aurix_event_flag` = started / stopped): the built-in VAD
+  heard speech on frames pushed while muted — the "you are muted" hint. Nothing is transmitted.
+
+`AURIX_EVENT_PARTICIPANT_LEFT` carries the reason in `aurix_event_message` (`left`, `timeout`,
+`kicked`, `banned`, `out_of_range`, `channel_closed`, `replaced`), and
+`aurix_error_describe(code)` / `aurix_error_retryable(code)` turn a wire error code into the
+"what to do" advice from the [cookbook](cookbook.md#error-codes).
+
+For support and QA, `cargo run -p aurix-client --example voice_cli -- <ws-url> <token> [channel]`
+is the core as a console: join, mute, move, play a WAV as the microphone, record the mix, print
+every event and the stats — no engine, no audio device.
+
 ## Priority speakers and ducking
 
 In a channel with `ducking` the node attenuates the other voices you receive while a priority

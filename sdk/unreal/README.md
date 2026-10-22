@@ -334,6 +334,18 @@ with `StartCapture(Index)` disappears, capture falls back to the system default 
 change reopens the stream so the engine follows the new default (`bFellBack = false`).
 `GetCaptureDeviceName()` tells which device is open.
 
+### Microphone diagnostics
+
+`StartCapture` tells the server whether a device opened (`SetCaptureAvailable`, call it yourself
+when you feed `PushCaptureAudio`); every `FAurixParticipant.bCaptureUnavailable` and
+`OnParticipantCaptureChanged(ChannelId, UserId, bAvailable)` reflect it — draw a crossed-out mic
+instead of letting teammates wonder why someone never talks. `OnSpeakingWhileMuted(bSpeaking)`
+fires when the VAD hears speech while muted (not with `bReleaseCaptureWhenMuted`): the
+"you are muted" hint. `OnParticipantRemoved` carries `EAurixLeaveReason` (`Kicked`, `Banned`,
+`Timeout`, `OutOfRange`, `ChannelClosed`, `Replaced`, `Left`). `GetTransmission`,
+`GetChannelFocus`, `IsPriority`, `GetUserId`, `IsCaptureAvailable`, `GetInputGain` read back
+what you set.
+
 ### Errors
 
 `DescribeError(Code)` / `IsErrorRetryable(Code)` (Blueprint-pure, static) turn the `Code` of
