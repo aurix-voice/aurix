@@ -115,6 +115,20 @@ namespace Aurix.Unity
                  "Off: every frame is sent, tagged with its level, and the server decides who is speaking.")]
         public bool GateOnVad = false;
 
+        [Header("Push-to-talk")]
+        [Tooltip("Hold this key to transmit; KeyCode.None = open microphone (VAD). Works with the legacy Input Manager.")]
+        public KeyCode PushToTalkKey = KeyCode.None;
+        [Tooltip("Toggle mode: press once to start transmitting, press again to stop (instead of hold).")]
+        public bool PushToTalkToggle = false;
+        [Tooltip("Keep transmitting this long after the key is released so the last word is not cut (seconds).")]
+        [Range(0f, 1f)] public float PushToTalkReleaseDelay = 0.15f;
+#if ENABLE_INPUT_SYSTEM
+        [Tooltip("Input System action (button) for push-to-talk — keyboard, gamepad or any binding. Used when set.")]
+        public UnityEngine.InputSystem.InputActionReference PushToTalkAction;
+#endif
+        private bool _pttTransmitting;
+        private float _pttReleaseAt = -1f;
+
         [Header("Mobile")]
         [Tooltip("Ask for the microphone permission (Android RECORD_AUDIO / iOS NSMicrophoneUsageDescription) before " +
                  "capturing. Off: connect as a listener when the permission is missing and let your UI request it.")]
@@ -289,6 +303,10 @@ namespace Aurix.Unity
         }
         /// <summary>Local VAD edge (true = started speaking). Fired from the Unity main thread.</summary>
         public event Action<bool> OnLocalSpeaking;
+        /// <summary>Microphone level 0..1 (RMS of the last captured frame, after input gain), ~every 20 ms; for input meters.</summary>
+        public event Action<float> OnInputLevel;
+        /// <summary>Last microphone level 0..1 (RMS of the most recent captured frame). Poll it from UI code.</summary>
+        public float InputLevel { get; private set; }
         /// <summary>
         /// Speech detected while muted (true = started, false = stopped or unmuted): show "you are muted".
         /// Not raised while the microphone is released (<see cref="ReleaseMicrophoneWhenMuted"/>).
@@ -727,8 +745,62 @@ namespace Aurix.Unity
             }
         }
 
+        private bool PushToTalkConfigured
+        {
+            get
+            {
+#if ENABLE_INPUT_SYSTEM
+                if (PushToTalkAction != null && PushToTalkAction.action != null) return true;
+#endif
+                return PushToTalkKey != KeyCode.None;
+            }
+        }
+
+        private bool PushToTalkPressedNow()
+        {
+#if ENABLE_INPUT_SYSTEM
+            if (PushToTalkAction != null && PushToTalkAction.action != null)
+            {
+                var a = PushToTalkAction.action;
+                if (!a.enabled) a.Enable();
+                return PushToTalkToggle ? a.WasPressedThisFrame() : a.IsPressed();
+            }
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER || !ENABLE_INPUT_SYSTEM
+            if (PushToTalkKey != KeyCode.None)
+                return PushToTalkToggle ? Input.GetKeyDown(PushToTalkKey) : Input.GetKey(PushToTalkKey);
+#endif
+            return false;
+        }
+
+        /// <summary>
+        /// Push-to-talk: while configured, the microphone is muted unless the key/action is held
+        /// (or toggled on). Drives <see cref="SetMuted"/>, so the server, the roster flags and
+        /// <see cref="IAurixVoiceClient.IsMuted"/> all agree; release delay avoids clipping the last word.
+        /// </summary>
+        private void UpdatePushToTalk()
+        {
+            if (!PushToTalkConfigured || Client == null) return;
+            bool pressed = PushToTalkPressedNow();
+            bool want = _pttTransmitting;
+            if (PushToTalkToggle) { if (pressed) want = !want; }
+            else want = pressed;
+            float now = Time.unscaledTime;
+            if (want)
+            {
+                _pttReleaseAt = -1f;
+                if (!_pttTransmitting) { _pttTransmitting = true; if (Client.IsMuted) SetMuted(false); }
+            }
+            else if (_pttTransmitting)
+            {
+                if (_pttReleaseAt < 0f) _pttReleaseAt = now + PushToTalkReleaseDelay;
+                if (now >= _pttReleaseAt) { _pttTransmitting = false; _pttReleaseAt = -1f; if (!Client.IsMuted) SetMuted(true); }
+            }
+        }
+
         private void Update()
         {
+            UpdatePushToTalk();
             Client?.Update();
             _outputRate = AudioSettings.outputSampleRate;
             var mixer = _mixer;
@@ -874,6 +946,8 @@ namespace Aurix.Unity
         {
             Vad.Threshold = VadThreshold;
             Vad.HangoverFrames = VadHangoverFrames;
+            InputLevel = Mathf.Clamp01(AudioLevel.Rms(_mono, AudioFormat.FrameSamples) * 4f);
+            OnInputLevel?.Invoke(InputLevel);
             if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
             TrackSpeakingWhileMuted();
             if (GateOnVad && !Vad.Speaking)
@@ -905,6 +979,8 @@ namespace Aurix.Unity
             for (int i = 0; i < AudioFormat.FrameSamples; i++) _mono[i] = (_stereo[i * 2] + _stereo[i * 2 + 1]) * 0.5f;
             Vad.Threshold = VadThreshold;
             Vad.HangoverFrames = VadHangoverFrames;
+            InputLevel = Mathf.Clamp01(AudioLevel.Rms(_mono, AudioFormat.FrameSamples) * 4f);
+            OnInputLevel?.Invoke(InputLevel);
             if (Vad.Process(_mono, AudioFormat.FrameSamples)) OnLocalSpeaking?.Invoke(Vad.Speaking);
             TrackSpeakingWhileMuted();
             if (GateOnVad && !Vad.Speaking)
