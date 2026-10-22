@@ -35,6 +35,7 @@
 # Client SDKs
 
 - [Overview](sdk/overview.md)
+- [Support matrix](sdk/support-matrix.md)
 - [Web SDK](sdk/web.md)
 - [SDK cookbook: tokens, join order, naming, bandwidth, errors](sdk/cookbook.md)
 - [Unity SDK](sdk/unity.md)

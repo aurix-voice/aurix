@@ -43,6 +43,8 @@ the same C ABI from a native plugin. The other half of every integration — the
 that mints the tokens these clients connect with — has its own typed SDKs (Node, Python, Go,
 C#), reference token servers and the `aurix` CLI: [Game backend](../backend/server-sdks.md).
 
+Platforms, engine and runtime versions and what each release ships per SDK: [Support matrix](support-matrix.md).
+
 ## Common lifecycle
 
 1. Backend mints a token (`POST /v1/tokens` or `POST /v1/tokens/action`) and hands it to the
