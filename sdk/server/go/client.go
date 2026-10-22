@@ -21,7 +21,7 @@ import (
 )
 
 // SDKVersion is reported in the User-Agent header.
-const SDKVersion = "1.8.1"
+const SDKVersion = "1.8.2"
 
 // Credentials selects how requests authenticate. Set exactly one field; precedence when several
 // are set: APIKey, AdminToken, PlayerToken, BootstrapToken.
