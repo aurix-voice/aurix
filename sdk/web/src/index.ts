@@ -297,3 +297,5 @@ export type {
   RegionsResponse,
 } from './regions.js';
 export { describeError, isErrorPlayerFacing, isErrorRetryable } from './errors.js';
+export { attachPushToTalk } from './push_to_talk.js';
+export type { PushToTalkOptions } from './push_to_talk.js';

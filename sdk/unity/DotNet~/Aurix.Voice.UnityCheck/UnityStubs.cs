@@ -67,13 +67,14 @@ namespace UnityEngine
     public static class Time { public static float deltaTime; public static float unscaledTime; public static float unscaledDeltaTime; public static float realtimeSinceStartup; }
     public static class Mathf
     {
+        public static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
         public static int Clamp(int v, int min, int max) => Math.Min(Math.Max(v, min), max);
         public static int RoundToInt(float f) => (int)Math.Round(f);
         public static float Max(float a, float b) => Math.Max(a, b);
     }
     public static class Screen { public static int width => 1280; public static int height => 720; }
     public enum KeyCode { None, Return, V }
-    public static class Input { public static bool GetKey(KeyCode k) => false; }
+    public static class Input { public static bool GetKey(KeyCode k) => false; public static bool GetKeyDown(KeyCode k) => false; }
     public struct Rect { public Rect(float x, float y, float w, float h) { } }
     public struct Vector2 { }
     public enum EventType { KeyDown }

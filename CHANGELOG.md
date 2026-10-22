@@ -11,6 +11,10 @@ released together.
 
 ## [Unreleased]
 
+### Added
+
+- Push-to-talk out of the box: Unity `AurixVoiceBehaviour.PushToTalkKey` / Input System `PushToTalkAction` (hold or toggle, release delay), Godot `push_to_talk_action` (InputMap), Web `attachPushToTalk(client, { keys, toggle, releaseDelayMs })` with `press()` for gamepads. Input level meters: core `capture_level/capture_energy` (C ABI, C++), Unreal `GetInputLevel/GetInputEnergy`, Godot `get_input_level`, Unity `InputLevel` + `OnInputLevel`.
+
 ### Fixed
 
 - Web and Node SDK `package.json` carry `repository` (url + directory) — npm provenance verification requires it; `release.yml` gained a manual `npm_publish` dispatch to re-publish an already released version.
