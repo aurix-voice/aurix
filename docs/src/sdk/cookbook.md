@@ -93,6 +93,10 @@ the last word from being clipped. The meter is `0..1` from the last captured fra
 | Web | `attachPushToTalk(client, { keys: ["KeyV"], toggle: false, releaseDelayMs: 150 })` → `.press(bool)` for gamepad/on-screen buttons, `.dispose()` | `localVoiceActivity` level events |
 | Native (C/C++) | `aurix_client_set_muted` from your input layer | `aurix_client_capture_level` (0 = loudest, 127 = silence) / `aurix_client_capture_energy` |
 
+Same semantics everywhere: *hold* mirrors the key; *toggle* latches on the press edge; in both
+modes the microphone stays open for the release delay (default 150 ms) after the key is released
+or toggled off, so the last syllable is not clipped. Toggle + release delay 0 closes instantly.
+
 Open microphone instead: leave PTT unset and use the VAD gate (`GateOnVad` / `SetVadGate` /
 `set_vad_gate_enabled`) so silence is not sent.
 

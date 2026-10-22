@@ -83,17 +83,26 @@ test('other keys are ignored; any of several bound keys transmits', () => {
   ptt.dispose();
 });
 
-test('toggle mode flips on each press and ignores keyup', () => {
+test('toggle mode flips on each press, ignores keyup and honours the release delay on the way off', async () => {
   const client = fakeClient();
   const target = new FakeTarget();
-  const ptt = attachPushToTalk(client, { keys: ['KeyV'], target, toggle: true });
+  const ptt = attachPushToTalk(client, { keys: ['KeyV'], target, toggle: true, releaseDelayMs: 20 });
   target.emit('keydown', { code: 'KeyV' });
   target.emit('keyup', { code: 'KeyV' });
   assert.equal(ptt.transmitting, true);
   assert.equal(client.muted, false);
   target.emit('keydown', { code: 'KeyV' });
+  target.emit('keyup', { code: 'KeyV' });
+  assert.equal(ptt.transmitting, true, 'still open inside the release delay');
+  await sleep(40);
   assert.equal(ptt.transmitting, false);
   assert.equal(client.muted, true);
+  target.emit('keydown', { code: 'KeyV' });
+  target.emit('keyup', { code: 'KeyV' });
+  target.emit('keydown', { code: 'KeyV' });
+  await sleep(40);
+  assert.equal(ptt.transmitting, false, 'toggle on then off again inside the delay ends closed');
+  assert.deepEqual(client.calls, [true, false, true, false, true], 'attach mutes, then open/close twice');
   ptt.dispose();
 });
 
@@ -139,7 +148,7 @@ test('press(bool) drives hold mode for gamepads and on-screen buttons', async ()
 
 test('press(true) in toggle mode flips; press(false) is ignored', () => {
   const client = fakeClient();
-  const ptt = attachPushToTalk(client, { keys: [], target: new FakeTarget(), toggle: true });
+  const ptt = attachPushToTalk(client, { keys: [], target: new FakeTarget(), toggle: true, releaseDelayMs: 0 });
   ptt.press(true);
   ptt.press(false);
   assert.equal(ptt.transmitting, true);

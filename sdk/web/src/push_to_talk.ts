@@ -49,34 +49,47 @@ export function attachPushToTalk(client: MuteControl, opts: PushToTalkOptions) {
     if (client.isMuted() === on) client.setMuted(!on);
     opts.onChange?.(on);
   };
+  // Toggle latches on the press edge; hold mirrors the key. The latch is separate from
+  // `transmitting` so a toggle-off runs out the release delay like the engine SDKs do.
+  let latched = false;
   const scheduleStop = () => {
     if (releaseTimer) clearTimeout(releaseTimer);
     releaseTimer = setTimeout(() => {
       releaseTimer = null;
-      if (held.size === 0) set(false);
+      if (!latched && (toggle || held.size === 0)) set(false);
     }, releaseDelay);
   };
+  const open = () => {
+    latched = true;
+    if (releaseTimer) {
+      clearTimeout(releaseTimer);
+      releaseTimer = null;
+    }
+    set(true);
+  };
+  const close = () => {
+    latched = false;
+    if (releaseDelay <= 0) set(false);
+    else scheduleStop();
+  };
+  const flip = () => (latched ? close() : open());
   const onDown = (e: Event) => {
     const ev = e as KeyboardEvent;
     if (!keys.has(ev.code) || (ignoreTyping && typing(ev))) return;
     if (ev.repeat) return;
     held.add(ev.code);
-    if (releaseTimer) {
-      clearTimeout(releaseTimer);
-      releaseTimer = null;
-    }
-    if (toggle) set(!transmitting);
-    else set(true);
+    if (toggle) flip();
+    else open();
   };
   const onUp = (e: Event) => {
     const ev = e as KeyboardEvent;
     if (!keys.has(ev.code)) return;
     held.delete(ev.code);
-    if (!toggle && held.size === 0) scheduleStop();
+    if (!toggle && held.size === 0) close();
   };
   const onBlur = () => {
     held.clear();
-    if (!toggle) scheduleStop();
+    if (!toggle) close();
   };
 
   if (!client.isMuted()) client.setMuted(true);
@@ -91,14 +104,9 @@ export function attachPushToTalk(client: MuteControl, opts: PushToTalkOptions) {
     /** Programmatic press/release — wire a gamepad button or an on-screen button to it. */
     press(down: boolean) {
       if (toggle) {
-        if (down) set(!transmitting);
-      } else if (down) {
-        if (releaseTimer) {
-          clearTimeout(releaseTimer);
-          releaseTimer = null;
-        }
-        set(true);
-      } else scheduleStop();
+        if (down) flip();
+      } else if (down) open();
+      else close();
     },
     dispose() {
       target?.removeEventListener('keydown', onDown);
