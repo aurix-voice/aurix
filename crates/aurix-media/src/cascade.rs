@@ -135,6 +135,7 @@ pub struct CascadeRelay {
     allowed_peers: Arc<DashMap<SocketAddr, Mutex<WideReplayWindow>>>,
     /// Peers from static configuration; never removed by discovery.
     static_peers: HashSet<SocketAddr>,
+    dropped_sources: Mutex<std::collections::HashMap<SocketAddr, Instant>>,
     /// Peers currently known through discovery (healthy nodes from the registry).
     dynamic_peers: Mutex<HashSet<SocketAddr>>,
     socket: Arc<MediaSocket>,
@@ -239,6 +240,7 @@ impl CascadeRelay {
             routes_by_hash: Arc::new(DashMap::new()),
             allowed_peers,
             static_peers,
+            dropped_sources: Mutex::new(std::collections::HashMap::new()),
             dynamic_peers: Mutex::new(HashSet::new()),
             socket,
             local_addr,
@@ -810,7 +812,7 @@ impl CascadeRelay {
                             }
                             Err(e) => {
                                 aurix_metrics::PACKETS_DROPPED.inc();
-                                debug!("Dropping cascade packet from {}: {}", src, e);
+                                self.note_dropped_source(src, &e);
                             }
                         }
                     }
@@ -824,6 +826,36 @@ impl CascadeRelay {
     }
 
     /// Ping every allowed peer each probe interval; open (and later close) TCP fallback links.
+    /// Unknown-source drops are the usual symptom of a NAT between peers (hairpin on a single
+    /// host, a proxy rewriting the source): surface them once a minute per source at WARN, the
+    /// rest stays at DEBUG so a flood cannot fill the log.
+    fn note_dropped_source(&self, src: SocketAddr, err: &AurixError) {
+        let unknown = !self.allowed_peers.contains_key(&src);
+        if unknown {
+            let now = Instant::now();
+            let mut last = self.dropped_sources.lock();
+            let warn = match last.get(&src) {
+                Some(t) if now.duration_since(*t) < Duration::from_secs(60) => false,
+                _ => {
+                    if last.len() >= 256 {
+                        last.clear();
+                    }
+                    last.insert(src, now);
+                    true
+                }
+            };
+            if warn {
+                warn!(
+                    "Dropping cascade packets from {src}: not an allowed peer. If this is another node of \
+                     the cell, its advertised address does not match what arrives here (NAT/hairpin or a \
+                     proxy rewriting the source); on one host use media.cascade_peers with container IPs."
+                );
+                return;
+            }
+        }
+        debug!("Dropping cascade packet from {}: {}", src, err);
+    }
+
     async fn run_prober(self: Arc<Self>) {
         let interval = self.options.probe_interval;
         let max_age = self.link_max_age();

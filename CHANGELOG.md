@@ -16,6 +16,7 @@ released together.
 
 ### Fixed
 
+- Cascade: packets from a source that is not an allowed peer are now reported at WARN once a minute per source with a NAT/hairpin hint (they were dropped silently at DEBUG), so a misrouted node is visible in the log.
 - `server.external_ws_url` given as a bare host (`wss://voice.example.com`) is advertised with the `/ws` path, so clients that connect to exactly the advertised URL no longer hit 404.
 
 - Godot: `regions_discovery_url` / `rank_regions` statics (region discovery parity with the C ABI); Node token-server example gains an Aurix Cloud mode (`AURIX_CLOUD_URL/PROJECT/TOKEN` → `POST /v1/projects/{id}/tokens`, region or coordinates hint).
