@@ -85,6 +85,7 @@ bool AurixVoiceClient::get_tls_tunnel_enabled() const { return config_.tls_tunne
 void AurixVoiceClient::set_device_id(const String& device_id) { device_id_ = device_id; }
 String AurixVoiceClient::get_device_id() const { return device_id_; }
 void AurixVoiceClient::set_auto_capture(bool enabled) { auto_capture_ = enabled; }
+bool AurixVoiceClient::is_push_to_talk_transmitting() const { return ptt_transmitting_; }
 void AurixVoiceClient::set_stop_microphone_in_background(bool enabled) { stop_microphone_in_background_ = enabled; }
 bool AurixVoiceClient::get_stop_microphone_in_background() const { return stop_microphone_in_background_; }
 void AurixVoiceClient::set_probe_after_background_seconds(double seconds) { probe_after_background_seconds_ = std::max(0.0, seconds); }
@@ -574,7 +575,9 @@ void AurixVoiceClient::update_push_to_talk(double delta) {
     if (push_to_talk_action_ == StringName()) return;
     if (!client_) {
         // Disconnected: forget the latch so a reconnect starts muted unless the key is down again.
+        const bool was = ptt_transmitting_;
         ptt_transmitting_ = false; ptt_latched_ = false; ptt_release_at_ = -1.0;
+        if (was) emit_signal("push_to_talk_changed", false);
         return;
     }
     Input* input = Input::get_singleton();
@@ -587,10 +590,10 @@ void AurixVoiceClient::update_push_to_talk(double delta) {
     const bool want = ptt_latched_;
     if (want) {
         ptt_release_at_ = -1.0;
-        if (!ptt_transmitting_) { ptt_transmitting_ = true; if (is_muted()) set_muted(false); }
+        if (!ptt_transmitting_) { ptt_transmitting_ = true; if (is_muted()) set_muted(false); emit_signal("push_to_talk_changed", true); }
     } else if (ptt_transmitting_) {
         if (ptt_release_at_ < 0.0) ptt_release_at_ = ptt_clock_ + push_to_talk_release_delay_;
-        if (ptt_clock_ >= ptt_release_at_) { ptt_transmitting_ = false; ptt_release_at_ = -1.0; if (!is_muted()) set_muted(true); }
+        if (ptt_clock_ >= ptt_release_at_) { ptt_transmitting_ = false; ptt_release_at_ = -1.0; if (!is_muted()) set_muted(true); emit_signal("push_to_talk_changed", false); }
     }
 }
 void AurixVoiceClient::set_input_gain(double gain) {
@@ -1462,6 +1465,7 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_device_id", "device_id"), &AurixVoiceClient::set_device_id);
     ClassDB::bind_method(D_METHOD("get_device_id"), &AurixVoiceClient::get_device_id);
     ClassDB::bind_method(D_METHOD("set_auto_capture", "enabled"), &AurixVoiceClient::set_auto_capture);
+    ClassDB::bind_method(D_METHOD("is_push_to_talk_transmitting"), &AurixVoiceClient::is_push_to_talk_transmitting);
     ClassDB::bind_method(D_METHOD("set_stop_microphone_in_background", "enabled"), &AurixVoiceClient::set_stop_microphone_in_background);
     ClassDB::bind_method(D_METHOD("get_stop_microphone_in_background"), &AurixVoiceClient::get_stop_microphone_in_background);
     ClassDB::bind_method(D_METHOD("set_probe_after_background_seconds", "seconds"), &AurixVoiceClient::set_probe_after_background_seconds);
@@ -1660,6 +1664,7 @@ void AurixVoiceClient::_bind_methods() {
                           PropertyInfo(Variant::DICTIONARY, "ducking")));
     ADD_SIGNAL(MethodInfo("channel_energy", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::DICTIONARY, "levels")));
     ADD_SIGNAL(MethodInfo("local_speaking", PropertyInfo(Variant::BOOL, "speaking")));
+    ADD_SIGNAL(MethodInfo("push_to_talk_changed", PropertyInfo(Variant::BOOL, "transmitting")));
     ADD_SIGNAL(MethodInfo("audio_injection_changed", PropertyInfo(Variant::BOOL, "active")));
     ADD_SIGNAL(MethodInfo("speaking_while_muted", PropertyInfo(Variant::BOOL, "speaking")));
     ADD_SIGNAL(MethodInfo("participant_capture_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),

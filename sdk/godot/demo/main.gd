@@ -18,6 +18,8 @@ extends Control
 @onready var join_button: Button = %JoinButton
 @onready var mute_button: CheckButton = %MuteButton
 @onready var spatial_button: CheckButton = %SpatialButton
+@onready var ptt_button: CheckButton = %PttButton
+@onready var input_level: ProgressBar = %InputLevel
 
 var _joined_channel := ""
 var _players: Dictionary = {}  # user_id → AurixParticipantPlayer
@@ -53,9 +55,30 @@ func _ready() -> void:
 	join_button.pressed.connect(_on_join_pressed)
 	mute_button.toggled.connect(func(on: bool) -> void: voice.set_muted(on))
 	spatial_button.toggled.connect(_on_spatial_toggled)
+	_ensure_ptt_action()
+	ptt_button.toggled.connect(func(on: bool) -> void:
+		voice.push_to_talk_action = &"voice_ptt" if on else &""
+		mute_button.disabled = on
+		if not on: voice.set_muted(mute_button.button_pressed))
+	voice.push_to_talk_changed.connect(func(transmitting: bool) -> void: ptt_button.text = "PTT (on air)" if transmitting else "PTT (hold Space / pad X)")
 	%SendButton.pressed.connect(_on_send_pressed)
 	%ChatInput.text_submitted.connect(func(_t: String) -> void: _on_send_pressed())
 	_on_state(voice.get_connection_state())
+
+func _process(_delta: float) -> void:
+	input_level.value = voice.get_input_level()
+
+# The demo registers its own binding; a game would ship "voice_ptt" in Project Settings → Input Map.
+func _ensure_ptt_action() -> void:
+	if InputMap.has_action(&"voice_ptt"):
+		return
+	InputMap.add_action(&"voice_ptt")
+	var key := InputEventKey.new()
+	key.physical_keycode = KEY_SPACE
+	InputMap.action_add_event(&"voice_ptt", key)
+	var pad := InputEventJoypadButton.new()
+	pad.button_index = JOY_BUTTON_X
+	InputMap.action_add_event(&"voice_ptt", pad)
 
 func _on_connect_pressed() -> void:
 	if voice.is_client_created():

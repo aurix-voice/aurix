@@ -192,6 +192,8 @@ public:
     /// Mobile lifecycle (APPLICATION_PAUSED/RESUMED, window focus on desktop): drop the microphone
     /// while suspended and, back in the foreground after this many seconds, probe the connection so
     /// a socket the OS silently killed is replaced now rather than after the ping timeout.
+    /// True while push-to-talk holds the microphone open (also emitted as `push_to_talk_changed`).
+    bool is_push_to_talk_transmitting() const;
     void set_stop_microphone_in_background(bool enabled);
     bool get_stop_microphone_in_background() const;
     void set_probe_after_background_seconds(double seconds);

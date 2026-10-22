@@ -115,6 +115,10 @@ default 0.15). With an action set the node mutes itself until the action is pres
 captured frame, independent of mute) and `get_input_energy()` feed a microphone meter from
 `_process`.
 
+`is_push_to_talk_transmitting()` and the `push_to_talk_changed(transmitting)` signal drive an
+on-air indicator; `get_input_level()` (0..1) feeds a `ProgressBar`. The demo scene wires both
+(`PttButton`, `InputLevel`).
+
 ## Audio injection
 
 `inject_audio(pcm: PackedFloat32Array, sample_rate_hz, channels, loop = false, gain = 1.0,
