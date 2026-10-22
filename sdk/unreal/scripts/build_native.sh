@@ -27,7 +27,7 @@ if [ -z "$TARGET" ]; then
 fi
 
 case "$TARGET" in
-  *-linux-*)
+  *-unknown-linux-*)
     UE_PLATFORM="Linux"
     ARTIFACTS=("libaurix_client.so")
     # Rust sets no SONAME; without it the packaged game would DT_NEED the absolute build path.
