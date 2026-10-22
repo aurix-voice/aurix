@@ -138,7 +138,7 @@ function renderRoster() {
       const li = document.createElement('li');
       li.className = (p.speaking ? 'speaking ' : '') + (p.muted || p.serverMuted ? 'muted' : '');
       li.textContent = `${p.displayName} (${p.userId.slice(0, 8)}) ${p.role !== 'unknown' ? p.role : ''}` +
-        `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.speaking ? ' 🔊' : ''}` +
+        `${p.muted ? ' [muted]' : ''}${p.serverMuted ? ' [server-muted]' : ''}${p.captureUnavailable ? ' [no mic]' : ''}${p.speaking ? ' 🔊' : ''}` +
         `${client.isUserBlocked(p.userId) ? ' [blocked]' : ''}` +
         `${client.getParticipantStream(p.userId) ? (client.isParticipantSpatialized(p.userId) ? ' [own track, HRTF]' : ' [own track]') : ''}`;
       const meter = document.createElement('span');
@@ -295,7 +295,9 @@ $('connect').onclick = async () => {
   client.on('transmissionChanged', (mode) => { log('transmission', mode); renderChannels(); });
   client.on('channelFocusChanged', (ch) => { log('focus', ch ?? 'none'); renderChannels(); });
   client.on('participantJoined', (ch, p) => { log('+', p.displayName); renderRoster(); });
-  client.on('participantLeft', (ch, u) => { log('-', u); renderRoster(); });
+  client.on('participantLeft', (ch, u, reason) => { if (reason !== 'out_of_range') log('-', u, reason); renderRoster(); });
+  client.on('participantCaptureChanged', (ch, p, available) => { log(p.displayName, available ? 'has a microphone again' : 'has no microphone'); renderRoster(); });
+  client.on('speakingWhileMuted', (on) => { $('micvad').textContent = on ? '🔇 you are muted' : ''; });
   client.on('participantUpdated', renderRoster);
   client.on('energy', (ch, levels) => {
     for (const l of levels) {

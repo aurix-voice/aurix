@@ -1017,6 +1017,7 @@ void AurixVoiceClient::dispatch(const aurix::Event& ev) {
     }
     case AURIX_EVENT_PARTICIPANT_LEFT:
         emit_signal("participant_left", channel, user);
+        emit_signal("participant_removed", channel, user, gstr(ev.message()));
         break;
     case AURIX_EVENT_PARTICIPANT_MUTE_CHANGED:
         emit_signal("participant_mute_changed", channel, user, ev.flag(), ev.flag2());
@@ -1387,6 +1388,8 @@ void AurixVoiceClient::_bind_methods() {
     ADD_SIGNAL(MethodInfo("channel_left", PropertyInfo(Variant::STRING, "channel_id")));
     ADD_SIGNAL(MethodInfo("participant_joined", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::DICTIONARY, "participant")));
     ADD_SIGNAL(MethodInfo("participant_left", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id")));
+    ADD_SIGNAL(MethodInfo("participant_removed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
+                          PropertyInfo(Variant::STRING, "reason")));
     ADD_SIGNAL(MethodInfo("participant_mute_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
                           PropertyInfo(Variant::BOOL, "muted"), PropertyInfo(Variant::BOOL, "server_muted")));
     ADD_SIGNAL(MethodInfo("participant_speaking", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
