@@ -343,6 +343,59 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  unreal-fab:
+    # Engine-compiled plugin (what Fab / an installed-engine project consumes). Needs the Epic-linked
+    # GHCR account for the UE container; without it the job records a notice and produces nothing.
+    name: Unreal BuildPlugin (Linux, -Rocket) → Fab package
+    needs: [verify, native, native-mobile]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      UE_IMAGE: ${{ vars.UE_CONTAINER_IMAGE || 'ghcr.io/epicgames/unreal-engine:dev-slim-5.3.2' }}
+      HAS_UE_ACCESS: ${{ secrets.UE_GHCR_TOKEN != '' && secrets.UE_GHCR_USER != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: env.HAS_UE_ACCESS == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-lib-*
+          path: libs
+      - name: Stage ThirdParty (Linux + Android; the container compiles Linux)
+        if: env.HAS_UE_ACCESS == 'true'
+        run: |
+          set -euo pipefail
+          tp=sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary
+          mkdir -p "$tp/lib/Linux" "$tp/lib/Android" "$tp/include"
+          cp libs/native-lib-x86_64-unknown-linux-gnu/libaurix_client.so "$tp/lib/Linux/"
+          cp -R libs/native-lib-android/. "$tp/lib/Android/"
+          cp crates/aurix-client/include/aurix_client.h crates/aurix-client/include/aurix_client.hpp "$tp/include/"
+      - if: env.HAS_UE_ACCESS == 'true'
+        run: echo "${{ secrets.UE_GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.UE_GHCR_USER }}" --password-stdin
+      - name: RunUAT BuildPlugin
+        if: env.HAS_UE_ACCESS == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p out/AurixVoice && chmod 777 out/AurixVoice
+          docker run --rm \
+            -v "$PWD/sdk/unreal/AurixVoice:/plugin" \
+            -v "$PWD/out/AurixVoice:/package" \
+            "$UE_IMAGE" \
+            /home/ue4/UnrealEngine/Engine/Build/BatchFiles/RunUAT.sh BuildPlugin \
+              -Plugin=/plugin/AurixVoice.uplugin -Package=/package \
+              -TargetPlatforms=Linux -Rocket -StrictIncludes
+          test -f out/AurixVoice/AurixVoice.uplugin
+          mkdir -p dist
+          (cd out && zip -qr "../dist/AurixVoice-unreal-${VERSION}-packaged-Linux.zip" AurixVoice -x '*/Intermediate/*')
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_UE_ACCESS == 'true'
+        with:
+          name: dist-unreal-fab
+          path: dist/*.zip
+          if-no-files-found: error
+      - if: env.HAS_UE_ACCESS != 'true'
+        run: echo "::notice title=Unreal BuildPlugin skipped::UE_GHCR_TOKEN/UE_GHCR_USER are not set; the release ships the source plugin zip only (compiled by the consumer's engine)."
+
   godot-bin:
     name: Godot GDExtension (${{ matrix.name }})
     needs: verify
@@ -703,7 +756,7 @@ jobs:
 
   publish:
     name: checksums, SBOM, signatures, GitHub release
-    needs: [verify, server, native, native-mobile, sdks, unreal-plugin, godot-addon, image-manifest, dashboard-image]
+    needs: [verify, server, native, native-mobile, sdks, unreal-plugin, unreal-fab, godot-addon, image-manifest, dashboard-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -713,6 +766,8 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       # Generated before the built artifacts are downloaded so the scan sees the source tree only.
       - name: Source SBOM (CycloneDX; Cargo.lock, package-lock.json, pyproject, go.mod, csproj)
         uses: anchore/sbom-action@v0
@@ -728,6 +783,35 @@ jobs:
           path: staged
           merge-multiple: true
       - run: mv "aurix-${VERSION}.source.cdx.json" staged/
+      - uses: actions/setup-node@v4
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Publish @aurix/web-sdk to npm (with provenance; skipped without NPM_TOKEN)
+        if: needs.verify.outputs.publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::notice title=npm publish skipped::NPM_TOKEN is not set; aurix-web-sdk-${VERSION}.tgz is attached to the release instead."
+            exit 0
+          fi
+          tag=latest; case "$VERSION" in *-*) tag=next ;; esac
+          npm publish "staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"
+      - name: Unity package branch for OpenUPM (upm = sdk/unity subtree, tag upm/v<version>)
+        if: needs.verify.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --unshallow 2>/dev/null || true
+          sha=$(git subtree split --prefix sdk/unity HEAD)
+          git push --force origin "$sha:refs/heads/upm"
+          git tag -f "upm/v${VERSION}" "$sha"
+          git push --force origin "refs/tags/upm/v${VERSION}"
+          echo "::notice title=Unity::upm branch + tag upm/v${VERSION} pushed; OpenUPM picks it up once com.aurix.voice is registered (gitTagPrefix upm/v)."
       - name: SHA256SUMS
         working-directory: staged
         run: |

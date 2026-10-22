@@ -28,6 +28,8 @@ sdk/unity/
 ## Install
 
 1. *Window ▸ Package Manager ▸ + ▸ Add package from git URL…* →
+   `https://github.com/aurix-voice/aurix.git#upm/v<version>` (the `upm` branch is the package alone,
+   pushed by every release; OpenUPM serves the same branch as `com.aurix.voice` once registered), or
    `https://github.com/aurix-voice/aurix.git?path=sdk/unity#<tag-or-commit>` (the same string works
    as a dependency in `Packages/manifest.json`; pin the tag/commit of the server you deploy), or
    *Add package from disk…* → `sdk/unity/package.json` of a checkout.

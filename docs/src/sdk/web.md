@@ -8,6 +8,12 @@ downlink. ES2020 module with type declarations and no runtime dependencies. Sour
 reference: `sdk/web/README.md`; a complete demo page lives in `sdk/web/demo`.
 
 ```bash
+npm install @aurix/web-sdk     # published by every release (tarball also attached to the GitHub release)
+```
+
+From source:
+
+```bash
 cd sdk/web
 npm install && npm run build   # -> dist/
 npm run demo                   # http://localhost:5173/
