@@ -2525,6 +2525,44 @@ mod tests {
 
     /// Wire shape shared with the Web/Unity SDKs: `{"mode":"single","channel_id":…}`.
     #[test]
+    fn capture_state_wire_shape_and_brief_default() {
+        let set = serde_json::to_string(&ControlMessage::SetCaptureAvailable { available: false })
+            .unwrap();
+        assert_eq!(
+            set,
+            r#"{"type":"SetCaptureAvailable","data":{"available":false}}"#
+        );
+        let changed: ControlMessage = serde_json::from_str(
+            r#"{"type":"CaptureStateChanged","data":{"channel_id":"00000000-0000-0000-0000-000000000001","user_id":"00000000-0000-0000-0000-000000000002","available":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            changed,
+            ControlMessage::CaptureStateChanged {
+                available: true,
+                ..
+            }
+        ));
+
+        // Briefs from older nodes carry no flag → false; false is not written on the wire.
+        let brief: ParticipantBrief = serde_json::from_str(
+            r#"{"user_id":"00000000-0000-0000-0000-000000000002","display_name":"a","ssrc":7,"role":"speaker","is_muted":false,"is_speaking":false}"#,
+        )
+        .unwrap();
+        assert!(!brief.capture_unavailable);
+        let json = serde_json::to_value(&brief).unwrap();
+        assert!(json.get("capture_unavailable").is_none());
+        let flagged = ParticipantBrief {
+            capture_unavailable: true,
+            ..brief
+        };
+        assert_eq!(
+            serde_json::to_value(&flagged).unwrap()["capture_unavailable"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn transmission_mode_wire_shape() {
         let ch = ChannelId(uuid::Uuid::nil());
         let single = serde_json::to_string(&ControlMessage::SetTransmission {
