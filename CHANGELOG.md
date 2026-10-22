@@ -11,6 +11,8 @@ released together.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-22
+
 ### Added
 
 - Release publishes `@aurix/web-sdk` to npm through OIDC trusted publishing (no token in the repository, provenance attached), pushes the Unity package as the `upm` branch + `upm/v<version>` tag for OpenUPM / git-URL installs, and — with the Epic-linked container access — attaches an engine-compiled Unreal plugin (`RunUAT BuildPlugin -Rocket`, Linux) next to the source zip.
