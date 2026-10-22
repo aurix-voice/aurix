@@ -17002,23 +17002,34 @@ async fn admin_jwt_with_x_aurix_app_acts_as_the_application() {
             |m| matches!(m, ControlMessage::Kick { reason, .. } if reason == "delegated kick"),
         )
         .await;
-    let (status, audit) = delegated(
-        &http,
-        &env,
-        reqwest::Method::GET,
-        "/v1/audit-log?per_page=50",
-        &moderator,
-        &app_a,
-        None,
-    )
-    .await;
-    assert_eq!(status, 200, "{audit}");
-    let kick = audit
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["action"] == "user_kicked" && e["target_id"] == uid_a)
-        .unwrap_or_else(|| panic!("kick must be audited: {audit}"));
+    // The audit row is written after the kick is delivered; poll briefly instead of racing it.
+    let mut audit = serde_json::Value::Null;
+    let mut kick = None;
+    for _ in 0..30 {
+        let (status, body) = delegated(
+            &http,
+            &env,
+            reqwest::Method::GET,
+            "/v1/audit-log?per_page=50",
+            &moderator,
+            &app_a,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        audit = body;
+        kick = audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == "user_kicked" && e["target_id"] == uid_a)
+            .cloned();
+        if kick.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let kick = kick.unwrap_or_else(|| panic!("kick must be audited: {audit}"));
     assert_eq!(
         kick["actor_id"], moderator_id,
         "the acting administrator is the audit actor, not an API key"
