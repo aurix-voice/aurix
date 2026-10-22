@@ -245,6 +245,29 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool IsMuted() const;
 
+	/** Whether this client told the server it has a usable microphone (SetCaptureAvailable). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	bool IsCaptureAvailable() const;
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
+	float GetInputGain() const;
+
+	/** Current transmission mode; OutChannelId is the target for Single. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	EAurixTransmissionMode GetTransmission(FGuid& OutChannelId) const;
+
+	/** Channel heard at full volume (SetChannelFocus); false when none. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool GetChannelFocus(FGuid& OutChannelId) const;
+
+	/** This session is a priority speaker in the channel. */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Channels")
+	bool IsPriority(FGuid ChannelId) const;
+
+	/** The local user id once a session exists (invalid before SessionReady). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Session")
+	FGuid GetUserId() const;
+
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool IsSpeaking() const;
 

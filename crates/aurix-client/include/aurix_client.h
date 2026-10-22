@@ -2144,6 +2144,39 @@ void aurix_client_set_capture_available(struct AurixClient *client, bool availab
 
 bool aurix_client_is_muted(const struct AurixClient *client);
 
+/**
+ * Whether this client told the server it has a usable microphone (default true).
+ */
+bool aurix_client_is_capture_available(const struct AurixClient *client);
+
+/**
+ * Software microphone gain set with `aurix_client_set_input_gain` (1 = unity).
+ */
+float aurix_client_input_gain(const struct AurixClient *client);
+
+/**
+ * Current transmission mode; for `AurixTransmitSingle` the target channel is written to
+ * `out_channel` (when non-NULL).
+ */
+enum AurixTransmissionMode aurix_client_transmission(const struct AurixClient *client,
+                                                     struct AurixUuid *out_channel);
+
+/**
+ * Channel heard at full volume (`aurix_client_set_channel_focus`): writes it to `out` and
+ * returns true; false when no focus is set.
+ */
+bool aurix_client_channel_focus(const struct AurixClient *client, struct AurixUuid *out);
+
+/**
+ * This session is a priority speaker in `channel`.
+ */
+bool aurix_client_is_priority(const struct AurixClient *client, const struct AurixUuid *channel);
+
+/**
+ * The local user id once a session exists (from the token subject / `SessionReady`).
+ */
+bool aurix_client_user_id(const struct AurixClient *client, struct AurixUuid *out);
+
 bool aurix_client_is_speaking(const struct AurixClient *client);
 
 /**

@@ -378,6 +378,32 @@ void AurixVoiceClient::push_capture_mono(const PackedFloat32Array& samples, int 
 void AurixVoiceClient::set_muted(bool muted) { if (client_) client_.set_muted(muted); }
 void AurixVoiceClient::set_capture_available(bool available) { if (client_) client_.set_capture_available(available); }
 bool AurixVoiceClient::is_muted() const { return client_ && client_.is_muted(); }
+bool AurixVoiceClient::is_capture_available() const { return !client_ || client_.is_capture_available(); }
+float AurixVoiceClient::get_input_gain() const { return client_ ? client_.input_gain() : 1.0f; }
+
+Dictionary AurixVoiceClient::get_transmission() const {
+    Dictionary d;
+    aurix::Uuid channel;
+    const AurixTransmissionMode mode = client_ ? client_.transmission(&channel) : AURIX_TRANSMIT_ALL;
+    d["mode"] = static_cast<int>(mode);
+    d["channel_id"] = mode == AURIX_TRANSMIT_SINGLE ? uuid_to_string(channel.raw) : String();
+    return d;
+}
+
+String AurixVoiceClient::get_channel_focus() const {
+    aurix::Uuid channel;
+    return client_ && client_.channel_focus(channel) ? uuid_to_string(channel.raw) : String();
+}
+
+bool AurixVoiceClient::is_priority(const String& channel_id) const {
+    AurixUuid channel;
+    return client_ && uuid_from_string(channel_id, channel) && client_.is_priority(aurix::Uuid(channel));
+}
+
+String AurixVoiceClient::get_user_id() const {
+    aurix::Uuid user;
+    return client_ && client_.user_id(user) ? uuid_to_string(user.raw) : String();
+}
 bool AurixVoiceClient::is_speaking() const { return client_ && client_.is_speaking(); }
 void AurixVoiceClient::set_input_gain(double gain) { if (client_) client_.set_input_gain(static_cast<float>(gain)); }
 double AurixVoiceClient::get_input_energy() const { return client_ ? client_.input_energy() : 0.0; }
@@ -1260,6 +1286,12 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_muted", "muted"), &AurixVoiceClient::set_muted);
     ClassDB::bind_method(D_METHOD("set_capture_available", "available"), &AurixVoiceClient::set_capture_available);
     ClassDB::bind_method(D_METHOD("is_muted"), &AurixVoiceClient::is_muted);
+    ClassDB::bind_method(D_METHOD("is_capture_available"), &AurixVoiceClient::is_capture_available);
+    ClassDB::bind_method(D_METHOD("get_input_gain"), &AurixVoiceClient::get_input_gain);
+    ClassDB::bind_method(D_METHOD("get_transmission"), &AurixVoiceClient::get_transmission);
+    ClassDB::bind_method(D_METHOD("get_channel_focus"), &AurixVoiceClient::get_channel_focus);
+    ClassDB::bind_method(D_METHOD("is_priority", "channel_id"), &AurixVoiceClient::is_priority);
+    ClassDB::bind_method(D_METHOD("get_user_id"), &AurixVoiceClient::get_user_id);
     ClassDB::bind_method(D_METHOD("is_speaking"), &AurixVoiceClient::is_speaking);
     ClassDB::bind_method(D_METHOD("set_input_gain", "gain"), &AurixVoiceClient::set_input_gain);
     ClassDB::bind_method(D_METHOD("get_input_energy"), &AurixVoiceClient::get_input_energy);

@@ -1251,6 +1251,55 @@ bool UAurixVoiceSubsystem::IsMuted() const
 	return Native && Native->Client.is_muted();
 }
 
+bool UAurixVoiceSubsystem::IsCaptureAvailable() const
+{
+	return !Native || Native->Client.is_capture_available();
+}
+
+float UAurixVoiceSubsystem::GetInputGain() const
+{
+	return Native ? Native->Client.input_gain() : 1.f;
+}
+
+EAurixTransmissionMode UAurixVoiceSubsystem::GetTransmission(FGuid& OutChannelId) const
+{
+	OutChannelId.Invalidate();
+	if (!Native)
+	{
+		return EAurixTransmissionMode::All;
+	}
+	aurix::Uuid Channel;
+	const AurixTransmissionMode Mode = Native->Client.transmission(&Channel);
+	if (Mode == AURIX_TRANSMIT_SINGLE)
+	{
+		OutChannelId = ToGuid(Channel.raw);
+	}
+	return ToTransmission(Mode);
+}
+
+bool UAurixVoiceSubsystem::GetChannelFocus(FGuid& OutChannelId) const
+{
+	OutChannelId.Invalidate();
+	aurix::Uuid Channel;
+	if (!Native || !Native->Client.channel_focus(Channel))
+	{
+		return false;
+	}
+	OutChannelId = ToGuid(Channel.raw);
+	return true;
+}
+
+bool UAurixVoiceSubsystem::IsPriority(FGuid ChannelId) const
+{
+	return Native && Native->Client.is_priority(ToUuid(ChannelId));
+}
+
+FGuid UAurixVoiceSubsystem::GetUserId() const
+{
+	aurix::Uuid User;
+	return Native && Native->Client.user_id(User) ? ToGuid(User.raw) : FGuid();
+}
+
 bool UAurixVoiceSubsystem::IsSpeaking() const
 {
 	return Native && Native->Client.is_speaking();

@@ -1680,6 +1680,11 @@ impl Client {
             .map(|c| c.participant_count)
     }
 
+    /// Channel heard at full volume (`set_channel_focus`); `None` = no focus.
+    pub fn channel_focus(&self) -> Option<ChannelId> {
+        self.inner.prefs.lock().focus
+    }
+
     pub fn set_channel_focus(&self, channel_id: Option<ChannelId>) -> Result<()> {
         self.inner.prefs.lock().focus = channel_id;
         self.send_cmd(Command::Send(ControlMessage::SetChannelFocus {

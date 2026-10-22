@@ -3493,6 +3493,89 @@ pub unsafe extern "C" fn aurix_client_is_muted(client: *const AurixClient) -> bo
     self::client(client).map(|c| c.is_muted()).unwrap_or(false)
 }
 
+/// Whether this client told the server it has a usable microphone (default true).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_is_capture_available(client: *const AurixClient) -> bool {
+    self::client(client)
+        .map(|c| c.is_capture_available())
+        .unwrap_or(true)
+}
+
+/// Software microphone gain set with `aurix_client_set_input_gain` (1 = unity).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_input_gain(client: *const AurixClient) -> f32 {
+    self::client(client).map(|c| c.input_gain()).unwrap_or(1.0)
+}
+
+/// Current transmission mode; for `AurixTransmitSingle` the target channel is written to
+/// `out_channel` (when non-NULL).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_transmission(
+    client: *const AurixClient,
+    out_channel: *mut AurixUuid,
+) -> AurixTransmissionMode {
+    match self::client(client).map(|c| c.transmission()) {
+        Ok(TransmissionMode::None) => AurixTransmissionMode::AurixTransmitNone,
+        Ok(TransmissionMode::Single { channel_id }) => {
+            if !out_channel.is_null() {
+                *out_channel = channel_id.0.into();
+            }
+            AurixTransmissionMode::AurixTransmitSingle
+        }
+        _ => AurixTransmissionMode::AurixTransmitAll,
+    }
+}
+
+/// Channel heard at full volume (`aurix_client_set_channel_focus`): writes it to `out` and
+/// returns true; false when no focus is set.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_channel_focus(
+    client: *const AurixClient,
+    out: *mut AurixUuid,
+) -> bool {
+    match self::client(client).ok().and_then(|c| c.channel_focus()) {
+        Some(ch) => {
+            if !out.is_null() {
+                *out = ch.0.into();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// This session is a priority speaker in `channel`.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_is_priority(
+    client: *const AurixClient,
+    channel: *const AurixUuid,
+) -> bool {
+    if channel.is_null() {
+        return false;
+    }
+    let ch = ChannelId::from_uuid(uuid::Uuid::from_bytes((*channel).bytes));
+    self::client(client)
+        .map(|c| c.is_priority(ch))
+        .unwrap_or(false)
+}
+
+/// The local user id once a session exists (from the token subject / `SessionReady`).
+#[no_mangle]
+pub unsafe extern "C" fn aurix_client_user_id(
+    client: *const AurixClient,
+    out: *mut AurixUuid,
+) -> bool {
+    match self::client(client).ok().and_then(|c| c.user_id()) {
+        Some(u) => {
+            if !out.is_null() {
+                *out = u.0.into();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn aurix_client_is_speaking(client: *const AurixClient) -> bool {
     self::client(client)

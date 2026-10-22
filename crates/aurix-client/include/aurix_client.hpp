@@ -414,6 +414,15 @@ public:
     void set_muted(bool muted) { aurix_client_set_muted(c_, muted); }
     void set_capture_available(bool available) { aurix_client_set_capture_available(c_, available); }
     bool is_muted() const { return aurix_client_is_muted(c_); }
+    bool is_capture_available() const { return aurix_client_is_capture_available(c_); }
+    float input_gain() const { return aurix_client_input_gain(c_); }
+    /// Transmission mode; `out_channel` (optional) receives the target of `AurixTransmitSingle`.
+    AurixTransmissionMode transmission(Uuid* out_channel = nullptr) const {
+        return aurix_client_transmission(c_, out_channel ? &out_channel->raw : nullptr);
+    }
+    bool channel_focus(Uuid& out) const { return aurix_client_channel_focus(c_, &out.raw); }
+    bool is_priority(const Uuid& channel) const { return aurix_client_is_priority(c_, &channel.raw); }
+    bool user_id(Uuid& out) const { return aurix_client_user_id(c_, &out.raw); }
     bool is_speaking() const { return aurix_client_is_speaking(c_); }
     void set_input_gain(float gain) { aurix_client_set_input_gain(c_, gain); }
     float input_energy() const { return aurix_client_input_energy(c_); }

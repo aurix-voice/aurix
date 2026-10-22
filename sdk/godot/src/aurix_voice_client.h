@@ -243,6 +243,16 @@ public:
     /// Tell the server whether this session has a usable microphone (false = no device / permission denied / open failed).
     void set_capture_available(bool available);
     bool is_muted() const;
+    /// Whether this client told the server it has a usable microphone (set_capture_available).
+    bool is_capture_available() const;
+    float get_input_gain() const;
+    /// {"mode": TransmissionMode, "channel_id": String} — channel_id only for SINGLE.
+    Dictionary get_transmission() const;
+    /// Channel heard at full volume (set_channel_focus); "" when none.
+    String get_channel_focus() const;
+    bool is_priority(const String& channel_id) const;
+    /// Local user id once a session exists ("" before session_ready).
+    String get_user_id() const;
     bool is_speaking() const;
     void set_input_gain(double gain);
     double get_input_energy() const;
