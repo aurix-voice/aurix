@@ -128,6 +128,8 @@ int AurixVoiceClient::connect_to_server(const String& ws_url, const String& toke
     cfg.raw = config_;
     cfg.device_id = device_id_.utf8().get_data();
     client_ = aurix::Client::create(cfg);
+    // A fresh native client starts unmuted; with push-to-talk configured the mic must stay closed until pressed.
+    if (push_to_talk_action_ != StringName() && client_) client_.set_muted(!ptt_transmitting_);
     ++client_generation_;
     if (!client_) {
         UtilityFunctions::push_error(String("AurixVoiceClient: create failed: ") + String::utf8(aurix::last_error().c_str()));
@@ -565,7 +567,12 @@ double AurixVoiceClient::get_push_to_talk_release_delay() const { return push_to
 // muted unless the action is held (or toggled on); drives set_muted so server/roster agree.
 void AurixVoiceClient::update_push_to_talk(double delta) {
     ptt_clock_ += delta;
-    if (push_to_talk_action_ == StringName() || !client_) return;
+    if (push_to_talk_action_ == StringName()) return;
+    if (!client_) {
+        // Disconnected: forget the latch so a reconnect starts muted unless the key is down again.
+        ptt_transmitting_ = false; ptt_latched_ = false; ptt_release_at_ = -1.0;
+        return;
+    }
     Input* input = Input::get_singleton();
     if (!input || !InputMap::get_singleton()->has_action(push_to_talk_action_)) return;
     const bool pressed = push_to_talk_toggle_ ? input->is_action_just_pressed(push_to_talk_action_)

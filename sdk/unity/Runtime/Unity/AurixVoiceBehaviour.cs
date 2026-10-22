@@ -422,6 +422,8 @@ namespace Aurix.Unity
             ApplyDspSettings();
 
             Client = new AurixVoiceClient(WebSocketUrl, Token);
+            // A fresh client starts unmuted; with push-to-talk configured the mic stays closed until pressed.
+            if (PushToTalkConfigured) Client.SetMuted(!_ptt.Transmitting);
             Client.Mixer = _mixer;
             Client.FollowChannelPolicy = FollowChannelPolicy;
             Client.MediaPathPolicy = MediaPath;
