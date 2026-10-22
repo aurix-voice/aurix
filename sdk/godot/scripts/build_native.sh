@@ -73,7 +73,7 @@ case "$GODOT_PLATFORM" in
     command -v cargo-ndk >/dev/null || { echo "cargo-ndk is required (cargo install cargo-ndk)" >&2; exit 2; }
     [ -n "${ANDROID_NDK_HOME:-}${ANDROID_NDK_ROOT:-}${ANDROID_HOME:-}" ] || {
       echo "set ANDROID_NDK_HOME (or ANDROID_HOME with an ndk/ directory)" >&2; exit 2; }
-    NDK_ARGS=(ndk -t "$NDK_ABI" -p "${ANDROID_API_LEVEL:-21}" build -p aurix-client --lib)
+    NDK_ARGS=(ndk -t "$NDK_ABI" --platform "${ANDROID_API_LEVEL:-21}" build -p aurix-client --lib)
     [ "$PROFILE" = "release" ] && NDK_ARGS+=(--release)
     echo "building aurix-client for $TARGET ($PROFILE) via cargo-ndk"
     ( cd "$ROOT" && RUSTFLAGS="${RUSTFLAGS:-} $LINK_ARGS" cargo "${NDK_ARGS[@]}" )
