@@ -17,6 +17,7 @@ and the restore procedure in [Backup and restore](backup-restore.md) (`tools/bac
 |---|---|
 | `aurix_active_sessions`, `aurix_sessions_total`, `aurix_session_duration_seconds` | sessions on this node |
 | `aurix_active_channels`, `aurix_active_participants`, `aurix_active_bans` | live gauges |
+| `aurix_cascade_peers{transport=udp\|tcp\|down}` | other nodes of the cell this node relays audio with; `down` = a peer that stopped answering probes, `tcp` = running on the TCP fallback link |
 | `aurix_packets_received_total`, `aurix_packets_sent_total`, `aurix_bytes_*_total` | SFU traffic |
 | `aurix_packets_dropped_total` | packets rejected before routing: bad authentication tag, replay, unknown session, malformed |
 | `aurix_packet_loss_rate`, `aurix_jitter_milliseconds`, `aurix_rtt_milliseconds` | quality aggregates |
@@ -99,7 +100,7 @@ per application with `GET /v1/audit-log` (`audit:read`) or fleet-wide with
 
 ## Health
 
-* `GET /health` — process is up.
+* `GET /health` — process is up; the body carries `active_sessions`, `active_channels` and, when cascading is on, `cascade.peers[]` (`peer`, `transport` `udp`/`tcp`/`null`, `rtt_ms`) and `cascade.connected`. A peer with `transport: null` is the thing to look at when audio does not cross nodes — the usual causes are a firewall on the cascade port (media port + 1, UDP and TCP) or a NAT that rewrites the source address (the receiving node then logs `not an allowed peer`).
 * `GET /ready` — PostgreSQL (and Redis when configured) reachable; used by the container
   healthcheck and by load balancers.
 * `GET /v1/nodes` (admin) — registry view of every node: healthy flag, load, last heartbeat.

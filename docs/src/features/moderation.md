@@ -160,6 +160,18 @@ The sweep runs under a PostgreSQL advisory lock, so only one node works at a tim
 `POST /admin/retention/sweep` (admin JWT) runs it immediately and returns per-table counts,
 or `409` if another node holds the lock.
 
+### Disk footprint
+
+Rows are small; what grows without bound is the number of *distinct players* if `inactive_users_days` stays at `0`. Rough Postgres sizes including indexes:
+
+| table | per row | 1 M players | 10 M players |
+|---|---|---|---|
+| `users` (id, app, external_id, display name, metadata, counters) | ~350 B | ~0.35 GB | ~3.5 GB |
+| `sessions` (one per connection) | ~250 B | — | — |
+| `moderation_events`, `audit_log`, `analytics` | 200–600 B | — | — |
+
+A cell that only keeps players is cheap even at tens of millions; sessions, analytics and chat history are what fill a disk, and they have their own `*_days` knobs above. Recommended production baseline: `sessions_days = 90`, `analytics_days = 400`, `inactive_users_days = 365` (bans survive the sweep, so an erased player who comes back is a fresh user with a clean slate only if they were never banned).
+
 ## Audit log
 
 `GET /v1/audit-log` (`audit:read`) returns this application's rows; `GET /admin/audit-log`

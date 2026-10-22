@@ -40,6 +40,16 @@ pub static PACKETS_RECEIVED: Lazy<IntCounter> = Lazy::new(|| {
 pub static PACKETS_SENT: Lazy<IntCounter> =
     Lazy::new(|| register_int_counter!("aurix_packets_sent_total", "Total packets sent").unwrap());
 
+/// Cascade peers of this node by link state (`udp`, `tcp` = fallback link, `down` = no answer).
+pub static CASCADE_PEERS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aurix_cascade_peers",
+        "Cascade peers of this node by link transport (udp, tcp, down)",
+        &["transport"]
+    )
+    .unwrap()
+});
+
 pub static PACKETS_DROPPED: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("aurix_packets_dropped_total", "Total packets dropped").unwrap()
 });

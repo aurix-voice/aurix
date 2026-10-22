@@ -78,9 +78,26 @@ pub async fn openapi() -> impl IntoResponse {
 }
 
 pub async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (participants, channels) = {
+    let (participants, channels, cascade) = {
         let sfu = state.sfu.read();
-        (sfu.active_participants(), sfu.active_channels())
+        let cascade = sfu.cascade().map(|c| {
+            let peers: Vec<serde_json::Value> = c
+                .link_reports()
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "peer": r.peer.to_string(),
+                        "transport": r.transport.map(|t| t.as_str()),
+                        "rtt_ms": r.rtt_ms,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "peers": peers,
+                "connected": peers.iter().filter(|p| !p["transport"].is_null()).count(),
+            })
+        });
+        (sfu.active_participants(), sfu.active_channels(), cascade)
     };
     Json(serde_json::json!({
         "status": "healthy",
@@ -89,6 +106,7 @@ pub async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "timestamp": Utc::now().to_rfc3339(),
         "active_sessions": participants,
         "active_channels": channels,
+        "cascade": cascade,
     }))
 }
 

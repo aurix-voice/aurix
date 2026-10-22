@@ -13,6 +13,7 @@ released together.
 
 ### Added
 
+- `GET /health` reports cascade peers (`cascade.peers[]` with transport and RTT, `cascade.connected`) and a new gauge `aurix_cascade_peers{transport}` so a node that cannot reach its peers is visible without reading logs; retention docs gained a disk-footprint table and a production baseline.
 
 ### Fixed
 

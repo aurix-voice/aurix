@@ -495,6 +495,19 @@ async fn main() -> anyhow::Result<()> {
                     let sfu = sfu.read();
                     aurix_metrics::ACTIVE_SESSIONS.set(sfu.active_participants() as i64);
                     aurix_metrics::ACTIVE_CHANNELS.set(sfu.active_channels() as i64);
+                    if let Some(cascade) = sfu.cascade() {
+                        let (mut udp, mut tcp, mut down) = (0, 0, 0);
+                        for r in cascade.link_reports() {
+                            match r.transport {
+                                Some(aurix_media::cascade_link::LinkTransport::Udp) => udp += 1,
+                                Some(aurix_media::cascade_link::LinkTransport::Tcp) => tcp += 1,
+                                None => down += 1,
+                            }
+                        }
+                        for (k, v) in [("udp", udp), ("tcp", tcp), ("down", down)] {
+                            aurix_metrics::CASCADE_PEERS.with_label_values(&[k]).set(v);
+                        }
+                    }
                     aurix_metrics::ACTIVE_PARTICIPANTS.set(sfu.active_channel_memberships() as i64);
                     advertise(sfu.node_info(
                         &node_address,
