@@ -61,6 +61,25 @@ Platforms, engine and runtime versions and what each release ships per SDK: [Sup
 The full event list and payloads are in the [WebSocket](../api/websocket.md) chapter; each SDK
 chapter maps its methods and events onto those messages.
 
+## The same six steps in every SDK
+
+Integration is the same shape everywhere; only the spelling follows the engine. One token carries
+the channel grants, so there is no separate login/channel-token round trip.
+
+| Step | Unity (`AurixVoiceBehaviour`) | Unreal (`UAurixVoiceSubsystem`, Blueprint or C++) | Godot (`AurixVoiceClient` node) | Web (`AurixClient`) |
+|---|---|---|---|---|
+| 1. Token from your backend | `Token = jwt` | `Settings.Token` | `token` argument | `{ token }` |
+| 2. Connect | `await Connect()` | `Connect(Settings)` → `OnSessionReady` | `connect_to_server(ws_url, token)` → `session_ready` | `await connect()` |
+| 3. Join | `ChannelId` (auto-join) / `Client.JoinChannelAsync(id)` | `JoinChannel(Id, JoinToken, RequestId)` → `OnChannelJoined` | `join_channel(id)` → `channel_joined` | `await joinChannel(id)` |
+| 4. Mute / push-to-talk | `SetMuted(bool)`; `PushToTalkKey` or `PushToTalkAction`, `OnPushToTalkChanged` | `SetMuted`; `SetPushToTalkEnabled/Action`, `OnPushToTalkChanged` | `set_muted(bool)`; `push_to_talk_action`, `push_to_talk_changed` | `setMuted(bool)`; `attachPushToTalk(client, {keys})` |
+| 5. Positional voice (optional) | `Client.UpdatePositionAsync(channel, self, pos, rot)` | `UpdateOwnPosition(Id, Location, Rotation)` | `update_positions(id, positions)` | `updatePosition(id, position, orientation)` |
+| 6. Disconnect | `Disconnect()` | `Disconnect()` | `disconnect_from_server()` | `disconnect()` |
+
+Input meter for the HUD: `InputLevel` / `OnInputLevel` (Unity), `GetInputLevel` (Unreal),
+`get_input_level()` (Godot), `localVoiceActivity` (Web) — all `0..1`. Reconnect on a dropped
+socket, background/foreground handling on mobile and the network-change probe are built into every
+SDK with the same defaults; nothing to wire for the common case.
+
 ## Choosing the codec in Unity
 
 The Unity SDK does not bundle Opus. The **Concentus Opus codec** sample (`Samples~/Concentus`)

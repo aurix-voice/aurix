@@ -19,6 +19,7 @@ released together.
 - Fixed: with push-to-talk configured, a freshly created client in Unity and Godot started unmuted until the first press/release; it now starts muted, and Godot drops a stale latch while disconnected.
 - Godot: background/foreground lifecycle like Unity/Unreal — `stop_microphone_in_background` (default on) and `probe_after_background_seconds` (default 2) on `AurixVoiceClient`, driven by `NOTIFICATION_APPLICATION_PAUSED/RESUMED` and window focus.
 - Godot: `push_to_talk_changed(transmitting)` signal + `is_push_to_talk_transmitting()` (parity with Unity `OnPushToTalkChanged` / Unreal `OnPushToTalkChanged`); the demo scene gained a PTT toggle (Space / gamepad X via InputMap) and an input-level bar.
+- Docs: SDK overview gained a "same six steps in every SDK" table (token → connect → join → mute/PTT → positional → disconnect) with the exact Unity/Unreal/Godot/Web names.
 - Godot smoke test covers the `push_to_talk_*` properties and the input meter; docs for Godot/Unity list the push-to-talk and meter APIs.
 
 - Push-to-talk out of the box: Unity `AurixVoiceBehaviour.PushToTalkKey` / Input System `PushToTalkAction` (hold or toggle, release delay), Godot `push_to_talk_action` (InputMap), Web `attachPushToTalk(client, { keys, toggle, releaseDelayMs })` with `press()` for gamepads. Input level meters: core `capture_level/capture_energy` (C ABI, C++), Unreal `GetInputLevel/GetInputEnergy`, Godot `get_input_level`, Unity `InputLevel` + `OnInputLevel`.
