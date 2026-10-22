@@ -2542,7 +2542,7 @@ pub async fn ws_handler(
     let ip = peer_ip(&state, &headers, peer.map(|p| p.0));
     let (validated, one_time) = match state
         .control
-        .authenticate_session(&creds.token, &ip.to_string())
+        .authenticate_session(&creds.token, &ip.to_string(), creds.device.as_deref())
         .await
     {
         Ok((v, _node, one_time)) => (v, one_time),

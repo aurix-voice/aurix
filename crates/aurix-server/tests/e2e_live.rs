@@ -17459,3 +17459,210 @@ async fn draining_a_node_stops_fresh_sessions_but_keeps_its_own() {
         "node_undrained must be audited: {audit}"
     );
 }
+
+/// Handshake status when connecting from a specific local address (loopback aliases let one
+/// box look like several clients to an `ip_address` ban).
+async fn connect_status_from(
+    env: &Env,
+    token: &str,
+    device: &str,
+    local: std::net::Ipv4Addr,
+) -> u16 {
+    let url = url::Url::parse(&format!("{}/ws", env.ws)).unwrap();
+    let host = url.host_str().unwrap().to_string();
+    let port = url.port_or_known_default().unwrap();
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(std::net::SocketAddr::new(local.into(), 0))
+        .unwrap();
+    let target: std::net::SocketAddr = format!("{host}:{port}").parse().unwrap();
+    let stream = sock.connect(target).await.unwrap();
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    req.headers_mut()
+        .insert("x-aurix-device", device.parse().unwrap());
+    match tokio_tungstenite::client_async(req, stream).await {
+        Ok(_) => 101,
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
+        Err(e) => panic!("unexpected handshake failure: {e}"),
+    }
+}
+
+/// Waits until the server closes the player's socket.
+async fn expect_closed(p: &mut Player) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, p.ws.next()).await {
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return,
+            Ok(Some(Ok(_))) => continue,
+            Err(_) => panic!("{}: session was not closed by the server", p.name),
+        }
+    }
+}
+
+/// Bans: an account ban closes the live session and refuses tokens and connects; a `device`
+/// ban (device id taken from what the server remembered) refuses *another* account from the
+/// same device; an `ip_address` ban refuses another account from the same address while a
+/// different address still connects; revoking restores everything.
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn bans_by_account_device_and_address() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let ch = create_channel(&env, &http).await;
+    let dev1 = format!("ban-dev-{}", uuid::Uuid::now_v7().simple());
+    let dev2 = format!("ban-dev-{}", uuid::Uuid::now_v7().simple());
+    // Fresh identities per run: bans issued here outlive the test when it fails midway.
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let ext = |who: &str| format!("e2e:ban-{who}-{run}");
+
+    // ── account scope ──
+    let (tok_a, uid_a) = issue_token(&env, &http, &ext("alice"), "Alice", ch).await;
+    let mut alice = connect_device(&env, "alice", tok_a.clone(), &dev1, DeviceVia::Header).await;
+    let (s, ban_a) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "ban",
+        serde_json::json!({"user_id": uid_a, "scope": "account", "reason": "e2e account ban"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{ban_a}");
+    assert_eq!(ban_a["scope"], "account", "{ban_a}");
+    expect_closed(&mut alice).await;
+    assert_eq!(
+        connect_status(&env, &tok_a, &dev1).await,
+        403,
+        "banned account reconnects"
+    );
+    let r = http
+        .post(format!("{}/v1/tokens", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(
+            &serde_json::json!({"external_id": ext("alice"), "display_name": "Alice",
+            "channels": [{"channel_id": ch, "join": true, "speak": true, "receive": true}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403, "token for a banned account");
+
+    // ── device scope, device id remembered from Alice's session ──
+    let (s, ban_d) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "ban",
+        serde_json::json!({"user_id": uid_a, "scope": "device", "reason": "e2e device ban"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{ban_d}");
+    assert_eq!(ban_d["device_id"], dev1.as_str(), "{ban_d}");
+    let (tok_b, uid_b) = issue_token(&env, &http, &ext("bob"), "Bob", ch).await;
+    assert_eq!(
+        connect_status(&env, &tok_b, &dev1).await,
+        403,
+        "new account, banned device"
+    );
+    assert_eq!(
+        connect_status(&env, &tok_b, &dev2).await,
+        101,
+        "new account, other device"
+    );
+    let (s, v) = moderation_call(
+        &env,
+        &http,
+        &env.api_key,
+        "ban",
+        serde_json::json!({"user_id": uid_b, "scope": "device", "reason": "no device yet"}),
+    )
+    .await;
+    // The refused handshake recorded nothing; the accepted one recorded `dev2`, so a ban
+    // without `device_id` lands on it.
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["device_id"], dev2.as_str(), "{v}");
+    assert_eq!(
+        connect_status(&env, &tok_b, &dev2).await,
+        403,
+        "Bob's own ban"
+    );
+
+    // ── ip_address scope from a second loopback address ──
+    let (tok_c, uid_c) = issue_token(&env, &http, &ext("carol"), "Carol", ch).await;
+    let (tok_d, _uid_d) = issue_token(&env, &http, &ext("dave"), "Dave", ch).await;
+    let alt = std::net::Ipv4Addr::new(127, 0, 0, 7);
+    let ws_host = url::Url::parse(&env.ws)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string();
+    if ws_host == "127.0.0.1" || ws_host == "localhost" {
+        assert_eq!(
+            connect_status_from(&env, &tok_c, "ban-dev-c", alt).await,
+            101
+        );
+        let (s, ban_ip) = moderation_call(
+            &env,
+            &http,
+            &env.api_key,
+            "ban",
+            serde_json::json!({"user_id": uid_c, "scope": "ip_address", "reason": "e2e ip ban",
+                "ip_address": alt.to_string()}),
+        )
+        .await;
+        assert_eq!(s, 200, "{ban_ip}");
+        assert_eq!(ban_ip["ip_address"], alt.to_string(), "{ban_ip}");
+        assert_eq!(
+            connect_status_from(&env, &tok_d, "ban-dev-d", alt).await,
+            403,
+            "other account, banned address"
+        );
+        assert_eq!(
+            connect_status(&env, &tok_d, "ban-dev-d").await,
+            101,
+            "other address"
+        );
+        let r = http
+            .post(format!("{}/v1/users/{uid_c}/unban", env.api))
+            .header("x-api-key", &env.api_key)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "unban carol");
+        assert_eq!(
+            connect_status_from(&env, &tok_d, "ban-dev-d", alt).await,
+            101,
+            "lifted"
+        );
+    } else {
+        eprintln!("ws host {ws_host} is not loopback; skipping the ip_address part");
+    }
+
+    // ── revoke restores the device ──
+    let r = http
+        .post(format!("{}/v1/users/{uid_a}/unban", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "unban alice");
+    let r = http
+        .post(format!("{}/v1/users/{uid_b}/unban", env.api))
+        .header("x-api-key", &env.api_key)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "unban bob");
+    assert_eq!(
+        connect_status(&env, &tok_b, &dev1).await,
+        101,
+        "device ban lifted"
+    );
+}

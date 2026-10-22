@@ -18,6 +18,10 @@ impl ModerationService {
         }
     }
 
+    /// Issues a ban. `device` / `ip_address` scopes also match later accounts seen from the same
+    /// device or address; when the matching field is omitted it is taken from what the server
+    /// has seen of the user — every device they connected with (one ban row per device) or the
+    /// address of their most recent session — and the call fails when nothing is known yet.
     #[allow(clippy::too_many_arguments)]
     pub async fn ban_user(
         &self,
@@ -31,32 +35,76 @@ impl ModerationService {
         ip_address: Option<&str>,
     ) -> Result<BanRow> {
         let expires_at = duration.map(|d| Utc::now() + d);
+        let scope_name = scope_name(scope);
 
-        let ban = BanRow {
-            id: Uuid::now_v7(),
-            app_id: app_id.0,
-            user_id: Some(user_id.0),
-            device_id: device_id.map(|s| s.to_string()),
-            ip_address: ip_address.map(|s| s.to_string()),
-            scope: format!("{:?}", scope).to_lowercase(),
-            reason: reason.to_string(),
-            issued_by: issued_by.0,
-            expires_at,
-            created_at: Utc::now(),
-            revoked_at: None,
-            revoked_by: None,
+        let mut targets: Vec<(Option<String>, Option<String>)> = match scope {
+            BanScope::Account => vec![(None, None)],
+            BanScope::Device => match device_id {
+                Some(d) => vec![(Some(d.to_string()), None)],
+                None => {
+                    let user = aurix_db::queries::get_user(&self.pool, app_id.0, user_id.0)
+                        .await
+                        .map_err(|e| AurixError::Database(format!("User lookup failed: {e}")))?
+                        .ok_or_else(|| AurixError::UserNotFound(user_id.to_string()))?;
+                    if user.device_ids.is_empty() {
+                        return Err(AurixError::Validation(
+                            "device scope: no device is known for this user yet; pass device_id"
+                                .into(),
+                        ));
+                    }
+                    user.device_ids
+                        .into_iter()
+                        .map(|d| (Some(d), None))
+                        .collect()
+                }
+            },
+            BanScope::IpAddress => {
+                let ip = match ip_address {
+                    Some(ip) => ip.to_string(),
+                    None => aurix_db::queries::latest_session_ip_for_user(
+                        &self.pool, app_id.0, user_id.0,
+                    )
+                    .await
+                    .map_err(|e| AurixError::Database(format!("Session lookup failed: {e}")))?
+                    .ok_or_else(|| {
+                        AurixError::Validation(
+                            "ip_address scope: the user has never connected; pass ip_address"
+                                .into(),
+                        )
+                    })?,
+                };
+                vec![(None, Some(ip))]
+            }
         };
 
-        let created = aurix_db::queries::create_ban(&self.pool, &ban)
-            .await
-            .map_err(|e| AurixError::Database(format!("Ban creation failed: {e}")))?;
+        let mut first: Option<BanRow> = None;
+        for (device_id, ip_address) in targets.drain(..) {
+            let ban = BanRow {
+                id: Uuid::now_v7(),
+                app_id: app_id.0,
+                user_id: Some(user_id.0),
+                device_id,
+                ip_address,
+                scope: scope_name.to_string(),
+                reason: reason.to_string(),
+                issued_by: issued_by.0,
+                expires_at,
+                created_at: Utc::now(),
+                revoked_at: None,
+                revoked_by: None,
+            };
+            let created = aurix_db::queries::create_ban(&self.pool, &ban)
+                .await
+                .map_err(|e| AurixError::Database(format!("Ban creation failed: {e}")))?;
+            first.get_or_insert(created);
+        }
 
         // Also update user record
         aurix_db::queries::ban_user(&self.pool, app_id.0, user_id.0, reason, expires_at)
             .await
             .map_err(|e| AurixError::Database(format!("User ban update failed: {e}")))?;
 
-        Ok(created)
+        Ok(first.expect("at least one ban target"))
     }
 
     /// Revoke one ban. The ban must belong to `app_id`; the user's `is_banned` flag is cleared
@@ -122,6 +170,24 @@ impl ModerationService {
         aurix_db::queries::list_bans(&self.pool, app_id.0, user_id.map(|u| u.0), limit, offset)
             .await
             .map_err(|e| AurixError::Database(format!("Ban list failed: {e}")))
+    }
+
+    /// Whether a connection from `device_id` / `ip` as `user_id` is refused: the user's own
+    /// bans, or a `device` / `ip_address` ban issued against another account from the same
+    /// device or address.
+    pub async fn is_banned_for(
+        &self,
+        app_id: AppId,
+        user_id: UserId,
+        device_id: Option<&str>,
+        ip: Option<&str>,
+    ) -> Result<bool> {
+        let bans = aurix_db::queries::get_active_bans_matching(
+            &self.pool, app_id.0, user_id.0, device_id, ip,
+        )
+        .await
+        .map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
+        Ok(!bans.is_empty())
     }
 
     pub async fn is_banned(&self, app_id: AppId, user_id: UserId) -> Result<bool> {
@@ -258,5 +324,27 @@ impl ModerationService {
         aurix_db::queries::list_moderation_events(&self.pool, app_id.0, status, limit, offset)
             .await
             .map_err(|e| AurixError::Database(format!("Event list failed: {e}")))
+    }
+}
+
+/// Wire name of a ban scope (`account` / `device` / `ip_address`), as stored in `bans.scope`.
+pub fn scope_name(scope: BanScope) -> &'static str {
+    match scope {
+        BanScope::Account => "account",
+        BanScope::Device => "device",
+        BanScope::IpAddress => "ip_address",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_names_match_the_wire_format() {
+        for s in [BanScope::Account, BanScope::Device, BanScope::IpAddress] {
+            let wire = serde_json::to_value(s).unwrap();
+            assert_eq!(wire.as_str().unwrap(), scope_name(s));
+        }
     }
 }

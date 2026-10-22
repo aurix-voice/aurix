@@ -1846,7 +1846,7 @@ pub async fn ban_user(
         AuditAction::UserBanned,
         "user",
         &user_id.to_string(),
-        serde_json::json!({"reason": req.reason, "scope": format!("{:?}", req.scope), "ban_id": ban.id}),
+        serde_json::json!({"reason": req.reason, "scope": aurix_moderation::scope_name(req.scope), "ban_id": ban.id}),
         client_ip_string(ip),
     );
     state

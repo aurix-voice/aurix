@@ -53,8 +53,18 @@ see [Priority speakers and ducking](channels.md#priority-speakers-and-ducking).
 }
 ```
 
-* Omitting `duration_hours` makes the ban permanent. `device` / `ip_address` scopes require the
-  matching field.
+* Omitting `duration_hours` makes the ban permanent.
+* `scope` decides who else the ban catches. `account` refuses this user id. `device` also refuses
+  **any account** that connects with the banned device id (the `X-Aurix-Device` handshake header
+  / `device.<id>` sub-protocol / `?device=`); `ip_address` any account connecting from the banned
+  address. Pass `device_id` / `ip_address` explicitly, or omit them: the server then bans every
+  device the user has connected with (one ban row per device — the server remembers the 16 most
+  recent) or the address of their most recent session, and answers `400` when it has seen
+  neither yet.
+* Device and address bans are checked on every session handshake, so a fresh account from the
+  same device/address is refused with `403` and the error text names the scope
+  (`This device is banned` / `This address is banned`). Token minting only knows the user id, so
+  `/v1/tokens` for a new account still succeeds — the refusal happens at connect.
 * The ban is stored in PostgreSQL and mirrored on the user row (`is_banned`,
   `ban_expires_at`), and a `user.banned` event closes every live session of that user on all
   nodes. Opening a new session or issuing a token for a banned user fails with

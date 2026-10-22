@@ -1451,6 +1451,55 @@ pub async fn get_active_bans_for_user(
     .bind(app_id).bind(user_id).fetch_all(pool).await
 }
 
+/// Active bans that apply to a connection: the user's own bans plus `device`-scoped bans on
+/// `device_id` and `ip_address`-scoped bans on `ip` issued against any other account of the app.
+pub async fn get_active_bans_matching(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    device_id: Option<&str>,
+    ip: Option<&str>,
+) -> Result<Vec<BanRow>, sqlx::Error> {
+    sqlx::query_as::<_, BanRow>(
+        "SELECT * FROM bans WHERE app_id = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) \
+         AND (user_id = $2 \
+              OR (scope = 'device' AND device_id IS NOT NULL AND device_id = $3) \
+              OR (scope = 'ip_address' AND ip_address IS NOT NULL AND ip_address = $4))",
+    )
+    .bind(app_id).bind(user_id).bind(device_id).bind(ip).fetch_all(pool).await
+}
+
+/// Address the user most recently connected from, if they ever had a session.
+pub async fn latest_session_ip_for_user(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT ip_address FROM sessions WHERE app_id = $1 AND user_id = $2 ORDER BY connected_at DESC LIMIT 1",
+    )
+    .bind(app_id).bind(user_id).fetch_optional(pool).await
+}
+
+/// Records `device_id` as the user's most recent device (`users.device_ids`, newest last,
+/// bounded to the 16 most recent). A no-op when it already is the most recent one.
+pub async fn remember_user_device(
+    pool: &DbPool,
+    app_id: Uuid,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET device_ids = ARRAY(\
+             SELECT d FROM unnest(array_append(array_remove(device_ids, $3), $3)) WITH ORDINALITY AS t(d, n) \
+             ORDER BY n OFFSET greatest(0, cardinality(array_append(array_remove(device_ids, $3), $3)) - 16)) \
+         WHERE app_id = $1 AND id = $2 \
+           AND (cardinality(device_ids) = 0 OR device_ids[cardinality(device_ids)] IS DISTINCT FROM $3)",
+    )
+    .bind(app_id).bind(user_id).bind(device_id).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn get_ban(
     pool: &DbPool,
     app_id: Uuid,

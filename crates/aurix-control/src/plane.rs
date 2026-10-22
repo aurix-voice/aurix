@@ -430,6 +430,7 @@ impl ControlPlane {
         &self,
         token: &str,
         ip_address: &str,
+        device_id: Option<&str>,
     ) -> Result<(ValidatedToken, MediaNodeInfo, Option<PendingClaim>)> {
         let (validated, one_time) = match self.jwt.validate_any(token)? {
             AnyToken::Session(v) => {
@@ -463,16 +464,38 @@ impl ControlPlane {
             ));
         }
 
-        let bans = aurix_db::queries::get_active_bans_for_user(
+        // The user's own bans plus device / address bans issued against other accounts.
+        let bans = aurix_db::queries::get_active_bans_matching(
             &self.pool,
             validated.app_id.0,
             validated.user_id.0,
+            device_id,
+            Some(ip_address),
         )
         .await
         .map_err(|e| AurixError::Database(format!("Ban check failed: {e}")))?;
 
-        if !bans.is_empty() {
-            return Err(AurixError::UserBanned("User is banned".into()));
+        if let Some(ban) = bans.first() {
+            let what = match ban.scope.as_str() {
+                "device" => "This device is banned",
+                "ip_address" => "This address is banned",
+                _ => "User is banned",
+            };
+            return Err(AurixError::UserBanned(what.into()));
+        }
+        if let Some(device) = device_id {
+            // Remember the device so a later `device`-scoped ban can be issued without
+            // the moderator knowing the id.
+            if let Err(e) = aurix_db::queries::remember_user_device(
+                &self.pool,
+                validated.app_id.0,
+                validated.user_id.0,
+                device,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "could not record the session's device id");
+            }
         }
 
         self.reject_if_erased(&validated).await?;
