@@ -143,6 +143,11 @@ godot --headless --path sdk/godot -s tests/smoke.gd                    # 100+ AP
 AURIX_E2E_API=… AURIX_E2E_WS=… AURIX_E2E_API_KEY=… sdk/godot/tests/live.sh   # two clients, real audio
 ```
 
+Releases ship a prebuilt addon (`aurix-godot-addon-<version>.zip`: Linux x86_64/arm64, Windows
+x86_64, macOS universal and Android arm64, debug + release templates, Rust core included) — unzip
+into your project's `addons/` and enable the plugin; the `-source.zip` variant is for building the
+other targets yourself with the script above.
+
 `addons/aurix_voice/aurix_voice.gdextension` maps Linux x86_64/arm64, Windows x86_64 and
 macOS universal, Android arm64/arm32/x86_64 and iOS arm64 to `bin/<platform>.<arch>/` and
 declares `aurix_client` as a `[dependencies]` entry so export templates ship both libraries.

@@ -188,6 +188,65 @@ jobs:
           path: sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/${{ matrix.platform }}
           if-no-files-found: error
 
+  native-mobile:
+    name: native core (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: android
+            os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+      - if: matrix.name == 'android'
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config cmake clang
+          cargo install cargo-ndk --locked
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Build (Android, three ABIs)
+        if: matrix.name == 'android'
+        run: |
+          set -euo pipefail
+          for t in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+            sdk/unreal/scripts/build_native.sh --target "$t"
+          done
+      - name: Stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tp=sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary
+          core="aurix-client-${VERSION}-${{ matrix.name }}"
+          mkdir -p "dist/$core"
+          cp -r "$tp/include" "dist/$core/include"
+          cp -r "$tp/lib/Android" "dist/$core/lib"
+          cp crates/aurix-client/LICENSE NOTICE "dist/$core/"
+          (cd dist && tar -czf "$core.tar.gz" "$core")
+          rm -rf "dist/$core"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-native-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-lib-${{ matrix.name }}
+          path: sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/Android
+          if-no-files-found: error
+
   sdks:
     name: SDK packages
     needs: verify
@@ -215,9 +274,9 @@ jobs:
       - name: Unity UPM tarball
         working-directory: sdk/unity
         run: npm pack --pack-destination ../../dist
-      - name: Godot addon (source; native libraries are built per platform with sdk/godot/scripts/build_native.sh)
+      - name: Godot addon (source only; the prebuilt addon is produced by the godot-addon job)
         run: |
-          (cd sdk/godot/addons && zip -qr "../../../dist/aurix-godot-addon-${VERSION}.zip" aurix_voice -x 'aurix_voice/bin/*')
+          (cd sdk/godot/addons && zip -qr "../../../dist/aurix-godot-addon-${VERSION}-source.zip" aurix_voice -x 'aurix_voice/bin/*')
       - name: Node server SDK
         working-directory: sdk/server/node
         run: |
@@ -239,8 +298,8 @@ jobs:
           if-no-files-found: error
 
   unreal-plugin:
-    name: Unreal plugin zip (Win64 + Mac universal + Linux)
-    needs: [verify, native]
+    name: Unreal plugin zip (Win64 + Mac universal + Linux + Android)
+    needs: [verify, native, native-mobile]
     runs-on: macos-14
     env:
       VERSION: ${{ needs.verify.outputs.version }}
@@ -262,6 +321,9 @@ jobs:
             libs/native-lib-x86_64-apple-darwin/libaurix_client.dylib \
             -output "$tp/lib/Mac/libaurix_client.dylib"
           lipo -info "$tp/lib/Mac/libaurix_client.dylib"
+          mkdir -p "$tp/lib/Android"
+          cp -R libs/native-lib-android/. "$tp/lib/Android/"
+          find "$tp/lib" -type f | sort
           cp crates/aurix-client/include/aurix_client.h crates/aurix-client/include/aurix_client.hpp "$tp/include/"
           python3 sdk/unreal/scripts/check_plugin.py
       - name: Zip
@@ -273,6 +335,142 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist-unreal
+          path: dist/*.zip
+          if-no-files-found: error
+
+  godot-bin:
+    name: Godot GDExtension (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    env:
+      GODOT_VERSION: 4.3-stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux.x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux.arm64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: windows.x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos.universal
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: android.arm64
+            os: ubuntu-22.04
+            target: aarch64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}${{ matrix.name == 'macos.universal' && ',x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-godot-${{ matrix.name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --quiet scons
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config cmake clang
+      - if: matrix.name == 'android.arm64'
+        run: |
+          cargo install cargo-ndk --locked
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Check out godot-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: godotengine/godot-cpp
+          ref: godot-${{ env.GODOT_VERSION }}
+          path: sdk/godot/godot-cpp
+      - uses: actions/cache@v4
+        with:
+          path: |
+            sdk/godot/godot-cpp/bin
+            sdk/godot/godot-cpp/gen
+            sdk/godot/godot-cpp/src/**/*.os
+            sdk/godot/godot-cpp/src/**/*.obj
+          key: godot-cpp-release-${{ env.GODOT_VERSION }}-${{ matrix.name }}-${{ hashFiles('sdk/godot/SConstruct') }}
+      - name: macOS universal Rust core (both slices, lipo)
+        if: matrix.name == 'macos.universal'
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p aurix-client --lib --target aarch64-apple-darwin
+          cargo build --release --locked -p aurix-client --lib --target x86_64-apple-darwin
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create target/aarch64-apple-darwin/release/libaurix_client.dylib target/x86_64-apple-darwin/release/libaurix_client.dylib \
+            -output target/universal-apple-darwin/release/libaurix_client.dylib
+          install_name_tool -id @loader_path/libaurix_client.dylib target/universal-apple-darwin/release/libaurix_client.dylib
+      - name: Build Rust core, stage, build the extension (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.name }}" = macos.universal ]; then
+            # build_native.sh builds one slice; swap in the universal dylib before scons.
+            sdk/godot/scripts/build_native.sh --release --target aarch64-apple-darwin --no-extension
+            cp -f target/universal-apple-darwin/release/libaurix_client.dylib sdk/godot/addons/aurix_voice/bin/macos.universal/libaurix_client.dylib
+            (cd sdk/godot && scons platform=macos target=template_release -j"$(sysctl -n hw.ncpu)")
+            (cd sdk/godot && scons platform=macos target=template_debug -j"$(sysctl -n hw.ncpu)")
+          else
+            sdk/godot/scripts/build_native.sh --release --target ${{ matrix.target }}
+            sdk/godot/scripts/build_native.sh --target ${{ matrix.target }}
+          fi
+          ls -R sdk/godot/addons/aurix_voice/bin
+      - name: Build Rust core, stage, build the extension (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked -p aurix-client --lib --target x86_64-pc-windows-msvc
+          $dest = "sdk/godot/addons/aurix_voice/bin/windows.x86_64"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/aurix_client.dll, target/x86_64-pc-windows-msvc/release/aurix_client.dll.lib $dest
+          Push-Location sdk/godot
+          scons platform=windows arch=x86_64 target=template_release
+          scons platform=windows arch=x86_64 target=template_debug
+          Pop-Location
+          Get-ChildItem -Recurse sdk/godot/addons/aurix_voice/bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: godot-bin-${{ matrix.name }}
+          path: sdk/godot/addons/aurix_voice/bin/${{ matrix.name }}
+          if-no-files-found: error
+
+  godot-addon:
+    name: Godot addon zip (all platforms)
+    needs: [verify, godot-bin]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: godot-bin-*
+          path: bins
+      - name: Assemble
+        run: |
+          set -euo pipefail
+          rm -rf sdk/godot/addons/aurix_voice/bin
+          mkdir -p sdk/godot/addons/aurix_voice/bin
+          for d in bins/godot-bin-*; do
+            name="${d#bins/godot-bin-}"
+            mkdir -p "sdk/godot/addons/aurix_voice/bin/$name"
+            cp -R "$d/." "sdk/godot/addons/aurix_voice/bin/$name/"
+          done
+          find sdk/godot/addons/aurix_voice/bin -maxdepth 2 | sort
+          mkdir -p dist
+          (cd sdk/godot/addons && zip -qry "../../../dist/aurix-godot-addon-${VERSION}.zip" aurix_voice)
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-godot
           path: dist/*.zip
           if-no-files-found: error
 
@@ -494,7 +692,7 @@ jobs:
 
   publish:
     name: checksums, SBOM, signatures, GitHub release
-    needs: [verify, server, native, sdks, unreal-plugin, image-manifest, dashboard-image]
+    needs: [verify, server, native, native-mobile, sdks, unreal-plugin, godot-addon, image-manifest, dashboard-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write

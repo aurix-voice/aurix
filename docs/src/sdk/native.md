@@ -747,7 +747,9 @@ Verified in CI: the native library builds with statically linked Opus on Linux x
 (MSVC), macOS arm64 and macOS x64 — the `native core` job runs the crate's unit tests, the
 header-drift check and the C/C++ samples against the freshly built library on each host, stages
 `lib/Win64` / `lib/Mac` with `build_native.ps1` / `build_native.sh` and uploads them as the
-`aurix-client-<target>` artifacts — and
+`aurix-client-<target>` artifacts; the `native core (android)` release job cross-compiles the same crate with
+`cargo-ndk` for arm64-v8a / armeabi-v7a / x86_64 (`aurix-client-<version>-android.tar.gz`, one
+`lib/<abi>/libaurix_client.so` each, API 21+) — and
 `unreal_plugin_uses_only_existing_abi` parses the plugin sources and checks that every
 `aurix_*` function, `AURIX_*` constant and `aurix::Client` method they use is declared in the
 committed headers (and that `AurixVoiceSamples` never reaches the C ABI). The `unreal` job runs

@@ -6,6 +6,7 @@
 //   lib/Win64/aurix_client.dll, aurix_client.dll.lib
 //   lib/Linux/libaurix_client.so
 //   lib/Mac/libaurix_client.dylib
+//   lib/Android/<arm64-v8a|armeabi-v7a|x86_64>/libaurix_client.so   (+ AurixClientLibrary_APL.xml)
 
 using System.IO;
 using UnrealBuildTool;
@@ -45,6 +46,28 @@ public class AurixClientLibrary : ModuleRules
 			string Lib = Path.Combine(LibDir, "Mac", "libaurix_client.dylib");
 			PublicAdditionalLibraries.Add(Lib);
 			RuntimeDependencies.Add("$(BinaryOutputDir)/libaurix_client.dylib", Lib);
+		}
+		else if (Target.Platform == UnrealTargetPlatform.Android)
+		{
+			// One .so per ABI; the APL copies them into the APK and loads the right one at startup.
+			string Dir = Path.Combine(LibDir, "Android");
+			string[] Abis = { "arm64-v8a", "armeabi-v7a", "x86_64" };
+			bool Any = false;
+			foreach (string Abi in Abis)
+			{
+				string Lib = Path.Combine(Dir, Abi, "libaurix_client.so");
+				if (File.Exists(Lib))
+				{
+					PublicAdditionalLibraries.Add(Lib);
+					Any = true;
+				}
+			}
+			if (!Any)
+			{
+				throw new BuildException("AurixClientLibrary: no prebuilt aurix_client for Android under " + Dir +
+					" (expected <abi>/libaurix_client.so; run sdk/unreal/scripts/build_native.sh --target aarch64-linux-android)");
+			}
+			AdditionalPropertiesForReceipt.Add("AndroidPlugin", Path.Combine(ModuleDirectory, "AurixClientLibrary_APL.xml"));
 		}
 		else
 		{

@@ -43,19 +43,43 @@ case "$TARGET" in
     ARTIFACTS=("aurix_client.dll" "aurix_client.dll.lib")
     LINK_ARGS=""
     ;;
+  aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android)
+    # Staged per ABI the way UE's Android packaging (APL) expects: lib/Android/<abi>/libaurix_client.so
+    case "$TARGET" in
+      aarch64-*) NDK_ABI="arm64-v8a" ;;
+      armv7-*)   NDK_ABI="armeabi-v7a" ;;
+      *)         NDK_ABI="x86_64" ;;
+    esac
+    UE_PLATFORM="Android/$NDK_ABI"
+    ARTIFACTS=("libaurix_client.so")
+    LINK_ARGS="-C link-arg=-Wl,-soname,libaurix_client.so"
+    ;;
   *)
     echo "unsupported target for the Unreal plugin: $TARGET" >&2
     exit 2
     ;;
 esac
 
-CARGO_ARGS=(build -p aurix-client --lib --target "$TARGET")
-[ "$PROFILE" = "release" ] && CARGO_ARGS+=(--release)
+case "$TARGET" in
+  *-linux-android*)
+    command -v cargo-ndk >/dev/null || { echo "cargo-ndk is required (cargo install cargo-ndk)" >&2; exit 2; }
+    [ -n "${ANDROID_NDK_HOME:-}${ANDROID_NDK_ROOT:-}${ANDROID_HOME:-}" ] || {
+      echo "set ANDROID_NDK_HOME (or ANDROID_HOME with an ndk/ directory)" >&2; exit 2; }
+    NDK_ARGS=(ndk -t "$NDK_ABI" -p "${ANDROID_API_LEVEL:-21}" build -p aurix-client --lib)
+    [ "$PROFILE" = "release" ] && NDK_ARGS+=(--release)
+    echo "building aurix-client for $TARGET ($PROFILE) via cargo-ndk"
+    ( cd "$ROOT" && RUSTFLAGS="${RUSTFLAGS:-} $LINK_ARGS" cargo "${NDK_ARGS[@]}" )
+    ;;
+  *)
+    CARGO_ARGS=(build -p aurix-client --lib --target "$TARGET")
+    [ "$PROFILE" = "release" ] && CARGO_ARGS+=(--release)
 
-echo "building aurix-client for $TARGET ($PROFILE)"
-# libopus 1.6 (DRED/OSCE) is compiled from the sources bundled with opusic-sys (needs cmake) and
-# linked statically, so the shipped library has no dependency on a system libopus.
-( cd "$ROOT" && RUSTFLAGS="${RUSTFLAGS:-} $LINK_ARGS" cargo "${CARGO_ARGS[@]}" )
+    echo "building aurix-client for $TARGET ($PROFILE)"
+    # libopus 1.6 (DRED/OSCE) is compiled from the sources bundled with opusic-sys (needs cmake) and
+    # linked statically, so the shipped library has no dependency on a system libopus.
+    ( cd "$ROOT" && RUSTFLAGS="${RUSTFLAGS:-} $LINK_ARGS" cargo "${CARGO_ARGS[@]}" )
+    ;;
+esac
 
 OUT="$ROOT/target/$TARGET/$PROFILE"
 DEST="$THIRD_PARTY/lib/$UE_PLATFORM"

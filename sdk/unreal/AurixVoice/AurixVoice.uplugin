@@ -15,19 +15,19 @@
   "IsBetaVersion": false,
   "IsExperimentalVersion": false,
   "Installed": false,
-  "SupportedTargetPlatforms": ["Win64", "Linux", "Mac"],
+  "SupportedTargetPlatforms": ["Win64", "Linux", "Mac", "Android"],
   "Modules": [
     {
       "Name": "AurixVoice",
       "Type": "Runtime",
       "LoadingPhase": "Default",
-      "PlatformAllowList": ["Win64", "Linux", "Mac"]
+      "PlatformAllowList": ["Win64", "Linux", "Mac", "Android"]
     },
     {
       "Name": "AurixVoiceSamples",
       "Type": "Runtime",
       "LoadingPhase": "Default",
-      "PlatformAllowList": ["Win64", "Linux", "Mac"]
+      "PlatformAllowList": ["Win64", "Linux", "Mac", "Android"]
     }
   ],
   "Plugins": [

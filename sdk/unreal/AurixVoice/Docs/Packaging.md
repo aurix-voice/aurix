@@ -4,7 +4,7 @@
 
 | Path | Purpose |
 | --- | --- |
-| `AurixVoice.uplugin` | `EngineVersion` 5.3.0, `SupportedTargetPlatforms` Win64 / Linux / Mac, two runtime modules, `AudioCapture` dependency, docs/support URLs. Bump `VersionName` together with the repository version; `Version` is the integer marketplace counter. |
+| `AurixVoice.uplugin` | `EngineVersion` 5.3.0, `SupportedTargetPlatforms` Win64 / Linux / Mac / Android, two runtime modules, `AudioCapture` dependency, docs/support URLs. Bump `VersionName` together with the repository version; `Version` is the integer marketplace counter. |
 | `Config/FilterPlugin.ini` | Extra files copied by `BuildPlugin` (the `Docs/` folder). |
 | `Resources/Icon128.png` | 128×128 plugin icon shown in the Plugins browser. |
 | `Source/AurixVoice` | Runtime module: subsystem, sound waves, types. `PublicDependencyModuleNames` only `Core` / `CoreUObject` / `Engine`; audio/HTTP/plugin-manager deps are private. |
@@ -37,6 +37,16 @@ Windows: `RunUAT.bat BuildPlugin -Plugin=... -Package=... -TargetPlatforms=Win64
   ThirdParty module throws at UBT time otherwise.
 * The output folder is what you upload or drop into another project's `Plugins/`; it contains
   `Binaries/`, `Intermediate/Build/.../Inc` (generated headers) and the copied sources.
+
+## Android
+
+`Source/ThirdParty/AurixClientLibrary/lib/Android/<abi>/libaurix_client.so` (arm64-v8a,
+armeabi-v7a, x86_64; `build_native.sh --target aarch64-linux-android` etc. with `cargo-ndk` and
+`ANDROID_NDK_HOME`, or the release zip which has them staged). `AurixClientLibrary_APL.xml` copies
+the ABIs the build targets into the APK, loads `aurix_client` before the game module and adds
+`RECORD_AUDIO` / `INTERNET` / `MODIFY_AUDIO_SETTINGS` to the manifest. Package with
+`-TargetPlatforms=Android`; the runtime microphone permission prompt is the game's to show
+(`AndroidPermission` plugin) — the module starts capture only after it is granted.
 
 ## CI
 
