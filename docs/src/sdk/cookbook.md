@@ -79,6 +79,23 @@ Rules of thumb: one positional channel per map zone or server shard (the server 
 command channel for leaders joined with `receive: true, speak: <leader>`. Keep names free of
 player-identifying data — they appear in logs, webhooks and the audit trail.
 
+## Push-to-talk and the input meter
+
+Both are built in; wire them in the inspector or in a few lines. Push-to-talk drives the real
+mute (`SetMuted`), so the server, the roster flags and `IsMuted` agree, and a release delay keeps
+the last word from being clipped. The meter is `0..1` from the last captured frame — draw it as a bar.
+
+| SDK | Push-to-talk | Input meter |
+| --- | --- | --- |
+| Unity | `AurixVoiceBehaviour.PushToTalkKey` (legacy Input) or `PushToTalkAction` (Input System: key, gamepad…); `PushToTalkToggle`, `PushToTalkReleaseDelay` | `InputLevel` / `OnInputLevel` |
+| Unreal | `SetMuted(false/true)` from an Input Action (Enhanced Input *Started*/*Completed*); the lobby sample's `Set Push To Talk Pressed` shows the pattern | `GetInputLevel()` / `GetInputEnergy()` (BlueprintPure; poll from Tick) |
+| Godot | `push_to_talk_action` = an InputMap action (`push_to_talk_toggle`, `push_to_talk_release_delay`) | `get_input_level()` / `get_input_energy()` |
+| Web | `attachPushToTalk(client, { keys: ["KeyV"], toggle: false, releaseDelayMs: 150 })` → `.press(bool)` for gamepad/on-screen buttons, `.dispose()` | `localVoiceActivity` level events |
+| Native (C/C++) | `aurix_client_set_muted` from your input layer | `aurix_client_capture_level` (0 = loudest, 127 = silence) / `aurix_client_capture_energy` |
+
+Open microphone instead: leave PTT unset and use the VAD gate (`GateOnVad` / `SetVadGate` /
+`set_vad_gate_enabled`) so silence is not sent.
+
 ## Bandwidth per participant
 
 Only speech is sent: with voice activity detection on (the default) a silent player costs
