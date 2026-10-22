@@ -39,6 +39,8 @@ namespace Aurix
         /// <summary><see cref="OnParticipantLeft"/> with the reason (kicked / timeout / out of range / ...).</summary>
         event Action<Guid, Participant, LeaveReason> OnParticipantRemoved;
         event Action<Guid, Participant> OnParticipantUpdated;
+        /// <summary>A member's microphone availability changed (<see cref="Participant.CaptureUnavailable"/>).</summary>
+        event Action<Guid, Participant, bool> OnParticipantCaptureChanged;
         event Action<Guid, Participant, bool> OnSpeaking;
         event Action<Guid, IReadOnlyList<ParticipantEnergy>> OnChannelEnergy;
         event Action<Guid, IReadOnlyList<UserPosition>> OnPositions;
@@ -78,6 +80,10 @@ namespace Aurix
         Task ModerateAsync(Guid channelId, Guid userId, ModerationAction action, string token, string reason = null, CancellationToken ct = default);
 
         void SetMuted(bool muted);
+
+        /// <summary>Tell the server whether this session has a usable microphone (false = no device / permission denied / open failed).</summary>
+
+        void SetCaptureAvailable(bool available);
         Task SetParticipantMutedAsync(Guid userId, bool muted, Guid? channelId = null, CancellationToken ct = default);
         bool IsParticipantMuted(Guid userId, Guid? channelId = null);
         Task SetParticipantVolumeAsync(Guid userId, float volume, CancellationToken ct = default);

@@ -8,6 +8,7 @@ server version it ships with (the repository is versioned as one unit).
 
 ### Added
 
+- `Participant.CaptureUnavailable` + `OnParticipantCaptureChanged`: members with no usable microphone are flagged in every roster; `AurixVoiceClient.SetCaptureAvailable` (the behaviour reports Microphone failures / denied permission itself). `AurixVoiceBehaviour.OnSpeakingWhileMuted` for the "you are muted" hint.
 - `AurixErrors.Describe(code)` / `IsRetryable(code)` / `IsPlayerFacing(code)`: the cookbook's error table as code for `OnRequestFailed` / `OnServerError` / `AurixApiException`.
 - `OnParticipantRemoved(channel, participant, LeaveReason)`: `OnParticipantLeft` plus why — `Kicked`, `Timeout` (connection lost), `Banned`, `OutOfRange` (positional roster radius), `ChannelClosed`, `Replaced`, `Left`.
 - `AurixPositionalSource`: reports the local player's pose to a positional channel at a fixed rate (only when moved) and attaches remote talkers' voices to their avatars (`AttachParticipantVoice`) — the Unity counterpart of Unreal's `AurixProximityVoiceComponent`.

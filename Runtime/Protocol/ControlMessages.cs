@@ -29,6 +29,7 @@ namespace Aurix.Protocol
         public bool IsSpeaking;
         /// <summary>Priority speaker: their speech ducks everyone else (<see cref="DuckingConfig"/>).</summary>
         public bool IsPriority;
+            public bool CaptureUnavailable;
     }
 
     /// <summary>
@@ -474,6 +475,7 @@ namespace Aurix.Protocol
                     IsMuted = MiniJson.GetBool(o, "is_muted"),
                     IsSpeaking = MiniJson.GetBool(o, "is_speaking"),
                     IsPriority = MiniJson.GetBool(o, "is_priority"),
+                    CaptureUnavailable = MiniJson.GetBool(o, "capture_unavailable"),
                 });
             }
             return list;
@@ -935,6 +937,9 @@ namespace Aurix.Protocol
             if (userId.HasValue) data["user_id"] = userId.Value;
             return Serialize("SetPriority", data);
         }
+
+        public static string SetCaptureAvailable(bool available) =>
+            Serialize("SetCaptureAvailable", new Dictionary<string, object> { { "available", available } });
 
         public static string SetTransmission(TransmissionMode mode) =>
             Serialize("SetTransmission", new Dictionary<string, object> { { "mode", mode.ToWire() } });

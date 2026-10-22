@@ -111,6 +111,7 @@ namespace Aurix.WebGL
         public event Action<Guid, Participant> OnParticipantLeft;
         public event Action<Guid, Participant, LeaveReason> OnParticipantRemoved;
         public event Action<Guid, Participant> OnParticipantUpdated;
+        public event Action<Guid, Participant, bool> OnParticipantCaptureChanged;
         public event Action<Guid, Participant, bool> OnSpeaking;
         public event Action<Guid, IReadOnlyList<ParticipantEnergy>> OnChannelEnergy;
         public event Action<Guid, IReadOnlyList<UserPosition>> OnPositions;
@@ -359,6 +360,11 @@ namespace Aurix.WebGL
         {
             _muted = muted;
             if (_handle > 0) Invoke("setMuted", new Dictionary<string, object> { { "muted", muted } });
+        }
+
+        public void SetCaptureAvailable(bool available)
+        {
+            if (_handle > 0) Invoke("setCaptureAvailable", new Dictionary<string, object> { { "available", available } });
         }
 
         public Task SetParticipantMutedAsync(Guid userId, bool muted, Guid? channelId = null, CancellationToken ct = default)
@@ -938,6 +944,20 @@ namespace Aurix.WebGL
                     p ??= new Participant { UserId = userId, DisplayName = string.Empty };
                     OnParticipantLeft?.Invoke(channelId, p);
                     OnParticipantRemoved?.Invoke(channelId, p, LeaveReasons.Parse(MiniJson.GetString(e, "reason")));
+                    return;
+                }
+                case "participantCaptureChanged":
+                {
+                    var channelId = BridgeJson.Id(e, "channelId");
+                    var userId = BridgeJson.Id(e, "userId");
+                    var available = MiniJson.GetBool(e, "available");
+                    Participant p = null;
+                    lock (_channels)
+                        if (_channels.TryGetValue(channelId, out var members)) members.TryGetValue(userId, out p);
+                    if (p == null) return;
+                    p.CaptureUnavailable = !available;
+                    OnParticipantUpdated?.Invoke(channelId, p);
+                    OnParticipantCaptureChanged?.Invoke(channelId, p, available);
                     return;
                 }
                 case "speaking":
