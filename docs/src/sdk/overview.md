@@ -76,7 +76,7 @@ the channel grants, so there is no separate login/channel-token round trip.
 | 6. Disconnect | `Disconnect()` | `Disconnect()` | `disconnect_from_server()` | `disconnect()` |
 
 Input meter for the HUD: `InputLevel` / `OnInputLevel` (Unity), `GetInputLevel` (Unreal),
-`get_input_level()` (Godot), `localVoiceActivity` (Web) — all `0..1`. Reconnect on a dropped
+`get_input_level()` (Godot), the `localEnergy` event (Web, on by default via `localVoiceActivity`) — all `0..1`. Reconnect on a dropped
 socket, background/foreground handling on mobile and the network-change probe are built into every
 SDK with the same defaults; nothing to wire for the common case.
 
