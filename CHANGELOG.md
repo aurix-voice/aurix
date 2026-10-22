@@ -14,9 +14,11 @@ released together.
 ### Added
 
 - Push-to-talk out of the box: Unity `AurixVoiceBehaviour.PushToTalkKey` / Input System `PushToTalkAction` (hold or toggle, release delay), Godot `push_to_talk_action` (InputMap), Web `attachPushToTalk(client, { keys, toggle, releaseDelayMs })` with `press()` for gamepads. Input level meters: core `capture_level/capture_energy` (C ABI, C++), Unreal `GetInputLevel/GetInputEnergy`, Godot `get_input_level`, Unity `InputLevel` + `OnInputLevel`.
+- Unreal: push-to-talk lives in the plugin — `SetPushToTalkEnabled` (hold or toggle, release delay), `SetPushToTalkAction` (Enhanced Input action polled per tick, so keyboard/gamepad/touch bindings work without C++), `SetPushToTalkPressed`, `IsPushToTalkTransmitting`, `OnPushToTalkChanged`; the lobby sample forwards to it. The plugin now depends on the EnhancedInput engine plugin.
 
 ### Fixed
 
+- Unreal: a duplicate `GetInputEnergy` declaration introduced with the input meter broke the plugin build; it is gone (the method returns the RMS of the last captured frame as before).
 - Web and Node SDK `package.json` carry `repository` (url + directory) — npm provenance verification requires it; `release.yml` gained a manual `npm_publish` dispatch to re-publish an already released version.
 
 ## [1.8.1] - 2026-10-22

@@ -18,6 +18,7 @@ public class AurixVoice : ModuleRules
 		{
 			"AudioCaptureCore",
 			"AudioCapture",
+			"EnhancedInput",
 			"HTTP",
 			"Json",
 			"Projects",

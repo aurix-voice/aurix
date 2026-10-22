@@ -88,7 +88,7 @@ the last word from being clipped. The meter is `0..1` from the last captured fra
 | SDK | Push-to-talk | Input meter |
 | --- | --- | --- |
 | Unity | `AurixVoiceBehaviour.PushToTalkKey` (legacy Input) or `PushToTalkAction` (Input System: key, gamepad…); `PushToTalkToggle`, `PushToTalkReleaseDelay` | `InputLevel` / `OnInputLevel` |
-| Unreal | `SetMuted(false/true)` from an Input Action (Enhanced Input *Started*/*Completed*); the lobby sample's `Set Push To Talk Pressed` shows the pattern | `GetInputLevel()` / `GetInputEnergy()` (BlueprintPure; poll from Tick) |
+| Unreal | `SetPushToTalkEnabled(true, bToggle, ReleaseDelay)` on the subsystem, then either `SetPushToTalkAction(InputAction)` (polled from Enhanced Input: keyboard, gamepad, touch) or `SetPushToTalkPressed(bool)` from your own events; `OnPushToTalkChanged` / `IsPushToTalkTransmitting` for the UI | `GetInputLevel()` / `GetInputEnergy()` (BlueprintPure; poll from Tick) |
 | Godot | `push_to_talk_action` = an InputMap action (`push_to_talk_toggle`, `push_to_talk_release_delay`) | `get_input_level()` / `get_input_energy()` |
 | Web | `attachPushToTalk(client, { keys: ["KeyV"], toggle: false, releaseDelayMs: 150 })` → `.press(bool)` for gamepad/on-screen buttons, `.dispose()` | `localVoiceActivity` level events |
 | Native (C/C++) | `aurix_client_set_muted` from your input layer | `aurix_client_capture_level` (0 = loudest, 127 = silence) / `aurix_client_capture_energy` |

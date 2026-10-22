@@ -80,7 +80,28 @@ Getting the remote avatar for a `User Id` is your game's mapping (PlayerState �
 A common pattern: put the voice user id in a replicated `PlayerState` property and resolve it
 in the avatar's *Begin Play*.
 
-## 3. Beyond the samples
+## 3. Push-to-talk and the microphone meter (no C++)
+
+Push-to-talk is a state machine inside **Aurix Voice Subsystem**, so it works the same with the
+lobby component or your own wiring:
+
+1. Create an *Input Action* (bool) — e.g. `IA_PushToTalk` — and bind it in your *Input Mapping
+   Context* to a key, a gamepad button or a touch region, as you do for any other action.
+2. After **Connect** (any time, actually): **Set Push To Talk Enabled** (`Enabled` = true,
+   `Toggle` = false for hold / true for press-to-toggle, `Release Delay Seconds` = 0.15 keeps the
+   last syllable from being clipped), then **Set Push To Talk Action** (`IA_PushToTalk`,
+   `Local Player Index` 0). The subsystem polls the action every tick: the mic is muted until the
+   action is down. Nothing else to bind. Alternative without an action: call
+   **Set Push To Talk Pressed** (true / false) from any event — UI button, *Started* /
+   *Completed* of an action, a controller event.
+3. UI: **On Push To Talk Changed** (`Transmitting`) → light the talk icon; **Is Push To Talk
+   Transmitting** for polling. **Get Input Level** (0..1 of the last captured frame, independent
+   of mute) or **Get Input Energy** (RMS) drive a microphone meter — bind a Progress Bar's
+   percent to it. The lobby component's **Push To Talk** tick does the same enable call for you.
+4. Switching back to open mic: **Set Push To Talk Enabled** (false) — the current mute state stays,
+   so follow it with **Set Muted** (false) if the player should be heard right away.
+
+## 4. Beyond the samples
 
 Everything else is on **Aurix Voice Subsystem** (*Get Game Instance Subsystem* or the library's
 **Get Aurix Voice**): multiple channels with **Set Transmission** / **Set Channel Focus**,

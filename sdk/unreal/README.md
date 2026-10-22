@@ -105,7 +105,8 @@ without a Rust toolchain) run `RunUAT BuildPlugin` as described in
   speaking, energy, muted / server-muted / locally-muted, priority, local volume), a status
   line (`On Status Changed`: state, media path, endpoint, quality bars, MOS, RTT), chat
   (`On Chat Line` / `Send Chat`) and errors (`On Error` with the server's codes). Input goes to
-  `Set Push To Talk Pressed` / `Toggle Microphone Muted`; per-player context menus to
+  `Set Push To Talk Pressed` / `Toggle Microphone Muted` (or bind an Input Action with the
+  subsystem's `Set Push To Talk Action` — hold/toggle, release delay); per-player context menus to
   `Set Participant Muted Locally` / `Set Participant Volume Locally`.
 * **Aurix Proximity Voice** on the local pawn: `Set Channel` after the join; it reports the
   pawn's (or `Pose Source`'s) pose at `Updates Per Second` when it moved, and

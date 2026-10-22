@@ -50,6 +50,7 @@ void UAurixVoiceLobbyComponent::Bind(UAurixVoiceSubsystem& Voice)
 	Voice.OnParticipantPriorityChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandlePriorityChanged);
 	Voice.OnChannelEnergy.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleEnergy);
 	Voice.OnLocalSpeaking.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleLocalSpeaking);
+	Voice.OnPushToTalkChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandlePushToTalkChanged);
 	Voice.OnMediaPathChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleMediaPath);
 	Voice.OnNetworkQuality.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleNetworkQuality);
 	Voice.OnEndpointChanged.AddDynamic(this, &UAurixVoiceLobbyComponent::HandleEndpointChanged);
@@ -77,6 +78,7 @@ void UAurixVoiceLobbyComponent::Unbind(UAurixVoiceSubsystem& Voice)
 	Voice.OnParticipantPriorityChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandlePriorityChanged);
 	Voice.OnChannelEnergy.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleEnergy);
 	Voice.OnLocalSpeaking.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleLocalSpeaking);
+	Voice.OnPushToTalkChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandlePushToTalkChanged);
 	Voice.OnMediaPathChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleMediaPath);
 	Voice.OnNetworkQuality.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleNetworkQuality);
 	Voice.OnEndpointChanged.RemoveDynamic(this, &UAurixVoiceLobbyComponent::HandleEndpointChanged);
@@ -172,9 +174,17 @@ void UAurixVoiceLobbyComponent::LeaveChannel()
 void UAurixVoiceLobbyComponent::SetPushToTalkPressed(bool bPressed)
 {
 	bPushToTalkPressed = bPressed;
-	if (bPushToTalk)
+	if (!bPushToTalk)
 	{
-		ApplyMicrophoneState();
+		return;
+	}
+	if (UAurixVoiceSubsystem* Voice = GetVoice())
+	{
+		if (!Voice->IsPushToTalkEnabled())
+		{
+			Voice->SetPushToTalkEnabled(true);
+		}
+		Voice->SetPushToTalkPressed(bPressed);
 	}
 }
 
@@ -192,6 +202,11 @@ void UAurixVoiceLobbyComponent::SetMicrophoneMuted(bool bMuted)
 	}
 }
 
+void UAurixVoiceLobbyComponent::HandlePushToTalkChanged(bool bTransmitting)
+{
+	NotifyStatus();
+}
+
 void UAurixVoiceLobbyComponent::ApplyMicrophoneState()
 {
 	UAurixVoiceSubsystem* Voice = GetVoice();
@@ -199,10 +214,24 @@ void UAurixVoiceLobbyComponent::ApplyMicrophoneState()
 	{
 		return;
 	}
-	const bool bMuted = bPushToTalk ? !bPushToTalkPressed : bOpenMicMuted;
-	if (Voice->IsMuted() != bMuted)
+	// Push-to-talk is the subsystem's state machine (hold/toggle/release delay); the component
+	// only forwards presses. Open mic keeps the explicit mute flag.
+	if (bPushToTalk)
 	{
-		Voice->SetMuted(bMuted);
+		if (!Voice->IsPushToTalkEnabled())
+		{
+			Voice->SetPushToTalkEnabled(true);
+			NotifyStatus();
+		}
+		return;
+	}
+	if (Voice->IsPushToTalkEnabled())
+	{
+		Voice->SetPushToTalkEnabled(false);
+	}
+	if (Voice->IsMuted() != bOpenMicMuted)
+	{
+		Voice->SetMuted(bOpenMicMuted);
 		NotifyStatus();
 	}
 }

@@ -741,6 +741,14 @@ above with the engine's `HTTP` module (bearer `GET /v1/me/regions`, optional pro
 `FAurixVoiceSettings.WebSocketUrl`. `CancelRegionDiscovery()` drops an in-flight request; a new
 `DiscoverRegions` cancels the previous one.
 
+Push-to-talk is part of the subsystem: `SetPushToTalkEnabled(true, bToggle, ReleaseDelaySeconds)`
+mutes the microphone until the PTT input is down, then either `SetPushToTalkAction(InputAction,
+LocalPlayerIndex)` lets the subsystem poll an Enhanced Input action every tick (keyboard, gamepad
+or touch — whatever the mapping context binds, no C++ needed) or your code calls
+`SetPushToTalkPressed(bool)`. `OnPushToTalkChanged` / `IsPushToTalkTransmitting()` feed the talk
+indicator; `GetInputLevel()` / `GetInputEnergy()` feed a microphone meter. Do not call `SetMuted`
+while push-to-talk is enabled — it owns the mute flag.
+
 ### Verification status
 
 Verified in CI: the native library builds with statically linked Opus on Linux x64, Windows x64

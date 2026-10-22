@@ -15,6 +15,7 @@ class FAurixAudioCapture;
 class FAurixRegionDiscovery;
 struct FAurixNativeClient;
 struct AurixEvent;
+class UInputAction;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixStateChanged, EAurixConnectionState, State);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixSessionReady, const FAurixSessionInfo&, Session);
@@ -34,6 +35,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAurixParticipantCaptureChanged, 
 /** Audio injection started (true) or ended (false: clip finished, StopAudioInjection, disconnect). */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioInjectionChanged, bool, bActive);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixLocalSpeaking, bool, bSpeaking);
+/** Push-to-talk let audio through (true) or closed the microphone again (false). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixPushToTalkChanged, bool, bTransmitting);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAurixTransmissionChanged, EAurixTransmissionMode, Mode, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixChannelFocusChanged, FGuid, ChannelId);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAurixAudioCodecChanged, EAurixAudioCodec, Codec);
@@ -249,6 +252,36 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool IsMuted() const;
 
+	/**
+	 * Push-to-talk owned by the plugin: while enabled the microphone is muted unless the PTT input
+	 * is held (or, with bToggle, flipped on by a press). Feed the input with SetPushToTalkPressed
+	 * (bind an Enhanced Input action's Started/Completed, a UI button, a gamepad event) or let the
+	 * subsystem poll an Enhanced Input action every tick (SetPushToTalkAction). ReleaseDelaySeconds
+	 * keeps transmitting that long after release so word endings are not clipped. While enabled,
+	 * do not call SetMuted yourself; disabling leaves the current mute state as it is.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone|Push-to-talk")
+	void SetPushToTalkEnabled(bool bEnabled, bool bToggle = false, float ReleaseDelaySeconds = 0.15f);
+
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone|Push-to-talk")
+	bool IsPushToTalkEnabled() const { return bPushToTalkEnabled; }
+
+	/** Hold mode: current pressed state. Toggle mode: a `true` call flips transmission. No-op while PTT is disabled. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone|Push-to-talk")
+	void SetPushToTalkPressed(bool bPressed);
+
+	/**
+	 * Poll an Enhanced Input action (keyboard, gamepad, touch — whatever its mapping context binds)
+	 * from the given local player every tick instead of calling SetPushToTalkPressed. The action must
+	 * be in an active mapping context of that player. Null stops polling.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone|Push-to-talk")
+	void SetPushToTalkAction(UInputAction* Action, int32 LocalPlayerIndex = 0);
+
+	/** True while push-to-talk lets audio through (held, within the release delay, or toggled on). */
+	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone|Push-to-talk")
+	bool IsPushToTalkTransmitting() const { return bPushToTalkEnabled && bPushToTalkTransmitting; }
+
 	/** Whether this client told the server it has a usable microphone (SetCaptureAvailable). */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	bool IsCaptureAvailable() const;
@@ -281,10 +314,6 @@ public:
 	 */
 	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
 	float GetInputLevel() const;
-
-	/** Smoothed linear RMS energy (0.0..1.0) of the most recent captured frames. */
-	UFUNCTION(BlueprintPure, Category = "Aurix Voice|Microphone")
-	float GetInputEnergy() const;
 
 	/** Software gain 0..4. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice|Microphone")
@@ -787,6 +816,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixDuckingChanged OnDuckingChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelEnergy OnChannelEnergy;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixLocalSpeaking OnLocalSpeaking;
+	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixPushToTalkChanged OnPushToTalkChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixTransmissionChanged OnTransmissionChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixChannelFocusChanged OnChannelFocusChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events") FAurixAudioCodecChanged OnAudioCodecChanged;
@@ -890,4 +920,19 @@ private:
 	void OnEnterBackground();
 	void OnEnterForeground();
 	bool bPlaybackRequested = false;
+
+	bool bPushToTalkEnabled = false;
+	bool bPushToTalkToggle = false;
+	float PushToTalkReleaseDelay = 0.15f;
+	bool bPushToTalkPressed = false;
+	bool bPushToTalkTransmitting = false;
+	bool bPushToTalkActionWasDown = false;
+	double PushToTalkReleaseAt = -1.0;
+	double PushToTalkClock = 0.0;
+	int32 PushToTalkLocalPlayerIndex = 0;
+	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> PushToTalkAction;
+	void UpdatePushToTalk(float DeltaTime);
+	void ApplyPushToTalk(bool bTransmitting);
+	void ScheduleOrClosePushToTalk();
 };

@@ -10,6 +10,10 @@
 #include "Components/SceneComponent.h"
 #include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
+#include "Engine/LocalPlayer.h"
+#include "EnhancedInputSubsystems.h"
+#include "EnhancedPlayerInput.h"
+#include "InputAction.h"
 #include "Engine/World.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/CoreDelegates.h"
@@ -781,6 +785,7 @@ void UAurixVoiceSubsystem::Tick(float DeltaTime)
 	PumpEvents();
 	PollCaptureDevices();
 	PumpInjection(DeltaTime);
+	UpdatePushToTalk(DeltaTime);
 }
 
 void UAurixVoiceSubsystem::InjectAudio(const TArray<float>& InterleavedPcm, int32 SampleRate, int32 Channels, bool bLoop, float Gain, bool bMixWithMicrophone)
@@ -978,6 +983,10 @@ bool UAurixVoiceSubsystem::Connect(const FAurixVoiceSettings& Settings)
 		return false;
 	}
 	Native = MoveTemp(Created);
+	if (bPushToTalkEnabled)
+	{
+		Native->Client.set_muted(!bPushToTalkTransmitting);
+	}
 
 	// Participant sounds and claims outlive the native client (reconnect with a new token).
 	for (const TPair<FGuid, TObjectPtr<UAurixParticipantSoundWave>>& Pair : ParticipantSounds)
@@ -1256,6 +1265,139 @@ bool UAurixVoiceSubsystem::IsMuted() const
 	return Native && Native->Client.is_muted();
 }
 
+void UAurixVoiceSubsystem::SetPushToTalkEnabled(bool bEnabled, bool bToggle, float ReleaseDelaySeconds)
+{
+	const bool bWasEnabled = bPushToTalkEnabled;
+	bPushToTalkEnabled = bEnabled;
+	bPushToTalkToggle = bToggle;
+	PushToTalkReleaseDelay = FMath::Max(0.f, ReleaseDelaySeconds);
+	if (!bEnabled)
+	{
+		bPushToTalkPressed = false;
+		bPushToTalkActionWasDown = false;
+		PushToTalkReleaseAt = -1.0;
+		if (bWasEnabled && bPushToTalkTransmitting)
+		{
+			bPushToTalkTransmitting = false;
+			OnPushToTalkChanged.Broadcast(false);
+		}
+		return;
+	}
+	if (!bWasEnabled)
+	{
+		bPushToTalkPressed = false;
+		bPushToTalkActionWasDown = false;
+		PushToTalkReleaseAt = -1.0;
+		bPushToTalkTransmitting = false;
+		SetMuted(true);
+	}
+}
+
+void UAurixVoiceSubsystem::SetPushToTalkPressed(bool bPressed)
+{
+	if (!bPushToTalkEnabled)
+	{
+		return;
+	}
+	const bool bWasPressed = bPushToTalkPressed;
+	bPushToTalkPressed = bPressed;
+	if (bPushToTalkToggle)
+	{
+		if (bPressed && !bWasPressed)
+		{
+			if (bPushToTalkTransmitting && PushToTalkReleaseAt < 0.0)
+			{
+				ScheduleOrClosePushToTalk();
+			}
+			else
+			{
+				PushToTalkReleaseAt = -1.0;
+				ApplyPushToTalk(true);
+			}
+		}
+		return;
+	}
+	if (bPressed)
+	{
+		PushToTalkReleaseAt = -1.0;
+		ApplyPushToTalk(true);
+	}
+	else if (bPushToTalkTransmitting && PushToTalkReleaseAt < 0.0)
+	{
+		ScheduleOrClosePushToTalk();
+	}
+}
+
+void UAurixVoiceSubsystem::ScheduleOrClosePushToTalk()
+{
+	if (PushToTalkReleaseDelay <= 0.f)
+	{
+		ApplyPushToTalk(false);
+	}
+	else
+	{
+		PushToTalkReleaseAt = PushToTalkClock + PushToTalkReleaseDelay;
+	}
+}
+
+void UAurixVoiceSubsystem::SetPushToTalkAction(UInputAction* Action, int32 LocalPlayerIndex)
+{
+	PushToTalkAction = Action;
+	PushToTalkLocalPlayerIndex = FMath::Max(0, LocalPlayerIndex);
+	if (!Action && bPushToTalkActionWasDown)
+	{
+		bPushToTalkActionWasDown = false;
+		SetPushToTalkPressed(false);
+	}
+}
+
+void UAurixVoiceSubsystem::UpdatePushToTalk(float DeltaTime)
+{
+	PushToTalkClock += DeltaTime;
+	if (!bPushToTalkEnabled)
+	{
+		return;
+	}
+	if (PushToTalkAction)
+	{
+		bool bDown = false;
+		if (const UGameInstance* GameInstance = GetGameInstance())
+		{
+			if (ULocalPlayer* LocalPlayer = GameInstance->GetLocalPlayerByIndex(PushToTalkLocalPlayerIndex))
+			{
+				if (const UEnhancedInputLocalPlayerSubsystem* EnhancedInput = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LocalPlayer))
+				{
+					if (const UEnhancedPlayerInput* PlayerInput = EnhancedInput->GetPlayerInput())
+					{
+						bDown = PlayerInput->GetActionValue(PushToTalkAction).Get<bool>();
+					}
+				}
+			}
+		}
+		if (bDown != bPushToTalkActionWasDown)
+		{
+			bPushToTalkActionWasDown = bDown;
+			SetPushToTalkPressed(bDown);
+		}
+	}
+	if (PushToTalkReleaseAt >= 0.0 && PushToTalkClock >= PushToTalkReleaseAt)
+	{
+		PushToTalkReleaseAt = -1.0;
+		ApplyPushToTalk(false);
+	}
+}
+
+void UAurixVoiceSubsystem::ApplyPushToTalk(bool bTransmitting)
+{
+	if (bPushToTalkTransmitting == bTransmitting && IsMuted() == !bTransmitting)
+	{
+		return;
+	}
+	bPushToTalkTransmitting = bTransmitting;
+	SetMuted(!bTransmitting);
+	OnPushToTalkChanged.Broadcast(bTransmitting);
+}
+
 bool UAurixVoiceSubsystem::IsCaptureAvailable() const
 {
 	return !Native || Native->Client.is_capture_available();
@@ -1315,11 +1457,6 @@ float UAurixVoiceSubsystem::GetInputLevel() const
 	if (!Native) return 0.f;
 	const uint8 Wire = Native->Client.capture_level();   // 0 = loudest, 127 = silence
 	return Wire >= 127 ? 0.f : 1.f - static_cast<float>(Wire) / 127.f;
-}
-
-float UAurixVoiceSubsystem::GetInputEnergy() const
-{
-	return Native ? FMath::Clamp(Native->Client.capture_energy(), 0.f, 1.f) : 0.f;
 }
 
 void UAurixVoiceSubsystem::SetInputGain(float Gain)

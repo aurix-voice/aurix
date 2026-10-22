@@ -168,7 +168,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice")
 	void LeaveChannel();
 
-	/** With bPushToTalk: unmute while pressed. Without: no effect. */
+	/** With bPushToTalk: forwards to the subsystem's push-to-talk (hold mode, 150 ms release delay). Without: no effect. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice")
 	void SetPushToTalkPressed(bool bPressed);
 
@@ -220,6 +220,7 @@ private:
 	UFUNCTION() void HandlePriorityChanged(FGuid Channel, FGuid UserId, bool bPriority);
 	UFUNCTION() void HandleEnergy(FGuid Channel, const TArray<FAurixParticipant>& Levels);
 	UFUNCTION() void HandleLocalSpeaking(bool bSpeaking);
+	UFUNCTION() void HandlePushToTalkChanged(bool bTransmitting);
 	bool bSpeakingWhileMuted = false;
 	UFUNCTION() void HandleMediaPath(EAurixMediaPath Path, const FString& Reason);
 	UFUNCTION() void HandleNetworkQuality(const FAurixNetworkQuality& Quality);
