@@ -82,6 +82,15 @@ func join(channel_id: String) -> void:
   channel; the fingerprint / identity-persistence API and the `E2EE_*` events are not bound to
   GDScript yet (a fresh identity per session).
 
+## Audio injection
+
+`inject_audio(pcm: PackedFloat32Array, sample_rate_hz, channels, loop = false, gain = 1.0,
+mix_with_microphone = true)` plays a clip into your transmitting channels — soundboards, voice
+lines, and the microphone test (join an echo channel, inject, listen). It works without a
+microphone (frames are pushed from `_process`), `stop_audio_injection()` ends it and
+`audio_injection_changed(active)` fires at start and when a non-looping clip finishes. Decode an
+`AudioStreamWAV` with `data` → floats, or use `AudioStreamGenerator`-style PCM you already have.
+
 ## Diagnostics
 
 - `participant_capture_changed(channel_id, user_id, available)` and the `capture_unavailable`

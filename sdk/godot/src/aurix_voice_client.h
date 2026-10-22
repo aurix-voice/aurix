@@ -246,6 +246,12 @@ public:
     bool is_capturing() const;
     void push_capture(const PackedVector2Array& frames, int sample_rate_hz);
     void push_capture_mono(const PackedFloat32Array& samples, int sample_rate_hz);
+    /// Play a PCM clip into your transmitting channels — mixed with the microphone (default) or
+    /// instead of it; works without a microphone too (frames are pushed from _process).
+    /// Interleaved float PCM, any rate, 1..8 channels. Soundboards, voice lines, mic tests.
+    void inject_audio(const PackedFloat32Array& interleaved_pcm, int sample_rate_hz, int channels, bool loop, double gain, bool mix_with_microphone);
+    void stop_audio_injection();
+    bool is_injecting_audio() const;
     void set_muted(bool muted);
     /// Tell the server whether this session has a usable microphone (false = no device / permission denied / open failed).
     void set_capture_available(bool available);
@@ -358,6 +364,10 @@ private:
     void pump_events();
     void dispatch(const aurix::Event& ev);
     void feed_capture();
+    /// Injected clip: next `frames` frames at `rate`, `channels` wide, added into (or replacing) `out`.
+    void mix_injection(float* out, size_t frames, int channels, uint32_t rate, bool replace_missing);
+    void pump_injection(double delta);
+    void finish_injection();
     void feed_playback();
     void destroy_capture_bus();
 
@@ -379,6 +389,16 @@ private:
     Ref<AudioEffectCapture> capture_effect_;
     int capture_bus_index_ = -1;
     std::vector<float> capture_scratch_;
+    std::vector<float> inject_pcm_;
+    std::vector<float> inject_frame_;
+    int inject_rate_ = 48000;
+    int inject_channels_ = 1;
+    bool inject_loop_ = false;
+    bool inject_mix_ = true;
+    float inject_gain_ = 1.0f;
+    double inject_pos_ = 0.0;
+    double inject_clock_ = 0.0;
+    bool injecting_ = false;
 
     // playback: client mix → AudioStreamGenerator → AudioStreamPlayer
     AudioStreamPlayer* out_player_ = nullptr;

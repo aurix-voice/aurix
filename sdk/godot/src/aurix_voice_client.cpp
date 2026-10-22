@@ -292,7 +292,10 @@ String AurixVoiceClient::user_for_ssrc(int64_t ssrc) const {
 bool AurixVoiceClient::start_capture() {
     if (mic_player_) return true;
     AudioServer* server = AudioServer::get_singleton();
-    if (!server) return false;
+    if (!server) {
+        if (client_) client_.set_capture_available(false);
+        return false;
+    }
 
     int bus = server->get_bus_index(kCaptureBusName);
     if (bus < 0) {
@@ -322,6 +325,7 @@ bool AurixVoiceClient::start_capture() {
     add_child(mic_player_);
     mic_player_->play();
     capture_effect_->clear_buffer();
+    if (client_) client_.set_capture_available(true);
     return true;
 }
 
@@ -360,7 +364,94 @@ void AurixVoiceClient::feed_capture() {
         capture_scratch_[static_cast<size_t>(i) * 2] = in[i].x;
         capture_scratch_[static_cast<size_t>(i) * 2 + 1] = in[i].y;
     }
+    if (injecting_) mix_injection(capture_scratch_.data(), static_cast<size_t>(frames.size()), 2, rate, false);
     client_.push_capture(capture_scratch_.data(), capture_scratch_.size(), rate, 2);
+}
+
+// ---- audio injection -------------------------------------------------------------------------
+
+void AurixVoiceClient::inject_audio(const PackedFloat32Array& interleaved_pcm, int sample_rate_hz, int channels, bool loop, double gain, bool mix_with_microphone) {
+    if (sample_rate_hz <= 0 || channels <= 0 || channels > 8 || interleaved_pcm.size() < channels) {
+        UtilityFunctions::push_warning("AurixVoiceClient.inject_audio: empty clip or bad format");
+        return;
+    }
+    const bool was = injecting_;
+    inject_pcm_.assign(interleaved_pcm.ptr(), interleaved_pcm.ptr() + interleaved_pcm.size());
+    inject_rate_ = sample_rate_hz;
+    inject_channels_ = channels;
+    inject_loop_ = loop;
+    inject_gain_ = static_cast<float>(gain < 0.0 ? 0.0 : gain);
+    inject_mix_ = mix_with_microphone;
+    inject_pos_ = 0.0;
+    inject_clock_ = 0.0;
+    injecting_ = true;
+    if (!was) emit_signal("audio_injection_changed", true);
+}
+
+void AurixVoiceClient::stop_audio_injection() {
+    if (!injecting_) return;
+    injecting_ = false;
+    inject_pcm_.clear();
+    emit_signal("audio_injection_changed", false);
+}
+
+bool AurixVoiceClient::is_injecting_audio() const { return injecting_; }
+
+void AurixVoiceClient::finish_injection() {
+    // Non-looping clip ran out: tell the game once.
+    injecting_ = false;
+    inject_pcm_.clear();
+    emit_signal("audio_injection_changed", false);
+}
+
+void AurixVoiceClient::mix_injection(float* out, size_t frames, int channels, uint32_t rate, bool replace_missing) {
+    const size_t src_frames = inject_pcm_.size() / static_cast<size_t>(inject_channels_);
+    if (src_frames == 0) return;
+    const double step = static_cast<double>(inject_rate_) / static_cast<double>(rate == 0 ? 48000u : rate);
+    bool live = true;
+    for (size_t f = 0; f < frames; ++f) {
+        float* dst = out + f * static_cast<size_t>(channels);
+        if (!live) {
+            if (!inject_mix_ || replace_missing) for (int c = 0; c < channels; ++c) dst[c] = 0.0f;
+            continue;
+        }
+        const size_t i0 = static_cast<size_t>(inject_pos_) < src_frames ? static_cast<size_t>(inject_pos_) : src_frames - 1;
+        const size_t i1 = i0 + 1 < src_frames ? i0 + 1 : (inject_loop_ ? 0 : i0);
+        const float frac = static_cast<float>(inject_pos_ - static_cast<double>(i0));
+        for (int c = 0; c < channels; ++c) {
+            const int sc = inject_channels_ == 1 ? 0 : (c < inject_channels_ ? c : inject_channels_ - 1);
+            const float a = inject_pcm_[i0 * static_cast<size_t>(inject_channels_) + static_cast<size_t>(sc)];
+            const float b = inject_pcm_[i1 * static_cast<size_t>(inject_channels_) + static_cast<size_t>(sc)];
+            const float v = (a + (b - a) * frac) * inject_gain_;
+            dst[c] = inject_mix_ && !replace_missing ? std::max(-1.0f, std::min(1.0f, dst[c] + v)) : v;
+        }
+        inject_pos_ += step;
+        if (inject_pos_ >= static_cast<double>(src_frames)) {
+            if (inject_loop_) {
+                inject_pos_ = std::fmod(inject_pos_, static_cast<double>(src_frames));
+            } else {
+                live = false;
+            }
+        }
+    }
+    if (!live) finish_injection();
+}
+
+void AurixVoiceClient::pump_injection(double delta) {
+    if (!injecting_ || !client_ || mic_player_) {
+        inject_clock_ = 0.0;
+        return;
+    }
+    // No microphone open: feed the clip ourselves, 20 ms mono at 48 kHz per step.
+    constexpr uint32_t kRate = 48000;
+    constexpr size_t kFrame = kRate / 50;
+    inject_clock_ += delta < 0.25 ? delta : 0.25;
+    while (inject_clock_ >= 0.02 && injecting_) {
+        inject_clock_ -= 0.02;
+        inject_frame_.assign(kFrame, 0.0f);
+        mix_injection(inject_frame_.data(), kFrame, 1, kRate, true);
+        client_.push_capture(inject_frame_.data(), inject_frame_.size(), kRate, 1);
+    }
 }
 
 void AurixVoiceClient::push_capture(const PackedVector2Array& frames, int sample_rate_hz) {
@@ -961,9 +1052,10 @@ Dictionary AurixVoiceClient::get_network_quality() const {
 
 // ---- frame loop ------------------------------------------------------------------------------
 
-void AurixVoiceClient::_process(double) {
+void AurixVoiceClient::_process(double delta) {
     if (Engine::get_singleton()->is_editor_hint()) return;
     feed_capture();
+    pump_injection(delta);
     pump_events();
     feed_playback();
 }
@@ -1292,6 +1384,10 @@ void AurixVoiceClient::_bind_methods() {
     ClassDB::bind_method(D_METHOD("is_capturing"), &AurixVoiceClient::is_capturing);
     ClassDB::bind_method(D_METHOD("push_capture", "frames", "sample_rate_hz"), &AurixVoiceClient::push_capture);
     ClassDB::bind_method(D_METHOD("push_capture_mono", "samples", "sample_rate_hz"), &AurixVoiceClient::push_capture_mono);
+    ClassDB::bind_method(D_METHOD("inject_audio", "interleaved_pcm", "sample_rate_hz", "channels", "loop", "gain", "mix_with_microphone"),
+                         &AurixVoiceClient::inject_audio, DEFVAL(false), DEFVAL(1.0), DEFVAL(true));
+    ClassDB::bind_method(D_METHOD("stop_audio_injection"), &AurixVoiceClient::stop_audio_injection);
+    ClassDB::bind_method(D_METHOD("is_injecting_audio"), &AurixVoiceClient::is_injecting_audio);
     ClassDB::bind_method(D_METHOD("set_muted", "muted"), &AurixVoiceClient::set_muted);
     ClassDB::bind_method(D_METHOD("set_capture_available", "available"), &AurixVoiceClient::set_capture_available);
     ClassDB::bind_method(D_METHOD("is_muted"), &AurixVoiceClient::is_muted);
@@ -1410,6 +1506,7 @@ void AurixVoiceClient::_bind_methods() {
                           PropertyInfo(Variant::DICTIONARY, "ducking")));
     ADD_SIGNAL(MethodInfo("channel_energy", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::DICTIONARY, "levels")));
     ADD_SIGNAL(MethodInfo("local_speaking", PropertyInfo(Variant::BOOL, "speaking")));
+    ADD_SIGNAL(MethodInfo("audio_injection_changed", PropertyInfo(Variant::BOOL, "active")));
     ADD_SIGNAL(MethodInfo("speaking_while_muted", PropertyInfo(Variant::BOOL, "speaking")));
     ADD_SIGNAL(MethodInfo("participant_capture_changed", PropertyInfo(Variant::STRING, "channel_id"), PropertyInfo(Variant::STRING, "user_id"),
                           PropertyInfo(Variant::BOOL, "available")));
