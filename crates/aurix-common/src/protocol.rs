@@ -1164,7 +1164,9 @@ pub enum ControlMessage {
     /// Client→server: this session has (`true`) / has no (`false`) usable microphone — no
     /// device, permission denied, device open failed. Idempotent; the server tells every
     /// channel the session is in via `CaptureStateChanged` and remembers it for rosters.
-    SetCaptureAvailable { available: bool },
+    SetCaptureAvailable {
+        available: bool,
+    },
     /// Server→client: a member's microphone availability changed (see `SetCaptureAvailable`).
     CaptureStateChanged {
         channel_id: ChannelId,

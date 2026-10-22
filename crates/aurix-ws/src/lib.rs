@@ -495,7 +495,7 @@ impl WsState {
                     role: entry.role,
                     is_muted: entry.is_muted,
                     is_priority: entry.is_priority,
-                capture_unavailable: entry.capture_unavailable,
+                    capture_unavailable: entry.capture_unavailable,
                 }
             } else {
                 ControlMessage::ParticipantLeft {
@@ -544,7 +544,7 @@ impl WsState {
                 role,
                 is_muted: entry.is_muted,
                 is_priority: entry.is_priority,
-            capture_unavailable: entry.capture_unavailable,
+                capture_unavailable: entry.capture_unavailable,
             }
         } else {
             ControlMessage::ParticipantLeft {
