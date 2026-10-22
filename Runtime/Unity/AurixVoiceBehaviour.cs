@@ -126,8 +126,11 @@ namespace Aurix.Unity
         [Tooltip("Input System action (button) for push-to-talk — keyboard, gamepad or any binding. Used when set.")]
         public UnityEngine.InputSystem.InputActionReference PushToTalkAction;
 #endif
-        private bool _pttTransmitting;
-        private float _pttReleaseAt = -1f;
+        private readonly Aurix.Audio.PushToTalkState _ptt = new Aurix.Audio.PushToTalkState();
+        /// <summary>True while push-to-talk lets audio through (held, within the release delay, or toggled on).</summary>
+        public bool PushToTalkTransmitting => _ptt.Transmitting;
+        /// <summary>Push-to-talk opened (true) or closed (false) the microphone.</summary>
+        public event Action<bool> OnPushToTalkChanged;
 
         [Header("Mobile")]
         [Tooltip("Ask for the microphone permission (Android RECORD_AUDIO / iOS NSMicrophoneUsageDescription) before " +
@@ -780,22 +783,17 @@ namespace Aurix.Unity
         /// </summary>
         private void UpdatePushToTalk()
         {
-            if (!PushToTalkConfigured || Client == null) return;
-            bool pressed = PushToTalkPressedNow();
-            bool want = _pttTransmitting;
-            if (PushToTalkToggle) { if (pressed) want = !want; }
-            else want = pressed;
-            float now = Time.unscaledTime;
-            if (want)
+            if (!PushToTalkConfigured || Client == null)
             {
-                _pttReleaseAt = -1f;
-                if (!_pttTransmitting) { _pttTransmitting = true; if (Client.IsMuted) SetMuted(false); }
+                if (_ptt.Transmitting && _ptt.Reset()) { if (Client != null && !Client.IsMuted) SetMuted(true); OnPushToTalkChanged?.Invoke(false); }
+                return;
             }
-            else if (_pttTransmitting)
-            {
-                if (_pttReleaseAt < 0f) _pttReleaseAt = now + PushToTalkReleaseDelay;
-                if (now >= _pttReleaseAt) { _pttTransmitting = false; _pttReleaseAt = -1f; if (!Client.IsMuted) SetMuted(true); }
-            }
+            _ptt.Toggle = PushToTalkToggle;
+            _ptt.ReleaseDelay = PushToTalkReleaseDelay;
+            bool? change = _ptt.Update(PushToTalkPressedNow(), Time.unscaledTime);
+            if (change == null) return;
+            if (Client.IsMuted == change.Value) SetMuted(!change.Value);
+            OnPushToTalkChanged?.Invoke(change.Value);
         }
 
         private void Update()
