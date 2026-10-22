@@ -420,6 +420,7 @@ private:
     bool push_to_talk_toggle_ = false;
     double push_to_talk_release_delay_ = 0.15;
     bool ptt_transmitting_ = false;
+    bool ptt_latched_ = false;
     double ptt_release_at_ = -1.0;
     double ptt_clock_ = 0.0;
     void update_push_to_talk(double delta);

@@ -570,8 +570,10 @@ void AurixVoiceClient::update_push_to_talk(double delta) {
     if (!input || !InputMap::get_singleton()->has_action(push_to_talk_action_)) return;
     const bool pressed = push_to_talk_toggle_ ? input->is_action_just_pressed(push_to_talk_action_)
                                               : input->is_action_pressed(push_to_talk_action_);
-    bool want = ptt_transmitting_;
-    if (push_to_talk_toggle_) { if (pressed) want = !want; } else want = pressed;
+    // Toggle latches on the press edge; hold mirrors the key. Latch and transmission are separate so a
+    // toggle-off can still run out the release delay instead of re-opening the next frame.
+    if (push_to_talk_toggle_) { if (pressed) ptt_latched_ = !ptt_latched_; } else ptt_latched_ = pressed;
+    const bool want = ptt_latched_;
     if (want) {
         ptt_release_at_ = -1.0;
         if (!ptt_transmitting_) { ptt_transmitting_ = true; if (is_muted()) set_muted(false); }

@@ -84,6 +84,14 @@ func _init() -> void:
 	_check(is_zero_approx(client.get_input_energy()), "zero input energy")
 	client.set_muted(true)
 	client.set_input_gain(2.0)
+	client.push_to_talk_action = &"voice_ptt"
+	client.push_to_talk_toggle = true
+	client.push_to_talk_release_delay = -1.0
+	_check(client.push_to_talk_action == &"voice_ptt", "push_to_talk_action round-trips")
+	_check(client.push_to_talk_toggle, "push_to_talk_toggle round-trips")
+	_check(client.push_to_talk_release_delay == 0.0, "push_to_talk_release_delay clamps negatives to 0")
+	_check(client.get_input_level() == 0.0 and client.get_input_energy() == 0.0, "input meter is silent before connecting")
+	client.push_to_talk_action = &""
 	client.set_output_volume(0.5)
 	client.set_output_muted(true)
 	client.set_vad(0.02, 5)

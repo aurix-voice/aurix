@@ -100,7 +100,8 @@ threshold/hang-over and `GateOnVad` (send only detected speech), and the mobile 
 (`RequestMicrophonePermission`, `StopMicrophoneInBackground`, `ProbeAfterBackgroundSeconds`,
 `ReconnectOnNetworkChange`). Push-to-talk is built in: `PushToTalkKey` (legacy Input Manager
 `KeyCode`) or `PushToTalkAction` (an Input System action reference — keyboard, gamepad, touch),
-`PushToTalkToggle`, `PushToTalkReleaseDelay`; the behaviour drives `SetMuted` itself. `InputLevel`
+`PushToTalkToggle`, `PushToTalkReleaseDelay`; the behaviour drives `SetMuted` itself and reports
+`PushToTalkTransmitting` / `OnPushToTalkChanged(bool)` for the HUD. `InputLevel`
 (0..1) and `OnInputLevel` feed a microphone meter. `voice.Client` exposes the full
 `AurixVoiceClient`.
 
@@ -143,7 +144,7 @@ Server side: [Regions](../operations/scaling.md#regions).
 
 | Feature | API |
 |---|---|
-| Push-to-talk / input meter | `AurixVoiceBehaviour.PushToTalkKey` / `PushToTalkAction` (Input System), `PushToTalkToggle`, `PushToTalkReleaseDelay`; `InputLevel`, `OnInputLevel(float)` |
+| Push-to-talk / input meter | `AurixVoiceBehaviour.PushToTalkKey` / `PushToTalkAction` (Input System), `PushToTalkToggle`, `PushToTalkReleaseDelay`, `PushToTalkTransmitting`, `OnPushToTalkChanged(bool)`; `InputLevel`, `OnInputLevel(float)` |
 | Reconnect / resume | `AutoReconnect`, `Reconnect` policy, `ForceReconnect()`, `OnRecovering(attempt, delay, cause)`, `OnRecovered(SessionInfo)`, `OnFailedToRecover`, `OnSessionClosed`; `Reconnect.DeadlineSeconds` (default 30) gives up by wall-clock time as well as by attempts |
 | Failover | `Endpoint`, `FailoverEndpoints`, `OnEndpointChanged(url)`, `SessionInfo.Migrated`, `SessionInfo.Failover` — attempts rotate current node → advertised failover nodes; a takeover keeps session id/SSRC, new media key/endpoint |
 | Action tokens | `TokenRefresher`, `JoinTokenProvider`, `JoinChannelAsync(id, joinToken)`, `ModerateAsync(channel, user, ModerationAction, token, reason)` |
