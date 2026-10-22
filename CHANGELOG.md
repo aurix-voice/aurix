@@ -11,6 +11,12 @@ released together.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-10-22
+
+### Fixed
+
+- Release workflow: `npm publish` of the Web SDK used a relative path that npm 11 parsed as a git specifier (`github:staged/...`); the Go module tag step no longer fails the release when Actions cannot push tags for commits touching workflow files (the releaser pushes `sdk/server/go/v<version>`).
+
 ## [1.8.0] - 2026-10-22
 
 ### Added

@@ -87,6 +87,11 @@ The `release` workflow (`.github/workflows/release.yml`) does the rest. Run it m
 | git tag `sdk/server/go/v<v>` | — | makes `go get …/sdk/server/go@v<v>` resolve |
 | `ghcr.io/<owner>/aurix-server:<v>` | linux/amd64, linux/arm64 | also `:X.Y`, `:X` and `:latest` for stable releases; signed, with an attached SBOM attestation |
 
+If the release commit touches `.github/workflows/`, Actions cannot create that tag (GitHub
+withholds the `workflows` permission from `GITHUB_TOKEN`); the job warns instead of failing and
+the releaser pushes it: `git tag sdk/server/go/v<version> <sha> && git push origin
+refs/tags/sdk/server/go/v<version>`.
+
 Packages are **not** pushed to npm, PyPI, NuGet or pkg.go.dev. Install from the release assets or
 the git URL (UPM: `https://github.com/<owner>/aurix.git?path=/sdk/unity#v1.3.0`;
 Go: `go get github.com/<owner>/aurix/sdk/server/go@v1.3.0` — the workflow also pushes the

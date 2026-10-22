@@ -795,7 +795,7 @@ jobs:
           npm install -g npm@latest >/dev/null   # trusted publishing needs npm >= 11.5.1
           npm --version
           tag=latest; case "$VERSION" in *-*) tag=next ;; esac
-          if npm publish "staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"; then
+          if npm publish "./staged/aurix-web-sdk-${VERSION}.tgz" --access public --provenance --tag "$tag"; then
             echo "::notice title=npm::@aurix/web-sdk@${VERSION} published (dist-tag ${tag})"
           else
             echo "::warning title=npm publish failed::Configure the trusted publisher on npmjs.com for @aurix/web-sdk (GitHub Actions: aurix-voice / aurix / release.yml, no environment). The tarball is attached to the GitHub release regardless."
@@ -882,5 +882,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="sdk/server/go/v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists"; exit 0
+          fi
           git tag "$tag" "$GITHUB_SHA"
-          git push origin "refs/tags/$tag"
+          # GITHUB_TOKEN may not create refs for commits that touch .github/workflows (needs the
+          # `workflows` permission GitHub does not grant to Actions); then the releaser pushes it.
+          git push origin "refs/tags/$tag" || echo "::warning title=Go module tag::could not push $tag from Actions; run: git tag $tag $GITHUB_SHA && git push origin refs/tags/$tag"
