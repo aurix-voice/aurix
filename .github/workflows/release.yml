@@ -835,6 +835,8 @@ jobs:
           path: staged
           merge-multiple: true
       - run: mv "aurix-${VERSION}.source.cdx.json" staged/
+      - name: Release acceptance — every SDK package contains what its consumers expect
+        run: python3 tools/release/check_assets.py "$VERSION" staged
       - uses: actions/setup-node@v4
         if: needs.verify.outputs.publish == 'true'
         with:

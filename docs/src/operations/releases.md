@@ -161,3 +161,11 @@ npm provenance requires `package.json#repository.url` to point at this repositor
 npm packages). `workflow_dispatch` with `npm_publish=true` re-publishes the workspace version to
 npm if the npm step of a release failed.
 
+## Release acceptance
+
+Before checksums are written, `tools/release/check_assets.py <version> staged` opens every SDK
+package the release produced and checks its contents against what consumers expect: READMEs, the
+prebuilt libraries for every advertised platform (Godot `bin/<platform>`, Unreal
+`lib/<Platform>`, Android ABIs), the UPM/npm layout, the wheel's long description and the nupkg
+README. A missing file fails the release instead of being discovered on the registry page.
+
