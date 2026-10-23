@@ -11,6 +11,8 @@ released together.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-23
+
 ### Added
 
 - **GeoIP region selection.** When neither the game backend (`location`) nor the player
@@ -759,7 +761,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/aurix-voice/aurix/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/aurix-voice/aurix/compare/v1.8.2...v1.9.0
 [1.7.0]: https://github.com/aurix-voice/aurix/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/aurix-voice/aurix/compare/v1.5.0...v1.6.0
