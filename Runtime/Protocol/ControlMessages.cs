@@ -912,6 +912,18 @@ namespace Aurix.Protocol
                 { "rtt_ms", rttMs }, { "jitter_ms", jitterMs }, { "packet_loss", lossPercent },
             });
 
+        public static string QualityReport(float rttMs, float jitterMs, float lossPercent, PlayoutReport playout) =>
+            Serialize("QualityReport", new Dictionary<string, object>
+            {
+                { "rtt_ms", rttMs }, { "jitter_ms", jitterMs }, { "packet_loss", lossPercent },
+                { "playout", new Dictionary<string, object>
+                    {
+                        { "concealed_percent", playout.ConcealedPercent }, { "recovered_percent", playout.RecoveredPercent },
+                        { "playout_delay_ms", playout.PlayoutDelayMs }, { "burst_ratio", playout.BurstRatio },
+                        { "underruns", playout.Underruns }, { "fec", playout.Fec }, { "dred", playout.Dred },
+                    } },
+            });
+
         public static string RecordingConsentResponse(Guid recordingId, RecordingConsent consent) =>
             Serialize("RecordingConsentResponse", new Dictionary<string, object>
             {

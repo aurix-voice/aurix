@@ -185,6 +185,24 @@ namespace Aurix
     /// are cumulative for the current media transport; <see cref="LossPercent"/>, <see cref="RFactor"/>,
     /// <see cref="Mos"/> and <see cref="Bars"/> describe the last quality period.
     /// </summary>
+    /// <summary>Playout counters sent with a <c>QualityReport</c>; drives the server's audio rating.</summary>
+    public struct PlayoutReport
+    {
+        public float ConcealedPercent;
+        public float RecoveredPercent;
+        public float PlayoutDelayMs;
+        public float BurstRatio;
+        public int Underruns;
+        public bool Fec;
+        public bool Dred;
+
+        public static PlayoutReport From(VoiceStats s, bool fec, bool dred) => new PlayoutReport
+        {
+            ConcealedPercent = s.ConcealedPercent, RecoveredPercent = s.RecoveredPercent, PlayoutDelayMs = s.PlayoutDelayMs,
+            BurstRatio = 1f, Underruns = s.IntervalUnderruns, Fec = fec, Dred = dred,
+        };
+    }
+
     public struct VoiceStats
     {
         public VoiceConnectionState State;
@@ -231,6 +249,16 @@ namespace Aurix
         public long FramesLate;
         public long Underruns;
         public int ActiveStreams;
+        /// <summary>Share of expected frames concealed by PLC since the previous <c>GetStats</c>, 0..100 (after FEC/DRED).</summary>
+        public float ConcealedPercent;
+        /// <summary>Share of expected frames rebuilt from FEC/DRED since the previous <c>GetStats</c>, 0..100.</summary>
+        public float RecoveredPercent;
+        /// <summary>Jitter-buffer delay the mixer adds on top of the network, ms.</summary>
+        public float PlayoutDelayMs;
+        /// <summary>Underruns since the previous <c>GetStats</c>.</summary>
+        public int IntervalUnderruns;
+        /// <summary>True once the counters above describe an interval (not the first sample).</summary>
+        public bool HasPlayout;
         // Derived quality.
         public float RFactor;
         public float Mos;
