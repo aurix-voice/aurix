@@ -88,6 +88,7 @@ public class ClientTests
     {
         token = "jwt", user_id = "11111111-0000-4000-8000-000000000001", expires_at = "2030-01-01T00:00:00Z", channels = Array.Empty<object>(),
         endpoint = new { region = "eu_west", node_id = "22222222-0000-4000-8000-000000000002", ws_url = "wss://node/ws", probe_url = (string?)null, location = (object?)null, distance_km = (double?)null, nodes = 1, load_factor = 0.1 },
+        location_source = "none",
     };
 
     private static AurixClient Client(FakeNode n, Credentials? creds = null, int? maxRetries = null) => new(new AurixClientOptions
