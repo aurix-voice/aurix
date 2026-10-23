@@ -1,3 +1,5 @@
+<p><img src="assets/logo.svg" width="56" height="56" alt="Aurix"></p>
+
 # Aurix Voice Platform
 
 Open-source, self-hosted voice chat for games and real-time apps — a drop-in alternative to
