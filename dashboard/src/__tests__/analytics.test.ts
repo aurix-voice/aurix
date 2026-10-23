@@ -25,8 +25,12 @@ const bucket = (p: Partial<T.UsageAppBucket> & { bucket: string }): T.UsageAppBu
   jitter_sum_ms: 0,
   loss_sum_permille: 0,
   poor_quality_samples: 0,
+  audio_quality_samples: 0,
+  audio_mos_sum_milli: 0,
+  concealed_sum_permille: 0,
+  joins_refused: 0,
   updated_at: p.bucket,
-  quality: { samples: 0, mos_avg: null, rtt_avg_ms: null, jitter_avg_ms: null, loss_avg_percent: null, poor_samples: 0, poor_percent: null },
+  quality: { samples: 0, mos_avg: null, rtt_avg_ms: null, jitter_avg_ms: null, loss_avg_percent: null, poor_samples: 0, poor_percent: null, audio_samples: 0, audio_mos_avg: null, concealed_avg_percent: null },
   ...p,
 });
 

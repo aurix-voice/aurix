@@ -452,7 +452,7 @@ async fn quota_body(
     }))
 }
 
-const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples,joins_refused";
+const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples,audio_quality_samples,audio_mos_sum_milli,concealed_sum_permille,joins_refused";
 const CHANNEL_CSV_HEADER: &str = "app_id,channel_id,bucket,peak_participants,participant_minutes,joins,unique_users,chat_messages,tts_requests,tts_characters,stt_audio_ms";
 
 fn app_csv(rows: &[UsageAppBucketRow]) -> String {
@@ -461,7 +461,7 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
     out.push('\n');
     for r in rows {
         out.push_str(&format!(
-            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.app_id,
             r.bucket.to_rfc3339(),
             r.peak_sessions,
@@ -484,6 +484,9 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
             r.jitter_sum_ms,
             r.loss_sum_permille,
             r.poor_quality_samples,
+            r.audio_quality_samples,
+            r.audio_mos_sum_milli,
+            r.concealed_sum_permille,
             r.joins_refused
         ));
     }
@@ -812,7 +815,7 @@ mod tests {
         let data = lines.next().unwrap();
         assert_eq!(header.split(',').count(), data.split(',').count());
         assert!(data.starts_with(&format!("{},{}", Uuid::nil(), now.to_rfc3339())));
-        assert!(data.ends_with(",100,200,5,0,0,0,2,8400,90,10,5,0"));
+        assert!(data.ends_with(",2,8400,90,10,5,0,0,0,0,0"), "{data}");
         let ch = UsageChannelBucketRow {
             app_id: Uuid::nil(),
             channel_id: Uuid::nil(),
