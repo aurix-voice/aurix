@@ -238,6 +238,9 @@ registry turns that into **region discovery**:
   player in `location_source` (`coordinates` / `geoip` / `none`); private addresses, unknown
   IPs and country-only records resolve to nothing. Treat it as a first guess: VPNs and
   carrier NAT misplace players by whole countries, which is why the SDKs still probe RTT.
+  The IP is used for the lookup only — nothing of it or of the result is stored, logged or
+  returned beyond the ordering (`location_source`) — but an IP is personal data in most
+  jurisdictions, so name the lookup (and the database vendor) in your privacy notice.
 * SDKs ([Web](../sdk/web.md#region-selection), [Unity](../sdk/unity.md#region-selection),
   [native / Unreal](../sdk/native.md#region-selection)) probe each `probe_url` over HTTP and
   rank by measured RTT, so a mis-set `location` or a routing detour is corrected client-side.
