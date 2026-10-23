@@ -1,6 +1,11 @@
-<p><img src="assets/logo.svg" width="56" height="56" alt="Aurix"></p>
-
-# Aurix Voice Platform
+<p align="center"><img src="assets/logo.svg" width="72" height="72" alt="Aurix"></p>
+<h1 align="center">Aurix</h1>
+<p align="center">
+  <a href="https://github.com/aurix-voice/aurix/releases"><img alt="Release" src="https://img.shields.io/github/v/release/aurix-voice/aurix?label=release&color=0a0a0a"></a>
+  <a href="https://github.com/aurix-voice/aurix/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/aurix-voice/aurix/ci.yml?branch=main&label=ci"></a>
+  <a href="https://www.npmjs.com/package/@aurix/web-sdk"><img alt="npm" src="https://img.shields.io/npm/v/%40aurix%2Fweb-sdk?label=web%20sdk&color=0a0a0a"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0%20%2B%20permissive%20SDKs-0a0a0a"></a>
+</p>
 
 Open-source, self-hosted voice chat for games and real-time apps — a drop-in alternative to
 Vivox / Agora / Photon Voice that you run on your own infrastructure.
