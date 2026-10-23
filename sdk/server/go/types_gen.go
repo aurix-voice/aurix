@@ -1148,7 +1148,9 @@ type FleetUsageAppsItem struct {
 	PoorQualitySamples int64 `json:"poor_quality_samples"`
 	// Derived from the `quality_*` counters
 	Quality QualityAggregate `json:"quality"`
-	AppID   string           `json:"app_id"`
+	// Connects and channel joins refused by a per-application cap in this bucket/range.
+	JoinsRefused int64  `json:"joins_refused"`
+	AppID        string `json:"app_id"`
 }
 
 // FleetUsageRange is the `FleetUsageRange` schema.
@@ -2140,6 +2142,8 @@ type UsageAppBucket struct {
 	UpdatedAt          string `json:"updated_at"`
 	// Derived from the `quality_*` counters
 	Quality QualityAggregate `json:"quality"`
+	// Connects and channel joins refused by a per-application cap in this bucket/range.
+	JoinsRefused int64 `json:"joins_refused"`
 }
 
 // One hourly channel bucket.
@@ -2222,6 +2226,8 @@ type UsageTotals struct {
 	PoorQualitySamples int64 `json:"poor_quality_samples"`
 	// Derived from the `quality_*` counters
 	Quality QualityAggregate `json:"quality"`
+	// Connects and channel joins refused by a per-application cap in this bucket/range.
+	JoinsRefused int64 `json:"joins_refused"`
 }
 
 // User is the `User` schema.

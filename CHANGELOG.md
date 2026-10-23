@@ -11,6 +11,9 @@ released together.
 
 ## [Unreleased]
 
+### Added
+- Usage analytics: `joins_refused` — connects and channel joins turned away by the application's caps (concurrent sessions, monthly participant-minutes) are metered per 5-minute bucket and reported in `GET /v1/analytics` totals/series, the CSV export and the fleet routes. Migration adds the column; older buckets read `0`. This is the "players could not join" signal a managed console shows next to the plan limit.
+
 ## [1.8.2] - 2026-10-22
 
 ### Added

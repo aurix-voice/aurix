@@ -179,6 +179,7 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
             "jitter_sum_ms": t.jitter_sum_ms,
             "loss_sum_permille": t.loss_sum_permille,
             "poor_quality_samples": t.poor_quality_samples,
+            "joins_refused": t.joins_refused,
             "quality": quality_json(
                 t.quality_samples,
                 t.mos_sum_milli,
@@ -194,7 +195,7 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
             "media_bytes_in": 0, "media_bytes_out": 0, "chat_messages": 0,
             "tts_requests": 0, "tts_characters": 0, "stt_audio_ms": 0,
             "quality_samples": 0, "mos_sum_milli": 0, "rtt_sum_ms": 0,
-            "jitter_sum_ms": 0, "loss_sum_permille": 0, "poor_quality_samples": 0,
+            "jitter_sum_ms": 0, "loss_sum_permille": 0, "poor_quality_samples": 0, "joins_refused": 0,
             "quality": quality_json(0, 0, 0, 0, 0, 0),
         }),
     }
@@ -426,7 +427,7 @@ async fn quota_body(
     }))
 }
 
-const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples";
+const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples,joins_refused";
 const CHANNEL_CSV_HEADER: &str = "app_id,channel_id,bucket,peak_participants,participant_minutes,joins,unique_users,chat_messages,tts_requests,tts_characters,stt_audio_ms";
 
 fn app_csv(rows: &[UsageAppBucketRow]) -> String {
@@ -435,7 +436,7 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
     out.push('\n');
     for r in rows {
         out.push_str(&format!(
-            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.app_id,
             r.bucket.to_rfc3339(),
             r.peak_sessions,
@@ -457,7 +458,8 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
             r.rtt_sum_ms,
             r.jitter_sum_ms,
             r.loss_sum_permille,
-            r.poor_quality_samples
+            r.poor_quality_samples,
+            r.joins_refused
         ));
     }
     out
@@ -767,6 +769,7 @@ mod tests {
             jitter_sum_ms: 10,
             loss_sum_permille: 5,
             poor_quality_samples: 0,
+            joins_refused: 0,
             updated_at: now,
         };
         let point = app_point_json(&row);

@@ -1007,6 +1007,8 @@ export interface FleetUsageAppsItem {
   poor_quality_samples: number;
   /** Derived from the `quality_*` counters */
   quality: QualityAggregate;
+  /** Connects and channel joins refused by a per-application cap in this bucket/range. */
+  joins_refused: number;
   app_id: string;
 }
 
@@ -2005,6 +2007,8 @@ export interface UsageAppBucket {
   updated_at: string;
   /** Derived from the `quality_*` counters */
   quality: QualityAggregate;
+  /** Connects and channel joins refused by a per-application cap in this bucket/range. */
+  joins_refused: number;
 }
 
 /** One hourly channel bucket. */
@@ -2091,6 +2095,8 @@ export interface UsageTotals {
   poor_quality_samples: number;
   /** Derived from the `quality_*` counters */
   quality: QualityAggregate;
+  /** Connects and channel joins refused by a per-application cap in this bucket/range. */
+  joins_refused: number;
 }
 
 export interface User {

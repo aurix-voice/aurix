@@ -13,7 +13,7 @@ There are two kinds of numbers, produced by two different mechanisms:
 | kind | metrics | source |
 |---|---|---|
 | **derived** | `peak_sessions` (CCU), `session_minutes`, `sessions_started`, `unique_users`, `peak_participants`, `participant_minutes`, `active_channels`, `recording_seconds`; per channel `peak_participants`, `participant_minutes`, `joins`, `unique_users` | recomputed from the `sessions`, `channel_memberships` and `recordings` intervals in PostgreSQL by **one node at a time** (advisory lock) every `usage.aggregate_interval_secs` |
-| **metered** | `media_bytes_in/out`, `chat_messages`, `tts_requests`, `tts_characters`, `stt_audio_ms`; quality sums `quality_samples`, `mos_sum_milli`, `rtt_sum_ms`, `jitter_sum_ms`, `loss_sum_permille`, `poor_quality_samples` (application rows only) | counted in memory on the node that did the work and **added** to the buckets by every node every `usage.flush_interval_secs` |
+| **metered** | `media_bytes_in/out`, `chat_messages`, `tts_requests`, `tts_characters`, `stt_audio_ms`; quality sums `quality_samples`, `mos_sum_milli`, `rtt_sum_ms`, `jitter_sum_ms`, `loss_sum_permille`, `poor_quality_samples`; `joins_refused` — connects/joins refused by the application's caps (application rows only) | counted in memory on the node that did the work and **added** to the buckets by every node every `usage.flush_interval_secs` |
 
 Derived metrics are interval arithmetic, not sampling: a session connected 10:03–10:19 puts
 2 minutes into the 10:00 bucket, 5 into 10:05, 5 into 10:10 and 4 into 10:15, and the peak
@@ -32,7 +32,7 @@ so nothing accrues forever.
 
 The quality sums are integer-scaled so that the buckets stay additive and idempotent: one
 `quality_samples` per rated period per session (`media.quality_interval_ms`), MOS × 1000, RTT
-and jitter in whole milliseconds, loss × 10, `poor_quality_samples` for samples at 1–2 bars.
+and jitter in whole milliseconds, loss × 10, `poor_quality_samples` for samples at 1–2 bars; `joins_refused` counts connects and channel joins the application's caps turned away (concurrent sessions, monthly minutes) — the "players could not join" signal.
 Every response derives `quality {samples, mos_avg, rtt_avg_ms, jitter_avg_ms,
 loss_avg_percent, poor_samples, poor_percent}` from them (`null` averages when nothing was
 rated), on `totals` and on every application series point; exports carry the raw sums.

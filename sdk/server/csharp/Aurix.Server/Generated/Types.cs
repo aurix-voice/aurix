@@ -2171,6 +2171,12 @@ public sealed record FleetUsageAppsItem
     [JsonPropertyName("quality")]
     public required QualityAggregate Quality { get; init; }
 
+    /// <summary>
+    /// Connects and channel joins refused by a per-application cap in this bucket/range.
+    /// </summary>
+    [JsonPropertyName("joins_refused")]
+    public required long JoinsRefused { get; init; }
+
     [JsonPropertyName("app_id")]
     public required string AppId { get; init; }
 }
@@ -4286,6 +4292,12 @@ public sealed record UsageAppBucket
     /// </summary>
     [JsonPropertyName("quality")]
     public required QualityAggregate Quality { get; init; }
+
+    /// <summary>
+    /// Connects and channel joins refused by a per-application cap in this bucket/range.
+    /// </summary>
+    [JsonPropertyName("joins_refused")]
+    public required long JoinsRefused { get; init; }
 }
 
 /// <summary>
@@ -4488,6 +4500,12 @@ public sealed record UsageTotals
     /// </summary>
     [JsonPropertyName("quality")]
     public required QualityAggregate Quality { get; init; }
+
+    /// <summary>
+    /// Connects and channel joins refused by a per-application cap in this bucket/range.
+    /// </summary>
+    [JsonPropertyName("joins_refused")]
+    public required long JoinsRefused { get; init; }
 }
 
 public sealed record User

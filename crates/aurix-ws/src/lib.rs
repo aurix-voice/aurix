@@ -3144,6 +3144,12 @@ async fn open_session(
             let _ = sfu.destroy_session(&session_id);
         }
         if matches!(e, AurixError::QuotaExceeded(_)) {
+            state.control.usage.record(
+                token.app_id,
+                None,
+                aurix_common::usage::UsageMetric::JoinsRefused,
+                1,
+            );
             return Err(e);
         }
         warn!("session persistence failed: {e}");

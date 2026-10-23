@@ -936,6 +936,7 @@ FleetUsageAppsItem = TypedDict(
         "loss_sum_permille": int,  # Sum of the worse direction's loss × 10
         "poor_quality_samples": int,  # Ratings at 1–2 bars
         "quality": "QualityAggregate",  # Derived from the `quality_*` counters
+        "joins_refused": int,  # Connects and channel joins refused by a per-application cap in this bucket/range.
         "app_id": str,
     },
 )
@@ -1953,6 +1954,7 @@ UsageAppBucket = TypedDict(
         "poor_quality_samples": int,  # Ratings at 1–2 bars
         "updated_at": str,
         "quality": "QualityAggregate",  # Derived from the `quality_*` counters
+        "joins_refused": int,  # Connects and channel joins refused by a per-application cap in this bucket/range.
     },
 )
 """One application bucket (5 minutes, or the requested `step` when rolled up). Buckets are aligned to UTC epoch multiples; a bucket at or after `range.finalized_through` is still accruing."""
@@ -2028,6 +2030,7 @@ UsageTotals = TypedDict(
         "loss_sum_permille": int,  # Sum of the worse direction's loss × 10
         "poor_quality_samples": int,  # Ratings at 1–2 bars
         "quality": "QualityAggregate",  # Derived from the `quality_*` counters
+        "joins_refused": int,  # Connects and channel joins refused by a per-application cap in this bucket/range.
     },
 )
 """Sums of additive counters and maxima of peaks over a range."""

@@ -394,6 +394,7 @@ impl UsageService {
             aurix_metrics::QUOTA_REJECTIONS
                 .with_label_values(&["participant_minutes"])
                 .inc();
+            self.record(app_id, None, UsageMetric::JoinsRefused, 1);
             return Err(AurixError::QuotaExceeded(format!(
                 "application has used its monthly participant-minutes ({monthly_minutes})"
             )));

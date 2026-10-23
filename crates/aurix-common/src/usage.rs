@@ -43,10 +43,13 @@ pub enum UsageMetric {
     LossSumPermille,
     /// Evaluations at 1–2 bars (R < 60).
     PoorQualitySamples,
+    /// Connects and channel joins refused by a per-application cap (concurrent sessions or
+    /// monthly participant-minutes) — the "players could not join" signal.
+    JoinsRefused,
 }
 
 impl UsageMetric {
-    pub const ALL: [UsageMetric; 12] = [
+    pub const ALL: [UsageMetric; 13] = [
         UsageMetric::MediaBytesIn,
         UsageMetric::MediaBytesOut,
         UsageMetric::ChatMessages,
@@ -59,6 +62,7 @@ impl UsageMetric {
         UsageMetric::JitterSumMs,
         UsageMetric::LossSumPermille,
         UsageMetric::PoorQualitySamples,
+        UsageMetric::JoinsRefused,
     ];
 
     /// Column/wire name.
@@ -76,6 +80,7 @@ impl UsageMetric {
             UsageMetric::JitterSumMs => "jitter_sum_ms",
             UsageMetric::LossSumPermille => "loss_sum_permille",
             UsageMetric::PoorQualitySamples => "poor_quality_samples",
+            UsageMetric::JoinsRefused => "joins_refused",
         }
     }
 

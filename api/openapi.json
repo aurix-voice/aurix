@@ -13482,6 +13482,11 @@
           "quality": {
             "$ref": "#/components/schemas/QualityAggregate",
             "description": "Derived from the `quality_*` counters"
+          },
+          "joins_refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Connects and channel joins refused by a per-application cap in this bucket/range."
           }
         },
         "required": [
@@ -13503,7 +13508,8 @@
           "jitter_sum_ms",
           "loss_sum_permille",
           "poor_quality_samples",
-          "quality"
+          "quality",
+          "joins_refused"
         ]
       },
       "UsageAppBucket": {
@@ -13615,6 +13621,11 @@
           "quality": {
             "$ref": "#/components/schemas/QualityAggregate",
             "description": "Derived from the `quality_*` counters"
+          },
+          "joins_refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Connects and channel joins refused by a per-application cap in this bucket/range."
           }
         },
         "required": [
@@ -13641,7 +13652,8 @@
           "jitter_sum_ms",
           "loss_sum_permille",
           "poor_quality_samples",
-          "quality"
+          "quality",
+          "joins_refused"
         ]
       },
       "UsageChannelBucket": {
