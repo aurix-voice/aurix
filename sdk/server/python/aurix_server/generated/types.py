@@ -56,6 +56,10 @@ ExportUsageScope_VALUES: List[ExportUsageScope] = ["app", "channels"]
 GetRecordingTranscriptFormat = Literal["json", "srt", "vtt"]
 GetRecordingTranscriptFormat_VALUES: List[GetRecordingTranscriptFormat] = ["json", "srt", "vtt"]
 
+LocationSource = Literal["coordinates", "geoip", "none"]
+"""Where the coordinates that ordered `endpoint` / `regions` came from: caller-supplied coordinates, the node's GeoIP database (from `client_ip` or the caller's address), or none (preferred region, then load)."""
+LocationSource_VALUES: List[LocationSource] = ["coordinates", "geoip", "none"]
+
 MediaNodeLinkTransport = Literal["udp", "tcp"]
 """Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked."""
 MediaNodeLinkTransport_VALUES: List[MediaNodeLinkTransport] = ["udp", "tcp"]
@@ -963,6 +967,7 @@ GenerateTokenRequest = TypedDict(
         "metadata": NotRequired[Optional[Dict[str, Any]]],
         "region": NotRequired[Optional["Region"]],  # Region the game wants the player in (e.g. the match's region). Wins in `endpoint` when it has capacity.
         "location": NotRequired[Optional["GeoLocation"]],  # Player's approximate coordinates from the game's own geo data, used to order regions by distance.
+        "client_ip": NotRequired[Optional[str]],  # Player's public IP as seen by your backend. Without `location`, resolved through the node's GeoIP database (when configured) to approximate coordinates for `endpoint`; private addresses never resolve.
     },
 )
 
@@ -1468,6 +1473,7 @@ RegionsResponse = TypedDict(
     {
         "regions": List["RegionEndpoint"],  # Best-first: the preferred region if it has capacity, then by distance to the declared location (regions without coordinates last), then by load. Clients that can measure RTT should probe every `probe_url` and pick the lowest; this order is the fallback.
         "recommended": Optional["RegionEndpoint"],  # First entry of `regions`, or `null` when no node advertises a WebSocket URL.
+        "location_source": "LocationSource",
     },
 )
 
@@ -1816,6 +1822,7 @@ TokenResponse = TypedDict(
         "expires_at": str,
         "channels": List["ChannelPermission"],
         "endpoint": Optional["RegionEndpoint"],  # Recommended node for this player (preferred `region` → nearest to `location` → least loaded). Hand `ws_url` to the client together with the token; `null` when no node advertises a public WebSocket URL, in which case clients use your configured URL.
+        "location_source": "LocationSource",
     },
 )
 
@@ -2273,6 +2280,7 @@ ListRegionsQuery = TypedDict(
         "region": NotRequired["Region"],
         "latitude": NotRequired[float],
         "longitude": NotRequired[float],
+        "client_ip": NotRequired[str],
     },
 )
 """Query parameters of `listRegions`."""

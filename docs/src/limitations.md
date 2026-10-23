@@ -247,8 +247,8 @@ the chapter that explains the boundary.
   the proxy ([Deployment](operations/deployment.md)).
 * **Region discovery is per node, not per player location service**: nodes are placed by
   `server.region` / `server.location`, and the server orders by preference, distance to the
-  coordinates the client sends, and load; the client-side RTT probe is what actually picks the
-  nearest node. Discovery hands out a node's own `wss://` URL, so every node needs a public
+  coordinates the client sends (or, with a `[geoip]` database, to where its IP appears to be),
+  and load; the client-side RTT probe is what actually picks the nearest node. Discovery hands out a node's own `wss://` URL, so every node needs a public
   hostname and certificate ([Regions](operations/scaling.md#regions)).
 * **Server SDKs are generated, unpublished, and REST-only.** The Node, Python, Go and C#
   clients are emitted from `api/openapi.json` and cannot drift from it, but they are not

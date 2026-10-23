@@ -652,6 +652,9 @@ func (c *Client) ListRegions(ctx context.Context, query *ListRegionsQuery, opts 
 		if query.Longitude != nil {
 			q.Set("longitude", strconv.FormatFloat(*query.Longitude, 'g', -1, 64))
 		}
+		if query.ClientIP != nil {
+			q.Set("client_ip", *query.ClientIP)
+		}
 	}
 	var out RegionsResponse
 	if err := c.doJSON(ctx, "GET", "/v1/regions", q, nil, &out, opts); err != nil {
@@ -2025,7 +2028,8 @@ func (c *Client) MyTurnCredentials(ctx context.Context, opts ...RequestOption) (
 //
 // Same list as `GET /v1/regions`, for the SDKs: they probe every `probe_url`, connect to the node
 // with the lowest RTT and fall back to the server's order when probing is impossible. Requires
-// only a session token.
+// only a session token. Without `latitude`/`longitude` the caller's own IP is resolved through the
+// node's GeoIP database when one is configured (`location_source: geoip`).
 //
 // `GET /v1/me/regions`
 // Auth: PlayerToken.

@@ -169,6 +169,19 @@ public static class GetRecordingTranscriptFormat
 }
 
 /// <summary>
+/// Where the coordinates that ordered `endpoint` / `regions` came from: caller-supplied
+/// coordinates, the node's GeoIP database (from `client_ip` or the caller's address), or none
+/// (preferred region, then load).
+/// </summary>
+public static class LocationSource
+{
+    public const string Coordinates = "coordinates";
+    public const string Geoip = "geoip";
+    public const string None = "none";
+    public static readonly IReadOnlyList<string> All = new[] { Coordinates, Geoip, None };
+}
+
+/// <summary>
 /// Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
 /// </summary>
 public static class MediaNodeLinkTransport
@@ -2232,6 +2245,14 @@ public sealed record GenerateTokenRequest
     /// </summary>
     [JsonPropertyName("location")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public GeoLocation? Location { get; init; }
+
+    /// <summary>
+    /// Player's public IP as seen by your backend. Without `location`, resolved through the node's
+    /// GeoIP database (when configured) to approximate coordinates for `endpoint`; private addresses
+    /// never resolve.
+    /// </summary>
+    [JsonPropertyName("client_ip")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ClientIp { get; init; }
 }
 
 /// <summary>
@@ -3389,6 +3410,9 @@ public sealed record RegionsResponse
     /// </summary>
     [JsonPropertyName("recommended")]
     public required RegionEndpoint? Recommended { get; init; }
+
+    [JsonPropertyName("location_source")]
+    public required string LocationSource { get; init; }
 }
 
 public sealed record ReportRequest
@@ -4034,6 +4058,9 @@ public sealed record TokenResponse
     /// </summary>
     [JsonPropertyName("endpoint")]
     public required RegionEndpoint? Endpoint { get; init; }
+
+    [JsonPropertyName("location_source")]
+    public required string LocationSource { get; init; }
 }
 
 public sealed record TokensRevoked
@@ -4988,6 +5015,11 @@ public sealed record ListRegionsQuery
     /// </summary>
     public double? Latitude { get; init; }
     public double? Longitude { get; init; }
+    /// <summary>
+    /// Player's public IP; resolved through GeoIP when `latitude`/`longitude` are absent. `GET
+    /// /v1/me/regions` uses the caller's own address instead.
+    /// </summary>
+    public string? ClientIp { get; init; }
 }
 
 /// <summary>Query parameters of <c>listChannels</c>.</summary>

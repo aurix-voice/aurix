@@ -1891,6 +1891,15 @@
               "minimum": -180,
               "maximum": 180
             }
+          },
+          {
+            "name": "client_ip",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Player's public IP; resolved through GeoIP when `latitude`/`longitude` are absent. `GET /v1/me/regions` uses the caller's own address instead."
           }
         ],
         "responses": {
@@ -6894,7 +6903,7 @@
         ],
         "summary": "Region discovery for the calling player",
         "operationId": "myRegions",
-        "description": "Same list as `GET /v1/regions`, for the SDKs: they probe every `probe_url`, connect to the node with the lowest RTT and fall back to the server's order when probing is impossible. Requires only a session token.",
+        "description": "Same list as `GET /v1/regions`, for the SDKs: they probe every `probe_url`, connect to the node with the lowest RTT and fall back to the server's order when probing is impossible. Requires only a session token. Without `latitude`/`longitude` the caller's own IP is resolved through the node's GeoIP database when one is configured (`location_source: geoip`).",
         "parameters": [
           {
             "name": "region",
@@ -10552,6 +10561,17 @@
               }
             ],
             "description": "Player's approximate coordinates from the game's own geo data, used to order regions by distance."
+          },
+          "client_ip": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Player's public IP as seen by your backend. Without `location`, resolved through the node's GeoIP database (when configured) to approximate coordinates for `endpoint`; private addresses never resolve."
           }
         },
         "required": [
@@ -11947,6 +11967,9 @@
               }
             ],
             "description": "Recommended node for this player (preferred `region` → nearest to `location` → least loaded). Hand `ws_url` to the client together with the token; `null` when no node advertises a public WebSocket URL, in which case clients use your configured URL."
+          },
+          "location_source": {
+            "$ref": "#/components/schemas/LocationSource"
           }
         },
         "required": [
@@ -11954,7 +11977,8 @@
           "user_id",
           "expires_at",
           "channels",
-          "endpoint"
+          "endpoint",
+          "location_source"
         ]
       },
       "TurnCredentials": {
@@ -12628,11 +12652,15 @@
               }
             ],
             "description": "First entry of `regions`, or `null` when no node advertises a WebSocket URL."
+          },
+          "location_source": {
+            "$ref": "#/components/schemas/LocationSource"
           }
         },
         "required": [
           "regions",
-          "recommended"
+          "recommended",
+          "location_source"
         ]
       },
       "SafetySource": {
@@ -14574,6 +14602,15 @@
           "production",
           "config"
         ]
+      },
+      "LocationSource": {
+        "type": "string",
+        "enum": [
+          "coordinates",
+          "geoip",
+          "none"
+        ],
+        "description": "Where the coordinates that ordered `endpoint` / `regions` came from: caller-supplied coordinates, the node's GeoIP database (from `client_ip` or the caller's address), or none (preferred region, then load)."
       }
     }
   }

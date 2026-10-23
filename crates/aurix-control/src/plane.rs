@@ -35,6 +35,7 @@ pub struct ControlPlane {
     /// Admin SSO; `None` unless `auth.oidc.enabled`.
     pub admin_oidc: Option<Arc<OidcProvider>>,
     pub nodes: Arc<NodeManager>,
+    pub geoip: Arc<crate::geoip::GeoIpResolver>,
     pub channels: Arc<ChannelManager>,
     pub sessions: Arc<SessionManager>,
     pub blocks: Arc<BlockManager>,
@@ -88,6 +89,8 @@ impl ControlPlane {
             None
         };
         let nodes = Arc::new(NodeManager::new(pool.clone()));
+        let geoip = Arc::new(crate::geoip::GeoIpResolver::from_config(&config.geoip));
+        geoip.spawn_maintenance(config.geoip.clone(), reqwest::Client::new());
         if let Err(e) = nodes.load_from_db().await {
             tracing::warn!("Could not load media nodes from database: {e}");
         }
@@ -265,6 +268,7 @@ impl ControlPlane {
             admin_auth,
             admin_oidc,
             nodes,
+            geoip,
             channels,
             sessions,
             action_tokens,

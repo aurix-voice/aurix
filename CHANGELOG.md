@@ -11,6 +11,19 @@ released together.
 
 ## [Unreleased]
 
+### Added
+
+- **GeoIP region selection.** When neither the game backend (`location`) nor the player
+  (`latitude`/`longitude`) supplied coordinates, the node resolves an IP through a
+  MaxMind-format city database (GeoLite2-City, DB-IP City Lite): `POST /v1/tokens` and
+  `GET /v1/regions` take the player's public `client_ip`, `GET /v1/me/regions` uses the
+  caller's own address. New `[geoip]` config (`database_path`, `download_url` with
+  `{YYYY}`/`{MM}` placeholders so the node downloads and refreshes the database itself,
+  `refresh_hours`, `reload_check_secs`); the Docker image defaults the path to
+  `/var/lib/aurix/geoip/city.mmdb`, the Helm chart and compose file mount a volume for it.
+  `TokenResponse` and `RegionsResponse` gain `location_source`
+  (`coordinates` / `geoip` / `none`). Server SDKs regenerated.
+
 ## [1.9.0] - 2026-10-23
 
 ### Changed

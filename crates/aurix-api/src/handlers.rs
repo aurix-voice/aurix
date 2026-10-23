@@ -17,6 +17,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 type JsonResult = Result<Json<serde_json::Value>, ApiError>;
@@ -141,6 +142,55 @@ pub struct GenerateTokenRequest {
     /// Player's approximate coordinates, if the game knows them; used to order regions.
     #[serde(default)]
     pub location: Option<GeoLocation>,
+    /// Player's public IP as seen by the game backend. Without `location`, resolved through
+    /// the node's GeoIP database (when configured) to approximate coordinates.
+    #[serde(default)]
+    pub client_ip: Option<IpAddr>,
+}
+
+/// Where the coordinates that ordered `endpoint` / `regions` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationSource {
+    /// Caller-supplied `location` / `latitude`+`longitude`.
+    Coordinates,
+    /// Resolved from an IP through the node's GeoIP database.
+    Geoip,
+    /// No location: preferred region, then load.
+    None,
+}
+
+fn selection_hint(
+    state: &AppState,
+    region: Option<Region>,
+    location: Option<GeoLocation>,
+    ip: Option<IpAddr>,
+) -> (SelectionHint, LocationSource) {
+    if let Some(location) = location.filter(GeoLocation::is_valid) {
+        return (
+            SelectionHint {
+                region,
+                location: Some(location),
+            },
+            LocationSource::Coordinates,
+        );
+    }
+    match ip.and_then(|ip| state.control.geoip.location(ip)) {
+        Some(location) => (
+            SelectionHint {
+                region,
+                location: Some(location),
+            },
+            LocationSource::Geoip,
+        ),
+        None => (
+            SelectionHint {
+                region,
+                location: None,
+            },
+            LocationSource::None,
+        ),
+    }
 }
 
 /// One channel entry of a token request. Either an existing `channel_id` or an `ad_hoc`
@@ -219,6 +269,8 @@ pub struct TokenResponse {
     /// Recommended node for this player (preferred region → nearest → least loaded). `null`
     /// when no node advertises a public WebSocket URL; clients then use a configured URL.
     pub endpoint: Option<RegionEndpoint>,
+    /// What located the player for `endpoint`: `location`, GeoIP of `client_ip`, or nothing.
+    pub location_source: LocationSource,
 }
 
 /// Issues an end-user JWT bound to the API key's app. The user row is upserted so bans, sessions
@@ -295,16 +347,15 @@ pub async fn generate_token(
         req.metadata,
     )?;
     let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs);
-    let endpoint = state.control.nodes.recommend(&SelectionHint {
-        region: req.region,
-        location: req.location,
-    });
+    let (hint, location_source) = selection_hint(&state, req.region, req.location, req.client_ip);
+    let endpoint = state.control.nodes.recommend(&hint);
     Ok(Json(TokenResponse {
         token,
         user_id,
         expires_at: expires_at.to_rfc3339(),
         channels,
         endpoint,
+        location_source,
     }))
 }
 
@@ -318,10 +369,14 @@ pub struct RegionsQuery {
     pub latitude: Option<f64>,
     #[serde(default)]
     pub longitude: Option<f64>,
+    /// `GET /v1/regions` only: the player's public IP, resolved through GeoIP when no
+    /// coordinates are given. `GET /v1/me/regions` uses the caller's own address instead.
+    #[serde(default)]
+    pub client_ip: Option<IpAddr>,
 }
 
 impl RegionsQuery {
-    fn hint(&self) -> Result<SelectionHint, ApiError> {
+    fn location(&self) -> Result<Option<GeoLocation>, ApiError> {
         let location = match (self.latitude, self.longitude) {
             (None, None) => None,
             (Some(latitude), Some(longitude)) => {
@@ -344,10 +399,7 @@ impl RegionsQuery {
                 .into())
             }
         };
-        Ok(SelectionHint {
-            region: self.region,
-            location,
-        })
+        Ok(location)
     }
 }
 
@@ -357,14 +409,22 @@ pub struct RegionsResponse {
     /// connect to the lowest; the order is the server's fallback when they cannot.
     pub regions: Vec<RegionEndpoint>,
     pub recommended: Option<RegionEndpoint>,
+    /// What located the player for the ordering: coordinates, GeoIP, or nothing.
+    pub location_source: LocationSource,
 }
 
-fn regions_response(state: &AppState, hint: &SelectionHint) -> RegionsResponse {
-    let regions = state.control.nodes.regions(hint);
-    RegionsResponse {
+fn regions_response(
+    state: &AppState,
+    query: &RegionsQuery,
+    ip: Option<IpAddr>,
+) -> Result<RegionsResponse, ApiError> {
+    let (hint, location_source) = selection_hint(state, query.region, query.location()?, ip);
+    let regions = state.control.nodes.regions(&hint);
+    Ok(RegionsResponse {
         recommended: regions.first().cloned(),
         regions,
-    }
+        location_source,
+    })
 }
 
 /// Server-to-server region discovery (`tokens:issue`): lets the game backend pick the node
@@ -376,7 +436,7 @@ pub async fn list_regions(
     Query(query): Query<RegionsQuery>,
 ) -> Result<Json<RegionsResponse>, ApiError> {
     ctx.require("tokens:issue")?;
-    Ok(Json(regions_response(&state, &query.hint()?)))
+    Ok(Json(regions_response(&state, &query, query.client_ip)?))
 }
 
 /// Player-facing region discovery: the SDKs call this with the session token, probe every
@@ -384,9 +444,14 @@ pub async fn list_regions(
 pub async fn list_regions_self(
     State(state): State<AppState>,
     Extension(_token): Extension<ValidatedToken>,
+    ip: Option<Extension<ClientIp>>,
     Query(query): Query<RegionsQuery>,
 ) -> Result<Json<RegionsResponse>, ApiError> {
-    Ok(Json(regions_response(&state, &query.hint()?)))
+    Ok(Json(regions_response(
+        &state,
+        &query,
+        ip.map(|Extension(c)| c.0),
+    )?))
 }
 
 /// Subject of `POST /v1/tokens/action`: either an existing user by id or an

@@ -229,6 +229,15 @@ registry turns that into **region discovery**:
   not offered.
 * `POST /v1/tokens` accepts the same `region` / `location` hints and returns the chosen
   `endpoint`, so a backend that knows where the player is can hand the SDK a node directly.
+* **GeoIP** fills in the location when nobody sent one: `POST /v1/tokens` / `GET /v1/regions`
+  take the player's public `client_ip` (the backend sees it; the node only sees the backend),
+  `GET /v1/me/regions` uses the caller's own address, and the node resolves it through a
+  MaxMind-format city database (`[geoip]`: `database_path`, optional `download_url` with
+  `{YYYY}`/`{MM}` so the node fetches and refreshes DB-IP City Lite or GeoLite2 itself, or
+  mount a file you manage and it is reloaded when it changes). Responses say what located the
+  player in `location_source` (`coordinates` / `geoip` / `none`); private addresses, unknown
+  IPs and country-only records resolve to nothing. Treat it as a first guess: VPNs and
+  carrier NAT misplace players by whole countries, which is why the SDKs still probe RTT.
 * SDKs ([Web](../sdk/web.md#region-selection), [Unity](../sdk/unity.md#region-selection),
   [native / Unreal](../sdk/native.md#region-selection)) probe each `probe_url` over HTTP and
   rank by measured RTT, so a mis-set `location` or a routing detour is corrected client-side.

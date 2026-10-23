@@ -62,6 +62,14 @@ config:
   location:
     latitude: ""
     longitude: ""
+  # GeoIP for region selection (IP -> coordinates when the token server / player sent none).
+  # Any MaxMind-format city database. With downloadUrl the node fetches and refreshes it into
+  # an emptyDir itself ({YYYY}/{MM} expand to the current month; .gz is unpacked), e.g.
+  # "https://download.db-ip.com/free/dbip-city-lite-{YYYY}-{MM}.mmdb.gz" (CC BY 4.0).
+  geoip:
+    enabled: false
+    downloadUrl: ""
+    refreshHours: 168
   # Public IP players send media to.
   #   static: use config.externalIp for every pod (only sensible with replicaCount=1) or
   #           the per-ordinal list config.externalIps

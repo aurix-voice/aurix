@@ -89,8 +89,12 @@ services:
       AURIX__RECORDING__ENCRYPTION_KEY: ${AURIX_RECORDING_ENCRYPTION_KEY:-}
       AURIX__RATE_LIMITING__ENABLED: "true"
       AURIX__TRACING__LOG_LEVEL: ${AURIX_LOG_LEVEL:-info}
+      # GeoIP for region selection: set a MaxMind-format city database URL and the node
+      # downloads/refreshes it itself (DB-IP City Lite is CC BY 4.0; GeoLite2 needs a key).
+      AURIX__GEOIP__DOWNLOAD_URL: ${AURIX_GEOIP_DOWNLOAD_URL:-}
     volumes:
       - recordings:/var/lib/aurix/recordings
+      - geoip:/var/lib/aurix/geoip
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
@@ -163,6 +167,7 @@ services:
 volumes:
   pgdata:
   recordings:
+  geoip:
   dashdata:
   promdata:
   grafanadata:

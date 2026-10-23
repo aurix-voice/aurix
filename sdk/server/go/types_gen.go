@@ -141,6 +141,17 @@ const (
 	GetRecordingTranscriptFormatVtt  GetRecordingTranscriptFormat = "vtt"
 )
 
+// Where the coordinates that ordered `endpoint` / `regions` came from: caller-supplied
+// coordinates, the node's GeoIP database (from `client_ip` or the caller's address), or none
+// (preferred region, then load).
+type LocationSource string
+
+const (
+	LocationSourceCoordinates LocationSource = "coordinates"
+	LocationSourceGeoip       LocationSource = "geoip"
+	LocationSourceNone        LocationSource = "none"
+)
+
 // Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked.
 type MediaNodeLinkTransport string
 
@@ -1176,6 +1187,10 @@ type GenerateTokenRequest struct {
 	// Player's approximate coordinates from the game's own geo data, used to order regions by
 	// distance.
 	Location *GeoLocation `json:"location,omitempty"`
+	// Player's public IP as seen by your backend. Without `location`, resolved through the node's
+	// GeoIP database (when configured) to approximate coordinates for `endpoint`; private addresses
+	// never resolve.
+	ClientIP *string `json:"client_ip,omitempty"`
 }
 
 // WGS-84 coordinates in degrees.
@@ -1695,7 +1710,8 @@ type RegionsResponse struct {
 	// every `probe_url` and pick the lowest; this order is the fallback.
 	Regions []RegionEndpoint `json:"regions"`
 	// First entry of `regions`, or `null` when no node advertises a WebSocket URL.
-	Recommended *RegionEndpoint `json:"recommended"`
+	Recommended    *RegionEndpoint `json:"recommended"`
+	LocationSource LocationSource  `json:"location_source"`
 }
 
 // ReportRequest is the `ReportRequest` schema.
@@ -2012,7 +2028,8 @@ type TokenResponse struct {
 	// Recommended node for this player (preferred `region` → nearest to `location` → least loaded).
 	// Hand `ws_url` to the client together with the token; `null` when no node advertises a public
 	// WebSocket URL, in which case clients use your configured URL.
-	Endpoint *RegionEndpoint `json:"endpoint"`
+	Endpoint       *RegionEndpoint `json:"endpoint"`
+	LocationSource LocationSource  `json:"location_source"`
 }
 
 // TokensRevoked is the `TokensRevoked` schema.
@@ -2461,6 +2478,9 @@ type ListRegionsQuery struct {
 	// Caller's approximate latitude; must be given together with `longitude`.
 	Latitude  *float64
 	Longitude *float64
+	// Player's public IP; resolved through GeoIP when `latitude`/`longitude` are absent. `GET
+	// /v1/me/regions` uses the caller's own address instead.
+	ClientIP *string
 }
 
 // ListChannelsQuery holds the query parameters of `listChannels`.

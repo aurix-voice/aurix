@@ -505,3 +505,15 @@ session_mirror_ttl_secs = 180
 node_lost_after_secs = 30
 # Other nodes' public `wss://` URLs listed in `SessionInitAck.failover` (0 = none).
 failover_endpoints = 3
+
+[geoip]
+# IP -> approximate coordinates for region selection (`endpoint` in POST /v1/tokens from
+# `client_ip`, GET /v1/me/regions from the caller's address) when neither the backend nor the
+# player sent a location. Any MaxMind-format city database works (GeoLite2-City, DB-IP City
+# Lite). Empty path = disabled; the SDKs' RTT probe still picks the final node.
+database_path = ""
+# Let the node fetch and refresh the database itself ({YYYY}/{MM} expand to the current UTC
+# year/month; .gz is unpacked). DB-IP City Lite is CC BY 4.0 — attribute it in your product.
+# download_url = "https://download.db-ip.com/free/dbip-city-lite-{YYYY}-{MM}.mmdb.gz"
+refresh_hours = 168          # re-download interval (1..=8760)
+reload_check_secs = 300      # pick up a file replaced by an external job (10..=86400)

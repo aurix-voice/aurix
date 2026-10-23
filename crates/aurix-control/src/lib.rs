@@ -5,6 +5,7 @@ pub mod cascade_topology;
 pub mod channel_manager;
 pub mod chat;
 pub mod event_bus;
+pub mod geoip;
 pub mod limits;
 pub mod moderation_actions;
 pub mod node_manager;

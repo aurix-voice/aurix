@@ -138,6 +138,17 @@ Non-secret environment shared by the server pods and the migration job.
 - name: AURIX__SERVER__LOCATION__LONGITUDE
   value: {{ .root.Values.config.location.longitude | quote }}
 {{- end }}
+{{- if .root.Values.config.geoip.enabled }}
+- name: AURIX__GEOIP__DATABASE_PATH
+  value: "/var/lib/aurix/geoip/city.mmdb"
+- name: AURIX__GEOIP__DOWNLOAD_URL
+  value: {{ .root.Values.config.geoip.downloadUrl | quote }}
+- name: AURIX__GEOIP__REFRESH_HOURS
+  value: {{ .root.Values.config.geoip.refreshHours | quote }}
+{{- else }}
+- name: AURIX__GEOIP__DATABASE_PATH
+  value: ""
+{{- end }}
 - name: AURIX__DATABASE__RUN_MIGRATIONS
   value: {{ or .job (not .root.Values.migrations.enabled) | quote }}
 - name: AURIX__MEDIA__PORT

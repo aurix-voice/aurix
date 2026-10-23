@@ -290,7 +290,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hmac",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "parking_lot",
  "rand 0.8.8",
  "serde",
@@ -409,7 +409,7 @@ dependencies = [
  "flume",
  "hex",
  "hmac",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "md-5",
  "parking_lot",
  "quinn",
@@ -440,6 +440,7 @@ dependencies = [
 name = "aurix-control"
 version = "1.9.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "async-trait",
  "aurix-auth",
@@ -449,10 +450,12 @@ dependencies = [
  "aurix-metrics",
  "chrono",
  "dashmap",
+ "flate2",
  "flume",
  "futures-util",
  "hex",
  "hmac",
+ "maxminddb",
  "parking_lot",
  "rand 0.8.8",
  "redis",
@@ -735,7 +738,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures-util",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2316,6 +2319,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "iri-string"
 version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2502,6 +2511,18 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "maxminddb"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b43d2458d977b610b04a3858e6504f06133663d303a1a0606601b530bfc9bc6"
+dependencies = [
+ "ipnetwork 0.21.1",
+ "memchr",
+ "serde",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "md-5"

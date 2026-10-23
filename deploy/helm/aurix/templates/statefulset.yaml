@@ -186,6 +186,8 @@ spec:
               mountPath: /tmp
             - name: recordings
               mountPath: /var/lib/aurix/recordings
+            - name: geoip
+              mountPath: /var/lib/aurix/geoip
       volumes:
         - name: entrypoint
           configMap:
@@ -194,6 +196,8 @@ spec:
         - name: runtime
           emptyDir: {}
         - name: tmp
+          emptyDir: {}
+        - name: geoip
           emptyDir: {}
         {{- if not .Values.persistence.enabled }}
         - name: recordings

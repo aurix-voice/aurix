@@ -429,7 +429,7 @@ class AurixClient(BaseClient):
         """
         return self._json("POST", "/v1/tokens/action", body=body, options=options)  # type: ignore[no-any-return]
 
-    def list_regions(self, *, region: Optional["T.Region"] = None, latitude: Optional[float] = None, longitude: Optional[float] = None, options: Optional[RequestOptions] = None) -> "T.RegionsResponse":
+    def list_regions(self, *, region: Optional["T.Region"] = None, latitude: Optional[float] = None, longitude: Optional[float] = None, client_ip: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.RegionsResponse":
         """Region discovery for the game backend
 
 
@@ -442,7 +442,7 @@ class AurixClient(BaseClient):
         Auth: ApiKeyHeader | ApiKeyBearer.
         Permissions: tokens:issue.
         """
-        return self._json("GET", "/v1/regions", query={"region": region, "latitude": latitude, "longitude": longitude}, options=options)  # type: ignore[no-any-return]
+        return self._json("GET", "/v1/regions", query={"region": region, "latitude": latitude, "longitude": longitude, "client_ip": client_ip}, options=options)  # type: ignore[no-any-return]
 
     def issue_turn_credentials(self, body: "T.TurnCredentialsRequest", *, options: Optional[RequestOptions] = None) -> "T.TurnCredentials":
         """TURN credentials for a user (server-to-server)
@@ -1336,7 +1336,8 @@ class AurixClient(BaseClient):
 
         Same list as `GET /v1/regions`, for the SDKs: they probe every `probe_url`, connect to the node
         with the lowest RTT and fall back to the server's order when probing is impossible. Requires
-        only a session token.
+        only a session token. Without `latitude`/`longitude` the caller's own IP is resolved through the
+        node's GeoIP database when one is configured (`location_source: geoip`).
 
         `GET /v1/me/regions`
         Auth: PlayerToken.
@@ -2102,7 +2103,7 @@ class AsyncAurixClient:
         """
         return await self._run(self.sync.issue_action_token, body, options=options)  # type: ignore[no-any-return]
 
-    async def list_regions(self, *, region: Optional["T.Region"] = None, latitude: Optional[float] = None, longitude: Optional[float] = None, options: Optional[RequestOptions] = None) -> "T.RegionsResponse":
+    async def list_regions(self, *, region: Optional["T.Region"] = None, latitude: Optional[float] = None, longitude: Optional[float] = None, client_ip: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.RegionsResponse":
         """Region discovery for the game backend
 
 
@@ -2115,7 +2116,7 @@ class AsyncAurixClient:
         Auth: ApiKeyHeader | ApiKeyBearer.
         Permissions: tokens:issue.
         """
-        return await self._run(self.sync.list_regions, region=region, latitude=latitude, longitude=longitude, options=options)  # type: ignore[no-any-return]
+        return await self._run(self.sync.list_regions, region=region, latitude=latitude, longitude=longitude, client_ip=client_ip, options=options)  # type: ignore[no-any-return]
 
     async def issue_turn_credentials(self, body: "T.TurnCredentialsRequest", *, options: Optional[RequestOptions] = None) -> "T.TurnCredentials":
         """TURN credentials for a user (server-to-server)
@@ -3009,7 +3010,8 @@ class AsyncAurixClient:
 
         Same list as `GET /v1/regions`, for the SDKs: they probe every `probe_url`, connect to the node
         with the lowest RTT and fall back to the server's order when probing is impossible. Requires
-        only a session token.
+        only a session token. Without `latitude`/`longitude` the caller's own IP is resolved through the
+        node's GeoIP database when one is configured (`location_source: geoip`).
 
         `GET /v1/me/regions`
         Auth: PlayerToken.

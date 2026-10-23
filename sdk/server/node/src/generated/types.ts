@@ -59,6 +59,14 @@ export const ExportUsageScopeValues: readonly ExportUsageScope[] = ["app", "chan
 export type GetRecordingTranscriptFormat = "json" | "srt" | "vtt";
 export const GetRecordingTranscriptFormatValues: readonly GetRecordingTranscriptFormat[] = ["json", "srt", "vtt"] as const;
 
+/**
+ * Where the coordinates that ordered `endpoint` / `regions` came from: caller-supplied
+ * coordinates, the node's GeoIP database (from `client_ip` or the caller's address), or none
+ * (preferred region, then load).
+ */
+export type LocationSource = "coordinates" | "geoip" | "none";
+export const LocationSourceValues: readonly LocationSource[] = ["coordinates", "geoip", "none"] as const;
+
 /** Transport currently used towards the peer: `udp` normally, `tcp` while UDP is blocked. */
 export type MediaNodeLinkTransport = "udp" | "tcp";
 export const MediaNodeLinkTransportValues: readonly MediaNodeLinkTransport[] = ["udp", "tcp"] as const;
@@ -1037,6 +1045,12 @@ export interface GenerateTokenRequest {
    * distance.
    */
   location?: GeoLocation | null;
+  /**
+   * Player's public IP as seen by your backend. Without `location`, resolved through the node's
+   * GeoIP database (when configured) to approximate coordinates for `endpoint`; private addresses
+   * never resolve.
+   */
+  client_ip?: string | null;
 }
 
 /** WGS-84 coordinates in degrees. */
@@ -1566,6 +1580,7 @@ export interface RegionsResponse {
   regions: RegionEndpoint[];
   /** First entry of `regions`, or `null` when no node advertises a WebSocket URL. */
   recommended: RegionEndpoint | null;
+  location_source: LocationSource;
 }
 
 export interface ReportRequest {
@@ -1873,6 +1888,7 @@ export interface TokenResponse {
    * WebSocket URL, in which case clients use your configured URL.
    */
   endpoint: RegionEndpoint | null;
+  location_source: LocationSource;
 }
 
 export interface TokensRevoked {
@@ -2326,6 +2342,11 @@ export interface ListRegionsQuery {
   /** Caller's approximate latitude; must be given together with `longitude`. */
   latitude?: number;
   longitude?: number;
+  /**
+   * Player's public IP; resolved through GeoIP when `latitude`/`longitude` are absent. `GET
+   * /v1/me/regions` uses the caller's own address instead.
+   */
+  client_ip?: string;
 }
 
 /** Query parameters of `listChannels`. */

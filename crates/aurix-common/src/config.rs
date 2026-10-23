@@ -38,6 +38,8 @@ pub struct AurixConfig {
     pub usage: UsageConfig,
     #[serde(default)]
     pub quality: QualityConfig,
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
 }
 
 impl AurixConfig {
@@ -157,6 +159,7 @@ impl AurixConfig {
             );
         }
         self.auth.oidc.validate()?;
+        self.geoip.validate()?;
         if !self.auth.admin_password_login && !self.auth.oidc.enabled {
             anyhow::bail!("auth.admin_password_login = false requires auth.oidc.enabled = true");
         }
@@ -1298,6 +1301,69 @@ impl Default for QualityConfig {
             loss_alert_percent: default_loss_alert_percent(),
             persist_interval_secs: default_quality_persist_interval_secs(),
         }
+    }
+}
+
+/// IP → approximate coordinates for region selection when neither the game backend
+/// (`POST /v1/tokens` `location`) nor the player (`GET /v1/me/regions` `latitude`/`longitude`)
+/// supplied any. Reads any MaxMind-format city database (GeoLite2-City, DB-IP City Lite).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GeoIpConfig {
+    /// Path of the `.mmdb` file. Empty disables GeoIP; a missing file is tolerated (logged
+    /// once) so a node can start before the first download lands.
+    #[serde(default)]
+    pub database_path: String,
+    /// When set, the node downloads the database itself into `database_path` at start-up
+    /// (if the file is missing) and again every `refresh_hours`. `.gz` responses are unpacked.
+    /// `{YYYY}` / `{MM}` expand to the current UTC year / month (DB-IP names its monthly
+    /// files that way); a MaxMind permalink carries the license key in the URL.
+    #[serde(default)]
+    pub download_url: Option<String>,
+    /// How often to re-download (hours, 1..=8760). DB-IP Lite is monthly, GeoLite2 weekly.
+    #[serde(default = "default_geoip_refresh_hours")]
+    pub refresh_hours: u64,
+    /// How often to check whether the file changed on disk and reload it (seconds,
+    /// 10..=86400); covers databases updated by an external job or a sidecar.
+    #[serde(default = "default_geoip_reload_check_secs")]
+    pub reload_check_secs: u64,
+}
+
+fn default_geoip_refresh_hours() -> u64 {
+    168
+}
+
+fn default_geoip_reload_check_secs() -> u64 {
+    300
+}
+
+impl GeoIpConfig {
+    pub fn enabled(&self) -> bool {
+        !self.database_path.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled() {
+            if self
+                .download_url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty())
+            {
+                anyhow::bail!("geoip.download_url requires geoip.database_path");
+            }
+            return Ok(());
+        }
+        if !(1..=8760).contains(&self.refresh_hours) {
+            anyhow::bail!("geoip.refresh_hours must be within 1..=8760");
+        }
+        if !(10..=86_400).contains(&self.reload_check_secs) {
+            anyhow::bail!("geoip.reload_check_secs must be within 10..=86400");
+        }
+        if let Some(url) = self.download_url.as_deref().map(str::trim) {
+            if !url.is_empty() && !url.starts_with("https://") {
+                anyhow::bail!("geoip.download_url must be https://");
+            }
+        }
+        Ok(())
     }
 }
 
