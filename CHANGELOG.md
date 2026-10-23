@@ -11,6 +11,8 @@ released together.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-10-23
+
 ### Changed
 - **Quality rating is the full E-model (ITU-T G.107)** instead of the simplified latency/loss formula: `R = 93.2 − Id − Ie,eff` with the one-way delay (RTT/2 + playout buffer + codec), the Opus impairment by bitrate, the loss robustness of the redundancy in use (PLC / in-band FEC / DRED) and the RFC 3611 burst ratio. Absolute values shift: a perfect link now rates ≈ 4.2 instead of 4.4, 2 % random loss without FEC ≈ 3.65 (was ≈ 4.2). Bars, alerts and analytics keep their meaning (R ≥ 80 / 70 / 60 / 50) — review `quality.mos_alert_threshold` if you tuned it to the old scale. [docs](docs/src/features/quality.md#how-the-rating-is-produced)
 
@@ -744,7 +746,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/aurix-voice/aurix/compare/v1.8.2...v1.9.0
 [1.7.0]: https://github.com/aurix-voice/aurix/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/aurix-voice/aurix/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/aurix-voice/aurix/compare/v1.4.0...v1.5.0
