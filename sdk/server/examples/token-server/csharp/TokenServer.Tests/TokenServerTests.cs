@@ -44,6 +44,7 @@ sealed class FakeAurix : IAsyncDisposable
                 expires_at = "2030-01-01T00:00:00Z",
                 channels = Array.Empty<object>(),
                 endpoint = new { region = "eu_west", node_id = "n1", ws_url = "wss://eu1.example/ws", nodes = 1, load_factor = 0.1 },
+                location_source = "none",
                 api_key_echo = ApiKey,
             });
         });
