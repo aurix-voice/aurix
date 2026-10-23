@@ -423,6 +423,9 @@ namespace Aurix.Transport
         public void SendQualityReport(float rttMs, float jitterMs, float lossPercent) =>
             Send(AurxPacket.QualityReport(NextSeq(), _ssrc, rttMs, jitterMs, lossPercent));
 
+        public void SendQualityReport(float rttMs, float jitterMs, float lossPercent, PlayoutReport playout) =>
+            Send(AurxPacket.QualityReport(NextSeq(), _ssrc, rttMs, jitterMs, lossPercent, playout));
+
         private void Send(AurxPacket packet)
         {
             var wire = packet.Seal(_keys);

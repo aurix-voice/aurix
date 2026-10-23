@@ -11,7 +11,11 @@ released together.
 
 ## [Unreleased]
 
+### Changed
+- **Quality rating is the full E-model (ITU-T G.107)** instead of the simplified latency/loss formula: `R = 93.2 − Id − Ie,eff` with the one-way delay (RTT/2 + playout buffer + codec), the Opus impairment by bitrate, the loss robustness of the redundancy in use (PLC / in-band FEC / DRED) and the RFC 3611 burst ratio. Absolute values shift: a perfect link now rates ≈ 4.2 instead of 4.4, 2 % random loss without FEC ≈ 3.65 (was ≈ 4.2). Bars, alerts and analytics keep their meaning (R ≥ 80 / 70 / 60 / 50) — review `quality.mos_alert_threshold` if you tuned it to the old scale. [docs](docs/src/features/quality.md#how-the-rating-is-produced)
+
 ### Added
+- **Audio MOS** next to the network MOS: clients add what their playout did to every `QualityReport` (`playout {concealed_percent, recovered_percent, playout_delay_ms, burst_ratio, underruns, fec, dred}`; native packet grows from 12 to 32 bytes, old 12-byte reports stay valid). `NetworkQuality` gains `audio_mos` / `audio_r_factor` (only frames the PLC had to invent count as loss, underruns cost extra) plus the playout fields; `QualitySummary` gains `audio_samples`, `audio_mos_avg/min/last`, `concealed_avg_percent`; usage buckets and `GET /v1/analytics/*` meter `audio_quality_samples`, `audio_mos_sum_milli`, `concealed_sum_permille` → `quality.audio_mos_avg`, `quality.concealed_avg_percent` (migration adds the columns). Senders: native core (Unreal / Godot / Unity native) with FEC/DRED recovery and loss bursts, Unity managed (`VoiceStats.ConcealedPercent` …, `PlayoutReport`), Web (`getStats()` `concealedSamples` / `totalSamplesReceived`, own counters on AURX; browsers cannot see FEC recovery or bursts).
 - Usage analytics: `joins_refused` — connects and channel joins turned away by the application's caps (concurrent sessions, monthly participant-minutes) are metered per 5-minute bucket and reported in `GET /v1/analytics` totals/series, the CSV export and the fleet routes. Migration adds the column; older buckets read `0`. This is the "players could not join" signal a managed console shows next to the plan limit.
 
 ## [1.8.2] - 2026-10-22

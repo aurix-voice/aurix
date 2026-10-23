@@ -1489,12 +1489,28 @@ impl PacketRouter {
         if !(rtt.is_finite() && jitter.is_finite() && loss.is_finite()) {
             return;
         }
+        // Playout extension (clients ≥ 1.9): 4 × f32 + 2 × u16 after the three floats.
+        let playout = (p.len() >= 32).then(|| {
+            let f = |i: usize| f32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+            let flags = u16::from_be_bytes([p[30], p[31]]);
+            aurix_common::types::PlayoutMetrics {
+                concealed_percent: f(12),
+                recovered_percent: f(16),
+                playout_delay_ms: f(20),
+                burst_ratio: f(24),
+                underruns: u32::from(u16::from_be_bytes([p[28], p[29]])),
+                fec: flags & 1 != 0,
+                dred: flags & 2 != 0,
+            }
+            .sanitized()
+        });
         let mut metrics = QualityMetrics {
             rtt_ms: rtt.clamp(0.0, 10_000.0),
             jitter_ms: jitter.clamp(0.0, 10_000.0),
             packet_loss_percent: loss.clamp(0.0, 100.0),
             bitrate_kbps: 0,
             mos_score: 0.0,
+            playout,
         };
         metrics.mos_score = metrics.calculate_mos();
         aurix_metrics::RTT_MS.observe(metrics.rtt_ms as f64);

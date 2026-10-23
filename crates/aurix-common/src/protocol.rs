@@ -1364,6 +1364,10 @@ pub enum ControlMessage {
         rtt_ms: f32,
         jitter_ms: f32,
         packet_loss: f32,
+        /// Playout counters over the report interval (clients that have them; drives the
+        /// audio rating `NetworkQuality.audio_mos`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        playout: Option<crate::types::PlayoutMetrics>,
     },
     /// Server→client: bitrate adaptation for the whole uplink, bounded by the merged channel
     /// policy (`min_bitrate_bps..=bitrate_bps`). `expected_loss_percent` is the loss the server

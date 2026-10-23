@@ -10533,6 +10533,7 @@ async fn network_quality_bars_bitrate_adaptation_and_session_stats() {
         rtt_ms: 40.0,
         jitter_ms: 5.0,
         packet_loss: 25.0,
+        playout: None,
     })
     .await;
     let cmd = expect_within(&mut bob, "BitrateCommand", Duration::from_secs(5), |m| {
@@ -10739,6 +10740,7 @@ async fn mos_alert_debounced_recovered_and_summary_persisted_into_analytics() {
         rtt_ms: 350.0,
         jitter_ms: 40.0,
         packet_loss: 5.0,
+        playout: None,
     })
     .await;
     let t_bad = tokio::time::Instant::now();
@@ -10801,6 +10803,7 @@ async fn mos_alert_debounced_recovered_and_summary_persisted_into_analytics() {
         rtt_ms: 30.0,
         jitter_ms: 3.0,
         packet_loss: 0.0,
+        playout: None,
     })
     .await;
     let t_good = tokio::time::Instant::now();
@@ -11077,6 +11080,7 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
         rtt_ms: 30.0,
         jitter_ms: 5.0,
         packet_loss: 25.0,
+        playout: None,
     })
     .await;
     let cmd = expect_within(&mut bob, "BitrateCommand", Duration::from_secs(5), |m| {
@@ -11150,6 +11154,7 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
         rtt_ms: 30.0,
         jitter_ms: 5.0,
         packet_loss: 25.0,
+        playout: None,
     })
     .await;
     let cmd = expect_within(
@@ -11164,6 +11169,7 @@ async fn channel_audio_policy_join_ack_live_update_and_bitrate_bounds() {
         rtt_ms: 30.0,
         jitter_ms: 5.0,
         packet_loss: 0.0,
+        playout: None,
     })
     .await;
     let cmd = expect_within(

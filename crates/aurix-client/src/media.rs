@@ -1131,11 +1131,26 @@ impl MediaTransport {
         self.send_sealed(&packet);
     }
 
-    pub fn send_quality_report(&self, rtt_ms: f32, jitter_ms: f32, loss_percent: f32) {
-        let mut payload = Vec::with_capacity(12);
+    pub fn send_quality_report(
+        &self,
+        rtt_ms: f32,
+        jitter_ms: f32,
+        loss_percent: f32,
+        playout: Option<aurix_common::types::PlayoutMetrics>,
+    ) {
+        let mut payload = Vec::with_capacity(32);
         payload.extend_from_slice(&rtt_ms.to_be_bytes());
         payload.extend_from_slice(&jitter_ms.to_be_bytes());
         payload.extend_from_slice(&loss_percent.to_be_bytes());
+        if let Some(p) = playout {
+            payload.extend_from_slice(&p.concealed_percent.to_be_bytes());
+            payload.extend_from_slice(&p.recovered_percent.to_be_bytes());
+            payload.extend_from_slice(&p.playout_delay_ms.to_be_bytes());
+            payload.extend_from_slice(&p.burst_ratio.to_be_bytes());
+            payload.extend_from_slice(&(p.underruns.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+            let flags = u16::from(p.fec) | (u16::from(p.dred) << 1);
+            payload.extend_from_slice(&flags.to_be_bytes());
+        }
         let packet = AurixPacket::new(
             PacketHeader::new(PacketType::QualityReport, self.next_seq(), 0, self.ssrc),
             Bytes::from(payload),
@@ -1368,7 +1383,7 @@ mod tests {
             transport.send_audio(ch, i * 960, Some(20), &[1, 2, 3, 4]);
         }
         transport.send_mute_state(true);
-        transport.send_quality_report(12.0, 3.0, 0.5);
+        transport.send_quality_report(12.0, 3.0, 0.5, None);
         transport.send_heartbeat();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline

@@ -217,6 +217,9 @@ namespace Aurix.Audio
         private long _retiredLost, _retiredLate, _retiredFec, _retiredDred, _underruns;
         private OpusDecoderSettings _decoderSettings = OpusDecoderSettings.Default;
 
+                /// <summary>Jitter-buffer delay on top of the network (target depth × 20 ms).</summary>
+        public float PlayoutDelayMs => 2 * 20f;
+
         public RemoteMixer(Func<IOpusCodec> decoderFactory) : this(decoderFactory, null) { }
 
         /// <summary>

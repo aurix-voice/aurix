@@ -294,6 +294,14 @@ impl SfuNode {
         meter.record(app, None, UsageMetric::JitterSumMs, q.jitter_ms);
         meter.record(app, None, UsageMetric::LossSumPermille, q.loss_permille);
         meter.record(app, None, UsageMetric::PoorQualitySamples, q.poor_samples);
+        meter.record(app, None, UsageMetric::AudioQualitySamples, q.audio_samples);
+        meter.record(app, None, UsageMetric::AudioMosSumMilli, q.audio_mos_milli);
+        meter.record(
+            app,
+            None,
+            UsageMetric::ConcealedSumPermille,
+            q.concealed_permille,
+        );
     }
 
     pub fn webrtc_manager(&self) -> Option<&Arc<WebRtcManager>> {

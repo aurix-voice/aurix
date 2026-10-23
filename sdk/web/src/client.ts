@@ -89,6 +89,7 @@ import {
   type ClientStats,
   type NetworkQuality,
   type RtcStatsInput,
+  PlayoutWindow,
 } from './quality.js';
 import {
   DEFAULT_AUDIO_POLICY,
@@ -157,6 +158,7 @@ function mergeInboundStats(acc: InboundRtpStats | undefined, s: InboundRtpStats)
     packetsLost: (acc.packetsLost ?? 0) + (s.packetsLost ?? 0),
     bytesReceived: (acc.bytesReceived ?? 0) + (s.bytesReceived ?? 0),
     concealedSamples: (acc.concealedSamples ?? 0) + (s.concealedSamples ?? 0),
+    totalSamplesReceived: (acc.totalSamplesReceived ?? 0) + (s.totalSamplesReceived ?? 0),
     packetsDiscarded: (acc.packetsDiscarded ?? 0) + (s.packetsDiscarded ?? 0),
     jitterBufferDelay: (acc.jitterBufferDelay ?? 0) + (s.jitterBufferDelay ?? 0),
     jitterBufferEmittedCount: (acc.jitterBufferEmittedCount ?? 0) + (s.jitterBufferEmittedCount ?? 0),
@@ -1275,6 +1277,7 @@ export class AurixClient {
   private rtt = new RttTracker();
   private qualityTimer: ReturnType<typeof setInterval> | undefined;
   private lossWindow = new LossWindow();
+  private playoutWindow = new PlayoutWindow();
   private statsSnapshot: ClientStats | undefined;
   private serverQuality: NetworkQuality | undefined;
   private state: ConnectionState = 'disconnected';
@@ -3557,9 +3560,15 @@ export class AurixClient {
     const stats = await this.getStats();
     this.emit('stats', stats);
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const playout = this.playoutWindow.advance(stats, this.opusPreferences.fec ?? false);
     this.send({
       type: 'QualityReport',
-      data: { rtt_ms: stats.rttMs, jitter_ms: stats.jitterMs, packet_loss: stats.lossPercent },
+      data: {
+        rtt_ms: stats.rttMs,
+        jitter_ms: stats.jitterMs,
+        packet_loss: stats.lossPercent,
+        ...(playout ? { playout } : {}),
+      },
     });
   }
 
@@ -5146,10 +5155,12 @@ export class AurixClient {
         bytesReceived: s.bytesReceived,
         packetsDiscarded: s.packetsRejected + (playback?.framesDropped ?? 0),
         concealedSamples: playback?.concealedSamples ?? 0,
+        totalSamplesReceived: (playback?.framesDecoded ?? 0) * 960,
         jitterBufferDelay: ((playback?.targetDelayMs ?? 0) / 1000) * (playback?.framesDecoded ?? 0),
         jitterBufferEmittedCount: playback?.framesDecoded ?? 0,
       },
       outbound: { packetsSent: s.packetsSent, bytesSent: s.bytesSent },
+      playoutUnderruns: playback?.underruns ?? 0,
     };
     if (s.rttMs !== undefined) input.iceRttSeconds = s.rttMs / 1000;
     const out = assembleClientStats(this.rtt, input, this.lossWindow, this.serverQuality);

@@ -427,6 +427,22 @@ namespace Aurix.Protocol
             return new AurxPacket(PacketHeader.Create(PacketType.QualityReport, seq, 0, ssrc), p);
         }
 
+        /// <summary>QualityReport with the playout extension (32-byte payload, servers ≥ 1.9 read it, older ones ignore it).</summary>
+        public static AurxPacket QualityReport(uint seq, uint ssrc, float rttMs, float jitterMs, float lossPercent, PlayoutReport playout)
+        {
+            var p = new byte[32];
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(0), BitConverter.SingleToInt32Bits(rttMs));
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(4), BitConverter.SingleToInt32Bits(jitterMs));
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(8), BitConverter.SingleToInt32Bits(lossPercent));
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(12), BitConverter.SingleToInt32Bits(playout.ConcealedPercent));
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(16), BitConverter.SingleToInt32Bits(playout.RecoveredPercent));
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(20), BitConverter.SingleToInt32Bits(playout.PlayoutDelayMs));
+            BinaryPrimitives.WriteInt32BigEndian(p.AsSpan(24), BitConverter.SingleToInt32Bits(playout.BurstRatio));
+            BinaryPrimitives.WriteUInt16BigEndian(p.AsSpan(28), (ushort)Math.Min(ushort.MaxValue, Math.Max(0, playout.Underruns)));
+            BinaryPrimitives.WriteUInt16BigEndian(p.AsSpan(30), (ushort)((playout.Fec ? 1 : 0) | (playout.Dred ? 2 : 0)));
+            return new AurxPacket(PacketHeader.Create(PacketType.QualityReport, seq, 0, ssrc), p);
+        }
+
         /// <summary>
         /// SessionBind payload: session_id (16, RFC 4122 byte order) | unix_ms (8) | nonce (8).
         /// Send with <see cref="EncodeAuthenticated"/> (signed, not encrypted).

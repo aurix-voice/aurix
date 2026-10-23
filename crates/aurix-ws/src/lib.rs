@@ -4904,6 +4904,7 @@ async fn handle_control_message(
             rtt_ms,
             jitter_ms,
             packet_loss,
+            playout,
         } => {
             if !(rtt_ms.is_finite() && jitter_ms.is_finite() && packet_loss.is_finite()) {
                 return;
@@ -4921,6 +4922,7 @@ async fn handle_control_message(
                     q.rtt_ms = rtt_ms;
                     q.jitter_ms = jitter_ms;
                     q.packet_loss_percent = packet_loss;
+                    q.playout = playout.map(aurix_common::types::PlayoutMetrics::sanitized);
                     q.mos_score = q.calculate_mos();
                 }
             }

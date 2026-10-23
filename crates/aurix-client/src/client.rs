@@ -342,6 +342,9 @@ struct Inner {
     tx_stats: Mutex<TransmitStats>,
     jitter: Mutex<JitterEstimator>,
     loss_window: Mutex<LossWindow>,
+    /// Mixer totals at the previous quality report (interval deltas for the playout metrics).
+    playout_prev: Mutex<MixerTotals>,
+    playout_prev_received: AtomicU64,
     server_quality: Mutex<Option<NetworkQuality>>,
     next_request: AtomicU64,
     closing: AtomicBool,
@@ -807,6 +810,8 @@ impl Client {
             tx_stats: Mutex::new(TransmitStats::default()),
             jitter: Mutex::new(JitterEstimator::default()),
             loss_window: Mutex::new(LossWindow::default()),
+            playout_prev: Mutex::new(MixerTotals::default()),
+            playout_prev_received: AtomicU64::new(0),
             server_quality: Mutex::new(None),
             next_request: AtomicU64::new(1),
             closing: AtomicBool::new(false),
@@ -2749,7 +2754,7 @@ async fn session(
             _ = heartbeat.tick() => {
                 media.send_heartbeat();
                 let stats = inner_stats(inner, &media);
-                media.send_quality_report(stats.0, stats.1, stats.2);
+                media.send_quality_report(stats.0, stats.1, stats.2, stats.3);
                 let native = matches!(media.path(), MediaPath::Udp | MediaPath::Quic);
                 let heartbeats_dead = cfg.udp_fallback_lost_heartbeats > 0
                     && media.consecutive_heartbeats_lost() >= cfg.udp_fallback_lost_heartbeats;
@@ -2899,14 +2904,80 @@ async fn session(
     }
 }
 
-fn inner_stats(inner: &Inner, media: &MediaTransport) -> (f32, f32, f32) {
+fn inner_stats(
+    inner: &Inner,
+    media: &MediaTransport,
+) -> (f32, f32, f32, Option<aurix_common::types::PlayoutMetrics>) {
     let m = media.stats();
-    let totals: MixerTotals = inner.mixer.lock().totals();
+    let (totals, playout_delay_ms): (MixerTotals, f32) = {
+        let mixer = inner.mixer.lock();
+        (mixer.totals(), mixer.playout_delay_ms())
+    };
     let loss = inner
         .loss_window
         .lock()
         .advance(totals.lost, m.audio_frames_received);
-    (m.rtt_ms, inner.jitter.lock().jitter_ms, loss)
+    let playout = playout_metrics(inner, &totals, m.audio_frames_received, playout_delay_ms);
+    (m.rtt_ms, inner.jitter.lock().jitter_ms, loss, playout)
+}
+
+/// Playout counters since the previous report: what the mixers concealed, what FEC/DRED
+/// rebuilt, how bursty the loss was and how often a stream ran dry.
+fn playout_metrics(
+    inner: &Inner,
+    totals: &MixerTotals,
+    frames_received: u64,
+    playout_delay_ms: f32,
+) -> Option<aurix_common::types::PlayoutMetrics> {
+    let mut prev = inner.playout_prev.lock();
+    let restarted = totals.lost < prev.lost || totals.underruns < prev.underruns;
+    let d = |now: u64, before: u64| now.saturating_sub(before);
+    let lost = d(totals.lost, prev.lost);
+    let recovered =
+        d(totals.fec_recovered, prev.fec_recovered) + d(totals.dred_recovered, prev.dred_recovered);
+    let runs = d(totals.loss_runs, prev.loss_runs);
+    let underruns = d(totals.underruns, prev.underruns);
+    *prev = *totals;
+    if restarted {
+        return None;
+    }
+    // Frames the window expected: what arrived in time plus what the buffers declared lost.
+    let prev_recv = inner
+        .playout_prev_received
+        .swap(frames_received, std::sync::atomic::Ordering::Relaxed);
+    let received = frames_received.saturating_sub(prev_recv);
+    let expected = received + lost;
+    let pct = |n: u64| {
+        if expected == 0 {
+            0.0
+        } else {
+            n as f32 * 100.0 / expected as f32
+        }
+    };
+    let concealed = lost.saturating_sub(recovered);
+    let loss_fraction = if expected == 0 {
+        0.0
+    } else {
+        lost as f32 / expected as f32
+    };
+    let burst_ratio = if runs == 0 || loss_fraction >= 1.0 {
+        1.0
+    } else {
+        ((lost as f32 / runs as f32) * (1.0 - loss_fraction)).clamp(1.0, 8.0)
+    };
+    let enc = inner.encoder.lock().settings();
+    Some(
+        aurix_common::types::PlayoutMetrics {
+            concealed_percent: pct(concealed),
+            recovered_percent: pct(recovered),
+            playout_delay_ms,
+            burst_ratio,
+            underruns: underruns.min(u64::from(u16::MAX)) as u32,
+            fec: enc.fec,
+            dred: enc.dred_duration_ms > 0,
+        }
+        .sanitized(),
+    )
 }
 
 fn path_name(path: MediaPath) -> &'static str {

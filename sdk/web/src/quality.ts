@@ -126,6 +126,10 @@ export interface ClientStats {
   packetsDiscarded: number;
   /** Jitter buffer target/actual delay in ms (browser-reported averages). */
   jitterBufferDelayMs: number;
+  /** Samples the receiver produced in total (browser `totalSamplesReceived`, or decoded frames × 960 on AURX). */
+  totalSamplesReceived: number;
+  /** Playout underruns since the session started (AURX paths; browsers do not expose them). */
+  playoutUnderruns: number;
   /** Outbound (uplink) audio. */
   packetsSent: number;
   bytesSent: number;
@@ -210,12 +214,15 @@ export class LossWindow {
  * types so the assembly can run (and be tested) outside a browser.
  */
 export interface RtcStatsInput {
+  /** AURX playout underruns (lifetime), when the SDK runs the jitter buffers itself. */
+  playoutUnderruns?: number;
   inbound?: {
     jitter?: number;
     packetsReceived?: number;
     packetsLost?: number;
     bytesReceived?: number;
     concealedSamples?: number;
+    totalSamplesReceived?: number;
     packetsDiscarded?: number;
     jitterBufferDelay?: number;
     jitterBufferEmittedCount?: number;
@@ -258,6 +265,8 @@ export function assembleClientStats(
     concealedSamples: 0,
     packetsDiscarded: 0,
     jitterBufferDelayMs: 0,
+    totalSamplesReceived: 0,
+    playoutUnderruns: input.playoutUnderruns ?? 0,
     packetsSent: 0,
     bytesSent: 0,
     remoteLossPercent: 0,
@@ -274,6 +283,7 @@ export function assembleClientStats(
     out.packetsLost = Math.max(0, i.packetsLost ?? 0);
     out.bytesReceived = i.bytesReceived ?? 0;
     out.concealedSamples = i.concealedSamples ?? 0;
+    out.totalSamplesReceived = i.totalSamplesReceived ?? 0;
     out.packetsDiscarded = i.packetsDiscarded ?? 0;
     const emitted = i.jitterBufferEmittedCount ?? 0;
     out.jitterBufferDelayMs = emitted > 0 ? ((i.jitterBufferDelay ?? 0) * 1000) / emitted : 0;
@@ -322,5 +332,55 @@ export class RttTracker {
   reset(): void {
     this.last = this.min = this.max = this.avg = 0;
     this.samples = 0;
+  }
+}
+
+/** Playout counters a `QualityReport` carries (server field names). */
+export interface PlayoutReport {
+  concealed_percent: number;
+  recovered_percent: number;
+  playout_delay_ms: number;
+  burst_ratio: number;
+  underruns: number;
+  fec: boolean;
+  dred: boolean;
+}
+
+/**
+ * Turns lifetime playout counters into per-interval figures for the periodic `QualityReport`:
+ * the share of samples the player had to conceal and the underruns since the previous call.
+ * Returns `undefined` until the receiver produced audio in the interval.
+ */
+export class PlayoutWindow {
+  private prevConcealed = 0;
+  private prevTotal = 0;
+  private prevUnderruns = 0;
+
+  advance(stats: ClientStats, fec: boolean): PlayoutReport | undefined {
+    const total = stats.totalSamplesReceived;
+    const concealed = stats.concealedSamples;
+    const underruns = stats.playoutUnderruns;
+    if (total < this.prevTotal || concealed < this.prevConcealed) {
+      this.prevTotal = total;
+      this.prevConcealed = concealed;
+      this.prevUnderruns = underruns;
+      return undefined;
+    }
+    const dTotal = total - this.prevTotal;
+    const dConcealed = Math.max(0, concealed - this.prevConcealed);
+    const dUnderruns = Math.max(0, underruns - this.prevUnderruns);
+    this.prevTotal = total;
+    this.prevConcealed = concealed;
+    this.prevUnderruns = underruns;
+    if (dTotal <= 0) return undefined;
+    return {
+      concealed_percent: clamp((dConcealed * 100) / dTotal, 0, 100),
+      recovered_percent: 0,
+      playout_delay_ms: Math.max(0, stats.jitterBufferDelayMs),
+      burst_ratio: 1,
+      underruns: dUnderruns,
+      fec,
+      dred: false,
+    };
   }
 }

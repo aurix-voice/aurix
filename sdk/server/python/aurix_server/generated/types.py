@@ -937,6 +937,9 @@ FleetUsageAppsItem = TypedDict(
         "poor_quality_samples": int,  # Ratings at 1–2 bars
         "quality": "QualityAggregate",  # Derived from the `quality_*` counters
         "joins_refused": int,  # Connects and channel joins refused by a per-application cap in this bucket/range.
+        "audio_quality_samples": NotRequired[int],
+        "audio_mos_sum_milli": NotRequired[int],
+        "concealed_sum_permille": NotRequired[int],
         "app_id": str,
     },
 )
@@ -1219,6 +1222,13 @@ NetworkQuality = TypedDict(
         "uplink_bitrate_kbps": NotRequired[int],
         "uplink_packets_received": NotRequired[int],
         "uplink_packets_lost": NotRequired[int],
+        "audio_r_factor": NotRequired[Optional[float]],  # Rating of what the client actually played (null until it reports playout metrics).
+        "audio_mos": NotRequired[Optional[float]],  # MOS of the played audio: only frames the PLC had to invent count as loss, underruns cost extra.
+        "concealed_percent": NotRequired[float],  # Share of frames concealed after FEC/DRED, from the client's last report.
+        "recovered_percent": NotRequired[float],  # Share of lost frames rebuilt from FEC/DRED.
+        "playout_delay_ms": NotRequired[float],  # Jitter-buffer / playout delay the client reported (0 = not reported).
+        "burst_ratio": NotRequired[float],  # RFC 3611 burst ratio of the downlink loss (1 = random / not reported).
+        "underruns": NotRequired[int],
     },
 )
 """Merged view of the client's `QualityReport` and the SFU's uplink measurements; the worse direction decides the rating (`R ≥ 80 → 5 bars, ≥ 70 → 4, ≥ 60 → 3, ≥ 50 → 2, else 1`)."""
@@ -1276,6 +1286,9 @@ QualityAggregate = TypedDict(
         "loss_avg_percent": Optional[float],  # Mean of the worse direction's packet loss
         "poor_samples": int,  # Ratings at 1–2 bars
         "poor_percent": Optional[float],  # `poor_samples / samples * 100`
+        "audio_samples": NotRequired[int],
+        "audio_mos_avg": NotRequired[Optional[float]],
+        "concealed_avg_percent": NotRequired[Optional[float]],
     },
 )
 """MOS (ITU-T G.107 E-model) quality aggregated from every per-session rating in the range (one rating per session per `media.quality_interval_ms`). Averages are `null` when there were no ratings."""
@@ -1310,6 +1323,11 @@ QualitySummary = TypedDict(
         "poor_seconds": float,  # Time rated at 1–2 bars
         "mos_alerts": int,  # `quality.alert` events with `metric: "mos"` raised for the session
         "last": NotRequired[Optional["NetworkQuality"]],  # Most recent rating
+        "audio_samples": NotRequired[int],  # Evaluations that carried playout metrics.
+        "audio_mos_avg": NotRequired[Optional[float]],
+        "audio_mos_min": NotRequired[Optional[float]],
+        "audio_mos_last": NotRequired[Optional[float]],
+        "concealed_avg_percent": NotRequired[Optional[float]],  # Average share of concealed frames over the audio-rated evaluations.
     },
 )
 """Lifetime quality record of one session: every rating (`media.quality_interval_ms`) since it connected, continued across cross-node failover. Persisted to the session row every `quality.persist_interval_secs` and at disconnect."""
@@ -1955,6 +1973,9 @@ UsageAppBucket = TypedDict(
         "updated_at": str,
         "quality": "QualityAggregate",  # Derived from the `quality_*` counters
         "joins_refused": int,  # Connects and channel joins refused by a per-application cap in this bucket/range.
+        "audio_quality_samples": NotRequired[int],
+        "audio_mos_sum_milli": NotRequired[int],
+        "concealed_sum_permille": NotRequired[int],
     },
 )
 """One application bucket (5 minutes, or the requested `step` when rolled up). Buckets are aligned to UTC epoch multiples; a bucket at or after `range.finalized_through` is still accruing."""
@@ -2031,6 +2052,9 @@ UsageTotals = TypedDict(
         "poor_quality_samples": int,  # Ratings at 1–2 bars
         "quality": "QualityAggregate",  # Derived from the `quality_*` counters
         "joins_refused": int,  # Connects and channel joins refused by a per-application cap in this bucket/range.
+        "audio_quality_samples": NotRequired[int],
+        "audio_mos_sum_milli": NotRequired[int],
+        "concealed_sum_permille": NotRequired[int],
     },
 )
 """Sums of additive counters and maxima of peaks over a range."""

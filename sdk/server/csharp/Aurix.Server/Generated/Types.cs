@@ -2177,6 +2177,15 @@ public sealed record FleetUsageAppsItem
     [JsonPropertyName("joins_refused")]
     public required long JoinsRefused { get; init; }
 
+    [JsonPropertyName("audio_quality_samples")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioQualitySamples { get; init; }
+
+    [JsonPropertyName("audio_mos_sum_milli")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioMosSumMilli { get; init; }
+
+    [JsonPropertyName("concealed_sum_permille")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? ConcealedSumPermille { get; init; }
+
     [JsonPropertyName("app_id")]
     public required string AppId { get; init; }
 }
@@ -2727,6 +2736,45 @@ public sealed record NetworkQuality
 
     [JsonPropertyName("uplink_packets_lost")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? UplinkPacketsLost { get; init; }
+
+    /// <summary>
+    /// Rating of what the client actually played (null until it reports playout metrics).
+    /// </summary>
+    [JsonPropertyName("audio_r_factor")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? AudioRFactor { get; init; }
+
+    /// <summary>
+    /// MOS of the played audio: only frames the PLC had to invent count as loss, underruns cost extra.
+    /// </summary>
+    [JsonPropertyName("audio_mos")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? AudioMos { get; init; }
+
+    /// <summary>
+    /// Share of frames concealed after FEC/DRED, from the client's last report.
+    /// </summary>
+    [JsonPropertyName("concealed_percent")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ConcealedPercent { get; init; }
+
+    /// <summary>
+    /// Share of lost frames rebuilt from FEC/DRED.
+    /// </summary>
+    [JsonPropertyName("recovered_percent")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? RecoveredPercent { get; init; }
+
+    /// <summary>
+    /// Jitter-buffer / playout delay the client reported (0 = not reported).
+    /// </summary>
+    [JsonPropertyName("playout_delay_ms")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? PlayoutDelayMs { get; init; }
+
+    /// <summary>
+    /// RFC 3611 burst ratio of the downlink loss (1 = random / not reported).
+    /// </summary>
+    [JsonPropertyName("burst_ratio")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? BurstRatio { get; init; }
+
+    [JsonPropertyName("underruns")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? Underruns { get; init; }
 }
 
 /// <summary>
@@ -2874,6 +2922,15 @@ public sealed record QualityAggregate
     /// </summary>
     [JsonPropertyName("poor_percent")]
     public required double? PoorPercent { get; init; }
+
+    [JsonPropertyName("audio_samples")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioSamples { get; init; }
+
+    [JsonPropertyName("audio_mos_avg")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? AudioMosAvg { get; init; }
+
+    [JsonPropertyName("concealed_avg_percent")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ConcealedAvgPercent { get; init; }
 }
 
 /// <summary>
@@ -2972,6 +3029,27 @@ public sealed record QualitySummary
     /// </summary>
     [JsonPropertyName("last")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public NetworkQuality? Last { get; init; }
+
+    /// <summary>
+    /// Evaluations that carried playout metrics.
+    /// </summary>
+    [JsonPropertyName("audio_samples")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioSamples { get; init; }
+
+    [JsonPropertyName("audio_mos_avg")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? AudioMosAvg { get; init; }
+
+    [JsonPropertyName("audio_mos_min")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? AudioMosMin { get; init; }
+
+    [JsonPropertyName("audio_mos_last")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? AudioMosLast { get; init; }
+
+    /// <summary>
+    /// Average share of concealed frames over the audio-rated evaluations.
+    /// </summary>
+    [JsonPropertyName("concealed_avg_percent")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ConcealedAvgPercent { get; init; }
 }
 
 /// <summary>
@@ -4298,6 +4376,15 @@ public sealed record UsageAppBucket
     /// </summary>
     [JsonPropertyName("joins_refused")]
     public required long JoinsRefused { get; init; }
+
+    [JsonPropertyName("audio_quality_samples")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioQualitySamples { get; init; }
+
+    [JsonPropertyName("audio_mos_sum_milli")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioMosSumMilli { get; init; }
+
+    [JsonPropertyName("concealed_sum_permille")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? ConcealedSumPermille { get; init; }
 }
 
 /// <summary>
@@ -4506,6 +4593,15 @@ public sealed record UsageTotals
     /// </summary>
     [JsonPropertyName("joins_refused")]
     public required long JoinsRefused { get; init; }
+
+    [JsonPropertyName("audio_quality_samples")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioQualitySamples { get; init; }
+
+    [JsonPropertyName("audio_mos_sum_milli")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? AudioMosSumMilli { get; init; }
+
+    [JsonPropertyName("concealed_sum_permille")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? ConcealedSumPermille { get; init; }
 }
 
 public sealed record User

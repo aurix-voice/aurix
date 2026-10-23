@@ -1149,8 +1149,11 @@ type FleetUsageAppsItem struct {
 	// Derived from the `quality_*` counters
 	Quality QualityAggregate `json:"quality"`
 	// Connects and channel joins refused by a per-application cap in this bucket/range.
-	JoinsRefused int64  `json:"joins_refused"`
-	AppID        string `json:"app_id"`
+	JoinsRefused         int64  `json:"joins_refused"`
+	AudioQualitySamples  *int64 `json:"audio_quality_samples,omitempty"`
+	AudioMOSSumMilli     *int64 `json:"audio_mos_sum_milli,omitempty"`
+	ConcealedSumPermille *int64 `json:"concealed_sum_permille,omitempty"`
+	AppID                string `json:"app_id"`
 }
 
 // FleetUsageRange is the `FleetUsageRange` schema.
@@ -1415,6 +1418,19 @@ type NetworkQuality struct {
 	UplinkBitrateKbps     *int64   `json:"uplink_bitrate_kbps,omitempty"`
 	UplinkPacketsReceived *int64   `json:"uplink_packets_received,omitempty"`
 	UplinkPacketsLost     *int64   `json:"uplink_packets_lost,omitempty"`
+	// Rating of what the client actually played (null until it reports playout metrics).
+	AudioRFactor *float64 `json:"audio_r_factor,omitempty"`
+	// MOS of the played audio: only frames the PLC had to invent count as loss, underruns cost extra.
+	AudioMOS *float64 `json:"audio_mos,omitempty"`
+	// Share of frames concealed after FEC/DRED, from the client's last report.
+	ConcealedPercent *float64 `json:"concealed_percent,omitempty"`
+	// Share of lost frames rebuilt from FEC/DRED.
+	RecoveredPercent *float64 `json:"recovered_percent,omitempty"`
+	// Jitter-buffer / playout delay the client reported (0 = not reported).
+	PlayoutDelayMs *float64 `json:"playout_delay_ms,omitempty"`
+	// RFC 3611 burst ratio of the downlink loss (1 = random / not reported).
+	BurstRatio *float64 `json:"burst_ratio,omitempty"`
+	Underruns  *int64   `json:"underruns,omitempty"`
 }
 
 // Operator drain (maintenance) in progress on a node.
@@ -1479,7 +1495,10 @@ type QualityAggregate struct {
 	// Ratings at 1–2 bars
 	PoorSamples int64 `json:"poor_samples"`
 	// `poor_samples / samples * 100`
-	PoorPercent *float64 `json:"poor_percent"`
+	PoorPercent         *float64 `json:"poor_percent"`
+	AudioSamples        *int64   `json:"audio_samples,omitempty"`
+	AudioMOSAvg         *float64 `json:"audio_mos_avg,omitempty"`
+	ConcealedAvgPercent *float64 `json:"concealed_avg_percent,omitempty"`
 }
 
 // Last `QualityReport` the client sent (loss in percent).
@@ -1518,6 +1537,13 @@ type QualitySummary struct {
 	MOSAlerts int64 `json:"mos_alerts"`
 	// Most recent rating
 	Last *NetworkQuality `json:"last,omitempty"`
+	// Evaluations that carried playout metrics.
+	AudioSamples *int64   `json:"audio_samples,omitempty"`
+	AudioMOSAvg  *float64 `json:"audio_mos_avg,omitempty"`
+	AudioMOSMin  *float64 `json:"audio_mos_min,omitempty"`
+	AudioMOSLast *float64 `json:"audio_mos_last,omitempty"`
+	// Average share of concealed frames over the audio-rated evaluations.
+	ConcealedAvgPercent *float64 `json:"concealed_avg_percent,omitempty"`
 }
 
 // Per-application limits and their current consumption. `0` means unlimited.
@@ -2143,7 +2169,10 @@ type UsageAppBucket struct {
 	// Derived from the `quality_*` counters
 	Quality QualityAggregate `json:"quality"`
 	// Connects and channel joins refused by a per-application cap in this bucket/range.
-	JoinsRefused int64 `json:"joins_refused"`
+	JoinsRefused         int64  `json:"joins_refused"`
+	AudioQualitySamples  *int64 `json:"audio_quality_samples,omitempty"`
+	AudioMOSSumMilli     *int64 `json:"audio_mos_sum_milli,omitempty"`
+	ConcealedSumPermille *int64 `json:"concealed_sum_permille,omitempty"`
 }
 
 // One hourly channel bucket.
@@ -2227,7 +2256,10 @@ type UsageTotals struct {
 	// Derived from the `quality_*` counters
 	Quality QualityAggregate `json:"quality"`
 	// Connects and channel joins refused by a per-application cap in this bucket/range.
-	JoinsRefused int64 `json:"joins_refused"`
+	JoinsRefused         int64  `json:"joins_refused"`
+	AudioQualitySamples  *int64 `json:"audio_quality_samples,omitempty"`
+	AudioMOSSumMilli     *int64 `json:"audio_mos_sum_milli,omitempty"`
+	ConcealedSumPermille *int64 `json:"concealed_sum_permille,omitempty"`
 }
 
 // User is the `User` schema.

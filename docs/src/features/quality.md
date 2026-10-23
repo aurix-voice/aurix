@@ -53,6 +53,31 @@ on resume); loss, R-factor, MOS and bars describe the latest period.
    client report with what the SFU measures on that session's **uplink** — sequence gaps (loss),
    RFC 3550 inter-arrival jitter and bitrate. The worse direction decides the rating. Sessions
    whose media path is not bound yet (no `SessionBind` / no WebRTC track) are not rated.
+
+   **The model.** Both directions are rated with the E-model (ITU-T G.107):
+   `R = 93.2 − Id − Ie,eff`, mapped to MOS 1.0–4.5 and to the 1–5 bars (R ≥ 80 / 70 / 60 / 50).
+   `Id` is the delay impairment of the one-way mouth-to-ear delay `RTT/2 + playout buffer
+   (reported, else 2 × jitter + 40 ms) + 25 ms codec` (`0.024·Ta`, plus `0.11·(Ta − 177.3)`
+   above 177 ms). `Ie,eff = Ie + (95 − Ie) · Ppl / (Ppl / BurstR + Bpl)` with the Opus
+   impairment `Ie` by bitrate (5 at ≥ 24 kbit/s, 10 at ≥ 16, 14 at ≥ 12, else 20), the loss
+   robustness `Bpl` of the redundancy the senders add (10 PLC only, 19 in-band FEC, 28 DRED)
+   and the RFC 3611 burst ratio of the loss. A perfect link therefore rates ≈ 4.2, 2 % random
+   loss without FEC ≈ 3.65, the same loss with FEC ≈ 3.95.
+
+   **Network vs. audio.** `mos` / `r_factor` / `bars` rate the *network*: raw loss, whichever
+   direction is worse. Clients that count what their playout did add a playout block to the
+   report — `playout {concealed_percent, recovered_percent, playout_delay_ms, burst_ratio,
+   underruns, fec, dred}` in the JSON message, or 20 extra bytes after the three floats of the
+   native packet (`f32 × 4`, `u16 underruns`, `u16 flags` bit 0 FEC / bit 1 DRED; 12-byte
+   reports from older clients are still accepted). From it the node also rates the *audio*:
+   `audio_mos` / `audio_r_factor` count only the frames the PLC had to invent (loss after FEC and
+   DRED rebuilt what they could), use the real buffer delay and subtract half a point of `R`
+   per underrun in the interval (at most ten). 2 % loss fully rebuilt by FEC therefore shows
+   `mos ≈ 3.95` (the network is lossy) next to `audio_mos ≈ 4.2` (nothing audible). The native
+   core (Unreal, Godot, Unity native), the Unity managed SDK and the Web SDK (`concealedSamples`
+   / `totalSamplesReceived` from `getStats()`, the SDK's own counters on AURX) send the block;
+   browsers cannot see FEC recovery or loss bursts, so they report `recovered_percent 0` and
+   `burst_ratio 1`. `audio_mos` is `null` until a session reported playout metrics.
 4. The result goes back to the client as `NetworkQuality` whenever the bars change, whenever
    the loss its senders must protect against crosses a tier (3 % / 10 %) and every fifth period
    as a summary:
@@ -61,7 +86,9 @@ on resume); loss, R-factor, MOS and bars describe the latest period.
 {"type":"NetworkQuality","data":{"quality":{"bars":4,"r_factor":76.2,"mos":3.9,"rtt_ms":48.0,
  "downlink_jitter_ms":6.5,"downlink_loss_percent":1.2,"uplink_jitter_ms":3.1,
  "uplink_loss_percent":4.0,"receivers_loss_percent":0.0,"uplink_bitrate_kbps":31,
- "uplink_packets_received":4120,"uplink_packets_lost":170}}}
+ "uplink_packets_received":4120,"uplink_packets_lost":170,
+ "audio_r_factor":84.1,"audio_mos":4.15,"concealed_percent":0.3,"recovered_percent":0.9,
+ "playout_delay_ms":60.0,"burst_ratio":1.2,"underruns":0}}}
 ```
 
 5. Uplink loss above `quality.loss_alert_percent` (20 %) over a period raises `quality.alert`
@@ -107,6 +134,12 @@ number of sessions whose alert is open right now. With the defaults a player has
 2 bars or worse for 6 s to alert and above ~3.3 MOS for 6 s to recover.
 
 ## Per-session history
+
+Next to the network figures every summary carries the audio rating when the client reported
+playout metrics: `audio_samples`, `audio_mos_avg` / `audio_mos_min` / `audio_mos_last` and
+`concealed_avg_percent` (`null` otherwise). Usage buckets and `GET /v1/analytics/*` meter the
+same as `audio_quality_samples`, `audio_mos_sum_milli`, `concealed_sum_permille` and expose
+`quality.audio_mos_avg` / `quality.concealed_avg_percent`.
 
 Every rated period also feeds a per-session **summary** that survives the session:
 

@@ -446,6 +446,7 @@ impl MediaSession {
                 packet_loss_percent: 0.0,
                 bitrate_kbps: 0,
                 mos_score: 4.5,
+                playout: None,
             }),
             commanded_bitrate_kbps: AtomicU32::new(0),
             uplink: Mutex::new(UplinkEstimator::default()),
@@ -1405,6 +1406,7 @@ mod tests {
             packet_loss_percent: loss,
             bitrate_kbps: 32,
             mos_score: 0.0,
+            playout: None,
         };
         s.update_quality(report(0.0));
         let good = s.refresh_network_quality(2.0, policy, 0.0);

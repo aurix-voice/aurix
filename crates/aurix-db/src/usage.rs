@@ -34,6 +34,9 @@ pub struct UsageAppBucketRow {
     pub jitter_sum_ms: i64,
     pub loss_sum_permille: i64,
     pub poor_quality_samples: i64,
+    pub audio_quality_samples: i64,
+    pub audio_mos_sum_milli: i64,
+    pub concealed_sum_permille: i64,
     pub joins_refused: i64,
     pub updated_at: DateTime<Utc>,
 }
@@ -76,6 +79,9 @@ pub struct UsageTotalsRow {
     pub jitter_sum_ms: i64,
     pub loss_sum_permille: i64,
     pub poor_quality_samples: i64,
+    pub audio_quality_samples: i64,
+    pub audio_mos_sum_milli: i64,
+    pub concealed_sum_permille: i64,
     pub joins_refused: i64,
 }
 
@@ -333,7 +339,7 @@ pub async fn aggregate_channel_buckets(
     Ok(rows)
 }
 
-const METERED_COLUMNS: [&str; 13] = [
+const METERED_COLUMNS: [&str; 16] = [
     "media_bytes_in",
     "media_bytes_out",
     "chat_messages",
@@ -346,6 +352,9 @@ const METERED_COLUMNS: [&str; 13] = [
     "jitter_sum_ms",
     "loss_sum_permille",
     "poor_quality_samples",
+    "audio_quality_samples",
+    "audio_mos_sum_milli",
+    "concealed_sum_permille",
     "joins_refused",
 ];
 
@@ -481,6 +490,9 @@ pub async fn app_series_rollup(
                   SUM(jitter_sum_ms)::bigint AS jitter_sum_ms,
                   SUM(loss_sum_permille)::bigint AS loss_sum_permille,
                   SUM(poor_quality_samples)::bigint AS poor_quality_samples,
+                  SUM(audio_quality_samples)::bigint AS audio_quality_samples,
+                  SUM(audio_mos_sum_milli)::bigint AS audio_mos_sum_milli,
+                  SUM(concealed_sum_permille)::bigint AS concealed_sum_permille,
                   SUM(joins_refused)::bigint AS joins_refused,
                   MAX(updated_at) AS updated_at
            FROM usage_app_buckets
@@ -604,6 +616,9 @@ const TOTALS_SELECT: &str = r#"SELECT app_id,
            SUM(jitter_sum_ms)::bigint AS jitter_sum_ms,
            SUM(loss_sum_permille)::bigint AS loss_sum_permille,
            SUM(poor_quality_samples)::bigint AS poor_quality_samples,
+           SUM(audio_quality_samples)::bigint AS audio_quality_samples,
+           SUM(audio_mos_sum_milli)::bigint AS audio_mos_sum_milli,
+           SUM(concealed_sum_permille)::bigint AS concealed_sum_permille,
            SUM(joins_refused)::bigint AS joins_refused
     FROM usage_app_buckets"#;
 

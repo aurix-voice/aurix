@@ -1009,6 +1009,9 @@ export interface FleetUsageAppsItem {
   quality: QualityAggregate;
   /** Connects and channel joins refused by a per-application cap in this bucket/range. */
   joins_refused: number;
+  audio_quality_samples?: number;
+  audio_mos_sum_milli?: number;
+  concealed_sum_permille?: number;
   app_id: string;
 }
 
@@ -1272,6 +1275,19 @@ export interface NetworkQuality {
   uplink_bitrate_kbps?: number;
   uplink_packets_received?: number;
   uplink_packets_lost?: number;
+  /** Rating of what the client actually played (null until it reports playout metrics). */
+  audio_r_factor?: number | null;
+  /** MOS of the played audio: only frames the PLC had to invent count as loss, underruns cost extra. */
+  audio_mos?: number | null;
+  /** Share of frames concealed after FEC/DRED, from the client's last report. */
+  concealed_percent?: number;
+  /** Share of lost frames rebuilt from FEC/DRED. */
+  recovered_percent?: number;
+  /** Jitter-buffer / playout delay the client reported (0 = not reported). */
+  playout_delay_ms?: number;
+  /** RFC 3611 burst ratio of the downlink loss (1 = random / not reported). */
+  burst_ratio?: number;
+  underruns?: number;
 }
 
 /** Operator drain (maintenance) in progress on a node. */
@@ -1343,6 +1359,9 @@ export interface QualityAggregate {
   poor_samples: number;
   /** `poor_samples / samples * 100` */
   poor_percent: number | null;
+  audio_samples?: number;
+  audio_mos_avg?: number | null;
+  concealed_avg_percent?: number | null;
 }
 
 /** Last `QualityReport` the client sent (loss in percent). */
@@ -1383,6 +1402,13 @@ export interface QualitySummary {
   mos_alerts: number;
   /** Most recent rating */
   last?: NetworkQuality | null;
+  /** Evaluations that carried playout metrics. */
+  audio_samples?: number;
+  audio_mos_avg?: number | null;
+  audio_mos_min?: number | null;
+  audio_mos_last?: number | null;
+  /** Average share of concealed frames over the audio-rated evaluations. */
+  concealed_avg_percent?: number | null;
 }
 
 /** Per-application limits and their current consumption. `0` means unlimited. */
@@ -2009,6 +2035,9 @@ export interface UsageAppBucket {
   quality: QualityAggregate;
   /** Connects and channel joins refused by a per-application cap in this bucket/range. */
   joins_refused: number;
+  audio_quality_samples?: number;
+  audio_mos_sum_milli?: number;
+  concealed_sum_permille?: number;
 }
 
 /** One hourly channel bucket. */
@@ -2097,6 +2126,9 @@ export interface UsageTotals {
   quality: QualityAggregate;
   /** Connects and channel joins refused by a per-application cap in this bucket/range. */
   joins_refused: number;
+  audio_quality_samples?: number;
+  audio_mos_sum_milli?: number;
+  concealed_sum_permille?: number;
 }
 
 export interface User {

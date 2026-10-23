@@ -20,6 +20,7 @@ export type LeaveReason =
  */
 
 import type { NetworkQualityWire } from './quality.js';
+import type { PlayoutReport } from './quality';
 
 export type ChannelRole = 'listener' | 'speaker' | 'moderator' | 'administrator';
 
@@ -282,7 +283,7 @@ export type ClientMessage =
   | { type: 'TtsCancel'; data?: undefined }
   | { type: 'PositionUpdate'; data: { channel_id: string; positions: UserPosition[] } }
   /** `packet_loss` is a percentage (`0..=100`) of the last report period. */
-  | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number } }
+  | { type: 'QualityReport'; data: { rtt_ms: number; jitter_ms: number; packet_loss: number; playout?: PlayoutReport } }
   | { type: 'RecordingConsentResponse'; data: { recording_id: string; consent: RecordingConsent } }
   | { type: 'WebRtcOffer'; data: { sdp: string } }
   /** Participants to keep on their own downlink track while audible (bounded by `webrtc_participant_streams`). */

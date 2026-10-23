@@ -1266,6 +1266,60 @@ pub struct QualityMetrics {
     pub packet_loss_percent: f32,
     pub bitrate_kbps: u32,
     pub mos_score: f32,
+    /// What the client's playout actually did with the downlink (`None` until a client that
+    /// reports playout metrics sent one).
+    #[serde(default)]
+    pub playout: Option<PlayoutMetrics>,
+}
+
+/// Playout-side counters a client adds to its `QualityReport`, over the report interval.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct PlayoutMetrics {
+    /// Share of expected frames the player had to conceal (PLC), `0..=100`, after FEC/DRED.
+    pub concealed_percent: f32,
+    /// Share of expected frames rebuilt from in-band FEC or DRED, `0..=100`.
+    pub recovered_percent: f32,
+    /// Jitter-buffer / playout delay on top of the network, ms.
+    pub playout_delay_ms: f32,
+    /// Mean loss-burst length relative to random loss (RFC 3611 `burst_ratio`), `>= 1`.
+    pub burst_ratio: f32,
+    /// Times a stream ran dry mid-spurt during the interval.
+    pub underruns: u32,
+    /// Receiver can use in-band FEC of the senders (decoder side always can; mirrors what the
+    /// senders are asked for) — raises the loss robustness the network rating assumes.
+    pub fec: bool,
+    /// DRED decoding is available and senders carry it.
+    pub dred: bool,
+}
+
+impl PlayoutMetrics {
+    /// Clamps every field into its domain (non-finite → neutral).
+    pub fn sanitized(self) -> Self {
+        let pct = |v: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 100.0)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            concealed_percent: pct(self.concealed_percent),
+            recovered_percent: pct(self.recovered_percent),
+            playout_delay_ms: if self.playout_delay_ms.is_finite() {
+                self.playout_delay_ms.clamp(0.0, 10_000.0)
+            } else {
+                0.0
+            },
+            burst_ratio: if self.burst_ratio.is_finite() {
+                self.burst_ratio.clamp(1.0, 8.0)
+            } else {
+                1.0
+            },
+            underruns: self.underruns.min(10_000),
+            fec: self.fec,
+            dred: self.dred,
+        }
+    }
 }
 
 impl QualityMetrics {
@@ -1273,8 +1327,35 @@ impl QualityMetrics {
         quality::mos_from_r(self.r_factor())
     }
 
+    /// Network rating of the downlink: raw loss against the robustness FEC/DRED give.
     pub fn r_factor(&self) -> f32 {
-        quality::r_factor(self.rtt_ms, self.jitter_ms, self.packet_loss_percent)
+        quality::r_factor_full(&quality::RInputs {
+            rtt_ms: self.rtt_ms,
+            jitter_ms: self.jitter_ms,
+            loss_percent: self.packet_loss_percent,
+            playout_delay_ms: self.playout.map(|p| p.playout_delay_ms),
+            burst_ratio: self.playout.map(|p| p.burst_ratio).unwrap_or(1.0),
+            bitrate_kbps: self.bitrate_kbps,
+            fec: self.playout.is_some_and(|p| p.fec),
+            dred: self.playout.is_some_and(|p| p.dred),
+        })
+    }
+
+    /// Rating of what was actually played: only the frames PLC had to invent count as loss,
+    /// buffer underruns cost extra. `None` without playout metrics.
+    pub fn audio_r_factor(&self) -> Option<f32> {
+        let p = self.playout?;
+        let base = quality::r_factor_full(&quality::RInputs {
+            rtt_ms: self.rtt_ms,
+            jitter_ms: self.jitter_ms,
+            loss_percent: p.concealed_percent,
+            playout_delay_ms: Some(p.playout_delay_ms),
+            burst_ratio: p.burst_ratio,
+            bitrate_kbps: self.bitrate_kbps,
+            fec: false,
+            dred: false,
+        });
+        Some((base - quality::underrun_penalty(p.underruns)).clamp(0.0, 100.0))
     }
 
     /// Network-quality indicator, `1` (unusable) to `5` (excellent).
@@ -1283,35 +1364,167 @@ impl QualityMetrics {
     }
 }
 
+#[cfg(test)]
+mod audio_rating_tests {
+    use super::*;
+
+    #[test]
+    fn audio_rating_ignores_loss_the_receiver_rebuilt() {
+        let net = QualityMetrics {
+            rtt_ms: 40.0,
+            jitter_ms: 5.0,
+            packet_loss_percent: 2.0,
+            bitrate_kbps: 32,
+            mos_score: 0.0,
+            playout: None,
+        };
+        assert_eq!(net.audio_r_factor(), None);
+        let mut with = net.clone();
+        with.playout = Some(PlayoutMetrics {
+            concealed_percent: 0.0,
+            recovered_percent: 2.0,
+            playout_delay_ms: 60.0,
+            burst_ratio: 1.0,
+            underruns: 0,
+            fec: true,
+            dred: false,
+        });
+        let audio = with.audio_r_factor().unwrap();
+        assert!(
+            audio > with.r_factor(),
+            "audio {audio} > network {}",
+            with.r_factor()
+        );
+        let q = NetworkQuality::compose(&with, 1.0, 0.0, 0.0, 32, 100, 0);
+        assert!(q.audio_mos.unwrap() > q.mos);
+        assert_eq!(q.recovered_percent, 2.0);
+        let mut starving = with.clone();
+        starving.playout.as_mut().unwrap().underruns = 6;
+        assert!(starving.audio_r_factor().unwrap() < audio);
+    }
+}
+
 /// Simplified E-model (ITU-T G.107) used by every Aurix component for a consistent
 /// quality indicator: clients compute it from their own measurements, the server from the
 /// client report plus what it observes on the uplink.
 pub mod quality {
-    /// Transmission rating `R` in `0..=100` from one-way network conditions. Jitter counts
-    /// double because the jitter buffer turns it into delay; each percent of loss costs 2.5.
+    /// Default `R0` of the E-model (ITU-T G.107): the rating of a perfect link.
+    pub const R0: f32 = 93.2;
+    /// Codec frame (20 ms) plus Opus look-ahead (5 ms): fixed one-way delay of the codec.
+    pub const CODEC_DELAY_MS: f32 = 25.0;
+    /// Loss robustness `Bpl` (G.113 style) when lost frames can only be concealed.
+    pub const BPL_PLC: f32 = 10.0;
+    /// … when the sender adds in-band FEC (single lost frames are rebuilt).
+    pub const BPL_FEC: f32 = 19.0;
+    /// … when the sender also carries DRED (bursts are rebuilt).
+    pub const BPL_DRED: f32 = 28.0;
+
+    /// Everything the full rating looks at. `bitrate_kbps == 0` means "unknown" (assume the
+    /// default Opus voice rate).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct RInputs {
+        pub rtt_ms: f32,
+        pub jitter_ms: f32,
+        /// `0..=100`.
+        pub loss_percent: f32,
+        /// Measured jitter-buffer / playout delay; `None` → estimated from the jitter.
+        pub playout_delay_ms: Option<f32>,
+        /// RFC 3611 burst ratio, `1` = random loss.
+        pub burst_ratio: f32,
+        pub bitrate_kbps: u32,
+        pub fec: bool,
+        pub dred: bool,
+    }
+
+    fn finite(v: f32, default: f32) -> f32 {
+        if v.is_finite() {
+            v
+        } else {
+            default
+        }
+    }
+
+    /// Equipment impairment `Ie` of Opus at a given voice bitrate (wideband; measured values
+    /// from the public Opus listening tests mapped onto the G.113 scale). `0` = unknown rate.
+    pub fn codec_ie(bitrate_kbps: u32) -> f32 {
+        match bitrate_kbps {
+            0 => 5.0,
+            k if k >= 24 => 5.0,
+            k if k >= 16 => 10.0,
+            k if k >= 12 => 14.0,
+            _ => 20.0,
+        }
+    }
+
+    /// Packet-loss robustness for the redundancy a sender adds.
+    pub fn bpl(fec: bool, dred: bool) -> f32 {
+        if dred {
+            BPL_DRED
+        } else if fec {
+            BPL_FEC
+        } else {
+            BPL_PLC
+        }
+    }
+
+    /// Delay impairment `Id` for a one-way mouth-to-ear delay `ta_ms` (G.107 simplified form:
+    /// linear below 177.3 ms, steeper above).
+    pub fn id_from_delay(ta_ms: f32) -> f32 {
+        let ta = finite(ta_ms, 0.0).max(0.0);
+        let over = (ta - 177.3).max(0.0);
+        0.024 * ta + 0.11 * over
+    }
+
+    /// Effective equipment impairment `Ie,eff = Ie + (95 − Ie) · Ppl / (Ppl / BurstR + Bpl)`.
+    pub fn ie_eff(ie: f32, loss_percent: f32, burst_ratio: f32, bpl: f32) -> f32 {
+        let ppl = finite(loss_percent, 100.0).clamp(0.0, 100.0);
+        let burst = finite(burst_ratio, 1.0).clamp(1.0, 8.0);
+        if ppl <= 0.0 {
+            return ie;
+        }
+        ie + (95.0 - ie) * ppl / (ppl / burst + bpl)
+    }
+
+    /// Rating `R` for a client that could not keep its buffer fed: half a point per underrun
+    /// in the interval, at most ten.
+    pub fn underrun_penalty(underruns: u32) -> f32 {
+        (underruns as f32 * 0.5).min(10.0)
+    }
+
+    /// Transmission rating `R` in `0..=100` (E-model, ITU-T G.107): `R0 − Id − Ie,eff`.
+    /// One-way delay = half the round trip + playout buffer (measured, else `2 × jitter + 40`)
+    /// + the codec's 25 ms.
+    pub fn r_factor_full(i: &RInputs) -> f32 {
+        let rtt = finite(i.rtt_ms, 0.0).max(0.0);
+        let jitter = finite(i.jitter_ms, 0.0).max(0.0);
+        let playout = i
+            .playout_delay_ms
+            .map(|p| finite(p, 0.0).max(0.0))
+            .unwrap_or(jitter * 2.0 + 40.0);
+        let ta = rtt / 2.0 + playout + CODEC_DELAY_MS;
+        let r = R0
+            - id_from_delay(ta)
+            - ie_eff(
+                codec_ie(i.bitrate_kbps),
+                i.loss_percent,
+                i.burst_ratio,
+                bpl(i.fec, i.dred),
+            );
+        r.clamp(0.0, 100.0)
+    }
+
+    /// Rating from network conditions alone: default Opus rate, no redundancy, random loss.
     pub fn r_factor(rtt_ms: f32, jitter_ms: f32, loss_percent: f32) -> f32 {
-        let rtt = if rtt_ms.is_finite() {
-            rtt_ms.max(0.0)
-        } else {
-            0.0
-        };
-        let jitter = if jitter_ms.is_finite() {
-            jitter_ms.max(0.0)
-        } else {
-            0.0
-        };
-        let loss = if loss_percent.is_finite() {
-            loss_percent.clamp(0.0, 100.0)
-        } else {
-            100.0
-        };
-        let effective_latency = rtt + jitter * 2.0 + 10.0;
-        let r = if effective_latency < 160.0 {
-            93.2 - (effective_latency / 40.0)
-        } else {
-            93.2 - ((effective_latency - 120.0) / 10.0)
-        };
-        (r - loss * 2.5).clamp(0.0, 100.0)
+        r_factor_full(&RInputs {
+            rtt_ms,
+            jitter_ms,
+            loss_percent,
+            playout_delay_ms: None,
+            burst_ratio: 1.0,
+            bitrate_kbps: 0,
+            fec: false,
+            dred: false,
+        })
     }
 
     /// Mean opinion score `1.0..=4.5` for a rating `R`.
@@ -1339,12 +1552,40 @@ pub mod quality {
         #[test]
         fn bands_follow_network_conditions() {
             assert_eq!(bars_from_r(r_factor(20.0, 2.0, 0.0)), 5);
-            assert_eq!(bars_from_r(r_factor(150.0, 20.0, 3.0)), 4);
-            assert_eq!(bars_from_r(r_factor(250.0, 30.0, 3.0)), 3);
-            assert_eq!(bars_from_r(r_factor(300.0, 40.0, 6.0)), 2);
+            assert_eq!(bars_from_r(r_factor(80.0, 10.0, 1.0)), 4);
+            assert_eq!(bars_from_r(r_factor(150.0, 20.0, 3.0)), 3);
+            assert_eq!(bars_from_r(r_factor(250.0, 20.0, 4.0)), 2);
             assert_eq!(bars_from_r(r_factor(500.0, 80.0, 20.0)), 1);
             assert_eq!(bars_from_r(r_factor(f32::NAN, f32::INFINITY, f32::NAN)), 1);
             assert!(mos_from_r(93.0) > 4.3 && mos_from_r(0.0) == 1.0);
+        }
+
+        #[test]
+        fn e_model_matches_the_documented_examples() {
+            // Perfect link, Opus ≥ 24 kbit/s: R ≈ 86.6 → MOS ≈ 4.2 (the codec costs the rest).
+            let perfect = mos_from_r(r_factor(0.0, 0.0, 0.0));
+            assert!((4.15..=4.3).contains(&perfect), "{perfect}");
+            // 2 % random loss with PLC only drops to ≈ 3.65 …
+            let lossy = mos_from_r(r_factor(0.0, 0.0, 2.0));
+            assert!((3.55..=3.75).contains(&lossy), "{lossy}");
+            // … FEC on the senders makes the same loss ≈ 3.95 …
+            let fec = mos_from_r(r_factor_full(&RInputs {
+                rtt_ms: 0.0,
+                jitter_ms: 0.0,
+                loss_percent: 2.0,
+                playout_delay_ms: None,
+                burst_ratio: 1.0,
+                bitrate_kbps: 32,
+                fec: true,
+                dred: false,
+            }));
+            assert!((3.85..=4.05).contains(&fec), "{fec}");
+            // … and bursty loss hurts more than random loss.
+            assert!(ie_eff(5.0, 2.0, 3.0, BPL_PLC) > ie_eff(5.0, 2.0, 1.0, BPL_PLC));
+            // Low bitrates and long delays are impairments of their own.
+            assert!(codec_ie(8) > codec_ie(32));
+            assert!(id_from_delay(300.0) > 2.0 * id_from_delay(150.0));
+            assert_eq!(underrun_penalty(100), 10.0);
         }
     }
 }
@@ -1376,6 +1617,30 @@ pub struct NetworkQuality {
     /// Totals since the session started.
     pub uplink_packets_received: u64,
     pub uplink_packets_lost: u64,
+    /// Rating of what the client actually played (`None` until it reports playout metrics):
+    /// only frames the PLC had to invent count as loss, underruns cost extra.
+    #[serde(default)]
+    pub audio_r_factor: Option<f32>,
+    #[serde(default)]
+    pub audio_mos: Option<f32>,
+    /// Share of frames concealed after FEC/DRED, from the client's last report.
+    #[serde(default)]
+    pub concealed_percent: f32,
+    /// Share of lost frames rebuilt from FEC/DRED.
+    #[serde(default)]
+    pub recovered_percent: f32,
+    /// Jitter-buffer / playout delay the client reported, ms (0 = not reported).
+    #[serde(default)]
+    pub playout_delay_ms: f32,
+    /// RFC 3611 burst ratio of the downlink loss (1 = random / not reported).
+    #[serde(default = "one")]
+    pub burst_ratio: f32,
+    #[serde(default)]
+    pub underruns: u32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl NetworkQuality {
@@ -1389,12 +1654,34 @@ impl NetworkQuality {
         uplink_packets_lost: u64,
     ) -> Self {
         let down = client.r_factor();
-        let up = quality::r_factor(client.rtt_ms, uplink_jitter_ms, uplink_loss_percent);
+        let up = quality::r_factor_full(&quality::RInputs {
+            rtt_ms: client.rtt_ms,
+            jitter_ms: uplink_jitter_ms,
+            loss_percent: uplink_loss_percent,
+            playout_delay_ms: None,
+            burst_ratio: 1.0,
+            bitrate_kbps: uplink_bitrate_kbps,
+            fec: client.playout.is_some_and(|p| p.fec),
+            dred: client.playout.is_some_and(|p| p.dred),
+        });
         let r = down.min(up);
+        let audio_r = client.audio_r_factor();
+        let p = client.playout.unwrap_or_default();
         Self {
             bars: quality::bars_from_r(r),
             r_factor: r,
             mos: quality::mos_from_r(r),
+            audio_r_factor: audio_r,
+            audio_mos: audio_r.map(quality::mos_from_r),
+            concealed_percent: p.concealed_percent,
+            recovered_percent: p.recovered_percent,
+            playout_delay_ms: p.playout_delay_ms,
+            burst_ratio: if client.playout.is_some() {
+                p.burst_ratio.max(1.0)
+            } else {
+                1.0
+            },
+            underruns: p.underruns,
             rtt_ms: client.rtt_ms,
             downlink_jitter_ms: client.jitter_ms,
             downlink_loss_percent: client.packet_loss_percent,
@@ -1450,6 +1737,18 @@ pub struct QualitySummary {
     pub poor_seconds: f64,
     /// `quality.alert {metric: "mos"}` events raised for the session.
     pub mos_alerts: u32,
+    /// Evaluations that carried playout metrics (audio rating).
+    #[serde(default)]
+    pub audio_samples: u64,
+    #[serde(default)]
+    pub audio_mos_avg: Option<f32>,
+    #[serde(default)]
+    pub audio_mos_min: Option<f32>,
+    #[serde(default)]
+    pub audio_mos_last: Option<f32>,
+    /// Average share of concealed frames over the audio-rated evaluations.
+    #[serde(default)]
+    pub concealed_avg_percent: Option<f32>,
     /// The most recent evaluation.
     pub last: Option<NetworkQuality>,
 }
@@ -1464,6 +1763,10 @@ pub struct QualityDelta {
     pub jitter_ms: u64,
     pub loss_permille: u64,
     pub poor_samples: u64,
+    /// Evaluations with an audio rating and their MOS sum.
+    pub audio_samples: u64,
+    pub audio_mos_milli: u64,
+    pub concealed_permille: u64,
 }
 
 impl QualityDelta {
@@ -1489,6 +1792,10 @@ pub struct QualityAccumulator {
     bars: [u64; 5],
     poor_seconds: f64,
     mos_alerts: u32,
+    audio_samples: u64,
+    audio_mos_sum: f64,
+    audio_mos_min: f32,
+    concealed_sum: f64,
     last: Option<NetworkQuality>,
     pending: QualityDelta,
 }
@@ -1512,6 +1819,11 @@ impl QualityAccumulator {
             bars: s.bars,
             poor_seconds: s.poor_seconds.max(0.0),
             mos_alerts: s.mos_alerts,
+            audio_samples: s.audio_samples,
+            audio_mos_sum: f64::from(s.audio_mos_avg.unwrap_or(0.0)) * s.audio_samples as f64,
+            audio_mos_min: s.audio_mos_min.unwrap_or(5.0),
+            concealed_sum: f64::from(s.concealed_avg_percent.unwrap_or(0.0))
+                * s.audio_samples as f64,
             last: s.last,
             pending: QualityDelta::default(),
         }
@@ -1554,6 +1866,20 @@ impl QualityAccumulator {
         self.pending.loss_permille += (loss.clamp(0.0, 100.0) * 10.0).round() as u64;
         if poor {
             self.pending.poor_samples += 1;
+        }
+        if let Some(a) = q.audio_mos {
+            self.audio_mos_min = if self.audio_samples == 0 {
+                a
+            } else {
+                self.audio_mos_min.min(a)
+            };
+            self.audio_samples += 1;
+            self.audio_mos_sum += f64::from(a);
+            self.concealed_sum += f64::from(q.concealed_percent);
+            self.pending.audio_samples += 1;
+            self.pending.audio_mos_milli += (a.clamp(0.0, 5.0) * 1000.0).round() as u64;
+            self.pending.concealed_permille +=
+                (q.concealed_percent.clamp(0.0, 100.0) * 10.0).round() as u64;
         }
     }
 
@@ -1598,6 +1924,13 @@ impl QualityAccumulator {
             bars: self.bars,
             poor_seconds: self.poor_seconds,
             mos_alerts: self.mos_alerts,
+            audio_samples: self.audio_samples,
+            audio_mos_avg: (self.audio_samples > 0)
+                .then(|| (self.audio_mos_sum / self.audio_samples as f64) as f32),
+            audio_mos_min: (self.audio_samples > 0).then_some(self.audio_mos_min),
+            audio_mos_last: self.last.and_then(|q| q.audio_mos),
+            concealed_avg_percent: (self.audio_samples > 0)
+                .then(|| (self.concealed_sum / self.audio_samples as f64) as f32),
             last: self.last,
         }
     }
@@ -2400,6 +2733,7 @@ mod tests {
             packet_loss_percent: loss,
             bitrate_kbps: 32,
             mos_score: 0.0,
+            playout: None,
         };
         NetworkQuality::compose(&client, 2.0, 0.0, 0.0, 30, 100, 0)
     }

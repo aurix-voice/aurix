@@ -43,13 +43,19 @@ pub enum UsageMetric {
     LossSumPermille,
     /// Evaluations at 1–2 bars (R < 60).
     PoorQualitySamples,
+    /// Evaluations that carried an audio rating (client reported playout metrics).
+    AudioQualitySamples,
+    /// Sum of the audio MOS × 1000 over those evaluations.
+    AudioMosSumMilli,
+    /// Sum of the concealed-frame share × 10 (permille) over those evaluations.
+    ConcealedSumPermille,
     /// Connects and channel joins refused by a per-application cap (concurrent sessions or
     /// monthly participant-minutes) — the "players could not join" signal.
     JoinsRefused,
 }
 
 impl UsageMetric {
-    pub const ALL: [UsageMetric; 13] = [
+    pub const ALL: [UsageMetric; 16] = [
         UsageMetric::MediaBytesIn,
         UsageMetric::MediaBytesOut,
         UsageMetric::ChatMessages,
@@ -62,6 +68,9 @@ impl UsageMetric {
         UsageMetric::JitterSumMs,
         UsageMetric::LossSumPermille,
         UsageMetric::PoorQualitySamples,
+        UsageMetric::AudioQualitySamples,
+        UsageMetric::AudioMosSumMilli,
+        UsageMetric::ConcealedSumPermille,
         UsageMetric::JoinsRefused,
     ];
 
@@ -80,6 +89,9 @@ impl UsageMetric {
             UsageMetric::JitterSumMs => "jitter_sum_ms",
             UsageMetric::LossSumPermille => "loss_sum_permille",
             UsageMetric::PoorQualitySamples => "poor_quality_samples",
+            UsageMetric::AudioQualitySamples => "audio_quality_samples",
+            UsageMetric::AudioMosSumMilli => "audio_mos_sum_milli",
+            UsageMetric::ConcealedSumPermille => "concealed_sum_permille",
             UsageMetric::JoinsRefused => "joins_refused",
         }
     }

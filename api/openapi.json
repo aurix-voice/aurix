@@ -11126,6 +11126,47 @@
           "uplink_packets_lost": {
             "type": "integer",
             "format": "int64"
+          },
+          "audio_r_factor": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Rating of what the client actually played (null until it reports playout metrics)."
+          },
+          "audio_mos": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "MOS of the played audio: only frames the PLC had to invent count as loss, underruns cost extra."
+          },
+          "concealed_percent": {
+            "type": "number",
+            "format": "float",
+            "description": "Share of frames concealed after FEC/DRED, from the client's last report."
+          },
+          "recovered_percent": {
+            "type": "number",
+            "format": "float",
+            "description": "Share of lost frames rebuilt from FEC/DRED."
+          },
+          "playout_delay_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "Jitter-buffer / playout delay the client reported (0 = not reported)."
+          },
+          "burst_ratio": {
+            "type": "number",
+            "format": "float",
+            "description": "RFC 3611 burst ratio of the downlink loss (1 = random / not reported)."
+          },
+          "underruns": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         },
         "required": [
@@ -13487,6 +13528,21 @@
             "type": "integer",
             "format": "int64",
             "description": "Connects and channel joins refused by a per-application cap in this bucket/range."
+          },
+          "audio_quality_samples": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "audio_mos_sum_milli": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "concealed_sum_permille": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "required": [
@@ -13626,6 +13682,21 @@
             "type": "integer",
             "format": "int64",
             "description": "Connects and channel joins refused by a per-application cap in this bucket/range."
+          },
+          "audio_quality_samples": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "audio_mos_sum_milli": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "concealed_sum_permille": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "required": [
@@ -14185,6 +14256,25 @@
             ],
             "format": "double",
             "description": "`poor_samples / samples * 100`"
+          },
+          "audio_samples": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "audio_mos_avg": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "concealed_avg_percent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
           }
         },
         "required": [
@@ -14270,6 +14360,41 @@
               }
             ],
             "description": "Most recent rating"
+          },
+          "audio_samples": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Evaluations that carried playout metrics."
+          },
+          "audio_mos_avg": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "audio_mos_min": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "audio_mos_last": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "concealed_avg_percent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Average share of concealed frames over the audio-rated evaluations."
           }
         },
         "required": [

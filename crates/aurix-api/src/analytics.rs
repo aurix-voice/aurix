@@ -139,11 +139,23 @@ fn quality_json(
     jitter_sum_ms: i64,
     loss_sum_permille: i64,
     poor_samples: i64,
+    audio: (i64, i64, i64),
 ) -> serde_json::Value {
+    let (audio_samples, audio_mos_sum_milli, concealed_sum_permille) = audio;
+    let (audio_mos_avg, concealed_avg_percent) = if audio_samples > 0 {
+        let a = audio_samples as f64;
+        (
+            serde_json::json!(audio_mos_sum_milli as f64 / 1000.0 / a),
+            serde_json::json!(concealed_sum_permille as f64 / 10.0 / a),
+        )
+    } else {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    };
     if samples <= 0 {
         return serde_json::json!({
             "samples": 0, "mos_avg": null, "rtt_avg_ms": null, "jitter_avg_ms": null,
             "loss_avg_percent": null, "poor_samples": 0, "poor_percent": null,
+            "audio_samples": 0, "audio_mos_avg": null, "concealed_avg_percent": null,
         });
     }
     let n = samples as f64;
@@ -155,6 +167,9 @@ fn quality_json(
         "loss_avg_percent": loss_sum_permille as f64 / 10.0 / n,
         "poor_samples": poor_samples,
         "poor_percent": poor_samples as f64 * 100.0 / n,
+        "audio_samples": audio_samples,
+        "audio_mos_avg": audio_mos_avg,
+        "concealed_avg_percent": concealed_avg_percent,
     })
 }
 
@@ -179,6 +194,9 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
             "jitter_sum_ms": t.jitter_sum_ms,
             "loss_sum_permille": t.loss_sum_permille,
             "poor_quality_samples": t.poor_quality_samples,
+            "audio_quality_samples": t.audio_quality_samples,
+            "audio_mos_sum_milli": t.audio_mos_sum_milli,
+            "concealed_sum_permille": t.concealed_sum_permille,
             "joins_refused": t.joins_refused,
             "quality": quality_json(
                 t.quality_samples,
@@ -187,6 +205,7 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
                 t.jitter_sum_ms,
                 t.loss_sum_permille,
                 t.poor_quality_samples,
+                (t.audio_quality_samples, t.audio_mos_sum_milli, t.concealed_sum_permille),
             ),
         }),
         None => serde_json::json!({
@@ -195,8 +214,9 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
             "media_bytes_in": 0, "media_bytes_out": 0, "chat_messages": 0,
             "tts_requests": 0, "tts_characters": 0, "stt_audio_ms": 0,
             "quality_samples": 0, "mos_sum_milli": 0, "rtt_sum_ms": 0,
-            "jitter_sum_ms": 0, "loss_sum_permille": 0, "poor_quality_samples": 0, "joins_refused": 0,
-            "quality": quality_json(0, 0, 0, 0, 0, 0),
+            "jitter_sum_ms": 0, "loss_sum_permille": 0, "poor_quality_samples": 0,
+            "audio_quality_samples": 0, "audio_mos_sum_milli": 0, "concealed_sum_permille": 0, "joins_refused": 0,
+            "quality": quality_json(0, 0, 0, 0, 0, 0, (0, 0, 0)),
         }),
     }
 }
@@ -239,6 +259,11 @@ fn app_point_json(r: &UsageAppBucketRow) -> serde_json::Value {
         r.jitter_sum_ms,
         r.loss_sum_permille,
         r.poor_quality_samples,
+        (
+            r.audio_quality_samples,
+            r.audio_mos_sum_milli,
+            r.concealed_sum_permille,
+        ),
     );
     v
 }
@@ -769,6 +794,9 @@ mod tests {
             jitter_sum_ms: 10,
             loss_sum_permille: 5,
             poor_quality_samples: 0,
+            audio_quality_samples: 0,
+            audio_mos_sum_milli: 0,
+            concealed_sum_permille: 0,
             joins_refused: 0,
             updated_at: now,
         };
@@ -777,7 +805,7 @@ mod tests {
         assert!((point["quality"]["mos_avg"].as_f64().unwrap() - 4.2).abs() < 1e-9);
         assert!((point["quality"]["loss_avg_percent"].as_f64().unwrap() - 0.25).abs() < 1e-9);
         assert_eq!(point["quality"]["poor_percent"], 0.0);
-        assert!(quality_json(0, 0, 0, 0, 0, 0)["mos_avg"].is_null());
+        assert!(quality_json(0, 0, 0, 0, 0, 0, (0, 0, 0))["mos_avg"].is_null());
         let csv = app_csv(&[row]);
         let mut lines = csv.lines();
         let header = lines.next().unwrap();

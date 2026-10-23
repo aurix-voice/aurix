@@ -1507,6 +1507,7 @@ mod tests {
                 packet_loss_percent: loss,
                 bitrate_kbps: 32,
                 mos_score: 0.0,
+                playout: None,
             })
         };
         report(&a, 12.0);

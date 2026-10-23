@@ -1132,6 +1132,9 @@ pub struct JitterBuffer<F = Vec<u8>> {
     started: bool,
     pub lost: u64,
     pub late: u64,
+    /// Loss bursts: `Lost` slots not directly preceded by another `Lost` slot.
+    pub loss_runs: u64,
+    in_loss: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1154,6 +1157,8 @@ impl<F> JitterBuffer<F> {
             started: false,
             lost: 0,
             late: 0,
+            loss_runs: 0,
+            in_loss: false,
         }
     }
 
@@ -1214,10 +1219,15 @@ impl<F> JitterBuffer<F> {
         }
         if let Some(f) = self.frames.remove(&self.next_seq) {
             self.next_seq = self.next_seq.wrapping_add(1);
+            self.in_loss = false;
             return JitterSlot::Frame(f);
         }
         if Self::seq_before(self.next_seq, first) {
             self.lost += 1;
+            if !self.in_loss {
+                self.loss_runs += 1;
+                self.in_loss = true;
+            }
             self.next_seq = self.next_seq.wrapping_add(1);
             return JitterSlot::Lost;
         }
@@ -1393,11 +1403,14 @@ pub struct MixerTotals {
     pub fec_recovered: u64,
     /// Lost frames rebuilt from Deep REDundancy (subset of `lost`).
     pub dred_recovered: u64,
+    /// Loss bursts (runs of consecutive lost frames); `lost / loss_runs` is the mean burst.
+    pub loss_runs: u64,
 }
 
 impl MixerTotals {
     fn absorb(&mut self, s: &Stream) {
         self.lost += s.jitter.lost;
+        self.loss_runs += s.jitter.loss_runs;
         self.late += s.jitter.late;
         self.fec_recovered += s.fec_recovered;
         self.dred_recovered += s.dred_recovered;
@@ -1708,6 +1721,12 @@ impl RemoteMixer {
 
     fn retire(&mut self, s: &Stream) {
         self.retired.absorb(s);
+    }
+
+    /// Playout delay the jitter buffers add on top of the network: the target depth in
+    /// 20 ms frames.
+    pub fn playout_delay_ms(&self) -> f32 {
+        self.target_depth as f32 * 20.0
     }
 
     pub fn stream_stats(&self) -> Vec<StreamStats> {

@@ -2653,12 +2653,44 @@ namespace Aurix
             return _control.SendAsync(ControlMessage.QualityReport(rttMs, jitterMs, lossPercent), ct);
         }
 
+        /// <summary>Report link quality with the playout counters (drives the server's <c>audio_mos</c>).</summary>
+        public Task ReportQualityAsync(float rttMs, float jitterMs, float lossPercent, PlayoutReport playout, CancellationToken ct = default)
+        {
+            EnsureConnected();
+            _media?.SendQualityReport(rttMs, jitterMs, lossPercent, playout);
+            return _control.SendAsync(ControlMessage.QualityReport(rttMs, jitterMs, lossPercent, playout), ct);
+        }
+
+        private long _playoutPrevLost, _playoutPrevFec, _playoutPrevDred, _playoutPrevUnderruns, _playoutPrevReceived;
+        private bool _playoutPrimed;
+
+        /// <summary>Per-interval playout figures from the lifetime mixer counters.</summary>
+        private void AdvancePlayout(ref VoiceStats s)
+        {
+            long dLost = s.FramesLost - _playoutPrevLost, dRec = (s.FramesFecRecovered - _playoutPrevFec) + (s.FramesDredRecovered - _playoutPrevDred);
+            long dUnder = s.Underruns - _playoutPrevUnderruns, dRecv = s.PacketsReceived - _playoutPrevReceived;
+            bool restarted = dLost < 0 || dRec < 0 || dUnder < 0 || dRecv < 0;
+            bool primed = _playoutPrimed;
+            _playoutPrevLost = s.FramesLost; _playoutPrevFec = s.FramesFecRecovered; _playoutPrevDred = s.FramesDredRecovered;
+            _playoutPrevUnderruns = s.Underruns; _playoutPrevReceived = s.PacketsReceived; _playoutPrimed = true;
+            if (!primed || restarted) return;
+            long expected = dRecv + dLost;
+            s.HasPlayout = true;
+            if (expected <= 0) return;
+            s.ConcealedPercent = Math.Max(0, dLost - dRec) * 100f / expected;
+            s.RecoveredPercent = Math.Max(0, dRec) * 100f / expected;
+            s.IntervalUnderruns = (int)Math.Min(int.MaxValue, dUnder);
+        }
+
         /// <summary>Sample <see cref="GetStats"/>, raise <see cref="OnStats"/> and report the measured RTT/jitter/loss to the server.</summary>
         public Task ReportQualityAsync(CancellationToken ct = default)
         {
             var s = GetStats();
             OnStats?.Invoke(s);
-            return ReportQualityAsync(s.RttMs > 0f ? s.RttMs : s.ControlRttMs, s.JitterMs, s.LossPercent, ct);
+            var rtt = s.RttMs > 0f ? s.RttMs : s.ControlRttMs;
+            if (!s.HasPlayout) return ReportQualityAsync(rtt, s.JitterMs, s.LossPercent, ct);
+            var enc = EffectiveEncoderSettings;
+            return ReportQualityAsync(rtt, s.JitterMs, s.LossPercent, PlayoutReport.From(s, enc.Fec, enc.DredDurationMs > 0), ct);
         }
 
         /// <summary>
@@ -2703,8 +2735,10 @@ namespace Aurix
                 s.FramesLate = t.Late;
                 s.Underruns = t.Underruns;
                 s.ActiveStreams = mixer.ActiveStreams;
+                s.PlayoutDelayMs = mixer.PlayoutDelayMs;
             }
             s.LossPercent = _lossWindow.Advance(s.FramesLost, s.PacketsReceived);
+            AdvancePlayout(ref s);
             s.RFactor = QualityModel.RFactor(s.RttMs > 0f ? s.RttMs : s.ControlRttMs, s.JitterMs, s.LossPercent);
             s.Mos = QualityModel.MosFromR(s.RFactor);
             s.Bars = QualityModel.BarsFromR(s.RFactor);
