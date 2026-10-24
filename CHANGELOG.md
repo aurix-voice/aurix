@@ -11,10 +11,12 @@ released together.
 
 ## [Unreleased]
 
-## [1.11.0] - 2026-10-24
+## [1.12.0] - 2026-10-24
 
 ### Fixed
 - `aurix-server` embeds `configs/default.toml`, so a release binary starts with environment variables alone; `--config` is now optional and only required to exist when passed explicitly (previously a bare binary failed with `configuration file "configs/default" not found`).
+
+## [1.11.0] - 2026-10-24
 
 ### Added
 
@@ -780,7 +782,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/aurix-voice/aurix/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/aurix-voice/aurix/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/aurix-voice/aurix/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/aurix-voice/aurix/compare/v1.8.2...v1.9.0
