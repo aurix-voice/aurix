@@ -261,11 +261,14 @@ fn missing_or_invalid_config_is_a_failure() {
         .args(["-o", "json", "doctor", "-c", partial.to_str().unwrap()])
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(2), "{:?}", text(&o));
+    // A partial file is valid: the binary carries configs/default.toml for everything else.
     let v = report(&o);
     let c = check(&v, "config");
-    assert_eq!(c["status"], "fail", "{v}");
-    assert!(hints(c).contains("configs/default"), "{c}");
+    assert_eq!(c["status"], "ok", "{v}");
+    assert!(
+        c["summary"].as_str().unwrap().contains("loaded and valid"),
+        "{c}"
+    );
 
     let bad = e.write(
         "bad.toml",
