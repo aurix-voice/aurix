@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Aurix.Protocol;
@@ -71,6 +72,8 @@ namespace Aurix
         public TimeSpan ProbeTimeout = TimeSpan.FromSeconds(2);
         /// <summary>RTT differences below this are ties broken by the server order (distance, load).</summary>
         public double RttToleranceMs = 15;
+        /// <summary>Tell the server which endpoint was chosen and what was measured (<c>POST /v1/me/regions/report</c>, fire-and-forget) so its recommendations can be audited.</summary>
+        public bool Report = true;
     }
 
     /// <summary>
@@ -95,7 +98,10 @@ namespace Aurix
             using var res = await http.SendAsync(req, ct).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)
                 throw new HttpRequestException($"region discovery failed: HTTP {(int)res.StatusCode}");
-            var regions = ParseResponse(await res.Content.ReadAsStringAsync().ConfigureAwait(false));
+            var body = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var regions = ParseResponse(body);
+            var serverRecommended = regions.Count > 0 ? regions[0] : null;
+            var locationSource = ParseLocationSource(body);
 
             if (options.Probe)
             {
@@ -108,7 +114,47 @@ namespace Aurix
                     });
                 await Task.WhenAll(probes).ConfigureAwait(false);
             }
-            return Rank(regions, options.PreferredRegion, options.RttToleranceMs);
+            var ranked = Rank(regions, options.PreferredRegion, options.RttToleranceMs);
+            if (options.Report && ranked.Count > 0)
+                _ = ReportAsync(http, apiUrl, token, ranked, serverRecommended, locationSource, ct);
+            return ranked;
+        }
+
+        /// <summary>
+        /// <c>POST /v1/me/regions/report</c>: the endpoint connected to (<paramref name="ranked"/>[0]), the
+        /// server's pre-probe recommendation and the RTT per probed region. Never throws; returns whether
+        /// the server accepted the report.
+        /// </summary>
+        public static async Task<bool> ReportAsync(HttpClient http, string apiUrl, string token, IReadOnlyList<RegionEndpoint> ranked,
+            RegionEndpoint serverRecommended, string locationSource, CancellationToken ct = default)
+        {
+            if (http == null || ranked == null || ranked.Count == 0) return false;
+            try
+            {
+                var probes = ranked.Where(r => r.RttMs.HasValue || r.ProbeFailed).Take(32)
+                    .Select(r => "{\"node_id\":\"" + r.NodeId + "\",\"rtt_ms\":" +
+                                 (r.RttMs.HasValue ? r.RttMs.Value.ToString("R", CultureInfo.InvariantCulture) : "null") + "}");
+                var json = "{\"recommended_node_id\":" + (serverRecommended == null ? "null" : "\"" + serverRecommended.NodeId + "\"") +
+                           ",\"chosen_node_id\":\"" + ranked[0].NodeId + "\"" +
+                           ",\"location_source\":\"" + (string.IsNullOrEmpty(locationSource) ? "none" : locationSource) + "\"" +
+                           ",\"probes\":[" + string.Join(",", probes) + "]}";
+                using var req = new HttpRequestMessage(HttpMethod.Post, apiUrl.TrimEnd('/') + "/v1/me/regions/report");
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+                using var res = await http.SendAsync(req, ct).ConfigureAwait(false);
+                return res.IsSuccessStatusCode;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary><c>location_source</c> of a discovery response (<c>coordinates</c> / <c>geoip</c> / <c>none</c>), or null.</summary>
+        public static string ParseLocationSource(string json)
+        {
+            var root = MiniJson.AsObject(MiniJson.Parse(json));
+            return root != null && root.TryGetValue("location_source", out var v) ? v as string : null;
         }
 
         /// <summary>
