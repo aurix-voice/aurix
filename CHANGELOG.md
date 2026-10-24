@@ -13,6 +13,9 @@ released together.
 
 ## [1.11.0] - 2026-10-24
 
+### Fixed
+- `aurix-server` embeds `configs/default.toml`, so a release binary starts with environment variables alone; `--config` is now optional and only required to exist when passed explicitly (previously a bare binary failed with `configuration file "configs/default" not found`).
+
 ### Added
 
 - **Region-selection telemetry.** SDKs report the endpoint they connected to after their RTT

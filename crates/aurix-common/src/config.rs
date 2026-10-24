@@ -43,8 +43,16 @@ pub struct AurixConfig {
 }
 
 impl AurixConfig {
+    /// `configs/default.toml` compiled into the binary, so a release build runs with env vars
+    /// alone (no checkout, no config file).
+    pub const EMBEDDED_DEFAULTS: &'static str = include_str!("../../../configs/default.toml");
+
     pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
         let mut builder = config::Config::builder();
+        builder = builder.add_source(config::File::from_str(
+            Self::EMBEDDED_DEFAULTS,
+            config::FileFormat::Toml,
+        ));
         builder = builder.add_source(config::File::with_name("configs/default").required(false));
         if let Some(p) = path {
             builder = builder.add_source(config::File::with_name(p).required(true));

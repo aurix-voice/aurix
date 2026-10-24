@@ -19,8 +19,9 @@ use tracing::{error, info, warn};
     about = "Aurix Voice Communication Server"
 )]
 struct Cli {
-    #[arg(short, long, default_value = "configs/default")]
-    config: String,
+    /// Extra config file layered over the built-in defaults (and `configs/default` if present).
+    #[arg(short, long)]
+    config: Option<String>,
 
     #[arg(long)]
     migrate_only: bool,
@@ -30,7 +31,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let config = AurixConfig::load(Some(&cli.config))?;
+    let config = AurixConfig::load(cli.config.as_deref())?;
     init_tracing(&config);
 
     info!(
