@@ -1575,7 +1575,7 @@ export interface RegionProbeReport {
   /** `node_id` from the discovery response. */
   node_id: string;
   /** Measured RTT to the endpoint's `probe_url`; `null` = unreachable. */
-  rtt_ms?: number;
+  rtt_ms?: number | null;
 }
 
 /**
@@ -1584,7 +1584,7 @@ export interface RegionProbeReport {
  */
 export interface RegionSelectionReport {
   /** `node_id` the token / discovery response listed first, if any. */
-  recommended_node_id?: string;
+  recommended_node_id?: string | null;
   /** The node the SDK connected to. */
   chosen_node_id: string;
   location_source?: LocationSource;
@@ -1601,8 +1601,8 @@ export interface RegionSelectionSummary {
   /** Reports whose chosen region equals the recommended one. */
   matched_recommendation: number;
   /** Median client-measured RTT to the chosen region. */
-  chosen_rtt_p50_ms?: number;
-  chosen_rtt_p90_ms?: number;
+  chosen_rtt_p50_ms?: number | null;
+  chosen_rtt_p90_ms?: number | null;
 }
 
 export interface RegionSelectionsResponse {
@@ -1612,7 +1612,7 @@ export interface RegionSelectionsResponse {
   with_recommendation: number;
   matched_recommendation: number;
   /** `matched_recommendation / with_recommendation`, `null` without recommendations. */
-  match_rate?: number;
+  match_rate?: number | null;
   regions: RegionSelectionSummary[];
 }
 

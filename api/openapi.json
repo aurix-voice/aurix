@@ -14725,8 +14725,10 @@
             "description": "`node_id` from the discovery response."
           },
           "rtt_ms": {
-            "type": "number",
-            "nullable": true,
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Measured RTT to the endpoint's `probe_url`; `null` = unreachable."
           }
         }
@@ -14739,9 +14741,11 @@
         "description": "What the SDK picked after probing; lets the node measure how often its recommendation (hints, GeoIP) matched the lowest-RTT choice.",
         "properties": {
           "recommended_node_id": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "uuid",
-            "nullable": true,
             "description": "`node_id` the token / discovery response listed first, if any."
           },
           "chosen_node_id": {
@@ -14793,13 +14797,17 @@
             "description": "Reports whose chosen region equals the recommended one."
           },
           "chosen_rtt_p50_ms": {
-            "type": "number",
-            "nullable": true,
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Median client-measured RTT to the chosen region."
           },
           "chosen_rtt_p90_ms": {
-            "type": "number",
-            "nullable": true
+            "type": [
+              "number",
+              "null"
+            ]
           }
         }
       },
@@ -14835,8 +14843,10 @@
             "format": "int64"
           },
           "match_rate": {
-            "type": "number",
-            "nullable": true,
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "`matched_recommendation / with_recommendation`, `null` without recommendations."
           },
           "regions": {
