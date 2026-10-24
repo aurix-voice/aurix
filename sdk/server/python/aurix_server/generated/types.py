@@ -1468,6 +1468,51 @@ RegionEndpoint = TypedDict(
 )
 """The least-loaded healthy node of one region that advertises a public WebSocket URL (`server.external_ws_url`). Connect the SDK to `ws_url`; `GET probe_url` is a cheap public request answered by exactly this node, so its round-trip time is a fair RTT estimate."""
 
+RegionProbeReport = TypedDict(
+    "RegionProbeReport",
+    {
+        "node_id": str,  # `node_id` from the discovery response.
+        "rtt_ms": NotRequired[float],  # Measured RTT to the endpoint's `probe_url`; `null` = unreachable.
+    },
+)
+
+RegionSelectionReport = TypedDict(
+    "RegionSelectionReport",
+    {
+        "recommended_node_id": NotRequired[str],  # `node_id` the token / discovery response listed first, if any.
+        "chosen_node_id": str,  # The node the SDK connected to.
+        "location_source": NotRequired["LocationSource"],
+        "probes": NotRequired[List["RegionProbeReport"]],  # One entry per probed endpoint.
+    },
+)
+"""What the SDK picked after probing; lets the node measure how often its recommendation (hints, GeoIP) matched the lowest-RTT choice."""
+
+RegionSelectionSummary = TypedDict(
+    "RegionSelectionSummary",
+    {
+        "chosen_region": "Region",
+        "location_source": "LocationSource",
+        "selections": int,
+        "with_recommendation": int,  # Reports that carried a recommendation.
+        "matched_recommendation": int,  # Reports whose chosen region equals the recommended one.
+        "chosen_rtt_p50_ms": NotRequired[float],  # Median client-measured RTT to the chosen region.
+        "chosen_rtt_p90_ms": NotRequired[float],
+    },
+)
+
+RegionSelectionsResponse = TypedDict(
+    "RegionSelectionsResponse",
+    {
+        "from": str,
+        "to": str,
+        "selections": int,
+        "with_recommendation": int,
+        "matched_recommendation": int,
+        "match_rate": NotRequired[float],  # `matched_recommendation / with_recommendation`, `null` without recommendations.
+        "regions": List["RegionSelectionSummary"],
+    },
+)
+
 RegionsResponse = TypedDict(
     "RegionsResponse",
     {
@@ -2524,3 +2569,12 @@ ListUserTranscriptsQuery = TypedDict(
     },
 )
 """Query parameters of `listUserTranscripts`."""
+
+GetRegionSelectionsQuery = TypedDict(
+    "GetRegionSelectionsQuery",
+    {
+        "from": NotRequired[str],
+        "to": NotRequired[str],
+    },
+)
+"""Query parameters of `getRegionSelections`."""

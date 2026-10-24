@@ -244,6 +244,14 @@ registry turns that into **region discovery**:
 * SDKs ([Web](../sdk/web.md#region-selection), [Unity](../sdk/unity.md#region-selection),
   [native / Unreal](../sdk/native.md#region-selection)) probe each `probe_url` over HTTP and
   rank by measured RTT, so a mis-set `location` or a routing detour is corrected client-side.
+* **Selection telemetry.** After probing, the SDKs post what they picked to
+  `POST /v1/me/regions/report` (recommended vs chosen `node_id`, `location_source`, RTT per
+  probe). `GET /v1/analytics/regions` aggregates it per chosen region and recommendation basis
+  (`selections`, `match_rate`, p50/p90 of the RTT players measured to the region they ended up
+  in) and the node exports `aurix_region_selections_total{location_source,outcome}` and
+  `aurix_region_probe_rtt_seconds{region}`. A low `match_rate` for `geoip` means the fallback
+  points players at the wrong region; `other` outcomes with a low RTT to the chosen region mean
+  the hint from the game backend was wrong. Reports are pruned with `retention.analytics_days`.
 
 Discovery returns **node** URLs rather than a regional balancer on purpose: sessions are
 node-local (above), so the client should connect where it will reconnect; the node then

@@ -448,6 +448,9 @@ impl RetentionService {
                 drain(|| aurix_db::queries::delete_analytics_before(&self.pool, cutoff, batch))
                     .await
                     .map_err(db)?;
+            report.analytics += aurix_db::queries::prune_region_selections(&self.pool, cutoff)
+                .await
+                .map_err(db)?;
         }
         if let Some(cutoff) = cutoff(now, self.cfg.tombstones_days) {
             report.tombstones = aurix_db::queries::delete_tombstones_before(&self.pool, cutoff)

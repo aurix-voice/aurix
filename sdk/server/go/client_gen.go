@@ -2545,3 +2545,43 @@ func (c *Client) DeleteTranscript(ctx context.Context, transcriptID string, opts
 	}
 	return &out, nil
 }
+
+// ReportRegionSelection — Report the region the SDK chose
+//
+// Sent by the SDKs once after region discovery: the endpoint they connected to, the one the server
+// recommended and the RTT measured per probe. Feeds `GET /v1/analytics/regions` and the
+// `aurix_region_selections_total` / `aurix_region_probe_rtt_seconds` metrics. Requires only a
+// session token; unknown node ids are rejected.
+//
+// `POST /v1/me/regions/report`
+// Auth: PlayerToken.
+func (c *Client) ReportRegionSelection(ctx context.Context, body RegionSelectionReport, opts ...RequestOption) error {
+	var q url.Values
+	return c.doJSON(ctx, "POST", "/v1/me/regions/report", q, body, nil, opts)
+}
+
+// GetRegionSelections — How well region recommendations match what SDKs actually chose
+//
+// Aggregates `POST /v1/me/regions/report` over the range (default: last 7 days) per chosen region
+// and recommendation basis (`location_source`). A low `match_rate` for `geoip` means the GeoIP
+// fallback sends players to the wrong region; the RTT percentiles show what players measure to the
+// region they ended up in.
+//
+// `GET /v1/analytics/regions`
+// Auth: ApiKeyHeader | ApiKeyBearer.
+func (c *Client) GetRegionSelections(ctx context.Context, query *GetRegionSelectionsQuery, opts ...RequestOption) (*RegionSelectionsResponse, error) {
+	q := url.Values{}
+	if query != nil {
+		if query.From != nil {
+			q.Set("from", *query.From)
+		}
+		if query.To != nil {
+			q.Set("to", *query.To)
+		}
+	}
+	var out RegionSelectionsResponse
+	if err := c.doJSON(ctx, "GET", "/v1/analytics/regions", q, nil, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

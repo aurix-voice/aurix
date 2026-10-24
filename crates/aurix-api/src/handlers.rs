@@ -454,6 +454,119 @@ pub async fn list_regions_self(
     )?))
 }
 
+/// Body of `POST /v1/me/regions/report`: what the SDK picked after probing.
+#[derive(Debug, Deserialize)]
+pub struct RegionSelectionReport {
+    /// `node_id` of the endpoint the token / discovery response listed first, if any.
+    #[serde(default)]
+    pub recommended_node_id: Option<MediaNodeId>,
+    /// The node the SDK connected to after ranking by RTT.
+    pub chosen_node_id: MediaNodeId,
+    /// `location_source` the discovery response carried (`coordinates` / `geoip` / `none`).
+    #[serde(default)]
+    pub location_source: Option<LocationSource>,
+    /// RTT the SDK measured per probed endpoint; `rtt_ms` null = unreachable.
+    #[serde(default)]
+    pub probes: Vec<RegionProbeReport>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RegionProbeReport {
+    pub node_id: MediaNodeId,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+}
+
+const MAX_REGION_PROBES: usize = 32;
+
+/// Wire spelling of a region (`eu_central`), as discovery responses and analytics use it.
+fn region_key(region: Region) -> String {
+    serde_json::to_value(region)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| region.as_str().to_owned())
+}
+
+impl LocationSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LocationSource::Coordinates => "coordinates",
+            LocationSource::Geoip => "geoip",
+            LocationSource::None => "none",
+        }
+    }
+}
+
+/// `POST /v1/me/regions/report` — the SDK tells the node which endpoint it finally chose and
+/// what it measured, so recommendation accuracy (hints, GeoIP) is observable. Player token.
+pub async fn report_region_selection(
+    State(state): State<AppState>,
+    Extension(token): Extension<ValidatedToken>,
+    Json(req): Json<RegionSelectionReport>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    if req.probes.len() > MAX_REGION_PROBES {
+        return Err(
+            AurixError::Validation(format!("probes: at most {MAX_REGION_PROBES} entries")).into(),
+        );
+    }
+    let (hint, _) = selection_hint(&state, None, None, None);
+    let endpoints = state.control.nodes.regions(&hint);
+    let region_of = |id: &MediaNodeId| {
+        endpoints
+            .iter()
+            .find(|e| e.node_id == *id)
+            .map(|e| e.region)
+    };
+    let Some(chosen_region) = region_of(&req.chosen_node_id) else {
+        return Err(AurixError::Validation("Unknown chosen_node_id".to_string()).into());
+    };
+    let recommended_region = req.recommended_node_id.as_ref().and_then(region_of);
+    let location_source = req.location_source.unwrap_or(LocationSource::None);
+    let outcome = match recommended_region {
+        None => "no_recommendation",
+        Some(r) if r == chosen_region => "recommended",
+        Some(_) => "other",
+    };
+    aurix_metrics::REGION_SELECTIONS
+        .with_label_values(&[location_source.as_str(), outcome])
+        .inc();
+    let probes: Vec<serde_json::Value> = req
+        .probes
+        .iter()
+        .filter_map(|p| {
+            let region = region_of(&p.node_id)?;
+            let rtt = p
+                .rtt_ms
+                .filter(|v| v.is_finite() && (0.0..=60_000.0).contains(v));
+            if let Some(rtt) = rtt {
+                aurix_metrics::REGION_PROBE_RTT
+                    .with_label_values(&[&region_key(region)])
+                    .observe(rtt / 1000.0);
+            }
+            Some(serde_json::json!({
+                "node_id": p.node_id.0,
+                "region": region_key(region),
+                "rtt_ms": rtt,
+            }))
+        })
+        .collect();
+    let row = aurix_db::models::RegionSelectionRow {
+        id: Uuid::now_v7(),
+        app_id: token.app_id.0,
+        user_id: token.user_id.0,
+        reporting_node_id: state.control.node_id.0.to_string(),
+        recommended_region: recommended_region.map(region_key),
+        recommended_node_id: req.recommended_node_id.map(|n| n.0.to_string()),
+        chosen_region: region_key(chosen_region),
+        chosen_node_id: req.chosen_node_id.0.to_string(),
+        location_source: location_source.as_str().to_string(),
+        probes: serde_json::Value::Array(probes),
+        created_at: chrono::Utc::now(),
+    };
+    state.control.sessions.record_region_selection(&row).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 /// Subject of `POST /v1/tokens/action`: either an existing user by id or an
 /// external identity that is upserted like `POST /v1/tokens` does.
 #[derive(Deserialize)]

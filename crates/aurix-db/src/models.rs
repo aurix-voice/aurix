@@ -556,3 +556,31 @@ pub struct AdminUserRow {
     pub token_generation: i64,
     pub tokens_revoked_at: Option<DateTime<Utc>>,
 }
+
+/// One SDK region-selection report (`POST /v1/me/regions/report`).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RegionSelectionRow {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub user_id: Uuid,
+    pub reporting_node_id: String,
+    pub recommended_region: Option<String>,
+    pub recommended_node_id: Option<String>,
+    pub chosen_region: String,
+    pub chosen_node_id: String,
+    pub location_source: String,
+    pub probes: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Aggregate of [`RegionSelectionRow`]s per chosen region and location source.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RegionSelectionSummaryRow {
+    pub chosen_region: String,
+    pub location_source: String,
+    pub selections: i64,
+    pub with_recommendation: i64,
+    pub matched_recommendation: i64,
+    pub chosen_rtt_p50_ms: Option<f64>,
+    pub chosen_rtt_p90_ms: Option<f64>,
+}

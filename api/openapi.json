@@ -8623,6 +8623,107 @@
           "transcripts:write"
         ]
       }
+    },
+    "/v1/me/regions/report": {
+      "post": {
+        "tags": [
+          "Player"
+        ],
+        "summary": "Report the region the SDK chose",
+        "operationId": "reportRegionSelection",
+        "description": "Sent by the SDKs once after region discovery: the endpoint they connected to, the one the server recommended and the RTT measured per probe. Feeds `GET /v1/analytics/regions` and the `aurix_region_selections_total` / `aurix_region_probe_rtt_seconds` metrics. Requires only a session token; unknown node ids are rejected.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegionSelectionReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "PlayerToken": []
+          }
+        ]
+      }
+    },
+    "/v1/analytics/regions": {
+      "get": {
+        "tags": [
+          "Analytics"
+        ],
+        "summary": "How well region recommendations match what SDKs actually chose",
+        "operationId": "getRegionSelections",
+        "description": "Aggregates `POST /v1/me/regions/report` over the range (default: last 7 days) per chosen region and recommendation basis (`location_source`). A low `match_rate` for `geoip` means the GeoIP fallback sends players to the wrong region; the RTT percentiles show what players measure to the region they ended up in.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400 days."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Range end, exclusive (RFC 3339). Default: now."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegionSelectionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyHeader": []
+          },
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -14611,6 +14712,140 @@
           "none"
         ],
         "description": "Where the coordinates that ordered `endpoint` / `regions` came from: caller-supplied coordinates, the node's GeoIP database (from `client_ip` or the caller's address), or none (preferred region, then load)."
+      },
+      "RegionProbeReport": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "`node_id` from the discovery response."
+          },
+          "rtt_ms": {
+            "type": "number",
+            "nullable": true,
+            "description": "Measured RTT to the endpoint's `probe_url`; `null` = unreachable."
+          }
+        }
+      },
+      "RegionSelectionReport": {
+        "type": "object",
+        "required": [
+          "chosen_node_id"
+        ],
+        "description": "What the SDK picked after probing; lets the node measure how often its recommendation (hints, GeoIP) matched the lowest-RTT choice.",
+        "properties": {
+          "recommended_node_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "`node_id` the token / discovery response listed first, if any."
+          },
+          "chosen_node_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The node the SDK connected to."
+          },
+          "location_source": {
+            "$ref": "#/components/schemas/LocationSource"
+          },
+          "probes": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "$ref": "#/components/schemas/RegionProbeReport"
+            },
+            "description": "One entry per probed endpoint."
+          }
+        }
+      },
+      "RegionSelectionSummary": {
+        "type": "object",
+        "required": [
+          "chosen_region",
+          "location_source",
+          "selections",
+          "with_recommendation",
+          "matched_recommendation"
+        ],
+        "properties": {
+          "chosen_region": {
+            "$ref": "#/components/schemas/Region"
+          },
+          "location_source": {
+            "$ref": "#/components/schemas/LocationSource"
+          },
+          "selections": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "with_recommendation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reports that carried a recommendation."
+          },
+          "matched_recommendation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reports whose chosen region equals the recommended one."
+          },
+          "chosen_rtt_p50_ms": {
+            "type": "number",
+            "nullable": true,
+            "description": "Median client-measured RTT to the chosen region."
+          },
+          "chosen_rtt_p90_ms": {
+            "type": "number",
+            "nullable": true
+          }
+        }
+      },
+      "RegionSelectionsResponse": {
+        "type": "object",
+        "required": [
+          "from",
+          "to",
+          "selections",
+          "with_recommendation",
+          "matched_recommendation",
+          "regions"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "selections": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "with_recommendation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "matched_recommendation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "match_rate": {
+            "type": "number",
+            "nullable": true,
+            "description": "`matched_recommendation / with_recommendation`, `null` without recommendations."
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RegionSelectionSummary"
+            }
+          }
+        }
       }
     }
   }

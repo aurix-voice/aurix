@@ -11,6 +11,20 @@ released together.
 
 ## [Unreleased]
 
+### Added
+
+- **Region-selection telemetry.** SDKs report the endpoint they connected to after their RTT
+  probe (`POST /v1/me/regions/report`: recommended vs chosen node, `location_source`, RTT per
+  probe). `GET /v1/analytics/regions` aggregates it per chosen region and recommendation basis
+  (selections, `match_rate`, p50/p90 of the measured RTT), with Prometheus counterparts
+  `aurix_region_selections_total{location_source,outcome}` and
+  `aurix_region_probe_rtt_seconds{region}`. Migration `20240101000027`; rows are pruned with
+  `retention.analytics_days`. The SDKs send it automatically after discovery — Web
+  `discoverRegions` (`report: false` opts out), Unity `RegionDiscovery.DiscoverAsync`
+  (`RegionDiscoveryOptions.Report`), Unreal `DiscoverRegions` (`bReport`); the native core exposes
+  `aurix_regions_report_url` / `aurix_regions_report_json` (Godot: `regions_report_url` /
+  `regions_report_json`) for hosts that drive discovery themselves.
+
 ## [1.10.0] - 2026-10-23
 
 ### Added

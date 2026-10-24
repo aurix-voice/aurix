@@ -247,10 +247,31 @@ void FAurixRegionDiscovery::Finish(bool bSuccess, const FString& Error)
 		{
 			Out.Add(ToEndpoint(R));
 		}
+		if (Request.bReport && Out.Num() > 0)
+		{
+			SendReport();
+		}
 	}
 	else
 	{
 		UE_LOG(LogAurixVoice, Warning, TEXT("Region discovery failed: %s"), *Error);
 	}
 	OnComplete.ExecuteIfBound(bSuccess, Out, Error);
+}
+
+void FAurixRegionDiscovery::SendReport()
+{
+	const std::string Body = Regions.report_json(0);
+	const std::string Url = aurix::Regions::report_url(ToUtf8(Request.ApiUrl.TrimStartAndEnd()));
+	if (Body.empty() || Url.empty())
+	{
+		return;
+	}
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Report = FHttpModule::Get().CreateRequest();
+	Report->SetURL(FromUtf8(Url.c_str()));
+	Report->SetVerb(TEXT("POST"));
+	Report->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Report->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Request.Token));
+	Report->SetContentAsString(FromUtf8(Body.c_str()));
+	Report->ProcessRequest();
 }

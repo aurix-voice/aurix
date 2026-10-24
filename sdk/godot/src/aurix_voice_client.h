@@ -241,6 +241,12 @@ public:
     /// HTTPRequest against each entry's `probe_url`) to `rank_regions`; entry 0 is the pick.
     static String regions_discovery_url(const String& api_url, const String& preferred_region, double latitude, double longitude);
     static Array rank_regions(const String& regions_json, const Dictionary& rtt_ms_by_region, const String& preferred_region, double rtt_tolerance_ms);
+    /// `POST /v1/me/regions/report` URL for `api_url`.
+    static String regions_report_url(const String& api_url);
+    /// JSON body for `regions_report_url` (bearer = session token): same inputs as `rank_regions`
+    /// plus the region actually connected to (empty = entry 0). Send once, fire-and-forget; it
+    /// lets the server audit how often its recommendation matched the measured choice.
+    static String regions_report_json(const String& regions_json, const Dictionary& rtt_ms_by_region, const String& preferred_region, double rtt_tolerance_ms, const String& chosen_region);
     String get_last_error() const;
     static String get_native_version();
 

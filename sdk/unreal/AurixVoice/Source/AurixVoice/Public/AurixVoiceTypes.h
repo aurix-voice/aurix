@@ -1364,6 +1364,10 @@ struct AURIXVOICE_API FAurixRegionDiscoveryRequest
 	/** Regions whose RTT differs by less than this keep the server's order. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Probe")
 	float RttToleranceMs = 15.f;
+
+	/** Tell the server which endpoint was chosen and what was measured (POST /v1/me/regions/report, fire-and-forget) so its recommendations can be audited. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix|Probe")
+	bool bReport = true;
 };
 
 /** One region as advertised by the server, plus the local probe result. Pass WsUrl to Connect. */

@@ -3747,3 +3747,76 @@ pub async fn revoke_admin_tokens(pool: &DbPool, admin_id: Uuid) -> Result<(), sq
     .await?;
     Ok(())
 }
+
+pub async fn insert_region_selection(
+    pool: &DbPool,
+    row: &RegionSelectionRow,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO region_selections
+           (id, app_id, user_id, reporting_node_id, recommended_region, recommended_node_id,
+            chosen_region, chosen_node_id, location_source, probes, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+    )
+    .bind(row.id)
+    .bind(row.app_id)
+    .bind(row.user_id)
+    .bind(&row.reporting_node_id)
+    .bind(&row.recommended_region)
+    .bind(&row.recommended_node_id)
+    .bind(&row.chosen_region)
+    .bind(&row.chosen_node_id)
+    .bind(&row.location_source)
+    .bind(&row.probes)
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Per (chosen region, location source) over `[from, to)`: how often the SDK agreed with the
+/// node's recommendation and the RTT it measured to the region it picked.
+pub async fn region_selection_summary(
+    pool: &DbPool,
+    app_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<RegionSelectionSummaryRow>, sqlx::Error> {
+    sqlx::query_as::<_, RegionSelectionSummaryRow>(
+        r#"SELECT s.chosen_region, s.location_source,
+                  COUNT(*)::bigint AS selections,
+                  COUNT(*) FILTER (WHERE s.recommended_region IS NOT NULL)::bigint AS with_recommendation,
+                  COUNT(*) FILTER (WHERE s.recommended_region = s.chosen_region)::bigint AS matched_recommendation,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY c.rtt) AS chosen_rtt_p50_ms,
+                  percentile_cont(0.9) WITHIN GROUP (ORDER BY c.rtt) AS chosen_rtt_p90_ms
+           FROM region_selections s
+           LEFT JOIN LATERAL (
+               SELECT (p->>'rtt_ms')::double precision AS rtt
+               FROM jsonb_array_elements(s.probes) p
+               WHERE p->>'node_id' = s.chosen_node_id AND jsonb_typeof(p->'rtt_ms') = 'number'
+               LIMIT 1
+           ) c ON true
+           WHERE s.app_id = $1 AND s.created_at >= $2 AND s.created_at < $3
+           GROUP BY s.chosen_region, s.location_source
+           ORDER BY selections DESC, s.chosen_region"#,
+    )
+    .bind(app_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete region-selection reports older than `before` (retention sweep).
+pub async fn prune_region_selections(
+    pool: &DbPool,
+    before: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query("DELETE FROM region_selections WHERE created_at < $1")
+            .bind(before)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}

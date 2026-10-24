@@ -3395,6 +3395,109 @@ public sealed record RegionEndpoint
     public required double LoadFactor { get; init; }
 }
 
+public sealed record RegionProbeReport
+{
+    /// <summary>
+    /// `node_id` from the discovery response.
+    /// </summary>
+    [JsonPropertyName("node_id")]
+    public required string NodeId { get; init; }
+
+    /// <summary>
+    /// Measured RTT to the endpoint's `probe_url`; `null` = unreachable.
+    /// </summary>
+    [JsonPropertyName("rtt_ms")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? RttMs { get; init; }
+}
+
+/// <summary>
+/// What the SDK picked after probing; lets the node measure how often its recommendation (hints,
+/// GeoIP) matched the lowest-RTT choice.
+/// </summary>
+public sealed record RegionSelectionReport
+{
+    /// <summary>
+    /// `node_id` the token / discovery response listed first, if any.
+    /// </summary>
+    [JsonPropertyName("recommended_node_id")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RecommendedNodeId { get; init; }
+
+    /// <summary>
+    /// The node the SDK connected to.
+    /// </summary>
+    [JsonPropertyName("chosen_node_id")]
+    public required string ChosenNodeId { get; init; }
+
+    [JsonPropertyName("location_source")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LocationSource { get; init; }
+
+    /// <summary>
+    /// One entry per probed endpoint.
+    /// </summary>
+    [JsonPropertyName("probes")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<RegionProbeReport>? Probes { get; init; }
+}
+
+public sealed record RegionSelectionSummary
+{
+    [JsonPropertyName("chosen_region")]
+    public required string ChosenRegion { get; init; }
+
+    [JsonPropertyName("location_source")]
+    public required string LocationSource { get; init; }
+
+    [JsonPropertyName("selections")]
+    public required long Selections { get; init; }
+
+    /// <summary>
+    /// Reports that carried a recommendation.
+    /// </summary>
+    [JsonPropertyName("with_recommendation")]
+    public required long WithRecommendation { get; init; }
+
+    /// <summary>
+    /// Reports whose chosen region equals the recommended one.
+    /// </summary>
+    [JsonPropertyName("matched_recommendation")]
+    public required long MatchedRecommendation { get; init; }
+
+    /// <summary>
+    /// Median client-measured RTT to the chosen region.
+    /// </summary>
+    [JsonPropertyName("chosen_rtt_p50_ms")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ChosenRttP50Ms { get; init; }
+
+    [JsonPropertyName("chosen_rtt_p90_ms")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ChosenRttP90Ms { get; init; }
+}
+
+public sealed record RegionSelectionsResponse
+{
+    [JsonPropertyName("from")]
+    public required string From { get; init; }
+
+    [JsonPropertyName("to")]
+    public required string To { get; init; }
+
+    [JsonPropertyName("selections")]
+    public required long Selections { get; init; }
+
+    [JsonPropertyName("with_recommendation")]
+    public required long WithRecommendation { get; init; }
+
+    [JsonPropertyName("matched_recommendation")]
+    public required long MatchedRecommendation { get; init; }
+
+    /// <summary>
+    /// `matched_recommendation / with_recommendation`, `null` without recommendations.
+    /// </summary>
+    [JsonPropertyName("match_rate")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? MatchRate { get; init; }
+
+    [JsonPropertyName("regions")]
+    public required List<RegionSelectionSummary> Regions { get; init; }
+}
+
 public sealed record RegionsResponse
 {
     /// <summary>
@@ -5403,4 +5506,20 @@ public sealed record ListUserTranscriptsQuery
     /// Page size, 1..=200 (default 50).
     /// </summary>
     public long? Limit { get; init; }
+}
+
+/// <summary>Query parameters of <c>getRegionSelections</c>.</summary>
+public sealed record GetRegionSelectionsQuery
+{
+    /// <summary>
+    /// Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for
+    /// application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the
+    /// effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400
+    /// days.
+    /// </summary>
+    public string? From { get; init; }
+    /// <summary>
+    /// Range end, exclusive (RFC 3339). Default: now.
+    /// </summary>
+    public string? To { get; init; }
 }

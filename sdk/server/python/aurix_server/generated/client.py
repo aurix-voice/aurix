@@ -1676,6 +1676,34 @@ class AurixClient(BaseClient):
         """
         return self._json("DELETE", f"/v1/transcripts/{_p(transcript_id)}", options=options)  # type: ignore[no-any-return]
 
+    def report_region_selection(self, body: "T.RegionSelectionReport", *, options: Optional[RequestOptions] = None) -> None:
+        """Report the region the SDK chose
+
+
+        Sent by the SDKs once after region discovery: the endpoint they connected to, the one the server
+        recommended and the RTT measured per probe. Feeds `GET /v1/analytics/regions` and the
+        `aurix_region_selections_total` / `aurix_region_probe_rtt_seconds` metrics. Requires only a
+        session token; unknown node ids are rejected.
+
+        `POST /v1/me/regions/report`
+        Auth: PlayerToken.
+        """
+        self._json("POST", "/v1/me/regions/report", body=body, options=options)
+
+    def get_region_selections(self, *, from_: Optional[str] = None, to: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.RegionSelectionsResponse":
+        """How well region recommendations match what SDKs actually chose
+
+
+        Aggregates `POST /v1/me/regions/report` over the range (default: last 7 days) per chosen region
+        and recommendation basis (`location_source`). A low `match_rate` for `geoip` means the GeoIP
+        fallback sends players to the wrong region; the RTT percentiles show what players measure to the
+        region they ended up in.
+
+        `GET /v1/analytics/regions`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        """
+        return self._json("GET", "/v1/analytics/regions", query={"from": from_, "to": to}, options=options)  # type: ignore[no-any-return]
+
 
 class AsyncAurixClient:
     """`asyncio` façade over `AurixClient`: every call runs the blocking request in a worker thread."""
@@ -3349,3 +3377,31 @@ class AsyncAurixClient:
         Permissions: transcripts:write.
         """
         return await self._run(self.sync.delete_transcript, transcript_id, options=options)  # type: ignore[no-any-return]
+
+    async def report_region_selection(self, body: "T.RegionSelectionReport", *, options: Optional[RequestOptions] = None) -> None:
+        """Report the region the SDK chose
+
+
+        Sent by the SDKs once after region discovery: the endpoint they connected to, the one the server
+        recommended and the RTT measured per probe. Feeds `GET /v1/analytics/regions` and the
+        `aurix_region_selections_total` / `aurix_region_probe_rtt_seconds` metrics. Requires only a
+        session token; unknown node ids are rejected.
+
+        `POST /v1/me/regions/report`
+        Auth: PlayerToken.
+        """
+        return await self._run(self.sync.report_region_selection, body, options=options)  # type: ignore[no-any-return]
+
+    async def get_region_selections(self, *, from_: Optional[str] = None, to: Optional[str] = None, options: Optional[RequestOptions] = None) -> "T.RegionSelectionsResponse":
+        """How well region recommendations match what SDKs actually chose
+
+
+        Aggregates `POST /v1/me/regions/report` over the range (default: last 7 days) per chosen region
+        and recommendation basis (`location_source`). A low `match_rate` for `geoip` means the GeoIP
+        fallback sends players to the wrong region; the RTT percentiles show what players measure to the
+        region they ended up in.
+
+        `GET /v1/analytics/regions`
+        Auth: ApiKeyHeader | ApiKeyBearer.
+        """
+        return await self._run(self.sync.get_region_selections, from_=from_, to=to, options=options)  # type: ignore[no-any-return]

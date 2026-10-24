@@ -149,6 +149,32 @@ impl SessionManager {
         .map_err(|e| AurixError::Database(format!("Session quality query failed: {e}")))
     }
 
+    pub async fn record_region_selection(
+        &self,
+        row: &aurix_db::models::RegionSelectionRow,
+    ) -> Result<()> {
+        aurix_db::queries::insert_region_selection(&self.pool, row)
+            .await
+            .map_err(|e| AurixError::Database(format!("Region selection insert failed: {e}")))
+    }
+
+    pub async fn region_selection_summary(
+        &self,
+        app_id: AppId,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+    ) -> Result<Vec<aurix_db::models::RegionSelectionSummaryRow>> {
+        aurix_db::queries::region_selection_summary(&self.pool, app_id.0, from, to)
+            .await
+            .map_err(|e| AurixError::Database(format!("Region selection query failed: {e}")))
+    }
+
+    pub async fn prune_region_selections(&self, before: chrono::DateTime<Utc>) -> Result<u64> {
+        aurix_db::queries::prune_region_selections(&self.pool, before)
+            .await
+            .map_err(|e| AurixError::Database(format!("Region selection prune failed: {e}")))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn add_channel_membership(
         &self,

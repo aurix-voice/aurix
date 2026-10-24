@@ -651,6 +651,23 @@ public:
     AurixResult rank(const std::string& preferred_region = std::string(), double rtt_tolerance_ms = 0.0) {
         return aurix_regions_rank(r_, preferred_region.empty() ? nullptr : preferred_region.c_str(), rtt_tolerance_ms);
     }
+    /// JSON body of `POST /v1/me/regions/report` (see `report_url()`): `chosen_index` is the entry
+    /// of the ranked list the host connected to. Empty on error.
+    std::string report_json(std::size_t chosen_index = 0) const {
+        std::size_t n = aurix_regions_report_json(r_, chosen_index, nullptr, 0);
+        if (n == 0) return std::string();
+        std::string out(n, '\0');
+        aurix_regions_report_json(r_, chosen_index, &out[0], n + 1);
+        return out;
+    }
+    /// URL to POST `report_json()` to (bearer = the session token), fire-and-forget.
+    static std::string report_url(const std::string& api_url) {
+        std::size_t n = aurix_regions_report_url(api_url.c_str(), nullptr, 0);
+        if (n == 0) return std::string();
+        std::string out(n, '\0');
+        aurix_regions_report_url(api_url.c_str(), &out[0], n + 1);
+        return out;
+    }
 
 private:
     explicit Regions(AurixRegionList* r) : r_(r) {}

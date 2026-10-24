@@ -17672,3 +17672,86 @@ async fn bans_by_account_device_and_address() {
         "device ban lifted"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a running Aurix server; see the e2e job in .github/workflows/ci.yml"]
+async fn region_selection_reports_feed_region_analytics() {
+    let Some(env) = env() else {
+        eprintln!("AURIX_E2E_API_KEY not set; skipping");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let ch = create_channel(&env, &http).await;
+    let (token, _) = issue_token(&env, &http, "region-reporter", "Region Reporter", ch).await;
+
+    let discovery: serde_json::Value = http
+        .get(format!("{}/v1/me/regions", env.api))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first = &discovery["regions"][0];
+    let node_id = first["node_id"].as_str().expect("node_id").to_string();
+    let region = first["region"].as_str().expect("region").to_string();
+    let location_source = discovery["location_source"]
+        .as_str()
+        .expect("location_source");
+
+    let report = |body: serde_json::Value| {
+        let http = http.clone();
+        let url = format!("{}/v1/me/regions/report", env.api);
+        let token = token.clone();
+        async move {
+            http.post(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let status = report(serde_json::json!({
+        "recommended_node_id": node_id,
+        "chosen_node_id": node_id,
+        "location_source": location_source,
+        "probes": [{"node_id": node_id, "rtt_ms": 12.5}],
+    }))
+    .await;
+    assert_eq!(status, 204, "report accepted");
+    let status = report(serde_json::json!({
+        "chosen_node_id": "00000000-0000-0000-0000-000000000000",
+    }))
+    .await;
+    assert_eq!(status, 400, "unknown chosen node is rejected");
+    let probes: Vec<serde_json::Value> = (0..33)
+        .map(|_| serde_json::json!({"node_id": node_id, "rtt_ms": 1.0}))
+        .collect();
+    let status = report(serde_json::json!({"chosen_node_id": node_id, "probes": probes})).await;
+    assert_eq!(status, 400, "probe list is capped");
+
+    let (status, analytics) = tenant_get(&env, &http, "/v1/analytics/regions").await;
+    assert_eq!(status, 200, "{analytics}");
+    assert!(
+        analytics["selections"].as_i64().unwrap_or(0) >= 1,
+        "{analytics}"
+    );
+    assert!(
+        analytics["matched_recommendation"].as_i64().unwrap_or(0) >= 1,
+        "{analytics}"
+    );
+    let row = analytics["regions"]
+        .as_array()
+        .expect("regions")
+        .iter()
+        .find(|r| r["chosen_region"] == region && r["location_source"] == location_source)
+        .unwrap_or_else(|| panic!("row for {region}/{location_source}: {analytics}"));
+    assert!(row["chosen_rtt_p50_ms"].is_number(), "{row}");
+    assert!(row["selections"].as_i64().unwrap() >= row["matched_recommendation"].as_i64().unwrap());
+}

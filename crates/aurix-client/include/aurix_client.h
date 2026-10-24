@@ -114,6 +114,11 @@
 #define DEFAULT_RTT_TOLERANCE_MS 15.0
 
 /**
+ * Entries of one report; longer probe lists are truncated.
+ */
+#define MAX_REPORTED_PROBES 32
+
+/**
  * Expected-loss floor the `Moderate` profile tunes in-band FEC for, percent.
  */
 #define LossProfilePolicy_MODERATE_EXPECTED_LOSS 10
@@ -2686,6 +2691,24 @@ enum AurixResult aurix_regions_set_rtt(struct AurixRegionList *regions,
 enum AurixResult aurix_regions_rank(struct AurixRegionList *regions,
                                     const char *preferred_region,
                                     double rtt_tolerance_ms);
+
+/**
+ * URL of `POST /v1/me/regions/report` for `api_url`. Copies the NUL-terminated URL into
+ * `buf` (truncated to `capacity`) and returns its full length; 0 on error.
+ */
+size_t aurix_regions_report_url(const char *api_url, char *buf, size_t capacity);
+
+/**
+ * JSON body of `POST /v1/me/regions/report` (bearer = the session token): `chosen_index`
+ * is the entry of the ranked list the host connected to; the server's pre-ranking
+ * recommendation and `location_source` are remembered from `aurix_regions_parse`. Send it
+ * once after connecting, fire-and-forget. Returns the body length (see
+ * `aurix_regions_report_url` for the buffer contract); 0 on error.
+ */
+size_t aurix_regions_report_json(const struct AurixRegionList *regions,
+                                 size_t chosen_index,
+                                 char *buf,
+                                 size_t capacity);
 
 /**
  * Create an Opus encoder for `sample_rate_hz` (8000/12000/16000/24000/48000) and 1 or 2

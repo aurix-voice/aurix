@@ -2286,4 +2286,43 @@ public sealed partial class AurixClient : AurixHttp
         return SendJsonAsync<DeleteTranscriptResponse>("/v1/transcripts/" + Uri.EscapeDataString(transcriptId), HttpMethod.Delete, q, null, options, cancellationToken);
     }
 
+    /// <summary>
+    /// Report the region the SDK chose
+    ///
+    /// Sent by the SDKs once after region discovery: the endpoint they connected to, the one the server
+    /// recommended and the RTT measured per probe. Feeds `GET /v1/analytics/regions` and the
+    /// `aurix_region_selections_total` / `aurix_region_probe_rtt_seconds` metrics. Requires only a
+    /// session token; unknown node ids are rejected.
+    ///
+    /// `POST /v1/me/regions/report`
+    /// Auth: PlayerToken.
+    /// </summary>
+    public Task ReportRegionSelectionAsync(RegionSelectionReport body, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, string>? q = null;
+        return SendJsonAsync("/v1/me/regions/report", HttpMethod.Post, q, body, options, cancellationToken);
+    }
+
+    /// <summary>
+    /// How well region recommendations match what SDKs actually chose
+    ///
+    /// Aggregates `POST /v1/me/regions/report` over the range (default: last 7 days) per chosen region
+    /// and recommendation basis (`location_source`). A low `match_rate` for `geoip` means the GeoIP
+    /// fallback sends players to the wrong region; the RTT percentiles show what players measure to the
+    /// region they ended up in.
+    ///
+    /// `GET /v1/analytics/regions`
+    /// Auth: ApiKeyHeader | ApiKeyBearer.
+    /// </summary>
+    public Task<RegionSelectionsResponse> GetRegionSelectionsAsync(GetRegionSelectionsQuery? query = null, RequestOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        var q = new Dictionary<string, string>();
+        if (query is not null)
+        {
+            if (query.From is not null) q["from"] = query.From;
+            if (query.To is not null) q["to"] = query.To;
+        }
+        return SendJsonAsync<RegionSelectionsResponse>("/v1/analytics/regions", HttpMethod.Get, q, null, options, cancellationToken);
+    }
+
 }

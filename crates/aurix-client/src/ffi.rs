@@ -5137,6 +5137,8 @@ pub struct AurixRegionEndpoint {
 /// Opaque, mutable list of regions; release with `aurix_regions_free`.
 pub struct AurixRegionList {
     regions: Vec<crate::regions::ProbedRegion>,
+    recommended_node_id: Option<aurix_common::types::MediaNodeId>,
+    location_source: Option<String>,
 }
 
 fn url_buf(s: &str) -> [c_char; AURIX_URL_LEN] {
@@ -5231,13 +5233,22 @@ pub unsafe extern "C" fn aurix_regions_parse(json: *const c_char) -> *mut AurixR
         return ptr::null_mut();
     };
     match crate::regions::parse_regions(&body) {
-        Ok(parsed) => Box::into_raw(Box::new(AurixRegionList {
-            regions: parsed
-                .regions
-                .into_iter()
-                .map(crate::regions::ProbedRegion::unprobed)
-                .collect(),
-        })),
+        Ok(parsed) => {
+            let recommended_node_id = parsed
+                .recommended
+                .as_ref()
+                .or(parsed.regions.first())
+                .map(|r| r.node_id);
+            Box::into_raw(Box::new(AurixRegionList {
+                regions: parsed
+                    .regions
+                    .into_iter()
+                    .map(crate::regions::ProbedRegion::unprobed)
+                    .collect(),
+                recommended_node_id,
+                location_source: parsed.location_source,
+            }))
+        }
         Err(e) => {
             fail(e);
             ptr::null_mut()
@@ -5333,6 +5344,49 @@ pub unsafe extern "C" fn aurix_regions_rank(
     list.regions =
         crate::regions::rank_regions(std::mem::take(&mut list.regions), preferred, tolerance);
     AurixResult::AurixOk
+}
+
+/// URL of `POST /v1/me/regions/report` for `api_url`. Copies the NUL-terminated URL into
+/// `buf` (truncated to `capacity`) and returns its full length; 0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_report_url(
+    api_url: *const c_char,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    let Ok(api) = cstr_arg(api_url, "api_url") else {
+        return 0;
+    };
+    copy_out(&crate::regions::report_url(&api), buf, capacity)
+}
+
+/// JSON body of `POST /v1/me/regions/report` (bearer = the session token): `chosen_index`
+/// is the entry of the ranked list the host connected to; the server's pre-ranking
+/// recommendation and `location_source` are remembered from `aurix_regions_parse`. Send it
+/// once after connecting, fire-and-forget. Returns the body length (see
+/// `aurix_regions_report_url` for the buffer contract); 0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn aurix_regions_report_json(
+    regions: *const AurixRegionList,
+    chosen_index: usize,
+    buf: *mut c_char,
+    capacity: usize,
+) -> usize {
+    if regions.is_null() {
+        set_error("regions is null");
+        return 0;
+    }
+    let list = &*regions;
+    let Some(body) = crate::regions::report_json(
+        &list.regions,
+        chosen_index,
+        list.recommended_node_id,
+        list.location_source.as_deref(),
+    ) else {
+        set_error("chosen_index out of range");
+        return 0;
+    };
+    copy_out(&body, buf, capacity)
 }
 
 // -------------------------------------------------------------------------------- bare codec

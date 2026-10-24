@@ -1703,6 +1703,52 @@ type RegionEndpoint struct {
 	LoadFactor float64 `json:"load_factor"`
 }
 
+// RegionProbeReport is the `RegionProbeReport` schema.
+type RegionProbeReport struct {
+	// `node_id` from the discovery response.
+	NodeID string `json:"node_id"`
+	// Measured RTT to the endpoint's `probe_url`; `null` = unreachable.
+	RTTMs *float64 `json:"rtt_ms,omitempty"`
+}
+
+// What the SDK picked after probing; lets the node measure how often its recommendation (hints,
+// GeoIP) matched the lowest-RTT choice.
+type RegionSelectionReport struct {
+	// `node_id` the token / discovery response listed first, if any.
+	RecommendedNodeID *string `json:"recommended_node_id,omitempty"`
+	// The node the SDK connected to.
+	ChosenNodeID   string          `json:"chosen_node_id"`
+	LocationSource *LocationSource `json:"location_source,omitempty"`
+	// One entry per probed endpoint.
+	Probes []RegionProbeReport `json:"probes,omitempty"`
+}
+
+// RegionSelectionSummary is the `RegionSelectionSummary` schema.
+type RegionSelectionSummary struct {
+	ChosenRegion   Region         `json:"chosen_region"`
+	LocationSource LocationSource `json:"location_source"`
+	Selections     int64          `json:"selections"`
+	// Reports that carried a recommendation.
+	WithRecommendation int64 `json:"with_recommendation"`
+	// Reports whose chosen region equals the recommended one.
+	MatchedRecommendation int64 `json:"matched_recommendation"`
+	// Median client-measured RTT to the chosen region.
+	ChosenRTTP50Ms *float64 `json:"chosen_rtt_p50_ms,omitempty"`
+	ChosenRTTP90Ms *float64 `json:"chosen_rtt_p90_ms,omitempty"`
+}
+
+// RegionSelectionsResponse is the `RegionSelectionsResponse` schema.
+type RegionSelectionsResponse struct {
+	From                  string `json:"from"`
+	To                    string `json:"to"`
+	Selections            int64  `json:"selections"`
+	WithRecommendation    int64  `json:"with_recommendation"`
+	MatchedRecommendation int64  `json:"matched_recommendation"`
+	// `matched_recommendation / with_recommendation`, `null` without recommendations.
+	MatchRate *float64                 `json:"match_rate,omitempty"`
+	Regions   []RegionSelectionSummary `json:"regions"`
+}
+
 // RegionsResponse is the `RegionsResponse` schema.
 type RegionsResponse struct {
 	// Best-first: the preferred region if it has capacity, then by distance to the declared location
@@ -2740,4 +2786,15 @@ type ListUserTranscriptsQuery struct {
 	After *string
 	// Page size, 1..=200 (default 50).
 	Limit *int64
+}
+
+// GetRegionSelectionsQuery holds the query parameters of `getRegionSelections`.
+type GetRegionSelectionsQuery struct {
+	// Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for
+	// application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the
+	// effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400
+	// days.
+	From *string
+	// Range end, exclusive (RFC 3339). Default: now.
+	To *string
 }

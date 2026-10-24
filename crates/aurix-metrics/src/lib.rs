@@ -788,3 +788,26 @@ pub fn gather_metrics() -> String {
 pub async fn metrics_handler() -> String {
     gather_metrics()
 }
+
+/// SDK region-selection reports (`POST /v1/me/regions/report`) by the basis of the node's
+/// recommendation (`location_source`) and whether the SDK's RTT probe agreed with it
+/// (`outcome` = `recommended` / `other` / `no_recommendation`).
+pub static REGION_SELECTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "aurix_region_selections_total",
+        "SDK region-selection reports by location_source and outcome",
+        &["location_source", "outcome"]
+    )
+    .unwrap()
+});
+
+/// RTT the SDK measured to each region's probe URL (reachable probes only).
+pub static REGION_PROBE_RTT: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "aurix_region_probe_rtt_seconds",
+        "Client-measured RTT to region probe URLs",
+        &["region"],
+        vec![0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0]
+    )
+    .unwrap()
+});

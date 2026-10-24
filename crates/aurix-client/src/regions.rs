@@ -25,6 +25,9 @@ pub struct RegionsResponse {
     pub regions: Vec<RegionEndpoint>,
     /// First entry of `regions`, if any.
     pub recommended: Option<RegionEndpoint>,
+    /// How the server located the caller: `coordinates`, `geoip` or `none`.
+    #[serde(default)]
+    pub location_source: Option<String>,
 }
 
 /// A region with the host's RTT measurement attached.
@@ -123,6 +126,41 @@ pub fn rank_regions(
     };
     regions.sort_by_key(key);
     regions
+}
+
+/// `POST /v1/me/regions/report` URL for `api_url`.
+pub fn report_url(api_url: &str) -> String {
+    format!("{}/v1/me/regions/report", api_url.trim_end_matches('/'))
+}
+
+/// Entries of one report; longer probe lists are truncated.
+pub const MAX_REPORTED_PROBES: usize = 32;
+
+/// JSON body of `POST /v1/me/regions/report`: `chosen` indexes `ranked` (the entry the host
+/// connected to), `recommended` is the server's first choice before ranking and
+/// `location_source` the discovery response's. `None` when `chosen` is out of range.
+pub fn report_json(
+    ranked: &[ProbedRegion],
+    chosen: usize,
+    recommended: Option<aurix_common::types::MediaNodeId>,
+    location_source: Option<&str>,
+) -> Option<String> {
+    let chosen = ranked.get(chosen)?;
+    let probes: Vec<serde_json::Value> = ranked
+        .iter()
+        .filter(|r| r.rtt_ms.is_some() || r.probe_failed)
+        .take(MAX_REPORTED_PROBES)
+        .map(|r| serde_json::json!({ "node_id": r.endpoint.node_id, "rtt_ms": r.rtt_ms }))
+        .collect();
+    Some(
+        serde_json::json!({
+            "recommended_node_id": recommended,
+            "chosen_node_id": chosen.endpoint.node_id,
+            "location_source": location_source.unwrap_or("none"),
+            "probes": probes,
+        })
+        .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -240,6 +278,57 @@ mod tests {
                 })
             ),
             "https://api/v1/me/regions"
+        );
+    }
+
+    #[test]
+    fn report_json_carries_choice_recommendation_and_probes() {
+        let parsed = parse_regions(
+            r#"{"regions":[
+                {"region":"eu_west","node_id":"00000000-0000-0000-0000-000000000001","ws_url":"wss://a/ws","probe_url":"https://a/health","location":null,"distance_km":null,"nodes":1,"load_factor":0.1},
+                {"region":"us_east","node_id":"00000000-0000-0000-0000-000000000002","ws_url":"wss://b/ws","probe_url":"https://b/health","location":null,"distance_km":null,"nodes":1,"load_factor":0.1},
+                {"region":"africa","node_id":"00000000-0000-0000-0000-000000000003","ws_url":"wss://c/ws","probe_url":null,"location":null,"distance_km":null,"nodes":1,"load_factor":0.1}
+            ],"recommended":null,"location_source":"geoip"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.location_source.as_deref(), Some("geoip"));
+        let recommended = parsed.regions[0].node_id;
+        let regions: Vec<ProbedRegion> = parsed
+            .regions
+            .into_iter()
+            .map(ProbedRegion::unprobed)
+            .collect();
+        let mut regions = regions;
+        regions[0].set_rtt(Some(80.0));
+        regions[1].set_rtt(Some(20.0));
+        let ranked = rank_regions(regions, None, DEFAULT_RTT_TOLERANCE_MS);
+        assert_eq!(ranked[0].endpoint.region, Region::UsEast);
+        let body: serde_json::Value = serde_json::from_str(
+            &report_json(
+                &ranked,
+                0,
+                Some(recommended),
+                parsed.location_source.as_deref(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["chosen_node_id"],
+            "00000000-0000-0000-0000-000000000002"
+        );
+        assert_eq!(
+            body["recommended_node_id"],
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(body["location_source"], "geoip");
+        let probes = body["probes"].as_array().unwrap();
+        assert_eq!(probes.len(), 2, "unprobed entries are omitted: {probes:?}");
+        assert_eq!(probes[0]["rtt_ms"], 20.0);
+        assert!(report_json(&ranked, 7, None, None).is_none());
+        assert_eq!(
+            report_url("https://api.example/"),
+            "https://api.example/v1/me/regions/report"
         );
     }
 }

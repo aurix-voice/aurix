@@ -262,6 +262,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/analytics", get(analytics::get_analytics))
         .route("/v1/analytics/quota", get(analytics::get_quota))
+        .route(
+            "/v1/analytics/regions",
+            get(analytics::get_region_selections),
+        )
         .route("/v1/analytics/export", get(analytics::export_usage))
         .route("/v1/analytics/channels", get(analytics::list_channel_usage))
         .route(
@@ -366,6 +370,10 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::get_turn_credentials_self),
         )
         .route("/v1/me/regions", get(handlers::list_regions_self))
+        .route(
+            "/v1/me/regions/report",
+            post(handlers::report_region_selection),
+        )
         .route("/v1/me/reports", post(handlers::report_user_self))
         .route(
             "/v1/me/recordings/:recording_id/consent",

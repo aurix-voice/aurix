@@ -1805,4 +1805,34 @@ export class AurixClient extends AurixHttp {
     return this.json<T.DeleteTranscriptResponse>("DELETE", `/v1/transcripts/${encodeURIComponent(transcriptId)}`, { ...options });
   }
 
+  /**
+   * Report the region the SDK chose
+   *
+   * Sent by the SDKs once after region discovery: the endpoint they connected to, the one the server
+   * recommended and the RTT measured per probe. Feeds `GET /v1/analytics/regions` and the
+   * `aurix_region_selections_total` / `aurix_region_probe_rtt_seconds` metrics. Requires only a
+   * session token; unknown node ids are rejected.
+   *
+   * `POST /v1/me/regions/report`
+   * Auth: PlayerToken.
+   */
+  reportRegionSelection(body: T.RegionSelectionReport, options?: RequestOptions): Promise<void> {
+    return this.json<void>("POST", "/v1/me/regions/report", { body, ...options });
+  }
+
+  /**
+   * How well region recommendations match what SDKs actually chose
+   *
+   * Aggregates `POST /v1/me/regions/report` over the range (default: last 7 days) per chosen region
+   * and recommendation basis (`location_source`). A low `match_rate` for `geoip` means the GeoIP
+   * fallback sends players to the wrong region; the RTT percentiles show what players measure to the
+   * region they ended up in.
+   *
+   * `GET /v1/analytics/regions`
+   * Auth: ApiKeyHeader | ApiKeyBearer.
+   */
+  getRegionSelections(query?: T.GetRegionSelectionsQuery, options?: RequestOptions): Promise<T.RegionSelectionsResponse> {
+    return this.json<T.RegionSelectionsResponse>("GET", "/v1/analytics/regions", { query, ...options });
+  }
+
 }

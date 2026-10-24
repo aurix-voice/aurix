@@ -44,6 +44,7 @@ private:
 	void OnProbeReceived(FHttpRequestPtr HttpRequest, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 ProbeIndex);
 	void RankAndFinish();
 	void Finish(bool bSuccess, const FString& Error);
+	void SendReport();
 
 	FAurixRegionDiscoveryRequest Request;
 	FOnComplete OnComplete;

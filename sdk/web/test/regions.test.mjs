@@ -95,3 +95,35 @@ test('discoverRegions sends the hint, bearer token and probes every region', asy
     /HTTP 401/,
   );
 });
+
+test('discoverRegions reports the chosen node and the measured RTTs (report: false opts out)', async () => {
+  const posts = [];
+  const f = fakeFetch(async (url, init) => {
+    if (url.endsWith('/v1/me/regions/report')) {
+      assert.equal(init.method, 'POST');
+      assert.equal(init.headers.Authorization, 'Bearer tok');
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 204 };
+    }
+    if (url.includes('/v1/me/regions')) {
+      return okJson({ regions: [ep('eu_west', 'eu1'), ep('us_east', 'us1')], recommended: ep('eu_west', 'eu1'), location_source: 'geoip' });
+    }
+    if (url.includes('eu1')) await new Promise((r) => setTimeout(r, 40));
+    return okJson({ status: 'healthy' });
+  });
+  const out = await discoverRegions({ apiUrl: 'https://api.example', token: 'tok', probeSamples: 1, fetch: f });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(out.locationSource, 'geoip');
+  assert.equal(out.serverRecommended.node_id, 'eu1');
+  assert.equal(out.recommended.node_id, 'us1');
+  assert.equal(posts.length, 1);
+  assert.deepEqual(
+    { ...posts[0], probes: posts[0].probes.map((p) => p.node_id).sort() },
+    { recommended_node_id: 'eu1', chosen_node_id: 'us1', location_source: 'geoip', probes: ['eu1', 'us1'] },
+  );
+  assert.ok(posts[0].probes.every((p) => typeof p.rtt_ms === 'number'));
+  posts.length = 0;
+  await discoverRegions({ apiUrl: 'https://api.example', token: 'tok', probeSamples: 1, report: false, fetch: f });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(posts.length, 0);
+});

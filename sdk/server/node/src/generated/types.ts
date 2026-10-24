@@ -1571,6 +1571,51 @@ export interface RegionEndpoint {
   load_factor: number;
 }
 
+export interface RegionProbeReport {
+  /** `node_id` from the discovery response. */
+  node_id: string;
+  /** Measured RTT to the endpoint's `probe_url`; `null` = unreachable. */
+  rtt_ms?: number;
+}
+
+/**
+ * What the SDK picked after probing; lets the node measure how often its recommendation (hints,
+ * GeoIP) matched the lowest-RTT choice.
+ */
+export interface RegionSelectionReport {
+  /** `node_id` the token / discovery response listed first, if any. */
+  recommended_node_id?: string;
+  /** The node the SDK connected to. */
+  chosen_node_id: string;
+  location_source?: LocationSource;
+  /** One entry per probed endpoint. */
+  probes?: RegionProbeReport[];
+}
+
+export interface RegionSelectionSummary {
+  chosen_region: Region;
+  location_source: LocationSource;
+  selections: number;
+  /** Reports that carried a recommendation. */
+  with_recommendation: number;
+  /** Reports whose chosen region equals the recommended one. */
+  matched_recommendation: number;
+  /** Median client-measured RTT to the chosen region. */
+  chosen_rtt_p50_ms?: number;
+  chosen_rtt_p90_ms?: number;
+}
+
+export interface RegionSelectionsResponse {
+  from: string;
+  to: string;
+  selections: number;
+  with_recommendation: number;
+  matched_recommendation: number;
+  /** `matched_recommendation / with_recommendation`, `null` without recommendations. */
+  match_rate?: number;
+  regions: RegionSelectionSummary[];
+}
+
 export interface RegionsResponse {
   /**
    * Best-first: the preferred region if it has capacity, then by distance to the declared location
@@ -2646,4 +2691,17 @@ export interface ListUserTranscriptsQuery {
   after?: string;
   /** Page size, 1..=200 (default 50). */
   limit?: number;
+}
+
+/** Query parameters of `getRegionSelections`. */
+export interface GetRegionSelectionsQuery {
+  /**
+   * Range start (RFC 3339), rounded down to the bucket boundary of the scope (5 minutes for
+   * application rows / `step`, 1 hour for channel rows) so the bucket it falls in is included; the
+   * effective value is echoed in `range.from`. Default: `to` minus 7 days. Ranges are capped at 400
+   * days.
+   */
+  from?: string;
+  /** Range end, exclusive (RFC 3339). Default: now. */
+  to?: string;
 }

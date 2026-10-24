@@ -278,6 +278,36 @@ pub async fn get_analytics(
     Ok(Json(app_usage_body(&state, ctx.app_id, &q).await?))
 }
 
+/// `GET /v1/analytics/regions` — SDK region-selection reports over the range (default 7
+/// days): per chosen region and recommendation basis, how often the SDK's RTT probe agreed
+/// with the node's recommendation and the RTT it measured to the region it picked.
+pub async fn get_region_selections(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Query(q): Query<RangeQuery>,
+) -> JsonResult {
+    ctx.require("analytics:read")?;
+    let range = parse_range(&q, 7)?;
+    let regions = state
+        .control
+        .sessions
+        .region_selection_summary(ctx.app_id, range.from, range.to)
+        .await?;
+    let selections: i64 = regions.iter().map(|r| r.selections).sum();
+    let with_recommendation: i64 = regions.iter().map(|r| r.with_recommendation).sum();
+    let matched: i64 = regions.iter().map(|r| r.matched_recommendation).sum();
+    let match_rate = (with_recommendation > 0).then(|| matched as f64 / with_recommendation as f64);
+    Ok(Json(serde_json::json!({
+        "from": range.from,
+        "to": range.to,
+        "selections": selections,
+        "with_recommendation": with_recommendation,
+        "matched_recommendation": matched,
+        "match_rate": match_rate,
+        "regions": regions,
+    })))
+}
+
 /// `GET /v1/analytics/channels` — per-channel totals over the range, busiest first.
 pub async fn list_channel_usage(
     State(state): State<AppState>,

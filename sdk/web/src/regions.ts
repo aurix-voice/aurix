@@ -30,6 +30,8 @@ export interface RegionEndpoint {
 export interface RegionsResponse {
   regions: RegionEndpoint[];
   recommended: RegionEndpoint | null;
+  /** How the server located the caller: `coordinates`, `geoip` or `none`. */
+  location_source: string | null;
 }
 
 export interface ProbedRegion extends RegionEndpoint {
@@ -48,6 +50,12 @@ export interface DiscoverRegionsOptions {
   location?: GeoLocation;
   /** Measure RTT to every region's `probe_url`; defaults to `true`. */
   probe?: boolean;
+  /**
+   * Tell the server which endpoint was chosen and what was measured (`POST
+   * /v1/me/regions/report`, fire-and-forget) so its recommendations can be audited; defaults to
+   * `true`.
+   */
+  report?: boolean;
   /** Timed samples per region after one warm-up request; defaults to `3`. */
   probeSamples?: number;
   /** Per-request timeout; defaults to `2000` ms. Regions that time out rank last. */
@@ -63,6 +71,10 @@ export interface DiscoveredRegions {
   regions: ProbedRegion[];
   /** `regions[0]`, or `null` when nothing is advertised. */
   recommended: ProbedRegion | null;
+  /** The server's own first choice before probing. */
+  serverRecommended: RegionEndpoint | null;
+  /** `location_source` of the discovery response. */
+  locationSource: string | null;
 }
 
 export const DEFAULT_PROBE_SAMPLES = 3;
@@ -104,7 +116,63 @@ export async function discoverRegions(opts: DiscoverRegionsOptions): Promise<Dis
   if (opts.region !== undefined) rank.preferred = opts.region;
   if (opts.rttToleranceMs !== undefined) rank.rttToleranceMs = opts.rttToleranceMs;
   const ranked = rankRegions(parsed.regions, rtts, rank);
-  return { regions: ranked, recommended: ranked[0] ?? null };
+  const serverRecommended = parsed.recommended ?? parsed.regions[0] ?? null;
+  const chosen = ranked[0] ?? null;
+  if ((opts.report ?? true) && chosen) {
+    void reportRegionSelection({
+      apiUrl: opts.apiUrl,
+      token: opts.token,
+      body: buildRegionReport(chosen, serverRecommended, parsed.location_source, rtts),
+      fetch: doFetch,
+    });
+  }
+  return { regions: ranked, recommended: chosen, serverRecommended, locationSource: parsed.location_source };
+}
+
+/** Body of `POST /v1/me/regions/report`. */
+export interface RegionSelectionReport {
+  recommended_node_id: string | null;
+  chosen_node_id: string;
+  location_source: string;
+  probes: { node_id: string; rtt_ms: number | null }[];
+}
+
+export const MAX_REPORTED_PROBES = 32;
+
+export function buildRegionReport(
+  chosen: RegionEndpoint,
+  recommended: RegionEndpoint | null,
+  locationSource: string | null,
+  rtts: ReadonlyMap<string, number | null>,
+): RegionSelectionReport {
+  const probes = [...rtts.entries()].slice(0, MAX_REPORTED_PROBES).map(([node_id, rtt_ms]) => ({ node_id, rtt_ms }));
+  return {
+    recommended_node_id: recommended?.node_id ?? null,
+    chosen_node_id: chosen.node_id,
+    location_source: locationSource ?? 'none',
+    probes,
+  };
+}
+
+/** Send a selection report; never throws, resolves to whether the server accepted it. */
+export async function reportRegionSelection(opts: {
+  apiUrl: string;
+  token: string;
+  body: RegionSelectionReport;
+  fetch?: typeof fetch;
+}): Promise<boolean> {
+  const doFetch = opts.fetch ?? fetch;
+  try {
+    const res = await doFetch(`${opts.apiUrl.replace(/\/$/, '')}/v1/me/regions/report`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${opts.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts.body),
+      keepalive: true,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 export interface ProbeOptions {
@@ -186,7 +254,12 @@ export function parseRegionsResponse(body: unknown): RegionsResponse {
   if (!Array.isArray(raw)) throw new Error('region discovery: malformed response');
   const regions = raw.map(parseEndpoint);
   const rec = (body as { recommended?: unknown }).recommended;
-  return { regions, recommended: rec === null || rec === undefined ? null : parseEndpoint(rec) };
+  const ls = (body as { location_source?: unknown }).location_source;
+  return {
+    regions,
+    recommended: rec === null || rec === undefined ? null : parseEndpoint(rec),
+    location_source: typeof ls === 'string' ? ls : null,
+  };
 }
 
 function parseEndpoint(v: unknown): RegionEndpoint {
