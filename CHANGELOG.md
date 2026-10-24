@@ -11,6 +11,8 @@ released together.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-24
+
 ### Added
 
 - **Region-selection telemetry.** SDKs report the endpoint they connected to after their RTT
@@ -775,7 +777,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.10.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.11.0...HEAD
+[1.11.0]: https://github.com/aurix-voice/aurix/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/aurix-voice/aurix/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/aurix-voice/aurix/compare/v1.8.2...v1.9.0
 [1.7.0]: https://github.com/aurix-voice/aurix/compare/v1.6.0...v1.7.0
