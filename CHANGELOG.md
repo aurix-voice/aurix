@@ -11,6 +11,11 @@ released together.
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-10-26
+
+### Changed
+- `GET /v1/analytics/sessions` accepts `min_samples=0` and then returns every session of the range; sessions without a quality report (bots, server-side participants) follow the rated ones, most recent first.
+
 ## [1.12.0] - 2026-10-24
 
 ### Fixed
