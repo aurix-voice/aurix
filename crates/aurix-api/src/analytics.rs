@@ -396,7 +396,8 @@ pub struct SessionQualityQuery {
     pub from: Option<String>,
     pub to: Option<String>,
     pub limit: Option<i64>,
-    /// Sessions rated fewer times than this are skipped (default 3).
+    /// Sessions rated fewer times than this are skipped (default 3); `0` also returns sessions
+    /// without any quality report (bots, server-side participants), after the rated ones.
     pub min_samples: Option<i64>,
 }
 
@@ -421,7 +422,7 @@ pub async fn list_session_quality(
         1,
     )?;
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let min_samples = q.min_samples.unwrap_or(3).clamp(1, 1_000_000);
+    let min_samples = q.min_samples.unwrap_or(3).clamp(0, 1_000_000);
     let rows = state
         .control
         .sessions

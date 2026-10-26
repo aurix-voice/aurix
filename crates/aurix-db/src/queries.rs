@@ -1115,11 +1115,12 @@ pub async fn update_session_quality(
     Ok(r.rows_affected())
 }
 
-/// Sessions of the application that started in `[from, to)` and have a quality summary,
-/// worst average MOS first (ties: most recent first). Sessions rated fewer than `min_samples`
-/// times are skipped so one bad first sample does not top the list. Only summaries whose
-/// `samples` and `mos_avg` are JSON numbers qualify, so a hand-edited row cannot break the
-/// listing for the whole application.
+/// Sessions of the application that started in `[from, to)`, worst average MOS first (ties: most
+/// recent first). With `min_samples >= 1` only sessions rated at least that many times are
+/// returned, so one bad first sample does not top the list. With `min_samples == 0` every session
+/// of the range is returned and the unrated ones (bots, server-side participants, clients that
+/// never reported) come after the rated ones, most recent first. Only summaries whose `samples`
+/// and `mos_avg` are JSON numbers count as rated, so a hand-edited row cannot break the listing.
 pub async fn worst_quality_sessions(
     pool: &DbPool,
     app_id: Uuid,
@@ -1131,10 +1132,13 @@ pub async fn worst_quality_sessions(
     sqlx::query_as::<_, SessionRow>(
         r#"SELECT * FROM sessions
            WHERE app_id = $1 AND connected_at >= $2 AND connected_at < $3
-             AND jsonb_typeof(quality_stats->'mos_avg') = 'number'
-             AND CASE WHEN jsonb_typeof(quality_stats->'samples') = 'number'
-                      THEN (quality_stats->>'samples')::bigint ELSE -1 END >= $4
-           ORDER BY (quality_stats->>'mos_avg')::double precision ASC, connected_at DESC
+             AND ($4 = 0 OR (
+               jsonb_typeof(quality_stats->'mos_avg') = 'number'
+               AND CASE WHEN jsonb_typeof(quality_stats->'samples') = 'number'
+                        THEN (quality_stats->>'samples')::bigint ELSE -1 END >= $4))
+           ORDER BY (jsonb_typeof(quality_stats->'mos_avg') = 'number') DESC,
+                    (quality_stats->>'mos_avg')::double precision ASC NULLS LAST,
+                    connected_at DESC
            LIMIT $5"#,
     )
     .bind(app_id)
