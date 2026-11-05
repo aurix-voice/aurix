@@ -10,6 +10,10 @@
 Open-source, self-hosted voice chat for games and real-time apps — a drop-in alternative to
 Vivox / Agora / Photon Voice that you run on your own infrastructure.
 
+Don't want to run it yourself? **[Aurix Cloud](https://aurix.run)** is the managed version of
+this server: free tier with no card, [docs](https://aurix.run/docs/) and a
+[live demo](https://rooms.aurix.run). Your servers, our control plane — also possible.
+
 * **Two media paths**: a native low-latency UDP protocol (**AURX**, for game engines) and
   **WebRTC** (for browsers / Unity WebGL), bridged by one SFU with per-participant volumes.
 * **Multi-tenant**: apps, API keys with fine-grained permissions, per-app users, channels,
