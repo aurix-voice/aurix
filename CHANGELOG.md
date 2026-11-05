@@ -13,6 +13,7 @@ released together.
 
 ### Fixed
 - Unreal: `UAurixVoiceSubsystem` declares the `FVTableHelper` constructor so the UHT-generated vtable helper is compiled in the module source where the pimpl types are complete; `RunUAT BuildPlugin` against an installed engine (Linux, UE 5.3.2) failed with `-Wdelete-incomplete` on `TUniquePtr<FAurixNativeClient>` / `TUniquePtr<FAurixAudioCapture>`.
+- Unreal: `AurixVoice` links `AudioExtensions`; the editor target of the plugin failed to link (`IAudioProxyDataFactory::CreateNewProxyData` undefined for `UAurixVoiceSoundWave` / `UAurixParticipantSoundWave`).
 
 ## [1.12.1] - 2026-10-26
 
