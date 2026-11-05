@@ -400,13 +400,13 @@ What has been verified in this repository:
   `*_API` export of public `UCLASS`es, every `AddDynamic` handler is a `UFUNCTION`, module
   dependency direction (samples → AurixVoice → ThirdParty, no cycles, no direct ABI use).
 
-What has **not** been run here, because no Unreal Engine installation is available in the
-development environment: Unreal Header Tool and the actual module compile on UE 5.3+, the
-`AudioCaptureCore` stream callback signature (`Audio::FOnAudioCaptureFunction`,
-`OpenAudioCaptureStream`) and `USoundWaveProcedural::GeneratePCMData` semantics against a live
-engine, the `HTTP` module request/response API used by `AurixRegionDiscovery.cpp`, packaging on
-Windows/macOS, `RunUAT BuildPlugin` and the Fab/Marketplace packaging conventions in
-`Docs/Packaging.md` (the CI job runs `BuildPlugin` inside Epic's `dev-slim` container only when
+Verified against an installed engine: `RunUAT BuildPlugin -TargetPlatforms=Linux -Rocket` on
+UE 5.3.2 (Epic's `dev-5.3.2` Linux image) compiles both modules for the editor and the Linux
+runtime target and packages the plugin. What has **not** been run: the same on Windows/macOS,
+a live-engine check of the `AudioCaptureCore` stream callback (`Audio::FOnAudioCaptureFunction`,
+`OpenAudioCaptureStream`) and `USoundWaveProcedural::GeneratePCMData` semantics at runtime, the
+`HTTP` requests in `AurixRegionDiscovery.cpp` against a server, and the Fab/Marketplace
+packaging conventions in `Docs/Packaging.md` (the CI job runs `BuildPlugin` inside Epic's `dev` container only when
 the repository has `UE_GHCR_TOKEN` / `UE_GHCR_USER` from an Epic-linked GitHub account; without
 them it prints a notice and does not claim a compile). Treat the first build in your project as a required
 verification step; the plugin sources are small and any mismatch surfaces as a compile error

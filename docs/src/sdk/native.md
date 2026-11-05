@@ -764,8 +764,8 @@ committed headers (and that `AurixVoiceSamples` never reaches the C ABI). The `u
 `sdk/unreal/scripts/check_plugin.py` — descriptor schema/URLs/version parity, packaging files,
 `.generated.h` / `GENERATED_BODY` / `*_API` / `UFUNCTION`-handler conventions, module dependency
 direction — and, only when the repository has `UE_GHCR_TOKEN` + `UE_GHCR_USER` from an
-Epic-linked GitHub account, `RunUAT BuildPlugin -TargetPlatforms=Linux -Rocket -StrictIncludes`
-inside Epic's `ghcr.io/epicgames/unreal-engine:dev-slim-5.3.2` image with the packaged plugin
+Epic-linked GitHub account, `RunUAT BuildPlugin -TargetPlatforms=Linux -Rocket`
+inside Epic's `ghcr.io/epicgames/unreal-engine:dev-5.3.2` image with the packaged plugin
 as an artifact; without the secrets it prints a notice and does **not** claim a compile.
 **Not** verified here: Unreal Header Tool and the module compile against a live
 UE 5.3+ install (`AudioCaptureCore` callback signature, `USoundWaveProcedural::GeneratePCMData`)

@@ -898,8 +898,11 @@ jobs:
       # Epic's Linux development image; pulling it requires a GitHub account linked to an Epic
       # Games account (https://github.com/EpicGames/UnrealEngine access) and a PAT with
       # read:packages stored as UE_GHCR_TOKEN (+ UE_GHCR_USER). Override the tag with the
-      # UE_CONTAINER_IMAGE repository variable.
-      UE_IMAGE: ${{ vars.UE_CONTAINER_IMAGE || 'ghcr.io/epicgames/unreal-engine:dev-slim-5.3.2' }}
+      # UE_CONTAINER_IMAGE repository variable. The full `dev` image is required: `dev-slim`
+      # ships no UnrealEditor precompiled manifests, so BuildPlugin's editor target cannot build
+      # there (slim only supports `-NoHostPlatform`). The image is ~20 GB compressed / ~80 GB on
+      # disk — run this job on a self-hosted runner with the image pre-pulled.
+      UE_IMAGE: ${{ vars.UE_CONTAINER_IMAGE || 'ghcr.io/epicgames/unreal-engine:dev-5.3.2' }}
       HAS_UE_ACCESS: ${{ secrets.UE_GHCR_TOKEN != '' && secrets.UE_GHCR_USER != '' }}
     steps:
       - uses: actions/checkout@v4
@@ -917,7 +920,9 @@ jobs:
       - name: Log in to GHCR with the Epic-linked account
         if: env.HAS_UE_ACCESS == 'true'
         run: echo "${{ secrets.UE_GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.UE_GHCR_USER }}" --password-stdin
-      - name: RunUAT BuildPlugin (Linux, -Rocket -StrictIncludes) inside ${{ env.UE_IMAGE }}
+      # No -StrictIncludes: it implies -DisableUnity, and UBT then looks for `UnrealEditorNU` /
+      # `UnrealGameNU` engine intermediates that installed (Rocket) Linux builds do not ship.
+      - name: RunUAT BuildPlugin (Linux, -Rocket) inside ${{ env.UE_IMAGE }}
         if: env.HAS_UE_ACCESS == 'true'
         run: |
           set -euo pipefail
@@ -928,7 +933,7 @@ jobs:
             "$UE_IMAGE" \
             /home/ue4/UnrealEngine/Engine/Build/BatchFiles/RunUAT.sh BuildPlugin \
               -Plugin=/plugin/AurixVoice.uplugin -Package=/package \
-              -TargetPlatforms=Linux -Rocket -StrictIncludes
+              -TargetPlatforms=Linux -Rocket
           test -f out/AurixVoice/AurixVoice.uplugin
           ls out/AurixVoice/Binaries/Linux
       - uses: actions/upload-artifact@v4

@@ -26,13 +26,13 @@ sdk\unreal\scripts\build_native.ps1                    # Windows host (MSVC .lib
 Engine/Build/BatchFiles/RunUAT.sh BuildPlugin \
   -Plugin=/abs/path/sdk/unreal/AurixVoice/AurixVoice.uplugin \
   -Package=/abs/path/out/AurixVoice \
-  -TargetPlatforms=Linux -StrictIncludes -Rocket
+  -TargetPlatforms=Linux -Rocket
 ```
 
-Windows: `RunUAT.bat BuildPlugin -Plugin=... -Package=... -TargetPlatforms=Win64 -StrictIncludes -Rocket`.
+Windows: `RunUAT.bat BuildPlugin -Plugin=... -Package=... -TargetPlatforms=Win64 -Rocket`.
 
 * `-Rocket` compiles the way an installed (launcher) engine does, which is what Fab requires.
-* `-StrictIncludes` catches missing includes that a unity build would hide.
+* `-StrictIncludes` catches missing includes that a unity build would hide, but it does not work against installed (Rocket) engine builds on Linux: it disables unity, and UBT then looks for `UnrealEditorNU` / `UnrealGameNU` engine intermediates that the installed build does not ship. Use it only against a source-built engine.
 * The `lib/<Platform>` folder for every `-TargetPlatforms` entry must be staged first; the
   ThirdParty module throws at UBT time otherwise.
 * The output folder is what you upload or drop into another project's `Plugins/`; it contains
@@ -63,7 +63,7 @@ the ABIs the build targets into the APK, loads `aurix_client` before the game mo
 2. **Gated:** when the repository has the `UE_GHCR_TOKEN` secret (a GitHub token of an account
    in the Epic Games organisation, which is what `ghcr.io/epicgames/unreal-engine` requires),
    the job stages the native library, logs in to GHCR, runs `RunUAT BuildPlugin` for Linux inside
-   the `dev-slim-5.3` image and uploads the packaged plugin as an artifact. Without the secret
+   the `dev-5.3.2` image (the slim image has no UnrealEditor precompiled manifests, so only the runtime target compiles there) and uploads the packaged plugin as an artifact. Without the secret
    the steps are skipped and the job reports that the engine build did not run — nothing in this
    repository claims a UE compile it did not perform.
 
