@@ -48,7 +48,7 @@ bool FAurixAudioCapture::Start(AurixClient* InClient, int32 DeviceIndex)
 		if (Injector.IsActive())
 		{
 			const int32 Count = NumFrames * NumChannels;
-			InjectScratch.SetNumUninitialized(Count, false);
+			InjectScratch.SetNumUninitialized(Count, AURIX_NO_SHRINK);
 			FMemory::Memcpy(InjectScratch.GetData(), Pcm, Count * sizeof(float));
 			Injector.Mix(InjectScratch.GetData(), NumFrames, NumChannels, InSampleRate);
 			Pcm = InjectScratch.GetData();
@@ -178,7 +178,7 @@ void FAurixAudioInjector::Mix(float* InOut, int32 NumFrames, int32 NumChannels, 
 
 void FAurixAudioInjector::Pull(TArray<float>& Out, int32 NumFrames, int32 NumChannels, int32 OutRate)
 {
-	Out.SetNumZeroed(NumFrames * NumChannels, false);
+	Out.SetNumZeroed(NumFrames * NumChannels, AURIX_NO_SHRINK);
 	FScopeLock Guard(&Lock);
 	for (int32 F = 0; F < NumFrames && bActive.load(); ++F)
 	{
