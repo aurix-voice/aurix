@@ -174,9 +174,16 @@ pub struct TurnHandler {
     max_allocations: u32,
     allocation_lifetime: i64,
     relay: RelayAddressing,
+    meter: std::sync::OnceLock<Arc<aurix_common::usage::UsageMeter>>,
 }
 
 impl TurnHandler {
+    /// Relayed bytes are metered per application once a meter is attached; before that (and
+    /// on a standalone TURN node) they are only counted on the allocation.
+    pub fn set_usage_meter(&self, meter: Arc<aurix_common::usage::UsageMeter>) {
+        let _ = self.meter.set(meter);
+    }
+
     pub fn new(
         realm: String,
         auth_secret: String,
@@ -197,6 +204,7 @@ impl TurnHandler {
             max_allocations,
             allocation_lifetime: allocation_lifetime.clamp(60, MAX_LIFETIME_SECS as i64),
             relay,
+            meter: std::sync::OnceLock::new(),
         }
     }
 
@@ -268,13 +276,8 @@ impl TurnHandler {
             let Some(binding) = alloc.get_channel_binding(number) else {
                 return;
             };
-            (
-                alloc.relay_socket.clone(),
-                binding.peer_addr,
-                alloc
-                    .bytes_relayed_out
-                    .fetch_add(len as u64, Ordering::Relaxed),
-            )
+            alloc.relayed_out(len);
+            (alloc.relay_socket.clone(), binding.peer_addr)
         };
         let _ = target.0.send_to(payload, target.1).await;
     }
@@ -575,6 +578,7 @@ impl TurnHandler {
             auth.username.clone(),
             self.realm.clone(),
             lifetime as i64,
+            self.meter.get().cloned(),
         );
         let closer = allocation.closer.clone();
         self.spawn_relay_task(client, relay_socket, relay_port, closer, sink.clone());
@@ -631,9 +635,7 @@ impl TurnHandler {
                     if alloc.is_expired() || !alloc.has_permission(&peer.ip()) {
                         continue;
                     }
-                    alloc
-                        .bytes_relayed_in
-                        .fetch_add(len as u64, Ordering::Relaxed);
+                    alloc.relayed_in(len);
                     match alloc.get_channel_for_peer(&peer) {
                         Some(ch) => {
                             let mut cd = BytesMut::with_capacity(4 + len + 3);
@@ -904,9 +906,7 @@ impl TurnHandler {
                 );
                 return Ok(());
             }
-            alloc
-                .bytes_relayed_out
-                .fetch_add(data.value.len() as u64, Ordering::Relaxed);
+            alloc.relayed_out(data.value.len());
             alloc.relay_socket.clone()
         };
         let _ = target.send_to(&data.value, peer).await;

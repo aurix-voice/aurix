@@ -184,6 +184,7 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
             "recording_seconds": t.recording_seconds,
             "media_bytes_in": t.media_bytes_in,
             "media_bytes_out": t.media_bytes_out,
+            "turn_bytes": t.turn_bytes,
             "chat_messages": t.chat_messages,
             "tts_requests": t.tts_requests,
             "tts_characters": t.tts_characters,
@@ -211,7 +212,7 @@ fn totals_json(t: Option<UsageTotalsRow>) -> serde_json::Value {
         None => serde_json::json!({
             "peak_sessions": 0, "session_minutes": 0.0, "sessions_started": 0,
             "peak_participants": 0, "participant_minutes": 0.0, "recording_seconds": 0.0,
-            "media_bytes_in": 0, "media_bytes_out": 0, "chat_messages": 0,
+            "media_bytes_in": 0, "media_bytes_out": 0, "turn_bytes": 0, "chat_messages": 0,
             "tts_requests": 0, "tts_characters": 0, "stt_audio_ms": 0,
             "quality_samples": 0, "mos_sum_milli": 0, "rtt_sum_ms": 0,
             "jitter_sum_ms": 0, "loss_sum_permille": 0, "poor_quality_samples": 0,
@@ -483,7 +484,7 @@ async fn quota_body(
     }))
 }
 
-const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples,audio_quality_samples,audio_mos_sum_milli,concealed_sum_permille,joins_refused";
+const APP_CSV_HEADER: &str = "app_id,bucket,peak_sessions,session_minutes,sessions_started,unique_users,peak_participants,participant_minutes,active_channels,recording_seconds,media_bytes_in,media_bytes_out,turn_bytes,chat_messages,tts_requests,tts_characters,stt_audio_ms,quality_samples,mos_sum_milli,rtt_sum_ms,jitter_sum_ms,loss_sum_permille,poor_quality_samples,audio_quality_samples,audio_mos_sum_milli,concealed_sum_permille,joins_refused";
 const CHANNEL_CSV_HEADER: &str = "app_id,channel_id,bucket,peak_participants,participant_minutes,joins,unique_users,chat_messages,tts_requests,tts_characters,stt_audio_ms";
 
 fn app_csv(rows: &[UsageAppBucketRow]) -> String {
@@ -492,7 +493,7 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
     out.push('\n');
     for r in rows {
         out.push_str(&format!(
-            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{:.4},{},{},{},{:.4},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.app_id,
             r.bucket.to_rfc3339(),
             r.peak_sessions,
@@ -505,6 +506,7 @@ fn app_csv(rows: &[UsageAppBucketRow]) -> String {
             r.recording_seconds,
             r.media_bytes_in,
             r.media_bytes_out,
+            r.turn_bytes,
             r.chat_messages,
             r.tts_requests,
             r.tts_characters,
@@ -818,6 +820,7 @@ mod tests {
             recording_seconds: 0.0,
             media_bytes_in: 100,
             media_bytes_out: 200,
+            turn_bytes: 0,
             chat_messages: 5,
             tts_requests: 0,
             tts_characters: 0,

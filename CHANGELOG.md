@@ -11,6 +11,12 @@ released together.
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-05
+
+### Added
+- **TURN relay accounting.** The built-in TURN server attributes relayed bytes to the application whose time-limited credentials opened the allocation; they are metered per 5-minute bucket as `turn_bytes` (`usage_app_buckets`), returned in `GET /v1/analytics` and `/admin/analytics/apps/{id}` totals and series, and included in the analytics CSV export. Server SDK types carry the new field.
+
+### Changed
 - Unreal: the plugin now builds on UE 5.3 – 5.8. The modules use the engine's default C++
   standard instead of forcing C++17 (UE 5.6+ headers need C++20), capture buffers use
   `EAllowShrinking` on 5.4+, and `BuildPlugin` packaging is verified on Epic's Linux images:

@@ -445,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
 
     if config.turn.enabled {
         let turn_server = Arc::new(TurnServer::new(&config.turn, &config.media));
+        turn_server.set_usage_meter(control.usage.meter());
         let cancel = shutdown.clone();
         tasks.spawn(async move {
             tokio::select! {

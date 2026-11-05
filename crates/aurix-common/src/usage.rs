@@ -22,6 +22,8 @@ pub enum UsageMetric {
     MediaBytesIn,
     /// Media bytes sent to clients.
     MediaBytesOut,
+    /// Bytes relayed by the TURN server for the app's players (both directions).
+    TurnBytes,
     /// Chat messages accepted (channel and direct).
     ChatMessages,
     /// Text-to-speech requests accepted.
@@ -55,9 +57,10 @@ pub enum UsageMetric {
 }
 
 impl UsageMetric {
-    pub const ALL: [UsageMetric; 16] = [
+    pub const ALL: [UsageMetric; 17] = [
         UsageMetric::MediaBytesIn,
         UsageMetric::MediaBytesOut,
+        UsageMetric::TurnBytes,
         UsageMetric::ChatMessages,
         UsageMetric::TtsRequests,
         UsageMetric::TtsCharacters,
@@ -79,6 +82,7 @@ impl UsageMetric {
         match self {
             UsageMetric::MediaBytesIn => "media_bytes_in",
             UsageMetric::MediaBytesOut => "media_bytes_out",
+            UsageMetric::TurnBytes => "turn_bytes",
             UsageMetric::ChatMessages => "chat_messages",
             UsageMetric::TtsRequests => "tts_requests",
             UsageMetric::TtsCharacters => "tts_characters",
@@ -129,6 +133,14 @@ pub struct UsageDelta {
 #[derive(Default)]
 pub struct UsageMeter {
     counters: DashMap<UsageKey, AtomicU64>,
+}
+
+impl std::fmt::Debug for UsageMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageMeter")
+            .field("counters", &self.counters.len())
+            .finish()
+    }
 }
 
 impl UsageMeter {

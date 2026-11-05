@@ -45,6 +45,11 @@ impl TurnServer {
     }
 
     /// Bind the UDP and TCP listeners and serve until the UDP loop ends.
+    /// Attributes relayed bytes to applications in the shared usage meter.
+    pub fn set_usage_meter(&self, meter: Arc<aurix_common::usage::UsageMeter>) {
+        self.handler.set_usage_meter(meter);
+    }
+
     pub async fn run(&self) -> Result<()> {
         let (socket, _tcp) = self.bind().await?;
         self.serve_udp(socket).await

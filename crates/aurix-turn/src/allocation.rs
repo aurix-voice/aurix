@@ -43,6 +43,10 @@ pub struct Allocation {
     pub closer: Arc<Notify>,
     pub bytes_relayed_in: std::sync::atomic::AtomicU64,
     pub bytes_relayed_out: std::sync::atomic::AtomicU64,
+    /// Application whose credentials opened the allocation (`<expiry>:<app>/<user>`), so
+    /// relayed bytes land in that app's usage; `None` for usernames of another shape.
+    pub app_id: Option<aurix_common::types::AppId>,
+    meter: Option<Arc<aurix_common::usage::UsageMeter>>,
 }
 
 impl Allocation {
@@ -53,8 +57,13 @@ impl Allocation {
         username: String,
         realm: String,
         lifetime_secs: i64,
+        meter: Option<Arc<aurix_common::usage::UsageMeter>>,
     ) -> Self {
         let now = Utc::now();
+        let app_id = aurix_common::crypto::parse_turn_username(&username)
+            .and_then(|(_, user)| user.split_once('/'))
+            .and_then(|(app, _)| app.parse().ok())
+            .map(aurix_common::types::AppId);
         Self {
             id: Uuid::now_v7(),
             client,
@@ -69,6 +78,33 @@ impl Allocation {
             closer: Arc::new(Notify::new()),
             bytes_relayed_in: std::sync::atomic::AtomicU64::new(0),
             bytes_relayed_out: std::sync::atomic::AtomicU64::new(0),
+            app_id,
+            meter,
+        }
+    }
+
+    /// Counts bytes relayed from a peer towards the client.
+    pub fn relayed_in(&self, len: usize) {
+        self.bytes_relayed_in
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        self.meter(len);
+    }
+
+    /// Counts bytes relayed from the client towards a peer.
+    pub fn relayed_out(&self, len: usize) {
+        self.bytes_relayed_out
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        self.meter(len);
+    }
+
+    fn meter(&self, len: usize) {
+        if let (Some(m), Some(app)) = (&self.meter, self.app_id) {
+            m.record(
+                app,
+                None,
+                aurix_common::usage::UsageMetric::TurnBytes,
+                len as u64,
+            );
         }
     }
 

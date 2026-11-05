@@ -24,6 +24,7 @@ pub struct UsageAppBucketRow {
     pub recording_seconds: f64,
     pub media_bytes_in: i64,
     pub media_bytes_out: i64,
+    pub turn_bytes: i64,
     pub chat_messages: i64,
     pub tts_requests: i64,
     pub tts_characters: i64,
@@ -69,6 +70,7 @@ pub struct UsageTotalsRow {
     pub recording_seconds: f64,
     pub media_bytes_in: i64,
     pub media_bytes_out: i64,
+    pub turn_bytes: i64,
     pub chat_messages: i64,
     pub tts_requests: i64,
     pub tts_characters: i64,
@@ -339,9 +341,10 @@ pub async fn aggregate_channel_buckets(
     Ok(rows)
 }
 
-const METERED_COLUMNS: [&str; 16] = [
+const METERED_COLUMNS: [&str; 17] = [
     "media_bytes_in",
     "media_bytes_out",
+    "turn_bytes",
     "chat_messages",
     "tts_requests",
     "tts_characters",
@@ -480,6 +483,7 @@ pub async fn app_series_rollup(
                   SUM(recording_seconds) AS recording_seconds,
                   SUM(media_bytes_in)::bigint AS media_bytes_in,
                   SUM(media_bytes_out)::bigint AS media_bytes_out,
+                  SUM(turn_bytes)::bigint AS turn_bytes,
                   SUM(chat_messages)::bigint AS chat_messages,
                   SUM(tts_requests)::bigint AS tts_requests,
                   SUM(tts_characters)::bigint AS tts_characters,
@@ -606,6 +610,7 @@ const TOTALS_SELECT: &str = r#"SELECT app_id,
            SUM(recording_seconds) AS recording_seconds,
            SUM(media_bytes_in)::bigint AS media_bytes_in,
            SUM(media_bytes_out)::bigint AS media_bytes_out,
+                  SUM(turn_bytes)::bigint AS turn_bytes,
            SUM(chat_messages)::bigint AS chat_messages,
            SUM(tts_requests)::bigint AS tts_requests,
            SUM(tts_characters)::bigint AS tts_characters,
