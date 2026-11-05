@@ -98,6 +98,9 @@ class AURIXVOICE_API UAurixVoiceSubsystem : public UGameInstanceSubsystem, publi
 
 public:
 	UAurixVoiceSubsystem();
+	// Declared here so the UHT-generated vtable-helper constructor is defined in the .cpp, where the
+	// pimpl types behind the TUniquePtr members below are complete.
+	UAurixVoiceSubsystem(FVTableHelper& Helper);
 	virtual ~UAurixVoiceSubsystem() override;
 
 	//~ USubsystem

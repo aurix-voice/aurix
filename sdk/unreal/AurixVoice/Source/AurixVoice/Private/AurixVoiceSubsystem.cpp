@@ -727,6 +727,7 @@ bool Check(AurixResult R, const TCHAR* What)
 } // namespace
 
 UAurixVoiceSubsystem::UAurixVoiceSubsystem() = default;
+UAurixVoiceSubsystem::UAurixVoiceSubsystem(FVTableHelper& Helper) : Super(Helper) {}
 UAurixVoiceSubsystem::~UAurixVoiceSubsystem() = default;
 
 void UAurixVoiceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
