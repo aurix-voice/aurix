@@ -11,6 +11,10 @@ released together.
 
 ## [Unreleased]
 
+- Unreal: the plugin now builds on UE 5.3 – 5.8. The modules use the engine's default C++
+  standard instead of forcing C++17 (UE 5.6+ headers need C++20), capture buffers use
+  `EAllowShrinking` on 5.4+, and `BuildPlugin` packaging is verified on Epic's Linux images:
+  editor + Linux on 5.3.2, runtime target on 5.5.4 / 5.6.1 / 5.7.4 / 5.8.4.
 ### Fixed
 - Unreal: `UAurixVoiceSubsystem` declares the `FVTableHelper` constructor so the UHT-generated vtable helper is compiled in the module source where the pimpl types are complete; `RunUAT BuildPlugin` against an installed engine (Linux, UE 5.3.2) failed with `-Wdelete-incomplete` on `TUniquePtr<FAurixNativeClient>` / `TUniquePtr<FAurixAudioCapture>`.
 - Unreal: `AurixVoice` links `AudioExtensions`; the editor target of the plugin failed to link (`IAudioProxyDataFactory::CreateNewProxyData` undefined for `UAurixVoiceSoundWave` / `UAurixParticipantSoundWave`).

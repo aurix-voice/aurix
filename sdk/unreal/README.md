@@ -1,6 +1,6 @@
 # Aurix Voice plugin for Unreal Engine
 
-`AurixVoice` is a runtime plugin (UE 5.3+, Win64 / Linux / Mac) that wraps the native
+`AurixVoice` is a runtime plugin (UE 5.3 – 5.8, Win64 / Linux / Mac) that wraps the native
 [`aurix-client`](../../crates/aurix-client/README.md) library through its stable C ABI. The
 plugin contains **no** protocol, crypto, networking or codec code of its own: AURX v2 over UDP,
 the WebSocket control plane, Opus, jitter buffering, VAD, directional mixing and
@@ -400,9 +400,11 @@ What has been verified in this repository:
   `*_API` export of public `UCLASS`es, every `AddDynamic` handler is a `UFUNCTION`, module
   dependency direction (samples → AurixVoice → ThirdParty, no cycles, no direct ABI use).
 
-Verified against an installed engine: `RunUAT BuildPlugin -TargetPlatforms=Linux -Rocket` on
-UE 5.3.2 (Epic's `dev-5.3.2` Linux image) compiles both modules for the editor and the Linux
-runtime target and packages the plugin. What has **not** been run: the same on Windows/macOS,
+Verified against installed engines (Epic's Linux container images): `RunUAT BuildPlugin
+-TargetPlatforms=Linux -Rocket` on UE 5.3.2 (`dev-5.3.2`) compiles both modules for the editor
+and the Linux runtime target and packages the plugin; the runtime target (`-NoHostPlatform`) also
+compiles warning-free on 5.5.4, 5.6.1, 5.7.4 and 5.8.4 (`dev-slim-*`). The modules use the
+engine's default C++ standard (C++17 on 5.3, C++20 from 5.6). What has **not** been run: the same on Windows/macOS,
 a live-engine check of the `AudioCaptureCore` stream callback (`Audio::FOnAudioCaptureFunction`,
 `OpenAudioCaptureStream`) and `USoundWaveProcedural::GeneratePCMData` semantics at runtime, the
 `HTTP` requests in `AurixRegionDiscovery.cpp` against a server, and the Fab/Marketplace

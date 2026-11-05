@@ -622,7 +622,7 @@ C++: `aurix::Regions` (RAII: `discovery_url`, `parse`, `set_rtt`, `rank`, `all`)
 
 ## Unreal plugin
 
-`sdk/unreal/AurixVoice` is a runtime plugin for UE 5.3+ (Win64 / Linux / Mac). It contains no
+`sdk/unreal/AurixVoice` is a runtime plugin for UE 5.3 – 5.8 (Win64 / Linux / Mac). It contains no
 protocol, crypto or codec code: `UAurixVoiceSubsystem` (a `UGameInstanceSubsystem`) pumps native
 events into Blueprint delegates on the game thread, feeds the engine `AudioCapture` microphone
 into `aurix_client_push_capture_f32` and plays the remote mix through a procedural 48 kHz stereo
@@ -767,9 +767,7 @@ direction — and, only when the repository has `UE_GHCR_TOKEN` + `UE_GHCR_USER`
 Epic-linked GitHub account, `RunUAT BuildPlugin -TargetPlatforms=Linux -Rocket`
 inside Epic's `ghcr.io/epicgames/unreal-engine:dev-5.3.2` image with the packaged plugin
 as an artifact; without the secrets it prints a notice and does **not** claim a compile.
-**Not** verified here: Unreal Header Tool and the module compile against a live
-UE 5.3+ install (`AudioCaptureCore` callback signature, `USoundWaveProcedural::GeneratePCMData`)
-, `BuildPlugin` itself and packaging of a game on Windows/macOS — treat the first build in your project as a required
-step; any
-mismatch surfaces as a compile error in `AurixAudioCapture.cpp`, `AurixVoiceSoundWave.cpp` or
-the sample components.
+Verified on Epic's Linux images: editor + Linux runtime on UE 5.3.2, runtime target on 5.5.4,
+5.6.1, 5.7.4 and 5.8.4 — all warning-free. **Not** verified: packaging on Windows/macOS and the
+runtime behaviour of `AudioCaptureCore` / `USoundWaveProcedural` in a live game — treat the
+first build in your project as a required step.
