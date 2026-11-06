@@ -261,6 +261,36 @@ DNS name and TLS certificate in front of every node (the Helm chart and Terrafor
 this) and keep the shared hostname for the REST API. Cross-region channels still work through
 cascade — with WAN latency between the nodes, so let players of one party land in one region.
 
+### One cell across regions
+
+A cell is one Postgres, one Redis, one JWT secret and one `media.cascade_secret`; the nodes
+that share them can sit anywhere. That is how a single pool serves several regions without
+splitting players into islands: every region gets media nodes with their own `server.region`,
+`server.external_url` / `external_ws_url` (a per-node hostname and certificate) and public media
+address, while the database and Redis stay in one place. What such a layout needs:
+
+* **A private path to the database.** Postgres/Redis are not on the media path (a join or a
+  roster event tolerates 100 ms to the database; audio never touches it), but they must not be
+  on the public Internet either. Put the cell on a private network — a WireGuard mesh with the
+  database host as hub is enough: Postgres/Redis listen on the hub's mesh address only, every
+  remote node is a peer with a /32, nothing else is exposed. Provider VPCs that span regions
+  work the same way.
+* **UDP between nodes.** Cascade probes and relays over the cascade port (UDP, TCP fallback when
+  UDP is filtered) and the mesh itself is UDP; cloud firewalls often allow outbound UDP only to
+  53/123 by default, so open the mesh and cascade ports in both directions before blaming the
+  software. `cascade.connected` in `/health` and the links table in `GET /v1/nodes` show which
+  pairs actually talk.
+* **`region_tree` with one hub per region** (above) keeps the WAN hop to one copy per region;
+  the first node in a new region simply becomes its hub.
+* **Discovery follows the nodes.** As soon as a healthy node in a region advertises a `wss://`
+  URL it is offered by `GET /v1/regions`; the SDKs probe it and the nearest players land
+  there. Nothing else has to be configured for the new region — no regional API hostname, no
+  DNS geo-steering.
+
+Isolated cells (a dedicated deployment per project or per publisher) do not bridge to each
+other by design: different databases, different keys. Use one cell per audience you want in the
+same channels, and regions inside it.
+
 ## Capacity
 
 A node's cost is dominated by the SFU fan-out (`speakers × (members − 1)` sealed packets per
