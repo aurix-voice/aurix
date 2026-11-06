@@ -494,7 +494,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             platform: Win64
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             platform: Mac
           - name: macOS x64

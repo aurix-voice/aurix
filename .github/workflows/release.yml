@@ -130,7 +130,7 @@ jobs:
             os: windows-latest
             platform: Win64
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             platform: Mac
           - target: x86_64-apple-darwin
             os: macos-15-intel
@@ -310,7 +310,7 @@ jobs:
   unreal-plugin:
     name: Unreal plugin zip (Win64 + Mac universal + Linux + Android)
     needs: [verify, native, native-mobile]
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
@@ -421,7 +421,7 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
           - name: macos.universal
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
           - name: android.arm64
             os: ubuntu-22.04
