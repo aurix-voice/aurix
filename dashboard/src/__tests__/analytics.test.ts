@@ -15,6 +15,7 @@ const bucket = (p: Partial<T.UsageAppBucket> & { bucket: string }): T.UsageAppBu
   recording_seconds: 0,
   media_bytes_in: 0,
   media_bytes_out: 0,
+  turn_bytes: 0,
   chat_messages: 0,
   tts_requests: 0,
   tts_characters: 0,

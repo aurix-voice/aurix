@@ -266,6 +266,23 @@ fn unreal_plugin_uses_only_existing_abi() {
 
     let declared_functions = identifiers(&header, "aurix_", true, &['(']);
     let declared_constants = identifiers(&header, "AURIX_", true, &[' ', ',', '\n']);
+    // Macros the plugin defines for itself (engine-version shims) are not ABI constants.
+    let plugin_defined: std::collections::HashSet<String> = sources
+        .iter()
+        .flat_map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    l.trim()
+                        .strip_prefix("#define ")
+                        .and_then(|r| r.split_whitespace().next())
+                        .filter(|n| n.starts_with("AURIX_"))
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let mut checked = 0usize;
     for path in sources {
         let text = std::fs::read_to_string(&path).unwrap();
@@ -278,6 +295,9 @@ fn unreal_plugin_uses_only_existing_abi() {
             checked += 1;
         }
         for constant in identifiers(&text, "AURIX_", true, &[')', ',', ':', ';', ' ']) {
+            if plugin_defined.contains(constant) {
+                continue;
+            }
             assert!(
                 declared_constants.contains(&constant),
                 "{} uses {constant}, which include/aurix_client.h does not define",
