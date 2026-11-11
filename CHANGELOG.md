@@ -6,6 +6,9 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+### Fixed
+- Projects without the Input System package no longer fail to compile: the push-to-talk `InputActionReference` field is guarded by a `com.unity.inputsystem` version define (`AURIX_INPUTSYSTEM`) and the assembly references `Unity.InputSystem` only when present.
+
 ## [1.8.2] — 2026-10-22
 
 - Push-to-talk out of the box on `AurixVoiceBehaviour`: `PushToTalkKey` (legacy input) or an Input System action (keyboard / gamepad), hold or toggle, release delay; `OnPushToTalkChanged` for HUDs. The state machine is `Aurix.Audio.PushToTalkState` (engine-free, unit-tested).

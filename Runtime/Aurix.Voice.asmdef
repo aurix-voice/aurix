@@ -1,7 +1,7 @@
 {
   "name": "Aurix.Voice",
   "rootNamespace": "Aurix",
-  "references": [],
+  "references": [ "Unity.InputSystem" ],
   "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
@@ -9,5 +9,6 @@
   "precompiledReferences": [],
   "autoReferenced": true,
   "defineConstraints": [],
+  "versionDefines": [ { "name": "com.unity.inputsystem", "expression": "", "define": "AURIX_INPUTSYSTEM" } ],
   "noEngineReferences": false
 }

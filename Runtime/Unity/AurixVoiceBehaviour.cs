@@ -122,7 +122,7 @@ namespace Aurix.Unity
         public bool PushToTalkToggle = false;
         [Tooltip("Keep transmitting this long after the key is released so the last word is not cut (seconds).")]
         [Range(0f, 1f)] public float PushToTalkReleaseDelay = 0.15f;
-#if ENABLE_INPUT_SYSTEM
+#if ENABLE_INPUT_SYSTEM && AURIX_INPUTSYSTEM
         [Tooltip("Input System action (button) for push-to-talk — keyboard, gamepad or any binding. Used when set.")]
         public UnityEngine.InputSystem.InputActionReference PushToTalkAction;
 #endif
@@ -754,7 +754,7 @@ namespace Aurix.Unity
         {
             get
             {
-#if ENABLE_INPUT_SYSTEM
+#if ENABLE_INPUT_SYSTEM && AURIX_INPUTSYSTEM
                 if (PushToTalkAction != null && PushToTalkAction.action != null) return true;
 #endif
                 return PushToTalkKey != KeyCode.None;
@@ -763,7 +763,7 @@ namespace Aurix.Unity
 
         private bool PushToTalkPressedNow()
         {
-#if ENABLE_INPUT_SYSTEM
+#if ENABLE_INPUT_SYSTEM && AURIX_INPUTSYSTEM
             if (PushToTalkAction != null && PushToTalkAction.action != null)
             {
                 var a = PushToTalkAction.action;
@@ -771,7 +771,7 @@ namespace Aurix.Unity
                 return PushToTalkToggle ? a.WasPressedThisFrame() : a.IsPressed();
             }
 #endif
-#if ENABLE_LEGACY_INPUT_MANAGER || !ENABLE_INPUT_SYSTEM
+#if ENABLE_LEGACY_INPUT_MANAGER || !(ENABLE_INPUT_SYSTEM && AURIX_INPUTSYSTEM)
             if (PushToTalkKey != KeyCode.None)
                 return PushToTalkToggle ? Input.GetKeyDown(PushToTalkKey) : Input.GetKey(PushToTalkKey);
 #endif
