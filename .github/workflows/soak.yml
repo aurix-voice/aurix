@@ -27,7 +27,7 @@ jobs:
     # Hosted runners cap a job at 6 h; the run itself is bounded by AURIX_SOAK_DURATION.
     timeout-minutes: 350
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake jq
@@ -52,7 +52,7 @@ jobs:
         run: |
           [ -f target/soak/summary.json ] && jq . target/soak/summary.json || true
           for f in target/soak/node*.log; do echo "::group::$f"; tail -n 300 "$f"; echo "::endgroup::"; done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: soak-${{ inputs.redis || 'sentinel' }}-${{ github.run_id }}
