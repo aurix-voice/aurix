@@ -22,7 +22,7 @@ use aurix_db::DbPool;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use hmac::{Hmac, Mac, KeyInit};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
 use sha2::Sha256;
 use std::collections::HashMap;

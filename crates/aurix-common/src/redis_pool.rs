@@ -204,14 +204,11 @@ fn build_sentinel_client(config: &RedisConfig, master: &str) -> Result<SentinelC
         }
         sentinel_addrs.push(info.addr().clone());
     }
-    let mut builder = SentinelClientBuilder::new(
-        sentinel_addrs,
-        master,
-        SentinelServerType::Master,
-    )
-    .map_err(|e| AurixError::Redis(format!("Sentinel client: {e}")))?
-    .set_client_to_redis_db(data.redis_settings().db())
-    .set_client_to_redis_protocol(data.redis_settings().protocol());
+    let mut builder =
+        SentinelClientBuilder::new(sentinel_addrs, master, SentinelServerType::Master)
+            .map_err(|e| AurixError::Redis(format!("Sentinel client: {e}")))?
+            .set_client_to_redis_db(data.redis_settings().db())
+            .set_client_to_redis_protocol(data.redis_settings().protocol());
     if let Some(tls) = tls_mode(data.addr()) {
         builder = builder.set_client_to_redis_tls_mode(tls);
     }

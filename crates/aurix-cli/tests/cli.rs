@@ -127,7 +127,7 @@ async fn start_fake() -> (SocketAddr, Log) {
             }),
         )
         .route(
-            "/v1/channels/:id",
+            "/v1/channels/{id}",
             get(|State(l): State<Log>, AxPath(id): AxPath<String>, h: HeaderMap| async move {
                 record(&l, "GET", format!("/v1/channels/{id}"), HashMap::new(), &h, &Bytes::new());
                 if let Some(e) = needs_api_key(&h) {

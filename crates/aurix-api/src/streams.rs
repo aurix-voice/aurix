@@ -689,7 +689,9 @@ async fn run_pull(
     let id = receiver.id;
     let (mut sink, mut source) = socket.split();
     let to_message = |out: Outgoing| match out {
-        Outgoing::Control(c) => serde_json::to_string(&c).ok().map(|s| Message::Text(s.into())),
+        Outgoing::Control(c) => serde_json::to_string(&c)
+            .ok()
+            .map(|s| Message::Text(s.into())),
         Outgoing::Audio(b) => Some(Message::Binary(b.to_vec().into())),
     };
     for out in replay {

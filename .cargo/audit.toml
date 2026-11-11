@@ -8,5 +8,10 @@ ignore = [
     # libsqlite3-sys (C SQLite CVE-2026-119375). Present only through sqlx-sqlite, an optional
     # sqlx dependency this workspace never enables or compiles (Postgres only).
     "RUSTSEC-2026-0459",
+    # crypto-bigint 0.5 timing variability: reached only through jsonwebtoken's rust_crypto
+    # backend (p256/p384). Aurix uses ECDSA solely to *verify* OIDC provider tokens (ES256/ES384,
+    # public inputs); all tokens Aurix issues are HS256. The fixed crypto-bigint (>=0.7.6) needs
+    # elliptic-curve 0.14, which jsonwebtoken does not support yet.
+    "RUSTSEC-2026-0387",
 ]
 informational_warnings = ["unmaintained"]

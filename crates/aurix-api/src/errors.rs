@@ -45,7 +45,9 @@ where
         req: axum::extract::Request,
         state: &S,
     ) -> Result<Option<Self>, Self::Rejection> {
-        match <axum::Json<T> as axum::extract::OptionalFromRequest<S>>::from_request(req, state).await {
+        match <axum::Json<T> as axum::extract::OptionalFromRequest<S>>::from_request(req, state)
+            .await
+        {
             Ok(Some(axum::Json(v))) => Ok(Some(Json(v))),
             Ok(None) => Ok(None),
             Err(e) => Err(ApiError::from(e)),

@@ -12252,9 +12252,11 @@ async fn no_bind_reply(p: &mut Player, wait: Duration) -> bool {
 /// binary frame → sealed `SessionBindAck` back on the socket and `MediaBound { tunnel }`.
 async fn bind_tunnel(p: &mut Player) {
     let pkt = AurixPacket::session_bind(&p.session_id, p.ssrc, now_ms(), rand::random());
-    p.ws.send(Message::Binary(pkt.encode_authenticated(&p.keys).to_vec().into()))
-        .await
-        .unwrap();
+    p.ws.send(Message::Binary(
+        pkt.encode_authenticated(&p.keys).to_vec().into(),
+    ))
+    .await
+    .unwrap();
     let (mut acked, mut bound) = (false, false);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !(acked && bound) {

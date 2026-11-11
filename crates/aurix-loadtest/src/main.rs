@@ -681,9 +681,9 @@ async fn setup_session(
         _ => None,
     };
 
-    ws.send(Message::Text(serde_json::to_string(
-        &ControlMessage::ChannelJoin { channel_id, token },
-    )?.into()))
+    ws.send(Message::Text(
+        serde_json::to_string(&ControlMessage::ChannelJoin { channel_id, token })?.into(),
+    ))
     .await?;
     wait_for(&mut ws, tunnel, "join", |f| {
         matches!(f, Ok(ControlMessage::ChannelJoinAck { .. })).then_some(())
@@ -691,11 +691,12 @@ async fn setup_session(
     .await?;
 
     if args.mix {
-        ws.send(Message::Text(serde_json::to_string(
-            &ControlMessage::SetDownlinkMode {
+        ws.send(Message::Text(
+            serde_json::to_string(&ControlMessage::SetDownlinkMode {
                 mode: DownlinkMode::Mixed,
-            },
-        )?.into()))
+            })?
+            .into(),
+        ))
         .await?;
         wait_for(&mut ws, tunnel, "mixed downlink", |f| {
             matches!(
@@ -710,9 +711,9 @@ async fn setup_session(
         stats.mix_acked.fetch_add(1, Ordering::Relaxed);
     }
     if args.noise_suppression && is_speaker {
-        ws.send(Message::Text(serde_json::to_string(
-            &ControlMessage::SetNoiseSuppression { enabled: true },
-        )?.into()))
+        ws.send(Message::Text(
+            serde_json::to_string(&ControlMessage::SetNoiseSuppression { enabled: true })?.into(),
+        ))
         .await?;
         // A full pool answers with an error; the session is still valid and keeps speaking
         // uncleaned, which is what the capacity number is about.

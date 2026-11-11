@@ -59,10 +59,13 @@ impl TempDb {
         let mut conn = sqlx::PgConnection::connect(&self.admin_url)
             .await
             .expect("postgres");
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.name)))
-            .execute(&mut conn)
-            .await
-            .expect("drop database");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {} WITH (FORCE)",
+            self.name
+        )))
+        .execute(&mut conn)
+        .await
+        .expect("drop database");
     }
 }
 

@@ -29,8 +29,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use aes::cipher::{InnerIvInit, StreamCipher, StreamCipherCoreWrapper};
-use hmac::{Hmac, Mac};
 use hmac::KeyInit;
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;

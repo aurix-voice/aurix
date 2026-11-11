@@ -2,7 +2,7 @@
 
 use aurix_common::error::{AurixError, Result};
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac, KeyInit};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 

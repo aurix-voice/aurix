@@ -75,15 +75,15 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::create_admin).get(handlers::list_admins),
         )
         .route(
-            "/admin/admins/:admin_id",
+            "/admin/admins/{admin_id}",
             get(handlers::get_admin).patch(handlers::update_admin),
         )
         .route(
-            "/admin/admins/:admin_id/password",
+            "/admin/admins/{admin_id}/password",
             post(handlers::reset_admin_password),
         )
         .route(
-            "/admin/admins/:admin_id/logout-all",
+            "/admin/admins/{admin_id}/logout-all",
             post(handlers::revoke_admin_tokens),
         )
         .route("/admin/audit-log", get(handlers::admin_list_audit_logs))
@@ -97,20 +97,23 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::create_app).get(handlers::list_apps),
         )
         .route(
-            "/v1/apps/:app_id",
+            "/v1/apps/{app_id}",
             get(handlers::get_app)
                 .patch(handlers::update_app)
                 .delete(handlers::delete_app),
         )
         .route(
-            "/v1/apps/:app_id/rotate-key",
+            "/v1/apps/{app_id}/rotate-key",
             post(handlers::admin_rotate_app_key),
         )
         .route("/v1/nodes", get(handlers::list_media_nodes))
         .route("/v1/nodes/links", get(handlers::list_media_node_links))
-        .route("/v1/nodes/{node_id}/drain", post(handlers::drain_media_node))
         .route(
-            "/v1/nodes/:node_id/undrain",
+            "/v1/nodes/{node_id}/drain",
+            post(handlers::drain_media_node),
+        )
+        .route(
+            "/v1/nodes/{node_id}/undrain",
             post(handlers::undrain_media_node),
         )
         .route("/admin/analytics/usage", get(analytics::admin_usage))
@@ -119,7 +122,7 @@ pub fn create_router(state: AppState) -> Router {
             get(analytics::admin_export_usage),
         )
         .route(
-            "/admin/analytics/apps/:app_id",
+            "/admin/analytics/apps/{app_id}",
             get(analytics::admin_app_usage),
         )
         .layer(axum_middleware::from_fn_with_state(
@@ -138,92 +141,92 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::create_channel).get(handlers::list_channels),
         )
         .route(
-            "/v1/channels/:channel_id",
+            "/v1/channels/{channel_id}",
             get(handlers::get_channel).delete(handlers::delete_channel),
         )
         .route(
-            "/v1/channels/:channel_id/config",
+            "/v1/channels/{channel_id}/config",
             put(handlers::update_channel),
         )
         .route(
-            "/v1/channels/:channel_id/participants",
+            "/v1/channels/{channel_id}/participants",
             get(handlers::get_channel_participants),
         )
         .route(
-            "/v1/sessions/:session_id/stats",
+            "/v1/sessions/{session_id}/stats",
             get(handlers::get_session_stats),
         )
         .route("/v1/users", get(handlers::search_users))
         .route(
-            "/v1/users/:user_id",
+            "/v1/users/{user_id}",
             get(handlers::get_user).delete(handlers::delete_user),
         )
         .route("/v1/users/{user_id}/export", get(handlers::export_user))
         .route("/v1/users/{user_id}/unban", post(handlers::unban_user_all))
         .route(
-            "/v1/users/:user_id/blocks",
+            "/v1/users/{user_id}/blocks",
             get(handlers::list_user_blocks).post(handlers::add_user_block),
         )
         .route(
-            "/v1/users/:user_id/blocks/:blocked_user_id",
+            "/v1/users/{user_id}/blocks/{blocked_user_id}",
             delete(handlers::remove_user_block),
         )
         .route(
-            "/v1/channels/:channel_id/messages",
+            "/v1/channels/{channel_id}/messages",
             get(handlers::list_channel_messages).post(handlers::send_channel_message),
         )
         .route(
-            "/v1/channels/:channel_id/messages/search",
+            "/v1/channels/{channel_id}/messages/search",
             get(handlers::search_channel_messages),
         )
         .route(
-            "/v1/users/:user_id/messages",
+            "/v1/users/{user_id}/messages",
             get(handlers::list_user_messages).post(handlers::send_user_message),
         )
         .route(
-            "/v1/users/:user_id/messages/search",
+            "/v1/users/{user_id}/messages/search",
             get(handlers::search_user_messages),
         )
         .route(
-            "/v1/channels/:channel_id/transcripts",
+            "/v1/channels/{channel_id}/transcripts",
             get(handlers::list_channel_transcripts).delete(handlers::delete_channel_transcripts),
         )
         .route(
-            "/v1/users/:user_id/transcripts",
+            "/v1/users/{user_id}/transcripts",
             get(handlers::list_user_transcripts),
         )
         .route(
-            "/v1/transcripts/:transcript_id",
+            "/v1/transcripts/{transcript_id}",
             delete(handlers::delete_transcript),
         )
         .route(
-            "/v1/messages/:message_id",
+            "/v1/messages/{message_id}",
             get(handlers::get_message)
                 .patch(handlers::edit_message)
                 .delete(handlers::delete_message),
         )
         .route(
-            "/v1/messages/:message_id/reactions/:reaction",
+            "/v1/messages/{message_id}/reactions/{reaction}",
             put(handlers::put_message_reaction).delete(handlers::delete_message_reaction),
         )
         .route(
-            "/v1/users/:user_id/read-markers",
+            "/v1/users/{user_id}/read-markers",
             get(handlers::list_user_read_markers).put(handlers::put_user_read_marker),
         )
         .route(
-            "/v1/channels/:channel_id/read-markers",
+            "/v1/channels/{channel_id}/read-markers",
             get(handlers::list_channel_read_markers),
         )
         .route(
-            "/v1/users/:user_id/chat-devices",
+            "/v1/users/{user_id}/chat-devices",
             get(handlers::list_user_chat_devices),
         )
         .route(
-            "/v1/users/:user_id/chat-devices/:device_id",
+            "/v1/users/{user_id}/chat-devices/{device_id}",
             delete(handlers::delete_user_chat_device),
         )
         .route(
-            "/v1/channels/:channel_id/tts",
+            "/v1/channels/{channel_id}/tts",
             post(handlers::announce_in_channel),
         )
         .route("/v1/tts/voices", get(handlers::tts_voices))
@@ -241,24 +244,24 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::list_moderation_events),
         )
         .route(
-            "/v1/moderation/events/:event_id",
+            "/v1/moderation/events/{event_id}",
             get(handlers::get_moderation_event),
         )
         .route(
-            "/v1/moderation/events/:event_id/resolve",
+            "/v1/moderation/events/{event_id}/resolve",
             post(handlers::resolve_moderation_event),
         )
         .route("/v1/safety/incidents", get(handlers::list_safety_incidents))
         .route(
-            "/v1/safety/incidents/:incident_id",
+            "/v1/safety/incidents/{incident_id}",
             get(handlers::get_safety_incident),
         )
         .route(
-            "/v1/safety/incidents/:incident_id/export",
+            "/v1/safety/incidents/{incident_id}/export",
             get(handlers::export_safety_incident),
         )
         .route(
-            "/v1/safety/users/:user_id/risk",
+            "/v1/safety/users/{user_id}/risk",
             get(handlers::get_safety_user_risk),
         )
         .route("/v1/analytics", get(analytics::get_analytics))
@@ -270,7 +273,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/analytics/export", get(analytics::export_usage))
         .route("/v1/analytics/channels", get(analytics::list_channel_usage))
         .route(
-            "/v1/analytics/channels/:channel_id",
+            "/v1/analytics/channels/{channel_id}",
             get(analytics::get_channel_usage),
         )
         .route(
@@ -282,7 +285,7 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::create_api_key).get(handlers::list_api_keys),
         )
         .route(
-            "/v1/api-keys/:key_id",
+            "/v1/api-keys/{key_id}",
             patch(handlers::update_api_key).delete(handlers::revoke_api_key),
         )
         .route("/v1/audit-log", get(handlers::list_audit_logs))
@@ -290,36 +293,36 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/recordings/start", post(handlers::start_recording))
         .route("/v1/recordings/mixdown", post(handlers::mixdown_recordings))
         .route(
-            "/v1/recordings/:recording_id",
+            "/v1/recordings/{recording_id}",
             get(handlers::get_recording).delete(handlers::delete_recording),
         )
         .route(
-            "/v1/recordings/:recording_id/download",
+            "/v1/recordings/{recording_id}/download",
             get(handlers::download_recording),
         )
         .route(
-            "/v1/recordings/:recording_id/stop",
+            "/v1/recordings/{recording_id}/stop",
             post(handlers::stop_recording),
         )
         .route(
-            "/v1/recordings/:recording_id/transcribe",
+            "/v1/recordings/{recording_id}/transcribe",
             post(handlers::transcribe_recording),
         )
         .route(
-            "/v1/recordings/:recording_id/transcript",
+            "/v1/recordings/{recording_id}/transcript",
             get(handlers::get_recording_transcript),
         )
         .route("/v1/audio/streams", get(streams::list_streams))
         .route(
-            "/v1/channels/:channel_id/audio/streams",
+            "/v1/channels/{channel_id}/audio/streams",
             post(streams::create_stream).get(streams::list_channel_streams),
         )
         .route(
-            "/v1/channels/:channel_id/audio/streams/pull",
+            "/v1/channels/{channel_id}/audio/streams/pull",
             get(streams::pull_stream),
         )
         .route(
-            "/v1/channels/:channel_id/audio/streams/:stream_id",
+            "/v1/channels/{channel_id}/audio/streams/{stream_id}",
             get(streams::get_stream).delete(streams::delete_stream),
         )
         .route(
@@ -328,33 +331,33 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/webhooks/events", get(webhooks::list_event_types))
         .route(
-            "/v1/webhooks/:webhook_id",
+            "/v1/webhooks/{webhook_id}",
             get(webhooks::get_webhook)
                 .patch(webhooks::update_webhook)
                 .delete(webhooks::delete_webhook),
         )
         .route(
-            "/v1/webhooks/:webhook_id/rotate-secret",
+            "/v1/webhooks/{webhook_id}/rotate-secret",
             post(webhooks::rotate_webhook_secret),
         )
         .route(
-            "/v1/webhooks/:webhook_id/test",
+            "/v1/webhooks/{webhook_id}/test",
             post(webhooks::test_webhook),
         )
         .route(
-            "/v1/webhooks/:webhook_id/resync",
+            "/v1/webhooks/{webhook_id}/resync",
             post(webhooks::resync_webhook),
         )
         .route(
-            "/v1/webhooks/:webhook_id/deliveries",
+            "/v1/webhooks/{webhook_id}/deliveries",
             get(webhooks::list_deliveries),
         )
         .route(
-            "/v1/webhooks/:webhook_id/deliveries/:delivery_id",
+            "/v1/webhooks/{webhook_id}/deliveries/{delivery_id}",
             get(webhooks::get_delivery),
         )
         .route(
-            "/v1/webhooks/:webhook_id/deliveries/:delivery_id/retry",
+            "/v1/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
             post(webhooks::retry_delivery),
         )
         .route("/v1/events", get(webhooks::event_stream))
@@ -377,7 +380,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/me/reports", post(handlers::report_user_self))
         .route(
-            "/v1/me/recordings/:recording_id/consent",
+            "/v1/me/recordings/{recording_id}/consent",
             post(handlers::recording_consent_self),
         )
         .route("/v1/webrtc/offer", post(handlers::webrtc_offer))
