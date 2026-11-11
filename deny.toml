@@ -12,7 +12,14 @@ yanked = "deny"
 # Transitive unmaintained crates (rustls-pemfile via axum-server)
 # are tracked in README "Limitations"; only direct dependencies fail the build.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  # rsa (Marvin timing attack): in the enabled graph through jsonwebtoken's rust_crypto backend, used
+  # only to verify RS256/RS384/RS512 OIDC provider tokens (public inputs). Aurix issues HS256 only.
+  "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5 timing variability: p256/p384 via jsonwebtoken rust_crypto, used only to verify
+  # ES256/ES384 OIDC tokens; the fix needs elliptic-curve 0.14, which jsonwebtoken does not support yet.
+  "RUSTSEC-2026-0387",
+]
 
 [licenses]
 version = 2
