@@ -35,49 +35,49 @@ publish = false
 
 [workspace.dependencies]
 tokio = { version = "1.36", features = ["full"] }
-axum = { version = "0.7", features = ["ws", "macros", "multipart"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "uuid", "chrono", "json", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "uuid", "chrono", "json", "migrate"] }
 uuid = { version = "1.7", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-jsonwebtoken = "9.2"
-argon2 = "0.5"
-rand = "0.8"
+jsonwebtoken = "11.1"
+argon2 = "0.6"
+rand = "0.10"
 ring = "0.17"
-base64 = "0.22"
-sha2 = "0.10"
-hmac = "0.12"
-aes-gcm = "0.10"
-aes = "0.8"
-ctr = "0.9"
+base64 = "0.23"
+sha2 = "0.11"
+hmac = "0.13"
+aes-gcm = "0.11"
+aes = "0.9"
+ctr = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.31"
-opentelemetry = { version = "0.30", features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "grpc-tonic", "tls", "tls-roots"] }
-opentelemetry_sdk = { version = "0.30", features = ["trace", "metrics", "rt-tokio"] }
-prometheus = { version = "0.13", default-features = false, features = ["process"] }
-redis = { version = "0.32", features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "sentinel", "cluster-async"] }
-dashmap = "5.5"
-parking_lot = "0.12"
+tracing-opentelemetry = "0.34"
+opentelemetry = { version = "0.33", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "tls", "tls-roots"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
+redis = { version = "1.8", features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "sentinel", "cluster-async"] }
+dashmap = "6.2"
+parking_lot = "0.13"
 bytes = "1.5"
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
-config = "0.14"
+config = "0.15"
 clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "http2"] }
 url = "2.5"
 regex = "1.10"
 aho-corasick = "1.1"
 unicode-normalization = "0.1"
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
-flume = "0.11"
+flume = "0.12"
 arc-swap = "1.7"
 maxminddb = "0.32"
 flate2 = "1.0"
@@ -85,17 +85,17 @@ governor = "0.6"
 pin-project-lite = "0.2"
 futures = "0.3"
 futures-util = "0.3"
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
-toml = "0.8"
-sha1 = "0.10"
+toml = "1.1"
+sha1 = "0.11"
 subtle = "2.6"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
-md-5 = "0.10"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+md-5 = "0.11"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
-str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }
 opus = { package = "aurix-opus", path = "crates/aurix-opus" }
 hex = "0.4"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
