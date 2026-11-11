@@ -25,8 +25,8 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-rust-version = "1.88"
-version = "1.13.0"
+rust-version = "1.95"
+version = "1.13.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/aurix-voice/aurix"

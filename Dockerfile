@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 # ---------- build ----------
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev cmake clang \
