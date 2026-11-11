@@ -5,5 +5,8 @@ ignore = [
     # not enabled: Aurix builds with the `postgres` feature exclusively and the crate is
     # never compiled (`cargo tree -i rsa` is empty). No fixed version exists upstream.
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys (C SQLite CVE-2026-119375). Present only through sqlx-sqlite, an optional
+    # sqlx dependency this workspace never enables or compiles (Postgres only).
+    "RUSTSEC-2026-0459",
 ]
 informational_warnings = ["unmaintained"]

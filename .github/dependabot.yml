@@ -1,0 +1,81 @@
+# Dependabot: weekly grouped update PRs per ecosystem (one PR per group, so CI runs once per batch).
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      cargo-deps: { patterns: ["*"] }
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      githubactions-deps: { patterns: ["*"] }
+  - package-ecosystem: "npm"
+    directory: "/dashboard"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps: { patterns: ["*"] }
+  - package-ecosystem: "npm"
+    directory: "/sdk/web"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps: { patterns: ["*"] }
+  - package-ecosystem: "npm"
+    directory: "/sdk/server/node"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps: { patterns: ["*"] }
+  - package-ecosystem: "npm"
+    directory: "/sdk/server/examples/token-server/node"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps: { patterns: ["*"] }
+  - package-ecosystem: "npm"
+    directory: "/examples/rooms/server"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps: { patterns: ["*"] }
+  - package-ecosystem: "npm"
+    directory: "/examples/rooms/web"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps: { patterns: ["*"] }
+  - package-ecosystem: "nuget"
+    directory: "/sdk/server/csharp/Aurix.Server"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      nuget-deps: { patterns: ["*"] }
+  - package-ecosystem: "nuget"
+    directory: "/sdk/server/csharp/Aurix.Server.Tests"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      nuget-deps: { patterns: ["*"] }
+  - package-ecosystem: "nuget"
+    directory: "/sdk/server/examples/token-server/csharp/TokenServer"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      nuget-deps: { patterns: ["*"] }
+  - package-ecosystem: "nuget"
+    directory: "/sdk/unity/DotNet~/Aurix.Voice"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      nuget-deps: { patterns: ["*"] }
+  - package-ecosystem: "nuget"
+    directory: "/sdk/unity/DotNet~/Aurix.Voice.Tests"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    groups:
+      nuget-deps: { patterns: ["*"] }
