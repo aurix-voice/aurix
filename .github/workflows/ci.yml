@@ -12,7 +12,7 @@ env:
 jobs:
   lint:
     name: fmt + clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -25,7 +25,7 @@ jobs:
 
   test:
     name: unit + integration tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,7 @@ jobs:
 
   e2e:
     name: live E2E (Postgres + Redis + server)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint]
     services:
       postgres:
@@ -384,7 +384,7 @@ jobs:
 
   audit:
     name: cargo audit / deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       checks: write
@@ -399,7 +399,7 @@ jobs:
 
   licensing:
     name: REUSE licence map + DCO
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -411,7 +411,7 @@ jobs:
 
   fuzz:
     name: fuzz (corpus replay + libFuzzer smoke)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -449,7 +449,7 @@ jobs:
 
   chaos:
     name: "chaos / HA (${{ matrix.redis }}: node kill, Redis failover, PostgreSQL restart)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -539,7 +539,7 @@ jobs:
 
   sdks:
     name: Web + Unity SDK tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -568,7 +568,7 @@ jobs:
 
   dashboard:
     name: dashboard (check + lint + unit + Caddy image + Playwright vs live node)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint]
     services:
       postgres:
@@ -662,7 +662,7 @@ jobs:
 
   server-sdks:
     name: Server SDKs (Node/Python/Go/C#) + token servers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Generated clients match api/openapi.json
@@ -713,7 +713,7 @@ jobs:
 
   rooms-demo:
     name: Rooms demo (backend tests + frontend build against the in-tree SDKs)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -739,7 +739,7 @@ jobs:
 
   godot:
     name: Godot GDExtension (build + headless smoke)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GODOT_VERSION: 4.3-stable
     steps:
@@ -783,7 +783,7 @@ jobs:
 
   godot-web:
     name: Godot Web export + Unity WebGL bridge + WebTransport media (Chromium, live node)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint]
     env:
       GODOT_VERSION: 4.3-stable
@@ -892,7 +892,7 @@ jobs:
 
   unreal:
     name: Unreal plugin (static checks; BuildPlugin only with UE container access)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint]
     env:
       # Epic's Linux development image; pulling it requires a GitHub account linked to an Epic
@@ -949,7 +949,7 @@ jobs:
 
   docs:
     name: OpenAPI + mdBook
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -964,7 +964,7 @@ jobs:
 
   deploy:
     name: Helm chart + Terraform example
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
@@ -1006,7 +1006,7 @@ jobs:
 
   docker:
     name: docker build + healthcheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint]
     steps:
       - uses: actions/checkout@v7

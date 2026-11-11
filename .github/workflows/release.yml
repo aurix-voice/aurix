@@ -42,7 +42,7 @@ env:
 jobs:
   verify:
     name: version + changelog + policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
@@ -260,7 +260,7 @@ jobs:
   sdks:
     name: SDK packages
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
@@ -353,7 +353,7 @@ jobs:
     # GHCR account for the UE container; without it the job records a notice and produces nothing.
     name: Unreal BuildPlugin (Linux, -Rocket) → Fab package
     needs: [verify, native, native-mobile]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       UE_IMAGE: ${{ vars.UE_CONTAINER_IMAGE || 'ghcr.io/epicgames/unreal-engine:dev-slim-5.3.2' }}
@@ -514,7 +514,7 @@ jobs:
   godot-addon:
     name: Godot addon zip (all platforms)
     needs: [verify, godot-bin]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
@@ -553,7 +553,7 @@ jobs:
         include:
           - platform: linux/amd64
             slug: linux-amd64
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - platform: linux/arm64
             slug: linux-arm64
             os: ubuntu-22.04-arm
@@ -606,7 +606,7 @@ jobs:
   image-manifest:
     name: container image manifest, SBOM, signature
     needs: [verify, image]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -687,7 +687,7 @@ jobs:
   dashboard-image:
     name: dashboard image (Caddy, multi-arch), SBOM, signature
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -765,7 +765,7 @@ jobs:
     name: re-publish packages (manual)
     if: github.event_name == 'workflow_dispatch' && inputs.npm_publish
     needs: [verify, sdks]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -809,7 +809,7 @@ jobs:
   publish:
     name: checksums, SBOM, signatures, GitHub release
     needs: [verify, server, native, native-mobile, sdks, unreal-plugin, unreal-fab, godot-addon, image-manifest, dashboard-image]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write

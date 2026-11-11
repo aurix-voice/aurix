@@ -23,7 +23,7 @@ env:
 jobs:
   soak:
     name: "soak (${{ inputs.duration || '90m' }}, ${{ inputs.redis || 'sentinel' }})"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Hosted runners cap a job at 6 h; the run itself is bounded by AURIX_SOAK_DURATION.
     timeout-minutes: 350
     steps:
