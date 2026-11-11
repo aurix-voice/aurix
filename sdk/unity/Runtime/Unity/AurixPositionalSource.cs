@@ -55,7 +55,7 @@ namespace Aurix.Unity
 
         private void OnEnable()
         {
-            if (Voice == null) Voice = FindObjectOfType<AurixVoiceBehaviour>();
+            if (Voice == null) Voice = Aurix.Unity.AurixFind.First<AurixVoiceBehaviour>();
             if (Channel == Guid.Empty && !string.IsNullOrEmpty(ChannelId) && Guid.TryParse(ChannelId, out var g)) Channel = g;
             _hasLast = false;
         }

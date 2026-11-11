@@ -72,7 +72,13 @@ namespace Aurix.Editor
                 else { problems++; report.AppendLine("  FIX   Run In Background is off (Player ▸ Resolution and Presentation): voice stops the moment the player alt-tabs"); }
             }
             var group = BuildPipeline.GetBuildTargetGroup(target);
-            if (PlayerSettings.GetScriptingBackend(group) == ScriptingImplementation.IL2CPP && PlayerSettings.GetManagedStrippingLevel(group) == ManagedStrippingLevel.High)
+#if UNITY_2021_2_OR_NEWER
+            var named = UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(group);
+            bool il2cppHighStrip = PlayerSettings.GetScriptingBackend(named) == ScriptingImplementation.IL2CPP && PlayerSettings.GetManagedStrippingLevel(named) == ManagedStrippingLevel.High;
+#else
+            bool il2cppHighStrip = PlayerSettings.GetScriptingBackend(group) == ScriptingImplementation.IL2CPP && PlayerSettings.GetManagedStrippingLevel(group) == ManagedStrippingLevel.High;
+#endif
+            if (il2cppHighStrip)
             {
                 report.AppendLine("  info  IL2CPP with High managed stripping: the codec and E2EE paths use reflection-free code, but keep the package's link.xml if you see MissingMethodException at runtime");
             }

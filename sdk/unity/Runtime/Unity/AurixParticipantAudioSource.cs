@@ -73,7 +73,7 @@ namespace Aurix.Unity
 
         private void OnEnable()
         {
-            if (Voice == null) Voice = FindObjectOfType<AurixVoiceBehaviour>();
+            if (Voice == null) Voice = Aurix.Unity.AurixFind.First<AurixVoiceBehaviour>();
             if (BoundUserId == Guid.Empty && !string.IsNullOrEmpty(UserId) && Guid.TryParse(UserId, out var parsed)) BoundUserId = parsed;
             AudioSettings.OnAudioConfigurationChanged += OnAudioConfigurationChanged;
             var src = GetComponent<AudioSource>();
@@ -155,7 +155,7 @@ namespace Aurix.Unity
 
         private void OnEnable()
         {
-            if (Voice == null) Voice = FindObjectOfType<AurixVoiceBehaviour>();
+            if (Voice == null) Voice = Aurix.Unity.AurixFind.First<AurixVoiceBehaviour>();
             _outputRate = AudioSettings.outputSampleRate;
             AudioSettings.OnAudioConfigurationChanged += OnAudioConfigurationChanged;
             if (Voice != null) Voice.RenderFedExternally = true;
