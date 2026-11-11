@@ -48,7 +48,7 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
       publish: ${{ steps.meta.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: meta
         run: |
           set -euo pipefail
@@ -86,7 +86,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -106,7 +106,7 @@ jobs:
           "dist/$name/bin/aurix" --version
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-server-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -136,7 +136,7 @@ jobs:
             os: macos-15-intel
             platform: Mac
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -179,7 +179,7 @@ jobs:
           fi
           rm -rf "dist/$core" "dist/$cli"
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-native-${{ matrix.target }}
           path: |
@@ -187,7 +187,7 @@ jobs:
             dist/*.zip
           if-no-files-found: error
       # Raw staged libraries for the Unreal plugin assembly below.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: native-lib-${{ matrix.target }}
           path: sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/${{ matrix.platform }}
@@ -204,7 +204,7 @@ jobs:
           - name: android
             os: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
@@ -244,14 +244,14 @@ jobs:
           (cd dist && tar -czf "$core.tar.gz" "$core")
           rm -rf "dist/$core"
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-native-${{ matrix.name }}
           path: |
             dist/*.tar.gz
             dist/*.zip
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: native-lib-${{ matrix.name }}
           path: sdk/unreal/AurixVoice/Source/ThirdParty/AurixClientLibrary/lib/Android
@@ -264,14 +264,14 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       - run: mkdir -p dist
@@ -301,7 +301,7 @@ jobs:
       - name: C# server SDK
         run: dotnet pack sdk/server/csharp/Aurix.Server/Aurix.Server.csproj -c Release -o dist -p:PackageVersion=${VERSION}
       - run: ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-sdks
           path: dist/
@@ -314,8 +314,8 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: native-lib-*
           path: libs
@@ -342,7 +342,7 @@ jobs:
           mkdir -p dist
           (cd sdk/unreal && zip -qr "../../dist/AurixVoice-unreal-${VERSION}.zip" AurixVoice -x '*/Binaries/*' '*/Intermediate/*')
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-unreal
           path: dist/*.zip
@@ -359,9 +359,9 @@ jobs:
       UE_IMAGE: ${{ vars.UE_CONTAINER_IMAGE || 'ghcr.io/epicgames/unreal-engine:dev-slim-5.3.2' }}
       HAS_UE_ACCESS: ${{ secrets.UE_GHCR_TOKEN != '' && secrets.UE_GHCR_USER != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - if: env.HAS_UE_ACCESS == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: native-lib-*
           path: libs
@@ -392,7 +392,7 @@ jobs:
           mkdir -p dist
           (cd out && zip -qr "../dist/AurixVoice-unreal-${VERSION}-packaged-Linux.zip" AurixVoice -x '*/Intermediate/*')
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: env.HAS_UE_ACCESS == 'true'
         with:
           name: dist-unreal-fab
@@ -427,14 +427,14 @@ jobs:
             os: ubuntu-22.04
             target: aarch64-linux-android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}${{ matrix.name == 'macos.universal' && ',x86_64-apple-darwin' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-godot-${{ matrix.name }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install --quiet scons
@@ -452,12 +452,12 @@ jobs:
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_PIN}" >> "$GITHUB_ENV"
           cargo install cargo-ndk --locked
       - name: Check out godot-cpp
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: godotengine/godot-cpp
           ref: godot-${{ env.GODOT_VERSION }}
           path: sdk/godot/godot-cpp
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             sdk/godot/godot-cpp/bin
@@ -505,7 +505,7 @@ jobs:
           scons platform=windows arch=x86_64 target=template_debug
           Pop-Location
           Get-ChildItem -Recurse sdk/godot/addons/aurix_voice/bin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: godot-bin-${{ matrix.name }}
           path: sdk/godot/addons/aurix_voice/bin/${{ matrix.name }}
@@ -518,8 +518,8 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: godot-bin-*
           path: bins
@@ -537,7 +537,7 @@ jobs:
           mkdir -p dist
           (cd sdk/godot/addons && zip -qry "../../../dist/aurix-godot-addon-${VERSION}.zip" aurix_voice)
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-godot
           path: dist/*.zip
@@ -561,9 +561,9 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         if: needs.verify.outputs.publish == 'true'
         with:
           registry: ghcr.io
@@ -573,7 +573,7 @@ jobs:
       # QEMU takes hours); the per-arch images are pushed by digest and merged into one tagged
       # manifest list by `image-manifest`.
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -596,7 +596,7 @@ jobs:
           set -euo pipefail
           mkdir -p digests
           touch "digests/${DIGEST#sha256:}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: needs.verify.outputs.publish == 'true'
         with:
           name: image-digest-${{ matrix.slug }}
@@ -616,15 +616,15 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.verify.outputs.publish == 'true'
         with:
           pattern: image-digest-*
           path: digests
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: needs.verify.outputs.publish == 'true'
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: needs.verify.outputs.publish == 'true'
         with:
           registry: ghcr.io
@@ -632,7 +632,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: tags
         if: needs.verify.outputs.publish == 'true'
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           # Release-derived tags only; `latest` follows stable releases, never pre-releases.
@@ -677,7 +677,7 @@ jobs:
           set -euo pipefail
           cosign sign --yes "${IMAGE}@${DIGEST}"
           cosign attest --yes --type cyclonedx --predicate "aurix-server-${{ needs.verify.outputs.version }}.image.cdx.json" "${IMAGE}@${DIGEST}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: needs.verify.outputs.publish == 'true'
         with:
           name: dist-image-sbom
@@ -695,17 +695,17 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         if: needs.verify.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: tags
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.DASHBOARD_IMAGE }}
           tags: |
@@ -716,7 +716,7 @@ jobs:
       # The SPA is compiled once on the build platform; only the Caddy runtime stage is per-arch,
       # so a single multi-platform build is cheap enough here (unlike the Rust server image).
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: dashboard/Dockerfile
@@ -752,7 +752,7 @@ jobs:
           set -euo pipefail
           cosign sign --yes "${DASHBOARD_IMAGE}@${DIGEST}"
           cosign attest --yes --type cyclonedx --predicate "aurix-dashboard-${{ needs.verify.outputs.version }}.image.cdx.json" "${DASHBOARD_IMAGE}@${DIGEST}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: needs.verify.outputs.publish == 'true'
         with:
           name: dist-dashboard-image-sbom
@@ -772,11 +772,11 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist-sdks
           path: staged
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -817,7 +817,7 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # Generated before the built artifacts are downloaded so the scan sees the source tree only.
@@ -829,7 +829,7 @@ jobs:
           output-file: aurix-${{ needs.verify.outputs.version }}.source.cdx.json
           upload-artifact: false
           upload-release-assets: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: staged
@@ -837,7 +837,7 @@ jobs:
       - run: mv "aurix-${VERSION}.source.cdx.json" staged/
       - name: Release acceptance — every SDK package contains what its consumers expect
         run: python3 tools/release/check_assets.py "$VERSION" staged
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: needs.verify.outputs.publish == 'true'
         with:
           node-version: 22
@@ -905,7 +905,7 @@ jobs:
             --bundle SHA256SUMS.sigstore.json
       - name: Build-provenance attestations for every file
         if: needs.verify.outputs.publish == 'true'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             staged/*
@@ -935,14 +935,14 @@ jobs:
             echo "Images: \`${IMAGE}:${VERSION}\` (digest \`${{ needs.image-manifest.outputs.digest }}\`), \`${DASHBOARD_IMAGE}:${VERSION}\` (digest \`${{ needs.dashboard-image.outputs.digest }}\`)."
           } > notes.md
           cat notes.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ needs.verify.outputs.version }}
           path: |
             staged/
             notes.md
           if-no-files-found: error
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         if: needs.verify.outputs.publish == 'true'
         with:
           name: Aurix ${{ needs.verify.outputs.version }}

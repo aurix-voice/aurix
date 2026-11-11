@@ -14,7 +14,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -27,7 +27,7 @@ jobs:
     name: unit + integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list; sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
@@ -53,7 +53,7 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list; sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
@@ -389,7 +389,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -401,7 +401,7 @@ jobs:
     name: REUSE licence map + DCO
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: fsfe/reuse-action@v6
@@ -413,7 +413,7 @@ jobs:
     name: fuzz (corpus replay + libFuzzer smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
@@ -440,7 +440,7 @@ jobs:
             cargo +nightly fuzz run "$target" "corpus/$target" -- -max_total_time=30 -max_len=4096 -timeout=10 -rss_limit_mb=2048
             echo "::endgroup::"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-artifacts
@@ -456,7 +456,7 @@ jobs:
       matrix:
         redis: [sentinel, cluster]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list; sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake jq
@@ -502,7 +502,7 @@ jobs:
             target: x86_64-apple-darwin
             platform: Mac
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -529,7 +529,7 @@ jobs:
             # MSVC emits the import library next to the DLL only when symbols are exported.
             test -s "$lib/aurix_client.dll.lib"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aurix-client-${{ matrix.target }}
           path: |
@@ -541,8 +541,8 @@ jobs:
     name: Web + Unity SDK tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -554,7 +554,7 @@ jobs:
       - name: Unity WebGL plugin (.jslib) against the real Web SDK bundle (Node, Emscripten stand-in — not a Unity player build)
         run: node --test test/unity-jslib.test.mjs
         working-directory: sdk/web
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       - run: dotnet test Aurix.sln -v q --nologo
@@ -586,8 +586,8 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -596,9 +596,9 @@ jobs:
         working-directory: dashboard
       - run: npm run check && npm run lint && npm test && npm run build
         working-directory: dashboard
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Dashboard image (Caddy)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: dashboard/Dockerfile
@@ -651,7 +651,7 @@ jobs:
         run: |
           tail -n 200 server.log || true
           docker logs dashboard 2>&1 | tail -n 100 || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: dashboard-playwright-report
@@ -664,10 +664,10 @@ jobs:
     name: Server SDKs (Node/Python/Go/C#) + token servers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Generated clients match api/openapi.json
         run: python3 tools/openapi-sdk/generate.py --check
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -680,7 +680,7 @@ jobs:
       - name: Node token server
         run: npm ci && npm test
         working-directory: sdk/server/examples/token-server/node
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python3 -m pip install --quiet "pytest>=8" "mypy>=1.10" "ruff>=0.6"
@@ -690,7 +690,7 @@ jobs:
       - name: Python token server
         run: python3 -m pytest -q && PYTHONPATH=../../../python python3 -m mypy . && python3 -m ruff check .
         working-directory: sdk/server/examples/token-server/python
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.23"
           cache: false   # stdlib-only modules, no go.sum
@@ -700,7 +700,7 @@ jobs:
       - name: Go token server
         run: test -z "$(gofmt -l .)" && go vet ./... && go test -count=1 ./...
         working-directory: sdk/server/examples/token-server/go
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       - name: C# SDK
@@ -715,8 +715,8 @@ jobs:
     name: Rooms demo (backend tests + frontend build against the in-tree SDKs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -743,17 +743,17 @@ jobs:
     env:
       GODOT_VERSION: 4.3-stable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list; sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config cmake scons
       - name: Check out godot-cpp
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: godotengine/godot-cpp
           ref: godot-${{ env.GODOT_VERSION }}
           path: sdk/godot/godot-cpp
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             sdk/godot/godot-cpp/bin
@@ -803,16 +803,16 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list; sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: sdk/web/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Playwright (Chromium)
@@ -905,7 +905,7 @@ jobs:
       UE_IMAGE: ${{ vars.UE_CONTAINER_IMAGE || 'ghcr.io/epicgames/unreal-engine:dev-5.3.2' }}
       HAS_UE_ACCESS: ${{ secrets.UE_GHCR_TOKEN != '' && secrets.UE_GHCR_USER != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Plugin descriptor, packaging files, UHT conventions, module dependency direction
         run: python3 sdk/unreal/scripts/check_plugin.py
       - if: env.HAS_UE_ACCESS == 'true'
@@ -936,7 +936,7 @@ jobs:
               -TargetPlatforms=Linux -Rocket
           test -f out/AurixVoice/AurixVoice.uplugin
           ls out/AurixVoice/Binaries/Linux
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: env.HAS_UE_ACCESS == 'true'
         with:
           name: unreal-plugin-linux
@@ -951,8 +951,8 @@ jobs:
     name: OpenAPI + mdBook
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - run: npx --yes @redocly/cli@1 lint api/openapi.json --skip-rule no-unused-components
@@ -966,11 +966,11 @@ jobs:
     name: Helm chart + Terraform example
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.9.8
       - name: Helm lint + template (every ci/ values file)
@@ -1009,9 +1009,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false
