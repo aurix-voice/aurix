@@ -7,9 +7,11 @@ uses the `AurixVoiceSamples` module (components + a function library) on top of 
 
 ## 0. Before the editor
 
-1. Stage the native library once per platform (from the Aurix repository):
-   `sdk/unreal/scripts/build_native.sh` (Linux/macOS) or `sdk/unreal/scripts/build_native.ps1`
-   (Windows). It builds `aurix-client` with cargo and copies the header + library into
+1. Get the native library. The release zip (`AurixVoice-unreal-<version>.zip` on GitHub) and the
+   Fab package already contain it for Win64 / Linux / Mac / Android — nothing to build. From a
+   repository checkout stage it once per platform: `sdk/unreal/scripts/build_native.sh`
+   (Linux/macOS) or `sdk/unreal/scripts/build_native.ps1` (Windows); the script builds
+   `aurix-client` with cargo and copies the header + library into
    `Source/ThirdParty/AurixClientLibrary/`. A plugin without them fails at build time with a
    message naming the missing file — never silently at runtime.
 2. Copy the `AurixVoice` folder to `<Project>/Plugins/AurixVoice`, open the project, accept the

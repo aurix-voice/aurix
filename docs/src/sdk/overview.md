@@ -5,7 +5,7 @@ action token from **your** backend, API keys never leave the server side), one c
 (the [WebSocket protocol](../api/websocket.md)) and one feature vocabulary — the table shows
 where they differ.
 
-| | [Web](web.md) | [Unity / .NET](unity.md) | [Native core](native.md) | [Unreal](native.md#unreal-plugin) | [Godot](godot.md) |
+| | [Web](web.md) | [Unity / .NET](unity.md) | [Native core](native.md) | [Unreal](unreal.md) | [Godot](godot.md) |
 |---|---|---|---|---|---|
 | Language | TypeScript (ES2020, no deps) | C# (netstandard2.1) | Rust + C ABI (`aurix_client.h`, C++11 RAII header) | C++ / Blueprint over the C ABI | GDExtension (C++ over the C ABI), GDScript/C# consumers |
 | Media transport | WebRTC (Opus, single peer connection); AURX v2 over WebTransport datagrams (Chromium) or over the control WebSocket (`transport: 'websocket'`, last resort) | AURX v2 over UDP → TLS tunnel → WS tunnel; Unity WebGL: as Web through the Web SDK | AURX v2 over QUIC datagrams (0-RTT, migration) → UDP → TLS tunnel → WS tunnel | AURX v2 over QUIC → UDP → TLS tunnel → WS tunnel | AURX v2 over QUIC → UDP → TLS tunnel → WS tunnel |
