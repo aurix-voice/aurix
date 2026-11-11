@@ -2518,12 +2518,15 @@ fn peer_ip(state: &WsState, headers: &HeaderMap, peer: Option<SocketAddr>) -> Ip
 }
 
 pub async fn ws_handler(
-    ws: WebSocketUpgrade,
     State(state): State<WsState>,
     headers: HeaderMap,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
     Query(query): Query<WsQuery>,
+    ws: WebSocketUpgrade,
 ) -> Response {
+    // axum 0.8 has no optional extractor for ConnectInfo; a server without connect-info
+    // middleware (tests, custom listeners) simply yields no peer address.
+    let peer = peer.ok();
     if state.control.config.media.cascade_relay_only {
         // A relay-only hub hosts no clients; discovery never advertises it, but a stale or
         // hand-written endpoint may still point here.
@@ -2633,7 +2636,7 @@ async fn send_direct(
 ) {
     let _ = ws_sender
         .send(Message::Text(
-            serde_json::to_string(msg).unwrap_or_default(),
+            serde_json::to_string(msg).unwrap_or_default().into(),
         ))
         .await;
 }
@@ -3539,12 +3542,12 @@ async fn handle_ws_connection(
                 biased;
                 msg = rx.recv() => match msg {
                     Some(m) if m == CLOSE_SENTINEL => { let _ = ws_sender.close().await; break; }
-                    Some(m) => { if ws_sender.send(Message::Text(m)).await.is_err() { break; } }
+                    Some(m) => { if ws_sender.send(Message::Text(m.into())).await.is_err() { break; } }
                     None => { let _ = ws_sender.close().await; break; }
                 },
-                _ = ping.tick() => { if ws_sender.send(Message::Ping(Vec::new())).await.is_err() { break; } }
+                _ = ping.tick() => { if ws_sender.send(Message::Ping(Default::default())).await.is_err() { break; } }
                 pkt = tunnel_rx.recv(), if tunnel_open => match pkt {
-                    Some(p) => { if ws_sender.send(Message::Binary(p)).await.is_err() { break; } }
+                    Some(p) => { if ws_sender.send(Message::Binary(p.into())).await.is_err() { break; } }
                     None => tunnel_open = false,
                 },
             }
@@ -5634,7 +5637,7 @@ async fn handle_event_stream(socket: WebSocket, state: WsState, app_id: AppId) {
                 continue;
             }
             let json = serde_json::to_string(&event).unwrap_or_default();
-            if ws_sender.send(Message::Text(json)).await.is_err() {
+            if ws_sender.send(Message::Text(json.into())).await.is_err() {
                 break;
             }
         }

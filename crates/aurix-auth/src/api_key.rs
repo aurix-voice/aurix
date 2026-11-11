@@ -3,7 +3,7 @@ use aurix_db::models::ApiKeyRow;
 use aurix_db::DbPool;
 use base64::Engine;
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -131,8 +131,8 @@ impl ApiKeyService {
     }
 
     fn generate_raw_key(&self) -> String {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
         format!(
             "aurx_{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)

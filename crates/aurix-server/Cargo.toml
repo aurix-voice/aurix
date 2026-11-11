@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+tonic = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }
@@ -36,7 +37,7 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 anyhow = { workspace = true }
 tokio-util = { workspace = true }
-axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 chrono = { workspace = true }
 [dev-dependencies]

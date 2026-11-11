@@ -374,7 +374,7 @@ async fn delete_user_rows(
     app_id: Uuid,
     user_id: Uuid,
 ) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(sql)
+    Ok(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
         .bind(app_id)
         .bind(user_id)
         .execute(&mut **tx)
@@ -984,10 +984,10 @@ pub async fn close_stale_sessions_for_node(
     media_node_id: Uuid,
     reason: &str,
 ) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(&format!(
+    let r = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE sessions SET disconnected_at = GREATEST(connected_at, LEAST(NOW(), {STALE_CUTOFF_SQL})), disconnect_reason = $2 \
          WHERE media_node_id = $1 AND disconnected_at IS NULL"
-    ))
+    )))
     .bind(media_node_id)
     .bind(reason)
     .execute(pool)
@@ -1013,10 +1013,10 @@ pub async fn close_stale_memberships_for_node(
     pool: &DbPool,
     media_node_id: Uuid,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar::<_, Uuid>(&format!(
+    sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(format!(
         "UPDATE channel_memberships SET left_at = GREATEST(joined_at, LEAST(NOW(), {STALE_CUTOFF_SQL})) \
          WHERE left_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE media_node_id = $1) RETURNING channel_id"
-    ))
+    )))
     .bind(media_node_id)
     .fetch_all(pool)
     .await
@@ -1029,13 +1029,13 @@ pub async fn close_memberships_for_lost_node(
     pool: &DbPool,
     media_node_id: Uuid,
 ) -> Result<Vec<LostMembershipRow>, sqlx::Error> {
-    sqlx::query_as::<_, LostMembershipRow>(&format!(
+    sqlx::query_as::<_, LostMembershipRow>(sqlx::AssertSqlSafe(format!(
         r#"UPDATE channel_memberships m SET left_at = GREATEST(m.joined_at, LEAST(NOW(), {STALE_CUTOFF_SQL}))
            FROM sessions s, channels c
            WHERE s.id = m.session_id AND c.id = m.channel_id
              AND m.left_at IS NULL AND s.media_node_id = $1 AND s.disconnected_at IS NULL
            RETURNING c.app_id, m.channel_id, m.user_id, m.session_id, m.role"#,
-    ))
+    )))
     .bind(media_node_id)
     .fetch_all(pool)
     .await
@@ -1983,14 +1983,14 @@ pub async fn list_channel_messages(
     forward: bool,
     limit: i64,
 ) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ChatMessageRow>(&format!(
+    sqlx::query_as::<_, ChatMessageRow>(sqlx::AssertSqlSafe(format!(
         r#"SELECT * FROM chat_messages
            WHERE app_id = $1 AND channel_id = $2
              AND ($3::timestamptz IS NULL OR (sent_at, id) < ($3, $4::uuid))
              AND ($5::timestamptz IS NULL OR (sent_at, id) > ($5, $6::uuid))
            ORDER BY {} LIMIT $7"#,
         page_order(forward)
-    ))
+    )))
     .bind(app_id)
     .bind(channel_id)
     .bind(before.map(|c| c.sent_at))
@@ -2014,7 +2014,7 @@ pub async fn list_direct_messages(
     forward: bool,
     limit: i64,
 ) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ChatMessageRow>(&format!(
+    sqlx::query_as::<_, ChatMessageRow>(sqlx::AssertSqlSafe(format!(
         r#"SELECT * FROM chat_messages
            WHERE app_id = $1
              AND ((from_user_id = $2 AND to_user_id = $3) OR (from_user_id = $3 AND to_user_id = $2))
@@ -2022,7 +2022,7 @@ pub async fn list_direct_messages(
              AND ($6::timestamptz IS NULL OR (sent_at, id) > ($6, $7::uuid))
            ORDER BY {} LIMIT $8"#,
         page_order(forward)
-    ))
+    )))
     .bind(app_id)
     .bind(user_id)
     .bind(peer_id)
@@ -2046,14 +2046,14 @@ pub async fn list_user_messages(
     forward: bool,
     limit: i64,
 ) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ChatMessageRow>(&format!(
+    sqlx::query_as::<_, ChatMessageRow>(sqlx::AssertSqlSafe(format!(
         r#"SELECT * FROM chat_messages
            WHERE app_id = $1 AND (from_user_id = $2 OR to_user_id = $2)
              AND ($3::timestamptz IS NULL OR (sent_at, id) < ($3, $4::uuid))
              AND ($5::timestamptz IS NULL OR (sent_at, id) > ($5, $6::uuid))
            ORDER BY {} LIMIT $7"#,
         page_order(forward)
-    ))
+    )))
     .bind(app_id)
     .bind(user_id)
     .bind(before.map(|c| c.sent_at))
@@ -2678,7 +2678,7 @@ pub async fn list_channel_transcripts(
     forward: bool,
     limit: i64,
 ) -> Result<Vec<TranscriptRow>, sqlx::Error> {
-    sqlx::query_as::<_, TranscriptRow>(&format!(
+    sqlx::query_as::<_, TranscriptRow>(sqlx::AssertSqlSafe(format!(
         r#"SELECT * FROM transcripts
            WHERE app_id = $1 AND channel_id = $2
              AND ($3::uuid IS NULL OR user_id = $3)
@@ -2686,7 +2686,7 @@ pub async fn list_channel_transcripts(
              AND ($6::timestamptz IS NULL OR (started_at, id) > ($6, $7::uuid))
            ORDER BY {} LIMIT $8"#,
         transcript_page_order(forward)
-    ))
+    )))
     .bind(app_id)
     .bind(channel_id)
     .bind(user_id)
@@ -2709,14 +2709,14 @@ pub async fn list_user_transcripts(
     forward: bool,
     limit: i64,
 ) -> Result<Vec<TranscriptRow>, sqlx::Error> {
-    sqlx::query_as::<_, TranscriptRow>(&format!(
+    sqlx::query_as::<_, TranscriptRow>(sqlx::AssertSqlSafe(format!(
         r#"SELECT * FROM transcripts
            WHERE app_id = $1 AND user_id = $2
              AND ($3::timestamptz IS NULL OR (started_at, id) < ($3, $4::uuid))
              AND ($5::timestamptz IS NULL OR (started_at, id) > ($5, $6::uuid))
            ORDER BY {} LIMIT $7"#,
         transcript_page_order(forward)
-    ))
+    )))
     .bind(app_id)
     .bind(user_id)
     .bind(before.map(|c| c.started_at))

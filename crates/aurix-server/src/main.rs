@@ -754,7 +754,7 @@ fn spawn_http_server(
         std::net::SocketAddr,
     >,
     tls: Option<axum_server::tls_rustls::RustlsConfig>,
-    handle: axum_server::Handle,
+    handle: axum_server::Handle<std::net::SocketAddr>,
 ) {
     tasks.spawn(async move {
         let result = match tls {

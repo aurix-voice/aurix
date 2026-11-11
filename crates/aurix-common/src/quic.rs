@@ -21,7 +21,7 @@ pub struct HighBitCidGenerator;
 impl quinn::ConnectionIdGenerator for HighBitCidGenerator {
     fn generate_cid(&mut self) -> quinn::ConnectionId {
         let mut bytes = [0u8; 8];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
         bytes[0] |= 0x80;
         quinn::ConnectionId::new(&bytes)
     }

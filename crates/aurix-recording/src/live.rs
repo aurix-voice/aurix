@@ -230,9 +230,9 @@ impl Outgoing {
     pub fn into_ws_message(self) -> Message {
         match self {
             Self::Control(c) => Message::Text(
-                serde_json::to_string(&c).unwrap_or_else(|_| "{\"type\":\"end\"}".into()),
+                serde_json::to_string(&c).unwrap_or_else(|_| "{\"type\":\"end\"}".into()).into(),
             ),
-            Self::Audio(b) => Message::Binary(b.to_vec()),
+            Self::Audio(b) => Message::Binary(b.to_vec().into()),
         }
     }
 }

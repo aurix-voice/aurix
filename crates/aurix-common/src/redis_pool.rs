@@ -104,7 +104,7 @@ impl RedisSource {
     /// Human-readable description of the configured endpoint(s), credentials stripped.
     pub fn describe(&self) -> String {
         match self {
-            Self::Direct(client) => client.get_connection_info().addr.to_string(),
+            Self::Direct(client) => client.get_connection_info().addr().to_string(),
             Self::Sentinel { master, .. } => format!("sentinel master {master}"),
             Self::Cluster { seeds, .. } => format!("cluster [{}]", seeds.join(", ")),
         }
@@ -202,33 +202,33 @@ fn build_sentinel_client(config: &RedisConfig, master: &str) -> Result<SentinelC
         if sentinel_auth.is_none() {
             sentinel_auth = Some(info.clone());
         }
-        sentinel_addrs.push(info.addr);
+        sentinel_addrs.push(info.addr().clone());
     }
     let mut builder = SentinelClientBuilder::new(
         sentinel_addrs,
-        master.to_string(),
+        master,
         SentinelServerType::Master,
     )
     .map_err(|e| AurixError::Redis(format!("Sentinel client: {e}")))?
-    .set_client_to_redis_db(data.redis.db)
-    .set_client_to_redis_protocol(data.redis.protocol);
-    if let Some(tls) = tls_mode(&data.addr) {
+    .set_client_to_redis_db(data.redis_settings().db())
+    .set_client_to_redis_protocol(data.redis_settings().protocol());
+    if let Some(tls) = tls_mode(data.addr()) {
         builder = builder.set_client_to_redis_tls_mode(tls);
     }
-    if let Some(user) = data.redis.username.clone() {
+    if let Some(user) = data.redis_settings().username().map(str::to_owned) {
         builder = builder.set_client_to_redis_username(user);
     }
-    if let Some(pass) = data.redis.password.clone() {
+    if let Some(pass) = data.redis_settings().password().map(str::to_owned) {
         builder = builder.set_client_to_redis_password(pass);
     }
     if let Some(first) = sentinel_auth {
-        if let Some(tls) = tls_mode(&first.addr) {
+        if let Some(tls) = tls_mode(first.addr()) {
             builder = builder.set_client_to_sentinel_tls_mode(tls);
         }
-        if let Some(user) = first.redis.username.clone() {
+        if let Some(user) = first.redis_settings().username().map(str::to_owned) {
             builder = builder.set_client_to_sentinel_username(user);
         }
-        if let Some(pass) = first.redis.password.clone() {
+        if let Some(pass) = first.redis_settings().password().map(str::to_owned) {
             builder = builder.set_client_to_sentinel_password(pass);
         }
     }

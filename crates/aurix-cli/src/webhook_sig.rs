@@ -1,7 +1,7 @@
 //! `X-Aurix-Signature` (`t=<unix>,v1=<hex hmac-sha256(secret, "<t>.<body>")>`) — mirrors
 //! `aurix-control::webhooks` and the shared vector in `sdk/server/vectors`.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, KeyInit};
 use sha2::Sha256;
 
 pub fn sign(secret: &str, ts: i64, body: &[u8]) -> String {

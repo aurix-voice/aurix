@@ -105,7 +105,7 @@ struct Player {
 impl Player {
     async fn send(&mut self, msg: &ControlMessage) {
         self.ws
-            .send(Message::Text(serde_json::to_string(msg).unwrap()))
+            .send(Message::Text(serde_json::to_string(msg).unwrap().into()))
             .await
             .unwrap();
     }
@@ -12252,7 +12252,7 @@ async fn no_bind_reply(p: &mut Player, wait: Duration) -> bool {
 /// binary frame → sealed `SessionBindAck` back on the socket and `MediaBound { tunnel }`.
 async fn bind_tunnel(p: &mut Player) {
     let pkt = AurixPacket::session_bind(&p.session_id, p.ssrc, now_ms(), rand::random());
-    p.ws.send(Message::Binary(pkt.encode_authenticated(&p.keys).to_vec()))
+    p.ws.send(Message::Binary(pkt.encode_authenticated(&p.keys).to_vec().into()))
         .await
         .unwrap();
     let (mut acked, mut bound) = (false, false);
@@ -12328,7 +12328,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
     alice
         .ws
         .send(Message::Binary(
-            foreign.encode_authenticated(&bob.keys).to_vec(),
+            foreign.encode_authenticated(&bob.keys).to_vec().into(),
         ))
         .await
         .unwrap();
@@ -12342,7 +12342,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
     let early = AurixPacket::audio(1, 960, alice.ssrc, hash, Bytes::from_static(&[0xFC, 9]));
     alice
         .ws
-        .send(Message::Binary(early.seal(&alice.keys).to_vec()))
+        .send(Message::Binary(early.seal(&alice.keys).to_vec().into()))
         .await
         .unwrap();
 
@@ -12359,7 +12359,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
     alice
         .ws
         .send(Message::Binary(
-            stale.encode_authenticated(&alice.keys).to_vec(),
+            stale.encode_authenticated(&alice.keys).to_vec().into(),
         ))
         .await
         .unwrap();
@@ -12394,7 +12394,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
         let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
         alice
             .ws
-            .send(Message::Binary(pkt.seal(&alice.keys).to_vec()))
+            .send(Message::Binary(pkt.seal(&alice.keys).to_vec().into()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -12450,7 +12450,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
     hb.header.sequence = seq;
     alice
         .ws
-        .send(Message::Binary(hb.seal(&alice.keys).to_vec()))
+        .send(Message::Binary(hb.seal(&alice.keys).to_vec().into()))
         .await
         .unwrap();
     let mut acked = false;
@@ -12471,7 +12471,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
     let replay = AurixPacket::audio(11, 11 * 960, alice.ssrc, hash, payload.clone());
     alice
         .ws
-        .send(Message::Binary(replay.seal(&alice.keys).to_vec()))
+        .send(Message::Binary(replay.seal(&alice.keys).to_vec().into()))
         .await
         .unwrap();
     assert!(
@@ -12518,7 +12518,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
     let orphan = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
     alice
         .ws
-        .send(Message::Binary(orphan.seal(&alice.keys).to_vec()))
+        .send(Message::Binary(orphan.seal(&alice.keys).to_vec().into()))
         .await
         .unwrap();
     assert!(
@@ -12537,7 +12537,7 @@ async fn native_media_tunnel_over_the_control_websocket() {
         let pkt = AurixPacket::audio(seq, seq * 960, alice.ssrc, hash, payload.clone());
         alice
             .ws
-            .send(Message::Binary(pkt.seal(&alice.keys).to_vec()))
+            .send(Message::Binary(pkt.seal(&alice.keys).to_vec().into()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;

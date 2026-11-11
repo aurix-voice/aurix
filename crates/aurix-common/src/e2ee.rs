@@ -30,7 +30,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use aes::cipher::{InnerIvInit, StreamCipher, StreamCipherCoreWrapper};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::KeyInit;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -131,7 +132,7 @@ impl std::fmt::Debug for IdentityKey {
 impl IdentityKey {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self::from_bytes(bytes)
     }
 
@@ -180,7 +181,7 @@ impl IdentityKey {
     ) -> Result<Vec<u8>> {
         let (enc, auth) = self.wrap_keys(recipient, self.public.as_bytes(), recipient)?;
         let mut nonce = [0u8; WRAP_NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let mut iv = [0u8; 16];
         iv[..WRAP_NONCE_LEN].copy_from_slice(&nonce);
         let mut ct = *secret;
@@ -449,7 +450,7 @@ pub struct Group {
 impl Group {
     pub fn new(identity: IdentityKey) -> Self {
         let mut secret = [0u8; SECRET_LEN];
-        rand::thread_rng().fill_bytes(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let key = SenderKey::derive(0, &secret);
         Self {
             identity,
@@ -701,7 +702,7 @@ impl Group {
             return Ok(Vec::new());
         }
         self.rotation_pending = false;
-        rand::thread_rng().fill_bytes(&mut self.secret);
+        rand::rng().fill_bytes(&mut self.secret);
         self.key = SenderKey::derive(self.key.generation.wrapping_add(1), &self.secret);
         self.counter = 0;
         let peers: Vec<UserId> = self.peers.keys().copied().collect();

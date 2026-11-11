@@ -651,7 +651,7 @@ impl TurnHandler {
                         }
                         None => {
                             let mut txid = [0u8; 12];
-                            rand::Rng::fill(&mut rand::thread_rng(), &mut txid);
+                            rand::Rng::fill_bytes(&mut rand::rng(), &mut txid);
                             let mut ind = StunMessage::new(StunMessageType::DataIndication, txid);
                             ind.add_xor_address(StunAttributeType::XorPeerAddress, peer);
                             ind.add_attribute(StunAttributeType::Data, buf[..len].to_vec());

@@ -285,7 +285,7 @@ impl ControlConnection {
     pub async fn send(&mut self, msg: &ControlMessage) -> Result<()> {
         let json = serde_json::to_string(msg)?;
         self.sink
-            .send(Message::Text(json))
+            .send(Message::Text(json.into()))
             .await
             .map_err(map_ws_error)
     }
@@ -293,7 +293,7 @@ impl ControlConnection {
     /// Send one sealed AURX packet as a binary frame (media tunnel uplink).
     pub async fn send_media(&mut self, packet: Vec<u8>) -> Result<()> {
         self.sink
-            .send(Message::Binary(packet))
+            .send(Message::Binary(packet.into()))
             .await
             .map_err(map_ws_error)
     }
@@ -313,7 +313,7 @@ impl ControlConnection {
                         .map(|m| Some(Inbound::Control(Box::new(m))))
                         .map_err(Into::into);
                 }
-                Some(Ok(Message::Binary(data))) => return Ok(Some(Inbound::Media(data))),
+                Some(Ok(Message::Binary(data))) => return Ok(Some(Inbound::Media(data.to_vec()))),
                 Some(Ok(Message::Close(_))) => return Ok(None),
                 Some(Ok(_)) => {}
             }

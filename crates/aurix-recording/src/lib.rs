@@ -1129,11 +1129,11 @@ fn encrypt_blob(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AurixError::Encryption(format!("Cipher init failed: {e}")))?;
     let mut nonce_bytes = [0u8; 12];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    use rand::Rng;
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).expect("12-byte nonce");
     let encrypted = cipher
-        .encrypt(nonce, data)
+        .encrypt(&nonce, data)
         .map_err(|e| AurixError::Encryption(format!("Encryption failed: {e}")))?;
     let mut result = Vec::with_capacity(12 + encrypted.len());
     result.extend_from_slice(&nonce_bytes);
@@ -1149,8 +1149,8 @@ fn decrypt_blob(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
     }
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AurixError::Encryption(format!("Cipher init failed: {e}")))?;
-    let nonce = Nonce::from_slice(&data[..12]);
-    cipher.decrypt(nonce, &data[12..]).map_err(|_| {
+    let nonce = Nonce::try_from(&data[..12]).expect("12-byte nonce");
+    cipher.decrypt(&nonce, &data[12..]).map_err(|_| {
         AurixError::Encryption("Decryption failed (wrong key or corrupted file)".into())
     })
 }

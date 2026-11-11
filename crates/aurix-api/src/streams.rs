@@ -633,7 +633,7 @@ async fn proxy_pull(
         tokio::select! {
             item = up_rx.next() => match item {
                 Some(Ok(UpstreamMessage::Text(t))) => {
-                    if down_tx.send(Message::Text(t)).await.is_err() { break; }
+                    if down_tx.send(Message::Text(t.as_str().into())).await.is_err() { break; }
                 }
                 Some(Ok(UpstreamMessage::Binary(b))) => {
                     if down_tx.send(Message::Binary(b)).await.is_err() { break; }
@@ -645,7 +645,7 @@ async fn proxy_pull(
                     let _ = down_tx
                         .send(Message::Close(frame.map(|f| CloseFrame {
                             code: f.code.into(),
-                            reason: f.reason.into_owned().into(),
+                            reason: f.reason.to_string().into(),
                         })))
                         .await;
                     return;
@@ -689,8 +689,8 @@ async fn run_pull(
     let id = receiver.id;
     let (mut sink, mut source) = socket.split();
     let to_message = |out: Outgoing| match out {
-        Outgoing::Control(c) => serde_json::to_string(&c).ok().map(Message::Text),
-        Outgoing::Audio(b) => Some(Message::Binary(b.to_vec())),
+        Outgoing::Control(c) => serde_json::to_string(&c).ok().map(|s| Message::Text(s.into())),
+        Outgoing::Audio(b) => Some(Message::Binary(b.to_vec().into())),
     };
     for out in replay {
         if let Some(msg) = to_message(out) {

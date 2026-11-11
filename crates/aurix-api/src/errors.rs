@@ -32,6 +32,27 @@ impl<T: serde::Serialize> IntoResponse for Json<T> {
     }
 }
 
+/// `Option<Json<T>>` as a handler argument: `None` without a JSON body (axum 0.8 routes optional
+/// body extractors through `OptionalFromRequest` instead of `FromRequest` for `Option<T>`).
+impl<T, S> axum::extract::OptionalFromRequest<S> for Json<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        match <axum::Json<T> as axum::extract::OptionalFromRequest<S>>::from_request(req, state).await {
+            Ok(Some(axum::Json(v))) => Ok(Some(Json(v))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(ApiError::from(e)),
+        }
+    }
+}
+
 /// `axum::extract::Path` with JSON-formatted rejections.
 #[derive(axum::extract::FromRequestParts)]
 #[from_request(via(axum::extract::Path), rejection(ApiError))]

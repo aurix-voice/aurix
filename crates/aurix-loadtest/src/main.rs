@@ -670,7 +670,7 @@ async fn setup_session(
     if let (Link::Native(mt), Some(_)) = (&link, &tunnel_uplink) {
         // WebSocket tunnel: the bind travels as a binary message and the ack comes back the
         // same way, through `MediaTransport::handle_frame`.
-        ws.send(Message::Binary(mt.bind_packet())).await?;
+        ws.send(Message::Binary(mt.bind_packet().into())).await?;
         wait_for(&mut ws, Some(mt), "tunnel bind", |f| {
             matches!(f, Err(FrameKind::BindAck)).then_some(())
         })
@@ -683,7 +683,7 @@ async fn setup_session(
 
     ws.send(Message::Text(serde_json::to_string(
         &ControlMessage::ChannelJoin { channel_id, token },
-    )?))
+    )?.into()))
     .await?;
     wait_for(&mut ws, tunnel, "join", |f| {
         matches!(f, Ok(ControlMessage::ChannelJoinAck { .. })).then_some(())
@@ -695,7 +695,7 @@ async fn setup_session(
             &ControlMessage::SetDownlinkMode {
                 mode: DownlinkMode::Mixed,
             },
-        )?))
+        )?.into()))
         .await?;
         wait_for(&mut ws, tunnel, "mixed downlink", |f| {
             matches!(
@@ -712,7 +712,7 @@ async fn setup_session(
     if args.noise_suppression && is_speaker {
         ws.send(Message::Text(serde_json::to_string(
             &ControlMessage::SetNoiseSuppression { enabled: true },
-        )?))
+        )?.into()))
         .await?;
         // A full pool answers with an error; the session is still valid and keeps speaking
         // uncleaned, which is what the capacity number is about.
@@ -1179,7 +1179,7 @@ async fn main() -> Result<()> {
                             }
                         } => {
                             let Some(frame) = frame else { return };
-                            if ws.send(Message::Binary(frame)).await.is_err() {
+                            if ws.send(Message::Binary(frame.into())).await.is_err() {
                                 stats.ws_closed.fetch_add(1, Ordering::Relaxed);
                                 return;
                             }

@@ -2,6 +2,7 @@ use crate::error::{AurixError, Result};
 use aes::cipher::{InnerIvInit, StreamCipher, StreamCipherCoreWrapper};
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use hmac::KeyInit;
 use ring::rand::SecureRandom;
 use ring::{aead, rand as ring_rand};
 use sha1::Sha1;

@@ -392,7 +392,7 @@ pub async fn add_counters(
         let app_ids: Vec<Uuid> = app_rows.iter().map(|d| d.app_id).collect();
         let buckets: Vec<DateTime<Utc>> = app_rows.iter().map(|d| d.bucket).collect();
         let values: Vec<i64> = app_rows.iter().map(|d| d.value).collect();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"INSERT INTO usage_app_buckets (app_id, bucket, {metric}, updated_at)
                SELECT app_id, bucket, SUM(value), NOW()
                FROM UNNEST($1::uuid[], $2::timestamptz[], $3::bigint[]) AS t(app_id, bucket, value)
@@ -401,7 +401,7 @@ pub async fn add_counters(
                ON CONFLICT (app_id, bucket) DO UPDATE SET
                    {metric} = usage_app_buckets.{metric} + EXCLUDED.{metric},
                    updated_at = NOW()"#
-        ))
+        )))
         .bind(&app_ids)
         .bind(&buckets)
         .bind(&values)
@@ -417,7 +417,7 @@ pub async fn add_counters(
         let channel_ids: Vec<Uuid> = channel_rows.iter().filter_map(|d| d.channel_id).collect();
         let buckets: Vec<DateTime<Utc>> = channel_rows.iter().map(|d| d.bucket).collect();
         let values: Vec<i64> = channel_rows.iter().map(|d| d.value).collect();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"INSERT INTO usage_channel_buckets (app_id, channel_id, bucket, {metric}, updated_at)
                SELECT app_id, channel_id, to_timestamp(floor(EXTRACT(EPOCH FROM bucket) / $5) * $5), SUM(value), NOW()
                FROM UNNEST($1::uuid[], $2::uuid[], $3::timestamptz[], $4::bigint[]) AS t(app_id, channel_id, bucket, value)
@@ -426,7 +426,7 @@ pub async fn add_counters(
                ON CONFLICT (app_id, channel_id, bucket) DO UPDATE SET
                    {metric} = usage_channel_buckets.{metric} + EXCLUDED.{metric},
                    updated_at = NOW()"#
-        ))
+        )))
         .bind(&app_ids)
         .bind(&channel_ids)
         .bind(&buckets)
@@ -576,9 +576,9 @@ pub async fn app_totals(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<Option<UsageTotalsRow>, sqlx::Error> {
-    sqlx::query_as::<_, UsageTotalsRow>(&format!(
+    sqlx::query_as::<_, UsageTotalsRow>(sqlx::AssertSqlSafe(format!(
         "{TOTALS_SELECT} WHERE app_id = $1 AND bucket >= $2 AND bucket < $3 GROUP BY app_id"
-    ))
+    )))
     .bind(app_id)
     .bind(from)
     .bind(to)
@@ -592,9 +592,9 @@ pub async fn all_app_totals(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<Vec<UsageTotalsRow>, sqlx::Error> {
-    sqlx::query_as::<_, UsageTotalsRow>(&format!(
+    sqlx::query_as::<_, UsageTotalsRow>(sqlx::AssertSqlSafe(format!(
         "{TOTALS_SELECT} WHERE bucket >= $1 AND bucket < $2 GROUP BY app_id ORDER BY app_id"
-    ))
+    )))
     .bind(from)
     .bind(to)
     .fetch_all(pool)

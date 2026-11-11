@@ -120,7 +120,7 @@ async fn cleanup(pool: &DbPool, apps: &[Uuid]) {
 }
 
 async fn count(pool: &DbPool, table: &str, app_id: Uuid) -> i64 {
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} WHERE app_id = $1"))
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE app_id = $1")))
         .bind(app_id)
         .fetch_one(pool)
         .await

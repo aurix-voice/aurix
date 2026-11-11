@@ -11,6 +11,9 @@ released together.
 
 ## [Unreleased]
 
+### Changed
+- Dependencies: axum 0.8 (`{param}` route syntax, `WebSocketUpgrade` last in `ws_handler`, `Option<Json<T>>` via `OptionalFromRequest`), sqlx 0.9 (dynamic SQL goes through `AssertSqlSafe`), redis 1.8, jsonwebtoken 11 (`rust_crypto`), argon2 0.6, rand 0.10, hmac 0.13 / sha2 0.11 / aes-gcm 0.11, tokio-tungstenite 0.29, tower 0.5 / tower-http 0.6, opentelemetry 0.33 (OTLP TLS now enabled through tonic features), axum-server 0.9, str0m 0.25. No wire or config changes.
+
 ## [1.13.0] - 2026-11-05
 
 ### Added

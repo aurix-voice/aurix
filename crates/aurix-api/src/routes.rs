@@ -46,9 +46,10 @@ fn cors_layer(state: &AppState) -> CorsLayer {
 pub fn create_router(state: AppState) -> Router {
     let cors = cors_layer(&state);
     let body_limit = DefaultBodyLimit::max(state.control.config.server.max_body_bytes);
-    let timeout = TimeoutLayer::new(Duration::from_secs(
-        state.control.config.server.request_timeout_secs,
-    ));
+    let timeout = TimeoutLayer::with_status_code(
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        Duration::from_secs(state.control.config.server.request_timeout_secs),
+    );
 
     let public_routes = Router::new()
         .route("/health", get(handlers::health))
@@ -107,7 +108,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/nodes", get(handlers::list_media_nodes))
         .route("/v1/nodes/links", get(handlers::list_media_node_links))
-        .route("/v1/nodes/:node_id/drain", post(handlers::drain_media_node))
+        .route("/v1/nodes/{node_id}/drain", post(handlers::drain_media_node))
         .route(
             "/v1/nodes/:node_id/undrain",
             post(handlers::undrain_media_node),
@@ -157,8 +158,8 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/users/:user_id",
             get(handlers::get_user).delete(handlers::delete_user),
         )
-        .route("/v1/users/:user_id/export", get(handlers::export_user))
-        .route("/v1/users/:user_id/unban", post(handlers::unban_user_all))
+        .route("/v1/users/{user_id}/export", get(handlers::export_user))
+        .route("/v1/users/{user_id}/unban", post(handlers::unban_user_all))
         .route(
             "/v1/users/:user_id/blocks",
             get(handlers::list_user_blocks).post(handlers::add_user_block),
@@ -228,7 +229,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/tts/voices", get(handlers::tts_voices))
         .route("/v1/moderation/ban", post(handlers::ban_user))
         .route("/v1/moderation/bans", get(handlers::list_bans))
-        .route("/v1/moderation/bans/:ban_id/revoke", post(handlers::unban))
+        .route("/v1/moderation/bans/{ban_id}/revoke", post(handlers::unban))
         .route("/v1/moderation/mute", post(handlers::server_mute))
         .route("/v1/moderation/mute-all", post(handlers::mute_all))
         .route("/v1/moderation/priority", post(handlers::set_priority))

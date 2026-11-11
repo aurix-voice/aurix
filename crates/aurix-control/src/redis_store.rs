@@ -20,6 +20,7 @@ const SENTINEL_POLL: Duration = Duration::from_secs(5);
 /// The Redis the store currently talks to. Swapped as a whole on a Sentinel failover; a
 /// cluster connection routes and re-routes by itself.
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)] // redis 1.x SentinelClient is large; the handle is created once per node
 enum Handle {
     Single {
         client: redis::Client,
@@ -165,7 +166,7 @@ impl RedisStore {
     /// and health output.
     pub fn master_addr(&self) -> String {
         match &**self.handle.load() {
-            Handle::Single { client, .. } => client.get_connection_info().addr.to_string(),
+            Handle::Single { client, .. } => client.get_connection_info().addr().to_string(),
             Handle::Cluster(_) => self.source.describe(),
         }
     }
@@ -191,7 +192,7 @@ impl RedisStore {
                         continue;
                     }
                 };
-                let next = client.get_connection_info().addr.to_string();
+                let next = client.get_connection_info().addr().to_string();
                 if next == current && store.ping().await.is_ok() {
                     continue;
                 }
@@ -711,9 +712,9 @@ impl RedisStore {
             }
             let (host, port): (String, u16) = match master {
                 redis::Value::Array(parts) if parts.len() >= 2 => (
-                    redis::from_redis_value(&parts[0])
+                    redis::from_redis_value(parts[0].clone())
                         .map_err(|e| AurixError::Redis(format!("cluster slots host: {e}")))?,
-                    redis::from_redis_value(&parts[1])
+                    redis::from_redis_value(parts[1].clone())
                         .map_err(|e| AurixError::Redis(format!("cluster slots port: {e}")))?,
                 ),
                 _ => continue,

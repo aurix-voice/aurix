@@ -705,6 +705,7 @@ fn same_family(a: Algorithm, b: Algorithm) -> bool {
             Algorithm::ES256 | Algorithm::ES384 => 2,
             Algorithm::EdDSA => 3,
             Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => 4,
+            _ => 0,
         }
     }
     family(a) == family(b)
@@ -737,6 +738,7 @@ fn jwk_algorithm(jwk: &Jwk) -> Option<Algorithm> {
         },
         AlgorithmParameters::OctetKeyPair(_) => Some(Algorithm::EdDSA),
         AlgorithmParameters::OctetKey(_) => None,
+        _ => None,
     }
 }
 

@@ -22,8 +22,8 @@ use aurix_db::DbPool;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
-use rand::Rng;
+use hmac::{Hmac, Mac, KeyInit};
+use rand::RngExt;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -158,8 +158,8 @@ pub fn verify_signature(
 }
 
 fn generate_secret() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
+    let mut rng = rand::rng();
+    let bytes: [u8; 32] = rng.random();
     format!("whsec_{}", hex::encode(bytes))
 }
 

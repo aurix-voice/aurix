@@ -41,7 +41,7 @@ impl BrowserClient {
         let local = sock.local_addr().unwrap();
         let mut rtc = Rtc::builder()
             .clear_codecs()
-            .enable_opus(true)
+            .enable_opus(true, false)
             .build(Instant::now());
         rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
         let mut api = rtc.sdp_api();
