@@ -91,7 +91,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake clang
+      - run: for i in 1 2 3 4 5; do sudo apt-get update && break; [ "$i" = 3 ] && sudo sed -i "s|azure.archive.ubuntu.com|archive.ubuntu.com|g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null; sleep 20; done && sudo apt-get install -y -o Acquire::Retries=5 --no-install-recommends pkg-config libssl-dev cmake clang
       - run: cargo build --release --locked --bin aurix-server --bin aurix --bin aurix-loadtest
       - name: Stage
         env:
@@ -144,7 +144,7 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake clang
+        run: for i in 1 2 3 4 5; do sudo apt-get update && break; [ "$i" = 3 ] && sudo sed -i "s|azure.archive.ubuntu.com|archive.ubuntu.com|g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null; sleep 20; done && sudo apt-get install -y -o Acquire::Retries=5 --no-install-recommends pkg-config libssl-dev cmake clang
       - name: Native core (Unix)
         if: runner.os != 'Windows'
         run: sdk/unreal/scripts/build_native.sh --target ${{ matrix.target }}
@@ -215,7 +215,7 @@ jobs:
         env:
           ANDROID_NDK_PIN: 27.2.12479018
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config cmake clang
+          for i in 1 2 3 4 5; do sudo apt-get update && break; [ "$i" = 3 ] && sudo sed -i "s|azure.archive.ubuntu.com|archive.ubuntu.com|g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null; sleep 20; done && sudo apt-get install -y -o Acquire::Retries=5 --no-install-recommends pkg-config cmake clang
           # Pin the NDK: the runner's "latest" (r30) is newer than cargo-ndk understands.
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_PIN}" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_PIN}" >> "$GITHUB_ENV"
@@ -439,7 +439,7 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --quiet scons
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config cmake clang
+        run: for i in 1 2 3 4 5; do sudo apt-get update && break; [ "$i" = 3 ] && sudo sed -i "s|azure.archive.ubuntu.com|archive.ubuntu.com|g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null; sleep 20; done && sudo apt-get install -y -o Acquire::Retries=5 --no-install-recommends pkg-config cmake clang
       - if: matrix.name == 'android.arm64'
         env:
           ANDROID_NDK_PIN: 27.2.12479018

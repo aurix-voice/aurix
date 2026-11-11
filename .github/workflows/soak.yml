@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake jq
+      - run: for i in 1 2 3 4 5; do sudo apt-get update && break; [ "$i" = 3 ] && sudo sed -i "s|azure.archive.ubuntu.com|archive.ubuntu.com|g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null; sleep 20; done && sudo apt-get install -y -o Acquire::Retries=5 --no-install-recommends pkg-config libssl-dev cmake jq
       - run: cargo build --locked --release --bin aurix-server --bin aurix-soak
       # Same topology as the chaos job (two nodes on loopback, PostgreSQL + Redis in host-network
       # containers), but instead of the E2E suite the real native client core runs as bots for
