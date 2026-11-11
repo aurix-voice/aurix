@@ -33,7 +33,7 @@ namespace Aurix.Samples
 
         public override void OnNetworkSpawn()
         {
-            if (Voice == null) Voice = FindObjectOfType<AurixVoiceBehaviour>();
+            if (Voice == null) Voice = Aurix.Unity.AurixFind.First<AurixVoiceBehaviour>();
             if (IsOwner)
             {
                 _source = gameObject.GetComponent<AurixPositionalSource>() ?? gameObject.AddComponent<AurixPositionalSource>();
@@ -78,7 +78,7 @@ namespace Aurix.Samples
             if (!Guid.TryParse(_userId.Value.ToString(), out var user) || user == Guid.Empty || user == _attachedAs) return;
             if (_attacher == null)
             {
-                _attacher = FindObjectOfType<AurixPositionalSource>();
+                _attacher = Aurix.Unity.AurixFind.First<AurixPositionalSource>();
                 if (_attacher == null) return; // the local player has not spawned yet; retried on the next value change
             }
             if (_attachedAs != Guid.Empty) _attacher.DetachParticipantVoice(_attachedAs);

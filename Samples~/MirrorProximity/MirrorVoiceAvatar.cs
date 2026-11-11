@@ -29,7 +29,7 @@ namespace Aurix.Samples
 
         public override void OnStartLocalPlayer()
         {
-            if (Voice == null) Voice = FindObjectOfType<AurixVoiceBehaviour>();
+            if (Voice == null) Voice = Aurix.Unity.AurixFind.First<AurixVoiceBehaviour>();
             _source = gameObject.GetComponent<AurixPositionalSource>() ?? gameObject.AddComponent<AurixPositionalSource>();
             _source.Voice = Voice;
             _source.PoseSource = Head;
@@ -78,7 +78,7 @@ namespace Aurix.Samples
             if (!Guid.TryParse(value, out var user) || user == Guid.Empty || user == _attachedAs) return;
             if (_attacher == null)
             {
-                _attacher = FindObjectOfType<AurixPositionalSource>();
+                _attacher = Aurix.Unity.AurixFind.First<AurixPositionalSource>();
                 if (_attacher == null) return;
             }
             if (_attachedAs != Guid.Empty) _attacher.DetachParticipantVoice(_attachedAs);

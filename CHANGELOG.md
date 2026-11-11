@@ -7,6 +7,7 @@ server version it ships with (the repository is versioned as one unit).
 ## [Unreleased]
 
 ### Fixed
+- No deprecation warnings on Unity 2023+/6: scene lookups go through `AurixFind.First<T>()` (`FindFirstObjectByType` where available), the setup check uses `NamedBuildTarget`.
 - Projects without the Input System package no longer fail to compile: the push-to-talk `InputActionReference` field is guarded by a `com.unity.inputsystem` version define (`AURIX_INPUTSYSTEM`) and the assembly references `Unity.InputSystem` only when present.
 
 ## [1.8.2] — 2026-10-22

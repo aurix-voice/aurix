@@ -27,10 +27,10 @@ namespace Aurix.Unity
             var local = self != null ? self.GetComponent<IAurixVoiceHost>() : null;
             if (local != null) return local;
 #if !(UNITY_WEBGL && !UNITY_EDITOR)
-            var native = Object.FindObjectOfType<AurixVoiceBehaviour>();
+            var native = Aurix.Unity.AurixFind.First<AurixVoiceBehaviour>();
             if (native != null) return native;
 #endif
-            return Object.FindObjectOfType<AurixWebGLVoiceBehaviour>();
+            return Aurix.Unity.AurixFind.First<AurixWebGLVoiceBehaviour>();
         }
     }
 }
