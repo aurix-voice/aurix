@@ -6,7 +6,7 @@ updates:
     schedule: { interval: "weekly", day: "monday" }
     open-pull-requests-limit: 5
     groups:
-      cargo-deps: { patterns: ["*"] }
+      cargo-deps: { patterns: ["*"], update-types: ["minor", "patch"] }
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule: { interval: "weekly", day: "monday" }
@@ -19,36 +19,66 @@ updates:
     open-pull-requests-limit: 5
     groups:
       npm-deps: { patterns: ["*"] }
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/sdk/web"
     schedule: { interval: "weekly", day: "monday" }
     open-pull-requests-limit: 5
     groups:
       npm-deps: { patterns: ["*"] }
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/sdk/server/node"
     schedule: { interval: "weekly", day: "monday" }
     open-pull-requests-limit: 5
     groups:
       npm-deps: { patterns: ["*"] }
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/sdk/server/examples/token-server/node"
     schedule: { interval: "weekly", day: "monday" }
     open-pull-requests-limit: 5
     groups:
       npm-deps: { patterns: ["*"] }
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/examples/rooms/server"
     schedule: { interval: "weekly", day: "monday" }
     open-pull-requests-limit: 5
     groups:
       npm-deps: { patterns: ["*"] }
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/examples/rooms/web"
     schedule: { interval: "weekly", day: "monday" }
     open-pull-requests-limit: 5
     groups:
       npm-deps: { patterns: ["*"] }
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "nuget"
     directory: "/sdk/server/csharp/Aurix.Server"
     schedule: { interval: "weekly", day: "monday" }
