@@ -166,7 +166,7 @@ blockquote.alert .alert-title { font-weight: 600; font-size: 13px; letter-spacin
 
 /* ---- brand row + site links (index.hbs) ---- */
 .ax-brand { display: flex; align-items: center; gap: 10px; height: var(--menu-bar-height); padding: 0 20px; border-bottom: 1px solid var(--ax-line); color: var(--fg); text-decoration: none; flex: none; }
-.ax-brand img { width: 20px; height: 20px; }
+.ax-brand .ax-mark { width: 20px; height: 20px; color: var(--fg); flex: none; }
 .ax-brand b { font-weight: 600; font-size: 14px; letter-spacing: -.01em; }
 .ax-brand span { font-size: 11px; color: var(--ax-faint); border: 1px solid var(--ax-line2); border-radius: 5px; padding: 1px 6px; font-family: var(--mono-font); letter-spacing: .04em; }
 .sidebar { display: flex; flex-direction: column; }
@@ -177,3 +177,57 @@ blockquote.alert .alert-title { font-weight: 600; font-size: 13px; letter-spacin
 .ax-cta:hover { background: var(--fg); color: var(--bg); opacity: .9; }
 @media (max-width: 900px) { .ax-link:not(.ax-cta) { display: none; } }
 @media (max-width: 560px) { .ax-link { display: none; } }
+
+/* ---- header geometry: one row, icons centred, no wrap ---- */
+#mdbook-menu-bar { flex-wrap: nowrap; align-items: center; }
+#mdbook-menu-bar .fa-svg, #mdbook-menu-bar .icon-button { line-height: 1; padding: 0; }
+#mdbook-menu-bar .fa-svg { display: block; }
+.left-buttons { margin: 0 8px; gap: 2px; }
+.right-buttons { margin: 0 12px; gap: 2px; }
+.right-buttons a { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 8px; color: var(--ax-faint); }
+.right-buttons a:hover { color: var(--fg); background: var(--ax-glass); }
+.right-buttons a.ax-link { width: auto; height: 30px; margin: 0 2px; }
+.menu-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ---- sidebar nesting: one thin guide line, modest indent ---- */
+.chapter li ol, .on-this-page { margin: 2px 0 4px 12px; padding-left: 6px; border-left: 1px solid var(--ax-line); }
+.on-this-page > ol, .chapter li ol ol { margin-left: 0; padding-left: 10px; border: 0; }
+.chapter li.chapter-item { margin-block-start: 0; line-height: 1.45; }
+.chapter li.header-item { margin-block-end: 0; }
+.chapter li.part-title { margin-top: 6px; }
+.chapter .spacer, .spacer { height: 1px; margin: 10px 0; background: var(--ax-line); }
+.chapter li a.active { position: relative; }
+
+/* ---- polish pass 2 ---- */
+.chapter, .chapter ol { list-style: none; margin: 0; padding: 0; }
+.chapter li ol, .on-this-page { margin: 2px 0 6px 14px; padding-left: 4px; border-left: 1px solid var(--ax-line); }
+.on-this-page > ol, .chapter li ol ol { margin: 0; padding-left: 8px; border: 0; }
+.chapter li ol li a, .on-this-page a { font-size: 12.5px; padding: 4px 10px; color: var(--ax-muted); }
+.chapter li ol li a.active, .chapter a.current-header { color: var(--fg); background: var(--ax-panel2); }
+.theme-popup { min-width: 170px; padding: 6px; }
+.theme-popup .theme { position: relative; padding: 7px 12px 7px 30px; border-radius: 7px; font-size: 13.5px; }
+.theme-selected::before { position: absolute; left: 11px; top: 7px; }
+.icon-button:focus, .right-buttons a:focus { outline: none; }
+.icon-button:focus-visible, .right-buttons a:focus-visible { outline: 2px solid var(--ax-faint); outline-offset: 2px; }
+.content pre { position: relative; }
+.content pre > code { padding-right: 64px; }
+pre > .buttons { position: absolute; right: 10px; top: 10px; margin: 0; }
+pre > .buttons button { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; }
+@media (max-width: 900px) { .right-buttons a.ax-link:not(.ax-cta) { display: none; } }
+@media (max-width: 560px) {
+  .right-buttons a.ax-link, .right-buttons a[title="Print this book"] { display: none; }
+  .menu-title { font-size: 13.5px; }
+  .left-buttons { margin: 0 4px; }
+  .right-buttons { margin: 0 6px; }
+}
+
+/* ---- polish pass 3: copy button in its own strip, tighter theme menu ---- */
+.content pre { padding-top: 40px; }
+.content pre::before { content: ""; position: absolute; left: 0; right: 0; top: 40px; border-top: 1px solid var(--ax-line); }
+.content pre > code { padding: 14px 18px 16px; padding-right: 18px; }
+pre > .buttons { top: 5px; right: 8px; }
+pre > .buttons button { width: 28px; height: 28px; }
+pre > .buttons button.clip-button::before { filter: var(--copy-button-filter); }
+.theme-popup { min-width: 150px; }
+.theme-popup .theme { padding: 7px 12px 7px 30px !important; }
+.theme-selected::before { left: 12px !important; }
+.chapter li ol, .on-this-page { margin-left: 10px; }
