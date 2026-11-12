@@ -229,6 +229,20 @@ func _init() -> void:
 	client.disconnect_from_server()
 	root.remove_child(client)
 	client.free()
+	# Scene helpers added in 1.14: register, accept defaults, stay inert without a client.
+	var helpers_root := Node3D.new()
+	var pos := AurixPositionalSource.new(); pos.channel_id = "11111111-2222-3333-4444-555555555555"; helpers_root.add_child(pos)
+	var lip := AurixLipSync.new(); lip.blend_shapes = PackedStringArray(["sil", "PP"]); helpers_root.add_child(lip)
+	var duck := AurixGameAudioDucker.new(); duck.bus = &"Master"; helpers_root.add_child(duck)
+	var lobby := AurixVoiceLobby.new(); lobby.channel_id = "11111111-2222-3333-4444-555555555555"; helpers_root.add_child(lobby)
+	var prox := AurixProximityVoice.new(); prox.channel_id = "11111111-2222-3333-4444-555555555555"; helpers_root.add_child(prox)
+	get_root().add_child(helpers_root)
+	_check(not pos.send_pose_now() and pos.get_updates_sent() == 0, "positional source without client")
+	_check(not lip.is_analysing() and lip.get_weights().size() == 9 and lip.get_mouth_open() == 0.0, "lip-sync idle")
+	_check(not duck.is_ducking() and duck.get_current_gain() == 1.0, "ducker idle")
+	_check(lobby.join_now() == AurixVoiceClient.RESULT_INVALID_ARGUMENT and not lobby.is_joined() and lobby.get_roster().is_empty(), "lobby join without client")
+	_check(not prox.is_joined() and prox.get_speaker_players().is_empty() and prox.get_speaker_player("x") == null, "proximity idle")
+	helpers_root.queue_free()
 	_finish()
 
 func _finish() -> void:

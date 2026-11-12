@@ -18,6 +18,7 @@ sdk/godot/
 │   ├── aurix_voice_client.{h,cpp}        AurixVoiceClient : Node — the whole API + signals
 │   ├── aurix_participant_player.{h,cpp}  AurixParticipantPlayer : AudioStreamPlayer3D
 │   ├── aurix_regions.{h,cpp}             AurixRegions : RefCounted — region discovery/ranking
+│   ├── aurix_nodes.{h,cpp}               scene helpers: AurixPositionalSource, AurixLipSync, AurixGameAudioDucker, AurixVoiceLobby, AurixProximityVoice
 │   ├── aurix_conversions.h               C ABI structs → Dictionary / String / Array
 │   └── register_types.cpp                GDExtension entry point
 ├── SConstruct                            builds against godot-cpp + the staged native library
@@ -38,6 +39,11 @@ sdk/godot/
 | `AurixVoiceClient` | `Node` | one per player: connect, channels, capture, playback, receiver controls, chat, speech, stats; every native event is a signal |
 | `AurixParticipantPlayer` | `AudioStreamPlayer3D` | one per remote speaker you want spatialised by Godot; pulls that participant's PCM from the client |
 | `AurixRegions` | `RefCounted` | parses `GET /v1/me/regions`, stores RTT probes, ranks endpoints |
+| `AurixVoiceLobby` | `Node` | party/lobby voice: joins `channel_id` when the session is media-bound (and after a reconnect), keeps a roster, `member_joined/left/speaking` signals |
+| `AurixProximityVoice` | `Node3D` | proximity voice: joins a positional channel, sends this node's transform, spawns one `AurixParticipantPlayer` per remote speaker and places it from server positions |
+| `AurixPositionalSource` | `Node3D` | reports a transform (own or `pose_source`) as the local pose, rate-limited and only when moved/turned; for custom positional setups |
+| `AurixLipSync` | `Node` | drives `MeshInstance3D` blend shapes from the viseme analysis of one participant (or the local mic), smoothed; `frame` signal |
+| `AurixGameAudioDucker` | `Node` | attenuates an audio bus while someone speaks in a channel whose policy ducks; follows the server envelope or your own |
 | `AurixWebVoiceClient` | `Node` (GDScript) | Web export only: same signals/dictionaries as `AurixVoiceClient`, media by the browser through the [Web SDK](../web/README.md) (`JavaScriptBridge`) |
 
 Platforms: Linux x86_64/arm64, Windows x86_64, macOS (universal) — wherever `aurix-client`

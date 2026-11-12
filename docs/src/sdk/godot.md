@@ -45,6 +45,39 @@ func join(channel_id: String) -> void:
 	voice.join_channel(channel_id)
 ```
 
+## Scene helper nodes
+
+Five nodes wrap the common gameplay patterns so a project needs no GDScript around the client. Each
+finds its client through `client_path` or, when empty, the nearest `AurixVoiceClient` ancestor (as
+`AurixParticipantPlayer` does), and stays inert while there is none. All registered by the
+extension (`src/aurix_nodes.{h,cpp}`); the smoke test instantiates each one.
+
+| Node | Base | Properties | Signals / methods |
+|---|---|---|---|
+| `AurixVoiceLobby` | `Node` | `channel_id`, `join_token`, `auto_join` | joins when the client reaches `STATE_MEDIA_BOUND` (again after a reconnect); `joined(participants)`, `left`, `member_joined(p)`, `member_left(user_id, p)`, `member_speaking(user_id, on)`, `roster_changed(roster)`; `get_roster()`, `get_speakers()`, `join_now()`, `leave_now()` |
+| `AurixProximityVoice` | `Node3D` | `channel_id`, `join_token`, `speakers_root`, `player_template` (an `AurixParticipantPlayer` to duplicate), `updates_per_second`, `world_to_meters`, `place_speakers` | sends this node's transform with `update_transforms`, switches the client to `PLAYBACK_PER_PARTICIPANT`, spawns one `AurixParticipantPlayer` per remote speaker and moves it to the position from the `positions` event (or `set_speaker_position` from your netcode); `speaker_added(user_id, player)`, `speaker_removed(user_id)`, `get_speaker_player(user_id)` |
+| `AurixPositionalSource` | `Node3D` | `channel_id`, `pose_source`, `updates_per_second`, `min_move`, `min_turn_degrees`, `world_to_meters` | rate-limited pose updates only when moved/turned, for positional channels you join yourself; `send_pose_now()`, `get_updates_sent()` |
+| `AurixLipSync` | `Node` | `user_id` (empty = local microphone), `target` (`MeshInstance3D`), `blend_shapes` (9 names in `AURIX_VISEME_*` order), `jaw_blend_shape`, `smoothing`, `enable_analysis` | turns on `visemes_enabled`, smooths the frame and writes blend shapes every frame; `frame(weights, mouth_open, dominant, analysing)`; `get_weights()`, `get_mouth_open()`, `get_dominant()`, `is_analysing()` |
+| `AurixGameAudioDucker` | `Node` | `channel_id` (empty = any), `bus`, `override_envelope`, `duck_gain`, `attack_ms`, `release_ms`, `hold_ms` | follows the client's `ducking_changed` signal: lowers the audio bus by the channel policy's gain/attack/release/hold (or your own when `override_envelope`), restores the bus volume on exit; `gain_changed(gain)`, `get_current_gain()`, `is_ducking()` |
+
+```gdscript
+# Party voice + positional voice with spatialised speakers, no code around the client.
+# Scene: AurixVoiceClient (ws_url/token set) → AurixVoiceLobby, Player (CharacterBody3D) → AurixProximityVoice
+$Client/Lobby.channel_id = party_channel
+$Player/Proximity.channel_id = world_channel
+$Player/Proximity.speaker_added.connect(func(user_id, player): player.max_distance = 30.0)
+```
+
+### FMOD, Wwise and other mixers
+
+Godot has no official FMOD/Wwise integration; third-party GDExtensions exist and work with the
+same four client methods documented under [Audio in Godot terms](#audio-in-godot-terms):
+`push_capture`/`push_capture_mono` when the middleware records the microphone, `mix_output(frames)`
+(stereo 48 kHz `PackedVector2Array`) from its output callback, `pull_participant(user_id, frames)` for
+one 3D emitter per speaker (set `playback_mode = PLAYBACK_PER_PARTICIPANT`), and `push_render(frames)`
+with the audio the middleware played so the echo canceller can subtract it. Godot's own
+`AudioStreamGenerator` path is what the extension uses by default and what the helper nodes assume.
+
 ## Audio in Godot terms
 
 * **Capture:** `auto_capture` (default) creates a muted `AurixCapture` bus with an

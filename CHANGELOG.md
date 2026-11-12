@@ -11,6 +11,16 @@ released together.
 
 ## [Unreleased]
 
+### Added
+- Unity SDK: external audio engine boundary on `AurixVoiceBehaviour` — `ExternalCapture` + `PushCapture()` (microphone from FMOD/Wwise/custom code, any rate, 1–2 channels, same DSP/VAD/effects/encode path), `MixOutput()` (add the remote mix into a middleware buffer at its sample rate), `PullParticipant()`/`ReleaseParticipant()` (one speaker for a middleware 3D emitter, claimed so the mix skips them), `PushRender()` (echo-canceller reference from an external mixer).
+- Unity SDK: `Samples~/FmodIntegration` — `AurixFmodOutput` (voice DSP on the master group or a bus + AEC reference tap), `AurixFmodCapture` (FMOD recording → Aurix), `AurixFmodParticipantVoice` (one Studio event with a Programmer instrument per speaker); compiled only with the `AURIX_FMOD` define.
+- Godot SDK: scene helper nodes `AurixVoiceLobby`, `AurixProximityVoice`, `AurixPositionalSource`, `AurixLipSync`, `AurixGameAudioDucker` (`src/aurix_nodes.{h,cpp}`), covered by `tests/smoke.gd`.
+- Unreal SDK: `Samples/FMOD/AurixFmodVoiceComponent.{h,cpp}` — drop-in FMOD Studio component (voice DSP via `MixOutputAudio`, AEC tap via `PushRenderAudio`, optional capture via `PushCaptureAudio`, per-speaker programmer sounds via `PullParticipantAudio`); not built by CI.
+- Docs: "External audio engines" (Unity), "FMOD Studio and Wwise" (Unreal) and "Scene helper nodes" (Godot) sections, verified against the SDK sources.
+
+### Fixed
+- Unity SDK: participants claimed through `PullParticipant()` stay excluded from the aggregate mix when `AurixParticipantAudioSource` components rebind (`RefreshClaims` no longer drops manual claims).
+
 ## [1.13.1] - 2026-11-11
 
 ### Fixed

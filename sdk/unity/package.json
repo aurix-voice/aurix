@@ -47,6 +47,11 @@
       "displayName": "Mirror proximity voice",
       "description": "Mirror: MirrorVoiceAvatar on the player prefab — the same voice-follows-the-avatar setup over SyncVar.",
       "path": "Samples~/MirrorProximity"
+    },
+    {
+      "displayName": "FMOD Integration",
+      "description": "Voice through FMOD Studio: DSP output, FMOD recording capture and per-speaker programmer-sound events (needs the FMOD for Unity package and the AURIX_FMOD define).",
+      "path": "Samples~/FmodIntegration"
     }
   ]
 }

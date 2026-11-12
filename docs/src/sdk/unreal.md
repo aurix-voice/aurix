@@ -122,6 +122,29 @@ translation / TTS, group E2EE fingerprints, priority speakers and ducking, voice
 statistics and raw events. The node-by-node reference is `sdk/unreal/README.md` in the repository
 and `Docs/QuickStart.md` inside the plugin.
 
+### 3.5 FMOD Studio and Wwise
+
+FMOD Studio for Unreal (and Wwise) bypass Unreal's audio device, so the plugin's 2D playback
+component and `SpawnParticipantAudioComponent` are silent there. The subsystem's PCM boundary covers
+this; all of it is BlueprintCallable except the DSP callbacks themselves, which FMOD/Wwise require in
+native code:
+
+| Need | `UAurixVoiceSubsystem` | Format |
+|---|---|---|
+| hear the team through the middleware | `StopPlayback()` (and clear `bAutoStartPlayback`), then `MixOutputAudio(Pcm, Channels)` from an FMOD DSP read callback / Wwise Audio Input | **adds** the mix into your buffer; 48 kHz interleaved float, 1–2 channels; returns active streams |
+| one 3D voice per speaker | `SetParticipantClaimed(UserId, true)` + `PullParticipantAudio(UserId, Pcm, Channels)` from a programmer-sound PCM callback | overwrites the buffer with that participant; 48 kHz; the mix skips claimed speakers |
+| middleware owns the microphone | `StopCapture()` then `PushCaptureAudio(Pcm, SampleRate, Channels)` | any rate / channel count; cut into 20 ms Opus frames by the core |
+| echo cancellation | `PushRenderAudio(Pcm, Channels)` with the game mix the middleware rendered | 48 kHz; audio obtained from `MixOutputAudio` is referenced automatically — do not push it again |
+
+Run FMOD at 48 kHz (*Project Settings → FMOD Studio → Sample Rate*); the plugin has no resampler on
+this boundary. `Samples/FMOD/AurixFmodVoiceComponent.{h,cpp}` in the plugin folder is a complete
+drop-in component for a game module depending on `AurixVoice` and `FMODStudio`: voice DSP on the
+master group or a bus, AEC reference tap upstream of the voice DSP, optional capture through
+`System::recordStart`, and `BindParticipantToEvent(UserId, UFMODAudioComponent*)` which streams one
+participant into an event with a Programmer instrument via `UFMODAudioComponent::SetProgrammerSound`.
+It is not compiled by this repository's CI (no FMOD licence there) — review it against your FMOD
+version (written for the 2.02/2.03 integration) before shipping.
+
 ## 4. C++
 
 ```cpp

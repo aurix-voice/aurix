@@ -1,3 +1,4 @@
+#include "aurix_nodes.h"
 #include "aurix_participant_player.h"
 #include "aurix_regions.h"
 #include "aurix_voice_client.h"
@@ -16,6 +17,11 @@ void initialize_aurix_voice(ModuleInitializationLevel level) {
     GDREGISTER_CLASS(AurixVoiceClient);
     GDREGISTER_CLASS(AurixParticipantPlayer);
     GDREGISTER_CLASS(AurixRegions);
+    GDREGISTER_CLASS(AurixPositionalSource);
+    GDREGISTER_CLASS(AurixLipSync);
+    GDREGISTER_CLASS(AurixGameAudioDucker);
+    GDREGISTER_CLASS(AurixVoiceLobby);
+    GDREGISTER_CLASS(AurixProximityVoice);
 }
 
 void uninitialize_aurix_voice(ModuleInitializationLevel level) {

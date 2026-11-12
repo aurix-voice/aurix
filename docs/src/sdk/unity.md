@@ -404,6 +404,50 @@ retransmits stall everything behind a lost segment): it keeps the player in the 
 remains the path to be on. `MediaTransport.OverTunnel(IMediaTunnel, …)` exposes the link for
 custom pipelines; `ControlChannel` implements `IMediaTunnel`.
 
+## External audio engines: FMOD, Wwise, custom mixers
+
+FMOD for Unity and Wwise replace Unity's audio pipeline: `AudioListener`/`AudioSource` stop
+rendering, so the component's own output (`OnAudioFilterRead`) and `Microphone` capture no longer
+run. `AurixVoiceBehaviour` therefore exposes the same PCM boundary the native core has, so an
+external mixer can own the device on both ends while AEC/NS/AGC, VAD, push-to-talk, voice effects,
+injection, Opus encoding and the jitter buffers keep working unchanged:
+
+| Call (`AurixVoiceBehaviour`) | Direction | Format | Thread |
+|---|---|---|---|
+| `ExternalCapture = true` + `PushCapture(float[] pcm, int sampleRate, int channels)` (or the `offset, count` overload) | microphone **into** Aurix | interleaved float, any rate, 1–2 channels; buffered and cut into 20 ms frames on the main thread | any |
+| `MixOutput(float[] pcm, int channels, int sampleRate)` | remote mix **out of** Aurix | **adds** the mix into your buffer, 1–2 channels, resampled to `sampleRate`; returns `false` before the first connect | any (audio thread safe) |
+| `PullParticipant(Guid userId, float[] pcm, int channels, int sampleRate)` / `ReleaseParticipant(userId)` | one speaker out, for your own 3D emitter | overwrites the buffer with that participant only; claims them so the aggregate mix skips them (`Playback = PerParticipant`) | any |
+| `PushRender(float[] pcm, int channels, int sampleRate)` + `RenderFedExternally = true` | what the player hears **into** the echo canceller | interleaved float, any rate, in playout order | any |
+
+Setting `ExternalCapture` releases Unity's microphone and sends `SetCaptureAvailable(true)` when the
+first buffer arrives; clearing it at runtime reopens the built-in microphone. `MixOutput` and
+`PullParticipant` convert from the core's 48 kHz with the same `OutputResampler` the built-in
+AudioSource path uses, so FMOD/Wwise may run at 44.1 or 48 kHz. Nothing allocates per call after the
+first buffer of a given size.
+
+### FMOD sample (`Samples~/FmodIntegration`)
+
+Import the sample from the package, add `AURIX_FMOD` to *Project Settings → Player → Scripting
+Define Symbols* (the files compile to nothing without it) and use the three components:
+
+| Component | Role | Uses |
+|---|---|---|
+| `AurixFmodOutput` | custom `FMOD.DSP` on the master channel group or a bus (`bus:/Voice`) that adds the voice mix; a second pass-through DSP at the master tail hands FMOD's output to the AEC; disables the component's AudioSource | `MixOutput`, `PushRender`, `RenderFedExternally` |
+| `AurixFmodCapture` | records the microphone with `System.recordStart` (FMOD owns the device — consoles, or projects already recording through FMOD) and pushes it every frame | `ExternalCapture`, `PushCapture` |
+| `AurixFmodParticipantVoice` | one Studio event per remote speaker (Programmer instrument + spatializer): a user-created stream whose PCM-read callback pulls that participant, attached to the avatar; `Bind(Guid)` / `UserId` | `PullParticipant`, `ReleaseParticipant` |
+
+Attenuation, occlusion, reverb zones and HRTF plug-ins are then FMOD's; `AurixParticipantAudioSource`,
+`AurixLipSync`, `AurixGameAudioDucker` (drive an FMOD bus volume from the `gain` instead of an
+`AudioMixer`) and everything else in the component are unaffected.
+
+### Wwise
+
+The same four calls map onto Wwise's Audio Input plug-in: `AkAudioInputManager.PostAudioInputEvent`
+with a sample callback filled from `MixOutput` (one 2D event for the whole team) or `PullParticipant`
+(one 3D event per speaker on the avatar's `AkGameObj`), `AkAudioInputManager`-recorded capture or
+Wwise's own microphone source pushed with `PushCapture`, and a master-bus effect or output capture
+pushed with `PushRender`. No Wwise sample ships in the package; the FMOD one is the reference.
+
 ## .NET: build, test, demo
 
 ```bash
