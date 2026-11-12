@@ -12,6 +12,9 @@ create-missing = false
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
+additional-css = ["theme/aurix.css"]
+git-repository-url = "https://github.com/aurix-voice/aurix"
+edit-url-template = "https://github.com/aurix-voice/aurix/edit/main/docs/{path}"
 
 [output.html.fold]
 enable = true
