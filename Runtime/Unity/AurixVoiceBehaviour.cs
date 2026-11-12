@@ -234,6 +234,145 @@ namespace Aurix.Unity
         /// </summary>
         public bool RenderFedExternally { get; set; }
 
+        /// <summary>
+        /// Capture comes from your own pipeline (FMOD, Wwise, a custom device layer) through
+        /// <see cref="PushCapture"/> instead of Unity's <c>Microphone</c>. Set it before <see cref="Connect"/>
+        /// or toggle at runtime: the built-in microphone is released and <c>SetCaptureAvailable(true)</c> is sent
+        /// as soon as the first buffer arrives. The capture DSP (AEC/NS/AGC), voice effects, VAD, push-to-talk,
+        /// injection and encoding run exactly as for the built-in path.
+        /// </summary>
+        [Tooltip("Feed microphone audio yourself with PushCapture() (FMOD / Wwise / custom) instead of Unity's Microphone.")]
+        public bool ExternalCapture = false;
+
+        private float[] _extFifo;
+        private int _extFifoCount;
+        private int _extRate;
+        private int _extChannels;
+        private bool _extAnnounced;
+
+        /// <summary>
+        /// Push interleaved float PCM you captured yourself (any sample rate, 1 or 2 channels, any length).
+        /// Thread-safe with respect to Unity's main thread only in the sense that frames are queued here and
+        /// encoded on the next <c>Update</c>; call it from the thread that owns your audio engine's record
+        /// buffer. Requires <see cref="ExternalCapture"/>; buffers are dropped otherwise.
+        /// </summary>
+        public void PushCapture(float[] interleavedPcm, int sampleRate, int channels)
+        {
+            PushCapture(interleavedPcm, 0, interleavedPcm.Length, sampleRate, channels);
+        }
+
+        /// <inheritdoc cref="PushCapture(float[], int, int)"/>
+        public void PushCapture(float[] interleavedPcm, int offset, int count, int sampleRate, int channels)
+        {
+            if (!ExternalCapture || interleavedPcm == null || count <= 0 || sampleRate < 8000 || channels < 1 || channels > 2) return;
+            lock (_extLock)
+            {
+                if (_extRate != sampleRate || _extChannels != channels || _extFifo == null)
+                {
+                    _extRate = sampleRate; _extChannels = channels; _extFifoCount = 0;
+                    // Half a second of headroom: Update() drains at game-frame cadence.
+                    _extFifo = new float[sampleRate * channels / 2];
+                }
+                int free = _extFifo.Length - _extFifoCount;
+                if (count > free)
+                {
+                    // Overrun: keep the newest audio, drop the oldest (a stall on the main thread).
+                    int drop = count - free;
+                    if (drop >= _extFifoCount) { _extFifoCount = 0; }
+                    else { Array.Copy(_extFifo, drop, _extFifo, 0, _extFifoCount - drop); _extFifoCount -= drop; }
+                    if (count > _extFifo.Length) { offset += count - _extFifo.Length; count = _extFifo.Length; }
+                }
+                Array.Copy(interleavedPcm, offset, _extFifo, _extFifoCount, count);
+                _extFifoCount += count;
+            }
+        }
+        private readonly object _extLock = new object();
+
+        /// <summary>
+        /// Add the remote mix into your own output buffer (interleaved float, <paramref name="channels"/> 1 or 2,
+        /// at <paramref name="sampleRate"/>). Use it from an FMOD / Wwise DSP read callback instead of letting the
+        /// component's <c>AudioSource</c> play; disable or remove that AudioSource (or keep it muted) so the voice is
+        /// not heard twice. Participants claimed by <see cref="AurixParticipantAudioSource"/> or
+        /// <see cref="PullParticipant"/> are excluded in <see cref="VoicePlaybackMode.PerParticipant"/>. Safe on any
+        /// thread; returns false when no mixer exists yet (buffer left untouched).
+        /// </summary>
+        public bool MixOutput(float[] interleavedPcm, int channels, int sampleRate)
+        {
+            var mixer = _mixer;
+            if (mixer == null || _fillFromMixer == null || interleavedPcm == null || channels < 1 || channels > 2) return false;
+            var rs = _externalOutputResampler ?? (_externalOutputResampler = new OutputResampler());
+            if (sampleRate == AudioFormat.SampleRate)
+            {
+                _fillFromMixer(interleavedPcm, 0, interleavedPcm.Length / channels, channels);
+                return true;
+            }
+            rs.Process(interleavedPcm, channels, sampleRate, _fillFromMixer);
+            return true;
+        }
+        private OutputResampler _externalOutputResampler;
+
+        /// <summary>
+        /// Pull one participant's decoded voice (interleaved float at <paramref name="sampleRate"/>) for your own
+        /// per-speaker 3D voice in FMOD / Wwise. The participant is claimed: the aggregate mix skips them while a
+        /// claim is active, so set <see cref="Playback"/> to <see cref="VoicePlaybackMode.PerParticipant"/>. Returns
+        /// the number of frames with signal (0 = silence written). Call <see cref="ReleaseParticipant"/> when the
+        /// speaker's event ends.
+        /// </summary>
+        public int PullParticipant(Guid userId, float[] interleavedPcm, int channels, int sampleRate)
+        {
+            var mixer = _mixer;
+            if (mixer == null || interleavedPcm == null || channels < 1 || channels > 2 || userId == Guid.Empty) return 0;
+            var part = Client != null ? Client.FindByUser(userId) : null;
+            uint ssrc = part != null ? part.Ssrc : 0;
+            if (ssrc == 0) { Array.Clear(interleavedPcm, 0, interleavedPcm.Length); return 0; }
+            PullState st; bool changed = false;
+            lock (_pulls)
+            {
+                if (!_pulls.TryGetValue(userId, out st)) { st = new PullState(); _pulls[userId] = st; }
+                if (st.Ssrc != ssrc)
+                {
+                    st.Ssrc = ssrc;
+                    st.Fill = (buf, off, frames, ch) => { st.Pulled = mixer.PullParticipant(st.Ssrc, buf, off, frames, ch); };
+                    changed = true;
+                }
+            }
+            if (changed) RefreshClaims();
+            if (sampleRate == AudioFormat.SampleRate) st.Fill(interleavedPcm, 0, interleavedPcm.Length / channels, channels);
+            else st.Resampler.Process(interleavedPcm, channels, sampleRate, st.Fill);
+            return st.Pulled;
+        }
+
+        /// <summary>Release a claim made by <see cref="PullParticipant"/>; the speaker returns to the aggregate mix.</summary>
+        public void ReleaseParticipant(Guid userId)
+        {
+            lock (_pulls)
+            {
+                if (!_pulls.Remove(userId)) return;
+            }
+            RefreshClaims();
+        }
+        private sealed class PullState { public uint Ssrc; public int Pulled; public OutputResampler.FillSource Fill; public readonly OutputResampler Resampler = new OutputResampler(); }
+        private readonly System.Collections.Generic.Dictionary<Guid, PullState> _pulls = new System.Collections.Generic.Dictionary<Guid, PullState>();
+
+        /// <summary>
+        /// Give the echo canceller the speaker audio Unity did not render (game audio from FMOD / Wwise):
+        /// interleaved float, 1 or 2 channels, any sample rate, in playout order. Set <see cref="RenderFedExternally"/>
+        /// when you call this so the built-in path stops feeding its own output.
+        /// </summary>
+        public void PushRender(float[] interleavedPcm, int channels, int sampleRate)
+        {
+            var dsp = Dsp;
+            if (dsp == null || interleavedPcm == null || channels < 1 || channels > 2) return;
+            if (sampleRate == AudioFormat.SampleRate) { dsp.PushRender(interleavedPcm, 0, interleavedPcm.Length, channels); return; }
+            int frames = interleavedPcm.Length / channels;
+            int need = RenderRateConverter.MaxOutputSamples(frames, channels, sampleRate);
+            if (_extRenderScratch == null || _extRenderScratch.Length < need) _extRenderScratch = new float[need];
+            int produced = _extRenderConverter.Convert(interleavedPcm, channels, sampleRate, _extRenderScratch);
+            dsp.PushRender(_extRenderScratch, 0, produced, channels);
+        }
+        private float[] _extRenderScratch;
+        private readonly RenderRateConverter _extRenderConverter = new RenderRateConverter();
+
         /// <summary>The downlink mixer (null before <see cref="Connect"/>). <see cref="AurixParticipantAudioSource"/> pulls from it.</summary>
         public RemoteMixer Mixer => _mixer;
 
@@ -265,6 +404,15 @@ namespace Aurix.Unity
                     if (ssrc == 0) continue;
                     _claimed.Add(ssrc);
                     _claimed.Add(ssrc | AurxPacket.SynthSsrcFlag);
+                }
+                lock (_pulls)
+                {
+                    foreach (var st in _pulls.Values)
+                    {
+                        if (st.Ssrc == 0) continue;
+                        _claimed.Add(st.Ssrc);
+                        _claimed.Add(st.Ssrc | AurxPacket.SynthSsrcFlag);
+                    }
                 }
             }
         }
@@ -338,7 +486,7 @@ namespace Aurix.Unity
         /// <summary>Device actually being captured (<c>null</c> = system default); differs from
         /// <see cref="MicrophoneDevice"/> after a fallback.</summary>
         public string ActiveInputDevice => _activeDevice;
-        public bool IsCapturing => _micClip != null;
+        public bool IsCapturing => _micClip != null || (ExternalCapture && _extAnnounced);
 
         private AudioClip _micClip;
         private string _activeDevice;
@@ -647,6 +795,7 @@ namespace Aurix.Unity
 
         private void StartMic()
         {
+            if (ExternalCapture) { StopMic(); return; }
             if (!EnsureMicrophonePermission()) return;
             string device = string.IsNullOrEmpty(MicrophoneDevice) ? null : MicrophoneDevice;
             if (device != null && Array.IndexOf(Microphone.devices, device) < 0)
@@ -741,6 +890,12 @@ namespace Aurix.Unity
         }
 
         private void StopMic()
+        {
+            _extAnnounced = false;
+            StopMicInner();
+        }
+
+        private void StopMicInner()
         {
             if (_micClip != null)
             {
@@ -868,7 +1023,9 @@ namespace Aurix.Unity
 
         private void PumpMicrophone()
         {
-            if (_micClip == null || Client == null || !IsConnected) return;
+            if (Client == null || !IsConnected) return;
+            if (ExternalCapture) { PumpExternalCapture(); return; }
+            if (_micClip == null) return;
             int writePos = Microphone.GetPosition(_activeDevice);
             int frameAtMicRate = _micRate * AudioFormat.FrameMs / 1000;
             int available = (writePos - _micReadPos + _micClip.samples) % _micClip.samples;
@@ -879,28 +1036,57 @@ namespace Aurix.Unity
                 _micClip.GetData(_micScratch, _micReadPos);
                 _micReadPos = (_micReadPos + frameAtMicRate) % _micClip.samples;
                 available -= frameAtMicRate;
-
-                if (UplinkChannels == 2)
-                {
-                    if (_stereo == null || _stereo.Length != AudioFormat.FrameSamples * 2) _stereo = new float[AudioFormat.FrameSamples * 2];
-                    SplitStereo(_micScratch, _micChannels, frameAtMicRate, _stereo, AudioFormat.FrameSamples);
-                    // The capture DSP is a voice (mono) chain: a music/broadcast source skips it.
-                    AudioLevel.ApplyGain(_stereo, AudioFormat.FrameSamples * 2, InputGain);
-                    Client.ApplyVoiceEffects(_stereo, AudioFormat.FrameSamples, 2);
-                    Client.AnalyzeLocalVoice(_stereo, AudioFormat.FrameSamples, 2);
-                    InjectIntoStereo();
-                    EncodeAndSendStereo();
-                    continue;
-                }
-                if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
-                Downmix(_micScratch, _micChannels, frameAtMicRate, _mono, AudioFormat.FrameSamples);
-                Dsp?.Process(_mono, AudioFormat.FrameSamples);
-                AudioLevel.ApplyGain(_mono, AudioFormat.FrameSamples, InputGain);
-                Client.ApplyVoiceEffects(_mono, AudioFormat.FrameSamples, 1);
-                Client.AnalyzeLocalVoice(_mono, AudioFormat.FrameSamples, 1);
-                Injector.Fill(_mono, AudioFormat.FrameSamples);
-                EncodeAndSend();
+                ProcessCaptureFrame(_micScratch, _micChannels, frameAtMicRate);
             }
+        }
+
+        /// <summary>Encode what <see cref="PushCapture"/> queued since the last game frame, 20 ms at a time.</summary>
+        private void PumpExternalCapture()
+        {
+            if (_micClip != null) StopMic();
+            if (!_extAnnounced) { _extAnnounced = true; Client?.SetCaptureAvailable(true); }
+            while (true)
+            {
+                int rate, channels, frameAtRate, needed;
+                lock (_extLock)
+                {
+                    if (_extFifo == null) return;
+                    rate = _extRate; channels = _extChannels;
+                    frameAtRate = rate * AudioFormat.FrameMs / 1000;
+                    needed = frameAtRate * channels;
+                    if (_extFifoCount < needed) return;
+                    if (_micScratch == null || _micScratch.Length != needed) _micScratch = new float[needed];
+                    Array.Copy(_extFifo, 0, _micScratch, 0, needed);
+                    Array.Copy(_extFifo, needed, _extFifo, 0, _extFifoCount - needed);
+                    _extFifoCount -= needed;
+                }
+                ProcessCaptureFrame(_micScratch, channels, frameAtRate);
+            }
+        }
+
+        /// <summary>One 20 ms capture frame (any rate / channel count) through DSP, effects, VAD, injection and the encoder.</summary>
+        private void ProcessCaptureFrame(float[] scratch, int channels, int framesAtRate)
+        {
+            if (UplinkChannels == 2)
+            {
+                if (_stereo == null || _stereo.Length != AudioFormat.FrameSamples * 2) _stereo = new float[AudioFormat.FrameSamples * 2];
+                SplitStereo(scratch, channels, framesAtRate, _stereo, AudioFormat.FrameSamples);
+                // The capture DSP is a voice (mono) chain: a music/broadcast source skips it.
+                AudioLevel.ApplyGain(_stereo, AudioFormat.FrameSamples * 2, InputGain);
+                Client.ApplyVoiceEffects(_stereo, AudioFormat.FrameSamples, 2);
+                Client.AnalyzeLocalVoice(_stereo, AudioFormat.FrameSamples, 2);
+                InjectIntoStereo();
+                EncodeAndSendStereo();
+                return;
+            }
+            if (_mono == null || _mono.Length != AudioFormat.FrameSamples) _mono = new float[AudioFormat.FrameSamples];
+            Downmix(scratch, channels, framesAtRate, _mono, AudioFormat.FrameSamples);
+            Dsp?.Process(_mono, AudioFormat.FrameSamples);
+            AudioLevel.ApplyGain(_mono, AudioFormat.FrameSamples, InputGain);
+            Client.ApplyVoiceEffects(_mono, AudioFormat.FrameSamples, 1);
+            Client.AnalyzeLocalVoice(_mono, AudioFormat.FrameSamples, 1);
+            Injector.Fill(_mono, AudioFormat.FrameSamples);
+            EncodeAndSend();
         }
 
         /// <summary>Without a microphone the injector alone paces the uplink at one frame per 20 ms.</summary>
