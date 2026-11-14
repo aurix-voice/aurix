@@ -208,7 +208,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurix-auth"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "argon2",
  "aurix-common",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-client"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "aurix-common",
  "aurix-opus",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-common"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-control"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-db"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "aurix-common",
  "chrono",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-media"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "arc-swap",
  "aurix-common",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-metrics"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "aurix-common",
  "axum",
@@ -415,14 +415,14 @@ dependencies = [
 
 [[package]]
 name = "aurix-opus"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "opusic-sys",
 ]
 
 [[package]]
 name = "aurix-recording"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "aurix-turn"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "aurix-common",
  "aurix-metrics",
