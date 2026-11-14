@@ -51,7 +51,9 @@ bottom.
    ```
 
    The script lists every file that still carries the old version. `cargo update -w` refreshes
-   `Cargo.lock`; `npm install` in `sdk/web` refreshes its lockfile.
+   `Cargo.lock` and `cargo update -w --manifest-path fuzz/Cargo.toml` refreshes `fuzz/Cargo.lock`
+   (the fuzz job runs `--locked`); `npm install --package-lock-only` in `sdk/web`, `sdk/server/node`
+   and `dashboard` refreshes their lockfiles.
 
 2. Turn `## [Unreleased]` into `## [1.3.0] - <date>` in `CHANGELOG.md`.
 

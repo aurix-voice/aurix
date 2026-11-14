@@ -11,6 +11,8 @@ released together.
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-11-14
+
 ### Added
 - Unity SDK: external audio engine boundary on `AurixVoiceBehaviour` — `ExternalCapture` + `PushCapture()` (microphone from FMOD/Wwise/custom code, any rate, 1–2 channels, same DSP/VAD/effects/encode path), `MixOutput()` (add the remote mix into a middleware buffer at its sample rate), `PullParticipant()`/`ReleaseParticipant()` (one speaker for a middleware 3D emitter, claimed so the mix skips them), `PushRender()` (echo-canceller reference from an external mixer).
 - Unity SDK: `Samples~/FmodIntegration` — `AurixFmodOutput` (voice DSP on the master group or a bus + AEC reference tap), `AurixFmodCapture` (FMOD recording → Aurix), `AurixFmodParticipantVoice` (one Studio event with a Programmer instrument per speaker); compiled only with the `AURIX_FMOD` define.
@@ -29,6 +31,10 @@ released together.
   replicate the voice identity at the right moment instead of polling `Get User Id`.
 
 ### Fixed
+- Unreal SDK: `Aurix Voice Lobby` owns only the channel it was asked to join. It used to adopt
+  *any* channel the subsystem joined (e.g. a positional world channel joined by the game) and its
+  next `Join Channel` left that adopted channel — so a lobby join kicked the player out of the
+  world channel and `Leave Channel` could leave the session with no channel at all.
 - Unreal SDK: `Aurix Voice Lobby` now raises `On Error` (`DISCONNECTED`, reason) when a connection it
   requested is refused or lost — a bad token or unreachable server used to end in the `Failed` state with
   no message; the subsystem also logs the reason (`LogAurixVoice`).
@@ -833,7 +839,10 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.13.2...HEAD
+[1.13.2]: https://github.com/aurix-voice/aurix/compare/v1.13.1...v1.13.2
+[1.13.1]: https://github.com/aurix-voice/aurix/compare/v1.13.0...v1.13.1
+[1.13.0]: https://github.com/aurix-voice/aurix/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/aurix-voice/aurix/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/aurix-voice/aurix/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/aurix-voice/aurix/compare/v1.9.0...v1.10.0

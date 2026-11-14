@@ -343,6 +343,13 @@ void UAurixVoiceLobbyComponent::HandleSessionReady(const FAurixSessionInfo& Sess
 
 void UAurixVoiceLobbyComponent::HandleChannelJoined(int64 RequestId, FGuid Channel, const TArray<FAurixParticipant>& Participants, bool bTranscription)
 {
+	// The subsystem may be a member of several channels (a positional world channel joined by
+	// the game, for example); this component only owns the one it was asked to join.
+	FGuid Wanted;
+	if (!UAurixVoiceSubsystem::ParseUuid(ChannelId, Wanted) || Wanted != Channel)
+	{
+		return;
+	}
 	JoinedChannel = Channel;
 	RebuildRoster(Participants);
 	NotifyStatus();
