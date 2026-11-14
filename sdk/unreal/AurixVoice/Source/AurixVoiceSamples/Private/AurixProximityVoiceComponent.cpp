@@ -19,10 +19,25 @@ UAurixVoiceSubsystem* UAurixProximityVoiceComponent::GetVoice() const
 	return GameInstance ? GameInstance->GetSubsystem<UAurixVoiceSubsystem>() : nullptr;
 }
 
+void UAurixProximityVoiceComponent::BeginPlay()
+{
+	Super::BeginPlay();
+	if (!PoseSource)
+	{
+		PoseSource = Cast<USceneComponent>(PoseSourceComponent.GetComponent(GetOwner()));
+	}
+}
+
 void UAurixProximityVoiceComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	DetachAllParticipantVoices();
 	Super::EndPlay(EndPlayReason);
+}
+
+void UAurixProximityVoiceComponent::SetPoseSource(USceneComponent* Source)
+{
+	PoseSource = Source;
+	bHasLastPose = false;
 }
 
 void UAurixProximityVoiceComponent::SetChannel(FGuid Channel)
@@ -61,6 +76,11 @@ bool UAurixProximityVoiceComponent::SendPoseNow()
 	FRotator Rotation;
 	if (!Voice || !ChannelId.IsValid() || !Voice->IsConnected() || !ReadPose(Location, Rotation))
 	{
+		return false;
+	}
+	if (!Voice->GetJoinedChannels().Contains(ChannelId))
+	{
+		// Not (yet / any more) a member: the server would answer AUTH_DENIED for every pose.
 		return false;
 	}
 	if (!Voice->UpdateOwnPosition(ChannelId, Location, Rotation, WorldToMeters))

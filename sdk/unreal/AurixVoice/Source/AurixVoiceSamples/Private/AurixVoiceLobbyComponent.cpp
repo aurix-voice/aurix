@@ -116,6 +116,7 @@ bool UAurixVoiceLobbyComponent::ConnectWithToken(const FString& Token)
 		OnError.Broadcast(TEXT("CONNECT_FAILED"), Voice->GetLastError());
 		return false;
 	}
+	bConnectRequested = true;
 	ApplyMicrophoneState();
 	NotifyStatus();
 	return true;
@@ -123,6 +124,7 @@ bool UAurixVoiceLobbyComponent::ConnectWithToken(const FString& Token)
 
 void UAurixVoiceLobbyComponent::Disconnect()
 {
+	bConnectRequested = false;
 	if (UAurixVoiceSubsystem* Voice = GetVoice())
 	{
 		Voice->Disconnect();
@@ -294,6 +296,8 @@ FAurixLobbyStatus UAurixVoiceLobbyComponent::GetStatus() const
 		Status.Endpoint = Voice->GetEndpoint();
 	}
 	Status.bInChannel = JoinedChannel.IsValid();
+	Status.bSessionReady = bSessionReady;
+	Status.UserId = SelfUserId;
 	Status.QualityBars = LastQuality.Bars;
 	Status.Mos = LastQuality.Mos;
 	Status.RttMs = LastQuality.RttMs;
@@ -614,6 +618,7 @@ void UAurixVoiceLobbyComponent::HandleKicked(FGuid Channel, const FString& Reaso
 
 void UAurixVoiceLobbyComponent::HandleFailedToRecover(const FString& Reason)
 {
+	bConnectRequested = false;
 	bSessionReady = false;
 	JoinedChannel.Invalidate();
 	Roster.Reset();
@@ -624,11 +629,19 @@ void UAurixVoiceLobbyComponent::HandleFailedToRecover(const FString& Reason)
 
 void UAurixVoiceLobbyComponent::HandleDisconnected(const FString& Reason)
 {
+	const bool bUnexpected = bConnectRequested;
+	bConnectRequested = false;
 	bSessionReady = false;
 	JoinedChannel.Invalidate();
 	Roster.Reset();
 	NotifyRoster();
 	NotifyStatus();
+	// A connection the game asked for ended without Disconnect(): a refused token, an unreachable
+	// server or a dropped link. Surface the reason so the HUD can show more than "Failed".
+	if (bUnexpected)
+	{
+		OnError.Broadcast(TEXT("DISCONNECTED"), Reason.IsEmpty() ? FString(TEXT("connection closed")) : Reason);
+	}
 }
 
 void UAurixVoiceLobbyComponent::NotifyRoster()

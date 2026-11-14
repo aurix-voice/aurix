@@ -61,7 +61,7 @@ The channel must be positional (`ChannelConfig.positional` on the server: roll-o
 optional radius visibility). Blueprint side:
 
 1. Add **Aurix Proximity Voice** to the locally controlled **Pawn** (or the PlayerController).
-   Optionally point **Pose Source** at the camera component and set **Voice Attenuation** to a
+   Optionally pick the camera as **Pose Source Component** (or call **Set Pose Source** at Begin Play) and set **Voice Attenuation** to a
    `SoundAttenuation` asset for attached voices.
 2. After the lobby component's **On Status Changed** reports `In Channel` (or your own
    *On Channel Joined*), call **Set Channel** with the positional channel id. The component now

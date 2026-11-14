@@ -49,7 +49,7 @@ def check_uplugin() -> list[str]:
         return []
 
     for key in ("FileVersion", "Version", "VersionName", "FriendlyName", "Description", "Category",
-                "CreatedBy", "EngineVersion", "Modules", "SupportedTargetPlatforms"):
+                "CreatedBy", "Modules", "SupportedTargetPlatforms"):
         if key not in desc:
             fail(f"{path.name}: missing {key}")
     if desc.get("FileVersion") != 3:
@@ -59,8 +59,11 @@ def check_uplugin() -> list[str]:
     version = workspace_version()
     if version and desc.get("VersionName") != version:
         fail(f"{path.name}: VersionName {desc.get('VersionName')!r} != workspace version {version!r}")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", str(desc.get("EngineVersion", ""))):
-        fail(f"{path.name}: EngineVersion must look like 5.3.0")
+    # EngineVersion is optional: the repository descriptor leaves it out so editors of every
+    # supported version (5.3 - 5.8) load the plugin without the "incompatible, load anyway?"
+    # prompt; per-engine Fab zips set it at packaging time.
+    if "EngineVersion" in desc and not re.fullmatch(r"\d+\.\d+\.\d+", str(desc["EngineVersion"])):
+        fail(f"{path.name}: EngineVersion must look like 5.3.0 when present")
     if len(str(desc.get("Description", ""))) > 2000:
         fail(f"{path.name}: Description too long")
     for key in ("CreatedByURL", "DocsURL", "SupportURL", "MarketplaceURL"):

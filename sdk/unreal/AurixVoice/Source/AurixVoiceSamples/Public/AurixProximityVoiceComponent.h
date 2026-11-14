@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "Engine/EngineTypes.h"
 #include "AurixProximityVoiceComponent.generated.h"
 
 class UAurixVoiceSubsystem;
@@ -46,17 +47,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix Voice", meta = (ClampMin = "1"))
 	float WorldToMeters = 100.f;
 
-	/** Report the pose of this component instead of the owner's root (e.g. the camera). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix Voice")
+	/**
+	 * Component on the owner whose pose is reported instead of the root (e.g. the follow camera).
+	 * Pick it here in the Blueprint editor; resolved into PoseSource at BeginPlay.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Aurix Voice", meta = (UseComponentPicker, AllowAnyActor = "false"))
+	FComponentReference PoseSourceComponent;
+
+	/** The resolved pose source (from PoseSourceComponent or SetPoseSource); null = the owner's root. */
+	UPROPERTY(BlueprintReadOnly, Transient, Category = "Aurix Voice")
 	TObjectPtr<USceneComponent> PoseSource = nullptr;
 
 	/** Attenuation for voices attached with AttachParticipantVoice (null = component defaults). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix Voice")
 	TObjectPtr<USoundAttenuation> VoiceAttenuation = nullptr;
 
-	/** Start (valid) or stop (invalid) reporting; sends one update immediately. */
+	/**
+	 * Start (valid) or stop (invalid) reporting; sends one update immediately. Poses are only sent
+	 * while the session is a member of Channel (join it first; the server rejects poses for other
+	 * channels with AUTH_DENIED).
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice")
 	void SetChannel(FGuid Channel);
+
+	/** Report the pose of Source (any scene component, e.g. a camera) instead of the owner's root. */
+	UFUNCTION(BlueprintCallable, Category = "Aurix Voice")
+	void SetPoseSource(USceneComponent* Source);
 
 	/** Send the current pose now regardless of the rate limit. */
 	UFUNCTION(BlueprintCallable, Category = "Aurix Voice")
@@ -84,6 +100,7 @@ public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 protected:
+	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
