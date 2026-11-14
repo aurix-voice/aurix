@@ -896,14 +896,24 @@ pub async fn create_session(pool: &DbPool, s: &SessionRow) -> Result<SessionRow,
 /// Inserts the session unless the application already has `max_concurrent` open sessions
 /// (`Ok(None)`). Count and insert run under a per-application transaction-scoped advisory
 /// lock, so concurrent admissions on any node serialize and the limit holds fleet-wide.
+/// Advisory-lock class for per-app session admission (`pg_advisory_xact_lock(class, app_key)`).
+const SESSION_ADMISSION_LOCK_CLASS: i32 = 0x4155_5253; // "AURS"
+
 pub async fn create_session_within_limit(
     pool: &DbPool,
     s: &SessionRow,
     max_concurrent: i64,
 ) -> Result<Option<SessionRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('aurix_sessions'), hashtext($1::text))")
-        .bind(s.app_id)
+    // One transaction-scoped advisory lock per app serialises admission. The key is derived
+    // in Rust from the app id so the lock does not depend on how the driver binds a UUID
+    // parameter into a text cast.
+    let b = s.app_id.as_bytes();
+    let app_key =
+        i32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(SESSION_ADMISSION_LOCK_CLASS)
+        .bind(app_key)
         .execute(&mut *tx)
         .await?;
     // A user reconnecting to the same node replaces their previous session there, which may
