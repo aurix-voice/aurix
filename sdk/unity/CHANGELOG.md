@@ -6,6 +6,15 @@ server version it ships with (the repository is versioned as one unit).
 
 ## [Unreleased]
 
+## [1.13.2] — 2026-11-14
+
+### Added
+- External audio engine boundary on `AurixVoiceBehaviour`: `ExternalCapture` + `PushCapture()` (microphone from FMOD/Wwise/custom code, any rate, 1–2 channels, same DSP/VAD/effects/encode path), `MixOutput()` (add the remote mix into a middleware buffer at its sample rate), `PullParticipant()`/`ReleaseParticipant()` (one speaker for a middleware 3D emitter, claimed so the mix skips it).
+- `Samples~/FmodIntegration`: `AurixFmodOutput` (voice DSP on the master group or a bus + AEC reference tap), `AurixFmodCapture` (FMOD recording → Aurix), `AurixFmodParticipantVoice` (one Studio event with a Programmer instrument per speaker); compiled only with the `AURIX_FMOD` define.
+
+### Fixed
+- Participants claimed through `PullParticipant()` stay excluded from the aggregate mix when `AurixParticipantAudioSource` components rebind (`RefreshClaims` no longer drops manual claims).
+
 ## [1.13.1] — 2026-11-11
 
 ### Fixed

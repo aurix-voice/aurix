@@ -226,7 +226,7 @@ namespace Aurix
     /// </summary>
     public sealed class AurixVoiceClient : IAurixVoiceClient
     {
-        public const string SdkVersion = "1.13.1";
+        public const string SdkVersion = "1.13.2";
 
         private readonly string _wsUrl;
         private string _token;
