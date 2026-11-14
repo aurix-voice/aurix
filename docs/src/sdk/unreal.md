@@ -78,7 +78,7 @@ The channel must be positional (`ChannelConfig.positional` on the server: roll-o
 optional radius visibility — see [Channels and audio routing](../features/channels.md)).
 
 1. Add **Aurix Proximity Voice** to the locally controlled **Pawn** (or the PlayerController).
-   Optionally point **Pose Source** at the camera and set **Voice Attenuation** to a
+   Optionally pick the camera as **Pose Source Component** (or call **Set Pose Source** at Begin Play) and set **Voice Attenuation** to a
    `SoundAttenuation` asset.
 2. After `In Channel` (or your own *On Channel Joined*) call **Set Channel** with the positional
    channel id. The component sends location/rotation **Updates Per Second** times a second when the

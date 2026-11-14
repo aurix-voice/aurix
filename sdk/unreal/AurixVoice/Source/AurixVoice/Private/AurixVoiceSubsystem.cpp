@@ -2744,13 +2744,21 @@ void UAurixVoiceSubsystem::DispatchEvent(const AurixEvent* Raw)
 		break;
 
 	case AURIX_EVENT_FAILED_TO_RECOVER:
-		OnFailedToRecover.Broadcast(FromUtf8(aurix_event_message(Raw)));
+	{
+		const FString Reason = FromUtf8(aurix_event_message(Raw));
+		UE_LOG(LogAurixVoice, Warning, TEXT("failed to recover the session: %s"), *Reason);
+		OnFailedToRecover.Broadcast(Reason);
 		break;
+	}
 
 	case AURIX_EVENT_DISCONNECTED:
+	{
+		const FString Reason = FromUtf8(aurix_event_message(Raw));
+		UE_LOG(LogAurixVoice, Warning, TEXT("disconnected: %s"), *Reason);
 		StopCapture();
-		OnDisconnected.Broadcast(FromUtf8(aurix_event_message(Raw)));
+		OnDisconnected.Broadcast(Reason);
 		break;
+	}
 
 	case AURIX_EVENT_NETWORK_QUALITY:
 	{

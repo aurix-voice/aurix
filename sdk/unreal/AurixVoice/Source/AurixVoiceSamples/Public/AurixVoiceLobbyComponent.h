@@ -65,6 +65,14 @@ struct AURIXVOICESAMPLES_API FAurixLobbyStatus
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bInChannel = false;
 
+	/** The server accepted the token and UserId is valid — safe to join channels and read Get User Id. */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	bool bSessionReady = false;
+
+	/** This player's Aurix user id (invalid until bSessionReady). */
+	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
+	FGuid UserId;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Aurix")
 	bool bMicrophoneMuted = false;
 
@@ -147,7 +155,11 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events")
 	FAurixLobbyChatLine OnChatLine;
 
-	/** Request failures, server errors, kicks and a lost connection (Code = "KICKED" / "DISCONNECTED"). */
+	/**
+	 * Request failures, server errors, kicks and a lost or refused connection: Code = "KICKED",
+	 * "DISCONNECTED" (Message = the reason, e.g. the server's rejection of the token or the
+	 * transport error). Not raised for a Disconnect() you asked for.
+	 */
 	UPROPERTY(BlueprintAssignable, Category = "Aurix Voice|Events")
 	FAurixLobbyError OnError;
 
@@ -245,6 +257,7 @@ private:
 	TObjectPtr<UAurixVoiceSubsystem> BoundVoice = nullptr;
 
 	TArray<FAurixLobbyEntry> Roster;
+	bool bConnectRequested = false;
 	FGuid JoinedChannel;
 	FGuid SelfUserId;
 	FAurixNetworkQuality LastQuality;

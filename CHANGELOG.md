@@ -18,7 +18,20 @@ released together.
 - Unreal SDK: `Samples/FMOD/AurixFmodVoiceComponent.{h,cpp}` — drop-in FMOD Studio component (voice DSP via `MixOutputAudio`, AEC tap via `PushRenderAudio`, optional capture via `PushCaptureAudio`, per-speaker programmer sounds via `PullParticipantAudio`); not built by CI.
 - Docs: "External audio engines" (Unity), "FMOD Studio and Wwise" (Unreal) and "Scene helper nodes" (Godot) sections, verified against the SDK sources.
 
+### Changed
+- Unreal SDK: `AurixVoice.uplugin` no longer pins `EngineVersion` (5.3.0), so UE 5.4+ editors stop asking
+  "incompatible plugin, load anyway?" at every start; the plugin keeps building on 5.3 – 5.8.
+- Unreal SDK: `Aurix Proximity Voice` gains an editor-pickable `Pose Source Component`
+  (`FComponentReference`, resolved at BeginPlay) and `Set Pose Source`; the old object pointer could not be
+  assigned from the Blueprint editor. Poses are only sent while the session is a member of the channel
+  (the server rejects poses for other channels with `AUTH_DENIED`).
+- Unreal SDK: `Aurix Lobby Status` carries `Session Ready` and `User Id`, so Blueprints can join channels and
+  replicate the voice identity at the right moment instead of polling `Get User Id`.
+
 ### Fixed
+- Unreal SDK: `Aurix Voice Lobby` now raises `On Error` (`DISCONNECTED`, reason) when a connection it
+  requested is refused or lost — a bad token or unreachable server used to end in the `Failed` state with
+  no message; the subsystem also logs the reason (`LogAurixVoice`).
 - Unity SDK: participants claimed through `PullParticipant()` stay excluded from the aggregate mix when `AurixParticipantAudioSource` components rebind (`RefreshClaims` no longer drops manual claims).
 
 ## [1.13.1] - 2026-11-11
