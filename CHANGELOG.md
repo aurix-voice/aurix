@@ -31,6 +31,10 @@ released together.
   replicate the voice identity at the right moment instead of polling `Get User Id`.
 
 ### Fixed
+- Unreal SDK: `Aurix Voice Lobby` owns only the channel it was asked to join. It used to adopt
+  *any* channel the subsystem joined (e.g. a positional world channel joined by the game) and its
+  next `Join Channel` left that adopted channel — so a lobby join kicked the player out of the
+  world channel and `Leave Channel` could leave the session with no channel at all.
 - Unreal SDK: `Aurix Voice Lobby` now raises `On Error` (`DISCONNECTED`, reason) when a connection it
   requested is refused or lost — a bad token or unreachable server used to end in the `Failed` state with
   no message; the subsystem also logs the reason (`LogAurixVoice`).

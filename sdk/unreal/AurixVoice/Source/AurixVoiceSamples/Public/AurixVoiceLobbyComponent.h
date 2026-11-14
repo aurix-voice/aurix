@@ -129,7 +129,9 @@ public:
 	/**
 	 * Channel to join after the session is ready (UUID text). Empty = call JoinChannel yourself.
 	 * Editable so a fixed lobby channel can live in a Blueprint default; game-created channels
-	 * arrive from your backend at runtime.
+	 * arrive from your backend at runtime. The component owns only this channel: other channels
+	 * the game joins on the subsystem (e.g. a positional world channel) are left alone, their
+	 * participants do not appear in the roster, and JoinChannel / LeaveChannel never leave them.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aurix Voice")
 	FString ChannelId;
