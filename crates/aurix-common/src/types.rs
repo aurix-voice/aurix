@@ -153,7 +153,7 @@ pub enum ChannelType {
 }
 
 /// What kind of participant a session token stands for. `Service` sessions (bots, recorders,
-/// TTS or music sources — anything automatic) are shown in rosters but are not counted as
+/// TTS or music sources - anything automatic) are shown in rosters but are not counted as
 /// participants anywhere: channel occupancy, live stats, usage buckets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
