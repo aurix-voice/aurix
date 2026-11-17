@@ -89,6 +89,7 @@ async fn channel(pool: &DbPool, app_id: Uuid) -> Uuid {
 
 fn session_row(app_id: Uuid, user_id: Uuid, at: DateTime<Utc>) -> SessionRow {
     SessionRow {
+        kind: "user".to_string(),
         id: Uuid::new_v4(),
         user_id,
         app_id,

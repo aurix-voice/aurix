@@ -59,8 +59,10 @@ impl SessionManager {
         media_node_id: MediaNodeId,
         client: ClientInfo<'_>,
         max_concurrent: i32,
+        kind: ParticipantKind,
     ) -> Result<SessionRow> {
         let row = SessionRow {
+            kind: kind.as_str().to_string(),
             id: session_id.0,
             user_id: user_id.0,
             app_id: app_id.0,

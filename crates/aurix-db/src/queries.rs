@@ -829,7 +829,8 @@ pub async fn recount_channel_participants(
     }
     let rows = sqlx::query_as::<_, (Uuid, Uuid, i32)>(
         r#"UPDATE channels c SET active_participants = (
-               SELECT COUNT(*) FROM channel_memberships m WHERE m.channel_id = c.id AND m.left_at IS NULL
+               SELECT COUNT(*) FROM channel_memberships m JOIN sessions s ON s.id = m.session_id
+           WHERE m.channel_id = c.id AND m.left_at IS NULL AND s.kind <> 'service'
            ), updated_at = NOW()
            WHERE c.id = ANY($1)
            RETURNING c.app_id, c.id, c.active_participants"#,
@@ -885,11 +886,11 @@ pub async fn count_active_channels(pool: &DbPool, app_id: Uuid) -> Result<i64, s
 
 pub async fn create_session(pool: &DbPool, s: &SessionRow) -> Result<SessionRow, sqlx::Error> {
     sqlx::query_as::<_, SessionRow>(
-        r#"INSERT INTO sessions (id, user_id, app_id, media_node_id, ip_address, user_agent, connected_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *"#
+        r#"INSERT INTO sessions (id, user_id, app_id, media_node_id, ip_address, user_agent, connected_at, kind)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *"#
     )
     .bind(s.id).bind(s.user_id).bind(s.app_id).bind(s.media_node_id)
-    .bind(&s.ip_address).bind(&s.user_agent).bind(s.connected_at)
+    .bind(&s.ip_address).bind(&s.user_agent).bind(s.connected_at).bind(&s.kind)
     .fetch_one(pool).await
 }
 
@@ -923,8 +924,8 @@ pub async fn create_session_within_limit(
         return Ok(None);
     }
     let row = sqlx::query_as::<_, SessionRow>(
-        r#"INSERT INTO sessions (id, user_id, app_id, media_node_id, ip_address, user_agent, connected_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *"#,
+        r#"INSERT INTO sessions (id, user_id, app_id, media_node_id, ip_address, user_agent, connected_at, kind)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *"#,
     )
     .bind(s.id)
     .bind(s.user_id)
@@ -933,6 +934,7 @@ pub async fn create_session_within_limit(
     .bind(&s.ip_address)
     .bind(&s.user_agent)
     .bind(s.connected_at)
+    .bind(&s.kind)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1164,7 +1166,7 @@ pub async fn get_active_sessions_for_user(
 
 pub async fn count_active_sessions(pool: &DbPool, app_id: Uuid) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM sessions WHERE app_id = $1 AND disconnected_at IS NULL",
+        "SELECT COUNT(*) FROM sessions WHERE app_id = $1 AND disconnected_at IS NULL AND kind <> 'service'",
     )
     .bind(app_id)
     .fetch_one(pool)
@@ -3823,4 +3825,25 @@ pub async fn prune_region_selections(
             .await?
             .rows_affected(),
     )
+}
+
+/// Sweep: fixes every channel whose `active_participants` disagrees with its open, counted
+/// memberships (a crash between the membership write and the counter update, a channel
+/// deleted over REST, …). Returns the channels corrected.
+pub async fn recount_drifted_channels(pool: &DbPool) -> Result<u64, sqlx::Error> {
+    let n = sqlx::query(
+        r#"UPDATE channels c SET active_participants = x.n, updated_at = NOW()
+           FROM (
+               SELECT c2.id, (
+                   SELECT COUNT(*) FROM channel_memberships m JOIN sessions s ON s.id = m.session_id
+                   WHERE m.channel_id = c2.id AND m.left_at IS NULL AND s.kind <> 'service'
+               )::int AS n
+               FROM channels c2 WHERE c2.deleted_at IS NULL
+           ) x
+           WHERE x.id = c.id AND c.active_participants <> x.n"#,
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
 }

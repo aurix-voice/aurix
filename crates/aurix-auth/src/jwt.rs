@@ -6,6 +6,10 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+fn is_user(k: &ParticipantKind) -> bool {
+    *k == ParticipantKind::User
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -19,6 +23,8 @@ pub struct Claims {
     pub jti: String,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "is_user")]
+    pub kind: ParticipantKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +42,7 @@ pub struct ChannelPermClaim {
 
 #[derive(Debug, Clone)]
 pub struct ValidatedToken {
+    pub kind: ParticipantKind,
     pub user_id: UserId,
     pub app_id: AppId,
     pub display_name: String,
@@ -135,6 +142,7 @@ impl ValidatedActionToken {
     /// Session-shaped view of a `login` token (no channel rights of its own).
     pub fn as_session(&self) -> ValidatedToken {
         ValidatedToken {
+            kind: ParticipantKind::User,
             user_id: self.user_id,
             app_id: self.app_id,
             display_name: self.display_name.clone(),
@@ -247,6 +255,7 @@ impl JwtService {
         display_name: &str,
         channels: Vec<ChannelPermission>,
         metadata: Option<serde_json::Value>,
+        kind: ParticipantKind,
     ) -> Result<String> {
         let encoding_key = self.encoding_key.as_ref().ok_or_else(|| {
             AurixError::AuthenticationFailed(
@@ -257,6 +266,7 @@ impl JwtService {
         let now = Utc::now().timestamp();
         let claims = Claims {
             sub: user_id.0.to_string(),
+            kind,
             user_id: user_id.0.to_string(),
             app_id: app_id.0.to_string(),
             display_name: display_name.to_string(),
@@ -316,6 +326,7 @@ impl JwtService {
             .collect();
 
         Ok(ValidatedToken {
+            kind: claims.kind,
             user_id: UserId::from_uuid(user_uuid),
             app_id: AppId::from_uuid(app_uuid),
             display_name: claims.display_name,
@@ -522,7 +533,7 @@ mod tests {
             Err(AurixError::TokenInvalid(_))
         ));
         let session = s
-            .generate_token(spec.user_id, spec.app_id, "Alice", vec![], None)
+            .generate_token(spec.user_id, spec.app_id, "Alice", vec![], None, ParticipantKind::User)
             .unwrap();
         assert!(!JwtService::is_action_token(&session));
         assert!(matches!(
@@ -553,7 +564,7 @@ mod tests {
             ad_hoc: Some(template.clone()),
         };
         let token = s
-            .generate_token(UserId::new(), app_id, "Alice", vec![perm], None)
+            .generate_token(UserId::new(), app_id, "Alice", vec![perm], None, ParticipantKind::User)
             .unwrap();
         let v = s.validate_token(&token).unwrap();
         assert_eq!(v.channels.len(), 1);

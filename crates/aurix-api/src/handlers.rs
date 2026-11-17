@@ -136,6 +136,10 @@ pub struct GenerateTokenRequest {
     #[serde(default)]
     pub channels: Vec<ChannelGrant>,
     pub metadata: Option<serde_json::Value>,
+    /// `user` (default) or `service`: bots, recorders and other automatic participants are
+    /// listed in rosters but never counted as participants or billed usage.
+    #[serde(default)]
+    pub kind: aurix_common::types::ParticipantKind,
     /// Region the game wants the player in (matchmaking region); see `endpoint` in the response.
     #[serde(default)]
     pub region: Option<Region>,
@@ -345,8 +349,10 @@ pub async fn generate_token(
         display_name,
         channels.clone(),
         req.metadata,
+        req.kind,
     )?;
-    let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs);
+    let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs
+    );
     let (hint, location_source) = selection_hint(&state, req.region, req.location, req.client_ip);
     let endpoint = state.control.nodes.recommend(&hint);
     Ok(Json(TokenResponse {
@@ -962,6 +968,9 @@ pub async fn delete_channel(
             .sessions
             .remove_channel_membership(channel_id, p.session_id)
             .await;
+    }
+    if let Err(e) = state.control.channels.recount_participants(&[channel_id]).await {
+        tracing::warn!("participant recount after channel delete failed: {e}");
     }
     if let Some(rec) = &state.recording {
         rec.stop_channel(app_id, &channel_id).await;
