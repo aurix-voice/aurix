@@ -397,10 +397,11 @@ export class RoomsService {
     return room;
   }
 
-  async issueToken(room, { externalId, displayName, moderate = false }) {
+  async issueToken(room, { externalId, displayName, moderate = false, kind = "user" }) {
     const res = await this.aurix.issueToken({
       external_id: externalId,
       display_name: displayName,
+      kind,
       channels: [{ channel_id: room.channelId, join: true, speak: true, receive: true, moderate }],
       metadata: { app: "aurix-rooms", room: room.slug },
       ...(this.cfg.region ? { region: this.cfg.region } : {}),
@@ -491,7 +492,7 @@ export class RoomsService {
         const body = await readJson(req);
         const room = this.requireRoom(typeof body.room === "string" ? body.room : this.cfg.stageSlug);
         const displayName = normalizeTitle(body.name) ?? "Aurix Bot";
-        const token = await this.issueToken(room, { externalId: `rooms-bot:${room.slug}`, displayName, moderate: true });
+        const token = await this.issueToken(room, { externalId: `rooms-bot:${room.slug}`, displayName, moderate: true, kind: "service" });
         return sendJson(res, 200, {
           token: token.token,
           userId: token.user_id,

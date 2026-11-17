@@ -67,6 +67,9 @@ pub struct SessionRow {
     pub disconnected_at: Option<DateTime<Utc>>,
     pub disconnect_reason: Option<String>,
     pub quality_stats: Option<serde_json::Value>,
+    /// `user` or `service` (see `ParticipantKind`); service sessions are never counted.
+    #[sqlx(default)]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

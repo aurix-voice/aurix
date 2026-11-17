@@ -152,6 +152,29 @@ pub enum ChannelType {
     Echo,
 }
 
+/// What kind of participant a session token stands for. `Service` sessions (bots, recorders,
+/// TTS or music sources - anything automatic) are shown in rosters but are not counted as
+/// participants anywhere: channel occupancy, live stats, usage buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParticipantKind {
+    #[default]
+    User,
+    Service,
+}
+
+impl ParticipantKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParticipantKind::User => "user",
+            ParticipantKind::Service => "service",
+        }
+    }
+    pub fn counts(self) -> bool {
+        self == ParticipantKind::User
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelRole {

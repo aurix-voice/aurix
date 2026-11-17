@@ -169,7 +169,7 @@ pub async fn aggregate_app_buckets(
            ), s AS (
                SELECT app_id, user_id, connected_at, COALESCE(disconnected_at, 'infinity'::timestamptz) AS ended
                FROM sessions
-               WHERE connected_at < $2 AND (disconnected_at IS NULL OR disconnected_at > $1)
+               WHERE kind <> 'service' AND connected_at < $2 AND (disconnected_at IS NULL OR disconnected_at > $1)
            ), ov AS (
                SELECT b.bucket, b.bucket_end, s.app_id, s.user_id, s.connected_at, s.ended
                FROM b JOIN s ON s.connected_at < b.bucket_end AND s.ended > b.bucket
@@ -215,6 +215,7 @@ pub async fn aggregate_app_buckets(
            ), m AS (
                SELECT c.app_id, m.channel_id, m.joined_at, COALESCE(m.left_at, 'infinity'::timestamptz) AS ended
                FROM channel_memberships m JOIN channels c ON c.id = m.channel_id
+               JOIN sessions s ON s.id = m.session_id AND s.kind <> 'service'
                WHERE m.joined_at < $2 AND (m.left_at IS NULL OR m.left_at > $1)
            ), ov AS (
                SELECT b.bucket, b.bucket_end, m.app_id, m.channel_id, m.joined_at, m.ended
