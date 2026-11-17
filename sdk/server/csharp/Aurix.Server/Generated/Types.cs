@@ -158,6 +158,18 @@ public static class ExportUsageScope
 }
 
 /// <summary>
+/// What the session stands for. `service` marks bots, recorders, music/TTS sources and other
+/// automatic participants: they appear in rosters but are never counted as participants (channel
+/// occupancy, live stats, usage) nor billed.
+/// </summary>
+public static class GenerateTokenRequestKind
+{
+    public const string User = "user";
+    public const string Service = "service";
+    public static readonly IReadOnlyList<string> All = new[] { User, Service };
+}
+
+/// <summary>
 /// Known values of the `GetRecordingTranscriptFormat` enum (fields typed as string stay forward compatible).
 /// </summary>
 public static class GetRecordingTranscriptFormat
@@ -2238,6 +2250,14 @@ public sealed record GenerateTokenRequest
 
     [JsonPropertyName("metadata")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, object?>? Metadata { get; init; }
+
+    /// <summary>
+    /// What the session stands for. `service` marks bots, recorders, music/TTS sources and other
+    /// automatic participants: they appear in rosters but are never counted as participants (channel
+    /// occupancy, live stats, usage) nor billed.
+    /// </summary>
+    [JsonPropertyName("kind")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Kind { get; init; }
 
     /// <summary>
     /// Region the game wants the player in (e.g. the match's region). Wins in `endpoint` when it has

@@ -51,6 +51,7 @@ impl SessionManager {
 
     /// Insert the session row; a positive `max_concurrent` makes the insert conditional on the
     /// application's open-session count (`QuotaExceeded` otherwise).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_session(
         &self,
         session_id: SessionId,
@@ -59,8 +60,10 @@ impl SessionManager {
         media_node_id: MediaNodeId,
         client: ClientInfo<'_>,
         max_concurrent: i32,
+        kind: ParticipantKind,
     ) -> Result<SessionRow> {
         let row = SessionRow {
+            kind: kind.as_str().to_string(),
             id: session_id.0,
             user_id: user_id.0,
             app_id: app_id.0,
