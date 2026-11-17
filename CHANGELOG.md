@@ -11,6 +11,30 @@ released together.
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-11-17
+
+### Added
+- Participant kind on tokens: `POST /v1/token` takes `kind: "user" | "service"` (default `user`,
+  carried in the JWT, stored on `sessions.kind`, migration 29). `service` is for bots, recorders,
+  music and TTS sources: they appear in rosters and can speak, but are not counted in
+  `active_participants`, live statistics or usage buckets (peaks, participant-minutes). The
+  server SDKs (Node, Python, Go, C#) expose the field; the Rooms example issues its stage bot's
+  token with `kind: "service"`.
+
+### Fixed
+- `channels.active_participants` could drift: deleting a channel over REST closed memberships
+  without touching the counter, and a crash between the membership write and the counter update
+  left it off by one. The counter is now recounted from open memberships of counted sessions on
+  channel delete, and the control plane runs a drift sweep every 5 minutes.
+- Session-admission advisory lock key is derived in Rust instead of SQL (`aurix-db`).
+
+### Changed
+- Dependencies: tower-http 0.7, maxminddb 0.33, tokio-tungstenite 0.30, webpki-roots 1.0.12,
+  axum-server 0.9.2; dashboard and Rooms example npm groups; .NET server SDK packages.
+- CI: the DCO check accepts GitHub App authors (Dependabot) by name; cargo-deny ignores
+  RUSTSEC-2026-0543 (chrono flagged unmaintained, no replacement yet); the live E2E server
+  quality assertion judges the steady state instead of the first packets.
+
 ## [1.13.2] - 2026-11-14
 
 ### Added
@@ -839,7 +863,8 @@ What the repository already contained when the shared version number was introdu
 
 Earlier development was not tagged; `git log` before `3fe205e` is the only record.
 
-[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.13.2...HEAD
+[Unreleased]: https://github.com/aurix-voice/aurix/compare/v1.13.3...HEAD
+[1.13.3]: https://github.com/aurix-voice/aurix/compare/v1.13.2...v1.13.3
 [1.13.2]: https://github.com/aurix-voice/aurix/compare/v1.13.1...v1.13.2
 [1.13.1]: https://github.com/aurix-voice/aurix/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/aurix-voice/aurix/compare/v1.12.0...v1.13.0
