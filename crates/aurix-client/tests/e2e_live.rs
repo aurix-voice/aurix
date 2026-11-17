@@ -487,7 +487,9 @@ async fn native_clients_talk_chat_resume_and_leave() {
         &alice,
         "server quality",
         Duration::from_secs(12),
-        |e| matches!(e, Event::NetworkQuality(q) if q.uplink_packets_received > 0),
+        // The first report arrives after a handful of packets, when the bitrate estimate is still
+        // warming up and can cost a bar; judge the steady state.
+        |e| matches!(e, Event::NetworkQuality(q) if q.uplink_packets_received >= 25),
     )
     .await
     else {

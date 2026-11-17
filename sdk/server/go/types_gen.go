@@ -132,6 +132,16 @@ const (
 	ExportUsageScopeChannels ExportUsageScope = "channels"
 )
 
+// What the session stands for. `service` marks bots, recorders, music/TTS sources and other
+// automatic participants: they appear in rosters but are never counted as participants (channel
+// occupancy, live stats, usage) nor billed.
+type GenerateTokenRequestKind string
+
+const (
+	GenerateTokenRequestKindUser    GenerateTokenRequestKind = "user"
+	GenerateTokenRequestKindService GenerateTokenRequestKind = "service"
+)
+
 // GetRecordingTranscriptFormat enumerates the values accepted by the API.
 type GetRecordingTranscriptFormat string
 
@@ -1184,6 +1194,10 @@ type GenerateTokenRequest struct {
 	DisplayName string         `json:"display_name"`
 	Channels    []ChannelGrant `json:"channels,omitempty"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
+	// What the session stands for. `service` marks bots, recorders, music/TTS sources and other
+	// automatic participants: they appear in rosters but are never counted as participants (channel
+	// occupancy, live stats, usage) nor billed.
+	Kind *GenerateTokenRequestKind `json:"kind,omitempty"`
 	// Region the game wants the player in (e.g. the match's region). Wins in `endpoint` when it has
 	// capacity.
 	Region *Region `json:"region,omitempty"`

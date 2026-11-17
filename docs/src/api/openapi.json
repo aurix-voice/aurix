@@ -10641,6 +10641,15 @@
             ],
             "additionalProperties": true
           },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "service"
+            ],
+            "default": "user",
+            "description": "What the session stands for. `service` marks bots, recorders, music/TTS sources and other automatic participants: they appear in rosters but are never counted as participants (channel occupancy, live stats, usage) nor billed."
+          },
           "region": {
             "oneOf": [
               {
