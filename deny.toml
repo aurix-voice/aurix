@@ -13,6 +13,10 @@ yanked = "deny"
 # are tracked in README "Limitations"; only direct dependencies fail the build.
 unmaintained = "workspace"
 ignore = [
+  # chrono is flagged unmaintained (RUSTSEC-2026-0543); it is a direct dependency across the
+  # workspace. No fix to apply: the crate is feature-complete and widely used; migration to a
+  # maintained replacement is tracked separately.
+  "RUSTSEC-2026-0543",
   # rsa (Marvin timing attack): in the enabled graph through jsonwebtoken's rust_crypto backend, used
   # only to verify RS256/RS384/RS512 OIDC provider tokens (public inputs). Aurix issues HS256 only.
   "RUSTSEC-2023-0071",
