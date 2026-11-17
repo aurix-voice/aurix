@@ -248,12 +248,18 @@ impl ChannelManager {
     }
 
     /// Re-derives `active_participants` from open, counted memberships for `channels`.
-    pub async fn recount_participants(&self, channels: &[ChannelId]) -> Result<Vec<(AppId, ChannelId)>> {
+    pub async fn recount_participants(
+        &self,
+        channels: &[ChannelId],
+    ) -> Result<Vec<(AppId, ChannelId)>> {
         let ids: Vec<Uuid> = channels.iter().map(|c| c.0).collect();
         let emptied = aurix_db::queries::recount_channel_participants(&self.pool, &ids)
             .await
             .map_err(|e| AurixError::Database(format!("Participant recount failed: {e}")))?;
-        Ok(emptied.into_iter().map(|(a, c)| (AppId::from_uuid(a), ChannelId::from_uuid(c))).collect())
+        Ok(emptied
+            .into_iter()
+            .map(|(a, c)| (AppId::from_uuid(a), ChannelId::from_uuid(c)))
+            .collect())
     }
 
     /// Returns the channel's participant count after the change.

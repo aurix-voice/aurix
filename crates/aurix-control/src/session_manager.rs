@@ -51,6 +51,7 @@ impl SessionManager {
 
     /// Insert the session row; a positive `max_concurrent` makes the insert conditional on the
     /// application's open-session count (`QuotaExceeded` otherwise).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_session(
         &self,
         session_id: SessionId,

@@ -196,7 +196,9 @@ impl ControlPlane {
             loop {
                 interval.tick().await;
                 match aurix_db::queries::recount_drifted_channels(&recount_pool).await {
-                    Ok(n) if n > 0 => tracing::info!("Corrected participant counters on {n} channels"),
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Corrected participant counters on {n} channels")
+                    }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("Participant recount sweep failed: {e}"),
                 }

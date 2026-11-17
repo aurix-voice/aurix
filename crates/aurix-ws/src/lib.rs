@@ -2407,9 +2407,16 @@ impl WsState {
         {
             warn!("membership close failed: {e}");
         }
-        let counted = self.connections.get(&session_id).map(|c| c.kind.counts()).unwrap_or(true);
+        let counted = self
+            .connections
+            .get(&session_id)
+            .map(|c| c.kind.counts())
+            .unwrap_or(true);
         let count = if counted {
-            self.control.channels.update_participant_count(channel_id, -1).await
+            self.control
+                .channels
+                .update_participant_count(channel_id, -1)
+                .await
         } else {
             Ok(-1)
         };
@@ -2933,7 +2940,11 @@ async fn restore_channel(
             .remove_channel_membership(channel_id, session_id)
             .await;
         let count = if token.kind.counts() {
-            state.control.channels.update_participant_count(channel_id, -1).await
+            state
+                .control
+                .channels
+                .update_participant_count(channel_id, -1)
+                .await
         } else {
             Ok(-1)
         };
@@ -3018,7 +3029,11 @@ async fn restore_channel(
             return false;
         }
         let count = if token.kind.counts() {
-            state.control.channels.update_participant_count(channel_id, 1).await
+            state
+                .control
+                .channels
+                .update_participant_count(channel_id, 1)
+                .await
         } else {
             Ok(-1)
         };
@@ -3114,7 +3129,7 @@ async fn open_session(
             token.user_id,
             token.app_id,
             token.display_name.clone(),
-                )
+        )
     };
     let media_session = created?;
     match state
@@ -3143,8 +3158,8 @@ async fn open_session(
                 user_agent,
             },
             limits.max_concurrent_sessions,
-                    token.kind,
-                )
+            token.kind,
+        )
         .await
     {
         {
@@ -4407,7 +4422,11 @@ async fn handle_control_message(
                 state.grant_priority(channel_id, session_id);
             }
             let count = if token.kind.counts() {
-                state.control.channels.update_participant_count(channel_id, 1).await
+                state
+                    .control
+                    .channels
+                    .update_participant_count(channel_id, 1)
+                    .await
             } else {
                 Ok(-1)
             };

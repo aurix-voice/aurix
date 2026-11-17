@@ -351,8 +351,7 @@ pub async fn generate_token(
         req.metadata,
         req.kind,
     )?;
-    let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs
-    );
+    let expires_at = Utc::now() + Duration::seconds(state.control.config.auth.token_ttl_secs);
     let (hint, location_source) = selection_hint(&state, req.region, req.location, req.client_ip);
     let endpoint = state.control.nodes.recommend(&hint);
     Ok(Json(TokenResponse {
@@ -969,7 +968,12 @@ pub async fn delete_channel(
             .remove_channel_membership(channel_id, p.session_id)
             .await;
     }
-    if let Err(e) = state.control.channels.recount_participants(&[channel_id]).await {
+    if let Err(e) = state
+        .control
+        .channels
+        .recount_participants(&[channel_id])
+        .await
+    {
         tracing::warn!("participant recount after channel delete failed: {e}");
     }
     if let Some(rec) = &state.recording {

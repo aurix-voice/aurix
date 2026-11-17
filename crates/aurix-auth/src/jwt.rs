@@ -533,7 +533,14 @@ mod tests {
             Err(AurixError::TokenInvalid(_))
         ));
         let session = s
-            .generate_token(spec.user_id, spec.app_id, "Alice", vec![], None, ParticipantKind::User)
+            .generate_token(
+                spec.user_id,
+                spec.app_id,
+                "Alice",
+                vec![],
+                None,
+                ParticipantKind::User,
+            )
             .unwrap();
         assert!(!JwtService::is_action_token(&session));
         assert!(matches!(
@@ -564,7 +571,14 @@ mod tests {
             ad_hoc: Some(template.clone()),
         };
         let token = s
-            .generate_token(UserId::new(), app_id, "Alice", vec![perm], None, ParticipantKind::User)
+            .generate_token(
+                UserId::new(),
+                app_id,
+                "Alice",
+                vec![perm],
+                None,
+                ParticipantKind::User,
+            )
             .unwrap();
         let v = s.validate_token(&token).unwrap();
         assert_eq!(v.channels.len(), 1);
