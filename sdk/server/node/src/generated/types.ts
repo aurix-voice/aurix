@@ -56,6 +56,14 @@ export const CoordinateSystemValues: readonly CoordinateSystem[] = ["left_handed
 export type ExportUsageScope = "app" | "channels";
 export const ExportUsageScopeValues: readonly ExportUsageScope[] = ["app", "channels"] as const;
 
+/**
+ * What the session stands for. `service` marks bots, recorders, music/TTS sources and other
+ * automatic participants: they appear in rosters but are never counted as participants (channel
+ * occupancy, live stats, usage) nor billed.
+ */
+export type GenerateTokenRequestKind = "user" | "service";
+export const GenerateTokenRequestKindValues: readonly GenerateTokenRequestKind[] = ["user", "service"] as const;
+
 export type GetRecordingTranscriptFormat = "json" | "srt" | "vtt";
 export const GetRecordingTranscriptFormatValues: readonly GetRecordingTranscriptFormat[] = ["json", "srt", "vtt"] as const;
 
@@ -1040,6 +1048,12 @@ export interface GenerateTokenRequest {
   display_name: string;
   channels?: ChannelGrant[];
   metadata?: Record<string, unknown> | null;
+  /**
+   * What the session stands for. `service` marks bots, recorders, music/TTS sources and other
+   * automatic participants: they appear in rosters but are never counted as participants (channel
+   * occupancy, live stats, usage) nor billed.
+   */
+  kind?: GenerateTokenRequestKind;
   /**
    * Region the game wants the player in (e.g. the match's region). Wins in `endpoint` when it has
    * capacity.

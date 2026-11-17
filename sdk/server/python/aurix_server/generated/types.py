@@ -53,6 +53,10 @@ CoordinateSystem_VALUES: List[CoordinateSystem] = ["left_handed", "right_handed"
 ExportUsageScope = Literal["app", "channels"]
 ExportUsageScope_VALUES: List[ExportUsageScope] = ["app", "channels"]
 
+GenerateTokenRequestKind = Literal["user", "service"]
+"""What the session stands for. `service` marks bots, recorders, music/TTS sources and other automatic participants: they appear in rosters but are never counted as participants (channel occupancy, live stats, usage) nor billed."""
+GenerateTokenRequestKind_VALUES: List[GenerateTokenRequestKind] = ["user", "service"]
+
 GetRecordingTranscriptFormat = Literal["json", "srt", "vtt"]
 GetRecordingTranscriptFormat_VALUES: List[GetRecordingTranscriptFormat] = ["json", "srt", "vtt"]
 
@@ -966,6 +970,7 @@ GenerateTokenRequest = TypedDict(
         "display_name": str,
         "channels": NotRequired[List["ChannelGrant"]],
         "metadata": NotRequired[Optional[Dict[str, Any]]],
+        "kind": NotRequired["GenerateTokenRequestKind"],  # What the session stands for. `service` marks bots, recorders, music/TTS sources and other automatic participants: they appear in rosters but are never counted as participants (channel occupancy, live stats, usage) nor billed.
         "region": NotRequired[Optional["Region"]],  # Region the game wants the player in (e.g. the match's region). Wins in `endpoint` when it has capacity.
         "location": NotRequired[Optional["GeoLocation"]],  # Player's approximate coordinates from the game's own geo data, used to order regions by distance.
         "client_ip": NotRequired[Optional[str]],  # Player's public IP as seen by your backend. Without `location`, resolved through the node's GeoIP database (when configured) to approximate coordinates for `endpoint`; private addresses never resolve.

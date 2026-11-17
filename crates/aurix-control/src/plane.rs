@@ -189,6 +189,22 @@ impl ControlPlane {
             }
         });
 
+        // Participant counters are denormalised; settle any drift every few minutes.
+        let recount_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                match aurix_db::queries::recount_drifted_channels(&recount_pool).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Corrected participant counters on {n} channels")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("Participant recount sweep failed: {e}"),
+                }
+            }
+        });
+
         let action_tokens = Arc::new(ActionTokenService::new(
             jwt.clone(),
             redis.clone(),

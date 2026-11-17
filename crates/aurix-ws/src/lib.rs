@@ -94,6 +94,7 @@ pub struct WsState {
 #[derive(Clone)]
 pub struct ConnectionInfo {
     pub tx: mpsc::Sender<String>,
+    pub kind: ParticipantKind,
     pub user_id: UserId,
     pub app_id: AppId,
     pub display_name: String,
@@ -2406,11 +2407,19 @@ impl WsState {
         {
             warn!("membership close failed: {e}");
         }
-        let count = self
-            .control
-            .channels
-            .update_participant_count(channel_id, -1)
-            .await;
+        let counted = self
+            .connections
+            .get(&session_id)
+            .map(|c| c.kind.counts())
+            .unwrap_or(true);
+        let count = if counted {
+            self.control
+                .channels
+                .update_participant_count(channel_id, -1)
+                .await
+        } else {
+            Ok(-1)
+        };
         if let Some(ref redis) = self.control.redis {
             let _ = redis.remove_user_channel(user_id, channel_id).await;
             let _ = redis.decr_channel_participants(channel_id).await;
@@ -2762,6 +2771,7 @@ async fn adopt_mirrored_session(
                         user_agent,
                     },
                     0,
+                    token.kind,
                 )
                 .await;
             if let Err(e) = created {
@@ -2834,6 +2844,7 @@ async fn adopt_mirrored_session(
     state.connections.insert(
         session_id,
         ConnectionInfo {
+            kind: token.kind,
             tx: tx.clone(),
             user_id: token.user_id,
             app_id: token.app_id,
@@ -2928,11 +2939,15 @@ async fn restore_channel(
             .sessions
             .remove_channel_membership(channel_id, session_id)
             .await;
-        let count = state
-            .control
-            .channels
-            .update_participant_count(channel_id, -1)
-            .await;
+        let count = if token.kind.counts() {
+            state
+                .control
+                .channels
+                .update_participant_count(channel_id, -1)
+                .await
+        } else {
+            Ok(-1)
+        };
         if let Some(redis) = &state.control.redis {
             let _ = redis.remove_user_channel(user_id, channel_id).await;
             let _ = redis.decr_channel_participants(channel_id).await;
@@ -3013,12 +3028,16 @@ async fn restore_channel(
             let _ = state.sfu.read().leave_channel(&session_id, &channel_id);
             return false;
         }
-        if let Ok(1) = state
-            .control
-            .channels
-            .update_participant_count(channel_id, 1)
-            .await
-        {
+        let count = if token.kind.counts() {
+            state
+                .control
+                .channels
+                .update_participant_count(channel_id, 1)
+                .await
+        } else {
+            Ok(-1)
+        };
+        if let Ok(1) = count {
             state.control.events.publish(ServerEvent::ChannelActivated {
                 app_id,
                 channel_id,
@@ -3139,6 +3158,7 @@ async fn open_session(
                 user_agent,
             },
             limits.max_concurrent_sessions,
+            token.kind,
         )
         .await
     {
@@ -3162,6 +3182,7 @@ async fn open_session(
     state.connections.insert(
         session_id,
         ConnectionInfo {
+            kind: token.kind,
             tx: tx.clone(),
             user_id: token.user_id,
             app_id: token.app_id,
@@ -4400,11 +4421,15 @@ async fn handle_control_message(
             if priority {
                 state.grant_priority(channel_id, session_id);
             }
-            let count = state
-                .control
-                .channels
-                .update_participant_count(channel_id, 1)
-                .await;
+            let count = if token.kind.counts() {
+                state
+                    .control
+                    .channels
+                    .update_participant_count(channel_id, 1)
+                    .await
+            } else {
+                Ok(-1)
+            };
             if let Ok(1) = count {
                 state.control.events.publish(ServerEvent::ChannelActivated {
                     app_id: token.app_id,
@@ -5699,6 +5724,7 @@ mod tests {
 
     fn jwt(user_id: UserId, app_id: AppId) -> ValidatedToken {
         ValidatedToken {
+            kind: ParticipantKind::User,
             user_id,
             app_id,
             display_name: "p".into(),
@@ -5712,6 +5738,7 @@ mod tests {
     fn detached(user_id: UserId, app_id: AppId, token: &ResumeToken) -> ConnectionInfo {
         let (tx, _rx) = mpsc::channel(1);
         ConnectionInfo {
+            kind: ParticipantKind::User,
             tx,
             user_id,
             app_id,

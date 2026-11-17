@@ -42,7 +42,10 @@ def main() -> int:
     checked = commits(sys.argv[1])
     for sha, name, email, body in checked:
         signoffs = [(m.group("name").strip(), m.group("email").strip()) for m in SIGNOFF.finditer(body)]
-        ok = any(n == name and e.lower() == email.lower() for n, e in signoffs)
+        # GitHub Apps (Dependabot and friends) sign off under their noreply address while the
+        # commit author carries a different one; for them the name is what identifies the author.
+        bot = name.endswith("[bot]")
+        ok = any(n == name and (bot or e.lower() == email.lower()) for n, e in signoffs)
         if not ok:
             subject = body.splitlines()[0] if body else ""
             have = ", ".join(f"{n} <{e}>" for n, e in signoffs) or "none"
